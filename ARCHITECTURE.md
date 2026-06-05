@@ -90,10 +90,11 @@ channel that can be prompt-injected. The model (the **confused-deputy** model):
 
 - **Adversarial (programmatic; the bulk).** Goal-directed search over the product's capability
   surface for unintended affordances and weak controls. The swarm-native workload. Built (v1 is
-  a deterministic stub model; the LLM control loop is Phase 3). → `heel/agents.py`.
+  a deterministic stub model by default; an LLM control loop swaps in via `HEEL_MODEL=anthropic`,
+  `heel/model.py`). → `heel/agents.py`.
 - **Opportunistic-human (motivation-profiled).** Ordinary motivated users who *game* the product
   within normal affordances, conditioned by a small declarative `MotivationProfile`. Contract
-  defined; built in Phase 3.
+  defined; **built** (`heel/agents_human.py`, `profiles.py`).
 
 ---
 

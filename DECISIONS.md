@@ -126,3 +126,17 @@ the §10 enforcement is identical and cannot diverge. No scope-creation route ex
 **Why:** §7/§8 — `heel_propose_control` returns the agent's recommendation plus a per-category
 control bank, ranked by estimated exploitability reduction. A Phase-4 version re-simulates each
 candidate against the affordance to measure the reduction empirically rather than estimate it.
+
+### D-018 — The scenario library is fully declarative (addable without code, incl. JSON)
+**Why:** §4 "scenarios are specs addable without code". Per-strategy probe functions are replaced by
+ONE generic `evaluate_criterion` over a small declarative language (guard_absent / prop±equals/in/
+exists / prop_contains / prop_neq / all_of / any_of / not). Controls + handoff move INTO the scenario
+spec. `heel/scenarios_lib/*.json` is merged at load. Breadth is now 34 scenarios across all 10
+categories; scenarios that match no synthetic affordance correctly don't fire (no FP inflation).
+
+### D-019 — LLM control loop is a swappable Model with an offline deterministic default
+**Why:** §11 "an LLM control loop ... a stub model path so the synthetic demo runs with no API key".
+`heel/model.py`: `StubModel` (deterministic, heuristic discovery, default) and `AnthropicModel`
+(`HEEL_MODEL=anthropic`, Messages API via stdlib urllib, no SDK). The model only sees observable
+properties and only proposes declarative scenario specs — HEEL builds the contained PoC; the model
+stays in lane and falls back to the heuristic on error/no-key. Keeps the pure-stdlib core.

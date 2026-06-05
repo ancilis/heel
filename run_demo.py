@@ -117,9 +117,12 @@ def main():
     all_rejected = all(r for _, r in gate_rows)
     L.append(f"  -> auth gate: {'PASS — no escalation reachable via the agent surface' if all_rejected else 'FAIL'}")
     L.append("")
-    L.append(f"SCENARIO LIBRARY: {len(SEED_SCENARIOS)} seed scenarios across "
-             f"{len({s.category.value for s in SEED_SCENARIOS})} categories; "
-             f"{sum(len(c['discovered_scenarios']) for _, c in results.values())} discovered by the swarm.")
+    from heel.model import get_model
+    from heel.scenarios import all_seed_scenarios, load_json_scenarios
+    alls = all_seed_scenarios()
+    L.append(f"SCENARIO LIBRARY: {len(alls)} scenarios across {len({s.category.value for s in alls})} categories "
+             f"({len(load_json_scenarios())} loaded from JSON — addable without code); "
+             f"discovery model: {get_model().name} (LLM loop swappable via HEEL_MODEL=anthropic).")
     L.append("=" * 80)
     L.append("Synthetic-first · contained PoCs (canary-only) · no prohibited content · plausibility-")
     L.append("weighted · severity-honest · immutable self-audit. See ARCHITECTURE.md / EVAL.md.")

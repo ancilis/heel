@@ -285,5 +285,40 @@ class TestRestSharesAuthGate(Base):  # spec §2 — REST is a thin client over t
             httpd.shutdown()
 
 
+class TestLibraryAndModel(Base):  # Phase 3 — library depth + LLM loop
+    def test_library_breadth_all_ten_categories(self):
+        from heel.scenarios import all_seed_scenarios
+        scs = all_seed_scenarios()
+        self.assertGreaterEqual(len(scs), 30)
+        self.assertEqual(len({s.category.value for s in scs}), 10)
+
+    def test_scenarios_addable_without_code_via_json(self):
+        from heel.scenarios import list_scenarios
+        ids = {s.id for s in list_scenarios()}
+        self.assertIn("sc.community.csv_formula_injection", ids)  # from scenarios_lib/*.json
+
+    def test_declarative_criterion_evaluator(self):
+        from heel.agents import evaluate_criterion
+        from heel.targets import get_target
+        aff = next(a for a in get_target("synthetic-saas").affordances if a.id == "record_get")
+        self.assertTrue(evaluate_criterion({"prop": "tenant_check", "equals": "missing"}, aff))
+        self.assertFalse(evaluate_criterion({"prop": "tenant_check", "equals": "enforced"}, aff))
+        self.assertTrue(evaluate_criterion({"any_of": [{"guard_absent": True}, {"prop": "x", "equals": 1}]}, aff))
+
+    def test_model_stub_is_default_and_anthropic_falls_back_without_key(self):
+        import os
+        from heel.model import AnthropicModel, StubModel, get_model
+        self.assertIsInstance(get_model(), StubModel)
+        # anthropic model with no key falls back to the heuristic (offline-safe)
+        m = AnthropicModel(api_key=None)
+        t = self._target_obj()
+        disc, extra = m.discover(t, set(), "r", lambda *a: None)
+        self.assertTrue(any(s.id == "sc.discovered.webhook_endpoint" for s in disc))
+
+    def _target_obj(self):
+        from heel.targets import get_target
+        return get_target("synthetic-saas")
+
+
 if __name__ == "__main__":
     unittest.main()

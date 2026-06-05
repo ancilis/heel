@@ -80,6 +80,10 @@ class AbuseScenario:
     containment_limits: dict = field(default_factory=dict)  # per-scenario back-off / sample caps
     applies_when: AppliesWhen = AppliesWhen.ALWAYS
     source: ScenarioSource = ScenarioSource.SEED
+    # declarative outputs (so scenarios are addable WITHOUT code, incl. from JSON):
+    recommended_control: str = ""
+    exploitability_reduction: float = 0.6
+    handoff: str = ""                      # "" | "appsec" | "model_redteam"
 
 
 # --------------------------------------------------------------------------- #

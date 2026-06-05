@@ -1,0 +1,22 @@
+[
+  {
+    "id": "sc.community.csv_formula_injection",
+    "category": "content_policy",
+    "objective": "CSV/formula injection in user-controlled export fields",
+    "kind": "export",
+    "success_criterion": {"prop": "formula_sanitization", "equals": "none"},
+    "severity_model": {"likelihood": 0.4, "impact": 0.5},
+    "recommended_control": "neutralize leading =,+,-,@ in exported cells",
+    "exploitability_reduction": 0.7
+  },
+  {
+    "id": "sc.community.coupon_velocity",
+    "category": "trust_economy",
+    "objective": "Promo/coupon farming via high-velocity redemption",
+    "kind": "referral",
+    "success_criterion": {"prop": "velocity_limit", "equals": "none"},
+    "severity_model": {"likelihood": 0.5, "impact": 0.5},
+    "recommended_control": "per-account + per-device coupon velocity limits",
+    "exploitability_reduction": 0.7
+  }
+]

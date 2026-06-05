@@ -173,3 +173,23 @@ sorted. (`TestControlSearch`.)
 **34 tests pass.** Still deferred to later Phase-3/4 waves: full library breadth (many scenarios
 per category), the LLM agent control loop, true thousand-agent fan-out, affordance-chaining
 discovery, and the UI.
+
+### Phase 3 — wave 2: library depth + LLM loop
+
+**Declarative library (§4, DoD #2).** Scenarios are now pure SPECS interpreted by a single generic
+criterion evaluator (`agents.evaluate_criterion`) — so they are **addable without code**, including
+from `heel/scenarios_lib/*.json`. The library is **34 scenarios across all 10 categories** (32
+declarative in-code + 2 from JSON), with breadth that exceeds the synthetic targets (many scenarios
+match no planted affordance — they're there for real targets, and correctly don't fire → no FP
+inflation). The honest signals are unchanged (coverage 0.93/0.95, FN `ato_chain`, FP `export_billing`,
+discovery `webhook_endpoint`, handoffs). (`TestLibraryAndModel`.)
+
+**LLM control loop (§3, §11).** The adversarial agent's discovery is driven by a swappable `Model`
+(`heel/model.py`). The default `StubModel` is deterministic and offline (the demo uses it, no key);
+`AnthropicModel` swaps in behind `HEEL_MODEL=anthropic` (+ `ANTHROPIC_API_KEY`), calling the Messages
+API via stdlib `urllib` (no SDK). The model only sees OBSERVABLE properties and only PROPOSES
+declarative scenario specs (HEEL builds the contained PoC), stays in HEEL's lane (no weaponization /
+prohibited content / jailbreak technique), and falls back to the heuristic on any error or missing
+key. (`test_model_stub_is_default_and_anthropic_falls_back_without_key`.)
+
+**38 tests pass.**
