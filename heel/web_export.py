@@ -89,7 +89,9 @@ def build_snapshot() -> dict:
                   "applies_when": s.applies_when.value, "source": s.source.value,
                   "control": s.recommended_control, "handoff": s.handoff} for s in all_seed_scenarios()]
 
+    from .blind_eval import blind_eval
     return {
+        "blind_eval": blind_eval(n=40, workers=8),
         "meta": {"server": "heel", "version": "1.0.0", "tools": [t["name"] for t in TOOL_SCHEMAS],
                  "tool_schemas": TOOL_SCHEMAS, "model": get_model().name,
                  "n_scenarios": len(scenarios), "n_json_scenarios": len(load_json_scenarios()),

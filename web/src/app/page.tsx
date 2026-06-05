@@ -2,12 +2,12 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useEffect, useState, type ReactNode } from "react";
 import {
-  Overview, AbuseBoard, Backtest, LiveSwarm, Scopes, Containment, Integration, AuthGate, Scenarios,
+  Overview, AbuseBoard, Backtest, BlindEval, LiveSwarm, Scopes, Containment, Integration, AuthGate, Scenarios,
 } from "@/components/screens";
 
 const NAV: { group: string; items: { k: string; label: string }[] }[] = [
   { group: "System", items: [{ k: "overview", label: "Overview" }, { k: "swarm", label: "Live swarm" }] },
-  { group: "Findings", items: [{ k: "abuse", label: "Abuse board" }, { k: "backtest", label: "Backtest" }, { k: "scenarios", label: "Scenario library" }] },
+  { group: "Findings", items: [{ k: "abuse", label: "Abuse board" }, { k: "backtest", label: "Backtest" }, { k: "blindeval", label: "Blind eval (real)" }, { k: "scenarios", label: "Scenario library" }] },
   { group: "Safety", items: [{ k: "auth", label: "Authorization gate" }, { k: "scopes", label: "Scope panel" }, { k: "containment", label: "Containment log" }, { k: "integration", label: "MCP / integration" }] },
 ];
 
@@ -24,6 +24,7 @@ export default function ControlRoom() {
     overview: <Overview s={snap} go={setActive} />,
     abuse: <AbuseBoard s={snap} target={target} setTarget={setTarget} />,
     backtest: <Backtest s={snap} />,
+    blindeval: <BlindEval s={snap} />,
     swarm: <LiveSwarm s={snap} target={target} setTarget={setTarget} />,
     scopes: <Scopes s={snap} />,
     containment: <Containment s={snap} target={target} setTarget={setTarget} />,
@@ -63,7 +64,7 @@ export default function ControlRoom() {
             <div className="text-[14px] font-semibold">{title}</div>
             <div className="text-[11px] text-muted">prove an abuse path is reachable · contained PoC · recommended control</div>
           </div>
-          <div className="text-[11px] text-muted tabnum">synthetic-first · safety spine §10 · {snap ? "38 tests green" : "loading"}</div>
+          <div className="text-[11px] text-muted tabnum">synthetic-first · safety spine §10 · {snap ? "42 tests green" : "loading"}</div>
         </header>
         <div className="p-6 max-w-[1180px]">
           {err && <div className="text-bad text-sm">Failed to load snapshot — run <code className="text-accent">make ui-data</code>. ({err})</div>}

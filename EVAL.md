@@ -193,3 +193,35 @@ prohibited content / jailbreak technique), and falls back to the heuristic on an
 key. (`test_model_stub_is_default_and_anthropic_falls_back_without_key`.)
 
 **38 tests pass.**
+
+### Phase 3 — wave 3: blind-target evaluation (the honest detection metric) + chaining + fan-out
+
+The red-team's deepest finding was that the synthetic coverage is a **self-consistency** metric, not
+detection accuracy. This wave fixes it with a genuinely independent measurement.
+
+**Blind-target evaluation (`heel/blind.py`, `heel/blind_eval.py`).** Procedurally-generated targets
+whose planted weaknesses use ENCODINGS authored independently of the seed probes — only some match a
+scenario; the rest are synonym vocabularies the library doesn't key off; decoys share property names
+with safe values. The library is run against many such targets concurrently (the §7 **fan-out**, a
+thread pool) and a real recall/precision DISTRIBUTION is aggregated:
+
+| metric | value |
+|---|---|
+| **real recall** | **0.25** (95% CI [0.19, 0.31]) — vs the 0.93+ self-consistency coverage |
+| real precision | 0.78 |
+| false-positive rate | 0.19 |
+| found / planted | 72 / 287 (215 missed — unanticipated encodings) |
+| category-10 clean on blind non-AI targets | **23/23** (verified, not structural) |
+
+This is the **honest real-target estimate**: HEEL catches what its library anticipates, which on
+blind targets is ~a quarter of plants. **Recall rises as the library's encoding breadth grows** —
+that is the honest improvement axis, and the metric can't be gamed by writing probes against known
+plants. (`TestBlindEvaluation`.)
+
+**Affordance-chaining (`heel/chaining.py`).** Multi-step abuse the single-affordance classes miss —
+e.g. ATO = weak recovery + non-rotated session. This closes the synthetic `ato_chain` FN with a real
+capability; the honest sub-1.0 signal now lives in the blind eval. Compound chain findings over
+genuinely-vulnerable affordances are reported separately, not counted as false positives.
+(`TestChaining`.)
+
+**42 tests pass.**

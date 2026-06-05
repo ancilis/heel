@@ -149,3 +149,25 @@ The UI honors the epistemics (reachability-weighting visible, implausible demote
 predicted/contained PoCs; optional classification shown when on; the scope panel is read-only and
 cannot mint/widen a scope). `node_modules` gitignored; the snapshot is committed so the UI renders
 on a clean checkout.
+
+### D-021 — Blind-target evaluation is the honest detection metric; coverage is self-consistency
+**Why:** the red-team showed the synthetic coverage is circular. `heel/blind.py` plants weaknesses
+using a broad ENCODING vocabulary authored independently of the seed probes (synonyms the library
+doesn't key off, verified not to leak via discovery either); `heel/blind_eval.py` aggregates real
+recall/precision/FP + 95% CI across many targets. Real recall ~0.25 (vs 0.93 self-consistency) is
+the honest real-target estimate; it rises only by growing the library's encoding breadth — it cannot
+be gamed by writing probes against known plants.
+
+### D-022 — Affordance-chaining is a real capability; compound findings aren't false positives
+**Why:** chaining (`heel/chaining.py`) finds multi-step abuse (ATO = weak recovery + non-rotated
+session) the single-affordance classes miss, closing the synthetic ato_chain FN. The backtest
+EXCLUDES `chain:`-prefixed compound findings from the FP count (a chain over two genuinely-vulnerable
+affordances is a legitimate escalation, not a false alarm on a hardened affordance). The honest
+sub-1.0 signal now lives in the blind eval, not the synthetic coverage.
+
+### D-023 — Fan-out is a bounded thread pool (honest about the GIL)
+**Why:** §7 thousand-agent fan-out. `blind_eval` runs targets via `concurrent.futures` threads — the
+INTERNAL eval path (no scope/real target, so no auth gate needed; it never touches a real system).
+With the stub model the GIL bounds CPU speedup, so we call it a bounded fan-out, not literal 1000×;
+with real LLM agents (`HEEL_MODEL=anthropic`) threads overlap network-bound work. Determinism is
+preserved (each target seeded; no shared mutable RNG across threads).

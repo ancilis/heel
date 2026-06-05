@@ -58,6 +58,13 @@ def run_abuse(scope, target_id: str, scenario_ids, caller: CallerContext, store,
                 by_aff[f.affordance_id] = f
         output["opportunistic_profiles"] = opp["profiles_used"]
 
+    # affordance-chaining discovery — multi-step abuse the single-affordance classes miss
+    if "adversarial" in classes:
+        from .chaining import run_chaining
+        for f in run_chaining(target, log, run_id):
+            if f.affordance_id not in by_aff:
+                by_aff[f.affordance_id] = f
+
     output["findings"] = list(by_aff.values())
     enrich_controls(output["findings"])
     classify_enrich(output["findings"], enabled=classify_enabled)   # optional annotation (off by default)

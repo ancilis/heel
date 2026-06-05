@@ -110,6 +110,15 @@ def main():
     L.append(f"  control search (vector {fs[0]['id']}): {len(ctrl['ranked_candidates'])} ranked candidates, "
              f"top = '{ctrl['ranked_candidates'][0]['control'][:46]}'")
     L.append("")
+    from heel.blind_eval import blind_eval
+    be = blind_eval(n=40, workers=8)
+    L.append("BLIND-TARGET EVALUATION — the HONEST real-detection metric (independent encodings, fan-out):")
+    L.append(f"  real recall {be['real_recall_mean']} (95% CI {be['real_recall_ci95']}) at precision "
+             f"{be['real_precision_mean']} across {be['n_targets']} blind targets ({be['workers']}-way fan-out)")
+    L.append(f"  -> FAR below the {results['synthetic-ai'][1]['coverage']} self-consistency number: blind plants "
+             f"use encodings the library wasn't written against ({be['total_missed']}/{be['total_planted']} missed).")
+    L.append(f"  category-10 cleanly 0 on {be['category10_clean_on_non_ai']} blind non-AI targets (not structural luck).")
+    L.append("")
     L.append("AUTHORIZATION GATE (agent caller is an untrusted, possibly prompt-injected channel):")
     for label, rejected in gate_rows:
         L.append(f"  [{'REJECTED+logged ✓' if rejected else 'NOT REJECTED ✗'}]  {label}")

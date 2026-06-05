@@ -74,6 +74,9 @@ def build_saas_target() -> SyntheticTarget:
              0.6, Severity(0.55, 0.6), route="/referral/redeem", self_referral_check="missing"),
         _aff("account_recovery", "auth_reset", Category.IDENTITY_ACCOUNT, "weak_account_recovery",
              0.65, Severity(0.6, 0.7), route="/recover", recovery_check="weak"),
+        # NOT a single-affordance vuln — only abusable when CHAINED with weak recovery (→ ato_chain)
+        _aff("session_mgmt", "session", Category.IDENTITY_ACCOUNT, None, 0.6, guard=True,
+             route="/session", session_rotation="none"),
         # --- planted but NOT covered by any seed scenario → the swarm must DISCOVER it ---
         _aff("webhook_endpoint", "integration", Category.INTEGRATION_EXTENSIBILITY, "webhook_replay",
              0.6, Severity(0.5, 0.5), route="/webhooks/in", replay_protection="missing"),

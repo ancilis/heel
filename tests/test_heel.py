@@ -129,10 +129,11 @@ class TestCoverageBacktest(Base):  # spec §5, DoD #4
         c = self.server.heel_get_coverage({"run_id": rid}, self.caller)["coverage"]
         self.assertTrue(c["discovered_scenarios"])
 
-    def test_honest_false_negative_reported(self):
+    def test_chaining_closes_ato_chain(self):  # affordance-chaining discovery (the real capability)
         rid = self.run_target("synthetic-saas")
         c = self.server.heel_get_coverage({"run_id": rid}, self.caller)["coverage"]
-        self.assertGreaterEqual(c["false_negatives"], 1)  # promo_stacking — a genuine miss
+        self.assertNotIn("ato_chain", [m["affordance"] for m in c["missed"]])
+        self.assertGreaterEqual(c["compound_chain_findings"], 1)
 
 
 class TestSafetySpine(Base):  # spec §10.2
@@ -238,11 +239,12 @@ class TestOpportunisticClass(Base):  # spec §3.2, DoD #3
         opp = self._opp(r["run_id"])
         self.assertEqual(opp, [])  # opportunistic class not run
 
-    def test_chain_vector_missed_by_both_classes(self):  # honest FN survives both classes
-        rid = self.run_target("synthetic-saas")
-        c = self.server.heel_get_coverage({"run_id": rid}, self.caller)["coverage"]
-        self.assertIn("ato_chain", [m["affordance"] for m in c["missed"]])
-        self.assertLess(c["coverage"], 1.0)
+    def test_opportunistic_does_not_run_for_adversarial_only(self):
+        r = self.server.heel_run({"scope_id": self.scope.scope_id, "target": "synthetic-saas",
+                                  "agent_classes": ["adversarial"]}, self.caller)
+        opp = [f for f in self.server.heel_get_findings({"run_id": r["run_id"]}, self.caller)["findings"]
+               if (f.get("reproduction") or {}).get("class") == "opportunistic_human"]
+        self.assertEqual(opp, [])
 
 
 class TestControlSearch(Base):  # spec §8
@@ -318,6 +320,36 @@ class TestLibraryAndModel(Base):  # Phase 3 — library depth + LLM loop
     def _target_obj(self):
         from heel.targets import get_target
         return get_target("synthetic-saas")
+
+
+class TestBlindEvaluation(unittest.TestCase):  # the honest real-detection metric (red-team fix)
+    @classmethod
+    def setUpClass(cls):
+        from heel.blind_eval import blind_eval
+        cls.r = blind_eval(n=24, workers=6)
+
+    def test_real_recall_far_below_self_consistency(self):
+        # blind plants use encodings the library wasn't written against → honest, low real recall
+        self.assertLess(self.r["real_recall_mean"], 0.7)
+        self.assertGreater(self.r["real_recall_mean"], 0.0)
+
+    def test_precision_and_ci_reported(self):
+        self.assertIsNotNone(self.r["real_precision_mean"])
+        self.assertEqual(len(self.r["real_recall_ci95"]), 2)
+
+    def test_category10_optional_verified_on_blind_non_ai_targets(self):
+        clean, total = self.r["category10_clean_on_non_ai"].split("/")
+        self.assertEqual(clean, total)  # cat-10 cleanly 0 on EVERY blind non-AI target
+
+
+class TestChaining(unittest.TestCase):
+    def test_chaining_finds_multi_affordance_abuse(self):
+        from heel.chaining import run_chaining
+        from heel.targets import get_target
+        vs = run_chaining(get_target("synthetic-saas"), lambda *a: None, "t")
+        self.assertTrue(any(v.affordance_id == "ato_chain" for v in vs))
+        for v in vs:  # contained
+            self.assertEqual(v.reproduction["sample"], "canary_only")
 
 
 if __name__ == "__main__":

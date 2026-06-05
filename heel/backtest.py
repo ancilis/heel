@@ -59,7 +59,11 @@ def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
 
     tp = [pv for pv in reachable if pv.affordance_id in found_aff]
     fn = [pv for pv in reachable if pv.affordance_id not in found_aff]
-    fp = [f for f in plausible if f.affordance_id not in planted_affordances]
+    # FP = a finding on a HARDENED/decoy affordance. A "chain:" compound over genuinely-vulnerable
+    # affordances is a legitimate escalation discovery, NOT a false alarm — excluded from FP.
+    compound = [f for f in plausible if f.affordance_id.startswith("chain:")]
+    fp = [f for f in plausible if f.affordance_id not in planted_affordances
+          and not f.affordance_id.startswith("chain:")]
 
     cov = len(tp) / len(reachable) if reachable else None
     # reachability-weighted coverage — LOAD-BEARING: every reachable planted vector is weighted by
@@ -115,6 +119,7 @@ def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
         "category10_clean_on_non_ai": (target.has_agent_surface or len(cat10_findings) == 0),
         "opportunistic_findings": len(opportunistic),
         "opportunistic_affordances": [f.affordance_id for f in opportunistic],
+        "compound_chain_findings": len(compound),
         "missed": [{"affordance": pv.affordance_id, "category": pv.category.value, "weakness": pv.weakness} for pv in fn],
         "false_positive_affordances": [f.affordance_id for f in fp],
         "discovered_scenarios": [s.id for s in agent_output["discovered_scenarios"]],
