@@ -190,13 +190,13 @@ export function HeldOut({ s }: { s: any }) {
           <div className="text-center"><Donut value={tsem.recall} color="#34d399" label="semantic (test)" />
             <div className="text-[10px] text-muted tabnum mt-1">CI [{tsem.wilson_ci95.join(", ")}]</div></div>
           <div className="flex-1 grid grid-cols-2 gap-2 min-w-[260px]">
-            <Stat label="TEST recall (unbiased)" value={fmt(tsem.recall, 2)} tone="ok" sub={`${test.total_planted} weaknesses · never tuned on`} />
-            <Stat label="TEST precision" value={fmt(tsem.precision, 2)} tone="accent" sub="holds on unseen vocabulary" />
-            <Stat label="DEV recall (tuned)" value={fmt(dev.with_semantic.recall, 2)} sub="the tuning ceiling" />
-            <Stat label="overfitting gap" value={`${Math.round((dev.with_semantic.recall - tsem.recall) * 100)}pp`} tone="warn" sub="dev − test, honestly shown" />
+            <Stat label="localization recall" value={fmt(tsem.recall, 2)} tone="ok" sub={`right affordance · cluster-CI [${tsem.recall_cluster_ci95.join(", ")}]`} />
+            <Stat label="attribution recall" value={fmt(tsem.attribution_recall, 2)} tone="warn" sub={`+ right category · CI [${tsem.attribution_cluster_ci95.join(", ")}]`} />
+            <Stat label="TEST precision" value={fmt(tsem.precision, 2)} tone="accent" sub={`CI [${tsem.precision_cluster_ci95.join(", ")}]`} />
+            <Stat label="overfitting gap" value={`${Math.round((dev.with_semantic.recall - tsem.recall) * 100)}pp`} tone="warn" sub={`dev ${fmt(dev.with_semantic.recall, 2)} − test, shown`} />
           </div>
         </div>
-        <div className="mt-3 text-[11px] text-dim">Exact property/kind matching barely generalizes to unseen vocabulary (test {fmt(tex.recall, 2)}); semantic synonym families (heel/semantic.py) recover ~{Math.round(tsem.recall / Math.max(tex.recall, 0.01))}×. Improves only by widening real-vocabulary coverage — never by writing probes against known plants. Not near 1.0 — the honest real-target ceiling.</div>
+        <div className="mt-3 text-[11px] text-dim">Two honest gaps shown, not hidden: <span className="text-text">dev→test</span> (overfitting) and <span className="text-text">localization→attribution</span> (~{Math.round((1 - tsem.attribution_recall / Math.max(tsem.recall, 0.01)) * 100)}% of flagged affordances get the wrong category). Exact matching barely generalizes (test {fmt(tex.recall, 2)}); semantic families recover ~{Math.round(tsem.recall / Math.max(tex.recall, 0.01))}× — only by widening real-vocabulary coverage, never by writing probes against known plants. CIs are target-level cluster bootstraps. Not near 1.0 — the honest ceiling.</div>
       </Panel>
       <Panel title="TEST recall by category (unbiased)" sub="Where HEEL generalizes vs where it has gaps, on targets it never saw.">
         <HBars items={Object.entries(tsem.recall_by_category).map(([c, v]) => {

@@ -124,13 +124,15 @@ def main():
     from heel.heldout_eval import heldout_eval
     he = heldout_eval()
     dev, test = he["dev"], he.get("test", he["dev"])
+    ts = test["with_semantic"]
     L.append("HELD-OUT EVALUATION — targets authored by an INDEPENDENT LLM swarm (blind to HEEL's probes):")
-    L.append(f"  DEV  (tuned on, {dev['total_planted']} weaknesses):  exact {dev['exact_match']['recall']} -> "
-             f"semantic {dev['with_semantic']['recall']} @ precision {dev['with_semantic']['precision']}")
-    L.append(f"  TEST (FROZEN, never tuned, {test['total_planted']} weaknesses):  exact {test['exact_match']['recall']} -> "
-             f"semantic {test['with_semantic']['recall']} (Wilson CI {test['with_semantic']['wilson_ci95']}) @ precision {test['with_semantic']['precision']}")
-    L.append("  -> the TEST number is the UNBIASED one; the dev->test gap is the overfitting gap. Semantic")
-    L.append("     generalization beats exact matching on vocabulary it never saw — but is not near 1.0 (honest ceiling).")
+    L.append(f"  DEV  (tuned on, {dev['total_planted']} weaknesses):  semantic localization {dev['with_semantic']['recall']} @ precision {dev['with_semantic']['precision']}")
+    L.append(f"  TEST (FROZEN, never tuned, {test['total_planted']} weaknesses, sha {test['sha256']}):")
+    L.append(f"     LOCALIZATION recall {ts['recall']} (cluster-CI {ts['recall_cluster_ci95']}) -- right affordance flagged")
+    L.append(f"     ATTRIBUTION  recall {ts['attribution_recall']} (cluster-CI {ts['attribution_cluster_ci95']}) -- AND right category (the stricter, honest number)")
+    L.append(f"     precision {ts['precision']} (cluster-CI {ts['precision_cluster_ci95']}); exact-match {test['exact_match']['recall']}")
+    L.append("  -> TEST is the UNBIASED number; dev->test is the overfitting gap; localization->attribution is the")
+    L.append("     mis-categorization gap. Semantic beats exact on unseen vocabulary, but is NOT near 1.0 (honest ceiling).")
     L.append("")
     L.append("AUTHORIZATION GATE (agent caller is an untrusted, possibly prompt-injected channel):")
     for label, rejected in gate_rows:

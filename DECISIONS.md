@@ -210,3 +210,16 @@ gap, shown rather than hidden. recall improves only by widening real-vocabulary 
 (audit_logged:true is GOOD, acts_on_content:true is BAD). Removed them; precision recovered to 0.96
 on both dev and the unseen test set. Where true==weakness, the signal matches the explicit bad word
 (e.g. "passthrough", "no_check") instead.
+
+### D-029 — Report localization AND attribution recall (affordance match ≠ correct detection)
+**Why:** the red-team showed ~29% of held-out localizations had the wrong category but still counted
+as TP. `backtest.score_target` now also computes attribution_coverage (affordance_id AND category
+match); heldout_eval reports both. The honest headline is the stricter attribution number (0.27),
+with localization (0.38) shown alongside. Attribution isn't "fixed" by peeking at ground-truth
+category to choose the signal (that would cheat) — the gap is disclosed.
+
+### D-030 — Token-anchored semantic matching + target-cluster bootstrap CIs
+**Why:** substring matching caused false fires (orm⊂format, ttl⊂throttle, allowed⊂disallowed) and
+mis-categorization; `heel/semantic.py` now anchors topic/permissive tokens at word boundaries
+(precision 0.97). The iid Wilson CI understated uncertainty on clustered data; heldout_eval uses a
+target-level cluster bootstrap. test_targets.json is content-hashed to pre-register the number.

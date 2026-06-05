@@ -41,8 +41,8 @@ the probes. HEEL's recall here is real detection accuracy with no author control
   independently-authored vocabulary.
 - **With semantic generalization ≈ 0.57** (Wilson CI ≈ [0.48, 0.68]) at **precision ≈ 0.95** — the
   `heel/semantic.py` synonym families recover roughly twice as much, on vocabulary HEEL never saw.
-- **Neither is near 1.0**, and `recall_by_category` shows exactly where HEEL is weak (e.g.
-  unintended-endpoints, license-entitlement) vs strong (data-harvesting, function-abuse).
+- **Neither is near 1.0.** `recall_by_category` is reported as descriptive per-category counts (k/n)
+  only — the denominators (≈1–29 per category) are far too small for per-category strong/weak claims.
 
 This is the honest real-target ceiling. It improves only by widening the library's semantic coverage
 of real abuse vocabularies — not by writing probes against known plants. The set is **frozen** so the
@@ -65,3 +65,23 @@ honest generalization on vocabulary HEEL never saw is ~0.38, and it rises only b
 semantic catalog's coverage of real abuse vocabularies — never by writing probes against known
 plants. (One TEST product was glimpsed by the tuner in a tool-result notification; the catalog was
 not tuned against it — a fresh red-team audits for any such leakage.)
+
+## Update — methodology red-team fixes (wave 5b)
+
+A 3-agent red-team audited the dev/test methodology (verdict: HONEST, with fixes). Applied:
+
+- **Localization vs attribution recall.** The score credited a TP on affordance match alone, so
+  ~29% of TEST localizations carried the wrong category. Now both are reported: TEST **localization
+  ~0.38** and the stricter **attribution ~0.27** (right affordance AND category). The
+  localization→attribution gap is shown, not hidden.
+- **Cluster bootstrap CIs.** The iid Wilson interval treated 199 clustered weaknesses as independent
+  (~30–45% too narrow). Replaced with a target-level bootstrap (resample the targets): localization
+  CI ≈ [0.29, 0.49], attribution ≈ [0.20, 0.35], precision ≈ [0.94, 1.0].
+- **Word-boundary matching.** Topic/permissive tokens are now anchored at token boundaries, killing
+  substring collisions (`orm`⊂`format`, `ttl`⊂`throttle`, `allowed`⊂`disallowed`); TEST precision
+  rose to ~0.97. Ambiguous `never`/`fixed` and bare `true`/`enabled` removed.
+- **Pre-registration.** `test_targets.json` is content-hashed (`sha256` in the eval output) so the
+  number is reported against a frozen set; the reachability≥0.25 gate is disclosed as a no-op (it
+  removes 0/199). The catalog was confirmed NOT fitted to the one glimpsed product (its two unique
+  tokens never fire). Auditor's residual caveat (honest): ~73% of the topic tokens that fire on TEST
+  also appear in DEV keys, though ~70% of catches still land on TEST-novel property keys.

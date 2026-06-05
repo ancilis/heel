@@ -308,3 +308,24 @@ polarity is property-dependent (`audit_logged:true` is good, `acts_on_content:tr
 
 **48 tests pass.** The four honesty levels now coexist: self-consistency ~1.0 → blind ~0.25 →
 held-out DEV ~0.73 (tuned) → **held-out TEST ~0.38 (unbiased) @ 0.96 precision**.
+
+### Phase 3 — wave 5b: held-out methodology red-team fixes
+
+A 3-agent red-team audited the dev/test held-out metric (verdict: HONEST, with real fixes). All applied:
+
+- **CRITICAL — localization vs attribution.** The score credited a true positive on affordance match
+  alone, so ~29% of TEST localizations carried the WRONG category. Both are now reported:
+  **localization recall 0.38**, the stricter **attribution recall 0.27** (right affordance AND
+  category). `heel/backtest.py` adds `attribution_coverage`; the gap is shown, not hidden.
+- **HIGH — clustered CI.** The iid Wilson treated 199 weaknesses nested in 14 targets as independent
+  (~30–45% too narrow). Replaced with a **target-level cluster bootstrap**: localization CI [0.29,
+  0.49], attribution [0.20, 0.35], precision [0.94, 1.0].
+- **HIGH — substring collisions.** `orm`⊂`format`, `ttl`⊂`throttle`, `allowed`⊂`disallowed` etc. fixed
+  by **word-boundary token matching** (`heel/semantic.py`); ambiguous `never`/`fixed`/bare `true`
+  removed. TEST precision rose to **0.97**.
+- **MEDIUM — researcher degrees of freedom.** `test_targets.json` is **content-hashed** (reported in
+  the eval); the reachability≥0.25 gate is disclosed as a no-op (0/199 filtered); per-category recall
+  is labelled descriptive-only (denominators too small for strong/weak claims).
+
+The honest TEST picture: **localization 0.38 (CI [0.29,0.49]) · attribution 0.27 (CI [0.20,0.35]) ·
+precision 0.97** on 199 independently-authored weaknesses, sha `3dba2486…`. **51 tests pass.**

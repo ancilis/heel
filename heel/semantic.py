@@ -14,22 +14,41 @@ category/control so the SEMANTIC_SCENARIOS are generated from this catalog (heel
 """
 from __future__ import annotations
 
+import re
+
 from .contracts import Category
 
 C = Category
 
+_TOK = re.compile(r"[^a-z0-9]+")
+
+
+def _norm(s) -> str:
+    # underscore-bounded token stream so matches anchor at token boundaries, not mid-word
+    # (fixes substring collisions like 'orm' in 'format', 'ttl' in 'throttle', 'allowed' in 'disallowed')
+    return "_" + "_".join(t for t in _TOK.split(str(s).lower()) if t) + "_"
+
+
+def _anchored(needle: str, norm_haystack: str) -> bool:
+    # needle must begin at a token boundary (allows suffixes: 'seat'->'seats', 'recover'->'recovery')
+    return ("_" + needle.strip("_").replace("-", "_")) in norm_haystack
+
 # NB: deliberately NO bare "true"/"yes"/"enabled" — boolean polarity is property-dependent
 # (audit_logged:true is GOOD, acts_on_content:true is BAD), so a global "true" wrecks precision.
 # Where true==weakness, the signal's permissive token is the EXPLICIT bad word (e.g. "passthrough").
+# token-anchored permissive values: distinctive whole words + explicit "no_X" phrases only.
+# NB no bare "true"/"enabled" (polarity is property-dependent), no "never"/"fixed" (negation-
+# ambiguous), no ultra-short prefixes like "no"/"all" (would anchor 'normal'/'allocation'). Where
+# true==weakness the signal matches the explicit bad word ("passthrough", "no_check", ...).
 _PERMISSIVE = ("missing", "none", "off", "disabled", "shared", "global", "wildcard", "allowed",
-               "open", "unbounded", "unlimited", "unrestricted", "weak", "client", "browser",
-               "frontend", "no_", "cross", "public", "settable", "absent", "sequential",
-               "incrementing", "guessable", "arbitrary", "external", "infinite", "never", "fixed",
+               "unbounded", "unlimited", "unrestricted", "weak", "client", "browser", "frontend",
+               "cross_tenant", "cross_account", "public", "settable", "absent", "sequential",
+               "incrementing", "monotonic", "guessable", "arbitrary", "external", "infinite",
                "reused", "plaintext", "exposed", "unverified", "unauthenticated", "anyone",
-               "spoofable", "ip_only", "email_only", "disposable", "soft_delete", "flag_only",
-               "retained", "indefinite", "unpinned", "ignored", "unsandboxed", "auto_approve",
-               "passthrough", "unscoped", "no_cooldown", "no_check", "no_limit", "no_rate",
-               "no_verification", "no_throttle", "false")
+               "spoofable", "disposable", "unpinned", "ignored", "unsandboxed", "passthrough",
+               "unscoped", "false", "ip_only", "email_only", "soft_delete", "flag_only", "retained",
+               "indefinite", "no_cooldown", "no_check", "no_limit", "no_rate", "no_verification",
+               "no_throttle", "no_dedupe", "no_cap", "not_emitted", "not_enforced", "not_validated")
 # values that mean the control IS present (suppress a match)
 _HARDENED = ("enforced", "server", "strict", "scoped", "pinned", "required", "verified", "rotated",
              "isolated", "allowlist", "per_tenant", "per-tenant", "signed", "rate_limited", "limited",
@@ -123,10 +142,10 @@ SEMANTIC_SIGNALS = {
 def _value_permissive(v) -> bool:
     if v is False or v in (0, None):
         return True
-    sv = str(v).lower()
-    if any(h in sv for h in _HARDENED):
+    vn = _norm(v)
+    if any(_anchored(h, vn) for h in _HARDENED):  # a present control suppresses the match (precision-favoring)
         return False
-    return any(perm in sv for perm in _PERMISSIVE)
+    return any(_anchored(p, vn) for p in _PERMISSIVE)
 
 
 def semantic_match(signal: str, aff) -> bool:
@@ -135,6 +154,7 @@ def semantic_match(signal: str, aff) -> bool:
         return False
     topics = spec[0]
     for k, v in aff.properties.items():
-        if any(t in str(k).lower() for t in topics) and _value_permissive(v):
+        kn = _norm(k)
+        if any(_anchored(t, kn) for t in topics) and _value_permissive(v):
             return True
     return False

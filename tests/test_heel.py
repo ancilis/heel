@@ -389,6 +389,16 @@ class TestHeldoutEvaluation(unittest.TestCase):  # strongest honesty test: indep
         self.assertLessEqual(test["with_semantic"]["recall"], self.r["dev"]["with_semantic"]["recall"])  # >= overfitting gap
         self.assertGreater(test["with_semantic"]["precision"], 0.85)  # precision holds on unseen vocabulary
 
+    def test_attribution_recall_is_reported_and_stricter(self):  # red-team CRITICAL fix
+        ws = self.r["test"]["with_semantic"]
+        # attribution (right affordance AND category) <= localization (right affordance only)
+        self.assertLessEqual(ws["attribution_recall"], ws["recall"])
+        self.assertEqual(len(ws["attribution_cluster_ci95"]), 2)
+        self.assertEqual(len(ws["recall_cluster_ci95"]), 2)  # target-level cluster bootstrap, not iid
+
+    def test_test_set_is_content_hashed(self):  # pre-registration against researcher degrees of freedom
+        self.assertEqual(len(self.r["test"]["sha256"]), 16)
+
     def test_wilson_ci_reported(self):
         self.assertEqual(len(self.r["with_semantic"]["wilson_ci95"]), 2)
 

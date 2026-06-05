@@ -59,6 +59,11 @@ def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
 
     tp = [pv for pv in reachable if pv.affordance_id in found_aff]
     fn = [pv for pv in reachable if pv.affordance_id not in found_aff]
+    # ATTRIBUTION-aware TP (red-team CRITICAL): localization (above) only checks the affordance was
+    # flagged; attribution also requires the reported CATEGORY to match the planted category. The gap
+    # between localization and attribution recall is reported honestly, never hidden.
+    found_cat = {f.affordance_id: f.category for f in plausible}
+    tp_attr = [pv for pv in tp if found_cat.get(pv.affordance_id) == pv.category]
     # FP accounting (red-team-hardened): a chain is a legitimate compound discovery ONLY if all its
     # legs are genuinely-vulnerable (no hardened decoy). A chain that touches a decoy is a real FALSE
     # ALARM — the blanket "chain:"-prefix exclusion was unsound and laundered such FPs.
@@ -79,6 +84,7 @@ def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
             fp.append(f)  # single finding on a hardened/decoy affordance
 
     cov = len(tp) / len(reachable) if reachable else None
+    cov_attr = round(len(tp_attr) / len(reachable), 3) if reachable else None  # category-correct recall
     # reachability-weighted coverage — LOAD-BEARING: every reachable planted vector is weighted by
     # the agent's per-affordance reachability ESTIMATE (continuous, depth-based), found or missed.
     find_by_aff = {f.affordance_id: f for f in plausible}
@@ -123,6 +129,8 @@ def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
         "reachable_planted": len(reachable),
         "true_positives": len(tp), "false_negatives": len(fn), "false_positives": len(fp),
         "coverage": round(cov, 3) if cov is not None else None,
+        "attribution_true_positives": len(tp_attr),
+        "attribution_coverage": cov_attr,  # right affordance AND right category (the stricter recall)
         "coverage_reachability_weighted": cov_w,
         "false_positive_rate": fp_rate,
         "severity_calibration": calibration,
