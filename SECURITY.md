@@ -54,6 +54,10 @@ red-team — neither is weaponized or counted as a product-abuse finding).
       on the scope-authorization model for *capability* control, not network access control. Do not
       expose it publicly; front it with your own authenticated gateway / mTLS / network policy if it
       must be reachable beyond localhost. It cannot mint or widen a scope regardless.
+      Read routes (`/runs/{id}/...`) are **not confidential between local callers** — all callers on
+      the loopback interface share one trust domain in v1; the `X-Heel-Caller` header is self-asserted
+      attribution, not authentication. The server also rejects non-loopback `Host` headers (anti
+      DNS-rebinding) and any request carrying an `Origin` (anti-CSRF).
 - [ ] **Run against synthetic or explicitly-authorized targets only.** v1 ships two synthetic
       targets; real-target adapters are out of v1 scope. A human must authorize any target
       out-of-band before it can be run.

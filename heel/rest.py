@@ -30,6 +30,19 @@ def make_handler(server: HeelServer):
             self.end_headers()
             self.wfile.write(body)
 
+        def _local_only(self) -> bool:
+            # Anti-DNS-rebinding + anti-CSRF (launch red-team HIGH): a loopback server must reject any
+            # request whose Host isn't loopback, and any request carrying an Origin (a real CLI/automation
+            # client never sends one; a browser always does on cross-origin requests).
+            host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+            if host not in ("127.0.0.1", "localhost", "::1", "[::1]", ""):
+                self._send(403, {"error": "host not allowed (loopback only); DNS-rebinding blocked"})
+                return False
+            if self.headers.get("Origin"):
+                self._send(403, {"error": "cross-origin requests are not accepted (CSRF protection)"})
+                return False
+            return True
+
         def _body(self):
             n = int(self.headers.get("Content-Length") or 0)
             return json.loads(self.rfile.read(n) or b"{}") if n else {}
@@ -44,6 +57,8 @@ def make_handler(server: HeelServer):
             pass
 
         def do_GET(self):
+            if not self._local_only():
+                return
             p = self.path.split("?")[0].strip("/").split("/")
             if p == ["scenarios"]:
                 return self._call("heel_list_scenarios", {})
@@ -59,6 +74,8 @@ def make_handler(server: HeelServer):
             self._send(404, {"error": "not found"})
 
         def do_POST(self):
+            if not self._local_only():
+                return
             p = self.path.split("?")[0].strip("/").split("/")
             if p == ["scopes"]:
                 # scope creation/widening is NEVER reachable via an API — human-only, out-of-band
@@ -76,7 +93,7 @@ def make_handler(server: HeelServer):
 
 
 def serve(port: int = 8780):  # pragma: no cover - exercised via real HTTP clients
-    os.makedirs(scopemod.heel_home(), exist_ok=True)
+    scopemod.ensure_home()
     server = HeelServer(Store(os.path.join(scopemod.heel_home(), "heel.db")))
     httpd = HTTPServer(("127.0.0.1", port), make_handler(server))
     print(f"HEEL REST API on http://127.0.0.1:{port}  (thin client over the MCP capability; same auth gate)")

@@ -29,8 +29,9 @@ MCP server, proven by an honest detection metric on independently-authored targe
   - localization recall **0.38** (cluster-CI [0.29, 0.49]), attribution recall **0.31**, precision
     **0.97** on 199 independently-authored weaknesses.
   - Two gaps disclosed, not hidden: dev→test (overfitting) and localization→attribution (mis-categorization).
-- Three adversarial red-team passes (safety spine, blind-eval honesty, held-out methodology); all
-  findings fixed. See `docs/REDTEAM_*.md`.
+- Four adversarial red-team passes (safety spine, blind-eval honesty, held-out methodology, and a
+  production launch-readiness security review — verdict SHIP, no blockers); all findings fixed,
+  including REST anti-DNS-rebinding + anti-CSRF and data-dir 0700 enforcement. See `docs/REDTEAM_*.md`.
 
 ### Tooling & ops
 - **Control-room UI** (`web/`, Next.js) — abuse board, backtest, blind/held-out eval, live swarm,

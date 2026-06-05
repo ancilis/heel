@@ -286,8 +286,28 @@ class TestRestSharesAuthGate(Base):  # spec §2 — REST is a thin client over t
             with self.assertRaises(urllib.error.HTTPError) as e:
                 post("/runs", {"scope_id": self.scope.scope_id, "target": "evil.com"})
             self.assertEqual(e.exception.code, 403)
+
+            # 4) DNS-rebinding blocked: a non-loopback Host header is rejected (403)
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/scopes", headers={"Host": "attacker.example.com"})
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(req)
+            self.assertEqual(e.exception.code, 403)
+
+            # 5) CSRF blocked: a request carrying an Origin header is rejected (403)
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/runs", data=b"{}", method="POST",
+                                         headers={"Origin": "https://evil.example.com"})
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(req)
+            self.assertEqual(e.exception.code, 403)
         finally:
             httpd.shutdown()
+
+    def test_data_home_is_locked_down(self):
+        import stat
+        from heel import scope as scopemod
+        home = scopemod.ensure_home()
+        mode = stat.S_IMODE(os.stat(home).st_mode)
+        self.assertEqual(mode & 0o077, 0)  # no group/other access (0700)
 
 
 class TestLibraryAndModel(Base):  # Phase 3 — library depth + LLM loop

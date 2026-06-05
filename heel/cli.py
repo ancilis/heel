@@ -56,8 +56,7 @@ def _doctor() -> int:
 
 
 def _server():
-    home = scopemod.heel_home()
-    os.makedirs(home, exist_ok=True)
+    home = scopemod.ensure_home()
     return HeelServer(Store(os.path.join(home, "heel.db")))
 
 

@@ -213,7 +213,7 @@ def handle_line(server, session, line: str):
 
 def main():  # pragma: no cover - exercised via real MCP clients
     import os
-    os.makedirs(scopemod.heel_home(), exist_ok=True)
+    scopemod.ensure_home()
     store = Store(os.path.join(scopemod.heel_home(), "heel.db"))
     server = HeelServer(store)
     session = {"caller": "stdio-client"}

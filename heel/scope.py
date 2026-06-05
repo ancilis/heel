@@ -24,6 +24,18 @@ def heel_home() -> str:
     return os.environ.get("HEEL_HOME", os.path.join(os.getcwd(), ".heel"))
 
 
+def ensure_home() -> str:
+    """Create HEEL_HOME and lock it to the owner (0700) — it holds the signing key, signed scopes,
+    and the containment log (launch red-team: enforce, don't just document)."""
+    home = heel_home()
+    os.makedirs(home, exist_ok=True)
+    try:
+        os.chmod(home, 0o700)
+    except OSError:  # best-effort (e.g. exotic filesystems)
+        pass
+    return home
+
+
 def _paths():
     home = heel_home()
     return home, os.path.join(home, "signing.key"), os.path.join(home, "scopes")
@@ -40,7 +52,7 @@ def _signing_key() -> bytes:
         with open(ext, "rb") as fh:
             return fh.read()
     home, keyfile, _ = _paths()
-    os.makedirs(home, exist_ok=True)
+    ensure_home()
     if not os.path.exists(keyfile):
         key = hashlib.sha256(os.urandom(32)).hexdigest().encode()  # random per home (NOT repo-stable)
         with open(keyfile, "wb") as fh:
@@ -79,6 +91,7 @@ def create_scope(target_allowlist: list[str], operator: str, limits: dict | None
                  data_mode: DataHandlingMode = DataHandlingMode.SYNTHETIC_ONLY,
                  ttl_seconds: int = 7 * 24 * 3600, now: float | None = None) -> AuthorizationScope:
     home, _, scopedir = _paths()
+    ensure_home()
     os.makedirs(scopedir, exist_ok=True)
     now = now if now is not None else time.time()
     limits = limits or {"max_requests": 200, "max_concurrency": 8, "backoff": True}

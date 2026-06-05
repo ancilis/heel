@@ -39,8 +39,11 @@ jobs:
         run: |
           python -m venv /tmp/v
           /tmp/v/bin/pip install dist/*.whl
+          /tmp/v/bin/heel --version
           /tmp/v/bin/heel scenarios > /dev/null
           /tmp/v/bin/python -c "from heel.heldout_eval import heldout_eval; r=heldout_eval(); assert r['test']['with_semantic']['precision'] > 0.85; print('smoke OK', r['test']['with_semantic']['recall'])"
+          # exercise the heel-mcp console script end-to-end (regression guard for the entry point)
+          printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | /tmp/v/bin/heel-mcp | grep -q heel_run && echo "mcp entry OK"
       - uses: actions/upload-artifact@v4
         with:
           name: dist
