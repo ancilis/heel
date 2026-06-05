@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Acceptance + safety tests (pure stdlib — no install needed)
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: One-command demo (auth gate + honest backtests)
+        run: python run_demo.py
+
+  package:
+    name: build + install wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip build
+      - name: Build wheel + sdist
+        run: python -m build
+      - name: Install the wheel in a clean env and smoke-test
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install dist/*.whl
+          /tmp/v/bin/heel scenarios > /dev/null
+          /tmp/v/bin/python -c "from heel.heldout_eval import heldout_eval; r=heldout_eval(); assert r['test']['with_semantic']['precision'] > 0.85; print('smoke OK', r['test']['with_semantic']['recall'])"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  ui:
+    name: control-room UI build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install + build (snapshot is committed, so this is a pure type/render check)
+        working-directory: web
+        run: |
+          npm ci || npm install
+          npm run build

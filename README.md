@@ -1,5 +1,7 @@
 # HEEL
 
+[![CI](https://github.com/ancilis/heel/actions/workflows/ci.yml/badge.svg)](https://github.com/ancilis/heel/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+
 **Rehearse how a customer or opportunistic third party could abuse your software — before it
 ships.** HEEL is a self-contained, **agent-native** abuse-simulation tool: a swarm of adversarial
 and opportunistic agents probes a product *you own*, proves an abuse path is reachable with a
