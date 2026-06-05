@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "heel"
+name = "heel-sim"
 version = "1.0.0"
 description = "Agent-native abuse-simulation tool — rehearse how a customer could abuse your product before it ships. MCP-first."
 readme = "README.md"

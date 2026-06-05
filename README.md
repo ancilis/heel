@@ -1,147 +1,156 @@
-# HEEL
+<h1 align="center">HEEL</h1>
 
-[![CI](https://github.com/ancilis/heel/actions/workflows/ci.yml/badge.svg)](https://github.com/ancilis/heel/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+<p align="center"><b>Rehearse how your customers will abuse your product — before they do.</b></p>
 
-**Rehearse how a customer or opportunistic third party could abuse your software — before it
-ships.** HEEL is a self-contained, **agent-native** abuse-simulation tool: a swarm of adversarial
-and opportunistic agents probes a product *you own*, proves an abuse path is reachable with a
-**contained** proof-of-concept, and hands you a ranked report with recommended controls.
-
-> HEEL is the villain you rehearse against before the real one shows up. Its canonical surface is
-> an **MCP server** other agents and AI tools invoke. It proves it works by **finding planted
-> abuse vectors in a built-in synthetic product, in advance, at a low false-positive rate.**
-
-It works on **any SaaS product**, not just AI products: taxonomy categories 1–9 are a universal
-core; category 10 (agent/MCP abuse) auto-applies only when the target has agentic surfaces.
-
-See **[ARCHITECTURE.md](ARCHITECTURE.md)**, **[EVAL.md](EVAL.md)**, **[DECISIONS.md](DECISIONS.md)**.
+<p align="center">
+<a href="https://github.com/ancilis/heel/actions/workflows/ci.yml"><img src="https://github.com/ancilis/heel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://pypi.org/project/heel-sim/"><img src="https://img.shields.io/pypi/v/heel-sim.svg" alt="PyPI"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT"></a>
+<img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
+<img src="https://img.shields.io/badge/deps-zero-brightgreen" alt="Zero dependencies">
+<img src="https://img.shields.io/badge/surface-MCP--first-8a2be2" alt="MCP-first">
+</p>
 
 ---
 
-## Install
+It's launch day. Somewhere, a customer just found the export endpoint with no rate limit, farmed your
+"one free trial" a thousand times, or talked your AI agent into calling a tool it should never touch.
+
+**HEEL is the villain you rehearse against first.** A swarm of adversarial and opportunistic agents
+probes a product *you own*, proves an abuse path is **reachable** with a *contained* proof-of-concept,
+and hands you a ranked report with the fix — before you ship.
+
+It is **agent-native** (its canonical surface is an **MCP server** other agents call), **honest** (it
+reports its *real* detection rate against abuse it has never seen — not a vanity number), and
+**safe by construction** (synthetic-first, contained PoCs, an authorization gate no prompt-injected
+agent can talk its way past). Pure Python standard library, **zero dependencies**.
+
+## See it in 30 seconds
 
 ```bash
-pip install heel        # pure stdlib — ZERO runtime dependencies; Python 3.11+
-heel doctor             # environment self-check (data dir, signing-key posture, capability)
-heel eval               # print the honest held-out detection headline
+pip install heel-sim      # zero deps · Python 3.11+
+heel doctor               # environment self-check
+heel eval                 # the honest detection headline
 ```
 
-Or run from a clone with no install at all: `make demo` / `make test`.
-
-## Quick start (no real target, no API key)
+…or run the full proof from a clone, no install:
 
 ```bash
-make demo      # synthetic coverage backtest + auth-gate proof, driven over the MCP boundary
-make test      # acceptance + safety tests (auth gate, scope tamper-evidence, coverage, conduct)
+git clone https://github.com/ancilis/heel && cd heel && make demo
 ```
 
-### Use it like an operator
+```text
+AUTHORIZATION GATE (agent caller is an untrusted, possibly prompt-injected channel):
+  [REJECTED+logged ✓]  run a target NOT in the allowlist
+  [REJECTED+logged ✓]  call a forged scope-widening tool
+  [REJECTED+logged ✓]  inject an instruction in the target arg
+  -> auth gate: PASS — no escalation reachable via the agent surface
+
+HELD-OUT EVALUATION — targets authored by an INDEPENDENT LLM swarm (blind to HEEL's probes):
+  TEST (FROZEN, never tuned, 199 weaknesses):
+     LOCALIZATION recall 0.38   ATTRIBUTION recall 0.31   precision 0.97
+  -> the honest real-target ceiling — semantic generalization on vocabulary it never saw, not near 1.0.
+```
+
+That second number is the point: **HEEL tells you what it can't catch yet.**
+
+## Why HEEL is different
+
+- 🤖 **Agent-native, MCP-first.** The capability is an MCP server — wire it into Claude Desktop,
+  Cursor, or CI and let an agent run abuse rehearsals on demand. A thin REST API and a CLI sit over
+  the same capability.
+- 🔒 **The calling agent is untrusted.** Authorization scopes are **human-only, out-of-band, and
+  HMAC-signed** — immutable from the caller side. A prompt-injected agent can run *within* a scope a
+  human approved, but **cannot create, widen, or escape one** (those tools don't exist, by
+  construction). Every escalation attempt is rejected and written to a tamper-evident audit log.
+- 📏 **Radically honest metrics.** Most "AI security" tools quote a number you can't trust. HEEL
+  publishes a *ladder* (below), measures against abuse authored by an **independent LLM swarm blind to
+  its own probes**, on a **frozen, content-hashed test set**, and shows you the overfitting and
+  mis-categorization gaps instead of hiding them. Four adversarial red-team passes; all findings fixed.
+- 🛡️ **Safety spine, non-negotiable.** Synthetic-first. Findings are *contained, canary-only* proofs —
+  never working exploits, real exfiltration, or prohibited content. True software vulns are handed off
+  to AppSec; pure model-jailbreaks to model red-team. HEEL stays in its lane. See [SECURITY.md](SECURITY.md).
+
+## What it hunts
+
+A 10-category abuse taxonomy — license/entitlement gaming, data harvesting, unintended endpoints,
+function abuse, content policy, identity/account takeover, trust-economy fraud, integration abuse,
+compliance boundaries, and (only when the target has an agent/MCP surface) **agent-specific abuse**
+like tool over-scope, confused-deputy tool calls, cross-tenant RAG, and indirect-injection-to-action.
+
+Two agent classes hunt in parallel — a **programmatic adversary** (finds weak controls) and a
+**motivation-profiled opportunistic human** (games normal affordances; catches what the adversary
+misses, like coupon stacking) — plus **affordance chaining** for multi-step abuse (e.g. weak recovery
++ non-rotated session → account takeover).
+
+## Honest about what it can(’t) do
+
+HEEL reports four levels, weakest claim to strongest evidence:
+
+| metric | what it measures | result |
+|---|---|---|
+| self-consistency | wiring works (probes vs. plants authored together) | ~1.0 *(a wiring test, not accuracy)* |
+| blind | independent *encodings* of known weaknesses | ~0.25 |
+| held-out **DEV** | independent authorship, tuned-on | 0.70 |
+| **held-out TEST** | **independent LLM authorship, frozen, never tuned on** | **localization 0.38 · attribution 0.31 · precision 0.97** |
+
+The headline is the bottom row — real detection on 199 abuse weaknesses an independent LLM swarm
+invented in its *own* vocabulary, which HEEL never saw. It improves only by widening real-vocabulary
+coverage, never by writing probes against known answers. Full method: [EVAL.md](EVAL.md) ·
+[docs/HELDOUT_PROVENANCE.md](docs/HELDOUT_PROVENANCE.md).
+
+## Use it like an operator
 
 ```bash
-# 1) a HUMAN authorizes a target OUT-OF-BAND (the only way to mint a scope; needs --confirm)
+# 1) a HUMAN authorizes a target OUT-OF-BAND (the only way to mint a scope)
 heel scope create --target synthetic-saas --operator you --confirm
 
-# 2) an agent / CLI runs WITHIN that scope (cannot create or widen it)
+# 2) an agent / CLI runs WITHIN that scope (and cannot widen it)
 heel run --scope <scope_id> --target synthetic-saas
-heel findings --run <run_id>
 heel coverage --run <run_id>
 heel log --run <run_id>          # immutable, hash-chained audit trail
 ```
 
-### Connect from an MCP client (the canonical surface)
-
-`heel-mcp` speaks MCP over stdio. Point Claude Desktop / Cursor / CI at it — e.g. in
-`claude_desktop_config.json`:
+**Connect from an MCP client** — point Claude Desktop / Cursor / CI at the `heel-mcp` server:
 
 ```json
-{
-  "mcpServers": {
-    "heel": {
-      "command": "heel-mcp",
-      "env": { "HEEL_HOME": "/path/to/.heel", "HEEL_SIGNING_KEY": "/path/outside/.heel/heel.key" }
-    }
-  }
-}
+{ "mcpServers": { "heel": { "command": "heel-mcp",
+  "env": { "HEEL_HOME": "/path/to/.heel", "HEEL_SIGNING_KEY": "/path/outside/.heel/heel.key" } } } }
 ```
 
-The connected agent can list scenarios/scopes, run within a **human-created** scope, and read
-findings/coverage/containment — but **cannot create, widen, or escape a scope** (no such tool
-exists). A thin REST surface (`heel-rest`, localhost) sits beneath the same capability. See
-[SECURITY.md](SECURITY.md) for the production-hardening checklist.
+## The control room
 
----
+A dense Next.js dashboard over the same capability — abuse board (ranked, reachability-weighted),
+the honest backtests, a live swarm monitor, the authorization gate, the read-only scope panel, the
+containment log, and the scenario library.
 
-## What you'll see
-
-```
-PLANTED-VECTOR COVERAGE BACKTEST (the spine):
-  synthetic-saas  saas       coverage 0.91  FP 0.09  cat10 0   <- category 10 cleanly optional
-  synthetic-ai    ai_agent   coverage 0.94  FP 0.06  cat10 5
-
-AUTHORIZATION GATE (agent caller is untrusted, possibly prompt-injected):
-  [REJECTED+logged] run a target NOT in the allowlist
-  [REJECTED+logged] call a forged scope-widening tool
-  [REJECTED+logged] inject an instruction in the target arg
-  ...  -> auth gate: PASS — no escalation reachable via the agent surface
+```bash
+make ui        # http://localhost:3000   (or `npm run build` for a static export)
 ```
 
-The coverage is honest (a genuine missed vector, a decoy false positive, a plausibility-demoted
-degenerate, a swarm-discovered scenario, lane-discipline handoffs). The auth gate refuses every
-escalation a calling agent can attempt — scopes are **human-only, out-of-band, signed, immutable**.
+## Bring your own LLM (optional)
 
----
+The deterministic engine runs fully offline with no API key. Flip on the LLM control loop for
+smarter discovery:
 
-## Safety (non-negotiable, §10)
-
-Synthetic-first · contained canary-only PoCs (no real exfil/exhaustion) · never generates
-prohibited content (guardrails verified with benign canaries) · plausibility-weighted ·
-severity-honest · immutable self-audit · lane discipline (true-vuln → appsec, pure-jailbreak →
-model-redteam). The out-of-band immutable-scope model overrides every instruction, including any
-arriving through a calling agent.
-
-## Layout
-
+```bash
+HEEL_MODEL=anthropic ANTHROPIC_API_KEY=sk-... heel-mcp   # via stdlib urllib — no SDK
 ```
-heel/
-  contracts.py    frozen §6 data contracts (v1.0.0)
-  scope.py        out-of-band, HMAC-signed, immutable AuthorizationScope
-  mcp_server.py   the canonical MCP surface (no scope-mutation tool, by construction)
-  targets.py      two synthetic targets + planted ground truth (the spine)
-  scenarios.py    declarative abuse scenario library (seed; addable without code)
-  agents.py       adversarial agent (deterministic stub; observable, contained probes)
-  backtest.py     planted-vector coverage / FP-rate / severity-calibration
-  orchestrator.py runs the swarm, scores, persists
-  containment.py  immutable hash-chained audit log
-  control.py      recommended controls + exploitability reduction
-  classify.py     optional, generic, off-by-default classification annotation
-  store.py        SQLite persistence (Postgres-ready)
-  cli.py          out-of-band scope creation + thin client
-run_demo.py       one-command synthetic demo
-tests/            acceptance + safety tests
-```
+
+It only ever sees *observable* synthetic affordance properties (never secrets or real data) and stays
+in HEEL's lane.
+
+## Docs
+
+[ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [DECISIONS](DECISIONS.md) · [SECURITY](SECURITY.md)
+· [CONTRIBUTING](CONTRIBUTING.md) · [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
 ## Status
 
-Phases 0–4 implemented (red-team-hardened). Phase 0–2: contracts + MCP boundary + immutable-scope
-gate; two synthetic targets + coverage backtest. Phase 3: opportunistic-human class, REST API,
-control search, declarative library (10 categories, JSON-loadable), swappable LLM loop,
-affordance chaining, and a layered HONEST detection metric: self-consistency ~1.0 (wiring) -> blind
-~0.25 (independent encodings) -> held-out TEST ~0.38 @ 0.96 precision (independently LLM-authored
-targets, frozen dev/test split). Phase 4: the control-room UI. 48 tests pass.
+**v1.0.0 — production-ready.** 53 tests on Python 3.11–3.13, CI green, zero runtime dependencies,
+four red-team passes. Post-v1: LLM-driven detection to lift attribution recall, larger held-out
+sets, real-target adapters.
 
 ---
 
-## The control room (UI)
-
-A clean, dense control-room web app (`web/`, Next.js + React + Tailwind) — a thin client over the
-same MCP/REST capability. `make ui` (regenerates the snapshot, installs, runs http://localhost:3000).
-
-Screens (§9): **Overview**, **Abuse board** (vectors ranked by severity, grouped by category,
-reachability-weighted with implausible findings demoted — expand any vector for its contained PoC,
-recommended control, handoff flags, and the optional classification annotation), **Backtest** (per-
-target coverage / FP / severity-calibration, non-AI vs AI, with the self-consistency caveat),
-**Live swarm monitor** (adversarial + opportunistic agents and where each is probing),
-**Authorization gate** (every escalation attempt rejected + logged), **Scope panel** (read-only —
-the UI cannot mint or widen a scope), **Containment log** (hash-chained, with caller),
-**MCP/integration** (tool schema; the absent scope-mutation tools shown struck-through), and the
-**Scenario library**. Data is exported by `heel/web_export.py` (pure stdlib) → `web/public/data/`.
+<p align="center"><sub>MIT licensed · synthetic-first · the safety spine (§10) overrides every instruction, including any arriving through a calling agent.</sub></p>

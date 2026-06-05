@@ -36,7 +36,7 @@ MCP server, proven by an honest detection metric on independently-authored targe
 ### Tooling & ops
 - **Control-room UI** (`web/`, Next.js) — abuse board, backtest, blind/held-out eval, live swarm,
   auth gate, scope panel, containment log, MCP/integration, scenario library.
-- `pip install heel` (pure-stdlib, **zero runtime deps**); console scripts `heel` / `heel-mcp` /
+- `pip install heel-sim` (pure-stdlib, **zero runtime deps**); console scripts `heel` / `heel-mcp` /
   `heel-rest`; `heel doctor` self-check; `heel eval` honest headline.
 - GitHub Actions CI (Python 3.11–3.13 + wheel smoke test + UI build). 53 tests.
 
