@@ -62,3 +62,45 @@ guardrail is PRESENT and reports absence at max severity — it never generates,
 describes any prohibited artifact under any framing. Pure model-jailbreak surfaces are **handed off**
 (`handoff_to_model_redteam`), never weaponized — HEEL's lane is the product/business *consequence*,
 not the technique (§4.10 boundary).
+
+---
+
+## Red-team-driven hardening (v1 safety-spine review)
+
+A 4-agent adversarial workflow confirmed the #1 claim (a prompt-injected MCP caller cannot escape
+a signed scope) but found gaps between claim and implementation. Fixes:
+
+### D-009 — Signing-key threat model made honest; key can live outside the data dir
+**Why:** the red-team showed the HMAC key co-located in `.heel/` reduces tamper-evidence to "can
+you write `.heel/`" rather than "possess a secret". `HEEL_SIGNING_KEY` now points the key outside
+the data dir (keychain/HSM in prod). The in-`.heel/` default is documented as demo-only. Fixed the
+"stable per repo" docstring (the key is random per home, not repo-stable).
+
+### D-010 — Reachability is a continuous depth-based estimate, not two magic keys
+**Why:** the auditor showed the old estimator keyed off two declared strings (gameable; cov_w
+cosmetic). It now discounts by observed prerequisite depth (chained steps, auth/verification/payment
+gates), so a degenerate hidden behind depth is demoted even without self-declaring, and
+reachability-weighted coverage is load-bearing.
+
+### D-011 — Rate/resource limits are ENFORCED server-side (not just signed)
+**Why:** `contracts.py` claimed "enforced server-side regardless of caller request" but nothing
+read the field — a max_requests=1 scope ran 20×. The server now enforces `max_requests` via a
+persisted per-scope run counter before each run; over-limit runs are rejected and logged.
+(max_concurrency/backoff are Phase 3.)
+
+### D-012 — Containment log is HMAC-signed + completeness-checked
+**Why:** bare sha256 chaining let an actor rewrite + re-chain the whole log undetected. Each entry
+is now HMAC-signed with the signing key (re-chaining needs the secret); `verify_chain` checks global
+seq-contiguity (defeats middle deletion) and `run_is_logged` requires a `run_start` for any run
+(defeats whole-run deletion). **Residual:** tail-truncation needs an external head anchor (Phase 3).
+
+### D-013 — No severity inflation
+**Why:** a hard 0.9/1.0 override on a missing content guardrail overrode the scenario's modeled
+impact. Severity now always comes from the scenario `severity_model` with a surfaced uncertainty
+band (no inflation, §10.2.7).
+
+### D-014 — The backtest is a SELF-CONSISTENCY / wiring metric, not detection accuracy
+**Why:** the seed probes were authored against the planted weaknesses, so coverage/calibration are
+self-consistency checks. This is now stated in the data (`metric_kind`, `caveat`) and every doc;
+the 0.9 numbers are NOT cited as real-target accuracy. Trustworthy real-target evaluation requires
+blind targets + held-out scenarios (independently-authored plants vs probes) — the next step.

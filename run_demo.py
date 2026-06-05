@@ -87,7 +87,7 @@ def main():
     L.append(f"OUT-OF-BAND scope (human-created, signed): {scope.scope_id}  "
              f"allowlist={scope.target_allowlist}  approver={scope.operator_confirmation}")
     L.append("")
-    L.append("PLANTED-VECTOR COVERAGE BACKTEST (the spine):")
+    L.append("PLANTED-VECTOR SELF-CONSISTENCY BACKTEST (wiring test — NOT real-target accuracy):")
     L.append(f"  {'target':<16}{'kind':<10}{'coverage':>9}{'cov(w)':>8}{'FP-rate':>8}{'sev-calib':>10}{'cat10':>7}")
     for t, (rid, c) in results.items():
         L.append(f"  {t:<16}{c['kind']:<10}{c['coverage']:>9.2f}{(c['coverage_reachability_weighted'] or 0):>8.2f}"

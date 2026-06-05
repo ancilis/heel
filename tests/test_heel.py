@@ -171,5 +171,44 @@ class TestSafetySpine(Base):  # spec §10.2
         self.assertFalse(ok2)
 
 
+class TestRedTeamFixes(Base):  # gaps the red-team found, now closed
+    def test_rate_limit_enforced(self):  # was: stored+signed but never enforced (HIGH)
+        s = scopemod.create_scope(["synthetic-saas"], operator="t", limits={"max_requests": 1})
+        self.server.heel_run({"scope_id": s.scope_id, "target": "synthetic-saas"}, self.caller)  # 1st ok
+        with self.assertRaises(ToolError):                                                        # 2nd rejected
+            self.server.heel_run({"scope_id": s.scope_id, "target": "synthetic-saas"}, self.caller)
+
+    def test_containment_rechain_without_key_fails(self):  # HMAC, not bare sha256 (HIGH)
+        import hashlib
+        rid = self.run_target("synthetic-saas")
+        self.assertTrue(verify_chain(self.store)[0])
+        # attacker rewrites attribution AND recomputes the hash with sha256 (no signing key)
+        row = self.store.containment_log()[1]
+        forged = hashlib.sha256((row["prev_hash"] + "forged").encode()).hexdigest()
+        self.store.conn.execute("UPDATE containment SET caller='attacker', entry_hash=? WHERE seq=?",
+                                (forged, row["seq"]))
+        self.store.conn.commit()
+        self.assertFalse(verify_chain(self.store)[0])   # HMAC defeats key-less re-chaining
+
+    def test_whole_run_deletion_detected(self):  # a 'complete' run with no log entries is unverified
+        from heel.containment import run_is_logged
+        rid = self.run_target("synthetic-saas")
+        self.assertTrue(run_is_logged(self.store, rid))
+        self.store.conn.execute("DELETE FROM containment WHERE run_id=?", (rid,))
+        self.store.conn.commit()
+        self.assertFalse(run_is_logged(self.store, rid))
+
+    def test_no_severity_inflation(self):  # severity uses the scenario model, no 0.9/1.0 override
+        rid = self.run_target("synthetic-ai")
+        for f in self.server.heel_get_findings({"run_id": rid}, self.caller)["findings"]:
+            self.assertGreater(f["severity"]["uncertainty"], 0.0)  # uncertainty always surfaced
+
+    def test_backtest_labeled_self_consistency(self):  # honest framing, not 'accuracy'
+        rid = self.run_target("synthetic-saas")
+        c = self.server.heel_get_coverage({"run_id": rid}, self.caller)["coverage"]
+        self.assertEqual(c["metric_kind"], "self_consistency")
+        self.assertIn("NOT a real-target detection-accuracy", c["caveat"])
+
+
 if __name__ == "__main__":
     unittest.main()

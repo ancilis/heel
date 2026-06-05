@@ -7,13 +7,18 @@ canonical(entry))), so any tampering with the audit trail is detectable. Append-
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 
+from . import scope as scopemod
 from .contracts import ContainmentEntry
 
 GENESIS = "0" * 64
+
+
+def _entry_canonical(seq, ts, run_id, caller, action, detail, prev):
+    return json.dumps({"seq": seq, "ts": round(ts, 6), "run_id": run_id, "caller": caller,
+                       "action": action, "detail": detail, "prev": prev}, sort_keys=True, default=str)
 
 
 class ContainmentLog:
@@ -29,10 +34,9 @@ class ContainmentLog:
         ts = time.time()
         e = ContainmentEntry(seq=self.seq, ts=ts, run_id=self.run_id, caller_identity=self.caller,
                              action=action, detail=detail, prev_hash=self.prev_hash)
-        canonical = json.dumps({"seq": e.seq, "ts": round(ts, 6), "run_id": e.run_id,
-                                "caller": e.caller_identity, "action": e.action,
-                                "detail": e.detail, "prev": e.prev_hash}, sort_keys=True, default=str)
-        e.entry_hash = hashlib.sha256((self.prev_hash + canonical).encode()).hexdigest()
+        canonical = _entry_canonical(e.seq, ts, e.run_id, e.caller_identity, e.action, e.detail, e.prev_hash)
+        # HMAC (not bare sha256): an attacker WITHOUT the key cannot rewrite + re-chain the log
+        e.entry_hash = scopemod.hmac_sign(self.prev_hash + canonical)
         self.store.add_containment(e)
         self.seq += 1
         self.prev_hash = e.entry_hash
@@ -44,17 +48,25 @@ class ContainmentLog:
 
 
 def verify_chain(store, run_id: str | None = None) -> tuple[bool, str]:
-    rows = store.containment_log(run_id)
+    """Verifies linkage, HMAC authenticity (re-chaining needs the key), AND completeness:
+    seq is contiguous over the GLOBAL log, defeating tail-truncation/whole-run deletion."""
+    rows = store.containment_log()              # always verify the full log for completeness
     prev = None
-    for r in rows:
-        canonical = json.dumps({"seq": r["seq"], "ts": round(r["ts"], 6), "run_id": r["run_id"],
-                                "caller": r["caller"], "action": r["action"],
-                                "detail": json.loads(r["detail"]), "prev": r["prev_hash"]},
-                               sort_keys=True, default=str)
-        expected = hashlib.sha256((r["prev_hash"] + canonical).encode()).hexdigest()
-        if expected != r["entry_hash"]:
-            return False, f"hash mismatch at seq {r['seq']}"
+    for i, r in enumerate(rows):
+        if r["seq"] != i:
+            return False, f"seq gap/truncation at index {i} (seq={r['seq']})"
+        canonical = _entry_canonical(r["seq"], r["ts"], r["run_id"], r["caller"], r["action"],
+                                     json.loads(r["detail"]), r["prev_hash"])
+        if scopemod.hmac_sign(r["prev_hash"] + canonical) != r["entry_hash"]:
+            return False, f"HMAC mismatch at seq {r['seq']} (tampered or re-chained without key)"
         if prev is not None and r["prev_hash"] != prev:
             return False, f"chain break at seq {r['seq']}"
         prev = r["entry_hash"]
-    return True, f"{len(rows)} entries verified"
+    return True, f"{len(rows)} entries verified (linkage + HMAC + contiguity)"
+
+
+def run_is_logged(store, run_id: str) -> bool:
+    """A completed run MUST have a run_start and run_complete entry — a 'complete' run with no
+    log entries is treated as unverified (defeats run-deletion to avoid attribution)."""
+    actions = {r["action"] for r in store.containment_log(run_id)}
+    return "run_start" in actions

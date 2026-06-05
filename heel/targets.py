@@ -85,6 +85,14 @@ def build_saas_target() -> SyntheticTarget:
              route="/api/billing/export", entitlement="checked", note="looks like export, properly gated"),
         _aff("admin_rotate_keys", "admin_action", Category.COMPLIANCE_BOUNDARY, None, 0.5, guard=True, decoy=True,
              route="/admin/rotate", audit_logged=True),
+        # hardened decoys that SHARE property names with vulnerable affordances but SAFE values —
+        # the precise probes must correctly NOT fire (true negatives → the low FP rate is earned).
+        _aff("record_get_safe", "record", Category.COMPLIANCE_BOUNDARY, None, 0.7, guard=True, decoy=True,
+             route="/api/records2/{id}", tenant_check="enforced"),
+        _aff("usage_meter_safe", "meter", Category.LICENSE_ENTITLEMENT, None, 0.6, guard=True, decoy=True,
+             route="/api/usage2", reset_window="server_authoritative"),
+        _aff("premium_safe", "flag", Category.UNINTENDED_ENDPOINTS, None, 0.6, guard=True, decoy=True,
+             flag="isPro", gated_by="server"),
         # --- degenerate (present but unreachable; plausibility-weighting bait) ---
         _aff("legacy_import", "endpoint", Category.UNINTENDED_ENDPOINTS, "deep_chain_only",
              0.12, Severity(0.3, 0.4), route="/legacy/import", client_reachable=False, requires="5-step chain"),
@@ -110,6 +118,9 @@ def build_ai_target() -> SyntheticTarget:
              0.75, Severity(0.8, 0.9), tool="rag_search", tenant_filter="missing"),
         _aff("agent_priv_tool", "agent_tool", Category.AGENT_MCP_SURFACE, "confused_deputy_tool",
              0.65, Severity(0.6, 0.7), tool="admin_action", authz_check="caller_assumed"),
+        # hardened agent-tool decoy: scope matches intent → the overscope probe must NOT fire
+        _aff("agent_tool_safe", "agent_tool", Category.AGENT_MCP_SURFACE, None, 0.7, guard=True, decoy=True,
+             tool="summarize", granted_scope="own_tenant", intended_scope="own_tenant"),
         _aff("mcp_connector_x", "mcp_connector", Category.AGENT_MCP_SURFACE, "mcp_context_bleed",
              0.6, Severity(0.7, 0.7), connector="external", context_isolation="missing"),
         # content guardrail — PRESENT (hardened). Verified with SAFE canaries only; no generation.

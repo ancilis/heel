@@ -43,6 +43,9 @@ class Store:
     def get_run(self, run_id):
         return self.conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
 
+    def scope_run_count(self, scope_id):
+        return self.conn.execute("SELECT COUNT(*) FROM runs WHERE scope_id=?", (scope_id,)).fetchone()[0]
+
     def add_finding(self, run_id, v):
         from dataclasses import asdict
         d = asdict(v); d["category"] = v.category.value

@@ -23,7 +23,7 @@ import sys
 import time
 
 from . import scope as scopemod
-from .containment import ContainmentLog, verify_chain
+from .containment import ContainmentLog, run_is_logged, verify_chain
 from .contracts import CallerContext
 from .control import propose_control
 from .orchestrator import run_abuse
@@ -102,6 +102,19 @@ class HeelServer:
                                 "requested_target": target, "allowlist": scope.target_allowlist})
             raise ToolError(f"target '{target}' is not in scope '{scope_id}' allowlist {scope.target_allowlist}; "
                             f"this server cannot widen a scope (human-only, out-of-band)")
+        # 4) ENFORCE the signed scope's resource limits server-side (not just store them)
+        limits = scope.rate_and_resource_limits or {}
+        maxreq = limits.get("max_requests")
+        if maxreq is not None and self.store.scope_run_count(scope_id) >= maxreq:
+            self._security_log(caller, "reject_run", {"reason": "scope max_requests exhausted",
+                                                      "scope_id": scope_id, "limit": maxreq})
+            raise ToolError(f"scope '{scope_id}' resource limit (max_requests={maxreq}) exhausted; "
+                            f"a new scope must be created out-of-band")
+        # accountability: log any caller args we deliberately ignore (cannot widen scope)
+        ignored = [k for k in args if k not in ("scope_id", "target", "scenario_ids", "agent_classes", "budget")]
+        if ignored:
+            self._security_log(caller, "ignored_args", {"scope_id": scope_id, "ignored": ignored,
+                                                        "note": "extra args cannot affect scope/limits"})
         # authorized → run within the scope's limits
         cc = CallerContext(caller_identity=caller, scope_id=scope_id, ts=time.time())
         rr = run_abuse(scope, target, args.get("scenario_ids"), cc, self.store,
@@ -133,7 +146,8 @@ class HeelServer:
     def heel_get_containment_log(self, args, caller):
         run_id = args.get("run_id")
         ok, msg = verify_chain(self.store, run_id)
-        return {"entries": self.store.containment_log(run_id), "chain_valid": ok, "chain_status": msg}
+        return {"entries": self.store.containment_log(run_id), "chain_valid": ok, "chain_status": msg,
+                "run_is_logged": run_is_logged(self.store, run_id)}
 
     # -- MCP dispatch -------------------------------------------------------- #
     def call_tool(self, name, args, caller):
@@ -148,7 +162,9 @@ class HeelServer:
     def dispatch(self, method, params, session):
         params = params or {}
         if method == "initialize":
-            session["caller"] = (params.get("clientInfo") or {}).get("name", "unknown-agent")
+            # caller identity is the transport's SELF-ASSERTED clientInfo (not a verified identity);
+            # the auth gate never depends on it — it only attributes runs (red-team accountability note).
+            session["caller"] = "mcp:" + (params.get("clientInfo") or {}).get("name", "unnamed-client")
             return {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                     "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO}
         if method == "notifications/initialized":
@@ -156,7 +172,7 @@ class HeelServer:
         if method == "tools/list":
             return {"tools": TOOL_SCHEMAS}
         if method == "tools/call":
-            caller = session.get("caller", "unknown-agent")
+            caller = session.get("caller", "unauthenticated:no-handshake")
             name = params.get("name")
             try:
                 result = self.call_tool(name, params.get("arguments") or {}, caller)

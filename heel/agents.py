@@ -101,31 +101,45 @@ CONTROLS = {
 
 
 def estimate_reachability(aff) -> float:
-    """The agent's OWN plausibility estimate from observable properties (not ground truth)."""
+    """The agent's OWN continuous plausibility estimate from observable PREREQUISITE DEPTH —
+    not two magic keys (red-team-hardened, DECISIONS D-010). Each gating prerequisite the probe
+    would have to traverse discounts reachability, so a degenerate that hides behind depth is
+    demoted even if it doesn't self-declare 'client_reachable: false'."""
     p = aff.properties
-    if p.get("client_reachable") is False or p.get("requires"):
-        return 0.15
-    base = 0.78 if not aff.guard_present else 0.55
+    reach = 0.85 if not aff.guard_present else 0.6
+    if p.get("client_reachable") is False:
+        reach *= 0.18
+    req = p.get("requires")
+    if req:
+        # discount by the number of chained steps a real probe would need
+        steps = 0
+        for tok in str(req).replace("-", " ").split():
+            if tok.isdigit():
+                steps = int(tok)
+        reach *= 0.85 ** max(steps, 3)
+    for k in ("auth_step", "verification", "payment", "depth"):
+        if p.get(k):
+            reach *= 0.7
     if p.get("documented") is False:
-        base += 0.05
-    return min(0.95, base)
+        reach = min(0.95, reach + 0.04)
+    return round(max(0.05, min(0.95, reach)), 3)
 
 
 def _vector(target, aff, scenario, evidence, vid) -> AbuseVector:
     ctrl, redux = CONTROLS.get(scenario.probe_strategy, CONTROLS["discovered"])
     reach = estimate_reachability(aff)
     sev = scenario.severity_model
-    likelihood = sev["likelihood"]
-    if evidence.get("max_severity"):
-        likelihood, impact = 0.9, 1.0
-    else:
-        impact = sev["impact"]
+    # Use the scenario's MODELED severity with explicit uncertainty — no global inflation override
+    # (red-team: a hard 0.9/1.0 override on missing-guardrail was severity inflation). A scenario
+    # that truly warrants high impact encodes it in its own severity_model.
+    likelihood, impact = sev["likelihood"], sev["impact"]
+    uncertainty = 0.3 if evidence.get("max_severity") else 0.2
     handoff_appsec = aff.properties.get("handoff") == "appsec"
     return AbuseVector(
         id=vid, scenario_id=scenario.id, category=scenario.category,
         reproduction={"strategy": scenario.probe_strategy, "steps": ["enumerate", "probe", "observe", "halt"],
                       "observed": evidence, "sample": "canary_only", "contained": True},
-        severity=Severity(likelihood, impact),
+        severity=Severity(likelihood, impact, uncertainty),
         reachability_score=round(reach, 3), plausible=reach >= PLAUSIBILITY_FLOOR,
         recommended_control=ctrl, estimated_exploitability_reduction=redux,
         handoff_to_appsec=handoff_appsec, target_id=target.id, affordance_id=aff.id,

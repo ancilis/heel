@@ -30,16 +30,29 @@ def _paths():
 
 
 def _signing_key() -> bytes:
+    """The HMAC key. THREAT MODEL (red-team-corrected, DECISIONS D-009): HMAC tamper-evidence
+    protects against actors WITHOUT the key. Set HEEL_SIGNING_KEY to a path OUTSIDE the data
+    dir (keychain/HSM in production) so the trust boundary is 'possess the key', not 'can write
+    .heel/'. The in-`.heel/` default is for the local synthetic demo only and is co-located with
+    the scopes it protects — adequate for the demo, NOT for a shared/real deployment."""
+    ext = os.environ.get("HEEL_SIGNING_KEY")
+    if ext and os.path.exists(ext):
+        with open(ext, "rb") as fh:
+            return fh.read()
     home, keyfile, _ = _paths()
     os.makedirs(home, exist_ok=True)
     if not os.path.exists(keyfile):
-        # created on first out-of-band use; 0600. Demo determinism: stable per repo.
-        key = hashlib.sha256(os.urandom(32)).hexdigest().encode()
+        key = hashlib.sha256(os.urandom(32)).hexdigest().encode()  # random per home (NOT repo-stable)
         with open(keyfile, "wb") as fh:
             fh.write(key)
         os.chmod(keyfile, 0o600)
     with open(keyfile, "rb") as fh:
         return fh.read()
+
+
+def hmac_sign(content: str) -> str:
+    """Public HMAC over `content` with the signing key. Used for scopes AND the containment log."""
+    return hmac.new(_signing_key(), content.encode(), hashlib.sha256).hexdigest()
 
 
 def _canonical(d: dict) -> str:
@@ -56,7 +69,7 @@ def _canonical(d: dict) -> str:
 
 
 def _sign(content: str) -> str:
-    return hmac.new(_signing_key(), content.encode(), hashlib.sha256).hexdigest()
+    return hmac_sign(content)
 
 
 # --------------------------------------------------------------------------- #

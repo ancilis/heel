@@ -5,7 +5,13 @@ computed at runtime; deterministic.
 
 ---
 
-## 1. Planted-vector coverage backtest (the spine, §5 / DoD #4)
+> **Framing (red-team-corrected, §8).** The coverage numbers below are a **self-consistency /
+> wiring backtest** on synthetic targets whose planted weaknesses and the seed probes were authored
+> together — **not** a real-target detection-accuracy claim. They prove the pipeline is wired, the
+> contracts hold, and the honest signals (FN/FP/demotion/discovery/handoff) work. Real-target
+> accuracy requires blind targets + held-out scenarios (§7, §8).
+
+## 1. Planted-vector self-consistency backtest (the spine, §5 / DoD #4)
 
 Two synthetic targets, run over the MCP boundary under an enforced scope:
 
@@ -16,7 +22,8 @@ Two synthetic targets, run over the MCP boundary under an enforced scope:
 
 - **Category 10 cleanly yields 0 findings on the non-AI target** — proving it is optional and
   auto-applies only when the target has agent/MCP surfaces (DoD #4).
-- The numbers are honest, not circular (DECISIONS D-004). Per target: **TP 10/16, a genuine miss
+- This is a **self-consistency metric** (see the framing note above + §8), made as honest as a
+  synthetic backtest can be via genuine signals. Per target: **TP 10/16, a genuine miss
   (FN=1: `promo_stacking` — planted, reachable, but no scenario can infer it), a real false
   positive (FP=1: `export_billing` — a hardened decoy the over-broad export heuristic flags), and
   1 implausible finding demoted by plausibility-weighting (`legacy_import` — present but
@@ -85,11 +92,10 @@ are human-only, out-of-band, signed (DECISIONS D-002).
 
 ## 6. Tests (DoD #8)
 
-`python3 -m unittest discover -s tests` → **22 tests pass**: auth gate (8), scope immutability /
-tamper-evidence / expiry (2), coverage backtest (5: coverage+FP, cat-10-clean-on-non-AI,
-cat-10-present-on-AI, discovery, honest-FN), safety spine (6: contained PoCs, content-guardrail
-never generates, appsec handoff, model-redteam handoff, implausible demotion, containment
-tamper-evidence + chain validity).
+`python3 -m unittest discover -s tests` → **27 tests pass**: auth gate (8), scope immutability /
+tamper-evidence / expiry (2), coverage backtest (5), safety spine (6), and the red-team-fix tests
+(5: rate-limit enforcement, containment HMAC re-chain resistance, whole-run-deletion detection,
+no severity inflation, self-consistency labeling).
 
 ## 7. Honest limits & what's next
 
@@ -106,3 +112,28 @@ tamper-evidence + chain validity).
 **Bottom line:** the falsifiable spine exists — two synthetic targets, an honest coverage backtest
 (category 10 cleanly optional), and an authorization gate that **refuses every escalation a calling
 agent can attempt** — all callable over MCP, with the §10 conduct guarantees implemented and tested.
+
+---
+
+## 8. Red-team findings (v1 safety-spine review) — `docs/`-level summary
+
+A 4-agent adversarial workflow attacked the auth gate, prompt-injection surface, §10.2 conduct
+guarantees, and backtest honesty. **The #1 claim held**: a prompt-injected MCP/REST caller cannot
+create, widen, add a target to, relax the limits of, or run outside a signed scope — every
+escalation path fails closed. It found real gaps between *claim* and *implementation*, now fixed:
+
+| red-team finding | severity | fix (verified by test) |
+|---|---|---|
+| rate/resource limits stored+signed but **never enforced** (ran 20× under a max_requests=1 scope) | HIGH | server-side per-scope request counter enforces `max_requests`; over-limit runs rejected+logged (`test_rate_limit_enforced`) |
+| containment log chained with **bare sha256** → re-chainable without a secret | HIGH | each entry **HMAC-signed** with the signing key; key-less re-chaining fails (`test_containment_rechain_without_key_fails`); + seq-contiguity + `run_is_logged` completeness (`test_whole_run_deletion_detected`) |
+| backtest is **circular** — coverage/calibration are self-consistency checks, not accuracy | HIGH | re-framed everywhere as a **self-consistency / wiring** metric with an explicit caveat in the data and the docs (`test_backtest_labeled_self_consistency`); added hardened decoys; reachability made depth-based |
+| **severity inflation** — hard 0.9/1.0 override for a missing content guardrail | MEDIUM | removed; severity comes from the scenario model with surfaced uncertainty (`test_no_severity_inflation`) |
+| signing key **co-located** with the scopes it protects | MEDIUM | `HEEL_SIGNING_KEY` env points the key outside the data dir; threat model documented honestly (DECISIONS D-009); fixed the os.urandom/"stable" docstring mismatch |
+| **accountability** — forgeable `clientInfo.name`, no-handshake anonymity, dropped args | MEDIUM | caller marked `mcp:`/`unauthenticated:no-handshake` and documented as self-asserted (auth gate never depends on it); ignored args are logged |
+| reachability-weighting recognized **two magic keys** (gameable) | MEDIUM | continuous **depth-based** estimator (prerequisite steps / auth gates discount reachability) |
+| FP rate rested on **one firing decoy** | MEDIUM | added hardened decoys sharing property names with vulnerable affordances (safe values) — the precise probes correctly don't fire (earned low FP) |
+
+**Residual (honest):** tail-truncation of the most-recent log entries needs an **external head
+anchor** (Phase 3); the backtest's real-target accuracy is still unmeasured (blind-target eval is
+the next step); limits enforce `max_requests` (concurrency/backoff are Phase 3). See DECISIONS
+D-009…D-014.

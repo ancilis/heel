@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 
+from .agents import estimate_reachability
 from .contracts import Category, SyntheticTarget
 
 
@@ -61,13 +62,18 @@ def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
     fp = [f for f in plausible if f.affordance_id not in planted_affordances]
 
     cov = len(tp) / len(reachable) if reachable else None
-    cov_weighted = (sum(pv.true_severity.score * pv.reachability if hasattr(pv, "reachability") else pv.true_severity.score for pv in tp)
-                    if False else None)
-    # reachability-weighted coverage: weight each reachable planted by an inferred reachability
-    # (we use the matched finding's reachability_score as the agent's plausibility estimate)
+    # reachability-weighted coverage — LOAD-BEARING: every reachable planted vector is weighted by
+    # the agent's per-affordance reachability ESTIMATE (continuous, depth-based), found or missed.
     find_by_aff = {f.affordance_id: f for f in plausible}
-    w_num = sum(find_by_aff[pv.affordance_id].reachability_score for pv in tp)
-    w_den = w_num + sum(0.7 for _ in fn)   # missed reachable vectors carry default weight
+    aff_by_id = {a.id: a for a in target.affordances}
+
+    def reach_est(pv):
+        if pv.affordance_id in find_by_aff:
+            return find_by_aff[pv.affordance_id].reachability_score
+        a = aff_by_id.get(pv.affordance_id)
+        return estimate_reachability(a) if a else 0.5
+    w_num = sum(reach_est(pv) for pv in tp)
+    w_den = sum(reach_est(pv) for pv in reachable)
     cov_w = round(w_num / w_den, 3) if w_den else None
 
     fp_rate = round(len(fp) / len(plausible), 3) if plausible else 0.0
@@ -92,6 +98,10 @@ def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
 
     return {
         "target": target.id, "kind": target.kind, "has_agent_surface": target.has_agent_surface,
+        "metric_kind": "self_consistency",
+        "caveat": ("self-consistency / wiring backtest on a synthetic target whose planted weaknesses "
+                   "and the seed probes were authored together; NOT a real-target detection-accuracy "
+                   "number. Trustworthy real-target evaluation needs blind targets + held-out scenarios."),
         "reachable_planted": len(reachable),
         "true_positives": len(tp), "false_negatives": len(fn), "false_positives": len(fp),
         "coverage": round(cov, 3) if cov is not None else None,
