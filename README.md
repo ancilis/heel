@@ -4,6 +4,8 @@
 
 <p align="center">
 <a href="https://github.com/ancilis/heel/actions/workflows/ci.yml"><img src="https://github.com/ancilis/heel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://github.com/ancilis/heel/actions/workflows/codeql.yml"><img src="https://github.com/ancilis/heel/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
+<a href="https://scorecard.dev/viewer/?uri=github.com/ancilis/heel"><img src="https://api.scorecard.dev/projects/github.com/ancilis/heel/badge" alt="OpenSSF Scorecard"></a>
 <a href="https://pypi.org/project/heel-sim/"><img src="https://img.shields.io/pypi/v/heel-sim.svg" alt="PyPI"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT"></a>
 <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
@@ -140,10 +142,19 @@ HEEL_MODEL=anthropic ANTHROPIC_API_KEY=sk-... heel-mcp   # via stdlib urllib —
 It only ever sees *observable* synthetic affordance properties (never secrets or real data) and stays
 in HEEL's lane.
 
+## Security & assurance
+
+A security tool has to earn trust. HEEL ships the evidence: **zero dependencies**, **reproducible
+builds**, **Sigstore-signed release provenance** + **SBOM**, **OpenSSF Scorecard** + **CodeQL**, and —
+the real assurance — **four independent multi-agent red-team passes** whose full reports are in the
+repo, every finding fixed with a regression test. The core claim held under attack: *a prompt-injected
+caller cannot create, widen, or escape a signed authorization scope.* See **[TRUST.md](TRUST.md)** and
+**[SECURITY.md](SECURITY.md)**, and verify the build yourself: `gh attestation verify <wheel> --repo ancilis/heel`.
+
 ## Docs
 
 [ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [DECISIONS](DECISIONS.md) · [SECURITY](SECURITY.md)
-· [CONTRIBUTING](CONTRIBUTING.md) · [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
+· [TRUST](TRUST.md) · [CONTRIBUTING](CONTRIBUTING.md) · [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
 ## Status
 

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.ancilis/heel",
+  "description": "Agent-native abuse-simulation: rehearse how a customer could abuse your product before it ships. Probes a product you own, proves an abuse path is reachable with a contained PoC, and returns a ranked report. Exposes only consumption/execution tools — never scope mutation (scopes are human-only, out-of-band, signed).",
+  "version": "1.0.0",
+  "repository": {
+    "url": "https://github.com/ancilis/heel",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registry_type": "pypi",
+      "registry_base_url": "https://pypi.org",
+      "identifier": "heel-sim",
+      "version": "1.0.0",
+      "transport": { "type": "stdio" },
+      "runtime_hint": "uvx",
+      "package_arguments": [
+        { "type": "named", "name": "--from", "value": "heel-sim" },
+        { "type": "positional", "value": "heel-mcp" }
+      ],
+      "environment_variables": [
+        {
+          "name": "HEEL_HOME",
+          "description": "Data directory for signed authorization scopes, the SQLite store, and the tamper-evident containment log (default ./.heel).",
+          "is_required": false,
+          "is_secret": false
+        },
+        {
+          "name": "HEEL_SIGNING_KEY",
+          "description": "Path to the HMAC signing key. For production, set this OUTSIDE HEEL_HOME (key/data separation).",
+          "is_required": false,
+          "is_secret": true
+        },
+        {
+          "name": "HEEL_MODEL",
+          "description": "Set to 'anthropic' to enable the optional LLM control loop (requires ANTHROPIC_API_KEY). Defaults to the deterministic offline model.",
+          "is_required": false,
+          "is_secret": false
+        }
+      ]
+    }
+  ]
+}
