@@ -68,15 +68,40 @@ WEAKNESSES = [
         ("agent_tool", {"fetch": "any_url"}, False)], True),
 ]
 
-# decoys: hardened affordances with tempting shapes; some trip over-broad heuristics (real FP risk)
+# decoys: hardened affordances on the BOUNDARY of each probe's failure mode (red-team-hardened so
+# precision is not carried by a single over-broad rule). Several legitimately-gated export routes
+# exercise the over-broad substring probe; the rest test that precise probes require the UNSAFE value.
 DECOYS = [
     ("record", {"tenant_check": "enforced"}, True),
     ("meter", {"reset_window": "server"}, True),
-    ("export", {"route": "/api/billing/export"}, True),   # over-broad export heuristic may FP here
+    ("export", {"route": "/api/billing/export"}, True),     # gated, but the over-broad probe trips
+    ("export", {"route": "/api/audit/export"}, True),       # ditto — FP is a category, not n=1
+    ("export", {"route": "/reports/export"}, True),
     ("admin_action", {"audit_logged": True}, True),
     ("flag", {"gated_by": "server"}, True),
-    ("agent_tool", {"granted_scope": "own", "intended_scope": "own"}, True),
+    ("agent_tool", {"granted_scope": "all", "intended_scope": "all"}, True),  # boundary for prop_neq
 ]
+
+
+def measure_encoding_overlap() -> dict:
+    """The library's measured coverage of the encoding vocabulary — the INDEPENDENT VARIABLE that
+    bounds blind recall (red-team fix). Runs the real library against each catalog encoding."""
+    from .agents import run_adversarial
+    from .model import StubModel
+    from .scenarios import all_seed_scenarios
+    scs = all_seed_scenarios()
+    total = matched = 0
+    for w in WEAKNESSES:
+        wid, cat, encs = w[0], w[1], w[2]
+        for idx, (kind, props, ga) in enumerate(encs):
+            total += 1
+            aff = Affordance(id=f"enc.{wid}.{idx}", kind=kind, category=cat, properties=dict(props),
+                             guard_present=not ga, reachability=0.8, planted_weakness=wid, true_severity=Severity(0.5, 0.5))
+            t = SyntheticTarget(id="probe", kind="ai_agent", has_agent_surface=True, affordances=[aff], planted_vectors=[])
+            out = run_adversarial(t, scs, lambda *a: None, "probe", model=StubModel())
+            if any(f.affordance_id == aff.id for f in out["findings"]):
+                matched += 1
+    return {"encodings": total, "matchable": matched, "overlap": round(matched / total, 3)}
 
 
 def generate_blind_target(seed: int) -> SyntheticTarget:

@@ -328,18 +328,38 @@ class TestBlindEvaluation(unittest.TestCase):  # the honest real-detection metri
         from heel.blind_eval import blind_eval
         cls.r = blind_eval(n=24, workers=6)
 
-    def test_real_recall_far_below_self_consistency(self):
-        # blind plants use encodings the library wasn't written against → honest, low real recall
-        self.assertLess(self.r["real_recall_mean"], 0.7)
-        self.assertGreater(self.r["real_recall_mean"], 0.0)
+    def test_recall_tracks_measured_overlap_as_lower_bound(self):
+        # recall is bounded by the measured library encoding-overlap (the independent variable),
+        # not an emergent skill — and far below the synthetic self-consistency coverage
+        self.assertLess(self.r["real_recall_pooled"], 0.7)
+        self.assertLessEqual(self.r["real_recall_pooled"], self.r["encoding_overlap"]["overlap"] + 0.05)
+        self.assertIn("LOWER BOUND", self.r["real_recall_is"])
 
-    def test_precision_and_ci_reported(self):
-        self.assertIsNotNone(self.r["real_precision_mean"])
-        self.assertEqual(len(self.r["real_recall_ci95"]), 2)
+    def test_wilson_ci_and_per_probe_fp_attribution(self):
+        self.assertEqual(len(self.r["real_recall_wilson_ci95"]), 2)
+        self.assertIsNotNone(self.r["real_precision_pooled"])
+        self.assertTrue(self.r["false_positives_by_probe"])  # FPs attributed to specific probe(s)
 
     def test_category10_optional_verified_on_blind_non_ai_targets(self):
         clean, total = self.r["category10_clean_on_non_ai"].split("/")
         self.assertEqual(clean, total)  # cat-10 cleanly 0 on EVERY blind non-AI target
+
+    def test_no_synonym_encoding_leaks_into_detection(self):  # red-team regression guard
+        from heel.agents import evaluate_criterion, heuristic_discover
+        from heel.blind import WEAKNESSES
+        from heel.contracts import Affordance, Severity, SyntheticTarget
+        from heel.scenarios import all_seed_scenarios
+        scs = all_seed_scenarios()
+        for w in WEAKNESSES:
+            for idx, (kind, props, ga) in enumerate(w[2][1:], 1):  # synonyms (enc#1+)
+                aff = Affordance(id="syn", kind=kind, category=w[1], properties=dict(props),
+                                 guard_present=not ga, reachability=0.8, planted_weakness=w[0], true_severity=Severity(0.5, 0.5))
+                # a scenario only fires if its KIND matches AND its criterion holds (the real gate)
+                leaks = any(sc.target_affordance_pattern.get("kind") == kind and evaluate_criterion(sc.success_criterion, aff) for sc in scs)
+                self.assertFalse(leaks, f"synonym leaks: {w[0]} {props}")
+                t = SyntheticTarget("x", "ai_agent", True, [aff], [])
+                disc, extra = heuristic_discover(t, set(), "r", lambda *a: None)
+                self.assertEqual(extra, [], f"synonym caught by discovery: {w[0]} {props}")
 
 
 class TestChaining(unittest.TestCase):
@@ -350,6 +370,21 @@ class TestChaining(unittest.TestCase):
         self.assertTrue(any(v.affordance_id == "ato_chain" for v in vs))
         for v in vs:  # contained
             self.assertEqual(v.reproduction["sample"], "canary_only")
+
+    def test_chain_over_decoy_counts_as_false_positive(self):  # red-team: no FP laundering
+        from heel.backtest import score_target
+        from heel.contracts import AbuseVector, Affordance, Category, PlantedVector, Severity, SyntheticTarget
+        decoy = Affordance("d", "export", Category.DATA_HARVESTING, {}, True, 0.7, decoy=True)
+        vuln = Affordance("v", "record", Category.COMPLIANCE_BOUNDARY, {"tenant_check": "missing"}, False, 0.8,
+                          planted_weakness="tb", true_severity=Severity(0.5, 0.5))
+        t = SyntheticTarget("t", "saas", False, [decoy, vuln],
+                            [PlantedVector("pv", "t", Category.COMPLIANCE_BOUNDARY, "v", "tb", Severity(0.5, 0.5))])
+        chain = AbuseVector(id="c", scenario_id="chain.x", category=Category.DATA_HARVESTING,
+                            reproduction={"strategy": "affordance_chain", "chain": ["v", "d"], "sample": "canary_only", "contained": True},
+                            severity=Severity(0.6, 0.7), reachability_score=0.5, plausible=True,
+                            recommended_control="x", affordance_id="chain:v+d")
+        sc = score_target(t, {"findings": [chain], "handoffs": [], "discovered_scenarios": []})
+        self.assertEqual(sc["false_positives"], 1)  # a chain touching a hardened decoy is a real FP
 
 
 if __name__ == "__main__":

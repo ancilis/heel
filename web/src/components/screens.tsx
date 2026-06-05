@@ -154,21 +154,21 @@ export function BlindEval({ s }: { s: any }) {
         sub="Planted weaknesses use encodings authored independently of the seed probes (heel/blind.py). Parallel fan-out over many blind targets. This is real detection accuracy — NOT the self-consistency coverage.">
         <div className="flex items-center gap-6 flex-wrap">
           <div className="text-center">
-            <Donut value={b.real_recall_mean} color="#fb7185" label="real recall" />
-            <div className="text-[10px] text-muted tabnum mt-1">95% CI [{b.real_recall_ci95.join(", ")}]</div>
+            <Donut value={b.real_recall_pooled} color="#fb7185" label="real recall" />
+            <div className="text-[10px] text-muted tabnum mt-1">95% CI [{b.real_recall_wilson_ci95.join(", ")}]</div>
           </div>
           <div className="text-center">
             <Donut value={ai} color="#34d399" label="self-consist." />
             <div className="text-[10px] text-muted tabnum mt-1">wiring metric</div>
           </div>
           <div className="flex-1 grid grid-cols-2 gap-2 min-w-[280px]">
-            <Stat label="real precision" value={fmt(b.real_precision_mean, 2)} tone="accent" />
+            <Stat label="real precision" value={fmt(b.real_precision_pooled, 2)} tone="accent" />
             <Stat label="false-positive rate" value={fmt(b.false_positive_rate_mean, 2)} />
             <Stat label="found / planted" value={`${b.total_found}/${b.total_planted}`} tone="bad" sub={`${b.total_missed} missed (unanticipated encodings)`} />
             <Stat label="cat-10 clean (blind non-AI)" value={b.category10_clean_on_non_ai} tone="ok" sub="verified, not structural" />
           </div>
         </div>
-        <div className="mt-3 rounded-md border border-bad/30 bg-bad/5 p-2 text-[11px] text-dim">{b.note}</div>
+        <div className="mt-3 rounded-md border border-bad/30 bg-bad/5 p-2 text-[11px] text-dim">measured encoding-overlap {b.encoding_overlap.overlap} · {b.real_recall_is}</div>
         <div className="mt-2 text-[11px] text-muted">fan-out: {b.fan_out} ({b.workers} workers, {b.n_targets} targets). Real recall rises as the library's encoding breadth grows — that is the honest improvement axis.</div>
       </Panel>
     </div>

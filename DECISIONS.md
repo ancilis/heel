@@ -171,3 +171,13 @@ INTERNAL eval path (no scope/real target, so no auth gate needed; it never touch
 With the stub model the GIL bounds CPU speedup, so we call it a bounded fan-out, not literal 1000×;
 with real LLM agents (`HEEL_MODEL=anthropic`) threads overlap network-bound work. Determinism is
 preserved (each target seeded; no shared mutable RNG across threads).
+
+### D-024 — The blind eval is a transparent LOWER BOUND vs measured encoding-overlap, not a dialed number
+**Why:** the second red-team showed recall ≈ the matchable-encoding fraction (author-chosen), precision
+rested on one over-broad probe, and the CI was mis-modelled. Fixes: report recall against the
+empirically-MEASURED encoding-overlap (the independent variable) and label it a stated lower bound;
+Wilson CI on the pooled proportion; per-probe FP attribution + boundary decoys; sound chaining FP
+accounting (a chain over a decoy is a real FP, not a laundered "compound"); a synonym-leak regression
+test; honest fan-out wording (GIL-bound thread pool). The honest claim: HEEL detects what its library
+anticipates (~the measured overlap); a defensible external accuracy claim needs independently-authored
+or held-out scenarios — stated, not hidden.

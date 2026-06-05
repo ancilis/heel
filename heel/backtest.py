@@ -59,11 +59,24 @@ def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
 
     tp = [pv for pv in reachable if pv.affordance_id in found_aff]
     fn = [pv for pv in reachable if pv.affordance_id not in found_aff]
-    # FP = a finding on a HARDENED/decoy affordance. A "chain:" compound over genuinely-vulnerable
-    # affordances is a legitimate escalation discovery, NOT a false alarm — excluded from FP.
-    compound = [f for f in plausible if f.affordance_id.startswith("chain:")]
-    fp = [f for f in plausible if f.affordance_id not in planted_affordances
-          and not f.affordance_id.startswith("chain:")]
+    # FP accounting (red-team-hardened): a chain is a legitimate compound discovery ONLY if all its
+    # legs are genuinely-vulnerable (no hardened decoy). A chain that touches a decoy is a real FALSE
+    # ALARM — the blanket "chain:"-prefix exclusion was unsound and laundered such FPs.
+    decoy_ids = {a.id for a in target.affordances if a.decoy}
+
+    def _is_chain(f):
+        return (f.reproduction or {}).get("strategy") == "affordance_chain"
+
+    def _legs(f):
+        return (f.reproduction or {}).get("chain", [])
+    fp, compound = [], []
+    for f in plausible:
+        if f.affordance_id in planted_affordances:
+            continue  # TP-eligible (counted via found_aff)
+        if _is_chain(f):
+            (fp if any(l in decoy_ids for l in _legs(f)) else compound).append(f)
+        else:
+            fp.append(f)  # single finding on a hardened/decoy affordance
 
     cov = len(tp) / len(reachable) if reachable else None
     # reachability-weighted coverage — LOAD-BEARING: every reachable planted vector is weighted by
@@ -122,6 +135,7 @@ def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
         "compound_chain_findings": len(compound),
         "missed": [{"affordance": pv.affordance_id, "category": pv.category.value, "weakness": pv.weakness} for pv in fn],
         "false_positive_affordances": [f.affordance_id for f in fp],
+        "false_positive_scenarios": [f.scenario_id for f in fp],
         "discovered_scenarios": [s.id for s in agent_output["discovered_scenarios"]],
         "handoffs": agent_output["handoffs"],
         "n_findings": len(findings), "n_plausible": len(plausible),

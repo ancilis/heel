@@ -43,6 +43,7 @@ def run_chaining(target, log, run_id: str) -> list[AbuseVector]:
         aid = pat["maps_to"] or ("chain:" + "+".join(m.id for m in matched))
         reach = round(min(estimate_reachability(m) for m in matched) * 0.8, 3)  # chains are deeper
         like, imp = pat["severity"]
+        like = round(like * max(0.3, min(1.0, reach / 0.6)), 3)  # demote severity when the chain is less reachable
         vid += 1
         log("chain_discovered", {"pattern": pat["id"], "affordances": [m.id for m in matched]})
         out.append(AbuseVector(

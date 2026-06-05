@@ -225,3 +225,27 @@ genuinely-vulnerable affordances are reported separately, not counted as false p
 (`TestChaining`.)
 
 **42 tests pass.**
+
+### Phase 3 — wave 3b: the blind eval, red-team-hardened
+
+A second red-team attacked the blind eval itself and found it was *partly* a re-parameterized knob.
+Fixes (DECISIONS D-024):
+- **Recall is reported against the MEASURED encoding-overlap** (the independent variable that bounds
+  it) and labelled a **stated lower bound** — not emergent detection skill. Measured overlap 0.33;
+  real recall 0.25 ≈ overlap minus reachability/category slack. It rises only as the library covers
+  more of the encoding vocabulary — uncheatable by writing probes against known plants. A defensible
+  external claim still needs independently-authored / held-out scenarios (stated honestly).
+- **Wilson score interval** on the pooled found/planted proportion (the right binomial model),
+  replacing population-stdev normal-z on a mean-of-ratios.
+- **Per-probe false-positive attribution**: all 44 FPs come from one over-broad probe
+  (`sc.export.overbroad`) — surfaced, so precision (0.62) isn't silently carried by a single rule.
+  Added boundary decoys exercising that failure mode.
+- **Chaining FP soundness**: the blanket `chain:`-prefix FP exclusion was unsound (it could launder
+  a false positive over a hardened decoy). Now a chain is a legitimate compound ONLY if all its legs
+  are genuinely vulnerable; a chain touching a decoy is counted as a real false positive
+  (`test_chain_over_decoy_counts_as_false_positive`). Compound severity is tied to reachability.
+- **Regression guard**: a test asserts no synonym encoding leaks into detection via any seed
+  criterion (with the kind gate) or the discovery heuristic. Fan-out asserts synthetic-only targets
+  and is described honestly (GIL-bound thread pool, not literal 1000×).
+
+**44 tests pass.**
