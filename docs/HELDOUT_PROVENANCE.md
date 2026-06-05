@@ -47,3 +47,21 @@ the probes. HEEL's recall here is real detection accuracy with no author control
 This is the honest real-target ceiling. It improves only by widening the library's semantic coverage
 of real abuse vocabularies — not by writing probes against known plants. The set is **frozen** so the
 eval is deterministic and offline; regenerating it requires re-running the authoring workflow.
+
+## Update — dev/test split (wave 5)
+
+To improve recall without overfitting, the held-out eval now uses two splits:
+
+- **DEV** (`heel/heldout/targets.json`, 8 products / 97 weaknesses) — the semantic catalog
+  (`heel/semantic.py`) was tuned on these.
+- **TEST** (`heel/heldout/test_targets.json`, 14 products / 199 weaknesses) — authored by a SECOND
+  independent LLM swarm (workflow `heel-heldout-testset`, 14 diverse product briefs), **frozen and
+  not inspected by the tuner** (the freeze script prints counts only, never properties). The TEST
+  recall is the unbiased number.
+
+Result: DEV semantic recall 0.73 vs **TEST semantic recall 0.38** (Wilson CI [0.31, 0.45]) at **0.96
+precision**; exact-match TEST 0.085. The dev→test gap is the overfitting gap, reported openly. The
+honest generalization on vocabulary HEEL never saw is ~0.38, and it rises only by widening the
+semantic catalog's coverage of real abuse vocabularies — never by writing probes against known
+plants. (One TEST product was glimpsed by the tuner in a tool-result notification; the catalog was
+not tuned against it — a fresh red-team audits for any such leakage.)

@@ -196,3 +196,17 @@ indicators (and absence of a hardened indicator), via `{"semantic": signal}` cri
 scenarios (agent-category ones gated to has_agent_surface to preserve cat-10 optionality). On the
 held-out set this roughly doubles recall at high precision. Topic+permissive (not topic alone) keeps
 precision: a tightened tenant topic avoids miscategorizing an MCP `context_isolation` finding.
+
+### D-027 — Held-out uses a dev/test split; the frozen TEST recall is the headline
+**Why:** tuning the semantic catalog to raise recall would overfit if measured on the same targets.
+The semantic catalog is tuned on DEV (heel/heldout/targets.json, 8 products); a larger TEST set
+(heel/heldout/test_targets.json, 14 products / 199 weaknesses) was authored by a fresh independent
+LLM swarm and frozen WITHOUT the tuner inspecting its properties. Reported: DEV semantic 0.73 vs
+TEST semantic 0.38 (Wilson CI [0.31,0.45]) at 0.96 precision — the dev→test gap is the overfitting
+gap, shown rather than hidden. recall improves only by widening real-vocabulary coverage.
+
+### D-028 — Boolean polarity is property-dependent → no bare "true" in the permissive vocabulary
+**Why:** broadening semantic permissive values with "true"/"enabled" wrecked precision
+(audit_logged:true is GOOD, acts_on_content:true is BAD). Removed them; precision recovered to 0.96
+on both dev and the unseen test set. Where true==weakness, the signal matches the explicit bad word
+(e.g. "passthrough", "no_check") instead.

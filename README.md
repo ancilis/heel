@@ -96,9 +96,10 @@ tests/            acceptance + safety tests
 
 Phases 0–4 implemented (red-team-hardened). Phase 0–2: contracts + MCP boundary + immutable-scope
 gate; two synthetic targets + coverage backtest. Phase 3: opportunistic-human class, REST API,
-control search, declarative full-breadth library (10 categories, JSON-loadable), swappable LLM
-control loop. Phase 4: the control-room UI. 38 tests pass. Next: blind-target evaluation, true
-thousand-agent fan-out, affordance-chaining discovery.
+control search, declarative library (10 categories, JSON-loadable), swappable LLM loop,
+affordance chaining, and a layered HONEST detection metric: self-consistency ~1.0 (wiring) -> blind
+~0.25 (independent encodings) -> held-out TEST ~0.38 @ 0.96 precision (independently LLM-authored
+targets, frozen dev/test split). Phase 4: the control-room UI. 48 tests pass.
 
 ---
 

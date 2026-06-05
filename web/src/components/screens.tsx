@@ -177,28 +177,29 @@ export function BlindEval({ s }: { s: any }) {
 
 /* ============================== HELD-OUT (independent authorship) ============================== */
 export function HeldOut({ s }: { s: any }) {
-  const h = s.heldout_eval, ex = h.exact_match, sem = h.with_semantic;
+  const h = s.heldout_eval, dev = h.dev || h, test = h.test || h;
+  const tsem = test.with_semantic, tex = test.exact_match;
   return (
     <div className="space-y-4">
       <Panel title="Held-out evaluation — independently-authored targets (the strongest honesty test)"
-        sub="Targets authored by a separate LLM swarm given only the abuse taxonomy — blind to HEEL's probe vocabulary (docs/HELDOUT_PROVENANCE.md). Real detection accuracy with NO author control over the encoding.">
+        sub="Targets authored by a separate LLM swarm given only the abuse taxonomy — blind to HEEL's probe vocabulary (docs/HELDOUT_PROVENANCE.md). Proper dev/test discipline: the semantic catalog was tuned on DEV; the TEST split was frozen and never inspected — its number is the unbiased one.">
         <div className="flex items-center gap-6 flex-wrap">
-          <div className="text-center"><Donut value={ex.recall} color="#6b7280" label="exact-match" />
-            <div className="text-[10px] text-muted tabnum mt-1">{ex.found}/{ex.planted} · barely generalizes</div></div>
+          <div className="text-center"><Donut value={tex.recall} color="#6b7280" label="exact (test)" />
+            <div className="text-[10px] text-muted tabnum mt-1">{tex.found}/{tex.planted}</div></div>
           <div className="text-2xl text-muted">→</div>
-          <div className="text-center"><Donut value={sem.recall} color="#34d399" label="+ semantic" />
-            <div className="text-[10px] text-muted tabnum mt-1">CI [{sem.wilson_ci95.join(", ")}]</div></div>
+          <div className="text-center"><Donut value={tsem.recall} color="#34d399" label="semantic (test)" />
+            <div className="text-[10px] text-muted tabnum mt-1">CI [{tsem.wilson_ci95.join(", ")}]</div></div>
           <div className="flex-1 grid grid-cols-2 gap-2 min-w-[260px]">
-            <Stat label="held-out targets" value={h.n_targets} sub={`${h.total_planted} planted weaknesses`} />
-            <Stat label="semantic precision" value={fmt(sem.precision, 2)} tone="accent" />
-            <Stat label="exact recall" value={fmt(ex.recall, 2)} tone="bad" />
-            <Stat label="semantic recall" value={fmt(sem.recall, 2)} tone="ok" sub="not near 1.0 — honest ceiling" />
+            <Stat label="TEST recall (unbiased)" value={fmt(tsem.recall, 2)} tone="ok" sub={`${test.total_planted} weaknesses · never tuned on`} />
+            <Stat label="TEST precision" value={fmt(tsem.precision, 2)} tone="accent" sub="holds on unseen vocabulary" />
+            <Stat label="DEV recall (tuned)" value={fmt(dev.with_semantic.recall, 2)} sub="the tuning ceiling" />
+            <Stat label="overfitting gap" value={`${Math.round((dev.with_semantic.recall - tsem.recall) * 100)}pp`} tone="warn" sub="dev − test, honestly shown" />
           </div>
         </div>
-        <div className="mt-3 text-[11px] text-dim">Exact property/kind matching barely generalizes to an unseen vocabulary; semantic synonym families (heel/semantic.py) recover roughly twice as much. Improves only by widening real-vocabulary coverage — not by writing probes against known plants.</div>
+        <div className="mt-3 text-[11px] text-dim">Exact property/kind matching barely generalizes to unseen vocabulary (test {fmt(tex.recall, 2)}); semantic synonym families (heel/semantic.py) recover ~{Math.round(tsem.recall / Math.max(tex.recall, 0.01))}×. Improves only by widening real-vocabulary coverage — never by writing probes against known plants. Not near 1.0 — the honest real-target ceiling.</div>
       </Panel>
-      <Panel title="Held-out recall by category" sub="Where HEEL generalizes well vs where it has gaps (semantic run).">
-        <HBars items={Object.entries(sem.recall_by_category).map(([c, v]) => {
+      <Panel title="TEST recall by category (unbiased)" sub="Where HEEL generalizes vs where it has gaps, on targets it never saw.">
+        <HBars items={Object.entries(tsem.recall_by_category).map(([c, v]) => {
           const [f, t] = (v as string).split("/").map(Number);
           return { label: catShort(c), value: t ? Math.round((f / t) * 100) : 0, color: CAT_COLOR[c], tag: <span className="tabnum text-[10px] text-muted w-10">{v as string}</span> };
         })} max={100} />

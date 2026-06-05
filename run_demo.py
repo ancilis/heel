@@ -123,12 +123,14 @@ def main():
     L.append("")
     from heel.heldout_eval import heldout_eval
     he = heldout_eval()
+    dev, test = he["dev"], he.get("test", he["dev"])
     L.append("HELD-OUT EVALUATION — targets authored by an INDEPENDENT LLM swarm (blind to HEEL's probes):")
-    L.append(f"  exact-match recall {he['exact_match']['recall']} -> with SEMANTIC generalization "
-             f"{he['with_semantic']['recall']} (Wilson CI {he['with_semantic']['wilson_ci95']}) "
-             f"at precision {he['with_semantic']['precision']}, over {he['total_planted']} planted weaknesses")
-    L.append("  -> exact property/kind matching barely generalizes to an unseen vocabulary; semantic synonym")
-    L.append("     families recover a fraction. The honest real-target ceiling — neither is near 1.0.")
+    L.append(f"  DEV  (tuned on, {dev['total_planted']} weaknesses):  exact {dev['exact_match']['recall']} -> "
+             f"semantic {dev['with_semantic']['recall']} @ precision {dev['with_semantic']['precision']}")
+    L.append(f"  TEST (FROZEN, never tuned, {test['total_planted']} weaknesses):  exact {test['exact_match']['recall']} -> "
+             f"semantic {test['with_semantic']['recall']} (Wilson CI {test['with_semantic']['wilson_ci95']}) @ precision {test['with_semantic']['precision']}")
+    L.append("  -> the TEST number is the UNBIASED one; the dev->test gap is the overfitting gap. Semantic")
+    L.append("     generalization beats exact matching on vocabulary it never saw — but is not near 1.0 (honest ceiling).")
     L.append("")
     L.append("AUTHORIZATION GATE (agent caller is an untrusted, possibly prompt-injected channel):")
     for label, rejected in gate_rows:

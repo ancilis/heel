@@ -25,7 +25,9 @@ from .contracts import Affordance, Category, PlantedVector, Severity, SyntheticT
 from .model import StubModel
 from .scenarios import all_seed_scenarios
 
-FIXTURES = os.path.join(os.path.dirname(__file__), "heldout", "targets.json")
+_DIR = os.path.join(os.path.dirname(__file__), "heldout")
+FIXTURES = os.path.join(_DIR, "targets.json")            # DEV split (tuned on)
+TEST_FIXTURES = os.path.join(_DIR, "test_targets.json")  # TEST split (frozen, never tuned on)
 
 
 def _noop(*a):
@@ -78,20 +80,33 @@ def _run(targets, semantic: bool) -> dict:
             "recall_by_category": {c: f"{cat_found[c]}/{cat_plant[c]}" for c in sorted(cat_plant)}}
 
 
+def _eval_split(path: str) -> dict:
+    with open(path) as fh:
+        targets = [_build_target(p) for p in json.load(fh)]
+    return {"n_targets": len(targets), "total_planted": _run(targets, True)["planted"],
+            "exact_match": _run(targets, False), "with_semantic": _run(targets, True)}
+
+
 def heldout_eval() -> dict:
-    with open(FIXTURES) as fh:
-        prods = json.load(fh)
-    targets = [_build_target(p) for p in prods]
-    exact, semantic = _run(targets, False), _run(targets, True)
-    return {
+    dev = _eval_split(FIXTURES)
+    out = {
         "provenance": "targets authored by an independent LLM swarm, blind to HEEL's probe vocabulary",
-        "n_targets": len(targets), "total_planted": semantic["planted"],
-        "exact_match": exact, "with_semantic": semantic,
-        "headline": (f"held-out real recall: exact-match {exact['recall']} -> with semantic generalization "
-                     f"{semantic['recall']} (Wilson CI {semantic['wilson_ci95']}). Exact property/kind matching "
-                     f"barely generalizes to an independently-authored vocabulary; semantic synonym families "
-                     f"recover a fraction. The honest real-target ceiling — neither is near 1.0."),
+        "discipline": "DEV split was tuned on; TEST split is frozen and was never inspected/tuned on "
+                      "(see docs/HELDOUT_PROVENANCE.md) — the TEST number is the unbiased one.",
+        "dev": dev,
+        # back-compat top-level = dev (existing callers/tests/UI)
+        "n_targets": dev["n_targets"], "total_planted": dev["total_planted"],
+        "exact_match": dev["exact_match"], "with_semantic": dev["with_semantic"],
     }
+    if os.path.exists(TEST_FIXTURES):
+        test = _eval_split(TEST_FIXTURES)
+        out["test"] = test
+        out["headline"] = (f"held-out TEST recall (unbiased, {test['total_planted']} weaknesses authored "
+                           f"blind to the tuner): exact {test['exact_match']['recall']} -> semantic "
+                           f"{test['with_semantic']['recall']} (Wilson CI {test['with_semantic']['wilson_ci95']}) "
+                           f"at precision {test['with_semantic']['precision']}. DEV recall {dev['with_semantic']['recall']}. "
+                           f"Generalizes to vocabulary it never saw; not near 1.0 — the honest ceiling.")
+    return out
 
 
 def main():

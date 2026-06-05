@@ -226,12 +226,15 @@ class TestOpportunisticClass(Base):  # spec §3.2, DoD #3
         self.assertIn("promo_stacking", opp_affs)  # the adversarial FN, closed by the human class
 
     def test_profiles_gate_which_vectors_surface(self):
-        rid = self.run_target("synthetic-saas")
-        opp = {f["affordance_id"]: f for f in self._opp(rid)}
-        # region arbitrage needs sophistication → only the arbitrageur pursues it
-        self.assertEqual(opp["region_pricing"]["reproduction"]["profiles"], ["sophisticated_arbitrageur"])
-        # seat sharing is low-bar → all three profiles
-        self.assertEqual(len(opp["seats"]["reproduction"]["profiles"]), 3)
+        # test the opportunistic class's motivation-gating directly (decoupled from the merge,
+        # since the semantic adversarial library may also now cover some commercial affordances)
+        from heel.agents_human import run_opportunistic
+        from heel.profiles import DEFAULT_PROFILES
+        from heel.targets import get_target
+        out = run_opportunistic(get_target("synthetic-saas"), DEFAULT_PROFILES, lambda *a: None, "t")
+        byaff = {f.affordance_id: f.reproduction["profiles"] for f in out["findings"]}
+        self.assertEqual(byaff["region_pricing"], ["sophisticated_arbitrageur"])  # needs sophistication
+        self.assertEqual(len(byaff["seats"]), 3)  # low-bar → all three profiles
 
     def test_agent_classes_param_respected(self):
         r = self.server.heel_run({"scope_id": self.scope.scope_id, "target": "synthetic-saas",
@@ -377,6 +380,14 @@ class TestHeldoutEvaluation(unittest.TestCase):  # strongest honesty test: indep
         self.assertGreater(sem, ex)        # semantic synonym families generalize to unseen vocabulary
         self.assertLess(sem, 0.95)         # but real recall on independent targets is NOT near 1.0
         self.assertGreater(self.r["with_semantic"]["precision"], 0.7)
+
+    def test_frozen_test_split_is_the_unbiased_number(self):
+        # TEST split was never tuned on; its recall should be the honest (lower) generalization number
+        test = self.r["test"]
+        self.assertGreaterEqual(test["total_planted"], 100)
+        self.assertGreater(test["with_semantic"]["recall"], test["exact_match"]["recall"])  # semantic still helps
+        self.assertLessEqual(test["with_semantic"]["recall"], self.r["dev"]["with_semantic"]["recall"])  # >= overfitting gap
+        self.assertGreater(test["with_semantic"]["precision"], 0.85)  # precision holds on unseen vocabulary
 
     def test_wilson_ci_reported(self):
         self.assertEqual(len(self.r["with_semantic"]["wilson_ci95"]), 2)

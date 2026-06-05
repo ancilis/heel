@@ -284,3 +284,27 @@ the exact→semantic jump. **47 tests pass.**
 **The three honesty levels, in one place:** self-consistency coverage ~1.0 (wiring) → blind lower
 bound ~0.25 (independent encodings, author-controlled overlap) → held-out semantic ~0.57 at 0.95
 precision (independent authorship, no author control). Each strips a layer of circularity.
+
+### Phase 3 — wave 5: dev/test discipline + broadened semantic coverage
+
+To improve recall honestly (not by overfitting), the held-out evaluation now uses a proper
+**dev/test split**. The semantic catalog (`heel/semantic.py`, expanded from 12 to ~34 signal
+families) was tuned on the **DEV** set (the original 8 products). A **larger TEST set — 14 products,
+199 weaknesses, authored by a fresh independent LLM swarm and frozen WITHOUT inspection** — gives the
+unbiased number.
+
+| split | exact recall | semantic recall | precision |
+|---|---|---|---|
+| DEV (tuned on, 97 weaknesses) | 0.26 | **0.73** | 0.96 |
+| **TEST (frozen, 199 weaknesses)** | 0.085 | **0.38** (Wilson CI [0.31, 0.45]) | **0.96** |
+
+The **dev→test gap (0.73 → 0.38) is the overfitting gap, shown honestly** — the unbiased
+generalization is 0.38, and **precision holds at 0.96 on entirely unseen vocabulary** (the semantic
+matcher's topic+permissive gating doesn't over-fire). Semantic generalization still beats exact
+matching ~4.4× on unseen targets (0.085 → 0.38). TEST `recall_by_category` exposes the real weak
+spots (agent/MCP 4/18, content-policy 1/11, unintended-endpoints 9/27) — the honest backlog. A key
+precision lesson: bare boolean `true`/`enabled` were removed from the permissive vocabulary because
+polarity is property-dependent (`audit_logged:true` is good, `acts_on_content:true` is bad).
+
+**48 tests pass.** The four honesty levels now coexist: self-consistency ~1.0 → blind ~0.25 →
+held-out DEV ~0.73 (tuned) → **held-out TEST ~0.38 (unbiased) @ 0.96 precision**.

@@ -122,28 +122,21 @@ SEED_SCENARIOS: list[AbuseScenario] = [
 
 # SEMANTIC scenarios — recognize weakness FAMILIES by topic+permissive vocabulary (heel/semantic.py),
 # so the library generalizes to vocabularies it didn't author. Kind "*" matches any affordance kind.
-def _sem(id, cat, objective, signal, like, imp, control, handoff="", kind="*", applies=AppliesWhen.ALWAYS):
-    return AbuseScenario(
-        id=id, category=cat, objective=objective, target_affordance_pattern={"kind": kind},
-        probe_strategy="semantic", success_criterion={"semantic": signal},
-        severity_model={"likelihood": like, "impact": imp}, applies_when=applies,
-        source=ScenarioSource.SEED, recommended_control=control, exploitability_reduction=0.7, handoff=handoff)
+def _build_semantic_scenarios():
+    from .semantic import SEMANTIC_SIGNALS
+    out = []
+    for signal, (topics, cat, control, handoff, like, imp) in SEMANTIC_SIGNALS.items():
+        out.append(AbuseScenario(
+            id=f"sc.sem.{signal}", category=cat,
+            objective=f"{signal.replace('_', ' ').title()} (recognized by any vocabulary)",
+            target_affordance_pattern={"kind": "*"}, probe_strategy="semantic",
+            success_criterion={"semantic": signal}, severity_model={"likelihood": like, "impact": imp},
+            applies_when=_AGENT if cat == Category.AGENT_MCP_SURFACE else AppliesWhen.ALWAYS,
+            source=ScenarioSource.SEED, recommended_control=control, exploitability_reduction=0.7, handoff=handoff))
+    return out
 
 
-SEMANTIC_SCENARIOS = [
-    _sem("sc.sem.tenant", Category.COMPLIANCE_BOUNDARY, "Tenant isolation absent (any vocabulary)", "tenant_isolation", 0.8, 0.9, "enforce per-tenant scoping"),
-    _sem("sc.sem.export", Category.DATA_HARVESTING, "Ungated bulk export/scrape (any vocabulary)", "bulk_export", 0.6, 0.7, "entitlement-gate + rate-limit exports"),
-    _sem("sc.sem.meter", Category.LICENSE_ENTITLEMENT, "Client-controllable metering (any vocabulary)", "meter_reset", 0.6, 0.6, "server-authoritative metering"),
-    _sem("sc.sem.tier", Category.UNINTENDED_ENDPOINTS, "Client-trusted tier gate (any vocabulary)", "tier_gate", 0.6, 0.7, "server-verified entitlement"),
-    _sem("sc.sem.audit", Category.COMPLIANCE_BOUNDARY, "Audit-log gap (any vocabulary)", "audit_gap", 0.6, 0.7, "complete audit coverage"),
-    _sem("sc.sem.recovery", Category.IDENTITY_ACCOUNT, "Weak account recovery (any vocabulary)", "recovery_weak", 0.6, 0.7, "strengthen + rate-limit recovery"),
-    _sem("sc.sem.agentscope", Category.AGENT_MCP_SURFACE, "Over-scoped agent tool (any vocabulary)", "agent_scope", 0.8, 0.9, "scope tool perms to caller", applies=_AGENT),
-    _sem("sc.sem.retrieval", Category.AGENT_MCP_SURFACE, "Cross-tenant retrieval (any vocabulary)", "retrieval_tenant", 0.8, 0.9, "tenant-filter retrieval", applies=_AGENT),
-    _sem("sc.sem.ssrf", Category.FUNCTION_ABUSE, "SSRF/egress (any vocabulary)", "ssrf", 0.6, 0.7, "egress allowlist", handoff="appsec"),
-    _sem("sc.sem.webhook", Category.INTEGRATION_EXTENSIBILITY, "Webhook replay (any vocabulary)", "webhook_replay", 0.5, 0.5, "replay protection"),
-    _sem("sc.sem.oauth", Category.INTEGRATION_EXTENSIBILITY, "Over-broad OAuth scope (any vocabulary)", "oauth_scope", 0.5, 0.6, "scope minimization"),
-    _sem("sc.sem.trial", Category.LICENSE_ENTITLEMENT, "Serial-trial weakness (any vocabulary)", "serial_trial", 0.5, 0.5, "identity dedupe + limits"),
-]
+SEMANTIC_SCENARIOS = _build_semantic_scenarios()
 
 
 def load_json_scenarios() -> list[AbuseScenario]:
