@@ -1,0 +1,6 @@
+include LICENSE README.md ARCHITECTURE.md EVAL.md DECISIONS.md
+recursive-include heel/scenarios_lib *.json
+recursive-include heel/heldout *.json
+recursive-include docs *.md
+global-exclude __pycache__/*
+global-exclude *.pyc

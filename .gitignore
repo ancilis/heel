@@ -10,3 +10,7 @@ venv/
 node_modules/
 .idea/
 .vscode/
+build/
+dist/
+*.egg-info/
+*.egg-info
