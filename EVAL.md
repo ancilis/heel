@@ -249,3 +249,38 @@ Fixes (DECISIONS D-024):
   and is described honestly (GIL-bound thread pool, not literal 1000×).
 
 **44 tests pass.**
+
+### Phase 3 — wave 4: held-out evaluation (independent authorship) + semantic generalization
+
+The final integrity step: even the blind eval's encodings were written by HEEL's author, so the
+encoding-overlap (hence recall) was ultimately a designer choice (red-team finding). This wave
+removes that last lever.
+
+**Held-out targets, independently authored.** A multi-agent workflow spawned 8 LLM agents that each
+authored a synthetic product with planted abuse weaknesses — given only the abuse taxonomy + an
+output schema, and **blind to HEEL's scenario/semantic vocabulary** (provenance:
+`docs/HELDOUT_PROVENANCE.md`). They invented their own property names
+(`tenant_scope_check: disabled`, `private_ip_range_block: absent`, `export_audit_event: not_emitted`,
+…). Frozen in `heel/heldout/targets.json`: 8 products, 97 planted weaknesses, all 10 categories.
+
+**Semantic generalization (`heel/semantic.py`).** Exact property==value criteria don't generalize to
+an unseen vocabulary. A scenario can instead declare a SEMANTIC signal — a weakness family recognized
+by topic keywords in the property key + permissive indicators in the value (topic+permissive keeps
+precision). This is the honest improvement axis: widen real-vocabulary coverage, don't write probes
+against known plants.
+
+**The honest real-target ceiling** (`heel/heldout_eval.py`, `make demo`):
+
+| | recall | precision |
+|---|---|---|
+| exact-match only | **0.26** (25/97) — barely generalizes | — |
+| **with semantic** | **0.57** (Wilson CI [0.47, 0.66]) | **0.95** |
+
+`recall_by_category` surfaces where HEEL is strong (data-harvesting 10/15, function-abuse 10/13) vs
+weak (unintended-endpoints 7/15, license-entitlement 7/14). Neither number is near 1.0 — this is the
+honest detection ceiling on independently-authored abuse, and the UI's "Held-out (real)" screen shows
+the exact→semantic jump. **47 tests pass.**
+
+**The three honesty levels, in one place:** self-consistency coverage ~1.0 (wiring) → blind lower
+bound ~0.25 (independent encodings, author-controlled overlap) → held-out semantic ~0.57 at 0.95
+precision (independent authorship, no author control). Each strips a layer of circularity.

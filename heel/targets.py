@@ -77,9 +77,12 @@ def build_saas_target() -> SyntheticTarget:
         # NOT a single-affordance vuln — only abusable when CHAINED with weak recovery (→ ato_chain)
         _aff("session_mgmt", "session", Category.IDENTITY_ACCOUNT, None, 0.6, guard=True,
              route="/session", session_rotation="none"),
-        # --- planted but NOT covered by any seed scenario → the swarm must DISCOVER it ---
+        # --- webhook replay: now covered by the SEMANTIC family (sc.sem.webhook) → a TP ---
         _aff("webhook_endpoint", "integration", Category.INTEGRATION_EXTENSIBILITY, "webhook_replay",
              0.6, Severity(0.5, 0.5), route="/webhooks/in", replay_protection="missing"),
+        # --- planted, NOT covered by any seed OR semantic scenario → the swarm must DISCOVER it ---
+        _aff("data_pipeline", "data_pipeline", Category.DATA_HARVESTING, "pii_passthrough",
+             0.6, Severity(0.5, 0.6), route="/ingest", pii_filter="none"),
         # --- planted, reachable, but NOT a "missing-control" signal → a genuine MISS for the
         #     ADVERSARIAL class (honest FN) that the OPPORTUNISTIC-human class closes (coupon stacking) ---
         _aff("promo_stacking", "endpoint", Category.LICENSE_ENTITLEMENT, "coupon_stacking",

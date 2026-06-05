@@ -362,6 +362,26 @@ class TestBlindEvaluation(unittest.TestCase):  # the honest real-detection metri
                 self.assertEqual(extra, [], f"synonym caught by discovery: {w[0]} {props}")
 
 
+class TestHeldoutEvaluation(unittest.TestCase):  # strongest honesty test: independent authorship
+    @classmethod
+    def setUpClass(cls):
+        from heel.heldout_eval import heldout_eval
+        cls.r = heldout_eval()
+
+    def test_targets_are_independently_authored_and_broad(self):
+        self.assertGreaterEqual(self.r["total_planted"], 50)  # an LLM swarm authored these, blind to the probes
+        self.assertIn("independent", self.r["provenance"])
+
+    def test_semantic_generalization_beats_exact_but_neither_is_perfect(self):
+        ex, sem = self.r["exact_match"]["recall"], self.r["with_semantic"]["recall"]
+        self.assertGreater(sem, ex)        # semantic synonym families generalize to unseen vocabulary
+        self.assertLess(sem, 0.95)         # but real recall on independent targets is NOT near 1.0
+        self.assertGreater(self.r["with_semantic"]["precision"], 0.7)
+
+    def test_wilson_ci_reported(self):
+        self.assertEqual(len(self.r["with_semantic"]["wilson_ci95"]), 2)
+
+
 class TestChaining(unittest.TestCase):
     def test_chaining_finds_multi_affordance_abuse(self):
         from heel.chaining import run_chaining

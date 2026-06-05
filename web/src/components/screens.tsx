@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 import { useState } from "react";
-import { Panel, Stat, Tag, SevBadge, CatBadge, ReachBar, Verdict, Donut, CAT_COLOR, fmt, cx, catShort } from "@/lib/ui";
+import { Panel, Stat, Tag, SevBadge, CatBadge, ReachBar, Verdict, Donut, HBars, CAT_COLOR, fmt, cx, catShort } from "@/lib/ui";
 
 export function TargetToggle({ target, set }: { target: string; set: (t: string) => void }) {
   return (
@@ -170,6 +170,38 @@ export function BlindEval({ s }: { s: any }) {
         </div>
         <div className="mt-3 rounded-md border border-bad/30 bg-bad/5 p-2 text-[11px] text-dim">measured encoding-overlap {b.encoding_overlap.overlap} · {b.real_recall_is}</div>
         <div className="mt-2 text-[11px] text-muted">fan-out: {b.fan_out} ({b.workers} workers, {b.n_targets} targets). Real recall rises as the library's encoding breadth grows — that is the honest improvement axis.</div>
+      </Panel>
+    </div>
+  );
+}
+
+/* ============================== HELD-OUT (independent authorship) ============================== */
+export function HeldOut({ s }: { s: any }) {
+  const h = s.heldout_eval, ex = h.exact_match, sem = h.with_semantic;
+  return (
+    <div className="space-y-4">
+      <Panel title="Held-out evaluation — independently-authored targets (the strongest honesty test)"
+        sub="Targets authored by a separate LLM swarm given only the abuse taxonomy — blind to HEEL's probe vocabulary (docs/HELDOUT_PROVENANCE.md). Real detection accuracy with NO author control over the encoding.">
+        <div className="flex items-center gap-6 flex-wrap">
+          <div className="text-center"><Donut value={ex.recall} color="#6b7280" label="exact-match" />
+            <div className="text-[10px] text-muted tabnum mt-1">{ex.found}/{ex.planted} · barely generalizes</div></div>
+          <div className="text-2xl text-muted">→</div>
+          <div className="text-center"><Donut value={sem.recall} color="#34d399" label="+ semantic" />
+            <div className="text-[10px] text-muted tabnum mt-1">CI [{sem.wilson_ci95.join(", ")}]</div></div>
+          <div className="flex-1 grid grid-cols-2 gap-2 min-w-[260px]">
+            <Stat label="held-out targets" value={h.n_targets} sub={`${h.total_planted} planted weaknesses`} />
+            <Stat label="semantic precision" value={fmt(sem.precision, 2)} tone="accent" />
+            <Stat label="exact recall" value={fmt(ex.recall, 2)} tone="bad" />
+            <Stat label="semantic recall" value={fmt(sem.recall, 2)} tone="ok" sub="not near 1.0 — honest ceiling" />
+          </div>
+        </div>
+        <div className="mt-3 text-[11px] text-dim">Exact property/kind matching barely generalizes to an unseen vocabulary; semantic synonym families (heel/semantic.py) recover roughly twice as much. Improves only by widening real-vocabulary coverage — not by writing probes against known plants.</div>
+      </Panel>
+      <Panel title="Held-out recall by category" sub="Where HEEL generalizes well vs where it has gaps (semantic run).">
+        <HBars items={Object.entries(sem.recall_by_category).map(([c, v]) => {
+          const [f, t] = (v as string).split("/").map(Number);
+          return { label: catShort(c), value: t ? Math.round((f / t) * 100) : 0, color: CAT_COLOR[c], tag: <span className="tabnum text-[10px] text-muted w-10">{v as string}</span> };
+        })} max={100} />
       </Panel>
     </div>
   );

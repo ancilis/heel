@@ -121,6 +121,15 @@ def main():
     L.append(f"  false positives by probe: {be['false_positives_by_probe']} (transparent attribution); "
              f"cat-10 cleanly 0 on {be['category10_clean_on_non_ai']} blind non-AI targets.")
     L.append("")
+    from heel.heldout_eval import heldout_eval
+    he = heldout_eval()
+    L.append("HELD-OUT EVALUATION — targets authored by an INDEPENDENT LLM swarm (blind to HEEL's probes):")
+    L.append(f"  exact-match recall {he['exact_match']['recall']} -> with SEMANTIC generalization "
+             f"{he['with_semantic']['recall']} (Wilson CI {he['with_semantic']['wilson_ci95']}) "
+             f"at precision {he['with_semantic']['precision']}, over {he['total_planted']} planted weaknesses")
+    L.append("  -> exact property/kind matching barely generalizes to an unseen vocabulary; semantic synonym")
+    L.append("     families recover a fraction. The honest real-target ceiling — neither is near 1.0.")
+    L.append("")
     L.append("AUTHORIZATION GATE (agent caller is an untrusted, possibly prompt-injected channel):")
     for label, rejected in gate_rows:
         L.append(f"  [{'REJECTED+logged ✓' if rejected else 'NOT REJECTED ✗'}]  {label}")

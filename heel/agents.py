@@ -29,6 +29,9 @@ from .targets import PLAUSIBILITY_FLOOR
 # --------------------------------------------------------------------------- #
 def evaluate_criterion(crit: dict, aff) -> bool:
     p = aff.properties
+    if "semantic" in crit:
+        from .semantic import semantic_match
+        return semantic_match(crit["semantic"], aff)
     if "guard_absent" in crit:
         return (not aff.guard_present) == bool(crit["guard_absent"])
     if "prop" in crit and "equals" in crit:
@@ -100,7 +103,7 @@ def run_adversarial(target, scenarios: list[AbuseScenario], log, run_id: str, mo
             continue  # category-10 cleanly yields nothing on a non-AI target
         kind = sc.target_affordance_pattern.get("kind")
         for aff in target.affordances:
-            if aff.kind != kind:
+            if kind != "*" and aff.kind != kind:
                 continue
             probe_count += 1
             hit = evaluate_criterion(sc.success_criterion, aff)
@@ -141,7 +144,7 @@ def heuristic_discover(target, fired, run_id, log):
         if aff.id in fired or aff.decoy:
             continue
         for k, val in aff.properties.items():
-            if any(h in k for h in _CONTROL_HINT_KEYS) and (val in _MISSING_VALUES):
+            if any(h in k for h in _CONTROL_HINT_KEYS) and isinstance(val, (str, bool)) and (val in _MISSING_VALUES):
                 sc = AbuseScenario(
                     id=f"sc.discovered.{aff.id}", category=aff.category,
                     objective=f"Discovered: missing control '{k}' on {aff.kind} affordance",

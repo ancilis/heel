@@ -181,3 +181,18 @@ accounting (a chain over a decoy is a real FP, not a laundered "compound"); a sy
 test; honest fan-out wording (GIL-bound thread pool). The honest claim: HEEL detects what its library
 anticipates (~the measured overlap); a defensible external accuracy claim needs independently-authored
 or held-out scenarios — stated, not hidden.
+
+### D-025 — Held-out, independently-authored targets are the strongest detection metric
+**Why:** the blind eval's encoding-overlap was still author-chosen. `heel/heldout/targets.json` is
+authored by an independent LLM swarm blind to HEEL's probes (workflow `heel-heldout-authoring`;
+provenance in docs/HELDOUT_PROVENANCE.md), removing author control over the vocabulary.
+`heel/heldout_eval.py` reports recall exact-match (~0.26) vs with semantic generalization (~0.57,
+Wilson CI), at ~0.95 precision, with per-category breakdown. Frozen for deterministic offline runs.
+
+### D-026 — Semantic signal matching is the honest generalization axis (not exact property names)
+**Why:** exact property==value/kind criteria don't generalize to vocabularies HEEL didn't author.
+`heel/semantic.py` matches weakness FAMILIES by topic keywords in the property KEY + permissive value
+indicators (and absence of a hardened indicator), via `{"semantic": signal}` criteria on kind "*"
+scenarios (agent-category ones gated to has_agent_surface to preserve cat-10 optionality). On the
+held-out set this roughly doubles recall at high precision. Topic+permissive (not topic alone) keeps
+precision: a tightened tenant topic avoids miscategorizing an MCP `context_isolation` finding.

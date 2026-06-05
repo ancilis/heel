@@ -90,8 +90,10 @@ def build_snapshot() -> dict:
                   "control": s.recommended_control, "handoff": s.handoff} for s in all_seed_scenarios()]
 
     from .blind_eval import blind_eval
+    from .heldout_eval import heldout_eval
     return {
         "blind_eval": blind_eval(n=40, workers=8),
+        "heldout_eval": heldout_eval(),
         "meta": {"server": "heel", "version": "1.0.0", "tools": [t["name"] for t in TOOL_SCHEMAS],
                  "tool_schemas": TOOL_SCHEMAS, "model": get_model().name,
                  "n_scenarios": len(scenarios), "n_json_scenarios": len(load_json_scenarios()),
