@@ -130,7 +130,7 @@ in `mcp_server.TOOL_SCHEMAS` (scope-mutation tools absent by construction).
 | **1 — synthetic targets + coverage backtest + auth gate FIRST** | ✅ 2 targets, coverage backtest, **auth gate PROVEN** (5 escalations rejected + logged) |
 | **2 — thin vertical slice over MCP** | ✅ scenario → agent → finding → coverage, callable over MCP |
 | **3 — parallelize against frozen contracts** | ▶ wave 1 done: opportunistic-human class (§3.2), REST API (§2), control search (§8), chain-FN; full library + LLM loop + fan-out next |
-| **4 — harden + UI** | pending |
+| **4 — control-room UI** | ✅ Next.js control room (`web/`, `make ui`) — abuse board, backtest, live swarm, auth gate, scope panel, containment log, MCP/integration, scenario library |
 
 ---
 

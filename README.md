@@ -94,6 +94,25 @@ tests/            acceptance + safety tests
 
 ## Status
 
-Phases 0–2 complete (contracts + MCP boundary + immutable-scope gate; two synthetic targets +
-coverage backtest; thin slice over MCP). Phase 3 (full scenario library, opportunistic-human
-class, MCP/REST clients, control search, orchestration) and Phase 4 (UI) are next.
+Phases 0–4 implemented (red-team-hardened). Phase 0–2: contracts + MCP boundary + immutable-scope
+gate; two synthetic targets + coverage backtest. Phase 3: opportunistic-human class, REST API,
+control search, declarative full-breadth library (10 categories, JSON-loadable), swappable LLM
+control loop. Phase 4: the control-room UI. 38 tests pass. Next: blind-target evaluation, true
+thousand-agent fan-out, affordance-chaining discovery.
+
+---
+
+## The control room (UI)
+
+A clean, dense control-room web app (`web/`, Next.js + React + Tailwind) — a thin client over the
+same MCP/REST capability. `make ui` (regenerates the snapshot, installs, runs http://localhost:3000).
+
+Screens (§9): **Overview**, **Abuse board** (vectors ranked by severity, grouped by category,
+reachability-weighted with implausible findings demoted — expand any vector for its contained PoC,
+recommended control, handoff flags, and the optional classification annotation), **Backtest** (per-
+target coverage / FP / severity-calibration, non-AI vs AI, with the self-consistency caveat),
+**Live swarm monitor** (adversarial + opportunistic agents and where each is probing),
+**Authorization gate** (every escalation attempt rejected + logged), **Scope panel** (read-only —
+the UI cannot mint or widen a scope), **Containment log** (hash-chained, with caller),
+**MCP/integration** (tool schema; the absent scope-mutation tools shown struck-through), and the
+**Scenario library**. Data is exported by `heel/web_export.py` (pure stdlib) → `web/public/data/`.

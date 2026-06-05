@@ -140,3 +140,12 @@ categories; scenarios that match no synthetic affordance correctly don't fire (n
 (`HEEL_MODEL=anthropic`, Messages API via stdlib urllib, no SDK). The model only sees observable
 properties and only proposes declarative scenario specs — HEEL builds the contained PoC; the model
 stays in lane and falls back to the heuristic on error/no-key. Keeps the pure-stdlib core.
+
+### D-020 — UI is a thin client over a pure-stdlib JSON snapshot
+**Why:** §9 control room. `heel/web_export.py` runs the full synthetic flow over the MCP capability
+(deterministic) and writes `web/public/data/snapshot.json`; the Next.js app reads it. Same pattern
+as the rest of HEEL: the capability is built once (MCP-first) and every surface is a thin client.
+The UI honors the epistemics (reachability-weighting visible, implausible demoted not hidden;
+predicted/contained PoCs; optional classification shown when on; the scope panel is read-only and
+cannot mint/widen a scope). `node_modules` gitignored; the snapshot is committed so the UI renders
+on a clean checkout.
