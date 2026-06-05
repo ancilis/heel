@@ -137,3 +137,39 @@ escalation path fails closed. It found real gaps between *claim* and *implementa
 anchor** (Phase 3); the backtest's real-target accuracy is still unmeasured (blind-target eval is
 the next step); limits enforce `max_requests` (concurrency/backoff are Phase 3). See DECISIONS
 D-009…D-014.
+
+---
+
+## 9. Phase 3 — wave 1 (capability breadth against the frozen contracts)
+
+Built against the frozen §6 contracts; the §10 auth gate is unchanged and shared by every surface.
+
+**Opportunistic-human agent class (§3.2, DoD #3).** Motivation-profiled gaming of *normal*
+affordances, conditioned by declarative `MotivationProfile`s (cost-driven cheapskate,
+low-sophistication rule-bender, sophisticated arbitrageur). Both classes now run by default and
+merge by affordance. Profiles gate which vectors surface:
+
+| gamed affordance | category | pursued by |
+|---|---|---|
+| `region_pricing` (region arbitrage) | license_entitlement | **only** `sophisticated_arbitrageur` (needs sophistication) |
+| `seats` (seat sharing) | license_entitlement | all three profiles (low bar) |
+| `promo_stacking` (coupon stacking) | license_entitlement | cost-driven profiles |
+
+`promo_stacking` was a **genuine blind spot for the programmatic adversarial class** (coupon
+stacking isn't a missing-control signal) — the opportunistic class **closes it**, demonstrating
+why both classes matter. A new multi-affordance-**chain** vector (`ato_chain`) is missed by *both*
+single-affordance classes → an honest FN keeps coverage at **0.93/0.95**, not 1.0.
+(`TestOpportunisticClass`.)
+
+**REST API (§2).** A thin REST surface (`heel/rest.py`, `make rest`) over the **same** `HeelServer`
+capability — so the auth gate is identical. There is **no scope-creation route** (`POST /scopes` →
+405 + security log); an out-of-allowlist `POST /runs` is rejected `403` exactly as over MCP.
+(`TestRestSharesAuthGate`.)
+
+**Control search (§8).** `heel_propose_control` now returns a **ranked set of candidate controls**
+by estimated exploitability reduction (the agent's recommendation + a per-category control bank),
+sorted. (`TestControlSearch`.)
+
+**34 tests pass.** Still deferred to later Phase-3/4 waves: full library breadth (many scenarios
+per category), the LLM agent control loop, true thousand-agent fan-out, affordance-chaining
+discovery, and the UI.

@@ -99,8 +99,16 @@ def main():
     for t, (rid, c) in results.items():
         L.append(f"  {t}: TP={c['true_positives']} FN={c['false_negatives']} FP={c['false_positives']} "
                  f"implausible-flagged={c['implausible_flagged']} missed={[m['affordance'] for m in c['missed']]}")
+        L.append(f"     adversarial + opportunistic-human classes; opportunistic vectors: "
+                 f"{c.get('opportunistic_findings', 0)} {c.get('opportunistic_affordances', [])} "
+                 f"(coupon-stacking was the adversarial blind spot, closed by the human class)")
         L.append(f"     discovered scenarios: {c['discovered_scenarios']}  handoffs: "
                  f"{[h.get('handoff') for h in c['handoffs']]}")
+    # control search example
+    fs = mcp(server, session, "heel_get_findings", {"run_id": results["synthetic-ai"][0]})["structuredContent"]["findings"]
+    ctrl = mcp(server, session, "heel_propose_control", {"vector_id": fs[0]["id"]})["structuredContent"]
+    L.append(f"  control search (vector {fs[0]['id']}): {len(ctrl['ranked_candidates'])} ranked candidates, "
+             f"top = '{ctrl['ranked_candidates'][0]['control'][:46]}'")
     L.append("")
     L.append("AUTHORIZATION GATE (agent caller is an untrusted, possibly prompt-injected channel):")
     for label, rejected in gate_rows:

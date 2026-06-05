@@ -118,7 +118,7 @@ class HeelServer:
         # authorized → run within the scope's limits
         cc = CallerContext(caller_identity=caller, scope_id=scope_id, ts=time.time())
         rr = run_abuse(scope, target, args.get("scenario_ids"), cc, self.store,
-                       classify_enabled=self.classify_enabled)
+                       classify_enabled=self.classify_enabled, agent_classes=args.get("agent_classes"))
         self.runs[rr.run_id] = rr
         return {"run_id": rr.run_id, "status": rr.status}
 

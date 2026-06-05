@@ -210,5 +210,80 @@ class TestRedTeamFixes(Base):  # gaps the red-team found, now closed
         self.assertIn("NOT a real-target detection-accuracy", c["caveat"])
 
 
+class TestOpportunisticClass(Base):  # spec §3.2, DoD #3
+    def _opp(self, run_id):
+        return [f for f in self.server.heel_get_findings({"run_id": run_id}, self.caller)["findings"]
+                if f["reproduction"].get("class") == "opportunistic_human"]
+
+    def test_both_classes_emit_vectors(self):
+        rid = self.run_target("synthetic-saas")  # default = adversarial + opportunistic
+        self.assertTrue(self._opp(rid))
+
+    def test_opportunistic_closes_adversarial_blind_spot(self):
+        rid = self.run_target("synthetic-saas")
+        opp_affs = {f["affordance_id"] for f in self._opp(rid)}
+        self.assertIn("promo_stacking", opp_affs)  # the adversarial FN, closed by the human class
+
+    def test_profiles_gate_which_vectors_surface(self):
+        rid = self.run_target("synthetic-saas")
+        opp = {f["affordance_id"]: f for f in self._opp(rid)}
+        # region arbitrage needs sophistication → only the arbitrageur pursues it
+        self.assertEqual(opp["region_pricing"]["reproduction"]["profiles"], ["sophisticated_arbitrageur"])
+        # seat sharing is low-bar → all three profiles
+        self.assertEqual(len(opp["seats"]["reproduction"]["profiles"]), 3)
+
+    def test_agent_classes_param_respected(self):
+        r = self.server.heel_run({"scope_id": self.scope.scope_id, "target": "synthetic-saas",
+                                  "agent_classes": ["adversarial"]}, self.caller)
+        opp = self._opp(r["run_id"])
+        self.assertEqual(opp, [])  # opportunistic class not run
+
+    def test_chain_vector_missed_by_both_classes(self):  # honest FN survives both classes
+        rid = self.run_target("synthetic-saas")
+        c = self.server.heel_get_coverage({"run_id": rid}, self.caller)["coverage"]
+        self.assertIn("ato_chain", [m["affordance"] for m in c["missed"]])
+        self.assertLess(c["coverage"], 1.0)
+
+
+class TestControlSearch(Base):  # spec §8
+    def test_ranked_controls_by_exploitability_reduction(self):
+        rid = self.run_target("synthetic-ai")
+        v = self.server.heel_get_findings({"run_id": rid}, self.caller)["findings"][0]
+        out = self.server.heel_propose_control({"vector_id": v["id"]}, self.caller)
+        self.assertIn("ranked_candidates", out)
+        reds = [c["estimated_exploitability_reduction"] or 0 for c in out["ranked_candidates"]]
+        self.assertEqual(reds, sorted(reds, reverse=True))
+
+
+class TestRestSharesAuthGate(Base):  # spec §2 — REST is a thin client over the same gate
+    def test_rest_enforces_gate_and_has_no_scope_creation(self):
+        import threading
+        import urllib.error
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+
+        from heel.rest import make_handler
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.server))
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            def post(path, body):
+                req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                             data=json.dumps(body).encode(), method="POST")
+                return urllib.request.urlopen(req)
+            # 1) scope creation via REST is impossible (405)
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                post("/scopes", {"target_allowlist": ["evil.com"]})
+            self.assertEqual(e.exception.code, 405)
+            # 2) in-scope run works (200)
+            self.assertEqual(post("/runs", {"scope_id": self.scope.scope_id, "target": "synthetic-saas"}).status, 200)
+            # 3) out-of-allowlist run rejected (403), same as MCP
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                post("/runs", {"scope_id": self.scope.scope_id, "target": "evil.com"})
+            self.assertEqual(e.exception.code, 403)
+        finally:
+            httpd.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()

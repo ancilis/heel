@@ -95,6 +95,7 @@ def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
     cat_cov = {c: {"found": v[0], "total": v[1]} for c, v in by_cat.items()}
 
     cat10_findings = [f for f in plausible if f.category == Category.AGENT_MCP_SURFACE]
+    opportunistic = [f for f in findings if (f.reproduction or {}).get("class") == "opportunistic_human"]
 
     return {
         "target": target.id, "kind": target.kind, "has_agent_surface": target.has_agent_surface,
@@ -112,6 +113,8 @@ def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
         "category_coverage": cat_cov,
         "category10_findings": len(cat10_findings),
         "category10_clean_on_non_ai": (target.has_agent_surface or len(cat10_findings) == 0),
+        "opportunistic_findings": len(opportunistic),
+        "opportunistic_affordances": [f.affordance_id for f in opportunistic],
         "missed": [{"affordance": pv.affordance_id, "category": pv.category.value, "weakness": pv.weakness} for pv in fn],
         "false_positive_affordances": [f.affordance_id for f in fp],
         "discovered_scenarios": [s.id for s in agent_output["discovered_scenarios"]],

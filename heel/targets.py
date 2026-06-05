@@ -77,9 +77,19 @@ def build_saas_target() -> SyntheticTarget:
         # --- planted but NOT covered by any seed scenario → the swarm must DISCOVER it ---
         _aff("webhook_endpoint", "integration", Category.INTEGRATION_EXTENSIBILITY, "webhook_replay",
              0.6, Severity(0.5, 0.5), route="/webhooks/in", replay_protection="missing"),
-        # --- planted, reachable, but NOT a "missing-control" signal → a genuine MISS (honest FN) ---
+        # --- planted, reachable, but NOT a "missing-control" signal → a genuine MISS for the
+        #     ADVERSARIAL class (honest FN) that the OPPORTUNISTIC-human class closes (coupon stacking) ---
         _aff("promo_stacking", "endpoint", Category.LICENSE_ENTITLEMENT, "coupon_stacking",
              0.6, Severity(0.5, 0.5), route="/checkout/apply", stackable=True, client_reachable=True),
+        # --- commercial-gaming affordances (gamed WITHIN normal affordances by the §3.2 class) ---
+        _aff("seats", "seat", Category.LICENSE_ENTITLEMENT, "seat_sharing",
+             0.7, Severity(0.5, 0.5), route="/team/seats", sharing_detection="none"),
+        _aff("region_pricing", "region", Category.LICENSE_ENTITLEMENT, "region_arbitrage",
+             0.6, Severity(0.5, 0.6), route="/billing/region", region_check="ip_only"),
+        # --- requires CHAINING two affordances → neither single-affordance class finds it
+        #     (a genuine FN that survives both classes; affordance-chaining is Phase-3 swarm work) ---
+        _aff("ato_chain", "chain", Category.IDENTITY_ACCOUNT, "multi_step_ato",
+             0.55, Severity(0.7, 0.8), route="(reset → session-fixation)", chain_required=True),
         # --- decoys (hardened; FP bait) ---
         _aff("export_billing", "export", Category.DATA_HARVESTING, None, 0.8, guard=True, decoy=True,
              route="/api/billing/export", entitlement="checked", note="looks like export, properly gated"),

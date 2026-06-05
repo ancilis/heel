@@ -104,3 +104,25 @@ band (no inflation, §10.2.7).
 self-consistency checks. This is now stated in the data (`metric_kind`, `caveat`) and every doc;
 the 0.9 numbers are NOT cited as real-target accuracy. Trustworthy real-target evaluation requires
 blind targets + held-out scenarios (independently-authored plants vs probes) — the next step.
+
+---
+
+## Phase 3 — wave 1
+
+### D-015 — Both agent classes merge by affordance; opportunistic ADDS, never overrides
+**Why:** the adversarial class produces calibrated severities; the opportunistic-human class would
+over-rate shared affordances. So the opportunistic class only ADDS affordances it uniquely games
+(seat sharing, region arbitrage, coupon stacking) — preserving adversarial calibration while
+closing the adversarial coupon-stacking blind spot. A multi-affordance `ato_chain` vector is
+missed by both (single-affordance) classes, keeping an honest FN (coverage < 1.0). Affordance-
+chaining discovery is later Phase-3 work.
+
+### D-016 — REST is a thin client over the SAME HeelServer (one auth gate)
+**Why:** §2 — build the capability once. `heel/rest.py` routes HTTP to `HeelServer.call_tool`, so
+the §10 enforcement is identical and cannot diverge. No scope-creation route exists (POST /scopes
+→ 405 + security log). `check_same_thread=False` lets the threaded server share the store.
+
+### D-017 — Control proposal is a ranked search, not a single string
+**Why:** §7/§8 — `heel_propose_control` returns the agent's recommendation plus a per-category
+control bank, ranked by estimated exploitability reduction. A Phase-4 version re-simulates each
+candidate against the affordance to measure the reduction empirically rather than estimate it.
