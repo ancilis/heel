@@ -10,10 +10,49 @@ import getpass
 import json
 import os
 
+from . import __version__
 from . import scope as scopemod
 from .contracts import DataHandlingMode
 from .mcp_server import HeelServer
 from .store import Store
+
+
+def _doctor() -> int:
+    """Self-check: install, data dir, signing-key posture, scenario library, capability."""
+    ok, warn = [], []
+    ok.append(f"heel {__version__} · python ok")
+    home = scopemod.heel_home()
+    try:
+        os.makedirs(home, exist_ok=True)
+        t = os.path.join(home, ".doctor"); open(t, "w").close(); os.remove(t)
+        ok.append(f"HEEL_HOME writable: {home}")
+    except Exception as e:
+        warn.append(f"HEEL_HOME not writable ({home}): {e}")
+    if os.environ.get("HEEL_SIGNING_KEY"):
+        ok.append("signing key: external (HEEL_SIGNING_KEY) — production posture ✓")
+    else:
+        warn.append("signing key is co-located in HEEL_HOME. For production set HEEL_SIGNING_KEY to a "
+                    "path OUTSIDE the data dir (key+data separation). See SECURITY.md.")
+    from .scenarios import all_seed_scenarios
+    scs = all_seed_scenarios()
+    cats = {s.category.value for s in scs}
+    (ok if len(cats) == 10 else warn).append(f"scenario library: {len(scs)} scenarios across {len(cats)}/10 categories")
+    try:
+        from .agents import run_adversarial
+        from .backtest import score_target
+        from .targets import get_target
+        out = run_adversarial(get_target("synthetic-saas"), scs, lambda *a: None, "doctor")
+        cov = score_target(get_target("synthetic-saas"), out)["coverage"]
+        ok.append(f"capability self-check: synthetic backtest ran (coverage {cov})")
+    except Exception as e:
+        warn.append(f"capability self-check FAILED: {e}")
+    for line in ok:
+        print(f"  [ok]   {line}")
+    for line in warn:
+        print(f"  [warn] {line}")
+    print(f"\nheel doctor: {'OK' if not any('FAILED' in w or 'not writable' in w for w in warn) else 'PROBLEMS'}"
+          f" ({len(ok)} ok, {len(warn)} warnings)")
+    return 0 if not any("FAILED" in w or "not writable" in w for w in warn) else 1
 
 
 def _server():
@@ -30,8 +69,11 @@ def _caller():
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="heel", description="HEEL — abuse-simulation tool")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap = argparse.ArgumentParser(prog="heel", description="HEEL — agent-native abuse-simulation tool")
+    ap.add_argument("--version", action="version", version=f"heel {__version__}")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("doctor", help="self-check: install, data dir, signing-key posture, capability")
+    sub.add_parser("eval", help="run the honest held-out detection eval and print the headline")
 
     sc = sub.add_parser("scope", help="manage authorization scopes (creation is out-of-band, human-only)")
     scs = sc.add_subparsers(dest="scmd", required=True)
@@ -53,6 +95,15 @@ def main(argv=None):
     scn = sub.add_parser("scenarios"); scn.add_argument("--filter")
 
     args = ap.parse_args(argv)
+    if args.cmd is None:
+        ap.print_help()
+        return 0
+    if args.cmd == "doctor":
+        return _doctor()
+    if args.cmd == "eval":
+        from .heldout_eval import heldout_eval
+        print(heldout_eval().get("headline", "(no held-out test set installed)"))
+        return 0
 
     if args.cmd == "scope" and args.scmd == "create":
         if not args.confirm:

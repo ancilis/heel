@@ -428,5 +428,32 @@ class TestChaining(unittest.TestCase):
         self.assertEqual(sc["false_positives"], 1)  # a chain touching a hardened decoy is a real FP
 
 
+class TestProductionHardening(Base):
+    def test_mcp_handler_never_crashes_on_bad_input(self):
+        from heel.mcp_server import handle_line
+        sess = {}
+        # malformed JSON -> parse error, not a crash
+        r = handle_line(self.server, sess, "{not json")
+        self.assertEqual(r["error"]["code"], -32700)
+        # non-object request -> invalid request
+        self.assertEqual(handle_line(self.server, sess, "[1,2,3]")["error"]["code"], -32600)
+        # unknown method -> an error response (server stays up), not a raised exception
+        r = handle_line(self.server, sess, json.dumps({"id": 1, "method": "no.such.method", "params": {}}))
+        self.assertIn("error", r)
+        # a well-formed tools/call still works afterwards (server not poisoned)
+        ok = handle_line(self.server, sess, json.dumps({"id": 2, "method": "tools/list", "params": {}}))
+        self.assertIn("result", ok)
+
+    def test_doctor_self_check_passes(self):
+        import io
+        from contextlib import redirect_stdout
+        from heel import cli
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli._doctor()
+        self.assertEqual(rc, 0)
+        self.assertIn("10/10 categories", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

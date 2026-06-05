@@ -187,6 +187,30 @@ class HeelServer:
 # --------------------------------------------------------------------------- #
 # stdio JSON-RPC loop for real MCP clients (Claude Desktop / Cursor / CI)
 # --------------------------------------------------------------------------- #
+def handle_line(server, session, line: str):
+    """Process one JSON-RPC line; return a response dict (or None for a handled notification).
+    NEVER raises — a malformed or hostile request yields a JSON-RPC error, never a crashed server."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        req = json.loads(line)
+    except Exception:
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
+    if not isinstance(req, dict):
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+    rid = req.get("id")
+    try:
+        result = server.dispatch(req.get("method"), req.get("params") or {}, session)
+        if result is None and rid is None:
+            return None  # notification
+        return {"jsonrpc": "2.0", "id": rid, "result": result}
+    except ToolError as e:
+        return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": str(e), "data": {"code": e.code}}}
+    except Exception as e:  # never let one bad request take down the server
+        return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": f"internal error: {e}"}}
+
+
 def main():  # pragma: no cover - exercised via real MCP clients
     import os
     os.makedirs(scopemod.heel_home(), exist_ok=True)
@@ -194,23 +218,10 @@ def main():  # pragma: no cover - exercised via real MCP clients
     server = HeelServer(store)
     session = {"caller": "stdio-client"}
     for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except Exception:
-            continue
-        rid = req.get("id")
-        try:
-            result = server.dispatch(req.get("method"), req.get("params"), session)
-            if result is None and rid is None:
-                continue  # notification
-            resp = {"jsonrpc": "2.0", "id": rid, "result": result}
-        except ToolError as e:
-            resp = {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": str(e)}}
-        sys.stdout.write(json.dumps(resp) + "\n")
-        sys.stdout.flush()
+        resp = handle_line(server, session, line)
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
 
 
 if __name__ == "__main__":

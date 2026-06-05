@@ -18,30 +18,56 @@ See **[ARCHITECTURE.md](ARCHITECTURE.md)**, **[EVAL.md](EVAL.md)**, **[DECISIONS
 
 ---
 
-## Quick start (no real target, no API key, no installs)
+## Install
+
+```bash
+pip install heel        # pure stdlib — ZERO runtime dependencies; Python 3.11+
+heel doctor             # environment self-check (data dir, signing-key posture, capability)
+heel eval               # print the honest held-out detection headline
+```
+
+Or run from a clone with no install at all: `make demo` / `make test`.
+
+## Quick start (no real target, no API key)
 
 ```bash
 make demo      # synthetic coverage backtest + auth-gate proof, driven over the MCP boundary
 make test      # acceptance + safety tests (auth gate, scope tamper-evidence, coverage, conduct)
 ```
 
-Requires only **Python 3.11+** (developed on 3.14). v1 is pure stdlib by design (DECISIONS D-001).
-
 ### Use it like an operator
 
 ```bash
 # 1) a HUMAN authorizes a target OUT-OF-BAND (the only way to mint a scope; needs --confirm)
-python3 -m heel.cli scope create --target synthetic-saas --operator you --confirm
+heel scope create --target synthetic-saas --operator you --confirm
 
 # 2) an agent / CLI runs WITHIN that scope (cannot create or widen it)
-python3 -m heel.cli run --scope <scope_id> --target synthetic-saas
-python3 -m heel.cli findings --run <run_id>
-python3 -m heel.cli coverage --run <run_id>
-python3 -m heel.cli log --run <run_id>          # immutable, hash-chained audit trail
-
-# the canonical surface is the MCP server (stdio JSON-RPC):
-python3 -m heel.mcp_server                       # connect from Claude Desktop / Cursor / CI
+heel run --scope <scope_id> --target synthetic-saas
+heel findings --run <run_id>
+heel coverage --run <run_id>
+heel log --run <run_id>          # immutable, hash-chained audit trail
 ```
+
+### Connect from an MCP client (the canonical surface)
+
+`heel-mcp` speaks MCP over stdio. Point Claude Desktop / Cursor / CI at it — e.g. in
+`claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "heel": {
+      "command": "heel-mcp",
+      "env": { "HEEL_HOME": "/path/to/.heel", "HEEL_SIGNING_KEY": "/path/outside/.heel/heel.key" }
+    }
+  }
+}
+```
+
+The connected agent can list scenarios/scopes, run within a **human-created** scope, and read
+findings/coverage/containment — but **cannot create, widen, or escape a scope** (no such tool
+exists). A thin REST surface (`heel-rest`, localhost) sits beneath the same capability. See
+[SECURITY.md](SECURITY.md) for the production-hardening checklist.
 
 ---
 
