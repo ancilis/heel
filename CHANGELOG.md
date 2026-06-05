@@ -38,7 +38,7 @@ MCP server, proven by an honest detection metric on independently-authored targe
   auth gate, scope panel, containment log, MCP/integration, scenario library.
 - `pip install heel` (pure-stdlib, **zero runtime deps**); console scripts `heel` / `heel-mcp` /
   `heel-rest`; `heel doctor` self-check; `heel eval` honest headline.
-- GitHub Actions CI (Python 3.11–3.13 + wheel smoke test + UI build). 51 tests.
+- GitHub Actions CI (Python 3.11–3.13 + wheel smoke test + UI build). 53 tests.
 
 ### Safety (§10, non-negotiable)
 Synthetic-first · contained canary-only PoCs · never generates prohibited content · no real-PII ·
