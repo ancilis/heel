@@ -328,4 +328,6 @@ A 3-agent red-team audited the dev/test held-out metric (verdict: HONEST, with r
   is labelled descriptive-only (denominators too small for strong/weak claims).
 
 The honest TEST picture: **localization 0.38 (CI [0.29,0.49]) · attribution 0.27 (CI [0.20,0.35]) ·
-precision 0.97** on 199 independently-authored weaknesses, sha `3dba2486…`. **51 tests pass.**
+precision 0.97** on 199 independently-authored weaknesses, sha `3dba2486…`. Specificity-ranked
+dedup (D-031) then lifted attribution to **0.31** (mis-categorization 29%→18%) — developed on dev,
+measured once on the frozen test. **51 tests pass.**

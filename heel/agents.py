@@ -93,6 +93,7 @@ def run_adversarial(target, scenarios: list[AbuseScenario], log, run_id: str, mo
     from .model import get_model
     model = model or get_model()
     findings: dict[str, AbuseVector] = {}
+    _rank: dict[str, tuple] = {}   # affordance_id -> (specificity, severity) of the kept finding
     handoffs: list[dict] = []
     fired: set[str] = set()
     probe_count = 0
@@ -118,9 +119,17 @@ def run_adversarial(target, scenarios: list[AbuseScenario], log, run_id: str, mo
                 continue
             vid += 1
             v = _vector(target, aff, sc, f"av:{run_id}:{vid}", {"criterion": sc.success_criterion})
+            # dedup rank = (specificity, severity): an EXACT prop match (100) beats a SPECIFIC semantic
+            # topic match beats a GENERIC one — improving category attribution without an oracle.
+            if "semantic" in sc.success_criterion:
+                from .semantic import semantic_specificity
+                rank = (semantic_specificity(sc.success_criterion["semantic"], aff), v.severity.score)
+            else:
+                rank = (100, v.severity.score)
             cur = findings.get(aff.id)
-            if cur is None or v.severity.score > cur.severity.score:
+            if cur is None or rank > _rank.get(aff.id, (-1, -1)):
                 findings[aff.id] = v
+                _rank[aff.id] = rank
             log("finding", {"affordance": aff.id, "category": v.category.value, "severity": v.severity.label})
 
     discovered, extra = model.discover(target, fired, run_id, log)

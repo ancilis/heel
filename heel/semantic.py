@@ -149,12 +149,22 @@ def _value_permissive(v) -> bool:
 
 
 def semantic_match(signal: str, aff) -> bool:
+    return semantic_specificity(signal, aff) > 0
+
+
+def semantic_specificity(signal: str, aff) -> int:
+    """Length of the longest topic token that matches (0 = no match). A more SPECIFIC topic match
+    (e.g. 'password_reset') is more likely the correct category than a generic one ('reset'), so
+    this breaks dedup ties toward correct attribution — WITHOUT peeking at ground-truth category."""
     spec = SEMANTIC_SIGNALS.get(signal)
     if not spec:
-        return False
-    topics = spec[0]
+        return 0
+    best = 0
     for k, v in aff.properties.items():
         kn = _norm(k)
-        if any(_anchored(t, kn) for t in topics) and _value_permissive(v):
-            return True
-    return False
+        if not _value_permissive(v):
+            continue
+        for t in spec[0]:
+            if _anchored(t, kn):
+                best = max(best, len(t.strip("_")))
+    return best

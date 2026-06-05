@@ -223,3 +223,11 @@ category to choose the signal (that would cheat) — the gap is disclosed.
 mis-categorization; `heel/semantic.py` now anchors topic/permissive tokens at word boundaries
 (precision 0.97). The iid Wilson CI understated uncertainty on clustered data; heldout_eval uses a
 target-level cluster bootstrap. test_targets.json is content-hashed to pre-register the number.
+
+### D-031 — Specificity-ranked dedup improves attribution without an oracle
+**Why:** when several semantic signals fire on one affordance, keeping the highest-SEVERITY one
+mis-categorized ~29% of held-out localizations (generic 'reset' beating specific 'password_reset').
+Dedup now ranks by (match specificity, severity) — exact prop match > specific topic > generic topic
+(`semantic.semantic_specificity`, `agents.run_adversarial`). Developed on DEV, measured ONCE on the
+frozen TEST set: attribution recall 0.27 -> 0.31 (mis-categorization 29% -> 18%), localization and
+precision unchanged. No ground-truth category is consulted, so it's a legitimate heuristic, not tuning.
