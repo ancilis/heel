@@ -43,5 +43,20 @@ Add/extend tests in `tests/test_heel.py` (stdlib `unittest`). All tests must pas
 
 ## Commit style
 
-Match the surrounding code's density and idiom. Explain *why* in the message. By contributing you
-agree your work is licensed under the repository's MIT license.
+Match the surrounding code's density and idiom. Explain *why* in the message.
+
+## Licensing & sign-off (DCO)
+
+This project is licensed under **Apache License 2.0** (see [LICENSE](LICENSE) and [NOTICE](NOTICE)).
+By contributing, you agree your contribution is provided under Apache-2.0.
+
+We use the **Developer Certificate of Origin** ([DCO](DCO)) instead of a CLA: every commit must be
+signed off, certifying you have the right to submit it. Add the sign-off automatically with `-s`:
+
+```bash
+git commit -s -m "your message"     # appends: Signed-off-by: Your Name <you@example.com>
+```
+
+(Maintainers can enable the [DCO GitHub App](https://github.com/apps/dco) to enforce this on PRs.)
+Keeping copyright provenance clean via the DCO preserves the project's ability to offer commercial
+licenses or relicense in the future.

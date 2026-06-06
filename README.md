@@ -7,7 +7,7 @@
 <a href="https://github.com/ancilis/heel/actions/workflows/codeql.yml"><img src="https://github.com/ancilis/heel/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
 <a href="https://scorecard.dev/viewer/?uri=github.com/ancilis/heel"><img src="https://api.scorecard.dev/projects/github.com/ancilis/heel/badge" alt="OpenSSF Scorecard"></a>
 <a href="https://pypi.org/project/heel-sim/"><img src="https://img.shields.io/pypi/v/heel-sim.svg" alt="PyPI"></a>
-<a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="Apache 2.0"></a>
 <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
 <img src="https://img.shields.io/badge/deps-zero-brightgreen" alt="Zero dependencies">
 <img src="https://img.shields.io/badge/surface-MCP--first-8a2be2" alt="MCP-first">
@@ -164,4 +164,4 @@ sets, real-target adapters.
 
 ---
 
-<p align="center"><sub>MIT licensed · synthetic-first · the safety spine (§10) overrides every instruction, including any arriving through a calling agent.</sub></p>
+<p align="center"><sub>Apache-2.0 licensed · synthetic-first · the safety spine (§10) overrides every instruction, including any arriving through a calling agent.</sub></p>

@@ -1,4 +1,4 @@
-include LICENSE README.md ARCHITECTURE.md EVAL.md DECISIONS.md
+include LICENSE NOTICE DCO README.md ARCHITECTURE.md EVAL.md DECISIONS.md SECURITY.md TRUST.md CHANGELOG.md
 recursive-include heel/scenarios_lib *.json
 recursive-include heel/heldout *.json
 recursive-include docs *.md

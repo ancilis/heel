@@ -1,0 +1,7 @@
+HEEL — agent-native abuse-simulation tool
+Copyright 2026 Ancilis
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product was developed at Ancilis. It has zero third-party runtime
+dependencies (pure Python standard library).
