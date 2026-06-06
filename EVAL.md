@@ -331,3 +331,28 @@ The honest TEST picture: **localization 0.38 (CI [0.29,0.49]) · attribution 0.2
 precision 0.97** on 199 independently-authored weaknesses, sha `3dba2486…`. Specificity-ranked
 dedup (D-031) then lifted attribution to **0.31** (mis-categorization 29%→18%) — developed on dev,
 measured once on the frozen test. **51 tests pass.**
+
+### Phase 3 — wave 6: external research library integration (the recall lever)
+
+Integrated a source-anchored external research deliverable — **45 business-logic abuse scenarios
+across all 10 categories** (declarative JSON, `scenarios_lib/research_owasp.json`) plus a semantic
+vocabulary expansion harvested from primary sources (OWASP API/OAT/WSTG/LLM Top-10, the MCP
+2025-06-18 schema, and Stripe/Kong/Microsoft/Auth0 config docs). The research was authored from those
+sources **independently of, and with no access to, the held-out test set**, so measuring its lift
+there is a fair, unbiased test.
+
+| | before | after |
+|---|---|---|
+| library size | 67 | **119** scenarios, 10 categories |
+| held-out **TEST** localization recall | 0.38 | **0.50** (cluster-CI [0.42, 0.59]) |
+| held-out **TEST** attribution recall | 0.31 | **0.33** |
+| held-out **TEST** precision | 0.97 | **0.98** |
+| blind real recall (encoding-overlap) | 0.25 | 0.43 |
+
+A genuine **+12pp localization recall lift on the frozen, independently-authored test set, at
+unchanged-to-better precision** — the honest recall lever the dev/test discipline was built to
+measure. Integration preserved the precision discipline: boolean-true-is-bad fields stayed as exact
+scenarios (not semantic topics); over-broad `{"not":{"prop_exists":X}}` absence-checks were paired
+with `guard_absent` (fixing a real precision liability on hardened affordances while keeping recall);
+a `prop_exists` operator was added to the criterion evaluator. Provenance + sources:
+[docs/RESEARCH_LIBRARY.md](docs/RESEARCH_LIBRARY.md). **53 tests pass.**

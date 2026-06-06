@@ -231,3 +231,13 @@ Dedup now ranks by (match specificity, severity) — exact prop match > specific
 (`semantic.semantic_specificity`, `agents.run_adversarial`). Developed on DEV, measured ONCE on the
 frozen TEST set: attribution recall 0.27 -> 0.31 (mis-categorization 29% -> 18%), localization and
 precision unchanged. No ground-truth category is consulted, so it's a legitimate heuristic, not tuning.
+
+### D-032 — External research library integrated as declarative JSON, precision-disciplined
+**Why:** the depth of the scenario library was the weak axis. A source-anchored research deliverable
+(45 scenarios across all 10 categories + semantic vocabulary, from OWASP/OAT/WSTG/LLM-Top-10, the MCP
+2025-06-18 schema, and vendor config docs) was integrated as `scenarios_lib/research_owasp.json` +
+enrichment of `semantic.py`. Because it was authored blind to the held-out test set, its measured
+lift there is fair: held-out TEST localization recall 0.38 -> 0.50 at precision 0.97 -> 0.98; library
+67 -> 119 scenarios. Discipline held: polarity-correct topics only (boolean-true-is-bad stays exact);
+`prop_exists` operator added; over-broad `not prop_exists` absence-checks paired with `guard_absent`
+to restore precision without losing recall. docs/RESEARCH_LIBRARY.md records provenance.

@@ -1,0 +1,1462 @@
+[
+  {
+    "id": "sc.research.license_entitlement.meter_reset_client_window",
+    "category": "license_entitlement",
+    "objective": "Customer games a usage meter so billable usage is undercounted or resets early, evading metered charges",
+    "kind": "meter",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "event_time_window",
+          "equals": "client"
+        },
+        {
+          "prop_contains": [
+            "aggregation",
+            "last"
+          ]
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.45,
+      "impact": 0.5
+    },
+    "recommended_control": "Aggregate usage server-side with idempotency keys; never trust client-supplied timestamps or reset windows; use sum aggregation with raw event-time windows and reconcile against an internal ledger",
+    "exploitability_reduction": 0.6,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.license_entitlement.seat_share_no_concurrency",
+    "category": "license_entitlement",
+    "objective": "One paid seat is shared by many users via credential sharing because no concurrent-session cap is enforced",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "concurrent_sessions",
+          "equals": "unlimited"
+        },
+        {
+          "prop": "seat_enforcement",
+          "equals": "none"
+        },
+        {
+          "all_of": [
+            {
+              "guard_absent": true
+            },
+            {
+              "not": {
+                "prop_exists": "max_concurrent_sessions"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.55,
+      "impact": 0.4
+    },
+    "recommended_control": "Enforce per-seat concurrent-session limits at login/feature checkout; bind sessions to device/identity; flag improbable concurrent geovelocity",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.license_entitlement.trial_serial_signup",
+    "category": "license_entitlement",
+    "objective": "Serial free-trial abuse: new trials created repeatedly with disposable emails to evade conversion",
+    "kind": "trial",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "trial_eligibility_check",
+          "equals": "none"
+        },
+        {
+          "prop_contains": [
+            "trial",
+            "unlimited"
+          ]
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.5,
+      "impact": 0.3
+    },
+    "recommended_control": "De-duplicate trial eligibility on durable signals (payment instrument, device, verified email domain); block disposable-email domains; require card-on-file for trial",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.license_entitlement.tier_gate_client_trusted",
+    "category": "license_entitlement",
+    "objective": "Premium/tier-gated feature is unlocked client-side, bypassing the paywall",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "entitlement_check",
+          "equals": "client"
+        },
+        {
+          "prop_contains": [
+            "feature_gate",
+            "client"
+          ]
+        },
+        {
+          "prop": "plan_enforcement",
+          "equals": "frontend"
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.45
+    },
+    "recommended_control": "Enforce entitlements server-side at runtime against the system of record; never gate paid features in client code or feature flags alone",
+    "exploitability_reduction": 0.65,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.license_entitlement.region_price_arbitrage",
+    "category": "license_entitlement",
+    "objective": "Region-pricing arbitrage: customer spoofs locale/billing region to obtain cheaper pricing",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "region_validation",
+          "equals": "none"
+        },
+        {
+          "prop": "billing_country_source",
+          "equals": "client"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.35,
+      "impact": 0.3
+    },
+    "recommended_control": "Validate billing region against payment-instrument BIN/issuer country and verified address; do not derive pricing region from client IP/locale alone",
+    "exploitability_reduction": 0.45,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.data_harvesting.ungated_bulk_export",
+    "category": "data_harvesting",
+    "objective": "Over-broad bulk export lets a low-privileged user extract the full dataset including other-scope records",
+    "kind": "export",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "export_scope",
+          "equals": "all"
+        },
+        {
+          "prop": "export_row_limit",
+          "equals": "unlimited"
+        },
+        {
+          "all_of": [
+            {
+              "guard_absent": true
+            },
+            {
+              "not": {
+                "prop_exists": "export_rate_limit"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.6
+    },
+    "recommended_control": "Scope exports to the caller's authorized records; enforce row caps, rate limits, and async approval for large exports; log and alert on bulk extraction",
+    "exploitability_reduction": 0.55,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "records"
+  },
+  {
+    "id": "sc.research.data_harvesting.record_enumeration_seq_id",
+    "category": "data_harvesting",
+    "objective": "Sequential/guessable object IDs allow record enumeration and scraping at scale (BOLA-adjacent harvest)",
+    "kind": "record",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "id_scheme",
+          "equals": "sequential"
+        },
+        {
+          "prop": "object_authorization",
+          "equals": "none"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.5,
+      "impact": 0.55
+    },
+    "recommended_control": "Use unpredictable identifiers (UUID/GUID) AND enforce per-object authorization on every access; add per-principal rate limits to blunt enumeration",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "records"
+  },
+  {
+    "id": "sc.research.data_harvesting.graphql_introspection_open",
+    "category": "data_harvesting",
+    "objective": "Open GraphQL introspection plus deep nested queries enable schema mapping and over-broad extraction",
+    "kind": "endpoint",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "introspection",
+          "equals": "enabled"
+        },
+        {
+          "prop": "query_depth_limit",
+          "equals": "none"
+        },
+        {
+          "prop": "pagination_max",
+          "equals": "unlimited"
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.45
+    },
+    "recommended_control": "Disable introspection in production; enforce query depth/complexity limits and pagination caps; cost-analyze queries",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "records"
+  },
+  {
+    "id": "sc.research.data_harvesting.excessive_field_exposure",
+    "category": "data_harvesting",
+    "objective": "API returns full object including sensitive fields, relying on client to filter (BOPLA excessive data exposure)",
+    "kind": "record",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "response_filtering",
+          "equals": "client"
+        },
+        {
+          "prop_contains": [
+            "serialization",
+            "to_json"
+          ]
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.45,
+      "impact": 0.45
+    },
+    "recommended_control": "Use response schema allowlists; return only fields required for the function; avoid generic to_json()/to_string() serialization",
+    "exploitability_reduction": 0.55,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "pii"
+  },
+  {
+    "id": "sc.research.unintended_endpoints.mass_assignment_privilege",
+    "category": "unintended_endpoints",
+    "objective": "Mass assignment lets a user set a privilege/financial field (isAdmin, role, balance) via extra request properties",
+    "kind": "endpoint",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "binding_mode",
+          "equals": "automatic"
+        },
+        {
+          "prop": "field_allowlist",
+          "equals": "none"
+        },
+        {
+          "prop_exists": "isAdmin"
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.45,
+      "impact": 0.75
+    },
+    "recommended_control": "Bind input via explicit DTO/allowlist (permit/only/strong parameters); never auto-bind privilege, verification, or money fields from request bodies",
+    "exploitability_reduction": 0.7,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.unintended_endpoints.forced_browsing_admin",
+    "category": "unintended_endpoints",
+    "objective": "Hidden/undocumented admin route is reachable via forced browsing because authorization is only enforced in the UI (BFLA)",
+    "kind": "endpoint",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "function_authorization",
+          "equals": "ui_only"
+        },
+        {
+          "prop_contains": [
+            "route",
+            "admin"
+          ]
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.65
+    },
+    "recommended_control": "Enforce explicit role checks at controller/middleware for every sensitive route; deny-by-default; audit admin endpoints specifically",
+    "exploitability_reduction": 0.65,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.unintended_endpoints.zombie_api_version",
+    "category": "unintended_endpoints",
+    "objective": "Deprecated/undocumented API version (v1, beta, test) remains live and unpatched, exposing weaker controls",
+    "kind": "endpoint",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop_contains": [
+            "path",
+            "/v1"
+          ]
+        },
+        {
+          "prop": "deprecated_route_status",
+          "equals": "active"
+        },
+        {
+          "prop": "inventory_managed",
+          "equals": "false"
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.35,
+      "impact": 0.5
+    },
+    "recommended_control": "Maintain a complete API inventory; retire deprecated versions; route all traffic through a gateway with consistent authz",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.unintended_endpoints.debug_endpoint_exposed",
+    "category": "unintended_endpoints",
+    "objective": "Debug/doc endpoints (swagger, /api-docs, stack traces) exposed in production reveal routes and internals",
+    "kind": "endpoint",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "debug_mode",
+          "equals": "on"
+        },
+        {
+          "prop_contains": [
+            "docs_endpoint",
+            "public"
+          ]
+        },
+        {
+          "prop": "stack_traces",
+          "equals": "verbose"
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.35
+    },
+    "recommended_control": "Disable debug and verbose errors in production; restrict access to API docs/admin; audit configs regularly",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.function_abuse.denial_of_wallet_amplification",
+    "category": "function_abuse",
+    "objective": "An intended capability is automated to amplify provider cost (denial-of-wallet) on a pay-per-use backend",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "per_user_rate_limit",
+          "equals": "none"
+        },
+        {
+          "prop": "cost_cap",
+          "equals": "unlimited"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.45,
+      "impact": 0.5
+    },
+    "recommended_control": "Enforce per-principal rate/cost caps and spend ceilings; tier expensive operations to authenticated/paying users; alert on cost spikes",
+    "exploitability_reduction": 0.55,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.function_abuse.notification_email_spam",
+    "category": "function_abuse",
+    "objective": "Invite/notification/share feature is automated to send spam from the product's trusted domain",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "invite_rate_limit",
+          "equals": "none"
+        },
+        {
+          "prop": "recipient_cap",
+          "equals": "unlimited"
+        },
+        {
+          "all_of": [
+            {
+              "guard_absent": true
+            },
+            {
+              "not": {
+                "prop_exists": "send_throttle"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.5,
+      "impact": 0.35
+    },
+    "recommended_control": "Rate-limit outbound invites/notifications per sender; cap recipients per action; add CAPTCHA/friction and content controls on user-triggered sends",
+    "exploitability_reduction": 0.55,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.function_abuse.human_gated_flow_automation",
+    "category": "function_abuse",
+    "objective": "A flow meant to be human-paced (checkout, booking, application) is automated to corner inventory or expedite (OAT-005/006/013)",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "bot_protection",
+          "equals": "none"
+        },
+        {
+          "prop": "step_pacing",
+          "equals": "unenforced"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.4
+    },
+    "recommended_control": "Add anti-automation (device fingerprinting, CAPTCHA, behavioral analysis) and per-account velocity limits on sensitive business flows",
+    "exploitability_reduction": 0.45,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.function_abuse.ssrf_url_passthrough",
+    "category": "function_abuse",
+    "objective": "User-supplied URL in an intended fetch/import feature is honored by the backend (consequence: internal access)",
+    "kind": "endpoint",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "url_allowlist",
+          "equals": "none"
+        },
+        {
+          "prop_contains": [
+            "fetch",
+            "passthrough"
+          ]
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.3,
+      "impact": 0.6
+    },
+    "recommended_control": "Allowlist outbound domains; block internal IP ranges/metadata endpoints; validate and canonicalize URLs (true software vuln \u2014 see appsec)",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "appsec",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.content_policy.guardrail_absent_canary",
+    "category": "content_policy",
+    "objective": "Detect whether a prohibited-content guardrail is PRESENT using a benign canary; absence means unmoderated generation",
+    "kind": "content_guardrail",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "blocks_prohibited",
+          "equals": false
+        },
+        {
+          "prop": "content_moderation",
+          "equals": "off"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.35,
+      "impact": 0.5
+    },
+    "recommended_control": "Enable input/output moderation guardrails; verify presence with benign canaries; fail closed when the moderation service is unavailable",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.content_policy.export_formula_injection",
+    "category": "content_policy",
+    "objective": "User-controlled values in CSV/spreadsheet export are interpreted as formulas when opened (formula injection)",
+    "kind": "export",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "csv_escape_formulas",
+          "equals": false
+        },
+        {
+          "prop": "export_sanitization",
+          "equals": "none"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.4
+    },
+    "recommended_control": "Escape cells beginning with =, +, -, @ (and Tab 0x09, Carriage Return 0x0D, and full-width variants); prefix risky cells with a tab character per OWASP",
+    "exploitability_reduction": 0.6,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.content_policy.guardrail_acts_on_content",
+    "category": "content_policy",
+    "objective": "Guardrail flag indicates the system acts on/generates content without a moderation gate present",
+    "kind": "content_guardrail",
+    "success_criterion": {
+      "all_of": [
+        {
+          "prop": "acts_on_content",
+          "equals": true
+        },
+        {
+          "not": {
+            "prop_exists": "moderation_gate"
+          }
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.3,
+      "impact": 0.45
+    },
+    "recommended_control": "Require a moderation gate before any content-generating/acting path; record guardrail presence as a config invariant",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.identity_account.reset_user_enumeration",
+    "category": "identity_account",
+    "objective": "Password-reset/forgot flow reveals whether an account exists, enabling enumeration",
+    "kind": "auth_reset",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "reset_response",
+          "equals": "account_specific"
+        },
+        {
+          "prop": "user_enumeration_protection",
+          "equals": "none"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.55,
+      "impact": 0.3
+    },
+    "recommended_control": "Return a consistent generic message and constant-time response regardless of account existence; apply the same to login and signup",
+    "exploitability_reduction": 0.6,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.identity_account.reset_token_weak",
+    "category": "identity_account",
+    "objective": "Reset token is predictable, long-lived, reusable, or placed in URL \u2014 enabling account takeover",
+    "kind": "auth_reset",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "reset_token_entropy",
+          "equals": "low"
+        },
+        {
+          "prop": "reset_token_single_use",
+          "equals": false
+        },
+        {
+          "prop": "reset_token_expiry",
+          "equals": "none"
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.65
+    },
+    "recommended_control": "Use cryptographically random single-use tokens with short (15-60 min) expiry; do not change account state until a valid token is presented",
+    "exploitability_reduction": 0.65,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.identity_account.reset_no_rate_limit",
+    "category": "identity_account",
+    "objective": "No rate limit on reset/OTP requests enables inbox/SMS flooding and brute-force of recovery",
+    "kind": "auth_reset",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "reset_rate_limit",
+          "equals": "none"
+        },
+        {
+          "prop": "otp_attempt_limit",
+          "equals": "unlimited"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.5,
+      "impact": 0.35
+    },
+    "recommended_control": "Rate-limit reset/OTP per-account and per-IP; add CAPTCHA; cap OTP verification attempts",
+    "exploitability_reduction": 0.55,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.identity_account.sybil_account_farming",
+    "category": "identity_account",
+    "objective": "Automated mass account creation (sybil/account farming) seeds downstream fraud (OAT-019)",
+    "kind": "signup",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "signup_verification",
+          "equals": "none"
+        },
+        {
+          "prop": "account_creation_rate_limit",
+          "equals": "none"
+        },
+        {
+          "prop_contains": [
+            "email",
+            "disposable_allowed"
+          ]
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.5,
+      "impact": 0.4
+    },
+    "recommended_control": "Require verified email/phone; block disposable domains; device/IP velocity limits; risk-score new accounts before granting incentives",
+    "exploitability_reduction": 0.45,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.trust_economy.self_referral_selfdeal",
+    "category": "trust_economy",
+    "objective": "Self-referral via fake accounts drains referral rewards without real customer acquisition",
+    "kind": "referral",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "self_referral_check",
+          "equals": "none"
+        },
+        {
+          "prop": "referral_reward_trigger",
+          "equals": "signup"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.55,
+      "impact": 0.35
+    },
+    "recommended_control": "Reward on qualified actions not signups; delay/hold rewards; match device/IP/payment across referrer-referee; cap redemptions per account",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.trust_economy.coupon_enumeration_farming",
+    "category": "trust_economy",
+    "objective": "Coupon/voucher/gift-code enumeration and reuse beyond intended limits (OAT-002 token cracking)",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "code_format",
+          "equals": "sequential"
+        },
+        {
+          "prop": "redemption_limit",
+          "equals": "none"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.45,
+      "impact": 0.4
+    },
+    "recommended_control": "Use high-entropy non-sequential codes; enforce per-account and global redemption caps; rate-limit redemption attempts",
+    "exploitability_reduction": 0.55,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.trust_economy.review_rating_manipulation",
+    "category": "trust_economy",
+    "objective": "Fake reviews/ratings manipulate reputation (OAT-016 skewing) via unverified or sock-puppet accounts",
+    "kind": "review",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "review_requires_purchase",
+          "equals": false
+        },
+        {
+          "prop": "rating_dedup",
+          "equals": "none"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.45,
+      "impact": 0.35
+    },
+    "recommended_control": "Gate reviews on verified transactions; detect coordinated rating rings via account/device linkage; rate-limit review submission",
+    "exploitability_reduction": 0.45,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.trust_economy.refund_credit_fraud",
+    "category": "trust_economy",
+    "objective": "Refund/credit/loyalty-point fraud exploits buyer-protection asymmetry to extract value and keep goods",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "refund_auto_approve",
+          "equals": true
+        },
+        {
+          "prop": "refund_velocity_check",
+          "equals": "none"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.45,
+      "impact": 0.45
+    },
+    "recommended_control": "Require evidence-based refund workflow; track refund/dispute velocity per account; hold loyalty accrual until settlement; link cross-account abuse",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.integration_extensibility.oauth_overbroad_scope",
+    "category": "integration_extensibility",
+    "objective": "Connected OAuth app requests/holds over-broad scopes (full access vs read-only), creating aggregation risk",
+    "kind": "oauth_app",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop_contains": [
+            "scope",
+            "full_access"
+          ]
+        },
+        {
+          "prop": "scope_enforcement",
+          "equals": "none"
+        },
+        {
+          "prop": "mandatory_scope",
+          "equals": false
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.55
+    },
+    "recommended_control": "Request least-privilege, atomic scopes with incremental/just-in-time authorization; enforce audience/resource restriction; review granted scopes",
+    "exploitability_reduction": 0.55,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.integration_extensibility.webhook_no_signature_replay",
+    "category": "integration_extensibility",
+    "objective": "Webhook endpoint lacks signature verification/timestamp checking, enabling spoofing and replay",
+    "kind": "webhook",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "webhook_signature",
+          "equals": "none"
+        },
+        {
+          "prop": "timestamp_validation",
+          "equals": "none"
+        },
+        {
+          "all_of": [
+            {
+              "guard_absent": true
+            },
+            {
+              "not": {
+                "prop_exists": "replay_protection"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.5
+    },
+    "recommended_control": "Verify HMAC signature over the raw body; reject stale timestamps (Stripe libraries default to a 5-minute/300-second tolerance \u2014 do not set tolerance to 0); dedupe on event/delivery ID; make handlers idempotent",
+    "exploitability_reduction": 0.65,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.integration_extensibility.api_key_exposed_unscoped",
+    "category": "integration_extensibility",
+    "objective": "API key/secret is unscoped, long-lived, or exposed in client code, granting broad access if leaked",
+    "kind": "oauth_app",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "key_scope",
+          "equals": "unrestricted"
+        },
+        {
+          "prop": "key_rotation",
+          "equals": "none"
+        },
+        {
+          "prop_contains": [
+            "secret",
+            "client_embedded"
+          ]
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.45,
+      "impact": 0.55
+    },
+    "recommended_control": "Issue scoped restricted keys; store secrets in a vault not client code; rotate on schedule and revoke on leak; one key per app/environment",
+    "exploitability_reduction": 0.6,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.integration_extensibility.webhook_payload_overexposure",
+    "category": "integration_extensibility",
+    "objective": "Webhook payloads carry excess PII to third parties because payload minimization is absent",
+    "kind": "webhook",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "payload_minimization",
+          "equals": "none"
+        },
+        {
+          "prop_contains": [
+            "payload",
+            "full_object"
+          ]
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.35,
+      "impact": 0.4
+    },
+    "recommended_control": "Send event summary + ID and require receiver to fetch details via authenticated API; minimize/redact PII in payloads; encrypt logs",
+    "exploitability_reduction": 0.45,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "pii"
+  },
+  {
+    "id": "sc.research.compliance_boundary.cross_tenant_access",
+    "category": "compliance_boundary",
+    "objective": "A tenant can read/modify another tenant's records because the tenant filter is missing or optional (BOLA cross-tenant)",
+    "kind": "record",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "tenant_filter",
+          "equals": "optional"
+        },
+        {
+          "prop": "tenant_isolation",
+          "equals": "none"
+        },
+        {
+          "all_of": [
+            {
+              "guard_absent": true
+            },
+            {
+              "not": {
+                "prop_exists": "tenant_id_check"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.85
+    },
+    "recommended_control": "Make tenant_id a mandatory, server-enforced filter on every query and object access; default-deny cross-tenant; test with two-tenant probes",
+    "exploitability_reduction": 0.7,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "records"
+  },
+  {
+    "id": "sc.research.compliance_boundary.residency_unpinned",
+    "category": "compliance_boundary",
+    "objective": "Data residency is unpinned/derived from client, allowing storage/processing outside the required region",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "data_region",
+          "equals": "unpinned"
+        },
+        {
+          "prop": "residency_enforcement",
+          "equals": "none"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.3,
+      "impact": 0.5
+    },
+    "recommended_control": "Pin tenant data region; ensure backups/logs/telemetry honor residency; block cross-region restore into mismatched regions",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "pii"
+  },
+  {
+    "id": "sc.research.compliance_boundary.retention_deletion_gap",
+    "category": "compliance_boundary",
+    "objective": "Retention/deletion is undefined or unenforced, so data persists indefinitely including in backups (storage-limitation breach)",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "retention_period",
+          "equals": "indefinite"
+        },
+        {
+          "prop": "deletion_enforcement",
+          "equals": "none"
+        },
+        {
+          "prop": "backup_retention",
+          "equals": "unbounded"
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.45
+    },
+    "recommended_control": "Define per-category retention periods; automate deletion across primary, backups, and processors; document erasures for accountability",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "pii"
+  },
+  {
+    "id": "sc.research.compliance_boundary.audit_log_gap",
+    "category": "compliance_boundary",
+    "objective": "Sensitive/admin actions are not audit-logged, defeating accountability and breach forensics",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "audit_logged",
+          "equals": false
+        },
+        {
+          "prop": "admin_action_logging",
+          "equals": "none"
+        },
+        {
+          "all_of": [
+            {
+              "guard_absent": true
+            },
+            {
+              "not": {
+                "prop_exists": "audit_trail"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.4
+    },
+    "recommended_control": "Log sensitive/admin/access events to a tamper-evident audit trail; monitor and alert; retain per policy",
+    "exploitability_reduction": 0.45,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.compliance_boundary.consent_gate_missing",
+    "category": "compliance_boundary",
+    "objective": "Processing proceeds without a consent gate / honoring withdrawal, breaching consent obligations",
+    "kind": "flag",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "consent_required",
+          "equals": false
+        },
+        {
+          "prop": "consent_withdrawal_honored",
+          "equals": false
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.3,
+      "impact": 0.4
+    },
+    "recommended_control": "Gate processing on recorded consent; honor withdrawal by stopping processing and deleting where no other basis applies; keep consent records",
+    "exploitability_reduction": 0.45,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "pii"
+  },
+  {
+    "id": "sc.research.agent_mcp_surface.tool_overscope_destructive",
+    "category": "agent_mcp_surface",
+    "objective": "An agent tool has more capability than its task needs (e.g. delete/write granted to a read-only role), enabling unsafe actions",
+    "kind": "agent_tool",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "readOnlyHint",
+          "equals": false
+        },
+        {
+          "prop": "destructiveHint",
+          "equals": true
+        },
+        {
+          "prop": "tool_scope",
+          "equals": "broad"
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.6
+    },
+    "recommended_control": "Scope tools to least privilege; separate read vs write/delete tools; remove unused/dev tools from production; gate destructive tools behind approval. NOTE: annotations are hints, not enforced \u2014 verify behavior, do not trust the label",
+    "exploitability_reduction": 0.55,
+    "applies_when": "has_agent_surface",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.agent_mcp_surface.no_human_approval_destructive",
+    "category": "agent_mcp_surface",
+    "objective": "Destructive tool calls auto-execute with no human-in-the-loop approval (require_approval never / needs_approval false)",
+    "kind": "agent_tool",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "require_approval",
+          "equals": "never"
+        },
+        {
+          "prop": "needs_approval",
+          "equals": false
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.6
+    },
+    "recommended_control": "Require approval (require_approval:always / needs_approval:true) for destructive or high-impact tools; maintain an allowlist of auto-approved read-only tools via tool_names",
+    "exploitability_reduction": 0.6,
+    "applies_when": "has_agent_surface",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.agent_mcp_surface.confused_deputy_shared_credential",
+    "category": "agent_mcp_surface",
+    "objective": "MCP server uses one broad shared credential and does not propagate user identity, so a tool acts with more authority than the requester (confused deputy)",
+    "kind": "mcp_connector",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "token_passthrough",
+          "equals": true
+        },
+        {
+          "prop": "per_user_identity",
+          "equals": false
+        },
+        {
+          "prop": "credential_model",
+          "equals": "shared"
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.35,
+      "impact": 0.75
+    },
+    "recommended_control": "Propagate end-user identity to the server; verify each request's token belongs to the requester; use Resource Indicators (RFC 8707); per the MCP spec, never accept tokens not explicitly issued for the MCP server",
+    "exploitability_reduction": 0.6,
+    "applies_when": "has_agent_surface",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.agent_mcp_surface.rag_cross_tenant_retrieval",
+    "category": "agent_mcp_surface",
+    "objective": "Agent RAG/memory retrieval returns another tenant's data because the namespace/tenant filter is not mandatory at retrieval",
+    "kind": "mcp_connector",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "tenant_filter",
+          "equals": "optional"
+        },
+        {
+          "prop": "namespace_isolation",
+          "equals": "none"
+        },
+        {
+          "all_of": [
+            {
+              "guard_absent": true
+            },
+            {
+              "not": {
+                "prop_exists": "tenant_id"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.7
+    },
+    "recommended_control": "Inject a mandatory tenant filter before similarity search (filter-first retrieval); use per-tenant namespaces/collections; scope memory by tenant",
+    "exploitability_reduction": 0.6,
+    "applies_when": "has_agent_surface",
+    "handoff": "",
+    "classification_impact": "records"
+  },
+  {
+    "id": "sc.research.agent_mcp_surface.tool_poisoning_description",
+    "category": "agent_mcp_surface",
+    "objective": "A tool description/schema contains hidden instructions that steer the agent (tool poisoning); detect presence of an unvetted/mutable tool definition",
+    "kind": "agent_tool",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "tool_description_vetted",
+          "equals": false
+        },
+        {
+          "prop": "tool_definition_pinned",
+          "equals": false
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.3,
+      "impact": 0.6
+    },
+    "recommended_control": "Vet and pin tool descriptions/schemas; alert on changes (rug-pull); treat tool descriptions as untrusted content; sandbox third-party servers (technique handoff to model_redteam)",
+    "exploitability_reduction": 0.45,
+    "applies_when": "has_agent_surface",
+    "handoff": "model_redteam",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.agent_mcp_surface.cross_server_context_bleed",
+    "category": "agent_mcp_surface",
+    "objective": "Multiple MCP servers share one agent context; a malicious server's tool can shadow/observe another trusted server's data (cross-server bleed)",
+    "kind": "mcp_connector",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "server_isolation",
+          "equals": "none"
+        },
+        {
+          "prop": "cross_server_context",
+          "equals": "shared"
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.3,
+      "impact": 0.55
+    },
+    "recommended_control": "Isolate context per server; restrict which servers' tools see which data; require explicit user consent per connector; verify server identity",
+    "exploitability_reduction": 0.45,
+    "applies_when": "has_agent_surface",
+    "handoff": "",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.agent_mcp_surface.indirect_injection_to_action",
+    "category": "agent_mcp_surface",
+    "objective": "Untrusted retrieved content triggers a real tool action with no confirmation (indirect-injection-to-action); detect missing action gate after untrusted input",
+    "kind": "agent_tool",
+    "success_criterion": {
+      "all_of": [
+        {
+          "prop": "acts_on_untrusted_content",
+          "equals": true
+        },
+        {
+          "any_of": [
+            {
+              "prop": "action_confirmation",
+              "equals": "none"
+            },
+            {
+              "prop": "openWorldHint",
+              "equals": true
+            }
+          ]
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.35,
+      "impact": 0.6
+    },
+    "recommended_control": "Require confirmation before tool actions driven by untrusted/retrieved content; treat model output as untrusted; constrain tool autonomy and turn limits (technique handoff to model_redteam)",
+    "exploitability_reduction": 0.45,
+    "applies_when": "has_agent_surface",
+    "handoff": "model_redteam",
+    "classification_impact": ""
+  },
+  {
+    "id": "sc.research.agent_mcp_surface.unbounded_tool_iteration",
+    "category": "agent_mcp_surface",
+    "objective": "No cap on tool-call iterations/turns enables runaway loops and denial-of-wallet via the agent",
+    "kind": "agent_tool",
+    "success_criterion": {
+      "any_of": [
+        {
+          "prop": "max_turns",
+          "equals": "unlimited"
+        },
+        {
+          "prop": "max_iterations",
+          "equals": "none"
+        },
+        {
+          "all_of": [
+            {
+              "guard_absent": true
+            },
+            {
+              "not": {
+                "prop_exists": "iteration_limit"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.45
+    },
+    "recommended_control": "Set max_turns/max_iterations and wall-clock timeouts; cap per-session tool calls and spend; alert on loop patterns",
+    "exploitability_reduction": 0.55,
+    "applies_when": "has_agent_surface",
+    "handoff": "",
+    "classification_impact": ""
+  }
+]

@@ -34,6 +34,8 @@ def evaluate_criterion(crit: dict, aff) -> bool:
         return semantic_match(crit["semantic"], aff)
     if "guard_absent" in crit:
         return (not aff.guard_present) == bool(crit["guard_absent"])
+    if "prop_exists" in crit:  # fires when the named property is PRESENT; {"not":{"prop_exists":X}} = absent
+        return crit["prop_exists"] in p
     if "prop" in crit and "equals" in crit:
         return p.get(crit["prop"]) == crit["equals"]
     if "prop" in crit and "in" in crit:

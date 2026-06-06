@@ -2,6 +2,17 @@
 
 All notable changes to HEEL are documented here. Format loosely follows Keep a Changelog.
 
+## [Unreleased]
+
+### Added — research scenario library (the recall lever)
+- **45 source-anchored business-logic abuse scenarios** across all 10 categories
+  (`heel/scenarios_lib/research_owasp.json`, declarative JSON) + a semantic-vocabulary expansion,
+  integrated from an external research deliverable anchored to OWASP API/OAT/WSTG/LLM-Top-10, the MCP
+  2025-06-18 schema, and Stripe/Kong/Microsoft/Auth0 config docs. Library 67 -> **119 scenarios**.
+- A `prop_exists` criterion operator; over-broad absence-checks paired with `guard_absent` for precision.
+- **Measured (frozen held-out test set, authored blind to the library): localization recall 0.38 ->
+  0.50 at precision 0.97 -> 0.98.** See `docs/RESEARCH_LIBRARY.md`, `EVAL.md` §wave 6, `DECISIONS.md` D-032.
+
 ## [1.0.0] — 2026-06-05
 
 First production-ready release: an agent-native abuse-simulation tool whose canonical surface is an

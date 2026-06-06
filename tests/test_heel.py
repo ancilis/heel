@@ -220,10 +220,13 @@ class TestOpportunisticClass(Base):  # spec §3.2, DoD #3
         rid = self.run_target("synthetic-saas")  # default = adversarial + opportunistic
         self.assertTrue(self._opp(rid))
 
-    def test_opportunistic_closes_adversarial_blind_spot(self):
+    def test_opportunistic_adds_unique_motivation_gated_findings(self):
+        # the opportunistic-human class surfaces motivation-gated gaming (seat-sharing) that the
+        # programmatic adversarial library doesn't flag. (Coupon-stacking, once an adversarial blind
+        # spot, is now covered adversarially by the expanded research library — a coverage win.)
         rid = self.run_target("synthetic-saas")
         opp_affs = {f["affordance_id"] for f in self._opp(rid)}
-        self.assertIn("promo_stacking", opp_affs)  # the adversarial FN, closed by the human class
+        self.assertIn("seats", opp_affs)
 
     def test_profiles_gate_which_vectors_surface(self):
         # test the opportunistic class's motivation-gating directly (decoupled from the merge,
