@@ -1,16 +1,16 @@
 """
-HEEL — blind-target evaluation harness. Phase 3, red-team-hardened.
+HEEL: blind-target evaluation harness. Phase 3, red-team-hardened.
 
 Runs the library against many procedurally-generated blind targets (heel/blind.py) whose planted
 weaknesses use encodings authored independently of the seed probes, and aggregates an honest
 detection DISTRIBUTION. Red-team corrections (EVAL §7):
   * recall is reported alongside the MEASURED encoding-overlap (the independent variable that bounds
-    it) and labelled a stated LOWER BOUND — it is not presented as emergent detection skill.
+    it) and labelled a stated LOWER BOUND: it is not presented as emergent detection skill.
   * a WILSON score interval is reported on the pooled found/planted proportion (the right model for
     a binomial), not a normal-z on a mean-of-ratios.
   * per-probe FALSE-POSITIVE attribution makes clear which probe(s) carry the precision number.
 This is also the §7 fan-out: targets run concurrently via a thread pool (GIL-bound with the stub
-model; with real LLM agents threads overlap network-bound work — see the honest wording below).
+model; with real LLM agents threads overlap network-bound work: see the honest wording below).
 """
 from __future__ import annotations
 

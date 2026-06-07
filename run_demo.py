@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-HEEL — one-command synthetic demo (spec §13). No real target, no API key.
+HEEL: one-command synthetic demo (spec §13). No real target, no API key.
 
 Drives the real MCP boundary: a human creates a scope OUT-OF-BAND, a (simulated) calling
-agent runs the coverage backtest within it over MCP, and a battery of escalation attempts —
-including a prompt-injected caller — is rejected and logged. Prints the architecture pointers,
+agent runs the coverage backtest within it over MCP, and a battery of escalation attempts,
+including a prompt-injected caller, is rejected and logged. Prints the architecture pointers,
 the MCP tool schema, the auth-gate result, the planted-vector coverage, and the scenario list.
 """
 from __future__ import annotations
@@ -77,17 +77,17 @@ def main():
     # ---------------------------------------------------------------- report
     L = []
     L.append("=" * 80)
-    L.append("HEEL — agent-native abuse-simulation tool · synthetic demo (no real target, no key)")
+    L.append("HEEL: agent-native abuse-simulation tool · synthetic demo (no real target, no key)")
     L.append("=" * 80)
     L.append(f"MCP server: {init['serverInfo']['name']} v{init['serverInfo']['version']}  "
              f"· caller: {session['caller']}")
     L.append(f"MCP tools exposed ({len(TOOL_NAMES)}): {', '.join(sorted(TOOL_NAMES))}")
-    L.append("  (NO scope-creation/widening tool exists — human-only, out-of-band, by construction)")
+    L.append("  (NO scope-creation/widening tool exists: human-only, out-of-band, by construction)")
     L.append("")
     L.append(f"OUT-OF-BAND scope (human-created, signed): {scope.scope_id}  "
              f"allowlist={scope.target_allowlist}  approver={scope.operator_confirmation}")
     L.append("")
-    L.append("PLANTED-VECTOR SELF-CONSISTENCY BACKTEST (wiring test — NOT real-target accuracy):")
+    L.append("PLANTED-VECTOR SELF-CONSISTENCY BACKTEST (wiring test: NOT real-target accuracy):")
     L.append(f"  {'target':<16}{'kind':<10}{'coverage':>9}{'cov(w)':>8}{'FP-rate':>8}{'sev-calib':>10}{'cat10':>7}")
     for t, (rid, c) in results.items():
         L.append(f"  {t:<16}{c['kind']:<10}{c['coverage']:>9.2f}{(c['coverage_reachability_weighted'] or 0):>8.2f}"
@@ -95,7 +95,7 @@ def main():
                  f"{c['category10_findings']:>7}")
     saas = results["synthetic-saas"][1]
     L.append(f"  -> category 10 (agent/MCP) on the non-AI target: {saas['category10_findings']} findings "
-             f"({'CLEAN — optional, as required' if saas['category10_clean_on_non_ai'] else 'LEAK'})")
+             f"({'CLEAN: optional, as required' if saas['category10_clean_on_non_ai'] else 'LEAK'})")
     for t, (rid, c) in results.items():
         L.append(f"  {t}: TP={c['true_positives']} FN={c['false_negatives']} FP={c['false_positives']} "
                  f"implausible-flagged={c['implausible_flagged']} missed={[m['affordance'] for m in c['missed']]}")
@@ -112,7 +112,7 @@ def main():
     L.append("")
     from heel.blind_eval import blind_eval
     be = blind_eval(n=40, workers=8)
-    L.append("BLIND-TARGET EVALUATION — the HONEST real-detection metric (independent encodings):")
+    L.append("BLIND-TARGET EVALUATION: the HONEST real-detection metric (independent encodings):")
     L.append(f"  real recall {be['real_recall_pooled']} (Wilson CI {be['real_recall_wilson_ci95']}) "
              f"~= measured library encoding-overlap {be['encoding_overlap']['overlap']} "
              f"(a stated LOWER BOUND); precision {be['real_precision_pooled']} over {be['n_targets']} targets")
@@ -125,7 +125,7 @@ def main():
     he = heldout_eval()
     dev, test = he["dev"], he.get("test", he["dev"])
     ts = test["with_semantic"]
-    L.append("HELD-OUT EVALUATION — targets authored by an INDEPENDENT LLM swarm (blind to HEEL's probes):")
+    L.append("HELD-OUT EVALUATION: targets authored by an INDEPENDENT LLM swarm (blind to HEEL's probes):")
     L.append(f"  DEV  (tuned on, {dev['total_planted']} weaknesses):  semantic localization {dev['with_semantic']['recall']} @ precision {dev['with_semantic']['precision']}")
     L.append(f"  TEST (FROZEN, never tuned, {test['total_planted']} weaknesses, sha {test['sha256']}):")
     L.append(f"     LOCALIZATION recall {ts['recall']} (cluster-CI {ts['recall_cluster_ci95']}) -- right affordance flagged")
@@ -139,13 +139,13 @@ def main():
         L.append(f"  [{'REJECTED+logged ✓' if rejected else 'NOT REJECTED ✗'}]  {label}")
     L.append(f"  containment log hash-chain: {'VALID ✓' if chain_ok else 'BROKEN ✗'} ({chain_msg})")
     all_rejected = all(r for _, r in gate_rows)
-    L.append(f"  -> auth gate: {'PASS — no escalation reachable via the agent surface' if all_rejected else 'FAIL'}")
+    L.append(f"  -> auth gate: {'PASS: no escalation reachable via the agent surface' if all_rejected else 'FAIL'}")
     L.append("")
     from heel.model import get_model
     from heel.scenarios import all_seed_scenarios, load_json_scenarios
     alls = all_seed_scenarios()
     L.append(f"SCENARIO LIBRARY: {len(alls)} scenarios across {len({s.category.value for s in alls})} categories "
-             f"({len(load_json_scenarios())} loaded from JSON — addable without code); "
+             f"({len(load_json_scenarios())} loaded from JSON: addable without code); "
              f"discovery model: {get_model().name} (LLM loop swappable via HEEL_MODEL=anthropic).")
     L.append("=" * 80)
     L.append("Synthetic-first · contained PoCs (canary-only) · no prohibited content · plausibility-")

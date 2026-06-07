@@ -1,5 +1,5 @@
 """
-HEEL — CLI (spec §2: a thin client over the same capability; PLUS the out-of-band
+HEEL: CLI (spec §2: a thin client over the same capability; PLUS the out-of-band
 human-only scope path). `heel scope create` is the ONLY way to mint a scope, requires
 explicit `--confirm`, and writes a signed scope file. Everything else calls the MCP capability.
 """
@@ -29,7 +29,7 @@ def _doctor() -> int:
     except Exception as e:
         warn.append(f"HEEL_HOME not writable ({home}): {e}")
     if os.environ.get("HEEL_SIGNING_KEY"):
-        ok.append("signing key: external (HEEL_SIGNING_KEY) — production posture ✓")
+        ok.append("signing key: external (HEEL_SIGNING_KEY): production posture ✓")
     else:
         warn.append("signing key is co-located in HEEL_HOME. For production set HEEL_SIGNING_KEY to a "
                     "path OUTSIDE the data dir (key+data separation). See SECURITY.md.")
@@ -68,7 +68,7 @@ def _caller():
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="heel", description="HEEL — agent-native abuse-simulation tool")
+    ap = argparse.ArgumentParser(prog="heel", description="HEEL: agent-native abuse-simulation tool")
     ap.add_argument("--version", action="version", version=f"heel {__version__}")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("doctor", help="self-check: install, data dir, signing-key posture, capability")
