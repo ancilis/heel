@@ -11,7 +11,7 @@ make demo     # auth-gate proof + honest backtests
 heel doctor   # environment self-check
 ```
 
-The core is **pure Python standard library** (DECISIONS D-001) — please keep runtime dependencies at
+The core is **pure Python standard library** (DECISIONS D-001), please keep runtime dependencies at
 zero. The UI (`web/`) is a separate Next.js app and a thin client over the same snapshot.
 
 ## The safety spine is non-negotiable (§10)
@@ -31,7 +31,7 @@ Any contribution **must** preserve these. PRs that weaken them will not be merge
 
 ## Adding scenarios (no code required)
 
-Drop a JSON file in `heel/scenarios_lib/` — it's merged at load time. Each scenario is a declarative
+Drop a JSON file in `heel/scenarios_lib/`, it's merged at load time. Each scenario is a declarative
 spec (surface pattern + `success_criterion` + severity + control). See `heel/scenarios.py` and the
 generic `evaluate_criterion`. For vocabulary that generalizes, prefer a `{"semantic": "<signal>"}`
 criterion and extend `heel/semantic.py`'s catalog (topic keywords + permissive/hardened values).

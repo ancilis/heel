@@ -6,7 +6,7 @@ production-hardening checklist, and the responsible-disclosure policy.
 ## Reporting a vulnerability in HEEL
 
 Please report security issues privately via a GitHub security advisory on `ancilis/heel`, or by
-email to the maintainers — **not** a public issue. We aim to acknowledge within 3 business days. Do
+email to the maintainers, **not** a public issue. We aim to acknowledge within 3 business days. Do
 not include real exploit payloads against third-party systems; HEEL is synthetic-first by design.
 
 ## What HEEL is (and is not)
@@ -14,9 +14,9 @@ not include real exploit payloads against third-party systems; HEEL is synthetic
 HEEL **rehearses how a customer or third party could abuse a product you own**, before launch. It is
 a pre-launch abuse-simulation harness, **not** a replacement for application-security review,
 penetration testing, or a bug-bounty program. Findings are **predicted, contained, canary-only**
-proofs that an abuse path is *reachable* — they are leads to harden, not exploit code.
+proofs that an abuse path is *reachable*, they are leads to harden, not exploit code.
 
-## The authorization model (§10 — the non-negotiable safety spine)
+## The authorization model (§10, the non-negotiable safety spine)
 
 HEEL is agent-native: its canonical surface is an MCP server that **other agents** call, and a
 calling agent is an **untrusted, possibly prompt-injected channel**. HEEL therefore treats the
@@ -25,7 +25,7 @@ caller as a **confused deputy**:
 - **Scopes are human-only and out-of-band.** A scope (target allowlist + limits + approver + expiry)
   is created **only** via `heel scope create --confirm` and written as an **HMAC-signed** file. No
   MCP / REST / agent code path can create, widen, add a target to, relax the limits of, or escape a
-  scope — those tools **do not exist in the registry, by construction**.
+  scope: those tools **do not exist in the registry, by construction**.
 - **Immutable from the caller side.** The server only loads + verifies scopes; it never writes them.
   Hand-editing a signed scope file breaks the signature and the scope fails closed.
 - **Every escalation is rejected and logged.** Out-of-allowlist targets, forged scope ids,
@@ -36,12 +36,12 @@ caller as a **confused deputy**:
 
 ## Conduct guarantees (§10.2)
 
-Synthetic-first · detection-not-weaponization (contained, canary-only PoCs — no real exfiltration or
+Synthetic-first · detection-not-weaponization (contained, canary-only PoCs, no real exfiltration or
 resource exhaustion) · **never generates prohibited or illegal content under any framing** (guardrail
 presence is verified with benign canaries only) · no real-PII harvesting · containment/back-off ·
 plausibility-weighting · severity honesty · immutable self-audit · **lane discipline** (a genuine
 software vulnerability is handed off to AppSec; a pure model-jailbreak surface is handed off to model
-red-team — neither is weaponized or counted as a product-abuse finding).
+red-team: neither is weaponized or counted as a product-abuse finding).
 
 ## Production hardening checklist
 
@@ -54,7 +54,7 @@ red-team — neither is weaponized or counted as a product-abuse finding).
       on the scope-authorization model for *capability* control, not network access control. Do not
       expose it publicly; front it with your own authenticated gateway / mTLS / network policy if it
       must be reachable beyond localhost. It cannot mint or widen a scope regardless.
-      Read routes (`/runs/{id}/...`) are **not confidential between local callers** — all callers on
+      Read routes (`/runs/{id}/...`) are **not confidential between local callers**: all callers on
       the loopback interface share one trust domain in v1; the `X-Heel-Caller` header is self-asserted
       attribution, not authentication. The server also rejects non-loopback `Host` headers (anti
       DNS-rebinding) and any request carrying an `Origin` (anti-CSRF).

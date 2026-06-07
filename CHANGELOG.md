@@ -2,11 +2,11 @@
 
 All notable changes to HEEL are documented here. Format loosely follows Keep a Changelog.
 
-## [1.1.0] — 2026-06-07
+## [1.1.0]: 2026-06-07
 
 Apache-2.0 relicense + DCO, and a major scenario-library depth expansion.
 
-### Added — research scenario library (the recall lever)
+### Added: research scenario library (the recall lever)
 - **45 source-anchored business-logic abuse scenarios** across all 10 categories
   (`heel/scenarios_lib/research_owasp.json`, declarative JSON) + a semantic-vocabulary expansion,
   integrated from an external research deliverable anchored to OWASP API/OAT/WSTG/LLM-Top-10, the MCP
@@ -15,13 +15,13 @@ Apache-2.0 relicense + DCO, and a major scenario-library depth expansion.
 - **Measured (frozen held-out test set, authored blind to the library): localization recall 0.38 ->
   0.50 at precision 0.97 -> 0.98.** See `docs/RESEARCH_LIBRARY.md`, `EVAL.md` §wave 6, `DECISIONS.md` D-032.
 
-## [1.0.0] — 2026-06-05
+## [1.0.0]: 2026-06-05
 
 First production-ready release: an agent-native abuse-simulation tool whose canonical surface is an
 MCP server, proven by an honest detection metric on independently-authored targets.
 
 ### Core capability
-- **MCP server** (`heel-mcp`, stdio JSON-RPC) exposing 8 consumption/execution tools — **no
+- **MCP server** (`heel-mcp`, stdio JSON-RPC) exposing 8 consumption/execution tools, **no
   scope-mutation tool exists, by construction**. Thin **REST API** (`heel-rest`) and **CLI** (`heel`)
   over the same capability.
 - **Out-of-band, HMAC-signed, immutable authorization scopes** (confused-deputy model). Every
@@ -43,11 +43,11 @@ MCP server, proven by an honest detection metric on independently-authored targe
     **0.97** on 199 independently-authored weaknesses.
   - Two gaps disclosed, not hidden: dev→test (overfitting) and localization→attribution (mis-categorization).
 - Four adversarial red-team passes (safety spine, blind-eval honesty, held-out methodology, and a
-  production launch-readiness security review — verdict SHIP, no blockers); all findings fixed,
+  production launch-readiness security review, verdict SHIP, no blockers); all findings fixed,
   including REST anti-DNS-rebinding + anti-CSRF and data-dir 0700 enforcement. See `docs/REDTEAM_*.md`.
 
 ### Tooling & ops
-- **Control-room UI** (`web/`, Next.js) — abuse board, backtest, blind/held-out eval, live swarm,
+- **Control-room UI** (`web/`, Next.js), abuse board, backtest, blind/held-out eval, live swarm,
   auth gate, scope panel, containment log, MCP/integration, scenario library.
 - `pip install heel-sim` (pure-stdlib, **zero runtime deps**); console scripts `heel` / `heel-mcp` /
   `heel-rest`; `heel doctor` self-check; `heel eval` honest headline.

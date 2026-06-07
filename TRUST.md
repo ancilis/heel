@@ -11,15 +11,15 @@ yourself.
 | **Reproducible build** | static version, no VCS-derived metadata | `python -m build` twice → identical wheel contents |
 | **Signed build provenance** | Sigstore attestation on every release (PEP 740) | `gh attestation verify <wheel> --repo ancilis/heel` |
 | **SBOM** | CycloneDX SBOM published with each release | `dist/sbom.cdx.json` on the GitHub Release |
-| **Trusted publishing** | PyPI OIDC — **no API token stored anywhere** | `.github/workflows/publish.yml` |
+| **Trusted publishing** | PyPI OIDC, **no API token stored anywhere** | `.github/workflows/publish.yml` |
 | **Pinned, auto-updated CI** | Dependabot watches Actions + UI deps | `.github/dependabot.yml` |
 
 ## Automated security posture
 
-- **OpenSSF Scorecard** — `.github/workflows/scorecard.yml` scores branch protection, CI, SAST,
+- **OpenSSF Scorecard**: `.github/workflows/scorecard.yml` scores branch protection, CI, SAST,
   dangerous workflows, and dependency pinning, and publishes the public badge.
 - **CodeQL** static analysis (`security-extended` queries) on every push/PR and weekly.
-- **CI matrix** — tests on Python 3.11/3.12/3.13 + a clean wheel-install smoke test + the UI build,
+- **CI matrix**: tests on Python 3.11/3.12/3.13 + a clean wheel-install smoke test + the UI build,
   green on every commit to `main`.
 
 ## Adversarial review (the real assurance)
@@ -27,10 +27,10 @@ yourself.
 HEEL was hardened by **four independent multi-agent red-team passes**, each attacking a different
 claim; every finding was fixed with a regression test. The full reports are in the repo:
 
-- [`docs/REDTEAM_FINDINGS.md`](docs/REDTEAM_FINDINGS.md) — the §10 safety/authorization spine.
-- [`docs/REDTEAM_BLIND_FINDINGS.md`](docs/REDTEAM_BLIND_FINDINGS.md) — blind-eval honesty (caught a circular metric).
-- [`docs/REDTEAM_HELDOUT_METHOD.md`](docs/REDTEAM_HELDOUT_METHOD.md) — held-out methodology (caught attribution-vs-localization conflation).
-- [`docs/REDTEAM_LAUNCH.md`](docs/REDTEAM_LAUNCH.md) — production launch review (verdict **SHIP**; REST DNS-rebinding/CSRF fixed pre-tag).
+- [`docs/REDTEAM_FINDINGS.md`](docs/REDTEAM_FINDINGS.md): the §10 safety/authorization spine.
+- [`docs/REDTEAM_BLIND_FINDINGS.md`](docs/REDTEAM_BLIND_FINDINGS.md): blind-eval honesty (caught a circular metric).
+- [`docs/REDTEAM_HELDOUT_METHOD.md`](docs/REDTEAM_HELDOUT_METHOD.md): held-out methodology (caught attribution-vs-localization conflation).
+- [`docs/REDTEAM_LAUNCH.md`](docs/REDTEAM_LAUNCH.md): production launch review (verdict **SHIP**; REST DNS-rebinding/CSRF fixed pre-tag).
 
 The #1 claim held under attack: **a prompt-injected MCP/REST caller cannot create, widen, or escape a
 signed authorization scope.** It is enforced in code (`tests/test_heel.py::TestAuthGate`,
@@ -40,7 +40,7 @@ signed authorization scope.** It is enforced in code (`tests/test_heel.py::TestA
 
 HEEL refuses to quote a number it can't defend. It reports a *ladder* from weakest to strongest
 evidence, ending in **held-out detection against abuse authored by an independent LLM swarm, blind to
-HEEL's probes, on a frozen content-hashed test set** — and discloses its overfitting and
+HEEL's probes, on a frozen content-hashed test set**, and discloses its overfitting and
 mis-categorization gaps rather than hiding them. Method + provenance:
 [`EVAL.md`](EVAL.md) · [`docs/HELDOUT_PROVENANCE.md`](docs/HELDOUT_PROVENANCE.md).
 
