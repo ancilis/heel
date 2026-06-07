@@ -2,7 +2,9 @@
 
 All notable changes to HEEL are documented here. Format loosely follows Keep a Changelog.
 
-## [Unreleased]
+## [1.1.0] — 2026-06-07
+
+Apache-2.0 relicense + DCO, and a major scenario-library depth expansion.
 
 ### Added — research scenario library (the recall lever)
 - **45 source-anchored business-logic abuse scenarios** across all 10 categories

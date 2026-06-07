@@ -50,7 +50,7 @@ AUTHORIZATION GATE (agent caller is an untrusted, possibly prompt-injected chann
 
 HELD-OUT EVALUATION — targets authored by an INDEPENDENT LLM swarm (blind to HEEL's probes):
   TEST (FROZEN, never tuned, 199 weaknesses):
-     LOCALIZATION recall 0.38   ATTRIBUTION recall 0.31   precision 0.97
+     LOCALIZATION recall 0.50   ATTRIBUTION recall 0.33   precision 0.98
   -> the honest real-target ceiling — semantic generalization on vocabulary it never saw, not near 1.0.
 ```
 
@@ -94,7 +94,7 @@ HEEL reports four levels, weakest claim to strongest evidence:
 | self-consistency | wiring works (probes vs. plants authored together) | ~1.0 *(a wiring test, not accuracy)* |
 | blind | independent *encodings* of known weaknesses | ~0.25 |
 | held-out **DEV** | independent authorship, tuned-on | 0.70 |
-| **held-out TEST** | **independent LLM authorship, frozen, never tuned on** | **localization 0.38 · attribution 0.31 · precision 0.97** |
+| **held-out TEST** | **independent LLM authorship, frozen, never tuned on** | **localization 0.50 · attribution 0.33 · precision 0.98** |
 
 The headline is the bottom row — real detection on 199 abuse weaknesses an independent LLM swarm
 invented in its *own* vocabulary, which HEEL never saw. It improves only by widening real-vocabulary
@@ -158,7 +158,7 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 
 ## Status
 
-**v1.0.0 — production-ready.** 53 tests on Python 3.11–3.13, CI green, zero runtime dependencies,
+**v1.1.0 — production-ready.** 53 tests on Python 3.11–3.13, CI green, zero runtime dependencies,
 four red-team passes. Post-v1: LLM-driven detection to lift attribution recall, larger held-out
 sets, real-target adapters.
 

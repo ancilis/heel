@@ -30,7 +30,7 @@ from .orchestrator import run_abuse
 from .scenarios import list_scenarios
 from .store import Store
 
-SERVER_INFO = {"name": "heel", "version": "1.0.0"}
+SERVER_INFO = {"name": "heel", "version": "1.1.0"}
 
 # Tools exposed over MCP. Scope-mutation tools are ABSENT by construction (§10.1).
 TOOL_SCHEMAS = [
