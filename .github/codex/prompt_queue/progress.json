@@ -1,0 +1,8 @@
+{
+  "queue_version": "0.1",
+  "next_prompt_id": 1,
+  "completed_prompt_ids": [],
+  "in_flight": null,
+  "last_pr": null,
+  "notes": "The local Codex CLI runner updates this file inside each queued PR. Merging the PR advances the queue."
+}
