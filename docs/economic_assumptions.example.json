@@ -1,0 +1,59 @@
+{
+  "schema_version": "EconomicAssumptions.v0.1",
+  "currency": "USD",
+  "defaults": {
+    "confidence": 0.45,
+    "time_to_detection": 0.5,
+    "friction_cost_of_control": 0.4
+  },
+  "affordances": {
+    "usage_meter": {
+      "events_per_month": {
+        "low": 3000,
+        "high": 18000
+      },
+      "unit_cloud_cost": 1.0,
+      "abuse_repeatability": 0.9,
+      "time_to_detection": 0.7,
+      "friction_cost_of_control": 0.3,
+      "confidence": 0.65,
+      "driver": "unmetered AI-token usage"
+    },
+    "promo_stacking": {
+      "events_per_month": {
+        "low": 25,
+        "high": 120
+      },
+      "unit_revenue_leakage": 8.0,
+      "abuse_repeatability": 0.7,
+      "time_to_detection": 0.6,
+      "friction_cost_of_control": 0.25,
+      "confidence": 0.55,
+      "driver": "coupon or promotion leakage"
+    },
+    "export_records": {
+      "events_per_month": {
+        "low": 2,
+        "high": 20
+      },
+      "unit_data_exposure_value": 250.0,
+      "unit_support_cost": 80.0,
+      "abuse_repeatability": 0.6,
+      "time_to_detection": 0.8,
+      "friction_cost_of_control": 0.45,
+      "confidence": 0.5,
+      "driver": "bulk canary-record exposure"
+    }
+  },
+  "categories": {
+    "trust_economy": {
+      "events_per_month": {
+        "low": 10,
+        "high": 100
+      },
+      "unit_trust_safety_cost": 15.0,
+      "confidence": 0.4,
+      "driver": "trust and safety review load"
+    }
+  }
+}

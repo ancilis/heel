@@ -1,19 +1,20 @@
 {
   "queue_version": "0.1",
-  "next_prompt_id": 6,
+  "next_prompt_id": 7,
   "completed_prompt_ids": [
     1,
     2,
     3,
     4,
-    5
+    5,
+    6
   ],
   "in_flight": null,
   "last_pr": {
-    "prompt_id": 5,
-    "slug": "05_launch_review_mode",
+    "prompt_id": 6,
+    "slug": "06_economic_severity",
     "pr_url": "",
-    "advanced_at": "2026-06-30T19:45:46.109559+00:00"
+    "advanced_at": "2026-06-30T21:30:38.339861+00:00"
   },
   "notes": "The local Codex CLI runner updates this file inside each queued PR. Merging the PR advances the queue."
 }

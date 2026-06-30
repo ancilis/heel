@@ -117,6 +117,7 @@ class AbuseVector:
     recommended_control: str
     classification_impact: Optional[dict] = None     # optional annotation (off by default)
     obligation_impact: Optional[dict] = None
+    economic_impact: Optional[dict] = None            # optional business-impact annotation
     estimated_exploitability_reduction: Optional[float] = None
     verification_status: VerificationStatus = VerificationStatus.PREDICTED
     handoff_to_appsec: bool = False    # true security vuln (memory/crypto/novel) — not HEEL's lane

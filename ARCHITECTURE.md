@@ -17,7 +17,8 @@ A team is about to ship a feature, review an existing product, or turn an incide
 regression. A human authorizes a target **out-of-band** (§10), then an agent (a SOC agent, a CI
 pipeline, a product copilot, a developer at the CLI) calls HEEL to run a swarm against it and
 receives a ranked **abuse report** as structured data. Each finding is an `AbuseVector` with a
-contained PoC, a severity, an optional data-classification annotation, and a recommended control.
+contained PoC, a severity, an optional data-classification annotation, an optional economic-impact
+annotation, and a recommended control.
 
 HEEL proves it works by **finding planted abuse vectors in a built-in synthetic product in
 advance, at a low false-positive rate.** That coverage backtest is the spine: built first, and
@@ -140,7 +141,9 @@ demoted by plausibility-weighting, a swarm-**discovered** scenario, and lane-dis
 
 `AbuseScenario`, `AbuseVector`, `MotivationProfile`, `AuthorizationScope` (signed, immutable),
 `CallerContext`, `SyntheticTarget`/`PlantedVector`, `ContainmentEntry`, plus the MCP tool schema
-in `mcp_server.TOOL_SCHEMAS` (scope-mutation tools absent by construction).
+in `mcp_server.TOOL_SCHEMAS` (scope-mutation tools absent by construction). `AbuseVector` can carry
+an optional `economic_impact` report-layer annotation; economic scoring is read-only and never
+creates, widens, relaxes, or mutates authorization scopes.
 
 ---
 

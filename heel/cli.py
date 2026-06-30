@@ -114,6 +114,44 @@ def _launch_review(args) -> int:
     return 2 if review.launch_gate_status == "block" else 1 if review.launch_gate_status == "warn" else 0
 
 
+def _report(srv: HeelServer, run_id: str, caller: str, economic: bool = False,
+            economic_assumptions: str | None = None) -> dict:
+    findings = srv.heel_get_findings({"run_id": run_id}, caller)["findings"]
+    row = srv.store.get_run(run_id)
+    report = {
+        "run_id": run_id,
+        "status": row["status"] if row else None,
+        "target": row["target"] if row else None,
+        "caller": row["caller"] if row else None,
+        "economic": bool(economic),
+        "findings": findings,
+    }
+    try:
+        report["coverage"] = srv.heel_get_coverage({"run_id": run_id}, caller)["coverage"]
+    except Exception:
+        report["coverage"] = None
+    if not economic:
+        return report
+
+    from .economics import estimate_economic_impact, load_assumptions, rank_by_economic_risk
+
+    assumptions = load_assumptions(economic_assumptions)
+    enriched = []
+    for finding in findings:
+        f = dict(finding)
+        f["economic_impact"] = estimate_economic_impact(f, assumptions=assumptions).to_dict()
+        enriched.append(f)
+    ranked = rank_by_economic_risk(enriched)
+    report["findings"] = ranked
+    report["economic_summary"] = {
+        "top_label": ranked[0]["economic_impact"]["label"] if ranked else None,
+        "top_estimated_monthly_range": ranked[0]["economic_impact"]["estimated_monthly_range"] if ranked else None,
+        "unknowns_present": any(f["economic_impact"]["unknowns"] for f in ranked),
+        "note": "Economic impact is directional and separate from security severity; assumptions and unknowns are shown per finding.",
+    }
+    return report
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="heel", description="HEEL: agent-native abuse-simulation tool")
     ap.add_argument("--version", action="version", version=f"heel {__version__}")
@@ -134,10 +172,16 @@ def main(argv=None):
     runp.add_argument("--scope", required=True)
     runp.add_argument("--target", required=True)
     runp.add_argument("--scenario", action="append")
+    runp.add_argument("--economic", action="store_true", help="include economic severity in the run output")
+    runp.add_argument("--economic-assumptions", help="optional EconomicAssumptions JSON file")
 
     for name in ("findings", "coverage", "log"):
         p = sub.add_parser(name)
         p.add_argument("--run", required=True)
+    report = sub.add_parser("report", help="print a run report with optional economic severity")
+    report.add_argument("--run", required=True)
+    report.add_argument("--economic", action="store_true")
+    report.add_argument("--economic-assumptions", help="optional EconomicAssumptions JSON file")
     scn = sub.add_parser("scenarios"); scn.add_argument("--filter")
     imp = sub.add_parser("import", help="validate sanitized target import models; no live probing")
     imps = imp.add_subparsers(dest="icmd", required=True)
@@ -230,7 +274,20 @@ def main(argv=None):
     if args.cmd == "run":
         try:
             r = srv.heel_run({"scope_id": args.scope, "target": args.target, "scenario_ids": args.scenario}, caller)
+            if args.economic:
+                r = dict(r)
+                r["economic_report"] = _report(srv, r["run_id"], caller, economic=True,
+                                               economic_assumptions=args.economic_assumptions)
             print(json.dumps(r, indent=2))
+        except Exception as e:
+            print(f"REJECTED: {e}")
+            return 1
+        return 0
+    if args.cmd == "report":
+        try:
+            print(json.dumps(_report(srv, args.run, caller, economic=args.economic,
+                                     economic_assumptions=args.economic_assumptions),
+                             indent=2, default=str))
         except Exception as e:
             print(f"REJECTED: {e}")
             return 1
