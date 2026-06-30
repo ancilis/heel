@@ -266,3 +266,13 @@ models those relationships as typed edges and converts suspicious edges into the
 systems. It is fed by sanitized ProductModel metadata, emits contained model affordances only, and
 inherits the imported-target rule: any rehearsal run still requires a human-created signed scope.
 MCP/REST/agent surfaces remain unable to create, widen, relax, or mutate scopes.
+
+### D-035 — Findings can become abuse regression tests without becoming repro playbooks
+**Why:** reports alone do not keep controls fixed. `heel.regressions` persists a finding's scenario,
+affordance pattern, declarative success criterion, recommended control, expected status, source run,
+and safety flags so teams can re-run the control check in CI or staging.
+
+**Safety consequence:** regression specs deliberately omit reproduction steps and working payloads.
+Re-runs call the same `HeelServer.heel_run` path, so signed scope verification, allowlist checks,
+resource limits, canary-only findings, and containment logging are reused. The regression CLI has no
+scope creation, widening, allowlist, or limit-mutation command.

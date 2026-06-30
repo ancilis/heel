@@ -126,6 +126,18 @@ def main(argv=None):
     imps = imp.add_subparsers(dest="icmd", required=True)
     impv = imps.add_parser("validate", help="validate a ProductModel JSON file")
     impv.add_argument("path")
+    reg = sub.add_parser("regress", help="turn findings into reusable abuse regression tests")
+    regs = reg.add_subparsers(dest="rcmd", required=True)
+    regadd = regs.add_parser("add", help="create a regression from a stored finding")
+    regadd.add_argument("--run", required=True)
+    regadd.add_argument("--vector", required=True)
+    regadd.add_argument("--name", required=True)
+    regs.add_parser("list", help="list abuse regressions")
+    regrun = regs.add_parser("run", help="run stored regressions within an existing signed scope")
+    regrun.add_argument("--target", required=True)
+    regrun.add_argument("--scope", required=True)
+    regexp = regs.add_parser("export", help="export regression specs and results")
+    regexp.add_argument("--format", choices=["json"], required=True)
 
     args = ap.parse_args(argv)
     if args.cmd is None:
@@ -139,6 +151,35 @@ def main(argv=None):
         return 0
     if args.cmd == "import" and args.icmd == "validate":
         return _import_validate(args.path)
+
+    if args.cmd == "regress":
+        from .regressions import (
+            add_regression_from_finding,
+            export_regressions,
+            resolve_target_argument,
+            run_regressions,
+        )
+        srv = _server()
+        caller = _caller()
+        try:
+            if args.rcmd == "add":
+                reg = add_regression_from_finding(srv.store, args.run, args.vector, args.name)
+                print(json.dumps({"regression": reg}, indent=2, default=str))
+                return 0
+            if args.rcmd == "list":
+                print(json.dumps({"regressions": srv.store.list_regressions()}, indent=2, default=str))
+                return 0
+            if args.rcmd == "run":
+                target = resolve_target_argument(args.target)
+                results = run_regressions(srv.store, srv, args.scope, target, caller)
+                print(json.dumps({"results": results}, indent=2, default=str))
+                return 0
+            if args.rcmd == "export":
+                print(json.dumps(export_regressions(srv.store), indent=2, default=str))
+                return 0
+        except Exception as e:
+            print(f"REJECTED: {e}")
+            return 1
 
     if args.cmd == "scope" and args.scmd == "create":
         if not args.confirm:
