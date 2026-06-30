@@ -50,6 +50,41 @@ def _spearman(xs, ys):
 def score_target(target: SyntheticTarget, agent_output: dict) -> dict:
     findings = agent_output["findings"]
     planted = target.planted_vectors
+    if not planted:
+        plausible = [f for f in findings if f.plausible]
+        implausible = [f for f in findings if not f.plausible]
+        cat10_findings = [f for f in plausible if f.category == Category.AGENT_MCP_SURFACE]
+        opportunistic = [f for f in findings if (f.reproduction or {}).get("class") == "opportunistic_human"]
+        imported = getattr(target, "requires_scope", False)
+        return {
+            "target": target.id, "kind": target.kind, "has_agent_surface": target.has_agent_surface,
+            "metric_kind": "imported_model_rehearsal" if imported else "unscored_no_ground_truth",
+            "caveat": ("Imported ProductModel rehearsal over sanitized metadata only; no planted ground truth "
+                       "exists, so coverage/precision/calibration are not measured and this is not live probing.")
+                      if imported else "No planted ground truth exists, so coverage is not measured.",
+            "reachable_planted": 0,
+            "true_positives": 0, "false_negatives": 0, "false_positives": None,
+            "coverage": None,
+            "attribution_true_positives": 0,
+            "attribution_coverage": None,
+            "coverage_reachability_weighted": None,
+            "false_positive_rate": None,
+            "severity_calibration": None,
+            "implausible_flagged": len(implausible),
+            "category_coverage": {},
+            "category10_findings": len(cat10_findings),
+            "category10_clean_on_non_ai": (target.has_agent_surface or len(cat10_findings) == 0),
+            "opportunistic_findings": len(opportunistic),
+            "opportunistic_affordances": [f.affordance_id for f in opportunistic],
+            "compound_chain_findings": 0,
+            "missed": [],
+            "false_positive_affordances": [],
+            "false_positive_scenarios": [],
+            "discovered_scenarios": [s.id for s in agent_output["discovered_scenarios"]],
+            "handoffs": agent_output["handoffs"],
+            "n_findings": len(findings), "n_plausible": len(plausible),
+            "safety_metadata": getattr(target, "safety_metadata", {}),
+        }
     planted_affordances = {pv.affordance_id for pv in planted}
     reachable = [pv for pv in planted if pv.reachable]
 

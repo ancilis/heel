@@ -159,7 +159,28 @@ def build_ai_target() -> SyntheticTarget:
 
 
 TARGETS = {t.id: t for t in (build_saas_target(), build_ai_target())}
+IMPORTED_TARGETS = {}
+
+
+def register_imported_target(target):
+    """Register a sanitized imported model for in-process rehearsal.
+
+    This does not authorize a run. The MCP/CLI/REST path still requires a signed
+    AuthorizationScope whose allowlist contains the imported target id.
+    """
+    if not getattr(target, "requires_scope", False):
+        raise ValueError("imported targets must require a signed scope")
+    safety = getattr(target, "safety_metadata", {}) or {}
+    if not safety.get("scope_required") or not safety.get("live_probing_disabled"):
+        raise ValueError("imported targets must carry safety metadata")
+    IMPORTED_TARGETS[target.id] = target
+    return target
+
+
+def clear_imported_targets():
+    """Clear in-memory imported targets. Primarily for tests and short-lived CLI sessions."""
+    IMPORTED_TARGETS.clear()
 
 
 def get_target(target_id: str) -> SyntheticTarget | None:
-    return TARGETS.get(target_id)
+    return TARGETS.get(target_id) or IMPORTED_TARGETS.get(target_id)

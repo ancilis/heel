@@ -193,7 +193,8 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 ## Docs
 
 [ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [DECISIONS](DECISIONS.md) · [SECURITY](SECURITY.md)
-· [TRUST](TRUST.md) · [CONTRIBUTING](CONTRIBUTING.md) · [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
+· [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
+[CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
 ## Status
 

@@ -480,6 +480,108 @@ class TestProductionHardening(Base):
         self.assertIn("10/10 categories", buf.getvalue())
 
 
+class TestProductModelImporter(Base):
+    def _product_model(self):
+        keys = [
+            "tenants", "roles", "plans", "meters", "coupons_promotions", "features_flags",
+            "endpoints_routes", "exports", "identity_auth_flows", "billing_objects",
+            "integration_oauth_apps", "webhooks", "support_admin_actions", "agent_tools",
+            "mcp_connectors", "data_classes", "audit_events", "declared_controls",
+            "canary_accounts", "safety_notes",
+        ]
+        model = {k: [] for k in keys}
+        model.update({
+            "schema_version": "ProductModel.v0.1",
+            "product_id": "acme-crm",
+            "source": "operator-authored launch review model",
+            "generated_at": "2026-06-30T12:00:00Z",
+            "environments": ["staging"],
+            "endpoints_routes": [
+                {"id": "records_export", "route": "/api/export", "entitlement_check": "missing"},
+            ],
+            "exports": [
+                {"id": "bulk_records", "route": "/api/export", "guard_present": False, "data_class": "canary_records"},
+            ],
+            "data_classes": ["canary_records"],
+            "canary_accounts": ["canary-user-001"],
+            "safety_notes": ["sanitized canary-only staging model; no secrets or customer data"],
+        })
+        return model
+
+    def test_valid_minimal_product_model_passes(self):
+        from heel.importers import validate_product_model
+        result = validate_product_model(self._product_model())
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.schema_version, "ProductModel.v0.1")
+        self.assertIn("acme-crm", result.summary)
+
+    def test_missing_required_product_model_fields_fail(self):
+        from heel.importers import validate_product_model
+        model = self._product_model()
+        del model["safety_notes"]
+        result = validate_product_model(model)
+        self.assertFalse(result.ok)
+        self.assertTrue(any("safety_notes" in e for e in result.errors))
+
+    def test_secrets_looking_keys_and_values_are_rejected_without_echoing_secret(self):
+        from heel.importers import validate_product_model
+        model = self._product_model()
+        secret = "sk-live-1234567890abcdef"
+        model["integration_oauth_apps"] = [{"id": "crm", "client_secret": secret}]
+        result = validate_product_model(model)
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.errors)
+        self.assertIn("client_secret", joined)
+        self.assertNotIn(secret, joined)
+
+    def test_conversion_produces_affordances_and_safety_metadata(self):
+        from heel.importers import target_from_product_model
+        target = target_from_product_model(self._product_model())
+        self.assertEqual(target.id, "imported:acme-crm")
+        self.assertGreaterEqual(len(target.affordances), 2)
+        self.assertEqual(target.planted_vectors, [])
+        self.assertTrue(target.requires_scope)
+        self.assertTrue(target.safety_notes)
+        self.assertTrue(target.safety_metadata["scope_required"])
+        self.assertTrue(target.safety_metadata["live_probing_disabled"])
+
+    def test_imported_target_requires_signed_scope_to_run(self):
+        from heel.importers import target_from_product_model
+        from heel.targets import clear_imported_targets, register_imported_target
+
+        clear_imported_targets()
+        target = register_imported_target(target_from_product_model(self._product_model()))
+        with self.assertRaises(ToolError):
+            self.server.heel_run({"target": target.id}, self.caller)
+        with self.assertRaises(ToolError):
+            self.server.heel_run({"scope_id": "scope-forged", "target": target.id}, self.caller)
+
+        scope = scopemod.create_scope([target.id], operator="tester")
+        run = self.server.heel_run({"scope_id": scope.scope_id, "target": target.id,
+                                    "agent_classes": ["adversarial"]}, self.caller)
+        self.assertEqual(run["status"], "complete")
+        cov = self.server.heel_get_coverage({"run_id": run["run_id"]}, self.caller)["coverage"]
+        self.assertEqual(cov["metric_kind"], "imported_model_rehearsal")
+        self.assertIsNone(cov["coverage"])
+        clear_imported_targets()
+
+    def test_import_validate_cli_prints_human_readable_summary(self):
+        import io
+        from contextlib import redirect_stdout
+        from heel import cli
+
+        path = Path(tempfile.mkdtemp()) / "product_model.json"
+        path.write_text(json.dumps(self._product_model()))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["import", "validate", str(path)])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("ProductModel.v0.1", out)
+        self.assertIn("imported:acme-crm", out)
+        self.assertIn("safety notes", out.lower())
+
+
 class TestDocsAndMetadata(unittest.TestCase):
     ROOT = Path(__file__).resolve().parents[1]
 
