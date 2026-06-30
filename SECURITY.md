@@ -11,10 +11,12 @@ not include real exploit payloads against third-party systems; HEEL is synthetic
 
 ## What HEEL is (and is not)
 
-HEEL **rehearses how a customer or third party could abuse a product you own**, before launch. It is
-a pre-launch abuse-simulation harness, **not** a replacement for application-security review,
-penetration testing, or a bug-bounty program. Findings are **predicted, contained, canary-only**
-proofs that an abuse path is *reachable*, they are leads to harden, not exploit code.
+HEEL **rehearses how a customer, integration, bot, or agent could abuse a SaaS product you own**,
+before launch and continuously after. Pre-launch launch review remains the default wedge, but
+existing products can be rehearsed through authorized staging, sandbox, imported-model, sanitized
+telemetry, or production-like adapter paths. It is **not** a replacement for application-security
+review, penetration testing, or a bug-bounty program. Findings are **predicted, contained,
+canary-only** proofs that an abuse path is *reachable*, they are leads to harden, not exploit code.
 
 ## The authorization model (§10, the non-negotiable safety spine)
 
@@ -26,6 +28,10 @@ caller as a **confused deputy**:
   is created **only** via `heel scope create --confirm` and written as an **HMAC-signed** file. No
   MCP / REST / agent code path can create, widen, add a target to, relax the limits of, or escape a
   scope: those tools **do not exist in the registry, by construction**.
+- **All non-synthetic flows require signed scopes.** Real-target adapters, imported product models,
+  sanitized telemetry, staging rehearsals, and production-like targets must be covered by an explicit
+  human-created `AuthorizationScope` before an agent can run. The scope binds the allowlist, data
+  handling mode, expiry, and operator-approved limits.
 - **Immutable from the caller side.** The server only loads + verifies scopes; it never writes them.
   Hand-editing a signed scope file breaks the signature and the scope fails closed.
 - **Every escalation is rejected and logged.** Out-of-allowlist targets, forged scope ids,
@@ -43,6 +49,19 @@ plausibility-weighting · severity honesty · immutable self-audit · **lane dis
 software vulnerability is handed off to AppSec; a pure model-jailbreak surface is handed off to model
 red-team: neither is weaponized or counted as a product-abuse finding).
 
+## Existing product mode safety constraints
+
+Existing-product rehearsal is allowed only when the operator keeps the run contained:
+
+- Prefer staging, sandbox, or imported product models over production-like targets.
+- Use synthetic users, canary tenants, canary records, and sanitized telemetry.
+- Prefer read-only discovery where possible.
+- Do not perform real exfiltration, credential abuse, payment abuse, spam, or resource exhaustion.
+- Do not run automated high-volume probing.
+- Keep limits operator-approved and encoded in the signed scope before any MCP, REST, or agent run.
+- Treat true software vulnerabilities as AppSec handoffs and pure jailbreaks as model red-team
+  handoffs, not HEEL findings to weaponize.
+
 ## Production hardening checklist
 
 - [ ] **Separate key from data.** Set `HEEL_SIGNING_KEY` to a path (or secret mount) **outside**
@@ -59,8 +78,9 @@ red-team: neither is weaponized or counted as a product-abuse finding).
       attribution, not authentication. The server also rejects non-loopback `Host` headers (anti
       DNS-rebinding) and any request carrying an `Origin` (anti-CSRF).
 - [ ] **Run against synthetic or explicitly-authorized targets only.** v1 ships two synthetic
-      targets; real-target adapters are out of v1 scope. A human must authorize any target
-      out-of-band before it can be run.
+      targets. Real-target adapters are beta and must run through signed scopes, canary-only data,
+      and operator-approved limits. A human must authorize any target out-of-band before it can be
+      run.
 - [ ] **LLM control loop.** The optional `HEEL_MODEL=anthropic` path sends only *observable
       affordance properties* (never secrets/PII) to the Messages API and only receives declarative
       scenario proposals; it stays in HEEL's lane and falls back to the offline deterministic model

@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "HEEL — control room",
-  description: "Rehearse abuse against your own product before it ships.",
+  description: "Rehearse SaaS abuse before launch and continuously after.",
 };
 
 export default function RootLayout({

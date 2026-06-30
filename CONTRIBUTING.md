@@ -1,6 +1,7 @@
 # Contributing to HEEL
 
-Thanks for helping rehearse abuse before it ships. HEEL is small, pure-stdlib, and test-first.
+Thanks for helping rehearse SaaS abuse before launch and continuously after. HEEL is small,
+pure-stdlib, and test-first.
 
 ## Setup
 

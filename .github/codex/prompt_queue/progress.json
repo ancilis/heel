@@ -1,8 +1,15 @@
 {
   "queue_version": "0.1",
-  "next_prompt_id": 1,
-  "completed_prompt_ids": [],
+  "next_prompt_id": 2,
+  "completed_prompt_ids": [
+    1
+  ],
   "in_flight": null,
-  "last_pr": null,
+  "last_pr": {
+    "prompt_id": 1,
+    "slug": "01_reposition_continuous_abuse_rehearsal",
+    "pr_url": "",
+    "advanced_at": "2026-06-30T04:39:45.420317+00:00"
+  },
   "notes": "The local Codex CLI runner updates this file inside each queued PR. Merging the PR advances the queue."
 }

@@ -5,7 +5,9 @@ Run: `python3 -m unittest discover -s tests`.
 """
 import json
 import os
+from pathlib import Path
 import tempfile
+import tomllib
 import unittest
 
 os.environ["HEEL_HOME"] = tempfile.mkdtemp()
@@ -476,6 +478,43 @@ class TestProductionHardening(Base):
             rc = cli._doctor()
         self.assertEqual(rc, 0)
         self.assertIn("10/10 categories", buf.getvalue())
+
+
+class TestDocsAndMetadata(unittest.TestCase):
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def _read(self, rel):
+        return (self.ROOT / rel).read_text()
+
+    def test_docs_do_not_claim_unrestricted_production_probing(self):
+        readme = self._read("README.md").lower()
+        security = self._read("SECURITY.md").lower()
+        combined = readme + "\n" + security
+
+        forbidden = [
+            "unrestricted production probing",
+            "arbitrary active probes against production",
+            "run arbitrary active probes against production",
+            "production targets do not require authorization",
+            "production probing without approval",
+        ]
+        for phrase in forbidden:
+            self.assertNotIn(phrase, combined)
+
+        self.assertIn("explicitly authorized production-like targets", readme)
+        self.assertIn("operator-approved limits", security)
+        self.assertIn("signed scopes", security)
+        self.assertIn("canary-only", security)
+
+    def test_pyproject_description_positions_abuse_rehearsal_without_pentest_overclaim(self):
+        with (self.ROOT / "pyproject.toml").open("rb") as fh:
+            project = tomllib.load(fh)["project"]
+        description = project["description"].lower()
+
+        self.assertIn("abuse rehearsal", description)
+        self.assertIn("saas", description)
+        self.assertNotIn("pentest replacement", description)
+        self.assertNotIn("penetration testing replacement", description)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,16 @@ yourself.
 - **CI matrix**: tests on Python 3.11/3.12/3.13 + a clean wheel-install smoke test + the UI build,
   green on every commit to `main`.
 
+## Production-ready vs beta
+
+The production-ready claim applies to HEEL's safety, authorization, containment, audit, and
+evaluation spine: signed scopes, no MCP/REST/agent scope mutation path, canary-only findings, lane
+discipline, and the honest evaluation ladder are implemented and tested.
+
+Real-target adapter coverage is beta. Existing-product rehearsals must stay inside explicit human
+authorization, canary-only data, sanitized imports or telemetry, and operator-approved limits until
+adapters mature.
+
 ## Adversarial review (the real assurance)
 
 HEEL was hardened by **four independent multi-agent red-team passes**, each attacking a different
@@ -49,7 +59,9 @@ mis-categorization gaps rather than hiding them. Method + provenance:
 Synthetic-first · contained, canary-only PoCs (never working exploits / real exfiltration) · never
 generates prohibited content under any framing · no real-PII · plausibility-weighted · severity-honest
 · immutable hash-chained self-audit · lane discipline (true vulns → AppSec, jailbreaks → model
-red-team). Threat model + production-hardening checklist + responsible disclosure:
+red-team). Existing-product runs use staging, imported models, sanitized telemetry, or explicitly
+authorized production-like targets with canaries and limits. Threat model + production-hardening
+checklist + responsible disclosure:
 [`SECURITY.md`](SECURITY.md).
 
 ## Verify it yourself in one minute

@@ -1,6 +1,6 @@
 <h1 align="center">HEEL</h1>
 
-<p align="center"><b>Rehearse how your customers will abuse your product, before they do.</b></p>
+<p align="center"><b>Abuse rehearsal for SaaS, before launch and continuously after.</b></p>
 
 <p align="center">
 <a href="https://github.com/ancilis/heel/actions/workflows/ci.yml"><img src="https://github.com/ancilis/heel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -17,10 +17,19 @@
 
 It's launch day. Somewhere, a customer just found the export endpoint with no rate limit, farmed your
 "one free trial" a thousand times, or talked your AI agent into calling a tool it should never touch.
+Six months later, the same product may be dealing with trial farming already happening, seat sharing
+on mature accounts, export scraping by legitimate customers, AI-token cost abuse, integration/OAuth
+overreach, or support/workflow gaming after an incident.
 
-**HEEL is the villain you rehearse against first.** A swarm of adversarial and opportunistic agents
+**HEEL is abuse rehearsal for SaaS.** A swarm of adversarial and opportunistic agents
 probes a product *you own*, proves an abuse path is **reachable** with a *contained* proof-of-concept,
-and hands you a ranked report with the fix, before you ship.
+and hands you a ranked report with the fix, before launch and continuously after.
+
+Pre-launch launch review remains the sharpest default use case. Existing products are supported
+through authorized, contained, canary-only runs against staging, imported product models, sanitized
+telemetry, or explicitly authorized production-like targets. HEEL is not a default permission slip
+for production probing: every non-synthetic path starts with a human-created scope and
+operator-approved limits.
 
 It is **agent-native** (its canonical surface is an **MCP server** other agents call), **honest** (it
 reports its *real* detection rate against abuse it has never seen, not a vanity number), and
@@ -72,6 +81,35 @@ That second number is the point: **HEEL tells you what it can't catch yet.**
 - 🛡️ **Safety spine, non-negotiable.** Synthetic-first. Findings are *contained, canary-only* proofs,
   never working exploits, real exfiltration, or prohibited content. True software vulns are handed off
   to AppSec, pure model-jailbreaks to model red-team. HEEL stays in its lane. See [SECURITY.md](SECURITY.md).
+
+## Pre-launch, post-launch, and after incidents
+
+- **Pre-launch:** run the launch review before customer traffic arrives. Rehearse trial farming,
+  export/rate-limit abuse, weak recovery, entitlement bypass, agent tool over-scope, and integration
+  abuse while the blast radius is still synthetic or staging-only.
+- **Post-launch:** turn observed product pressure into contained scenarios. Rehearse trial farming
+  already happening, seat sharing on mature accounts, export scraping by legitimate customers,
+  AI-token cost abuse, and integration/OAuth overreach.
+- **After incidents:** convert the incident pattern into a regression scenario, especially support
+  and workflow gaming where the issue was a business-process affordance rather than a software vuln.
+
+## What HEEL is not
+
+HEEL complements adjacent programs; it does not replace them.
+
+- Not a pentest replacement.
+- Not functional QA.
+- Not runtime fraud decisioning.
+- Not a bot mitigation service.
+- Not a jailbreak tool.
+
+| tool class | primary job | how HEEL differs |
+|---|---|---|
+| Pentest / AppSec scanner | Find software vulnerabilities and exploitable implementation flaws | HEEL rehearses product-abuse paths and hands true vulns to AppSec |
+| QA / functional testing | Prove expected workflows work | HEEL asks how valid features can be gamed by customers, integrations, bots, or agents |
+| Fraud / bot platform | Make live runtime allow/block decisions | HEEL rehearses controls with canaries; it is not production fraud decisioning |
+| Model red-team | Probe model jailbreak and safety behavior | HEEL handles product and business consequences; pure jailbreaks are handed to model red-team |
+| HEEL | Rehearse SaaS abuse before launch and across production life | MCP-first, scope-gated, contained, canary-only abuse rehearsal |
 
 ## What it hunts
 
@@ -140,7 +178,8 @@ HEEL_MODEL=anthropic ANTHROPIC_API_KEY=sk-... heel-mcp   # via stdlib urllib, no
 ```
 
 It only ever sees *observable* synthetic affordance properties (never secrets or real data) and stays
-in HEEL's lane.
+in HEEL's lane. For imported or real-target adapters, that means scoped, sanitized, canary-only
+metadata, never secrets or real customer data.
 
 ## Security & assurance
 
@@ -158,9 +197,10 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 
 ## Status
 
-**Production-ready (v1.1.0).** 53 tests on Python 3.11 to 3.13, CI green, zero runtime dependencies,
-four red-team passes. Next: LLM-driven detection to lift attribution recall, larger held-out sets,
-real-target adapters.
+**Production-ready safety/auth/eval spine, beta real-target adapter coverage (v1.1.0).** 55 core
+tests on Python 3.11 to 3.13, CI green, zero runtime dependencies, four red-team passes. The core
+authorization gate, containment model, and evaluation ladder are the production-ready spine.
+Real-target adapters remain beta until adapter coverage and operator controls mature.
 
 ---
 

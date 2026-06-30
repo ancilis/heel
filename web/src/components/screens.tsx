@@ -27,7 +27,7 @@ export function Overview({ s, go }: { s: any; go: (k: string) => void }) {
   ];
   return (
     <div className="space-y-4">
-      <Panel title="HEEL" sub="Rehearse how a customer or third party could abuse your product — before it ships.">
+      <Panel title="HEEL" sub="Rehearse customer, integration, bot, and agent abuse before launch and continuously after.">
         <div className="grid grid-cols-2 md:grid-cols-3 gap-2.5">
           {tiles.map(t => <button key={t.k} onClick={() => go(t.k)} className="text-left"><Stat label={t.label} value={t.value} sub={t.sub} tone={(t as any).tone} /></button>)}
         </div>
