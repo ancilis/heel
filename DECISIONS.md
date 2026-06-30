@@ -255,3 +255,14 @@ requires an explicit human-created `AuthorizationScope`. MCP, REST, and agent su
 execution/read-only and cannot create, widen, relax, or mutate scopes. Real-target adapters are beta
 until adapter coverage matures, and must run with signed scopes, canary-only data, no real
 exfiltration, no resource exhaustion, no automated high-volume probing, and operator-approved limits.
+
+### D-034 — EntitlementGraph is a static model layer that emits ordinary affordances
+**Why:** entitlement abuse is the common SaaS case: a principal gets more feature, data, quota,
+tenant reach, cost shift, integration power, or agent power than intended. `heel.entitlements`
+models those relationships as typed edges and converts suspicious edges into the same declarative
+`Affordance` shape the existing scenario engine already evaluates.
+
+**Safety consequence:** the graph does not add a new execution surface and does not probe live
+systems. It is fed by sanitized ProductModel metadata, emits contained model affordances only, and
+inherits the imported-target rule: any rehearsal run still requires a human-created signed scope.
+MCP/REST/agent surfaces remain unable to create, widen, relax, or mutate scopes.
