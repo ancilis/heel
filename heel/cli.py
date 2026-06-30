@@ -67,6 +67,36 @@ def _caller():
         return "cli:operator"
 
 
+def _import_validate(path: str) -> int:
+    from .importers import ProductModelError, load_product_model, target_from_product_model, validate_product_model
+    try:
+        model = load_product_model(path)
+    except ProductModelError as e:
+        print(f"ProductModel validation: FAIL ({e})")
+        return 1
+    result = validate_product_model(model)
+    print(f"ProductModel validation: {'PASS' if result.ok else 'FAIL'}")
+    print(f"  schema: {result.schema_version}")
+    print(f"  summary: {result.summary}")
+    if result.errors:
+        print("  errors:")
+        for err in result.errors:
+            print(f"    - {err}")
+    if result.warnings:
+        print("  warnings:")
+        for warn in result.warnings:
+            print(f"    - {warn}")
+    if not result.ok:
+        return 1
+    target = target_from_product_model(model)
+    print(f"  target id: {target.id}")
+    print(f"  affordances: {len(target.affordances)}")
+    print(f"  safety notes: {len(target.safety_notes)}")
+    print("  mode: imported-model rehearsal only; no live probing or network calls")
+    print("  authorization: signed human-created scope required before any run")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="heel", description="HEEL: agent-native abuse-simulation tool")
     ap.add_argument("--version", action="version", version=f"heel {__version__}")
@@ -92,6 +122,10 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument("--run", required=True)
     scn = sub.add_parser("scenarios"); scn.add_argument("--filter")
+    imp = sub.add_parser("import", help="validate sanitized target import models; no live probing")
+    imps = imp.add_subparsers(dest="icmd", required=True)
+    impv = imps.add_parser("validate", help="validate a ProductModel JSON file")
+    impv.add_argument("path")
 
     args = ap.parse_args(argv)
     if args.cmd is None:
@@ -103,6 +137,8 @@ def main(argv=None):
         from .heldout_eval import heldout_eval
         print(heldout_eval().get("headline", "(no held-out test set installed)"))
         return 0
+    if args.cmd == "import" and args.icmd == "validate":
+        return _import_validate(args.path)
 
     if args.cmd == "scope" and args.scmd == "create":
         if not args.confirm:
