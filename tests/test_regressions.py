@@ -12,7 +12,7 @@ os.environ["HEEL_HOME"] = tempfile.mkdtemp()
 from heel import cli  # noqa: E402
 from heel import scope as scopemod  # noqa: E402
 from heel.mcp_server import HeelServer, ToolError  # noqa: E402
-from heel.regressions import add_regression_from_finding, run_regressions  # noqa: E402
+from heel.regressions import add_regression_from_finding, resolve_target_argument, run_regressions  # noqa: E402
 from heel.store import Store  # noqa: E402
 from heel.targets import clear_imported_targets, get_target, register_imported_target  # noqa: E402
 
@@ -173,6 +173,17 @@ class TestAbuseRegressions(RegressionBase):
             self.assertEqual(cli.main(["regress", "export", "--format", "json"]), 0)
         exported = json.loads(out.getvalue())
         self.assertEqual(exported["regressions"][0]["original_vector_id"], self.vector["id"])
+
+    def test_target_id_matching_non_json_file_is_not_imported(self):
+        cwd = os.getcwd()
+        try:
+            os.chdir(self.home)
+            with open("synthetic-saas", "w") as fh:
+                fh.write("{}")
+
+            self.assertEqual(resolve_target_argument("synthetic-saas"), "synthetic-saas")
+        finally:
+            os.chdir(cwd)
 
     def test_missing_scope_is_rejected_instead_of_created(self):
         self.add_trial_regression()

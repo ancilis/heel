@@ -212,7 +212,7 @@ def export_regressions(store) -> dict:
 
 def resolve_target_argument(target_arg: str) -> str:
     """Resolve `heel regress run --target` as either a target id or a ProductModel JSON path."""
-    if os.path.exists(target_arg):
+    if os.path.isfile(target_arg) and target_arg.lower().endswith(".json"):
         from .importers import load_product_model, target_from_product_model
         from .targets import register_imported_target
 
