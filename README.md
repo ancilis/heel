@@ -149,6 +149,10 @@ heel scope create --target synthetic-saas --operator you --confirm
 heel run --scope <scope_id> --target synthetic-saas
 heel coverage --run <run_id>
 heel log --run <run_id>          # immutable, hash-chained audit trail
+
+# 3) turn a finding into a permanent abuse-control regression
+heel regress add --run <run_id> --vector <vector_id> --name free_trial_serial_signup
+heel regress run --scope <scope_id> --target synthetic-saas
 ```
 
 **Connect from an MCP client.** Point Claude Desktop / Cursor / CI at the `heel-mcp` server:
@@ -193,7 +197,7 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 ## Docs
 
 [ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [DECISIONS](DECISIONS.md) · [SECURITY](SECURITY.md)
-· [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) · [ENTITLEMENTS](docs/ENTITLEMENTS.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
+· [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) · [ENTITLEMENTS](docs/ENTITLEMENTS.md) · [REGRESSIONS](docs/REGRESSIONS.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
 [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
 ## Status

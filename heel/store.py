@@ -18,8 +18,15 @@ CREATE TABLE IF NOT EXISTS findings(
 CREATE TABLE IF NOT EXISTS containment(
   seq INTEGER, ts REAL, run_id TEXT, caller TEXT, action TEXT, detail TEXT,
   prev_hash TEXT, entry_hash TEXT);
+CREATE TABLE IF NOT EXISTS regressions(
+  regression_id TEXT PRIMARY KEY, name TEXT, original_vector_id TEXT, scenario_id TEXT,
+  target_affordance_pattern TEXT, success_criterion TEXT, recommended_control TEXT,
+  expected_status TEXT, created_at REAL, source_run_id TEXT, safety_flags TEXT, json TEXT);
+CREATE TABLE IF NOT EXISTS regression_results(
+  regression_id TEXT, run_id TEXT, scope_id TEXT, target TEXT, status TEXT, created_at REAL, json TEXT);
 CREATE INDEX IF NOT EXISTS idx_find_run ON findings(run_id);
 CREATE INDEX IF NOT EXISTS idx_cont_run ON containment(run_id);
+CREATE INDEX IF NOT EXISTS idx_reg_result_reg ON regression_results(regression_id);
 """
 
 
@@ -59,9 +66,66 @@ class Store:
         return [json.loads(r["json"]) for r in
                 self.conn.execute("SELECT json FROM findings WHERE run_id=? ORDER BY severity DESC", (run_id,)).fetchall()]
 
-    def find_vector(self, vector_id):
-        r = self.conn.execute("SELECT json FROM findings WHERE vector_id=? LIMIT 1", (vector_id,)).fetchone()
+    def find_vector(self, vector_id, run_id=None):
+        if run_id is not None:
+            r = self.conn.execute("SELECT json FROM findings WHERE vector_id=? AND run_id=? LIMIT 1",
+                                  (vector_id, run_id)).fetchone()
+        else:
+            r = self.conn.execute("SELECT json FROM findings WHERE vector_id=? LIMIT 1", (vector_id,)).fetchone()
         return json.loads(r["json"]) if r else None
+
+    def add_regression(self, regression):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO regressions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                regression["regression_id"],
+                regression["name"],
+                regression["original_vector_id"],
+                regression["scenario_id"],
+                json.dumps(regression["target_affordance_pattern"], sort_keys=True, default=str),
+                json.dumps(regression["success_criterion"], sort_keys=True, default=str),
+                regression["recommended_control"],
+                regression["expected_status"],
+                regression["created_at"],
+                regression["source_run_id"],
+                json.dumps(regression["safety_flags"], sort_keys=True, default=str),
+                json.dumps(regression, sort_keys=True, default=str),
+            ),
+        )
+        self.conn.commit()
+
+    def get_regression(self, regression_id):
+        r = self.conn.execute("SELECT json FROM regressions WHERE regression_id=?", (regression_id,)).fetchone()
+        return json.loads(r["json"]) if r else None
+
+    def list_regressions(self):
+        rows = self.conn.execute("SELECT json FROM regressions ORDER BY created_at, regression_id").fetchall()
+        return [json.loads(r["json"]) for r in rows]
+
+    def add_regression_result(self, result):
+        self.conn.execute(
+            "INSERT INTO regression_results VALUES (?,?,?,?,?,?,?)",
+            (
+                result["regression_id"],
+                result["run_id"],
+                result["scope_id"],
+                result["target"],
+                result["current_status"],
+                result["created_at"],
+                json.dumps(result, sort_keys=True, default=str),
+            ),
+        )
+        self.conn.commit()
+
+    def list_regression_results(self, regression_id=None):
+        if regression_id:
+            rows = self.conn.execute(
+                "SELECT json FROM regression_results WHERE regression_id=? ORDER BY created_at",
+                (regression_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT json FROM regression_results ORDER BY created_at").fetchall()
+        return [json.loads(r["json"]) for r in rows]
 
     def add_containment(self, e):
         self.conn.execute("INSERT INTO containment VALUES (?,?,?,?,?,?,?,?)",

@@ -107,6 +107,19 @@ Open draft queued PRs instead of ready PRs:
 python3 scripts/codex/local_queue_runner.py run-next --draft-pr
 ```
 
+Act on trusted Claude review feedback for an open queue PR:
+
+```bash
+python3 scripts/codex/local_queue_runner.py repair-pr 15
+```
+
+`repair-pr` only consumes formal Claude reviewer Action reviews and local
+comments headed `### Local Claude Max review` from trusted authors. It checks
+out the PR branch, gives Codex the original queued prompt, trusted review text,
+and current PR diff, then asks Codex to verify each item, implement only valid
+actionable feedback, run tests, push any repair commit to the same PR, and post
+a summary comment. It refuses to run on PRs that are not labeled `codex-queue`.
+
 ## Files
 
 - `.github/codex/prompts/` - one prompt per PR-sized task.

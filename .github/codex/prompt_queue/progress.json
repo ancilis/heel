@@ -1,17 +1,18 @@
 {
   "queue_version": "0.1",
-  "next_prompt_id": 4,
+  "next_prompt_id": 5,
   "completed_prompt_ids": [
     1,
     2,
-    3
+    3,
+    4
   ],
   "in_flight": null,
   "last_pr": {
-    "prompt_id": 3,
-    "slug": "03_entitlement_graph",
+    "prompt_id": 4,
+    "slug": "04_abuse_regressions",
     "pr_url": "",
-    "advanced_at": "2026-06-30T13:34:17.010956+00:00"
+    "advanced_at": "2026-06-30T14:55:30.155500+00:00"
   },
   "notes": "The local Codex CLI runner updates this file inside each queued PR. Merging the PR advances the queue."
 }

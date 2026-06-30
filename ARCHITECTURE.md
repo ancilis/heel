@@ -59,6 +59,11 @@ CLI and (future) UI are thin clients over the same capability.
 allowlist modification, limit relaxation. **These tools do not exist in the registry by
 construction** — there is no code path from the MCP/REST/agent surface to mint or widen a scope.
 
+**CLI-only regression harness:** `heel regress add/list/run/export` turns stored findings into
+abuse-control regression tests. It is a thin client over the same store and `HeelServer` run path:
+regression re-runs still require an existing signed scope, never mutate scopes, emit canary-only
+evidence summaries instead of repro steps, and append containment log entries.
+
 ---
 
 ## 3. The safety & authorization spine (NON-NEGOTIABLE, §10)
