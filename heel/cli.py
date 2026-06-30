@@ -97,6 +97,23 @@ def _import_validate(path: str) -> int:
     return 0
 
 
+def _launch_review(args) -> int:
+    from .importers import ProductModelError
+    from .launch_review import load_and_review, render_human_summary, review_git_diff, review_to_json
+    try:
+        if args.diff:
+            review = review_git_diff(args.diff)
+        else:
+            review = load_and_review(args.before, args.after)
+    except ProductModelError as e:
+        print(f"Launch review: FAIL ({e})")
+        return 2
+    print(render_human_summary(review))
+    print("JSON report:")
+    print(review_to_json(review))
+    return 2 if review.launch_gate_status == "block" else 1 if review.launch_gate_status == "warn" else 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="heel", description="HEEL: agent-native abuse-simulation tool")
     ap.add_argument("--version", action="version", version=f"heel {__version__}")
@@ -126,6 +143,11 @@ def main(argv=None):
     imps = imp.add_subparsers(dest="icmd", required=True)
     impv = imps.add_parser("validate", help="validate a ProductModel JSON file")
     impv.add_argument("path")
+    launch = sub.add_parser("launch-review", help="compare ProductModel changes before launch")
+    launch_inputs = launch.add_mutually_exclusive_group(required=True)
+    launch_inputs.add_argument("--diff", help="git revision range containing a ProductModel JSON change")
+    launch_inputs.add_argument("--before", help="ProductModel JSON before the launch change")
+    launch.add_argument("--after", help="ProductModel JSON after the launch change")
     reg = sub.add_parser("regress", help="turn findings into reusable abuse regression tests")
     regs = reg.add_subparsers(dest="rcmd", required=True)
     regadd = regs.add_parser("add", help="create a regression from a stored finding")
@@ -149,6 +171,11 @@ def main(argv=None):
         from .heldout_eval import heldout_eval
         print(heldout_eval().get("headline", "(no held-out test set installed)"))
         return 0
+    if args.cmd == "launch-review":
+        if not args.diff and not args.after:
+            print("Launch review: FAIL (--after is required with --before)")
+            return 2
+        return _launch_review(args)
     if args.cmd == "import" and args.icmd == "validate":
         return _import_validate(args.path)
 
