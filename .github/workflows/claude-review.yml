@@ -1,0 +1,170 @@
+# Claude reviewer workflow for Heel.
+#
+# Required repo secret: CLAUDE_CODE_OAUTH_TOKEN
+# Generate it through Claude Code /install-github-app or the Claude Code
+# dashboard GitHub App flow. This uses Claude account OAuth, not an Anthropic
+# API key.
+#
+# The workflow asks Claude to review the PR diff, return a structured verdict,
+# then submits a formal GitHub review with gh pr review.
+
+name: Claude reviewer
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to review manually
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Skip drafts and fork PRs on pull_request events; allow manual dispatch.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve PR number
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.pr_number }}" ]; then
+            echo "number=${{ inputs.pr_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check Claude OAuth token
+        id: claude_auth
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip until Claude OAuth token is configured
+        if: steps.claude_auth.outputs.enabled != 'true'
+        run: |
+          echo "CLAUDE_CODE_OAUTH_TOKEN is not configured; skipping Claude review."
+
+      - name: Run Claude reviewer
+        if: steps.claude_auth.outputs.enabled == 'true'
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --json-schema '{"type":"object","required":["verdict","summary"],"properties":{"verdict":{"type":"string","enum":["approve","comment","request_changes"]},"summary":{"type":"string","description":"Markdown review body, 2-8 sentences"}}}'
+            --allowed-tools "Read,Glob,Grep,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*)"
+            --max-turns 12
+          prompt: |
+            You are the Claude reviewer for Heel. Review PR #${{ steps.pr.outputs.number }} in this repo.
+
+            ## How to gather context
+
+            1. `gh pr view ${{ steps.pr.outputs.number }} --json title,body,author,baseRefName,headRefName,additions,deletions,changedFiles,labels,isDraft`
+            2. `gh pr diff ${{ steps.pr.outputs.number }}` - read the full diff
+            3. Use Read / Glob to inspect unchanged files needed for context
+            4. `gh pr checks ${{ steps.pr.outputs.number }}` if CI status is relevant
+
+            ## How to decide
+
+            Pick exactly one verdict:
+
+            - `approve` - the change is correct, in scope, tested where appropriate, and has no safety, security, dependency, or product-claim concern.
+            - `comment` - the change has questions, suggestions, or context worth surfacing, but nothing blocking.
+            - `request_changes` - there is a real defect, safety regression, security issue, missing required test, unjustified runtime dependency, inaccurate public claim, or CI failure that is not a known flake.
+
+            ## Heel review priorities
+
+            - Heel is synthetic-first abuse rehearsal software. It must not drift into real exploitation, prohibited content generation, or production probing without explicit authorization.
+            - The authorization gate is non-negotiable: agent, MCP, REST, and CLI surfaces must not be able to create, widen, forge, or mutate human-approved scopes.
+            - Scope files, HMAC signing, audit logs, and containment evidence must remain tamper-evident.
+            - Runtime dependencies should stay zero unless the PR explicitly justifies a change and updates packaging, docs, and tests.
+            - Public docs must not overclaim detection quality, production readiness, or exploit capability beyond the measured held-out results.
+            - Agent-authored PRs are normal. Review them on their merits.
+            - For PRs labeled `codex-queue`, confirm the diff addresses only that queued prompt, does not start later prompts, and advances `.github/codex/prompt_queue/progress.json` by exactly one prompt.
+
+            ## Output format
+
+            Return ONLY a JSON object matching the configured schema:
+
+            ```json
+            {"verdict":"approve|comment|request_changes","summary":"<your markdown review, 2-8 sentences>"}
+            ```
+
+            The summary is posted as the formal review body. Make it useful: name what changed, what you checked, and why you chose the verdict.
+
+      - name: Submit formal review
+        if: always() && steps.claude_auth.outputs.enabled == 'true' && steps.claude.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          STRUCTURED_OUTPUT: ${{ steps.claude.outputs.structured_output }}
+          SESSION_ID: ${{ steps.claude.outputs.session_id }}
+        run: |
+          if [ -z "$STRUCTURED_OUTPUT" ]; then
+            echo "No structured output from Claude; nothing to submit."
+            exit 0
+          fi
+
+          VERDICT=$(echo "$STRUCTURED_OUTPUT" | jq -r '.verdict // empty')
+          SUMMARY=$(echo "$STRUCTURED_OUTPUT" | jq -r '.summary // empty')
+
+          if [ -z "$VERDICT" ] || [ -z "$SUMMARY" ]; then
+            echo "Claude returned malformed structured_output:"
+            echo "$STRUCTURED_OUTPUT"
+            exit 0
+          fi
+
+          BODY=$(cat <<BODY_EOF
+          $SUMMARY
+
+          ---
+          Submitted by the Claude reviewer Action. session=\`$SESSION_ID\`.
+          BODY_EOF
+          )
+
+          case "$VERDICT" in
+            approve)
+              gh pr review "$PR_NUMBER" --approve --body "$BODY"
+              ;;
+            request_changes)
+              gh pr review "$PR_NUMBER" --request-changes --body "$BODY"
+              ;;
+            comment|*)
+              gh pr review "$PR_NUMBER" --comment --body "$BODY"
+              ;;
+          esac
+
+      - name: Surface failure as a comment
+        if: steps.claude_auth.outputs.enabled == 'true' && (failure() || steps.claude.outcome != 'success')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          gh pr comment "$PR_NUMBER" --body "Claude reviewer Action failed to produce a verdict. Falling back to human review. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
