@@ -734,6 +734,144 @@ class TestEntitlementGraph(unittest.TestCase):
         self.assertEqual({f.scenario_id for f in out["findings"]}, {"sc.export.entitlement", "sc.integration.oauth"})
 
 
+class TestLaunchReview(unittest.TestCase):
+    def _model(self):
+        keys = [
+            "tenants", "roles", "plans", "meters", "coupons_promotions", "features_flags",
+            "endpoints_routes", "exports", "identity_auth_flows", "billing_objects",
+            "integration_oauth_apps", "webhooks", "support_admin_actions", "agent_tools",
+            "mcp_connectors", "data_classes", "audit_events", "declared_controls",
+            "canary_accounts", "safety_notes",
+        ]
+        model = {k: [] for k in keys}
+        model.update({
+            "schema_version": "ProductModel.v0.1",
+            "product_id": "launch-demo",
+            "source": "operator-authored launch review model",
+            "generated_at": "2026-06-30T12:00:00Z",
+            "environments": ["staging"],
+            "plans": [{"id": "trial"}, {"id": "pro"}],
+            "data_classes": ["canary_records"],
+            "canary_accounts": ["canary-user-001"],
+            "safety_notes": ["sanitized launch-review model; no live probing or customer data"],
+        })
+        return model
+
+    def _review(self, after_update):
+        from heel.launch_review import review_product_models
+        before = self._model()
+        after = self._model()
+        after_update(after)
+        return review_product_models(before, after).to_dict()
+
+    def test_new_export_without_entitlement_check_blocks_launch(self):
+        report = self._review(lambda m: m["exports"].append({
+            "id": "bulk_records",
+            "route": "/api/export",
+            "entitlement_check": "missing",
+            "tenant_quota": "missing",
+            "reachable_by_plan": "trial",
+            "data_class": "canary_records",
+        }))
+
+        self.assertEqual(report["launch_gate_status"], "block")
+        self.assertTrue(any(f["surface_id"] == "bulk_records" for f in report["new_abuse_affordances"]))
+        self.assertTrue(any(c["control"] == "server-side entitlement check" for c in report["high_risk_missing_controls"]))
+        self.assertTrue(any("bulk_records" in r["name"] for r in report["suggested_regression_tests"]))
+
+    def test_stackable_coupon_without_redemption_limit_warns_or_blocks_by_severity(self):
+        warn_report = self._review(lambda m: m["coupons_promotions"].append({
+            "id": "launch25",
+            "stackable": True,
+            "discount_percent": 25,
+        }))
+        self.assertEqual(warn_report["launch_gate_status"], "warn")
+
+        block_report = self._review(lambda m: m["coupons_promotions"].append({
+            "id": "free_year",
+            "stackable": True,
+            "discount_percent": 100,
+            "applies_to": "all_plans",
+            "reachable_by_plan": "trial",
+        }))
+        self.assertEqual(block_report["launch_gate_status"], "block")
+
+    def test_oauth_scope_all_warns_or_blocks_by_reachability_and_impact(self):
+        warn_report = self._review(lambda m: m["integration_oauth_apps"].append({
+            "id": "crm_sync",
+            "scope": "all",
+        }))
+        self.assertEqual(warn_report["launch_gate_status"], "warn")
+
+        block_report = self._review(lambda m: m["integration_oauth_apps"].append({
+            "id": "crm_sync",
+            "scope": "all",
+            "auto_approved": True,
+            "installable_by_role": "member",
+        }))
+        self.assertEqual(block_report["launch_gate_status"], "block")
+
+    def test_agent_tool_scope_wider_than_intended_blocks_launch(self):
+        report = self._review(lambda m: m["agent_tools"].append({
+            "id": "assistant_export",
+            "tool": "export_all",
+            "granted_scope": "all_tenants",
+            "intended_scope": "own_tenant",
+        }))
+
+        self.assertEqual(report["launch_gate_status"], "block")
+        self.assertTrue(any(f["surface_type"] == "agent_tools" for f in report["new_abuse_affordances"]))
+
+    def test_no_risky_changes_passes(self):
+        report = self._review(lambda m: m["plans"].append({"id": "team", "limits": {"exports_per_day": 10}}))
+
+        self.assertEqual(report["launch_gate_status"], "pass")
+        self.assertEqual(report["new_abuse_affordances"], [])
+        self.assertEqual(report["high_risk_missing_controls"], [])
+
+    def test_suggested_regressions_match_changed_surfaces(self):
+        report = self._review(lambda m: (
+            m["exports"].append({"id": "bulk_records", "route": "/api/export", "entitlement_check": "missing"}),
+            m["coupons_promotions"].append({"id": "launch25", "stackable": True}),
+        ))
+
+        changed = {c["surface_id"] for c in report["changed_surfaces"]}
+        regression_surfaces = {r["surface_id"] for r in report["suggested_regression_tests"]}
+        self.assertLessEqual(regression_surfaces, changed)
+        self.assertIn("bulk_records", regression_surfaces)
+        self.assertIn("launch25", regression_surfaces)
+
+    def test_launch_review_cli_prints_human_summary_and_json_report(self):
+        import io
+        from contextlib import redirect_stdout
+        from heel import cli
+
+        before = self._model()
+        after = self._model()
+        after["exports"].append({
+            "id": "bulk_records",
+            "route": "/api/export",
+            "entitlement_check": "missing",
+            "reachable_by_plan": "trial",
+        })
+        td = Path(tempfile.mkdtemp())
+        before_path = td / "before.json"
+        after_path = td / "after.json"
+        before_path.write_text(json.dumps(before))
+        after_path.write_text(json.dumps(after))
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["launch-review", "--before", str(before_path), "--after", str(after_path)])
+
+        self.assertEqual(rc, 2)
+        out = buf.getvalue()
+        self.assertIn("Launch gate: block", out)
+        self.assertIn("JSON report:", out)
+        report = json.loads(out.split("JSON report:\n", 1)[1])
+        self.assertEqual(report["launch_gate_status"], "block")
+
+
 class TestDocsAndMetadata(unittest.TestCase):
     ROOT = Path(__file__).resolve().parents[1]
 
