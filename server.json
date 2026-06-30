@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
   "name": "io.github.ancilis/heel",
-  "description": "Agent-native abuse-simulation: rehearse how a customer could abuse your product before it ships. Probes a product you own, proves an abuse path is reachable with a contained PoC, and returns a ranked report. Exposes only consumption/execution tools — never scope mutation (scopes are human-only, out-of-band, signed).",
+  "description": "MCP-first continuous SaaS abuse rehearsal: probe a product you own before launch and after, prove an abuse path is reachable with a contained PoC, and return a ranked report. Exposes only consumption/execution tools and never scope mutation; scopes are human-only, out-of-band, and signed.",
   "version": "1.1.0",
   "repository": {
     "url": "https://github.com/ancilis/heel",

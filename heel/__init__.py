@@ -1,4 +1,6 @@
-"""HEEL — agent-native abuse-simulation tool. Rehearse abuse against your own product
-before it ships. MCP-first; synthetic-target backtest is the spine; safety spine §10 is
-non-negotiable."""
+"""HEEL: MCP-first SaaS abuse rehearsal before launch and continuously after.
+
+Synthetic-target backtests are the evaluation spine; the safety spine in section 10 is
+non-negotiable.
+"""
 __version__ = "1.1.0"

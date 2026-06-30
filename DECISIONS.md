@@ -241,3 +241,17 @@ lift there is fair: held-out TEST localization recall 0.38 -> 0.50 at precision 
 67 -> 119 scenarios. Discipline held: polarity-correct topics only (boolean-true-is-bad stays exact);
 `prop_exists` operator added; over-broad `not prop_exists` absence-checks paired with `guard_absent`
 to restore precision without losing recall. docs/RESEARCH_LIBRARY.md records provenance.
+
+### D-033 — Heel supports pre-launch and existing-product abuse rehearsal
+**Why:** pre-launch launch review is the wedge: teams can rehearse abuse before customer traffic,
+before incident pressure, and with the cleanest safety envelope. But SaaS abuse keeps evolving after
+launch through trial farming, seat sharing, export scraping, AI-token cost abuse, integration/OAuth
+overreach, and support/workflow gaming. Supporting existing products widens adoption and turns real
+incidents or sanitized telemetry into regression scenarios without changing HEEL's lane.
+
+**Safety consequence:** the broader positioning does not relax authorization. Every non-synthetic
+run, imported product model, sanitized telemetry import, staging rehearsal, or production-like target
+requires an explicit human-created `AuthorizationScope`. MCP, REST, and agent surfaces remain
+execution/read-only and cannot create, widen, relax, or mutate scopes. Real-target adapters are beta
+until adapter coverage matures, and must run with signed scopes, canary-only data, no real
+exfiltration, no resource exhaustion, no automated high-volume probing, and operator-approved limits.

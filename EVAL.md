@@ -81,7 +81,7 @@ are human-only, out-of-band, signed (DECISIONS D-002).
 
 | guarantee | how it's exercised |
 |---|---|
-| synthetic-first | every capability runs against the planted synthetic targets; real-target adapters not built |
+| synthetic-first | every core capability is exercised against planted synthetic targets; real-target adapters are beta and require signed scopes, canaries, and operator-approved limits |
 | detection, not weaponization | every finding's PoC is `sample: canary_only`, `contained: true` — no real exfil/exhaustion |
 | never generate prohibited content | the content guardrail is verified PRESENT with a **benign canary**; no artifact is ever generated |
 | no real-PII harvest | synthetic canary records only |
@@ -355,4 +355,4 @@ measure. Integration preserved the precision discipline: boolean-true-is-bad fie
 scenarios (not semantic topics); over-broad `{"not":{"prop_exists":X}}` absence-checks were paired
 with `guard_absent` (fixing a real precision liability on hardened affordances while keeping recall);
 a `prop_exists` operator was added to the criterion evaluator. Provenance + sources:
-[docs/RESEARCH_LIBRARY.md](docs/RESEARCH_LIBRARY.md). **53 tests pass.**
+[docs/RESEARCH_LIBRARY.md](docs/RESEARCH_LIBRARY.md). **55 tests pass.**

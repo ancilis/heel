@@ -1,9 +1,9 @@
 # HEEL — Architecture (v1)
 
-> **HEEL** is the villain you rehearse against before the real one shows up: a swarm of
-> adversarial and opportunistic agents that probe a product *you own*, prove an abuse path is
-> reachable with a **contained** proof-of-concept, and hand you a ranked report with
-> recommended controls — before you ship.
+> **HEEL** is abuse rehearsal for SaaS: a swarm of adversarial and opportunistic agents that
+> probe a product *you own*, prove an abuse path is reachable with a **contained**
+> proof-of-concept, and hand you a ranked report with recommended controls before launch and
+> throughout production life.
 
 HEEL is **agent-native**: its canonical surface is an **MCP server** that other agents and AI
 tools invoke. It is **self-contained** — it depends on no other platform. This document is the
@@ -13,11 +13,11 @@ single mental model every squad shares. Read it first.
 
 ## 1. North star
 
-A team is about to ship a feature. A human authorizes a target **out-of-band** (§10), then an
-agent (a SOC agent, a CI pipeline, a product copilot, a developer at the CLI) calls HEEL to run
-a swarm against it and receives a ranked **abuse report** as structured data. Each finding is an
-`AbuseVector` with a contained PoC, a severity, an optional data-classification annotation, and a
-recommended control.
+A team is about to ship a feature, review an existing product, or turn an incident into a
+regression. A human authorizes a target **out-of-band** (§10), then an agent (a SOC agent, a CI
+pipeline, a product copilot, a developer at the CLI) calls HEEL to run a swarm against it and
+receives a ranked **abuse report** as structured data. Each finding is an `AbuseVector` with a
+contained PoC, a severity, an optional data-classification annotation, and a recommended control.
 
 HEEL proves it works by **finding planted abuse vectors in a built-in synthetic product in
 advance, at a low false-positive rate.** That coverage backtest is the spine: built first, and
@@ -26,6 +26,23 @@ the acceptance test.
 **HEEL works on any SaaS product, not just AI products.** Taxonomy categories 1–9 are a universal
 core; category 10 (agent/MCP surface abuse) auto-applies only when the target *has* agentic/MCP
 surfaces and cleanly yields nothing when it doesn't.
+
+## 1.1. Operating modes
+
+HEEL has one safety model across several operating modes:
+
+| mode | purpose | target/data boundary |
+|---|---|---|
+| Synthetic demo | Show the full MCP/auth/eval spine with no customer system | Built-in synthetic targets only |
+| Launch review | Default wedge before a SaaS feature ships | Human-created scope over synthetic, staging, sandbox, or launch-review adapter |
+| Staging rehearsal | Exercise a realistic deployed environment without customer blast radius | Signed scope, synthetic users, canary records, operator-approved limits |
+| Existing-product imported model | Rehearse from product models, sanitized telemetry, configs, or catalogs | Import is authorized out-of-band; no real secrets or raw customer data |
+| Incident-to-scenario | Convert an abuse incident or near miss into a regression scenario | Sanitized incident facts, canaries for reproduction, no real exfiltration |
+| Continuous regression | Re-run approved scenarios in CI or release checks | Existing signed scope and immutable audit trail; no scope mutation from MCP/REST/agents |
+
+All non-synthetic runs, imports, and production-like rehearsals require an explicit human-created
+`AuthorizationScope`. MCP, REST, and agent surfaces can execute within a valid scope and read
+results, but they cannot create, widen, relax, or mutate scopes.
 
 ---
 
@@ -131,6 +148,7 @@ in `mcp_server.TOOL_SCHEMAS` (scope-mutation tools absent by construction).
 | **2 — thin vertical slice over MCP** | ✅ scenario → agent → finding → coverage, callable over MCP |
 | **3 — parallelize against frozen contracts** | ▶ wave 1 done: opportunistic-human class (§3.2), REST API (§2), control search (§8), chain-FN; full library + LLM loop + fan-out next |
 | **4 — control-room UI** | ✅ Next.js control room (`web/`, `make ui`) — abuse board, backtest, live swarm, auth gate, scope panel, containment log, MCP/integration, scenario library |
+| **5 — real-target adapters** | beta: must use signed scopes, canary-only data, and operator-approved limits until adapter coverage matures |
 
 ---
 
