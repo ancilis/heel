@@ -5,6 +5,10 @@ HEEL adapters start with a product model, not a live connection. The first contr
 of a SaaS product using sanitized metadata. Validation and conversion are local, stdlib-only, and
 make no network calls.
 
+During conversion, HEEL also builds an entitlement graph from the same sanitized metadata. The graph
+derives scenario-ready affordances for plan, role, tenant, quota, audit, OAuth, and agent-tool scope
+mismatches. See [ENTITLEMENTS.md](ENTITLEMENTS.md).
+
 The purpose is abuse rehearsal before launch or against an existing product model while preserving
 HEEL's safety boundary:
 
@@ -166,6 +170,7 @@ It does not register a persistent target, create a scope, or run a rehearsal.
 scenario engine. The target contains:
 
 - affordances derived from the ProductModel lists,
+- entitlement-graph affordances derived from the same static metadata,
 - `planted_vectors: []` because imported models have no synthetic ground truth,
 - `requires_scope: true`,
 - safety metadata recording source, environments, canaries, data classes, declared controls, and

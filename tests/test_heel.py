@@ -582,6 +582,158 @@ class TestProductModelImporter(Base):
         self.assertIn("safety notes", out.lower())
 
 
+class TestEntitlementGraph(unittest.TestCase):
+    class NoDiscoveryModel:
+        name = "no-discovery"
+
+        def discover(self, target, fired, run_id, log):
+            return [], []
+
+    def _model(self):
+        keys = [
+            "tenants", "roles", "plans", "meters", "coupons_promotions", "features_flags",
+            "endpoints_routes", "exports", "identity_auth_flows", "billing_objects",
+            "integration_oauth_apps", "webhooks", "support_admin_actions", "agent_tools",
+            "mcp_connectors", "data_classes", "audit_events", "declared_controls",
+            "canary_accounts", "safety_notes",
+        ]
+        model = {k: [] for k in keys}
+        model.update({
+            "schema_version": "ProductModel.v0.1",
+            "product_id": "entitlements-demo",
+            "source": "operator-authored entitlement model",
+            "generated_at": "2026-06-30T12:00:00Z",
+            "environments": ["staging"],
+            "tenants": [{"id": "tenant-a"}, {"id": "tenant-b"}],
+            "roles": [
+                {"id": "member", "granted_permissions": ["invite:create"], "intended_permissions": ["record:read"]},
+                {"id": "admin", "granted_permissions": ["invite:create", "support:purge"]},
+            ],
+            "plans": [{"id": "free"}, {"id": "pro"}, {"id": "enterprise"}],
+            "features_flags": [
+                {"id": "audit_vault", "required_plan": "enterprise", "reachable_by_plan": "free", "gated_by": "client"},
+            ],
+            "exports": [
+                {"id": "bulk_records", "route": "/api/export", "entitlement_check": "missing", "data_class": "canary_records"},
+            ],
+            "meters": [
+                {"id": "llm_tokens", "billable": True, "server_side_accounting": False},
+            ],
+            "integration_oauth_apps": [
+                {"id": "crm_sync", "scope": "all", "needed_scopes": ["records:read"]},
+            ],
+            "support_admin_actions": [
+                {"id": "impersonate_user", "audit_logged": False, "required_role": "admin", "reachable_by_role": "member"},
+            ],
+            "agent_tools": [
+                {"id": "assistant_export", "tool": "export_all", "granted_scope": "global", "intended_scope": "tenant"},
+            ],
+            "endpoints_routes": [
+                {"id": "record_read", "route": "/api/records/{id}", "tenant_filter": "missing"},
+            ],
+            "data_classes": ["canary_records"],
+            "canary_accounts": ["canary-user-001"],
+            "safety_notes": ["sanitized entitlement model; no live probing or customer data"],
+        })
+        return model
+
+    def test_graph_construction_and_queries_find_initial_signals(self):
+        from heel.entitlements import EntitlementGraph
+
+        graph = EntitlementGraph.from_product_model(self._model())
+
+        self.assertTrue(any(e.signal == "plan_mismatch" for e in graph.find_cross_plan_edges()))
+        self.assertTrue(any(e.signal == "permission_mismatch" for e in graph.edges))
+        self.assertTrue(any(e.signal == "tenant_filter_missing" for e in graph.find_cross_tenant_edges()))
+        self.assertTrue(any(e.signal == "unmetered_billable_resource" for e in graph.find_unmetered_cost_edges()))
+        self.assertTrue(any(e.signal == "agent_tool_overscope" for e in graph.find_agent_overreach_edges()))
+        self.assertTrue(any(e.signal == "missing_audit_event" for e in graph.find_missing_audit_edges()))
+
+    def test_free_user_reaching_enterprise_feature_produces_affordance(self):
+        from heel.entitlements import EntitlementGraph
+
+        affordances = EntitlementGraph.from_product_model(self._model()).to_affordances()
+        feature = next(a for a in affordances if a.properties.get("source_id") == "audit_vault")
+
+        self.assertEqual(feature.kind, "flag")
+        self.assertEqual(feature.properties["required_plan"], "enterprise")
+        self.assertEqual(feature.properties["reachable_by_plan"], "free")
+        self.assertFalse(feature.guard_present)
+
+    def test_export_without_entitlement_check_maps_to_existing_scenario(self):
+        from heel.agents import run_adversarial
+        from heel.contracts import SyntheticTarget
+        from heel.entitlements import EntitlementGraph
+        from heel.scenarios import list_scenarios
+
+        affordances = EntitlementGraph.from_product_model(self._model()).to_affordances()
+        target = SyntheticTarget("imported:entitlements-demo", "imported_saas", False, affordances, [])
+        scenarios = [s for s in list_scenarios(semantic=False) if s.id == "sc.export.entitlement"]
+        out = run_adversarial(target, scenarios, lambda *a: None, "entitlement-test", model=self.NoDiscoveryModel())
+
+        self.assertEqual([f.scenario_id for f in out["findings"]], ["sc.export.entitlement"])
+
+    def test_agent_tool_scope_mismatch_maps_to_existing_overscope_scenario(self):
+        from heel.agents import run_adversarial
+        from heel.contracts import SyntheticTarget
+        from heel.entitlements import EntitlementGraph
+        from heel.scenarios import list_scenarios
+
+        affordances = EntitlementGraph.from_product_model(self._model()).to_affordances()
+        target = SyntheticTarget("imported:entitlements-demo", "imported_ai_agent", True, affordances, [])
+        scenarios = [s for s in list_scenarios(semantic=False) if s.id == "sc.agent.overscope"]
+        out = run_adversarial(target, scenarios, lambda *a: None, "entitlement-test", model=self.NoDiscoveryModel())
+
+        self.assertEqual([f.scenario_id for f in out["findings"]], ["sc.agent.overscope"])
+        self.assertEqual(out["findings"][0].affordance_id, "eg:agent_tool:assistant_export:agent_tool_overscope")
+
+    def test_oauth_scope_all_maps_to_existing_integration_abuse_scenario(self):
+        from heel.agents import run_adversarial
+        from heel.contracts import SyntheticTarget
+        from heel.entitlements import EntitlementGraph
+        from heel.scenarios import list_scenarios
+
+        affordances = EntitlementGraph.from_product_model(self._model()).to_affordances()
+        target = SyntheticTarget("imported:entitlements-demo", "imported_saas", False, affordances, [])
+        scenarios = [s for s in list_scenarios(semantic=False) if s.id == "sc.integration.oauth"]
+        out = run_adversarial(target, scenarios, lambda *a: None, "entitlement-test", model=self.NoDiscoveryModel())
+
+        self.assertEqual([f.scenario_id for f in out["findings"]], ["sc.integration.oauth"])
+
+    def test_graph_output_is_deterministic(self):
+        from heel.entitlements import EntitlementGraph
+
+        first = EntitlementGraph.from_product_model(self._model()).to_affordances()
+        second = EntitlementGraph.from_product_model(self._model()).to_affordances()
+
+        def freeze(affordances):
+            return [
+                (
+                    a.id,
+                    a.kind,
+                    a.category.value,
+                    a.guard_present,
+                    a.reachability,
+                    json.dumps(a.properties, sort_keys=True),
+                )
+                for a in affordances
+            ]
+
+        self.assertEqual(freeze(first), freeze(second))
+
+    def test_product_model_import_includes_entitlement_affordances(self):
+        from heel.agents import run_adversarial
+        from heel.importers import target_from_product_model
+        from heel.scenarios import list_scenarios
+
+        target = target_from_product_model(self._model())
+        self.assertTrue(any(a.id.startswith("eg:") for a in target.affordances))
+
+        scenarios = [s for s in list_scenarios(semantic=False) if s.id in {"sc.export.entitlement", "sc.integration.oauth"}]
+        out = run_adversarial(target, scenarios, lambda *a: None, "entitlement-test", model=self.NoDiscoveryModel())
+        self.assertEqual({f.scenario_id for f in out["findings"]}, {"sc.export.entitlement", "sc.integration.oauth"})
+
+
 class TestDocsAndMetadata(unittest.TestCase):
     ROOT = Path(__file__).resolve().parents[1]
 

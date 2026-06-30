@@ -14,6 +14,7 @@ import re
 from typing import Any, Mapping
 
 from .contracts import Affordance, Category, SyntheticTarget
+from .entitlements import EntitlementGraph
 
 PRODUCT_MODEL_VERSION = "ProductModel.v0.1"
 ALLOWED_ENVIRONMENTS = {"production", "staging", "sandbox", "synthetic"}
@@ -194,7 +195,8 @@ def product_model_from_dict(model: Mapping[str, Any]) -> ProductModel:
 
 def target_from_product_model(model: Mapping[str, Any] | ProductModel) -> ImportedTarget:
     pm = model if isinstance(model, ProductModel) else product_model_from_dict(model)
-    affordances = _affordances(pm)
+    graph = EntitlementGraph.from_product_model(pm)
+    affordances = _affordances(pm) + graph.to_affordances()
     has_agent_surface = bool(pm.agent_tools or pm.mcp_connectors)
     safety_metadata = {
         "schema_version": PRODUCT_MODEL_VERSION,
@@ -210,6 +212,7 @@ def target_from_product_model(model: Mapping[str, Any] | ProductModel) -> Import
         "canary_accounts": list(pm.canary_accounts),
         "data_classes": list(pm.data_classes),
         "declared_controls": list(pm.declared_controls),
+        "entitlement_graph_edges": len(graph.edges),
         "safety_notes": list(pm.safety_notes),
     }
     return ImportedTarget(
