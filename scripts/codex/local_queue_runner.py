@@ -174,8 +174,6 @@ def build_codex_command(
             str(repo_root),
             "--sandbox",
             sandbox,
-            "--ask-for-approval",
-            approval_policy,
             "--output-last-message",
             str(output_path),
             "-",

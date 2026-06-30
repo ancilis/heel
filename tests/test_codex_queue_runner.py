@@ -31,8 +31,6 @@ class TestLocalCodexQueueRunner(unittest.TestCase):
             "/repo",
             "--sandbox",
             "workspace-write",
-            "--ask-for-approval",
-            "never",
             "--output-last-message",
             "codex-output.md",
             "-",
