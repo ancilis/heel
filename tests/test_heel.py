@@ -234,12 +234,14 @@ class TestOpportunisticClass(Base):  # spec §3.2, DoD #3
         # test the opportunistic class's motivation-gating directly (decoupled from the merge,
         # since the semantic adversarial library may also now cover some commercial affordances)
         from heel.agents_human import run_opportunistic
-        from heel.profiles import DEFAULT_PROFILES
+        from heel.profiles import DEFAULT_PERSONAS
         from heel.targets import get_target
-        out = run_opportunistic(get_target("synthetic-saas"), DEFAULT_PROFILES, lambda *a: None, "t")
-        byaff = {f.affordance_id: f.reproduction["profiles"] for f in out["findings"]}
-        self.assertEqual(byaff["region_pricing"], ["sophisticated_arbitrageur"])  # needs sophistication
-        self.assertEqual(len(byaff["seats"]), 3)  # low-bar → all three profiles
+        out = run_opportunistic(get_target("synthetic-saas"), DEFAULT_PERSONAS, lambda *a: None, "t")
+        byaff = {f.affordance_id: f for f in out["findings"]}
+        self.assertEqual(byaff["region_pricing"].reproduction["persona"]["id"], "agency_reseller")
+        seat_personas = {e["persona_id"] for e in byaff["seats"].reproduction["persona_evidence"]}
+        self.assertIn("seat_sharer", seat_personas)
+        self.assertIn("agency_reseller", seat_personas)
 
     def test_agent_classes_param_respected(self):
         r = self.server.heel_run({"scope_id": self.scope.scope_id, "target": "synthetic-saas",

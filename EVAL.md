@@ -144,22 +144,26 @@ D-009…D-014.
 
 Built against the frozen §6 contracts; the §10 auth gate is unchanged and shared by every surface.
 
-**Opportunistic-human agent class (§3.2, DoD #3).** Motivation-profiled gaming of *normal*
-affordances, conditioned by declarative `MotivationProfile`s (cost-driven cheapskate,
-low-sophistication rule-bender, sophisticated arbitrageur). Both classes now run by default and
-merge by affordance. Profiles gate which vectors surface:
+**Opportunistic-human agent class (§3.2, DoD #3).** Persona-modeled gaming of *normal*
+affordances, conditioned by a declarative customer-incentive library in `heel/profiles.py`.
+The built-ins cover coupon stacking, seat sharing, agency resale, data brokerage, trial farming,
+integration overreach, support pressure, marketplace reputation gaming, usage-meter optimization,
+AI cost amplification, and agent-wrapper building. Personas gate on motivation tags, sophistication,
+patience, risk tolerance, and observable affordance criteria:
 
 | gamed affordance | category | pursued by |
 |---|---|---|
-| `region_pricing` (region arbitrage) | license_entitlement | **only** `sophisticated_arbitrageur` (needs sophistication) |
-| `seats` (seat sharing) | license_entitlement | all three profiles (low bar) |
-| `promo_stacking` (coupon stacking) | license_entitlement | cost-driven profiles |
+| `region_pricing` (region arbitrage) | license_entitlement | `agency_reseller` (requires higher sophistication) |
+| `seats` (seat sharing / concurrency) | license_entitlement | `seat_sharer`, with agency-reseller evidence when resale motivation also matches |
+| `promo_stacking` (coupon stacking) | license_entitlement | `coupon_stacker` |
+| `export_records` + `record_get` | data_harvesting | `data_broker` (export first, enumeration second) |
+| `agent_infer_loop` | agent_mcp_surface | `ai_cost_amplifier` |
 
-`promo_stacking` was a **genuine blind spot for the programmatic adversarial class** (coupon
-stacking isn't a missing-control signal) — the opportunistic class **closes it**, demonstrating
-why both classes matter. A new multi-affordance-**chain** vector (`ato_chain`) is missed by *both*
-single-affordance classes → an honest FN keeps coverage at **0.93/0.95**, not 1.0.
-(`TestOpportunisticClass`.)
+Both classes run by default. If an adversarial finding already owns an affordance, it stays primary
+and persona evidence is attached without changing severity/category/control. Persona-only findings
+are ranked by a stable severity/reachability rule. This is why reports can explain not just what is
+weak, but which motivated customer archetype would game it. (`TestOpportunisticClass`,
+`TestPersonaFindings`; operator guide: `docs/PERSONAS.md`.)
 
 **REST API (§2).** A thin REST surface (`heel/rest.py`, `make rest`) over the **same** `HeelServer`
 capability — so the auth gate is identical. There is **no scope-creation route** (`POST /scopes` →
