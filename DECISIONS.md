@@ -276,3 +276,14 @@ and safety flags so teams can re-run the control check in CI or staging.
 Re-runs call the same `HeelServer.heel_run` path, so signed scope verification, allowlist checks,
 resource limits, canary-only findings, and containment logging are reused. The regression CLI has no
 scope creation, widening, allowlist, or limit-mutation command.
+
+### D-036 — Economic severity is report-layer business-impact metadata
+**Why:** SaaS abuse is often a business-loss problem rather than a CVSS-style software vulnerability.
+`heel.economics` estimates directional monthly exposure from existing contained findings plus
+operator-supplied assumptions, keeps assumptions and unknowns visible, and ranks by economic impact
+without replacing the existing security severity.
+
+**Safety consequence:** economic scoring is read-only and report-only. It adds no probe, exploit,
+payment, credential, spam, data-exfiltration, or resource-exhaustion capability, and it does not
+authorize any target. MCP, REST, and agent surfaces remain unable to create, widen, relax, or mutate
+scopes. Missing assumptions produce qualitative scores only rather than fake precision.

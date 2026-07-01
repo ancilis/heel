@@ -265,6 +265,168 @@ class TestControlSearch(Base):  # spec §8
         self.assertEqual(reds, sorted(reds, reverse=True))
 
 
+class TestEconomicSeverity(Base):
+    def _vector(self, vector_id, affordance_id, scenario_id, category, severity):
+        from heel.contracts import AbuseVector, Severity
+
+        return AbuseVector(
+            id=vector_id,
+            scenario_id=scenario_id,
+            category=category,
+            reproduction={"sample": "canary_only", "contained": True},
+            severity=Severity(*severity),
+            reachability_score=0.75,
+            plausible=True,
+            recommended_control="server-side control",
+            affordance_id=affordance_id,
+            target_id="synthetic-saas",
+        )
+
+    def test_usage_meter_with_token_cost_ranks_above_low_impact_coupon_issue(self):
+        from heel.contracts import Category
+        from heel.economics import estimate_economic_impact, rank_by_economic_risk
+
+        assumptions = {
+            "currency": "USD",
+            "affordances": {
+                "usage_meter": {
+                    "events_per_month": {"low": 1_000_000, "high": 6_000_000},
+                    "unit_cloud_cost": 0.003,
+                    "driver": "unmetered AI-token usage",
+                    "confidence": 0.7,
+                },
+                "promo_stacking": {
+                    "events_per_month": {"low": 10, "high": 50},
+                    "unit_revenue_leakage": 5,
+                    "driver": "low-impact coupon issue",
+                    "confidence": 0.8,
+                },
+            },
+        }
+        usage = self._vector("usage", "usage_meter", "sc.meter.reset", Category.LICENSE_ENTITLEMENT, (0.4, 0.4, 0.2))
+        coupon = self._vector("coupon", "promo_stacking", "opportunistic.coupon_stacking",
+                              Category.LICENSE_ENTITLEMENT, (0.8, 0.8, 0.2))
+        usage.economic_impact = estimate_economic_impact(usage, assumptions=assumptions).to_dict()
+        coupon.economic_impact = estimate_economic_impact(coupon, assumptions=assumptions).to_dict()
+
+        ranked = rank_by_economic_risk([coupon, usage])
+
+        self.assertEqual(ranked[0].id, "usage")
+        self.assertGreater(ranked[0].economic_impact["estimated_monthly_range"]["high"],
+                           ranked[1].economic_impact["estimated_monthly_range"]["high"])
+
+    def test_high_friction_control_is_not_automatically_preferred(self):
+        from heel.contracts import Category
+        from heel.economics import estimate_economic_impact, recommend_control_bundle
+
+        finding = self._vector("usage", "usage_meter", "sc.meter.reset", Category.LICENSE_ENTITLEMENT, (0.6, 0.6, 0.2))
+        finding.economic_impact = estimate_economic_impact(
+            finding,
+            assumptions={"affordances": {"usage_meter": {
+                "events_per_month": {"low": 1_000, "high": 2_000},
+                "unit_cloud_cost": 1.0,
+                "confidence": 0.8,
+            }}},
+        ).to_dict()
+        controls = [
+            {"id": "manual_review", "control": "manual review every usage event",
+             "estimated_exploitability_reduction": 0.95, "friction_cost": {"monthly": 5_000}},
+            {"id": "server_metering", "control": "server-authoritative metering",
+             "estimated_exploitability_reduction": 0.65, "friction_cost": {"monthly": 100}},
+        ]
+
+        bundle = recommend_control_bundle([finding], controls)
+
+        self.assertEqual(bundle["ranked_candidates"][0]["id"], "server_metering")
+        self.assertLess(bundle["ranked_candidates"][0]["friction_cost_monthly"],
+                        bundle["ranked_candidates"][1]["friction_cost_monthly"])
+
+    def test_missing_assumptions_produce_qualitative_score_only(self):
+        from heel.contracts import Category
+        from heel.economics import estimate_economic_impact
+
+        vector = self._vector("coupon", "promo_stacking", "opportunistic.coupon_stacking",
+                              Category.LICENSE_ENTITLEMENT, (0.6, 0.6, 0.2))
+        impact = estimate_economic_impact(vector).to_dict()
+
+        self.assertIn(impact["label"], {"low", "medium", "high", "critical"})
+        self.assertIsNone(impact["estimated_monthly_range"])
+        self.assertTrue(impact["unknowns"])
+
+    def test_economic_score_does_not_replace_existing_security_severity(self):
+        from dataclasses import asdict
+        from heel.contracts import Category
+        from heel.economics import estimate_economic_impact
+
+        vector = self._vector("coupon", "promo_stacking", "opportunistic.coupon_stacking",
+                              Category.LICENSE_ENTITLEMENT, (0.9, 0.8, 0.2))
+        security_label = vector.severity.label
+        vector.economic_impact = estimate_economic_impact(vector).to_dict()
+        serialized = asdict(vector)
+
+        self.assertEqual(security_label, "critical")
+        self.assertEqual(vector.severity.label, security_label)
+        self.assertIn("severity", serialized)
+        self.assertIn("economic_impact", serialized)
+
+    def test_output_includes_assumptions_and_confidence(self):
+        from heel.contracts import Category
+        from heel.economics import estimate_economic_impact
+
+        vector = self._vector("usage", "usage_meter", "sc.meter.reset", Category.LICENSE_ENTITLEMENT, (0.4, 0.5, 0.2))
+        impact = estimate_economic_impact(
+            vector,
+            assumptions={"affordances": {"usage_meter": {
+                "events_per_month": {"low": 3_000, "high": 18_000},
+                "unit_cloud_cost": 1.0,
+                "driver": "unmetered AI-token usage",
+                "confidence": 0.65,
+            }}},
+        ).to_dict()
+
+        self.assertIn("assumptions", impact)
+        self.assertEqual(impact["assumptions"]["events_per_month"]["low"], 3_000)
+        self.assertIn("confidence", impact)
+        self.assertGreater(impact["confidence"], 0)
+
+    def test_cli_report_can_include_economic_impact(self):
+        import io
+        from contextlib import redirect_stdout
+        from heel import cli
+
+        assumptions_path = Path(tempfile.mkdtemp()) / "economic_assumptions.json"
+        assumptions_path.write_text(json.dumps({
+            "affordances": {
+                "usage_meter": {
+                    "events_per_month": {"low": 3_000, "high": 18_000},
+                    "unit_cloud_cost": 1.0,
+                    "confidence": 0.65,
+                }
+            }
+        }))
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli.main(["scope", "create", "--target", "synthetic-saas",
+                                       "--operator", "tester", "--confirm"]), 0)
+        scope_id = json.loads(buf.getvalue())["created_scope"]
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli.main(["run", "--scope", scope_id, "--target", "synthetic-saas"]), 0)
+        run_id = json.loads(buf.getvalue())["run_id"]
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli.main(["report", "--run", run_id, "--economic",
+                                       "--economic-assumptions", str(assumptions_path)]), 0)
+        report = json.loads(buf.getvalue())
+
+        self.assertTrue(report["economic"])
+        self.assertIn("economic_impact", report["findings"][0])
+        self.assertIn("confidence", report["findings"][0]["economic_impact"])
+
+
 class TestRestSharesAuthGate(Base):  # spec §2 — REST is a thin client over the same gate
     def test_rest_enforces_gate_and_has_no_scope_creation(self):
         import threading

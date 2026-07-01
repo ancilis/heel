@@ -147,6 +147,7 @@ heel scope create --target synthetic-saas --operator you --confirm
 
 # 2) an agent / CLI runs WITHIN that scope (and cannot widen it)
 heel run --scope <scope_id> --target synthetic-saas
+heel report --run <run_id> --economic --economic-assumptions docs/economic_assumptions.example.json
 heel coverage --run <run_id>
 heel log --run <run_id>          # immutable, hash-chained audit trail
 
@@ -197,7 +198,7 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 ## Docs
 
 [ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [DECISIONS](DECISIONS.md) · [SECURITY](SECURITY.md)
-· [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) · [ENTITLEMENTS](docs/ENTITLEMENTS.md) · [REGRESSIONS](docs/REGRESSIONS.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
+· [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) · [ENTITLEMENTS](docs/ENTITLEMENTS.md) · [ECONOMIC SEVERITY](docs/ECONOMIC_SEVERITY.md) · [REGRESSIONS](docs/REGRESSIONS.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
 [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
 ## Status
