@@ -115,9 +115,13 @@ channel that can be prompt-injected. The model (the **confused-deputy** model):
   surface for unintended affordances and weak controls. The swarm-native workload. Built (v1 is
   a deterministic stub model by default; an LLM control loop swaps in via `HEEL_MODEL=anthropic`,
   `heel/model.py`). → `heel/agents.py`.
-- **Opportunistic-human (motivation-profiled).** Ordinary motivated users who *game* the product
-  within normal affordances, conditioned by a small declarative `MotivationProfile`. Contract
-  defined; **built** (`heel/agents_human.py`, `profiles.py`).
+- **Opportunistic-human (persona-modeled).** Ordinary motivated users, agencies, integration
+  owners, or builders who *game* the product within normal affordances. A declarative persona
+  library models motivation, sophistication, patience, risk tolerance, target affordance types,
+  preferred chains, deterring controls, and canary-only rehearsal examples. Persona evidence can
+  annotate a better-calibrated adversarial finding without replacing its severity/category/control;
+  persona-only findings are ranked by a stable severity/reachability rule. Built in
+  `heel/agents_human.py` and `heel/profiles.py`; operator guide in `docs/PERSONAS.md`.
 
 ---
 

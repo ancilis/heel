@@ -287,3 +287,19 @@ without replacing the existing security severity.
 payment, credential, spam, data-exfiltration, or resource-exhaustion capability, and it does not
 authorize any target. MCP, REST, and agent surfaces remain unable to create, widen, relax, or mutate
 scopes. Missing assumptions produce qualitative scores only rather than fake precision.
+
+### D-037 — Opportunistic humans are first-class customer-incentive personas
+**Why:** abuse reports need to explain not only which affordance is weak, but which motivated
+customer archetype would game it. The old three-profile model was too coarse, so `heel.profiles`
+now defines declarative personas with motivation, sophistication, patience, risk tolerance, target
+affordance types, preferred chains, deterring controls, canary rehearsal examples, and observable
+matching rules. The default library covers coupon stacking, seat sharing, agency resale, data
+brokerage, trial farming, integration overreach, support pressure, marketplace reputation gaming,
+usage-meter optimization, AI cost amplification, and agent-wrapper building.
+
+**Safety consequence:** personas are customer incentive models, not criminal playbooks. Persona
+rules only match observable affordances and emit contained, canary-only evidence. If the
+adversarial class already owns an affordance, it remains primary; persona evidence annotates it
+without changing severity/category/control. Persona-only findings have an explicit deterministic
+ranking rule. No scope creation, widening, target authorization, real exfiltration, payment abuse,
+credential abuse, spam, resource exhaustion, or third-party probing is added.

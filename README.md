@@ -199,7 +199,7 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 
 [ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [DECISIONS](DECISIONS.md) · [SECURITY](SECURITY.md)
 · [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) · [ENTITLEMENTS](docs/ENTITLEMENTS.md) · [ECONOMIC SEVERITY](docs/ECONOMIC_SEVERITY.md) · [REGRESSIONS](docs/REGRESSIONS.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
-[CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
+[PERSONAS](docs/PERSONAS.md) · [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
 ## Status
 

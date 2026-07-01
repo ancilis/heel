@@ -1,22 +1,572 @@
 """
-HEEL — declarative motivation profiles for the opportunistic-human agent class (spec §3.2).
+HEEL — declarative customer-incentive personas for the opportunistic-human agent class.
 
-Defined INLINE (not learned from any telemetry). Axes: cost_sensitivity, risk_tolerance,
-sophistication, tos_willingness — all in [0,1]. Operators add more as specs.
+These are not criminal labels and they are not learned from telemetry. They are deterministic
+customer incentive models: ordinary users, customers, agencies, or builders who may game normal
+SaaS affordances when motivation, patience, risk tolerance, sophistication, and the observed
+affordance all line up.
 """
 from __future__ import annotations
 
-from .contracts import MotivationProfile
+from dataclasses import dataclass
 
+from .contracts import Category, MotivationProfile
+
+
+@dataclass(frozen=True)
+class PersonaRule:
+    id: str
+    affordance_kind: str
+    criterion: dict
+    category: Category
+    preferred_chain: str
+    motivation_tags: tuple[str, ...]
+    required_sophistication: float
+    required_patience: float
+    required_risk_tolerance: float
+    impact: float
+    recommended_control: str
+    affordance_match: str
+    why: str
+
+
+@dataclass(frozen=True)
+class AbusePersona:
+    id: str
+    motivation: str
+    motivation_tags: tuple[str, ...]
+    sophistication: float
+    patience: float
+    risk_tolerance: float
+    target_affordance_types: tuple[str, ...]
+    preferred_abuse_chains: tuple[str, ...]
+    deterring_controls: tuple[str, ...]
+    canary_rehearsal_examples: tuple[str, ...]
+    rules: tuple[PersonaRule, ...]
+    motivation_intensity: float = 0.75
+
+
+def _r(id, kind, criterion, category, chain, tags, soph, patience, risk, impact, control, match, why):
+    return PersonaRule(
+        id=id,
+        affordance_kind=kind,
+        criterion=criterion,
+        category=category,
+        preferred_chain=chain,
+        motivation_tags=tuple(tags),
+        required_sophistication=soph,
+        required_patience=patience,
+        required_risk_tolerance=risk,
+        impact=impact,
+        recommended_control=control,
+        affordance_match=match,
+        why=why,
+    )
+
+
+DEFAULT_PERSONAS: list[AbusePersona] = [
+    AbusePersona(
+        id="coupon_stacker",
+        motivation="Reduce subscription or checkout cost by combining normal promotional paths.",
+        motivation_tags=("cost_reduction", "coupon_arbitrage"),
+        sophistication=0.35,
+        patience=0.45,
+        risk_tolerance=0.45,
+        target_affordance_types=("endpoint", "coupon", "checkout"),
+        preferred_abuse_chains=("coupon stacking", "promo plus trial rollover"),
+        deterring_controls=("one promo per order", "server-side redemption ledger", "identity-bound promo caps"),
+        canary_rehearsal_examples=("Apply two canary coupons to a canary checkout and halt before payment capture.",),
+        rules=(
+            _r(
+                "coupon_stacking",
+                "endpoint",
+                {"prop": "stackable", "equals": True},
+                Category.LICENSE_ENTITLEMENT,
+                "coupon stacking",
+                ("cost_reduction", "coupon_arbitrage"),
+                0.20,
+                0.25,
+                0.30,
+                0.50,
+                "one promo per order; disallow coupon stacking in the server-side redemption ledger",
+                "checkout endpoint accepts a stackable promotion flag",
+                "A discount-motivated customer would try stacking visible promotions before paying.",
+            ),
+        ),
+        motivation_intensity=0.85,
+    ),
+    AbusePersona(
+        id="seat_sharer",
+        motivation="Avoid per-seat pricing by sharing one paid seat across several real users.",
+        motivation_tags=("seat_cost", "license_cost"),
+        sophistication=0.25,
+        patience=0.50,
+        risk_tolerance=0.40,
+        target_affordance_types=("seat", "session"),
+        preferred_abuse_chains=("shared login", "concurrent session reuse"),
+        deterring_controls=("concurrent-session limits", "device posture per seat", "seat transfer audit"),
+        canary_rehearsal_examples=("Use two canary devices against one canary seat and stop after observing concurrent access.",),
+        rules=(
+            _r(
+                "seat_concurrency",
+                "seat",
+                {"any_of": [{"prop": "sharing_detection", "equals": "none"}, {"prop": "concurrency_limit", "equals": "none"}]},
+                Category.LICENSE_ENTITLEMENT,
+                "concurrent session reuse",
+                ("seat_cost", "license_cost"),
+                0.10,
+                0.30,
+                0.25,
+                0.50,
+                "concurrent-session / device limits per seat",
+                "seat affordance has no sharing or concurrency detection",
+                "A seat-cost-sensitive customer would try one paid login across teammates.",
+            ),
+        ),
+        motivation_intensity=0.80,
+    ),
+    AbusePersona(
+        id="agency_reseller",
+        motivation="Serve multiple downstream clients from one account or plan margin.",
+        motivation_tags=("resale_margin", "seat_cost", "account_pooling"),
+        sophistication=0.65,
+        patience=0.70,
+        risk_tolerance=0.60,
+        target_affordance_types=("seat", "region", "trial"),
+        preferred_abuse_chains=("account pooling", "regional price arbitrage", "client seat multiplexing"),
+        deterring_controls=("reseller terms", "domain verification", "seat transfer review", "billing-region verification"),
+        canary_rehearsal_examples=("Invite canary users from two canary client domains and stop after access is observed.",),
+        rules=(
+            _r(
+                "client_seat_pooling",
+                "seat",
+                {"prop": "sharing_detection", "equals": "none"},
+                Category.LICENSE_ENTITLEMENT,
+                "client seat multiplexing",
+                ("resale_margin", "seat_cost"),
+                0.45,
+                0.55,
+                0.45,
+                0.55,
+                "domain verification + reseller controls for managed-client access",
+                "team seats can be shared without detecting downstream client use",
+                "An agency with margin pressure would try stretching one plan across clients.",
+            ),
+            _r(
+                "region_arbitrage",
+                "region",
+                {"prop": "region_check", "equals": "ip_only"},
+                Category.LICENSE_ENTITLEMENT,
+                "regional price arbitrage",
+                ("resale_margin", "account_pooling"),
+                0.60,
+                0.45,
+                0.45,
+                0.55,
+                "verify billing region via payment instrument, not IP alone",
+                "region pricing relies on an IP-only check",
+                "A reseller would try cheaper regional pricing when billing checks are weak.",
+            ),
+        ),
+        motivation_intensity=0.72,
+    ),
+    AbusePersona(
+        id="data_broker",
+        motivation="Acquire large or enumerable datasets for resale, benchmarking, or enrichment.",
+        motivation_tags=("data_resale", "dataset_building", "enumeration"),
+        sophistication=0.75,
+        patience=0.85,
+        risk_tolerance=0.70,
+        target_affordance_types=("export", "record", "data_pipeline"),
+        preferred_abuse_chains=("bulk export", "record enumeration", "canary dataset enrichment"),
+        deterring_controls=("export entitlements", "non-enumerable ids", "per-tenant export quotas", "download audit"),
+        canary_rehearsal_examples=("Export canary records only and stop after confirming the export boundary.",),
+        rules=(
+            _r(
+                "bulk_export",
+                "export",
+                {"guard_absent": True},
+                Category.DATA_HARVESTING,
+                "bulk export",
+                ("data_resale", "dataset_building"),
+                0.50,
+                0.60,
+                0.50,
+                0.75,
+                "enforce server-side entitlement checks, export quotas, and audit events",
+                "bulk export is reachable without an entitlement guard",
+                "A dataset-motivated customer would start with the highest-volume export path.",
+            ),
+            _r(
+                "record_enumeration",
+                "record",
+                {"any_of": [{"prop": "id_scheme", "equals": "sequential"}, {"prop": "tenant_check", "equals": "missing"}]},
+                Category.DATA_HARVESTING,
+                "record enumeration",
+                ("data_resale", "enumeration"),
+                0.55,
+                0.65,
+                0.55,
+                0.65,
+                "use non-enumerable ids, tenant checks, and per-tenant velocity limits",
+                "records expose enumerable or weakly scoped access patterns",
+                "After exports, a patient data-seeker would test whether canary records can be enumerated.",
+            ),
+            _r(
+                "pipeline_passthrough",
+                "data_pipeline",
+                {"prop": "pii_filter", "equals": "none"},
+                Category.DATA_HARVESTING,
+                "canary dataset enrichment",
+                ("data_resale", "dataset_building"),
+                0.55,
+                0.70,
+                0.50,
+                0.60,
+                "filter sensitive fields before ingestion and emit export-style audit events",
+                "data pipeline lacks a PII/canary filter",
+                "A data-motivated customer would test whether uploaded canary datasets pass through unchanged.",
+            ),
+        ),
+        motivation_intensity=0.78,
+    ),
+    AbusePersona(
+        id="trial_farmer",
+        motivation="Keep receiving trial value by cycling identities or eligibility markers.",
+        motivation_tags=("free_trial", "account_farming", "eligibility"),
+        sophistication=0.40,
+        patience=0.75,
+        risk_tolerance=0.55,
+        target_affordance_types=("trial", "signup"),
+        preferred_abuse_chains=("serial trial signup", "eligibility reset"),
+        deterring_controls=("trial-per-identity limits", "velocity checks", "proof-of-uniqueness", "device/account graph"),
+        canary_rehearsal_examples=("Create two canary trial identities and stop after eligibility is incorrectly granted.",),
+        rules=(
+            _r(
+                "weak_trial_eligibility",
+                "trial",
+                {"prop": "identity_check", "equals": "email_only"},
+                Category.LICENSE_ENTITLEMENT,
+                "serial trial signup",
+                ("free_trial", "eligibility"),
+                0.20,
+                0.50,
+                0.35,
+                0.50,
+                "device/identity fingerprinting + trial-per-identity limit",
+                "trial eligibility depends only on an email identity check",
+                "A trial-motivated customer would try resetting eligibility with another email.",
+            ),
+            _r(
+                "weak_signup_uniqueness",
+                "signup",
+                {"prop": "verification", "equals": "none"},
+                Category.IDENTITY_ACCOUNT,
+                "account farming",
+                ("account_farming", "eligibility"),
+                0.25,
+                0.55,
+                0.40,
+                0.50,
+                "proof-of-uniqueness + velocity limits on signup",
+                "signup has no uniqueness verification",
+                "A trial farmer would use weak signup controls to create canary accounts at low cost.",
+            ),
+        ),
+        motivation_intensity=0.82,
+    ),
+    AbusePersona(
+        id="integration_overreacher",
+        motivation="Install integrations with broader access than needed to simplify operations or capture more data.",
+        motivation_tags=("integration_power", "scope_expansion", "automation"),
+        sophistication=0.70,
+        patience=0.65,
+        risk_tolerance=0.60,
+        target_affordance_types=("oauth_app", "agent_tool", "mcp_connector"),
+        preferred_abuse_chains=("over-broad OAuth grant", "connector context bleed", "tool scope expansion"),
+        deterring_controls=("OAuth scope minimization", "per-app review", "connector isolation", "least-privilege tool grants"),
+        canary_rehearsal_examples=("Install a canary integration and verify it cannot read beyond canary-granted scopes.",),
+        rules=(
+            _r(
+                "oauth_scope_all",
+                "oauth_app",
+                {"prop": "scope", "equals": "all"},
+                Category.INTEGRATION_EXTENSIBILITY,
+                "over-broad OAuth grant",
+                ("integration_power", "scope_expansion"),
+                0.45,
+                0.45,
+                0.45,
+                0.60,
+                "OAuth scope minimization + per-app review",
+                "integration can request all scopes instead of the minimum needed",
+                "An integration-heavy customer would accept broad scopes if that makes automation easier.",
+            ),
+            _r(
+                "connector_context_bleed",
+                "mcp_connector",
+                {"prop": "context_isolation", "equals": "missing"},
+                Category.AGENT_MCP_SURFACE,
+                "connector context bleed",
+                ("integration_power", "automation"),
+                0.55,
+                0.50,
+                0.45,
+                0.60,
+                "isolate per-connector context; no transitive trust between connectors",
+                "connector context isolation is missing",
+                "A power user would try chaining connectors when context boundaries are unclear.",
+            ),
+        ),
+        motivation_intensity=0.70,
+    ),
+    AbusePersona(
+        id="support_pressure_user",
+        motivation="Use urgency, renewal pressure, or support escalation to get account or workflow exceptions.",
+        motivation_tags=("support_exception", "workflow_bypass", "account_recovery"),
+        sophistication=0.45,
+        patience=0.65,
+        risk_tolerance=0.50,
+        target_affordance_types=("auth_reset", "admin_action"),
+        preferred_abuse_chains=("support-assisted recovery", "manual admin exception"),
+        deterring_controls=("step-up verification", "support playbooks", "dual-control admin actions", "audit logging"),
+        canary_rehearsal_examples=("Request a canary recovery exception and stop after the workflow decision is logged.",),
+        rules=(
+            _r(
+                "weak_recovery_pressure",
+                "auth_reset",
+                {"prop": "recovery_check", "equals": "weak"},
+                Category.IDENTITY_ACCOUNT,
+                "support-assisted recovery",
+                ("support_exception", "account_recovery"),
+                0.25,
+                0.45,
+                0.35,
+                0.60,
+                "rate-limit + strengthen account-recovery verification",
+                "account recovery uses a weak verification check",
+                "A pressured customer would ask support to shortcut a weak recovery path.",
+            ),
+            _r(
+                "unlogged_admin_exception",
+                "admin_action",
+                {"prop": "audit_logged", "equals": False},
+                Category.COMPLIANCE_BOUNDARY,
+                "manual admin exception",
+                ("support_exception", "workflow_bypass"),
+                0.30,
+                0.50,
+                0.35,
+                0.55,
+                "require dual control and immutable audit logging for support/admin exceptions",
+                "admin action is not written to the audit log",
+                "A customer pushing for an exception would benefit if manual actions leave no canary audit trail.",
+            ),
+        ),
+        motivation_intensity=0.66,
+    ),
+    AbusePersona(
+        id="marketplace_reputation_gamer",
+        motivation="Improve ranking, reviews, referrals, or marketplace standing through normal trust-economy features.",
+        motivation_tags=("reputation_gain", "trust_economy", "referral_credit"),
+        sophistication=0.45,
+        patience=0.75,
+        risk_tolerance=0.55,
+        target_affordance_types=("review", "referral"),
+        preferred_abuse_chains=("review manipulation", "self-referral loop"),
+        deterring_controls=("verified-purchase weighting", "review provenance", "self-referral blocks", "velocity limits"),
+        canary_rehearsal_examples=("Submit canary reviews/referrals only and stop after provenance checks are evaluated.",),
+        rules=(
+            _r(
+                "review_manipulation",
+                "review",
+                {"prop": "provenance_check", "equals": "none"},
+                Category.TRUST_ECONOMY,
+                "review manipulation",
+                ("reputation_gain", "trust_economy"),
+                0.25,
+                0.60,
+                0.40,
+                0.50,
+                "verified-purchase weighting + review provenance",
+                "review/rating flow lacks provenance checks",
+                "A reputation-motivated customer would try boosting visible trust signals.",
+            ),
+            _r(
+                "self_referral_loop",
+                "referral",
+                {"prop": "self_referral_check", "equals": "missing"},
+                Category.TRUST_ECONOMY,
+                "self-referral loop",
+                ("referral_credit", "trust_economy"),
+                0.25,
+                0.45,
+                0.35,
+                0.50,
+                "block self-referral + referral velocity limits",
+                "referral credit can be self-redeemed",
+                "A customer chasing credits would try a canary self-referral loop.",
+            ),
+        ),
+        motivation_intensity=0.70,
+    ),
+    AbusePersona(
+        id="usage_meter_optimizer",
+        motivation="Reduce billable usage by timing, resetting, or routing work around metering boundaries.",
+        motivation_tags=("meter_cost", "usage_optimization", "quota_avoidance"),
+        sophistication=0.55,
+        patience=0.80,
+        risk_tolerance=0.50,
+        target_affordance_types=("meter", "endpoint"),
+        preferred_abuse_chains=("client-side meter reset", "rate window hopping"),
+        deterring_controls=("server-authoritative metering", "quota ledgers", "rate and concurrency limits"),
+        canary_rehearsal_examples=("Run canary usage events around a canary meter boundary and stop after the counter result.",),
+        rules=(
+            _r(
+                "client_meter_reset",
+                "meter",
+                {"prop": "reset_window", "equals": "client_controlled"},
+                Category.LICENSE_ENTITLEMENT,
+                "client-side meter reset",
+                ("meter_cost", "usage_optimization"),
+                0.35,
+                0.60,
+                0.35,
+                0.55,
+                "server-authoritative metering windows",
+                "usage meter window is client controlled",
+                "A usage-cost-sensitive customer would try shifting canary usage across reset windows.",
+            ),
+            _r(
+                "missing_rate_limit",
+                "endpoint",
+                {"prop": "rate_limit", "equals": "none"},
+                Category.LICENSE_ENTITLEMENT,
+                "rate window hopping",
+                ("quota_avoidance", "usage_optimization"),
+                0.35,
+                0.55,
+                0.40,
+                0.50,
+                "server-side rate + concurrency limits",
+                "endpoint lacks rate limits",
+                "A quota optimizer would try running canary requests around missing rate limits.",
+            ),
+        ),
+        motivation_intensity=0.76,
+    ),
+    AbusePersona(
+        id="ai_cost_amplifier",
+        motivation="Shift AI-token, tool-call, or workflow cost onto the product through unbounded agent surfaces.",
+        motivation_tags=("ai_cost_shift", "token_amplification", "tool_cost"),
+        sophistication=0.70,
+        patience=0.75,
+        risk_tolerance=0.65,
+        target_affordance_types=("agent_tool", "meter"),
+        preferred_abuse_chains=("unbounded agent loop", "cheap-to-expensive tool fanout", "token cost amplification"),
+        deterring_controls=("per-call cost ceilings", "bounded multi-step runs", "tenant cost budgets", "tool-call quotas"),
+        canary_rehearsal_examples=("Run a bounded canary agent task and stop after observing cost ceiling enforcement.",),
+        rules=(
+            _r(
+                "unbounded_agent_cost",
+                "agent_tool",
+                {"prop": "multi_step", "equals": "unbounded"},
+                Category.AGENT_MCP_SURFACE,
+                "token cost amplification",
+                ("ai_cost_shift", "token_amplification", "tool_cost"),
+                0.45,
+                0.55,
+                0.50,
+                0.65,
+                "bound multi-step runs + per-call token and tool-cost ceilings",
+                "agent tool can run unbounded multi-step work",
+                "A cost-shifting customer would try turning a cheap prompt into expensive token/tool work.",
+            ),
+        ),
+        motivation_intensity=0.78,
+    ),
+    AbusePersona(
+        id="agent_wrapper_builder",
+        motivation="Wrap the product's agent or MCP surface into another product and inherit more authority than intended.",
+        motivation_tags=("wrapper_product", "agent_power", "scope_expansion"),
+        sophistication=0.85,
+        patience=0.80,
+        risk_tolerance=0.70,
+        target_affordance_types=("agent_tool", "mcp_connector"),
+        preferred_abuse_chains=("agent wrapper overscope", "confused-deputy tool call", "connector transitive trust"),
+        deterring_controls=("tenant-scoped tool grants", "caller intent checks", "per-connector context isolation", "tool review"),
+        canary_rehearsal_examples=("Use a canary wrapper identity and stop after verifying it cannot exceed its granted scope.",),
+        rules=(
+            _r(
+                "agent_tool_overscope",
+                "agent_tool",
+                {"prop_neq": ["granted_scope", "intended_scope"]},
+                Category.AGENT_MCP_SURFACE,
+                "agent wrapper overscope",
+                ("wrapper_product", "agent_power", "scope_expansion"),
+                0.65,
+                0.60,
+                0.55,
+                0.70,
+                "scope agent tool permissions to caller intent and tenant",
+                "agent tool grants a broader scope than intended",
+                "A wrapper builder would test whether their canary integration inherits broad tenant authority.",
+            ),
+            _r(
+                "confused_deputy_tool",
+                "agent_tool",
+                {"prop": "authz_check", "equals": "caller_assumed"},
+                Category.AGENT_MCP_SURFACE,
+                "confused-deputy tool call",
+                ("wrapper_product", "agent_power"),
+                0.60,
+                0.60,
+                0.55,
+                0.65,
+                "re-check authorization at the privileged tool",
+                "privileged tool assumes the caller is already authorized",
+                "A wrapper builder would test whether canary delegated calls inherit product privileges.",
+            ),
+            _r(
+                "mcp_context_bleed",
+                "mcp_connector",
+                {"prop": "context_isolation", "equals": "missing"},
+                Category.AGENT_MCP_SURFACE,
+                "connector transitive trust",
+                ("wrapper_product", "scope_expansion"),
+                0.65,
+                0.60,
+                0.55,
+                0.60,
+                "isolate per-connector context; review third-party connector metadata",
+                "MCP connector context isolation is missing",
+                "A wrapper builder would try chaining canary connectors when trust boundaries are blurry.",
+            ),
+        ),
+        motivation_intensity=0.75,
+    ),
+]
+
+
+PERSONA_BY_ID = {p.id: p for p in DEFAULT_PERSONAS}
+
+# Backward-compatible legacy profiles for callers that still import them directly.
 DEFAULT_PROFILES: list[MotivationProfile] = [
-    # high cost-sensitivity, low sophistication, moderate ToS-willingness
     MotivationProfile("cost_driven_cheapskate", cost_sensitivity=0.95, risk_tolerance=0.40,
                       sophistication=0.30, tos_willingness=0.55),
-    # low sophistication, high willingness to bend rules
     MotivationProfile("low_sophistication_rule_bender", cost_sensitivity=0.70, risk_tolerance=0.55,
                       sophistication=0.20, tos_willingness=0.85),
-    # high sophistication, comfortable with arbitrage/ToS edge
     MotivationProfile("sophisticated_arbitrageur", cost_sensitivity=0.80, risk_tolerance=0.75,
                       sophistication=0.95, tos_willingness=0.85),
 ]
 PROFILE_BY_ID = {p.id: p for p in DEFAULT_PROFILES}
+
+
+__all__ = [
+    "AbusePersona",
+    "PersonaRule",
+    "DEFAULT_PERSONAS",
+    "PERSONA_BY_ID",
+    "DEFAULT_PROFILES",
+    "PROFILE_BY_ID",
+]

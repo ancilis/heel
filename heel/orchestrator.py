@@ -18,11 +18,27 @@ from .classify import enrich as classify_enrich
 from .containment import ContainmentLog
 from .contracts import CallerContext, RunResult
 from .control import enrich_controls
-from .profiles import DEFAULT_PROFILES
+from .profiles import DEFAULT_PERSONAS
 from .scenarios import list_scenarios
 from .targets import get_target
 
 DEFAULT_CLASSES = ["adversarial", "opportunistic"]
+
+
+def _attach_persona_evidence(vector, evidence: list[dict]):
+    if not evidence:
+        return
+    existing = list((vector.reproduction or {}).get("persona_evidence", []))
+    seen = {(e.get("persona_id"), e.get("matched_affordance"), e.get("preferred_abuse_chain")) for e in existing}
+    for item in evidence:
+        key = (item.get("persona_id"), item.get("matched_affordance"), item.get("preferred_abuse_chain"))
+        if key not in seen:
+            existing.append(item)
+            seen.add(key)
+    vector.reproduction["persona_evidence"] = existing
+    ids = ", ".join(e.get("persona_id", "unknown") for e in existing)
+    suffix = f"persona evidence: {ids}"
+    vector.notes = f"{vector.notes}; {suffix}" if vector.notes else suffix
 
 
 def run_abuse(scope, target_id: str, scenario_ids, caller: CallerContext, store,
@@ -50,12 +66,18 @@ def run_abuse(scope, target_id: str, scenario_ids, caller: CallerContext, store,
         {"findings": [], "handoffs": [], "discovered_scenarios": [], "probe_count": 0}
     by_aff = {f.affordance_id: f for f in output["findings"]}
 
-    # opportunistic-human class — motivation-profiled gaming of normal affordances (§3.2)
+    # opportunistic-human class — persona-modeled gaming of normal affordances (§3.2).
+    # Adversarial findings stay primary for an affordance; persona evidence can annotate them
+    # without changing calibrated severity/category/control. Persona-only findings are added.
     if "opportunistic" in classes:
-        opp = run_opportunistic(target, DEFAULT_PROFILES, log, run_id)
+        opp = run_opportunistic(target, DEFAULT_PERSONAS, log, run_id)
         for f in opp["findings"]:
             if f.affordance_id not in by_aff:   # ADD what it uniquely games; keep adversarial's calibrated severities
                 by_aff[f.affordance_id] = f
+        for aff_id, evidence in opp.get("persona_evidence_by_affordance", {}).items():
+            if aff_id in by_aff:
+                _attach_persona_evidence(by_aff[aff_id], evidence)
+        output["opportunistic_personas"] = opp["personas_used"]
         output["opportunistic_profiles"] = opp["profiles_used"]
 
     # affordance-chaining discovery — multi-step abuse the single-affordance classes miss
