@@ -14,19 +14,34 @@ import glob
 import json
 import os
 
-from .contracts import AbuseScenario, AppliesWhen, Category, ScenarioSource
+from .contracts import AbuseScenario, AppliesWhen, Category, ScenarioPack, ScenarioSource
 
 _AGENT = AppliesWhen.HAS_AGENT_SURFACE
 
 
+def _default_pack(category: Category) -> ScenarioPack:
+    if category == Category.AGENT_MCP_SURFACE:
+        return ScenarioPack.AGENT_MCP
+    if category in {Category.LICENSE_ENTITLEMENT, Category.DATA_HARVESTING}:
+        return ScenarioPack.PAYMENTS_BILLING
+    if category in {Category.TRUST_ECONOMY, Category.CONTENT_POLICY, Category.IDENTITY_ACCOUNT}:
+        return ScenarioPack.TRUST_SAFETY
+    if category == Category.INTEGRATION_EXTENSIBILITY:
+        return ScenarioPack.INTEGRATIONS
+    if category == Category.COMPLIANCE_BOUNDARY:
+        return ScenarioPack.COMPLIANCE
+    return ScenarioPack.CORE_SAAS
+
+
 def _s(id, cat, objective, kind, crit, like, imp, control, redux=0.75, applies=AppliesWhen.ALWAYS,
-       handoff="", cls=None):
+       handoff="", cls=None, pack=None):
+    scenario_pack = pack or _default_pack(cat)
     return AbuseScenario(
         id=id, category=cat, objective=objective, target_affordance_pattern={"kind": kind},
         probe_strategy=id.split(".", 1)[-1], success_criterion=crit,
         severity_model={"likelihood": like, "impact": imp}, classification_impact=cls,
         applies_when=applies, source=ScenarioSource.SEED, recommended_control=control,
-        exploitability_reduction=redux, handoff=handoff,
+        exploitability_reduction=redux, handoff=handoff, pack=scenario_pack,
         containment_limits={"max_probe_calls": 5, "backoff": True, "sample": "canary_only"})
 
 
@@ -132,7 +147,8 @@ def _build_semantic_scenarios():
             target_affordance_pattern={"kind": "*"}, probe_strategy="semantic",
             success_criterion={"semantic": signal}, severity_model={"likelihood": like, "impact": imp},
             applies_when=_AGENT if cat == Category.AGENT_MCP_SURFACE else AppliesWhen.ALWAYS,
-            source=ScenarioSource.SEED, recommended_control=control, exploitability_reduction=0.7, handoff=handoff))
+            source=ScenarioSource.SEED, pack=_default_pack(cat), recommended_control=control,
+            exploitability_reduction=0.7, handoff=handoff))
     return out
 
 
@@ -147,6 +163,7 @@ def load_json_scenarios() -> list[AbuseScenario]:
         try:
             with open(fn) as fh:
                 for s in json.load(fh):
+                    cat = Category(s["category"])
                     out.append(AbuseScenario(
                         id=s["id"], category=Category(s["category"]), objective=s["objective"],
                         target_affordance_pattern={"kind": s["kind"]},
@@ -154,7 +171,8 @@ def load_json_scenarios() -> list[AbuseScenario]:
                         success_criterion=s["success_criterion"],
                         severity_model=s["severity_model"],
                         applies_when=AppliesWhen(s.get("applies_when", "always")),
-                        source=ScenarioSource.SEED, recommended_control=s.get("recommended_control", ""),
+                        source=ScenarioSource.SEED, pack=ScenarioPack(s.get("pack", _default_pack(cat).value)),
+                        recommended_control=s.get("recommended_control", ""),
                         exploitability_reduction=s.get("exploitability_reduction", 0.6),
                         handoff=s.get("handoff", ""), classification_impact=s.get("classification_impact")))
         except Exception:
@@ -168,11 +186,27 @@ def all_seed_scenarios(semantic: bool = True) -> list[AbuseScenario]:
 
 
 def list_scenarios(filter_category: str | None = None, include_discovered: list | None = None,
-                   semantic: bool = True) -> list[AbuseScenario]:
+                   semantic: bool = True, pack_filter: str | None = None,
+                   pack_filters: list[str] | None = None) -> list[AbuseScenario]:
     out = all_seed_scenarios(semantic=semantic) + list(include_discovered or [])
     if filter_category:
         out = [s for s in out if s.category.value == filter_category]
+    packs = _pack_filter_set(pack_filter, pack_filters)
+    if packs:
+        out = [s for s in out if s.pack.value in packs]
     return out
+
+
+def _pack_filter_set(pack_filter: str | None, pack_filters: list[str] | None) -> set[str]:
+    raw = []
+    if pack_filter:
+        raw.extend(str(pack_filter).split(","))
+    for pack in pack_filters or []:
+        raw.extend(str(pack).split(","))
+    packs = {p.strip() for p in raw if p and p.strip()}
+    for pack in packs:
+        ScenarioPack(pack)
+    return packs
 
 
 SEED_BY_ID = {s.id: s for s in SEED_SCENARIOS}

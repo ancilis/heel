@@ -118,6 +118,11 @@ function abuse, content policy, identity/account takeover, trust-economy fraud, 
 compliance boundaries, and (only when the target has an agent/MCP surface) **agent-specific abuse**
 like tool over-scope, confused-deputy tool calls, cross-tenant RAG, and indirect-injection-to-action.
 
+Scenarios are organized into packs so teams can focus a run without narrowing HEEL's positioning:
+`core_saas`, `payments_billing`, `trust_safety`, `integrations`, `compliance`, and `agent_mcp`.
+Agent/MCP is one premium pack for products with agentic surfaces; HEEL remains broad SaaS abuse
+rehearsal first. See [docs/SCENARIO_PACKS.md](docs/SCENARIO_PACKS.md).
+
 Two agent classes hunt in parallel: a **programmatic adversary** (finds weak controls) and a
 **motivation-profiled opportunistic human** (games normal affordances, catches what the adversary
 misses, like coupon stacking). Plus **affordance chaining** for multi-step abuse (for example, weak
@@ -199,7 +204,7 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 
 [ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [DECISIONS](DECISIONS.md) · [SECURITY](SECURITY.md)
 · [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) · [ENTITLEMENTS](docs/ENTITLEMENTS.md) · [ECONOMIC SEVERITY](docs/ECONOMIC_SEVERITY.md) · [REGRESSIONS](docs/REGRESSIONS.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
-[PERSONAS](docs/PERSONAS.md) · [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
+[PERSONAS](docs/PERSONAS.md) · [SCENARIO PACKS](docs/SCENARIO_PACKS.md) · [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
 ## Status
 

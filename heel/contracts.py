@@ -54,6 +54,15 @@ class ScenarioSource(str, Enum):
     DISCOVERED = "discovered"
 
 
+class ScenarioPack(str, Enum):
+    CORE_SAAS = "core_saas"
+    AGENT_MCP = "agent_mcp"
+    PAYMENTS_BILLING = "payments_billing"
+    TRUST_SAFETY = "trust_safety"
+    INTEGRATIONS = "integrations"
+    COMPLIANCE = "compliance"
+
+
 class VerificationStatus(str, Enum):
     PREDICTED = "predicted"     # reachability proven by contained PoC, not yet observed in prod
     OBSERVED = "observed"       # later corroborated by real post-launch telemetry (stretch hook)
@@ -80,6 +89,7 @@ class AbuseScenario:
     containment_limits: dict = field(default_factory=dict)  # per-scenario back-off / sample caps
     applies_when: AppliesWhen = AppliesWhen.ALWAYS
     source: ScenarioSource = ScenarioSource.SEED
+    pack: ScenarioPack = ScenarioPack.CORE_SAAS
     # declarative outputs (so scenarios are addable WITHOUT code, incl. from JSON):
     recommended_control: str = ""
     exploitability_reduction: float = 0.6
@@ -237,6 +247,7 @@ class RunSpec:
     target: str
     scenario_ids: Optional[list[str]] = None
     agent_classes: Optional[list[str]] = None       # ["adversarial"] for v1 slice
+    packs: Optional[list[str]] = None
     budget: dict = field(default_factory=dict)
 
 

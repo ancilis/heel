@@ -1,6 +1,6 @@
 {
   "queue_version": "0.1",
-  "next_prompt_id": 8,
+  "next_prompt_id": 9,
   "completed_prompt_ids": [
     1,
     2,
@@ -8,14 +8,15 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "in_flight": null,
   "last_pr": {
-    "prompt_id": 7,
-    "slug": "07_persona_system",
+    "prompt_id": 8,
+    "slug": "08_scenario_packs_agent_mcp",
     "pr_url": "",
-    "advanced_at": "2026-07-01T03:35:54.870640+00:00"
+    "advanced_at": "2026-07-02T12:56:30.495364+00:00"
   },
   "notes": "The local Codex CLI runner updates this file inside each queued PR. Merging the PR advances the queue."
 }
