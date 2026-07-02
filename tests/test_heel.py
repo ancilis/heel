@@ -138,6 +138,67 @@ class TestCoverageBacktest(Base):  # spec §5, DoD #4
         self.assertGreaterEqual(c["compound_chain_findings"], 1)
 
 
+class TestScenarioPacks(Base):
+    def test_agent_mcp_pack_contains_existing_agent_scenarios(self):
+        from heel.contracts import AppliesWhen, ScenarioPack
+        from heel.scenarios import list_scenarios
+
+        scs = list_scenarios(pack_filter="agent_mcp", semantic=False)
+        ids = {s.id for s in scs}
+
+        self.assertEqual({s.pack for s in scs}, {ScenarioPack.AGENT_MCP})
+        self.assertTrue({"sc.agent.overscope", "sc.agent.deputy", "sc.agent.retrieval",
+                         "sc.agent.indirect", "sc.mcp.toolpoison"}.issubset(ids))
+        self.assertTrue(all(s.applies_when == AppliesWhen.HAS_AGENT_SURFACE for s in scs))
+
+    def test_filtering_by_pack_works_in_library_and_mcp(self):
+        from heel.scenarios import list_scenarios
+
+        agent_ids = {s.id for s in list_scenarios(pack_filter="agent_mcp", semantic=False)}
+        core_ids = {s.id for s in list_scenarios(pack_filter="core_saas", semantic=False)}
+        out = self.server.heel_list_scenarios({"pack": "agent_mcp"}, self.caller)
+
+        self.assertIn("sc.agent.overscope", agent_ids)
+        self.assertNotIn("sc.agent.overscope", core_ids)
+        self.assertTrue(out["scenarios"])
+        self.assertEqual({s["pack"] for s in out["scenarios"]}, {"agent_mcp"})
+
+    def test_agent_mcp_pack_does_not_fire_on_non_agent_target(self):
+        r = self.server.heel_run({"scope_id": self.scope.scope_id, "target": "synthetic-saas",
+                                  "packs": ["agent_mcp"], "agent_classes": ["adversarial"]}, self.caller)
+        findings = self.server.heel_get_findings({"run_id": r["run_id"]}, self.caller)["findings"]
+        coverage = self.server.heel_get_coverage({"run_id": r["run_id"]}, self.caller)["coverage"]
+
+        self.assertEqual(findings, [])
+        self.assertEqual(coverage["category10_findings"], 0)
+        self.assertTrue(coverage["category10_clean_on_non_ai"])
+
+    def test_default_run_remains_backward_compatible(self):
+        default = self.server.heel_run({"scope_id": self.scope.scope_id, "target": "synthetic-ai",
+                                        "agent_classes": ["adversarial"]}, self.caller)
+        explicit = self.server.heel_run({"scope_id": self.scope.scope_id, "target": "synthetic-ai",
+                                         "packs": ["core_saas", "agent_mcp", "payments_billing",
+                                                   "trust_safety", "integrations", "compliance"],
+                                         "agent_classes": ["adversarial"]}, self.caller)
+
+        def scenario_ids(run_id):
+            return {f["scenario_id"] for f in self.server.heel_get_findings({"run_id": run_id}, self.caller)["findings"]}
+
+        self.assertEqual(scenario_ids(default["run_id"]), scenario_ids(explicit["run_id"]))
+
+    def test_cli_accepts_pack_filters(self):
+        import io
+        from contextlib import redirect_stdout
+        from heel import cli
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli.main(["scenarios", "--pack", "agent_mcp"]), 0)
+        scenarios = json.loads(buf.getvalue())["scenarios"]
+        self.assertTrue(scenarios)
+        self.assertEqual({s["pack"] for s in scenarios}, {"agent_mcp"})
+
+
 class TestSafetySpine(Base):  # spec §10.2
     def setUp(self):
         super().setUp()
@@ -1071,6 +1132,16 @@ class TestDocsAndMetadata(unittest.TestCase):
         self.assertIn("saas", description)
         self.assertNotIn("pentest replacement", description)
         self.assertNotIn("penetration testing replacement", description)
+
+    def test_readme_positions_agent_mcp_as_one_scenario_pack(self):
+        readme = self._read("README.md").lower()
+        scenario_packs = self._read("docs/SCENARIO_PACKS.md").lower()
+
+        readme_unwrapped = " ".join(readme.split())
+        self.assertIn("agent/mcp is one premium pack", readme_unwrapped)
+        self.assertIn("broad saas abuse rehearsal", readme_unwrapped)
+        self.assertIn("heel covers saas abuse broadly", scenario_packs)
+        self.assertIn("agent/mcp is a premium pack", scenario_packs)
 
 
 if __name__ == "__main__":

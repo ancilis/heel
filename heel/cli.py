@@ -172,6 +172,7 @@ def main(argv=None):
     runp.add_argument("--scope", required=True)
     runp.add_argument("--target", required=True)
     runp.add_argument("--scenario", action="append")
+    runp.add_argument("--packs", help="comma-separated scenario packs to run")
     runp.add_argument("--economic", action="store_true", help="include economic severity in the run output")
     runp.add_argument("--economic-assumptions", help="optional EconomicAssumptions JSON file")
 
@@ -182,7 +183,9 @@ def main(argv=None):
     report.add_argument("--run", required=True)
     report.add_argument("--economic", action="store_true")
     report.add_argument("--economic-assumptions", help="optional EconomicAssumptions JSON file")
-    scn = sub.add_parser("scenarios"); scn.add_argument("--filter")
+    scn = sub.add_parser("scenarios")
+    scn.add_argument("--filter")
+    scn.add_argument("--pack")
     imp = sub.add_parser("import", help="validate sanitized target import models; no live probing")
     imps = imp.add_subparsers(dest="icmd", required=True)
     impv = imps.add_parser("validate", help="validate a ProductModel JSON file")
@@ -273,7 +276,10 @@ def main(argv=None):
     caller = _caller()
     if args.cmd == "run":
         try:
-            r = srv.heel_run({"scope_id": args.scope, "target": args.target, "scenario_ids": args.scenario}, caller)
+            run_args = {"scope_id": args.scope, "target": args.target, "scenario_ids": args.scenario}
+            if args.packs:
+                run_args["packs"] = [p.strip() for p in args.packs.split(",") if p.strip()]
+            r = srv.heel_run(run_args, caller)
             if args.economic:
                 r = dict(r)
                 r["economic_report"] = _report(srv, r["run_id"], caller, economic=True,
@@ -299,7 +305,7 @@ def main(argv=None):
     if args.cmd == "log":
         print(json.dumps(srv.heel_get_containment_log({"run_id": args.run}, caller), indent=2, default=str)); return 0
     if args.cmd == "scenarios":
-        print(json.dumps(srv.heel_list_scenarios({"filter": args.filter}, caller), indent=2)); return 0
+        print(json.dumps(srv.heel_list_scenarios({"filter": args.filter, "pack": args.pack}, caller), indent=2)); return 0
 
 
 if __name__ == "__main__":

@@ -16,13 +16,14 @@ from .agents_human import run_opportunistic
 from .backtest import score_target
 from .classify import enrich as classify_enrich
 from .containment import ContainmentLog
-from .contracts import CallerContext, RunResult
+from .contracts import AppliesWhen, CallerContext, RunResult
 from .control import enrich_controls
 from .profiles import DEFAULT_PERSONAS
 from .scenarios import list_scenarios
 from .targets import get_target
 
 DEFAULT_CLASSES = ["adversarial", "opportunistic"]
+_NON_AGENT_CHAIN_PACKS = {"core_saas", "payments_billing", "trust_safety", "integrations", "compliance"}
 
 
 def _attach_persona_evidence(vector, evidence: list[dict]):
@@ -43,7 +44,7 @@ def _attach_persona_evidence(vector, evidence: list[dict]):
 
 def run_abuse(scope, target_id: str, scenario_ids, caller: CallerContext, store,
               run_id: str | None = None, classify_enabled: bool = False,
-              agent_classes: list | None = None) -> RunResult:
+              agent_classes: list | None = None, packs: list | None = None) -> RunResult:
     run_id = run_id or ("run-" + uuid.uuid4().hex[:10])
     store.add_run(run_id, scope.scope_id, target_id, caller.caller_identity, "running", time.time())
     log = ContainmentLog(store, run_id, caller.caller_identity).logger()
@@ -56,13 +57,16 @@ def run_abuse(scope, target_id: str, scenario_ids, caller: CallerContext, store,
         log("reject", {"reason": "unknown target", "target": target_id})
         return RunResult(run_id, "rejected", caller, error="unknown target")
 
-    scenarios = list_scenarios()
+    scenarios = list_scenarios(pack_filters=packs)
     if scenario_ids:
         scenarios = [s for s in scenarios if s.id in set(scenario_ids)]
     classes = agent_classes or DEFAULT_CLASSES
+    selected_packs = {str(p) for p in (packs or [])}
+
+    applicable = [s for s in scenarios if not (s.applies_when == AppliesWhen.HAS_AGENT_SURFACE and not target.has_agent_surface)]
 
     # adversarial (programmatic) class — the bulk of the swarm
-    output = run_adversarial(target, scenarios, log, run_id) if "adversarial" in classes else \
+    output = run_adversarial(target, scenarios, log, run_id) if "adversarial" in classes and (not selected_packs or applicable) else \
         {"findings": [], "handoffs": [], "discovered_scenarios": [], "probe_count": 0}
     by_aff = {f.affordance_id: f for f in output["findings"]}
 
@@ -81,7 +85,7 @@ def run_abuse(scope, target_id: str, scenario_ids, caller: CallerContext, store,
         output["opportunistic_profiles"] = opp["profiles_used"]
 
     # affordance-chaining discovery — multi-step abuse the single-affordance classes miss
-    if "adversarial" in classes:
+    if "adversarial" in classes and (not selected_packs or selected_packs & _NON_AGENT_CHAIN_PACKS):
         from .chaining import run_chaining
         for f in run_chaining(target, log, run_id):
             if f.affordance_id not in by_aff:

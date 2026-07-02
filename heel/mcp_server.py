@@ -35,13 +35,14 @@ SERVER_INFO = {"name": "heel", "version": "1.1.0"}
 # Tools exposed over MCP. Scope-mutation tools are ABSENT by construction (§10.1).
 TOOL_SCHEMAS = [
     {"name": "heel_list_scenarios", "description": "List the abuse scenario library (read).",
-     "inputSchema": {"type": "object", "properties": {"filter": {"type": "string"}}}},
+     "inputSchema": {"type": "object", "properties": {"filter": {"type": "string"}, "pack": {"type": "string"}}}},
     {"name": "heel_list_scopes", "description": "List authorized scopes (read; never returns secrets). Scopes are created out-of-band by a human; agents cannot mint or widen them.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "heel_run", "description": "Start an abuse run WITHIN an existing scope. Rejected if scope_id is unknown or target is not in the scope allowlist.",
      "inputSchema": {"type": "object", "required": ["scope_id", "target"],
                      "properties": {"scope_id": {"type": "string"}, "target": {"type": "string"},
                                     "scenario_ids": {"type": "array", "items": {"type": "string"}},
+                                    "packs": {"type": "array", "items": {"type": "string"}},
                                     "agent_classes": {"type": "array", "items": {"type": "string"}},
                                     "budget": {"type": "object"}}}},
     {"name": "heel_run_status", "description": "Run progress.",
@@ -75,9 +76,10 @@ class HeelServer:
 
     # -- tool handlers (caller identity always passed in) -------------------- #
     def heel_list_scenarios(self, args, caller):
-        scs = list_scenarios(args.get("filter"))
+        scs = list_scenarios(args.get("filter"), pack_filter=args.get("pack"))
         return {"scenarios": [{"id": s.id, "category": s.category.value, "objective": s.objective,
-                               "applies_when": s.applies_when.value, "source": s.source.value} for s in scs]}
+                               "pack": s.pack.value, "applies_when": s.applies_when.value,
+                               "source": s.source.value} for s in scs]}
 
     def heel_list_scopes(self, args, caller):
         return {"scopes": [s.public_view() for s in scopemod.load_scopes()]}
@@ -111,14 +113,15 @@ class HeelServer:
             raise ToolError(f"scope '{scope_id}' resource limit (max_requests={maxreq}) exhausted; "
                             f"a new scope must be created out-of-band")
         # accountability: log any caller args we deliberately ignore (cannot widen scope)
-        ignored = [k for k in args if k not in ("scope_id", "target", "scenario_ids", "agent_classes", "budget")]
+        ignored = [k for k in args if k not in ("scope_id", "target", "scenario_ids", "packs", "agent_classes", "budget")]
         if ignored:
             self._security_log(caller, "ignored_args", {"scope_id": scope_id, "ignored": ignored,
                                                         "note": "extra args cannot affect scope/limits"})
         # authorized → run within the scope's limits
         cc = CallerContext(caller_identity=caller, scope_id=scope_id, ts=time.time())
         rr = run_abuse(scope, target, args.get("scenario_ids"), cc, self.store,
-                       classify_enabled=self.classify_enabled, agent_classes=args.get("agent_classes"))
+                       classify_enabled=self.classify_enabled, agent_classes=args.get("agent_classes"),
+                       packs=args.get("packs"))
         self.runs[rr.run_id] = rr
         return {"run_id": rr.run_id, "status": rr.status}
 
