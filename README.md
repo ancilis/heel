@@ -93,23 +93,21 @@ That second number is the point: **HEEL tells you what it can't catch yet.**
 - **After incidents:** convert the incident pattern into a regression scenario, especially support
   and workflow gaming where the issue was a business-process affordance rather than a software vuln.
 
-## What HEEL is not
+## Why not pentest, QA, or a fraud platform?
 
-HEEL complements adjacent programs; it does not replace them.
+HEEL is not a replacement for penetration testing, AppSec scanners, functional QA,
+fraud/bot platforms, runtime WAF/API protection, Trust & Safety manual review, or
+model red-team tools. Those programs remain necessary. HEEL complements them by filling
+the missing product-abuse rehearsal step: intended features, legitimate customer paths,
+pricing and entitlement rules, workflows, integrations, and agent tools can all be
+misused even when the endpoint has no injection bug and the UI works as specified.
 
-- Not a pentest replacement.
-- Not functional QA.
-- Not runtime fraud decisioning.
-- Not a bot mitigation service.
-- Not a jailbreak tool.
+Example: QA says export button works. AppSec says endpoint has no injection bug. A fraud
+platform may catch abuse after traffic appears. HEEL asks whether the export business
+flow can be used by a trial user to harvest more data than intended, then proves that
+only with contained, canary-only evidence.
 
-| tool class | primary job | how HEEL differs |
-|---|---|---|
-| Pentest / AppSec scanner | Find software vulnerabilities and exploitable implementation flaws | HEEL rehearses product-abuse paths and hands true vulns to AppSec |
-| QA / functional testing | Prove expected workflows work | HEEL asks how valid features can be gamed by customers, integrations, bots, or agents |
-| Fraud / bot platform | Make live runtime allow/block decisions | HEEL rehearses controls with canaries; it is not production fraud decisioning |
-| Model red-team | Probe model jailbreak and safety behavior | HEEL handles product and business consequences; pure jailbreaks are handed to model red-team |
-| HEEL | Rehearse SaaS abuse before launch and across production life | MCP-first, scope-gated, contained, canary-only abuse rehearsal |
+See [docs/POSITIONING.md](docs/POSITIONING.md) for the full comparison table.
 
 ## What it hunts
 
@@ -203,7 +201,7 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 
 ## Docs
 
-[ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [DECISIONS](DECISIONS.md) · [SECURITY](SECURITY.md)
+[ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [POSITIONING](docs/POSITIONING.md) · [DECISIONS](DECISIONS.md) · [SECURITY](SECURITY.md)
 · [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) · [ENTITLEMENTS](docs/ENTITLEMENTS.md) · [CONTROL SIMULATOR](docs/CONTROL_SIMULATOR.md) · [ECONOMIC SEVERITY](docs/ECONOMIC_SEVERITY.md) · [REGRESSIONS](docs/REGRESSIONS.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
 [PERSONAS](docs/PERSONAS.md) · [SCENARIO PACKS](docs/SCENARIO_PACKS.md) · [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
