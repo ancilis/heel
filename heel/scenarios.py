@@ -173,6 +173,7 @@ def load_json_scenarios() -> list[AbuseScenario]:
                         applies_when=AppliesWhen(s.get("applies_when", "always")),
                         source=ScenarioSource.SEED, pack=ScenarioPack(s.get("pack", _default_pack(cat).value)),
                         recommended_control=s.get("recommended_control", ""),
+                        containment_limits=s.get("containment_limits", {}),
                         exploitability_reduction=s.get("exploitability_reduction", 0.6),
                         handoff=s.get("handoff", ""), classification_impact=s.get("classification_impact")))
         except Exception:

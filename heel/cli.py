@@ -117,6 +117,25 @@ def _openapi_import(path: str, out_path: str) -> int:
     return 0
 
 
+def _scenario_validate(path: str) -> int:
+    from .scenario_validate import render_validation_report, validate_scenario_file
+
+    results = validate_scenario_file(path)
+    print(render_validation_report(results))
+    return 0 if results and all(result.ok for result in results) else 1
+
+
+def _scenario_explain(scenario_id: str) -> int:
+    from .scenario_validate import explain_scenario
+
+    explanation = explain_scenario(scenario_id)
+    if explanation is None:
+        print(f"Scenario explain: FAIL (unknown scenario id '{scenario_id}')")
+        return 1
+    print(explanation)
+    return 0
+
+
 def _launch_review(args) -> int:
     from .importers import ProductModelError
     from .launch_review import load_and_review, render_human_summary, review_git_diff, review_to_json
@@ -219,6 +238,12 @@ def main(argv=None):
     scn = sub.add_parser("scenarios")
     scn.add_argument("--filter")
     scn.add_argument("--pack")
+    scenario = sub.add_parser("scenario", help="validate and explain declarative scenario pack entries")
+    scenario_sub = scenario.add_subparsers(dest="scenariocmd", required=True)
+    scenario_validate = scenario_sub.add_parser("validate", help="validate a scenario JSON object or list")
+    scenario_validate.add_argument("path")
+    scenario_explain = scenario_sub.add_parser("explain", help="explain a known scenario id")
+    scenario_explain.add_argument("scenario_id")
     imp = sub.add_parser("import", help="validate sanitized target import models; no live probing")
     imps = imp.add_subparsers(dest="icmd", required=True)
     impv = imps.add_parser("validate", help="validate a ProductModel JSON file")
@@ -291,6 +316,10 @@ def main(argv=None):
         return _import_validate(args.path)
     if args.cmd == "import" and args.icmd == "openapi":
         return _openapi_import(args.path, args.out)
+    if args.cmd == "scenario" and args.scenariocmd == "validate":
+        return _scenario_validate(args.path)
+    if args.cmd == "scenario" and args.scenariocmd == "explain":
+        return _scenario_explain(args.scenario_id)
 
     if args.cmd == "incident":
         from .incident import IncidentError, add_regression_draft, draft_scenario, import_incident, review_incident

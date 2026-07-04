@@ -7,6 +7,7 @@
     "success_criterion": {"prop": "formula_sanitization", "equals": "none"},
     "severity_model": {"likelihood": 0.4, "impact": 0.5},
     "recommended_control": "neutralize leading =,+,-,@ in exported cells",
+    "containment_limits": {"canary_only": true, "no_live_targets": true, "max_examples": 3},
     "exploitability_reduction": 0.7
   },
   {
@@ -17,6 +18,7 @@
     "success_criterion": {"prop": "velocity_limit", "equals": "none"},
     "severity_model": {"likelihood": 0.5, "impact": 0.5},
     "recommended_control": "per-account + per-device coupon velocity limits",
+    "containment_limits": {"canary_only": true, "no_live_targets": true, "max_examples": 3},
     "exploitability_reduction": 0.7
   }
 ]
