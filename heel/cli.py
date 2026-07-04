@@ -199,6 +199,16 @@ def main(argv=None):
     imps = imp.add_subparsers(dest="icmd", required=True)
     impv = imps.add_parser("validate", help="validate a ProductModel JSON file")
     impv.add_argument("path")
+    incident = sub.add_parser("incident", help="turn sanitized abuse incidents into local scenario drafts")
+    incidents = incident.add_subparsers(dest="incmd", required=True)
+    incident_import = incidents.add_parser("import", help="validate and store a sanitized incident JSON file")
+    incident_import.add_argument("path")
+    incident_draft = incidents.add_parser("draft-scenario", help="write and print a local scenario draft")
+    incident_draft.add_argument("incident_id")
+    incident_reg = incidents.add_parser("add-regression", help="write and print a canary-only regression draft")
+    incident_reg.add_argument("incident_id")
+    incident_review = incidents.add_parser("review", help="print exactly what incident drafts would add")
+    incident_review.add_argument("incident_id")
     launch = sub.add_parser("launch-review", help="compare ProductModel changes before launch")
     launch_inputs = launch.add_mutually_exclusive_group(required=True)
     launch_inputs.add_argument("--diff", help="git revision range containing a ProductModel JSON change")
@@ -247,6 +257,25 @@ def main(argv=None):
         return _launch_review(args)
     if args.cmd == "import" and args.icmd == "validate":
         return _import_validate(args.path)
+
+    if args.cmd == "incident":
+        from .incident import IncidentError, add_regression_draft, draft_scenario, import_incident, review_incident
+        try:
+            if args.incmd == "import":
+                print(json.dumps(import_incident(args.path), indent=2, default=str))
+                return 0
+            if args.incmd == "draft-scenario":
+                print(json.dumps(draft_scenario(args.incident_id), indent=2, default=str))
+                return 0
+            if args.incmd == "add-regression":
+                print(json.dumps(add_regression_draft(args.incident_id), indent=2, default=str))
+                return 0
+            if args.incmd == "review":
+                print(json.dumps(review_incident(args.incident_id), indent=2, default=str))
+                return 0
+        except IncidentError as e:
+            print(f"REJECTED: {e}")
+            return 1
 
     if args.cmd == "regress":
         from .regressions import (
