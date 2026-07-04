@@ -303,3 +303,17 @@ adversarial class already owns an affordance, it remains primary; persona eviden
 without changing severity/category/control. Persona-only findings have an explicit deterministic
 ranking rule. No scope creation, widening, target authorization, real exfiltration, payment abuse,
 credential abuse, spam, resource exhaustion, or third-party probing is added.
+
+### D-038 — Control simulation is proposed-fix ranking, not verification
+**Why:** teams need help choosing fixes after HEEL identifies a reachable abuse path. A single
+recommended control is too thin for launch and regression planning, so `heel.control_simulator`
+estimates a ranked bundle from vector fields, scenario category, affordance properties, optional
+ProductModel/EntitlementGraph signals, and a local control bank. The ranking is deterministic and
+balances abuse reduction, friction, legitimate-path preservation, and confidence.
+
+**Safety consequence:** the simulator is read-only report logic. It does not touch live targets,
+does not generate exploit payloads, and does not perform exfiltration, credential abuse, payment
+abuse, spam, or resource exhaustion. Its CLI can read stored findings or an operator-provided
+finding JSON file, but it cannot create, widen, relax, or mutate authorization scopes. Output is
+labelled as proposed offline estimates until a human-owned regression or launch review verifies the
+implemented control.

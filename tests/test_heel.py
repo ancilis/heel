@@ -1133,6 +1133,11 @@ class TestDocsAndMetadata(unittest.TestCase):
         self.assertNotIn("pentest replacement", description)
         self.assertNotIn("penetration testing replacement", description)
 
+    def test_docs_keep_production_ready_spine_beta_adapters_phrase(self):
+        readme = self._read("README.md")
+
+        self.assertIn("production-ready spine, beta adapters", readme)
+
     def test_readme_positions_agent_mcp_as_one_scenario_pack(self):
         readme = self._read("README.md").lower()
         scenario_packs = self._read("docs/SCENARIO_PACKS.md").lower()

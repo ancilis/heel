@@ -203,15 +203,15 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 ## Docs
 
 [ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [DECISIONS](DECISIONS.md) · [SECURITY](SECURITY.md)
-· [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) · [ENTITLEMENTS](docs/ENTITLEMENTS.md) · [ECONOMIC SEVERITY](docs/ECONOMIC_SEVERITY.md) · [REGRESSIONS](docs/REGRESSIONS.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
+· [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) · [ENTITLEMENTS](docs/ENTITLEMENTS.md) · [CONTROL SIMULATOR](docs/CONTROL_SIMULATOR.md) · [ECONOMIC SEVERITY](docs/ECONOMIC_SEVERITY.md) · [REGRESSIONS](docs/REGRESSIONS.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
 [PERSONAS](docs/PERSONAS.md) · [SCENARIO PACKS](docs/SCENARIO_PACKS.md) · [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
 ## Status
 
-**Production-ready safety/auth/eval spine, beta real-target adapter coverage (v1.1.0).** 55 core
-tests on Python 3.11 to 3.13, CI green, zero runtime dependencies, four red-team passes. The core
-authorization gate, containment model, and evaluation ladder are the production-ready spine.
-Real-target adapters remain beta until adapter coverage and operator controls mature.
+**Status: production-ready spine, beta adapters (v1.1.0).** 55 core tests on Python 3.11 to
+3.13, CI green, zero runtime dependencies, four red-team passes. The core authorization gate,
+containment model, and evaluation ladder are the production-ready spine. Real-target adapters remain
+beta until adapter coverage and operator controls mature.
 
 ---
 
