@@ -1,6 +1,6 @@
 {
   "queue_version": "0.1",
-  "next_prompt_id": 12,
+  "next_prompt_id": 13,
   "completed_prompt_ids": [
     1,
     2,
@@ -12,14 +12,15 @@
     8,
     9,
     10,
-    11
+    11,
+    12
   ],
   "in_flight": null,
   "last_pr": {
-    "prompt_id": 11,
-    "slug": "11_incident_to_scenario",
+    "prompt_id": 12,
+    "slug": "12_dashboard_war_room",
     "pr_url": "",
-    "advanced_at": "2026-07-04T12:06:11Z"
+    "advanced_at": "2026-07-04T12:29:37Z"
   },
   "notes": "The local Codex CLI runner updates this file inside each queued PR. Merging the PR advances the queue."
 }

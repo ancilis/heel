@@ -14,22 +14,46 @@ export function TargetToggle({ target, set }: { target: string; set: (t: string)
   );
 }
 
+function usdRange(range: number[] | undefined) {
+  if (!range || range.length < 2) return "$--";
+  return `$${range[0].toLocaleString()}-$${range[1].toLocaleString()}/mo`;
+}
+
+function uniqueValues(rows: any[], key: string) {
+  return Array.from(new Set(rows.map(r => r[key]).filter(Boolean))).sort();
+}
+
+function FilterSelect({ label, value, options, set }: { label: string; value: string; options: string[]; set: (v: string) => void }) {
+  return (
+    <label className="text-[10px] uppercase tracking-wider text-muted">
+      <span className="block mb-1">{label}</span>
+      <select value={value} onChange={e => set(e.target.value)}
+        className="bg-panel2 border border-border rounded-md px-2 py-1.5 text-[11px] text-text normal-case tracking-normal w-full">
+        <option value="">all</option>
+        {options.map(o => <option key={o} value={o}>{o}</option>)}
+      </select>
+    </label>
+  );
+}
+
 /* ============================== OVERVIEW ============================== */
 export function Overview({ s, go }: { s: any; go: (k: string) => void }) {
   const ai = s.targets["synthetic-ai"].coverage, saas = s.targets["synthetic-saas"].coverage;
+  const econ = s.economics || {};
   const tiles = [
-    { k: "abuse", label: "Abuse vectors (AI target)", value: s.targets["synthetic-ai"].findings.length, tone: "accent", sub: "ranked, reachability-weighted" },
-    { k: "backtest", label: "Self-consistency coverage", value: `${Math.round(ai.coverage * 100)}%`, tone: "ok", sub: `FP ${ai.false_positive_rate} · cat-10 cleanly ${saas.category10_findings} on non-AI` },
-    { k: "auth", label: "Authorization gate", value: s.auth_gate.all_rejected ? "PASS" : "FAIL", tone: s.auth_gate.all_rejected ? "ok" : "bad", sub: "every escalation rejected + logged" },
-    { k: "integration", label: "MCP tools exposed", value: s.meta.tools.length, sub: "no scope-mutation tool, by design" },
-    { k: "scenarios", label: "Scenario library", value: s.meta.n_scenarios, sub: `${s.meta.categories.length} categories · model: ${s.meta.model}` },
-    { k: "swarm", label: "Agent classes", value: "2", tone: "accent", sub: "adversarial + opportunistic-human" },
+    { k: "abuse-count", screen: "abuse", label: "What can customers game?", value: s.abuse_board?.ranked_findings?.length ?? s.targets["synthetic-ai"].findings.length, tone: "accent", sub: "ranked by reachability, severity, and dollars" },
+    { k: "abuse-cost", screen: "abuse", label: "How much can it cost us?", value: usdRange(econ.total_estimated_monthly_exposure_usd), tone: "bad", sub: "directional monthly exposure" },
+    { k: "controls", screen: "controls", label: "Which control stops most abuse?", value: s.controls?.recommended_bundle?.estimated_abuse_reduction ? `${Math.round(s.controls.recommended_bundle.estimated_abuse_reduction * 100)}%` : "—", tone: "ok", sub: s.controls?.recommended_bundle?.friction_cost },
+    { k: "regressions", screen: "regressions", label: "Is this covered by regression?", value: `${s.regressions?.with_regression?.length ?? 0}/${(s.regressions?.with_regression?.length ?? 0) + (s.regressions?.without_regression?.length ?? 0)}`, tone: "warn", sub: s.regressions?.last_run_status },
+    { k: "launch", screen: "launch", label: "Launch gate", value: (s.launch_review?.gate_status || "warn").toUpperCase(), tone: s.launch_review?.gate_status === "block" ? "bad" : "warn", sub: "changed surfaces + suggested regressions" },
+    { k: "safety", screen: "safety", label: "Safety & Authorization", value: s.safety_authorization?.canary_only ? "CANARY" : "CHECK", tone: s.safety_authorization?.scope_mutation_path ? "bad" : "ok", sub: "No production probing; scopes read-only" },
   ];
   return (
     <div className="space-y-4">
-      <Panel title="HEEL" sub="Rehearse customer, integration, bot, and agent abuse before launch and continuously after.">
+      <Panel title="HEEL Abuse War Room" sub="Operator control room for safe SaaS abuse rehearsal: economics first, controls second, regression coverage always visible."
+        right={<div className="flex gap-1"><Tag color="#34d399">synthetic</Tag><Tag color="#60a5fa">imported</Tag><Tag color="#fbbf24">staging</Tag></div>}>
         <div className="grid grid-cols-2 md:grid-cols-3 gap-2.5">
-          {tiles.map(t => <button key={t.k} onClick={() => go(t.k)} className="text-left"><Stat label={t.label} value={t.value} sub={t.sub} tone={(t as any).tone} /></button>)}
+          {tiles.map(t => <button key={t.k} onClick={() => go(t.screen)} className="text-left"><Stat label={t.label} value={t.value} sub={t.sub} tone={(t as any).tone} /></button>)}
         </div>
       </Panel>
       <div className="grid md:grid-cols-2 gap-4">
@@ -41,11 +65,12 @@ export function Overview({ s, go }: { s: any; go: (k: string) => void }) {
             <li>• Plausibility-weighted · severity-honest · immutable hash-chained self-audit · lane discipline (<Tag color="#fb7185">appsec</Tag>/<Tag color="#a78bfa">model-redteam</Tag> handoffs).</li>
           </ul>
         </Panel>
-        <Panel title="Honest framing">
+        <Panel title="Operator framing">
           <div className="space-y-2 text-[12px] text-dim">
-            <div>The coverage number is a <span className="text-warn">self-consistency / wiring</span> metric on synthetic targets (seed probes + planted weaknesses authored together) — <span className="text-text">not</span> real-target accuracy.</div>
-            <div>Honest signals: a genuine miss (<span className="tabnum">ato_chain</span>, found by neither class), a decoy false positive, a plausibility-demoted degenerate, a swarm-discovered scenario, and lane handoffs.</div>
-            <div>Both agent classes matter: coupon-stacking is a blind spot for the programmatic class, <span className="text-text">closed by the opportunistic-human class</span>.</div>
+            <div><span className="text-text">Synthetic</span> mode is active in this snapshot. Imported and staging modes are visible operator states, not permission to run against production.</div>
+            <div><span className="text-text">No production probing.</span> Real or imported target execution remains signed-scope gated, read-only from this UI, and canary-only.</div>
+            <div>Benchmark evidence stays available below: synthetic wiring, blind eval, held-out eval, and containment history.</div>
+            <div className="text-[11px] text-muted">Reference coverage still shows: AI self-consistency {Math.round(ai.coverage * 100)}%, non-AI category-10 findings {saas.category10_findings}.</div>
           </div>
         </Panel>
       </div>
@@ -56,72 +81,258 @@ export function Overview({ s, go }: { s: any; go: (k: string) => void }) {
 /* ============================== ABUSE BOARD ============================== */
 export function AbuseBoard({ s, target, setTarget }: { s: any; target: string; setTarget: (t: string) => void }) {
   const [open, setOpen] = useState<string | null>(null);
-  const t = s.targets[target];
-  const byCat: Record<string, any[]> = {};
-  for (const f of t.findings) (byCat[f.category] ||= []).push(f);
-  const cats = Object.keys(byCat).sort((a, b) => Math.max(...byCat[b].map(f => f.severity.score)) - Math.max(...byCat[a].map(f => f.severity.score)));
+  const [category, setCategory] = useState("");
+  const [persona, setPersona] = useState("");
+  const [pack, setPack] = useState("");
+  const [productArea, setProductArea] = useState("");
+  const allRows = s.abuse_board?.ranked_findings || [];
+  const rows = allRows.filter((f: any) =>
+    (!category || f.category === category) &&
+    (!persona || f.persona === persona) &&
+    (!pack || f.pack === pack) &&
+    (!productArea || f.product_area === productArea)
+  );
   return (
     <div className="space-y-4">
-      <Panel title="Abuse board" sub="Vectors ranked by severity, grouped by category. Reachability-weighted — implausible findings demoted, not hidden."
-        right={<TargetToggle target={target} set={setTarget} />}>
-        <div className="flex flex-wrap gap-2 text-[11px] text-muted mb-1">
-          <span>{t.findings.length} vectors</span><span>·</span>
-          <span>{t.coverage.opportunistic_findings} from the opportunistic-human class</span><span>·</span>
-          <span>handoffs: {JSON.stringify(t.coverage.handoffs.map((h: any) => h.handoff))}</span>
+      <Panel title="Abuse Board" sub="Ranked by reachability, severity, and optional economic impact. Filter by category, persona, pack, and product area."
+        right={<div className="flex items-center gap-2"><Tag color="#fb7185">{usdRange(s.economics?.top_estimated_monthly_range_usd)}</Tag><TargetToggle target={target} set={setTarget} /></div>}>
+        <div className="grid sm:grid-cols-4 gap-2">
+          <FilterSelect label="category" value={category} set={setCategory} options={s.abuse_board?.filters?.category || uniqueValues(allRows, "category")} />
+          <FilterSelect label="persona" value={persona} set={setPersona} options={s.abuse_board?.filters?.persona || uniqueValues(allRows, "persona")} />
+          <FilterSelect label="pack" value={pack} set={setPack} options={s.abuse_board?.filters?.pack || uniqueValues(allRows, "pack")} />
+          <FilterSelect label="product area" value={productArea} set={setProductArea} options={s.abuse_board?.filters?.product_area || uniqueValues(allRows, "product_area")} />
         </div>
       </Panel>
-      {cats.map(cat => (
-        <Panel key={cat} title={catShort(cat)} sub={`${byCat[cat].length} vector(s)`}
-          right={<span className="w-2.5 h-2.5 rounded-full" style={{ background: CAT_COLOR[cat] }} />}>
-          <div className="space-y-1.5">
-            {byCat[cat].sort((a, b) => b.severity.score - a.severity.score).map((f: any) => (
-              <div key={f.id} className="rounded-lg border border-border bg-panel2/40">
-                <button onClick={() => setOpen(open === f.id ? null : f.id)} className="w-full flex items-center gap-2 px-3 py-2 text-left">
-                  <SevBadge s={f.severity.label} />
-                  <span className="tabnum text-[12px] text-text flex-1 truncate">{f.affordance_id}</span>
-                  {f.klass === "opportunistic_human" && <Tag color="#34d399">human</Tag>}
-                  {f.handoff_to_appsec && <Tag color="#fb7185">→ appsec</Tag>}
-                  <ReachBar r={f.reachability_score} plausible={f.plausible} />
-                  <span className="tabnum text-[11px] text-muted w-10 text-right">{f.severity.score}</span>
-                </button>
-                {open === f.id && (
-                  <div className="px-3 pb-3 pt-1 border-t border-border/60 text-[12px] space-y-2">
-                    <div className="text-dim">{(s.scenarios.find((x: any) => x.id === f.scenario_id) || {}).objective || f.scenario_id}</div>
-                    <div className="grid sm:grid-cols-2 gap-2">
-                      <div className="rounded-md bg-panel border border-border p-2">
-                        <div className="text-[10px] uppercase text-muted mb-1">contained PoC</div>
-                        <div className="tabnum text-[11px] text-dim">strategy: {f.reproduction.strategy}</div>
-                        <div className="tabnum text-[11px] text-dim">sample: <span className="text-ok">{f.reproduction.sample}</span> · contained: {String(f.reproduction.contained)}</div>
-                        {f.reproduction.profiles && <div className="tabnum text-[11px] text-dim">profiles: {f.reproduction.profiles.join(", ")}</div>}
-                      </div>
-                      <div className="rounded-md bg-panel border border-border p-2">
-                        <div className="text-[10px] uppercase text-muted mb-1">recommended control</div>
-                        <div className="text-[12px] text-text">{f.recommended_control}</div>
-                        <div className="text-[11px] text-muted mt-1">est. exploitability reduction: <span className="text-ok tabnum">{fmt(f.estimated_exploitability_reduction, 2)}</span></div>
-                      </div>
+      <Panel title="Ranked abuse queue" sub={`${rows.length} visible of ${allRows.length} finding(s). Dollar severity leads the row; CVSS is intentionally absent.`}>
+        <div className="space-y-1.5">
+          {rows.map((f: any) => (
+            <div key={`${f.target_id}:${f.id}`} className="rounded-lg border border-border bg-panel2/40">
+              <button onClick={() => setOpen(open === f.id ? null : f.id)} className="w-full flex items-center gap-2 px-3 py-2 text-left">
+                <Tag color="#fb7185" solid>{usdRange(f.economic_impact?.estimated_monthly_range_usd)}</Tag>
+                <SevBadge s={f.severity.label} />
+                <span className="tabnum text-[12px] text-text flex-1 truncate">{f.affordance_id}</span>
+                <CatBadge c={f.category} />
+                <Tag color="#34d399">{f.persona}</Tag>
+                <ReachBar r={f.reachability_score} plausible={f.plausible} />
+                <span className="tabnum text-[11px] text-muted w-10 text-right">{f.rank_score}</span>
+              </button>
+              {open === f.id && (
+                <div className="px-3 pb-3 pt-1 border-t border-border/60 text-[12px] space-y-2">
+                  <div className="text-dim">{(s.scenarios.find((x: any) => x.id === f.scenario_id) || {}).objective || f.scenario_id}</div>
+                  <div className="grid sm:grid-cols-3 gap-2">
+                    <div className="rounded-md bg-panel border border-border p-2">
+                      <div className="text-[10px] uppercase text-muted mb-1">economic assumption</div>
+                      <div className="text-[12px] text-text">{f.economic_impact?.assumption}</div>
+                      <div className="tabnum text-[11px] text-muted mt-1">{f.economic_impact?.confidence}</div>
                     </div>
-                    {f.classification_impact && (
-                      <div className="rounded-md border border-info/30 bg-info/5 p-2">
-                        <div className="text-[10px] uppercase text-info mb-1">classification annotation (optional, ON)</div>
-                        <div className="text-[11px] text-dim">data classes: {(f.classification_impact.data_classes || []).join(", ")}</div>
-                        <div className="text-[11px] text-dim">obligations: {(f.obligation_impact?.obligations || []).join(", ")}</div>
-                      </div>
-                    )}
+                    <div className="rounded-md bg-panel border border-border p-2">
+                      <div className="text-[10px] uppercase text-muted mb-1">surface</div>
+                      <div className="tabnum text-[11px] text-dim">target: {f.target_id}</div>
+                      <div className="tabnum text-[11px] text-dim">pack: {f.pack}</div>
+                      <div className="text-[11px] text-dim">area: {f.product_area}</div>
+                    </div>
+                    <div className="rounded-md bg-panel border border-border p-2">
+                      <div className="text-[10px] uppercase text-muted mb-1">recommended control</div>
+                      <div className="text-[12px] text-text">{f.recommended_control}</div>
+                      <div className="text-[11px] text-muted mt-1">reduction: <span className="text-ok tabnum">{fmt(f.estimated_exploitability_reduction, 2)}</span></div>
+                    </div>
                   </div>
-                )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+/* ============================== LAUNCH REVIEW ============================== */
+export function LaunchReview({ s }: { s: any }) {
+  const lr = s.launch_review;
+  return (
+    <div className="space-y-4">
+      <Panel title="Launch Review" sub="Changed surfaces, pass/warn/block gate, and the regressions operators should add before launch."
+        right={<Tag color={lr.gate_status === "block" ? "#fb7185" : "#fbbf24"} solid>{lr.gate_status.toUpperCase()}</Tag>}>
+        <div className="grid md:grid-cols-3 gap-2">
+          {lr.changed_surfaces.map((surface: any) => (
+            <div key={surface.surface} className="rounded-lg border border-border bg-panel2/50 p-3">
+              <div className="text-[12px] text-text font-medium">{surface.surface}</div>
+              <div className="text-[11px] text-muted mt-1">{surface.product_area}</div>
+              <div className="text-[11px] text-warn mt-2">{surface.risk}</div>
+            </div>
+          ))}
+        </div>
+      </Panel>
+      <Panel title="Suggested regressions" sub="Drafts only; they become active after operator review.">
+        <div className="space-y-1.5">
+          {lr.suggested_regressions.map((r: any) => (
+            <div key={r.finding_id} className="flex items-center gap-2 rounded-md border border-border bg-panel2/40 px-3 py-2">
+              <Tag color="#34d399">candidate</Tag>
+              <span className="tabnum text-[12px] text-text">{r.scenario_id}</span>
+              <span className="tabnum text-[11px] text-muted ml-auto">{r.finding_id}</span>
+            </div>
+          ))}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+/* ============================== EXISTING PRODUCT REVIEW ============================== */
+export function ExistingProductReview({ s }: { s: any }) {
+  const ep = s.existing_product;
+  return (
+    <div className="space-y-4">
+      <Panel title="Existing Product Review" sub="Imported model summary, entitlement graph risks, and explicit mode state."
+        right={<div className="flex gap-1">{ep.mode_indicator.available_modes.map((m: string) => <Tag key={m} color={m === ep.mode_indicator.active_mode ? "#34d399" : "#60a5fa"}>{m}</Tag>)}</div>}>
+        <div className="grid md:grid-cols-3 gap-2">
+          <Stat label="active mode" value={ep.mode_indicator.active_mode} tone="ok" sub={ep.mode_indicator.note} />
+          <Stat label="surfaces" value={ep.imported_model_summary.surfaces.length} sub={ep.imported_model_summary.name} />
+          <Stat label="data mode" value={ep.imported_model_summary.data_mode} sub="canary-only rehearsal" />
+        </div>
+      </Panel>
+      <Panel title="Entitlement graph risks">
+        <div className="space-y-1.5">
+          {ep.entitlement_graph_risks.map((risk: any) => (
+            <div key={risk.node} className="grid md:grid-cols-[220px_1fr_140px] gap-2 rounded-md border border-border bg-panel2/40 px-3 py-2 text-[12px]">
+              <span className="tabnum text-accent">{risk.node}</span>
+              <span className="text-dim">{risk.risk}</span>
+              <CatBadge c={risk.category} />
+            </div>
+          ))}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+/* ============================== CONTROL SIMULATOR ============================== */
+export function ControlSimulator({ s }: { s: any }) {
+  const controls = s.controls;
+  return (
+    <div className="space-y-4">
+      <Panel title="Control Simulator" sub="Candidate controls ranked by abuse reduction and friction cost."
+        right={<Tag color="#34d399" solid>{Math.round(controls.recommended_bundle.estimated_abuse_reduction * 100)}% bundle</Tag>}>
+        <div className="grid md:grid-cols-3 gap-2 mb-3">
+          <Stat label="recommended bundle" value={controls.recommended_bundle.name} tone="ok" sub={controls.recommended_bundle.friction_cost} />
+          <Stat label="controls" value={controls.recommended_bundle.controls.length} />
+          <Stat label="friction" value={controls.recommended_bundle.friction_cost} tone="warn" />
+        </div>
+        <div className="space-y-1.5">
+          {controls.candidate_controls.map((c: any, i: number) => (
+            <div key={`${c.control}-${i}`} className="rounded-md border border-border bg-panel2/40 px-3 py-2">
+              <div className="flex items-center gap-2">
+                <span className="text-[12px] text-text flex-1">{c.control}</span>
+                <Tag color="#34d399">{Math.round(c.estimated_abuse_reduction * 100)}% reduction</Tag>
+                <Tag color={c.friction_cost === "low" ? "#34d399" : "#fbbf24"}>{c.friction_cost} friction</Tag>
+              </div>
+              <div className="text-[10px] text-muted mt-1">{c.notes}</div>
+            </div>
+          ))}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+/* ============================== REGRESSION COVERAGE ============================== */
+export function RegressionCoverage({ s }: { s: any }) {
+  const regs = s.regressions;
+  return (
+    <div className="space-y-4">
+      <Panel title="Regression Coverage" sub="Which findings are now permanent canary-only abuse regressions."
+        right={<Tag color="#34d399">{regs.last_run_status}</Tag>}>
+        <div className="grid md:grid-cols-2 gap-3">
+          <div>
+            <div className="text-[11px] uppercase tracking-wider text-muted mb-1">findings with regression</div>
+            {regs.with_regression.map((f: any) => <CoverageRow key={f.id} f={f} covered />)}
+          </div>
+          <div>
+            <div className="text-[11px] uppercase tracking-wider text-muted mb-1">findings without regression</div>
+            {regs.without_regression.map((f: any) => <CoverageRow key={f.id} f={f} />)}
+          </div>
+        </div>
+        <div className="text-[11px] text-muted mt-3">{regs.coverage_note}</div>
+      </Panel>
+    </div>
+  );
+}
+
+function CoverageRow({ f, covered }: { f: any; covered?: boolean }) {
+  return (
+    <div className="flex items-center gap-2 rounded-md border border-border bg-panel2/40 px-3 py-2 mb-1">
+      <Tag color={covered ? "#34d399" : "#fbbf24"}>{covered ? "covered" : "gap"}</Tag>
+      <span className="tabnum text-[11px] text-text truncate">{f.scenario_id}</span>
+      <span className="ml-auto"><CatBadge c={f.category} /></span>
+    </div>
+  );
+}
+
+/* ============================== INCIDENT LIBRARY ============================== */
+export function IncidentLibrary({ s }: { s: any }) {
+  const incidents = s.incidents;
+  return (
+    <div className="space-y-4">
+      <Panel title="Incident Library" sub="Sanitized incidents, generated scenarios, and generated canary-only regressions. Nothing auto-enables.">
+        <div className="grid md:grid-cols-3 gap-3">
+          <div>
+            <div className="text-[11px] uppercase tracking-wider text-muted mb-1">sanitized incidents</div>
+            {incidents.sanitized_incidents.map((i: any) => (
+              <div key={i.incident_id} className="rounded-md border border-border bg-panel2/40 p-2 mb-1">
+                <div className="tabnum text-[12px] text-text">{i.incident_id}</div>
+                <div className="text-[11px] text-dim mt-1">{i.summary}</div>
+                <Tag color={i.prohibited_fields_removed_confirmed ? "#34d399" : "#fb7185"}>sanitized</Tag>
               </div>
             ))}
           </div>
-        </Panel>
-      ))}
+          <div>
+            <div className="text-[11px] uppercase tracking-wider text-muted mb-1">generated scenarios</div>
+            {incidents.generated_scenarios.map((sc: any) => (
+              <div key={sc.scenario_id} className="rounded-md border border-border bg-panel2/40 p-2 mb-1">
+                <div className="tabnum text-[12px] text-text">{sc.scenario_id}</div>
+                <CatBadge c={sc.category} /> <Tag color="#fbbf24">draft</Tag>
+              </div>
+            ))}
+          </div>
+          <div>
+            <div className="text-[11px] uppercase tracking-wider text-muted mb-1">generated regressions</div>
+            {incidents.generated_regressions.map((r: any) => (
+              <div key={r.regression_id} className="rounded-md border border-border bg-panel2/40 p-2 mb-1">
+                <div className="tabnum text-[12px] text-text">{r.regression_id}</div>
+                <Tag color="#34d399">{r.evidence_mode}</Tag>
+              </div>
+            ))}
+          </div>
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+/* ============================== SAFETY & AUTHORIZATION ============================== */
+export function SafetyAuthorization({ s, target, setTarget }: { s: any; target: string; setTarget: (t: string) => void }) {
+  const safety = s.safety_authorization;
+  return (
+    <div className="space-y-4">
+      <Panel title="Safety & Authorization" sub="Signed scope status, read-only scope panel, containment chain, canary-only status, and no scope mutation path."
+        right={<div className="flex gap-1"><Verdict pass={!safety.scope_mutation_path} labels={["no mutation path", "mutation path"]} /><TargetToggle target={target} set={setTarget} /></div>}>
+        <div className="grid md:grid-cols-4 gap-2">
+          <Stat label="signed scope" value={safety.signed_scope_status} tone="ok" />
+          <Stat label="scope panel" value={safety.scope_panel.read_only ? "read-only" : "mutable"} tone={safety.scope_panel.read_only ? "ok" : "bad"} />
+          <Stat label="containment" value={safety.containment_log.chain_valid ? "valid" : "broken"} tone={safety.containment_log.chain_valid ? "ok" : "bad"} sub={safety.containment_log.chain_status} />
+          <Stat label="evidence mode" value={safety.canary_only ? "canary-only" : "check"} tone={safety.canary_only ? "ok" : "bad"} />
+        </div>
+        <div className="rounded-md border border-ok/30 bg-ok/5 p-2 mt-3 text-[11px] text-dim">{safety.mode_note}</div>
+      </Panel>
+      <AuthGate s={s} />
     </div>
   );
 }
 
 /* ============================== BACKTEST ============================== */
-export function Backtest({ s }: { s: any }) {
-  const saas = s.targets["synthetic-saas"].coverage, ai = s.targets["synthetic-ai"].coverage;
-  const Row = ({ c }: { c: any }) => (
+function BacktestRow({ c }: { c: any }) {
+  return (
     <Panel title={c.target} sub={`${c.kind} · ${c.true_positives} TP / ${c.false_negatives} FN / ${c.false_positives} FP`}>
       <div className="flex items-center gap-4">
         <Donut value={c.coverage} color={c.coverage >= 0.9 ? "#34d399" : "#fbbf24"} label="coverage" />
@@ -135,12 +346,16 @@ export function Backtest({ s }: { s: any }) {
       <div className="mt-2 text-[11px] text-muted">missed (honest FN): {c.missed.map((m: any) => m.affordance).join(", ") || "—"} · discovered: {c.discovered_scenarios.join(", ")}</div>
     </Panel>
   );
+}
+
+export function Backtest({ s }: { s: any }) {
+  const saas = s.targets["synthetic-saas"].coverage, ai = s.targets["synthetic-ai"].coverage;
   return (
     <div className="space-y-4">
       <Panel title="Planted-vector self-consistency backtest" sub="Coverage / FP / severity-calibration on the two synthetic targets. Category 10 cleanly yields nothing on the non-AI target — proving it is optional.">
         <div className="rounded-md border border-warn/30 bg-warn/5 p-2 text-[11px] text-dim">{saas.caveat}</div>
       </Panel>
-      <div className="grid md:grid-cols-2 gap-4"><Row c={saas} /><Row c={ai} /></div>
+      <div className="grid md:grid-cols-2 gap-4"><BacktestRow c={saas} /><BacktestRow c={ai} /></div>
     </div>
   );
 }
@@ -169,7 +384,7 @@ export function BlindEval({ s }: { s: any }) {
           </div>
         </div>
         <div className="mt-3 rounded-md border border-bad/30 bg-bad/5 p-2 text-[11px] text-dim">measured encoding-overlap {b.encoding_overlap.overlap} · {b.real_recall_is}</div>
-        <div className="mt-2 text-[11px] text-muted">fan-out: {b.fan_out} ({b.workers} workers, {b.n_targets} targets). Real recall rises as the library's encoding breadth grows — that is the honest improvement axis.</div>
+        <div className="mt-2 text-[11px] text-muted">fan-out: {b.fan_out} ({b.workers} workers, {b.n_targets} targets). Real recall rises as the library&apos;s encoding breadth grows — that is the honest improvement axis.</div>
       </Panel>
     </div>
   );
