@@ -1,0 +1,74 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Acme Platform API",
+    "version": "2026-07"
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
+      },
+      "OAuthAll": {
+        "type": "oauth2",
+        "flows": {
+          "clientCredentials": {
+            "tokenUrl": "https://auth.example.invalid/token",
+            "scopes": {
+              "all": "Broad access for tests"
+            }
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/api/export/bulk": {
+      "get": {
+        "tags": ["Exports"],
+        "operationId": "downloadBulkExport",
+        "summary": "Download a bulk export"
+      }
+    },
+    "/oauth/apps": {
+      "post": {
+        "tags": ["Integrations"],
+        "operationId": "createOAuthApp",
+        "security": [{"OAuthAll": ["all"]}]
+      }
+    },
+    "/signup/trial": {
+      "post": {
+        "tags": ["Growth"],
+        "operationId": "startTrial"
+      }
+    },
+    "/billing/usage/meter": {
+      "get": {
+        "tags": ["Billing"],
+        "operationId": "readUsageMeter"
+      }
+    },
+    "/members/seats": {
+      "post": {
+        "tags": ["Identity"],
+        "operationId": "inviteSeat"
+      }
+    },
+    "/admin/support/impersonate": {
+      "post": {
+        "tags": ["Support"],
+        "operationId": "supportImpersonate"
+      }
+    },
+    "/agent/tools/run": {
+      "post": {
+        "tags": ["Agent"],
+        "operationId": "runAgentTool",
+        "x-heel-agent-tool": true
+      }
+    }
+  }
+}

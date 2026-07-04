@@ -97,6 +97,26 @@ def _import_validate(path: str) -> int:
     return 0
 
 
+def _openapi_import(path: str, out_path: str) -> int:
+    from .openapi_import import OpenAPIImportError, import_openapi_file, write_product_model
+    try:
+        model = import_openapi_file(path)
+        write_product_model(model, out_path)
+    except OpenAPIImportError as e:
+        print(f"OpenAPI import: FAIL ({e})")
+        return 1
+    warnings = model.get("import_warnings", [])
+    print("OpenAPI import: PASS")
+    print(f"  wrote: {out_path}")
+    print(f"  product_id: {model['product_id']}")
+    print(f"  affordance draft count: {sum(len(model.get(f, [])) for f in ('exports', 'identity_auth_flows', 'billing_objects', 'meters', 'roles', 'integration_oauth_apps', 'webhooks', 'support_admin_actions', 'agent_tools'))}")
+    print(f"  warnings: {len(warnings)}")
+    for warning in warnings:
+        print(f"    - {warning}")
+    print("  mode: local OpenAPI-to-ProductModel draft only; no live probing or network calls")
+    return 0
+
+
 def _launch_review(args) -> int:
     from .importers import ProductModelError
     from .launch_review import load_and_review, render_human_summary, review_git_diff, review_to_json
@@ -168,6 +188,10 @@ def main(argv=None):
     bench_report.add_argument("--blind-targets", type=int, default=24, help="number of blind synthetic targets")
     bench_report.add_argument("--workers", type=int, default=6, help="blind-eval worker threads")
 
+    init = sub.add_parser("init", help="initialize local Heel artifacts")
+    init.add_argument("--from-openapi", dest="from_openapi", help="local OpenAPI JSON/YAML file to convert into a ProductModel draft")
+    init.add_argument("--out", required=True, help="ProductModel JSON output path")
+
     sc = sub.add_parser("scope", help="manage authorization scopes (creation is out-of-band, human-only)")
     scs = sc.add_subparsers(dest="scmd", required=True)
     sccreate = scs.add_parser("create", help="OUT-OF-BAND human scope creation (requires --confirm)")
@@ -199,6 +223,9 @@ def main(argv=None):
     imps = imp.add_subparsers(dest="icmd", required=True)
     impv = imps.add_parser("validate", help="validate a ProductModel JSON file")
     impv.add_argument("path")
+    impo = imps.add_parser("openapi", help="convert a local OpenAPI spec into a ProductModel JSON draft")
+    impo.add_argument("path")
+    impo.add_argument("--out", required=True, help="ProductModel JSON output path")
     incident = sub.add_parser("incident", help="turn sanitized abuse incidents into local scenario drafts")
     incidents = incident.add_subparsers(dest="incmd", required=True)
     incident_import = incidents.add_parser("import", help="validate and store a sanitized incident JSON file")
@@ -250,6 +277,11 @@ def main(argv=None):
         output_format = "json" if args.bcmd == "run" else args.format
         print(format_report(report, output_format))
         return 0
+    if args.cmd == "init":
+        if not args.from_openapi:
+            print("OpenAPI import: FAIL (--from-openapi is required for init)")
+            return 2
+        return _openapi_import(args.from_openapi, args.out)
     if args.cmd == "launch-review":
         if not args.diff and not args.after:
             print("Launch review: FAIL (--after is required with --before)")
@@ -257,6 +289,8 @@ def main(argv=None):
         return _launch_review(args)
     if args.cmd == "import" and args.icmd == "validate":
         return _import_validate(args.path)
+    if args.cmd == "import" and args.icmd == "openapi":
+        return _openapi_import(args.path, args.out)
 
     if args.cmd == "incident":
         from .incident import IncidentError, add_regression_draft, draft_scenario, import_incident, review_incident
