@@ -65,6 +65,12 @@ abuse-control regression tests. It is a thin client over the same store and `Hee
 regression re-runs still require an existing signed scope, never mutate scopes, emit canary-only
 evidence summaries instead of repro steps, and append containment log entries.
 
+**CLI-only control simulator:** `heel controls simulate --vector/--finding-json/--run` estimates
+which controls would block or reduce a finding. It is an offline report layer over stored or imported
+finding data: it reads vector fields, scenario category, affordance properties, optional
+ProductModel/EntitlementGraph signals, and a local control bank. It does not contact a live target
+and does not create, widen, relax, or mutate authorization scopes.
+
 ---
 
 ## 3. The safety & authorization spine (NON-NEGOTIABLE, §10)
@@ -148,6 +154,8 @@ demoted by plausibility-weighting, a swarm-**discovered** scenario, and lane-dis
 in `mcp_server.TOOL_SCHEMAS` (scope-mutation tools absent by construction). `AbuseVector` can carry
 an optional `economic_impact` report-layer annotation; economic scoring is read-only and never
 creates, widens, relaxes, or mutates authorization scopes.
+Control simulation is also report-layer metadata: proposed controls are estimates until an operator
+implements the fix and verifies it with a regression or launch review.
 
 ---
 

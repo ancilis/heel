@@ -207,6 +207,13 @@ def main(argv=None):
     regrun.add_argument("--scope", required=True)
     regexp = regs.add_parser("export", help="export regression specs and results")
     regexp.add_argument("--format", choices=["json"], required=True)
+    controls = sub.add_parser("controls", help="simulate candidate controls for stored or imported findings")
+    control_sub = controls.add_subparsers(dest="ccmd", required=True)
+    control_sim = control_sub.add_parser("simulate", help="offline control simulation; no live target is touched")
+    control_input = control_sim.add_mutually_exclusive_group(required=True)
+    control_input.add_argument("--vector", help="stored vector id to simulate")
+    control_input.add_argument("--finding-json", help="path to one finding JSON object")
+    control_input.add_argument("--run", help="stored run id to simulate")
 
     args = ap.parse_args(argv)
     if args.cmd is None:
@@ -250,6 +257,29 @@ def main(argv=None):
                 return 0
             if args.rcmd == "export":
                 print(json.dumps(export_regressions(srv.store), indent=2, default=str))
+                return 0
+        except Exception as e:
+            print(f"REJECTED: {e}")
+            return 1
+
+    if args.cmd == "controls" and args.ccmd == "simulate":
+        from .control_simulator import load_finding_json, simulate_finding, simulate_run
+        srv = _server()
+        try:
+            if args.finding_json:
+                finding, options = load_finding_json(args.finding_json)
+                print(json.dumps(simulate_finding(finding, **options), indent=2, default=str))
+                return 0
+            if args.vector:
+                vector = srv.store.find_vector(args.vector)
+                if not vector:
+                    raise ValueError(f"unknown vector_id '{args.vector}'")
+                print(json.dumps(simulate_finding(vector), indent=2, default=str))
+                return 0
+            if args.run:
+                if not srv.store.get_run(args.run):
+                    raise ValueError(f"unknown run_id '{args.run}'")
+                print(json.dumps(simulate_run(srv.store.get_findings(args.run), run_id=args.run), indent=2, default=str))
                 return 0
         except Exception as e:
             print(f"REJECTED: {e}")
