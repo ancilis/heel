@@ -142,7 +142,8 @@ HEEL reports four levels, weakest claim to strongest evidence:
 The headline is the bottom row: real detection on 199 abuse weaknesses an independent LLM swarm
 invented in its *own* vocabulary, which HEEL never saw. It improves only by widening real-vocabulary
 coverage, never by writing probes against known answers. Full method: [EVAL.md](EVAL.md) ·
-[docs/HELDOUT_PROVENANCE.md](docs/HELDOUT_PROVENANCE.md).
+[docs/HELDOUT_PROVENANCE.md](docs/HELDOUT_PROVENANCE.md). Reusable benchmark harness:
+[docs/HEELBENCH.md](docs/HEELBENCH.md).
 
 ## Use it like an operator
 
