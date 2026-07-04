@@ -116,7 +116,8 @@ def _run(targets, semantic: bool) -> dict:
 
 
 def _eval_split(path: str) -> dict:
-    raw = open(path, "rb").read()
+    with open(path, "rb") as fh:
+        raw = fh.read()
     targets = [_build_target(p) for p in json.loads(raw)]
     n_planted = sum(1 for t in targets for pv in t.planted_vectors)
     n_reach = sum(1 for t in targets for pv in t.planted_vectors if pv.reachable)

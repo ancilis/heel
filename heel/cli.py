@@ -158,6 +158,15 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("doctor", help="self-check: install, data dir, signing-key posture, capability")
     sub.add_parser("eval", help="run the honest held-out detection eval and print the headline")
+    bench = sub.add_parser("bench", help="run or render the HEELBench public benchmark")
+    bench_sub = bench.add_subparsers(dest="bcmd", required=True)
+    bench_run = bench_sub.add_parser("run", help="run HEELBench and emit canonical JSON")
+    bench_run.add_argument("--blind-targets", type=int, default=24, help="number of blind synthetic targets")
+    bench_run.add_argument("--workers", type=int, default=6, help="blind-eval worker threads")
+    bench_report = bench_sub.add_parser("report", help="render a HEELBench report")
+    bench_report.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    bench_report.add_argument("--blind-targets", type=int, default=24, help="number of blind synthetic targets")
+    bench_report.add_argument("--workers", type=int, default=6, help="blind-eval worker threads")
 
     sc = sub.add_parser("scope", help="manage authorization scopes (creation is out-of-band, human-only)")
     scs = sc.add_subparsers(dest="scmd", required=True)
@@ -224,6 +233,12 @@ def main(argv=None):
     if args.cmd == "eval":
         from .heldout_eval import heldout_eval
         print(heldout_eval().get("headline", "(no held-out test set installed)"))
+        return 0
+    if args.cmd == "bench":
+        from .bench import format_report, run_benchmark
+        report = run_benchmark(blind_targets=args.blind_targets, blind_workers=args.workers)
+        output_format = "json" if args.bcmd == "run" else args.format
+        print(format_report(report, output_format))
         return 0
     if args.cmd == "launch-review":
         if not args.diff and not args.after:
