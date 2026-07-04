@@ -136,11 +136,144 @@ def _scenario_explain(scenario_id: str) -> int:
     return 0
 
 
+def _mode_payload(mode, target_source: str, resolved_target: str | None = None) -> dict:
+    payload = mode.to_dict()
+    payload["target_source"] = target_source
+    if resolved_target:
+        payload["resolved_target"] = resolved_target
+    return payload
+
+
+def _resolve_run_target_for_mode(mode, target_arg: str | None) -> tuple[str | None, str, dict | None, str | None]:
+    if not target_arg:
+        return None, "", None, f"Mode {mode.id} requires --target"
+    if target_arg.lower().endswith(".json") and os.path.isfile(target_arg):
+        from .importers import ProductModelError, load_product_model, target_from_product_model
+        from .targets import register_imported_target
+
+        try:
+            model = load_product_model(target_arg)
+            target = register_imported_target(target_from_product_model(model))
+        except ProductModelError as e:
+            return None, "", None, f"ProductModel validation: FAIL ({e})"
+        except Exception as e:
+            return None, "", None, f"ProductModel target registration: FAIL ({e})"
+        return target.id, "ProductModel/EntitlementGraph import; no live probing", model, None
+    if mode.id == "existing-imported":
+        return None, "", None, "Mode existing-imported requires --target to be a ProductModel JSON file"
+    if mode.id == "staging":
+        return target_arg, "canary staging target", None, None
+    return target_arg, "built-in synthetic target", None, None
+
+
+def _scope_for_mode(mode, scope_id: str | None):
+    if not mode.requires_scope:
+        return None, None
+    if not scope_id:
+        return None, f"Mode {mode.id} requires --scope with a human-created signed AuthorizationScope"
+    scope = scopemod.get_scope(scope_id)
+    if scope is None:
+        return None, f"Mode {mode.id} rejected: unknown scope_id '{scope_id}'"
+    ok, reason = scopemod.verify(scope)
+    if not ok:
+        return None, f"Mode {mode.id} rejected: scope invalid: {reason}"
+    if mode.id == "staging":
+        from .modes import scope_limit_errors
+
+        violations = scope_limit_errors(mode, scope.rate_and_resource_limits)
+        if violations:
+            return None, (
+                "Mode staging requires stricter signed scope limits: "
+                + ", ".join(violations)
+            )
+    return scope, None
+
+
+def _canary_errors_for_mode(mode, model: dict | None, canary_accounts: list[str] | None) -> list[str]:
+    if not mode.requires_canary_accounts:
+        return []
+    if canary_accounts:
+        return []
+    if model and model.get("canary_accounts"):
+        return []
+    return [f"Mode {mode.id} requires canary account metadata"]
+
+
+def _run_with_mode(args) -> int:
+    from .modes import get_mode
+
+    try:
+        mode = get_mode(args.mode)
+    except ValueError as e:
+        print(f"REJECTED: {e}")
+        return 2
+
+    if mode.id == "launch-review":
+        if not args.before or not args.after:
+            print("Mode launch-review requires --before and --after ProductModel JSON files")
+            return 2
+        print("mode: launch-review")
+        print("safety: static ProductModel diff; no live probing")
+        return _launch_review(args)
+
+    scope, scope_error = _scope_for_mode(mode, args.scope)
+    if scope_error:
+        print(scope_error)
+        return 2
+
+    if mode.id == "incident-regression":
+        if not args.target:
+            print("Mode incident-regression requires --target")
+            return 2
+        from .regressions import resolve_target_argument, run_regressions
+
+        srv = _server()
+        caller = _caller()
+        try:
+            target = resolve_target_argument(args.target)
+            results = run_regressions(srv.store, srv, args.scope, target, caller)
+        except Exception as e:
+            print(f"REJECTED: {e}")
+            return 1
+        print(json.dumps({
+            "mode": _mode_payload(mode, "stored abuse regressions", target),
+            "results": results,
+        }, indent=2, default=str))
+        return 0
+
+    target, target_source, model, target_error = _resolve_run_target_for_mode(mode, args.target)
+    if target_error:
+        print(target_error)
+        return 2
+    canary_errors = _canary_errors_for_mode(mode, model, args.canary_account)
+    if canary_errors:
+        print("; ".join(canary_errors))
+        return 2
+
+    srv = _server()
+    caller = _caller()
+    try:
+        run_args = {"scope_id": args.scope, "target": target, "scenario_ids": args.scenario}
+        if args.packs:
+            run_args["packs"] = [p.strip() for p in args.packs.split(",") if p.strip()]
+        r = srv.heel_run(run_args, caller)
+        r = dict(r)
+        r["mode"] = _mode_payload(mode, target_source, target)
+        if args.economic:
+            r["economic_report"] = _report(srv, r["run_id"], caller, economic=True,
+                                           economic_assumptions=args.economic_assumptions)
+        print(json.dumps(r, indent=2))
+    except Exception as e:
+        print(f"REJECTED: {e}")
+        return 1
+    return 0
+
+
 def _launch_review(args) -> int:
     from .importers import ProductModelError
     from .launch_review import load_and_review, render_human_summary, review_git_diff, review_to_json
     try:
-        if args.diff:
+        if getattr(args, "diff", None):
             review = review_git_diff(args.diff)
         else:
             review = load_and_review(args.before, args.after)
@@ -220,9 +353,15 @@ def main(argv=None):
     sccreate.add_argument("--confirm", action="store_true", help="explicit human confirmation (required)")
     scs.add_parser("list", help="list scopes (read; no secrets)")
 
-    runp = sub.add_parser("run", help="run an abuse sim within a scope (thin client over MCP)")
-    runp.add_argument("--scope", required=True)
-    runp.add_argument("--target", required=True)
+    from .modes import MODES
+
+    runp = sub.add_parser("run", help="run an abuse sim or static mode workflow")
+    runp.add_argument("--mode", choices=sorted(MODES), default="synthetic")
+    runp.add_argument("--scope")
+    runp.add_argument("--target")
+    runp.add_argument("--before", help="before ProductModel JSON for --mode launch-review")
+    runp.add_argument("--after", help="after ProductModel JSON for --mode launch-review")
+    runp.add_argument("--canary-account", action="append", help="canary account metadata for staging modes")
     runp.add_argument("--scenario", action="append")
     runp.add_argument("--packs", help="comma-separated scenario packs to run")
     runp.add_argument("--economic", action="store_true", help="include economic severity in the run output")
@@ -409,23 +548,11 @@ def main(argv=None):
         print(json.dumps(srv.heel_list_scopes({}, _caller()), indent=2))
         return 0
 
+    if args.cmd == "run":
+        return _run_with_mode(args)
+
     srv = _server()
     caller = _caller()
-    if args.cmd == "run":
-        try:
-            run_args = {"scope_id": args.scope, "target": args.target, "scenario_ids": args.scenario}
-            if args.packs:
-                run_args["packs"] = [p.strip() for p in args.packs.split(",") if p.strip()]
-            r = srv.heel_run(run_args, caller)
-            if args.economic:
-                r = dict(r)
-                r["economic_report"] = _report(srv, r["run_id"], caller, economic=True,
-                                               economic_assumptions=args.economic_assumptions)
-            print(json.dumps(r, indent=2))
-        except Exception as e:
-            print(f"REJECTED: {e}")
-            return 1
-        return 0
     if args.cmd == "report":
         try:
             print(json.dumps(_report(srv, args.run, caller, economic=args.economic,
