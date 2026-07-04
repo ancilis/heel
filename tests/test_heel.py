@@ -1148,6 +1148,48 @@ class TestDocsAndMetadata(unittest.TestCase):
         self.assertIn("heel covers saas abuse broadly", scenario_packs)
         self.assertIn("agent/mcp is a premium pack", scenario_packs)
 
+    def test_positioning_docs_explain_complementary_category(self):
+        readme = self._read("README.md")
+        positioning = self._read("docs/POSITIONING.md")
+        combined = f"{readme}\n{positioning}"
+        combined_lower = combined.lower()
+
+        self.assertIn("docs/POSITIONING.md", readme)
+        self.assertIn("missing product-abuse rehearsal step", combined_lower)
+        self.assertIn("heel is not a replacement", combined_lower)
+        self.assertIn("complements", combined_lower)
+
+        for category in (
+            "penetration testing",
+            "functional QA",
+            "fraud/bot platforms",
+            "runtime WAF/API protection",
+            "Trust & Safety manual review",
+            "model red-team tools",
+        ):
+            self.assertIn(category, combined)
+
+        for column in (
+            "Tool category",
+            "Primary question",
+            "When it runs",
+            "Typical signal",
+            "What it misses",
+            "How Heel complements it",
+        ):
+            self.assertIn(column, positioning)
+
+        for phrase in (
+            "QA says export button works",
+            "AppSec says endpoint has no injection bug",
+            "Fraud platform may catch abuse after traffic appears",
+            "trial user to harvest more data than intended",
+        ):
+            self.assertIn(phrase, positioning)
+
+        for adjacent_tool in ("pentest", "qa", "fraud", "waf", "model red-team"):
+            self.assertNotIn(f"replaces {adjacent_tool}", combined_lower)
+
 
 if __name__ == "__main__":
     unittest.main()

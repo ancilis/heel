@@ -1,6 +1,6 @@
 {
   "queue_version": "0.1",
-  "next_prompt_id": 15,
+  "next_prompt_id": 16,
   "completed_prompt_ids": [
     1,
     2,
@@ -15,14 +15,15 @@
     11,
     12,
     13,
-    14
+    14,
+    15
   ],
   "in_flight": null,
   "last_pr": {
-    "prompt_id": 14,
-    "slug": "14_scenario_authoring_validation",
+    "prompt_id": 15,
+    "slug": "15_positioning_docs",
     "pr_url": "",
-    "advanced_at": "2026-07-04T18:17:28Z"
+    "advanced_at": "2026-07-04T21:54:08Z"
   },
   "notes": "The local Codex CLI runner updates this file inside each queued PR. Merging the PR advances the queue."
 }
