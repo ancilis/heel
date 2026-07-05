@@ -1,6 +1,6 @@
 {
   "queue_version": "0.1",
-  "next_prompt_id": 18,
+  "next_prompt_id": 19,
   "completed_prompt_ids": [
     1,
     2,
@@ -18,14 +18,15 @@
     14,
     15,
     16,
-    17
+    17,
+    18
   ],
   "in_flight": null,
   "last_pr": {
-    "prompt_id": 17,
-    "slug": "17_realish_local_saas_demo",
+    "prompt_id": 18,
+    "slug": "18_ci_demo_commands",
     "pr_url": "",
-    "advanced_at": "2026-07-05T03:48:04Z"
+    "advanced_at": "2026-07-05T14:11:16Z"
   },
   "notes": "The local Codex CLI runner updates this file inside each queued PR. Merging the PR advances the queue."
 }
