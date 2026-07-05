@@ -1,0 +1,367 @@
+{
+  "schema_version": "ProductModel.v0.1",
+  "product_id": "heel-saas-demo",
+  "source": "local example SaaS demo adapter; sanitized metadata only",
+  "generated_at": "2026-07-05T00:00:00Z",
+  "environments": [
+    "staging",
+    "sandbox"
+  ],
+  "tenants": [
+    {
+      "id": "canary-tenant-free",
+      "name": "Canary Free Workspace",
+      "plan": "free",
+      "region": "us",
+      "data_boundary": "canary_only"
+    },
+    {
+      "id": "canary-tenant-enterprise",
+      "name": "Canary Enterprise Workspace",
+      "plan": "enterprise",
+      "region": "eu",
+      "data_boundary": "canary_only"
+    }
+  ],
+  "roles": [
+    {
+      "id": "owner",
+      "permissions": [
+        "billing.manage",
+        "exports.run",
+        "members.invite"
+      ]
+    },
+    {
+      "id": "support_admin",
+      "permissions": [
+        "support.view_canary",
+        "admin.impersonate_canary"
+      ]
+    },
+    {
+      "id": "viewer",
+      "permissions": [
+        "records.read_canary"
+      ]
+    }
+  ],
+  "plans": [
+    {
+      "id": "free",
+      "name": "Free",
+      "seat_limit": 2,
+      "trial_days": 14,
+      "exports_allowed": false
+    },
+    {
+      "id": "pro",
+      "name": "Pro",
+      "seat_limit": 10,
+      "trial_days": 14,
+      "exports_allowed": true
+    },
+    {
+      "id": "enterprise",
+      "name": "Enterprise",
+      "seat_limit": 250,
+      "trial_days": 30,
+      "exports_allowed": true
+    }
+  ],
+  "meters": [
+    {
+      "id": "monthly_api_calls",
+      "kind": "meter",
+      "category": "license_entitlement",
+      "route": "/api/usage/monthly",
+      "reset_window": "client_controlled",
+      "guard_present": false,
+      "unit": "request"
+    },
+    {
+      "id": "ai_token_units",
+      "kind": "meter",
+      "category": "license_entitlement",
+      "route": "/api/ai/usage",
+      "reset_window": "server_authoritative",
+      "guard_present": true,
+      "unit": "ai_token"
+    }
+  ],
+  "coupons_promotions": [
+    {
+      "id": "WELCOME20",
+      "kind": "promotion",
+      "category": "license_entitlement",
+      "route": "/billing/coupons/apply",
+      "stackable": true,
+      "redemption_cap": "missing",
+      "guard_present": false
+    }
+  ],
+  "features_flags": [
+    {
+      "id": "enterprise_export_preview",
+      "kind": "flag",
+      "category": "unintended_endpoints",
+      "flag": "enterpriseExportPreview",
+      "gated_by": "client",
+      "required_plan": "enterprise",
+      "guard_present": false
+    }
+  ],
+  "endpoints_routes": [
+    {
+      "id": "trial_signup",
+      "kind": "trial",
+      "category": "license_entitlement",
+      "route": "/signup/trial",
+      "identity_check": "email_only",
+      "guard_present": false
+    },
+    {
+      "id": "team_invites",
+      "kind": "invite",
+      "category": "identity_account",
+      "route": "/team/invites",
+      "verification": "none",
+      "guard_present": false
+    },
+    {
+      "id": "tenant_record_get",
+      "kind": "record",
+      "category": "compliance_boundary",
+      "route": "/api/records/{id}",
+      "tenant_check": "missing",
+      "id_scheme": "sequential",
+      "residency": "unpinned",
+      "hard_delete": "false",
+      "data_class": "canary_records",
+      "guard_present": false
+    },
+    {
+      "id": "internal_debug_panel",
+      "kind": "endpoint",
+      "category": "unintended_endpoints",
+      "route": "/internal/debug",
+      "documented": false,
+      "client_reachable": true,
+      "guard_present": false
+    },
+    {
+      "id": "bulk_job_launcher",
+      "kind": "endpoint",
+      "category": "function_abuse",
+      "route": "/api/jobs/bulk-run",
+      "human_challenge": "none",
+      "rate_limit": "none",
+      "guard_present": false
+    },
+    {
+      "id": "content_guardrail_check",
+      "kind": "content_guardrail",
+      "category": "content_policy",
+      "route": "/api/ai/content/check",
+      "blocks_prohibited": false,
+      "sample": "benign_canary_only",
+      "guard_present": false
+    },
+    {
+      "id": "marketplace_reviews",
+      "kind": "review",
+      "category": "trust_economy",
+      "route": "/marketplace/reviews",
+      "provenance_check": "none",
+      "guard_present": false
+    }
+  ],
+  "exports": [
+    {
+      "id": "bulk_records_export",
+      "kind": "export",
+      "category": "data_harvesting",
+      "route": "/api/export/bulk-records",
+      "required_plan": "enterprise",
+      "entitlement_check": "missing",
+      "tenant_quota": "missing",
+      "rate_limit": "none",
+      "guard_present": false,
+      "data_class": "canary_records"
+    }
+  ],
+  "identity_auth_flows": [
+    {
+      "id": "account_recovery",
+      "kind": "auth_reset",
+      "category": "identity_account",
+      "route": "/recover",
+      "recovery_check": "weak",
+      "guard_present": false
+    },
+    {
+      "id": "trial_signup",
+      "kind": "signup",
+      "category": "identity_account",
+      "route": "/signup/trial",
+      "identity_check": "email_only",
+      "verification": "none",
+      "guard_present": false
+    }
+  ],
+  "billing_objects": [
+    {
+      "id": "seat_pool",
+      "kind": "seat",
+      "category": "license_entitlement",
+      "route": "/team/seats",
+      "sharing_detection": "none",
+      "concurrency_limit": "missing",
+      "guard_present": false
+    }
+  ],
+  "integration_oauth_apps": [
+    {
+      "id": "workspace_sync_app",
+      "kind": "oauth_app",
+      "category": "integration_extensibility",
+      "route": "/oauth/apps/workspace-sync",
+      "scope": "all",
+      "review_required": false,
+      "guard_present": false
+    }
+  ],
+  "webhooks": [
+    {
+      "id": "records_changed_webhook",
+      "kind": "integration",
+      "category": "integration_extensibility",
+      "route": "/webhooks/records/changed",
+      "replay_protection": "missing",
+      "tenant_filter": "missing",
+      "guard_present": false
+    }
+  ],
+  "support_admin_actions": [
+    {
+      "id": "support_impersonate_canary",
+      "kind": "admin_action",
+      "category": "compliance_boundary",
+      "route": "/admin/support/impersonate",
+      "action": "impersonate_canary_account",
+      "human_approval": "missing",
+      "audit_logged": false,
+      "guard_present": false
+    }
+  ],
+  "agent_tools": [
+    {
+      "id": "agent_export_all",
+      "tool": "export_all_records",
+      "kind": "agent_tool",
+      "category": "agent_mcp_surface",
+      "granted_scope": "all_tenants",
+      "intended_scope": "own_tenant",
+      "tenant_filter": "missing",
+      "guard_present": false
+    },
+    {
+      "id": "agent_ai_token_writer",
+      "tool": "draft_ai_reports",
+      "kind": "agent_tool",
+      "category": "agent_mcp_surface",
+      "multi_step": "unbounded",
+      "cost_ceiling": "missing",
+      "meter": "ai_token_units",
+      "guard_present": false
+    },
+    {
+      "id": "agent_url_fetch",
+      "tool": "fetch_url_preview",
+      "kind": "agent_tool",
+      "category": "function_abuse",
+      "allowlist": "missing",
+      "handoff": "appsec",
+      "guard_present": false
+    }
+  ],
+  "mcp_connectors": [
+    {
+      "id": "workspace_mcp_manifest",
+      "connector": "workspace-records",
+      "kind": "mcp_connector",
+      "category": "agent_mcp_surface",
+      "context_isolation": "missing",
+      "tool_metadata_trusted": true,
+      "version_pin": "missing",
+      "guard_present": false
+    }
+  ],
+  "data_classes": [
+    {
+      "id": "canary_records",
+      "kind": "data_class",
+      "category": "compliance_boundary",
+      "description": "synthetic tenant records seeded for local demo runs"
+    },
+    {
+      "id": "canary_billing_metadata",
+      "kind": "data_class",
+      "category": "compliance_boundary",
+      "description": "synthetic plan, seat, and meter metadata"
+    }
+  ],
+  "audit_events": [
+    {
+      "id": "export_started",
+      "kind": "audit_event",
+      "category": "compliance_boundary",
+      "event": "export_started",
+      "covers": "bulk_records_export"
+    },
+    {
+      "id": "support_impersonate_missing",
+      "kind": "audit_event",
+      "category": "compliance_boundary",
+      "event": "support_impersonate_canary",
+      "coverage": "missing"
+    }
+  ],
+  "declared_controls": [
+    {
+      "id": "tenant_filter_records",
+      "status": "missing",
+      "applies_to": "tenant_record_get"
+    },
+    {
+      "id": "export_entitlement_check",
+      "status": "missing",
+      "applies_to": "bulk_records_export"
+    },
+    {
+      "id": "webhook_replay_protection",
+      "status": "missing",
+      "applies_to": "records_changed_webhook"
+    },
+    {
+      "id": "canary_data_isolation",
+      "status": "present",
+      "applies_to": "all demo data"
+    },
+    {
+      "id": "scope_required",
+      "status": "present",
+      "applies_to": "imported:heel-saas-demo"
+    }
+  ],
+  "canary_accounts": [
+    "canary-free-owner@heel.local",
+    "canary-pro-admin@heel.local",
+    "canary-enterprise-viewer@heel.local"
+  ],
+  "safety_notes": [
+    "local/canary-only demo metadata; no live probing and no external services",
+    "all tenants, users, records, exports, webhooks, and agent tools are synthetic canaries",
+    "intentional weaknesses are configuration facts for rehearsal, not working exploit payloads"
+  ]
+}
