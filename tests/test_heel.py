@@ -898,6 +898,34 @@ class TestEntitlementGraph(unittest.TestCase):
 
         self.assertEqual([f.scenario_id for f in out["findings"]], ["sc.export.entitlement"])
 
+    def test_ui_backing_endpoint_paid_api_bypass_maps_to_shadow_api_scenario(self):
+        from heel.agents import run_adversarial
+        from heel.contracts import SyntheticTarget
+        from heel.entitlements import EntitlementGraph
+        from heel.scenarios import list_scenarios
+
+        model = self._model()
+        model["plans"] = [{"id": "app", "rank": 1}, {"id": "api_bulk", "rank": 2}]
+        model["endpoints_routes"].append({
+            "id": "wallet_lookup_ui",
+            "route": "/ui/data/wallet_lookup",
+            "kind": "endpoint",
+            "ui_backing_endpoint": True,
+            "paid_api_equivalent": True,
+            "required_plan": "api_bulk",
+            "reachable_by_plan": "app",
+            "rate_limit": "missing",
+            "automation_guard": "missing",
+            "tenant_filter": "declared",
+        })
+        affordances = EntitlementGraph.from_product_model(model).to_affordances()
+        target = SyntheticTarget("imported:entitlements-demo", "imported_saas", False, affordances, [])
+        scenarios = [s for s in list_scenarios(semantic=False) if s.id == "sc.ui.shadow_api_bulk_access"]
+        out = run_adversarial(target, scenarios, lambda *a: None, "entitlement-test", model=self.NoDiscoveryModel())
+
+        self.assertEqual([f.scenario_id for f in out["findings"]], ["sc.ui.shadow_api_bulk_access"])
+        self.assertEqual(out["findings"][0].category.value, "license_entitlement")
+
     def test_agent_tool_scope_mismatch_maps_to_existing_overscope_scenario(self):
         from heel.agents import run_adversarial
         from heel.contracts import SyntheticTarget
@@ -1003,6 +1031,27 @@ class TestLaunchReview(unittest.TestCase):
         self.assertTrue(any(f["surface_id"] == "bulk_records" for f in report["new_abuse_affordances"]))
         self.assertTrue(any(c["control"] == "server-side entitlement check" for c in report["high_risk_missing_controls"]))
         self.assertTrue(any("bulk_records" in r["name"] for r in report["suggested_regression_tests"]))
+
+    def test_ui_backing_endpoint_that_bypasses_paid_api_blocks_launch(self):
+        report = self._review(lambda m: (
+            m["plans"].extend([{"id": "app", "rank": 1}, {"id": "api_bulk", "rank": 2}]),
+            m["endpoints_routes"].append({
+                "id": "wallet_lookup_ui",
+                "route": "/ui/data/wallet_lookup",
+                "kind": "endpoint",
+                "ui_backing_endpoint": True,
+                "paid_api_equivalent": True,
+                "required_plan": "api_bulk",
+                "reachable_by_plan": "app",
+                "rate_limit": "missing",
+                "automation_guard": "missing",
+                "tenant_filter": "declared",
+            }),
+        ))
+
+        self.assertEqual(report["launch_gate_status"], "block")
+        self.assertTrue(any(f["risk"] == "ui_backing_endpoint_paid_api_bypass" for f in report["new_abuse_affordances"]))
+        self.assertTrue(any(c["control"] == "shared UI/API entitlement and lookup quota" for c in report["high_risk_missing_controls"]))
 
     def test_stackable_coupon_without_redemption_limit_warns_or_blocks_by_severity(self):
         warn_report = self._review(lambda m: m["coupons_promotions"].append({

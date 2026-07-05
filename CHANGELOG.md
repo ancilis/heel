@@ -20,6 +20,7 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - HEELBench public benchmark scaffolding and report rendering.
 - incident-to-scenario workflow for sanitized incidents and near misses.
 - dashboard war room over the same MCP-first capability.
+- shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
 ## [1.1.0]: 2026-06-07
 

@@ -55,6 +55,21 @@ SEED_SCENARIOS: list[AbuseScenario] = [
        "trial", {"prop": "identity_check", "equals": "email_only"}, 0.5, 0.5, "device/identity fingerprinting + trial-per-identity limit"),
     _s("sc.rate.circumvention", Category.LICENSE_ENTITLEMENT, "Rate/concurrency limit circumvention",
        "endpoint", {"prop": "rate_limit", "equals": "none"}, 0.5, 0.5, "server-side rate + concurrency limits"),
+    _s("sc.ui.shadow_api_bulk_access", Category.LICENSE_ENTITLEMENT,
+       "Interactive UI backing endpoint can be scripted as an unpriced bulk API",
+       "endpoint",
+       {"all_of": [
+           {"prop": "ui_backing_endpoint", "equals": True},
+           {"prop": "paid_api_equivalent", "equals": True},
+           {"any_of": [
+               {"prop": "entitlement_signal", "equals": "plan_mismatch"},
+               {"prop_neq": ["required_plan", "reachable_by_plan"]},
+               {"prop": "rate_limit", "equals": "missing"},
+               {"prop": "automation_guard", "equals": "missing"},
+           ]},
+       ]},
+       0.6, 0.8,
+       "share server-side UI/API entitlements; add per-tenant lookup quotas, automation controls, and audit events"),
     # ---------- 4.2 data harvesting ----------
     _s("sc.export.entitlement", Category.DATA_HARVESTING, "Bulk export reachable without an entitlement check",
        "export", {"guard_absent": True}, 0.7, 0.8, "enforce server-side entitlement check on export", cls="records"),
