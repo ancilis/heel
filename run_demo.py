@@ -78,6 +78,8 @@ def main():
     L = []
     L.append("=" * 80)
     L.append("HEEL: agent-native abuse-simulation tool · synthetic demo (no real target, no key)")
+    L.append("mode: synthetic")
+    L.append("safety: local synthetic targets only; no API keys, network access, or real systems")
     L.append("=" * 80)
     L.append(f"MCP server: {init['serverInfo']['name']} v{init['serverInfo']['version']}  "
              f"· caller: {session['caller']}")

@@ -65,6 +65,28 @@ HELD-OUT EVALUATION: targets authored by an INDEPENDENT LLM swarm (blind to HEEL
 
 That second number is the point: **HEEL tells you what it can't catch yet.**
 
+Try a SaaS abuse review against the sanitized local demo model, still with no API keys,
+network access, or real systems touched:
+
+```bash
+heel import validate examples/saas_demo/product_model.json
+heel launch-review --before examples/saas_demo/product_model.json --after examples/saas_demo/product_model.json
+heel scope create --target synthetic-saas --operator you --confirm
+heel run --mode synthetic --scope <scope_id> --target synthetic-saas --scenario sc.trial.serial
+heel findings --run <run_id>
+heel regress add --run <run_id> --vector <vector_id> --name free_trial_serial_signup
+heel regress run --scope <scope_id> --target synthetic-saas
+```
+
+From a clone, the same local workflows are available as CI-friendly demos:
+
+```bash
+make demo-import
+make demo-launch-review
+make demo-regressions
+make demo-bench
+```
+
 ## Why HEEL is different
 
 - 🤖 **Agent-native, MCP-first.** The capability is an MCP server. Wire it into Claude Desktop,
