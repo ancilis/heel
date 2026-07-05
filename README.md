@@ -160,6 +160,12 @@ heel regress add --run <run_id> --vector <vector_id> --name free_trial_serial_si
 heel regress run --scope <scope_id> --target synthetic-saas
 ```
 
+For a real-ish local SaaS shape without connecting to a customer system, see
+[`examples/saas_demo`](examples/saas_demo/). It provides a sanitized ProductModel and OpenAPI
+fixture for Free/Pro/Enterprise plans, seats, trial eligibility, coupons, usage and AI-token meters,
+exports, OAuth, webhooks, support actions, agent tools, MCP connector metadata, and canary-only
+declared controls.
+
 **Connect from an MCP client.** Point Claude Desktop / Cursor / CI at the `heel-mcp` server:
 
 ```json
