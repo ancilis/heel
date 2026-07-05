@@ -1,46 +1,54 @@
-# HEEL — Evaluation (v1, Phase 0–2)
+# HEEL — Evaluation
 
-Honest results from the synthetic spine. Reproduce with `make demo` / `make test`. Everything is
-computed at runtime; deterministic.
+Honest results from the integrated HEEL platform. Reproduce with `make demo`, `make demo-bench`, or
+`python3 -m unittest discover -s tests`. Everything is computed locally and deterministically.
+The evaluation story applies to the same product described in README, ARCHITECTURE, SECURITY, TRUST,
+and DECISIONS: pre-launch launch review plus existing-product abuse rehearsal, with signed scopes,
+canary-only findings, beta adapters, and no scope creation, widening, relaxation, or mutation path
+over MCP, REST, or agent surfaces.
 
 ---
 
-> **Framing (red-team-corrected, §8).** The coverage numbers below are a **self-consistency /
-> wiring backtest** on synthetic targets whose planted weaknesses and the seed probes were authored
-> together — **not** a real-target detection-accuracy claim. They prove the pipeline is wired, the
-> contracts hold, and the honest signals (FN/FP/demotion/discovery/handoff) work. Real-target
-> accuracy requires blind targets + held-out scenarios (§7, §8).
+> **Framing.** HEEL reports a ladder, not a vanity number. Synthetic self-consistency proves the
+> wiring and safety spine. Blind targets give a lower bound against independently encoded weaknesses.
+> The headline is the frozen held-out TEST split: independently authored targets, blind to HEEL's
+> probes, with localization, attribution, precision, and cluster CIs reported separately.
 
-## 1. Planted-vector self-consistency backtest (the spine, §5 / DoD #4)
+## 1. Current headline metrics
 
-Two synthetic targets, run over the MCP boundary under an enforced scope:
+The current public benchmark (`heel bench report`) summarizes the integrated library:
 
-| target | kind | coverage | cov (reach-wt) | FP-rate | severity-calib | category-10 findings |
-|---|---|---|---|---|---|---|
-| **synthetic-saas** | non-AI | **0.91** | 0.92 | **0.09** | 0.78 | **0** |
-| **synthetic-ai** | AI/agent | **0.94** | 0.95 | **0.06** | 0.66 | 5 |
+| metric | value | meaning |
+|---|---:|---|
+| self-consistency coverage | 1.00 | synthetic wiring check, not real-target accuracy |
+| blind lower-bound recall | 0.267 | repository-authored blind encodings; lower bound, not an external claim |
+| held-out DEV localization recall | 0.763 | tuned-on split, useful for development |
+| held-out DEV attribution recall | 0.485 | right affordance and category on DEV |
+| held-out TEST localization recall | **0.497** | frozen, independently authored TEST split |
+| held-out TEST attribution recall | **0.332** | stricter TEST headline: right affordance and category |
+| held-out TEST precision | **0.98** | precision on unseen vocabulary |
+| scenario library | **119 scenarios** | declarative scenarios across all 10 abuse categories |
 
-- **Category 10 cleanly yields 0 findings on the non-AI target** — proving it is optional and
-  auto-applies only when the target has agent/MCP surfaces (DoD #4).
-- This is a **self-consistency metric** (see the framing note above + §8), made as honest as a
-  synthetic backtest can be via genuine signals. Per target: **TP 10/16, a genuine miss
-  (FN=1: `promo_stacking` — planted, reachable, but no scenario can infer it), a real false
-  positive (FP=1: `export_billing` — a hardened decoy the over-broad export heuristic flags), and
-  1 implausible finding demoted by plausibility-weighting (`legacy_import` — present but
-  unreachable).**
-- **Severity calibration < 1.0** (0.66–0.78): HEEL's severity estimates rank-correlate with the
-  planted true impact but are deliberately imperfect (no inflation, no peeking).
+Rounded for README: localization recall 0.50, attribution recall 0.33, precision 0.98. The
+localization→attribution gap is disclosed because flagging the right affordance is weaker evidence
+than also assigning the right abuse category.
 
-## 2. Scenario library (DoD #2)
+## 2. What each metric is allowed to mean
 
-**19 seed scenarios across 9 categories** (data_harvesting, license_entitlement,
-unintended_endpoints, function_abuse, content_policy, identity_account, trust_economy,
-compliance_boundary, agent_mcp_surface) **+ integration_extensibility represented via a
-swarm-DISCOVERED scenario** (`sc.discovered.webhook_endpoint`, found on a planted vector no seed
-scenario covers) = **all 10 §4 categories represented.** The §4.10 agent/MCP pack
-(`applies_when = has_agent_surface`) runs only on the AI target.
+- **Self-consistency** runs synthetic targets over the MCP boundary under an enforced signed scope.
+  It proves contracts, containment, planted-vector scoring, category-10 optionality, and auth-gate
+  behavior. It is a wiring test, not real-target detection accuracy.
+- **Blind lower bound** uses procedurally generated targets with independently encoded weaknesses.
+  It measures the library's encoding overlap and surfaces false-positive attribution.
+- **Held-out DEV** is allowed to influence semantic/library work.
+- **Held-out TEST** is frozen and content-hashed. It is the unbiased number for independently
+  authored target vocabulary.
+- **Imported ProductModel / existing-product modes** are model rehearsals over sanitized metadata
+  unless an operator explicitly authorizes canary-only staging or production-like adapters. Imported
+  targets have no planted ground truth, so HEEL labels their outputs as rehearsals instead of
+  coverage or accuracy.
 
-## 3. Authorization gate (the safety spine, §10.1 / DoD #6)
+## 3. Safety and authorization invariants
 
 The agent caller is treated as an untrusted, possibly prompt-injected confused deputy. Every
 escalation attempt over the MCP surface is **rejected and logged**:
@@ -58,9 +66,11 @@ escalation attempt over the MCP surface is **rejected and logged**:
 → **Auth gate: PASS** — no escalation is reachable via the agent surface. Runs are attributed to
 the caller; the **containment log hash-chain verifies** and is **tamper-evident** (mutating any
 entry fails `verify_chain`). There is **no scope-creation/widening tool** in the registry; scopes
-are human-only, out-of-band, signed (DECISIONS D-002).
+are human-only, out-of-band, signed (DECISIONS D-002). The same no-scope-mutation rule applies to
+MCP, REST, CLI-triggered agent workflows, imported ProductModels, regressions, incidents, launch
+review, and control simulation.
 
-## 4. Recommended controls, handoffs, optional enrichment (DoD #5)
+## 4. Recommended controls, handoffs, optional enrichment
 
 - Every `AbuseVector` carries a **recommended control** + estimated exploitability reduction
   (`heel_propose_control`).
@@ -77,7 +87,7 @@ are human-only, out-of-band, signed (DECISIONS D-002).
                                        data_subject_rights]}
   ```
 
-## 5. Safety guards exercised (§10.2)
+## 5. Safety guards exercised
 
 | guarantee | how it's exercised |
 |---|---|
@@ -90,28 +100,16 @@ are human-only, out-of-band, signed (DECISIONS D-002).
 | self-audit | immutable hash-chained `ContainmentLog`, verified each run, attributed to the caller |
 | lane discipline | true-vuln → `handoff_to_appsec`; pure-jailbreak → `handoff_to_model_redteam` |
 
-## 6. Tests (DoD #8)
+## 6. Honest limits
 
-`python3 -m unittest discover -s tests` → **27 tests pass**: auth gate (8), scope immutability /
-tamper-evidence / expiry (2), coverage backtest (5), safety spine (6), and the red-team-fix tests
-(5: rate-limit enforcement, containment HMAC re-chain resistance, whole-run-deletion detection,
-no severity inflation, self-consistency labeling).
-
-## 7. Honest limits & what's next
-
-1. **The backtest measures the synthetic targets**, where HEEL's seed scenarios were written
-   against the planted weaknesses — high coverage is expected; the value is the *falsifiable
-   harness* plus the honest FN/FP/calibration. Real-target coverage is unknown until a
-   human-authorized run; an optional real-telemetry residual loop is a stretch hook (§5).
-2. **Agents are a deterministic stub** (D-005); the LLM control loop and the opportunistic-human
-   class are Phase 3.
-3. **Full 10-category library breadth** (many scenarios per category) and the **MCP/REST/UI** thin
-   clients are Phase 3/4. v1 seeds enough to score coverage and prove the spine.
-4. **Severity calibration on 10–16 true positives** is a small sample; treat it as directional.
-
-**Bottom line:** the falsifiable spine exists — two synthetic targets, an honest coverage backtest
-(category 10 cleanly optional), and an authorization gate that **refuses every escalation a calling
-agent can attempt** — all callable over MCP, with the §10 conduct guarantees implemented and tested.
+- HEEL is strongest as abuse rehearsal, not an exploit generator, pentest replacement, fraud
+  platform, or permission slip for production probing.
+- Real-target adapter coverage remains beta. Existing-product runs must stay scoped, canary-only,
+  rate-limited, and operator-approved.
+- Held-out TEST recall is not near 1.0. The honest improvement path is broader source-anchored
+  scenario and semantic vocabulary coverage, measured against frozen or newly held-out targets.
+- Economic severity and control simulation are report-layer estimates until a human implements a
+  control and verifies it through launch review or regression.
 
 ---
 
@@ -174,7 +172,7 @@ capability — so the auth gate is identical. There is **no scope-creation route
 by estimated exploitability reduction (the agent's recommendation + a per-category control bank),
 sorted. (`TestControlSearch`.)
 
-**34 tests pass.** Still deferred to later Phase-3/4 waves: full library breadth (many scenarios
+The suite passed for this wave. Still deferred to later Phase-3/4 waves: full library breadth (many scenarios
 per category), the LLM agent control loop, true thousand-agent fan-out, affordance-chaining
 discovery, and the UI.
 
@@ -196,7 +194,7 @@ declarative scenario specs (HEEL builds the contained PoC), stays in HEEL's lane
 prohibited content / jailbreak technique), and falls back to the heuristic on any error or missing
 key. (`test_model_stub_is_default_and_anthropic_falls_back_without_key`.)
 
-**38 tests pass.**
+The suite passed for this wave.
 
 ### Phase 3 — wave 3: blind-target evaluation (the honest detection metric) + chaining + fan-out
 
@@ -228,7 +226,7 @@ capability; the honest sub-1.0 signal now lives in the blind eval. Compound chai
 genuinely-vulnerable affordances are reported separately, not counted as false positives.
 (`TestChaining`.)
 
-**42 tests pass.**
+The suite passed for this wave.
 
 ### Phase 3 — wave 3b: the blind eval, red-team-hardened
 
@@ -252,7 +250,7 @@ Fixes (DECISIONS D-024):
   criterion (with the kind gate) or the discovery heuristic. Fan-out asserts synthetic-only targets
   and is described honestly (GIL-bound thread pool, not literal 1000×).
 
-**44 tests pass.**
+The suite passed for this wave.
 
 ### Phase 3 — wave 4: held-out evaluation (independent authorship) + semantic generalization
 
@@ -283,7 +281,7 @@ against known plants.
 `recall_by_category` surfaces where HEEL is strong (data-harvesting 10/15, function-abuse 10/13) vs
 weak (unintended-endpoints 7/15, license-entitlement 7/14). Neither number is near 1.0 — this is the
 honest detection ceiling on independently-authored abuse, and the UI's "Held-out (real)" screen shows
-the exact→semantic jump. **47 tests pass.**
+the exact→semantic jump. The suite passed for this wave.
 
 **The three honesty levels, in one place:** self-consistency coverage ~1.0 (wiring) → blind lower
 bound ~0.25 (independent encodings, author-controlled overlap) → held-out semantic ~0.57 at 0.95
@@ -310,7 +308,7 @@ spots (agent/MCP 4/18, content-policy 1/11, unintended-endpoints 9/27) — the h
 precision lesson: bare boolean `true`/`enabled` were removed from the permissive vocabulary because
 polarity is property-dependent (`audit_logged:true` is good, `acts_on_content:true` is bad).
 
-**48 tests pass.** The four honesty levels now coexist: self-consistency ~1.0 → blind ~0.25 →
+The suite passed for this wave. The four honesty levels now coexist: self-consistency ~1.0 → blind ~0.25 →
 held-out DEV ~0.73 (tuned) → **held-out TEST ~0.38 (unbiased) @ 0.96 precision**.
 
 ### Phase 3 — wave 5b: held-out methodology red-team fixes
@@ -334,7 +332,7 @@ A 3-agent red-team audited the dev/test held-out metric (verdict: HONEST, with r
 The honest TEST picture: **localization 0.38 (CI [0.29,0.49]) · attribution 0.27 (CI [0.20,0.35]) ·
 precision 0.97** on 199 independently-authored weaknesses, sha `3dba2486…`. Specificity-ranked
 dedup (D-031) then lifted attribution to **0.31** (mis-categorization 29%→18%) — developed on dev,
-measured once on the frozen test. **51 tests pass.**
+measured once on the frozen test. The suite passed for this wave.
 
 ### Phase 3 — wave 6: external research library integration (the recall lever)
 
@@ -359,4 +357,4 @@ measure. Integration preserved the precision discipline: boolean-true-is-bad fie
 scenarios (not semantic topics); over-broad `{"not":{"prop_exists":X}}` absence-checks were paired
 with `guard_absent` (fixing a real precision liability on hardened affordances while keeping recall);
 a `prop_exists` operator was added to the criterion evaluator. Provenance + sources:
-[docs/RESEARCH_LIBRARY.md](docs/RESEARCH_LIBRARY.md). **55 tests pass.**
+[docs/RESEARCH_LIBRARY.md](docs/RESEARCH_LIBRARY.md). The suite passed for this wave.

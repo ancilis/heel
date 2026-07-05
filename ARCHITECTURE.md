@@ -30,7 +30,7 @@ surfaces and cleanly yields nothing when it doesn't.
 
 ## 1.1. Operating modes
 
-HEEL has one safety model across several operating modes:
+HEEL has one safety model across pre-launch and existing-product operating modes:
 
 | mode | purpose | target/data boundary |
 |---|---|---|
@@ -144,6 +144,8 @@ channel that can be prompt-injected. The model (the **confused-deputy** model):
 (reachability-weighted), **false-positive rate**, **severity calibration**, the **non-AI vs AI
 breakdown**, plus honest signals — a genuine miss (FN), a decoy false positive (FP), a degenerate
 demoted by plausibility-weighting, a swarm-**discovered** scenario, and lane-discipline handoffs.
+The public evaluation ladder then separates that self-consistency wiring check from blind lower-bound
+recall and the frozen held-out TEST metrics used as the honest detection headline.
 
 ---
 
