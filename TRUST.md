@@ -31,6 +31,8 @@ discipline, and the honest evaluation ladder are implemented and tested.
 Real-target adapter coverage is beta. Existing-product rehearsals must stay inside explicit human
 authorization, canary-only data, sanitized imports or telemetry, and operator-approved limits until
 adapters mature.
+The same pre-launch and existing-product safety contract is enforced across every surface: no scope
+creation, widening, relaxation, or mutation path exists over MCP, REST, or agent callers.
 
 ## Adversarial review (the real assurance)
 

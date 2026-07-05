@@ -2,6 +2,25 @@
 
 All notable changes to HEEL are documented here. Format loosely follows Keep a Changelog.
 
+## [Unreleased]
+
+Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
+
+### Integrated
+- continuous abuse rehearsal positioning for pre-launch launch review, existing-product rehearsal,
+  incident follow-up, and CI regressions.
+- ProductModel adapter contract for sanitized imports, staging/catalog models, and local demo data.
+- entitlement graph mapping product metadata into ordinary HEEL affordances.
+- launch review for static ProductModel diffs before customer traffic arrives.
+- regressions that turn findings into reusable abuse-control checks without repro playbooks.
+- economic severity as report-layer business-impact metadata.
+- personas for motivation-profiled opportunistic customer abuse.
+- scenario packs that keep agent/MCP as one premium pack within broad SaaS abuse rehearsal.
+- control simulator for offline proposed-fix ranking.
+- HEELBench public benchmark scaffolding and report rendering.
+- incident-to-scenario workflow for sanitized incidents and near misses.
+- dashboard war room over the same MCP-first capability.
+
 ## [1.1.0]: 2026-06-07
 
 Apache-2.0 relicense + DCO, and a major scenario-library depth expansion.

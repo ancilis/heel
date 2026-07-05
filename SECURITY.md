@@ -17,6 +17,8 @@ existing products can be rehearsed through authorized staging, sandbox, imported
 telemetry, or production-like adapter paths. It is **not** a replacement for application-security
 review, penetration testing, or a bug-bounty program. Findings are **predicted, contained,
 canary-only** proofs that an abuse path is *reachable*, they are leads to harden, not exploit code.
+Evaluation is reported as an honest ladder ending in frozen held-out TEST metrics, not as a blanket
+claim of live-target exploit accuracy.
 
 ## The authorization model (§10, the non-negotiable safety spine)
 
@@ -61,6 +63,8 @@ Existing-product rehearsal is allowed only when the operator keeps the run conta
 - Keep limits operator-approved and encoded in the signed scope before any MCP, REST, or agent run.
 - Treat true software vulnerabilities as AppSec handoffs and pure jailbreaks as model red-team
   handoffs, not HEEL findings to weaponize.
+- The same pre-launch and existing-product contract applies everywhere: no scope creation, widening,
+  relaxation, or mutation exists over MCP, REST, or agent surfaces.
 
 ## Production hardening checklist
 

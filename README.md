@@ -26,10 +26,11 @@ probes a product *you own*, proves an abuse path is **reachable** with a *contai
 and hands you a ranked report with the fix, before launch and continuously after.
 
 Pre-launch launch review remains the sharpest default use case. Existing products are supported
-through authorized, contained, canary-only runs against staging, imported product models, sanitized
-telemetry, or explicitly authorized production-like targets. HEEL is not a default permission slip
-for production probing: every non-synthetic path starts with a human-created scope and
-operator-approved limits.
+through existing-product rehearsal: authorized, contained, canary-only runs against staging,
+imported product models, sanitized telemetry, or explicitly authorized production-like targets.
+HEEL is not a default permission slip for production probing: every non-synthetic path starts with a
+human-created scope and operator-approved limits. There is no scope creation, widening, relaxation,
+or mutation path over MCP, REST, or agent surfaces.
 
 It is **agent-native** (its canonical surface is an **MCP server** other agents call), **honest** (it
 reports its *real* detection rate against abuse it has never seen, not a vanity number), and
@@ -229,9 +230,18 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 
 ## Docs
 
-[ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [POSITIONING](docs/POSITIONING.md) · [MODES](docs/MODES.md) · [DECISIONS](DECISIONS.md) · [SECURITY](SECURITY.md)
-· [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) · [ENTITLEMENTS](docs/ENTITLEMENTS.md) · [CONTROL SIMULATOR](docs/CONTROL_SIMULATOR.md) · [ECONOMIC SEVERITY](docs/ECONOMIC_SEVERITY.md) · [REGRESSIONS](docs/REGRESSIONS.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
-[PERSONAS](docs/PERSONAS.md) · [SCENARIO PACKS](docs/SCENARIO_PACKS.md) · [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
+[ARCHITECTURE](ARCHITECTURE.md) · [EVAL](EVAL.md) · [DECISIONS](DECISIONS.md) ·
+[SECURITY](SECURITY.md) · [TRUST](TRUST.md) · [ADAPTERS](docs/ADAPTERS.md) ·
+[MODES](docs/MODES.md) · [POSITIONING](docs/POSITIONING.md) ·
+[ENTITLEMENTS](docs/ENTITLEMENTS.md) · [LAUNCH REVIEW](docs/LAUNCH_REVIEW.md) ·
+[REGRESSIONS](docs/REGRESSIONS.md) · [INCIDENTS](docs/INCIDENTS.md) ·
+[OPENAPI IMPORT](docs/OPENAPI_IMPORT.md) · [SCENARIO AUTHORING](docs/SCENARIO_AUTHORING.md) ·
+[SCENARIO PACKS](docs/SCENARIO_PACKS.md) · [PERSONAS](docs/PERSONAS.md) ·
+[CONTROL SIMULATOR](docs/CONTROL_SIMULATOR.md) ·
+[ECONOMIC SEVERITY](docs/ECONOMIC_SEVERITY.md) · [HEELBENCH](docs/HEELBENCH.md) ·
+[HELDOUT PROVENANCE](docs/HELDOUT_PROVENANCE.md) ·
+[RESEARCH LIBRARY](docs/RESEARCH_LIBRARY.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
+[CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
 ## Status
 
