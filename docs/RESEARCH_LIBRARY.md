@@ -1,9 +1,9 @@
-# HEEL — research scenario library (`scenarios_lib/research_owasp.json`)
+# Arceo — research scenario library (`scenarios_lib/research_owasp.json`)
 
 45 business-logic abuse-detection scenarios across all 10 categories, plus a semantic-vocabulary
 expansion, integrated from an external source-anchored research deliverable. The scenarios are
 declarative JSON (addable without code) and were authored from PRIMARY SOURCES, independently of —
-and with no access to — HEEL's held-out evaluation targets.
+and with no access to — Arceo's held-out evaluation targets.
 
 ## Measured impact (honest, on the FROZEN held-out test set)
 
@@ -16,7 +16,7 @@ The research was authored blind to the test set, so measuring its lift there is 
 | held-out **TEST** precision | 0.97 | **0.98** |
 | exact-match TEST recall | 0.085 | 0.10 |
 
-A genuine +12pp recall lift at unchanged-to-better precision on vocabulary HEEL never saw.
+A genuine +12pp recall lift at unchanged-to-better precision on vocabulary Arceo never saw.
 
 ## Primary sources
 

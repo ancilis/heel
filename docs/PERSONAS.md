@@ -1,13 +1,13 @@
 # Abuse Personas
 
-HEEL's opportunistic-human agent uses **customer incentive models**, not criminal personas.
+Arceo's opportunistic-human agent uses **customer incentive models**, not criminal personas.
 They describe why an ordinary customer, agency, integration owner, or builder might game a normal
 SaaS affordance when the product makes that path easy.
 
 Personas do not create authorization, widen scope, attack third-party systems, or produce working
 exploit payloads. Every rehearsal example is contained and canary-only. For staging, imported, or
 production-like targets, the normal rule still applies: a human-created `AuthorizationScope` must
-already exist before HEEL can run.
+already exist before Arceo can run.
 
 ## Built-In Personas
 
@@ -38,7 +38,7 @@ A persona emits evidence only when both conditions are true:
   `sharing_detection=none` on seats, `identity_check=email_only` on a trial, or
   `multi_step=unbounded` on an agent tool.
 
-When an adversarial finding already exists for the same affordance, HEEL keeps that better-calibrated
+When an adversarial finding already exists for the same affordance, Arceo keeps that better-calibrated
 finding as primary and attaches persona evidence to it. Persona-only findings are ranked by
 persona severity, reachability, and stable scenario id. This lets reports explain both what is weak
 and which customer archetype would try it without inflating calibrated adversarial severity.
@@ -68,8 +68,8 @@ All persona findings still use `sample: "canary_only"` and `contained: true`.
 Custom personas are ordinary Python data. Keep rules declarative, observable, and canary-only:
 
 ```python
-from heel.contracts import Category
-from heel.profiles import AbusePersona, PersonaRule
+from arceo.contracts import Category
+from arceo.profiles import AbusePersona, PersonaRule
 
 partner_plan_gamer = AbusePersona(
     id="partner_plan_gamer",

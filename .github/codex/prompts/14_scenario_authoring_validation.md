@@ -5,10 +5,10 @@ Task: Make scenario-pack authoring a first-class workflow.
 Create:
 
 - docs/SCENARIO_AUTHORING.md
-- heel/scenario_validate.py
+- arceo/scenario_validate.py
 - CLI:
-  - heel scenario validate <file.json>
-  - heel scenario explain <scenario_id>
+  - arceo scenario validate <file.json>
+  - arceo scenario explain <scenario_id>
 - tests
 
 Validator should check:

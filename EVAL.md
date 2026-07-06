@@ -1,6 +1,6 @@
-# HEEL — Evaluation
+# Arceo — Evaluation
 
-Honest results from the integrated HEEL platform. Reproduce with `make demo`, `make demo-bench`, or
+Honest results from the integrated Arceo platform. Reproduce with `make demo`, `make demo-bench`, or
 `python3 -m unittest discover -s tests`. Everything is computed locally and deterministically.
 The evaluation story applies to the same product described in README, ARCHITECTURE, SECURITY, TRUST,
 and DECISIONS: pre-launch launch review plus existing-product abuse rehearsal, with signed scopes,
@@ -9,14 +9,14 @@ over MCP, REST, or agent surfaces.
 
 ---
 
-> **Framing.** HEEL reports a ladder, not a vanity number. Synthetic self-consistency proves the
+> **Framing.** Arceo reports a ladder, not a vanity number. Synthetic self-consistency proves the
 > wiring and safety spine. Blind targets give a lower bound against independently encoded weaknesses.
-> The headline is the frozen held-out TEST split: independently authored targets, blind to HEEL's
+> The headline is the frozen held-out TEST split: independently authored targets, blind to Arceo's
 > probes, with localization, attribution, precision, and cluster CIs reported separately.
 
 ## 1. Current headline metrics
 
-The current public benchmark (`heel bench report`) summarizes the integrated library:
+The current public benchmark (`arceo bench report`) summarizes the integrated library:
 
 | metric | value | meaning |
 |---|---:|---|
@@ -45,7 +45,7 @@ than also assigning the right abuse category.
   authored target vocabulary.
 - **Imported ProductModel / existing-product modes** are model rehearsals over sanitized metadata
   unless an operator explicitly authorizes canary-only staging or production-like adapters. Imported
-  targets have no planted ground truth, so HEEL labels their outputs as rehearsals instead of
+  targets have no planted ground truth, so Arceo labels their outputs as rehearsals instead of
   coverage or accuracy.
 
 ## 3. Safety and authorization invariants
@@ -56,7 +56,7 @@ escalation attempt over the MCP surface is **rejected and logged**:
 | attempt (via MCP) | result |
 |---|---|
 | run a `target` NOT in the scope allowlist | **REJECTED + logged** |
-| call a forged `heel_widen_scope` tool | **REJECTED + logged** (tool absent by construction) |
+| call a forged `arceo_widen_scope` tool | **REJECTED + logged** (tool absent by construction) |
 | inject an instruction in the `target` arg | **REJECTED + logged** (target matched literally) |
 | run with a forged `scope_id` | **REJECTED + logged** |
 | pass an injected `allowlist` / `_relax_limits` arg | **REJECTED + logged** (extra args ignored) |
@@ -73,7 +73,7 @@ review, and control simulation.
 ## 4. Recommended controls, handoffs, optional enrichment
 
 - Every `AbuseVector` carries a **recommended control** + estimated exploitability reduction
-  (`heel_propose_control`).
+  (`arceo_propose_control`).
 - **Lane discipline:** the SSRF url-fetch vector is found AND flagged `handoff_to_appsec`; the pure
   model-jailbreak surface is **handed off** (`handoff_to_model_redteam`), never weaponized or
   counted as a product-abuse finding.
@@ -102,7 +102,7 @@ review, and control simulation.
 
 ## 6. Honest limits
 
-- HEEL is strongest as abuse rehearsal, not an exploit generator, pentest replacement, fraud
+- Arceo is strongest as abuse rehearsal, not an exploit generator, pentest replacement, fraud
   platform, or permission slip for production probing.
 - Real-target adapter coverage remains beta. Existing-product runs must stay scoped, canary-only,
   rate-limited, and operator-approved.
@@ -126,7 +126,7 @@ escalation path fails closed. It found real gaps between *claim* and *implementa
 | containment log chained with **bare sha256** → re-chainable without a secret | HIGH | each entry **HMAC-signed** with the signing key; key-less re-chaining fails (`test_containment_rechain_without_key_fails`); + seq-contiguity + `run_is_logged` completeness (`test_whole_run_deletion_detected`) |
 | backtest is **circular** — coverage/calibration are self-consistency checks, not accuracy | HIGH | re-framed everywhere as a **self-consistency / wiring** metric with an explicit caveat in the data and the docs (`test_backtest_labeled_self_consistency`); added hardened decoys; reachability made depth-based |
 | **severity inflation** — hard 0.9/1.0 override for a missing content guardrail | MEDIUM | removed; severity comes from the scenario model with surfaced uncertainty (`test_no_severity_inflation`) |
-| signing key **co-located** with the scopes it protects | MEDIUM | `HEEL_SIGNING_KEY` env points the key outside the data dir; threat model documented honestly (DECISIONS D-009); fixed the os.urandom/"stable" docstring mismatch |
+| signing key **co-located** with the scopes it protects | MEDIUM | `ARCEO_SIGNING_KEY` env points the key outside the data dir; threat model documented honestly (DECISIONS D-009); fixed the os.urandom/"stable" docstring mismatch |
 | **accountability** — forgeable `clientInfo.name`, no-handshake anonymity, dropped args | MEDIUM | caller marked `mcp:`/`unauthenticated:no-handshake` and documented as self-asserted (auth gate never depends on it); ignored args are logged |
 | reachability-weighting recognized **two magic keys** (gameable) | MEDIUM | continuous **depth-based** estimator (prerequisite steps / auth gates discount reachability) |
 | FP rate rested on **one firing decoy** | MEDIUM | added hardened decoys sharing property names with vulnerable affordances (safe values) — the precise probes correctly don't fire (earned low FP) |
@@ -143,7 +143,7 @@ D-009…D-014.
 Built against the frozen §6 contracts; the §10 auth gate is unchanged and shared by every surface.
 
 **Opportunistic-human agent class (§3.2, DoD #3).** Persona-modeled gaming of *normal*
-affordances, conditioned by a declarative customer-incentive library in `heel/profiles.py`.
+affordances, conditioned by a declarative customer-incentive library in `arceo/profiles.py`.
 The built-ins cover coupon stacking, seat sharing, agency resale, data brokerage, trial farming,
 integration overreach, support pressure, marketplace reputation gaming, usage-meter optimization,
 AI cost amplification, and agent-wrapper building. Personas gate on motivation tags, sophistication,
@@ -163,12 +163,12 @@ are ranked by a stable severity/reachability rule. This is why reports can expla
 weak, but which motivated customer archetype would game it. (`TestOpportunisticClass`,
 `TestPersonaFindings`; operator guide: `docs/PERSONAS.md`.)
 
-**REST API (§2).** A thin REST surface (`heel/rest.py`, `make rest`) over the **same** `HeelServer`
+**REST API (§2).** A thin REST surface (`arceo/rest.py`, `make rest`) over the **same** `ArceoServer`
 capability — so the auth gate is identical. There is **no scope-creation route** (`POST /scopes` →
 405 + security log); an out-of-allowlist `POST /runs` is rejected `403` exactly as over MCP.
 (`TestRestSharesAuthGate`.)
 
-**Control search (§8).** `heel_propose_control` now returns a **ranked set of candidate controls**
+**Control search (§8).** `arceo_propose_control` now returns a **ranked set of candidate controls**
 by estimated exploitability reduction (the agent's recommendation + a per-category control bank),
 sorted. (`TestControlSearch`.)
 
@@ -180,17 +180,17 @@ discovery, and the UI.
 
 **Declarative library (§4, DoD #2).** Scenarios are now pure SPECS interpreted by a single generic
 criterion evaluator (`agents.evaluate_criterion`) — so they are **addable without code**, including
-from `heel/scenarios_lib/*.json`. The library is **34 scenarios across all 10 categories** (32
+from `arceo/scenarios_lib/*.json`. The library is **34 scenarios across all 10 categories** (32
 declarative in-code + 2 from JSON), with breadth that exceeds the synthetic targets (many scenarios
 match no planted affordance — they're there for real targets, and correctly don't fire → no FP
 inflation). The honest signals are unchanged (coverage 0.93/0.95, FN `ato_chain`, FP `export_billing`,
 discovery `webhook_endpoint`, handoffs). (`TestLibraryAndModel`.)
 
 **LLM control loop (§3, §11).** The adversarial agent's discovery is driven by a swappable `Model`
-(`heel/model.py`). The default `StubModel` is deterministic and offline (the demo uses it, no key);
-`AnthropicModel` swaps in behind `HEEL_MODEL=anthropic` (+ `ANTHROPIC_API_KEY`), calling the Messages
+(`arceo/model.py`). The default `StubModel` is deterministic and offline (the demo uses it, no key);
+`AnthropicModel` swaps in behind `ARCEO_MODEL=anthropic` (+ `ANTHROPIC_API_KEY`), calling the Messages
 API via stdlib `urllib` (no SDK). The model only sees OBSERVABLE properties and only PROPOSES
-declarative scenario specs (HEEL builds the contained PoC), stays in HEEL's lane (no weaponization /
+declarative scenario specs (Arceo builds the contained PoC), stays in Arceo's lane (no weaponization /
 prohibited content / jailbreak technique), and falls back to the heuristic on any error or missing
 key. (`test_model_stub_is_default_and_anthropic_falls_back_without_key`.)
 
@@ -201,7 +201,7 @@ The suite passed for this wave.
 The red-team's deepest finding was that the synthetic coverage is a **self-consistency** metric, not
 detection accuracy. This wave fixes it with a genuinely independent measurement.
 
-**Blind-target evaluation (`heel/blind.py`, `heel/blind_eval.py`).** Procedurally-generated targets
+**Blind-target evaluation (`arceo/blind.py`, `arceo/blind_eval.py`).** Procedurally-generated targets
 whose planted weaknesses use ENCODINGS authored independently of the seed probes — only some match a
 scenario; the rest are synonym vocabularies the library doesn't key off; decoys share property names
 with safe values. The library is run against many such targets concurrently (the §7 **fan-out**, a
@@ -215,12 +215,12 @@ thread pool) and a real recall/precision DISTRIBUTION is aggregated:
 | found / planted | 72 / 287 (215 missed — unanticipated encodings) |
 | category-10 clean on blind non-AI targets | **23/23** (verified, not structural) |
 
-This is the **honest real-target estimate**: HEEL catches what its library anticipates, which on
+This is the **honest real-target estimate**: Arceo catches what its library anticipates, which on
 blind targets is ~a quarter of plants. **Recall rises as the library's encoding breadth grows** —
 that is the honest improvement axis, and the metric can't be gamed by writing probes against known
 plants. (`TestBlindEvaluation`.)
 
-**Affordance-chaining (`heel/chaining.py`).** Multi-step abuse the single-affordance classes miss —
+**Affordance-chaining (`arceo/chaining.py`).** Multi-step abuse the single-affordance classes miss —
 e.g. ATO = weak recovery + non-rotated session. This closes the synthetic `ato_chain` FN with a real
 capability; the honest sub-1.0 signal now lives in the blind eval. Compound chain findings over
 genuinely-vulnerable affordances are reported separately, not counted as false positives.
@@ -254,31 +254,31 @@ The suite passed for this wave.
 
 ### Phase 3 — wave 4: held-out evaluation (independent authorship) + semantic generalization
 
-The final integrity step: even the blind eval's encodings were written by HEEL's author, so the
+The final integrity step: even the blind eval's encodings were written by Arceo's author, so the
 encoding-overlap (hence recall) was ultimately a designer choice (red-team finding). This wave
 removes that last lever.
 
 **Held-out targets, independently authored.** A multi-agent workflow spawned 8 LLM agents that each
 authored a synthetic product with planted abuse weaknesses — given only the abuse taxonomy + an
-output schema, and **blind to HEEL's scenario/semantic vocabulary** (provenance:
+output schema, and **blind to Arceo's scenario/semantic vocabulary** (provenance:
 `docs/HELDOUT_PROVENANCE.md`). They invented their own property names
 (`tenant_scope_check: disabled`, `private_ip_range_block: absent`, `export_audit_event: not_emitted`,
-…). Frozen in `heel/heldout/targets.json`: 8 products, 97 planted weaknesses, all 10 categories.
+…). Frozen in `arceo/heldout/targets.json`: 8 products, 97 planted weaknesses, all 10 categories.
 
-**Semantic generalization (`heel/semantic.py`).** Exact property==value criteria don't generalize to
+**Semantic generalization (`arceo/semantic.py`).** Exact property==value criteria don't generalize to
 an unseen vocabulary. A scenario can instead declare a SEMANTIC signal — a weakness family recognized
 by topic keywords in the property key + permissive indicators in the value (topic+permissive keeps
 precision). This is the honest improvement axis: widen real-vocabulary coverage, don't write probes
 against known plants.
 
-**The honest real-target ceiling** (`heel/heldout_eval.py`, `make demo`):
+**The honest real-target ceiling** (`arceo/heldout_eval.py`, `make demo`):
 
 | | recall | precision |
 |---|---|---|
 | exact-match only | **0.26** (25/97) — barely generalizes | — |
 | **with semantic** | **0.57** (Wilson CI [0.47, 0.66]) | **0.95** |
 
-`recall_by_category` surfaces where HEEL is strong (data-harvesting 10/15, function-abuse 10/13) vs
+`recall_by_category` surfaces where Arceo is strong (data-harvesting 10/15, function-abuse 10/13) vs
 weak (unintended-endpoints 7/15, license-entitlement 7/14). Neither number is near 1.0 — this is the
 honest detection ceiling on independently-authored abuse, and the UI's "Held-out (real)" screen shows
 the exact→semantic jump. The suite passed for this wave.
@@ -290,7 +290,7 @@ precision (independent authorship, no author control). Each strips a layer of ci
 ### Phase 3 — wave 5: dev/test discipline + broadened semantic coverage
 
 To improve recall honestly (not by overfitting), the held-out evaluation now uses a proper
-**dev/test split**. The semantic catalog (`heel/semantic.py`, expanded from 12 to ~34 signal
+**dev/test split**. The semantic catalog (`arceo/semantic.py`, expanded from 12 to ~34 signal
 families) was tuned on the **DEV** set (the original 8 products). A **larger TEST set — 14 products,
 199 weaknesses, authored by a fresh independent LLM swarm and frozen WITHOUT inspection** — gives the
 unbiased number.
@@ -318,12 +318,12 @@ A 3-agent red-team audited the dev/test held-out metric (verdict: HONEST, with r
 - **CRITICAL — localization vs attribution.** The score credited a true positive on affordance match
   alone, so ~29% of TEST localizations carried the WRONG category. Both are now reported:
   **localization recall 0.38**, the stricter **attribution recall 0.27** (right affordance AND
-  category). `heel/backtest.py` adds `attribution_coverage`; the gap is shown, not hidden.
+  category). `arceo/backtest.py` adds `attribution_coverage`; the gap is shown, not hidden.
 - **HIGH — clustered CI.** The iid Wilson treated 199 weaknesses nested in 14 targets as independent
   (~30–45% too narrow). Replaced with a **target-level cluster bootstrap**: localization CI [0.29,
   0.49], attribution [0.20, 0.35], precision [0.94, 1.0].
 - **HIGH — substring collisions.** `orm`⊂`format`, `ttl`⊂`throttle`, `allowed`⊂`disallowed` etc. fixed
-  by **word-boundary token matching** (`heel/semantic.py`); ambiguous `never`/`fixed`/bare `true`
+  by **word-boundary token matching** (`arceo/semantic.py`); ambiguous `never`/`fixed`/bare `true`
   removed. TEST precision rose to **0.97**.
 - **MEDIUM — researcher degrees of freedom.** `test_targets.json` is **content-hashed** (reported in
   the eval); the reachability≥0.25 gate is disclosed as a no-op (0/199 filtered); per-category recall

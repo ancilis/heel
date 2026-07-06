@@ -1,11 +1,11 @@
-# HEEL — Red-team findings: blind-eval / chaining / fan-out
+# Arceo — Red-team findings: blind-eval / chaining / fan-out
 
 3-agent review of the honesty-metric work. The blind eval was found to be structurally less
 circular than the self-consistency backtest (synonyms genuinely don't leak), but recall was a
 re-parameterized knob, precision rested on one probe, and the chaining FP exclusion was unsound.
 All fixed — see EVAL §wave3b / DECISIONS D-024, D-022.
 
-## measurement-skeptic / red-team auditor of the HEEL blind-eval detection metric
+## measurement-skeptic / red-team auditor of the Arceo blind-eval detection metric
 
 **Verdict:** PARTIALLY RIGGED — independent ENCODINGS but a DIALED recall. The metric removes the seed/plant co-authorship circularity (synonyms are real blind spots, no synonym leaks into detection), so it is a strictly better number than the 0.93 self-consistency coverage. But recall ≈ 0.25 is a re-parameterized hand-tune, not a discovered property: it equals the matchable-encoding fraction (1/3, minus reachability/category-mix), which the author controls by choosing how many encodings per weakness match a seed. Precision is dominated by one decoy and one over-broad probe. Not yet a defensible third-party detection metric; it is an honest-DISTRIBUTION shaped backtest, and should be labeled a stated LOWER BOUND with held-out/independently-authored scenarios before any external claim.
 
@@ -45,72 +45,72 @@ All fixed — see EVAL §wave3b / DECISIONS D-024, D-022.
 
 **Recommendation:** Ship the metric only with: independently-authored held-out encodings, a Wilson CI on pooled 72/287, a published encoding distribution, and the recall-vs-breadth curve. Then 0.25 becomes a defensible lower bound rather than a re-parameterized hand-tune.
 
-## Red-team reviewer (HEEL chaining + backtest soundness)
+## Red-team reviewer (Arceo chaining + backtest soundness)
 
 **Verdict:** Chaining is a real capability and honesty is preserved in the blind eval, BUT the backtest's blanket "chain:"-prefix FP exclusion (backtest.py:64-66) is unsound and exploitable: a chain over hardened decoys is laundered into a zero-FP "compound discovery," and this blind spot propagates into the headline blind-eval precision. Fix required before the FP/precision numbers can be trusted.
 
 ### [HIGH] Blanket 'chain:'-prefix FP exclusion launders false positives over hardened decoys
-*Location:* `/Users/hellohelloalbus/heel/heel/backtest.py:62-66`
+*Location:* `/Users/hellohelloalbus/arceo/arceo/backtest.py:62-66`
 
 **Evidence:** fp is computed as `[f for f in plausible if f.affordance_id not in planted_affordances and not f.affordance_id.startswith("chain:")]` — the chain: prefix is excluded UNCONDITIONALLY, with no verification that the chain's legs are planted/vulnerable. I built a target of two pure decoys (Affordance(... decoy=True) record with tenant_check=missing + ungated export decoy); run_chaining emitted a plausible high-severity 'chain:dec_record+dec_export' finding, and score_target reported false_positives=0, false_positive_affordances=[], compound_chain_findings=1, fp_rate=0.0. A genuine false alarm was scored as a legitimate compound discovery. The comment at backtest.py:62-63 asserts a chain is 'over genuinely-vulnerable affordances' but the code never checks that.
 
 **Recommendation:** Do not exclude chains by prefix. Instead, count a chain as a TP only if its constituent legs are all planted-vulnerable (members ⊆ planted_affordances / not decoys); count it as an FP if any leg is a decoy/hardened affordance. Concretely, decompose affordance_id after 'chain:' (or carry the matched leg ids on the AbuseVector) and validate each leg against planted_affordances and aff.decoy before deciding TP vs FP. The chaining code already has the leg ids at chaining.py:43 — propagate them so the scorer can audit them.
 
 ### [HIGH] Compound-FP blindness propagates into the headline blind-eval precision
-*Location:* `/Users/hellohelloalbus/heel/heel/blind_eval.py:36-39`
+*Location:* `/Users/hellohelloalbus/arceo/arceo/blind_eval.py:36-39`
 
 **Evidence:** _eval_one sets `tp, fp = sc["true_positives"], sc["false_positives"]` and `precision = tp/(tp+fp)`. Since sc['false_positives'] comes from score_target's chain-excluding fp set (backtest.py:65-66), any false-positive chain is invisible to both fp_rate and the reported real_precision_mean (~0.78). The precision CI therefore cannot detect compound false alarms by construction. On the current 40-seed blind corpus only 1 chain fires and not over a non-planted leg, so the defect is latent there — but it is structural, and I reproduced it directly with a decoy pair.
 
 **Recommendation:** After fixing backtest FP accounting (finding 1), the blind-eval precision will automatically include compound FPs. Additionally add a blind-eval assertion/metric counting plausible chain findings whose legs are not all planted, so compound precision is explicitly tracked rather than silently zero.
 
 ### [MEDIUM] Compound severity is static and decoupled from reachability — label stays 'high' when implausible
-*Location:* `/Users/hellohelloalbus/heel/heel/chaining.py:46-53`
+*Location:* `/Users/hellohelloalbus/arceo/arceo/chaining.py:46-53`
 
 **Evidence:** like, imp = pat['severity'] reads the hardcoded (0.7,0.8) tuple from the pattern definition (chaining.py:17,22) and emits Severity(like, imp, 0.25) regardless of the matched legs' true_severity. reachability_score is correctly discounted (reach=min(...)*0.8, chaining.py:44) and plausible=reach>=0.25 (chaining.py:52), but the Severity object is independent: I observed a degenerate chain at reach=0.054 plausible=False still reporting severity.label='high' (Severity.label, contracts.py:103-105, keys only on likelihood*impact). A consumer sorting/triaging by severity.label could surface an unreachable compound vector as high.
 
 **Recommendation:** Derive compound severity from the matched legs (e.g., max/aggregate of leg true/assigned severities) rather than a static tuple, and reflect implausibility in the surfaced severity (demote label when plausible is False, or expose an effective_severity = severity*reachability), consistent with the contracts.py:16-17 promise that 'degenerate findings are flagged, never ranked.'
 
 ### [LOW] exfil_chain double-counts already-found single-affordance vulns and inflates the precision denominator
-*Location:* `/Users/hellohelloalbus/heel/heel/chaining.py:22-26`
+*Location:* `/Users/hellohelloalbus/arceo/arceo/chaining.py:22-26`
 
 **Evidence:** On synthetic-saas the exfil_chain fires as 'chain:record_get+export_records', but record_get (cross_tenant_idor) and export_records (export_no_entitlement_check) are ALREADY reported as TPs by the single-affordance probes (sc.record.tenant, sc.export.entitlement). The chain adds a redundant plausible finding (n_plausible went to 13) that is exempt from the FP numerator (backtest.py:65-66) but still counts in the plausible denominator used elsewhere — net effect: it can only dilute fp_rate and pad the compound_chain_findings count without representing new ground truth.
 
 **Recommendation:** Either suppress a compound finding whose legs are each already independently reported (only emit when the chain crosses a NON-vulnerable/guarded leg, as ato_chain legitimately does via session_mgmt at targets.py:78-79), or mark such redundant compounds so they are not counted as distinct discoveries.
 
 ### [INFO] ato_chain mapping (maps_to) sidesteps the chain: prefix, so the legitimate compound is itself unaudited as a chain
-*Location:* `/Users/hellohelloalbus/heel/heel/chaining.py:43`
+*Location:* `/Users/hellohelloalbus/arceo/arceo/chaining.py:43`
 
 **Evidence:** aid = pat['maps_to'] or ('chain:' + ...) — because ato_chain sets maps_to='ato_chain' (chaining.py:21), its finding gets affordance_id='ato_chain' (no 'chain:' prefix), matching the planted vector and scoring as a normal TP (confirmed: coverage no longer lists ato_chain in missed). This is the intended/legitimate path, but note the consequence: the chain: prefix is the ONLY signal the backtest uses to identify compounds, and the one genuinely-good compound bypasses it while spurious compounds (finding 1) carry it. The prefix is thus a poor discriminator for the FP decision.
 
 **Recommendation:** Identify compound findings by a structural flag on AbuseVector (e.g., reproduction['strategy']=='affordance_chain', already set at chaining.py:50) plus validated leg membership, rather than by string-prefixing the affordance_id, which is both spoofable and inconsistently applied.
 
-## Security and concurrency reviewer (HEEL blind_eval fan-out)
+## Security and concurrency reviewer (Arceo blind_eval fan-out)
 
-**Verdict:** blind_eval is deterministic and race-free (verified: identical across runs and across 1/8/16 workers; per-seed local RNG, read-only module globals, no shared Store/connection). It intentionally runs WITHOUT scope/Store/containment because targets are purely synthetic and in-memory — acceptable for an internal detection-accuracy eval, but the unscoped/unlogged path is structurally reusable and should be guarded against non-synthetic targets. The 'thousand-agent fan-out' label is dishonest: it is 40 targets, 8 GIL-bound threads, deterministic stub, no real parallelism — and the real-LLM concerns in (3) are currently moot because the fan-out hardcodes StubModel and never consults HEEL_MODEL.
+**Verdict:** blind_eval is deterministic and race-free (verified: identical across runs and across 1/8/16 workers; per-seed local RNG, read-only module globals, no shared Store/connection). It intentionally runs WITHOUT scope/Store/containment because targets are purely synthetic and in-memory — acceptable for an internal detection-accuracy eval, but the unscoped/unlogged path is structurally reusable and should be guarded against non-synthetic targets. The 'thousand-agent fan-out' label is dishonest: it is 40 targets, 8 GIL-bound threads, deterministic stub, no real parallelism — and the real-LLM concerns in (3) are currently moot because the fan-out hardcodes StubModel and never consults ARCEO_MODEL.
 
 ### [MEDIUM] 'Thousand-agent fan-out' is overstated: 40 targets, GIL-bound threads, deterministic stub
-*Location:* `/Users/hellohelloalbus/heel/heel/blind_eval.py`
+*Location:* `/Users/hellohelloalbus/arceo/arceo/blind_eval.py`
 
 **Evidence:** blind_eval.py:7 labels it 'the §7 thousand-agent FAN-OUT'; blind_eval.py:50 defines def blind_eval(n: int = 40, workers: int = 8); blind_eval.py:51 ThreadPoolExecutor(max_workers=workers); _eval_one runs a StubModel (blind_eval.py:30) doing pure-Python dict comparisons with no I/O. orchestrator.py:6 itself says 'the true thousand-agent fan-out are Phase 3.' Under the CPython GIL, CPU-bound stub work across threads serializes, so there is no real parallelism and nowhere near a thousand agents.
 
 **Recommendation:** Rename/reword to an honest description, e.g. '40 synthetic targets scored concurrently via a thread pool (GIL-bound, deterministic stub)'. Reserve 'fan-out'/'thousand-agent' for the network-bound real-LLM path, and only once it is actually wired and measured.
 
 ### [MEDIUM] Fan-out runs agent with no scope, no Store, and a _noop containment log (no audit trail)
-*Location:* `/Users/hellohelloalbus/heel/heel/blind_eval.py`
+*Location:* `/Users/hellohelloalbus/arceo/arceo/blind_eval.py`
 
-**Evidence:** _noop at blind_eval.py:24 is passed as the log to run_adversarial (blind_eval.py:30) and run_chaining (blind_eval.py:32), discarding every probe/finding/handoff/chain event. The scoped path mcp_server.heel_run (scope.verify, target_in_scope, max_requests at mcp_server.py:94-112) + orchestrator.run_abuse (ContainmentLog at orchestrator.py:33) is entirely bypassed. run_adversarial/run_chaining accept any object with .affordances, so nothing structurally prevents this unscoped, unlogged path from being pointed at a non-synthetic target.
+**Evidence:** _noop at blind_eval.py:24 is passed as the log to run_adversarial (blind_eval.py:30) and run_chaining (blind_eval.py:32), discarding every probe/finding/handoff/chain event. The scoped path mcp_server.arceo_run (scope.verify, target_in_scope, max_requests at mcp_server.py:94-112) + orchestrator.run_abuse (ContainmentLog at orchestrator.py:33) is entirely bypassed. run_adversarial/run_chaining accept any object with .affordances, so nothing structurally prevents this unscoped, unlogged path from being pointed at a non-synthetic target.
 
 **Recommendation:** Acceptable for the internal eval because every target is an in-memory SyntheticTarget from generate_blind_target (no network, no real system). Harden by asserting isinstance(t, SyntheticTarget) (or a synthetic-only flag) at the top of _eval_one, and add a one-line docstring note that this path is deliberately unscoped/unlogged and synthetic-only, so a future caller cannot repurpose it against a real target.
 
-### [LOW] Real-LLM fan-out concerns are latent: HEEL_MODEL=anthropic is bypassed and the LLM path is unaudited
-*Location:* `/Users/hellohelloalbus/heel/heel/blind_eval.py`
+### [LOW] Real-LLM fan-out concerns are latent: ARCEO_MODEL=anthropic is bypassed and the LLM path is unaudited
+*Location:* `/Users/hellohelloalbus/arceo/arceo/blind_eval.py`
 
-**Evidence:** _eval_one hardcodes model=StubModel() (blind_eval.py:30), so get_model()/AnthropicModel (model.py:110-113) never runs in the fan-out and HEEL_MODEL is ignored here. If swapped to get_model(): no backoff/rate-limit (scope limits are bypassed per the unscoped path); urllib.request.urlopen(timeout=30) (model.py:76) blocks one worker thread per call; 429/errors silently fall back to the heuristic (model.py:62-64), inflating apparent recall; the response is parsed by text.find('{')/rfind('}') with no schema validation (model.py:79); lane discipline is prompt-only (model.py:23-31) with no post-hoc enforcement; and because the log is _noop, model_error/model_fallback/discovered_scenario_llm events are discarded so the parallel LLM calls cannot be audited.
+**Evidence:** _eval_one hardcodes model=StubModel() (blind_eval.py:30), so get_model()/AnthropicModel (model.py:110-113) never runs in the fan-out and ARCEO_MODEL is ignored here. If swapped to get_model(): no backoff/rate-limit (scope limits are bypassed per the unscoped path); urllib.request.urlopen(timeout=30) (model.py:76) blocks one worker thread per call; 429/errors silently fall back to the heuristic (model.py:62-64), inflating apparent recall; the response is parsed by text.find('{')/rfind('}') with no schema validation (model.py:79); lane discipline is prompt-only (model.py:23-31) with no post-hoc enforcement; and because the log is _noop, model_error/model_fallback/discovered_scenario_llm events are discarded so the parallel LLM calls cannot be audited.
 
 **Recommendation:** Either keep the fan-out stub-only and say so explicitly, or, when enabling the real model, (a) thread the scope's rate/concurrency limits and a real backoff through the pool, (b) cap workers and add per-call retry/jitter for 429s, (c) validate the model's returned scenarios against a schema before materializing, and (d) replace _noop with a real (even in-memory) logger so the LLM control loop is auditable.
 
 ### [INFO] Determinism and race-freedom confirmed (no actionable defect)
-*Location:* `/Users/hellohelloalbus/heel/heel/blind.py`
+*Location:* `/Users/hellohelloalbus/arceo/arceo/blind.py`
 
 **Evidence:** Only RNG is the per-target local random.Random(f"blind:{seed}") at blind.py:83 (never the global random module). Module globals touched by the fan-out are read-only constants (scenarios.py:33,157; agents.py:133-134; model.py:23). No Store/sqlite connection is opened in the fan-out (store.py Store uses check_same_thread=False but is never instantiated here). ex.map preserves input order, so aggregation/CI is order-stable. Empirically verified: blind_eval(40,8) gave byte-identical results on repeat runs (recall 0.248, CI [0.19,0.306], precision 0.785), and results were invariant across workers=1/8/16 (total_found=72, total_missed=215, total_planted=287).
 

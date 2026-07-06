@@ -1,39 +1,39 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
-  "name": "io.github.ancilis/heel",
-  "description": "MCP-first continuous SaaS abuse rehearsal: probe a product you own before launch and after, prove an abuse path is reachable with a contained PoC, and return a ranked report. Exposes only consumption/execution tools and never scope mutation; scopes are human-only, out-of-band, and signed.",
+  "name": "io.github.ancilis/arceo",
+  "description": "Arceo is MCP-first continuous SaaS abuse rehearsal: probe a product you own before launch and after, prove an abuse path is reachable with a contained PoC, and return a ranked report. Exposes only consumption/execution tools and never scope mutation; scopes are human-only, out-of-band, and signed.",
   "version": "1.1.0",
   "repository": {
-    "url": "https://github.com/ancilis/heel",
+    "url": "https://github.com/ancilis/arceo",
     "source": "github"
   },
   "packages": [
     {
       "registry_type": "pypi",
       "registry_base_url": "https://pypi.org",
-      "identifier": "heel-sim",
+      "identifier": "arceo",
       "version": "1.1.0",
       "transport": { "type": "stdio" },
       "runtime_hint": "uvx",
       "package_arguments": [
-        { "type": "named", "name": "--from", "value": "heel-sim" },
-        { "type": "positional", "value": "heel-mcp" }
+        { "type": "named", "name": "--from", "value": "arceo" },
+        { "type": "positional", "value": "arceo-mcp" }
       ],
       "environment_variables": [
         {
-          "name": "HEEL_HOME",
-          "description": "Data directory for signed authorization scopes, the SQLite store, and the tamper-evident containment log (default ./.heel).",
+          "name": "ARCEO_HOME",
+          "description": "Data directory for signed authorization scopes, the SQLite store, and the tamper-evident containment log (default ./.arceo).",
           "is_required": false,
           "is_secret": false
         },
         {
-          "name": "HEEL_SIGNING_KEY",
-          "description": "Path to the HMAC signing key. For production, set this OUTSIDE HEEL_HOME (key/data separation).",
+          "name": "ARCEO_SIGNING_KEY",
+          "description": "Path to the HMAC signing key. For production, set this OUTSIDE ARCEO_HOME (key/data separation).",
           "is_required": false,
           "is_secret": true
         },
         {
-          "name": "HEEL_MODEL",
+          "name": "ARCEO_MODEL",
           "description": "Set to 'anthropic' to enable the optional LLM control loop (requires ANTHROPIC_API_KEY). Defaults to the deterministic offline model.",
           "is_required": false,
           "is_secret": false

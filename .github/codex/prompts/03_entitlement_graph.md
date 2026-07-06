@@ -1,13 +1,13 @@
 # Prompt 3 — Add the entitlement graph
 
-Task: Add an EntitlementGraph primitive to Heel.
+Task: Add an EntitlementGraph primitive to Arceo.
 
 Why:
 Most SaaS abuse is entitlement abuse: a customer gets more feature, data, quota, tenant reach, cost-shift, or agent power than intended.
 
 Create:
 
-- heel/entitlements.py
+- arceo/entitlements.py
 - tests for entitlement graph construction and queries
 - docs/ENTITLEMENTS.md
 

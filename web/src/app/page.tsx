@@ -63,7 +63,7 @@ export default function ControlRoom() {
     <div className="min-h-screen flex">
       <aside className="w-56 shrink-0 border-r border-border bg-panel/60 flex flex-col">
         <div className="px-4 py-4 border-b border-border">
-          <div className="text-[15px] font-bold tracking-tight">HEEL</div>
+          <div className="text-[15px] font-bold tracking-tight">Arceo</div>
           <div className="text-[10px] text-muted mt-0.5">SaaS abuse rehearsal war room</div>
         </div>
         <nav className="flex-1 overflow-y-auto py-2">

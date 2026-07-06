@@ -26,7 +26,7 @@ def valid_scenario():
 
 class TestScenarioValidation(unittest.TestCase):
     def test_valid_scenario_passes(self):
-        from heel.scenario_validate import validate_scenario
+        from arceo.scenario_validate import validate_scenario
 
         result = validate_scenario(valid_scenario())
 
@@ -34,17 +34,17 @@ class TestScenarioValidation(unittest.TestCase):
         self.assertEqual(result.scenario_id, "sc.community.billing.coupon_stacking")
 
     def test_bundled_community_pack_validates_and_keeps_limits(self):
-        from heel.scenario_validate import validate_scenario_file
-        from heel.scenarios import list_scenarios
+        from arceo.scenario_validate import validate_scenario_file
+        from arceo.scenarios import list_scenarios
 
-        results = validate_scenario_file("heel/scenarios_lib/community.json")
+        results = validate_scenario_file("arceo/scenarios_lib/community.json")
 
         self.assertTrue(all(result.ok for result in results), [r.errors for r in results])
         csv_scenario = next(s for s in list_scenarios() if s.id == "sc.community.csv_formula_injection")
         self.assertEqual(csv_scenario.containment_limits["max_examples"], 3)
 
     def test_missing_control_fails(self):
-        from heel.scenario_validate import validate_scenario
+        from arceo.scenario_validate import validate_scenario
 
         scenario = valid_scenario()
         del scenario["recommended_control"]
@@ -55,7 +55,7 @@ class TestScenarioValidation(unittest.TestCase):
         self.assertTrue(any("recommended_control" in e for e in result.errors))
 
     def test_unknown_operator_fails(self):
-        from heel.scenario_validate import validate_scenario
+        from arceo.scenario_validate import validate_scenario
 
         scenario = valid_scenario()
         scenario["success_criterion"] = {"shell_exec": "blocked"}
@@ -66,7 +66,7 @@ class TestScenarioValidation(unittest.TestCase):
         self.assertTrue(any("unsupported operator" in e for e in result.errors))
 
     def test_unsafe_payload_looking_string_fails_without_echoing_payload(self):
-        from heel.scenario_validate import validate_scenario
+        from arceo.scenario_validate import validate_scenario
 
         scenario = valid_scenario()
         unsafe = "PAYLOAD_REDACTED: exploit real credentials and exfiltrate customer data"
@@ -80,7 +80,7 @@ class TestScenarioValidation(unittest.TestCase):
         self.assertNotIn(unsafe.lower(), joined)
 
     def test_scenario_namespace_and_containment_limits_are_required(self):
-        from heel.scenario_validate import validate_scenario
+        from arceo.scenario_validate import validate_scenario
 
         scenario = valid_scenario()
         scenario["id"] = "sc.partner.coupon_stacking"
@@ -93,7 +93,7 @@ class TestScenarioValidation(unittest.TestCase):
         self.assertTrue(any("canary" in e for e in result.errors))
 
     def test_cli_validate_file_prints_errors(self):
-        from heel import cli
+        from arceo import cli
 
         scenario = valid_scenario()
         scenario["success_criterion"] = {"unknown": True}
@@ -109,7 +109,7 @@ class TestScenarioValidation(unittest.TestCase):
         self.assertIn("unsupported operator", buf.getvalue())
 
     def test_cli_explain_prints_objective_category_control_and_safety_limits(self):
-        from heel import cli
+        from arceo import cli
 
         buf = io.StringIO()
         with redirect_stdout(buf):

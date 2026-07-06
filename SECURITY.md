@@ -1,17 +1,17 @@
 # Security
 
-HEEL is a security tool, so its own security model matters. This document is the threat model, the
+Arceo is a security tool, so its own security model matters. This document is the threat model, the
 production-hardening checklist, and the responsible-disclosure policy.
 
-## Reporting a vulnerability in HEEL
+## Reporting a vulnerability in Arceo
 
-Please report security issues privately via a GitHub security advisory on `ancilis/heel`, or by
+Please report security issues privately via a GitHub security advisory on `ancilis/arceo`, or by
 email to the maintainers, **not** a public issue. We aim to acknowledge within 3 business days. Do
-not include real exploit payloads against third-party systems; HEEL is synthetic-first by design.
+not include real exploit payloads against third-party systems; Arceo is synthetic-first by design.
 
-## What HEEL is (and is not)
+## What Arceo is (and is not)
 
-HEEL **rehearses how a customer, integration, bot, or agent could abuse a SaaS product you own**,
+Arceo **rehearses how a customer, integration, bot, or agent could abuse a SaaS product you own**,
 before launch and continuously after. Pre-launch launch review remains the default wedge, but
 existing products can be rehearsed through authorized staging, sandbox, imported-model, sanitized
 telemetry, or production-like adapter paths. It is **not** a replacement for application-security
@@ -22,12 +22,12 @@ claim of live-target exploit accuracy.
 
 ## The authorization model (§10, the non-negotiable safety spine)
 
-HEEL is agent-native: its canonical surface is an MCP server that **other agents** call, and a
-calling agent is an **untrusted, possibly prompt-injected channel**. HEEL therefore treats the
+Arceo is agent-native: its canonical surface is an MCP server that **other agents** call, and a
+calling agent is an **untrusted, possibly prompt-injected channel**. Arceo therefore treats the
 caller as a **confused deputy**:
 
 - **Scopes are human-only and out-of-band.** A scope (target allowlist + limits + approver + expiry)
-  is created **only** via `heel scope create --confirm` and written as an **HMAC-signed** file. No
+  is created **only** via `arceo scope create --confirm` and written as an **HMAC-signed** file. No
   MCP / REST / agent code path can create, widen, add a target to, relax the limits of, or escape a
   scope: those tools **do not exist in the registry, by construction**.
 - **All non-synthetic flows require signed scopes.** Real-target adapters, imported product models,
@@ -62,32 +62,32 @@ Existing-product rehearsal is allowed only when the operator keeps the run conta
 - Do not run automated high-volume probing.
 - Keep limits operator-approved and encoded in the signed scope before any MCP, REST, or agent run.
 - Treat true software vulnerabilities as AppSec handoffs and pure jailbreaks as model red-team
-  handoffs, not HEEL findings to weaponize.
+  handoffs, not Arceo findings to weaponize.
 - The same pre-launch and existing-product contract applies everywhere: no scope creation, widening,
   relaxation, or mutation exists over MCP, REST, or agent surfaces.
 
 ## Production hardening checklist
 
-- [ ] **Separate key from data.** Set `HEEL_SIGNING_KEY` to a path (or secret mount) **outside**
-      `HEEL_HOME`. Co-locating the key with the data dir only deters actors without filesystem
-      access. `heel doctor` warns when the key is co-located.
-- [ ] **Restrict the data dir.** `HEEL_HOME` (default `./.heel`) holds signed scopes, the SQLite
+- [ ] **Separate key from data.** Set `ARCEO_SIGNING_KEY` to a path (or secret mount) **outside**
+      `ARCEO_HOME`. Co-locating the key with the data dir only deters actors without filesystem
+      access. `arceo doctor` warns when the key is co-located.
+- [ ] **Restrict the data dir.** `ARCEO_HOME` (default `./.arceo`) holds signed scopes, the SQLite
       store, and the containment log. Lock it down (`chmod 700`); it is git-ignored by default.
-- [ ] **The REST API has no transport auth of its own.** `heel-rest` binds to `127.0.0.1` and relies
+- [ ] **The REST API has no transport auth of its own.** `arceo-rest` binds to `127.0.0.1` and relies
       on the scope-authorization model for *capability* control, not network access control. Do not
       expose it publicly; front it with your own authenticated gateway / mTLS / network policy if it
       must be reachable beyond localhost. It cannot mint or widen a scope regardless.
       Read routes (`/runs/{id}/...`) are **not confidential between local callers**: all callers on
-      the loopback interface share one trust domain in v1; the `X-Heel-Caller` header is self-asserted
+      the loopback interface share one trust domain in v1; the `X-Arceo-Caller` header is self-asserted
       attribution, not authentication. The server also rejects non-loopback `Host` headers (anti
       DNS-rebinding) and any request carrying an `Origin` (anti-CSRF).
 - [ ] **Run against synthetic or explicitly-authorized targets only.** v1 ships two synthetic
       targets. Real-target adapters are beta and must run through signed scopes, canary-only data,
       and operator-approved limits. A human must authorize any target out-of-band before it can be
       run.
-- [ ] **LLM control loop.** The optional `HEEL_MODEL=anthropic` path sends only *observable
+- [ ] **LLM control loop.** The optional `ARCEO_MODEL=anthropic` path sends only *observable
       affordance properties* (never secrets/PII) to the Messages API and only receives declarative
-      scenario proposals; it stays in HEEL's lane and falls back to the offline deterministic model
+      scenario proposals; it stays in Arceo's lane and falls back to the offline deterministic model
       on any error. Review your data-egress policy before enabling it.
 
 ## Supported versions

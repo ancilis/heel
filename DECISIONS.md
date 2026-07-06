@@ -1,4 +1,4 @@
-# HEEL — Decision log
+# Arceo — Decision log
 
 Every non-obvious decision and assumption (spec §14). Append-only.
 
@@ -11,7 +11,7 @@ no third-party libs and scipy/torch wheels for Python 3.14 aren't guaranteed) ru
 checkout with zero `pip install` and is fully testable. The MCP protocol is language-agnostic, so
 the MCP server is implemented in stdlib Python (stdio JSON-RPC) — a legitimate, common choice. The
 TypeScript MCP server + Next.js UI (§11) are the Phase-3/4 productionization that wrap this same
-capability behind the *same* tool schema. **Impact:** `heel/` is pure stdlib; `sqlite3`/`hmac`/
+capability behind the *same* tool schema. **Impact:** `arceo/` is pure stdlib; `sqlite3`/`hmac`/
 `hashlib` (all stdlib) back persistence/signing/audit.
 
 ### D-002 — AuthorizationScope is an out-of-band, HMAC-signed, immutable file
@@ -46,9 +46,9 @@ properties) — never the planted ground truth — and emit contained, canary-on
 Anthropic/LLM control loop and the opportunistic-human class are Phase 3 behind the same contracts.
 
 ### D-006 — Classification enrichment is optional, generic, off by default
-**Why:** §8 — annotative only, no governance coupling. `heel/classify.py` is a swappable
+**Why:** §8 — annotative only, no governance coupling. `arceo/classify.py` is a swappable
 `Classifier` interface with a default field-name/shape heuristic; `enrich(..., enabled=False)` is a
-no-op unless explicitly turned on. HEEL is fully functional with it off; it enforces nothing at
+no-op unless explicitly turned on. Arceo is fully functional with it off; it enforces nothing at
 runtime and binds to no external framework.
 
 ### D-007 — `git init` + commit the scaffold locally; do not push
@@ -60,7 +60,7 @@ an explicit request.
 **Why:** §10.2.3 is absolute. The content-guardrail probe sends a **benign canary** to check that a
 guardrail is PRESENT and reports absence at max severity — it never generates, completes, or
 describes any prohibited artifact under any framing. Pure model-jailbreak surfaces are **handed off**
-(`handoff_to_model_redteam`), never weaponized — HEEL's lane is the product/business *consequence*,
+(`handoff_to_model_redteam`), never weaponized — Arceo's lane is the product/business *consequence*,
 not the technique (§4.10 boundary).
 
 ---
@@ -71,9 +71,9 @@ A 4-agent adversarial workflow confirmed the #1 claim (a prompt-injected MCP cal
 a signed scope) but found gaps between claim and implementation. Fixes:
 
 ### D-009 — Signing-key threat model made honest; key can live outside the data dir
-**Why:** the red-team showed the HMAC key co-located in `.heel/` reduces tamper-evidence to "can
-you write `.heel/`" rather than "possess a secret". `HEEL_SIGNING_KEY` now points the key outside
-the data dir (keychain/HSM in prod). The in-`.heel/` default is documented as demo-only. Fixed the
+**Why:** the red-team showed the HMAC key co-located in `.arceo/` reduces tamper-evidence to "can
+you write `.arceo/`" rather than "possess a secret". `ARCEO_SIGNING_KEY` now points the key outside
+the data dir (keychain/HSM in prod). The in-`.arceo/` default is documented as demo-only. Fixed the
 "stable per repo" docstring (the key is random per home, not repo-stable).
 
 ### D-010 — Reachability is a continuous depth-based estimate, not two magic keys
@@ -117,13 +117,13 @@ closing the adversarial coupon-stacking blind spot. A multi-affordance `ato_chai
 missed by both (single-affordance) classes, keeping an honest FN (coverage < 1.0). Affordance-
 chaining discovery is later Phase-3 work.
 
-### D-016 — REST is a thin client over the SAME HeelServer (one auth gate)
-**Why:** §2 — build the capability once. `heel/rest.py` routes HTTP to `HeelServer.call_tool`, so
+### D-016 — REST is a thin client over the SAME ArceoServer (one auth gate)
+**Why:** §2 — build the capability once. `arceo/rest.py` routes HTTP to `ArceoServer.call_tool`, so
 the §10 enforcement is identical and cannot diverge. No scope-creation route exists (POST /scopes
 → 405 + security log). `check_same_thread=False` lets the threaded server share the store.
 
 ### D-017 — Control proposal is a ranked search, not a single string
-**Why:** §7/§8 — `heel_propose_control` returns the agent's recommendation plus a per-category
+**Why:** §7/§8 — `arceo_propose_control` returns the agent's recommendation plus a per-category
 control bank, ranked by estimated exploitability reduction. A Phase-4 version re-simulates each
 candidate against the affordance to measure the reduction empirically rather than estimate it.
 
@@ -131,35 +131,35 @@ candidate against the affordance to measure the reduction empirically rather tha
 **Why:** §4 "scenarios are specs addable without code". Per-strategy probe functions are replaced by
 ONE generic `evaluate_criterion` over a small declarative language (guard_absent / prop±equals/in/
 exists / prop_contains / prop_neq / all_of / any_of / not). Controls + handoff move INTO the scenario
-spec. `heel/scenarios_lib/*.json` is merged at load. Breadth is now 34 scenarios across all 10
+spec. `arceo/scenarios_lib/*.json` is merged at load. Breadth is now 34 scenarios across all 10
 categories; scenarios that match no synthetic affordance correctly don't fire (no FP inflation).
 
 ### D-019 — LLM control loop is a swappable Model with an offline deterministic default
 **Why:** §11 "an LLM control loop ... a stub model path so the synthetic demo runs with no API key".
-`heel/model.py`: `StubModel` (deterministic, heuristic discovery, default) and `AnthropicModel`
-(`HEEL_MODEL=anthropic`, Messages API via stdlib urllib, no SDK). The model only sees observable
-properties and only proposes declarative scenario specs — HEEL builds the contained PoC; the model
+`arceo/model.py`: `StubModel` (deterministic, heuristic discovery, default) and `AnthropicModel`
+(`ARCEO_MODEL=anthropic`, Messages API via stdlib urllib, no SDK). The model only sees observable
+properties and only proposes declarative scenario specs — Arceo builds the contained PoC; the model
 stays in lane and falls back to the heuristic on error/no-key. Keeps the pure-stdlib core.
 
 ### D-020 — UI is a thin client over a pure-stdlib JSON snapshot
-**Why:** §9 control room. `heel/web_export.py` runs the full synthetic flow over the MCP capability
+**Why:** §9 control room. `arceo/web_export.py` runs the full synthetic flow over the MCP capability
 (deterministic) and writes `web/public/data/snapshot.json`; the Next.js app reads it. Same pattern
-as the rest of HEEL: the capability is built once (MCP-first) and every surface is a thin client.
+as the rest of Arceo: the capability is built once (MCP-first) and every surface is a thin client.
 The UI honors the epistemics (reachability-weighting visible, implausible demoted not hidden;
 predicted/contained PoCs; optional classification shown when on; the scope panel is read-only and
 cannot mint/widen a scope). `node_modules` gitignored; the snapshot is committed so the UI renders
 on a clean checkout.
 
 ### D-021 — Blind-target evaluation is the honest detection metric; coverage is self-consistency
-**Why:** the red-team showed the synthetic coverage is circular. `heel/blind.py` plants weaknesses
+**Why:** the red-team showed the synthetic coverage is circular. `arceo/blind.py` plants weaknesses
 using a broad ENCODING vocabulary authored independently of the seed probes (synonyms the library
-doesn't key off, verified not to leak via discovery either); `heel/blind_eval.py` aggregates real
+doesn't key off, verified not to leak via discovery either); `arceo/blind_eval.py` aggregates real
 recall/precision/FP + 95% CI across many targets. Real recall ~0.25 (vs 0.93 self-consistency) is
 the honest real-target estimate; it rises only by growing the library's encoding breadth — it cannot
 be gamed by writing probes against known plants.
 
 ### D-022 — Affordance-chaining is a real capability; compound findings aren't false positives
-**Why:** chaining (`heel/chaining.py`) finds multi-step abuse (ATO = weak recovery + non-rotated
+**Why:** chaining (`arceo/chaining.py`) finds multi-step abuse (ATO = weak recovery + non-rotated
 session) the single-affordance classes miss, closing the synthetic ato_chain FN. The backtest
 EXCLUDES `chain:`-prefixed compound findings from the FP count (a chain over two genuinely-vulnerable
 affordances is a legitimate escalation, not a false alarm on a hardened affordance). The honest
@@ -169,7 +169,7 @@ sub-1.0 signal now lives in the blind eval, not the synthetic coverage.
 **Why:** §7 thousand-agent fan-out. `blind_eval` runs targets via `concurrent.futures` threads — the
 INTERNAL eval path (no scope/real target, so no auth gate needed; it never touches a real system).
 With the stub model the GIL bounds CPU speedup, so we call it a bounded fan-out, not literal 1000×;
-with real LLM agents (`HEEL_MODEL=anthropic`) threads overlap network-bound work. Determinism is
+with real LLM agents (`ARCEO_MODEL=anthropic`) threads overlap network-bound work. Determinism is
 preserved (each target seeded; no shared mutable RNG across threads).
 
 ### D-024 — The blind eval is a transparent LOWER BOUND vs measured encoding-overlap, not a dialed number
@@ -178,20 +178,20 @@ rested on one over-broad probe, and the CI was mis-modelled. Fixes: report recal
 empirically-MEASURED encoding-overlap (the independent variable) and label it a stated lower bound;
 Wilson CI on the pooled proportion; per-probe FP attribution + boundary decoys; sound chaining FP
 accounting (a chain over a decoy is a real FP, not a laundered "compound"); a synonym-leak regression
-test; honest fan-out wording (GIL-bound thread pool). The honest claim: HEEL detects what its library
+test; honest fan-out wording (GIL-bound thread pool). The honest claim: Arceo detects what its library
 anticipates (~the measured overlap); a defensible external accuracy claim needs independently-authored
 or held-out scenarios — stated, not hidden.
 
 ### D-025 — Held-out, independently-authored targets are the strongest detection metric
-**Why:** the blind eval's encoding-overlap was still author-chosen. `heel/heldout/targets.json` is
-authored by an independent LLM swarm blind to HEEL's probes (workflow `heel-heldout-authoring`;
+**Why:** the blind eval's encoding-overlap was still author-chosen. `arceo/heldout/targets.json` is
+authored by an independent LLM swarm blind to Arceo's probes (workflow `arceo-heldout-authoring`;
 provenance in docs/HELDOUT_PROVENANCE.md), removing author control over the vocabulary.
-`heel/heldout_eval.py` reports recall exact-match (~0.26) vs with semantic generalization (~0.57,
+`arceo/heldout_eval.py` reports recall exact-match (~0.26) vs with semantic generalization (~0.57,
 Wilson CI), at ~0.95 precision, with per-category breakdown. Frozen for deterministic offline runs.
 
 ### D-026 — Semantic signal matching is the honest generalization axis (not exact property names)
-**Why:** exact property==value/kind criteria don't generalize to vocabularies HEEL didn't author.
-`heel/semantic.py` matches weakness FAMILIES by topic keywords in the property KEY + permissive value
+**Why:** exact property==value/kind criteria don't generalize to vocabularies Arceo didn't author.
+`arceo/semantic.py` matches weakness FAMILIES by topic keywords in the property KEY + permissive value
 indicators (and absence of a hardened indicator), via `{"semantic": signal}` criteria on kind "*"
 scenarios (agent-category ones gated to has_agent_surface to preserve cat-10 optionality). On the
 held-out set this roughly doubles recall at high precision. Topic+permissive (not topic alone) keeps
@@ -199,8 +199,8 @@ precision: a tightened tenant topic avoids miscategorizing an MCP `context_isola
 
 ### D-027 — Held-out uses a dev/test split; the frozen TEST recall is the headline
 **Why:** tuning the semantic catalog to raise recall would overfit if measured on the same targets.
-The semantic catalog is tuned on DEV (heel/heldout/targets.json, 8 products); a larger TEST set
-(heel/heldout/test_targets.json, 14 products / 199 weaknesses) was authored by a fresh independent
+The semantic catalog is tuned on DEV (arceo/heldout/targets.json, 8 products); a larger TEST set
+(arceo/heldout/test_targets.json, 14 products / 199 weaknesses) was authored by a fresh independent
 LLM swarm and frozen WITHOUT the tuner inspecting its properties. Reported: DEV semantic 0.73 vs
 TEST semantic 0.38 (Wilson CI [0.31,0.45]) at 0.96 precision — the dev→test gap is the overfitting
 gap, shown rather than hidden. recall improves only by widening real-vocabulary coverage.
@@ -220,7 +220,7 @@ category to choose the signal (that would cheat) — the gap is disclosed.
 
 ### D-030 — Token-anchored semantic matching + target-cluster bootstrap CIs
 **Why:** substring matching caused false fires (orm⊂format, ttl⊂throttle, allowed⊂disallowed) and
-mis-categorization; `heel/semantic.py` now anchors topic/permissive tokens at word boundaries
+mis-categorization; `arceo/semantic.py` now anchors topic/permissive tokens at word boundaries
 (precision 0.97). The iid Wilson CI understated uncertainty on clustered data; heldout_eval uses a
 target-level cluster bootstrap. test_targets.json is content-hashed to pre-register the number.
 
@@ -242,12 +242,12 @@ lift there is fair: held-out TEST localization recall 0.38 -> 0.50 at precision 
 `prop_exists` operator added; over-broad `not prop_exists` absence-checks paired with `guard_absent`
 to restore precision without losing recall. docs/RESEARCH_LIBRARY.md records provenance.
 
-### D-033 — Heel supports pre-launch and existing-product abuse rehearsal
+### D-033 — Arceo supports pre-launch and existing-product abuse rehearsal
 **Why:** pre-launch launch review is the wedge: teams can rehearse abuse before customer traffic,
 before incident pressure, and with the cleanest safety envelope. But SaaS abuse keeps evolving after
 launch through trial farming, seat sharing, export scraping, AI-token cost abuse, integration/OAuth
 overreach, and support/workflow gaming. Supporting existing products widens adoption and turns real
-incidents or sanitized telemetry into regression scenarios without changing HEEL's lane.
+incidents or sanitized telemetry into regression scenarios without changing Arceo's lane.
 
 **Safety consequence:** the broader positioning does not relax authorization. Every non-synthetic
 run, imported product model, sanitized telemetry import, staging rehearsal, or production-like target
@@ -258,7 +258,7 @@ exfiltration, no resource exhaustion, no automated high-volume probing, and oper
 
 ### D-034 — EntitlementGraph is a static model layer that emits ordinary affordances
 **Why:** entitlement abuse is the common SaaS case: a principal gets more feature, data, quota,
-tenant reach, cost shift, integration power, or agent power than intended. `heel.entitlements`
+tenant reach, cost shift, integration power, or agent power than intended. `arceo.entitlements`
 models those relationships as typed edges and converts suspicious edges into the same declarative
 `Affordance` shape the existing scenario engine already evaluates.
 
@@ -268,18 +268,18 @@ inherits the imported-target rule: any rehearsal run still requires a human-crea
 MCP/REST/agent surfaces remain unable to create, widen, relax, or mutate scopes.
 
 ### D-035 — Findings can become abuse regression tests without becoming repro playbooks
-**Why:** reports alone do not keep controls fixed. `heel.regressions` persists a finding's scenario,
+**Why:** reports alone do not keep controls fixed. `arceo.regressions` persists a finding's scenario,
 affordance pattern, declarative success criterion, recommended control, expected status, source run,
 and safety flags so teams can re-run the control check in CI or staging.
 
 **Safety consequence:** regression specs deliberately omit reproduction steps and working payloads.
-Re-runs call the same `HeelServer.heel_run` path, so signed scope verification, allowlist checks,
+Re-runs call the same `ArceoServer.arceo_run` path, so signed scope verification, allowlist checks,
 resource limits, canary-only findings, and containment logging are reused. The regression CLI has no
 scope creation, widening, allowlist, or limit-mutation command.
 
 ### D-036 — Economic severity is report-layer business-impact metadata
 **Why:** SaaS abuse is often a business-loss problem rather than a CVSS-style software vulnerability.
-`heel.economics` estimates directional monthly exposure from existing contained findings plus
+`arceo.economics` estimates directional monthly exposure from existing contained findings plus
 operator-supplied assumptions, keeps assumptions and unknowns visible, and ranks by economic impact
 without replacing the existing security severity.
 
@@ -290,7 +290,7 @@ scopes. Missing assumptions produce qualitative scores only rather than fake pre
 
 ### D-037 — Opportunistic humans are first-class customer-incentive personas
 **Why:** abuse reports need to explain not only which affordance is weak, but which motivated
-customer archetype would game it. The old three-profile model was too coarse, so `heel.profiles`
+customer archetype would game it. The old three-profile model was too coarse, so `arceo.profiles`
 now defines declarative personas with motivation, sophistication, patience, risk tolerance, target
 affordance types, preferred chains, deterring controls, canary rehearsal examples, and observable
 matching rules. The default library covers coupon stacking, seat sharing, agency resale, data
@@ -305,8 +305,8 @@ ranking rule. No scope creation, widening, target authorization, real exfiltrati
 credential abuse, spam, resource exhaustion, or third-party probing is added.
 
 ### D-038 — Control simulation is proposed-fix ranking, not verification
-**Why:** teams need help choosing fixes after HEEL identifies a reachable abuse path. A single
-recommended control is too thin for launch and regression planning, so `heel.control_simulator`
+**Why:** teams need help choosing fixes after Arceo identifies a reachable abuse path. A single
+recommended control is too thin for launch and regression planning, so `arceo.control_simulator`
 estimates a ranked bundle from vector fields, scenario category, affordance properties, optional
 ProductModel/EntitlementGraph signals, and a local control bank. The ranking is deterministic and
 balances abuse reduction, friction, legitimate-path preservation, and confidence.

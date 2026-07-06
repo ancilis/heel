@@ -1,13 +1,13 @@
-# Prompt 13 — Add OpenAPI import MVP: `heel init --from-openapi`
+# Prompt 13 — Add OpenAPI import MVP: `arceo init --from-openapi`
 
 Task: Add a minimal OpenAPI importer that creates a ProductModel draft.
 
 Create:
 
-- heel/openapi_import.py
+- arceo/openapi_import.py
 - CLI:
-  - heel init --from-openapi openapi.yaml --out product_model.json
-  - heel import openapi openapi.yaml --out product_model.json
+  - arceo init --from-openapi openapi.yaml --out product_model.json
+  - arceo import openapi openapi.yaml --out product_model.json
 - docs/OPENAPI_IMPORT.md
 - tests with example OpenAPI files
 
@@ -32,13 +32,13 @@ Mapping:
 - paths with admin/support -> admin_action/support affordances
 - securitySchemes -> declared auth controls
 - tags -> product areas
-- x-heel-* vendor extensions, if present:
-  - x-heel-plan
-  - x-heel-tenant-scope
-  - x-heel-meter
-  - x-heel-data-class
-  - x-heel-control
-  - x-heel-agent-tool
+- x-arceo-* vendor extensions, if present:
+  - x-arceo-plan
+  - x-arceo-tenant-scope
+  - x-arceo-meter
+  - x-arceo-data-class
+  - x-arceo-control
+  - x-arceo-agent-tool
 
 Output:
 
@@ -56,7 +56,7 @@ Tests:
 - export path maps to export surface
 - OAuth path maps to integration surface
 - missing metadata creates warnings
-- x-heel vendor extensions improve mapping
+- x-arceo vendor extensions improve mapping
 - no live calls are made
 
 Docs:
@@ -66,4 +66,4 @@ Docs:
 
 Acceptance criteria:
 
-- A real SaaS team can run one command against an API spec and get a safe Heel model draft.
+- A real SaaS team can run one command against an API spec and get a safe Arceo model draft.

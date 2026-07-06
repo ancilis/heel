@@ -1,15 +1,15 @@
 # Prompt 2 — Build the adapter contract: `docs/ADAPTERS.md` + core target-import schema
 
-Task: Add the first real-target adapter contract for Heel.
+Task: Add the first real-target adapter contract for Arceo.
 
 Create:
 
 - docs/ADAPTERS.md
-- heel/importers.py
+- arceo/importers.py
 - tests covering the importer contract
 
 Purpose:
-Heel needs a stable way to turn a SaaS product description into Heel’s internal affordance model without touching real systems.
+Arceo needs a stable way to turn a SaaS product description into Arceo’s internal affordance model without touching real systems.
 
 Add a versioned JSON schema-like contract named ProductModel v0.1. It should be plain Python dictionaries / dataclasses, no third-party JSON-schema dependency.
 
@@ -64,7 +64,7 @@ CLI:
 Add a placeholder command:
 
 ```bash
-heel import validate <product_model.json>
+arceo import validate <product_model.json>
 ```
 
 It validates required fields and prints a human-readable summary.
@@ -80,5 +80,5 @@ Tests:
 
 Acceptance criteria:
 
-- A user can read docs/ADAPTERS.md and understand how to bring a real SaaS product into Heel safely.
+- A user can read docs/ADAPTERS.md and understand how to bring a real SaaS product into Arceo safely.
 - No actual live adapter or network probing exists yet.

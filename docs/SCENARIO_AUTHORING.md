@@ -1,11 +1,11 @@
 # Scenario Pack Authoring
 
-HEEL scenario packs are declarative JSON. Authors describe an abuse pattern, the product
+Arceo scenario packs are declarative JSON. Authors describe an abuse pattern, the product
 affordance it applies to, the observable success condition, the recommended control, and
 the safety limits. The Python evaluator stays unchanged, so community, research,
 internal, and incident-derived scenarios can be added without touching code.
 
-HEEL keeps a production-ready spine, beta adapters posture: authored packs are local
+Arceo keeps a production-ready spine, beta adapters posture: authored packs are local
 artifacts, validated offline, and executed only through canary-only rehearsal with a
 human-created signed AuthorizationScope.
 
@@ -14,13 +14,13 @@ human-created signed AuthorizationScope.
 Validate a single scenario object or a list:
 
 ```bash
-heel scenario validate my_scenarios.json
+arceo scenario validate my_scenarios.json
 ```
 
 Explain a known scenario before authoring a related pack:
 
 ```bash
-heel scenario explain sc.community.csv_formula_injection
+arceo scenario explain sc.community.csv_formula_injection
 ```
 
 Validation does not probe products, call live targets, create scopes, relax scopes, or
@@ -55,7 +55,7 @@ Scenario IDs must start with one of:
 - `sc.internal.`
 - `sc.incident.`
 
-`category` must be one of the taxonomy values in `heel.contracts.Category`.
+`category` must be one of the taxonomy values in `arceo.contracts.Category`.
 `applies_when` may be `always` or `has_agent_surface`.
 
 ## Operators
@@ -72,7 +72,7 @@ Scenario IDs must start with one of:
 - `all_of`: non-empty list of criteria, all must match.
 - `any_of`: non-empty list of criteria, at least one must match.
 - `not`: negates a single nested criterion.
-- `semantic`: named semantic family recognized by HEEL.
+- `semantic`: named semantic family recognized by Arceo.
 
 Unsupported operator names are rejected so a scenario pack cannot smuggle executable
 logic or payload instructions into the evaluator.
@@ -182,5 +182,5 @@ Every authored scenario must state canary-only containment limits:
 - `no_live_targets`: `true`
 - one bounded cap such as `max_examples`, `max_probe_calls`, `max_requests`, or `sample_cap`
 
-The cap must be a small integer. HEEL validation is offline and HEEL execution remains
+The cap must be a small integer. Arceo validation is offline and Arceo execution remains
 bounded by signed scopes, run budgets, audit logging, and canary data handling.

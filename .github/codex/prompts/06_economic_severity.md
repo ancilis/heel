@@ -7,7 +7,7 @@ Customer abuse is often a business-loss issue, not a CVSS-style vulnerability.
 
 Create:
 
-- heel/economics.py
+- arceo/economics.py
 - docs/ECONOMIC_SEVERITY.md
 - tests
 
@@ -36,8 +36,8 @@ Integrate:
 
 - Add optional economic_impact field to AbuseVector serialization or report layer.
 - Add CLI flag:
-  - heel run ... --economic
-  - heel report --run <run_id> --economic
+  - arceo run ... --economic
+  - arceo report --run <run_id> --economic
 - Do not break existing tests.
 
 Scoring:
@@ -68,4 +68,4 @@ Docs:
 
 Acceptance criteria:
 
-- Heel can rank findings by business impact without hiding uncertainty.
+- Arceo can rank findings by business impact without hiding uncertainty.

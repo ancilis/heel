@@ -1,18 +1,18 @@
 # Control Simulator
 
-HEEL identifies reachable abuse paths; the control simulator helps teams choose likely fixes. It
+Arceo identifies reachable abuse paths; the control simulator helps teams choose likely fixes. It
 does not contact a live target and it does not prove a control works. It estimates which controls
 would block or reduce a stored or imported finding, then ranks a small bundle for follow-up.
 
 ## Run It
 
 ```bash
-heel controls simulate --vector <vector_id>
-heel controls simulate --finding-json finding.json
-heel controls simulate --run <run_id>
+arceo controls simulate --vector <vector_id>
+arceo controls simulate --finding-json finding.json
+arceo controls simulate --run <run_id>
 ```
 
-`--vector` and `--run` read findings already stored in HEEL's local store. `--finding-json` accepts a
+`--vector` and `--run` read findings already stored in Arceo's local store. `--finding-json` accepts a
 single finding object, or an object with a `finding` field plus optional `affordance_properties`,
 `product_model`, or `control_bank` fields. All modes are offline report generation only.
 
@@ -21,10 +21,10 @@ single finding object, or an object with a `finding` field plus optional `afford
 A proposed control is a simulator estimate. It is based on the finding fields, scenario category,
 affordance properties, optional ProductModel or EntitlementGraph signals, and the local control
 bank. Proposed controls include a confidence score, but confidence is capped below certainty because
-HEEL has not re-run the product with the fix.
+Arceo has not re-run the product with the fix.
 
 A verified control is different: the team has implemented the fix and run a regression or launch
-review against an authorized target or imported model. Verification still follows HEEL's safety
+review against an authorized target or imported model. Verification still follows Arceo's safety
 spine: human-created scope, canary-only evidence, no real exfiltration, no credential/payment abuse,
 no spam, and no resource exhaustion.
 

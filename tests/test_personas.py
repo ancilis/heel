@@ -4,22 +4,22 @@ from dataclasses import asdict, replace
 import tempfile
 import unittest
 
-os.environ["HEEL_HOME"] = tempfile.mkdtemp()
+os.environ["ARCEO_HOME"] = tempfile.mkdtemp()
 
-from heel import scope as scopemod  # noqa: E402
-from heel.agents_human import run_opportunistic  # noqa: E402
-from heel.contracts import Affordance, Category, SyntheticTarget  # noqa: E402
-from heel.mcp_server import HeelServer  # noqa: E402
-from heel.profiles import DEFAULT_PERSONAS, PERSONA_BY_ID  # noqa: E402
-from heel.store import Store  # noqa: E402
-from heel.targets import get_target  # noqa: E402
+from arceo import scope as scopemod  # noqa: E402
+from arceo.agents_human import run_opportunistic  # noqa: E402
+from arceo.contracts import Affordance, Category, SyntheticTarget  # noqa: E402
+from arceo.mcp_server import ArceoServer  # noqa: E402
+from arceo.profiles import DEFAULT_PERSONAS, PERSONA_BY_ID  # noqa: E402
+from arceo.store import Store  # noqa: E402
+from arceo.targets import get_target  # noqa: E402
 
 
 class PersonaBase(unittest.TestCase):
     def setUp(self):
-        os.environ["HEEL_HOME"] = tempfile.mkdtemp()
+        os.environ["ARCEO_HOME"] = tempfile.mkdtemp()
         self.store = Store()
-        self.server = HeelServer(self.store)
+        self.server = ArceoServer(self.store)
         self.caller = "persona-test-agent"
         self.scope = scopemod.create_scope(["synthetic-saas", "synthetic-ai"], operator="tester")
 
@@ -27,10 +27,10 @@ class PersonaBase(unittest.TestCase):
         args = {"scope_id": self.scope.scope_id, "target": target}
         if classes is not None:
             args["agent_classes"] = classes
-        return self.server.heel_run(args, self.caller)["run_id"]
+        return self.server.arceo_run(args, self.caller)["run_id"]
 
     def findings(self, run_id):
-        return self.server.heel_get_findings({"run_id": run_id}, self.caller)["findings"]
+        return self.server.arceo_get_findings({"run_id": run_id}, self.caller)["findings"]
 
 
 class TestPersonaLibrary(unittest.TestCase):
@@ -150,7 +150,7 @@ class TestPersonaFindings(PersonaBase):
         findings = self.findings(rid)
         self.assertFalse(any(f["reproduction"].get("class") == "opportunistic_human" for f in findings))
         self.assertFalse(any(f["reproduction"].get("persona_evidence") for f in findings))
-        coverage = self.server.heel_get_coverage({"run_id": rid}, self.caller)["coverage"]
+        coverage = self.server.arceo_get_coverage({"run_id": rid}, self.caller)["coverage"]
         self.assertEqual(coverage["opportunistic_findings"], 0)
 
     def test_persona_outputs_are_deterministic(self):

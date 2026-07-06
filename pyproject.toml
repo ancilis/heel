@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "heel-sim"
+name = "arceo"
 version = "1.1.0"
-description = "MCP-first continuous SaaS abuse rehearsal for pre-launch review and authorized canary-only existing-product runs."
+description = "Arceo is MCP-first continuous SaaS abuse rehearsal for pre-launch review and authorized canary-only existing-product runs."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -24,9 +24,9 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/ancilis/heel"
-Source = "https://github.com/ancilis/heel"
-Issues = "https://github.com/ancilis/heel/issues"
+Homepage = "https://github.com/ancilis/arceo"
+Source = "https://github.com/ancilis/arceo"
+Issues = "https://github.com/ancilis/arceo/issues"
 
 [project.optional-dependencies]
 # the LLM control loop uses the Anthropic Messages API via stdlib urllib (no SDK needed);
@@ -34,15 +34,15 @@ Issues = "https://github.com/ancilis/heel/issues"
 llm = []
 
 [project.scripts]
-heel = "heel.cli:main"
-heel-mcp = "heel.mcp_server:main"
-heel-rest = "heel.rest:serve"
+arceo = "arceo.cli:main"
+arceo-mcp = "arceo.mcp_server:main"
+arceo-rest = "arceo.rest:serve"
 
 [tool.setuptools]
-packages = ["heel"]
+packages = ["arceo"]
 
 [tool.setuptools.package-data]
-heel = ["scenarios_lib/*.json", "heldout/*.json"]
+arceo = ["scenarios_lib/*.json", "heldout/*.json"]
 
 [tool.setuptools.exclude-package-data]
-heel = ["**/__pycache__/*"]
+arceo = ["**/__pycache__/*"]

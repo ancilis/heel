@@ -67,7 +67,7 @@
       "post": {
         "tags": ["Agent"],
         "operationId": "runAgentTool",
-        "x-heel-agent-tool": true
+        "x-arceo-agent-tool": true
       }
     }
   }

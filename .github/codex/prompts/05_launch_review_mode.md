@@ -1,13 +1,13 @@
 # Prompt 5 — Add launch review mode
 
-Task: Add a launch-review mode that focuses Heel on changed product surfaces.
+Task: Add a launch-review mode that focuses Arceo on changed product surfaces.
 
 Create:
 
-- heel/launch_review.py
+- arceo/launch_review.py
 - CLI:
-  - heel launch-review --before <product_model_before.json> --after <product_model_after.json>
-  - heel launch-review --diff main..feature/pricing-v2
+  - arceo launch-review --before <product_model_before.json> --after <product_model_after.json>
+  - arceo launch-review --diff main..feature/pricing-v2
 - docs/LAUNCH_REVIEW.md
 - tests
 

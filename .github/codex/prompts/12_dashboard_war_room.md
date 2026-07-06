@@ -47,7 +47,7 @@ Add or update UI sections:
 
 Update:
 
-- heel/web_export.py to include new snapshot fields using deterministic sample data.
+- arceo/web_export.py to include new snapshot fields using deterministic sample data.
 - web/public/data/snapshot.json
 - UI components in web/
 
