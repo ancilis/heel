@@ -58,7 +58,7 @@ class FinalIntegrationDocsTests(unittest.TestCase):
 
     def test_eval_doc_leads_with_current_metrics_and_library_size(self):
         eval_doc = self.read("EVAL.md")
-        self.assertIn("119 scenarios", eval_doc)
+        self.assertIn("120 scenarios", eval_doc)
         self.assertIn("localization recall 0.50", eval_doc)
         self.assertIn("attribution recall 0.33", eval_doc)
         self.assertIn("precision 0.98", eval_doc)

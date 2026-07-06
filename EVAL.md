@@ -21,13 +21,13 @@ The current public benchmark (`heel bench report`) summarizes the integrated lib
 | metric | value | meaning |
 |---|---:|---|
 | self-consistency coverage | 1.00 | synthetic wiring check, not real-target accuracy |
-| blind lower-bound recall | 0.267 | repository-authored blind encodings; lower bound, not an external claim |
+| blind lower-bound recall | 0.404 | repository-authored blind encodings; lower bound, not an external claim |
 | held-out DEV localization recall | 0.763 | tuned-on split, useful for development |
 | held-out DEV attribution recall | 0.485 | right affordance and category on DEV |
 | held-out TEST localization recall | **0.497** | frozen, independently authored TEST split |
 | held-out TEST attribution recall | **0.332** | stricter TEST headline: right affordance and category |
 | held-out TEST precision | **0.98** | precision on unseen vocabulary |
-| scenario library | **119 scenarios** | declarative scenarios across all 10 abuse categories |
+| scenario library | **120 scenarios** | declarative scenarios across all 10 abuse categories |
 
 Rounded for README: localization recall 0.50, attribution recall 0.33, precision 0.98. The
 localization→attribution gap is disclosed because flagging the right affordance is weaker evidence

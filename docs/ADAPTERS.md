@@ -84,8 +84,10 @@ access tokens, cookies, private keys, production customer records, or payment in
 
 OpenAPI or route catalogs can map to `endpoints_routes` and `exports`. Include route templates,
 methods, documented status, entitlement expectations, rate-limit metadata, and tenant-filter
-metadata. Do not include real headers, bearer tokens, examples with real customer data, or raw
-responses.
+metadata. For UI backing endpoints that expose data also sold through a paid API or bulk export,
+mark `ui_backing_endpoint`, `paid_api_equivalent`, required/reachable plan metadata, lookup quotas,
+automation guards, and audit controls. Do not include real headers, bearer tokens, examples with real
+customer data, or raw responses.
 
 Pricing and plan config can map to `plans`, `meters`, `coupons_promotions`, and `billing_objects`.
 Model plan names, entitlement names, meter reset windows, coupon stacking rules, trial boundaries,

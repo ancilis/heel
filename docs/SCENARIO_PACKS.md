@@ -11,7 +11,7 @@ MCP/REST/agent callers still cannot create, widen, or mutate scopes.
 | pack | purpose |
 |---|---|
 | `core_saas` | General SaaS abuse surfaces that do not fit a narrower pack. |
-| `payments_billing` | License, entitlement, usage, billing, export, and commercial abuse surfaces. |
+| `payments_billing` | License, entitlement, usage, billing, export, shadow-API/UI backing endpoint, and commercial abuse surfaces. |
 | `trust_safety` | Signup, account, content, review, referral, and trust-economy abuse surfaces. |
 | `integrations` | OAuth, webhook, and integration extensibility abuse surfaces. |
 | `compliance` | Tenant isolation, audit, residency, retention, and admin/support workflow boundaries. |

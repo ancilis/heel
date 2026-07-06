@@ -275,19 +275,48 @@ def _export_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> list[Ris
 
 
 def _endpoint_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> list[RiskFinding]:
+    findings = _ui_backing_endpoint_risks(surface, props)
     text = _text(props, "id", "name", "route", "path")
     if "export" in text:
-        return _export_risks(surface, props)
+        findings.extend(_export_risks(surface, props))
+        return findings
     tenant_missing = _bad_control(_first(props, "tenant_filter", "tenant_check", "tenant_isolation"))
     if not tenant_missing:
-        return []
-    return [_finding(
+        return findings
+    findings.append(_finding(
         surface,
         risk="endpoint_without_tenant_filter",
         severity="block" if _reachable(props) else "warn",
         control="tenant filter",
         reason=f"new {surface.surface_id} endpoint lacks server-side tenant filtering",
         reachable=_reachable(props),
+    ))
+    return findings
+
+
+def _ui_backing_endpoint_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> list[RiskFinding]:
+    ui_backing = _truthy(_first(props, "ui_backing_endpoint", "interactive_ui_endpoint", "browser_endpoint"))
+    paid_equivalent = _truthy(_first(props, "paid_api_equivalent", "bulk_api_equivalent", "api_equivalent"))
+    if not (ui_backing and paid_equivalent):
+        return []
+
+    required = str(_first(props, "required_plan", "entitlement_plan", "min_plan", "plan_required") or "").lower()
+    reachable = str(_first(props, "reachable_by_plan", "granted_plan", "current_plan", "observed_plan") or "").lower()
+    plan_mismatch = bool(required and reachable and required != reachable)
+    entitlement_missing = _bad_control(_first(props, "entitlement_check", "authz_check", "guard", "guard_present"))
+    quota_missing = _bad_control(_first(props, "lookup_quota", "lookup_limit", "rate_limit", "tenant_quota", "quota"))
+    automation_missing = _bad_control(_first(props, "automation_guard", "anti_automation", "bot_protection", "human_challenge"))
+    if not (plan_mismatch or entitlement_missing or quota_missing or automation_missing):
+        return []
+
+    reachable_signal = _reachable(props) or plan_mismatch
+    return [_finding(
+        surface,
+        risk="ui_backing_endpoint_paid_api_bypass",
+        severity="block" if reachable_signal else "warn",
+        control="shared UI/API entitlement and lookup quota",
+        reason=f"new {surface.surface_id} UI backing endpoint can be scripted as unpriced bulk API access",
+        reachable=reachable_signal,
     )]
 
 

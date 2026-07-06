@@ -134,10 +134,11 @@ See [docs/POSITIONING.md](docs/POSITIONING.md) for the full comparison table.
 
 ## What it hunts
 
-A 10-category abuse taxonomy: license/entitlement gaming, data harvesting, unintended endpoints,
-function abuse, content policy, identity/account takeover, trust-economy fraud, integration abuse,
-compliance boundaries, and (only when the target has an agent/MCP surface) **agent-specific abuse**
-like tool over-scope, confused-deputy tool calls, cross-tenant RAG, and indirect-injection-to-action.
+A 10-category abuse taxonomy: license/entitlement gaming, UI backing endpoints used as unpriced bulk
+APIs, data harvesting, unintended endpoints, function abuse, content policy, identity/account
+takeover, trust-economy fraud, integration abuse, compliance boundaries, and (only when the target
+has an agent/MCP surface) **agent-specific abuse** like tool over-scope, confused-deputy tool calls,
+cross-tenant RAG, and indirect-injection-to-action.
 
 Scenarios are organized into packs so teams can focus a run without narrowing HEEL's positioning:
 `core_saas`, `payments_billing`, `trust_safety`, `integrations`, `compliance`, and `agent_mcp`.
@@ -156,7 +157,7 @@ HEEL reports four levels, weakest claim to strongest evidence:
 | metric | what it measures | result |
 |---|---|---|
 | self-consistency | wiring works (probes vs. plants authored together) | ~1.0 *(a wiring test, not accuracy)* |
-| blind | independent *encodings* of known weaknesses | ~0.25 |
+| blind | independent *encodings* of known weaknesses | ~0.40 |
 | held-out **DEV** | independent authorship, tuned-on | 0.70 |
 | **held-out TEST** | **independent LLM authorship, frozen, never tuned on** | **localization 0.50 · attribution 0.33 · precision 0.98** |
 
@@ -240,7 +241,7 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 [CONTROL SIMULATOR](docs/CONTROL_SIMULATOR.md) ·
 [ECONOMIC SEVERITY](docs/ECONOMIC_SEVERITY.md) · [HEELBENCH](docs/HEELBENCH.md) ·
 [HELDOUT PROVENANCE](docs/HELDOUT_PROVENANCE.md) ·
-[RESEARCH LIBRARY](docs/RESEARCH_LIBRARY.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
+[RESEARCH LIBRARY](docs/RESEARCH_LIBRARY.md) · [ROADMAP](docs/ROADMAP.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
 [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
 ## Status
