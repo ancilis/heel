@@ -30,7 +30,7 @@
   "category10_clean_on_non_ai": "23/23"
  },
  "heldout_eval": {
-  "provenance": "targets authored by an independent LLM swarm, blind to HEEL's probe vocabulary",
+  "provenance": "targets authored by an independent LLM swarm, blind to Arceo's probe vocabulary",
   "discipline": "DEV split was tuned on; TEST split is frozen + content-hashed and was never inspected/tuned on (docs/HELDOUT_PROVENANCE.md): the TEST number is the unbiased one. Recall is reported two ways: LOCALIZATION (right affordance) and the stricter ATTRIBUTION (right affordance AND category). CIs are target-level cluster bootstraps.",
   "dev": {
    "n_targets": 8,
@@ -348,21 +348,21 @@
   "_headline_legacy": "held-out TEST recall (unbiased, 199 weaknesses authored blind to the tuner): exact 0.101 -> semantic 0.497 (Wilson CI [0.429, 0.566]) at precision 0.98. DEV recall 0.763. Generalizes to vocabulary it never saw; not near 1.0: the honest ceiling."
  },
  "meta": {
-  "server": "heel",
+  "server": "arceo",
   "version": "1.0.0",
   "tools": [
-   "heel_list_scenarios",
-   "heel_list_scopes",
-   "heel_run",
-   "heel_run_status",
-   "heel_get_findings",
-   "heel_get_coverage",
-   "heel_propose_control",
-   "heel_get_containment_log"
+   "arceo_list_scenarios",
+   "arceo_list_scopes",
+   "arceo_run",
+   "arceo_run_status",
+   "arceo_get_findings",
+   "arceo_get_coverage",
+   "arceo_propose_control",
+   "arceo_get_containment_log"
   ],
   "tool_schemas": [
    {
-    "name": "heel_list_scenarios",
+    "name": "arceo_list_scenarios",
     "description": "List the abuse scenario library (read).",
     "inputSchema": {
      "type": "object",
@@ -377,7 +377,7 @@
     }
    },
    {
-    "name": "heel_list_scopes",
+    "name": "arceo_list_scopes",
     "description": "List authorized scopes (read; never returns secrets). Scopes are created out-of-band by a human; agents cannot mint or widen them.",
     "inputSchema": {
      "type": "object",
@@ -385,7 +385,7 @@
     }
    },
    {
-    "name": "heel_run",
+    "name": "arceo_run",
     "description": "Start an abuse run WITHIN an existing scope. Rejected if scope_id is unknown or target is not in the scope allowlist.",
     "inputSchema": {
      "type": "object",
@@ -425,7 +425,7 @@
     }
    },
    {
-    "name": "heel_run_status",
+    "name": "arceo_run_status",
     "description": "Run progress.",
     "inputSchema": {
      "type": "object",
@@ -440,7 +440,7 @@
     }
    },
    {
-    "name": "heel_get_findings",
+    "name": "arceo_get_findings",
     "description": "The AbuseVectors for a run.",
     "inputSchema": {
      "type": "object",
@@ -455,7 +455,7 @@
     }
    },
    {
-    "name": "heel_get_coverage",
+    "name": "arceo_get_coverage",
     "description": "Coverage, false-positive rate, severity calibration (meaningful vs synthetic targets).",
     "inputSchema": {
      "type": "object",
@@ -470,7 +470,7 @@
     }
    },
    {
-    "name": "heel_propose_control",
+    "name": "arceo_propose_control",
     "description": "Recommended control + estimated exploitability reduction for a vector.",
     "inputSchema": {
      "type": "object",
@@ -485,8 +485,8 @@
     }
    },
    {
-    "name": "heel_get_containment_log",
-    "description": "The immutable audit trail of what HEEL did (with caller).",
+    "name": "arceo_get_containment_log",
+    "description": "The immutable audit trail of what Arceo did (with caller).",
     "inputSchema": {
      "type": "object",
      "required": [
@@ -4474,32 +4474,32 @@
      {
       "affordance": "agent_prompt_surface",
       "handoff": "model_redteam",
-      "reason": "pure model-jailbreak surface \u2014 out of HEEL's lane"
+      "reason": "pure model-jailbreak surface \u2014 out of Arceo's lane"
      },
      {
       "affordance": "agent_tool_export",
       "handoff": "model_redteam",
-      "reason": "pure model-jailbreak surface \u2014 out of HEEL's lane"
+      "reason": "pure model-jailbreak surface \u2014 out of Arceo's lane"
      },
      {
       "affordance": "agent_infer_loop",
       "handoff": "model_redteam",
-      "reason": "pure model-jailbreak surface \u2014 out of HEEL's lane"
+      "reason": "pure model-jailbreak surface \u2014 out of Arceo's lane"
      },
      {
       "affordance": "agent_retrieval",
       "handoff": "model_redteam",
-      "reason": "pure model-jailbreak surface \u2014 out of HEEL's lane"
+      "reason": "pure model-jailbreak surface \u2014 out of Arceo's lane"
      },
      {
       "affordance": "agent_priv_tool",
       "handoff": "model_redteam",
-      "reason": "pure model-jailbreak surface \u2014 out of HEEL's lane"
+      "reason": "pure model-jailbreak surface \u2014 out of Arceo's lane"
      },
      {
       "affordance": "url_fetch",
       "handoff": "model_redteam",
-      "reason": "pure model-jailbreak surface \u2014 out of HEEL's lane"
+      "reason": "pure model-jailbreak surface \u2014 out of Arceo's lane"
      }
     ],
     "n_findings": 25,
@@ -7475,7 +7475,7 @@
    {
     "label": "call a forged scope-widening tool",
     "rejected": true,
-    "message": "unknown tool 'heel_widen_scope': HEEL exposes no scope-creation/widening tool; scopes are human-only and out-of-band"
+    "message": "unknown tool 'arceo_widen_scope': Arceo exposes no scope-creation/widening tool; scopes are human-only and out-of-band"
    },
    {
     "label": "inject an instruction in the target arg",

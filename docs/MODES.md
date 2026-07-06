@@ -1,6 +1,6 @@
-# HEEL Modes
+# Arceo Modes
 
-HEEL modes make the adoption path explicit. Synthetic demos, launch review, staging
+Arceo modes make the adoption path explicit. Synthetic demos, launch review, staging
 rehearsal, mature existing-product imports, and incident regressions all use the same
 safety spine: no scope mutation, no credential use, no exploit payloads, no real
 exfiltration, and no live production probing by default.
@@ -21,22 +21,22 @@ or relax scopes.
 
 ## Synthetic
 
-`heel run --mode synthetic --scope <scope_id> --target synthetic-saas`
+`arceo run --mode synthetic --scope <scope_id> --target synthetic-saas`
 
 Synthetic mode is the existing built-in target path. It uses no external product data
 and remains the safest local demo and backtest path.
 
 ## Launch Review
 
-`heel run --mode launch-review --before before.json --after after.json`
+`arceo run --mode launch-review --before before.json --after after.json`
 
 Launch-review mode compares two sanitized ProductModels. It is static by design: no
 live probing, no target scope required, and no network calls. If the launch gate blocks,
-the command returns the same non-zero status as `heel launch-review`.
+the command returns the same non-zero status as `arceo launch-review`.
 
 ## Staging
 
-`heel run --mode staging --scope <scope_id> --target staging_model.json`
+`arceo run --mode staging --scope <scope_id> --target staging_model.json`
 
 Staging mode is for canary-only rehearsal with stricter signed-scope limits. The scope
 must already exist, must allow the resolved target, and must be at least as strict as
@@ -44,16 +44,16 @@ the mode defaults. The ProductModel or CLI must identify canary accounts.
 
 ## Existing Imported
 
-`heel run --mode existing-imported --scope <scope_id> --target product_model.json`
+`arceo run --mode existing-imported --scope <scope_id> --target product_model.json`
 
 Existing-imported mode is the first-class path for mature products. Operators provide
-a sanitized ProductModel/EntitlementGraph instead of a live adapter. HEEL registers an
+a sanitized ProductModel/EntitlementGraph instead of a live adapter. Arceo registers an
 in-process imported target, requires a signed scope for the resolved `imported:<id>`
 target, and runs model-only rehearsal with no live probing.
 
 ## Incident Regression
 
-`heel run --mode incident-regression --scope <scope_id> --target synthetic-saas`
+`arceo run --mode incident-regression --scope <scope_id> --target synthetic-saas`
 
 Incident-regression mode reruns stored abuse regressions created from sanitized
 incidents or previous findings. It uses the same signed scope and target allowlist

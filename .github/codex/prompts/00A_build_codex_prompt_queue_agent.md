@@ -28,7 +28,7 @@ Workflow behavior:
 - Advance `progress.json` inside the PR branch.
 - Open a PR labeled:
   - `codex-queue`
-  - `heel-uplift`
+  - `arceo-uplift`
   - `needs-human-review`
 
 Do not create an endlessly running agent. Use merge-gated PR acceptance as the control point.

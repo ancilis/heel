@@ -1,9 +1,9 @@
 name: Publish to PyPI
 
-# Publishes heel-sim to PyPI when a GitHub Release is published, using PyPI Trusted
+# Publishes arceo to PyPI when a GitHub Release is published, using PyPI Trusted
 # Publishing (OIDC) — NO API token is stored anywhere. One-time setup on PyPI:
 #   PyPI → your project (or "pending publisher") → Publishing → add a GitHub publisher:
-#     owner: ancilis   repo: heel   workflow: publish.yml   environment: pypi
+#     owner: ancilis   repo: arceo   workflow: publish.yml   environment: pypi
 # Then publish a GitHub Release and this workflow uploads the wheel + sdist.
 
 on:

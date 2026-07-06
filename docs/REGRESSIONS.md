@@ -1,6 +1,6 @@
 # Abuse Regression Testing
 
-Abuse regression tests are unit tests for product abuse controls. When a HEEL run finds a reachable
+Abuse regression tests are unit tests for product abuse controls. When a Arceo run finds a reachable
 abuse path, you can save the finding as a reusable regression and re-run it in CI, staging, or an
 imported ProductModel rehearsal to check whether the recommended control is now blocking the path.
 
@@ -11,7 +11,7 @@ reachable and is currently reachable, blocked, or inconclusive, plus a short evi
 
 ## Safety Model
 
-Regression runs use the same safety spine as ordinary HEEL runs:
+Regression runs use the same safety spine as ordinary Arceo runs:
 
 - A human-created, HMAC-signed `AuthorizationScope` is required.
 - The target must be in the signed scope allowlist.
@@ -23,12 +23,12 @@ Regression runs use the same safety spine as ordinary HEEL runs:
 
 ## Create A Regression
 
-Run HEEL against a scoped target, then save a finding by vector id:
+Run Arceo against a scoped target, then save a finding by vector id:
 
 ```bash
-heel run --scope scope-123 --target staging-saas
-heel findings --run run-abc
-heel regress add --run run-abc --vector av:run-abc:7 --name free_trial_serial_signup
+arceo run --scope scope-123 --target staging-saas
+arceo findings --run run-abc
+arceo regress add --run run-abc --vector av:run-abc:7 --name free_trial_serial_signup
 ```
 
 New regressions default to `expected_status: blocked`, because the normal workflow is to add a
@@ -37,8 +37,8 @@ control and then keep the abuse path blocked permanently.
 ## List And Export
 
 ```bash
-heel regress list
-heel regress export --format json
+arceo regress list
+arceo regress export --format json
 ```
 
 The JSON export contains regression specs and stored regression results. It is safe to persist as a
@@ -49,17 +49,17 @@ CI artifact because it omits reproduction steps and secrets.
 Create the scope out of band as a human operator, then have CI consume only that existing scope:
 
 ```bash
-heel scope create --target staging-saas --operator security-reviewer --confirm
-heel regress run --scope scope-123 --target staging-saas
+arceo scope create --target staging-saas --operator security-reviewer --confirm
+arceo regress run --scope scope-123 --target staging-saas
 ```
 
 For imported ProductModel rehearsals, authorize the converted target id and pass the sanitized JSON
 model as the target argument:
 
 ```bash
-heel import validate product_model.json
-heel scope create --target imported:acme-crm --operator security-reviewer --confirm
-heel regress run --scope scope-123 --target product_model.json
+arceo import validate product_model.json
+arceo scope create --target imported:acme-crm --operator security-reviewer --confirm
+arceo regress run --scope scope-123 --target product_model.json
 ```
 
 The run fails closed if the scope is missing, expired, tampered with, or does not allow the target.
@@ -76,5 +76,5 @@ Each regression run result includes:
 - `evidence_summary`: a non-weaponized summary of the canary-only observation.
 - `matches_expected`: whether the current status equals the stored expected status.
 
-Use the evidence summary to route the work. Use the original HEEL finding and recommended control to
+Use the evidence summary to route the work. Use the original Arceo finding and recommended control to
 decide the remediation; do not turn regression artifacts into exploit playbooks.

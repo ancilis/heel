@@ -7,31 +7,31 @@ from dataclasses import replace
 import tempfile
 import unittest
 
-os.environ["HEEL_HOME"] = tempfile.mkdtemp()
+os.environ["ARCEO_HOME"] = tempfile.mkdtemp()
 
-from heel import cli  # noqa: E402
-from heel import scope as scopemod  # noqa: E402
-from heel.mcp_server import HeelServer, ToolError  # noqa: E402
-from heel.regressions import add_regression_from_finding, resolve_target_argument, run_regressions  # noqa: E402
-from heel.store import Store  # noqa: E402
-from heel.targets import clear_imported_targets, get_target, register_imported_target  # noqa: E402
+from arceo import cli  # noqa: E402
+from arceo import scope as scopemod  # noqa: E402
+from arceo.mcp_server import ArceoServer, ToolError  # noqa: E402
+from arceo.regressions import add_regression_from_finding, resolve_target_argument, run_regressions  # noqa: E402
+from arceo.store import Store  # noqa: E402
+from arceo.targets import clear_imported_targets, get_target, register_imported_target  # noqa: E402
 
 
 class RegressionBase(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
-        os.environ["HEEL_HOME"] = self.home
-        self.store = Store(os.path.join(self.home, "heel.db"))
-        self.server = HeelServer(self.store)
+        os.environ["ARCEO_HOME"] = self.home
+        self.store = Store(os.path.join(self.home, "arceo.db"))
+        self.server = ArceoServer(self.store)
         self.caller = "test-regression-agent"
         self.scope = scopemod.create_scope(["synthetic-saas", "hardened-saas"], operator="tester")
-        self.run_id = self.server.heel_run(
+        self.run_id = self.server.arceo_run(
             {"scope_id": self.scope.scope_id, "target": "synthetic-saas", "scenario_ids": ["sc.trial.serial"],
              "agent_classes": ["adversarial"]},
             self.caller,
         )["run_id"]
         self.vector = next(
-            f for f in self.server.heel_get_findings({"run_id": self.run_id}, self.caller)["findings"]
+            f for f in self.server.arceo_get_findings({"run_id": self.run_id}, self.caller)["findings"]
             if f["affordance_id"] == "trial_signup"
         )
 
@@ -143,7 +143,7 @@ class TestAbuseRegressions(RegressionBase):
 
     def test_no_regression_command_can_create_or_widen_scope(self):
         self.add_trial_regression()
-        scope_path = os.path.join(scopemod.heel_home(), "scopes", self.scope.scope_id + ".json")
+        scope_path = os.path.join(scopemod.arceo_home(), "scopes", self.scope.scope_id + ".json")
         with open(scope_path) as fh:
             before = json.load(fh)
 
@@ -198,12 +198,12 @@ class TestAbuseRegressions(RegressionBase):
             )
 
     def test_discovered_finding_can_be_saved_as_regression(self):
-        run_id = self.server.heel_run(
+        run_id = self.server.arceo_run(
             {"scope_id": self.scope.scope_id, "target": "synthetic-saas", "agent_classes": ["adversarial"]},
             self.caller,
         )["run_id"]
         vector = next(
-            f for f in self.server.heel_get_findings({"run_id": run_id}, self.caller)["findings"]
+            f for f in self.server.arceo_get_findings({"run_id": run_id}, self.caller)["findings"]
             if f["scenario_id"].startswith("sc.discovered.")
         )
 

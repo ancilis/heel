@@ -6,12 +6,12 @@ from pathlib import Path
 import tempfile
 import unittest
 
-os.environ["HEEL_HOME"] = tempfile.mkdtemp()
+os.environ["ARCEO_HOME"] = tempfile.mkdtemp()
 
-from heel import cli  # noqa: E402
-from heel import scope as scopemod  # noqa: E402
-from heel.mcp_server import TOOL_NAMES  # noqa: E402
-from heel.targets import clear_imported_targets  # noqa: E402
+from arceo import cli  # noqa: E402
+from arceo import scope as scopemod  # noqa: E402
+from arceo.mcp_server import TOOL_NAMES  # noqa: E402
+from arceo.targets import clear_imported_targets  # noqa: E402
 
 
 MODEL_LIST_FIELDS = [
@@ -65,10 +65,10 @@ def product_model(product_id="acme-existing", canaries=True):
     return model
 
 
-class TestHeelModes(unittest.TestCase):
+class TestArceoModes(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
-        os.environ["HEEL_HOME"] = self.home
+        os.environ["ARCEO_HOME"] = self.home
         clear_imported_targets()
 
     def tearDown(self):
@@ -86,7 +86,7 @@ class TestHeelModes(unittest.TestCase):
         return rc, buf.getvalue()
 
     def test_mode_registry_defines_required_safety_fields(self):
-        from heel.modes import MODES, describe_mode
+        from arceo.modes import MODES, describe_mode
 
         self.assertEqual(
             set(MODES),
@@ -230,11 +230,11 @@ class TestHeelModes(unittest.TestCase):
         self.assertTrue(payload["results"][0]["safety_flags"]["canary_only"])
 
     def test_no_mode_allows_scope_mutation(self):
-        from heel.modes import MODES
+        from arceo.modes import MODES
 
         for mode in MODES.values():
             self.assertFalse(mode.allows_scope_mutation)
-        for forbidden in ("heel_create_scope", "heel_widen_scope", "heel_add_target", "heel_set_limits"):
+        for forbidden in ("arceo_create_scope", "arceo_widen_scope", "arceo_add_target", "arceo_set_limits"):
             self.assertNotIn(forbidden, TOOL_NAMES)
 
     def test_docs_list_safety_constraints_per_mode(self):

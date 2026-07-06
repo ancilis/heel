@@ -6,9 +6,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
-os.environ["HEEL_HOME"] = tempfile.mkdtemp()
+os.environ["ARCEO_HOME"] = tempfile.mkdtemp()
 
-from heel.contracts import Category  # noqa: E402
+from arceo.contracts import Category  # noqa: E402
 
 
 def finding(vector_id, scenario_id, category, affordance_id, properties=None):
@@ -32,7 +32,7 @@ def controls(report):
 
 class TestControlSimulator(unittest.TestCase):
     def test_export_abuse_recommends_entitlement_rate_limit_and_audit(self):
-        from heel.control_simulator import simulate_finding
+        from arceo.control_simulator import simulate_finding
 
         report = simulate_finding(finding(
             "av-export",
@@ -49,7 +49,7 @@ class TestControlSimulator(unittest.TestCase):
         self.assertFalse(report["verified"])
 
     def test_trial_farming_recommends_uniqueness_and_payment_verification(self):
-        from heel.control_simulator import simulate_finding
+        from arceo.control_simulator import simulate_finding
 
         report = simulate_finding(finding(
             "av-trial",
@@ -63,7 +63,7 @@ class TestControlSimulator(unittest.TestCase):
         self.assertIn("payment_verification", controls(report))
 
     def test_agent_overscope_recommends_tool_scope_reduction_and_per_action_authorization(self):
-        from heel.control_simulator import simulate_finding
+        from arceo.control_simulator import simulate_finding
 
         report = simulate_finding(finding(
             "av-agent",
@@ -77,7 +77,7 @@ class TestControlSimulator(unittest.TestCase):
         self.assertIn("per_action_authorization", controls(report))
 
     def test_cost_amplification_recommends_cost_ceiling_and_step_bound(self):
-        from heel.control_simulator import simulate_finding
+        from arceo.control_simulator import simulate_finding
 
         report = simulate_finding(finding(
             "av-cost",
@@ -91,7 +91,7 @@ class TestControlSimulator(unittest.TestCase):
         self.assertIn("step_bound", controls(report))
 
     def test_control_bundle_ranking_is_deterministic(self):
-        from heel.control_simulator import simulate_finding
+        from arceo.control_simulator import simulate_finding
 
         f = finding(
             "av-webhook",
@@ -108,7 +108,7 @@ class TestControlSimulator(unittest.TestCase):
         self.assertEqual(controls(first), controls(second))
 
     def test_simulator_does_not_claim_certainty_without_evidence(self):
-        from heel.control_simulator import simulate_finding
+        from arceo.control_simulator import simulate_finding
 
         report = simulate_finding(finding(
             "av-unknown",
@@ -123,7 +123,7 @@ class TestControlSimulator(unittest.TestCase):
         self.assertLess(max(c["confidence"] for c in report["candidates"]), 0.8)
 
     def test_product_model_signal_can_inform_control_choice(self):
-        from heel.control_simulator import simulate_finding
+        from arceo.control_simulator import simulate_finding
 
         model = {
             "product_id": "acme",
@@ -145,7 +145,7 @@ class TestControlSimulator(unittest.TestCase):
         self.assertIn("tenant isolation evidence", report["recommended_bundle"][0]["evidence"])
 
     def test_cli_simulates_from_finding_json(self):
-        from heel import cli
+        from arceo import cli
 
         path = Path(tempfile.mkdtemp()) / "finding.json"
         path.write_text(json.dumps(finding(
@@ -166,7 +166,7 @@ class TestControlSimulator(unittest.TestCase):
         self.assertEqual(report["input"]["vector_id"], "av-cli")
 
     def test_cli_simulates_from_vector_and_run(self):
-        from heel import cli
+        from arceo import cli
 
         buf = io.StringIO()
         with redirect_stdout(buf):

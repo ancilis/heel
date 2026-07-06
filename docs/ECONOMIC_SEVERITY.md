@@ -1,6 +1,6 @@
 # Economic Severity
 
-Economic severity ranks abuse findings by expected business exposure. It sits beside HEEL's existing
+Economic severity ranks abuse findings by expected business exposure. It sits beside Arceo's existing
 security severity; it does not replace AppSec severity, CVSS-style reasoning, or lane discipline.
 
 AppSec severity asks whether a weakness is technically serious: exploitability, data class, isolation
@@ -32,22 +32,22 @@ scopes.
 Run normally and ask for economic reporting:
 
 ```bash
-heel run --scope <scope_id> --target synthetic-saas --economic
+arceo run --scope <scope_id> --target synthetic-saas --economic
 ```
 
 Add operator assumptions when you want estimated monthly ranges:
 
 ```bash
-heel report --run <run_id> --economic \
+arceo report --run <run_id> --economic \
   --economic-assumptions docs/economic_assumptions.example.json
 ```
 
-Without assumptions, HEEL returns a qualitative label only (`low`, `medium`, `high`, `critical`) and
+Without assumptions, Arceo returns a qualitative label only (`low`, `medium`, `high`, `critical`) and
 lists unknowns such as missing monthly event volume or unit cost.
 
 ## Output Fields
 
-`heel.economics.EconomicImpact` includes:
+`arceo.economics.EconomicImpact` includes:
 
 - `revenue_leakage`
 - `cloud_cost`

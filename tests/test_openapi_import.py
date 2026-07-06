@@ -13,8 +13,8 @@ FIXTURES = Path(__file__).parent / "fixtures" / "openapi"
 
 class TestOpenAPIImport(unittest.TestCase):
     def test_json_openapi_import_creates_product_model(self):
-        from heel.importers import validate_product_model
-        from heel.openapi_import import import_openapi_file
+        from arceo.importers import validate_product_model
+        from arceo.openapi_import import import_openapi_file
 
         model = import_openapi_file(str(FIXTURES / "saas_api.json"))
 
@@ -26,7 +26,7 @@ class TestOpenAPIImport(unittest.TestCase):
         self.assertTrue(validate_product_model(model).ok)
 
     def test_export_and_oauth_paths_map_to_expected_surfaces(self):
-        from heel.openapi_import import import_openapi_file
+        from arceo.openapi_import import import_openapi_file
 
         model = import_openapi_file(str(FIXTURES / "saas_api.json"))
 
@@ -37,7 +37,7 @@ class TestOpenAPIImport(unittest.TestCase):
         self.assertEqual(model["exports"][0]["product_area"], "Exports")
 
     def test_missing_metadata_creates_warnings(self):
-        from heel.openapi_import import import_openapi_file
+        from arceo.openapi_import import import_openapi_file
 
         model = import_openapi_file(str(FIXTURES / "saas_api.json"))
         warnings = "\n".join(model["import_warnings"])
@@ -48,8 +48,8 @@ class TestOpenAPIImport(unittest.TestCase):
         self.assertIn("broad OAuth scope", warnings)
         self.assertIn("agent-like endpoint lacks scope metadata", warnings)
 
-    def test_x_heel_vendor_extensions_improve_mapping(self):
-        from heel.openapi_import import import_openapi_file
+    def test_x_arceo_vendor_extensions_improve_mapping(self):
+        from arceo.openapi_import import import_openapi_file
 
         model = import_openapi_file(str(FIXTURES / "vendor_extensions.json"))
         export = next(e for e in model["exports"] if e["route"] == "/api/export/invoices")
@@ -66,7 +66,7 @@ class TestOpenAPIImport(unittest.TestCase):
         self.assertEqual(tool["intended_scope"], "tenant")
 
     def test_url_input_is_rejected_without_live_calls(self):
-        from heel.openapi_import import OpenAPIImportError, import_openapi_file
+        from arceo.openapi_import import OpenAPIImportError, import_openapi_file
 
         with mock.patch("urllib.request.urlopen", side_effect=AssertionError("network called")) as urlopen:
             with self.assertRaises(OpenAPIImportError):
@@ -74,7 +74,7 @@ class TestOpenAPIImport(unittest.TestCase):
         urlopen.assert_not_called()
 
     def test_secret_looking_examples_are_rejected_without_echoing_secret(self):
-        from heel.openapi_import import OpenAPIImportError, product_model_from_openapi
+        from arceo.openapi_import import OpenAPIImportError, product_model_from_openapi
 
         secret = "sk-live-1234567890abcdef"
         spec = {
@@ -89,7 +89,7 @@ class TestOpenAPIImport(unittest.TestCase):
         self.assertNotIn(secret, str(ctx.exception))
 
     def test_yaml_without_pyyaml_returns_clear_error(self):
-        from heel.openapi_import import OpenAPIImportError, import_openapi_file
+        from arceo.openapi_import import OpenAPIImportError, import_openapi_file
 
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "openapi.yaml"
@@ -104,7 +104,7 @@ class TestOpenAPIImport(unittest.TestCase):
 
 class TestOpenAPIImportCli(unittest.TestCase):
     def test_cli_init_from_openapi_writes_json(self):
-        from heel import cli
+        from arceo import cli
 
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "product_model.json"
@@ -119,7 +119,7 @@ class TestOpenAPIImportCli(unittest.TestCase):
             self.assertIn("warnings", buf.getvalue().lower())
 
     def test_cli_import_openapi_alias_writes_json(self):
-        from heel import cli
+        from arceo import cli
 
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "product_model.json"
