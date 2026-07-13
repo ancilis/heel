@@ -39,7 +39,7 @@ unproven gate.
 | 3 | Job plane, target verification, signed scopes, safe adapters | **DONE** (verification.py, jobs.py, egress.py + HTTP wiring; 14 tests) |
 | 4 | Usage ledger, quotas, billing lifecycle, reconciliation | **DONE** (ledger/billing from Phase 1 + reconcile.py; 5 tests) |
 | 5 | App UX, onboarding, live dashboard, integration surfaces | **DONE** (dashboard.py server-rendered app; 6 tests) |
-| 6 | Public website, pricing, enterprise, docs, lifecycle email, legal | pending |
+| 6 | Public website, pricing, enterprise, docs, lifecycle email, legal | **DONE** (site.py static generator; 6 tests; legal = counsel-review templates) |
 | 7 | Security, privacy, admin, observability, support, runbooks | pending |
 | 8 | IaC, CI/CD, staging, backup/restore/rollback | pending |
 | 9 | Adversarial/integration/browser/load/recovery/black-box | pending |
@@ -79,9 +79,19 @@ former OWNER_ACTIONS #12 blocker is CLEARED at the model level. The direct `mcp_
 Gate-1 call from the main session hit a 1800 s idle timeout (no response/progress); a background
 agent is retrying Gate 1 over MCP. Record its verdict + thread ID in the gate table when it
 returns; if MCP transport keeps hanging, that (not the model) is the remaining blocker.
-Non-blocked implementation continues at **Phase 6**: public website + docs (static, generated,
-no tenant data), then Phase 7 ops/runbooks. Do NOT mark anything launch-ratified until Sol gates
-1–4 pass.
+Non-blocked implementation continues at **Phase 7**: security/ops hardening — admin surface,
+observability counters, support/runbook docs (THREAT_MODEL.md and OPERATIONS.md already exist;
+extend, don't duplicate). Do NOT mark anything launch-ratified until Sol gates 1–4 pass.
+
+## Phase 6 evidence (2026-07-13)
+- `arceo/saas/site.py` — static site generator (index, pricing, docs, security, terms, privacy).
+  Pricing/quotas rendered FROM `catalog.py` so the site cannot disagree with enforcement; every
+  marketing claim maps to an enforcing module; legal pages carry a visible "template — requires
+  counsel review" banner (owner action). Never touches tenant data.
+- Lifecycle email remains a stub by design (invite tokens returned in-band); real ESP is an
+  owner-credential adapter, listed in OWNER_ACTIONS.
+- Tests: `tests/test_saas_site.py` (6) — catalog/site consistency, safety claims present, no
+  secret/tenant material in output.
 
 ## Phase 5 evidence (2026-07-13)
 - `arceo/saas/dashboard.py` — server-rendered `/app` on the same control plane and session auth:
@@ -123,4 +133,4 @@ no tenant data), then Phase 7 ops/runbooks. Do NOT mark anything launch-ratified
 - Tests: `tests/test_saas_http_api.py` (15).
 
 ## Fresh verification (2026-07-13, HEAD)
-`python3 -m unittest discover -s tests -p 'test_*.py'` → **312 tests, OK** (Python 3.14.3).
+`python3 -m unittest discover -s tests -p 'test_*.py'` → **318 tests, OK** (Python 3.14.3).
