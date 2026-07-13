@@ -102,6 +102,9 @@ def handle(handler, method: str, parts: list) -> bool:
             if tail == ("signup",):
                 if "@" not in email:
                     raise ValueError("valid email required")
+                # Same trial-farming brake as /v1/signup: throttled BEFORE any account or
+                # password-hash work, and before the duplicate check leaks anything.
+                cp.auth.throttle_signup(handler.client_address[0], email)
                 if cp.user_by_email(email):
                     raise ValueError("account already exists")
                 from .catalog import CATALOG_VERSION

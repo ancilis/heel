@@ -260,6 +260,36 @@ class Gate1AbuseBoundTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_dashboard_signup_form_is_throttled_too(self):
+        """Round-7: the browser form signup goes through the same brake as /v1/signup."""
+        cp = ControlPlane()
+        cp.auth.signup_max_per_ip = 2
+        cp.auth.signup_max_global = 100
+        server = serve(cp)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            def form_signup(email):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                body = f"email={email}&password={PW}"
+                c.request("POST", "/app/signup", body.encode(),
+                          {"Content-Type": "application/x-www-form-urlencoded"})
+                r = c.getresponse()
+                r.read()
+                return r.status, r.getheader("Location", "")
+            self.assertEqual(form_signup("f1@example.com")[0], 303)
+            self.assertEqual(form_signup("f2@example.com")[0], 303)
+            status, loc = form_signup("f3@example.com")
+            self.assertIn("err=", loc, "throttled signup must bounce back with an error")
+            users = cp.store.conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+            self.assertEqual(users, 2, "no account may be created past the throttle")
+            events = cp.store.conn.execute(
+                "SELECT COUNT(*) AS n FROM signup_events").fetchone()["n"]
+            self.assertEqual(events, 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_global_verified_runs_circuit_breaker(self):
         """Many workspaces, each within its own quota, still hit the platform-wide cap —
         the automatic breaker that bounds AGGREGATE liability."""
