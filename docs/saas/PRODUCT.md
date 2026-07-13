@@ -55,8 +55,10 @@ safety spine.
 Every free unit is atomically capped in the usage ledger (reserve-at-enqueue). Worst case per free
 workspace per month: 25 run credits total, of which at most 5 verified — i.e. up to 20 synthetic
 runs at ~$0 marginal plus 5 verified runs under per-run budget ceilings (wall-clock ≤ 60 s, egress
-limited to the verified target, token budget capped), or 25 synthetic runs at ~$0. Signup
-throttles, proof-of-control, and global/tenant circuit breakers bound aggregate liability.
+limited to the verified target, token budget capped), or 25 synthetic runs at ~$0. Aggregate
+liability is bounded by implemented brakes: per-IP + platform-wide signup throttles, target
+proof-of-control with a cross-workspace cap per hostname, and an automatic platform circuit
+breaker on total run / verified-run reservations per period (plus manual kill switches).
 
 ## Non-goals (v1)
 - No usage-based pay-as-you-go pricing and no metered overage: predictable tiers only, every

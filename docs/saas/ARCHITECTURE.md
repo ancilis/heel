@@ -51,7 +51,10 @@ injected via env (`live_price_id`) so no production ID lives in code.
   so a scope for target A never authorizes target B.
 - SSRF/rebinding/redirect/private-address defenses at the worker egress layer (`verification.py` +
   worker guard); target-to-IP pinning; cross-tenant target substitution rejected.
-- Findings contained, canary-only. Global + tenant kill switches.
+- Findings contained, canary-only. Global + tenant kill switches (manual), plus an automatic
+  platform circuit breaker: platform-wide run / verified-run caps enforced inside the ledger's
+  reserve transaction. Signup is throttled per-IP and platform-wide; one hostname can hold an
+  active verification in only a bounded number of workspaces.
 
 ## Boundaries
 Every durable record, object key, cache key, queue message, log, trace, audit event carries a

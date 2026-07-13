@@ -1,6 +1,11 @@
 """Phase 3 tests: target verification, egress guard, job plane, and the wired HTTP run path."""
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+
 import http.client
 import json
 import sqlite3

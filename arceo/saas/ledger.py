@@ -47,6 +47,15 @@ class IdempotencyConflict(Exception):
     capacity. The caller retries with a fresh key (and passes quota checks anew)."""
 
 
+class GlobalCapExceeded(Exception):
+    """The PLATFORM-WIDE cap for this meter/period is reached — the automatic circuit breaker
+    that bounds aggregate (not just per-workspace) liability. Callers surface this as a
+    temporary service condition (503), never as a per-tenant upgrade prompt."""
+    def __init__(self, meter: Meter, used: int, cap: int):
+        self.meter, self.used, self.cap = meter, used, cap
+        super().__init__(f"platform circuit breaker: {meter.value} at {used}/{cap} this period")
+
+
 class QuotaExceeded(Exception):
     def __init__(self, meter: Meter, requested: int, used: int, quota: int):
         self.meter, self.requested, self.used, self.quota = meter, requested, used, quota
@@ -101,8 +110,22 @@ class UsageLedger:
         return max(0, q - self.usage(workspace_id, meter, period))
 
     # --- writes ---
+    def global_usage(self, meter: Meter, period: str) -> int:
+        """Platform-wide active usage for a meter (reserved − refunded across ALL workspaces)."""
+        row = self.conn.execute(
+            """SELECT
+                 COALESCE(SUM(CASE WHEN kind='reserve' THEN amount END),0) -
+                 COALESCE(SUM(CASE WHEN kind='refund'  THEN amount END),0) AS used
+               FROM usage_ledger WHERE meter=? AND period=?""",
+            (meter.value, period)).fetchone()
+        return int(row["used"] or 0)
+
     def reserve(self, plan: Plan, workspace_id: str, meter: Meter, amount: int, period: str,
-                *, idempotency_key: str | None = None, ref: str | None = None) -> Reservation:
+                *, idempotency_key: str | None = None, ref: str | None = None,
+                global_cap: int | None = None) -> Reservation:
+        """global_cap, when given, is the platform-wide ceiling for this meter/period — the
+        automatic circuit breaker. It is checked inside the same write transaction as the
+        per-workspace quota, so racing reservations cannot pierce it."""
         if amount <= 0:
             raise ValueError("reserve amount must be positive")
         try:
@@ -132,6 +155,11 @@ class UsageLedger:
                 if used + amount > q:
                     self.conn.execute("ROLLBACK")
                     raise QuotaExceeded(meter, amount, used, q)
+            if global_cap is not None:
+                gused = self.global_usage(meter, period)
+                if gused + amount > global_cap:
+                    self.conn.execute("ROLLBACK")
+                    raise GlobalCapExceeded(meter, gused, global_cap)
             rid = f"resv_{secrets.token_hex(8)}"
             self.conn.execute(
                 "INSERT INTO usage_ledger VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -139,7 +167,7 @@ class UsageLedger:
                  amount, rid, idempotency_key, ref, _now()))
             self.conn.execute("COMMIT")
             return Reservation(rid, workspace_id, meter, amount, period)
-        except QuotaExceeded:
+        except (GlobalCapExceeded, QuotaExceeded):
             raise
         except Exception:
             try:

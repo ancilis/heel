@@ -13,6 +13,7 @@ re-checkable and revocable.
 """
 from __future__ import annotations
 
+import os
 import re
 import secrets
 import sqlite3
@@ -53,6 +54,17 @@ class TargetLimitExceeded(Exception):
     """Verifying this target would exceed the plan's verified-target quota."""
 
 
+class HostnameReuseExceeded(Exception):
+    """This hostname is already actively verified in too many other workspaces. Caps the
+    trial-farming pattern of one controlled target funding verified runs across an unbounded
+    number of Free workspaces; legitimate multi-workspace use (consultancies) fits under the
+    cap or goes through support."""
+
+
+# Distinct workspaces one hostname may be actively verified in (env-tunable per deployment).
+MAX_WORKSPACES_PER_HOSTNAME = 3
+
+
 @dataclass
 class Challenge:
     target_id: str
@@ -67,11 +79,16 @@ class TargetVerifier:
 
     def __init__(self, conn: sqlite3.Connection, *,
                  dns_txt: Callable[[str], list] | None = None,
-                 http_get: Callable[[str], str] | None = None):
+                 http_get: Callable[[str], str] | None = None,
+                 max_workspaces_per_hostname: int | None = None):
         self.conn = conn
         self.conn.executescript(_SCHEMA)
         self.dns_txt = dns_txt
         self.http_get = http_get
+        self.max_workspaces_per_hostname = (
+            max_workspaces_per_hostname if max_workspaces_per_hostname is not None
+            else int(os.environ.get("ARCEO_MAX_WORKSPACES_PER_HOSTNAME",
+                                    MAX_WORKSPACES_PER_HOSTNAME)))
 
     def start(self, workspace_id: str, hostname: str) -> Challenge:
         h = hostname.strip().lower().rstrip(".")
@@ -142,11 +159,22 @@ class TargetVerifier:
                     self.conn.execute("ROLLBACK")
                     raise TargetLimitExceeded(
                         f"verified target limit ({max_verified}) reached")
+            if not already and self.max_workspaces_per_hostname >= 0:
+                others = self.conn.execute(
+                    "SELECT COUNT(DISTINCT workspace_id) AS n FROM verified_targets "
+                    "WHERE hostname=? AND workspace_id!=? AND revoked_at IS NULL "
+                    "AND verified_at IS NOT NULL AND verified_at > ?",
+                    (h, workspace_id, _now() - REVERIFY_AFTER)).fetchone()["n"]
+                if others >= self.max_workspaces_per_hostname:
+                    self.conn.execute("ROLLBACK")
+                    raise HostnameReuseExceeded(
+                        f"{h} is already verified in {others} other workspaces; "
+                        "contact support to raise this limit")
             self.conn.execute(
                 "UPDATE verified_targets SET verified_at=?, method=? WHERE target_id=?",
                 (_now(), method, row["target_id"]))
             self.conn.execute("COMMIT")
-        except TargetLimitExceeded:
+        except (HostnameReuseExceeded, TargetLimitExceeded):
             raise
         except Exception:
             try:

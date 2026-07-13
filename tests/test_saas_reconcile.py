@@ -1,6 +1,11 @@
 """Phase 4 tests: reconciliation report and customer-favorable auto-repair."""
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+
 import time
 import unittest
 

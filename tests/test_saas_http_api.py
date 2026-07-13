@@ -1,6 +1,11 @@
 """Phase 2 tests: auth store, migrations, and the require()-guarded control-plane HTTP API."""
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+
 import http.client
 import json
 import sqlite3

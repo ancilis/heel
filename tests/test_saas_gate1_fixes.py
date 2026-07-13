@@ -2,6 +2,11 @@
 catalog pinning, integrations cap, retention purge."""
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+
 import hashlib
 import hmac
 import http.client
@@ -215,6 +220,84 @@ class Gate1ConcurrencyTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class Gate1AbuseBoundTests(unittest.TestCase):
+    """Round-6: aggregate free-tier liability is bounded — signup throttles, the automatic
+    platform circuit breaker, and the cross-workspace hostname cap."""
+
+    def test_signup_throttle_per_ip_and_global(self):
+        from arceo.saas.auth import AuthStore, ThrottledError
+        auth = AuthStore(_conn(), signup_max_per_ip=3, signup_max_global=5)
+        for i in range(3):
+            auth.throttle_signup("10.0.0.1", f"a{i}@example.com")
+        with self.assertRaises(ThrottledError):
+            auth.throttle_signup("10.0.0.1", "a3@example.com")   # per-IP wall
+        for i in range(2):
+            auth.throttle_signup(f"10.0.0.{i + 2}", f"b{i}@example.com")
+        with self.assertRaises(ThrottledError):
+            auth.throttle_signup("10.0.0.9", "c@example.com")    # platform-wide wall
+
+    def test_signup_throttle_over_http_is_429(self):
+        cp = ControlPlane()
+        cp.auth.signup_max_per_ip = 2
+        cp.auth.signup_max_global = 100
+        server = serve(cp)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            def signup(email):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                c.request("POST", "/v1/signup",
+                          json.dumps({"email": email, "password": PW}).encode())
+                r = c.getresponse()
+                r.read()
+                return r.status
+            self.assertEqual(signup("t1@example.com"), 201)
+            self.assertEqual(signup("t2@example.com"), 201)
+            self.assertEqual(signup("t3@example.com"), 429)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_global_verified_runs_circuit_breaker(self):
+        """Many workspaces, each within its own quota, still hit the platform-wide cap —
+        the automatic breaker that bounds AGGREGATE liability."""
+        from arceo.saas.catalog import get_plan
+        from arceo.saas.entitlement import EntitlementService, Subscription
+        from arceo.saas.ledger import GlobalCapExceeded
+        ledger = UsageLedger(_conn())
+        svc = EntitlementService(ledger, global_runs_cap=1000, global_verified_runs_cap=3)
+        period = "2026-07"
+        for i in range(3):
+            svc.reserve_run(Subscription(f"ws{i}", "free", "active", CATALOG_VERSION),
+                            period, verified=True)
+        with self.assertRaises(GlobalCapExceeded):
+            svc.reserve_run(Subscription("ws99", "free", "active", CATALOG_VERSION),
+                            period, verified=True)
+        # the paired RUNS reservation was refunded, not leaked
+        self.assertEqual(ledger.usage("ws99", Meter.RUNS, period), 0)
+        # synthetic runs (no verified draw-down) still flow
+        svc.reserve_run(Subscription("ws99", "free", "active", CATALOG_VERSION),
+                        period, verified=False)
+
+    def test_hostname_reuse_capped_across_workspaces(self):
+        from arceo.saas.verification import HostnameReuseExceeded, TargetVerifier
+        records = {}
+        v = TargetVerifier(_conn(), dns_txt=lambda name: records.get(name, []),
+                           max_workspaces_per_hostname=2)
+        for ws in ("ws1", "ws2"):
+            ch = v.start(ws, "shared.example.com")
+            records["_arceo.shared.example.com"] = [f"arceo-verify={ch.token}"]
+            self.assertTrue(v.check(ws, "shared.example.com"))
+        ch = v.start("ws3", "shared.example.com")
+        records["_arceo.shared.example.com"] = [f"arceo-verify={ch.token}"]
+        with self.assertRaises(HostnameReuseExceeded):
+            v.check("ws3", "shared.example.com")
+        # re-verifying an existing holder is unaffected
+        ch = v.start("ws1", "shared.example.com")
+        records["_arceo.shared.example.com"] = [f"arceo-verify={ch.token}"]
+        self.assertTrue(v.check("ws1", "shared.example.com"))
 
 
 class Gate1JobPlaneTests(unittest.TestCase):

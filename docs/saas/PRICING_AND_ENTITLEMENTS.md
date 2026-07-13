@@ -43,11 +43,16 @@ Every free unit is atomically capped. Worst-case monthly cost per free workspace
 - 5 verified-target runs × per-run budget ceiling (CPU wall-clock ≤ 60 s, network egress restricted
   to the single verified target, token budget capped) ≈ small bounded compute.
 - Concurrency 1, retention 7 d, 1 seat, 1 verified target.
-- Trial-farming defenses: proof-of-uniqueness on signup, target proof-of-control (DNS TXT / HTTP),
-  per-IP and per-identity signup throttles, global + tenant kill switches.
+- Trial-farming defenses (implemented, env-tunable): duplicate-email rejection; per-IP and
+  platform-wide signup throttles (checked and recorded in one transaction); target
+  proof-of-control (DNS TXT / HTTP); a cap on how many workspaces may hold an active
+  verification for the same hostname; manual global + tenant kill switches. Stronger identity
+  proof (card-on-file, email-verification loop, SSO) is an owner-gated addition.
 
-Result: free-tier liability is a **calculable, bounded** number per workspace and globally capped by
-a platform circuit breaker. See `docs/saas/PRODUCT.md` §cost-model.
+Result: free-tier liability is a **calculable, bounded** number per workspace AND in aggregate:
+an automatic platform circuit breaker caps platform-wide run and verified-run reservations per
+period inside the ledger transaction (`ARCEO_GLOBAL_RUNS_CAP`, `ARCEO_GLOBAL_VERIFIED_RUNS_CAP`),
+answering 503 — never a surprise bill — once tripped. See `docs/saas/PRODUCT.md` §cost-model.
 
 ## Overage behavior
 All self-serve plans (Free, Pro, Team) hard-stop at quota with an in-context upgrade path — no

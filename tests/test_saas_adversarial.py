@@ -6,6 +6,11 @@ leak or double spend.
 """
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+
 import concurrent.futures
 import hashlib
 import hmac

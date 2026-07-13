@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import secrets
 import sqlite3
 import time
@@ -24,6 +25,9 @@ SESSION_TTL = 12 * 3600          # absolute lifetime
 SESSION_IDLE = 2 * 3600          # sliding idle timeout
 LOCKOUT_THRESHOLD = 5            # consecutive failures before lockout
 LOCKOUT_WINDOW = 15 * 60         # seconds locked out / failure-counting window
+SIGNUP_WINDOW = 3600             # signup-throttle window (seconds)
+SIGNUP_MAX_PER_IP = 3            # workspaces one client address may create per window
+SIGNUP_MAX_GLOBAL = 50           # platform-wide signups per window (trial-farming brake)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS credentials(
@@ -34,7 +38,10 @@ CREATE TABLE IF NOT EXISTS sessions(
   created_at REAL, last_seen_at REAL, revoked_at REAL);
 CREATE TABLE IF NOT EXISTS login_failures(
   email TEXT PRIMARY KEY, count INTEGER NOT NULL, first_at REAL, last_at REAL);
+CREATE TABLE IF NOT EXISTS signup_events(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, email TEXT, ts REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_sess_token ON sessions(token_hash);
+CREATE INDEX IF NOT EXISTS idx_signup_ip ON signup_events(ip, ts);
 """
 
 
@@ -58,10 +65,17 @@ class Session:
 
 
 class AuthStore:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, *,
+                 signup_max_per_ip: int | None = None,
+                 signup_max_global: int | None = None):
         self.conn = conn
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        env = os.environ
+        self.signup_max_per_ip = (signup_max_per_ip if signup_max_per_ip is not None
+                                  else int(env.get("ARCEO_SIGNUP_MAX_PER_IP", SIGNUP_MAX_PER_IP)))
+        self.signup_max_global = (signup_max_global if signup_max_global is not None
+                                  else int(env.get("ARCEO_SIGNUP_MAX_GLOBAL", SIGNUP_MAX_GLOBAL)))
 
     # --- passwords ---
     def set_password(self, user_id: str, password: str) -> None:
@@ -106,6 +120,35 @@ class AuthStore:
     def clear_failures(self, email: str) -> None:
         self.conn.execute("DELETE FROM login_failures WHERE email=?", (email.lower(),))
         self.conn.commit()
+
+    def throttle_signup(self, ip: str, email: str) -> None:
+        """Per-IP and platform-wide signup throttle, check + record in one write transaction
+        so concurrent signups cannot race past the limits. The event is recorded at attempt
+        time (before account creation) — a rejected duplicate still burns the slot, which is
+        the anti-farming direction. Raises ThrottledError when a limit is hit."""
+        now = _now()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            per_ip = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM signup_events WHERE ip=? AND ts>?",
+                (ip, now - SIGNUP_WINDOW)).fetchone()["n"]
+            total = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM signup_events WHERE ts>?",
+                (now - SIGNUP_WINDOW,)).fetchone()["n"]
+            if per_ip >= self.signup_max_per_ip or total >= self.signup_max_global:
+                self.conn.execute("ROLLBACK")
+                raise ThrottledError("too many recent signups; try again later")
+            self.conn.execute("INSERT INTO signup_events(ip,email,ts) VALUES(?,?,?)",
+                              (ip, email.lower(), now))
+            self.conn.execute("COMMIT")
+        except ThrottledError:
+            raise
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
 
     # --- sessions ---
     def create_session(self, user_id: str) -> Session:

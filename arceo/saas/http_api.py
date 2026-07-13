@@ -27,12 +27,12 @@ from .billing import BillingStore, StubBilling, SubscriptionManager
 from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
 from .entitlement import EntitlementService, Subscription
 from .jobs import JobPlane
-from .ledger import IdempotencyConflict, QuotaExceeded, UsageLedger
+from .ledger import GlobalCapExceeded, IdempotencyConflict, QuotaExceeded, UsageLedger
 from .ops import KillSwitchTripped, Metrics, OpsStore
 from .tenancy import (
     ControlPlaneStore, IntegrationLimitExceeded, Role, SeatLimitExceeded, require,
 )
-from .verification import TargetLimitExceeded, TargetVerifier
+from .verification import HostnameReuseExceeded, TargetLimitExceeded, TargetVerifier
 
 MAX_BODY = 64 * 1024
 
@@ -211,6 +211,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(503, {"error": str(e)})
         except IdempotencyConflict as e:
             self._json(409, {"error": str(e)})
+        except GlobalCapExceeded as e:
+            # Automatic platform circuit breaker: a temporary service condition, never a
+            # per-tenant upgrade prompt.
+            self.cp.metrics.inc("circuit_breaker_total")
+            self._json(503, {"error": str(e)})
+        except HostnameReuseExceeded as e:
+            self._json(403, {"error": str(e)})
         except PermissionError as e:
             self._json(403, {"error": str(e)})
         except ThrottledError as e:
@@ -288,6 +295,10 @@ class _Handler(BaseHTTPRequestHandler):
         email, password = str(b.get("email", "")).strip(), str(b.get("password", ""))
         if "@" not in email:
             raise ApiError(400, "valid email required")
+        # Trial-farming brake: per-IP + platform-wide signup throttle (429). The direct socket
+        # address is used; a TLS edge that proxies must be configured as the deployment's
+        # trusted source of client addresses before X-Forwarded-For is ever honored.
+        self.cp.auth.throttle_signup(self.client_address[0], email)
         if self.cp.user_by_email(email):
             raise ApiError(409, "account already exists")
         uid = self.cp.store.create_user(email)

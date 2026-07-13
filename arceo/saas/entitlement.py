@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from .catalog import (
     CONFIG_GATED_FEATURES, CUSTOM, Feature, Meter, Plan, get_plan,
 )
-from .ledger import QuotaExceeded, Reservation, UsageLedger
+from .ledger import GlobalCapExceeded, QuotaExceeded, Reservation, UsageLedger
 
 
 # Subscription states in which entitlements are ACTIVE (paid features usable).
@@ -31,12 +31,26 @@ class Subscription:
     catalog_version: str
 
 
+# Platform-wide per-period ceilings — the automatic circuit breaker bounding AGGREGATE
+# liability (many small workspaces are still finite). Deployment-tunable via env.
+GLOBAL_RUNS_CAP = 100_000
+GLOBAL_VERIFIED_RUNS_CAP = 10_000
+
+
 class EntitlementService:
-    def __init__(self, ledger: UsageLedger, *, config_features: frozenset | None = None):
+    def __init__(self, ledger: UsageLedger, *, config_features: frozenset | None = None,
+                 global_runs_cap: int | None = None,
+                 global_verified_runs_cap: int | None = None):
         self.ledger = ledger
         # Which config-gated (enterprise) features this deployment has actually configured.
         # Anything not here is DISABLED even if the plan lists it (no dead checkboxes).
         self.config_features = config_features if config_features is not None else _config_from_env()
+        env = os.environ
+        self.global_runs_cap = (global_runs_cap if global_runs_cap is not None
+                                else int(env.get("ARCEO_GLOBAL_RUNS_CAP", GLOBAL_RUNS_CAP)))
+        self.global_verified_runs_cap = (
+            global_verified_runs_cap if global_verified_runs_cap is not None
+            else int(env.get("ARCEO_GLOBAL_VERIFIED_RUNS_CAP", GLOBAL_VERIFIED_RUNS_CAP)))
 
     def effective_plan(self, sub: Subscription) -> Plan:
         """The plan whose entitlements currently apply, resolved from the catalog version the
@@ -82,14 +96,17 @@ class EntitlementService:
         """Reserve one rehearsal run. A verified-target run also draws down the VERIFIED_RUNS ceiling
         (the costly subset that bounds free-tier liability). Both reservations succeed or neither does:
         if the verified ceiling is exhausted, the RUNS reservation is refunded before raising."""
-        runs_resv = self.reserve(sub, Meter.RUNS, 1, period,
-                                 idempotency_key=idempotency_key, ref=ref)
+        runs_resv = self.ledger.reserve(self.effective_plan(sub), sub.workspace_id, Meter.RUNS,
+                                        1, period, idempotency_key=idempotency_key, ref=ref,
+                                        global_cap=self.global_runs_cap)
         if not verified:
             return [runs_resv]
         vk = f"{idempotency_key}:verified" if idempotency_key else None
         try:
-            vr = self.reserve(sub, Meter.VERIFIED_RUNS, 1, period, idempotency_key=vk, ref=ref)
-        except QuotaExceeded:
+            vr = self.ledger.reserve(self.effective_plan(sub), sub.workspace_id,
+                                     Meter.VERIFIED_RUNS, 1, period, idempotency_key=vk,
+                                     ref=ref, global_cap=self.global_verified_runs_cap)
+        except (QuotaExceeded, GlobalCapExceeded):
             self.ledger.refund(runs_resv.reservation_id)
             raise
         return [runs_resv, vr]
