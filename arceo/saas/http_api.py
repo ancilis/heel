@@ -317,6 +317,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, {"user_id": uid, "workspaces": [
                 {"workspace_id": r["workspace_id"], "role": r["role"]} for r in rows]})
         elif kind == "api_key":
+            # Same live entitlement rule as _authorize: no Feature.API, no hosted API — even
+            # for self-introspection, so "paid hosted API access" holds literally everywhere.
+            sub = self.cp.subscription(key[0])
+            if not self.cp.entitlements.has_feature(sub, Feature.API):
+                raise ApiError(402, "API access is not included in this plan",
+                               upgrade_to=self.cp.entitlements.upgrade_target(sub))
             self._json(200, {"workspace_id": key[0], "role": key[1].value})
         else:
             raise ApiError(401, "authentication required")
