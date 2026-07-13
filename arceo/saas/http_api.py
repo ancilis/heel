@@ -161,6 +161,11 @@ class _Handler(BaseHTTPRequestHandler):
     def _route(self, method: str) -> None:
         try:
             parts = [p for p in self.path.split("?")[0].split("/") if p]
+            if parts and parts[0] == "app":
+                from . import dashboard
+                if dashboard.handle(self, method, parts):
+                    return
+                raise ApiError(404, "not found")
             handler = self._match(method, parts)
             if handler is None:
                 raise ApiError(404, "not found")
