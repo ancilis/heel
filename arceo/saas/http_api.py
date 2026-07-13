@@ -29,8 +29,8 @@ from .entitlement import EntitlementService, Subscription
 from .jobs import JobPlane
 from .ledger import QuotaExceeded, UsageLedger
 from .ops import KillSwitchTripped, Metrics, OpsStore
-from .tenancy import ControlPlaneStore, Role, hash_api_key, require
-from .verification import TargetVerifier
+from .tenancy import ControlPlaneStore, Role, SeatLimitExceeded, require
+from .verification import TargetLimitExceeded, TargetVerifier
 
 MAX_BODY = 64 * 1024
 
@@ -165,6 +165,12 @@ class _Handler(BaseHTTPRequestHandler):
                 raise ApiError(403, "API key is scoped to a different workspace")
             if capability == "create_scope":
                 raise ApiError(403, "authorization scopes are human-only; use a signed-in session")
+            # Live entitlement: keys minted on a paid plan stop working the moment the
+            # workspace no longer has API access (downgrade, cancellation, dunning fall-back).
+            sub = self.cp.subscription(workspace_id)
+            if not self.cp.entitlements.has_feature(sub, Feature.API):
+                raise ApiError(402, "API access is not included in this plan",
+                               upgrade_to=self.cp.entitlements.upgrade_target(sub))
             from .tenancy import role_can
             if not role_can(role, capability):
                 raise ApiError(403, f"API key role {role.value} lacks {capability!r}")
@@ -372,18 +378,17 @@ class _Handler(BaseHTTPRequestHandler):
         if kind != "session":
             raise ApiError(401, "sign in to accept an invite")
         token = str(self._body().get("token", ""))
-        # Validate the token before anything else so invalid tokens learn nothing about the
-        # workspace (not even its quota state).
-        valid = self.cp.store.conn.execute(
-            "SELECT 1 FROM invites WHERE workspace_id=? AND token_hash=? AND accepted_at IS NULL",
-            (wid, hash_api_key(token))).fetchone()
-        if not valid:
-            raise ApiError(403, "invalid or already-used invite")
-        # Authoritative seat check at the moment the membership would be created — invites
-        # issued earlier must not carry a workspace past its seat quota.
-        if self.cp.store.get_role(wid, uid) is None and self._seat_limit_reached(wid):
-            raise ApiError(402, "seat limit reached; ask an admin to upgrade the plan")
-        role = self.cp.store.accept_invite(wid, token, uid)
+        # Seat quota is enforced atomically inside accept_invite (count + insert in one write
+        # transaction), so concurrent accepts cannot race past the limit. The token is checked
+        # first inside the same transaction, so invalid tokens learn nothing about quota state.
+        sub = self.cp.subscription(wid)
+        limit = self.cp.entitlements.quota(sub, Meter.SEATS)
+        try:
+            role = self.cp.store.accept_invite(
+                wid, token, uid, max_seats=None if limit < 0 else limit)
+        except SeatLimitExceeded:
+            raise ApiError(402, "seat limit reached; ask an admin to upgrade the plan",
+                           upgrade_to=self.cp.entitlements.upgrade_target(sub))
         self._json(200, {"workspace_id": wid, "role": role.value})
 
     def _ws_key_create(self, wid: str):
@@ -496,11 +501,16 @@ class _Handler(BaseHTTPRequestHandler):
     def _ws_target_check(self, wid: str):
         self._authorize(wid, "manage_targets")
         hostname = str(self._body().get("hostname", ""))
-        if self.cp.target_quota_blocked(wid, hostname):
-            self._json(402, {"error": "verified target limit reached", "upgrade_to":
-                             self.cp.entitlements.upgrade_target(self.cp.subscription(wid))})
-            return
-        ok = self.cp.verifier.check(wid, hostname)
+        # Quota is enforced atomically inside the verifier (count + verify in one write
+        # transaction), so concurrent checks cannot race past the plan limit.
+        sub = self.cp.subscription(wid)
+        limit = self.cp.entitlements.quota(sub, Meter.VERIFIED_TARGETS)
+        try:
+            ok = self.cp.verifier.check(wid, hostname,
+                                        max_verified=None if limit < 0 else limit)
+        except TargetLimitExceeded:
+            raise ApiError(402, "verified target limit reached",
+                           upgrade_to=self.cp.entitlements.upgrade_target(sub))
         self._json(200, {"verified": ok})
 
     def _ws_checkout(self, wid: str):

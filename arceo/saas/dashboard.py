@@ -174,11 +174,16 @@ def handle(handler, method: str, parts: list) -> bool:
         return True
 
     if method == "POST" and tail == ("target-check",):
+        from .verification import TargetLimitExceeded
+        from .catalog import Meter
         hostname = _form_body(handler).get("hostname", "")
-        if cp.target_quota_blocked(wid, hostname):
+        sub = cp.subscription(wid)
+        limit = cp.entitlements.quota(sub, Meter.VERIFIED_TARGETS)
+        try:
+            cp.verifier.check(wid, hostname, max_verified=None if limit < 0 else limit)
+        except TargetLimitExceeded:
             _redirect(handler, "/app?quota=1")
             return True
-        cp.verifier.check(wid, hostname)
         _redirect(handler, "/app")
         return True
 

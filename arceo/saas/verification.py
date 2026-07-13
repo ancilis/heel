@@ -49,6 +49,10 @@ def valid_hostname(hostname: str) -> bool:
     return h not in ("localhost",) and not h.endswith((".local", ".internal", ".localhost"))
 
 
+class TargetLimitExceeded(Exception):
+    """Verifying this target would exceed the plan's verified-target quota."""
+
+
 @dataclass
 class Challenge:
     target_id: str
@@ -96,8 +100,15 @@ class TargetVerifier:
             "SELECT * FROM verified_targets WHERE workspace_id=? AND hostname=?",
             (workspace_id, hostname.strip().lower().rstrip("."))).fetchone()
 
-    def check(self, workspace_id: str, hostname: str) -> bool:
-        """Attempt verification via whichever methods have injected resolvers."""
+    def check(self, workspace_id: str, hostname: str, *,
+              max_verified: int | None = None) -> bool:
+        """Attempt verification via whichever methods have injected resolvers.
+
+        max_verified, when given, is enforced atomically at the write: the count of currently
+        verified targets is taken inside the same write transaction that records this
+        verification, so concurrent checks serialize and cannot verify past the quota
+        (raises TargetLimitExceeded). Re-verifying an already-verified target never counts
+        against the limit."""
         row = self._row(workspace_id, hostname)
         if not row or row["revoked_at"]:
             return False
@@ -119,10 +130,30 @@ class TargetVerifier:
                 pass
         if method is None:
             return False
-        self.conn.execute(
-            "UPDATE verified_targets SET verified_at=?, method=? WHERE target_id=?",
-            (_now(), method, row["target_id"]))
-        self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            fresh = self.conn.execute(
+                "SELECT verified_at FROM verified_targets WHERE target_id=?",
+                (row["target_id"],)).fetchone()
+            already = fresh and fresh["verified_at"] and \
+                _now() - fresh["verified_at"] <= REVERIFY_AFTER
+            if max_verified is not None and not already:
+                if self._verified_count_locked(workspace_id) >= max_verified:
+                    self.conn.execute("ROLLBACK")
+                    raise TargetLimitExceeded(
+                        f"verified target limit ({max_verified}) reached")
+            self.conn.execute(
+                "UPDATE verified_targets SET verified_at=?, method=? WHERE target_id=?",
+                (_now(), method, row["target_id"]))
+            self.conn.execute("COMMIT")
+        except TargetLimitExceeded:
+            raise
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
         return True
 
     def is_verified(self, workspace_id: str, hostname: str) -> bool:
@@ -137,7 +168,13 @@ class TargetVerifier:
             (_now(), workspace_id, hostname.strip().lower().rstrip(".")))
         self.conn.commit()
 
-    def verified_count(self, workspace_id: str) -> int:
+    def _verified_count_locked(self, workspace_id: str) -> int:
+        """Count of CURRENTLY verified targets (fresh within the re-verify window) — the same
+        predicate as is_verified, so a stale target frees its quota slot for re-verification."""
         return self.conn.execute(
-            "SELECT COUNT(*) FROM verified_targets WHERE workspace_id=? AND verified_at IS NOT "
-            "NULL AND revoked_at IS NULL", (workspace_id,)).fetchone()[0]
+            "SELECT COUNT(*) FROM verified_targets WHERE workspace_id=? AND revoked_at IS NULL "
+            "AND verified_at IS NOT NULL AND verified_at > ?",
+            (workspace_id, _now() - REVERIFY_AFTER)).fetchone()[0]
+
+    def verified_count(self, workspace_id: str) -> int:
+        return self._verified_count_locked(workspace_id)

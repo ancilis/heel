@@ -18,6 +18,10 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+class SeatLimitExceeded(Exception):
+    """Accepting this invite would exceed the plan's seat quota."""
+
+
 class Role(str, Enum):
     OWNER = "owner"
     ADMIN = "admin"
@@ -155,18 +159,42 @@ class ControlPlaneStore:
         self.conn.commit()
         return token  # emailed to invitee; only the hash is stored
 
-    def accept_invite(self, workspace_id: str, token: str, user_id: str) -> Role:
+    def accept_invite(self, workspace_id: str, token: str, user_id: str,
+                      *, max_seats: int | None = None) -> Role:
+        """max_seats, when given, is enforced atomically: the member count is taken inside the
+        same write transaction that inserts the membership, so concurrent accepts serialize and
+        cannot carry the workspace past its seat quota (raises SeatLimitExceeded). An existing
+        member re-accepting never counts against the limit."""
         th = hash_api_key(token)
-        row = self.conn.execute(
-            "SELECT * FROM invites WHERE workspace_id=? AND token_hash=? AND accepted_at IS NULL",
-            (workspace_id, th)).fetchone()
-        if not row:
-            raise PermissionError("invalid or already-used invite")
-        role = Role(row["role"])
-        self.add_member(workspace_id, user_id, role)
-        self.conn.execute("UPDATE invites SET accepted_at=? WHERE invite_id=?",
-                          (_now(), row["invite_id"]))
-        self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM invites WHERE workspace_id=? AND token_hash=? "
+                "AND accepted_at IS NULL", (workspace_id, th)).fetchone()
+            if not row:
+                raise PermissionError("invalid or already-used invite")
+            role = Role(row["role"])
+            existing = self.conn.execute(
+                "SELECT 1 FROM memberships WHERE workspace_id=? AND user_id=?",
+                (workspace_id, user_id)).fetchone()
+            if max_seats is not None and not existing:
+                n = self.conn.execute(
+                    "SELECT COUNT(*) FROM memberships WHERE workspace_id=?",
+                    (workspace_id,)).fetchone()[0]
+                if n >= max_seats:
+                    raise SeatLimitExceeded(f"seat limit ({max_seats}) reached")
+            self.conn.execute(
+                "INSERT OR REPLACE INTO memberships VALUES(?,?,?,?)",
+                (workspace_id, user_id, role.value, _now()))
+            self.conn.execute("UPDATE invites SET accepted_at=? WHERE invite_id=?",
+                              (_now(), row["invite_id"]))
+            self.conn.execute("COMMIT")
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
         return role
 
     # --- API keys ---

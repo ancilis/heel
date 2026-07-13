@@ -185,6 +185,97 @@ class AdversarialTests(unittest.TestCase):
         check.conn.row_factory = sqlite3.Row
         self.assertEqual(check.usage(wid, Meter.RUNS, "2099-01"), 25)
 
+    def test_concurrent_target_checks_never_verify_past_quota(self):
+        # Sol Gate-1 round-3 regression: two checks that both observed headroom must not both
+        # verify. The count is taken inside the verifier's write transaction (BEGIN IMMEDIATE),
+        # one connection per worker.
+        import os
+        import sqlite3
+        import tempfile
+
+        from arceo.saas.verification import TargetLimitExceeded, TargetVerifier
+        db = os.path.join(tempfile.mkdtemp(), "vrace.db")
+        records = {}
+        seed_conn = sqlite3.connect(db)
+        seed_conn.row_factory = sqlite3.Row
+        seed = TargetVerifier(seed_conn, dns_txt=lambda n: records.get(n, []))
+        wid = "ws_vrace"
+        hosts = [f"h{i}.example.com" for i in range(12)]
+        for h in hosts:
+            ch = seed.start(wid, h)
+            records[f"_arceo.{h}"] = [f"arceo-verify={ch.token}"]
+        seed_conn.close()
+        verified, blocked, lock = [], [], threading.Lock()
+
+        def check(h):
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            v = TargetVerifier(conn, dns_txt=lambda n: records.get(n, []))
+            try:
+                if v.check(wid, h, max_verified=1):
+                    with lock:
+                        verified.append(h)
+            except TargetLimitExceeded:
+                with lock:
+                    blocked.append(h)
+            finally:
+                conn.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+            list(ex.map(check, hosts))
+        self.assertEqual(len(verified), 1, verified)
+        self.assertEqual(len(blocked), len(hosts) - 1)
+
+    def test_concurrent_invite_accepts_never_exceed_seats(self):
+        # Same shape for seats: count + insert are one write transaction in accept_invite.
+        import os
+        import tempfile
+
+        from arceo.saas.tenancy import ControlPlaneStore, Role, SeatLimitExceeded
+        db = os.path.join(tempfile.mkdtemp(), "srace.db")
+        seed = ControlPlaneStore(db)
+        org = seed.create_org("o")
+        wid = seed.create_workspace(org, "w", "pro", "v")   # pro: 3 seats
+        seed.add_member(wid, "u_owner", Role.OWNER)
+        tokens = [(f"u{i}", seed.create_invite(wid, f"u{i}@e.co", Role.MEMBER))
+                  for i in range(10)]
+        seed.conn.close()
+        joined, refused, lock = [], [], threading.Lock()
+
+        def accept(item):
+            uid, tok = item
+            store = ControlPlaneStore(db)
+            try:
+                store.accept_invite(wid, tok, uid, max_seats=3)
+                with lock:
+                    joined.append(uid)
+            except SeatLimitExceeded:
+                with lock:
+                    refused.append(uid)
+            finally:
+                store.conn.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+            list(ex.map(accept, tokens))
+        self.assertEqual(len(joined), 2, joined)          # owner + 2 = 3 seats
+        self.assertEqual(len(refused), 8)
+        self.assertEqual(len(ControlPlaneStore(db).members(wid)), 3)
+
+    def test_api_key_stops_working_after_downgrade(self):
+        # Sol Gate-1 round-3 regression: hosted API access is a live entitlement, not a
+        # grant frozen at key-mint time.
+        wid, hdr, _ = self.signup("downgrade@example.com")
+        self.pin_plan(wid, "pro")
+        s, body = self.req("POST", f"/v1/workspaces/{wid}/api-keys", {"role": "member"}, hdr)
+        self.assertEqual(s, 201)
+        khdr = {"Authorization": f"Bearer {body['secret']}"}
+        s, _ = self.req("POST", f"/v1/workspaces/{wid}/runs", {}, khdr)
+        self.assertEqual(s, 202)
+        self.pin_plan(wid, "free")
+        s, body = self.req("POST", f"/v1/workspaces/{wid}/runs", {}, khdr)
+        self.assertEqual(s, 402, body)
+        self.assertEqual(body["upgrade_to"], "pro")
+
     # --- malformed input ---
     def test_malformed_and_oversized_bodies(self):
         wid, hdr, _ = self.signup("mal@example.com")
