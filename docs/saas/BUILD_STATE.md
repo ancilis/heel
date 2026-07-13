@@ -37,7 +37,7 @@ unproven gate.
 | 1 | Brand/open-core ADR, ICP, plans/prices, entitlement contract, architecture | in progress |
 | 2 | SaaS foundation: schema, tenancy, auth, roles, API keys | **DONE** (auth.py, migrate.py, http_api.py; 15 tests) |
 | 3 | Job plane, target verification, signed scopes, safe adapters | **DONE** (verification.py, jobs.py, egress.py + HTTP wiring; 14 tests) |
-| 4 | Usage ledger, quotas, billing lifecycle, reconciliation | pending |
+| 4 | Usage ledger, quotas, billing lifecycle, reconciliation | **DONE** (ledger/billing from Phase 1 + reconcile.py; 5 tests) |
 | 5 | App UX, onboarding, live dashboard, integration surfaces | pending |
 | 6 | Public website, pricing, enterprise, docs, lifecycle email, legal | pending |
 | 7 | Security, privacy, admin, observability, support, runbooks | pending |
@@ -79,10 +79,17 @@ former OWNER_ACTIONS #12 blocker is CLEARED at the model level. The direct `mcp_
 Gate-1 call from the main session hit a 1800 s idle timeout (no response/progress); a background
 agent is retrying Gate 1 over MCP. Record its verdict + thread ID in the gate table when it
 returns; if MCP transport keeps hanging, that (not the model) is the remaining blocker.
-Non-blocked implementation continues at **Phase 4**: usage/quotas are already ledger-enforced, so
-Phase 4 closes billing lifecycle (dunning transitions already in billing.py — add period rollover
-+ reconciliation report) and then Phase 5 onboarding/dashboard UX. Do NOT mark anything
+Non-blocked implementation continues at **Phase 5**: onboarding + dashboard UX (server-rendered,
+stdlib-only, served by the control plane), then Phase 6 public website/docs. Do NOT mark anything
 launch-ratified until Sol gates 1–4 pass.
+
+## Phase 4 evidence (2026-07-13)
+- Quotas/ledger/dunning already landed in Phase 1 (`ledger.py`, `billing.py`; period buckets make
+  monthly rollover implicit). New: `arceo/saas/reconcile.py` — nightly-runnable invariant report:
+  workspace plan-pin vs subscription mismatch, subscriptions for unknown workspaces, stale
+  unsettled reservations (auto-refund under `repair=True` only when >24 h old AND no live job),
+  unapplied webhook-event count. Repairs are customer-favorable only (refunds, never charges).
+- Tests: `tests/test_saas_reconcile.py` (5).
 
 ## Phase 3 evidence (2026-07-13)
 - `arceo/saas/verification.py` — DNS TXT / HTTP-file ownership challenges, injected resolvers,
@@ -109,4 +116,4 @@ launch-ratified until Sol gates 1–4 pass.
 - Tests: `tests/test_saas_http_api.py` (15).
 
 ## Fresh verification (2026-07-13, HEAD)
-`python3 -m unittest discover -s tests -p 'test_*.py'` → **301 tests, OK** (Python 3.14.3).
+`python3 -m unittest discover -s tests -p 'test_*.py'` → **306 tests, OK** (Python 3.14.3).
