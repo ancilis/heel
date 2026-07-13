@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LicenseRef-Arceo-Commercial */
+/* SPDX-License-Identifier: Apache-2.0 */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 import { useState } from "react";

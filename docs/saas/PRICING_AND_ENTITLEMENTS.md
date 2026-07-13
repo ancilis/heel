@@ -19,8 +19,8 @@ We do **not** gate UI decoration.
 ## Catalog
 | Plan | Price/mo | Runs/mo | of which verified runs | Verified targets | Concurrency | Retention | Seats | Integrations | Surfaces | Support |
 |---|---|---|---|---|---|---|---|---|---|---|
-| **Free** | $0 (no card) | 25 | 5 | 1 | 1 | 7 d | 1 | 0 | CLI, guided UI | community |
-| **Pro** | $49 | 300 | 100 | 5 | 3 | 30 d | 3 | 3 | + API, MCP, exports, scheduled regressions | email |
+| **Free** | $0 (no card) | 25 | 5 | 1 | 1 | 7 d | 1 | 0 | guided browser app | community |
+| **Pro** | $49 | 300 | 100 | 5 | 3 | 30 d | 3 | 3 | + API keys (CLI/CI/MCP), exports, scheduled regressions | email |
 | **Team** | $199 | 1,500 | 500 | 25 | 8 | 90 d | 10 | 10 | + RBAC, audit export | priority |
 | **Enterprise** | custom (annual) | custom | custom | custom | custom / dedicated | custom | custom | custom | + SSO/SAML-OIDC, SCIM*, data-region*, private runners | SLA conversation |
 
@@ -31,6 +31,11 @@ synthetic runs (~$0 marginal) may consume the whole pool.
 
 \* SSO/SCIM/data-region are **contact-sales / deployment-option** capabilities. Where not configured
 they are disabled and honestly surfaced through the enterprise flow — never dead checkboxes.
+
+The browser app (session sign-in) is available on every tier, including Free. What the API
+entitlement gates is *programmatic* access: creating and using tenant-scoped API keys for
+CLI/CI/MCP. Active API keys count against the plan's integrations quota. The open-source CLI
+against a self-hosted engine is free and out of scope of hosted pricing.
 
 ## Free-tier hard maximum liability
 Every free unit is atomically capped. Worst-case monthly cost per free workspace:

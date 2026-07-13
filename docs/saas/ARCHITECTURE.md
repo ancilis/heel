@@ -3,29 +3,42 @@
 Two separated planes over the open-source engine. Everything runs locally with zero external
 accounts; prod adapters swap in behind interfaces.
 
+**Implementation status (honest):** what exists today is the local layer — SQLite stores, the
+SQLite-backed job plane, `StubBilling`, and the loopback HTTP control plane, all covered by the
+test suite. Production adapters (live Stripe, Postgres, managed queue, deployed workers) are
+*designs behind the same interfaces*, gated on owner credentials (OWNER_ACTIONS); they are not
+implemented yet, and nothing below should be read as a claim that they are. Stripe price IDs are
+injected via env (`live_price_id`) so no production ID lives in code.
+
 ## Control plane (`arceo/saas/`)
 - **Identity & tenancy:** orgs/workspaces, memberships, invites. Roles: owner, admin,
   member/operator, billing, viewer. Sessions, scoped service accounts, hashed+scoped API keys.
 - **Entitlement service** (`entitlement.py`) — the single server-side authority. Consumed by UI, API,
   MCP, workers, billing. Client claims and raw Stripe metadata are never authorization.
 - **Product catalog** (`catalog.py`) — one typed, versioned source of truth for plans/quotas.
-- **Usage ledger** (`ledger.py`) — append-only, idempotent, reserve/consume/refund. Quotas enforced
-  transactionally at enqueue AND at execution.
-- **Billing** (`billing.py`) — Stripe adapter + `StubBilling`; subscription state machine; webhook
-  dedupe/replay/order safety.
+- **Usage ledger** (`ledger.py`) — append-only, idempotent, reserve/consume/refund. Run quotas are
+  reserved transactionally at enqueue; at execution the job plane enforces the concurrency
+  entitlement in `JobPlane.claim` and the retention entitlement via `JobPlane.purge_retention`;
+  active API keys are capped by the integrations quota at key creation.
+- **Billing** (`billing.py`) — subscription state machine + webhook dedupe/replay/order safety,
+  with `StubBilling` driving the full lifecycle locally. The live Stripe adapter is not yet
+  implemented (owner-gated); its price IDs come from env via `live_price_id`. The webhook
+  endpoint fails closed: without a configured signing secret it answers 503.
 - **Target verification** (`verification.py`) — human-only proof-of-control (DNS TXT / HTTP challenge)
   before a target becomes eligible for a signed scope. A checkbox is never sufficient.
-- **Store** — tenant-scoped Postgres (prod) / SQLite (local) behind `store.py`-style abstraction, with
-  a tenant boundary column on **every** durable record and RLS where supported.
+- **Store** — SQLite today, with a tenant boundary column on **every** durable record; the planned
+  Postgres production store (RLS where supported) sits behind the same abstraction (owner-gated).
 
 ## Execution plane
-- Durable job queue (Postgres SKIP LOCKED local; managed in prod). Reservation → execute →
-  refund/finalize semantics tied to the ledger.
+- Durable job queue: SQLite-backed `JobPlane` today (reservation → claim/lease → settle/refund
+  semantics tied to the ledger, idempotent enqueue keyed to the reservation's idempotency key);
+  a managed queue is the owner-gated production swap.
 - Isolated workers: a worker pinned to a tenant claims with a workspace filter (`JobPlane.claim`
-  refuses foreign jobs at the SQL level); shared-pool workers rely on per-run isolation (sandbox +
-  egress), never a shared mutable filesystem/cache namespace. Egress restricted to the run's single
-  verified target, per-run CPU/wall-clock/network/token/storage budgets, cancellation, retries,
-  timeouts, backpressure, dead-letter.
+  refuses foreign jobs at the SQL level) and claim refuses to exceed the workspace's concurrency
+  entitlement; shared-pool workers rely on per-run isolation (sandbox + egress), never a shared
+  mutable filesystem/cache namespace. Every job carries an immutable `RunBudget` (wall-clock,
+  token, egress-host ceilings) that workers are contractually required to enforce; the deployed
+  worker fleet that executes real runs is owner-gated and not yet built.
 - Workers never trust user-controlled job fields; targets and scopes are re-verified server-side.
 
 ## Safety spine (inherited + strengthened)

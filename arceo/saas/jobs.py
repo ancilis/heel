@@ -28,9 +28,11 @@ CREATE TABLE IF NOT EXISTS jobs(
   job_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, kind TEXT NOT NULL,
   state TEXT NOT NULL, target TEXT, scope_ref TEXT, budget TEXT NOT NULL,
   reservations TEXT NOT NULL, created_at REAL, claimed_at REAL, lease_until REAL,
-  worker_id TEXT, finished_at REAL, outcome TEXT);
+  worker_id TEXT, finished_at REAL, outcome TEXT, idempotency_key TEXT);
 CREATE INDEX IF NOT EXISTS idx_jobs_ws ON jobs(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idem
+  ON jobs(workspace_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 """
 
 STATES = ("queued", "running", "succeeded", "failed", "expired")
@@ -63,26 +65,48 @@ class Job:
 
 class JobPlane:
     def __init__(self, conn: sqlite3.Connection, *,
-                 scope_validator: Callable[[str, str, str], bool] | None = None):
+                 scope_validator: Callable[[str, str, str], bool] | None = None,
+                 concurrency_limit: Callable[[str], int] | None = None):
         """scope_validator(workspace_id, scope_ref, target) -> bool. Injected from the engine's
         signed scope verifier by the deployment; absent means verified jobs cannot be enqueued at
         all (fail closed). The target is part of the check so a scope minted for one target can
-        never authorize a different target, verified or not."""
+        never authorize a different target, verified or not.
+
+        concurrency_limit(workspace_id) -> int is the entitlement-side concurrency quota
+        (negative = unlimited). When provided, claim() refuses to start a job for a workspace
+        already running at its limit — the sold CONCURRENCY meter is enforced at execution,
+        not just documented."""
         self.conn = conn
+        try:  # pre-existing databases created before the idempotency column
+            self.conn.execute("ALTER TABLE jobs ADD COLUMN idempotency_key TEXT")
+        except sqlite3.OperationalError:
+            pass  # fresh database (no table yet) or column already present
         self.conn.executescript(_SCHEMA)
         self.scope_validator = scope_validator
+        self.concurrency_limit = concurrency_limit
 
     # --- enqueue ---
     def enqueue(self, workspace_id: str, *, kind: str, reservation_ids: list,
                 target: str | None = None, target_is_verified: bool = False,
-                scope_ref: str | None = None, budget: RunBudget | None = None) -> Job:
+                scope_ref: str | None = None, budget: RunBudget | None = None,
+                idempotency_key: str | None = None) -> Job:
         """Quota must already be reserved by the caller (EntitlementService.reserve_run) — the
         reservation ids are recorded so settlement is exact. Verified jobs fail closed unless the
-        target is verified AND a valid human-minted scope reference is presented."""
+        target is verified AND a valid human-minted scope reference is presented.
+
+        idempotency_key must be the same key the ledger reservation used: a replayed request
+        whose reservation was deduplicated returns the EXISTING job instead of enqueuing a new
+        one, so one reservation can never fund more than one job."""
         if kind not in ("synthetic", "verified"):
             raise ValueError("kind must be synthetic or verified")
         if not reservation_ids:
             raise ValueError("enqueue requires the ledger reservation ids")
+        if idempotency_key is not None:
+            prior = self.conn.execute(
+                "SELECT * FROM jobs WHERE workspace_id=? AND idempotency_key=?",
+                (workspace_id, idempotency_key)).fetchone()
+            if prior:
+                return self._to_job(prior)
         if kind == "synthetic":
             budget = budget or RunBudget()
             if budget.egress_hosts:
@@ -101,34 +125,73 @@ class JobPlane:
             if extra:
                 raise PermissionError(f"egress beyond the verified target refused: {sorted(extra)}")
         jid = f"job_{secrets.token_hex(8)}"
-        self.conn.execute(
-            "INSERT INTO jobs(job_id,workspace_id,kind,state,target,scope_ref,budget,"
-            "reservations,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (jid, workspace_id, kind, "queued", target, scope_ref,
-             json.dumps(asdict(budget)), json.dumps(list(reservation_ids)), _now()))
+        try:
+            self.conn.execute(
+                "INSERT INTO jobs(job_id,workspace_id,kind,state,target,scope_ref,budget,"
+                "reservations,created_at,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (jid, workspace_id, kind, "queued", target, scope_ref,
+                 json.dumps(asdict(budget)), json.dumps(list(reservation_ids)), _now(),
+                 idempotency_key))
+        except sqlite3.IntegrityError:
+            # Concurrent replay lost the insert race — the winner's job is the job.
+            prior = self.conn.execute(
+                "SELECT * FROM jobs WHERE workspace_id=? AND idempotency_key=?",
+                (workspace_id, idempotency_key)).fetchone()
+            return self._to_job(prior)
         self.conn.commit()
         return Job(jid, workspace_id, kind, "queued", target, budget)
 
     # --- worker side ---
     def claim(self, worker_id: str, *, workspace_id: str | None = None,
               lease_s: int = DEFAULT_LEASE) -> Job | None:
-        """Atomically claim the oldest queued job. Workers pinned to a tenant pass their
-        workspace_id and can only ever claim that tenant's jobs; a None filter is for
-        shared-pool deployments where isolation is per-run (sandbox + egress), not per-worker."""
+        """Atomically claim the oldest queued job whose workspace is under its concurrency
+        limit. Workers pinned to a tenant pass their workspace_id and can only ever claim that
+        tenant's jobs; a None filter is for shared-pool deployments where isolation is per-run
+        (sandbox + egress), not per-worker."""
         now = _now()
-        where = "state='queued'"
-        args: list = [worker_id, now, now + lease_s]
-        if workspace_id is not None:
-            where += " AND workspace_id=?"
-            args.append(workspace_id)
-        cur = self.conn.execute(
-            "UPDATE jobs SET state='running', worker_id=?, claimed_at=?, lease_until=? "
-            f"WHERE job_id=(SELECT job_id FROM jobs WHERE {where} "
-            "ORDER BY created_at LIMIT 1) RETURNING *",
-            args)
-        row = cur.fetchone()
-        self.conn.commit()
-        return self._to_job(row) if row else None
+        self.conn.execute("BEGIN IMMEDIATE")  # serialize check-limit-then-claim across workers
+        try:
+            where = "state='queued'"
+            args: list = []
+            if workspace_id is not None:
+                where += " AND workspace_id=?"
+                args.append(workspace_id)
+            candidates = self.conn.execute(
+                f"SELECT job_id, workspace_id FROM jobs WHERE {where} ORDER BY created_at",
+                args).fetchall()
+            over_limit: set = set()
+            chosen = None
+            for c in candidates:
+                ws = c["workspace_id"]
+                if ws in over_limit:
+                    continue
+                if self.concurrency_limit is not None:
+                    limit = self.concurrency_limit(ws)
+                    if limit >= 0:
+                        running = self.conn.execute(
+                            "SELECT COUNT(*) AS n FROM jobs WHERE workspace_id=? AND state='running'",
+                            (ws,)).fetchone()["n"]
+                        if running >= limit:
+                            over_limit.add(ws)
+                            continue
+                chosen = c["job_id"]
+                break
+            if chosen is None:
+                self.conn.execute("COMMIT")
+                return None
+            cur = self.conn.execute(
+                "UPDATE jobs SET state='running', worker_id=?, claimed_at=?, lease_until=? "
+                "WHERE job_id=? AND state='queued' RETURNING *",
+                (worker_id, now, now + lease_s, chosen))
+            row = cur.fetchone()
+            self.conn.execute("COMMIT")
+            return self._to_job(row) if row else None
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
 
     def heartbeat(self, job_id: str, worker_id: str, *, lease_s: int = DEFAULT_LEASE) -> bool:
         cur = self.conn.execute(
@@ -173,6 +236,25 @@ class JobPlane:
             if self._settle(r["job_id"] if isinstance(r, sqlite3.Row) else r[0], None,
                             "expired", "lease_expired", ledger.refund):
                 n += 1
+        return n
+
+    def purge_retention(self, retention_days: Callable[[str], int]) -> int:
+        """Delete finished jobs older than the workspace's RETENTION_DAYS entitlement
+        (negative = keep forever). The retention meter's enforcement consumer: run it from the
+        same periodic loop as reap_expired."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT workspace_id FROM jobs WHERE finished_at IS NOT NULL").fetchall()
+        n = 0
+        for r in rows:
+            ws = r["workspace_id"]
+            days = retention_days(ws)
+            if days < 0:
+                continue
+            cur = self.conn.execute(
+                "DELETE FROM jobs WHERE workspace_id=? AND finished_at IS NOT NULL "
+                "AND finished_at < ?", (ws, _now() - days * 86400))
+            n += cur.rowcount
+        self.conn.commit()
         return n
 
     # --- queries ---

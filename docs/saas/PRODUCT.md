@@ -32,12 +32,15 @@ Not sold: the engine itself (Apache-2.0), UI decoration, or access to anything t
 safety spine.
 
 ## Product surfaces
-- **App (Next.js):** onboarding, guided first rehearsal against a synthetic target, live run
-  dashboard, findings, billing portal, member/role management.
-- **Hosted API + MCP access (paid tiers):** tenant-scoped API keys, run enqueue/status/results, CI
-  integration. What is paid is access to the *hosted* control plane; the engine's own loopback
-  MCP/REST surfaces stay Apache-2.0 and free for self-hosters (ADR-0001).
-- **CLI:** the open-source CLI can point at the hosted API with an API key.
+- **App (server-rendered, all tiers):** onboarding, guided first rehearsal against a synthetic
+  target, live run dashboard, findings, billing portal, member/role management. The browser app
+  authenticates with sessions and uses the same control-plane JSON endpoints on every tier; what
+  the API entitlement gates is programmatic (API-key) access, not the app.
+- **Programmatic access via API keys (paid tiers):** tenant-scoped API keys for CLI/CI/MCP use —
+  run enqueue/status/results. What is paid is API-key access to the *hosted* control plane; the
+  engine's own loopback MCP/REST surfaces stay Apache-2.0 and free for self-hosters (ADR-0001).
+- **CLI:** the open-source CLI works against a self-hosted engine for free; pointing it at the
+  hosted API requires an API key, which is a paid-tier capability.
 - **Public website:** product, pricing, docs, security page, enterprise contact.
 
 ## Onboarding funnel (free, no card)

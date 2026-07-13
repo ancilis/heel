@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LicenseRef-Arceo-Commercial */
+/* SPDX-License-Identifier: Apache-2.0 */
 import type { NextConfig } from "next";
 import path from "path";
 // Static export: `npm run build` emits a fully static site in web/out/ (deploy to any static host).

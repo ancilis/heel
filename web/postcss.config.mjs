@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LicenseRef-Arceo-Commercial */
+/* SPDX-License-Identifier: Apache-2.0 */
 const config = {
   plugins: {
     "@tailwindcss/postcss": {},

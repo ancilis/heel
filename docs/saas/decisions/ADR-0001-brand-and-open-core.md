@@ -18,8 +18,14 @@ renamed on GitHub — an owner action). The core is Apache-2.0 with a DCO and NO
    - **Open core (Apache-2.0, stays in this repo, `arceo/` package):** the engine — scope safety
      spine, synthetic targets, agents, scenarios, entitlement graph, importers, evaluation honesty,
      containment log, CLI, MCP server, loopback REST. This is the reusable, auditable value.
-   - **Commercial hosted layer (proprietary, isolated under `arceo/saas/` + `web/`):** multi-tenant
-     control plane, billing, metering, quotas, hosted auth, managed workers, admin. This code is a
+     The pre-existing Next.js control-room UI under `web/` reads only the engine's static
+     snapshot export and predates the hosted layer; it belongs to the engine side and stays
+     Apache-2.0. Relabeling existing open code proprietary would move the boundary after the
+     fact; the boundary only ever applies to new commercial code.
+   - **Commercial hosted layer (proprietary, isolated under `arceo/saas/`):** multi-tenant
+     control plane, billing, metering, quotas, hosted auth, managed workers, admin, and the
+     hosted app UI (v1: the server-rendered app in `arceo/saas/dashboard.py`; any future hosted
+     web frontend is new code under this boundary, not a relabel of `web/`). This code is a
      **separate licensing unit** and MUST carry its own proprietary header, NOT the Apache grant.
 4. **Do not relicense the Apache core.** Adding proprietary hosted code to an Apache repo is
    permitted (Apache-2.0 does not virally relicense combined/aggregate works), but the boundary must

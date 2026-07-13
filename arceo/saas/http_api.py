@@ -60,7 +60,9 @@ class ControlPlane:
         self.billing = StubBilling()
         self.entitlements = EntitlementService(self.ledger)
         self.verifier = TargetVerifier(conn, dns_txt=dns_txt, http_get=http_get)
-        self.jobs = JobPlane(conn, scope_validator=scope_validator)
+        self.jobs = JobPlane(conn, scope_validator=scope_validator,
+                             concurrency_limit=lambda wid: self.entitlements.quota(
+                                 self.subscription(wid), Meter.CONCURRENCY))
         # scope_minter(workspace_id, target, requested_by) -> scope_ref. Injected from the
         # engine's human-only signed-scope path; this layer never constructs scope material
         # itself. Absent → the mint route answers 501 and verified runs need an out-of-band
@@ -75,7 +77,9 @@ class ControlPlane:
             raise ApiError(404, "workspace not found")
         sub = self.billing_store.get(workspace_id)
         if sub is not None and sub.state:
-            return Subscription(workspace_id, sub.plan_id, sub.state, ws["catalog_version"])
+            # The subscription's own pinned catalog version wins — grandfathering resolves
+            # against the catalog the subscription was created on, not the workspace default.
+            return Subscription(workspace_id, sub.plan_id, sub.state, sub.catalog_version)
         return Subscription(workspace_id, ws["plan_id"], "active", ws["catalog_version"])
 
     def target_quota_blocked(self, workspace_id: str, hostname: str | None = None) -> bool:
@@ -411,6 +415,16 @@ class _Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "invalid role")
         if role in (Role.OWNER, Role.ADMIN):
             raise ApiError(400, "API keys may not carry owner/admin roles")
+        # The INTEGRATIONS meter's enforcement consumer: active API keys count against it.
+        limit = self.cp.entitlements.quota(sub, Meter.INTEGRATIONS)
+        if limit >= 0:
+            active = self.cp.store.conn.execute(
+                "SELECT COUNT(*) AS n FROM api_keys WHERE workspace_id=? AND revoked_at IS NULL",
+                (wid,)).fetchone()["n"]
+            if active >= limit:
+                self._json(402, {"error": "integration (API key) limit reached",
+                                 "upgrade_to": self.cp.entitlements.upgrade_target(sub)})
+                return
         issued = self.cp.store.issue_api_key(wid, role, str(b.get("name", "")))
         self._json(201, {"key_id": issued.key_id, "secret": issued.secret,
                          "note": "store this secret now; it is not retrievable again"})
@@ -473,11 +487,16 @@ class _Handler(BaseHTTPRequestHandler):
             job = self.cp.jobs.enqueue(
                 wid, kind="verified" if verified else "synthetic", reservation_ids=rids,
                 target=target if verified else None, target_is_verified=verified,
-                scope_ref=str(b.get("scope_ref", "")) or None)
+                scope_ref=str(b.get("scope_ref", "")) or None,
+                idempotency_key=idem)
         except PermissionError as e:
             for rid in rids:
                 self.cp.ledger.refund(rid)
             raise ApiError(403, str(e))
+        if job.state != "queued":
+            # Idempotent replay of an already-processed request: report the existing job.
+            self._json(202, {"status": job.state, "job_id": job.job_id, "period": period})
+            return
         self.cp.metrics.inc("runs_enqueued_total")
         self._json(202, {"status": "queued", "job_id": job.job_id, "period": period})
 
@@ -538,12 +557,15 @@ class _Handler(BaseHTTPRequestHandler):
     def _webhook(self):
         from .billing import WebhookVerificationError, verify_webhook_signature
         payload = self._raw_body()
-        if self.webhook_secret:
-            header = self.headers.get("X-Arceo-Billing-Signature", "")
-            try:
-                verify_webhook_signature(payload, header, self.webhook_secret)
-            except WebhookVerificationError as e:
-                raise ApiError(400, f"webhook signature invalid: {e}")
+        # Fail CLOSED: a deployment without a webhook secret has no billing webhook at all.
+        # Unsigned events must never be able to change a workspace's plan or entitlements.
+        if not self.webhook_secret:
+            raise ApiError(503, "billing webhook not configured (no signing secret)")
+        header = self.headers.get("X-Arceo-Billing-Signature", "")
+        try:
+            verify_webhook_signature(payload, header, self.webhook_secret)
+        except WebhookVerificationError as e:
+            raise ApiError(400, f"webhook signature invalid: {e}")
         try:
             event = json.loads(payload)
         except json.JSONDecodeError:
@@ -553,9 +575,12 @@ class _Handler(BaseHTTPRequestHandler):
         sub = self.cp.billing_store.get(event.get("workspace_id", ""))
         if sub is not None and disposition == "applied":
             ws = self.cp.store.get_workspace(sub.workspace_id)
-            if ws is not None and ws["plan_id"] != sub.plan_id:
+            if ws is not None and (ws["plan_id"] != sub.plan_id
+                                   or ws["catalog_version"] != sub.catalog_version):
+                # Sync plan AND the subscription's pinned catalog version, so the workspace
+                # record never points grandfathering at the wrong catalog.
                 self.cp.store.set_workspace_plan(sub.workspace_id, sub.plan_id,
-                                                 ws["catalog_version"])
+                                                 sub.catalog_version)
         self._json(200, {"disposition": disposition})
 
 
