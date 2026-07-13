@@ -24,7 +24,7 @@ RECORDS = {}
 
 def main(db_path: str = ":memory:") -> int:
     cp = ControlPlane(db_path, dns_txt=lambda n: RECORDS.get(n, []),
-                      scope_validator=lambda ws, ref: ref == "smoke-scope")
+                      scope_validator=lambda ws, ref, tgt: ref == "smoke-scope")
     server = serve(cp)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()

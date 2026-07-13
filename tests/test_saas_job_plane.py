@@ -87,7 +87,7 @@ class JobPlaneTests(unittest.TestCase):
     def setUp(self):
         conn = _conn()
         self.ledger = UsageLedger(conn)
-        self.jobs = JobPlane(conn, scope_validator=lambda ws, ref: ref == f"scope-ok-{ws}")
+        self.jobs = JobPlane(conn, scope_validator=lambda ws, ref, tgt: ref == f"scope-ok-{ws}-{tgt}")
 
     def _resv(self, ws="ws1"):
         from arceo.saas.catalog import Meter, get_plan
@@ -126,7 +126,7 @@ class JobPlaneTests(unittest.TestCase):
         with self.assertRaises(PermissionError):    # unverified target
             self.jobs.enqueue("ws1", kind="verified", reservation_ids=rid,
                               target="a.example.com", target_is_verified=False,
-                              scope_ref="scope-ok-ws1")
+                              scope_ref="scope-ok-ws1-a.example.com")
         with self.assertRaises(PermissionError):    # bad scope
             self.jobs.enqueue("ws1", kind="verified", reservation_ids=rid,
                               target="a.example.com", target_is_verified=True,
@@ -134,12 +134,29 @@ class JobPlaneTests(unittest.TestCase):
         with self.assertRaises(PermissionError):    # egress beyond target
             self.jobs.enqueue("ws1", kind="verified", reservation_ids=rid,
                               target="a.example.com", target_is_verified=True,
-                              scope_ref="scope-ok-ws1",
+                              scope_ref="scope-ok-ws1-a.example.com",
                               budget=RunBudget(egress_hosts=("a.example.com", "evil.com")))
         job = self.jobs.enqueue("ws1", kind="verified", reservation_ids=rid,
                                 target="a.example.com", target_is_verified=True,
-                                scope_ref="scope-ok-ws1")
+                                scope_ref="scope-ok-ws1-a.example.com")
         self.assertEqual(job.budget.egress_hosts, ("a.example.com",))
+
+    def test_scope_is_bound_to_the_exact_target(self):
+        # A scope minted for a.example.com must not authorize a run against b.example.com,
+        # even though both belong to the same workspace and b is verified.
+        r = self._resv()
+        with self.assertRaises(PermissionError):
+            self.jobs.enqueue("ws1", kind="verified", reservation_ids=[r.reservation_id],
+                              target="b.example.com", target_is_verified=True,
+                              scope_ref="scope-ok-ws1-a.example.com")
+
+    def test_workspace_pinned_worker_never_claims_foreign_jobs(self):
+        r1, r2 = self._resv("ws1"), self._resv("ws2")
+        self.jobs.enqueue("ws1", kind="synthetic", reservation_ids=[r1.reservation_id])
+        j2 = self.jobs.enqueue("ws2", kind="synthetic", reservation_ids=[r2.reservation_id])
+        got = self.jobs.claim("worker-ws2", workspace_id="ws2")
+        self.assertEqual(got.job_id, j2.job_id)
+        self.assertIsNone(self.jobs.claim("worker-ws2", workspace_id="ws2"))  # ws1 job untouched
 
     def test_no_validator_disables_verified(self):
         plane = JobPlane(_conn(), scope_validator=None)
@@ -159,7 +176,7 @@ class HttpRunPathTests(unittest.TestCase):
     def setUpClass(cls):
         cls.records = {}
         cls.cp = ControlPlane(dns_txt=lambda name: cls.records.get(name, []),
-                              scope_validator=lambda ws, ref: ref.startswith("scope-ok"))
+                              scope_validator=lambda ws, ref, tgt: ref.startswith("scope-ok"))
         cls.server = serve(cls.cp)
         cls.port = cls.server.server_address[1]
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
@@ -237,6 +254,102 @@ class HttpRunPathTests(unittest.TestCase):
                                 {"hostname": "two.example.com"}, hdr)
         self.assertEqual(status, 402)
         self.assertEqual(body["upgrade_to"], "pro")
+
+
+class ScopeMintPathTests(unittest.TestCase):
+    """The hosted human-only scope path: verify target -> session mints scope -> verified run."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.records = {}
+        cls.cp = ControlPlane(
+            dns_txt=lambda name: cls.records.get(name, []),
+            scope_validator=lambda ws, ref, tgt: ref == f"minted-{ws}-{tgt}",
+            scope_minter=lambda ws, tgt, uid: f"minted-{ws}-{tgt}")
+        cls.server = serve(cls.cp)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    req = HttpRunPathTests.req
+    signup = HttpRunPathTests.signup
+
+    def _verify(self, wid, hdr, host):
+        _, ch = self.req("POST", f"/v1/workspaces/{wid}/targets", {"hostname": host}, hdr)
+        self.records[f"_arceo.{host}"] = [f"arceo-verify={ch['token']}"]
+        self.req("POST", f"/v1/workspaces/{wid}/targets/check", {"hostname": host}, hdr)
+
+    def test_mint_requires_stepup_reason_and_verified_target(self):
+        wid, hdr = self.signup("minter@example.com")
+        # unverified target refused before anything else can happen
+        self.assertEqual(self.req("POST", f"/v1/workspaces/{wid}/scopes",
+                                  {"target": "app.example.com", "confirm_target": "app.example.com",
+                                   "reason": "rehearsal"}, hdr)[0], 403)
+        self._verify(wid, hdr, "app.example.com")
+        # step-up confirmation must repeat the exact target
+        self.assertEqual(self.req("POST", f"/v1/workspaces/{wid}/scopes",
+                                  {"target": "app.example.com", "confirm_target": "app.example.co",
+                                   "reason": "rehearsal"}, hdr)[0], 400)
+        # a reason is mandatory (it lands in the audit log)
+        self.assertEqual(self.req("POST", f"/v1/workspaces/{wid}/scopes",
+                                  {"target": "app.example.com",
+                                   "confirm_target": "app.example.com"}, hdr)[0], 400)
+        status, body = self.req("POST", f"/v1/workspaces/{wid}/scopes",
+                                {"target": "app.example.com", "confirm_target": "app.example.com",
+                                 "reason": "quarterly rehearsal"}, hdr)
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["scope_ref"], f"minted-{wid}-app.example.com")
+        # the mint is audited
+        self.assertTrue(any(r["action"] == "scope_mint" for r in self.cp.ops.audit_tail()))
+        # and the minted scope drives a verified run end to end
+        status, run = self.req("POST", f"/v1/workspaces/{wid}/runs",
+                               {"verified": True, "target": "app.example.com",
+                                "scope_ref": body["scope_ref"]}, hdr)
+        self.assertEqual(status, 202, run)
+        # target binding at HTTP level: a scope minted for one target is refused for another
+        # (cross-target unit coverage lives in test_scope_is_bound_to_the_exact_target)
+        self.assertEqual(self.req("POST", f"/v1/workspaces/{wid}/runs",
+                                  {"verified": True, "target": "other.example.com",
+                                   "scope_ref": body["scope_ref"]}, hdr)[0], 403)
+
+    def test_api_keys_can_never_mint(self):
+        wid, hdr = self.signup("keys@example.com")
+        _, key = self.req("POST", f"/v1/workspaces/{wid}/api-keys",
+                          {"role": "member", "name": "ci"}, hdr)
+        khdr = {"Authorization": f"Bearer {key['secret']}"}
+        self.assertEqual(self.req("POST", f"/v1/workspaces/{wid}/scopes",
+                                  {"target": "x.example.com", "confirm_target": "x.example.com",
+                                   "reason": "nope"}, khdr)[0], 403)
+
+    def test_unconfigured_minter_fails_closed(self):
+        records = {}
+        cp = ControlPlane(dns_txt=lambda name: records.get(name, []))
+        server = serve(cp)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            saved_port, type(self).port = self.port, port
+            try:
+                wid, hdr = self.signup("nominter@example.com")
+                _, ch = self.req("POST", f"/v1/workspaces/{wid}/targets",
+                                 {"hostname": "app.example.com"}, hdr)
+                records["_arceo.app.example.com"] = [f"arceo-verify={ch['token']}"]
+                self.req("POST", f"/v1/workspaces/{wid}/targets/check",
+                         {"hostname": "app.example.com"}, hdr)
+                status, _ = self.req("POST", f"/v1/workspaces/{wid}/scopes",
+                                     {"target": "app.example.com",
+                                      "confirm_target": "app.example.com",
+                                      "reason": "rehearsal"}, hdr)
+                self.assertEqual(status, 501)
+            finally:
+                type(self).port = saved_port
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

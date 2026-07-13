@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LicenseRef-Arceo-Commercial */
 import React from "react";
 
 export const cx = (...c: (string | false | undefined)[]) => c.filter(Boolean).join(" ");

@@ -39,10 +39,13 @@ class EntitlementService:
         self.config_features = config_features if config_features is not None else _config_from_env()
 
     def effective_plan(self, sub: Subscription) -> Plan:
-        """The plan whose entitlements currently apply. Non-active subscriptions fall back to free."""
+        """The plan whose entitlements currently apply, resolved from the catalog version the
+        subscription pinned at creation — a later catalog edit never silently changes a
+        grandfathered subscription. Non-active subscriptions fall back to that version's free plan."""
+        version = sub.catalog_version or None
         if sub.state in ACTIVE_STATES:
-            return get_plan(sub.plan_id)
-        return get_plan("free")
+            return get_plan(sub.plan_id, version)
+        return get_plan("free", version)
 
     def has_feature(self, sub: Subscription, feature: Feature) -> bool:
         plan = self.effective_plan(sub)

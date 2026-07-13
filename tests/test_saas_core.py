@@ -314,5 +314,43 @@ class BillingTests(unittest.TestCase):
             live_price_id(get_plan("pro"), "month")
 
 
+class CatalogVersioningTests(unittest.TestCase):
+    """A subscription pins the catalog version it was created on; editing the current catalog
+    must never silently change a grandfathered subscription (functional, not nominal)."""
+
+    def test_pinned_version_resolves_grandfathered_plans(self):
+        from arceo.saas import catalog as cat
+        old = dict(cat._PLANS)
+        cheaper_pro = cat.Plan(
+            id="pro", name="Pro", price_month_cents=2900, price_year_cents=29000,
+            quotas=old["pro"].quotas, features=old["pro"].features, support="email")
+        cat._CATALOGS["2099-01-01"] = {**old, "pro": cheaper_pro}
+        try:
+            self.assertEqual(get_plan("pro").price_month_cents, 4900)
+            self.assertEqual(get_plan("pro", "2099-01-01").price_month_cents, 2900)
+            self.assertEqual(get_plan("pro", CATALOG_VERSION).price_month_cents, 4900)
+            with self.assertRaises(KeyError):
+                get_plan("pro", "1999-01-01")   # unknown pinned version fails loud
+        finally:
+            del cat._CATALOGS["2099-01-01"]
+
+    def test_entitlements_computed_from_pinned_version(self):
+        from arceo.saas import catalog as cat
+        old = dict(cat._PLANS)
+        big_pro = cat.Plan(
+            id="pro", name="Pro", price_month_cents=4900, price_year_cents=49000,
+            quotas={**old["pro"].quotas, Meter.SEATS: 99},
+            features=old["pro"].features, support="email")
+        cat._CATALOGS["2099-02-02"] = {**old, "pro": big_pro}
+        try:
+            svc = EntitlementService(UsageLedger.in_memory(), config_features=frozenset())
+            pinned = Subscription("ws1", "pro", "active", "2099-02-02")
+            current = Subscription("ws2", "pro", "active", CATALOG_VERSION)
+            self.assertEqual(svc.quota(pinned, Meter.SEATS), 99)
+            self.assertEqual(svc.quota(current, Meter.SEATS), 3)
+        finally:
+            del cat._CATALOGS["2099-02-02"]
+
+
 if __name__ == "__main__":
     unittest.main()

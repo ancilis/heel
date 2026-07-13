@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LicenseRef-Arceo-Commercial */
 "use client";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useEffect, useState, type ReactNode } from "react";

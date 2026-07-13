@@ -9,17 +9,24 @@ and the unit economics. Prices are USD, monthly unless noted; annual = 10× mont
 - **execution concurrency** — parallel workers
 - **retained results** — retention window (days)
 - **seats** — org members
-- **integrations / private-runner capacity** — CI/API/MCP + dedicated runners (paid tiers)
+- **integrations** — CI/API/MCP connectors (paid tiers)
+
+Private runners are an enterprise deployment capability (a boolean feature configured per
+deployment), not a metered unit; capacity is sized in the enterprise contract.
 
 We do **not** gate UI decoration.
 
 ## Catalog
-| Plan | Price/mo | Runs/mo | Verified targets | Concurrency | Retention | Seats | Surfaces | Support |
-|---|---|---|---|---|---|---|---|---|
-| **Free** | $0 (no card) | 20 synthetic + 5 verified | 1 | 1 | 7 d | 1 | CLI, guided UI | community |
-| **Pro** | $49 | 300 | 5 | 3 | 30 d | 3 | + API, MCP, exports, scheduled regressions | email |
-| **Team** | $199 | 1,500 | 25 | 8 | 90 d | 10 | + RBAC, audit export, integrations | priority |
-| **Enterprise** | custom (annual) | custom | custom | custom / dedicated | custom | custom | + SSO/SAML-OIDC, SCIM*, data-region*, private runners | SLA conversation |
+| Plan | Price/mo | Runs/mo | of which verified runs | Verified targets | Concurrency | Retention | Seats | Integrations | Surfaces | Support |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **Free** | $0 (no card) | 25 | 5 | 1 | 1 | 7 d | 1 | 0 | CLI, guided UI | community |
+| **Pro** | $49 | 300 | 100 | 5 | 3 | 30 d | 3 | 3 | + API, MCP, exports, scheduled regressions | email |
+| **Team** | $199 | 1,500 | 500 | 25 | 8 | 90 d | 10 | 10 | + RBAC, audit export | priority |
+| **Enterprise** | custom (annual) | custom | custom | custom | custom / dedicated | custom | custom | custom | + SSO/SAML-OIDC, SCIM*, data-region*, private runners | SLA conversation |
+
+"Runs/mo" is the total credit pool (synthetic + verified). "Of which verified runs" is a subset
+ceiling on runs against verified real targets — the costly, liability-bearing kind — drawn down
+alongside the total. On Free that means at most 20 synthetic + 5 verified.
 
 \* SSO/SCIM/data-region are **contact-sales / deployment-option** capabilities. Where not configured
 they are disabled and honestly surfaced through the enterprise flow — never dead checkboxes.
@@ -37,8 +44,9 @@ Result: free-tier liability is a **calculable, bounded** number per workspace an
 a platform circuit breaker. See `docs/saas/PRODUCT.md` §cost-model.
 
 ## Overage behavior
-Free/Pro: hard stop at quota with an in-context upgrade path (no surprise bills). Team: soft cap with
-admin-approved metered overage (opt-in). Enterprise: contractual.
+All self-serve plans (Free, Pro, Team) hard-stop at quota with an in-context upgrade path — no
+surprise bills, enforced transactionally in the usage ledger. Enterprise: contractual. Metered
+opt-in overage is deliberately not offered in v1.
 
 ## Grandfathering & versioning
 Catalog entries are versioned (`catalog_version`). A subscription pins the version it was created on;

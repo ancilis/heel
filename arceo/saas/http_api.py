@@ -8,10 +8,12 @@ route resolves the caller's role server-side through `tenancy.require`; client-s
 workspace claims are never trusted. Binds loopback by default — production exposure goes through
 the deployment's TLS-terminating edge, never by widening this default.
 
-Safety boundary (unchanged from the engine): the human-only, HMAC-signed AuthorizationScope is not
-mintable here, and API-key principals can never exercise `create_scope` — it is
-session-principal-only by construction. Verified real-target runs additionally require a
-currently verified target plus a valid scope reference, enforced fail-closed by the job plane.
+Safety boundary (unchanged from the engine): scope material is never constructed in this layer.
+The only hosted minting path is `POST /workspaces/{id}/scopes` — session principals with
+`create_scope` (owner/admin), step-up confirmation, audited, delegating to an engine-injected
+minter and answering 501 when none is configured. API-key principals can never exercise
+`create_scope` by construction. Verified real-target runs additionally require a currently
+verified target plus a scope valid for that exact target, enforced fail-closed by the job plane.
 """
 from __future__ import annotations
 
@@ -48,7 +50,7 @@ class ControlPlane:
     """All stores on one SQLite connection; the unit the HTTP layer serves."""
 
     def __init__(self, path: str = ":memory:", *, dns_txt=None, http_get=None,
-                 scope_validator=None):
+                 scope_validator=None, scope_minter=None):
         self.store = ControlPlaneStore(path)
         conn = self.store.conn
         self.auth = AuthStore(conn)
@@ -59,6 +61,11 @@ class ControlPlane:
         self.entitlements = EntitlementService(self.ledger)
         self.verifier = TargetVerifier(conn, dns_txt=dns_txt, http_get=http_get)
         self.jobs = JobPlane(conn, scope_validator=scope_validator)
+        # scope_minter(workspace_id, target, requested_by) -> scope_ref. Injected from the
+        # engine's human-only signed-scope path; this layer never constructs scope material
+        # itself. Absent → the mint route answers 501 and verified runs need an out-of-band
+        # engine-minted scope reference.
+        self.scope_minter = scope_minter
         self.ops = OpsStore(conn)
         self.metrics = Metrics()
 
@@ -212,6 +219,7 @@ class _Handler(BaseHTTPRequestHandler):
                 ("POST", ("invites", "accept")): lambda: self._ws_invite_accept(wid),
                 ("POST", ("api-keys",)): lambda: self._ws_key_create(wid),
                 ("POST", ("runs",)): lambda: self._ws_run(wid),
+                ("POST", ("scopes",)): lambda: self._ws_scope_mint(wid),
                 ("POST", ("targets",)): lambda: self._ws_target_start(wid),
                 ("POST", ("targets", "check")): lambda: self._ws_target_check(wid),
                 ("POST", ("billing", "checkout")): lambda: self._ws_checkout(wid),
@@ -366,6 +374,31 @@ class _Handler(BaseHTTPRequestHandler):
             raise ApiError(404, "key not found")
         self.cp.store.revoke_api_key(key_id)
         self._json(200, {"ok": True})
+
+    def _ws_scope_mint(self, wid: str):
+        """The human-only hosted scope path. Session principals with `create_scope`
+        (owner/admin) only — API keys are rejected in _authorize by construction. Requires a
+        currently verified target, a step-up confirmation (retype the exact target), and a
+        reason that lands in the append-only admin audit. Delegates the actual scope material
+        to the engine's injected minter; fails closed (501) when none is configured."""
+        self._authorize(wid, "create_scope")
+        b = self._body()
+        target = str(b.get("target", "")).strip().lower()
+        confirm = str(b.get("confirm_target", "")).strip().lower()
+        reason = str(b.get("reason", "")).strip()
+        if not target or confirm != target:
+            raise ApiError(400, "confirm_target must repeat the exact target (step-up confirmation)")
+        if not reason:
+            raise ApiError(400, "a reason is required; it is recorded in the admin audit log")
+        if not self.cp.verifier.is_verified(wid, target):
+            raise ApiError(403, "target is not verified for this workspace")
+        if self.cp.scope_minter is None:
+            raise ApiError(501, "scope minting is not configured in this deployment; mint via "
+                                "the engine's human-only path and pass scope_ref to /runs")
+        _, user_id, _ = self._principal()
+        scope_ref = self.cp.scope_minter(wid, target, user_id)
+        self.cp.ops.record(user_id or "unknown", "scope_mint", f"{wid}:{target}", reason)
+        self._json(201, {"scope_ref": scope_ref, "target": target})
 
     def _ws_run(self, wid: str):
         self._authorize(wid, "run_rehearsal")

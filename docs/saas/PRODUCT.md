@@ -34,7 +34,9 @@ safety spine.
 ## Product surfaces
 - **App (Next.js):** onboarding, guided first rehearsal against a synthetic target, live run
   dashboard, findings, billing portal, member/role management.
-- **API + MCP (paid tiers):** tenant-scoped API keys, run enqueue/status/results, CI integration.
+- **Hosted API + MCP access (paid tiers):** tenant-scoped API keys, run enqueue/status/results, CI
+  integration. What is paid is access to the *hosted* control plane; the engine's own loopback
+  MCP/REST surfaces stay Apache-2.0 and free for self-hosters (ADR-0001).
 - **CLI:** the open-source CLI can point at the hosted API with an API key.
 - **Public website:** product, pricing, docs, security page, enterprise contact.
 
@@ -42,7 +44,8 @@ safety spine.
 1. Sign up → workspace created on Free (no card).
 2. Guided first rehearsal against a **synthetic** target (deterministic, $0 marginal cost) —
    value visible in minutes.
-3. Verify a real target via DNS TXT / HTTP challenge → up to 5 verified runs on Free.
+3. Verify a real target via DNS TXT / HTTP challenge, then a signed-in owner/admin mints a
+   target-bound authorization scope (step-up confirmation, audited) → up to 5 verified runs on Free.
 4. Quota hit → in-context upgrade to Pro (self-serve checkout).
 
 ## Cost model (free-tier ceiling) {#cost-model}
@@ -52,8 +55,8 @@ ceilings (wall-clock ≤ 60 s, egress limited to the verified target, token budg
 throttles, proof-of-control, and global/tenant circuit breakers bound aggregate liability.
 
 ## Non-goals (v1)
-- No usage-based pay-as-you-go pricing (predictable tiers only; Team opt-in overage is the sole
-  metered exception).
+- No usage-based pay-as-you-go pricing and no metered overage: predictable tiers only, every
+  self-serve quota is a hard stop with an in-context upgrade path.
 - No unverified real-target execution at any tier, ever.
 - No on-prem control plane in v1 (private runners cover the data-locality need; full on-prem is a
   later enterprise conversation).

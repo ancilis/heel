@@ -63,10 +63,11 @@ class Job:
 
 class JobPlane:
     def __init__(self, conn: sqlite3.Connection, *,
-                 scope_validator: Callable[[str, str], bool] | None = None):
-        """scope_validator(workspace_id, scope_ref) -> bool. Injected from the engine's signed
-        scope verifier by the deployment; absent means verified jobs cannot be enqueued at all
-        (fail closed)."""
+                 scope_validator: Callable[[str, str, str], bool] | None = None):
+        """scope_validator(workspace_id, scope_ref, target) -> bool. Injected from the engine's
+        signed scope verifier by the deployment; absent means verified jobs cannot be enqueued at
+        all (fail closed). The target is part of the check so a scope minted for one target can
+        never authorize a different target, verified or not."""
         self.conn = conn
         self.conn.executescript(_SCHEMA)
         self.scope_validator = scope_validator
@@ -92,8 +93,9 @@ class JobPlane:
                 raise PermissionError("verified run requires a currently verified target")
             if self.scope_validator is None:
                 raise PermissionError("no scope validator configured; verified runs disabled")
-            if not scope_ref or not self.scope_validator(workspace_id, scope_ref):
-                raise PermissionError("verified run requires a valid human-authorized scope")
+            if not scope_ref or not self.scope_validator(workspace_id, scope_ref, target):
+                raise PermissionError(
+                    "verified run requires a valid human-authorized scope for this exact target")
             budget = budget or RunBudget(egress_hosts=(target,))
             extra = set(budget.egress_hosts) - {target}
             if extra:
@@ -108,14 +110,22 @@ class JobPlane:
         return Job(jid, workspace_id, kind, "queued", target, budget)
 
     # --- worker side ---
-    def claim(self, worker_id: str, *, lease_s: int = DEFAULT_LEASE) -> Job | None:
-        """Atomically claim the oldest queued job."""
+    def claim(self, worker_id: str, *, workspace_id: str | None = None,
+              lease_s: int = DEFAULT_LEASE) -> Job | None:
+        """Atomically claim the oldest queued job. Workers pinned to a tenant pass their
+        workspace_id and can only ever claim that tenant's jobs; a None filter is for
+        shared-pool deployments where isolation is per-run (sandbox + egress), not per-worker."""
         now = _now()
+        where = "state='queued'"
+        args: list = [worker_id, now, now + lease_s]
+        if workspace_id is not None:
+            where += " AND workspace_id=?"
+            args.append(workspace_id)
         cur = self.conn.execute(
             "UPDATE jobs SET state='running', worker_id=?, claimed_at=?, lease_until=? "
-            "WHERE job_id=(SELECT job_id FROM jobs WHERE state='queued' "
+            f"WHERE job_id=(SELECT job_id FROM jobs WHERE {where} "
             "ORDER BY created_at LIMIT 1) RETURNING *",
-            (worker_id, now, now + lease_s))
+            args)
         row = cur.fetchone()
         self.conn.commit()
         return self._to_job(row) if row else None

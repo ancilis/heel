@@ -124,11 +124,26 @@ FREE_VERIFIED_RUNS = 5
 CONFIG_GATED_FEATURES = frozenset({Feature.SSO, Feature.SCIM, Feature.DATA_REGION, Feature.PRIVATE_RUNNERS})
 
 
-def get_plan(plan_id: str) -> Plan:
+# Versioned catalog history. A subscription pins the version it was created on; editing the
+# CURRENT _PLANS therefore never silently alters a grandfathered subscription. To change prices
+# or quotas: copy _PLANS into _CATALOGS under the old version string, bump CATALOG_VERSION,
+# then edit _PLANS. Removing an entry a live subscription still pins is a fail-loud KeyError.
+_CATALOGS: dict[str, dict] = {CATALOG_VERSION: _PLANS}
+
+
+def get_plan(plan_id: str, catalog_version: str | None = None) -> Plan:
+    plans = _PLANS if catalog_version is None else _catalog(catalog_version)
     try:
-        return _PLANS[plan_id]
+        return plans[plan_id]
     except KeyError:
-        raise KeyError(f"unknown plan {plan_id!r}; known: {sorted(_PLANS)}")
+        raise KeyError(f"unknown plan {plan_id!r}; known: {sorted(plans)}")
+
+
+def _catalog(version: str) -> dict:
+    try:
+        return _CATALOGS[version]
+    except KeyError:
+        raise KeyError(f"unknown catalog version {version!r}; known: {sorted(_CATALOGS)}")
 
 
 def all_plans() -> list[Plan]:

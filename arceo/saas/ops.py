@@ -39,6 +39,13 @@ class OpsStore:
             "INSERT INTO admin_audit(actor,action,subject,reason,ts) VALUES(?,?,?,?,?)",
             (actor, action, subject, reason, time.time()))
 
+    def record(self, actor: str, action: str, subject: str, reason: str) -> None:
+        """Append a privileged control-plane action (e.g. scope_mint) to the audit log."""
+        if not reason.strip():
+            raise ValueError("audited actions require a non-empty reason")
+        self._audit(actor, action, subject, reason)
+        self.conn.commit()
+
     # --- kill switches ---
     def trip(self, scope: str, *, actor: str, reason: str) -> None:
         """scope: 'global' or a workspace_id. Requires a non-empty reason (runbook discipline)."""
