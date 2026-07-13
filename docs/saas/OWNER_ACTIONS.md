@@ -19,6 +19,12 @@ else is built and testable locally without them. Ordered by launch criticality.
 7. **Secret manager** (cloud KMS/Secrets Manager) for the scope signing key and vendor secrets.
 8. **Error tracking + status page** accounts (Sentry, statuspage/Better Stack) — provide DSN/keys.
 
+## Blocking the mandatory independent review
+12. **Upgrade Codex CLI/app** so the reviewer model `gpt-5.6-sol` resolves. Current installed Codex
+    rejects it: `400 … "The 'gpt-5.6-sol' model requires a newer version of Codex."` Until upgraded,
+    the four mandatory Sol adversarial gates (§17) cannot run and the build is **not launch-ratified**.
+    Verify with: a `mcp__codex__codex` call using `model: gpt-5.6-sol` returns a normal response.
+
 ## Non-blocking but recommended
 9. **GitHub repo rename** `ancilis/heel` → `ancilis/arceo` (badges/URLs already reference `arceo`).
 10. Email/SMTP provider (Postmark/Resend) for lifecycle email — `RESEND_API_KEY`.

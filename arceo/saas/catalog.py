@@ -20,7 +20,8 @@ CATALOG_VERSION = "2026-07-13"
 
 class Meter(str, Enum):
     """The costly, durable units we meter. NOT UI decoration."""
-    RUNS = "runs"                       # rehearsal run credits / month
+    RUNS = "runs"                       # total rehearsal run credits / month (synthetic + verified)
+    VERIFIED_RUNS = "verified_runs"     # subset ceiling: costly runs against a verified real target
     VERIFIED_TARGETS = "verified_targets"
     CONCURRENCY = "concurrency"         # parallel workers
     RETENTION_DAYS = "retention_days"

@@ -45,13 +45,26 @@ unproven gate.
 | 9 | Adversarial/integration/browser/load/recovery/black-box | pending |
 | 10 | Staging rehearsal, launch docs, owner handoff | pending |
 
-## Sol review gates
+## Sol review gates — BLOCKED (mandatory independent review cannot run)
+The Codex MCP transport is reachable (`mcp__codex__codex` returns structured responses), but the
+mandated reviewer model **`gpt-5.6-sol` is unavailable on the installed Codex**. Exact error, returned
+twice (initial + one retry) on 2026-07-13:
+
+> 400 invalid_request_error: "The 'gpt-5.6-sol' model requires a newer version of Codex. Please
+> upgrade to the latest app or CLI and try again."
+
+Per §17 of the master prompt, I must NOT silently substitute another reviewer (e.g. gpt-5.2). No Sol
+gate can be ratified until an owner upgrades the Codex CLI/app so `gpt-5.6-sol` resolves. This is a
+true external blocker (see OWNER_ACTIONS #12). A **builder self-review** was performed instead and is
+recorded in `docs/saas/SELF_REVIEW.md` — it is explicitly NOT the mandated independent review and does
+not satisfy any gate.
+
 | Gate | Scope | Thread ID | Disposition |
 |---|---|---|---|
-| 1 | Catalog, brand, architecture, open-core boundary | (pending) | |
-| 2 | Tenancy, target verification, scope, worker isolation | (pending) | |
-| 3 | Billing, entitlement, usage ledger, free-tier liability | (pending) | |
-| 4 | Final diff, threat model, ops, website claims, launch readiness | (pending) | |
+| 1 | Catalog, brand, architecture, open-core boundary | — | BLOCKED (Codex upgrade needed) |
+| 2 | Tenancy, target verification, scope, worker isolation | — | BLOCKED |
+| 3 | Billing, entitlement, usage ledger, free-tier liability | — | BLOCKED |
+| 4 | Final diff, threat model, ops, website claims, launch readiness | — | BLOCKED |
 
 ## Open risks
 - Full hosted deployment (live Postgres, Stripe live mode, deployed Next.js backend, workers, IaC-provisioned cloud) requires owner-only external credentials — tracked in `OWNER_ACTIONS.md`.
