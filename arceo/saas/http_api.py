@@ -24,12 +24,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .auth import AuthStore, ThrottledError
 from .billing import BillingStore, StubBilling, SubscriptionManager
-from .catalog import CATALOG_VERSION, Meter, get_plan, self_serve_plans
+from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
 from .entitlement import EntitlementService, Subscription
 from .jobs import JobPlane
 from .ledger import QuotaExceeded, UsageLedger
 from .ops import KillSwitchTripped, Metrics, OpsStore
-from .tenancy import ControlPlaneStore, Role, require
+from .tenancy import ControlPlaneStore, Role, hash_api_key, require
 from .verification import TargetVerifier
 
 MAX_BODY = 64 * 1024
@@ -77,6 +77,19 @@ class ControlPlane:
         if sub is not None and sub.state:
             return Subscription(workspace_id, sub.plan_id, sub.state, ws["catalog_version"])
         return Subscription(workspace_id, ws["plan_id"], "active", ws["catalog_version"])
+
+    def target_quota_blocked(self, workspace_id: str, hostname: str | None = None) -> bool:
+        """True when verifying (another) target would exceed the plan's verified-target quota.
+        Checked at challenge start AND at check time, on every surface — starting several
+        challenges in parallel must not verify past the limit. Re-verifying an already
+        verified hostname is always allowed."""
+        sub = self.subscription(workspace_id)
+        limit = self.entitlements.quota(sub, Meter.VERIFIED_TARGETS)
+        if limit < 0:
+            return False
+        if hostname and self.verifier.is_verified(workspace_id, hostname):
+            return False
+        return self.verifier.verified_count(workspace_id) >= limit
 
     def user_by_email(self, email: str) -> sqlite3.Row | None:
         return self.store.conn.execute(
@@ -329,8 +342,17 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(200, {"period": period, "remaining": {
             m.value: svc.remaining(sub, m, period) for m in Meter}})
 
+    def _seat_limit_reached(self, wid: str) -> bool:
+        sub = self.cp.subscription(wid)
+        limit = self.cp.entitlements.quota(sub, Meter.SEATS)
+        return limit >= 0 and len(self.cp.store.members(wid)) >= limit
+
     def _ws_invite(self, wid: str):
         self._authorize(wid, "manage_members")
+        if self._seat_limit_reached(wid):
+            self._json(402, {"error": "seat limit reached", "upgrade_to":
+                             self.cp.entitlements.upgrade_target(self.cp.subscription(wid))})
+            return
         b = self._body()
         try:
             role = Role(str(b.get("role", "")))
@@ -350,11 +372,27 @@ class _Handler(BaseHTTPRequestHandler):
         if kind != "session":
             raise ApiError(401, "sign in to accept an invite")
         token = str(self._body().get("token", ""))
+        # Validate the token before anything else so invalid tokens learn nothing about the
+        # workspace (not even its quota state).
+        valid = self.cp.store.conn.execute(
+            "SELECT 1 FROM invites WHERE workspace_id=? AND token_hash=? AND accepted_at IS NULL",
+            (wid, hash_api_key(token))).fetchone()
+        if not valid:
+            raise ApiError(403, "invalid or already-used invite")
+        # Authoritative seat check at the moment the membership would be created — invites
+        # issued earlier must not carry a workspace past its seat quota.
+        if self.cp.store.get_role(wid, uid) is None and self._seat_limit_reached(wid):
+            raise ApiError(402, "seat limit reached; ask an admin to upgrade the plan")
         role = self.cp.store.accept_invite(wid, token, uid)
         self._json(200, {"workspace_id": wid, "role": role.value})
 
     def _ws_key_create(self, wid: str):
         self._authorize(wid, "manage_api_keys")
+        sub = self.cp.subscription(wid)
+        if not self.cp.entitlements.has_feature(sub, Feature.API):
+            self._json(402, {"error": "API access is not included in this plan",
+                             "upgrade_to": self.cp.entitlements.upgrade_target(sub)})
+            return
         b = self._body()
         try:
             role = Role(str(b.get("role", "viewer")))
@@ -443,11 +481,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _ws_target_start(self, wid: str):
         self._authorize(wid, "manage_targets")
         hostname = str(self._body().get("hostname", ""))
-        sub = self.cp.subscription(wid)
-        limit = self.cp.entitlements.quota(sub, Meter.VERIFIED_TARGETS)
-        if limit >= 0 and self.cp.verifier.verified_count(wid) >= limit:
-            self._json(402, {"error": "verified target limit reached",
-                             "upgrade_to": self.cp.entitlements.upgrade_target(sub)})
+        if self.cp.target_quota_blocked(wid):
+            self._json(402, {"error": "verified target limit reached", "upgrade_to":
+                             self.cp.entitlements.upgrade_target(self.cp.subscription(wid))})
             return
         try:
             ch = self.cp.verifier.start(wid, hostname)
@@ -460,6 +496,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _ws_target_check(self, wid: str):
         self._authorize(wid, "manage_targets")
         hostname = str(self._body().get("hostname", ""))
+        if self.cp.target_quota_blocked(wid, hostname):
+            self._json(402, {"error": "verified target limit reached", "upgrade_to":
+                             self.cp.entitlements.upgrade_target(self.cp.subscription(wid))})
+            return
         ok = self.cp.verifier.check(wid, hostname)
         self._json(200, {"verified": ok})
 

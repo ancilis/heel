@@ -316,8 +316,30 @@ class ScopeMintPathTests(unittest.TestCase):
                                   {"verified": True, "target": "other.example.com",
                                    "scope_ref": body["scope_ref"]}, hdr)[0], 403)
 
+    def test_parallel_challenges_cannot_verify_past_target_quota(self):
+        # Sol Gate-1 regression: start two challenges while under quota, verify one, then the
+        # second check must be refused (402), not verified — quota is enforced at check time.
+        wid, hdr = self.signup("parallel@example.com")   # free: 1 verified target
+        _, ch1 = self.req("POST", f"/v1/workspaces/{wid}/targets", {"hostname": "a.example.com"}, hdr)
+        _, ch2 = self.req("POST", f"/v1/workspaces/{wid}/targets", {"hostname": "b.example.com"}, hdr)
+        self.records["_arceo.a.example.com"] = [f"arceo-verify={ch1['token']}"]
+        self.records["_arceo.b.example.com"] = [f"arceo-verify={ch2['token']}"]
+        status, body = self.req("POST", f"/v1/workspaces/{wid}/targets/check",
+                                {"hostname": "a.example.com"}, hdr)
+        self.assertTrue(body["verified"])
+        status, body = self.req("POST", f"/v1/workspaces/{wid}/targets/check",
+                                {"hostname": "b.example.com"}, hdr)
+        self.assertEqual(status, 402, body)
+        # re-checking the already-verified target stays allowed at the limit
+        status, body = self.req("POST", f"/v1/workspaces/{wid}/targets/check",
+                                {"hostname": "a.example.com"}, hdr)
+        self.assertEqual(status, 200)
+
     def test_api_keys_can_never_mint(self):
         wid, hdr = self.signup("keys@example.com")
+        self.cp.store.conn.execute(
+            "UPDATE workspaces SET plan_id='pro' WHERE workspace_id=?", (wid,))
+        self.cp.store.conn.commit()   # API keys are a paid feature
         _, key = self.req("POST", f"/v1/workspaces/{wid}/api-keys",
                           {"role": "member", "name": "ci"}, hdr)
         khdr = {"Authorization": f"Bearer {key['secret']}"}

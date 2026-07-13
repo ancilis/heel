@@ -50,8 +50,9 @@ safety spine.
 
 ## Cost model (free-tier ceiling) {#cost-model}
 Every free unit is atomically capped in the usage ledger (reserve-at-enqueue). Worst case per free
-workspace per month: 20 synthetic runs at ~$0 marginal + 5 verified runs under per-run budget
-ceilings (wall-clock ≤ 60 s, egress limited to the verified target, token budget capped). Signup
+workspace per month: 25 run credits total, of which at most 5 verified — i.e. up to 20 synthetic
+runs at ~$0 marginal plus 5 verified runs under per-run budget ceilings (wall-clock ≤ 60 s, egress
+limited to the verified target, token budget capped), or 25 synthetic runs at ~$0. Signup
 throttles, proof-of-control, and global/tenant circuit breakers bound aggregate liability.
 
 ## Non-goals (v1)

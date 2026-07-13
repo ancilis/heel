@@ -84,7 +84,8 @@ _PLANS = {
         id="free", name="Free", price_month_cents=0, price_year_cents=0, no_card=True,
         support="community",
         quotas=_q(runs=25, verified_runs=5, verified_targets=1, concurrency=1, retention_days=7, seats=1, integrations=0),
-        # 25 = 20 synthetic + 5 verified (enforced separately by run kind; see PRICING doc).
+        # 25 total run credits; at most 5 of them may be verified-target runs (the VERIFIED_RUNS
+        # subset ceiling, enforced in reserve_run). Synthetic runs may consume all 25.
         features=frozenset(),
     ),
     "pro": Plan(
@@ -115,8 +116,8 @@ _PLANS = {
     ),
 }
 
-# Free-tier split: synthetic vs verified-target runs (verified runs are the costly ones).
-FREE_SYNTHETIC_RUNS = 20
+# Free-tier verified ceiling (the costly, liability-bearing run kind). The total pool is
+# Meter.RUNS on the free plan; synthetic runs (~$0 marginal) may consume all of it.
 FREE_VERIFIED_RUNS = 5
 
 # Enterprise capabilities that require deployment configuration before they do anything.

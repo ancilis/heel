@@ -117,6 +117,12 @@ class HttpApiTests(unittest.TestCase):
         token = cookies.split(";")[0].split("=", 1)[1]
         return body["user_id"], body["workspace_id"], {"Cookie": f"arceo_session={token}"}
 
+    def pin_plan(self, wid, plan_id="pro"):
+        """Pin a workspace to a paid plan directly in the store (tests only)."""
+        self.cp.store.conn.execute(
+            "UPDATE workspaces SET plan_id=? WHERE workspace_id=?", (plan_id, wid))
+        self.cp.store.conn.commit()
+
     def test_health_and_plans_open(self):
         self.assertEqual(self.req("GET", "/v1/health")[0], 200)
         status, body, _ = self.req("GET", "/v1/plans")
@@ -144,6 +150,12 @@ class HttpApiTests(unittest.TestCase):
 
     def test_invite_flow_and_role_limits(self):
         _, wid, hdr = self.signup("owner-inv@example.com")
+        # free has a single seat: the invite is refused with an upgrade hint
+        status, body, _ = self.req("POST", f"/v1/workspaces/{wid}/invites",
+                                   {"email": "m@example.com", "role": "member"}, hdr)
+        self.assertEqual(status, 402)
+        self.assertEqual(body["upgrade_to"], "pro")
+        self.pin_plan(wid)
         status, body, _ = self.req("POST", f"/v1/workspaces/{wid}/invites",
                                    {"email": "m@example.com", "role": "member"}, hdr)
         self.assertEqual(status, 201)
@@ -162,6 +174,12 @@ class HttpApiTests(unittest.TestCase):
 
     def test_api_keys_scoped_and_never_privileged(self):
         _, wid, hdr = self.signup("keys@example.com")
+        # API access is a paid feature: key creation on free is refused with an upgrade hint
+        status, body, _ = self.req("POST", f"/v1/workspaces/{wid}/api-keys",
+                                   {"role": "member", "name": "ci"}, hdr)
+        self.assertEqual(status, 402)
+        self.assertEqual(body["upgrade_to"], "pro")
+        self.pin_plan(wid)
         status, body, _ = self.req("POST", f"/v1/workspaces/{wid}/api-keys",
                                    {"role": "member", "name": "ci"}, hdr)
         self.assertEqual(status, 201)

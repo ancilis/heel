@@ -26,14 +26,15 @@ We do **not** gate UI decoration.
 
 "Runs/mo" is the total credit pool (synthetic + verified). "Of which verified runs" is a subset
 ceiling on runs against verified real targets — the costly, liability-bearing kind — drawn down
-alongside the total. On Free that means at most 20 synthetic + 5 verified.
+alongside the total. On Free that means 25 run credits of which at most 5 may be verified;
+synthetic runs (~$0 marginal) may consume the whole pool.
 
 \* SSO/SCIM/data-region are **contact-sales / deployment-option** capabilities. Where not configured
 they are disabled and honestly surfaced through the enterprise flow — never dead checkboxes.
 
 ## Free-tier hard maximum liability
 Every free unit is atomically capped. Worst-case monthly cost per free workspace:
-- 20 synthetic runs (deterministic StubModel, no LLM spend) ≈ **$0 marginal**.
+- up to 25 synthetic runs (deterministic StubModel, no LLM spend) ≈ **$0 marginal**.
 - 5 verified-target runs × per-run budget ceiling (CPU wall-clock ≤ 60 s, network egress restricted
   to the single verified target, token budget capped) ≈ small bounded compute.
 - Concurrency 1, retention 7 d, 1 seat, 1 verified target.

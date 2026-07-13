@@ -59,6 +59,12 @@ class AdversarialTests(unittest.TestCase):
         conn.close()
         return b["workspace_id"], {"Cookie": f"arceo_session={token}"}, token
 
+    def pin_plan(self, wid, plan_id="pro"):
+        """Pin a workspace to a paid plan directly in the store (tests only)."""
+        self.cp.store.conn.execute(
+            "UPDATE workspaces SET plan_id=? WHERE workspace_id=?", (plan_id, wid))
+        self.cp.store.conn.commit()
+
     # --- auth bypass ---
     def test_forged_and_mutated_credentials_rejected(self):
         wid, hdr, token = self.signup("adv1@example.com")
@@ -85,6 +91,7 @@ class AdversarialTests(unittest.TestCase):
     def test_cross_tenant_objects_unreachable(self):
         wid_a, hdr_a, _ = self.signup("tena@example.com")
         wid_b, hdr_b, _ = self.signup("tenb@example.com")
+        self.pin_plan(wid_a)   # API keys are a paid-plan feature
         s, body = self.req("POST", f"/v1/workspaces/{wid_a}/runs", {}, hdr_a)
         job_id = body["job_id"]
         s, _ = self.req("GET", f"/v1/workspaces/{wid_b}/jobs/{job_id}", None, hdr_b)
@@ -99,6 +106,7 @@ class AdversarialTests(unittest.TestCase):
     def test_invite_token_wrong_workspace_rejected(self):
         wid_a, hdr_a, _ = self.signup("inva@example.com")
         wid_b, _, _ = self.signup("invb@example.com")
+        self.pin_plan(wid_a)   # free has 1 seat; invites need seat headroom
         s, body = self.req("POST", f"/v1/workspaces/{wid_a}/invites",
                            {"email": "j@e.co", "role": "viewer"}, hdr_a)
         token = body["invite_token"]

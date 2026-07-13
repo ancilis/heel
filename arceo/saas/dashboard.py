@@ -162,6 +162,9 @@ def handle(handler, method: str, parts: list) -> bool:
 
     if method == "POST" and tail == ("target",):
         hostname = _form_body(handler).get("hostname", "")
+        if cp.target_quota_blocked(wid):
+            _redirect(handler, "/app?quota=1")
+            return True
         try:
             cp.verifier.start(wid, hostname)
         except ValueError as e:
@@ -171,7 +174,11 @@ def handle(handler, method: str, parts: list) -> bool:
         return True
 
     if method == "POST" and tail == ("target-check",):
-        cp.verifier.check(wid, _form_body(handler).get("hostname", ""))
+        hostname = _form_body(handler).get("hostname", "")
+        if cp.target_quota_blocked(wid, hostname):
+            _redirect(handler, "/app?quota=1")
+            return True
+        cp.verifier.check(wid, hostname)
         _redirect(handler, "/app")
         return True
 
