@@ -42,7 +42,7 @@ unproven gate.
 | 6 | Public website, pricing, enterprise, docs, lifecycle email, legal | **DONE** (site.py static generator; 6 tests; legal = counsel-review templates) |
 | 7 | Security, privacy, admin, observability, support, runbooks | **DONE** (ops.py kill switches/audit/metrics, healthz/readyz, RUNBOOKS.md; 5 tests) |
 | 8 | IaC, CI/CD, staging, backup/restore/rollback | **DONE (local layer)** — smoke + backup/verify scripts, make targets, CI steps; cloud IaC owner-gated |
-| 9 | Adversarial/integration/browser/load/recovery/black-box | pending |
+| 9 | Adversarial/integration/browser/load/recovery/black-box | **DONE (local scope)** — 8 black-box adversarial tests; browser/load vs deployed infra owner-gated |
 | 10 | Staging rehearsal, launch docs, owner handoff | pending |
 
 ## Sol review gates — BLOCKED (mandatory independent review cannot run)
@@ -79,9 +79,18 @@ former OWNER_ACTIONS #12 blocker is CLEARED at the model level. The direct `mcp_
 Gate-1 call from the main session hit a 1800 s idle timeout (no response/progress); a background
 agent is retrying Gate 1 over MCP. Record its verdict + thread ID in the gate table when it
 returns; if MCP transport keeps hanging, that (not the model) is the remaining blocker.
-Non-blocked implementation continues at **Phase 9**: adversarial/black-box test pass (cross-tenant
-probing, auth bypass attempts, quota races), then Phase 10 launch docs + handoff. Do NOT mark
-anything launch-ratified until Sol gates 1–4 pass.
+Non-blocked implementation continues at **Phase 10**: launch/handoff docs refresh against the
+shipped system. Do NOT mark anything launch-ratified until Sol gates 1–4 pass.
+
+## Phase 9 evidence (2026-07-13)
+- `tests/test_saas_adversarial.py` (8): forged/mutated cookies + bearer keys → 401; client-supplied
+  role claims ignored (server-side membership only); cross-tenant job read → 404, cross-tenant key
+  revoke → 404/403; invite tokens workspace-bound; webhook duplicate not re-applied and stale
+  timestamp → 400; idempotent duplicate enqueues charge exactly once; 60-thread quota race on
+  separate connections yields exactly 25 grants / 35 denials; malformed JSON 400, non-object 400,
+  oversized body 413, path junk 404.
+- Recovery drill covered by Phase 8 backup VERIFY PASS; browser/load tests against deployed cloud
+  infra remain owner-gated.
 
 ## Phase 8 evidence (2026-07-13)
 - `scripts/saas_smoke.py` — boots the real server, drives signup → synthetic run → target verify →
@@ -151,4 +160,4 @@ anything launch-ratified until Sol gates 1–4 pass.
 - Tests: `tests/test_saas_http_api.py` (15).
 
 ## Fresh verification (2026-07-13, HEAD)
-`python3 -m unittest discover -s tests -p 'test_*.py'` → **323 tests, OK** · `make saas-smoke` → SMOKE PASS · backup/verify drill → VERIFY PASS (Python 3.14.3).
+`python3 -m unittest discover -s tests -p 'test_*.py'` → **331 tests, OK** · `make saas-smoke` → SMOKE PASS · backup/verify drill → VERIFY PASS (Python 3.14.3).
