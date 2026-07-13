@@ -36,7 +36,7 @@ unproven gate.
 | 0 | Inventory, reconcile upstream, worktree, baseline | **DONE** |
 | 1 | Brand/open-core ADR, ICP, plans/prices, entitlement contract, architecture | in progress |
 | 2 | SaaS foundation: schema, tenancy, auth, roles, API keys | **DONE** (auth.py, migrate.py, http_api.py; 15 tests) |
-| 3 | Job plane, target verification, signed scopes, safe adapters | pending |
+| 3 | Job plane, target verification, signed scopes, safe adapters | **DONE** (verification.py, jobs.py, egress.py + HTTP wiring; 14 tests) |
 | 4 | Usage ledger, quotas, billing lifecycle, reconciliation | pending |
 | 5 | App UX, onboarding, live dashboard, integration surfaces | pending |
 | 6 | Public website, pricing, enterprise, docs, lifecycle email, legal | pending |
@@ -79,9 +79,23 @@ former OWNER_ACTIONS #12 blocker is CLEARED at the model level. The direct `mcp_
 Gate-1 call from the main session hit a 1800 s idle timeout (no response/progress); a background
 agent is retrying Gate 1 over MCP. Record its verdict + thread ID in the gate table when it
 returns; if MCP transport keeps hanging, that (not the model) is the remaining blocker.
-Non-blocked implementation continues at **Phase 3**: job plane, target verification (DNS TXT /
-HTTP challenge), signed-scope integration, per-run budget ceilings, egress guard. Do NOT mark
-anything launch-ratified until Sol gates 1–4 pass.
+Non-blocked implementation continues at **Phase 4**: usage/quotas are already ledger-enforced, so
+Phase 4 closes billing lifecycle (dunning transitions already in billing.py — add period rollover
++ reconciliation report) and then Phase 5 onboarding/dashboard UX. Do NOT mark anything
+launch-ratified until Sol gates 1–4 pass.
+
+## Phase 3 evidence (2026-07-13)
+- `arceo/saas/verification.py` — DNS TXT / HTTP-file ownership challenges, injected resolvers,
+  24 h challenge TTL, 30-day re-verify window, revocation, per-workspace verified count.
+- `arceo/saas/egress.py` — default-deny allowlist; only the run's verified target, ports 80/443;
+  post-resolution private/loopback/link-local IP refusal (DNS-rebinding block).
+- `arceo/saas/jobs.py` — reserve-at-enqueue settlement (consume on success, refund on
+  failure/lease expiry via reaper), worker leases + heartbeat, immutable RunBudget (60 s wall
+  clock, token cap, egress limited to verified target). Verified jobs fail closed: verified
+  target + engine-minted scope reference required; no validator configured → disabled.
+- HTTP wiring: `/targets`, `/targets/check`, `/jobs/{id}`; verified `/runs` path 403s and
+  refunds reservations on any guard failure; verified-target plan limit → 402 + upgrade hint.
+- Tests: `tests/test_saas_job_plane.py` (14).
 
 ## Phase 2 evidence (2026-07-13)
 - `arceo/saas/auth.py` — PBKDF2 (600k iters) passwords, hashed opaque sessions with TTL+idle
@@ -95,4 +109,4 @@ anything launch-ratified until Sol gates 1–4 pass.
 - Tests: `tests/test_saas_http_api.py` (15).
 
 ## Fresh verification (2026-07-13, HEAD)
-`python3 -m unittest discover -s tests -p 'test_*.py'` → **287 tests, OK** (Python 3.14.3).
+`python3 -m unittest discover -s tests -p 'test_*.py'` → **301 tests, OK** (Python 3.14.3).

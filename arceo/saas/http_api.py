@@ -9,9 +9,9 @@ workspace claims are never trusted. Binds loopback by default — production exp
 the deployment's TLS-terminating edge, never by widening this default.
 
 Safety boundary (unchanged from the engine): the human-only, HMAC-signed AuthorizationScope is not
-creatable here at all in this phase, and API-key principals will never be able to create one —
-`create_scope` is session-principal-only by construction. Verified real-target runs return 501
-until the Phase 3 job plane lands target verification.
+mintable here, and API-key principals can never exercise `create_scope` — it is
+session-principal-only by construction. Verified real-target runs additionally require a
+currently verified target plus a valid scope reference, enforced fail-closed by the job plane.
 """
 from __future__ import annotations
 
@@ -24,8 +24,10 @@ from .auth import AuthStore, ThrottledError
 from .billing import BillingStore, StubBilling, SubscriptionManager
 from .catalog import CATALOG_VERSION, Meter, get_plan, self_serve_plans
 from .entitlement import EntitlementService, Subscription
+from .jobs import JobPlane
 from .ledger import QuotaExceeded, UsageLedger
 from .tenancy import ControlPlaneStore, Role, require
+from .verification import TargetVerifier
 
 MAX_BODY = 64 * 1024
 
@@ -44,7 +46,8 @@ class ApiError(Exception):
 class ControlPlane:
     """All stores on one SQLite connection; the unit the HTTP layer serves."""
 
-    def __init__(self, path: str = ":memory:"):
+    def __init__(self, path: str = ":memory:", *, dns_txt=None, http_get=None,
+                 scope_validator=None):
         self.store = ControlPlaneStore(path)
         conn = self.store.conn
         self.auth = AuthStore(conn)
@@ -53,6 +56,8 @@ class ControlPlane:
         self.subs = SubscriptionManager(self.billing_store)
         self.billing = StubBilling()
         self.entitlements = EntitlementService(self.ledger)
+        self.verifier = TargetVerifier(conn, dns_txt=dns_txt, http_get=http_get)
+        self.jobs = JobPlane(conn, scope_validator=scope_validator)
 
     def subscription(self, workspace_id: str) -> Subscription:
         ws = self.store.get_workspace(workspace_id)
@@ -194,12 +199,16 @@ class _Handler(BaseHTTPRequestHandler):
                 ("POST", ("invites", "accept")): lambda: self._ws_invite_accept(wid),
                 ("POST", ("api-keys",)): lambda: self._ws_key_create(wid),
                 ("POST", ("runs",)): lambda: self._ws_run(wid),
+                ("POST", ("targets",)): lambda: self._ws_target_start(wid),
+                ("POST", ("targets", "check")): lambda: self._ws_target_check(wid),
                 ("POST", ("billing", "checkout")): lambda: self._ws_checkout(wid),
             }
             if (method, tail) in ws_routes:
                 return ws_routes[(method, tail)]
             if method == "DELETE" and len(tail) == 2 and tail[0] == "api-keys":
                 return lambda: self._ws_key_revoke(wid, tail[1])
+            if method == "GET" and len(tail) == 2 and tail[0] == "jobs":
+                return lambda: self._ws_job_get(wid, tail[1])
         return None
 
     # --- open endpoints ---
@@ -333,21 +342,62 @@ class _Handler(BaseHTTPRequestHandler):
     def _ws_run(self, wid: str):
         self._authorize(wid, "run_rehearsal")
         b = self._body()
-        if bool(b.get("verified", False)):
-            raise ApiError(501, "verified real-target runs arrive with the Phase 3 job plane; "
-                                "synthetic rehearsals are available now")
+        verified = bool(b.get("verified", False))
+        target = str(b.get("target", "")).strip().lower() or None
         sub = self.cp.subscription(wid)
         period = current_period()
         idem = str(b.get("idempotency_key")) if b.get("idempotency_key") else None
+        if verified and (not target or not self.cp.verifier.is_verified(wid, target)):
+            raise ApiError(403, "target is not verified for this workspace")
         try:
-            resv = self.cp.entitlements.reserve_run(sub, period, verified=False,
+            resv = self.cp.entitlements.reserve_run(sub, period, verified=verified,
                                                     idempotency_key=idem)
         except QuotaExceeded as e:
             self._json(402, {"error": "quota exceeded", "meter": e.meter.value,
                              "upgrade_to": self.cp.entitlements.upgrade_target(sub)})
             return
-        self._json(202, {"status": "queued", "reservation_id": resv[0].reservation_id,
-                         "period": period})
+        rids = [r.reservation_id for r in resv]
+        try:
+            job = self.cp.jobs.enqueue(
+                wid, kind="verified" if verified else "synthetic", reservation_ids=rids,
+                target=target if verified else None, target_is_verified=verified,
+                scope_ref=str(b.get("scope_ref", "")) or None)
+        except PermissionError as e:
+            for rid in rids:
+                self.cp.ledger.refund(rid)
+            raise ApiError(403, str(e))
+        self._json(202, {"status": "queued", "job_id": job.job_id, "period": period})
+
+    def _ws_job_get(self, wid: str, job_id: str):
+        self._authorize(wid, "view")
+        job = self.cp.jobs.get(wid, job_id)
+        if job is None:
+            raise ApiError(404, "job not found")
+        self._json(200, {"job_id": job.job_id, "kind": job.kind, "state": job.state,
+                         "target": job.target})
+
+    def _ws_target_start(self, wid: str):
+        self._authorize(wid, "manage_targets")
+        hostname = str(self._body().get("hostname", ""))
+        sub = self.cp.subscription(wid)
+        limit = self.cp.entitlements.quota(sub, Meter.VERIFIED_TARGETS)
+        if limit >= 0 and self.cp.verifier.verified_count(wid) >= limit:
+            self._json(402, {"error": "verified target limit reached",
+                             "upgrade_to": self.cp.entitlements.upgrade_target(sub)})
+            return
+        try:
+            ch = self.cp.verifier.start(wid, hostname)
+        except ValueError as e:
+            raise ApiError(400, str(e))
+        self._json(201, {"target_id": ch.target_id, "hostname": ch.hostname,
+                         "token": ch.token, "dns_record": ch.dns_record,
+                         "http_url": ch.http_url})
+
+    def _ws_target_check(self, wid: str):
+        self._authorize(wid, "manage_targets")
+        hostname = str(self._body().get("hostname", ""))
+        ok = self.cp.verifier.check(wid, hostname)
+        self._json(200, {"verified": ok})
 
     def _ws_checkout(self, wid: str):
         self._authorize(wid, "manage_billing")

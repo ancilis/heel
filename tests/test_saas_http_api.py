@@ -195,9 +195,9 @@ class HttpApiTests(unittest.TestCase):
                 self.assertEqual(body["upgrade_to"], "pro")
                 break
         self.assertEqual(ok, 25)  # free plan RUNS quota
-        # verified runs are 501 until Phase 3
+        # verified runs without a verified target fail closed
         self.assertEqual(self.req("POST", f"/v1/workspaces/{wid}/runs",
-                                  {"verified": True}, hdr)[0], 501)
+                                  {"verified": True}, hdr)[0], 403)
 
     def test_checkout_and_webhook_upgrade(self):
         _, wid, hdr = self.signup("billing@example.com")
