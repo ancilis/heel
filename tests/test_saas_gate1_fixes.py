@@ -137,6 +137,86 @@ class Gate1HttpTests(unittest.TestCase):
             "POST", f"/v1/workspaces/{wid}/api-keys", {"role": "member"}, hdr)[0], 201)
 
 
+class Gate1ConcurrencyTests(unittest.TestCase):
+    def test_concurrent_key_issuance_cannot_exceed_quota(self):
+        """Count + insert are one write transaction: racing issuers on separate connections
+        must not overshoot the integrations quota (Sol Gate-1 round-5 #2)."""
+        import os
+        import tempfile
+        from arceo.saas.tenancy import (
+            ControlPlaneStore, IntegrationLimitExceeded, Role,
+        )
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "cp.db")
+            ControlPlaneStore(path)  # create schema
+            results = []
+            barrier = threading.Barrier(8)
+
+            def worker():
+                store = ControlPlaneStore(path)
+                barrier.wait()
+                try:
+                    store.issue_api_key("wsK", Role.MEMBER, max_active=3)
+                    results.append("ok")
+                except IntegrationLimitExceeded:
+                    results.append("limit")
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            check = ControlPlaneStore(path)
+            active = check.conn.execute(
+                "SELECT COUNT(*) AS n FROM api_keys WHERE workspace_id='wsK' "
+                "AND revoked_at IS NULL").fetchone()["n"]
+            self.assertEqual(active, 3)
+            self.assertEqual(results.count("ok"), 3)
+            self.assertEqual(results.count("limit"), 5)
+
+    def test_refunded_key_replay_over_http_is_409(self):
+        """HTTP path of round-5 #1: a verified request that reserves then refunds (missing
+        scope) burns its idempotency key; the replay is 409, never a free job."""
+        records = {}
+        cp = ControlPlane(dns_txt=lambda name: records.get(name, []))
+        server = serve(cp, webhook_secret=SECRET)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+
+            def req(method, path, body=None, headers=None):
+                conn2 = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                data = json.dumps(body).encode() if body is not None else None
+                conn2.request(method, path, data, headers or {})
+                r = conn2.getresponse()
+                raw = r.read()
+                return r.status, json.loads(raw) if raw else {}, r.getheader("Set-Cookie", "")
+
+            status, body, cookies = req("POST", "/v1/signup",
+                                        {"email": "burn@example.com", "password": PW})
+            wid = body["workspace_id"]
+            hdr = {"Cookie": f"arceo_session={cookies.split(';')[0].split('=', 1)[1]}"}
+            ch = cp.verifier.start(wid, "t.example.com")
+            records["_arceo.t.example.com"] = [f"arceo-verify={ch.token}"]
+            self.assertTrue(cp.verifier.check(wid, "t.example.com"))
+            run = {"verified": True, "target": "t.example.com", "idempotency_key": "burned"}
+            # no scope_ref → job plane refuses → reservations refunded, key burned
+            self.assertEqual(req("POST", f"/v1/workspaces/{wid}/runs", run, hdr)[0], 403)
+            self.assertEqual(cp.ledger.usage(wid, Meter.RUNS, current_period()), 0)
+            for attempt in range(5):
+                status, _, _ = req("POST", f"/v1/workspaces/{wid}/runs", run, hdr)
+                self.assertEqual(status, 409)
+            n = cp.store.conn.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE workspace_id=?", (wid,)).fetchone()["n"]
+            self.assertEqual(n, 0)
+            self.assertEqual(cp.ledger.usage(wid, Meter.RUNS, current_period()), 0)
+            conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 class Gate1JobPlaneTests(unittest.TestCase):
     def _enqueue(self, jobs, ledger, ws, n):
         from arceo.saas.catalog import get_plan
@@ -182,6 +262,67 @@ class Gate1JobPlaneTests(unittest.TestCase):
         conn.commit()
         self.assertEqual(jobs.purge_retention(lambda ws: 7), 1)
         self.assertIsNone(jobs.get("ws1", job.job_id))
+
+    def test_refunded_reservation_key_is_burned(self):
+        """A refunded reservation is terminal: replaying its idempotency key must raise, not
+        hand back quota-free capacity (Sol Gate-1 round-5 #1)."""
+        from arceo.saas.catalog import get_plan
+        from arceo.saas.ledger import IdempotencyConflict
+        ledger = UsageLedger(_conn())
+        plan = get_plan("free")
+        r = ledger.reserve(plan, "ws1", Meter.RUNS, 1, "2026-07", idempotency_key="k1")
+        ledger.refund(r.reservation_id)
+        self.assertEqual(ledger.usage("ws1", Meter.RUNS, "2026-07"), 0)
+        with self.assertRaises(IdempotencyConflict):
+            ledger.reserve(plan, "ws1", Meter.RUNS, 1, "2026-07", idempotency_key="k1")
+        # a fresh key re-enters the normal quota path
+        r2 = ledger.reserve(plan, "ws1", Meter.RUNS, 1, "2026-07", idempotency_key="k2")
+        self.assertEqual(ledger.usage("ws1", Meter.RUNS, "2026-07"), 1)
+        ledger.consume(r2.reservation_id)
+
+    def test_enqueue_race_conflict_leaves_no_open_transaction(self):
+        """The losing side of an idempotency-insert race must roll back, return the winner's
+        job, and leave the connection usable (Sol Gate-1 round-5 #3)."""
+        from arceo.saas.catalog import get_plan
+        conn = _conn()
+        ledger = UsageLedger(conn)
+        jobs = JobPlane(conn)
+        r = ledger.reserve(get_plan("team"), "ws1", Meter.RUNS, 1, "2026-07",
+                           idempotency_key="race-k")
+        winner = jobs.enqueue("ws1", kind="synthetic", reservation_ids=[r.reservation_id],
+                              idempotency_key="race-k")
+
+        class _MissFirstPriorCheck:
+            """Proxy connection that hides the winner from the fast-path SELECT once, forcing
+            the INSERT onto the unique index — the true concurrent-race code path."""
+            def __init__(self, real):
+                self._real = real
+                self._missed = False
+
+            def execute(self, sql, *a):
+                if (not self._missed and sql.startswith(
+                        "SELECT * FROM jobs WHERE workspace_id")):
+                    self._missed = True
+
+                    class _None:
+                        def fetchone(self):
+                            return None
+                    return _None()
+                return self._real.execute(sql, *a)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        jobs.conn = _MissFirstPriorCheck(conn)
+        loser = jobs.enqueue("ws1", kind="synthetic", reservation_ids=[r.reservation_id],
+                             idempotency_key="race-k")
+        jobs.conn = conn
+        self.assertEqual(loser.job_id, winner.job_id)
+        self.assertFalse(conn.in_transaction,
+                         "IntegrityError path must not leave a dangling transaction")
+        # the table is not locked: normal work proceeds
+        r2 = ledger.reserve(get_plan("team"), "ws1", Meter.RUNS, 1, "2026-07")
+        jobs.enqueue("ws1", kind="synthetic", reservation_ids=[r2.reservation_id])
 
     def test_enqueue_replay_race_returns_single_job(self):
         conn = _conn()

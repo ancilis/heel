@@ -134,6 +134,9 @@ class JobPlane:
                  idempotency_key))
         except sqlite3.IntegrityError:
             # Concurrent replay lost the insert race — the winner's job is the job.
+            # Roll back the failed insert's transaction first, or this connection would
+            # hold the write lock open with a dangling transaction.
+            self.conn.rollback()
             prior = self.conn.execute(
                 "SELECT * FROM jobs WHERE workspace_id=? AND idempotency_key=?",
                 (workspace_id, idempotency_key)).fetchone()

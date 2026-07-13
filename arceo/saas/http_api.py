@@ -27,9 +27,11 @@ from .billing import BillingStore, StubBilling, SubscriptionManager
 from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
 from .entitlement import EntitlementService, Subscription
 from .jobs import JobPlane
-from .ledger import QuotaExceeded, UsageLedger
+from .ledger import IdempotencyConflict, QuotaExceeded, UsageLedger
 from .ops import KillSwitchTripped, Metrics, OpsStore
-from .tenancy import ControlPlaneStore, Role, SeatLimitExceeded, require
+from .tenancy import (
+    ControlPlaneStore, IntegrationLimitExceeded, Role, SeatLimitExceeded, require,
+)
 from .verification import TargetLimitExceeded, TargetVerifier
 
 MAX_BODY = 64 * 1024
@@ -207,6 +209,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(e.status, e.body)
         except KillSwitchTripped as e:
             self._json(503, {"error": str(e)})
+        except IdempotencyConflict as e:
+            self._json(409, {"error": str(e)})
         except PermissionError as e:
             self._json(403, {"error": str(e)})
         except ThrottledError as e:
@@ -415,17 +419,16 @@ class _Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "invalid role")
         if role in (Role.OWNER, Role.ADMIN):
             raise ApiError(400, "API keys may not carry owner/admin roles")
-        # The INTEGRATIONS meter's enforcement consumer: active API keys count against it.
+        # The INTEGRATIONS meter's enforcement consumer: active API keys count against it,
+        # enforced atomically inside issue_api_key (count + insert in one write transaction).
         limit = self.cp.entitlements.quota(sub, Meter.INTEGRATIONS)
-        if limit >= 0:
-            active = self.cp.store.conn.execute(
-                "SELECT COUNT(*) AS n FROM api_keys WHERE workspace_id=? AND revoked_at IS NULL",
-                (wid,)).fetchone()["n"]
-            if active >= limit:
-                self._json(402, {"error": "integration (API key) limit reached",
-                                 "upgrade_to": self.cp.entitlements.upgrade_target(sub)})
-                return
-        issued = self.cp.store.issue_api_key(wid, role, str(b.get("name", "")))
+        try:
+            issued = self.cp.store.issue_api_key(
+                wid, role, str(b.get("name", "")), max_active=None if limit < 0 else limit)
+        except IntegrationLimitExceeded:
+            self._json(402, {"error": "integration (API key) limit reached",
+                             "upgrade_to": self.cp.entitlements.upgrade_target(sub)})
+            return
         self._json(201, {"key_id": issued.key_id, "secret": issued.secret,
                          "note": "store this secret now; it is not retrievable again"})
 

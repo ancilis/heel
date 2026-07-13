@@ -41,6 +41,12 @@ CREATE INDEX IF NOT EXISTS idx_ledger_resv ON usage_ledger(reservation_id);
 """
 
 
+class IdempotencyConflict(Exception):
+    """The idempotency key was already used by a reservation that has since been refunded.
+    A refunded reservation is terminal; replaying its key must NOT hand back quota-free
+    capacity. The caller retries with a fresh key (and passes quota checks anew)."""
+
+
 class QuotaExceeded(Exception):
     def __init__(self, meter: Meter, requested: int, used: int, quota: int):
         self.meter, self.requested, self.used, self.quota = meter, requested, used, quota
@@ -108,7 +114,16 @@ class UsageLedger:
                        AND idempotency_key=? AND kind='reserve'""",
                     (workspace_id, meter.value, idempotency_key)).fetchone()
                 if prior:
+                    refunded = self.conn.execute(
+                        "SELECT 1 FROM usage_ledger WHERE reservation_id=? AND kind='refund'",
+                        (prior["reservation_id"],)).fetchone()
                     self.conn.execute("COMMIT")
+                    if refunded:
+                        # Terminal: the reservation was released. Replaying its key must not
+                        # return quota-free capacity — the key is burned.
+                        raise IdempotencyConflict(
+                            f"idempotency key {idempotency_key!r} belongs to a refunded "
+                            "reservation; retry with a new key")
                     return Reservation(prior["reservation_id"], workspace_id, meter,
                                        prior["amount"], prior["period"])
             q = plan.quota(meter)

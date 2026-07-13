@@ -22,6 +22,10 @@ class SeatLimitExceeded(Exception):
     """Accepting this invite would exceed the plan's seat quota."""
 
 
+class IntegrationLimitExceeded(Exception):
+    """Issuing this API key would exceed the plan's integrations quota."""
+
+
 class Role(str, Enum):
     OWNER = "owner"
     ADMIN = "admin"
@@ -101,6 +105,9 @@ class ControlPlaneStore:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
+        # Block (don't instantly fail) when another writer holds the lock, so concurrent
+        # writers on separate connections serialize cleanly (same as the usage ledger).
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(_SCHEMA)
 
     # --- orgs / workspaces ---
@@ -198,13 +205,35 @@ class ControlPlaneStore:
         return role
 
     # --- API keys ---
-    def issue_api_key(self, workspace_id: str, role: Role, name: str = "") -> ApiKeyIssued:
+    def issue_api_key(self, workspace_id: str, role: Role, name: str = "",
+                      *, max_active: int | None = None) -> ApiKeyIssued:
+        """Issue a key, enforcing the integrations quota atomically: the active-key count and
+        the insert happen in one write transaction, so concurrent creations cannot race past
+        the limit (same pattern as accept_invite's seat quota)."""
         secret = f"arceo_sk_{secrets.token_urlsafe(32)}"
         kid = _id("key")
-        self.conn.execute("INSERT INTO api_keys VALUES(?,?,?,?,?,?,?,?)",
-                          (kid, workspace_id, role.value, name, hash_api_key(secret),
-                           _now(), None, None))
-        self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            if max_active is not None:
+                active = self.conn.execute(
+                    "SELECT COUNT(*) AS n FROM api_keys WHERE workspace_id=? AND revoked_at IS NULL",
+                    (workspace_id,)).fetchone()["n"]
+                if active >= max_active:
+                    self.conn.execute("ROLLBACK")
+                    raise IntegrationLimitExceeded(
+                        f"workspace {workspace_id} already has {active} active keys (limit {max_active})")
+            self.conn.execute("INSERT INTO api_keys VALUES(?,?,?,?,?,?,?,?)",
+                              (kid, workspace_id, role.value, name, hash_api_key(secret),
+                               _now(), None, None))
+            self.conn.execute("COMMIT")
+        except IntegrationLimitExceeded:
+            raise
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
         return ApiKeyIssued(kid, workspace_id, role, secret)
 
     def authenticate_api_key(self, raw_secret: str) -> tuple[str, Role] | None:
