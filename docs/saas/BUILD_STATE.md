@@ -43,7 +43,7 @@ unproven gate.
 | 7 | Security, privacy, admin, observability, support, runbooks | **DONE** (ops.py kill switches/audit/metrics, healthz/readyz, RUNBOOKS.md; 5 tests) |
 | 8 | IaC, CI/CD, staging, backup/restore/rollback | **DONE (local layer)** — smoke + backup/verify scripts, make targets, CI steps; cloud IaC owner-gated |
 | 9 | Adversarial/integration/browser/load/recovery/black-box | **DONE (local scope)** — 8 black-box adversarial tests; browser/load vs deployed infra owner-gated |
-| 10 | Staging rehearsal, launch docs, owner handoff | pending |
+| 10 | Staging rehearsal, launch docs, owner handoff | **DONE (local scope)** — LAUNCH.md refreshed vs shipped system; staging rehearsal owner-gated |
 
 ## Sol review gates — BLOCKED (mandatory independent review cannot run)
 The Codex MCP transport is reachable (`mcp__codex__codex` returns structured responses), but the
@@ -79,8 +79,10 @@ former OWNER_ACTIONS #12 blocker is CLEARED at the model level. The direct `mcp_
 Gate-1 call from the main session hit a 1800 s idle timeout (no response/progress); a background
 agent is retrying Gate 1 over MCP. Record its verdict + thread ID in the gate table when it
 returns; if MCP transport keeps hanging, that (not the model) is the remaining blocker.
-Non-blocked implementation continues at **Phase 10**: launch/handoff docs refresh against the
-shipped system. Do NOT mark anything launch-ratified until Sol gates 1–4 pass.
+All non-blocked implementation phases (0–10 local scope) are COMPLETE. Remaining work is
+gate-or-owner-blocked only: (a) Sol gates 1–4 over MCP — model resolves, transport retrying;
+(b) owner credentials for cloud deploy (OWNER_ACTIONS #1–8); (c) staging rehearsal + counsel
+review once (b) lands. Do NOT mark anything launch-ratified until Sol gates 1–4 pass.
 
 ## Phase 9 evidence (2026-07-13)
 - `tests/test_saas_adversarial.py` (8): forged/mutated cookies + bearer keys → 401; client-supplied
