@@ -40,7 +40,7 @@ unproven gate.
 | 4 | Usage ledger, quotas, billing lifecycle, reconciliation | **DONE** (ledger/billing from Phase 1 + reconcile.py; 5 tests) |
 | 5 | App UX, onboarding, live dashboard, integration surfaces | **DONE** (dashboard.py server-rendered app; 6 tests) |
 | 6 | Public website, pricing, enterprise, docs, lifecycle email, legal | **DONE** (site.py static generator; 6 tests; legal = counsel-review templates) |
-| 7 | Security, privacy, admin, observability, support, runbooks | pending |
+| 7 | Security, privacy, admin, observability, support, runbooks | **DONE** (ops.py kill switches/audit/metrics, healthz/readyz, RUNBOOKS.md; 5 tests) |
 | 8 | IaC, CI/CD, staging, backup/restore/rollback | pending |
 | 9 | Adversarial/integration/browser/load/recovery/black-box | pending |
 | 10 | Staging rehearsal, launch docs, owner handoff | pending |
@@ -79,9 +79,19 @@ former OWNER_ACTIONS #12 blocker is CLEARED at the model level. The direct `mcp_
 Gate-1 call from the main session hit a 1800 s idle timeout (no response/progress); a background
 agent is retrying Gate 1 over MCP. Record its verdict + thread ID in the gate table when it
 returns; if MCP transport keeps hanging, that (not the model) is the remaining blocker.
-Non-blocked implementation continues at **Phase 7**: security/ops hardening — admin surface,
-observability counters, support/runbook docs (THREAT_MODEL.md and OPERATIONS.md already exist;
-extend, don't duplicate). Do NOT mark anything launch-ratified until Sol gates 1–4 pass.
+Non-blocked implementation continues at **Phase 8**: local CI/CD + backup/restore tooling
+(everything cloud-side is owner-credential-gated, so Phase 8 delivers the runnable local layer:
+verify/build/backup scripts + smoke test). Do NOT mark anything launch-ratified until Sol gates
+1–4 pass.
+
+## Phase 7 evidence (2026-07-13)
+- `arceo/saas/ops.py` — global/per-workspace kill switches denying new run enqueues (503) with
+  mandatory reason + append-only `admin_audit`; thread-safe metrics counters with text exposition.
+- HTTP: `/v1/healthz`, `/v1/readyz` (DB probe), `/v1/metrics`; `runs_enqueued_total` /
+  `quota_exceeded_total` counters wired at the enqueue choke point.
+- `docs/saas/RUNBOOKS.md` — kill switch, target abuse, billing support, key rotation, credential
+  breach, restore drill, generic incident; all local steps executable today, owner steps marked.
+- Tests: `tests/test_saas_ops.py` (5).
 
 ## Phase 6 evidence (2026-07-13)
 - `arceo/saas/site.py` — static site generator (index, pricing, docs, security, terms, privacy).
@@ -133,4 +143,4 @@ extend, don't duplicate). Do NOT mark anything launch-ratified until Sol gates 1
 - Tests: `tests/test_saas_http_api.py` (15).
 
 ## Fresh verification (2026-07-13, HEAD)
-`python3 -m unittest discover -s tests -p 'test_*.py'` → **318 tests, OK** (Python 3.14.3).
+`python3 -m unittest discover -s tests -p 'test_*.py'` → **323 tests, OK** (Python 3.14.3).

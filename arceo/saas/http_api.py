@@ -26,6 +26,7 @@ from .catalog import CATALOG_VERSION, Meter, get_plan, self_serve_plans
 from .entitlement import EntitlementService, Subscription
 from .jobs import JobPlane
 from .ledger import QuotaExceeded, UsageLedger
+from .ops import KillSwitchTripped, Metrics, OpsStore
 from .tenancy import ControlPlaneStore, Role, require
 from .verification import TargetVerifier
 
@@ -58,6 +59,8 @@ class ControlPlane:
         self.entitlements = EntitlementService(self.ledger)
         self.verifier = TargetVerifier(conn, dns_txt=dns_txt, http_get=http_get)
         self.jobs = JobPlane(conn, scope_validator=scope_validator)
+        self.ops = OpsStore(conn)
+        self.metrics = Metrics()
 
     def subscription(self, workspace_id: str) -> Subscription:
         ws = self.store.get_workspace(workspace_id)
@@ -172,6 +175,8 @@ class _Handler(BaseHTTPRequestHandler):
             handler()
         except ApiError as e:
             self._json(e.status, e.body)
+        except KillSwitchTripped as e:
+            self._json(503, {"error": str(e)})
         except PermissionError as e:
             self._json(403, {"error": str(e)})
         except ThrottledError as e:
@@ -185,6 +190,9 @@ class _Handler(BaseHTTPRequestHandler):
         rest = p[1:]
         flat = {
             ("GET", ("health",)): self._health,
+            ("GET", ("healthz",)): self._health,
+            ("GET", ("readyz",)): self._readyz,
+            ("GET", ("metrics",)): self._metrics,
             ("GET", ("plans",)): self._plans,
             ("POST", ("signup",)): self._signup,
             ("POST", ("login",)): self._login,
@@ -219,6 +227,21 @@ class _Handler(BaseHTTPRequestHandler):
     # --- open endpoints ---
     def _health(self):
         self._json(200, {"ok": True, "catalog_version": CATALOG_VERSION})
+
+    def _readyz(self):
+        try:
+            self.cp.store.conn.execute("SELECT 1")
+        except Exception:
+            raise ApiError(503, "database unavailable")
+        self._json(200, {"ready": True})
+
+    def _metrics(self):
+        body = self.cp.metrics.render().encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _plans(self):
         self._json(200, {"catalog_version": CATALOG_VERSION, "plans": [
@@ -352,12 +375,14 @@ class _Handler(BaseHTTPRequestHandler):
         sub = self.cp.subscription(wid)
         period = current_period()
         idem = str(b.get("idempotency_key")) if b.get("idempotency_key") else None
+        self.cp.ops.check(wid)   # kill switch: deny new spend at enqueue
         if verified and (not target or not self.cp.verifier.is_verified(wid, target)):
             raise ApiError(403, "target is not verified for this workspace")
         try:
             resv = self.cp.entitlements.reserve_run(sub, period, verified=verified,
                                                     idempotency_key=idem)
         except QuotaExceeded as e:
+            self.cp.metrics.inc("quota_exceeded_total")
             self._json(402, {"error": "quota exceeded", "meter": e.meter.value,
                              "upgrade_to": self.cp.entitlements.upgrade_target(sub)})
             return
@@ -371,6 +396,7 @@ class _Handler(BaseHTTPRequestHandler):
             for rid in rids:
                 self.cp.ledger.refund(rid)
             raise ApiError(403, str(e))
+        self.cp.metrics.inc("runs_enqueued_total")
         self._json(202, {"status": "queued", "job_id": job.job_id, "period": period})
 
     def _ws_job_get(self, wid: str, job_id: str):
