@@ -1,7 +1,7 @@
 # Arceo — one-command bring-up (spec §11). Pure stdlib: no installs needed.
 PY ?= python3
 
-.PHONY: demo demo-import demo-launch-review demo-regressions demo-bench test mcp rest ui ui-data scenarios clean help
+.PHONY: demo demo-import demo-launch-review demo-regressions demo-bench test mcp rest ui ui-data scenarios clean help saas-smoke saas-backup saas-restore-verify saas-site
 
 help:
 	@echo "make demo   - synthetic coverage backtest + auth-gate proof (over the MCP boundary)"
@@ -33,6 +33,18 @@ demo-bench:
 
 test:
 	$(PY) -m unittest discover -s tests -p 'test_*.py' -v
+
+saas-smoke:
+	$(PY) scripts/saas_smoke.py
+
+saas-backup:
+	$(PY) scripts/saas_backup.py backup $(DB) $(OUT)
+
+saas-restore-verify:
+	$(PY) scripts/saas_backup.py verify $(OUT)
+
+saas-site:
+	$(PY) -c "from arceo.saas.site import build; print(*build('build/site'), sep='\n')"
 
 mcp:
 	$(PY) -m arceo.mcp_server

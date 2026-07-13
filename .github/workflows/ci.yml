@@ -23,6 +23,10 @@ jobs:
         run: python -m unittest discover -s tests -p 'test_*.py' -v
       - name: One-command demo (auth gate + honest backtests)
         run: python run_demo.py
+      - name: Hosted control-plane smoke (signup → run → verify → kill switch)
+        run: python scripts/saas_smoke.py
+      - name: Static site build
+        run: python -c "from arceo.saas.site import build; build('build/site')"
 
   package:
     name: build + install wheel
