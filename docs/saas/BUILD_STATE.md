@@ -73,4 +73,11 @@ not satisfy any gate.
 See `docs/saas/OWNER_ACTIONS.md`.
 
 ## Exact next action
-Write Phase-1 ADRs (brand/open-core, stack, billing provider) + PRODUCT/PRICING/ARCHITECTURE, then implement the tested control-plane core (catalog + tenancy + entitlement service + atomic usage ledger).
+**BLOCKED on OWNER_ACTIONS #12** (Codex upgrade for `gpt-5.6-sol`) before any Sol gate can ratify.
+Non-blocked implementation continues at **Phase 2**: hosted auth/session HTTP surface + `migrate`
+module (SQLite↔Postgres) + `require()`-guarded control-plane API, then Phase 3 job plane + target
+verification + egress guard. Resume by reading this ledger, re-running the verify command, and
+continuing from Phase 2. Do NOT mark anything launch-ratified until Sol gates 1–4 pass.
+
+## Fresh verification (2026-07-13, base + HEAD)
+`python3 -m unittest discover -s tests -p 'test_*.py'` → **235 tests, OK** (Python 3.14.3).

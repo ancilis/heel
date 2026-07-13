@@ -83,18 +83,18 @@ _PLANS = {
     "free": Plan(
         id="free", name="Free", price_month_cents=0, price_year_cents=0, no_card=True,
         support="community",
-        quotas=_q(runs=25, verified_targets=1, concurrency=1, retention_days=7, seats=1, integrations=0),
+        quotas=_q(runs=25, verified_runs=5, verified_targets=1, concurrency=1, retention_days=7, seats=1, integrations=0),
         # 25 = 20 synthetic + 5 verified (enforced separately by run kind; see PRICING doc).
         features=frozenset(),
     ),
     "pro": Plan(
         id="pro", name="Pro", price_month_cents=4900, price_year_cents=49000, support="email",
-        quotas=_q(runs=300, verified_targets=5, concurrency=3, retention_days=30, seats=3, integrations=3),
+        quotas=_q(runs=300, verified_runs=100, verified_targets=5, concurrency=3, retention_days=30, seats=3, integrations=3),
         features=frozenset({Feature.API, Feature.MCP, Feature.EXPORTS, Feature.SCHEDULED_REGRESSIONS}),
     ),
     "team": Plan(
         id="team", name="Team", price_month_cents=19900, price_year_cents=199000, support="priority",
-        quotas=_q(runs=1500, verified_targets=25, concurrency=8, retention_days=90, seats=10, integrations=10),
+        quotas=_q(runs=1500, verified_runs=500, verified_targets=25, concurrency=8, retention_days=90, seats=10, integrations=10),
         features=frozenset({
             Feature.API, Feature.MCP, Feature.EXPORTS, Feature.SCHEDULED_REGRESSIONS,
             Feature.RBAC, Feature.AUDIT_EXPORT,
@@ -103,7 +103,7 @@ _PLANS = {
     "enterprise": Plan(
         id="enterprise", name="Enterprise", price_month_cents=CUSTOM, price_year_cents=CUSTOM,
         contact_sales=True, support="sla",
-        quotas=_q(runs=CUSTOM, verified_targets=CUSTOM, concurrency=CUSTOM, retention_days=CUSTOM,
+        quotas=_q(runs=CUSTOM, verified_runs=CUSTOM, verified_targets=CUSTOM, concurrency=CUSTOM, retention_days=CUSTOM,
                   seats=CUSTOM, integrations=CUSTOM),
         # Enterprise-only features default present in the plan but are gated ON only when the
         # deployment actually configures them (entitlement.py checks configuration, not the flag).

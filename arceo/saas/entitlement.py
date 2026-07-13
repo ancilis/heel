@@ -74,6 +74,23 @@ class EntitlementService:
         return self.ledger.reserve(self.effective_plan(sub), sub.workspace_id, meter, amount, period,
                                    idempotency_key=idempotency_key, ref=ref)
 
+    def reserve_run(self, sub: Subscription, period: str, *, verified: bool,
+                    idempotency_key: str | None = None, ref: str | None = None) -> list[Reservation]:
+        """Reserve one rehearsal run. A verified-target run also draws down the VERIFIED_RUNS ceiling
+        (the costly subset that bounds free-tier liability). Both reservations succeed or neither does:
+        if the verified ceiling is exhausted, the RUNS reservation is refunded before raising."""
+        runs_resv = self.reserve(sub, Meter.RUNS, 1, period,
+                                 idempotency_key=idempotency_key, ref=ref)
+        if not verified:
+            return [runs_resv]
+        vk = f"{idempotency_key}:verified" if idempotency_key else None
+        try:
+            vr = self.reserve(sub, Meter.VERIFIED_RUNS, 1, period, idempotency_key=vk, ref=ref)
+        except QuotaExceeded:
+            self.ledger.refund(runs_resv.reservation_id)
+            raise
+        return [runs_resv, vr]
+
     def can_run(self, sub: Subscription, period: str, amount: int = 1) -> bool:
         rem = self.remaining(sub, Meter.RUNS, period)
         return rem is None or rem >= amount

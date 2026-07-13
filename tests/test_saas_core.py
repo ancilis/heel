@@ -237,6 +237,20 @@ class EntitlementTests(unittest.TestCase):
     def test_enterprise_no_upgrade_target(self):
         self.assertIsNone(self.ent.upgrade_target(self.sub("enterprise")))
 
+    def test_verified_run_ceiling_bounds_free_liability(self):
+        # Free: runs=25 but verified_runs=5. All-verified usage must stop at 5, not 25.
+        s = self.sub("free")
+        for i in range(5):
+            self.ent.reserve_run(s, PERIOD, verified=True, idempotency_key=f"r{i}")
+        with self.assertRaises(QuotaExceeded):
+            self.ent.reserve_run(s, PERIOD, verified=True, idempotency_key="r5")
+        # The refund on failure means total RUNS usage is exactly 5 (no leaked run credit).
+        self.assertEqual(self.ledger.usage("ws1", Meter.RUNS, PERIOD), 5)
+        self.assertEqual(self.ledger.usage("ws1", Meter.VERIFIED_RUNS, PERIOD), 5)
+        # Synthetic runs still available up to the total run credit.
+        self.ent.reserve_run(s, PERIOD, verified=False, idempotency_key="syn0")
+        self.assertEqual(self.ledger.usage("ws1", Meter.RUNS, PERIOD), 6)
+
 
 class BillingTests(unittest.TestCase):
     def setUp(self):
