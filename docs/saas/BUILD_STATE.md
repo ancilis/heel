@@ -35,7 +35,7 @@ unproven gate.
 |---|---|---|
 | 0 | Inventory, reconcile upstream, worktree, baseline | **DONE** |
 | 1 | Brand/open-core ADR, ICP, plans/prices, entitlement contract, architecture | in progress |
-| 2 | SaaS foundation: schema, tenancy, auth, roles, API keys | pending |
+| 2 | SaaS foundation: schema, tenancy, auth, roles, API keys | **DONE** (auth.py, migrate.py, http_api.py; 15 tests) |
 | 3 | Job plane, target verification, signed scopes, safe adapters | pending |
 | 4 | Usage ledger, quotas, billing lifecycle, reconciliation | pending |
 | 5 | App UX, onboarding, live dashboard, integration surfaces | pending |
@@ -73,11 +73,26 @@ not satisfy any gate.
 See `docs/saas/OWNER_ACTIONS.md`.
 
 ## Exact next action
-**BLOCKED on OWNER_ACTIONS #12** (Codex upgrade for `gpt-5.6-sol`) before any Sol gate can ratify.
-Non-blocked implementation continues at **Phase 2**: hosted auth/session HTTP surface + `migrate`
-module (SQLite↔Postgres) + `require()`-guarded control-plane API, then Phase 3 job plane + target
-verification + egress guard. Resume by reading this ledger, re-running the verify command, and
-continuing from Phase 2. Do NOT mark anything launch-ratified until Sol gates 1–4 pass.
+Codex CLI is now **0.144.3** and `gpt-5.6-sol` RESOLVES (CLI diagnostic `codex exec --model
+gpt-5.6-sol` returned `SOL-OK`, session `019f5b57-9ef2-7910-8cf6-e4a29ffd8ddd`, 2026-07-13) — the
+former OWNER_ACTIONS #12 blocker is CLEARED at the model level. The direct `mcp__codex__codex`
+Gate-1 call from the main session hit a 1800 s idle timeout (no response/progress); a background
+agent is retrying Gate 1 over MCP. Record its verdict + thread ID in the gate table when it
+returns; if MCP transport keeps hanging, that (not the model) is the remaining blocker.
+Non-blocked implementation continues at **Phase 3**: job plane, target verification (DNS TXT /
+HTTP challenge), signed-scope integration, per-run budget ceilings, egress guard. Do NOT mark
+anything launch-ratified until Sol gates 1–4 pass.
 
-## Fresh verification (2026-07-13, base + HEAD)
-`python3 -m unittest discover -s tests -p 'test_*.py'` → **235 tests, OK** (Python 3.14.3).
+## Phase 2 evidence (2026-07-13)
+- `arceo/saas/auth.py` — PBKDF2 (600k iters) passwords, hashed opaque sessions with TTL+idle
+  expiry, per-email lockout throttle.
+- `arceo/saas/migrate.py` — ordered versioned migrations + `schema_migrations` tracking,
+  sqlite/postgres dialect translate, parametrized `copy_table` export.
+- `arceo/saas/http_api.py` — loopback-default JSON control plane; every workspace route through
+  `tenancy.require`; API keys workspace-bound, never owner/admin, never `create_scope`
+  (human-only preserved); verified runs 501 until Phase 3; signed webhook + plan re-pin;
+  quota 402 with upgrade hint.
+- Tests: `tests/test_saas_http_api.py` (15).
+
+## Fresh verification (2026-07-13, HEAD)
+`python3 -m unittest discover -s tests -p 'test_*.py'` → **287 tests, OK** (Python 3.14.3).
