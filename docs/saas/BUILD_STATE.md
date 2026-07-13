@@ -45,31 +45,26 @@ unproven gate.
 | 9 | Adversarial/integration/browser/load/recovery/black-box | **DONE (local scope)** — 8 black-box adversarial tests; browser/load vs deployed infra owner-gated |
 | 10 | Staging rehearsal, launch docs, owner handoff | **DONE (local scope)** — LAUNCH.md refreshed vs shipped system; staging rehearsal owner-gated |
 
-## Sol review gates — BLOCKED (MCP transport, not the model)
-History: the original blocker (`gpt-5.6-sol` needs newer Codex) is CLEARED — Codex CLI is 0.144.3
-and a CLI diagnostic (`codex exec --model gpt-5.6-sol`, session `019f5b57-9ef2-7910-8cf6-e4a29ffd8ddd`,
-2026-07-13) returned the expected output in seconds. Per instruction, CLI output is diagnostic only;
-gates must run over `mcp__codex__codex`.
-
-Current blocker: **three** Gate-1 attempts over `mcp__codex__codex` on 2026-07-13 (one from the main
-session ~11:28–11:58, two from a delegated agent 11:58–12:59, identical read-only Gate-1 prompt,
-model `gpt-5.6-sol`, sandbox read-only) each aborted with:
-
-> MCP server "codex" tool "codex" sent no response or progress for 1800s; aborting.
-
-The MCP server accepts the call but emits no response/progress for 30 minutes while the same model
-answers instantly via CLI — the transport (likely a stale running MCP server process, or Sol-ultra
-runs exceeding the idle timeout without progress events) is the fault. Owner remedies: restart the
-codex MCP server so it runs the 0.144.3 binary, and/or set a per-server `timeout` (or
-`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=0`) so long silent Sol runs can complete. A **builder
-self-review** exists in `docs/saas/SELF_REVIEW.md`; it does NOT satisfy any gate.
+## Sol review gates
+The MCP transport blocker is CLEARED: on the fresh 2026-07-13 session (Codex CLI 0.144.3), the
+prior codex MCP server had been restarted and `mcp__codex__codex` (model `gpt-5.6-sol`, sandbox
+read-only) responded normally. Gate 1 ran as a true adversarial loop — Sol found real defects each
+round; Fable fixed, tested, committed, and re-submitted on the same thread until PASS.
 
 | Gate | Scope | Thread ID | Disposition |
 |---|---|---|---|
-| 1 | Catalog, brand, architecture, open-core boundary | — | BLOCKED (MCP idle-timeout ×3; model OK via CLI) |
-| 2 | Tenancy, target verification, scope, worker isolation | — | BLOCKED |
-| 3 | Billing, entitlement, usage ledger, free-tier liability | — | BLOCKED |
-| 4 | Final diff, threat model, ops, website claims, launch readiness | — | BLOCKED |
+| 1 | Catalog, brand, architecture, open-core boundary | `019f5d11-c4f2-70e3-ad85-1111ffedf685` | **PASS** (2026-07-13, after 4 fix rounds: e0c1581, ca2e4a6, 2cb4cf8, d8cff3c) |
+| 2 | Tenancy, target verification, scope, worker isolation | — | pending |
+| 3 | Billing, entitlement, usage ledger, free-tier liability | — | pending |
+| 4 | Final diff, threat model, ops, website claims, launch readiness | — | pending |
+
+Gate-1 defects closed (each re-verified by Sol): replay-proof idempotent enqueue; fail-closed
+billing webhook (503 without secret); execution-side concurrency/retention/integrations
+enforcement; subscription catalog-version pinning; `web/` restored to Apache-2.0 with corrected
+ADR-0001 boundary; honest API/CLI pricing language; honest ADR-0002/0003 implementation status;
+refunded idempotency keys burned (409); atomic API-key quota; enqueue-race rollback; per-IP +
+platform-wide signup throttles on BOTH signup surfaces; automatic global run/verified-run circuit
+breaker inside the ledger transaction; cross-workspace hostname verification cap.
 
 ## Open risks
 - Full hosted deployment (live Postgres, Stripe live mode, deployed Next.js backend, workers, IaC-provisioned cloud) requires owner-only external credentials — tracked in `OWNER_ACTIONS.md`.
@@ -78,16 +73,12 @@ self-review** exists in `docs/saas/SELF_REVIEW.md`; it does NOT satisfy any gate
 See `docs/saas/OWNER_ACTIONS.md`.
 
 ## Exact next action
-Codex CLI is now **0.144.3** and `gpt-5.6-sol` RESOLVES (CLI diagnostic `codex exec --model
-gpt-5.6-sol` returned `SOL-OK`, session `019f5b57-9ef2-7910-8cf6-e4a29ffd8ddd`, 2026-07-13) — the
-former OWNER_ACTIONS #12 blocker is CLEARED at the model level. The direct `mcp__codex__codex`
-Gate-1 call from the main session hit a 1800 s idle timeout (no response/progress); a background
-agent is retrying Gate 1 over MCP. Record its verdict + thread ID in the gate table when it
-returns; if MCP transport keeps hanging, that (not the model) is the remaining blocker.
-All non-blocked implementation phases (0–10 local scope) are COMPLETE. Remaining work is
-gate-or-owner-blocked only: (a) Sol gates 1–4 over MCP — model resolves, transport retrying;
-(b) owner credentials for cloud deploy (OWNER_ACTIONS #1–8); (c) staging rehearsal + counsel
-review once (b) lands. Do NOT mark anything launch-ratified until Sol gates 1–4 pass.
+Gate 1 is **PASS** (thread `019f5d11-c4f2-70e3-ad85-1111ffedf685`). Run Gates 2 → 3 → 4 over
+`mcp__codex__codex` the same way (fresh thread per gate, read-only, `gpt-5.6-sol`), fixing any
+findings between rounds and recording thread IDs + verdicts above. After Gate 4 passes, the
+remaining work is owner-gated only: (a) owner credentials for cloud deploy (OWNER_ACTIONS #1–8);
+(b) staging rehearsal + counsel review once (a) lands. Do NOT mark anything launch-ratified until
+Sol gates 1–4 pass. Suite state at Gate-1 PASS: 360 tests OK, smoke PASS (d8cff3c).
 
 ## Phase 9 evidence (2026-07-13)
 - `tests/test_saas_adversarial.py` (8): forged/mutated cookies + bearer keys → 401; client-supplied
