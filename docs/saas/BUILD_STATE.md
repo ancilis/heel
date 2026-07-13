@@ -45,23 +45,28 @@ unproven gate.
 | 9 | Adversarial/integration/browser/load/recovery/black-box | **DONE (local scope)** — 8 black-box adversarial tests; browser/load vs deployed infra owner-gated |
 | 10 | Staging rehearsal, launch docs, owner handoff | **DONE (local scope)** — LAUNCH.md refreshed vs shipped system; staging rehearsal owner-gated |
 
-## Sol review gates — BLOCKED (mandatory independent review cannot run)
-The Codex MCP transport is reachable (`mcp__codex__codex` returns structured responses), but the
-mandated reviewer model **`gpt-5.6-sol` is unavailable on the installed Codex**. Exact error, returned
-twice (initial + one retry) on 2026-07-13:
+## Sol review gates — BLOCKED (MCP transport, not the model)
+History: the original blocker (`gpt-5.6-sol` needs newer Codex) is CLEARED — Codex CLI is 0.144.3
+and a CLI diagnostic (`codex exec --model gpt-5.6-sol`, session `019f5b57-9ef2-7910-8cf6-e4a29ffd8ddd`,
+2026-07-13) returned the expected output in seconds. Per instruction, CLI output is diagnostic only;
+gates must run over `mcp__codex__codex`.
 
-> 400 invalid_request_error: "The 'gpt-5.6-sol' model requires a newer version of Codex. Please
-> upgrade to the latest app or CLI and try again."
+Current blocker: **three** Gate-1 attempts over `mcp__codex__codex` on 2026-07-13 (one from the main
+session ~11:28–11:58, two from a delegated agent 11:58–12:59, identical read-only Gate-1 prompt,
+model `gpt-5.6-sol`, sandbox read-only) each aborted with:
 
-Per §17 of the master prompt, I must NOT silently substitute another reviewer (e.g. gpt-5.2). No Sol
-gate can be ratified until an owner upgrades the Codex CLI/app so `gpt-5.6-sol` resolves. This is a
-true external blocker (see OWNER_ACTIONS #12). A **builder self-review** was performed instead and is
-recorded in `docs/saas/SELF_REVIEW.md` — it is explicitly NOT the mandated independent review and does
-not satisfy any gate.
+> MCP server "codex" tool "codex" sent no response or progress for 1800s; aborting.
+
+The MCP server accepts the call but emits no response/progress for 30 minutes while the same model
+answers instantly via CLI — the transport (likely a stale running MCP server process, or Sol-ultra
+runs exceeding the idle timeout without progress events) is the fault. Owner remedies: restart the
+codex MCP server so it runs the 0.144.3 binary, and/or set a per-server `timeout` (or
+`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=0`) so long silent Sol runs can complete. A **builder
+self-review** exists in `docs/saas/SELF_REVIEW.md`; it does NOT satisfy any gate.
 
 | Gate | Scope | Thread ID | Disposition |
 |---|---|---|---|
-| 1 | Catalog, brand, architecture, open-core boundary | — | BLOCKED (Codex upgrade needed) |
+| 1 | Catalog, brand, architecture, open-core boundary | — | BLOCKED (MCP idle-timeout ×3; model OK via CLI) |
 | 2 | Tenancy, target verification, scope, worker isolation | — | BLOCKED |
 | 3 | Billing, entitlement, usage ledger, free-tier liability | — | BLOCKED |
 | 4 | Final diff, threat model, ops, website claims, launch readiness | — | BLOCKED |
