@@ -82,13 +82,14 @@ class FinalIntegrationDocsTests(unittest.TestCase):
     def test_pyproject_keeps_zero_runtime_dependencies_and_matches_readme_positioning(self):
         with (ROOT / "pyproject.toml").open("rb") as fh:
             project = tomllib.load(fh)["project"]
-        readme = self.read("README.md").lower()
         description = project["description"].lower()
 
         self.assertEqual(project["dependencies"], [])
-        self.assertIn("abuse rehearsal", description)
-        self.assertIn("pre-launch", description)
-        self.assertIn("existing-product", description)
+        self.assertEqual(
+            description,
+            "privacy-first local saas launch review for browser, cli, and mcp workflows.",
+        )
+        readme = self.read("README.md").lower()
         self.assertIn("abuse rehearsal", readme)
         self.assertIn("pre-launch", readme)
         self.assertIn("existing products", readme)

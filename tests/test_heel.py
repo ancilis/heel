@@ -1194,15 +1194,14 @@ class TestDocsAndMetadata(unittest.TestCase):
         self.assertIn("signed scopes", security)
         self.assertIn("canary-only", security)
 
-    def test_pyproject_description_positions_abuse_rehearsal_without_pentest_overclaim(self):
+    def test_pyproject_description_positions_local_launch_review(self):
         with (self.ROOT / "pyproject.toml").open("rb") as fh:
             project = tomllib.load(fh)["project"]
-        description = project["description"].lower()
 
-        self.assertIn("abuse rehearsal", description)
-        self.assertIn("saas", description)
-        self.assertNotIn("pentest replacement", description)
-        self.assertNotIn("penetration testing replacement", description)
+        self.assertEqual(
+            project["description"],
+            "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.",
+        )
 
     def test_docs_keep_production_ready_spine_beta_adapters_phrase(self):
         readme = self._read("README.md")

@@ -30,10 +30,12 @@ class HeelBrandingTests(unittest.TestCase):
             project = tomllib.load(fh)["project"]
 
         self.assertEqual(project["name"], "heel-sim")
-        self.assertIn("Heel", project["description"])
-        self.assertEqual(project["urls"]["Homepage"], "https://github.com/ancilis/heel")
-        self.assertEqual(project["urls"]["Source"], "https://github.com/ancilis/heel")
-        self.assertEqual(project["urls"]["Issues"], "https://github.com/ancilis/heel/issues")
+        self.assertEqual(
+            project["description"],
+            "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.",
+        )
+        self.assertEqual(project["readme"], "release/open-core/README.md")
+        self.assertNotIn("urls", project)
 
     def test_console_scripts_use_heel_names_only(self):
         with (ROOT / "pyproject.toml").open("rb") as fh:
@@ -56,9 +58,13 @@ class HeelBrandingTests(unittest.TestCase):
             setuptools,
             {
                 "include-package-data": False,
+                "license-files": ["LICENSE", "NOTICE"],
                 "packages": ["heel"],
                 "package-data": {
-                    "heel": ["scenarios_lib/*.json", "heldout/*.json"],
+                    "heel": [
+                        "heldout/targets.json",
+                        "scenarios_lib/community.json",
+                    ],
                 },
             },
         )

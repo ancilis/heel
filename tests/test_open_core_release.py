@@ -1,10 +1,19 @@
 """Fail-closed boundary tests for the Apache-only Heel release contract."""
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 from pathlib import Path, PurePosixPath
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
 import tomllib
 import unittest
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,35 +24,51 @@ FORBIDDEN_PREFIXES = (
     "docs/saas/",
     "docs/superpowers/",
     "heel/saas/",
+    "tests/",
+    "web/",
+)
+FORBIDDEN_RELEASE_MARKERS = (
+    b"LicenseRef-Heel-Commercial",
+    b"LICENSE-COMMERCIAL",
+)
+FORBIDDEN_DISTRIBUTED_CONTENT_MARKERS = FORBIDDEN_RELEASE_MARKERS + (
+    b"apps/heel-cloud",
+    b"deploy/",
+    b"docs/saas",
+    b"docs/superpowers",
+    b"heel/saas",
+    b"tests/saas",
+)
+FORBIDDEN_RELEASE_DOC_MARKERS = (
+    "apps/",
+    "docs/saas",
+    "github.com/ancilis/heel",
+    "heel/saas",
+    "pypi.org/project/heel-sim",
+    "pip install heel-sim",
+    "tests/",
     "web/",
 )
 EXPECTED_CONTRACT = {
+    "build_files": [
+        "MANIFEST.in",
+        "pyproject.toml",
+        "release/open-core-v1.json",
+    ],
     "console_scripts": {
         "heel": "heel.cli:main",
         "heel-mcp": "heel.mcp_server:main",
         "heel-rest": "heel.rest:serve",
     },
     "documents": [
-        "ARCHITECTURE.md",
-        "CHANGELOG.md",
-        "CONTRIBUTING.md",
-        "DECISIONS.md",
-        "README.md",
-        "SECURITY.md",
-        "TRUST.md",
-        "docs/ENTITLEMENTS.md",
-        "docs/LAUNCH_REVIEW.md",
-        "docs/MCP_QUICKSTART.md",
-        "docs/MODES.md",
-        "docs/OPENAPI_IMPORT.md",
-        "docs/REGRESSIONS.md",
+        "release/open-core/MCP_QUICKSTART.md",
+        "release/open-core/README.md",
+        "release/open-core/SECURITY.md",
     ],
     "licenses": ["DCO", "LICENSE", "NOTICE"],
     "package_data": [
         "heel/heldout/targets.json",
-        "heel/heldout/test_targets.json",
         "heel/scenarios_lib/community.json",
-        "heel/scenarios_lib/research_owasp.json",
     ],
     "python_modules": [
         "heel/__init__.py",
@@ -95,17 +120,53 @@ EXPECTED_CONTRACT = {
     "schema_version": "heel.open-core-release.v1",
     "version": "1.1.0",
 }
-EXPECTED_MANIFEST = """include ARCHITECTURE.md CHANGELOG.md CONTRIBUTING.md DCO DECISIONS.md LICENSE NOTICE README.md SECURITY.md TRUST.md
-include docs/ENTITLEMENTS.md docs/LAUNCH_REVIEW.md docs/MCP_QUICKSTART.md docs/MODES.md docs/OPENAPI_IMPORT.md docs/REGRESSIONS.md
+EXPECTED_MANIFEST = """include DCO LICENSE NOTICE
 include heel/*.py
-include heel/heldout/*.json
-include heel/scenarios_lib/*.json
-prune heel/saas
+include heel/heldout/targets.json
+include heel/scenarios_lib/community.json
+include release/open-core-v1.json
+include release/open-core/MCP_QUICKSTART.md release/open-core/README.md release/open-core/SECURITY.md
+exclude LICENSE-COMMERCIAL.md
+exclude README.md
+exclude heel/heldout/test_targets.json
+exclude heel/scenarios_lib/research_owasp.json
+prune apps
+prune deploy
 prune docs/saas
 prune docs/superpowers
+prune heel/saas
+prune tests
+prune web
 global-exclude __pycache__/*
 global-exclude *.pyc
 """
+
+
+def _copy_tracked_snapshot(destination: Path) -> None:
+    """Copy tracked files plus newly allowlisted release inputs for pre-commit builds."""
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    )
+    relative_paths = {
+        os.fsdecode(raw_path)
+        for raw_path in result.stdout.split(b"\0")
+        if raw_path
+    }
+    contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+    for field in ("build_files", "documents", "licenses", "package_data", "python_modules"):
+        relative_paths.update(contract[field])
+    for relative_name in sorted(relative_paths):
+        relative = Path(relative_name)
+        source = ROOT / relative
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            target.symlink_to(os.readlink(source))
+        else:
+            shutil.copy2(source, target)
 
 
 class OpenCoreReleaseTests(unittest.TestCase):
@@ -128,6 +189,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
         self.assertEqual(
             set(contract),
             {
+                "build_files",
                 "console_scripts",
                 "documents",
                 "licenses",
@@ -139,7 +201,8 @@ class OpenCoreReleaseTests(unittest.TestCase):
         )
         self.assertEqual(contract["schema_version"], "heel.open-core-release.v1")
         paths = (
-            contract["python_modules"]
+            contract["build_files"]
+            + contract["python_modules"]
             + contract["package_data"]
             + contract["documents"]
             + contract["licenses"]
@@ -151,23 +214,192 @@ class OpenCoreReleaseTests(unittest.TestCase):
             self.assertFalse(normalized.is_absolute(), path)
             self.assertFalse(path.startswith(FORBIDDEN_PREFIXES), path)
             self.assertNotIn("..", normalized.parts)
+            self.assertTrue((ROOT / path).is_file(), path)
+
+        actual_python_modules = {
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / "heel").glob("*.py")
+            if path.is_file()
+        }
+        self.assertEqual(actual_python_modules, set(contract["python_modules"]))
 
         with (ROOT / "pyproject.toml").open("rb") as file:
-            setuptools = tomllib.load(file)["tool"]["setuptools"]
+            pyproject = tomllib.load(file)
+        project = pyproject["project"]
+        self.assertEqual(
+            project["description"],
+            "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.",
+        )
+        self.assertEqual(project["readme"], "release/open-core/README.md")
+        self.assertNotIn("urls", project)
+        setuptools = pyproject["tool"]["setuptools"]
         self.assertEqual(
             setuptools,
             {
                 "include-package-data": False,
+                "license-files": ["LICENSE", "NOTICE"],
                 "packages": ["heel"],
                 "package-data": {
-                    "heel": ["scenarios_lib/*.json", "heldout/*.json"],
+                    "heel": [
+                        "heldout/targets.json",
+                        "scenarios_lib/community.json",
+                    ],
                 },
             },
+        )
+        self.assertEqual(
+            {f"heel/{path}" for path in setuptools["package-data"]["heel"]},
+            set(contract["package_data"]),
         )
         self.assertEqual(
             (ROOT / "MANIFEST.in").read_text(encoding="utf-8"),
             EXPECTED_MANIFEST,
         )
+
+    def test_release_docs_are_self_contained_and_avoid_private_commands(self):
+        contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        documents = set(contract["documents"])
+        missing_links: dict[str, list[str]] = {}
+
+        for source in contract["documents"]:
+            source_path = ROOT / source
+            text = source_path.read_text(encoding="utf-8")
+            for destination in re.findall(r"\[[^]]*\]\(([^)]+)\)", text):
+                destination = destination.split("#", 1)[0].strip()
+                if not destination or "://" in destination or destination.startswith("mailto:"):
+                    continue
+                target = (source_path.parent / destination).resolve()
+                try:
+                    relative = target.relative_to(ROOT.resolve()).as_posix()
+                except ValueError:
+                    self.fail(f"release doc link escapes the repository: {source} -> {destination}")
+                if relative.endswith(".md") and relative not in documents:
+                    missing_links.setdefault(relative, []).append(source)
+
+            fenced_blocks = re.findall(r"```[^\n]*\n(.*?)```", text, flags=re.DOTALL)
+            for block in fenced_blocks:
+                for marker in FORBIDDEN_RELEASE_DOC_MARKERS:
+                    self.assertNotIn(marker, block, f"{source}: {marker}")
+            for marker in FORBIDDEN_RELEASE_DOC_MARKERS:
+                self.assertNotIn(marker, text, f"{source}: {marker}")
+
+        self.assertEqual(missing_links, {})
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("build") is not None,
+        "the optional local 'build' package is required for archive integration",
+    )
+    def test_standard_setuptools_artifacts_preserve_public_boundary(self):
+        contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        dist_info = "heel_sim-1.1.0.dist-info"
+
+        with tempfile.TemporaryDirectory(prefix="heel-open-core-build-") as temporary:
+            temporary_path = Path(temporary)
+            source = temporary_path / "source"
+            dist = temporary_path / "dist"
+            source.mkdir()
+            _copy_tracked_snapshot(source)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "build",
+                    "--no-isolation",
+                    "--outdir",
+                    str(dist),
+                    str(source),
+                ],
+                cwd=source,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stdout + "\n" + result.stderr,
+            )
+
+            wheels = list(dist.glob("*.whl"))
+            sdists = list(dist.glob("*.tar.gz"))
+            self.assertEqual(len(wheels), 1, wheels)
+            self.assertEqual(len(sdists), 1, sdists)
+
+            expected_wheel_files = set(contract["python_modules"])
+            expected_wheel_files.update(contract["package_data"])
+            expected_wheel_files.update(
+                {
+                    f"{dist_info}/METADATA",
+                    f"{dist_info}/RECORD",
+                    f"{dist_info}/WHEEL",
+                    f"{dist_info}/entry_points.txt",
+                    f"{dist_info}/licenses/LICENSE",
+                    f"{dist_info}/licenses/NOTICE",
+                    f"{dist_info}/top_level.txt",
+                }
+            )
+            with zipfile.ZipFile(wheels[0]) as wheel:
+                wheel_files = wheel.namelist()
+                self.assertEqual(len(wheel_files), len(set(wheel_files)))
+                self.assertEqual(set(wheel_files), expected_wheel_files)
+                for path in wheel_files:
+                    self.assertFalse(path.startswith(FORBIDDEN_PREFIXES), path)
+                metadata = wheel.read(f"{dist_info}/METADATA")
+                self.assertEqual(
+                    [
+                        line
+                        for line in metadata.decode("utf-8").splitlines()
+                        if line.startswith("License-File: ")
+                    ],
+                    ["License-File: LICENSE", "License-File: NOTICE"],
+                )
+                for path in wheel_files:
+                    contents = wheel.read(path)
+                    for marker in FORBIDDEN_DISTRIBUTED_CONTENT_MARKERS:
+                        self.assertNotIn(marker, contents, path)
+
+            sdist_prefix = f"heel_sim-{contract['version']}/"
+            expected_sdist_files = {
+                *contract["build_files"],
+                *contract["documents"],
+                *contract["licenses"],
+                *contract["python_modules"],
+                *contract["package_data"],
+                "PKG-INFO",
+                "setup.cfg",
+                "heel_sim.egg-info/PKG-INFO",
+                "heel_sim.egg-info/SOURCES.txt",
+                "heel_sim.egg-info/dependency_links.txt",
+                "heel_sim.egg-info/entry_points.txt",
+                "heel_sim.egg-info/requires.txt",
+                "heel_sim.egg-info/top_level.txt",
+            }
+            with tarfile.open(sdists[0], "r:gz") as sdist:
+                members = sdist.getmembers()
+                self.assertFalse(
+                    [member.name for member in members if member.issym() or member.islnk()]
+                )
+                sdist_files = [member for member in members if member.isfile()]
+                names = [member.name for member in sdist_files]
+                self.assertEqual(len(names), len(set(names)))
+                for name in names:
+                    self.assertTrue(name.startswith(sdist_prefix), name)
+                relative_files = {name.removeprefix(sdist_prefix) for name in names}
+                self.assertEqual(relative_files, expected_sdist_files)
+                for path in relative_files:
+                    self.assertFalse(path.startswith(FORBIDDEN_PREFIXES), path)
+                    self.assertNotIn("LICENSE-COMMERCIAL", path)
+                for member in sdist_files:
+                    file = sdist.extractfile(member)
+                    self.assertIsNotNone(file, member.name)
+                    contents = file.read()
+                    if member.name == sdist_prefix + "MANIFEST.in":
+                        self.assertEqual(contents.count(b"LICENSE-COMMERCIAL"), 1)
+                        self.assertNotIn(b"LicenseRef-Heel-Commercial", contents)
+                        continue
+                    for marker in FORBIDDEN_DISTRIBUTED_CONTENT_MARKERS:
+                        self.assertNotIn(marker, contents, member.name)
 
 
 if __name__ == "__main__":

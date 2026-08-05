@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "heel-sim"
 version = "1.1.0"
-description = "Heel is MCP-first continuous SaaS abuse rehearsal for pre-launch review and authorized canary-only existing-product runs."
-readme = "README.md"
+description = "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows."
+readme = "release/open-core/README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Ancilis" }]
@@ -23,11 +23,6 @@ classifiers = [
 # v1 core is PURE STANDARD LIBRARY by design (DECISIONS D-001) — zero runtime dependencies.
 dependencies = []
 
-[project.urls]
-Homepage = "https://github.com/ancilis/heel"
-Source = "https://github.com/ancilis/heel"
-Issues = "https://github.com/ancilis/heel/issues"
-
 [project.optional-dependencies]
 # the LLM control loop uses the Anthropic Messages API via stdlib urllib (no SDK needed);
 # this extra is only a convenience marker — no package is actually required.
@@ -40,7 +35,8 @@ heel-rest = "heel.rest:serve"
 
 [tool.setuptools]
 include-package-data = false
+license-files = ["LICENSE", "NOTICE"]
 packages = ["heel"]
 
 [tool.setuptools.package-data]
-heel = ["scenarios_lib/*.json", "heldout/*.json"]
+heel = ["heldout/targets.json", "scenarios_lib/community.json"]

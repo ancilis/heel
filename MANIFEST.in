@@ -1,10 +1,19 @@
-include ARCHITECTURE.md CHANGELOG.md CONTRIBUTING.md DCO DECISIONS.md LICENSE NOTICE README.md SECURITY.md TRUST.md
-include docs/ENTITLEMENTS.md docs/LAUNCH_REVIEW.md docs/MCP_QUICKSTART.md docs/MODES.md docs/OPENAPI_IMPORT.md docs/REGRESSIONS.md
+include DCO LICENSE NOTICE
 include heel/*.py
-include heel/heldout/*.json
-include heel/scenarios_lib/*.json
-prune heel/saas
+include heel/heldout/targets.json
+include heel/scenarios_lib/community.json
+include release/open-core-v1.json
+include release/open-core/MCP_QUICKSTART.md release/open-core/README.md release/open-core/SECURITY.md
+exclude LICENSE-COMMERCIAL.md
+exclude README.md
+exclude heel/heldout/test_targets.json
+exclude heel/scenarios_lib/research_owasp.json
+prune apps
+prune deploy
 prune docs/saas
 prune docs/superpowers
+prune heel/saas
+prune tests
+prune web
 global-exclude __pycache__/*
 global-exclude *.pyc
