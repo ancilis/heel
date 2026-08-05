@@ -116,7 +116,9 @@ function analyzeSource(fileName, text) {
   );
   const relativeName = relative(appRootPath, fileName).replaceAll("\\", "/");
   const violations = [];
-  const networkCapabilities = new Set(["fetch", "XMLHttpRequest", "WebSocket", "EventSource", "sendBeacon"]);
+  const networkCapabilities = new Set([
+    "fetch", "importScripts", "XMLHttpRequest", "WebSocket", "EventSource", "sendBeacon",
+  ]);
   const ambientRoots = new Set([
     "document", "frames", "globalThis", "navigator", "parent", "self", "top", "window",
   ]);
@@ -560,6 +562,17 @@ function analyzeSource(fileName, text) {
 
   function reviewedRuntimeUrlDeclaration(name) {
     if (!["RUNTIME_MANIFEST_URL", "WHEEL_URL"].includes(name)) return false;
+    return reviewedRuntimeConstantDeclaration(name);
+  }
+
+  function reviewedRuntimeConstantDeclaration(name) {
+    const expected = new Map([
+      ["RUNTIME_ROOT", `"/heel-runtime/"`],
+      ["RUNTIME_MODULE_URL", `"/heel-runtime/pyodide.mjs"`],
+      ["RUNTIME_MANIFEST_URL", `"/heel-runtime/runtime-manifest.json"`],
+      ["WHEEL_URL", "`${RUNTIME_ROOT}${WHEEL_FILENAME}`"],
+    ]);
+    if (!expected.has(name)) return false;
     const declarations = lexicalBindings(name);
     if (declarations.length !== 1 || !ts.isVariableDeclaration(declarations[0])) return false;
     const declaration = declarations[0];
@@ -570,11 +583,99 @@ function analyzeSource(fileName, text) {
       || !ts.isVariableStatement(statement)
       || statement.parent !== parsed
     ) return false;
-    if (name === "RUNTIME_MANIFEST_URL") {
-      return ts.isStringLiteralLike(declaration.initializer)
-        && declaration.initializer.text === "/heel-runtime/runtime-manifest.json";
+    return declaration.initializer?.getText(parsed) === expected.get(name);
+  }
+
+  function topLevelVariable(declaration, kind, type, initializer) {
+    return ts.isVariableDeclaration(declaration)
+      && ts.isIdentifier(declaration.name)
+      && ts.isVariableDeclarationList(declaration.parent)
+      && (declaration.parent.flags & kind) !== 0
+      && ts.isVariableStatement(declaration.parent.parent)
+      && declaration.parent.parent.parent === parsed
+      && (type === null ? declaration.type === undefined : declaration.type?.getText(parsed) === type)
+      && declaration.initializer?.getText(parsed) === initializer;
+  }
+
+  function parameterMatches(parameter, name, type) {
+    return ts.isIdentifier(parameter.name)
+      && parameter.name.text === name
+      && parameter.type?.getText(parsed) === type
+      && parameter.initializer === undefined
+      && parameter.dotDotDotToken === undefined;
+  }
+
+  function reviewedFunction(declaration, name, parameters, returnType, asynchronous = false) {
+    return ts.isFunctionDeclaration(declaration)
+      && declaration.name?.text === name
+      && declaration.parent === parsed
+      && declaration.body !== undefined
+      && declaration.parameters.length === parameters.length
+      && declaration.parameters.every((parameter, index) => (
+        parameterMatches(parameter, parameters[index][0], parameters[index][1])
+      ))
+      && declaration.type?.getText(parsed) === returnType
+      && Boolean(declaration.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) === asynchronous;
+  }
+
+  function reviewedCriticalBinding(name, declaration) {
+    if (["RUNTIME_ROOT", "RUNTIME_MODULE_URL", "RUNTIME_MANIFEST_URL", "WHEEL_URL"].includes(name)) {
+      return reviewedRuntimeConstantDeclaration(name) && lexicalBindings(name)[0] === declaration;
     }
-    return declaration.initializer?.getText(parsed) === "`${RUNTIME_ROOT}${WHEEL_FILENAME}`";
+    if (name === "scope") {
+      return topLevelVariable(
+        declaration,
+        ts.NodeFlags.Const,
+        null,
+        "globalThis as unknown as DedicatedWorkerGlobalScope",
+      );
+    }
+    if (name === "bootstrapFetch") {
+      return isReviewedBootstrapDeclaration(declaration)
+        && ts.isVariableStatement(declaration.parent.parent)
+        && declaration.parent.parent.parent === parsed;
+    }
+    if (name === "reviewEntry") {
+      return topLevelVariable(declaration, ts.NodeFlags.Let, "PyodideCallable | null", "null");
+    }
+    if (name === "acceptingInput") {
+      return topLevelVariable(declaration, ts.NodeFlags.Let, null, "false");
+    }
+    if (name === "fetcher") return isReviewedFetcherDeclaration(declaration);
+    if (name === "fetchLocal") {
+      return reviewedFunction(declaration, name, [["path", "string"]], "Promise<Response>", true);
+    }
+    if (name === "boot") return reviewedFunction(declaration, name, [], "Promise<void>", true);
+    if (name === "guardAmbientNetwork") return reviewedFunction(declaration, name, [], "void");
+    if (name === "guardDynamicPackages") {
+      return reviewedFunction(declaration, name, [["pyodide", "HeelPyodideRuntime"]], "void");
+    }
+    if (name === "guardProperty") {
+      return reviewedFunction(
+        declaration,
+        name,
+        [["owner", "Record<string, unknown>"], ["name", "string"]],
+        "void",
+      );
+    }
+    if (name === "send") {
+      return reviewedFunction(declaration, name, [["value", "Record<string, unknown>"]], "void");
+    }
+    return false;
+  }
+
+  function validateCriticalWorkerBindings() {
+    const names = [
+      "RUNTIME_ROOT", "RUNTIME_MODULE_URL", "RUNTIME_MANIFEST_URL", "WHEEL_URL",
+      "acceptingInput", "boot", "bootstrapFetch", "fetchLocal", "fetcher",
+      "guardAmbientNetwork", "guardDynamicPackages", "guardProperty", "reviewEntry", "scope", "send",
+    ];
+    for (const name of names) {
+      const bindings = lexicalBindings(name);
+      if (bindings.length !== 1 || !reviewedCriticalBinding(name, bindings[0])) {
+        report(bindings[1] ?? bindings[0] ?? parsed, `critical worker binding ${name} is not unique and exact`);
+      }
+    }
   }
 
   function allowedBootReference(node) {
@@ -590,6 +691,34 @@ function analyzeSource(fileName, text) {
     ) return false;
     const statement = call.parent.parent;
     return parsed.statements.at(-1) === statement;
+  }
+
+  function isDynamicImportCall(node) {
+    return ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword;
+  }
+
+  function allowedDynamicImport(node) {
+    return engineWorker
+      && isDynamicImportCall(node)
+      && node.arguments.length === 1
+      && ts.isIdentifier(node.arguments[0])
+      && node.arguments[0].text === "RUNTIME_MODULE_URL"
+      && reviewedRuntimeConstantDeclaration("RUNTIME_MODULE_URL")
+      && enclosingFunctionName(node) === "boot"
+      && ts.isAwaitExpression(node.parent)
+      && node.getText(parsed) === "import(/* @vite-ignore */ RUNTIME_MODULE_URL)";
+  }
+
+  function validateDynamicImportContract() {
+    const imports = [];
+    function inspect(current) {
+      if (isDynamicImportCall(current)) imports.push(current);
+      ts.forEachChild(current, inspect);
+    }
+    inspect(parsed);
+    if (imports.length !== 1 || !allowedDynamicImport(imports[0])) {
+      report(imports[1] ?? imports[0] ?? parsed, "dynamic import authority contract is not exact");
+    }
   }
 
   function exactBootstrapRevocation(statement) {
@@ -995,12 +1124,20 @@ function analyzeSource(fileName, text) {
       const root = rootName(node.expression);
       const args = [...(node.arguments ?? [])];
       if (ts.isCallExpression(node)) {
+        if (isDynamicImportCall(node) && !allowedDynamicImport(node)) {
+          report(node, "dynamic import authority is not the reviewed boot import");
+        }
         const reflected = reflectiveNetworkLookup(node);
         if (reflected !== null) report(node, `reflective network capability lookup ${reflected}`);
       }
       if (ts.isIdentifier(node.expression) && sinkAliases.has(node.expression.text)) {
         report(node, `network sink alias ${node.expression.text}`);
       }
+      if (
+        ts.isIdentifier(node.expression)
+        && networkCapabilities.has(node.expression.text)
+        && !allowedFetchCall(node)
+      ) report(node, `network sink ${node.expression.text}`);
       for (const resolvedName of names) {
         if (networkCapabilities.has(resolvedName) && !allowedFetchCall(node)) {
           report(node, `network sink ${resolvedName}`);
@@ -1022,7 +1159,11 @@ function analyzeSource(fileName, text) {
     ts.forEachChild(node, visit);
   }
   visit(parsed);
-  if (engineWorker) validateBootstrapRevocationContract();
+  if (engineWorker) {
+    validateCriticalWorkerBindings();
+    validateDynamicImportContract();
+    validateBootstrapRevocationContract();
+  }
   return violations;
 }
 
@@ -1559,14 +1700,102 @@ test("the privacy analyzer rejects composed boot reentry, URL shadowing, and ear
 });
 
 
+test("the privacy analyzer allows only the reviewed boot-time dynamic import", async () => {
+  const worker = await source("workers/heel-review.worker.ts");
+  assert.deepEqual(analyzeSource(join(appRootPath, "workers/heel-review.worker.ts"), worker), []);
+  const mutation = worker.replace(
+    "    const response = reviewEntry(request.source, request.answers_json);",
+    `    void import(/* @vite-ignore */ (RUNTIME_MODULE_URL + "?source=" + encodeURIComponent(request.source)));
+    const response = reviewEntry(request.source, request.answers_json);`,
+  );
+  const violations = analyzeSource(
+    join(appRootPath, "workers/heel-review.worker.ts"),
+    mutation,
+  );
+  assert.ok(
+    violations.some((violation) => violation.includes("dynamic import authority")),
+    violations.join("\n"),
+  );
+
+  const variants = [
+    `void import(RUNTIME_MODULE_URL);`,
+    `async function boot() { await import(RUNTIME_MODULE_URL + "?query=1"); }`,
+    `const load = (path) => import(path); load(RUNTIME_MODULE_URL);`,
+    `importScripts(RUNTIME_MODULE_URL);`,
+  ];
+  for (const [index, candidate] of variants.entries()) {
+    const candidateViolations = analyzeSource(
+      join(appRootPath, "workers/heel-review.worker.ts"),
+      candidate,
+    );
+    assert.ok(
+      candidateViolations.some((violation) => (
+        violation.includes("dynamic import authority")
+        || violation.includes("network sink importScripts")
+      )),
+      `${index}: ${candidateViolations.join("\n")}`,
+    );
+  }
+});
+
+
+test("the privacy analyzer rejects every lexical shadow of critical worker authority", async () => {
+  const worker = await source("workers/heel-review.worker.ts");
+  const exactShadow = worker.replace(
+    "  try {\n    const manifestResponse",
+    `  try {
+    let {bootstrapFetch} = {bootstrapFetch: null};
+    const {guardAmbientNetwork} = {guardAmbientNetwork() {}};
+    const manifestResponse`,
+  );
+  const exactViolations = analyzeSource(
+    join(appRootPath, "workers/heel-review.worker.ts"),
+    exactShadow,
+  );
+  for (const name of ["bootstrapFetch", "guardAmbientNetwork"]) {
+    assert.ok(
+      exactViolations.some((violation) => violation.includes(`critical worker binding ${name}`)),
+      `${name}: ${exactViolations.join("\n")}`,
+    );
+  }
+
+  const variants = [
+    [worker.replace(
+      "async function boot(): Promise<void> {",
+      "async function boot(send = () => {}): Promise<void> {",
+    ), "send"],
+    [worker.replace(
+      "  try {\n    const manifestResponse",
+      "  try {\n    function fetchLocal() {}\n    const manifestResponse",
+    ), "fetchLocal"],
+    [worker.replace(
+      "  try {\n    const manifestResponse",
+      "  try {\n    class scope {}\n    const manifestResponse",
+    ), "scope"],
+  ];
+  for (const [index, [candidate, name]] of variants.entries()) {
+    const candidateViolations = analyzeSource(
+      join(appRootPath, "workers/heel-review.worker.ts"),
+      candidate,
+    );
+    assert.ok(
+      candidateViolations.some((violation) => violation.includes(`critical worker binding ${name}`)),
+      `${index}: ${candidateViolations.join("\n")}`,
+    );
+  }
+});
+
+
 test("the privacy analyzer permits only the reviewed engine and server fetch sites", () => {
   const engine = `
 const RUNTIME_ROOT = "/heel-runtime/";
+const RUNTIME_MODULE_URL = "/heel-runtime/pyodide.mjs";
 const RUNTIME_MANIFEST_URL = "/heel-runtime/runtime-manifest.json";
 const WHEEL_FILENAME = "heel.whl";
 const WHEEL_URL = \`\${RUNTIME_ROOT}\${WHEEL_FILENAME}\`;
 const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
 let bootstrapFetch: typeof fetch | null = scope.fetch.bind(scope);
+let reviewEntry: PyodideCallable | null = null;
 async function fetchLocal(path: string): Promise<Response> {
   const fetcher = bootstrapFetch;
   if (fetcher === null || !path.startsWith(RUNTIME_ROOT) || path.includes("..")) {
@@ -1580,22 +1809,25 @@ async function fetchLocal(path: string): Promise<Response> {
   new URL(response.url || path, scope.location.href);
   return response;
 }
-function send(value) { scope.postMessage(JSON.stringify(value)); }
-function guardProperty(owner, name) {
+function send(value: Record<string, unknown>): void { scope.postMessage(JSON.stringify(value)); }
+function guardProperty(owner: Record<string, unknown>, name: string): void {
   Object.defineProperty(owner, name, {value: () => { throw new Error("disabled"); }});
 }
-function guardAmbientNetwork() {
+function guardAmbientNetwork(): void {
   const ambient = scope as unknown as Record<string, unknown>;
   for (const name of ["fetch", "XMLHttpRequest", "WebSocket", "EventSource"]) {
     guardProperty(ambient, name);
   }
 }
+function guardDynamicPackages(pyodide: HeelPyodideRuntime): void {}
 scope.onmessage = () => {};
 let acceptingInput = false;
 async function boot(): Promise<void> {
   try {
     await fetchLocal(RUNTIME_MANIFEST_URL);
     await fetchLocal(WHEEL_URL);
+    await import(/* @vite-ignore */ RUNTIME_MODULE_URL);
+    guardDynamicPackages({} as HeelPyodideRuntime);
     guardAmbientNetwork();
     bootstrapFetch = null;
     acceptingInput = true;
