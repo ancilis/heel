@@ -438,6 +438,11 @@ def _forbidden_local_import(tree: ast.Module) -> str | None:
             if node.level == 0:
                 if module == "heel.saas" or module.startswith("heel.saas."):
                     return "heel.saas"
+                if module == "heel" and any(
+                    alias.name == "saas" or alias.name.startswith("saas.")
+                    for alias in node.names
+                ):
+                    return "heel.saas"
             elif node.level == 1:
                 if module == "saas" or module.startswith("saas."):
                     return "heel.saas"
@@ -455,10 +460,16 @@ def _validate_pyproject(payload: bytes, contract: dict[str, object]) -> None:
     except (UnicodeError, tomllib.TOMLDecodeError) as error:
         raise OpenCoreBuildError("pyproject.toml cannot be parsed") from error
     try:
+        build_system = pyproject["build-system"]
         project = pyproject["project"]
         setuptools = pyproject["tool"]["setuptools"]
     except (KeyError, TypeError) as error:
         raise OpenCoreBuildError("pyproject.toml is missing release metadata") from error
+    if build_system != {
+        "requires": ["setuptools>=77"],
+        "build-backend": "setuptools.build_meta",
+    }:
+        raise OpenCoreBuildError("pyproject build backend mismatch")
     if project.get("name") != "heel-sim":
         raise OpenCoreBuildError("pyproject name mismatch")
     if project.get("version") != contract["version"]:
@@ -469,14 +480,31 @@ def _validate_pyproject(payload: bytes, contract: dict[str, object]) -> None:
         raise OpenCoreBuildError("pyproject console scripts mismatch")
     if project.get("dependencies") != []:
         raise OpenCoreBuildError("open-core runtime dependencies must remain empty")
+    if project.get("optional-dependencies", {}) != {}:
+        raise OpenCoreBuildError("open-core optional dependencies must remain empty")
+    if "dynamic" in project:
+        raise OpenCoreBuildError("open-core dynamic metadata is forbidden")
+    if project.get("license") != "Apache-2.0":
+        raise OpenCoreBuildError("pyproject must declare the Apache-2.0 license")
+    if project.get("license-files") != ["LICENSE", "NOTICE"]:
+        raise OpenCoreBuildError("pyproject Apache-2.0 license files mismatch")
+    classifiers = project.get("classifiers")
+    if type(classifiers) is not list:
+        raise OpenCoreBuildError("pyproject classifiers must be a list")
+    if any(
+        type(classifier) is not str
+        or classifier.startswith("License ::")
+        for classifier in classifiers
+    ):
+        raise OpenCoreBuildError("pyproject legacy license classifiers are forbidden")
     if setuptools.get("packages") != ["heel"]:
         raise OpenCoreBuildError("pyproject package boundary mismatch")
     package_data = setuptools.get("package-data", {}).get("heel")
     expected_data = [path.removeprefix("heel/") for path in contract["package_data"]]
     if package_data != expected_data:
         raise OpenCoreBuildError("pyproject package data mismatch")
-    if setuptools.get("license-files") != ["LICENSE", "NOTICE"]:
-        raise OpenCoreBuildError("pyproject license files mismatch")
+    if "license-files" in setuptools:
+        raise OpenCoreBuildError("pyproject legacy setuptools license files are forbidden")
 
 
 def _load_public_sources(source: SourceTree) -> tuple[dict[str, object], dict[str, bytes]]:
@@ -666,16 +694,47 @@ def _validate_record(payloads: dict[str, bytes]) -> None:
         raise OpenCoreBuildError("wheel RECORD self row mismatch")
 
 
+def _zip_eocd_member_count(wheel: bytes) -> int:
+    if len(wheel) < 22:
+        raise OpenCoreBuildError("wheel end-of-central-directory is truncated")
+    (
+        signature,
+        disk_number,
+        central_disk,
+        disk_entries,
+        total_entries,
+        central_size,
+        central_offset,
+        comment_length,
+    ) = struct.unpack("<IHHHHIIH", wheel[-22:])
+    if disk_entries > MAX_ARCHIVE_MEMBERS or total_entries > MAX_ARCHIVE_MEMBERS:
+        raise OpenCoreBuildError("wheel contains too many members")
+    if (
+        signature != 0x06054B50
+        or disk_number != 0
+        or central_disk != 0
+        or disk_entries != total_entries
+        or disk_entries == 0xFFFF
+        or central_size == 0xFFFFFFFF
+        or central_offset == 0xFFFFFFFF
+        or comment_length != 0
+        or central_offset + central_size != len(wheel) - 22
+    ):
+        raise OpenCoreBuildError("wheel central directory is noncanonical or ZIP64")
+    return total_entries
+
+
 def _validate_wheel(wheel: bytes, expected_payloads: dict[str, bytes]) -> None:
     if len(wheel) > MAX_ARCHIVE_BYTES:
         raise OpenCoreBuildError("wheel exceeds the archive byte limit")
-    if b"PK\x06\x06" in wheel or b"PK\x06\x07" in wheel:
-        raise OpenCoreBuildError("wheel unexpectedly uses ZIP64")
+    expected_member_count = _zip_eocd_member_count(wheel)
     try:
         with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
             if archive.comment:
                 raise OpenCoreBuildError("wheel comment is forbidden")
             infos = archive.infolist()
+            if len(infos) != expected_member_count:
+                raise OpenCoreBuildError("wheel central-directory member count mismatch")
             expected_order = [
                 *sorted(path for path in expected_payloads if path != RECORD_PATH),
                 RECORD_PATH,
@@ -700,6 +759,8 @@ def _validate_wheel(wheel: bytes, expected_payloads: dict[str, bytes]) -> None:
                     raise OpenCoreBuildError(f"wheel mode mismatch: {info.filename}")
                 if info.file_size > MAX_MEMBER_BYTES or info.compress_size != info.file_size:
                     raise OpenCoreBuildError(f"wheel member exceeds bounds: {info.filename}")
+                if total + info.file_size > MAX_TOTAL_MEMBER_BYTES:
+                    raise OpenCoreBuildError("wheel uncompressed payload exceeds the total limit")
                 payload = archive.read(info)
                 if zlib.crc32(payload) & 0xFFFFFFFF != info.CRC:
                     raise OpenCoreBuildError(f"wheel CRC mismatch: {info.filename}")
@@ -730,17 +791,35 @@ def _validate_wheel(wheel: bytes, expected_payloads: dict[str, bytes]) -> None:
         raise OpenCoreBuildError("generated wheel is invalid") from error
 
 
+def _bounded_gzip_decompress(payload: bytes, *, limit: int) -> bytes:
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(payload), mode="rb") as stream:
+            expanded = stream.read(limit + 1)
+    except (EOFError, OSError) as error:
+        raise OpenCoreBuildError("source archive gzip stream is invalid") from error
+    if len(expanded) > limit:
+        raise OpenCoreBuildError("source archive expands beyond the total limit")
+    return expanded
+
+
+def _bounded_tar_members(archive: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    members: list[tarfile.TarInfo] = []
+    for member in archive:
+        if len(members) >= MAX_ARCHIVE_MEMBERS:
+            raise OpenCoreBuildError("source archive contains too many members")
+        members.append(member)
+    return members
+
+
 def _validate_sdist(sdist: bytes, expected_payloads: dict[str, bytes]) -> None:
     if len(sdist) > MAX_ARCHIVE_BYTES:
         raise OpenCoreBuildError("source archive exceeds the archive byte limit")
     if sdist[:10] != EXPECTED_GZIP_HEADER:
         raise OpenCoreBuildError("source archive gzip header is noncanonical")
-    try:
-        tar_payload = gzip.decompress(sdist)
-    except (EOFError, OSError) as error:
-        raise OpenCoreBuildError("source archive gzip stream is invalid") from error
-    if len(tar_payload) > MAX_TOTAL_MEMBER_BYTES + 65536:
-        raise OpenCoreBuildError("source archive expands beyond the total limit")
+    tar_payload = _bounded_gzip_decompress(
+        sdist,
+        limit=MAX_TOTAL_MEMBER_BYTES + 65536,
+    )
     expected_crc, expected_size = struct.unpack("<II", sdist[-8:])
     if expected_crc != zlib.crc32(tar_payload) & 0xFFFFFFFF:
         raise OpenCoreBuildError("source archive gzip CRC mismatch")
@@ -749,13 +828,11 @@ def _validate_sdist(sdist: bytes, expected_payloads: dict[str, bytes]) -> None:
     if len(tar_payload) % tarfile.RECORDSIZE != 0 or not tar_payload.endswith(b"\0" * 1024):
         raise OpenCoreBuildError("source archive tar padding is noncanonical")
     try:
-        with tarfile.open(fileobj=io.BytesIO(sdist), mode="r:gz") as archive:
-            members = archive.getmembers()
+        with tarfile.open(fileobj=io.BytesIO(tar_payload), mode="r:") as archive:
+            members = _bounded_tar_members(archive)
             expected_order = [SDIST_PREFIX + path for path in sorted(expected_payloads)]
             if [member.name for member in members] != expected_order:
                 raise OpenCoreBuildError("source archive member order mismatch")
-            if len(members) > MAX_ARCHIVE_MEMBERS:
-                raise OpenCoreBuildError("source archive contains too many members")
             total = 0
             for member in members:
                 _safe_archive_name(member.name)
@@ -779,6 +856,8 @@ def _validate_sdist(sdist: bytes, expected_payloads: dict[str, bytes]) -> None:
                     raise OpenCoreBuildError(f"source archive metadata mismatch: {member.name}")
                 if member.size > MAX_MEMBER_BYTES:
                     raise OpenCoreBuildError(f"source archive member exceeds bounds: {member.name}")
+                if total + member.size > MAX_TOTAL_MEMBER_BYTES:
+                    raise OpenCoreBuildError("source archive payload exceeds the total limit")
                 header = tar_payload[member.offset:member.offset + tarfile.BLOCKSIZE]
                 if header[257:263] != b"ustar\x00":
                     raise OpenCoreBuildError(f"source archive member is not USTAR: {member.name}")

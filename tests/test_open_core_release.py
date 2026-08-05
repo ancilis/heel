@@ -64,6 +64,7 @@ MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 MAX_MEMBER_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_MEMBER_BYTES = 24 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 128
+MIN_SETUPTOOLS_MAJOR = 77
 # Task5 CI must install the PyPA ``build`` frontend, then run this exact command.
 STANDARD_BUILD_CI_COMMAND = (
     "HEEL_REQUIRE_STANDARD_BUILD=1 "
@@ -384,6 +385,62 @@ def _record_digest(payload: bytes) -> str:
     return "sha256=" + digest.rstrip(b"=").decode("ascii")
 
 
+def _read_bounded_path(path: Path, limit: int, label: str) -> bytes:
+    size = path.stat().st_size
+    if size > limit:
+        raise AssertionError(f"{label} exceeds the byte limit")
+    with path.open("rb") as stream:
+        payload = stream.read(limit + 1)
+    if len(payload) > limit:
+        raise AssertionError(f"{label} exceeds the byte limit")
+    return payload
+
+
+def _assert_bounded_zip_eocd(test_case: unittest.TestCase, payload: bytes) -> int:
+    test_case.assertGreaterEqual(len(payload), 22)
+    fields = struct.unpack("<IHHHHIIH", payload[-22:])
+    test_case.assertEqual(fields[0], 0x06054B50)
+    test_case.assertEqual(fields[1:3], (0, 0))
+    test_case.assertEqual(fields[3], fields[4])
+    test_case.assertLessEqual(fields[4], MAX_ARCHIVE_MEMBERS)
+    test_case.assertNotEqual(fields[5], 0xFFFFFFFF)
+    test_case.assertNotEqual(fields[6], 0xFFFFFFFF)
+    test_case.assertEqual(fields[7], 0)
+    test_case.assertEqual(fields[5] + fields[6], len(payload) - 22)
+    return fields[4]
+
+
+def _bounded_tar_members_for_test(
+    test_case: unittest.TestCase,
+    archive: tarfile.TarFile,
+) -> list[tarfile.TarInfo]:
+    members: list[tarfile.TarInfo] = []
+    for member in archive:
+        test_case.assertLess(len(members), MAX_ARCHIVE_MEMBERS)
+        members.append(member)
+    return members
+
+
+def _bounded_gzip_decompress(payload: bytes, limit: int) -> bytes:
+    with gzip.GzipFile(fileobj=io.BytesIO(payload), mode="rb") as stream:
+        expanded = stream.read(limit + 1)
+    if len(expanded) > limit:
+        raise AssertionError("source archive expands beyond the total limit")
+    return expanded
+
+
+def _load_builder_module():
+    specification = importlib.util.spec_from_file_location(
+        "heel_open_core_release_builder_for_test",
+        BUILDER,
+    )
+    if specification is None or specification.loader is None:
+        raise AssertionError("release builder cannot be imported")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
 def _assert_record_is_valid(
     test_case: unittest.TestCase,
     payloads: dict[str, bytes],
@@ -412,11 +469,12 @@ def _assert_wheel_is_bounded_and_canonical(
     wheel_path: Path,
     expected_names: set[str],
 ) -> dict[str, bytes]:
-    raw = wheel_path.read_bytes()
-    test_case.assertLessEqual(len(raw), MAX_ARCHIVE_BYTES)
+    raw = _read_bounded_path(wheel_path, MAX_ARCHIVE_BYTES, "wheel")
+    expected_member_count = _assert_bounded_zip_eocd(test_case, raw)
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         test_case.assertEqual(archive.comment, b"")
         infos = archive.infolist()
+        test_case.assertEqual(len(infos), expected_member_count)
         test_case.assertLessEqual(len(infos), MAX_ARCHIVE_MEMBERS)
         names = [info.filename for info in infos]
         test_case.assertEqual(names, [*sorted(expected_names - {RECORD_PATH}), RECORD_PATH])
@@ -436,6 +494,11 @@ def _assert_wheel_is_bounded_and_canonical(
             test_case.assertEqual(info.external_attr >> 16, stat.S_IFREG | 0o644, info.filename)
             test_case.assertLessEqual(info.file_size, MAX_MEMBER_BYTES, info.filename)
             test_case.assertEqual(info.compress_size, info.file_size, info.filename)
+            test_case.assertLessEqual(
+                total_size + info.file_size,
+                MAX_TOTAL_MEMBER_BYTES,
+                info.filename,
+            )
             payload = archive.read(info)
             test_case.assertEqual(info.CRC, __import__("zlib").crc32(payload) & 0xFFFFFFFF)
             payloads[info.filename] = payload
@@ -473,10 +536,11 @@ def _normalized_wheel(
             expected_names,
         )
     else:
-        raw = wheel_path.read_bytes()
-        test_case.assertLessEqual(len(raw), MAX_ARCHIVE_BYTES)
+        raw = _read_bounded_path(wheel_path, MAX_ARCHIVE_BYTES, "rebuilt wheel")
+        expected_member_count = _assert_bounded_zip_eocd(test_case, raw)
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             infos = archive.infolist()
+            test_case.assertEqual(len(infos), expected_member_count)
             names = [info.filename for info in infos]
             test_case.assertEqual(set(names), expected_names)
             test_case.assertEqual(len(names), len(set(names)))
@@ -486,6 +550,11 @@ def _normalized_wheel(
                 _assert_safe_archive_name(test_case, info.filename)
                 test_case.assertFalse(info.flag_bits & 0x1, info.filename)
                 test_case.assertLessEqual(info.file_size, MAX_MEMBER_BYTES, info.filename)
+                test_case.assertLessEqual(
+                    total_size + info.file_size,
+                    MAX_TOTAL_MEMBER_BYTES,
+                    info.filename,
+                )
                 payloads[info.filename] = archive.read(info)
                 total_size += info.file_size
             test_case.assertLessEqual(total_size, MAX_TOTAL_MEMBER_BYTES)
@@ -504,7 +573,11 @@ def _normalized_wheel(
             "Version",
             "Summary",
             "Requires-Python",
+            "License",
+            "License-Expression",
             "License-File",
+            "Requires-Dist",
+            "Provides-Extra",
         )
     ) + tuple(
         (f"WHEEL:{name}", tuple(wheel_message.get_all(name, [])))
@@ -586,6 +659,33 @@ def _provision_local_build_tools(
             destination = purelib.joinpath(*relative.parts)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
+
+
+def _require_local_build_tools(test_case: unittest.TestCase) -> None:
+    missing: list[str] = []
+    for distribution_name in ("setuptools", "wheel"):
+        try:
+            distribution = importlib.metadata.distribution(distribution_name)
+        except importlib.metadata.PackageNotFoundError:
+            missing.append(distribution_name)
+            continue
+        if distribution_name == "setuptools":
+            try:
+                major = int(distribution.version.split(".", 1)[0])
+            except ValueError:
+                missing.append(f"setuptools>={MIN_SETUPTOOLS_MAJOR}")
+            else:
+                if major < MIN_SETUPTOOLS_MAJOR:
+                    missing.append(f"setuptools>={MIN_SETUPTOOLS_MAJOR}")
+    if not missing:
+        return
+    message = (
+        "clean source rebuild requires locally installed release tooling: "
+        + ", ".join(missing)
+    )
+    if STANDARD_BUILD_REQUIRED:
+        test_case.fail(message)
+    test_case.skipTest(message)
 
 
 class OpenCoreReleaseTests(unittest.TestCase):
@@ -700,13 +800,17 @@ class OpenCoreReleaseTests(unittest.TestCase):
             "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.",
         )
         self.assertEqual(project["readme"], "release/open-core/README.md")
+        self.assertEqual(project["license"], "Apache-2.0")
+        self.assertEqual(project["license-files"], ["LICENSE", "NOTICE"])
+        self.assertFalse(
+            any(classifier.startswith("License ::") for classifier in project["classifiers"])
+        )
         self.assertNotIn("urls", project)
         setuptools = pyproject["tool"]["setuptools"]
         self.assertEqual(
             setuptools,
             {
                 "include-package-data": False,
-                "license-files": ["LICENSE", "NOTICE"],
                 "packages": ["heel"],
                 "package-data": {
                     "heel": [
@@ -863,7 +967,12 @@ class OpenCoreReleaseTests(unittest.TestCase):
             self.assertEqual({path.name for path in first.iterdir()}, expected_artifacts)
             self.assertEqual({path.name for path in second.iterdir()}, expected_artifacts)
             for name in expected_artifacts:
-                self.assertEqual((first / name).read_bytes(), (second / name).read_bytes(), name)
+                limit = MAX_MEMBER_BYTES if name == ARTIFACT_MANIFEST else MAX_ARCHIVE_BYTES
+                self.assertEqual(
+                    _read_bounded_path(first / name, limit, name),
+                    _read_bounded_path(second / name, limit, name),
+                    name,
+                )
                 self.assertEqual(stat.S_IMODE((first / name).stat().st_mode), 0o644, name)
 
             wheel_payloads = _assert_wheel_is_bounded_and_canonical(
@@ -892,17 +1001,21 @@ class OpenCoreReleaseTests(unittest.TestCase):
             for name, payload in wheel_payloads.items():
                 _assert_public_payload(self, name, payload)
 
-            sdist_raw = (first / SDIST).read_bytes()
-            self.assertLessEqual(len(sdist_raw), MAX_ARCHIVE_BYTES)
+            sdist_raw = _read_bounded_path(
+                first / SDIST,
+                MAX_ARCHIVE_BYTES,
+                "source archive",
+            )
             self.assertEqual(sdist_raw[:10], EXPECTED_GZIP_HEADER)
-            tar_raw = gzip.decompress(sdist_raw)
-            self.assertLessEqual(len(tar_raw), MAX_TOTAL_MEMBER_BYTES + 65536)
+            tar_raw = _bounded_gzip_decompress(
+                sdist_raw,
+                MAX_TOTAL_MEMBER_BYTES + 65536,
+            )
             self.assertEqual(len(tar_raw) % tarfile.RECORDSIZE, 0)
             self.assertTrue(tar_raw.endswith(b"\0" * 1024))
             prefix = "heel_sim-1.1.0/"
             with tarfile.open(fileobj=io.BytesIO(sdist_raw), mode="r:gz") as archive:
-                members = archive.getmembers()
-                self.assertLessEqual(len(members), MAX_ARCHIVE_MEMBERS)
+                members = _bounded_tar_members_for_test(self, archive)
                 names = [member.name for member in members]
                 expected_names = [prefix + name for name in sorted(sdist_relative_names)]
                 self.assertEqual(names, expected_names)
@@ -922,6 +1035,11 @@ class OpenCoreReleaseTests(unittest.TestCase):
                     self.assertEqual(member.devmajor, 0, member.name)
                     self.assertEqual(member.devminor, 0, member.name)
                     self.assertLessEqual(member.size, MAX_MEMBER_BYTES, member.name)
+                    self.assertLessEqual(
+                        total_size + member.size,
+                        MAX_TOTAL_MEMBER_BYTES,
+                        member.name,
+                    )
                     header = tar_raw[member.offset:member.offset + tarfile.BLOCKSIZE]
                     self.assertEqual(header[257:263], b"ustar\x00", member.name)
                     extracted = archive.extractfile(member)
@@ -945,7 +1063,11 @@ class OpenCoreReleaseTests(unittest.TestCase):
 
             archives = []
             for name in (WHEEL, SDIST):
-                payload = (first / name).read_bytes()
+                payload = _read_bounded_path(
+                    first / name,
+                    MAX_ARCHIVE_BYTES,
+                    name,
+                )
                 archives.append(
                     {
                         "name": name,
@@ -958,7 +1080,11 @@ class OpenCoreReleaseTests(unittest.TestCase):
                 "schema_version": "heel.open-core-artifacts.v1",
                 "version": "1.1.0",
             }
-            manifest_bytes = (first / ARTIFACT_MANIFEST).read_bytes()
+            manifest_bytes = _read_bounded_path(
+                first / ARTIFACT_MANIFEST,
+                MAX_MEMBER_BYTES,
+                "artifact manifest",
+            )
             self.assertEqual(
                 manifest_bytes,
                 (
@@ -1041,6 +1167,30 @@ class OpenCoreReleaseTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             path.write_text(text.replace('version = "1.1.0"', 'version = "1.1.1"', 1))
 
+        def proprietary_license(source: Path) -> None:
+            path = source / "pyproject.toml"
+            text = path.read_text(encoding="utf-8")
+            path.write_text(
+                text.replace('license = "Apache-2.0"', 'license = "Proprietary"', 1),
+                encoding="utf-8",
+            )
+
+        def dependency_bearing_extra(source: Path) -> None:
+            path = source / "pyproject.toml"
+            text = path.read_text(encoding="utf-8")
+            path.write_text(
+                text + '\n[project.optional-dependencies]\nllm = ["requests"]\n',
+                encoding="utf-8",
+            )
+
+        def wrong_build_backend(source: Path) -> None:
+            path = source / "pyproject.toml"
+            text = path.read_text(encoding="utf-8")
+            path.write_text(
+                text.replace('build-backend = "setuptools.build_meta"', 'build-backend = "hatchling.build"', 1),
+                encoding="utf-8",
+            )
+
         def package_version_mismatch(source: Path) -> None:
             path = source / "heel/__init__.py"
             text = path.read_text(encoding="utf-8")
@@ -1080,12 +1230,20 @@ class OpenCoreReleaseTests(unittest.TestCase):
             ("schema mismatch", schema_mismatch, "schema version"),
             ("contract version mismatch", contract_version_mismatch, "version mismatch"),
             ("pyproject version mismatch", pyproject_version_mismatch, "pyproject version"),
+            ("proprietary project license", proprietary_license, "apache-2.0 license"),
+            ("dependency-bearing optional extra", dependency_bearing_extra, "optional dependencies"),
+            ("wrong build backend", wrong_build_backend, "build backend"),
             ("package version mismatch", package_version_mismatch, "heel.__version__"),
             ("backslash path", backslash_contract_path, "backslash"),
             ("future TEST module", unclassified_module, "unclassified top-level module"),
             (
                 "absolute proprietary import",
                 lambda source: proprietary_import(source, "import heel.saas"),
+                "forbidden local import: heel.saas",
+            ),
+            (
+                "absolute from proprietary import",
+                lambda source: proprietary_import(source, "from heel import saas"),
                 "forbidden local import: heel.saas",
             ),
             (
@@ -1104,6 +1262,73 @@ class OpenCoreReleaseTests(unittest.TestCase):
         for label, mutation, expected_message in mutations:
             with self.subTest(label):
                 self._assert_mutated_snapshot_is_rejected(mutation, expected_message)
+
+    def test_zip64_signature_inside_regular_payload_is_not_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="heel-open-core-zip64-payload-") as temporary:
+            temporary_path = Path(temporary).resolve()
+            source = temporary_path / "source"
+            source.mkdir()
+            _copy_public_builder_snapshot(source)
+            notice = source / "NOTICE"
+            notice.write_bytes(notice.read_bytes() + b"\nopaque marker: PK\x06\x06\n")
+            result = _run_release_builder(
+                temporary_path / "output",
+                builder=source / "scripts/build_open_core_release.py",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_gzip_validation_stops_at_the_expansion_limit(self):
+        module = _load_builder_module()
+        compressed = gzip.compress(b"x" * 131072, mtime=0)
+        self.assertTrue(
+            hasattr(module, "_bounded_gzip_decompress"),
+            "builder must expose bounded gzip validation",
+        )
+        with self.assertRaisesRegex(module.OpenCoreBuildError, "expands beyond"):
+            module._bounded_gzip_decompress(compressed, limit=1024)
+
+    def test_zip_member_count_is_rejected_before_zipfile_parsing(self):
+        module = _load_builder_module()
+        oversized_eocd = struct.pack(
+            "<IHHHHIIH",
+            0x06054B50,
+            0,
+            0,
+            MAX_ARCHIVE_MEMBERS + 1,
+            MAX_ARCHIVE_MEMBERS + 1,
+            0,
+            0,
+            0,
+        )
+
+        def unexpected_zipfile(*_args, **_kwargs):
+            raise AssertionError("ZipFile must not parse an over-count archive")
+
+        original_zipfile = module.zipfile.ZipFile
+        module.zipfile.ZipFile = unexpected_zipfile
+        try:
+            with self.assertRaisesRegex(module.OpenCoreBuildError, "too many members"):
+                module._validate_wheel(oversized_eocd, {})
+        finally:
+            module.zipfile.ZipFile = original_zipfile
+
+    def test_tar_member_iteration_stops_at_the_count_limit(self):
+        module = _load_builder_module()
+        self.assertTrue(
+            hasattr(module, "_bounded_tar_members"),
+            "builder must expose bounded tar-member iteration",
+        )
+
+        class FakeArchive:
+            def __iter__(self):
+                for index in range(MAX_ARCHIVE_MEMBERS + 1):
+                    yield tarfile.TarInfo(f"member-{index}")
+
+            def getmembers(self):
+                raise AssertionError("getmembers must not materialize the archive")
+
+        with self.assertRaisesRegex(module.OpenCoreBuildError, "too many members"):
+            module._bounded_tar_members(FakeArchive())
 
     def test_builder_rejects_unsafe_output_and_check_is_read_only(self):
         self.assertTrue(BUILDER.is_file(), "scripts/build_open_core_release.py is missing")
@@ -1212,6 +1437,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
 
     def test_clean_wheel_and_sdist_installs_reproduce_the_public_package(self):
         self.assertTrue(BUILDER.is_file(), "scripts/build_open_core_release.py is missing")
+        _require_local_build_tools(self)
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
         expected_names = {
             *contract["python_modules"],
@@ -1420,7 +1646,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
                     "-c",
                     (
                         "import importlib.util,setuptools,wheel;"
-                        "assert int(setuptools.__version__.split('.',1)[0]) >= 68;"
+                        f"assert int(setuptools.__version__.split('.',1)[0]) >= {MIN_SETUPTOOLS_MAJOR};"
                         "assert importlib.util.find_spec('heel') is None"
                     ),
                 ],
@@ -1589,6 +1815,11 @@ class OpenCoreReleaseTests(unittest.TestCase):
                     ],
                     ["License-File: LICENSE", "License-File: NOTICE"],
                 )
+                parsed_metadata = BytesParser(policy=policy.default).parsebytes(metadata)
+                self.assertEqual(parsed_metadata.get_all("License-Expression"), ["Apache-2.0"])
+                self.assertEqual(parsed_metadata.get_all("License", []), [])
+                self.assertEqual(parsed_metadata.get_all("Requires-Dist", []), [])
+                self.assertEqual(parsed_metadata.get_all("Provides-Extra", []), [])
                 for path in wheel_files:
                     contents = wheel.read(path)
                     for marker in FORBIDDEN_DISTRIBUTED_CONTENT_MARKERS:
@@ -1607,11 +1838,10 @@ class OpenCoreReleaseTests(unittest.TestCase):
                 "heel_sim.egg-info/SOURCES.txt",
                 "heel_sim.egg-info/dependency_links.txt",
                 "heel_sim.egg-info/entry_points.txt",
-                "heel_sim.egg-info/requires.txt",
                 "heel_sim.egg-info/top_level.txt",
             }
             with tarfile.open(sdists[0], "r:gz") as sdist:
-                members = sdist.getmembers()
+                members = _bounded_tar_members_for_test(self, sdist)
                 self.assertFalse(
                     [member.name for member in members if member.issym() or member.islnk()]
                 )

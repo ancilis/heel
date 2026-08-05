@@ -35,6 +35,11 @@ class HeelBrandingTests(unittest.TestCase):
             "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.",
         )
         self.assertEqual(project["readme"], "release/open-core/README.md")
+        self.assertEqual(project["license"], "Apache-2.0")
+        self.assertEqual(project["license-files"], ["LICENSE", "NOTICE"])
+        self.assertFalse(
+            any(classifier.startswith("License ::") for classifier in project["classifiers"])
+        )
         self.assertNotIn("urls", project)
 
     def test_console_scripts_use_heel_names_only(self):
@@ -58,7 +63,6 @@ class HeelBrandingTests(unittest.TestCase):
             setuptools,
             {
                 "include-package-data": False,
-                "license-files": ["LICENSE", "NOTICE"],
                 "packages": ["heel"],
                 "package-data": {
                     "heel": [
