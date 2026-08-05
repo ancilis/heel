@@ -181,8 +181,7 @@ function analyzeSource(fileName, text) {
     report(reportNode, `network sink alias ${target.text}`);
   }
 
-  function isCapabilityIdentifierReference(node) {
-    if (!networkCapabilities.has(node.text)) return false;
+  function isRuntimeIdentifierReference(node) {
     let current = node.parent;
     while (current && !ts.isSourceFile(current)) {
       if (ts.isTypeNode(current)) return false;
@@ -196,6 +195,52 @@ function analyzeSource(fileName, text) {
       && !ts.isShorthandPropertyAssignment(parent)
     ) return false;
     return true;
+  }
+
+  function isCapabilityIdentifierReference(node) {
+    return networkCapabilities.has(node.text) && isRuntimeIdentifierReference(node);
+  }
+
+  function allowedObjectReference(node) {
+    const member = node.parent;
+    if (
+      !(ts.isPropertyAccessExpression(member) || ts.isElementAccessExpression(member))
+      || member.expression !== node
+    ) return false;
+    const call = member.parent;
+    if (!ts.isCallExpression(call) || call.expression !== member) return false;
+    const name = memberName(member);
+    if (["entries", "freeze", "fromEntries", "is", "keys"].includes(name ?? "")) return true;
+    return engineWorker
+      && name === "defineProperty"
+      && enclosingFunctionName(call) === "guardProperty"
+      && call.arguments.length >= 2
+      && ts.isIdentifier(call.arguments[0])
+      && call.arguments[0].text === "owner"
+      && ts.isIdentifier(call.arguments[1])
+      && call.arguments[1].text === "name";
+  }
+
+  function isReflectiveRootReference(node) {
+    if (!isRuntimeIdentifierReference(node)) return false;
+    if (node.text === "Reflect") return true;
+    return node.text === "Object" && !allowedObjectReference(node);
+  }
+
+  function reflectiveMethodAuthority(node) {
+    const root = rootName(node);
+    const name = memberName(node);
+    if (
+      root === "Reflect"
+      && ["apply", "construct", "get", "getOwnPropertyDescriptor"].includes(name ?? "")
+    ) return name;
+    if (
+      root === "Object"
+      && ["getOwnPropertyDescriptor", "getOwnPropertyDescriptors"].includes(name ?? "")
+    ) return name;
+    if (["__lookupGetter__", "__lookupSetter__"].includes(name ?? "")) return name;
+    if (ambientRoots.has(root ?? "") && ["Object", "Reflect"].includes(name ?? "")) return name;
+    return null;
   }
 
   function containsAmbientReference(node) {
@@ -249,6 +294,9 @@ function analyzeSource(fileName, text) {
     if (ts.isIdentifier(node) && isCapabilityIdentifierReference(node)) {
       report(node, `network sink capability reference ${node.text}`);
     }
+    if (ts.isIdentifier(node) && isReflectiveRootReference(node)) {
+      report(node, `reflective root authority reference ${node.text}`);
+    }
 
     if (ts.isVariableDeclaration(node) && node.initializer) {
       if (ts.isIdentifier(node.name)) {
@@ -290,6 +338,10 @@ function analyzeSource(fileName, text) {
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const name = memberName(node);
       const root = rootName(node);
+      const reflectiveAuthority = reflectiveMethodAuthority(node);
+      if (reflectiveAuthority !== null) {
+        report(node, `reflective method authority reference ${reflectiveAuthority}`);
+      }
       if (networkCapabilities.has(name ?? "") && !allowedFetchReference(node)) {
         report(node, `network sink capability reference ${name}`);
       }
@@ -470,6 +522,45 @@ test("the privacy analyzer rejects descriptor and legacy getter retrieval", () =
 });
 
 
+test("the privacy analyzer rejects reflective method references in every carrier", () => {
+  const mutations = [
+    `const get = Reflect.get;`,
+    `const descriptor = Object.getOwnPropertyDescriptor;`,
+    `const holder = {sink: Reflect["g" + "et"]};`,
+    `const holder = {}; holder.sink = Object["getOwn" + "PropertyDescriptor"];`,
+    `const legacy = globalThis["__lookup" + "Getter__"];`,
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, `components/nested/reflective-authority-${index}.ts`),
+      mutation,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("reflective method authority reference")),
+      violations.join("\n"),
+    );
+  }
+});
+
+
+test("the privacy analyzer rejects copying Reflect and Object roots", () => {
+  const mutations = [
+    `const R = Reflect; R.get(globalThis, "fetch");`,
+    `const O = Object; O.getOwnPropertyDescriptor(globalThis, "fetch");`,
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, `components/nested/reflective-root-${index}.ts`),
+      mutation,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("reflective root authority reference")),
+      violations.join("\n"),
+    );
+  }
+});
+
+
 test("the privacy analyzer permits only the reviewed engine and server fetch sites", () => {
   const engine = `
 const scope = globalThis;
@@ -497,6 +588,16 @@ async function route(request, env, ctx) {
   );
   assert.deepEqual(
     analyzeSource(join(appRootPath, "worker/index.ts"), server),
+    [],
+  );
+  assert.deepEqual(
+    analyzeSource(join(appRootPath, "lib/safe-object.ts"), `
+Object.freeze({});
+Object.entries({});
+Object.keys({});
+Object.is(0, -0);
+Object.fromEntries([]);
+`),
     [],
   );
 });
