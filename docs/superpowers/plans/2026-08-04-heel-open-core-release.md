@@ -298,6 +298,18 @@ Required builder behavior:
 8. Write with descriptor-safe atomic replacement and reject symlinked output roots/components.
 9. `--check` compares exact committed bytes without rewriting them.
 
+Descriptor-safe means component-wise `dir_fd`/`openat` operations with `O_NOFOLLOW`, `fstat`
+regular-file checks, same-directory exclusive temporary files, file and directory `fsync`, and
+`dir_fd`-anchored replacement. Stage the wheel, source archive, and candidate manifest, then publish
+the manifest last. A path-only precheck followed by `mkstemp`/`os.replace` is not sufficient.
+
+Archive parsing tests must enforce hard limits for archive bytes, member count, per-member bytes,
+and total uncompressed bytes before allocation. The wheel must be unencrypted `ZIP_STORED` without
+ZIP64, comments, or extra fields; tests read every member, validate its local header/CRC, fixed
+mode/time, exact order, and `RECORD`-last URL-safe SHA-256 rows. The source archive uses USTAR regular
+files only and rejects links, devices, sparse/GNU/PAX records, unsafe names, and non-canonical
+mode/uid/gid/mtime/order; gzip mtime, filename, XFL, and OS header bytes are pinned.
+
 The CLI must be:
 
 ```text
@@ -323,9 +335,14 @@ Then send newline-delimited `initialize`, `notifications/initialized`, and `tool
 
 Create a second clean environment and install `heel_sim-1.1.0.tar.gz` offline with
 `--no-index --no-deps --no-build-isolation`. Rebuild a wheel from that source archive and compare
-its normalized member names, contents, metadata, entry points, and `RECORD` hashes with the
-allowlist-built wheel. The source archive is not accepted if it is merely a snapshot that cannot
-install and reproduce the same package members.
+its semantic package parity with the allowlist-built wheel: exact source/data/license/entry-point
+members and bytes, required METADATA/WHEEL fields, and independently valid `RECORD` hash/size/self
+rows. Setuptools-generated generator strings and metadata serialization need not be byte-identical.
+Run clean-install checks from a directory outside the repository with `PYTHONPATH` removed,
+`PYTHONNOUSERSITE=1`, pip `--isolated --no-cache-dir`, and scrubbed pip environment/config. Provision
+the already-installed `setuptools>=68` backend explicitly for `--no-build-isolation`; never fetch it.
+The source archive is not accepted if it is merely a snapshot that cannot install and reproduce the
+same public package members.
 
 - [ ] **Step 5: Run release tests and commit**
 
