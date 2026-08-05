@@ -122,7 +122,9 @@ export default function McpQuickstart() {
             </p>
             <p className="quickstart-note">
               All exposed MCP tools remain constrained. Static review tools stay local. Target execution
-              requires a pre-existing, human-created signed scope; an agent cannot create, widen, or relax one.
+              requires a pre-existing, human-created signed scope. Heel MCP exposes no tool to create,
+              widen, or relax a scope. Scope creation is an out-of-band CLI action; do not grant
+              agent-controlled shells access to that CLI, HEEL_HOME, or the signing key.
             </p>
           </article>
         </section>

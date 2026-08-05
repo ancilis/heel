@@ -200,6 +200,11 @@ describe("Heel anonymous launch review", () => {
     expect(screen.getByText(/heel cannot enforce that client-provider boundary/i)).toBeTruthy();
     expect(screen.getByText(/all exposed mcp tools remain constrained/i)).toBeTruthy();
     expect(screen.getByText(/pre-existing, human-created signed scope/i)).toBeTruthy();
+    expect(screen.getByText(/heel mcp exposes no tool to create, widen, or relax a scope/i)).toBeTruthy();
+    expect(screen.getByText(
+      /scope creation is an out-of-band cli action; do not grant agent-controlled shells access to that cli, heel_home, or the signing key/i,
+    )).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/an agent cannot create, widen, or relax one/i);
   });
 
   test("shows source bytes and rejects oversize input before worker messaging", async () => {
