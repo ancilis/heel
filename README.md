@@ -6,7 +6,6 @@
 <a href="https://github.com/ancilis/heel/actions/workflows/ci.yml"><img src="https://github.com/ancilis/heel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <a href="https://github.com/ancilis/heel/actions/workflows/codeql.yml"><img src="https://github.com/ancilis/heel/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
 <a href="https://scorecard.dev/viewer/?uri=github.com/ancilis/heel"><img src="https://api.scorecard.dev/projects/github.com/ancilis/heel/badge" alt="OpenSSF Scorecard"></a>
-<a href="https://pypi.org/project/heel-sim/"><img src="https://img.shields.io/pypi/v/heel-sim.svg" alt="PyPI"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="Apache 2.0"></a>
 <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
 <img src="https://img.shields.io/badge/deps-zero-brightgreen" alt="Zero dependencies">
@@ -37,18 +36,40 @@ reports its *real* detection rate against abuse it has never seen, not a vanity 
 **safe by construction** (synthetic-first, contained PoCs, an authorization gate no prompt-injected
 agent can talk its way past). Pure Python standard library, **zero dependencies**.
 
-## See it in 30 seconds
+## Five-minute local launch review
+
+`heel-sim` is not yet published to PyPI. Install the current source checkout into an isolated
+environment, choose a private local data directory, and review the included sanitized OpenAPI
+fixture:
 
 ```bash
-pip install heel-sim  # zero deps · Python 3.11+
-heel doctor           # environment self-check
-heel eval             # the honest detection headline
+git clone https://github.com/ancilis/heel
+cd heel
+python3 -m venv .venv
+.venv/bin/python3 -m pip install .
+export HEEL_HOME="$PWD/.heel-local"
+.venv/bin/heel review openapi tests/fixtures/openapi/saas_api.json
 ```
 
-Or run the full proof from a clone, no install:
+The default report is validated Markdown. Add `--json` for the canonical `heel.review.v1`
+envelope used by automation and MCP:
 
 ```bash
-git clone https://github.com/ancilis/heel && cd heel && make demo
+.venv/bin/heel review openapi tests/fixtures/openapi/saas_api.json --json
+```
+
+This path needs no account or signing key, makes no analyzer network calls, uploads and syncs
+nothing, and stores the successful review only under `$HEEL_HOME/reviews/`. Inputs must be
+sanitized UTF-8 OpenAPI JSON without credentials or customer data and no larger than 2 MiB.
+See the [MCP quickstart](docs/MCP_QUICKSTART.md) for current-wheel installation and stdio client
+configuration.
+
+Run the broader synthetic proof from the same clone:
+
+```bash
+.venv/bin/heel doctor
+.venv/bin/heel eval
+make demo
 ```
 
 ```text
@@ -190,12 +211,17 @@ fixture for Free/Pro/Enterprise plans, seats, trial eligibility, coupons, usage 
 exports, OAuth, webhooks, support actions, agent tools, MCP connector metadata, and canary-only
 declared controls.
 
-**Connect from an MCP client.** Point Claude Desktop / Cursor / CI at the `heel-mcp` server:
+**Connect from an MCP client.** After installing from source or a current wheel, point any
+stdio-capable MCP client at `heel-mcp`:
 
 ```json
 { "mcpServers": { "heel": { "command": "heel-mcp",
-  "env": { "HEEL_HOME": "/path/to/.heel", "HEEL_SIGNING_KEY": "/path/outside/.heel/heel.key" } } } }
+  "env": { "HEEL_HOME": "/absolute/path/to/private/heel-data" } } } }
 ```
+
+Call `heel_review_openapi` with the parsed OpenAPI object to receive and save the same local
+`heel.review.v1` envelope as the CLI. Configuration details, privacy boundaries, and an honest
+source/wheel/PyPI installation matrix are in [docs/MCP_QUICKSTART.md](docs/MCP_QUICKSTART.md).
 
 ## The control room
 
@@ -241,6 +267,7 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 [CONTROL SIMULATOR](docs/CONTROL_SIMULATOR.md) ·
 [ECONOMIC SEVERITY](docs/ECONOMIC_SEVERITY.md) · [HEELBENCH](docs/HEELBENCH.md) ·
 [HELDOUT PROVENANCE](docs/HELDOUT_PROVENANCE.md) ·
+[MCP QUICKSTART](docs/MCP_QUICKSTART.md) ·
 [RESEARCH LIBRARY](docs/RESEARCH_LIBRARY.md) · [ROADMAP](docs/ROADMAP.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
 [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 

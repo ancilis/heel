@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
   "name": "io.github.ancilis/heel",
-  "description": "Heel is MCP-first continuous SaaS abuse rehearsal: probe a product you own before launch and after, prove an abuse path is reachable with a contained PoC, and return a ranked report. Exposes only consumption/execution tools and never scope mutation; scopes are human-only, out-of-band, and signed.",
+  "description": "Heel reviews a SaaS product model before launch and returns ranked abuse paths, missing controls, and regression tests. The heel_review_openapi MCP tool analyzes an inline OpenAPI document locally, makes no analyzer network calls, and saves the heel.review.v1 result under HEEL_HOME. Heel exposes no scope-mutation tools.",
   "version": "1.1.0",
   "repository": {
     "url": "https://github.com/ancilis/heel",
@@ -22,7 +22,7 @@
       "environment_variables": [
         {
           "name": "HEEL_HOME",
-          "description": "Data directory for signed authorization scopes, the SQLite store, and the tamper-evident containment log (default ./.heel).",
+          "description": "Private local data directory for saved reviews, signed authorization scopes, the SQLite store, and the tamper-evident containment log (default ./.heel).",
           "is_required": false,
           "is_secret": false
         },

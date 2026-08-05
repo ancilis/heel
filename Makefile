@@ -1,7 +1,7 @@
 # Heel — one-command bring-up (spec §11). Pure stdlib: no installs needed.
 PY ?= python3
 
-.PHONY: demo demo-import demo-launch-review demo-regressions demo-bench test mcp rest ui ui-data scenarios clean help saas-smoke saas-backup saas-restore-verify saas-site
+.PHONY: demo demo-import demo-launch-review demo-regressions demo-bench test mcp rest ui ui-data scenarios clean help release-smoke saas-smoke saas-backup saas-restore-verify saas-site
 
 help:
 	@echo "make demo   - synthetic coverage backtest + auth-gate proof (over the MCP boundary)"
@@ -10,6 +10,7 @@ help:
 	@echo "make demo-regressions - create and run a synthetic abuse regression"
 	@echo "make demo-bench - render a fast local HeelBench report"
 	@echo "make test   - acceptance + safety tests (auth gate, scope tamper-evidence, coverage)"
+	@echo "make release-smoke - build a clean wheel and exercise its installed CLI + MCP"
 	@echo "make mcp    - run the MCP server (stdio JSON-RPC) for a real MCP client"
 	@echo "make rest   - run the thin REST API (same auth gate) on :8780"
 	@echo "make ui-data- regenerate the control-room data snapshot"
@@ -33,6 +34,9 @@ demo-bench:
 
 test:
 	$(PY) -m unittest discover -s tests -p 'test_*.py' -v
+
+release-smoke:
+	$(PY) scripts/release_smoke.py
 
 saas-smoke:
 	$(PY) scripts/saas_smoke.py

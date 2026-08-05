@@ -1,7 +1,7 @@
-"""
-Heel: CLI (spec §2: a thin client over the same capability; PLUS the out-of-band
-human-only scope path). `heel scope create` is the ONLY way to mint a scope, requires
-explicit `--confirm`, and writes a signed scope file. Everything else calls the MCP capability.
+"""Heel CLI over the shared review and abuse-rehearsal capabilities.
+
+`heel scope create` is the only path that can mint an authorization scope. It requires
+explicit human confirmation and remains unavailable through the MCP and REST surfaces.
 """
 from __future__ import annotations
 
@@ -9,12 +9,99 @@ import argparse
 import getpass
 import json
 import os
+import stat
+import sys
 
 from . import __version__
 from . import scope as scopemod
 from .contracts import DataHandlingMode
-from .mcp_server import HeelServer
+from .mcp_server import (
+    MAX_OPENAPI_PAYLOAD_BYTES,
+    MAX_RESULT_BYTES,
+    HeelServer,
+    _json_within_limit,
+    _success_tool_result,
+)
 from .store import Store
+
+
+_SAFE_REVIEW_FAILURE = (
+    "Heel OpenAPI review failed: input could not be read or reviewed safely."
+)
+_OPENAPI_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
+
+
+def _reject_duplicate_json_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _load_bounded_openapi(path: str) -> dict:
+    """Read one regular, non-symlink JSON file without exceeding the MCP limit."""
+    descriptor = os.open(path, _OPENAPI_READ_FLAGS)
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError("OpenAPI input must be a regular file")
+        if status.st_size > MAX_OPENAPI_PAYLOAD_BYTES:
+            raise ValueError("OpenAPI input exceeds the local review limit")
+
+        chunks = []
+        remaining = MAX_OPENAPI_PAYLOAD_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > MAX_OPENAPI_PAYLOAD_BYTES:
+            raise ValueError("OpenAPI input exceeds the local review limit")
+    finally:
+        os.close(descriptor)
+
+    value = json.loads(
+        payload.decode("utf-8"),
+        object_pairs_hook=_reject_duplicate_json_keys,
+    )
+    if type(value) is not dict:
+        raise ValueError("OpenAPI input must be a JSON object")
+    return value
+
+
+def _review_openapi_file(path: str, *, as_json: bool) -> int:
+    """Review a local file through the same pure service and exporters as MCP."""
+    from .local_projects import LocalProjectStore
+    from .review_export import review_to_json, review_to_markdown
+    from .review_service import review_openapi
+
+    try:
+        specification = _load_bounded_openapi(path)
+        review = review_openapi(specification, execution_mode="machine_local")
+        if not _json_within_limit(
+            _success_tool_result("heel_review_openapi", review),
+            MAX_RESULT_BYTES,
+        ):
+            raise ValueError("review exceeds the shared MCP result limit")
+        LocalProjectStore().save_review(review)
+        rendered = review_to_json(review) if as_json else review_to_markdown(review)
+    # This is the command's trust boundary: parser, analyzer, exporter, and storage errors
+    # must fail closed without reflecting a path, OpenAPI value, or traceback.
+    except Exception:
+        print(_SAFE_REVIEW_FAILURE, file=sys.stderr)
+        return 2
+
+    sys.stdout.write(rendered)
+    return 0
 
 
 def _doctor() -> int:
@@ -340,6 +427,23 @@ def main(argv=None):
     bench_report.add_argument("--blind-targets", type=int, default=24, help="number of blind synthetic targets")
     bench_report.add_argument("--workers", type=int, default=6, help="blind-eval worker threads")
 
+    review = sub.add_parser(
+        "review",
+        help="review local product definitions without an account or network access",
+    )
+    review_sub = review.add_subparsers(dest="reviewcmd", required=True)
+    review_openapi_parser = review_sub.add_parser(
+        "openapi",
+        help="review a local OpenAPI JSON file and save the result under HEEL_HOME",
+    )
+    review_openapi_parser.add_argument("path", metavar="PATH")
+    review_openapi_parser.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="emit the canonical heel.review.v1 JSON envelope",
+    )
+
     init = sub.add_parser("init", help="initialize local Heel artifacts")
     init.add_argument("--from-openapi", dest="from_openapi", help="local OpenAPI JSON/YAML file to convert into a ProductModel draft")
     init.add_argument("--out", required=True, help="ProductModel JSON output path")
@@ -441,6 +545,8 @@ def main(argv=None):
         output_format = "json" if args.bcmd == "run" else args.format
         print(format_report(report, output_format))
         return 0
+    if args.cmd == "review" and args.reviewcmd == "openapi":
+        return _review_openapi_file(args.path, as_json=args.as_json)
     if args.cmd == "init":
         if not args.from_openapi:
             print("OpenAPI import: FAIL (--from-openapi is required for init)")
