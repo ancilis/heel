@@ -457,6 +457,47 @@ def _local_definitions(tree: ast.Module) -> frozenset[str]:
     )
 
 
+class _DeclarationBindingVisitor(ast.NodeVisitor):
+    """Reject declaration replacement without conflating distinct lexical scopes."""
+
+    def __init__(self, protected_bindings: frozenset[str]):
+        self._protected_bindings = protected_bindings
+        self._scope_declarations: list[set[str]] = [set()]
+
+    def _declare(self, name: str) -> None:
+        if name in self._protected_bindings:
+            raise BrowserEngineBuildError(
+                f"browser module shadows reviewed declaration binding: {name}"
+            )
+        declarations = self._scope_declarations[-1]
+        if name in declarations:
+            raise BrowserEngineBuildError(
+                f"browser module has duplicate declaration: {name}"
+            )
+        declarations.add(name)
+
+    def _visit_declaration_scope(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+    ) -> None:
+        self._declare(node.name)
+        self._scope_declarations.append(set())
+        try:
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self._scope_declarations.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_declaration_scope(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_declaration_scope(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_declaration_scope(node)
+
+
 def _validate_reviewed_binding_provenance(
     tree: ast.Module,
     module_bindings: frozenset[str],
@@ -464,6 +505,9 @@ def _validate_reviewed_binding_provenance(
 ) -> None:
     # This protects authority provenance in reviewed source; it does not turn
     # the source checker into an arbitrary-Python or bytecode malware sandbox.
+    _DeclarationBindingVisitor(
+        REVIEWED_BUILTIN_CALLS | module_bindings | imported_symbols
+    ).visit(tree)
     protected_bindings = (
         REVIEWED_BUILTIN_CALLS
         | module_bindings

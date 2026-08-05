@@ -394,8 +394,8 @@ class BrowserEngineBuildTests(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0, mutation)
                 self.assertRegex(
                     completed.stderr,
-                    r"ambient capability|reviewed binding|reviewed module attribute|"
-                    r"forbidden dynamic primitive",
+                    r"ambient capability|reviewed binding|reviewed declaration binding|"
+                    r"reviewed module attribute|forbidden dynamic primitive",
                 )
 
         reviewed_declarations = self._run_builder_with_browser_review_mutation(
@@ -469,6 +469,86 @@ class BrowserEngineBuildTests(unittest.TestCase):
             "HeelReviewedWrites()"
         )
         self.assertEqual(reviewed_writes.returncode, 0, reviewed_writes.stderr)
+
+    def test_declarations_cannot_shadow_or_replace_reviewed_bindings(self):
+        mutations = {
+            "function shadows imported serializer": (
+                "def stable_json(value):\n"
+                "    return value\n"
+                "stable_json({})"
+            ),
+            "class shadows imported serializer": (
+                "class stable_json:\n"
+                "    pass\n"
+                "stable_json()"
+            ),
+            "async function shadows imported serializer": (
+                "async def stable_json(value):\n"
+                "    return value"
+            ),
+            "function shadows safe builtin": "def len(value):\n    return 0\nlen(())",
+            "class shadows safe builtin": "class len:\n    pass\nlen()",
+            "function shadows module binding": "def json():\n    return None",
+            "class shadows module binding": "import re\nclass re:\n    pass",
+            "function shadows another imported symbol": (
+                "def validate_review_envelope(value):\n"
+                "    return value"
+            ),
+            "duplicate function declaration": (
+                "def heel_once():\n"
+                "    return 1\n"
+                "def heel_once():\n"
+                "    return 2"
+            ),
+            "duplicate class declaration": (
+                "class HeelOnce:\n"
+                "    pass\n"
+                "class HeelOnce:\n"
+                "    pass"
+            ),
+            "function replaced by class": (
+                "def heel_once():\n"
+                "    return 1\n"
+                "class heel_once:\n"
+                "    pass"
+            ),
+            "async function replaced by function": (
+                "async def heel_once():\n"
+                "    return 1\n"
+                "def heel_once():\n"
+                "    return 2"
+            ),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                completed = self._run_builder_with_browser_review_mutation(mutation)
+                self.assertNotEqual(completed.returncode, 0, mutation)
+                self.assertRegex(
+                    completed.stderr,
+                    r"reviewed declaration binding|duplicate declaration|"
+                    r"rebinds reviewed module",
+                )
+
+        reviewed_declarations = self._run_builder_with_browser_review_mutation(
+            "def heel_unique_function():\n"
+            "    return None\n"
+            "async def heel_unique_async_function():\n"
+            "    return None\n"
+            "class HeelUniqueClass:\n"
+            "    def heel_shared_method(self):\n"
+            "        return None\n"
+            "class HeelSecondUniqueClass:\n"
+            "    def heel_shared_method(self):\n"
+            "        return None\n"
+            "heel_unique_function()\n"
+            "HeelUniqueClass()\n"
+            "HeelSecondUniqueClass()"
+        )
+        self.assertEqual(
+            reviewed_declarations.returncode,
+            0,
+            reviewed_declarations.stderr,
+        )
 
     def test_builder_produces_only_the_proven_browser_closure_and_metadata(self):
         wheel, _manifest = self._require_build()
