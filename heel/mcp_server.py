@@ -26,14 +26,31 @@ from . import scope as scopemod
 from .containment import ContainmentLog, run_is_logged, verify_chain
 from .contracts import CallerContext
 from .control import propose_control
+from .local_projects import (
+    LocalProjectStore,
+    SecureStorageUnavailable,
+    StoredReviewError,
+)
+from .openapi_import import OpenAPIImportError
 from .orchestrator import run_abuse
+from .review_contract import (
+    ENGINE_VERSION,
+    REVIEW_SCHEMA_VERSION,
+    stable_json,
+    validate_review_envelope,
+    validate_review_id,
+)
+from .review_export import review_to_json, review_to_markdown
+from .review_service import review_openapi
 from .scenarios import list_scenarios
 from .store import Store
 
 SERVER_INFO = {"name": "heel", "version": "1.1.0"}
+MCP_SCHEMA_VERSION = "heel.mcp.v1"
+MAX_OPENAPI_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 # Tools exposed over MCP. Scope-mutation tools are ABSENT by construction (§10.1).
-TOOL_SCHEMAS = [
+EXISTING_TOOL_SCHEMAS = [
     {"name": "heel_list_scenarios", "description": "List the abuse scenario library (read).",
      "inputSchema": {"type": "object", "properties": {"filter": {"type": "string"}, "pack": {"type": "string"}}}},
     {"name": "heel_list_scopes", "description": "List authorized scopes (read; never returns secrets). Scopes are created out-of-band by a human; agents cannot mint or widen them.",
@@ -56,6 +73,90 @@ TOOL_SCHEMAS = [
     {"name": "heel_get_containment_log", "description": "The immutable audit trail of what Heel did (with caller).",
      "inputSchema": {"type": "object", "required": ["run_id"], "properties": {"run_id": {"type": "string"}}}},
 ]
+
+# Canonical local review contract. These schemas are intentionally strict, deterministic, and
+# explicit about local-only behavior. Validation is repeated server-side; schemas are hints to MCP
+# clients, not a security boundary.
+REVIEW_TOOL_SCHEMAS = [
+    {
+        "name": "heel_status",
+        "description": (
+            "Report the local Heel engine and review contract. No upload or network calls; "
+            "no cloud account is required."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "heel_review_openapi",
+        "description": (
+            "Analyze an OpenAPI JSON object locally, save it locally, and return its launch "
+            "review. No upload or network calls."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["openapi"],
+            "properties": {"openapi": {"type": "object"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "heel_list_reviews",
+        "description": "List locally saved Heel reviews. No upload or network calls.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "heel_get_review",
+        "description": "Read one locally saved Heel review. No upload or network calls.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["review_id"],
+            "properties": {"review_id": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "heel_explain_finding",
+        "description": (
+            "Explain one exact finding from a locally saved review. No upload or network calls."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["review_id", "surface_id", "risk"],
+            "properties": {
+                "review_id": {"type": "string"},
+                "surface_id": {"type": "string"},
+                "risk": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "heel_export_review",
+        "description": (
+            "Export a locally saved review as deterministic Markdown or JSON. "
+            "No upload or network calls."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["review_id", "format"],
+            "properties": {
+                "review_id": {"type": "string"},
+                "format": {"type": "string", "enum": ["markdown", "json"]},
+            },
+            "additionalProperties": False,
+        },
+    },
+]
+REVIEW_TOOL_NAMES = {tool["name"] for tool in REVIEW_TOOL_SCHEMAS}
+TOOL_SCHEMAS = EXISTING_TOOL_SCHEMAS + REVIEW_TOOL_SCHEMAS
 TOOL_NAMES = {t["name"] for t in TOOL_SCHEMAS}
 
 
@@ -66,13 +167,64 @@ class ToolError(Exception):
 
 
 class HeelServer:
-    def __init__(self, store: Store | None = None, classify_enabled: bool = False):
+    def __init__(
+        self,
+        store: Store | None = None,
+        classify_enabled: bool = False,
+        projects: LocalProjectStore | None = None,
+    ):
         self.store = store or Store()
         self.runs: dict[str, object] = {}
         self.classify_enabled = classify_enabled
+        self._projects = projects
+
+    @property
+    def projects(self) -> LocalProjectStore:
+        """Create the canonical review store only when a review capability needs it."""
+        if self._projects is None:
+            self._projects = LocalProjectStore()
+        return self._projects
 
     def _security_log(self, caller: str, action: str, detail: dict):
         ContainmentLog(self.store, "security", caller).append(action, detail)
+
+    @staticmethod
+    def _validate_exact_args(
+        args,
+        *,
+        fields: tuple[str, ...],
+        string_fields: tuple[str, ...] = (),
+    ) -> dict:
+        """Enforce each review tool's exact JSON-object shape independently of MCP schemas."""
+        if type(args) is not dict:
+            raise ToolError("arguments must be a JSON object", code="invalid_input")
+        if frozenset(args) != frozenset(fields):
+            raise ToolError(
+                "arguments must contain exactly the documented fields",
+                code="invalid_input",
+            )
+        if any(type(args[field]) is not str or not args[field].strip() for field in string_fields):
+            raise ToolError(
+                "documented string arguments must be nonempty strings",
+                code="invalid_input",
+            )
+        return args
+
+    @staticmethod
+    def _invalid_review_input(message: str = "review input or local review data is invalid"):
+        raise ToolError(message, code="invalid_input")
+
+    def _load_review(self, review_id: str) -> dict:
+        try:
+            validate_review_id(review_id)
+            review = self.projects.get_review(review_id)
+            if review is None:
+                raise ToolError("review was not found", code="not_found")
+            return validate_review_envelope(review)
+        except ToolError:
+            raise
+        except (SecureStorageUnavailable, StoredReviewError, OSError, UnicodeError, ValueError):
+            self._invalid_review_input()
 
     # -- tool handlers (caller identity always passed in) -------------------- #
     def heel_list_scenarios(self, args, caller):
@@ -152,6 +304,107 @@ class HeelServer:
         return {"entries": self.store.containment_log(run_id), "chain_valid": ok, "chain_status": msg,
                 "run_is_logged": run_is_logged(self.store, run_id)}
 
+    # -- canonical local review handlers ----------------------------------- #
+    def heel_status(self, args, caller):
+        self._validate_exact_args(args, fields=())
+        return {
+            "engine_version": ENGINE_VERSION,
+            "mcp_schema_version": MCP_SCHEMA_VERSION,
+            "review_schema_version": REVIEW_SCHEMA_VERSION,
+            "execution_mode": "machine_local",
+            "network_calls": False,
+            "cloud_sync": False,
+            "account_required": False,
+        }
+
+    def heel_review_openapi(self, args, caller):
+        self._validate_exact_args(args, fields=("openapi",))
+        spec = args["openapi"]
+        if type(spec) is not dict:
+            self._invalid_review_input("openapi must be a JSON object")
+        try:
+            canonical_size = len(stable_json(spec).encode("utf-8"))
+        except (TypeError, UnicodeError, ValueError):
+            self._invalid_review_input("openapi must be a portable JSON object")
+        if canonical_size > MAX_OPENAPI_PAYLOAD_BYTES:
+            self._invalid_review_input("openapi canonical payload exceeds the 2 MiB limit")
+
+        try:
+            envelope = validate_review_envelope(
+                review_openapi(spec, execution_mode="machine_local")
+            )
+            self.projects.save_review(envelope)
+        except (
+            OpenAPIImportError,
+            SecureStorageUnavailable,
+            StoredReviewError,
+            OSError,
+            UnicodeError,
+            ValueError,
+        ):
+            self._invalid_review_input(
+                "OpenAPI review could not be processed or saved safely"
+            )
+
+        # Audit only stable result metadata and caller attribution. Raw OpenAPI source, routes,
+        # descriptions, and examples never enter the containment log.
+        self._security_log(caller, "review_openapi", {
+            "review_id": envelope["review_id"],
+            "product_id": envelope["product_id"],
+        })
+        return envelope
+
+    def heel_list_reviews(self, args, caller):
+        self._validate_exact_args(args, fields=())
+        try:
+            return {"reviews": self.projects.list_reviews()}
+        except (SecureStorageUnavailable, StoredReviewError, OSError, UnicodeError, ValueError):
+            self._invalid_review_input()
+
+    def heel_get_review(self, args, caller):
+        self._validate_exact_args(
+            args, fields=("review_id",), string_fields=("review_id",)
+        )
+        return self._load_review(args["review_id"])
+
+    def heel_explain_finding(self, args, caller):
+        self._validate_exact_args(
+            args,
+            fields=("review_id", "surface_id", "risk"),
+            string_fields=("review_id", "surface_id", "risk"),
+        )
+        review = self._load_review(args["review_id"])
+        finding = next((
+            item for item in review["findings"]
+            if item["surface_id"] == args["surface_id"] and item["risk"] == args["risk"]
+        ), None)
+        if finding is None:
+            raise ToolError("finding was not found", code="not_found")
+        return {
+            "finding": finding,
+            "explanation": finding["reason"],
+            "recommended_control": finding["control"],
+        }
+
+    def heel_export_review(self, args, caller):
+        self._validate_exact_args(
+            args,
+            fields=("review_id", "format"),
+            string_fields=("review_id", "format"),
+        )
+        if args["format"] not in {"markdown", "json"}:
+            self._invalid_review_input("format must be markdown or json")
+        review = self._load_review(args["review_id"])
+        try:
+            content = (
+                review_to_markdown(review)
+                if args["format"] == "markdown"
+                else review_to_json(review)
+            )
+        except (UnicodeError, ValueError):
+            self._invalid_review_input()
+        return {"format": args["format"], "content": content}
+
     # -- MCP dispatch -------------------------------------------------------- #
     def call_tool(self, name, args, caller):
         if name not in TOOL_NAMES:
@@ -160,7 +413,11 @@ class HeelServer:
                                {"requested_tool": name, "reason": "tool not in registry; scope mutation is human-only out-of-band"})
             raise ToolError(f"unknown tool '{name}': Heel exposes no scope-creation/widening tool; "
                             f"scopes are human-only and out-of-band", code="unknown_tool")
-        return getattr(self, name)(args or {}, caller)
+        # Preserve the legacy direct-call convention where falsey arguments meant an empty
+        # object. Review tools instead receive the exact value so their strict v1 validation
+        # cannot be bypassed with ``None`` or an empty array.
+        handler_args = args if name in REVIEW_TOOL_NAMES else (args or {})
+        return getattr(self, name)(handler_args, caller)
 
     def dispatch(self, method, params, session):
         params = params or {}
@@ -178,7 +435,8 @@ class HeelServer:
             caller = session.get("caller", "unauthenticated:no-handshake")
             name = params.get("name")
             try:
-                result = self.call_tool(name, params.get("arguments") or {}, caller)
+                arguments = params["arguments"] if "arguments" in params else {}
+                result = self.call_tool(name, arguments, caller)
                 return {"content": [{"type": "text", "text": json.dumps(result, default=str)}],
                         "structuredContent": result}
             except ToolError as e:
@@ -216,9 +474,9 @@ def handle_line(server, session, line: str):
 
 def main():  # pragma: no cover - exercised via real MCP clients
     import os
-    scopemod.ensure_home()
-    store = Store(os.path.join(scopemod.heel_home(), "heel.db"))
-    server = HeelServer(store)
+    home = scopemod.ensure_home()
+    store = Store(os.path.join(home, "heel.db"))
+    server = HeelServer(store, projects=LocalProjectStore(home))
     session = {"caller": "stdio-client"}
     for line in sys.stdin:
         resp = handle_line(server, session, line)
