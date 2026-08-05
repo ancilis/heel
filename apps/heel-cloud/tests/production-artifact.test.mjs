@@ -6,7 +6,7 @@ import { cp, lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "n
 import { extname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
-import { deflateRawSync, gunzipSync, gzipSync, inflateRawSync } from "node:zlib";
+import { deflateRawSync, gunzipSync, inflateRawSync } from "node:zlib";
 
 import { validateReleaseDownloads } from "../scripts/prepare-runtime.mjs";
 
@@ -65,7 +65,7 @@ function syntheticZip(records) {
   for (const record of records) {
     const name = Buffer.from(record.name, "utf8");
     const payload = record.payload ?? Buffer.alloc(0);
-    const compression = record.compression ?? 8;
+    const compression = record.compression ?? 0;
     const compressed = compression === 0 ? payload : deflateRawSync(payload);
     const checksum = crc32(payload);
     const declaredSize = record.declaredSize ?? payload.byteLength;
@@ -74,6 +74,7 @@ function syntheticZip(records) {
     local.writeUInt16LE(20, 4);
     local.writeUInt16LE(0, 6);
     local.writeUInt16LE(compression, 8);
+    local.writeUInt16LE(33, 12);
     local.writeUInt32LE(checksum, 14);
     local.writeUInt32LE(compressed.byteLength, 18);
     local.writeUInt32LE(declaredSize, 22);
@@ -86,6 +87,7 @@ function syntheticZip(records) {
     central.writeUInt16LE(20, 6);
     central.writeUInt16LE(0, 8);
     central.writeUInt16LE(compression, 10);
+    central.writeUInt16LE(33, 14);
     central.writeUInt32LE(checksum, 16);
     central.writeUInt32LE(compressed.byteLength, 20);
     central.writeUInt32LE(declaredSize, 24);
@@ -134,7 +136,7 @@ function syntheticTar(records) {
     header[155] = 0x20;
     chunks.push(header, payload, Buffer.alloc((512 - (payload.byteLength % 512)) % 512));
   }
-  return gzipSync(Buffer.concat([...chunks, Buffer.alloc(1024)]), { mtime: 0 });
+  return canonicalGzip(Buffer.concat([...chunks, Buffer.alloc(1024)]));
 }
 
 
@@ -163,6 +165,69 @@ function zipCentralEntries(archive) {
     cursor += 46 + nameLength + extraLength + commentLength;
   }
   return { centralOffset, endOffset, entries };
+}
+
+
+function insertFirstCentralMetadata(archive, { comment = Buffer.alloc(0), extra = Buffer.alloc(0) }) {
+  const layout = zipCentralEntries(archive);
+  const first = layout.entries[0].centralOffset;
+  const nameLength = archive.readUInt16LE(first + 28);
+  const insertion = first + 46 + nameLength;
+  const metadata = Buffer.concat([extra, comment]);
+  const mutated = Buffer.concat([
+    archive.subarray(0, insertion),
+    metadata,
+    archive.subarray(insertion),
+  ]);
+  mutated.writeUInt16LE(extra.byteLength, first + 30);
+  mutated.writeUInt16LE(comment.byteLength, first + 32);
+  const endOffset = layout.endOffset + metadata.byteLength;
+  mutated.writeUInt32LE(archive.readUInt32LE(layout.endOffset + 12) + metadata.byteLength, endOffset + 12);
+  return mutated;
+}
+
+
+function insertFirstLocalExtra(archive, extra) {
+  const layout = zipCentralEntries(archive);
+  const firstLocal = layout.entries[0].localOffset;
+  const localNameLength = archive.readUInt16LE(firstLocal + 26);
+  const insertion = firstLocal + 30 + localNameLength;
+  const mutated = Buffer.concat([
+    archive.subarray(0, insertion),
+    extra,
+    archive.subarray(insertion),
+  ]);
+  mutated.writeUInt16LE(extra.byteLength, firstLocal + 28);
+  const shiftedCentral = layout.centralOffset + extra.byteLength;
+  const shiftedEnd = layout.endOffset + extra.byteLength;
+  mutated.writeUInt32LE(shiftedCentral, shiftedEnd + 16);
+  for (const entry of layout.entries) {
+    const central = entry.centralOffset + extra.byteLength;
+    const local = entry.localOffset >= insertion ? entry.localOffset + extra.byteLength : entry.localOffset;
+    mutated.writeUInt32LE(local, central + 42);
+  }
+  return mutated;
+}
+
+
+function canonicalGzip(payload) {
+  const header = Buffer.from("1f8b08000000000002ff", "hex");
+  const trailer = Buffer.alloc(8);
+  trailer.writeUInt32LE(crc32(payload), 0);
+  trailer.writeUInt32LE(payload.byteLength >>> 0, 4);
+  return Buffer.concat([header, deflateRawSync(payload, { level: 9 }), trailer]);
+}
+
+
+function mutateFirstTarHeader(archive, mutation) {
+  const payload = gunzipSync(archive);
+  mutation(payload.subarray(0, 512));
+  payload.fill(0x20, 148, 156);
+  const checksum = payload.subarray(0, 512).reduce((total, byte) => total + byte, 0);
+  payload.write(checksum.toString(8).padStart(6, "0"), 148, 6, "ascii");
+  payload[154] = 0;
+  payload[155] = 0x20;
+  return canonicalGzip(payload);
 }
 
 
@@ -255,38 +320,53 @@ function zipMembers(archive, label = "wheel") {
   for (let index = 0; index < entryCount; index += 1) {
     assert.ok(cursor <= centralEnd - 46, `${label} central directory entry ${index} is out of bounds`);
     assert.equal(archive.readUInt32LE(cursor), 0x02014b50, `${label} central entry ${index}`);
-    const creatorSystem = archive.readUInt16LE(cursor + 4) >> 8;
+    const creatorVersion = archive.readUInt16LE(cursor + 4);
+    const creatorSystem = creatorVersion >> 8;
+    const createdByVersion = creatorVersion & 0xff;
+    const extractVersion = archive.readUInt16LE(cursor + 6);
     const flags = archive.readUInt16LE(cursor + 8);
     const compression = archive.readUInt16LE(cursor + 10);
+    const modifiedTime = archive.readUInt16LE(cursor + 12);
+    const modifiedDate = archive.readUInt16LE(cursor + 14);
     const checksum = archive.readUInt32LE(cursor + 16);
     const compressedSize = archive.readUInt32LE(cursor + 20);
     const uncompressedSize = archive.readUInt32LE(cursor + 24);
     const nameLength = archive.readUInt16LE(cursor + 28);
     const extraLength = archive.readUInt16LE(cursor + 30);
     const commentLength = archive.readUInt16LE(cursor + 32);
+    const diskStart = archive.readUInt16LE(cursor + 34);
+    const internalAttributes = archive.readUInt16LE(cursor + 36);
     const externalAttributes = archive.readUInt32LE(cursor + 38);
     const localOffset = archive.readUInt32LE(cursor + 42);
     const centralEntryEnd = cursor + 46 + nameLength + extraLength + commentLength;
     assert.ok(centralEntryEnd <= centralEnd, `${label} central entry ${index} is out of bounds`);
     const name = decodeUtf8(archive.subarray(cursor + 46, cursor + 46 + nameLength), `${label} member ${index}`);
-    assert.equal(flags & 1, 0, `${name} is encrypted`);
-    assert.equal(flags & 0x0008, 0, `${name} uses an unsupported data descriptor`);
+    assert.equal(extraLength, 0, `${name} has a forbidden central extra field`);
+    assert.equal(commentLength, 0, `${name} has a forbidden per-entry comment`);
+    assert.equal(flags, 0, `${name} has noncanonical ZIP flags`);
+    assert.equal(compression, 0, `${name} compression must be canonically stored`);
+    assert.equal(creatorSystem, 3, `${name} creator system must be canonical Unix`);
+    assert.equal(createdByVersion, 20, `${name} creator version is noncanonical`);
+    assert.equal(extractVersion, 20, `${name} extract version is noncanonical`);
+    assert.equal(modifiedTime, 0, `${name} timestamp is noncanonical`);
+    assert.equal(modifiedDate, 33, `${name} timestamp is noncanonical`);
+    assert.equal(diskStart, 0, `${name} disk metadata is noncanonical`);
+    assert.equal(internalAttributes, 0, `${name} internal attributes are noncanonical`);
     assert.equal(name.endsWith("/"), false, `${name} is a directory, not a regular file`);
     assertSafeArchivePath(name, `${label}:${name}`);
     assert.equal(seenNames.has(name), false, `${name} is duplicated`);
     seenNames.add(name);
-    if (creatorSystem === 3) {
-      const fileType = (externalAttributes >>> 16) & 0o170000;
-      assert.notEqual(fileType, 0o120000, `${name} is a symbolic link`);
-      assert.ok(fileType === 0 || fileType === 0o100000, `${name} is not a regular file`);
-    }
+    assert.equal(externalAttributes, (0o100644 << 16) >>> 0, `${name} mode is noncanonical`);
     assert.ok(uncompressedSize <= maxReleaseMemberBytes, `${name} exceeds the member size limit`);
     expandedBytes += uncompressedSize;
     assert.ok(expandedBytes <= maxReleaseExpandedBytes, `${label} exceeds the expanded size limit`);
     assert.ok(localOffset <= centralOffset - 30, `${name} local header is out of bounds`);
     assert.equal(archive.readUInt32LE(localOffset), 0x04034b50, `${name} local header`);
+    const localExtractVersion = archive.readUInt16LE(localOffset + 4);
     const localFlags = archive.readUInt16LE(localOffset + 6);
     const localCompression = archive.readUInt16LE(localOffset + 8);
+    const localModifiedTime = archive.readUInt16LE(localOffset + 10);
+    const localModifiedDate = archive.readUInt16LE(localOffset + 12);
     const localChecksum = archive.readUInt32LE(localOffset + 14);
     const localCompressedSize = archive.readUInt32LE(localOffset + 18);
     const localUncompressedSize = archive.readUInt32LE(localOffset + 22);
@@ -298,6 +378,10 @@ function zipMembers(archive, label = "wheel") {
       archive.subarray(localOffset + 30, localOffset + 30 + localNameLength),
       `${label}:${name} local name`,
     );
+    assert.equal(localExtractVersion, 20, `${name} local extract version is noncanonical`);
+    assert.equal(localExtraLength, 0, `${name} has a forbidden local extra field`);
+    assert.equal(localModifiedTime, 0, `${name} local timestamp is noncanonical`);
+    assert.equal(localModifiedDate, 33, `${name} local timestamp is noncanonical`);
     assert.equal(localFlags, flags, `${name} local and central flags disagree`);
     assert.equal(localCompression, compression, `${name} local and central compression disagree`);
     assert.equal(localChecksum, checksum, `${name} local and central CRC disagree`);
@@ -348,10 +432,41 @@ function parseTarNumber(field, label) {
 }
 
 
+function canonicalTarText(field, label) {
+  const terminator = field.indexOf(0);
+  const end = terminator === -1 ? field.byteLength : terminator;
+  if (terminator !== -1) {
+    assert.equal(field.subarray(terminator).every((byte) => byte === 0), true, `${label} contains hidden metadata`);
+  }
+  return decodeUtf8(field.subarray(0, end), label);
+}
+
+
+function assertZeroTarField(field, label) {
+  assert.equal(field.every((byte) => byte === 0), true, `${label} must be empty canonical metadata`);
+}
+
+
 function tarMembers(archive, label = "source archive") {
   assert.ok(archive.byteLength <= maxReleaseArchiveBytes, `${label} exceeds the archive size limit`);
+  assert.ok(archive.byteLength >= 18, `${label} gzip stream is truncated`);
+  assert.deepEqual(
+    archive.subarray(0, 10),
+    Buffer.from("1f8b08000000000002ff", "hex"),
+    `${label} gzip header or metadata is noncanonical`,
+  );
   const maximumTarBytes = maxReleaseExpandedBytes + maxReleaseMembers * 1023 + 1024;
-  const payload = gunzipSync(archive, { maxOutputLength: maximumTarBytes });
+  const compressed = archive.subarray(10, archive.byteLength - 8);
+  let expanded;
+  try {
+    expanded = inflateRawSync(compressed, { info: true, maxOutputLength: maximumTarBytes });
+  } catch {
+    assert.fail(`${label} gzip stream is invalid or exceeds its expansion bound`);
+  }
+  assert.equal(expanded.engine.bytesWritten, compressed.byteLength, `${label} gzip stream is concatenated or has trailing metadata`);
+  const payload = expanded.buffer;
+  assert.equal(archive.readUInt32LE(archive.byteLength - 8), crc32(payload), `${label} gzip CRC mismatch`);
+  assert.equal(archive.readUInt32LE(archive.byteLength - 4), payload.byteLength >>> 0, `${label} gzip size mismatch`);
   assert.equal(payload.byteLength % 512, 0, `${label} has a partial TAR block`);
   const members = [];
   const names = new Set();
@@ -370,14 +485,26 @@ function tarMembers(archive, label = "source archive") {
     }
     assert.ok(members.length < maxReleaseMembers, `${label} exceeds the member count limit`);
     assert.equal(header.subarray(257, 263).toString("ascii"), "ustar\0", `${label} member is not USTAR`);
+    assert.equal(header.subarray(263, 265).toString("ascii"), "00", `${label} member version metadata is noncanonical`);
+    assert.equal(header.subarray(100, 108).toString("ascii"), "0000644\0", `${label} member mode metadata is noncanonical`);
+    assert.equal(header.subarray(108, 116).toString("ascii"), "0000000\0", `${label} member uid metadata is noncanonical`);
+    assert.equal(header.subarray(116, 124).toString("ascii"), "0000000\0", `${label} member gid metadata is noncanonical`);
+    assert.match(header.subarray(124, 136).toString("ascii"), /^[0-7]{11}\0$/, `${label} member size metadata is noncanonical`);
+    assert.equal(header.subarray(136, 148).toString("ascii"), "00000000000\0", `${label} member mtime metadata is noncanonical`);
+    assert.match(header.subarray(148, 156).toString("ascii"), /^[0-7]{6}\0 $/, `${label} member checksum metadata is noncanonical`);
+    assertZeroTarField(header.subarray(157, 257), `${label} member linkname`);
+    assertZeroTarField(header.subarray(265, 297), `${label} member uname`);
+    assertZeroTarField(header.subarray(297, 329), `${label} member gname`);
+    assertZeroTarField(header.subarray(329, 337), `${label} member device-major`);
+    assertZeroTarField(header.subarray(337, 345), `${label} member device-minor`);
     const expectedChecksum = parseTarNumber(header.subarray(148, 156), `${label} member checksum`);
     let actualChecksum = 0;
     for (let index = 0; index < header.byteLength; index += 1) {
       actualChecksum += index >= 148 && index < 156 ? 0x20 : header[index];
     }
     assert.equal(actualChecksum, expectedChecksum, `${label} member checksum mismatch`);
-    const name = decodeUtf8(header.subarray(0, 100), `${label} member name`).replace(/\0.*$/s, "");
-    const prefix = decodeUtf8(header.subarray(345, 500), `${label} member prefix`).replace(/\0.*$/s, "");
+    const name = canonicalTarText(header.subarray(0, 100), `${label} member name`);
+    const prefix = canonicalTarText(header.subarray(345, 500), `${label} member prefix`);
     const fullName = prefix ? `${prefix}/${name}` : name;
     assertSafeArchivePath(fullName, `${label}:${fullName}`);
     assert.equal(names.has(fullName), false, `${fullName} is duplicated`);
@@ -568,8 +695,9 @@ test("ZIP scanner rejects malformed end records, hidden entries, metadata disagr
     name: "heel/bomb.py",
     payload: Buffer.alloc(maxReleaseMemberBytes + 1),
     declaredSize: 1,
+    compression: 8,
   }]);
-  assert.throws(() => zipMembers(bomb, "compressed bomb wheel"), /member size limit|decompression/i);
+  assert.throws(() => zipMembers(bomb, "compressed bomb wheel"), /member size limit|decompression|compression/i);
 });
 
 
@@ -606,26 +734,111 @@ test("ZIP scanner rejects comments and every unreferenced byte before the centra
 });
 
 
+test("ZIP scanner rejects every noncanonical per-entry metadata channel", async () => {
+  const wheel = await readFile(join(appRoot, "public/downloads", agentWheelName));
+  const layout = zipCentralEntries(wheel);
+  const central = layout.entries[0].centralOffset;
+  const local = layout.entries[0].localOffset;
+  const mutations = [
+    ["central extra", insertFirstCentralMetadata(wheel, { extra: Buffer.from("LicenseRef-Heel-Commercial") })],
+    ["central comment", insertFirstCentralMetadata(wheel, { comment: Buffer.from("ghp_12345678901234567890") })],
+    ["local extra", insertFirstLocalExtra(wheel, Buffer.from("//# sourceMappingURL=private.map"))],
+  ];
+
+  const flags = Buffer.from(wheel);
+  flags.writeUInt16LE(0x0800, central + 8);
+  flags.writeUInt16LE(0x0800, local + 6);
+  mutations.push(["flags", flags]);
+
+  const creator = Buffer.from(wheel);
+  creator.writeUInt16LE(20, central + 4);
+  mutations.push(["creator system", creator]);
+
+  const mode = Buffer.from(wheel);
+  mode.writeUInt32LE((0o100600 << 16) >>> 0, central + 38);
+  mutations.push(["mode", mode]);
+
+  const timestamp = Buffer.from(wheel);
+  timestamp.writeUInt16LE(1, central + 12);
+  timestamp.writeUInt16LE(1, local + 10);
+  mutations.push(["timestamp", timestamp]);
+
+  const version = Buffer.from(wheel);
+  version.writeUInt16LE((3 << 8) | 21, central + 4);
+  version.writeUInt16LE(21, central + 6);
+  version.writeUInt16LE(21, local + 4);
+  mutations.push(["version", version]);
+
+  for (const [name, archive] of mutations) {
+    assert.throws(() => zipMembers(archive, `${name} wheel`), /canonical|extra|comment|flags|creator|mode|timestamp|version/i, name);
+  }
+});
+
+
+test("gzip scanner rejects metadata, concatenated streams, and corrupt trailers", async () => {
+  const source = await readFile(join(appRoot, "public/downloads", agentSourceName));
+  const filename = Buffer.concat([source.subarray(0, 10), Buffer.from("LicenseRef-Heel-Commercial\0"), source.subarray(10)]);
+  filename[3] = 0x08;
+  assert.throws(() => tarMembers(filename, "filename gzip"), /gzip header|metadata/i);
+
+  const comment = Buffer.concat([source.subarray(0, 10), Buffer.from("//# sourceMappingURL=private.map\0"), source.subarray(10)]);
+  comment[3] = 0x10;
+  assert.throws(() => tarMembers(comment, "comment gzip"), /gzip header|metadata/i);
+
+  const concatenated = Buffer.concat([source, canonicalGzip(Buffer.alloc(0))]);
+  assert.throws(() => tarMembers(concatenated, "concatenated gzip"), /single|concatenated|gzip/i);
+
+  const badCrc = Buffer.from(source);
+  badCrc.writeUInt32LE(0, badCrc.byteLength - 8);
+  assert.throws(() => tarMembers(badCrc, "bad-CRC gzip"), /CRC|gzip/i);
+
+  const badSize = Buffer.from(source);
+  badSize.writeUInt32LE(0, badSize.byteLength - 4);
+  assert.throws(() => tarMembers(badSize, "bad-size gzip"), /size|gzip/i);
+});
+
+
+test("TAR scanner rejects noncanonical and nonempty unused header metadata", async () => {
+  const source = await readFile(join(appRoot, "public/downloads", agentSourceName));
+  const mutations = [
+    ["mode", (header) => header.write("0000600\0", 100, 8, "ascii")],
+    ["uid", (header) => header.write("0000001\0", 108, 8, "ascii")],
+    ["gid", (header) => header.write("0000001\0", 116, 8, "ascii")],
+    ["mtime", (header) => header.write("00000000001\0", 136, 12, "ascii")],
+    ["linkname", (header) => header.write("LicenseRef-Heel-Commercial", 157, "utf8")],
+    ["uname", (header) => header.write("ghp_12345678901234567890", 265, "utf8")],
+    ["gname", (header) => header.write("sourceMappingURL", 297, "utf8")],
+    ["devmajor", (header) => header.write("0000001\0", 329, 8, "ascii")],
+    ["devminor", (header) => header.write("0000001\0", 337, 8, "ascii")],
+    ["version", (header) => header.write("01", 263, 2, "ascii")],
+  ];
+  for (const [name, mutation] of mutations) {
+    const archive = mutateFirstTarHeader(source, mutation);
+    assert.throws(() => tarMembers(archive, `${name} source`), /metadata|mode|uid|gid|mtime|link|name|device|version/i, name);
+  }
+});
+
+
 test("TAR scanner rejects corrupt checksums, padding, termination, and private members", () => {
   const valid = syntheticTar([{ name: "heel_sim-1.1.0/heel/model.py", payload: Buffer.from("VALUE = 1\n") }]);
   const raw = gunzipSync(valid);
 
   const badChecksum = Buffer.from(raw);
   badChecksum[0] ^= 1;
-  assert.throws(() => tarMembers(gzipSync(badChecksum), "bad-checksum source"), /checksum/i);
+  assert.throws(() => tarMembers(canonicalGzip(badChecksum), "bad-checksum source"), /checksum/i);
 
   const size = Number.parseInt(raw.subarray(124, 136).toString("ascii").replace(/\0.*$/s, "").trim(), 8);
   const badPadding = Buffer.from(raw);
   badPadding[512 + size] = 1;
-  assert.throws(() => tarMembers(gzipSync(badPadding), "bad-padding source"), /padding/i);
+  assert.throws(() => tarMembers(canonicalGzip(badPadding), "bad-padding source"), /padding/i);
 
   const firstEndBlock = 512 + Math.ceil(size / 512) * 512;
-  const singleEndBlock = gzipSync(raw.subarray(0, firstEndBlock + 512));
+  const singleEndBlock = canonicalGzip(raw.subarray(0, firstEndBlock + 512));
   assert.throws(() => tarMembers(singleEndBlock, "single-end-block source"), /two zero blocks|termination/i);
 
   const trailingPayload = Buffer.from(raw);
   trailingPayload[trailingPayload.byteLength - 1] = 1;
-  assert.throws(() => tarMembers(gzipSync(trailingPayload), "trailing-data source"), /trailing|termination/i);
+  assert.throws(() => tarMembers(canonicalGzip(trailingPayload), "trailing-data source"), /trailing|termination/i);
 
   const privateSource = syntheticTar([
     { name: "heel_sim-1.1.0/heel/model.py", payload: Buffer.from("VALUE = 1\n") },
