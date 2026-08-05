@@ -1,6 +1,7 @@
 import json
 import math
 import unittest
+from typing import Any, get_type_hints
 
 from heel.review_contract import (
     ENGINE_VERSION,
@@ -200,6 +201,34 @@ class ReviewContractTests(unittest.TestCase):
                     "network_calls": False,
                     **mode_privacy,
                 })
+                self.assertEqual(
+                    envelope["safety"]["network_calls"],
+                    envelope["privacy"]["network_calls"],
+                )
+
+    def test_static_safety_record_is_fixed_v1_output(self):
+        self.assertEqual(self._build()["safety"], safety())
+
+    def test_contradictory_static_safety_values_are_rejected(self):
+        unsafe_variants = {
+            "mode": "live ProductModel diff",
+            "live_probing": True,
+            "network_calls": True,
+            "requires_signed_scope_for_live_or_staging_runs": False,
+            "canary_only": False,
+        }
+        for field, unsafe_value in unsafe_variants.items():
+            review = self._review()
+            review["safety"][field] = unsafe_value
+            with self.subTest(field=field, unsafe_value=unsafe_value):
+                with self.assertRaisesRegex(ValueError, f"safety.{field}"):
+                    self._build(review)
+
+    def test_public_builder_annotations_match_strict_json_containers(self):
+        hints = get_type_hints(build_review_envelope)
+        self.assertEqual(hints["review"], dict[str, Any])
+        self.assertEqual(hints["questions"], list[dict[str, Any]])
+        self.assertEqual(hints["return"], dict[str, Any])
 
     def test_contract_is_json_serializable_and_baseline_hash_may_be_none(self):
         envelope = self._build(baseline_hash=None)

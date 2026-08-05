@@ -5,7 +5,7 @@ import hashlib
 import json
 import math
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 
 REVIEW_SCHEMA_VERSION = "heel.review.v1"
@@ -39,6 +39,13 @@ _SAFETY_FIELDS = (
     "requires_signed_scope_for_live_or_staging_runs",
     "canary_only",
 )
+_STATIC_SAFETY = {
+    "mode": "static ProductModel diff",
+    "live_probing": False,
+    "network_calls": False,
+    "requires_signed_scope_for_live_or_staging_runs": True,
+    "canary_only": True,
+}
 
 
 def _validate_unicode(value: str, path: str) -> None:
@@ -175,7 +182,7 @@ def _validate_safety(value: Any) -> dict[str, Any]:
     path = "safety"
     item = _require_object(value, path)
     _require_exact_fields(item, _SAFETY_FIELDS, path)
-    return {
+    validated = {
         "mode": _require_nonempty_string(item["mode"], "safety.mode"),
         "live_probing": _require_boolean(item["live_probing"], "safety.live_probing"),
         "network_calls": _require_boolean(item["network_calls"], "safety.network_calls"),
@@ -185,6 +192,10 @@ def _validate_safety(value: Any) -> dict[str, Any]:
         ),
         "canary_only": _require_boolean(item["canary_only"], "safety.canary_only"),
     }
+    for field, expected in _STATIC_SAFETY.items():
+        if validated[field] != expected:
+            raise ValueError(f"safety.{field} contradicts the static v1 contract")
+    return dict(_STATIC_SAFETY)
 
 
 def _validate_hash(value: Any, path: str, *, allow_none: bool = False) -> str | None:
@@ -196,9 +207,9 @@ def _validate_hash(value: Any, path: str, *, allow_none: bool = False) -> str | 
 
 
 def build_review_envelope(
-    review: Mapping[str, Any], *, source_hash: str, model_hash: str,
+    review: dict[str, Any], *, source_hash: str, model_hash: str,
     baseline_hash: str | None, execution_mode: str,
-    questions: Sequence[Mapping[str, Any]],
+    questions: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Validate and build the deterministic envelope shared by every execution surface."""
     if type(execution_mode) is not str or execution_mode not in EXECUTION_MODES:
