@@ -18,6 +18,7 @@ demo.
 ```bash
 npm ci --ignore-scripts --no-audit --no-fund
 npm test
+npm run typecheck
 npm run lint
 npm run build
 ```

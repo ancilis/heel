@@ -12,6 +12,7 @@
     "test:unit": "vitest run",
     "test:node": "node --test tests/*.test.mjs",
     "test": "npm run test:unit && npm run test:node",
+    "typecheck": "tsc --noEmit --incremental false",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {
