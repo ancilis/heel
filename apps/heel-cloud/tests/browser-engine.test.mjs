@@ -26,6 +26,7 @@ const repositoryRoot = resolve(appRoot, "../..");
 const prepareScript = join(appRoot, "scripts/prepare-runtime.mjs");
 const runtimeRoot = join(appRoot, "public/heel-runtime");
 const engineRoot = join(appRoot, "browser-engine");
+const permissionRunner = join(appRoot, "tests/browser-engine-permission-runner.mjs");
 const wheelName = "heel_browser-1.1.0-py3-none-any.whl";
 const pyodideSource = "https://github.com/pyodide/pyodide/tree/ac57031be7564f864d061cb37c5c152e59f83ad4";
 const cpythonSource = "https://github.com/python/cpython/tree/df793163d5821791d4e7caf88885a2c11a107986";
@@ -366,6 +367,8 @@ test("prepares only integrity-pinned local engine and Pyodide runtime assets", a
     pyodideLicense,
     cpythonLicense,
     packageJson,
+    packageLock,
+    readme,
     gitignore,
   ] = await Promise.all([
     readFile(join(runtimeRoot, "runtime-manifest.json"), "utf8").then(JSON.parse),
@@ -374,6 +377,8 @@ test("prepares only integrity-pinned local engine and Pyodide runtime assets", a
     readFile(join(runtimeRoot, "LICENSE.PYODIDE-MPL-2.0.txt")),
     readFile(join(runtimeRoot, "LICENSE.CPYTHON-PSF-2.0.txt")),
     readFile(join(appRoot, "package.json"), "utf8").then(JSON.parse),
+    readFile(join(appRoot, "package-lock.json"), "utf8").then(JSON.parse),
+    readFile(join(appRoot, "README.md"), "utf8"),
     readFile(join(appRoot, ".gitignore"), "utf8"),
   ]);
 
@@ -413,6 +418,10 @@ test("prepares only integrity-pinned local engine and Pyodide runtime assets", a
   assert.match(cpythonLicense.toString("utf8"), /BEOPEN\.COM LICENSE AGREEMENT FOR PYTHON 2\.0/);
   assert.match(cpythonLicense.toString("utf8"), /CNRI LICENSE AGREEMENT FOR PYTHON 1\.6\.1/);
   assert.ok(cpythonLicense.length > 13_000, "full CPython license history must be distributed");
+  assert.equal(packageJson.engines.node, ">=24.13.1");
+  assert.equal(packageLock.packages[""].engines.node, ">=24.13.1");
+  assert.match(readme, /Production and hosting: Node\.js `>=24\.13\.1`/);
+  assert.match(readme, /Security verification: Node\.js 25\+; Node\.js 26 is recommended/);
   assert.equal(packageJson.scripts.predev, "node scripts/prepare-runtime.mjs");
   assert.equal(packageJson.scripts.prebuild, "node scripts/prepare-runtime.mjs");
   assert.equal(
@@ -595,4 +604,59 @@ test("executes the real local wheel in Pyodide with outbound network disabled", 
     confinement.restore();
     await confinement.proveBuiltinEsmRestoration();
   }
+});
+
+
+test("executes the real wheel in a Node permission-confined process", async () => {
+  const nodeMajor = Number.parseInt(process.versions.node.split(".", 1)[0], 10);
+  assert.ok(
+    nodeMajor >= 25,
+    `browser security test requires Node 25+ permission capabilities; Node 26 is recommended (found ${process.version})`,
+  );
+  const prepared = prepareRuntime();
+  assert.equal(prepared.status, 0, prepared.stderr);
+  const sample = await readFile(join(repositoryRoot, "tests/fixtures/openapi/saas_api.json"), "utf8");
+  const native = spawnSync(
+    process.env.PYTHON ?? "python3",
+    ["-c", "import sys; from heel.browser_review import review_openapi_json; sys.stdout.write(review_openapi_json(sys.stdin.read()))"],
+    { cwd: repositoryRoot, input: sample, encoding: "utf8", timeout: 30_000 },
+  );
+  assert.equal(native.status, 0, native.stderr);
+
+  const permissionArguments = [
+    "--permission",
+    `--allow-fs-read=${runtimeRoot}`,
+    `--allow-fs-read=${join(appRoot, "node_modules/ws")}`,
+    permissionRunner,
+  ];
+  for (const forbidden of [
+    "--allow-addons",
+    "--allow-child-process",
+    "--allow-fs-write",
+    "--allow-net",
+    "--allow-wasi",
+    "--allow-worker",
+  ]) {
+    assert.ok(
+      permissionArguments.every((argument) => !argument.startsWith(forbidden)),
+      `${forbidden} must not be granted to the browser security child`,
+    );
+  }
+  const confined = spawnSync(process.execPath, permissionArguments, {
+    cwd: appRoot,
+    encoding: "utf8",
+    input: JSON.stringify({ expected: native.stdout, sample }),
+    timeout: 30_000,
+  });
+  assert.equal(confined.status, 0, confined.stderr);
+  const result = JSON.parse(confined.stdout);
+  assert.equal(result.actual, native.stdout);
+  assert.deepEqual(result.bindingRequests, ["constants"]);
+  assert.equal(result.cpythonVersion, "3.14.2");
+  assert.deepEqual(result.denied, ["net", "child", "worker", "fs.write"]);
+  assert.equal(result.runtimeReadAllowed, true);
+  await assert.rejects(
+    readFile(join(appRoot, ".permission-write-must-fail")),
+    { code: "ENOENT" },
+  );
 });
