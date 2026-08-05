@@ -6,17 +6,38 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
+  workflow-lint:
+    name: GitHub Actions structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Run integrity-pinned actionlint 1.7.8
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLo /tmp/actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.8/actionlint_1.7.8_linux_amd64.tar.gz
+          echo 'be92c2652ab7b6d08425428797ceabeb16e31a781c07bc388456b4e592f3e36a  /tmp/actionlint.tar.gz' \
+            | sha256sum -c -
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint -color
+
   test:
     name: tests (py${{ matrix.python }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
       - name: Acceptance + safety tests (pure stdlib — no install needed)
@@ -29,42 +50,94 @@ jobs:
         run: python -c "from heel.saas.site import build; build('build/site')"
 
   package:
-    name: build + install wheel
+    name: verify + install deterministic Agent release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade pip build
-      - name: Build wheel + sdist
-        run: python -m build
-      - name: Install the wheel in a clean env and smoke-test
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - name: Install the pinned standard-build test frontend
+        run: >-
+          env PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1
+          python -m pip --isolated install --require-hashes --only-binary=:all:
+          -r release/requirements-release.txt
+      - name: Check deterministic Apache-only release artifacts
         run: |
-          python -m venv /tmp/v
-          /tmp/v/bin/pip install dist/*.whl
-          /tmp/v/bin/heel --version
-          /tmp/v/bin/heel scenarios > /dev/null
-          /tmp/v/bin/python -c "from heel.heldout_eval import heldout_eval; r=heldout_eval(); assert r['test']['with_semantic']['precision'] > 0.85; print('smoke OK', r['test']['with_semantic']['recall'])"
-          # exercise the heel-mcp console script end-to-end (regression guard for the entry point)
-          printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | /tmp/v/bin/heel-mcp | grep -q heel_run && echo "mcp entry OK"
-      - uses: actions/upload-artifact@v4
+          python scripts/build_open_core_release.py --output apps/heel-cloud/public/downloads --check
+          HEEL_REQUIRE_STANDARD_BUILD=1 python -m unittest tests.test_open_core_release -v
+      - name: Install the committed wheel and complete the MCP lifecycle
+        run: |
+          python -m venv /tmp/heel-release
+          env -u PYTHONPATH -u PYTHONHOME \
+            PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1 \
+            /tmp/heel-release/bin/python -m pip --isolated install \
+            --no-index --no-deps --no-cache-dir \
+            apps/heel-cloud/public/downloads/heel_sim-1.1.1-py3-none-any.whl
+          install -d -m 700 /tmp/heel-ci-workspace /tmp/heel-ci-home
+          /tmp/heel-release/bin/python -I - <<'PY'
+          import importlib.util
+          import json
+          import os
+          import subprocess
+
+          assert importlib.util.find_spec("heel.saas") is None
+          messages = [
+              '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"heel-ci","version":"1.0"}}}',
+              '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}',
+              '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
+              '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"heel_review_openapi","arguments":{"openapi":{"openapi":"3.1.0","info":{"title":"CI SaaS","version":"1.0.0"},"paths":{}}}}}',
+          ]
+          environment = os.environ.copy()
+          environment.pop("PYTHONPATH", None)
+          environment.pop("PYTHONHOME", None)
+          environment["HEEL_HOME"] = "/tmp/heel-ci-home"
+          environment["PYTHONNOUSERSITE"] = "1"
+          result = subprocess.run(
+              ["/tmp/heel-release/bin/heel-mcp"],
+              input="\n".join(messages) + "\n",
+              text=True,
+              capture_output=True,
+              check=True,
+              cwd="/tmp/heel-ci-workspace",
+              env=environment,
+              timeout=30,
+          )
+          responses = [json.loads(line) for line in result.stdout.splitlines() if line]
+          assert len(responses) == 3, responses
+          assert responses[0]["result"]["serverInfo"]["name"] == "heel"
+          assert "heel_review_openapi" in {
+              tool["name"] for tool in responses[1]["result"]["tools"]
+          }
+          assert responses[2]["id"] == 3
+          assert responses[2]["result"].get("isError") is not True
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dist
-          path: dist/*
+          name: heel-open-core-1.1.1
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            apps/heel-cloud/public/downloads/heel_sim-1.1.1-py3-none-any.whl
+            apps/heel-cloud/public/downloads/heel_sim-1.1.1.tar.gz
+            apps/heel-cloud/public/downloads/heel-open-core-manifest.json
 
   ui:
     name: control-room UI build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
       - name: Install + build (snapshot is committed, so this is a pure type/render check)
         working-directory: web
         run: |
-          npm ci || npm install
+          npm ci
           npm run build
 
   browser-alpha:
@@ -72,11 +145,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "26"
           # setup-node caches npm's download cache only, never app state or input.

@@ -17,9 +17,9 @@ const clientRoot = join(distRoot, "client");
 const runtimeRoot = join(clientRoot, "heel-runtime");
 const downloadsRoot = join(clientRoot, "downloads");
 const serverRoot = join(distRoot, "server");
-const wheelName = "heel_browser-1.1.0-py3-none-any.whl";
-const agentWheelName = "heel_sim-1.1.0-py3-none-any.whl";
-const agentSourceName = "heel_sim-1.1.0.tar.gz";
+const wheelName = "heel_browser-1.1.1-py3-none-any.whl";
+const agentWheelName = "heel_sim-1.1.1-py3-none-any.whl";
+const agentSourceName = "heel_sim-1.1.1.tar.gz";
 const agentManifestName = "heel-open-core-manifest.json";
 const expectedDownloadNames = [agentManifestName, agentWheelName, agentSourceName];
 const internalOriginHeader = "x-heel-internal-origin";
@@ -33,6 +33,7 @@ const maxReleaseArchiveBytes = 32 * 1024 * 1024;
 const maxReleaseMemberBytes = 4 * 1024 * 1024;
 const maxReleaseMembers = 128;
 const maxReleaseExpandedBytes = 24 * 1024 * 1024;
+const maxReleaseMemberNameBytes = 512;
 const forbiddenReleasePrefixes = [
   "apps/",
   "deploy/",
@@ -210,6 +211,21 @@ function insertFirstLocalExtra(archive, extra) {
 }
 
 
+function swapFirstTwoCentralEntries(archive) {
+  const layout = zipCentralEntries(archive);
+  assert.ok(layout.entries.length >= 2);
+  const firstStart = layout.entries[0].centralOffset;
+  const secondStart = layout.entries[1].centralOffset;
+  const secondEnd = layout.entries[2]?.centralOffset ?? layout.endOffset;
+  return Buffer.concat([
+    archive.subarray(0, firstStart),
+    archive.subarray(secondStart, secondEnd),
+    archive.subarray(firstStart, secondStart),
+    archive.subarray(secondEnd),
+  ]);
+}
+
+
 function canonicalGzip(payload) {
   const header = Buffer.from("1f8b08000000000002ff", "hex");
   const trailer = Buffer.alloc(8);
@@ -233,6 +249,16 @@ function mutateFirstTarHeader(archive, mutation) {
 
 function sha256(payload) {
   return createHash("sha256").update(payload).digest("hex");
+}
+
+
+function failureOf(action, label) {
+  try {
+    action();
+  } catch (error) {
+    return error;
+  }
+  assert.fail(`${label} was accepted`);
 }
 
 
@@ -276,8 +302,34 @@ function decodeUtf8(payload, label) {
 function assertSafeArchivePath(name, label) {
   assert.ok(name && !name.startsWith("/") && !name.includes("\\"), `${label} has an unsafe path`);
   assert.equal(name.includes("\0"), false, `${label} contains NUL`);
+  assert.ok(Buffer.byteLength(name, "utf8") <= maxReleaseMemberNameBytes, `${label} member path is too long`);
+  assert.equal(
+    /LicenseRef-Heel-Commercial|LICENSE-COMMERCIAL/.test(name),
+    false,
+    `${label} exposes a commercial marker in its member path`,
+  );
+  assert.equal(
+    /(?:\/\/[#@]|\/\*#)\s*sourceMappingURL=/i.test(name),
+    false,
+    `${label} exposes a source map directive in its member path`,
+  );
+  assert.equal(extname(name).toLowerCase() === ".map", false, `${label} exposes a source map member path`);
+  assertNoCredentials(name, `${label} exposes credential-like material in its member path`);
   const parts = name.split("/");
   assert.equal(parts.some((part) => part === "" || part === "." || part === ".."), false, `${label} traverses directories`);
+}
+
+
+function compareUtf8(left, right) {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+
+function compareBuilderWheelNames(left, right) {
+  const leftIsRecord = /\.dist-info\/RECORD$/.test(left);
+  const rightIsRecord = /\.dist-info\/RECORD$/.test(right);
+  if (leftIsRecord !== rightIsRecord) return leftIsRecord ? 1 : -1;
+  return compareUtf8(left, right);
 }
 
 
@@ -316,6 +368,8 @@ function zipMembers(archive, label = "wheel") {
   const seenNames = new Set();
   const localSpans = [];
   let expandedBytes = 0;
+  let previousCentralName = null;
+  let expectedLocalOffset = 0;
 
   for (let index = 0; index < entryCount; index += 1) {
     assert.ok(cursor <= centralEnd - 46, `${label} central directory entry ${index} is out of bounds`);
@@ -353,9 +407,17 @@ function zipMembers(archive, label = "wheel") {
     assert.equal(diskStart, 0, `${name} disk metadata is noncanonical`);
     assert.equal(internalAttributes, 0, `${name} internal attributes are noncanonical`);
     assert.equal(name.endsWith("/"), false, `${name} is a directory, not a regular file`);
-    assertSafeArchivePath(name, `${label}:${name}`);
+    assertSafeArchivePath(name, `${label} member ${index} path`);
     assert.equal(seenNames.has(name), false, `${name} is duplicated`);
     seenNames.add(name);
+    if (previousCentralName !== null) {
+      assert.equal(
+        compareBuilderWheelNames(previousCentralName, name) < 0,
+        true,
+        `${label} central member order does not match the deterministic builder`,
+      );
+    }
+    previousCentralName = name;
     assert.equal(externalAttributes, (0o100644 << 16) >>> 0, `${name} mode is noncanonical`);
     assert.ok(uncompressedSize <= maxReleaseMemberBytes, `${name} exceeds the member size limit`);
     expandedBytes += uncompressedSize;
@@ -390,7 +452,13 @@ function zipMembers(archive, label = "wheel") {
     assert.equal(localName, name, `${name} local and central names disagree`);
     const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
     assert.ok(compressedSize <= centralOffset - dataOffset, `${name} compressed data is out of bounds`);
+    assert.equal(
+      localOffset,
+      expectedLocalOffset,
+      `${label} local record order does not match its central directory`,
+    );
     const compressed = archive.subarray(dataOffset, dataOffset + compressedSize);
+    expectedLocalOffset = dataOffset + compressedSize;
     localSpans.push({ end: dataOffset + compressedSize, name, start: localOffset });
     let payload;
     if (compression === 0) payload = compressed;
@@ -467,12 +535,14 @@ function tarMembers(archive, label = "source archive") {
   const payload = expanded.buffer;
   assert.equal(archive.readUInt32LE(archive.byteLength - 8), crc32(payload), `${label} gzip CRC mismatch`);
   assert.equal(archive.readUInt32LE(archive.byteLength - 4), payload.byteLength >>> 0, `${label} gzip size mismatch`);
+  assert.deepEqual(archive, canonicalGzip(payload), `${label} gzip DEFLATE stream is noncanonical`);
   assert.equal(payload.byteLength % 512, 0, `${label} has a partial TAR block`);
   const members = [];
   const names = new Set();
   let cursor = 0;
   let expandedBytes = 0;
   let terminated = false;
+  let previousMemberName = null;
   while (cursor + 512 <= payload.byteLength) {
     const header = payload.subarray(cursor, cursor + 512);
     if (header.every((byte) => byte === 0)) {
@@ -492,11 +562,13 @@ function tarMembers(archive, label = "source archive") {
     assert.match(header.subarray(124, 136).toString("ascii"), /^[0-7]{11}\0$/, `${label} member size metadata is noncanonical`);
     assert.equal(header.subarray(136, 148).toString("ascii"), "00000000000\0", `${label} member mtime metadata is noncanonical`);
     assert.match(header.subarray(148, 156).toString("ascii"), /^[0-7]{6}\0 $/, `${label} member checksum metadata is noncanonical`);
+    assert.equal(header[156], 0x30, `${label} member typeflag metadata is noncanonical`);
     assertZeroTarField(header.subarray(157, 257), `${label} member linkname`);
     assertZeroTarField(header.subarray(265, 297), `${label} member uname`);
     assertZeroTarField(header.subarray(297, 329), `${label} member gname`);
     assertZeroTarField(header.subarray(329, 337), `${label} member device-major`);
     assertZeroTarField(header.subarray(337, 345), `${label} member device-minor`);
+    assertZeroTarField(header.subarray(500, 512), `${label} member header padding`);
     const expectedChecksum = parseTarNumber(header.subarray(148, 156), `${label} member checksum`);
     let actualChecksum = 0;
     for (let index = 0; index < header.byteLength; index += 1) {
@@ -505,11 +577,20 @@ function tarMembers(archive, label = "source archive") {
     assert.equal(actualChecksum, expectedChecksum, `${label} member checksum mismatch`);
     const name = canonicalTarText(header.subarray(0, 100), `${label} member name`);
     const prefix = canonicalTarText(header.subarray(345, 500), `${label} member prefix`);
+    assert.equal(prefix, "", `${label} member prefix encoding is noncanonical`);
     const fullName = prefix ? `${prefix}/${name}` : name;
-    assertSafeArchivePath(fullName, `${label}:${fullName}`);
+    assertSafeArchivePath(fullName, `${label} member path`);
     assert.equal(names.has(fullName), false, `${fullName} is duplicated`);
     names.add(fullName);
-    const type = header[156] === 0 ? "0" : String.fromCharCode(header[156]);
+    if (previousMemberName !== null) {
+      assert.equal(
+        compareUtf8(previousMemberName, fullName) < 0,
+        true,
+        `${label} member order does not match the deterministic builder`,
+      );
+    }
+    previousMemberName = fullName;
+    const type = String.fromCharCode(header[156]);
     assert.equal(type, "0", `${fullName} is not a regular file`);
     const size = parseTarNumber(header.subarray(124, 136), `${fullName} size`);
     assert.ok(size <= maxReleaseMemberBytes, `${fullName} exceeds the member size limit`);
@@ -535,7 +616,7 @@ function classifyReleaseMembers(records, { label, rootPrefix = "" }) {
   const names = new Set();
   let expandedBytes = 0;
   for (const record of records) {
-    assertSafeArchivePath(record.name, `${label}:${record.name}`);
+    assertSafeArchivePath(record.name, `${label} member path`);
     assert.equal(names.has(record.name), false, `${label}:${record.name} is duplicated`);
     names.add(record.name);
     assert.equal(record.type ?? "0", "0", `${label}:${record.name} is not a regular file`);
@@ -545,7 +626,7 @@ function classifyReleaseMembers(records, { label, rootPrefix = "" }) {
 
     assert.ok(!rootPrefix || record.name.startsWith(rootPrefix), `${label}:${record.name} escapes its release root`);
     const releasePath = rootPrefix ? record.name.slice(rootPrefix.length) : record.name;
-    assertSafeArchivePath(releasePath, `${label}:${record.name}`);
+    assertSafeArchivePath(releasePath, `${label} release path`);
     for (const prefix of forbiddenReleasePrefixes) {
       assert.equal(releasePath.startsWith(prefix), false, `${label}:${record.name} crosses the commercial boundary`);
     }
@@ -596,7 +677,7 @@ function assertNoCredentials(source, label) {
     /\bxox[baprs]-[A-Za-z0-9-]{12,}\b/,
     /\bBearer\s+eyJ[A-Za-z0-9_-]{12,}\./,
     /\b(?:api[_-]?key|secret|token)\s*[:=]\s*["'][A-Za-z0-9+/=_-]{24,}["']/i,
-  ]) assert.doesNotMatch(source, credential, label);
+  ]) assert.equal(credential.test(source), false, label);
 }
 
 
@@ -788,6 +869,16 @@ test("gzip scanner rejects metadata, concatenated streams, and corrupt trailers"
   const concatenated = Buffer.concat([source, canonicalGzip(Buffer.alloc(0))]);
   assert.throws(() => tarMembers(concatenated, "concatenated gzip"), /single|concatenated|gzip/i);
 
+  const noncanonicalDeflate = Buffer.concat([
+    source.subarray(0, 10),
+    Buffer.from("f80000ffff", "hex"),
+    source.subarray(10),
+  ]);
+  assert.throws(
+    () => tarMembers(noncanonicalDeflate, "noncanonical DEFLATE source"),
+    /canonical|DEFLATE|gzip/i,
+  );
+
   const badCrc = Buffer.from(source);
   badCrc.writeUInt32LE(0, badCrc.byteLength - 8);
   assert.throws(() => tarMembers(badCrc, "bad-CRC gzip"), /CRC|gzip/i);
@@ -811,6 +902,8 @@ test("TAR scanner rejects noncanonical and nonempty unused header metadata", asy
     ["devmajor", (header) => header.write("0000001\0", 329, 8, "ascii")],
     ["devminor", (header) => header.write("0000001\0", 337, 8, "ascii")],
     ["version", (header) => header.write("01", 263, 2, "ascii")],
+    ["NUL typeflag", (header) => { header[156] = 0; }],
+    ["header padding", (header) => { header[500] = 1; }],
   ];
   for (const [name, mutation] of mutations) {
     const archive = mutateFirstTarHeader(source, mutation);
@@ -820,7 +913,7 @@ test("TAR scanner rejects noncanonical and nonempty unused header metadata", asy
 
 
 test("TAR scanner rejects corrupt checksums, padding, termination, and private members", () => {
-  const valid = syntheticTar([{ name: "heel_sim-1.1.0/heel/model.py", payload: Buffer.from("VALUE = 1\n") }]);
+  const valid = syntheticTar([{ name: "heel_sim-1.1.1/heel/model.py", payload: Buffer.from("VALUE = 1\n") }]);
   const raw = gunzipSync(valid);
 
   const badChecksum = Buffer.from(raw);
@@ -841,13 +934,13 @@ test("TAR scanner rejects corrupt checksums, padding, termination, and private m
   assert.throws(() => tarMembers(canonicalGzip(trailingPayload), "trailing-data source"), /trailing|termination/i);
 
   const privateSource = syntheticTar([
-    { name: "heel_sim-1.1.0/heel/model.py", payload: Buffer.from("VALUE = 1\n") },
-    { name: "heel_sim-1.1.0/docs/saas/PRODUCT.md", payload: Buffer.from("private\n") },
+    { name: "heel_sim-1.1.1/docs/saas/PRODUCT.md", payload: Buffer.from("private\n") },
+    { name: "heel_sim-1.1.1/heel/model.py", payload: Buffer.from("VALUE = 1\n") },
   ]);
   assert.throws(
     () => classifyReleaseMembers(tarMembers(privateSource), {
       label: "mutated source",
-      rootPrefix: "heel_sim-1.1.0/",
+      rootPrefix: "heel_sim-1.1.1/",
     }),
     /commercial boundary/,
   );
@@ -856,7 +949,7 @@ test("TAR scanner rejects corrupt checksums, padding, termination, and private m
 
 test("TAR decompression budget includes bounded headers and padding", () => {
   const records = Array.from({ length: 6 }, (_, index) => ({
-    name: `heel_sim-1.1.0/heel/payload_${index}.py`,
+    name: `heel_sim-1.1.1/heel/payload_${index}.py`,
     payload: Buffer.alloc(maxReleaseMemberBytes),
   }));
   assert.equal(tarMembers(syntheticTar(records), "limit source").length, records.length);
@@ -871,6 +964,66 @@ test("ZIP member classification rejects an actual private-member archive", () =>
   const records = [...zipMembers(privateWheel, "mutated wheel")]
     .map(([name, payload]) => ({ name, payload, type: "0" }));
   assert.throws(() => classifyReleaseMembers(records, { label: "mutated wheel" }), /commercial boundary/);
+});
+
+
+test("ZIP and TAR scanners reject sensitive canonical member paths", () => {
+  const payload = Buffer.from("VALUE = 1\n");
+  const sensitivePaths = [
+    "heel/LicenseRef-Heel-Commercial.py",
+    "heel/ghp_12345678901234567890.py",
+    "heel/*# sourceMappingURL=private.py",
+    "heel/private.map",
+  ];
+  for (const sensitivePath of sensitivePaths) {
+    const zipError = failureOf(
+      () => zipMembers(syntheticZip([{ name: sensitivePath, payload }]), "sensitive-path wheel"),
+      "sensitive ZIP member path",
+    );
+    const tarError = failureOf(
+      () => tarMembers(syntheticTar([{ name: sensitivePath, payload }]), "sensitive-path source"),
+      "sensitive TAR member path",
+    );
+    assert.match(zipError.message, /commercial|credential|source map|member path/i);
+    assert.match(tarError.message, /commercial|credential|source map|member path/i);
+    assert.equal(zipError.message.includes(sensitivePath), false);
+    assert.equal(tarError.message.includes(sensitivePath), false);
+  }
+});
+
+
+test("TAR scanner requires the builder's exact name encoding and member order", () => {
+  const payload = Buffer.from("VALUE = 1\n");
+  const reversed = syntheticTar([
+    { name: "heel/b.py", payload },
+    { name: "heel/a.py", payload },
+  ]);
+  assert.throws(() => tarMembers(reversed, "reordered source"), /member order/i);
+
+  const canonical = syntheticTar([{ name: "heel/model.py", payload }]);
+  const split = mutateFirstTarHeader(canonical, (header) => {
+    header.fill(0, 0, 100);
+    header.write("model.py", 0, "utf8");
+    header.fill(0, 345, 500);
+    header.write("heel", 345, "utf8");
+  });
+  assert.throws(() => tarMembers(split, "split-path source"), /prefix|name encoding/i);
+});
+
+
+test("ZIP scanner requires exact builder central and local member order", () => {
+  const payload = Buffer.from("VALUE = 1\n");
+  const reversed = syntheticZip([
+    { name: "heel/b.py", payload },
+    { name: "heel/a.py", payload },
+  ]);
+  assert.throws(() => zipMembers(reversed, "reordered wheel"), /central.*order|member order/i);
+
+  const centralSortedLocalReversed = swapFirstTwoCentralEntries(reversed);
+  assert.throws(
+    () => zipMembers(centralSortedLocalReversed, "local-order wheel"),
+    /local.*order/i,
+  );
 });
 
 
@@ -890,7 +1043,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
   const manifest = JSON.parse(decodeUtf8(manifestPayload, `downloads/${agentManifestName}`));
   assert.deepEqual(Object.keys(manifest).sort(), ["artifacts", "schema_version", "version"]);
   assert.equal(manifest.schema_version, "heel.open-core-artifacts.v1");
-  assert.equal(manifest.version, "1.1.0");
+  assert.equal(manifest.version, "1.1.1");
   assert.deepEqual(manifest.artifacts.map(({ name }) => name), [agentWheelName, agentSourceName]);
   await validateReleaseDownloads(downloadsRoot);
 
@@ -911,7 +1064,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
   const sourceRecords = tarMembers(artifacts.get(agentSourceName), "Heel Agent source archive");
   classifyReleaseMembers(sourceRecords, {
     label: "Heel Agent source archive",
-    rootPrefix: "heel_sim-1.1.0/",
+    rootPrefix: "heel_sim-1.1.1/",
   });
 });
 
@@ -919,7 +1072,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
 test("release member classification rejects private paths and hostile archive shapes", () => {
   const safeWheel = { name: "heel/model.py", payload: Buffer.from("VALUE = 1\n"), type: "0" };
   const safeSource = {
-    name: "heel_sim-1.1.0/heel/model.py",
+    name: "heel_sim-1.1.1/heel/model.py",
     payload: Buffer.from("VALUE = 1\n"),
     type: "0",
   };
@@ -932,8 +1085,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "source private documentation",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.1.0/docs/saas/PRODUCT.md" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.1.0/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.1.1/docs/saas/PRODUCT.md" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.1.1/" },
       message: /commercial boundary/,
     },
     {
@@ -956,8 +1109,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "device",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.1.0/heel/device.py", type: "3" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.1.0/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.1.1/heel/device.py", type: "3" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.1.1/" },
       message: /not a regular file/,
     },
     {
@@ -967,6 +1120,18 @@ test("release member classification rejects private paths and hostile archive sh
       message: /mutated wheel/,
     },
     {
+      label: "commercial marker in member path",
+      records: [{ ...safeWheel, name: "heel/LicenseRef-Heel-Commercial.py" }],
+      options: { label: "mutated wheel" },
+      message: /commercial|sensitive|member path/,
+    },
+    {
+      label: "oversized member path",
+      records: [{ ...safeWheel, name: `heel/${"a".repeat(512)}.py` }],
+      options: { label: "mutated wheel" },
+      message: /path|name|long|length/i,
+    },
+    {
       label: "source map directive",
       records: [{ ...safeWheel, payload: Buffer.from("//# sourceMappingURL=private.map\n") }],
       options: { label: "mutated wheel" },
@@ -974,8 +1139,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "unexpected extension",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.1.0/private.pem" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.1.0/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.1.1/private.pem" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.1.1/" },
       message: /unexpected extension/,
     },
   ];

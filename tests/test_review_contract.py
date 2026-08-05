@@ -1,5 +1,6 @@
 import json
 import math
+from pathlib import Path
 import unittest
 from typing import Any, get_type_hints
 
@@ -18,6 +19,9 @@ from heel.review_contract import (
 SOURCE_HASH = "a" * 64
 MODEL_HASH = "b" * 64
 BASELINE_HASH = "c" * 64
+LEGACY_REVIEW_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures/reviews/legacy_review_1_1_0.json"
+)
 
 
 def finding(surface_type="exports", surface_id="export_users", risk="missing_entitlement",
@@ -208,9 +212,10 @@ class ReviewContractTests(unittest.TestCase):
             validate_review_envelope(tampered)
 
     def test_envelope_validator_rejects_other_engine_even_when_rehashed(self):
-        self.assertEqual(SUPPORTED_ENGINE_VERSIONS, frozenset({ENGINE_VERSION}))
+        self.assertEqual(ENGINE_VERSION, "1.1.1")
+        self.assertEqual(SUPPORTED_ENGINE_VERSIONS, frozenset({"1.1.0", "1.1.1"}))
         envelope = self._build()
-        envelope["engine_version"] = "0.0.0"
+        envelope["engine_version"] = "1.1.2"
         body = {
             key: value for key, value in envelope.items()
             if key not in {"review_id", "result_hash"}
@@ -220,6 +225,20 @@ class ReviewContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "engine_version"):
             validate_review_envelope(envelope)
+
+    def test_genuine_legacy_envelope_is_preserved_and_remains_bound_to_its_original_body(self):
+        legacy = json.loads(LEGACY_REVIEW_FIXTURE.read_text(encoding="utf-8"))
+
+        validated = validate_review_envelope(legacy)
+
+        self.assertEqual(validated, legacy)
+        self.assertEqual(validated["engine_version"], "1.1.0")
+        self.assertIsNot(validated, legacy)
+
+        tampered = json.loads(json.dumps(legacy))
+        tampered["product_id"] = "tampered"
+        with self.assertRaisesRegex(ValueError, "result_hash"):
+            validate_review_envelope(tampered)
 
     def test_envelope_validator_rejects_non_string_engine_version(self):
         envelope = self._build()

@@ -24,14 +24,14 @@ import zlib
 
 ROOT = Path(os.path.abspath(__file__)).parents[1]
 CONTRACT_PATH = "release/open-core-v1.json"
-RELEASE_VERSION = "1.1.0"
-WHEEL_NAME = "heel_sim-1.1.0-py3-none-any.whl"
-SDIST_NAME = "heel_sim-1.1.0.tar.gz"
+RELEASE_VERSION = "1.1.1"
+WHEEL_NAME = "heel_sim-1.1.1-py3-none-any.whl"
+SDIST_NAME = "heel_sim-1.1.1.tar.gz"
 MANIFEST_NAME = "heel-open-core-manifest.json"
 ARTIFACT_NAMES = (WHEEL_NAME, SDIST_NAME, MANIFEST_NAME)
-DIST_INFO = "heel_sim-1.1.0.dist-info"
+DIST_INFO = "heel_sim-1.1.1.dist-info"
 RECORD_PATH = f"{DIST_INFO}/RECORD"
-SDIST_PREFIX = "heel_sim-1.1.0/"
+SDIST_PREFIX = "heel_sim-1.1.1/"
 FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 FIXED_TAR_MTIME = 0
 EXPECTED_GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff"
@@ -97,7 +97,7 @@ FORBIDDEN_CONTENT = (
 METADATA = (
     "Metadata-Version: 2.4\n"
     "Name: heel-sim\n"
-    "Version: 1.1.0\n"
+    "Version: 1.1.1\n"
     "Summary: Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.\n"
     "Requires-Python: >=3.11\n"
     "License-Expression: Apache-2.0\n"

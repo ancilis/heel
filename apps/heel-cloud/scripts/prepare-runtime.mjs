@@ -14,9 +14,9 @@ const PYODIDE_HOMEPAGE = "https://github.com/pyodide/pyodide";
 const PYODIDE_SOURCE = "https://github.com/pyodide/pyodide/tree/ac57031be7564f864d061cb37c5c152e59f83ad4";
 const CPYTHON_VERSION = "3.14.2";
 const CPYTHON_SOURCE = "https://github.com/python/cpython/tree/df793163d5821791d4e7caf88885a2c11a107986";
-const WHEEL_NAME = "heel_browser-1.1.0-py3-none-any.whl";
-const RELEASE_WHEEL_NAME = "heel_sim-1.1.0-py3-none-any.whl";
-const RELEASE_SOURCE_NAME = "heel_sim-1.1.0.tar.gz";
+const WHEEL_NAME = "heel_browser-1.1.1-py3-none-any.whl";
+const RELEASE_WHEEL_NAME = "heel_sim-1.1.1-py3-none-any.whl";
+const RELEASE_SOURCE_NAME = "heel_sim-1.1.1.tar.gz";
 const RELEASE_MANIFEST_NAME = "heel-open-core-manifest.json";
 const RELEASE_DOWNLOAD_NAMES = Object.freeze([
   RELEASE_MANIFEST_NAME,
@@ -200,7 +200,7 @@ export async function validateReleaseDownloads(downloadsRoot) {
   assertExactObject(manifest, ["artifacts", "schema_version", "version"], "release manifest");
   if (
     manifest.schema_version !== "heel.open-core-artifacts.v1"
-    || manifest.version !== "1.1.0"
+    || manifest.version !== "1.1.1"
     || !Array.isArray(manifest.artifacts)
     || manifest.artifacts.length !== 2
   ) {
@@ -299,7 +299,7 @@ async function validateHeelEngine(engineRoot) {
   assertExactObject(manifest.wheel, ["filename", "sha256", "size"], "Heel engine wheel manifest");
   if (
     manifest.schema_version !== "heel.browser-engine-manifest.v1"
-    || manifest.engine_version !== "1.1.0"
+    || manifest.engine_version !== "1.1.1"
     || manifest.wheel.filename !== WHEEL_NAME
     || !Number.isSafeInteger(manifest.wheel.size)
     || !/^[0-9a-f]{64}$/.test(manifest.wheel.sha256)

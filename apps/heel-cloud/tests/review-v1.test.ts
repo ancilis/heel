@@ -5,7 +5,9 @@ import { describe, expect, test } from "vitest";
 
 import sampleEnvelope from "../../../tests/fixtures/reviews/sample_review_v1.json";
 import presentationFixture from "../../../tests/fixtures/reviews/browser_answer_presentation_v1.json";
+import legacyEnvelope from "./legacy-review-1.1.0.fixture.json";
 import {
+  parseCurrentReviewEnvelopeV1,
   parseReviewEnvelopeV1,
   type ReviewEnvelopeV1,
 } from "../lib/review-v1";
@@ -96,7 +98,7 @@ describe("parseReviewEnvelopeV1", () => {
     expect(parsed).not.toBe(source);
     expect(parsed.findings).not.toBe(source.findings);
     expect(parsed.schema_version).toBe("heel.review.v1");
-    expect(parsed.engine_version).toBe("1.1.0");
+    expect(parsed.engine_version).toBe("1.1.1");
     expect(parsed.execution_mode).toBe("browser_local");
     expect(parsed.privacy).toEqual({
       execution: "browser_local",
@@ -148,6 +150,22 @@ describe("parseReviewEnvelopeV1", () => {
     const idTampered = browserEnvelope();
     idTampered.review_id = `review_${"0".repeat(20)}`;
     expect(() => parseReviewEnvelopeV1(idTampered)).toThrow(/review id/i);
+  });
+
+  test("preserves a genuine 1.1.0 envelope while current-only boundaries reject it", () => {
+    const parsed = parseReviewEnvelopeV1(legacyEnvelope);
+
+    expect(parsed).toEqual(legacyEnvelope);
+    expect(parsed.engine_version).toBe("1.1.0");
+    expect(() => parseCurrentReviewEnvelopeV1(legacyEnvelope)).toThrow(/engine_version/i);
+    expect(parseCurrentReviewEnvelopeV1(browserEnvelope()).engine_version).toBe("1.1.1");
+  });
+
+  test("rejects an unknown next engine version even when its hash is recomputed", () => {
+    const unknown = structuredClone(browserEnvelope());
+    unknown.engine_version = "1.1.2";
+
+    expect(() => parseReviewEnvelopeV1(rehash(unknown))).toThrow(/engine_version/i);
   });
 });
 

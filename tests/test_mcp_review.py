@@ -30,6 +30,7 @@ from heel.store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
 OPENAPI_FIXTURE = ROOT / "tests/fixtures/openapi/saas_api.json"
+LEGACY_REVIEW_FIXTURE = ROOT / "tests/fixtures/reviews/legacy_review_1_1_0.json"
 
 
 def _sample_spec():
@@ -152,6 +153,36 @@ class MCPReviewTests(unittest.TestCase):
             "format": "json", "content": review_to_json(review),
         })
         self.assertEqual(json.loads(json_export["content"]), review)
+
+    def test_mcp_history_and_exports_preserve_a_genuine_1_1_0_review(self):
+        legacy = json.loads(LEGACY_REVIEW_FIXTURE.read_text(encoding="utf-8"))
+        self.projects.save_review(legacy)
+
+        listed = self.server.call_tool("heel_list_reviews", {}, self.caller)
+        loaded = self.server.call_tool(
+            "heel_get_review", {"review_id": legacy["review_id"]}, self.caller
+        )
+        json_export = self.server.call_tool("heel_export_review", {
+            "review_id": legacy["review_id"], "format": "json",
+        }, self.caller)
+        markdown_export = self.server.call_tool("heel_export_review", {
+            "review_id": legacy["review_id"], "format": "markdown",
+        }, self.caller)
+
+        self.assertEqual(listed, {"reviews": [{
+            "review_id": legacy["review_id"],
+            "product_id": legacy["product_id"],
+            "gate_status": legacy["gate_status"],
+        }]})
+        self.assertEqual(loaded, legacy)
+        self.assertEqual(loaded["engine_version"], "1.1.0")
+        self.assertEqual(json_export, {
+            "format": "json", "content": review_to_json(legacy),
+        })
+        self.assertEqual(json.loads(json_export["content"]), legacy)
+        self.assertEqual(markdown_export, {
+            "format": "markdown", "content": review_to_markdown(legacy),
+        })
 
     def test_review_listing_is_deterministic(self):
         for title in ("Zulu Product", "Alpha Product"):

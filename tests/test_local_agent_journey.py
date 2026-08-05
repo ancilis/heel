@@ -284,10 +284,15 @@ class LocalAgentJourneyTests(unittest.TestCase):
         quickstart = (ROOT / "docs/MCP_QUICKSTART.md").read_text(encoding="utf-8")
 
         self.assertIn("heel review openapi", readme)
-        self.assertIn("python3 -m pip install .", readme)
+        self.assertIn(
+            ".venv/bin/python -m pip install ./heel_sim-1.1.1-py3-none-any.whl",
+            readme,
+        )
+        self.assertIn("/downloads/heel_sim-1.1.1-py3-none-any.whl", readme)
         self.assertIn("not yet published", readme.lower())
+        self.assertNotIn("git clone https://github.com/ancilis/heel", readme)
         self.assertIn("python3 -m pip install heel-sim", quickstart)
-        self.assertIn("only after `heel-sim` is published", quickstart.lower())
+        self.assertIn("only after an actual pypi release", quickstart.lower())
         self.assertIn('"command": "heel-mcp"', quickstart)
         self.assertIn('"HEEL_HOME": "/absolute/path/to/private/heel-data"', quickstart)
         self.assertIn("no Heel Cloud account", quickstart)

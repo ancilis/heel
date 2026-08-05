@@ -22,6 +22,16 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
+## [1.1.1]: 2026-08-04
+
+Launch-ready Heel Cloud and local-agent distribution with deterministic, digest-pinned browser and
+open-core artifacts. New reviews are written as engine 1.1.1 while genuine persisted 1.1.0 review
+history remains readable and content-addressed under the unchanged `heel.review.v1` schema.
+
+### Security
+- Hardened release verification against noncanonical ZIP, gzip/DEFLATE, and USTAR metadata channels,
+  sensitive member paths, archive traversal, and expansion/resource-bound violations.
+
 ## [1.1.0]: 2026-06-07
 
 Apache-2.0 relicense + DCO, and a major scenario-library depth expansion.

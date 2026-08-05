@@ -3,7 +3,13 @@
 /** Dependency-free validation for the untrusted Python worker response. */
 
 export const REVIEW_SCHEMA_VERSION = "heel.review.v1" as const;
-export const REVIEW_ENGINE_VERSION = "1.1.0" as const;
+export const REVIEW_ENGINE_VERSION = "1.1.1" as const;
+export type ReviewEngineVersion = "1.1.0" | typeof REVIEW_ENGINE_VERSION;
+
+const SUPPORTED_REVIEW_ENGINE_VERSIONS = new Set<ReviewEngineVersion>([
+  "1.1.0",
+  REVIEW_ENGINE_VERSION,
+]);
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const REVIEW_ID = /^review_[0-9a-f]{20}$/;
@@ -55,7 +61,7 @@ export interface ReviewEnvelopeV1 {
   review_id: string;
   result_hash: string;
   schema_version: typeof REVIEW_SCHEMA_VERSION;
-  engine_version: typeof REVIEW_ENGINE_VERSION;
+  engine_version: ReviewEngineVersion;
   product_id: string;
   source_hash: string;
   model_hash: string;
@@ -335,9 +341,13 @@ export function parseReviewEnvelopeV1(value: unknown): ReviewEnvelopeV1 {
   if (item.schema_version !== REVIEW_SCHEMA_VERSION) {
     throw new ReviewEnvelopeError(`schema_version must be ${REVIEW_SCHEMA_VERSION}`);
   }
-  if (item.engine_version !== REVIEW_ENGINE_VERSION) {
+  if (
+    typeof item.engine_version !== "string"
+    || !SUPPORTED_REVIEW_ENGINE_VERSIONS.has(item.engine_version as ReviewEngineVersion)
+  ) {
     throw new ReviewEnvelopeError("engine_version is not supported");
   }
+  const engineVersion = item.engine_version as ReviewEngineVersion;
   if (item.execution_mode !== "browser_local") {
     throw new ReviewEnvelopeError("execution_mode must be browser_local");
   }
@@ -415,7 +425,7 @@ export function parseReviewEnvelopeV1(value: unknown): ReviewEnvelopeV1 {
     review_id: reviewId,
     result_hash: resultHash,
     schema_version: REVIEW_SCHEMA_VERSION,
-    engine_version: REVIEW_ENGINE_VERSION,
+    engine_version: engineVersion,
     product_id: string(item.product_id, "product_id"),
     source_hash: hash(item.source_hash, "source_hash")!,
     model_hash: hash(item.model_hash, "model_hash")!,
@@ -441,4 +451,18 @@ export function parseReviewEnvelopeV1(value: unknown): ReviewEnvelopeV1 {
       sync_intent: "none",
     },
   };
+}
+
+
+export type CurrentReviewEnvelopeV1 = ReviewEnvelopeV1 & {
+  engine_version: typeof REVIEW_ENGINE_VERSION;
+};
+
+
+export function parseCurrentReviewEnvelopeV1(value: unknown): CurrentReviewEnvelopeV1 {
+  const parsed = parseReviewEnvelopeV1(value);
+  if (parsed.engine_version !== REVIEW_ENGINE_VERSION) {
+    throw new ReviewEnvelopeError(`engine_version must be current (${REVIEW_ENGINE_VERSION})`);
+  }
+  return parsed as CurrentReviewEnvelopeV1;
 }

@@ -18,7 +18,7 @@ import zipfile
 
 
 ROOT = Path(os.path.abspath(__file__)).parents[1]
-ENGINE_VERSION = "1.1.0"
+ENGINE_VERSION = "1.1.1"
 WHEEL_NAME = f"heel_browser-{ENGINE_VERSION}-py3-none-any.whl"
 DIST_INFO = f"heel_browser-{ENGINE_VERSION}.dist-info"
 RECORD_PATH = f"{DIST_INFO}/RECORD"

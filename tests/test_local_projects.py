@@ -14,10 +14,15 @@ from heel.review_service import review_openapi
 ROOT = Path(__file__).resolve().parents[1]
 OPENAPI_FIXTURE = ROOT / "tests/fixtures/openapi/saas_api.json"
 GOLDEN_FIXTURE = ROOT / "tests/fixtures/reviews/sample_review_v1.json"
+LEGACY_REVIEW_FIXTURE = ROOT / "tests/fixtures/reviews/legacy_review_1_1_0.json"
 
 
 def _golden_envelope():
     return json.loads(GOLDEN_FIXTURE.read_text(encoding="utf-8"))
+
+
+def _legacy_envelope():
+    return json.loads(LEGACY_REVIEW_FIXTURE.read_text(encoding="utf-8"))
 
 
 def _sample_spec():
@@ -43,6 +48,22 @@ def _review_files(root):
 
 
 class LocalProjectStoreTests(unittest.TestCase):
+    def test_genuine_1_1_0_history_survives_save_list_and_get(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalProjectStore(_physical_temp(tmp))
+            legacy = _legacy_envelope()
+
+            store.save_review(legacy)
+
+            self.assertEqual(store.get_review(legacy["review_id"]), legacy)
+            self.assertEqual(store.list_reviews(), [{
+                "review_id": legacy["review_id"],
+                "product_id": legacy["product_id"],
+                "gate_status": legacy["gate_status"],
+            }])
+
     def test_unsupported_secure_storage_capabilities_fail_closed(self):
         from heel.local_projects import LocalProjectStore, SecureStorageUnavailable
 

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import sampleEnvelope from "../../../tests/fixtures/reviews/sample_review_v1.json";
 import canonicalEnforcedRerun from "./canonical-enforced-rerun.fixture.json";
+import legacyEnvelope from "./legacy-review-1.1.0.fixture.json";
 import {
   BrowserReviewClient,
   BrowserReviewClientError,
@@ -451,6 +452,19 @@ describe("BrowserReviewClient", () => {
     workers[1].emit("x".repeat(MAX_BROWSER_RESULT_BYTES * 2 + 70_000));
     await expect(oversized).rejects.toMatchObject({ code: "result_too_large" });
     expect(client.retainedInput?.source).toBe("retained-large-result-source");
+  });
+
+  test("rejects a valid persisted 1.1.0 envelope when returned by the live worker", async () => {
+    const worker = new FakeWorker();
+    const client = new BrowserReviewClient({ workerFactory: () => worker });
+    ready(worker);
+    await client.whenReady();
+
+    const pending = client.review("legacy-live-worker-source");
+    const request = JSON.parse(worker.sent.at(-1)!);
+    result(worker, request.request_id, legacyEnvelope);
+
+    await expect(pending).rejects.toMatchObject({ code: "worker_protocol" });
   });
 
   test.each(["toString", "constructor", "__proto__"])(

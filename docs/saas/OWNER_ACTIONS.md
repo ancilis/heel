@@ -4,29 +4,31 @@ These require a human legal identity, ownership, or credentials a model cannot p
 else is built and testable locally without them. Ordered by launch criticality.
 
 ## Blocking production launch
-1. **Legal counsel review** of Terms, Privacy, AUP, target-authorization policy, DPA, refund terms,
+1. **Release identity and publisher approval.** Preserve the existing `v1.1.0` tag and mark its
+   release notes as superseded; remove the false `pip install`, published-provenance, and SBOM claims
+   without moving or deleting the tag. Protect the GitHub `pypi` environment with a required
+   non-self reviewer, disable administrator bypass, and restrict deployments to protected release
+   tags. Configure the PyPI Trusted Publisher for the exact owner/repository, `publish.yml`, and
+   `pypi` environment. After the current source is pushed and CI passes, create the new immutable
+   `v1.1.1` tag and stable (not draft or prerelease) GitHub Release. The workflow then verifies,
+   attests, and publishes only the named 1.1.1 wheel and source archive.
+2. **Legal counsel review** of Terms, Privacy, AUP, target-authorization policy, DPA, refund terms,
    and the open-core / commercial-license split (ADR-0001). Draft docs are in `docs/saas/legal/`
    (marked DRAFT — NOT LEGAL ADVICE).
-2. **Stripe account** (live + test). Provide: `STRIPE_SECRET_KEY`, `STRIPE_TEST_KEY`,
+3. **Stripe account** (live + test). Provide: `STRIPE_SECRET_KEY`, `STRIPE_TEST_KEY`,
    `STRIPE_WEBHOOK_SECRET`. Then run `python3 -m heel.saas.billing sync` to create Products/Prices
    from the code catalog. Verify with the included test-clock lifecycle suite.
-3. **Managed Postgres** (Neon/Supabase/RDS). Provide `DATABASE_URL`. Run migrations:
+4. **Managed Postgres** (Neon/Supabase/RDS). Provide `DATABASE_URL`. Run migrations:
    `python3 -m heel.saas.migrate up`.
-4. **Auth vendor** (Clerk or WorkOS). Provide publishable/secret keys. Enterprise SSO/SCIM needs
+5. **Auth vendor** (Clerk or WorkOS). Provide publishable/secret keys. Enterprise SSO/SCIM needs
    WorkOS org config.
-5. **Domain + DNS** ownership (e.g. `heel.dev`/`.com`) for the marketing site, app, and TLS.
-6. **Hosting accounts**: web host (Vercel) + worker/container host. Provide deploy tokens.
-7. **Secret manager** (cloud KMS/Secrets Manager) for the scope signing key and vendor secrets.
-8. **Error tracking + status page** accounts (Sentry, statuspage/Better Stack) — provide DSN/keys.
-
-## Blocking the mandatory independent review
-12. **Upgrade Codex CLI/app** so the reviewer model `gpt-5.6-sol` resolves. Current installed Codex
-    rejects it: `400 … "The 'gpt-5.6-sol' model requires a newer version of Codex."` Until upgraded,
-    the four mandatory Sol adversarial gates (§17) cannot run and the build is **not launch-ratified**.
-    Verify with: a `mcp__codex__codex` call using `model: gpt-5.6-sol` returns a normal response.
+6. **Domain + DNS** ownership (e.g. `heel.dev`/`.com`) for the marketing site, app, and TLS.
+7. **Hosting accounts** for the browser app and Python control plane. Provide deploy credentials only
+   through the selected hosts' secret managers.
+8. **Secret manager** (cloud KMS/Secrets Manager) for the scope signing key and vendor secrets.
+9. **Error tracking + status page** accounts (Sentry, statuspage/Better Stack) — provide DSN/keys.
 
 ## Non-blocking but recommended
-9. **GitHub repo rename** `ancilis/heel` → `ancilis/heel` (badges/URLs already reference `heel`).
 10. Email/SMTP provider (Postmark/Resend) for lifecycle email — `RESEND_API_KEY`.
 11. Analytics provider (privacy-aware, e.g. PostHog) — `POSTHOG_KEY`.
 

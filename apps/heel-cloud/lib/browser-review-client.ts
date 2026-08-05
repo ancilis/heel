@@ -6,7 +6,11 @@ import {
   type ReviewAnswer,
   type ReviewAnswerReceiptV1,
 } from "./review-presentation";
-import { parseReviewEnvelopeV1, type ReviewEnvelopeV1 } from "./review-v1";
+import {
+  parseCurrentReviewEnvelopeV1,
+  parseReviewEnvelopeV1,
+  type ReviewEnvelopeV1,
+} from "./review-v1";
 
 
 export const WORKER_PROTOCOL_VERSION = "heel.browser-worker.v1" as const;
@@ -456,7 +460,7 @@ export class BrowserReviewClient {
       return;
     }
     try {
-      const envelope = parseReviewEnvelopeV1(JSON.parse(record.result_json));
+      const envelope = parseCurrentReviewEnvelopeV1(JSON.parse(record.result_json));
       if (
         active.before !== null
         && (
@@ -472,7 +476,7 @@ export class BrowserReviewClient {
       if (active.before === null) {
         this.#baseline = {
           source: active.source,
-          envelope: parseReviewEnvelopeV1(envelope),
+          envelope: parseCurrentReviewEnvelopeV1(envelope),
         };
       }
       clearTimeout(active.timer);

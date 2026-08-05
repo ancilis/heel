@@ -5,12 +5,14 @@ import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, test } from "vitest";
 
 import sampleEnvelope from "../../../tests/fixtures/reviews/sample_review_v1.json";
+import legacyEnvelope from "./legacy-review-1.1.0.fixture.json";
 import {
   LOCAL_REVIEW_DATABASE,
   LOCAL_REVIEW_STORE,
   LocalReviewStore,
   MAX_LOCAL_REVIEWS,
 } from "../lib/local-reviews";
+import { reviewToJson, reviewToMarkdown } from "../lib/review-export";
 
 
 function canonicalJson(value: unknown): string {
@@ -114,6 +116,35 @@ function storedEnvelope(productId: string, savedAt: number): Record<string, unkn
 
 
 describe("LocalReviewStore", () => {
+  test("retains genuine 1.1.0 history through get, list, save, and trimming", async () => {
+    const factory = new IDBFactory();
+    const store = new LocalReviewStore({ indexedDB: factory, maxItems: 2, now: () => 30 });
+    await expect(store.list()).resolves.toEqual([]);
+    await injectStoredValue(factory, {
+      schema_version: "heel.local-review.v1",
+      envelope: legacyEnvelope,
+      saved_at: 10,
+      sync_state: "local_only",
+    });
+
+    const loaded = await store.get(legacyEnvelope.review_id);
+    expect(loaded).toMatchObject({
+      envelope: { engine_version: "1.1.0", review_id: legacyEnvelope.review_id },
+    });
+    expect(JSON.parse(reviewToJson(loaded?.envelope)).engine_version).toBe("1.1.0");
+    expect(reviewToMarkdown(loaded?.envelope)).toContain("legacy\\-1\\-1\\-0");
+    await expect(store.list()).resolves.toMatchObject([
+      { envelope: { engine_version: "1.1.0", review_id: legacyEnvelope.review_id } },
+    ]);
+
+    const current = envelope("current-after-upgrade");
+    await expect(store.save(current)).resolves.toBe(true);
+    await expect(store.list()).resolves.toMatchObject([
+      { envelope: { engine_version: "1.1.1", review_id: current.review_id } },
+      { envelope: { engine_version: "1.1.0", review_id: legacyEnvelope.review_id } },
+    ]);
+  });
+
   test("persists only a validated local-only envelope wrapper", async () => {
     const factory = new IDBFactory();
     const store = new LocalReviewStore({ indexedDB: factory, now: () => 1_700_000_000_000 });

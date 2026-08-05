@@ -3,9 +3,6 @@
 <p align="center"><b>Abuse rehearsal for SaaS, before launch and continuously after.</b></p>
 
 <p align="center">
-<a href="https://github.com/ancilis/heel/actions/workflows/ci.yml"><img src="https://github.com/ancilis/heel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-<a href="https://github.com/ancilis/heel/actions/workflows/codeql.yml"><img src="https://github.com/ancilis/heel/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
-<a href="https://scorecard.dev/viewer/?uri=github.com/ancilis/heel"><img src="https://api.scorecard.dev/projects/github.com/ancilis/heel/badge" alt="OpenSSF Scorecard"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="Apache 2.0"></a>
 <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
 <img src="https://img.shields.io/badge/deps-zero-brightgreen" alt="Zero dependencies">
@@ -38,31 +35,37 @@ agent can talk its way past). Pure Python standard library, **zero dependencies*
 
 ## Five-minute local launch review
 
-`heel-sim` is not yet published to PyPI. Install the current source checkout into an isolated
-environment, choose a private local data directory, and review the included sanitized OpenAPI
-fixture:
+The Heel Cloud app now carries the verified Agent wheel, source archive, and manifest on its own
+origin. Open `/mcp`, choose **Download Heel Agent 1.1.1**, and save
+`/downloads/heel_sim-1.1.1-py3-none-any.whl` in an empty working directory. Then install it into an
+isolated environment and review a sanitized OpenAPI document you own:
 
 ```bash
-git clone https://github.com/ancilis/heel
-cd heel
 python3 -m venv .venv
-.venv/bin/python3 -m pip install .
+.venv/bin/python -m pip install ./heel_sim-1.1.1-py3-none-any.whl
 export HEEL_HOME="$PWD/.heel-local"
-.venv/bin/heel review openapi tests/fixtures/openapi/saas_api.json
+.venv/bin/heel review openapi ./sanitized-openapi.json
 ```
 
 The default report is validated Markdown. Add `--json` for the canonical `heel.review.v1`
 envelope used by automation and MCP:
 
 ```bash
-.venv/bin/heel review openapi tests/fixtures/openapi/saas_api.json --json
+.venv/bin/heel review openapi ./sanitized-openapi.json --json
 ```
 
 This path needs no account or signing key, makes no analyzer network calls, uploads and syncs
 nothing, and stores the successful review only under `$HEEL_HOME/reviews/`. Inputs must be
 sanitized UTF-8 OpenAPI JSON without credentials or customer data and no larger than 2 MiB.
-See the [MCP quickstart](docs/MCP_QUICKSTART.md) for current-wheel installation and stdio client
-configuration.
+The same-origin files exist in the deployable app now; public customer access still requires the
+approved deployment. `heel-sim` is not yet published to PyPI, and a current public repository export
+is a release-owner action that is not complete. See the [MCP quickstart](docs/MCP_QUICKSTART.md) for
+the exact acquisition matrix and stdio client configuration.
+
+The base local CLI/MCP is Apache-2.0 and has no commercial usage limit. Its safety and 2 MiB input
+limits still apply. Hosted findings synchronization and remote MCP are paid Heel Cloud features;
+neither is enabled in this private preview. Windows secure local project storage is not supported at
+launch; use the browser workspace or a supported POSIX environment.
 
 ## Anonymous browser workspace
 
@@ -105,12 +108,11 @@ empty cloud capabilities; rejects source maps, CDN fallbacks, and credentials; a
 social metadata uses the request URL rather than caller-controlled host headers. It does not replace
 the outstanding interactive browser or deployment acceptance gates.
 
-Run the broader synthetic proof from the same clone:
+Run the broader synthetic proof from the installed Agent:
 
 ```bash
 .venv/bin/heel doctor
 .venv/bin/heel eval
-make demo
 ```
 
 ```text
@@ -289,12 +291,12 @@ metadata, never secrets or real customer data.
 
 ## Security & assurance
 
-A security tool has to earn trust. Heel ships the evidence: **zero dependencies**, **reproducible
-builds**, **Sigstore-signed release provenance** + **SBOM**, **OpenSSF Scorecard** + **CodeQL**, and
-the real assurance, **four independent multi-agent red-team passes** whose full reports are in the
-repo, every finding fixed with a regression test. The core claim held under attack: *a prompt-injected
-caller cannot create, widen, or escape a signed authorization scope.* See **[TRUST.md](TRUST.md)** and
-**[SECURITY.md](SECURITY.md)**, and verify the build yourself: `gh attestation verify <wheel> --repo ancilis/heel`.
+A security tool has to earn trust. Heel ships zero-runtime-dependency Agent artifacts, a deterministic
+Apache-only release manifest, clean-install tests, and four independent multi-agent red-team passes
+whose findings have regression coverage. The release workflow is prepared to add PyPI provenance
+attestations only after the protected publisher and a real release exist; no published provenance or
+SBOM is claimed yet. The core claim held under attack: *a prompt-injected caller cannot create, widen,
+or escape a signed authorization scope.* See **[TRUST.md](TRUST.md)** and **[SECURITY.md](SECURITY.md)**.
 
 ## Docs
 
@@ -314,7 +316,7 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 
 ## Status
 
-**Status: production-ready spine, beta adapters (v1.1.0).** Core coverage runs on Python 3.11 to
+**Status: production-ready spine, beta adapters (v1.1.1).** Core coverage runs on Python 3.11 to
 3.13 with zero runtime dependencies and four completed red-team passes. The core authorization gate,
 containment model, and evaluation ladder are the production-ready spine. Real-target adapters remain
 beta until adapter coverage and operator controls mature. The anonymous browser workspace remains a

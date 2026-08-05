@@ -17,7 +17,7 @@ APP = ROOT / "apps/heel-cloud"
 FIXTURE = ROOT / "tests/fixtures/openapi/saas_api.json"
 ENGINE = APP / "browser-engine"
 PYODIDE = APP / "node_modules/pyodide"
-WHEEL_NAME = "heel_browser-1.1.0-py3-none-any.whl"
+WHEEL_NAME = "heel_browser-1.1.1-py3-none-any.whl"
 MANIFEST = ENGINE / "manifest.json"
 WHEEL = ENGINE / WHEEL_NAME
 SUBSTANTIVE_FIELDS = (
@@ -57,8 +57,8 @@ const [wheel, manifest, source] = await Promise.all([
 ]);
 if (
   manifest.schema_version !== "heel.browser-engine-manifest.v1"
-  || manifest.engine_version !== "1.1.0"
-  || manifest.wheel.filename !== "heel_browser-1.1.0-py3-none-any.whl"
+  || manifest.engine_version !== "1.1.1"
+  || manifest.wheel.filename !== "heel_browser-1.1.1-py3-none-any.whl"
   || manifest.wheel.size !== wheel.byteLength
   || manifest.wheel.sha256 !== createHash("sha256").update(wheel).digest("hex")
 ) throw new Error("committed browser wheel does not match its manifest");
