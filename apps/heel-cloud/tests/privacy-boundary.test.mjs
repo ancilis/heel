@@ -243,6 +243,90 @@ function analyzeSource(fileName, text) {
     return null;
   }
 
+  function initializerDeclaration(node) {
+    let current = node.parent;
+    while (
+      ts.isAsExpression(current)
+      || ts.isTypeAssertionExpression(current)
+      || ts.isParenthesizedExpression(current)
+      || ts.isNonNullExpression(current)
+      || ts.isSatisfiesExpression(current)
+    ) current = current.parent;
+    return ts.isVariableDeclaration(current) ? current : null;
+  }
+
+  function isReviewedWorkerScopeDeclaration(node) {
+    const declaration = initializerDeclaration(node);
+    return engineWorker
+      && declaration !== null
+      && ts.isIdentifier(declaration.name)
+      && declaration.name.text === "scope"
+      && declaration.initializer?.getText(parsed) === "globalThis as unknown as DedicatedWorkerGlobalScope";
+  }
+
+  function allowedAmbientRootReference(node) {
+    if (
+      relativeName === "lib/local-reviews.ts"
+      && node.text === "globalThis"
+      && (ts.isPropertyAccessExpression(node.parent) || ts.isElementAccessExpression(node.parent))
+      && node.parent.expression === node
+      && memberName(node.parent) === "indexedDB"
+    ) return true;
+    return node.text === "globalThis" && isReviewedWorkerScopeDeclaration(node);
+  }
+
+  function isBootstrapBindScopeArgument(node) {
+    const call = node.parent;
+    if (!ts.isCallExpression(call) || !call.arguments.includes(node)) return false;
+    const bind = call.expression;
+    return ts.isPropertyAccessExpression(bind)
+      && bind.name.text === "bind"
+      && (ts.isPropertyAccessExpression(bind.expression) || ts.isElementAccessExpression(bind.expression))
+      && allowedFetchReference(bind.expression);
+  }
+
+  function isGuardScopeAlias(node) {
+    const declaration = initializerDeclaration(node);
+    return declaration !== null
+      && ts.isIdentifier(declaration.name)
+      && declaration.name.text === "ambient"
+      && declaration.initializer?.getText(parsed) === "scope as unknown as Record<string, unknown>"
+      && enclosingFunctionName(declaration) === "guardAmbientNetwork";
+  }
+
+  function allowedWorkerScopeReference(node) {
+    if (node.text === "ambient") {
+      const call = node.parent;
+      return ts.isCallExpression(call)
+        && call.expression.getText(parsed) === "guardProperty"
+        && call.arguments[0] === node
+        && call.arguments.length >= 2
+        && ts.isIdentifier(call.arguments[1])
+        && call.arguments[1].text === "name"
+        && enclosingFunctionName(call) === "guardAmbientNetwork";
+    }
+    if (isBootstrapBindScopeArgument(node) || isGuardScopeAlias(node)) return true;
+    const member = node.parent;
+    if (
+      !(ts.isPropertyAccessExpression(member) || ts.isElementAccessExpression(member))
+      || member.expression !== node
+    ) return false;
+    const name = memberName(member);
+    if (name === "fetch") return allowedFetchReference(member);
+    if (name === "location") return enclosingFunctionName(member) === "fetchLocal";
+    if (name === "postMessage") {
+      return ts.isCallExpression(member.parent)
+        && member.parent.expression === member
+        && enclosingFunctionName(member.parent) === "send";
+    }
+    if (name === "onmessage") {
+      return ts.isBinaryExpression(member.parent)
+        && member.parent.left === member
+        && member.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken;
+    }
+    return false;
+  }
+
   function containsAmbientReference(node) {
     let found = false;
     function inspect(current) {
@@ -297,6 +381,19 @@ function analyzeSource(fileName, text) {
     if (ts.isIdentifier(node) && isReflectiveRootReference(node)) {
       report(node, `reflective root authority reference ${node.text}`);
     }
+    if (
+      ts.isIdentifier(node)
+      && ambientRoots.has(node.text)
+      && isRuntimeIdentifierReference(node)
+      && !allowedAmbientRootReference(node)
+    ) report(node, `ambient root authority reference ${node.text}`);
+    if (
+      engineWorker
+      && ts.isIdentifier(node)
+      && ["ambient", "scope"].includes(node.text)
+      && isRuntimeIdentifierReference(node)
+      && !allowedWorkerScopeReference(node)
+    ) report(node, `worker ambient alias authority reference ${node.text}`);
 
     if (ts.isVariableDeclaration(node) && node.initializer) {
       if (ts.isIdentifier(node.name)) {
@@ -561,20 +658,61 @@ test("the privacy analyzer rejects copying Reflect and Object roots", () => {
 });
 
 
+test("the privacy analyzer rejects ambient-root copying and variable-key destructuring", () => {
+  const mutations = [
+    `const key = "fetch"; const {[key]: sink} = globalThis;`,
+    `const root = globalThis; root.fetch("/leak");`,
+    `const carry = (value) => value; carry(window);`,
+    `function copied() { return self; }`,
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, `components/nested/ambient-root-${index}.ts`),
+      mutation,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("ambient root authority reference")),
+      violations.join("\n"),
+    );
+  }
+});
+
+
+test("the privacy analyzer rejects destructuring and copying the reviewed worker scope alias", () => {
+  const mutations = [
+    `const key = "fetch"; const {[key]: sink} = scope;`,
+    `const copied = scope;`,
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    const sourceText = `
+const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
+${mutation}
+`;
+    const violations = analyzeSource(join(appRootPath, "workers/heel-review.worker.ts"), sourceText);
+    assert.ok(
+      violations.some((violation) => violation.includes("worker ambient alias authority reference scope")),
+      `${index}: ${violations.join("\n")}`,
+    );
+  }
+});
+
+
 test("the privacy analyzer permits only the reviewed engine and server fetch sites", () => {
   const engine = `
-const scope = globalThis;
+const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
 const bootstrapFetch = scope.fetch.bind(scope);
 async function fetchLocal(fetcher, path) { return fetcher(path); }
+function send(value) { scope.postMessage(JSON.stringify(value)); }
 function guardProperty(owner, name) {
   Object.defineProperty(owner, name, {value: () => { throw new Error("disabled"); }});
 }
 function guardAmbientNetwork() {
-  const ambient = scope;
+  const ambient = scope as unknown as Record<string, unknown>;
   for (const name of ["fetch", "XMLHttpRequest", "WebSocket", "EventSource"]) {
     guardProperty(ambient, name);
   }
 }
+scope.onmessage = () => {};
 `;
   const server = `
 async function route(request, env, ctx) {
@@ -598,6 +736,13 @@ Object.keys({});
 Object.is(0, -0);
 Object.fromEntries([]);
 `),
+    [],
+  );
+  assert.deepEqual(
+    analyzeSource(
+      join(appRootPath, "lib/local-reviews.ts"),
+      `const database = globalThis.indexedDB;`,
+    ),
     [],
   );
 });
