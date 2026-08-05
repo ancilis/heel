@@ -412,6 +412,64 @@ class BrowserEngineBuildTests(unittest.TestCase):
             reviewed_declarations.stderr,
         )
 
+    def test_module_ambient_globals_and_attribute_writes_are_denied(self):
+        object_fixture = (
+            "class HeelList:\n"
+            "    pass\n"
+            "heel_list = HeelList()\n"
+        )
+        mutations = {
+            "Fable loader file read": (
+                object_fixture
+                + "heel_list.append = __loader__.get_data\n"
+                + "heel_list.append('/etc/hosts')"
+            ),
+            "Fable spec loader file read": (
+                object_fixture
+                + "heel_list.append = __spec__.loader.get_data\n"
+                + "heel_list.append('/etc/hosts')"
+            ),
+            "reviewed data method store": object_fixture + "heel_list.append = None",
+            "reviewed data method delete": object_fixture + "del heel_list.append",
+            "arbitrary attribute store": object_fixture + "heel_list.escape = None",
+            "arbitrary attribute delete": object_fixture + "del heel_list.escape",
+            "reviewed name on wrong receiver": object_fixture + "heel_list.code = 'x'",
+        }
+        ambient_names = (
+            "__loader__",
+            "__spec__",
+            "__builtins__",
+            "__file__",
+            "__cached__",
+            "__package__",
+            "__name__",
+            "__doc__",
+            "__annotations__",
+            "__path__",
+        )
+        mutations.update({
+            f"module ambient {name} reference": f"heel_alias = {name}"
+            for name in ambient_names
+        })
+
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                completed = self._run_builder_with_browser_review_mutation(mutation)
+                self.assertNotEqual(completed.returncode, 0, mutation)
+                self.assertRegex(
+                    completed.stderr,
+                    r"forbidden dynamic primitive|unreviewed attribute write",
+                )
+
+        reviewed_writes = self._run_builder_with_browser_review_mutation(
+            "class HeelReviewedWrites:\n"
+            "    def __init__(self):\n"
+            "        self.code = 'heel.reviewed'\n"
+            "        self.public_message = 'reviewed'\n"
+            "HeelReviewedWrites()"
+        )
+        self.assertEqual(reviewed_writes.returncode, 0, reviewed_writes.stderr)
+
     def test_builder_produces_only_the_proven_browser_closure_and_metadata(self):
         wheel, _manifest = self._require_build()
         with zipfile.ZipFile(wheel) as archive:

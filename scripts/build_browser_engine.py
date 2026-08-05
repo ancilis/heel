@@ -181,8 +181,25 @@ REVIEWED_DATA_METHOD_CALLS = {
         "to_dict",
     }),
 }
-FORBIDDEN_DYNAMIC_NAMES = frozenset({
+REVIEWED_ATTRIBUTE_STORES = {
+    "browser_review": frozenset({
+        ("self", "code"),
+        ("self", "public_message"),
+    }),
+}
+FORBIDDEN_MODULE_AMBIENT_NAMES = frozenset({
+    "__annotations__",
     "__builtins__",
+    "__cached__",
+    "__doc__",
+    "__file__",
+    "__loader__",
+    "__name__",
+    "__package__",
+    "__path__",
+    "__spec__",
+})
+FORBIDDEN_DYNAMIC_NAMES = frozenset({
     "__import__",
     "breakpoint",
     "builtins",
@@ -204,7 +221,7 @@ FORBIDDEN_DYNAMIC_NAMES = frozenset({
     "quit",
     "setattr",
     "vars",
-})
+}) | FORBIDDEN_MODULE_AMBIENT_NAMES
 FORBIDDEN_DYNAMIC_ATTRIBUTES = frozenset({
     "__base__",
     "__bases__",
@@ -348,8 +365,14 @@ def _validate_reviewed_imports(
 
 def _validate_reviewed_module_uses(
     tree: ast.Module,
+    source_module: str,
     module_bindings: frozenset[str],
 ) -> None:
+    reviewed_attribute_stores = REVIEWED_ATTRIBUTE_STORES.get(
+        source_module,
+        frozenset(),
+    )
+    observed_attribute_stores: set[tuple[str, str]] = set()
     parents = {
         child: parent
         for parent in ast.walk(tree)
@@ -363,18 +386,27 @@ def _validate_reviewed_module_uses(
                 )
             rooted_attribute = _module_attribute_path(node, module_bindings)
             if rooted_attribute is not None:
-                module, attributes = rooted_attribute
-                allowed_attributes = REVIEWED_MODULE_ATTRIBUTES[module]
+                imported_module, attributes = rooted_attribute
+                allowed_attributes = REVIEWED_MODULE_ATTRIBUTES[imported_module]
                 if len(attributes) != 1 or attributes[0] not in allowed_attributes:
-                    rendered = ".".join((module, *attributes))
+                    rendered = ".".join((imported_module, *attributes))
                     raise BrowserEngineBuildError(
                         f"browser module uses unreviewed module attribute: {rendered}"
                     )
                 if isinstance(node.ctx, (ast.Store, ast.Del)):
                     raise BrowserEngineBuildError(
                         "browser module rebinds reviewed module attribute: "
-                        f"{module}.{attributes[0]}"
+                        f"{imported_module}.{attributes[0]}"
                     )
+            elif isinstance(node.ctx, (ast.Store, ast.Del)):
+                receiver = node.value.id if isinstance(node.value, ast.Name) else ""
+                target = (receiver, node.attr)
+                if not isinstance(node.ctx, ast.Store) or target not in reviewed_attribute_stores:
+                    rendered = f"{receiver}.{node.attr}" if receiver else node.attr
+                    raise BrowserEngineBuildError(
+                        f"browser module uses unreviewed attribute write: {rendered}"
+                    )
+                observed_attribute_stores.add(target)
         elif (
             isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)
@@ -408,6 +440,13 @@ def _validate_reviewed_module_uses(
             raise BrowserEngineBuildError(
                 f"browser module rebinds reviewed module: {node.name}"
             )
+    if observed_attribute_stores != reviewed_attribute_stores:
+        unused = sorted(reviewed_attribute_stores - observed_attribute_stores)
+        receiver, attribute = unused[0]
+        raise BrowserEngineBuildError(
+            "browser attribute-write policy contains unused target: "
+            f"{source_module}.{receiver}.{attribute}"
+        )
 
 
 def _local_definitions(tree: ast.Module) -> frozenset[str]:
@@ -593,7 +632,7 @@ def _prove_import_closure() -> None:
             module_bindings,
             imported_symbols,
         )
-        _validate_reviewed_module_uses(tree, module_bindings)
+        _validate_reviewed_module_uses(tree, module, module_bindings)
         observed_builtin_calls.update(
             _validate_reviewed_calls(
                 tree,
