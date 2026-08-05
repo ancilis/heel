@@ -198,6 +198,53 @@ function analyzeSource(fileName, text) {
     return true;
   }
 
+  function containsAmbientReference(node) {
+    let found = false;
+    function inspect(current) {
+      if (ts.isIdentifier(current) && ambientRoots.has(current.text)) {
+        found = true;
+        return;
+      }
+      if (!found) ts.forEachChild(current, inspect);
+    }
+    inspect(node);
+    return found;
+  }
+
+  function networkNameWithin(node) {
+    let found = null;
+    function inspect(current) {
+      const value = constantString(current);
+      if (value !== null && networkCapabilities.has(value)) {
+        found = value;
+        return;
+      }
+      if (found === null) ts.forEachChild(current, inspect);
+    }
+    inspect(node);
+    return found;
+  }
+
+  function reflectiveNetworkLookup(node) {
+    const expression = node.expression;
+    const root = rootName(expression);
+    const name = memberName(expression);
+    const text = expression.getText(parsed);
+    const reflective = (
+      root === "Reflect"
+      && ["get", "apply", "construct", "getOwnPropertyDescriptor"].includes(name ?? "")
+    ) || (
+      root === "Object"
+      && ["getOwnPropertyDescriptor", "getOwnPropertyDescriptors"].includes(name ?? "")
+    ) || (
+      ["__lookupGetter__", "__lookupSetter__"].some((lookup) => text.includes(lookup))
+    );
+    if (!reflective || !containsAmbientReference(node)) return null;
+    const networkName = networkNameWithin(node);
+    if (networkName !== null) return networkName;
+    return root === "Object" && name === "getOwnPropertyDescriptors" ? "ambient descriptors" : null;
+  }
+
   function visit(node) {
     if (ts.isIdentifier(node) && isCapabilityIdentifierReference(node)) {
       report(node, `network sink capability reference ${node.text}`);
@@ -259,6 +306,10 @@ function analyzeSource(fileName, text) {
       const name = memberName(node.expression);
       const root = rootName(node.expression);
       const args = [...(node.arguments ?? [])];
+      if (ts.isCallExpression(node)) {
+        const reflected = reflectiveNetworkLookup(node);
+        if (reflected !== null) report(node, `reflective network capability lookup ${reflected}`);
+      }
       if (ts.isIdentifier(node.expression) && sinkAliases.has(node.expression.text)) {
         report(node, `network sink alias ${node.expression.text}`);
       }
@@ -380,11 +431,59 @@ test("the privacy analyzer rejects array, closure, return, and argument carriers
 });
 
 
+test("the privacy analyzer rejects Reflect get, apply, and construct retrieval", () => {
+  const mutations = [`
+const source = "private";
+const sink = Reflect.get(globalThis, "fet" + "ch");
+sink("/leak", {body: source});
+`, `
+const sink = Reflect.apply(Reflect.get, Reflect, [globalThis, "fetch"]);
+`, `
+const Socket = Reflect.construct(Reflect.get(globalThis, "Web" + "Socket"), ["wss://invalid"]);
+`];
+  for (const [index, mutation] of mutations.entries()) {
+    const violations = analyzeSource(join(appRootPath, `components/nested/reflect-${index}.ts`), mutation);
+    assert.ok(
+      violations.some((violation) => violation.includes("reflective network capability lookup")),
+      violations.join("\n"),
+    );
+  }
+});
+
+
+test("the privacy analyzer rejects descriptor and legacy getter retrieval", () => {
+  const mutations = [
+    `const sink = Object.getOwnPropertyDescriptor(globalThis, "fetch").value;`,
+    `const sink = globalThis.__lookupGetter__("fet" + "ch");`,
+    `const sink = Object.prototype.__lookupGetter__.call(globalThis, "fetch");`,
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, `components/nested/reflective-getter-${index}.ts`),
+      mutation,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("reflective network capability lookup fetch")),
+      violations.join("\n"),
+    );
+  }
+});
+
+
 test("the privacy analyzer permits only the reviewed engine and server fetch sites", () => {
   const engine = `
 const scope = globalThis;
 const bootstrapFetch = scope.fetch.bind(scope);
 async function fetchLocal(fetcher, path) { return fetcher(path); }
+function guardProperty(owner, name) {
+  Object.defineProperty(owner, name, {value: () => { throw new Error("disabled"); }});
+}
+function guardAmbientNetwork() {
+  const ambient = scope;
+  for (const name of ["fetch", "XMLHttpRequest", "WebSocket", "EventSource"]) {
+    guardProperty(ambient, name);
+  }
+}
 `;
   const server = `
 async function route(request, env, ctx) {
