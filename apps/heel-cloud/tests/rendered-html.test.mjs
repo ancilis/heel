@@ -93,10 +93,11 @@ test("keeps the anonymous app free of server-side customer capabilities", async 
 });
 
 test("uses Heel identity and marks original source as commercial", async () => {
-  const [page, layout, readme] = await Promise.all([
+  const [page, layout, readme, socialCard] = await Promise.all([
     readFile(new URL("app/page.tsx", appRoot), "utf8"),
     readFile(new URL("app/layout.tsx", appRoot), "utf8"),
     readFile(new URL("README.md", appRoot), "utf8"),
+    readFile(new URL("public/og.png", appRoot)),
   ]);
 
   const identitySource = `${page}\n${layout}`;
@@ -104,7 +105,12 @@ test("uses Heel identity and marks original source as commercial", async () => {
     identitySource,
     /codex-preview|SkeletonPreview|Starter Project|Your site is taking shape/i,
   );
-  assert.match(layout, /title:\s*"Heel/);
+  assert.match(layout, /const title = "Heel/);
+  assert.match(layout, /generateMetadata/);
+  assert.match(layout, /x-forwarded-host/);
+  assert.match(layout, /\$\{origin\}\/og\.png/);
+  assert.equal(socialCard.readUInt32BE(16), 1200);
+  assert.equal(socialCard.readUInt32BE(20), 630);
   assert.match(readme, /browser-local/i);
   assert.match(readme, /never uploaded/i);
   assert.match(readme, /Task 5/);

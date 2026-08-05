@@ -333,7 +333,10 @@ describe("Heel anonymous launch review", () => {
 
   test("creates bounded Blob downloads on demand and revokes them without an API", async () => {
     const outbound = vi.fn();
-    const createObjectURL = vi.fn((_blob: Blob) => "blob:heel-local-review");
+    const createObjectURL = vi.fn((blob: Blob) => {
+      void blob;
+      return "blob:heel-local-review";
+    });
     const revokeObjectURL = vi.fn();
     vi.stubGlobal("fetch", outbound);
     vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
