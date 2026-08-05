@@ -723,7 +723,7 @@ class LocalProjectStoreTests(unittest.TestCase):
             self.assertNotIn("Broad access for tests", persisted)
             self.assertNotIn('"paths"', persisted)
             self.assertIn("downloadbulkexport", persisted)
-            self.assertIn("/api/export/bulk", persisted)
+            self.assertNotIn("/api/export/bulk", persisted)
 
 
 class ReviewExportTests(unittest.TestCase):

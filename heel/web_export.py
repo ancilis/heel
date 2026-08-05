@@ -290,7 +290,16 @@ def _build_snapshot() -> dict:
     store = Store(db)
     server = HeelServer(store, classify_enabled=True)   # show the optional annotation ON
     session = {}
-    server.dispatch("initialize", {"clientInfo": {"name": "control-room"}}, session)
+    server.dispatch(
+        "initialize",
+        {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "control-room", "version": "1.0"},
+        },
+        session,
+    )
+    server.dispatch("notifications/initialized", {}, session)
     scope = scopemod.create_scope(["synthetic-saas", "synthetic-ai"], operator="demo-human",
                                   data_mode=DataHandlingMode.SYNTHETIC_ONLY, now=SNAPSHOT_TIME)
 

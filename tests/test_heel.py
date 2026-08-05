@@ -690,8 +690,23 @@ class TestProductionHardening(Base):
         # unknown method -> an error response (server stays up), not a raised exception
         r = handle_line(self.server, sess, json.dumps({"id": 1, "method": "no.such.method", "params": {}}))
         self.assertIn("error", r)
-        # a well-formed tools/call still works afterwards (server not poisoned)
+        # initialize the stateful MCP session; malformed input did not poison the server
+        initialized = handle_line(self.server, sess, json.dumps({
+            "jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "hardening-test", "version": "1"},
+            },
+        }))
+        self.assertIn("result", initialized)
+        self.assertIsNone(handle_line(self.server, sess, json.dumps({
+            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {},
+        })))
+        # a well-formed tools/list still works afterwards
         ok = handle_line(self.server, sess, json.dumps({"id": 2, "method": "tools/list", "params": {}}))
+        self.assertIn("error", ok)  # exact JSON-RPC 2.0 is required
+        ok = handle_line(self.server, sess, json.dumps({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {},
+        }))
         self.assertIn("result", ok)
 
     def test_doctor_self_check_passes(self):

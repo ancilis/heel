@@ -42,7 +42,9 @@ def main():
     server = HeelServer(store)
     session = {}
     init = server.dispatch("initialize", {"protocolVersion": "2025-06-18",
+                                          "capabilities": {},
                                           "clientInfo": {"name": "demo-soc-agent", "version": "1.0"}}, session)
+    server.dispatch("notifications/initialized", {}, session)
 
     # --- OUT-OF-BAND human scope creation (NOT through the server) ---
     scope = scopemod.create_scope(["synthetic-saas", "synthetic-ai"], operator="demo-human",

@@ -12,6 +12,17 @@ from .review_contract import build_review_envelope, stable_json_hash
 _BASELINE_SAFETY_NOTE = (
     "Synthetic empty baseline for local OpenAPI review; no live probing."
 )
+_QUESTION_PROMPTS = {
+    "missing_tenant_metadata": "How is tenant access enforced for this operation?",
+    "missing_entitlement_metadata": "Which plan or entitlement protects this operation?",
+    "broad_oauth_scope": "Which least-privilege OAuth scopes should protect this surface?",
+    "export_missing_controls": (
+        "Which server-side entitlement and rate controls protect this export operation?"
+    ),
+    "agent_scope_metadata_missing": (
+        "What intended and granted scopes constrain this agent operation?"
+    ),
+}
 
 
 def empty_product_model(product_id: str) -> dict[str, Any]:
@@ -39,19 +50,15 @@ def questions_from_hints(hints: list[dict[str, Any]]) -> list[dict[str, Any]]:
         operation_id = str(hint["operation_id"])
         message = str(hint["message"])
         semantic_context = [code, field, method, route, operation_id, message]
-        operation_context = f"{method} {route} (operation {operation_id})"
-        if field == "tenant_filter":
-            prompt = f"How is tenant access enforced for {operation_context}?"
-        elif field == "entitlement_check":
-            prompt = f"Which plan or entitlement protects {operation_context}?"
-        elif method == route == operation_id == "product":
-            prompt = message
-        else:
-            prompt = f"{message} [{method} {route}; operation {operation_id}]"
+        prompt = _QUESTION_PROMPTS.get(
+            code,
+            "Which product rule or server-side control should protect this surface?",
+        )
+        surface = "product" if method == route == operation_id == "product" else operation_id
         questions.append({
             "id": f"{field}:{stable_json_hash(semantic_context)[:12]}",
             "field": field,
-            "surface": route,
+            "surface": surface,
             "prompt": prompt,
             "required": False,
         })
