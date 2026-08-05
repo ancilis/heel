@@ -115,7 +115,9 @@ function analyzeSource(fileName, text) {
   const relativeName = relative(appRootPath, fileName).replaceAll("\\", "/");
   const violations = [];
   const networkCapabilities = new Set(["fetch", "XMLHttpRequest", "WebSocket", "EventSource", "sendBeacon"]);
-  const ambientRoots = new Set(["globalThis", "window", "self", "navigator"]);
+  const ambientRoots = new Set([
+    "document", "frames", "globalThis", "navigator", "parent", "self", "top", "window",
+  ]);
   const sinkAliases = new Set();
   const engineWorker = relativeName === "workers/heel-review.worker.ts";
   const serverWorker = relativeName === "worker/index.ts";
@@ -135,10 +137,8 @@ function analyzeSource(fileName, text) {
         : null;
       return capture !== null
         && ts.isCallExpression(capture)
-        && capture.parent !== undefined
         && ts.isVariableDeclaration(capture.parent)
-        && ts.isIdentifier(capture.parent.name)
-        && capture.parent.name.text === "bootstrapFetch";
+        && isReviewedBootstrapDeclaration(capture.parent);
     }
     return serverWorker
       && ["env.ASSETS.fetch", "handler.fetch"].includes(expression)
@@ -149,12 +149,113 @@ function analyzeSource(fileName, text) {
   function allowedFetchCall(node) {
     const expression = node.expression.getText(parsed);
     if (serverWorker && ["env.ASSETS.fetch", "handler.fetch"].includes(expression)) return true;
-    return engineWorker
-      && expression === "fetcher"
-      && enclosingFunctionName(node) === "fetchLocal"
-      && node.arguments.length >= 1
+    return engineWorker && expression === "fetcher" && isReviewedFetcherCall(node);
+  }
+
+  function isReviewedBootstrapDeclaration(declaration) {
+    if (
+      !ts.isIdentifier(declaration.name)
+      || declaration.name.text !== "bootstrapFetch"
+      || declaration.type?.getText(parsed) !== "typeof fetch | null"
+      || !ts.isVariableDeclarationList(declaration.parent)
+      || (declaration.parent.flags & ts.NodeFlags.Let) === 0
+      || (declaration.parent.flags & ts.NodeFlags.Const) !== 0
+    ) return false;
+    const capture = declaration.initializer;
+    if (!capture || !ts.isCallExpression(capture) || capture.questionDotToken) return false;
+    const bind = capture.expression;
+    if (!ts.isPropertyAccessExpression(bind) || bind.name.text !== "bind") return false;
+    const fetchMember = bind.expression;
+    return ts.isPropertyAccessExpression(fetchMember)
+      && ts.isIdentifier(fetchMember.expression)
+      && fetchMember.expression.text === "scope"
+      && fetchMember.name.text === "fetch"
+      && capture.arguments.length === 1
+      && ts.isIdentifier(capture.arguments[0])
+      && capture.arguments[0].text === "scope";
+  }
+
+  function enclosingFunctionDeclaration(node) {
+    let current = node.parent;
+    while (current) {
+      if (ts.isFunctionDeclaration(current)) return current;
+      current = current.parent;
+    }
+    return null;
+  }
+
+  function isReviewedFetcherDeclaration(declaration) {
+    return ts.isIdentifier(declaration.name)
+      && declaration.name.text === "fetcher"
+      && ts.isVariableDeclarationList(declaration.parent)
+      && (declaration.parent.flags & ts.NodeFlags.Const) !== 0
+      && declaration.initializer !== undefined
+      && ts.isIdentifier(declaration.initializer)
+      && declaration.initializer.text === "bootstrapFetch"
+      && enclosingFunctionName(declaration) === "fetchLocal";
+  }
+
+  function hasReviewedPathGuards(functionNode) {
+    let startsAtRuntimeRoot = false;
+    let rejectsTraversal = false;
+    function inspect(current) {
+      if (ts.isCallExpression(current) && ts.isPropertyAccessExpression(current.expression)) {
+        const owner = current.expression.expression;
+        const name = current.expression.name.text;
+        if (ts.isIdentifier(owner) && owner.text === "path" && current.arguments.length === 1) {
+          if (
+            name === "startsWith"
+            && ts.isIdentifier(current.arguments[0])
+            && current.arguments[0].text === "RUNTIME_ROOT"
+          ) startsAtRuntimeRoot = true;
+          if (
+            name === "includes"
+            && ts.isStringLiteralLike(current.arguments[0])
+            && current.arguments[0].text === ".."
+          ) rejectsTraversal = true;
+        }
+      }
+      ts.forEachChild(current, inspect);
+    }
+    inspect(functionNode);
+    return startsAtRuntimeRoot && rejectsTraversal;
+  }
+
+  function isReviewedFetchOptions(node) {
+    if (!ts.isObjectLiteralExpression(node) || node.properties.length !== 3) return false;
+    const expected = new Map([
+      ["cache", "no-store"],
+      ["credentials", "same-origin"],
+      ["redirect", "error"],
+    ]);
+    for (const property of node.properties) {
+      if (!ts.isPropertyAssignment(property)) return false;
+      const name = ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)
+        ? property.name.text
+        : null;
+      if (
+        name === null
+        || !ts.isStringLiteralLike(property.initializer)
+        || property.initializer.text !== expected.get(name)
+      ) return false;
+      expected.delete(name);
+    }
+    return expected.size === 0;
+  }
+
+  function isReviewedFetcherCall(node) {
+    if (!ts.isCallExpression(node) || node.questionDotToken || node.arguments.length !== 2) return false;
+    const functionNode = enclosingFunctionDeclaration(node);
+    return functionNode?.name?.text === "fetchLocal"
+      && functionNode.parameters.length === 1
+      && ts.isIdentifier(functionNode.parameters[0].name)
+      && functionNode.parameters[0].name.text === "path"
+      && functionNode.parameters[0].type?.getText(parsed) === "string"
+      && functionNode.type?.getText(parsed) === "Promise<Response>"
+      && hasReviewedPathGuards(functionNode)
       && ts.isIdentifier(node.arguments[0])
-      && node.arguments[0].text === "path";
+      && node.arguments[0].text === "path"
+      && isReviewedFetchOptions(node.arguments[1]);
   }
 
   function capabilitySource(node) {
@@ -327,6 +428,36 @@ function analyzeSource(fileName, text) {
     return false;
   }
 
+  function allowedBootstrapFetchReference(node) {
+    const parent = node.parent;
+    if (
+      ts.isVariableDeclaration(parent)
+      && parent.initializer === node
+      && isReviewedFetcherDeclaration(parent)
+    ) return true;
+    return ts.isBinaryExpression(parent)
+      && parent.left === node
+      && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && parent.right.kind === ts.SyntaxKind.NullKeyword
+      && enclosingFunctionName(parent) === "boot";
+  }
+
+  function allowedFetcherReference(node) {
+    const parent = node.parent;
+    if (ts.isCallExpression(parent) && parent.expression === node) {
+      return isReviewedFetcherCall(parent);
+    }
+    if (
+      ts.isBinaryExpression(parent)
+      && parent.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken
+      && enclosingFunctionName(parent) === "fetchLocal"
+    ) {
+      const other = parent.left === node ? parent.right : parent.left;
+      return other.kind === ts.SyntaxKind.NullKeyword;
+    }
+    return false;
+  }
+
   function containsAmbientReference(node) {
     let found = false;
     function inspect(current) {
@@ -394,6 +525,27 @@ function analyzeSource(fileName, text) {
       && isRuntimeIdentifierReference(node)
       && !allowedWorkerScopeReference(node)
     ) report(node, `worker ambient alias authority reference ${node.text}`);
+    if (
+      engineWorker
+      && ts.isVariableDeclaration(node)
+      && ts.isIdentifier(node.name)
+      && node.name.text === "bootstrapFetch"
+      && !isReviewedBootstrapDeclaration(node)
+    ) report(node, "unreviewed bootstrap fetch authority declaration");
+    if (
+      engineWorker
+      && ts.isIdentifier(node)
+      && node.text === "bootstrapFetch"
+      && isRuntimeIdentifierReference(node)
+      && !allowedBootstrapFetchReference(node)
+    ) report(node, "bootstrap fetch authority reference bootstrapFetch");
+    if (
+      engineWorker
+      && ts.isIdentifier(node)
+      && node.text === "fetcher"
+      && isRuntimeIdentifierReference(node)
+      && !allowedFetcherReference(node)
+    ) report(node, "bootstrap fetch authority reference fetcher");
 
     if (ts.isVariableDeclaration(node) && node.initializer) {
       if (ts.isIdentifier(node.name)) {
@@ -678,6 +830,27 @@ test("the privacy analyzer rejects ambient-root copying and variable-key destruc
 });
 
 
+test("the privacy analyzer rejects Window authority through document, top, parent, and frames", () => {
+  const roots = ["document.defaultView", "top", "parent", "frames"];
+  for (const [index, root] of roots.entries()) {
+    const mutation = `
+const source = "private";
+const key = "fetch";
+const {[key]: sink} = ${root};
+sink("/leak", {body: source});
+`;
+    const violations = analyzeSource(
+      join(appRootPath, `components/nested/window-root-${index}.ts`),
+      mutation,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("ambient root authority reference")),
+      violations.join("\n"),
+    );
+  }
+});
+
+
 test("the privacy analyzer rejects destructuring and copying the reviewed worker scope alias", () => {
   const mutations = [
     `const key = "fetch"; const {[key]: sink} = scope;`,
@@ -697,11 +870,102 @@ ${mutation}
 });
 
 
+test("the privacy analyzer rejects direct use of the captured bootstrap fetch authority", () => {
+  const mutation = `
+const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
+let bootstrapFetch: typeof fetch | null = scope.fetch.bind(scope);
+const source = "private";
+bootstrapFetch("/leak", {method: "POST", body: source});
+`;
+  const violations = analyzeSource(join(appRootPath, "workers/heel-review.worker.ts"), mutation);
+  assert.ok(
+    violations.some((violation) => violation.includes("bootstrap fetch authority reference bootstrapFetch")),
+    violations.join("\n"),
+  );
+});
+
+
+test("the privacy analyzer requires the exact reviewed bootstrap declaration", () => {
+  const declarations = [
+    `const bootstrapFetch: typeof fetch | null = scope.fetch.bind(scope);`,
+    `var bootstrapFetch: typeof fetch | null = scope.fetch.bind(scope);`,
+    `let bootstrapFetch = scope.fetch.bind(scope);`,
+  ];
+  for (const [index, declaration] of declarations.entries()) {
+    const mutation = `
+const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
+${declaration}
+`;
+    const violations = analyzeSource(join(appRootPath, "workers/heel-review.worker.ts"), mutation);
+    assert.ok(
+      violations.some((violation) => violation.includes("unreviewed bootstrap fetch authority declaration")),
+      `${index}: ${violations.join("\n")}`,
+    );
+  }
+});
+
+
+test("the privacy analyzer rejects bootstrap aliases, passing, return, reassignment, destructuring, and optional calls", () => {
+  const prefix = `
+const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
+let bootstrapFetch: typeof fetch | null = scope.fetch.bind(scope);
+`;
+  const mutations = [
+    `const alias = bootstrapFetch;`,
+    `function pass(value) {} pass(bootstrapFetch);`,
+    `function expose() { return bootstrapFetch; }`,
+    `const [alias] = [bootstrapFetch];`,
+    `bootstrapFetch = () => Promise.reject(new Error("changed"));`,
+    `bootstrapFetch?.("/leak");`,
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, "workers/heel-review.worker.ts"),
+      `${prefix}\n${mutation}`,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("bootstrap fetch authority reference bootstrapFetch")),
+      `${index}: ${violations.join("\n")}`,
+    );
+  }
+});
+
+
+test("the privacy analyzer rejects non-runtime fetcher calls inside fetchLocal", () => {
+  const mutation = `
+const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
+let bootstrapFetch: typeof fetch | null = scope.fetch.bind(scope);
+async function fetchLocal(path: string): Promise<Response> {
+  const fetcher = bootstrapFetch;
+  if (fetcher === null) throw new Error("unavailable");
+  return fetcher("/leak", {method: "POST", body: "private"});
+}
+`;
+  const violations = analyzeSource(join(appRootPath, "workers/heel-review.worker.ts"), mutation);
+  assert.ok(
+    violations.some((violation) => violation.includes("bootstrap fetch authority reference fetcher")),
+    violations.join("\n"),
+  );
+});
+
+
 test("the privacy analyzer permits only the reviewed engine and server fetch sites", () => {
   const engine = `
 const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
-const bootstrapFetch = scope.fetch.bind(scope);
-async function fetchLocal(fetcher, path) { return fetcher(path); }
+let bootstrapFetch: typeof fetch | null = scope.fetch.bind(scope);
+async function fetchLocal(path: string): Promise<Response> {
+  const fetcher = bootstrapFetch;
+  if (fetcher === null || !path.startsWith(RUNTIME_ROOT) || path.includes("..")) {
+    throw new Error("runtime asset path is unavailable");
+  }
+  const response = await fetcher(path, {
+    cache: "no-store",
+    credentials: "same-origin",
+    redirect: "error",
+  });
+  new URL(response.url || path, scope.location.href);
+  return response;
+}
 function send(value) { scope.postMessage(JSON.stringify(value)); }
 function guardProperty(owner, name) {
   Object.defineProperty(owner, name, {value: () => { throw new Error("disabled"); }});
@@ -713,6 +977,7 @@ function guardAmbientNetwork() {
   }
 }
 scope.onmessage = () => {};
+async function boot() { bootstrapFetch = null; }
 `;
   const server = `
 async function route(request, env, ctx) {
