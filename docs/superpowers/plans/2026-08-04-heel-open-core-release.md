@@ -158,6 +158,7 @@ Replace the wildcard package finder in `pyproject.toml` with:
 ```toml
 [tool.setuptools]
 include-package-data = false
+license-files = ["LICENSE", "NOTICE"]
 packages = ["heel"]
 
 [tool.setuptools.package-data]
@@ -179,10 +180,19 @@ Replace `MANIFEST.in` with explicit public includes and a final defensive prune:
 
 ```text
 include DCO LICENSE NOTICE
-include release/open-core/README.md release/open-core/MCP_QUICKSTART.md release/open-core/SECURITY.md
 include heel/*.py
 include heel/heldout/targets.json
 include heel/scenarios_lib/community.json
+include release/open-core-v1.json
+include release/open-core/MCP_QUICKSTART.md release/open-core/README.md release/open-core/SECURITY.md
+exclude LICENSE-COMMERCIAL.md
+exclude README.md
+exclude heel/heldout/test_targets.json
+exclude heel/scenarios_lib/research_owasp.json
+prune apps
+prune deploy
+prune tests
+prune web
 prune heel/saas
 prune docs/saas
 prune docs/superpowers
@@ -199,6 +209,13 @@ python3 -m unittest tests.test_open_core_release.OpenCoreReleaseTests.test_relea
 ```
 
 Expected: `PASS`.
+
+Also run the standard-build integration in mandatory mode so a missing PyPA build frontend fails
+instead of skipping:
+
+```bash
+HEEL_REQUIRE_STANDARD_BUILD=1 python3 -m unittest tests.test_open_core_release -v
+```
 
 Commit:
 
