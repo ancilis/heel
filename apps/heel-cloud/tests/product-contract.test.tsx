@@ -53,6 +53,7 @@ vi.mock("../lib/local-reviews", async (importOriginal) => {
 });
 
 import Home from "../app/page";
+import McpQuickstart from "../app/mcp/page";
 import { OpenApiInput } from "../components/review/OpenApiInput";
 import { ReviewWorkspace } from "../components/review/ReviewWorkspace";
 
@@ -185,6 +186,20 @@ describe("Heel anonymous launch review", () => {
     expect(section?.textContent).toContain("heel-mcp");
     expect(section?.textContent).toMatch(/source checkout/i);
     expect(section?.textContent).not.toMatch(/pip install|pypi/i);
+  });
+
+  test("states the MCP release, platform, privacy, and execution boundaries", () => {
+    render(<McpQuickstart />);
+
+    expect(screen.getByText(/base mcp core is apache-2\.0 licensed and free/i)).toBeTruthy();
+    expect(screen.getByText(/not yet available as a public download/i)).toBeTruthy();
+    expect(screen.getByText(/python 3\.11 or newer/i)).toBeTruthy();
+    expect(screen.getByText(/posix filesystem/i)).toBeTruthy();
+    expect(screen.getByText(/windows is not currently supported/i)).toBeTruthy();
+    expect(screen.getByText(/client or model provider may receive or upload/i)).toBeTruthy();
+    expect(screen.getByText(/heel cannot enforce that client-provider boundary/i)).toBeTruthy();
+    expect(screen.getByText(/all exposed mcp tools remain constrained/i)).toBeTruthy();
+    expect(screen.getByText(/pre-existing, human-created signed scope/i)).toBeTruthy();
   });
 
   test("shows source bytes and rejects oversize input before worker messaging", async () => {
@@ -355,6 +370,19 @@ describe("Heel anonymous launch review", () => {
     await act(async () => read.resolve(new TextEncoder().encode("stale").buffer));
     expect((screen.getByLabelText(/paste openapi json/i) as HTMLTextAreaElement).value).toBe("");
     expect(screen.queryByRole("status", { name: /selected file/i })).toBeNull();
+  });
+
+  test("restarting custom input returns focus to the reset input region", async () => {
+    const { container } = render(<Home />);
+    const analyzeMine = screen.getByRole("button", { name: /analyze mine/i });
+    fireEvent.click(analyzeMine);
+    const inputRegion = container.querySelector<HTMLElement>(".input-focus-target");
+    await waitFor(() => expect(document.activeElement).toBe(inputRegion));
+
+    analyzeMine.focus();
+    expect(document.activeElement).toBe(analyzeMine);
+    fireEvent.click(analyzeMine);
+    await waitFor(() => expect(document.activeElement).toBe(inputRegion));
   });
 
   test("rejects non-JSON names and reports exact oversized file identity before decoding", async () => {

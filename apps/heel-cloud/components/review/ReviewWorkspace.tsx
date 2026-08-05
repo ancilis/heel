@@ -173,7 +173,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
 
   useEffect(() => {
     if (inputOpen) inputHeadingRef.current?.focus();
-  }, [inputOpen]);
+  }, [inputOpen, inputResetGeneration]);
 
   useEffect(() => {
     if (error) errorRef.current?.focus();

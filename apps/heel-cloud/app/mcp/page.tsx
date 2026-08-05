@@ -19,13 +19,16 @@ const MCP_CONFIGURATION = `{
   }
 }`;
 
-const VERIFY_SERVER = `printf '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\\n' \\
+const VERIFY_SERVER = `printf '%s\\n' \\
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"heel-quickstart-check","version":"1.0"}}}' \\
+  '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \\
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \\
   | /absolute/path/to/heel/.venv/bin/heel-mcp`;
 
 
 export const metadata: Metadata = {
   title: "Local MCP setup — Heel",
-  description: "Connect Heel's local stdio MCP server to an AI client from a licensed source checkout.",
+  description: "Connect Heel's local stdio MCP server to an AI client from an official release source package.",
 };
 
 
@@ -46,10 +49,10 @@ export default function McpQuickstart() {
       <article className="mcp-quickstart">
         <header className="quickstart-hero">
           <div>
-            <p className="eyebrow">MCP quickstart · source checkout</p>
+            <p className="eyebrow">MCP quickstart · release source package</p>
             <h1>Run Heel from your AI client.</h1>
             <p>
-              Install the <code>heel-sim</code> distribution from licensed source,
+              Install the <code>heel-sim</code> distribution from the official release source package,
               then point any stdio-capable MCP client at the <code>heel-mcp</code> executable.
             </p>
           </div>
@@ -60,18 +63,27 @@ export default function McpQuickstart() {
           <strong>Know the boundary.</strong>
           <p>
             Heel&apos;s MCP review process runs on your machine, makes no analyzer network calls,
-            and does not upload your OpenAPI to Heel. Your AI client is separate and may have
-            its own data handling. Use a sanitized API description without credentials or customer data.
+            and does not upload your OpenAPI to Heel. Your AI client is separate from Heel. The AI
+            client or model provider may receive or upload the OpenAPI before invoking local Heel.
+            Heel cannot enforce that client-provider boundary. Check the client&apos;s data handling and
+            use a sanitized API description without credentials or customer data.
           </p>
         </aside>
 
         <section className="quickstart-steps" aria-label="Local MCP setup steps">
           <article className="quickstart-card">
             <p className="step-number">01 · Install</p>
-            <h2>Install from your source checkout</h2>
+            <h2>Install from the release source</h2>
             <p>
-              <code>heel-sim</code> is not published to PyPI. Run these commands only inside
-              the licensed source checkout supplied to you.
+              Heel&apos;s base MCP core is Apache-2.0 licensed and free to run locally. The current
+              MCP release source package is not yet available as a public download. Do not use the
+              public main branch as a substitute; run these commands only after obtaining and extracting
+              the official release package.
+            </p>
+            <p>
+              <code>heel-sim</code> is not published to PyPI. Python 3.11 or newer is required.
+              Secure project storage requires a POSIX filesystem with descriptor-relative operations
+              and no-follow support. Windows is not currently supported for MCP local project storage.
             </p>
             <pre><code>{INSTALL_FROM_SOURCE}</code></pre>
           </article>
@@ -90,8 +102,8 @@ export default function McpQuickstart() {
             <p className="step-number">03 · Verify</p>
             <h2>Check the executable before connecting</h2>
             <p>
-              This sends a standard JSON-RPC tool-list request over local stdin and prints the
-              response to stdout. It does not start a hosted service.
+              This performs the required initialize, initialized-notification, and tool-list sequence
+              over local stdin, then prints the two JSON-RPC responses. It does not start a hosted service.
             </p>
             <pre><code>{VERIFY_SERVER}</code></pre>
           </article>
@@ -107,6 +119,10 @@ export default function McpQuickstart() {
             <p className="quickstart-note">
               If your client does not use the <code>mcpServers</code> shape, enter the same absolute
               executable path and <code>HEEL_HOME</code> value in its local stdio MCP settings.
+            </p>
+            <p className="quickstart-note">
+              All exposed MCP tools remain constrained. Static review tools stay local. Target execution
+              requires a pre-existing, human-created signed scope; an agent cannot create, widen, or relax one.
             </p>
           </article>
         </section>
