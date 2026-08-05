@@ -64,6 +64,47 @@ sanitized UTF-8 OpenAPI JSON without credentials or customer data and no larger 
 See the [MCP quickstart](docs/MCP_QUICKSTART.md) for current-wheel installation and stdio client
 configuration.
 
+## Anonymous browser workspace
+
+`apps/heel-cloud/` is the commercial, evidence-first browser workspace. It renders a committed
+sample finding immediately, then lets an anonymous visitor run that sample or paste/drop a
+sanitized OpenAPI JSON document. The canonical Python review wheel runs in a dedicated Web Worker;
+the analyzer loads its integrity-pinned Pyodide assets and wheel from the same origin. Raw OpenAPI
+source and guided answers remain in memory, are not uploaded or synchronized, and are not written
+to local history. A visitor may explicitly save only the validated result envelope in that device's
+IndexedDB and download deterministic JSON or Markdown locally.
+
+This repository state is a **private acceptance preview**, not a claim that a public alpha is live
+or launch-ready. The remaining public claim requires the documented browser acceptance run,
+explicit public-access approval, and a public deployment. There is no account system, cloud save,
+team synchronization, billing, hosted review API, analytics, database, or object-storage binding in
+this browser milestone.
+
+Use Node.js 26 for the security gate:
+
+```bash
+python3 scripts/build_browser_engine.py --output apps/heel-cloud/browser-engine --check
+python3 scripts/build_browser_sample.py --check
+cd apps/heel-cloud
+npm ci --ignore-scripts --no-audit --no-fund
+cd ../..
+python3 -m unittest tests.test_browser_engine_build tests.test_browser_review \
+  tests.test_browser_sample tests.test_browser_native_parity -v
+cd apps/heel-cloud
+node --test tests/browser-engine.test.mjs
+npm run test:unit
+npm run typecheck
+npm run lint
+npm run build
+node --test tests/privacy-boundary.test.mjs tests/rendered-html.test.mjs \
+  tests/production-artifact.test.mjs
+```
+
+The final artifact inspection verifies the shipped runtime digests, same-origin worker bootstrap,
+security headers, empty persistence bindings, absence of source maps and credential files, and the
+host-derived 1200×630 social metadata. It does not replace the outstanding interactive browser or
+deployment acceptance gates.
+
 Run the broader synthetic proof from the same clone:
 
 ```bash
@@ -273,10 +314,11 @@ caller cannot create, widen, or escape a signed authorization scope.* See **[TRU
 
 ## Status
 
-**Status: production-ready spine, beta adapters (v1.1.0).** 55 core tests on Python 3.11 to
-3.13, CI green, zero runtime dependencies, four red-team passes. The core authorization gate,
+**Status: production-ready spine, beta adapters (v1.1.0).** Core coverage runs on Python 3.11 to
+3.13 with zero runtime dependencies and four completed red-team passes. The core authorization gate,
 containment model, and evaluation ladder are the production-ready spine. Real-target adapters remain
-beta until adapter coverage and operator controls mature.
+beta until adapter coverage and operator controls mature. The anonymous browser workspace remains a
+private acceptance preview until its separate browser and deployment gates are complete.
 
 ---
 

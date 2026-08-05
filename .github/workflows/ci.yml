@@ -66,3 +66,53 @@ jobs:
         run: |
           npm ci || npm install
           npm run build
+
+  browser-alpha:
+    name: anonymous browser security + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          # setup-node caches npm's download cache only, never app state or input.
+          cache: npm
+          cache-dependency-path: apps/heel-cloud/package-lock.json
+      - name: Install pinned browser dependencies without lifecycle scripts
+        working-directory: apps/heel-cloud
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Check deterministic browser wheel and sample artifacts
+        run: |
+          python scripts/build_browser_engine.py --output apps/heel-cloud/browser-engine --check
+          python scripts/build_browser_sample.py --check
+      - name: Python browser, sample, and native/Pyodide parity gates
+        run: >-
+          python -m unittest
+          tests.test_browser_engine_build
+          tests.test_browser_review
+          tests.test_browser_sample
+          tests.test_browser_native_parity
+          -v
+      - name: Actual Pyodide wheel under Node 26 security confinement
+        working-directory: apps/heel-cloud
+        run: node --test tests/browser-engine.test.mjs
+      - name: Application unit tests and static checks
+        working-directory: apps/heel-cloud
+        run: |
+          npm run test:unit
+          npm run typecheck
+          npm run lint
+      - name: Build Cloudflare-compatible production artifact
+        working-directory: apps/heel-cloud
+        run: npm run build
+      - name: Inspect production privacy, product, and deployment artifact contracts
+        working-directory: apps/heel-cloud
+        run: >-
+          node --test
+          tests/privacy-boundary.test.mjs
+          tests/rendered-html.test.mjs
+          tests/production-artifact.test.mjs
