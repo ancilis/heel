@@ -461,7 +461,7 @@ export class BrowserReviewClient {
         active.before !== null
         && (
           envelope.product_id !== active.before.product_id
-          || envelope.source_hash !== active.before.source_hash
+          || envelope.baseline_hash !== active.before.baseline_hash
         )
       ) {
         throw new Error("rerun result identity does not match its baseline");

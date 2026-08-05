@@ -74,14 +74,42 @@ function transactionComplete(transaction: IDBTransaction): Promise<void> {
 
 
 async function injectStoredValue(factory: IDBFactory, value: unknown): Promise<void> {
+  await injectStoredValues(factory, [value]);
+}
+
+
+async function injectStoredValues(factory: IDBFactory, values: readonly unknown[]): Promise<void> {
   const database = await requestResult(factory.open(LOCAL_REVIEW_DATABASE));
   try {
     const transaction = database.transaction(LOCAL_REVIEW_STORE, "readwrite");
-    transaction.objectStore(LOCAL_REVIEW_STORE).put(value);
+    const store = transaction.objectStore(LOCAL_REVIEW_STORE);
+    for (const value of values) store.put(value);
     await transactionComplete(transaction);
   } finally {
     database.close();
   }
+}
+
+
+async function rawRecordCount(factory: IDBFactory): Promise<number> {
+  const database = await requestResult(factory.open(LOCAL_REVIEW_DATABASE));
+  try {
+    return await requestResult(
+      database.transaction(LOCAL_REVIEW_STORE, "readonly").objectStore(LOCAL_REVIEW_STORE).count(),
+    );
+  } finally {
+    database.close();
+  }
+}
+
+
+function storedEnvelope(productId: string, savedAt: number): Record<string, unknown> {
+  return {
+    schema_version: "heel.local-review.v1",
+    envelope: envelope(productId),
+    saved_at: savedAt,
+    sync_state: "local_only",
+  };
 }
 
 
@@ -170,6 +198,62 @@ describe("LocalReviewStore", () => {
       prototype.getAllKeys = originalGetAllKeys;
       prototype.openCursor = originalOpenCursor;
     }
+  });
+
+  test("purges key-valid rows missing saved_at before enforcing the total bound", async () => {
+    const factory = new IDBFactory();
+    const store = new LocalReviewStore({ indexedDB: factory, maxItems: 2, now: () => 100 });
+    await expect(store.list()).resolves.toEqual([]);
+    await injectStoredValues(factory, Array.from({ length: 5 }, (_, index) => ({
+      schema_version: "heel.local-review.v1",
+      envelope: { review_id: `review_${index.toString(16).padStart(20, "0")}` },
+      sync_state: "local_only",
+    })));
+
+    const saved = envelope("retained-after-unindexed-poison");
+    await expect(store.save(saved)).resolves.toBe(true);
+    await expect(rawRecordCount(factory)).resolves.toBeLessThanOrEqual(2);
+    await expect(store.list()).resolves.toMatchObject([
+      { envelope: { review_id: saved.review_id } },
+    ]);
+  });
+
+  test("purges malformed indexed rows instead of counting them as retained history", async () => {
+    const factory = new IDBFactory();
+    const store = new LocalReviewStore({ indexedDB: factory, maxItems: 2, now: () => 100 });
+    await expect(store.list()).resolves.toEqual([]);
+    await injectStoredValues(factory, Array.from({ length: 3 }, (_, index) => ({
+      schema_version: "heel.local-review.v1",
+      envelope: { review_id: `review_${(index + 10).toString(16).padStart(20, "0")}` },
+      saved_at: index,
+      sync_state: "local_only",
+    })));
+
+    const saved = envelope("retained-after-indexed-poison");
+    await expect(store.save(saved)).resolves.toBe(true);
+    await expect(rawRecordCount(factory)).resolves.toBe(1);
+    await expect(store.list()).resolves.toMatchObject([
+      { envelope: { review_id: saved.review_id } },
+    ]);
+  });
+
+  test("trims a large valid preexisting set oldest-first with constant-memory cursors", async () => {
+    const factory = new IDBFactory();
+    const store = new LocalReviewStore({ indexedDB: factory, maxItems: 3, now: () => 10_000 });
+    await expect(store.list()).resolves.toEqual([]);
+    await injectStoredValues(factory, Array.from(
+      { length: 75 },
+      (_, index) => storedEnvelope(`bulk-${index}`, index + 1),
+    ));
+
+    await expect(store.save(envelope("latest"))).resolves.toBe(true);
+    await expect(rawRecordCount(factory)).resolves.toBe(3);
+    const records = await store.list();
+    expect(records.map((record) => record.envelope.product_id)).toEqual([
+      "latest",
+      "bulk-74",
+      "bulk-73",
+    ]);
   });
 
   test("supports delete and clear without adding a cloud sync state", async () => {

@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import sampleEnvelope from "../../../tests/fixtures/reviews/sample_review_v1.json";
+import canonicalEnforcedRerun from "./canonical-enforced-rerun.fixture.json";
 import {
   BrowserReviewClient,
   BrowserReviewClientError,
@@ -581,6 +582,38 @@ describe("BrowserReviewClient", () => {
     const unrelatedAfter = withoutQuestion(browserEnvelope("unrelated-product"), answer.surface, answer.field);
     result(worker, rerunRequest.request_id, unrelatedAfter);
     await expect(rerun).rejects.toMatchObject({ code: "worker_protocol" });
+  });
+
+  test("accepts canonical enforced-answer output when enrichment changes the source hash", async () => {
+    const adapter = canonicalEnforcedRerun as {
+      source: string;
+      answer: { surface: string; field: "tenant_filter"; value: "enforced" };
+      before: Record<string, unknown>;
+      after: Record<string, unknown>;
+    };
+    expect(adapter.after.source_hash).not.toBe(adapter.before.source_hash);
+    const worker = new FakeWorker();
+    const client = new BrowserReviewClient({ workerFactory: () => worker });
+    ready(worker);
+    await client.whenReady();
+
+    const initial = client.review(adapter.source);
+    const initialRequest = JSON.parse(worker.sent.at(-1)!);
+    result(worker, initialRequest.request_id, adapter.before);
+    await initial;
+
+    const rerun = client.rerun(
+      adapter.source,
+      parseReviewEnvelopeV1(adapter.before),
+      [adapter.answer],
+    );
+    const rerunRequest = JSON.parse(worker.sent.at(-1)!);
+    result(worker, rerunRequest.request_id, adapter.after);
+    await expect(rerun).resolves.toMatchObject({
+      receipt: {
+        items: [{ ...adapter.answer, receipt: "applied" }],
+      },
+    });
   });
 
   test("redacts synchronous postMessage failures and restarts cleanly", async () => {
