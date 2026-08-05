@@ -2,7 +2,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { lstat, mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, parse, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 
@@ -41,10 +41,36 @@ function canonicalJson(value) {
 
 
 async function readRegular(path, label) {
+  await assertNoSymlinkComponents(path, label);
   const status = await lstat(path);
   if (status.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
   if (!status.isFile()) throw new Error(`${label} must be a regular file`);
   return readFile(path);
+}
+
+
+async function assertNoSymlinkComponents(path, label, { allowMissing = false } = {}) {
+  const absolute = resolve(path);
+  const root = parse(absolute).root;
+  let current = root;
+  for (const component of relative(root, absolute).split(sep).filter(Boolean)) {
+    current = join(current, component);
+    try {
+      const status = await lstat(current);
+      if (status.isSymbolicLink()) throw new Error(`${label} contains a symbolic link: ${current}`);
+    } catch (error) {
+      if (allowMissing && error?.code === "ENOENT") continue;
+      throw error;
+    }
+  }
+  return absolute;
+}
+
+
+async function validateDirectoryRoot(path, label) {
+  await assertNoSymlinkComponents(path, label);
+  const status = await lstat(path);
+  if (!status.isDirectory()) throw new Error(`${label} must be a directory`);
 }
 
 
@@ -120,6 +146,7 @@ async function validateHeelEngine(engineRoot) {
 
 
 async function validateOutputDirectory(outputRoot, expectedNames) {
+  await assertNoSymlinkComponents(outputRoot, "runtime output", { allowMissing: true });
   try {
     const status = await lstat(outputRoot);
     if (status.isSymbolicLink()) throw new Error("runtime output must not be a symbolic link");
@@ -128,9 +155,11 @@ async function validateOutputDirectory(outputRoot, expectedNames) {
     if (error?.code !== "ENOENT") throw error;
     await mkdir(outputRoot, { recursive: true, mode: 0o755 });
   }
+  await validateDirectoryRoot(outputRoot, "runtime output");
   const entries = await readdir(outputRoot, { withFileTypes: true });
   for (const entry of entries) {
     if (!expectedNames.has(entry.name)) throw new Error(`unexpected runtime path: ${entry.name}`);
+    await assertNoSymlinkComponents(join(outputRoot, entry.name), `runtime path ${entry.name}`);
     if (entry.isSymbolicLink()) throw new Error(`runtime path must not be a symbolic link: ${entry.name}`);
     if (!entry.isFile()) throw new Error(`runtime path must be a regular file: ${entry.name}`);
   }
@@ -138,6 +167,12 @@ async function validateOutputDirectory(outputRoot, expectedNames) {
 
 
 async function writeAtomic(outputRoot, name, payload) {
+  await validateDirectoryRoot(outputRoot, "runtime output");
+  const destination = await assertNoSymlinkComponents(
+    join(outputRoot, name),
+    `runtime path ${name}`,
+    { allowMissing: true },
+  );
   const temporary = join(outputRoot, `.prepare-${randomBytes(12).toString("hex")}`);
   let handle;
   try {
@@ -146,10 +181,19 @@ async function writeAtomic(outputRoot, name, payload) {
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await rename(temporary, join(outputRoot, name));
+    await validateDirectoryRoot(outputRoot, "runtime output");
+    await assertNoSymlinkComponents(temporary, "runtime temporary artifact");
+    await assertNoSymlinkComponents(destination, `runtime path ${name}`, { allowMissing: true });
+    await rename(temporary, destination);
   } finally {
     if (handle) await handle.close();
-    await rm(temporary, { force: true });
+    let cleanupIsSafe = true;
+    try {
+      await assertNoSymlinkComponents(temporary, "runtime temporary artifact", { allowMissing: true });
+    } catch {
+      cleanupIsSafe = false;
+    }
+    if (cleanupIsSafe) await rm(temporary, { force: true });
   }
 }
 
@@ -165,6 +209,11 @@ export async function prepareRuntime(options = {}) {
   const outputRoot = options.outputRoot
     ? resolve(options.outputRoot)
     : join(appRoot, "public/heel-runtime");
+  await Promise.all([
+    validateDirectoryRoot(appRoot, "application root"),
+    validateDirectoryRoot(pyodideRoot, "Pyodide root"),
+    validateDirectoryRoot(engineRoot, "Heel engine root"),
+  ]);
   const [pyodideAssets, heel] = await Promise.all([
     validatePyodide(pyodideRoot),
     validateHeelEngine(engineRoot),

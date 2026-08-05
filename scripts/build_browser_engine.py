@@ -17,7 +17,7 @@ import tempfile
 import zipfile
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(os.path.abspath(__file__)).parents[1]
 ENGINE_VERSION = "1.1.0"
 WHEEL_NAME = f"heel_browser-{ENGINE_VERSION}-py3-none-any.whl"
 DIST_INFO = f"heel_browser-{ENGINE_VERSION}.dist-info"
@@ -53,8 +53,35 @@ class BrowserEngineBuildError(RuntimeError):
     pass
 
 
+def _assert_no_symlink_components(
+    path: Path,
+    label: str,
+    *,
+    allow_missing: bool = False,
+) -> Path:
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            status = current.lstat()
+        except FileNotFoundError as error:
+            if allow_missing:
+                continue
+            raise BrowserEngineBuildError(f"{label} is unavailable: {current}") from error
+        if stat.S_ISLNK(status.st_mode):
+            raise BrowserEngineBuildError(
+                f"{label} contains a symbolic link: {current}"
+            )
+    return absolute
+
+
 def _regular_source(relative_path: str) -> bytes:
-    path = ROOT / relative_path
+    _assert_no_symlink_components(ROOT, "browser source root")
+    path = _assert_no_symlink_components(
+        ROOT / relative_path,
+        f"required source {relative_path}",
+    )
     try:
         status = path.lstat()
     except OSError as error:
@@ -219,6 +246,12 @@ def build_manifest(wheel: bytes) -> bytes:
 
 
 def _write_atomic(output: Path, filename: str, payload: bytes) -> None:
+    _assert_no_symlink_components(output, "browser engine output")
+    destination = _assert_no_symlink_components(
+        output / filename,
+        f"browser engine artifact {filename}",
+        allow_missing=True,
+    )
     descriptor, temporary_name = tempfile.mkstemp(prefix=".heel-browser-", dir=output)
     temporary = Path(temporary_name)
     try:
@@ -227,15 +260,44 @@ def _write_atomic(output: Path, filename: str, payload: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o644)
-        os.replace(temporary, output / filename)
+        _assert_no_symlink_components(output, "browser engine output")
+        _assert_no_symlink_components(temporary, "browser engine temporary artifact")
+        _assert_no_symlink_components(
+            destination,
+            f"browser engine artifact {filename}",
+            allow_missing=True,
+        )
+        os.replace(temporary, destination)
     finally:
         try:
-            temporary.unlink()
-        except FileNotFoundError:
+            _assert_no_symlink_components(temporary, "browser engine temporary artifact")
+        except BrowserEngineBuildError:
             pass
+        else:
+            temporary.unlink(missing_ok=True)
+
+
+def _validate_output_directory(output: Path) -> None:
+    _assert_no_symlink_components(output, "browser engine output")
+    try:
+        status = output.lstat()
+    except OSError as error:
+        raise BrowserEngineBuildError("output must be a directory") from error
+    if not stat.S_ISDIR(status.st_mode):
+        raise BrowserEngineBuildError("output must be a directory")
+
+
+def _validate_output_artifacts(output: Path) -> None:
+    for filename in (WHEEL_NAME, "manifest.json"):
+        _assert_no_symlink_components(
+            output / filename,
+            f"browser engine artifact {filename}",
+            allow_missing=True,
+        )
 
 
 def _check_exact(path: Path, expected: bytes) -> None:
+    _assert_no_symlink_components(path, f"generated artifact {path.name}")
     try:
         actual = path.read_bytes()
     except OSError as error:
@@ -244,6 +306,15 @@ def _check_exact(path: Path, expected: bytes) -> None:
         raise BrowserEngineBuildError(f"generated artifact is stale: {path.name}")
 
 
+def _prepare_output_directory(output: Path) -> None:
+    _assert_no_symlink_components(
+        output,
+        "browser engine output",
+        allow_missing=True,
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    _validate_output_directory(output)
+    _validate_output_artifacts(output)
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
@@ -254,12 +325,12 @@ def main(argv: list[str] | None = None) -> int:
         wheel = build_wheel()
         manifest = build_manifest(wheel)
         if arguments.check:
+            _validate_output_directory(output)
+            _validate_output_artifacts(output)
             _check_exact(output / WHEEL_NAME, wheel)
             _check_exact(output / "manifest.json", manifest)
         else:
-            output.mkdir(parents=True, exist_ok=True)
-            if not output.is_dir():
-                raise BrowserEngineBuildError("output must be a directory")
+            _prepare_output_directory(output)
             _write_atomic(output, WHEEL_NAME, wheel)
             _write_atomic(output, "manifest.json", manifest)
     except (BrowserEngineBuildError, OSError) as error:

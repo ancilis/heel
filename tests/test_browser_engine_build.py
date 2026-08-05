@@ -76,7 +76,7 @@ class BrowserEngineBuildTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._temporary = tempfile.TemporaryDirectory()
-        cls.output = Path(cls._temporary.name) / "engine"
+        cls.output = Path(cls._temporary.name).resolve() / "engine"
         cls.output.mkdir()
         cls.completed = None
         if BUILDER.is_file():
@@ -104,7 +104,7 @@ class BrowserEngineBuildTests(unittest.TestCase):
 
     def _run_builder_with_browser_review_mutation(self, mutation: str) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = Path(temporary)
+            fixture = Path(temporary).resolve()
             fixture_builder = fixture / "scripts" / BUILDER.name
             fixture_builder.parent.mkdir()
             shutil.copy2(BUILDER, fixture_builder)
@@ -146,7 +146,7 @@ class BrowserEngineBuildTests(unittest.TestCase):
 
     def test_package_initializer_is_subject_to_the_pure_import_policy(self):
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = Path(temporary)
+            fixture = Path(temporary).resolve()
             fixture_builder = fixture / "scripts" / BUILDER.name
             fixture_builder.parent.mkdir()
             shutil.copy2(BUILDER, fixture_builder)
@@ -311,7 +311,7 @@ class BrowserEngineBuildTests(unittest.TestCase):
     def test_two_builds_are_byte_identical_and_check_mode_detects_drift(self):
         wheel, manifest = self._require_build()
         with tempfile.TemporaryDirectory() as temporary:
-            other = Path(temporary)
+            other = Path(temporary).resolve()
             rebuilt = subprocess.run(
                 [sys.executable, str(BUILDER), "--output", str(other)],
                 cwd=ROOT,
@@ -343,7 +343,7 @@ class BrowserEngineBuildTests(unittest.TestCase):
     def test_builder_preserves_unrelated_output_files(self):
         self.assertTrue(BUILDER.is_file(), "browser engine builder is missing")
         with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
+            output = Path(temporary).resolve()
             sentinel = output / "owner-file.txt"
             sentinel.write_text("preserve me", encoding="utf-8")
             completed = subprocess.run(
@@ -355,6 +355,110 @@ class BrowserEngineBuildTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me")
+
+    def test_builder_rejects_symlinked_output_roots_parents_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary).resolve()
+            outside = fixture / "outside"
+            outside.mkdir()
+
+            direct_output = fixture / "direct-output"
+            direct_output.symlink_to(outside, target_is_directory=True)
+            direct = subprocess.run(
+                [sys.executable, str(BUILDER), "--output", str(direct_output)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertNotEqual(direct.returncode, 0)
+            self.assertEqual(list(outside.iterdir()), [], "builder wrote through output symlink")
+
+            outside_engine = outside / "engine"
+            outside_engine.mkdir()
+            linked_parent = fixture / "linked-parent"
+            linked_parent.symlink_to(outside, target_is_directory=True)
+            parent_output = linked_parent / "engine"
+            parent = subprocess.run(
+                [sys.executable, str(BUILDER), "--output", str(parent_output)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertNotEqual(parent.returncode, 0)
+            self.assertEqual(list(outside_engine.iterdir()), [], "builder wrote through linked parent")
+
+            artifact_output = fixture / "artifact-output"
+            artifact_output.mkdir()
+            outside_artifact = outside / "artifact"
+            outside_artifact.write_text("outside sentinel", encoding="utf-8")
+            (artifact_output / WHEEL_NAME).symlink_to(outside_artifact)
+            artifact = subprocess.run(
+                [sys.executable, str(BUILDER), "--output", str(artifact_output)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertNotEqual(artifact.returncode, 0)
+            self.assertEqual(outside_artifact.read_text(encoding="utf-8"), "outside sentinel")
+
+    def test_builder_rejects_a_symlinked_source_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary).resolve()
+            fixture_builder = fixture / "scripts" / BUILDER.name
+            fixture_builder.parent.mkdir()
+            shutil.copy2(BUILDER, fixture_builder)
+            outside_heel = fixture / "outside-heel"
+            outside_heel.mkdir()
+            for relative_path in MODULE_PATHS:
+                source = ROOT / relative_path
+                shutil.copy2(source, outside_heel / source.name)
+            (fixture / "heel").symlink_to(outside_heel, target_is_directory=True)
+            shutil.copy2(ROOT / "LICENSE", fixture / "LICENSE")
+            shutil.copy2(ROOT / "NOTICE", fixture / "NOTICE")
+
+            completed = subprocess.run(
+                [sys.executable, str(fixture_builder), "--output", str(fixture / "output")],
+                cwd=fixture,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("symbolic link", completed.stderr)
+
+    def test_builder_rejects_invocation_through_a_symlinked_repository_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            anchor = Path(temporary).resolve()
+            fixture = anchor / "actual-source-root"
+            fixture_builder = fixture / "scripts" / BUILDER.name
+            fixture_builder.parent.mkdir(parents=True)
+            shutil.copy2(BUILDER, fixture_builder)
+            for relative_path in (*MODULE_PATHS, "LICENSE", "NOTICE"):
+                destination = fixture / relative_path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative_path, destination)
+            linked_fixture = anchor / "linked-source-root"
+            linked_fixture.symlink_to(fixture, target_is_directory=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(linked_fixture / "scripts" / BUILDER.name),
+                    "--output",
+                    str(anchor / "output"),
+                ],
+                cwd=fixture,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("browser source root contains a symbolic link", completed.stderr)
 
     def test_committed_artifacts_equal_a_fresh_build(self):
         wheel, manifest = self._require_build()

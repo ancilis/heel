@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import dgram from "node:dgram";
 import dns from "node:dns";
 import dnsPromises from "node:dns/promises";
-import { copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import http from "node:http";
 import http2 from "node:http2";
 import https from "node:https";
@@ -425,7 +425,7 @@ test("prepares only integrity-pinned local engine and Pyodide runtime assets", a
 
 test("runtime preparation rejects tampering, symlinks, unpinned versions, and unexpected output", async () => {
   const { prepareRuntime: prepare } = await importPrepareModule();
-  const temporary = await mkdtemp(join(tmpdir(), "heel-runtime-security-"));
+  const temporary = await realpath(await mkdtemp(join(tmpdir(), "heel-runtime-security-")));
   try {
     const tamperedEngine = join(temporary, "tampered-engine");
     await mkdir(tamperedEngine);
@@ -459,6 +459,44 @@ test("runtime preparation rejects tampering, symlinks, unpinned versions, and un
     );
     await assert.rejects(
       prepare({ pyodideRoot: symlinkPackage, outputRoot: join(temporary, "symlink-output") }),
+      /symbolic link/i,
+    );
+
+    const outsideOutput = join(temporary, "outside-output");
+    await mkdir(outsideOutput);
+    const directOutput = join(temporary, "direct-output");
+    await symlink(outsideOutput, directOutput);
+    await assert.rejects(
+      prepare({ outputRoot: directOutput }),
+      /symbolic link/i,
+    );
+    assert.deepEqual(await readdir(outsideOutput), []);
+    const outsideRuntime = join(outsideOutput, "runtime");
+    await mkdir(outsideRuntime);
+    const linkedOutputParent = join(temporary, "linked-output-parent");
+    await symlink(outsideOutput, linkedOutputParent);
+    await assert.rejects(
+      prepare({ outputRoot: join(linkedOutputParent, "runtime") }),
+      /symbolic link/i,
+    );
+    assert.deepEqual(await readdir(outsideRuntime), []);
+
+    const linkedAppRoot = join(temporary, "linked-app-root");
+    await symlink(appRoot, linkedAppRoot);
+    await assert.rejects(
+      prepare({ appRoot: linkedAppRoot, outputRoot: join(temporary, "app-root-output") }),
+      /symbolic link/i,
+    );
+    const linkedEngineRoot = join(temporary, "linked-engine-root");
+    await symlink(engineRoot, linkedEngineRoot);
+    await assert.rejects(
+      prepare({ engineRoot: linkedEngineRoot, outputRoot: join(temporary, "engine-root-output") }),
+      /symbolic link/i,
+    );
+    const linkedPyodideRoot = join(temporary, "linked-pyodide-root");
+    await symlink(join(appRoot, "node_modules/pyodide"), linkedPyodideRoot);
+    await assert.rejects(
+      prepare({ pyodideRoot: linkedPyodideRoot, outputRoot: join(temporary, "pyodide-root-output") }),
       /symbolic link/i,
     );
 
