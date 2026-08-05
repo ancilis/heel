@@ -2,18 +2,26 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import dgram from "node:dgram";
+import dns from "node:dns";
+import dnsPromises from "node:dns/promises";
 import { copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import http from "node:http";
+import http2 from "node:http2";
 import https from "node:https";
+import { registerHooks } from "node:module";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import tls from "node:tls";
 
 
 const appRoot = fileURLToPath(new URL("../", import.meta.url));
+const confinementSymbolKey = "heel.browser-engine.test.network-confinement";
+const networkDeniedMessage = "outbound network disabled for browser-engine test";
 const repositoryRoot = resolve(appRoot, "../..");
 const prepareScript = join(appRoot, "scripts/prepare-runtime.mjs");
 const runtimeRoot = join(appRoot, "public/heel-runtime");
@@ -71,6 +79,224 @@ async function importPrepareModule() {
 
 function sha256(payload) {
   return createHash("sha256").update(payload).digest("hex");
+}
+
+
+function deniedModuleUrl(moduleName) {
+  const common = `
+const state = globalThis[Symbol.for(${JSON.stringify(confinementSymbolKey)})];
+if (!state) throw new Error("Heel network confinement is unavailable");
+const deny = (label) => function deniedOutboundMechanism(...args) {
+  return state.deny(label, args);
+};
+export const __heelNetworkDenied = true;
+export const __heelConfinementToken = state.token;
+`;
+  const source = moduleName === "ws"
+    ? `${common}
+export const WebSocket = deny("module:ws.WebSocket");
+export const WebSocketServer = deny("module:ws.WebSocketServer");
+export const Server = WebSocketServer;
+export const Receiver = deny("module:ws.Receiver");
+export const Sender = deny("module:ws.Sender");
+export const createWebSocketStream = deny("module:ws.createWebSocketStream");
+export default WebSocket;
+`
+    : `${common}
+export const fetch = deny("module:undici.fetch");
+export const request = deny("module:undici.request");
+export const stream = deny("module:undici.stream");
+export const pipeline = deny("module:undici.pipeline");
+export const connect = deny("module:undici.connect");
+export const WebSocket = deny("module:undici.WebSocket");
+export const EventSource = deny("module:undici.EventSource");
+export const Client = deny("module:undici.Client");
+export const Pool = deny("module:undici.Pool");
+export const Agent = deny("module:undici.Agent");
+export const ProxyAgent = deny("module:undici.ProxyAgent");
+export default { fetch, request, stream, pipeline, connect, WebSocket, EventSource, Client, Pool, Agent, ProxyAgent };
+`;
+  return `data:text/javascript,${encodeURIComponent(source)}`;
+}
+
+
+function installNetworkConfinement() {
+  assert.equal(typeof registerHooks, "function", "Node must support synchronous module confinement hooks");
+  const attempts = [];
+  const token = `heel-network-confinement-${process.pid}`;
+  const stateSymbol = Symbol.for(confinementSymbolKey);
+  const previousStateDescriptor = Object.getOwnPropertyDescriptor(globalThis, stateSymbol);
+  const restorers = [];
+  const state = {
+    deny(label) {
+      attempts.push(label);
+      throw new Error(`${networkDeniedMessage}: ${label}`);
+    },
+    token,
+  };
+  Object.defineProperty(globalThis, stateSymbol, {
+    configurable: true,
+    value: state,
+  });
+
+  const moduleUrls = {
+    undici: deniedModuleUrl("undici"),
+    ws: deniedModuleUrl("ws"),
+  };
+  const moduleHooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === "ws") return { shortCircuit: true, url: moduleUrls.ws };
+      if (specifier === "undici" || specifier.startsWith("undici/")) {
+        return { shortCircuit: true, url: moduleUrls.undici };
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+
+  function guard(owner, name, label, { construct = false, optional = false } = {}) {
+    const original = owner?.[name];
+    if (typeof original !== "function") {
+      if (optional) return undefined;
+      assert.fail(`${label} is unavailable and cannot be confined`);
+    }
+    const ownDescriptor = Object.getOwnPropertyDescriptor(owner, name);
+    const denied = function deniedOutboundMechanism(...args) {
+      return state.deny(label, args);
+    };
+    Object.defineProperty(owner, name, {
+      configurable: ownDescriptor?.configurable ?? true,
+      enumerable: ownDescriptor?.enumerable ?? false,
+      value: denied,
+      writable: ownDescriptor?.writable ?? true,
+    });
+    restorers.push(() => {
+      if (ownDescriptor) Object.defineProperty(owner, name, ownDescriptor);
+      else delete owner[name];
+    });
+    const installed = { construct, denied, label, name, owner };
+    return installed;
+  }
+
+  const methodGuards = [
+    guard(http, "get", "node:http.get"),
+    guard(http, "request", "node:http.request"),
+    guard(https, "get", "node:https.get"),
+    guard(https, "request", "node:https.request"),
+    guard(http.Agent.prototype, "createConnection", "node:http.Agent.createConnection"),
+    guard(https.Agent.prototype, "createConnection", "node:https.Agent.createConnection"),
+    guard(net, "connect", "node:net.connect"),
+    guard(net, "createConnection", "node:net.createConnection"),
+    guard(net.Socket.prototype, "connect", "node:net.Socket.connect"),
+    guard(tls, "connect", "node:tls.connect"),
+    guard(dgram, "createSocket", "node:dgram.createSocket"),
+    guard(dgram.Socket.prototype, "connect", "node:dgram.Socket.connect"),
+    guard(dgram.Socket.prototype, "send", "node:dgram.Socket.send"),
+    guard(dgram.Socket.prototype, "sendto", "node:dgram.Socket.sendto"),
+    guard(http2, "connect", "node:http2.connect"),
+  ];
+  const dnsMethods = [...new Set([...Object.keys(dns), ...Object.keys(dnsPromises)])]
+    .filter((name) => /^(lookup|resolve|reverse)/.test(name))
+    .sort();
+  for (const name of dnsMethods) {
+    methodGuards.push(guard(dns, name, `node:dns.${name}`));
+    methodGuards.push(guard(dnsPromises, name, `node:dns/promises.${name}`));
+  }
+  methodGuards.push(guard(dns, "Resolver", "node:dns.Resolver", { construct: true }));
+  methodGuards.push(guard(
+    dnsPromises,
+    "Resolver",
+    "node:dns/promises.Resolver",
+    { construct: true },
+  ));
+
+  const globalGuards = [
+    guard(globalThis, "fetch", "global.fetch"),
+    guard(globalThis, "WebSocket", "global.WebSocket", { construct: true }),
+    guard(globalThis, "EventSource", "global.EventSource", { construct: true, optional: true }),
+    guard(
+      globalThis,
+      "XMLHttpRequest",
+      "global.XMLHttpRequest",
+      { construct: true, optional: true },
+    ),
+    guard(
+      globalThis,
+      "WebSocketStream",
+      "global.WebSocketStream",
+      { construct: true, optional: true },
+    ),
+  ].filter(Boolean);
+  if (typeof globalThis.navigator?.sendBeacon === "function") {
+    globalGuards.push(guard(globalThis.navigator, "sendBeacon", "navigator.sendBeacon"));
+  }
+
+  function proveGuards(selectedGuards) {
+    for (const installed of selectedGuards) {
+      assert.equal(
+        installed.owner[installed.name],
+        installed.denied,
+        `${installed.label} remains usable`,
+      );
+      const before = attempts.length;
+      assert.throws(
+        () => installed.construct
+          ? Reflect.construct(installed.owner[installed.name], [])
+          : Reflect.apply(installed.owner[installed.name], installed.owner, []),
+        new RegExp(networkDeniedMessage),
+        installed.label,
+      );
+      assert.deepEqual(attempts.slice(before), [installed.label]);
+    }
+  }
+
+  return {
+    attempts,
+    guard,
+    methodGuards,
+    globalGuards,
+    async proveModuleGuards() {
+      const wsModule = await import("ws");
+      assert.equal(wsModule.__heelNetworkDenied, true);
+      assert.equal(wsModule.__heelConfinementToken, token);
+      for (const name of ["default", "WebSocket", "WebSocketServer", "createWebSocketStream"]) {
+        assert.throws(
+          () => Reflect.construct(wsModule[name], ["ws://127.0.0.1/"]),
+          new RegExp(networkDeniedMessage),
+          `ws.${name}`,
+        );
+      }
+      const undiciModule = await import("undici");
+      assert.equal(undiciModule.__heelNetworkDenied, true);
+      assert.equal(undiciModule.__heelConfinementToken, token);
+      for (const name of ["fetch", "request", "stream", "pipeline", "connect"]) {
+        assert.throws(
+          () => undiciModule[name]("https://example.invalid/"),
+          new RegExp(networkDeniedMessage),
+          `undici.${name}`,
+        );
+      }
+      for (const name of ["WebSocket", "EventSource", "Client", "Pool", "Agent", "ProxyAgent"]) {
+        assert.throws(
+          () => Reflect.construct(undiciModule[name], ["https://example.invalid/"]),
+          new RegExp(networkDeniedMessage),
+          `undici.${name}`,
+        );
+      }
+    },
+    proveGuards,
+    resetAttempts() {
+      attempts.length = 0;
+    },
+    restore() {
+      moduleHooks.deregister();
+      for (const restore of restorers.reverse()) restore();
+      if (previousStateDescriptor) {
+        Object.defineProperty(globalThis, stateSymbol, previousStateDescriptor);
+      } else {
+        delete globalThis[stateSymbol];
+      }
+    },
+  };
 }
 
 
@@ -214,29 +440,40 @@ test("executes the real local wheel in Pyodide with outbound network disabled", 
   );
   assert.equal(native.status, 0, native.stderr);
 
-  let networkAttempts = 0;
-  const denyNetwork = () => {
-    networkAttempts += 1;
-    throw new Error("outbound network disabled for browser-engine test");
-  };
-  const patches = [
-    [http, "get"], [http, "request"], [https, "get"], [https, "request"],
-    [net, "connect"], [net, "createConnection"],
-  ];
-  const originals = patches.map(([owner, name]) => [owner, name, owner[name]]);
-  const originalFetch = globalThis.fetch;
-  for (const [owner, name] of patches) owner[name] = denyNetwork;
-  globalThis.fetch = denyNetwork;
-  assert.throws(() => http.get("http://127.0.0.1/"), /outbound network disabled/);
-  networkAttempts = 0;
+  const confinement = installNetworkConfinement();
 
   try {
+    confinement.proveGuards([
+      ...confinement.methodGuards,
+      ...confinement.globalGuards,
+    ]);
+    await confinement.proveModuleGuards();
+    confinement.resetAttempts();
+
     const runtimeModule = await import(pathToFileURL(join(runtimeRoot, "pyodide.mjs")).href);
     assert.equal(runtimeModule.version, "314.0.3");
     const pyodide = await runtimeModule.loadPyodide({
+      cdnUrl: runtimeRoot,
       indexURL: runtimeRoot,
       lockFileURL: join(runtimeRoot, "pyodide-lock.json"),
+      packageBaseUrl: runtimeRoot,
     });
+    const packageLoadingGuards = [
+      confinement.guard(pyodide, "loadPackage", "pyodide.loadPackage"),
+      confinement.guard(
+        pyodide,
+        "loadPackagesFromImports",
+        "pyodide.loadPackagesFromImports",
+      ),
+    ];
+    confinement.proveGuards(packageLoadingGuards);
+    assert.equal(
+      pyodide.runPython("import importlib.util; importlib.util.find_spec('micropip') is not None"),
+      false,
+      "micropip must not be available in the no-dependency local runtime",
+    );
+    confinement.resetAttempts();
+
     const wheel = await readFile(join(runtimeRoot, wheelName));
     const sitePackages = pyodide.runPython("import sysconfig; sysconfig.get_paths()['purelib']");
     pyodide.unpackArchive(new Uint8Array(wheel), "wheel", { extractDir: sitePackages });
@@ -256,9 +493,12 @@ test("executes the real local wheel in Pyodide with outbound network disabled", 
     assert.equal(envelope.execution_mode, "browser_local");
     assert.ok(envelope.summary.findings > 0);
     assert.ok(envelope.recommended_controls.length > 0);
-    assert.equal(networkAttempts, 0, "engine attempted outbound network access");
+    assert.deepEqual(
+      confinement.attempts,
+      [],
+      "runtime or engine attempted an outbound or dynamic-package mechanism",
+    );
   } finally {
-    for (const [owner, name, original] of originals) owner[name] = original;
-    globalThis.fetch = originalFetch;
+    confinement.restore();
   }
 });
