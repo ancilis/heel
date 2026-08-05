@@ -3,26 +3,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from .importers import LIST_FIELDS, PRODUCT_MODEL_VERSION
-from .launch_review import review_product_models
-from .openapi_import import product_model_from_openapi
+from .openapi_model import QUESTION_PROMPTS, product_model_from_openapi
+from .product_model import LIST_FIELDS, PRODUCT_MODEL_VERSION
 from .review_contract import build_review_envelope, stable_json_hash
+from .static_review import review_product_models
 
 
 _BASELINE_SAFETY_NOTE = (
     "Synthetic empty baseline for local OpenAPI review; no live probing."
 )
-_QUESTION_PROMPTS = {
-    "missing_tenant_metadata": "How is tenant access enforced for this operation?",
-    "missing_entitlement_metadata": "Which plan or entitlement protects this operation?",
-    "broad_oauth_scope": "Which least-privilege OAuth scopes should protect this surface?",
-    "export_missing_controls": (
-        "Which server-side entitlement and rate controls protect this export operation?"
-    ),
-    "agent_scope_metadata_missing": (
-        "What intended and granted scopes constrain this agent operation?"
-    ),
-}
 
 
 def empty_product_model(product_id: str) -> dict[str, Any]:
@@ -50,7 +39,7 @@ def questions_from_hints(hints: list[dict[str, Any]]) -> list[dict[str, Any]]:
         operation_id = str(hint["operation_id"])
         message = str(hint["message"])
         semantic_context = [code, field, method, route, operation_id, message]
-        prompt = _QUESTION_PROMPTS.get(
+        prompt = QUESTION_PROMPTS.get(
             code,
             "Which product rule or server-side control should protect this surface?",
         )
