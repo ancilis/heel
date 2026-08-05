@@ -1,6 +1,10 @@
-include LICENSE NOTICE DCO README.md ARCHITECTURE.md EVAL.md DECISIONS.md SECURITY.md TRUST.md CHANGELOG.md
-recursive-include heel/scenarios_lib *.json
-recursive-include heel/heldout *.json
-recursive-include docs *.md
+include ARCHITECTURE.md CHANGELOG.md CONTRIBUTING.md DCO DECISIONS.md LICENSE NOTICE README.md SECURITY.md TRUST.md
+include docs/ENTITLEMENTS.md docs/LAUNCH_REVIEW.md docs/MCP_QUICKSTART.md docs/MODES.md docs/OPENAPI_IMPORT.md docs/REGRESSIONS.md
+include heel/*.py
+include heel/heldout/*.json
+include heel/scenarios_lib/*.json
+prune heel/saas
+prune docs/saas
+prune docs/superpowers
 global-exclude __pycache__/*
 global-exclude *.pyc

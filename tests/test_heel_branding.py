@@ -48,11 +48,20 @@ class HeelBrandingTests(unittest.TestCase):
             },
         )
 
-    def test_setuptools_discovers_all_heel_subpackages(self):
+    def test_setuptools_discovers_only_the_public_top_level_package(self):
         with (ROOT / "pyproject.toml").open("rb") as fh:
             setuptools = tomllib.load(fh)["tool"]["setuptools"]
 
-        self.assertEqual(setuptools["packages"]["find"]["include"], ["heel*"])
+        self.assertEqual(
+            setuptools,
+            {
+                "include-package-data": False,
+                "packages": ["heel"],
+                "package-data": {
+                    "heel": ["scenarios_lib/*.json", "heldout/*.json"],
+                },
+            },
+        )
 
     def test_legacy_state_directory_is_quarantined(self):
         ignore_lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()

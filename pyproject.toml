@@ -38,11 +38,9 @@ heel = "heel.cli:main"
 heel-mcp = "heel.mcp_server:main"
 heel-rest = "heel.rest:serve"
 
-[tool.setuptools.packages.find]
-include = ["heel*"]
+[tool.setuptools]
+include-package-data = false
+packages = ["heel"]
 
 [tool.setuptools.package-data]
 heel = ["scenarios_lib/*.json", "heldout/*.json"]
-
-[tool.setuptools.exclude-package-data]
-heel = ["**/__pycache__/*"]
