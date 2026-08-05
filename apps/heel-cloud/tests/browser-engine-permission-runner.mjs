@@ -12,6 +12,7 @@ import { Worker } from "node:worker_threads";
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeRoot = join(appRoot, "public/heel-runtime");
+const wsRoot = join(appRoot, "node_modules/ws");
 const wheelName = "heel_browser-1.1.0-py3-none-any.whl";
 const wheelPath = join(runtimeRoot, wheelName);
 
@@ -30,6 +31,7 @@ function assertAccessDenied(label, operation) {
 assert.ok(process.permission, "Node permission model must be active");
 assert.equal(process.permission.has("fs.read", runtimeRoot), true);
 assert.equal(process.permission.has("fs.read", wheelPath), true);
+assert.equal(process.permission.has("fs.read", wsRoot), true);
 assert.equal(process.permission.has("fs.write", appRoot), false);
 for (const scope of ["addons", "child", "net", "wasi", "worker"]) {
   assert.equal(process.permission.has(scope), false, `${scope} permission must be denied`);
@@ -102,4 +104,5 @@ process.stdout.write(JSON.stringify({
   cpythonVersion,
   denied: ["net", "child", "worker", "fs.write"],
   runtimeReadAllowed: process.permission.has("fs.read", runtimeRoot),
+  wsReadAllowed: process.permission.has("fs.read", wsRoot),
 }));

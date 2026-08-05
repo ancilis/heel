@@ -708,6 +708,7 @@ test("executes the real wheel in a Node permission-confined process", async () =
   assert.equal(result.cpythonVersion, "3.14.2");
   assert.deepEqual(result.denied, ["net", "child", "worker", "fs.write"]);
   assert.equal(result.runtimeReadAllowed, true);
+  assert.equal(result.wsReadAllowed, true);
   await assert.rejects(
     readFile(join(appRoot, ".permission-write-must-fail")),
     { code: "ENOENT" },
