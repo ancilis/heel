@@ -21,12 +21,18 @@ const ignoredRootDirectories = new Set([
   "outputs",
   "work",
 ]);
+const ignoredRootPaths = new Set(["public/heel-runtime"]);
 
 async function assertMissing(relativePath) {
   await assert.rejects(access(new URL(relativePath, appRoot)));
 }
 
 async function sourceFiles(directoryUrl, rootUrl = directoryUrl) {
+  const relativeDirectory = relative(fileURLToPath(rootUrl), fileURLToPath(directoryUrl)).replaceAll("\\", "/");
+  if (ignoredRootPaths.has(relativeDirectory)) {
+    return [];
+  }
+
   const entries = await readdir(directoryUrl, { withFileTypes: true });
   const files = [];
 
@@ -60,8 +66,8 @@ test("keeps the anonymous app free of server-side customer capabilities", async 
   assert.equal(packageJson.dependencies["react-loading-skeleton"], undefined);
   assert.equal(packageJson.dependencies["drizzle-orm"], undefined);
   assert.equal(packageJson.devDependencies["drizzle-kit"], undefined);
-  assert.equal(packageJson.scripts.predev, undefined);
-  assert.equal(packageJson.scripts.prebuild, undefined);
+  assert.equal(packageJson.scripts.predev, "node scripts/prepare-runtime.mjs");
+  assert.equal(packageJson.scripts.prebuild, "node scripts/prepare-runtime.mjs");
   assert.deepEqual(hosting, { d1: null, r2: null });
 
   for (const path of [
@@ -131,6 +137,7 @@ test("lints tracked build source and ignores compiler state", async () => {
   assert.doesNotMatch(eslintConfig, /["']build\/\*\*["']/);
   assert.equal(await eslint.isPathIgnored("build/sites-vite-plugin.ts"), false);
   assert.match(gitignore, /^\*\.tsbuildinfo$/m);
+  assert.match(gitignore, /^\/public\/heel-runtime\/$/m);
 });
 
 test("commercial source discovery skips generated roots but checks nested namesakes", async () => {
@@ -139,7 +146,10 @@ test("commercial source discovery skips generated roots but checks nested namesa
   try {
     await writeFile(join(fixtureRoot, "tracked.ts"), commercialHeader, "utf8");
     const generatedDirectories = [...ignoredRootDirectories];
-    const nestedSources = generatedDirectories.map((directory) => `app/${directory}/source.ts`);
+    const nestedSources = [
+      ...generatedDirectories.map((directory) => `app/${directory}/source.ts`),
+      "app/public/heel-runtime/source.mjs",
+    ];
 
     for (const directory of generatedDirectories) {
       await mkdir(join(fixtureRoot, directory), { recursive: true });
@@ -147,6 +157,11 @@ test("commercial source discovery skips generated roots but checks nested namesa
       await mkdir(join(fixtureRoot, "app", directory), { recursive: true });
       await writeFile(join(fixtureRoot, "app", directory, "source.ts"), "unlicensed", "utf8");
     }
+
+    await mkdir(join(fixtureRoot, "public", "heel-runtime"), { recursive: true });
+    await writeFile(join(fixtureRoot, "public", "heel-runtime", "generated.mjs"), "generated", "utf8");
+    await mkdir(join(fixtureRoot, "app", "public", "heel-runtime"), { recursive: true });
+    await writeFile(join(fixtureRoot, "app", "public", "heel-runtime", "source.mjs"), "unlicensed", "utf8");
 
     const files = await sourceFiles(pathToFileURL(`${fixtureRoot}/`));
     const relativeFiles = files
