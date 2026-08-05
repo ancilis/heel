@@ -95,7 +95,10 @@ function enclosingFunctionName(node) {
 function containsSensitiveInput(node) {
   let found = false;
   function visit(current) {
-    if (ts.isIdentifier(current) && /^(?:source|rawSource|answers|answersJson|answers_json)$/.test(current.text)) {
+    if (
+      ts.isIdentifier(current)
+      && /^(?:source|rawSource|answers|answersJson|answers_json|review|reviewJson|review_json|namespaceKey|namespace_key)$/.test(current.text)
+    ) {
       found = true;
       return;
     }
@@ -379,6 +382,72 @@ function analyzeSource(fileName, text) {
       && call.arguments[1].text === "name";
   }
 
+  function enclosingCallable(node) {
+    let current = node.parent;
+    while (current) {
+      if (ts.isFunctionLike(current)) return current;
+      current = current.parent;
+    }
+    return null;
+  }
+
+  function reviewedFindingsClientPostMessage(node) {
+    if (
+      relativeName !== "lib/findings-sync-client.ts"
+      || !ts.isCallExpression(node)
+      || node.expression.getText(parsed) !== "worker.postMessage"
+      || node.arguments.length !== 2
+      || !ts.isIdentifier(node.arguments[0])
+      || node.arguments[0].text !== "message"
+      || !ts.isArrayLiteralExpression(node.arguments[1])
+      || node.arguments[1].elements.length !== 1
+      || node.arguments[1].elements[0].getText(parsed) !== "namespaceBuffer"
+    ) return false;
+    const callable = enclosingCallable(node);
+    if (!callable || !ts.isMethodDeclaration(callable) || callable.name.getText(parsed) !== "#begin") {
+      return false;
+    }
+    const messageObjects = [];
+    function inspect(current) {
+      if (
+        ts.isVariableDeclaration(current)
+        && ts.isIdentifier(current.name)
+        && current.name.text === "message"
+        && ts.isObjectLiteralExpression(current.initializer)
+      ) messageObjects.push(current.initializer);
+      ts.forEachChild(current, inspect);
+    }
+    inspect(callable);
+    if (messageObjects.length !== 1 || messageObjects[0].properties.length !== 6) return false;
+    const messageObject = messageObjects[0];
+    const expected = new Map([
+      ["type", '"project_findings"'],
+      ["protocol_version", "WORKER_PROTOCOL_VERSION"],
+      ["request_id", "requestId"],
+      ["review_json", "pending.reviewJson"],
+      ["project_ref", "pending.projectRef"],
+      ["namespace_key", "namespaceBuffer"],
+    ]);
+    for (const property of messageObject.properties) {
+      if (!ts.isPropertyAssignment(property)) return false;
+      const name = ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)
+        ? property.name.text
+        : null;
+      if (name === null || property.initializer.getText(parsed) !== expected.get(name)) return false;
+      expected.delete(name);
+    }
+    return expected.size === 0;
+  }
+
+  function reviewedWorkerPostMessage(node) {
+    return relativeName === "workers/heel-review.worker.ts"
+      && ts.isCallExpression(node)
+      && node.expression.getText(parsed) === "scope.postMessage"
+      && node.arguments.length === 1
+      && node.arguments[0].getText(parsed) === "JSON.stringify(value)"
+      && enclosingFunctionName(node) === "send";
+  }
+
   function isReflectiveRootReference(node) {
     if (!isRuntimeIdentifierReference(node)) return false;
     if (node.text === "Reflect") return true;
@@ -638,6 +707,9 @@ function analyzeSource(fileName, text) {
     if (name === "reviewEntry") {
       return topLevelVariable(declaration, ts.NodeFlags.Let, "PyodideCallable | null", "null");
     }
+    if (name === "findingsEntry") {
+      return topLevelVariable(declaration, ts.NodeFlags.Let, "PyodideCallable | null", "null");
+    }
     if (name === "acceptingInput") {
       return topLevelVariable(declaration, ts.NodeFlags.Let, null, "false");
     }
@@ -668,13 +740,66 @@ function analyzeSource(fileName, text) {
     const names = [
       "RUNTIME_ROOT", "RUNTIME_MODULE_URL", "RUNTIME_MANIFEST_URL", "WHEEL_URL",
       "acceptingInput", "boot", "bootstrapFetch", "fetchLocal", "fetcher",
-      "guardAmbientNetwork", "guardDynamicPackages", "guardProperty", "reviewEntry", "scope", "send",
+      "findingsEntry", "guardAmbientNetwork", "guardDynamicPackages", "guardProperty",
+      "reviewEntry", "scope", "send",
     ];
     for (const name of names) {
       const bindings = lexicalBindings(name);
       if (bindings.length !== 1 || !reviewedCriticalBinding(name, bindings[0])) {
         report(bindings[1] ?? bindings[0] ?? parsed, `critical worker binding ${name} is not unique and exact`);
       }
+    }
+  }
+
+  function validateFindingsProjectionContract() {
+    if (!parsed.getFullText().includes('type: "project_findings"')) return;
+    const contract = [
+      "function projectFindings(request: FindingsRequest): void {",
+      "const namespaceKey = new Uint8Array(request.namespace_key);",
+      "let ownsOperation = false;\n  try {\n    if (reviewing) {",
+      "reviewing = true;\n    ownsOperation = true;",
+      "namespaceKey.fill(0);",
+      "if (ownsOperation) reviewing = false;",
+      "new Uint8Array(event.data.namespace_key).fill(0);",
+    ];
+    const sourceText = parsed.getFullText();
+    for (const fragment of contract) {
+      if (sourceText.split(fragment).length - 1 !== 1) {
+        report(parsed, `findings worker contract is missing exact ${fragment}`);
+      }
+    }
+    const resultSends = [];
+    function inspect(current) {
+      if (sendMessageType(current) === "findings_result") resultSends.push(current);
+      ts.forEachChild(current, inspect);
+    }
+    inspect(parsed);
+    const result = resultSends[0];
+    const expected = new Map([
+      ["type", '"findings_result"'],
+      ["protocol_version", "WORKER_PROTOCOL_VERSION"],
+      ["request_id", "request.request_id"],
+      ["request_json", "requestJson"],
+    ]);
+    let exactResult = resultSends.length === 1
+      && ts.isCallExpression(result)
+      && ts.isObjectLiteralExpression(result.arguments[0])
+      && result.arguments[0].properties.length === expected.size;
+    if (exactResult) {
+      for (const property of result.arguments[0].properties) {
+        const name = ts.isPropertyAssignment(property)
+          && (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name))
+          ? property.name.text
+          : null;
+        if (name === null || property.initializer.getText(parsed) !== expected.get(name)) {
+          exactResult = false;
+          break;
+        }
+        expected.delete(name);
+      }
+    }
+    if (!exactResult || expected.size !== 0) {
+      report(result ?? parsed, "findings worker result disclosure is not exact");
     }
   }
 
@@ -1152,9 +1277,20 @@ function analyzeSource(fileName, text) {
       ) report(node, `${name} receives customer source or answers`);
       if (name === "postMessage" && args.some(containsSensitiveInput)) {
         const allowed = relativeName === "lib/browser-review-client.ts"
-          || relativeName === "workers/heel-review.worker.ts";
+          || reviewedFindingsClientPostMessage(node)
+          || reviewedWorkerPostMessage(node);
         if (!allowed) report(node, "customer input crosses an unapproved message boundary");
       }
+      if (
+        name === "postMessage"
+        && relativeName === "lib/findings-sync-client.ts"
+        && !reviewedFindingsClientPostMessage(node)
+      ) report(node, "findings projection crosses an unapproved message boundary");
+      if (
+        name === "postMessage"
+        && relativeName === "workers/heel-review.worker.ts"
+        && !reviewedWorkerPostMessage(node)
+      ) report(node, "worker output crosses an unapproved message boundary");
     }
     ts.forEachChild(node, visit);
   }
@@ -1163,6 +1299,7 @@ function analyzeSource(fileName, text) {
     validateCriticalWorkerBindings();
     validateDynamicImportContract();
     validateBootstrapRevocationContract();
+    validateFindingsProjectionContract();
   }
   return violations;
 }
@@ -1178,6 +1315,46 @@ test("keeps customer source in the worker message path and out of durable or net
 
   const localReviews = await source("lib/local-reviews.ts");
   assert.match(localReviews, /sync_state:\s*["']local_only["']/);
+});
+
+
+test("pins the findings message, result, busy-state, and key-zeroization boundaries", async () => {
+  const client = await source("lib/findings-sync-client.ts");
+  const worker = await source("workers/heel-review.worker.ts");
+  const clientMutations = [
+    client.replace(
+      "      namespace_key: namespaceBuffer,",
+      "      namespace_key: namespaceBuffer,\n      raw_review: pending.reviewJson,",
+    ),
+    client.replace(
+      "      worker.postMessage(message, [namespaceBuffer]);",
+      "      worker.postMessage(message, []);",
+    ),
+  ];
+  for (const [index, candidate] of clientMutations.entries()) {
+    const violations = analyzeSource(join(appRootPath, "lib/findings-sync-client.ts"), candidate);
+    assert.ok(
+      violations.some((violation) => violation.includes("unapproved message boundary")),
+      `${index}: ${violations.join("\n")}`,
+    );
+  }
+
+  const workerMutations = [
+    worker.replace("    namespaceKey.fill(0);", ""),
+    worker.replace("    if (ownsOperation) reviewing = false;", "    reviewing = false;"),
+    worker.replace("        new Uint8Array(event.data.namespace_key).fill(0);", ""),
+    worker.replace(
+      "      request_json: requestJson,",
+      "      request_json: requestJson,\n      raw_review: request.review_json,",
+    ),
+  ];
+  for (const [index, candidate] of workerMutations.entries()) {
+    const violations = analyzeSource(join(appRootPath, "workers/heel-review.worker.ts"), candidate);
+    assert.ok(
+      violations.some((violation) => violation.includes("findings worker")),
+      `${index}: ${violations.join("\n")}`,
+    );
+  }
 });
 
 
@@ -1796,6 +1973,7 @@ const WHEEL_URL = \`\${RUNTIME_ROOT}\${WHEEL_FILENAME}\`;
 const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
 let bootstrapFetch: typeof fetch | null = scope.fetch.bind(scope);
 let reviewEntry: PyodideCallable | null = null;
+let findingsEntry: PyodideCallable | null = null;
 async function fetchLocal(path: string): Promise<Response> {
   const fetcher = bootstrapFetch;
   if (fetcher === null || !path.startsWith(RUNTIME_ROOT) || path.includes("..")) {

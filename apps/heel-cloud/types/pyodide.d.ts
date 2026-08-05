@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
 export interface PyodideCallable {
-  (source: string, answersJson: string): unknown;
+  (...args: string[]): unknown;
   destroy?(): void;
 }
 

@@ -21,7 +21,10 @@ const MAX_BROWSER_ANSWERS_BYTES = 64 * 1024;
 // Keep fan-out bounded before the result crosses the structured-clone boundary.
 const MAX_BROWSER_RESULT_BYTES = 4 * 1024 * 1024;
 const MAX_WORKER_REQUEST_BYTES = MAX_BROWSER_INPUT_BYTES * 2 + MAX_BROWSER_ANSWERS_BYTES * 2 + 64 * 1024;
+const MAX_FINDINGS_SYNC_BYTES = 256 * 1024;
+const MAX_FINDINGS_REVIEW_BYTES = 4 * 1024 * 1024;
 const REQUEST_ID = /^request_[0-9]+$/;
+const PROJECT_REF = /^prj_[0-9a-f]{32}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 
 const PUBLIC_ERRORS: Readonly<Record<string, string>> = Object.freeze({
@@ -38,6 +41,9 @@ const PUBLIC_ERRORS: Readonly<Record<string, string>> = Object.freeze({
   engine_unavailable: "The browser-local review engine could not be started.",
   engine_not_ready: "The browser-local review engine is not ready.",
   review_in_progress: "A browser-local review is already running.",
+  projection_failed: "The findings projection could not be completed safely.",
+  projection_too_large: "The findings projection exceeds the browser limit.",
+  operation_in_progress: "A browser-local Heel operation is already running.",
   worker_protocol: "The browser-local review received an invalid request.",
 });
 
@@ -59,10 +65,20 @@ interface ReviewRequest {
   answers_json: string;
 }
 
+interface FindingsRequest {
+  type: "project_findings";
+  protocol_version: typeof WORKER_PROTOCOL_VERSION;
+  request_id: string;
+  review_json: string;
+  project_ref: string;
+  namespace_key: ArrayBuffer;
+}
+
 
 const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
 let bootstrapFetch: typeof fetch | null = scope.fetch.bind(scope);
 let reviewEntry: PyodideCallable | null = null;
+let findingsEntry: PyodideCallable | null = null;
 let acceptingInput = false;
 let reviewing = false;
 
@@ -204,6 +220,73 @@ function parseRequest(message: string): ReviewRequest {
 }
 
 
+function parseFindingsRequest(value: unknown): FindingsRequest {
+  if (!isRecord(value) || !exactFields(value, [
+    "type", "protocol_version", "request_id", "review_json", "project_ref", "namespace_key",
+  ])) throw new Error("worker findings request shape mismatch");
+  if (
+    value.type !== "project_findings"
+    || value.protocol_version !== WORKER_PROTOCOL_VERSION
+    || typeof value.request_id !== "string"
+    || !REQUEST_ID.test(value.request_id)
+    || typeof value.review_json !== "string"
+    || typeof value.project_ref !== "string"
+    || !PROJECT_REF.test(value.project_ref)
+    || !(value.namespace_key instanceof ArrayBuffer)
+    || value.namespace_key.byteLength !== 32
+  ) throw new Error("worker findings request fields are invalid");
+  if (new TextEncoder().encode(value.review_json).byteLength > MAX_FINDINGS_REVIEW_BYTES) {
+    throw new Error("worker findings review exceeds its input bound");
+  }
+  return value as unknown as FindingsRequest;
+}
+
+
+function bytesHex(value: Uint8Array): string {
+  return Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+
+function projectFindings(request: FindingsRequest): void {
+  const namespaceKey = new Uint8Array(request.namespace_key);
+  let ownsOperation = false;
+  try {
+    if (reviewing) {
+      error(request.request_id, "operation_in_progress");
+      return;
+    }
+    const entry = findingsEntry;
+    if (!acceptingInput || entry === null) {
+      error(request.request_id, "engine_not_ready");
+      return;
+    }
+    reviewing = true;
+    ownsOperation = true;
+    const response = entry(request.review_json, request.project_ref, bytesHex(namespaceKey));
+    if (typeof response !== "string" || response.length < 2 || response[0] !== "R") {
+      error(request.request_id, "projection_failed");
+      return;
+    }
+    const requestJson = response.slice(1);
+    if (new TextEncoder().encode(requestJson).byteLength > MAX_FINDINGS_SYNC_BYTES) {
+      error(request.request_id, "projection_too_large");
+      return;
+    }
+    send({
+      type: "findings_result",
+      protocol_version: WORKER_PROTOCOL_VERSION,
+      request_id: request.request_id,
+      request_json: requestJson,
+    });
+  } catch {
+    error(request.request_id, "projection_failed");
+  } finally {
+    namespaceKey.fill(0);
+    if (ownsOperation) reviewing = false;
+  }
+}
+
+
 async function boot(): Promise<void> {
   try {
     const manifestResponse = await fetchLocal(RUNTIME_MANIFEST_URL);
@@ -228,17 +311,32 @@ async function boot(): Promise<void> {
     pyodide.runPython(`
 from heel.browser_review import BrowserReviewError as _HeelBrowserReviewError
 from heel.browser_review import review_openapi_json as _heel_review_openapi_json
+from heel.findings_sync import project_findings_sync as _heel_project_findings_sync
 from heel.review_contract import stable_json as _heel_stable_json
+import json as _heel_json
 def _heel_browser_entry(source, answers_json):
     try:
         return "R" + _heel_review_openapi_json(source, answers_json)
     except _HeelBrowserReviewError as error:
         return "E" + _heel_stable_json({"code": error.code})
+def _heel_findings_entry(review_json, project_ref, namespace_key_hex):
+    try:
+        review = _heel_json.loads(review_json)
+        key = bytes.fromhex(namespace_key_hex)
+        return "R" + _heel_stable_json(_heel_project_findings_sync(review, project_ref, key))
+    except Exception:
+        return "E" + _heel_stable_json({"code": "projection_failed"})
 `);
     const callable = pyodide.globals.get("_heel_browser_entry");
     pyodide.globals.delete("_heel_browser_entry");
     if (typeof callable !== "function") throw new Error("Heel browser entry point is unavailable");
     reviewEntry = callable as PyodideCallable;
+    const findingsCallable = pyodide.globals.get("_heel_findings_entry");
+    pyodide.globals.delete("_heel_findings_entry");
+    if (typeof findingsCallable !== "function") {
+      throw new Error("Heel findings entry point is unavailable");
+    }
+    findingsEntry = findingsCallable as PyodideCallable;
 
     guardDynamicPackages(pyodide);
     guardAmbientNetwork();
@@ -259,6 +357,20 @@ def _heel_browser_entry(source, answers_json):
 
 
 scope.onmessage = (event: MessageEvent<unknown>) => {
+  if (isRecord(event.data) && event.data.type === "project_findings") {
+    let findingsRequest: FindingsRequest;
+    try {
+      findingsRequest = parseFindingsRequest(event.data);
+    } catch {
+      if (event.data.namespace_key instanceof ArrayBuffer) {
+        new Uint8Array(event.data.namespace_key).fill(0);
+      }
+      error("request_0", "worker_protocol");
+      return;
+    }
+    projectFindings(findingsRequest);
+    return;
+  }
   if (typeof event.data !== "string") {
     error("request_0", "worker_protocol");
     return;
