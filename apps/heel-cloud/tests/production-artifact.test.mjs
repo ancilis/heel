@@ -6,7 +6,7 @@ import { cp, lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "n
 import { extname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
-import { gunzipSync, inflateRawSync } from "node:zlib";
+import { deflateRawSync, gunzipSync, gzipSync, inflateRawSync } from "node:zlib";
 
 import { validateReleaseDownloads } from "../scripts/prepare-runtime.mjs";
 
@@ -44,6 +44,106 @@ const forbiddenReleasePrefixes = [
 ];
 const allowedReleaseExtensions = new Set([".in", ".json", ".md", ".py", ".toml", ".txt"]);
 const allowedExtensionlessNames = new Set(["DCO", "LICENSE", "METADATA", "NOTICE", "PKG-INFO", "RECORD", "WHEEL"]);
+
+
+function crc32(payload) {
+  let crc = 0xffffffff;
+  for (const byte of payload) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+
+function syntheticZip(records) {
+  const localRecords = [];
+  const centralRecords = [];
+  let localOffset = 0;
+  for (const record of records) {
+    const name = Buffer.from(record.name, "utf8");
+    const payload = record.payload ?? Buffer.alloc(0);
+    const compression = record.compression ?? 8;
+    const compressed = compression === 0 ? payload : deflateRawSync(payload);
+    const checksum = crc32(payload);
+    const declaredSize = record.declaredSize ?? payload.byteLength;
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(compression, 8);
+    local.writeUInt32LE(checksum, 14);
+    local.writeUInt32LE(compressed.byteLength, 18);
+    local.writeUInt32LE(declaredSize, 22);
+    local.writeUInt16LE(name.byteLength, 26);
+    localRecords.push(local, name, compressed);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE((3 << 8) | 20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(compression, 10);
+    central.writeUInt32LE(checksum, 16);
+    central.writeUInt32LE(compressed.byteLength, 20);
+    central.writeUInt32LE(declaredSize, 24);
+    central.writeUInt16LE(name.byteLength, 28);
+    central.writeUInt32LE(((record.mode ?? 0o100644) << 16) >>> 0, 38);
+    central.writeUInt32LE(localOffset, 42);
+    centralRecords.push(central, name);
+    localOffset += local.byteLength + name.byteLength + compressed.byteLength;
+  }
+  const localPayload = Buffer.concat(localRecords);
+  const centralPayload = Buffer.concat(centralRecords);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(records.length, 8);
+  end.writeUInt16LE(records.length, 10);
+  end.writeUInt32LE(centralPayload.byteLength, 12);
+  end.writeUInt32LE(localPayload.byteLength, 16);
+  return Buffer.concat([localPayload, centralPayload, end]);
+}
+
+
+function writeTarOctal(header, offset, length, value) {
+  const encoded = value.toString(8).padStart(length - 1, "0") + "\0";
+  header.write(encoded, offset, length, "ascii");
+}
+
+
+function syntheticTar(records) {
+  const chunks = [];
+  for (const record of records) {
+    const payload = record.payload ?? Buffer.alloc(0);
+    const header = Buffer.alloc(512);
+    header.write(record.name, 0, 100, "utf8");
+    writeTarOctal(header, 100, 8, 0o644);
+    writeTarOctal(header, 108, 8, 0);
+    writeTarOctal(header, 116, 8, 0);
+    writeTarOctal(header, 124, 12, payload.byteLength);
+    writeTarOctal(header, 136, 12, 0);
+    header.fill(0x20, 148, 156);
+    header[156] = (record.type ?? "0").charCodeAt(0);
+    header.write("ustar\0", 257, 6, "ascii");
+    header.write("00", 263, 2, "ascii");
+    const checksum = header.reduce((total, byte) => total + byte, 0);
+    header.write(checksum.toString(8).padStart(6, "0"), 148, 6, "ascii");
+    header[154] = 0;
+    header[155] = 0x20;
+    chunks.push(header, payload, Buffer.alloc((512 - (payload.byteLength % 512)) % 512));
+  }
+  return gzipSync(Buffer.concat([...chunks, Buffer.alloc(1024)]), { mtime: 0 });
+}
+
+
+function findZipEndRecord(archive) {
+  for (let offset = archive.byteLength - 22; offset >= 0; offset -= 1) {
+    if (archive.readUInt32LE(offset) === 0x06054b50) return offset;
+  }
+  assert.fail("ZIP end record is absent");
+}
 
 
 function sha256(payload) {
@@ -102,24 +202,41 @@ function zipMembers(archive, label = "wheel") {
   let endRecord = -1;
   for (let offset = archive.byteLength - minimumEndRecord; offset >= 0; offset -= 1) {
     if (archive.readUInt32LE(offset) === 0x06054b50) {
-      endRecord = offset;
-      break;
+      const commentLength = archive.readUInt16LE(offset + 20);
+      if (offset + minimumEndRecord + commentLength === archive.byteLength) {
+        endRecord = offset;
+        break;
+      }
     }
   }
-  assert.notEqual(endRecord, -1, `${label} has no ZIP end record`);
+  assert.notEqual(endRecord, -1, `${label} has no structurally final ZIP end record or has trailing data`);
   assert.equal(archive.readUInt16LE(endRecord + 4), 0, `${label} is multi-disk`);
   assert.equal(archive.readUInt16LE(endRecord + 6), 0, `${label} is multi-disk`);
+  const diskEntryCount = archive.readUInt16LE(endRecord + 8);
   const entryCount = archive.readUInt16LE(endRecord + 10);
+  const centralSize = archive.readUInt32LE(endRecord + 12);
+  const centralOffset = archive.readUInt32LE(endRecord + 16);
+  assert.notEqual(diskEntryCount, 0xffff, `${label} uses unsupported ZIP64 metadata`);
+  assert.notEqual(entryCount, 0xffff, `${label} uses unsupported ZIP64 metadata`);
+  assert.notEqual(centralSize, 0xffffffff, `${label} uses unsupported ZIP64 metadata`);
+  assert.notEqual(centralOffset, 0xffffffff, `${label} uses unsupported ZIP64 metadata`);
+  assert.equal(diskEntryCount, entryCount, `${label} entry counts disagree`);
   assert.ok(entryCount > 0 && entryCount <= maxReleaseMembers, `${label} has an invalid member count`);
-  let cursor = archive.readUInt32LE(endRecord + 16);
+  assert.ok(centralOffset <= endRecord && centralSize <= endRecord - centralOffset, `${label} central directory is out of bounds`);
+  const centralEnd = centralOffset + centralSize;
+  assert.equal(centralEnd, endRecord, `${label} central directory does not end at its end record`);
+  let cursor = centralOffset;
   const members = new Map();
+  const seenNames = new Set();
   let expandedBytes = 0;
 
   for (let index = 0; index < entryCount; index += 1) {
+    assert.ok(cursor <= centralEnd - 46, `${label} central directory entry ${index} is out of bounds`);
     assert.equal(archive.readUInt32LE(cursor), 0x02014b50, `${label} central entry ${index}`);
     const creatorSystem = archive.readUInt16LE(cursor + 4) >> 8;
     const flags = archive.readUInt16LE(cursor + 8);
     const compression = archive.readUInt16LE(cursor + 10);
+    const checksum = archive.readUInt32LE(cursor + 16);
     const compressedSize = archive.readUInt32LE(cursor + 20);
     const uncompressedSize = archive.readUInt32LE(cursor + 24);
     const nameLength = archive.readUInt16LE(cursor + 28);
@@ -127,33 +244,63 @@ function zipMembers(archive, label = "wheel") {
     const commentLength = archive.readUInt16LE(cursor + 32);
     const externalAttributes = archive.readUInt32LE(cursor + 38);
     const localOffset = archive.readUInt32LE(cursor + 42);
+    const centralEntryEnd = cursor + 46 + nameLength + extraLength + commentLength;
+    assert.ok(centralEntryEnd <= centralEnd, `${label} central entry ${index} is out of bounds`);
     const name = decodeUtf8(archive.subarray(cursor + 46, cursor + 46 + nameLength), `${label} member ${index}`);
     assert.equal(flags & 1, 0, `${name} is encrypted`);
-    assertSafeArchivePath(name.replace(/\/$/, ""), `${label}:${name}`);
-    assert.equal(members.has(name), false, `${name} is duplicated`);
+    assert.equal(flags & 0x0008, 0, `${name} uses an unsupported data descriptor`);
+    assert.equal(name.endsWith("/"), false, `${name} is a directory, not a regular file`);
+    assertSafeArchivePath(name, `${label}:${name}`);
+    assert.equal(seenNames.has(name), false, `${name} is duplicated`);
+    seenNames.add(name);
     if (creatorSystem === 3) {
       const fileType = (externalAttributes >>> 16) & 0o170000;
       assert.notEqual(fileType, 0o120000, `${name} is a symbolic link`);
-      assert.ok(fileType === 0 || fileType === 0o100000 || fileType === 0o040000, `${name} is not a regular file`);
+      assert.ok(fileType === 0 || fileType === 0o100000, `${name} is not a regular file`);
     }
     assert.ok(uncompressedSize <= maxReleaseMemberBytes, `${name} exceeds the member size limit`);
     expandedBytes += uncompressedSize;
     assert.ok(expandedBytes <= maxReleaseExpandedBytes, `${label} exceeds the expanded size limit`);
+    assert.ok(localOffset <= centralOffset - 30, `${name} local header is out of bounds`);
     assert.equal(archive.readUInt32LE(localOffset), 0x04034b50, `${name} local header`);
+    const localFlags = archive.readUInt16LE(localOffset + 6);
+    const localCompression = archive.readUInt16LE(localOffset + 8);
+    const localChecksum = archive.readUInt32LE(localOffset + 14);
+    const localCompressedSize = archive.readUInt32LE(localOffset + 18);
+    const localUncompressedSize = archive.readUInt32LE(localOffset + 22);
     const localNameLength = archive.readUInt16LE(localOffset + 26);
     const localExtraLength = archive.readUInt16LE(localOffset + 28);
+    const localHeaderEnd = localOffset + 30 + localNameLength + localExtraLength;
+    assert.ok(localHeaderEnd <= centralOffset, `${name} local header is out of bounds`);
+    const localName = decodeUtf8(
+      archive.subarray(localOffset + 30, localOffset + 30 + localNameLength),
+      `${label}:${name} local name`,
+    );
+    assert.equal(localFlags, flags, `${name} local and central flags disagree`);
+    assert.equal(localCompression, compression, `${name} local and central compression disagree`);
+    assert.equal(localChecksum, checksum, `${name} local and central CRC disagree`);
+    assert.equal(localCompressedSize, compressedSize, `${name} local and central compressed sizes disagree`);
+    assert.equal(localUncompressedSize, uncompressedSize, `${name} local and central uncompressed sizes disagree`);
+    assert.equal(localName, name, `${name} local and central names disagree`);
     const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
+    assert.ok(compressedSize <= centralOffset - dataOffset, `${name} compressed data is out of bounds`);
     const compressed = archive.subarray(dataOffset, dataOffset + compressedSize);
-    const payload = compression === 0
-      ? compressed
-      : compression === 8
-        ? inflateRawSync(compressed)
-        : assert.fail(`${name} uses unsupported ZIP compression ${compression}`);
+    let payload;
+    if (compression === 0) payload = compressed;
+    else if (compression === 8) {
+      try {
+        payload = inflateRawSync(compressed, { maxOutputLength: Math.max(1, uncompressedSize) });
+      } catch {
+        assert.fail(`${name} exceeded its bounded decompression or member size limit`);
+      }
+    } else assert.fail(`${name} uses unsupported ZIP compression ${compression}`);
     assert.equal(payload.byteLength, uncompressedSize, `${name} uncompressed size`);
-    if (!name.endsWith("/")) members.set(name, payload);
-    cursor += 46 + nameLength + extraLength + commentLength;
+    assert.equal(crc32(payload), checksum, `${name} CRC mismatch`);
+    members.set(name, payload);
+    cursor = centralEntryEnd;
   }
-  assert.equal(members.size > 0, true, "wheel has no file members");
+  assert.equal(cursor, centralEnd, `${label} central directory has hidden entries or disagrees with its entry count`);
+  assert.equal(members.size, entryCount, `${label} did not consume every central entry`);
   return members;
 }
 
@@ -167,16 +314,32 @@ function parseTarNumber(field, label) {
 
 function tarMembers(archive, label = "source archive") {
   assert.ok(archive.byteLength <= maxReleaseArchiveBytes, `${label} exceeds the archive size limit`);
-  const payload = gunzipSync(archive, { maxOutputLength: maxReleaseExpandedBytes + 1024 });
+  const maximumTarBytes = maxReleaseExpandedBytes + maxReleaseMembers * 1023 + 1024;
+  const payload = gunzipSync(archive, { maxOutputLength: maximumTarBytes });
+  assert.equal(payload.byteLength % 512, 0, `${label} has a partial TAR block`);
   const members = [];
   const names = new Set();
   let cursor = 0;
   let expandedBytes = 0;
+  let terminated = false;
   while (cursor + 512 <= payload.byteLength) {
     const header = payload.subarray(cursor, cursor + 512);
-    if (header.every((byte) => byte === 0)) break;
+    if (header.every((byte) => byte === 0)) {
+      const terminator = payload.subarray(cursor, cursor + 1024);
+      assert.equal(terminator.byteLength, 1024, `${label} termination requires two zero blocks`);
+      assert.equal(terminator.every((byte) => byte === 0), true, `${label} termination contains trailing data`);
+      assert.equal(cursor + 1024, payload.byteLength, `${label} has trailing data after its canonical termination`);
+      terminated = true;
+      break;
+    }
     assert.ok(members.length < maxReleaseMembers, `${label} exceeds the member count limit`);
     assert.equal(header.subarray(257, 263).toString("ascii"), "ustar\0", `${label} member is not USTAR`);
+    const expectedChecksum = parseTarNumber(header.subarray(148, 156), `${label} member checksum`);
+    let actualChecksum = 0;
+    for (let index = 0; index < header.byteLength; index += 1) {
+      actualChecksum += index >= 148 && index < 156 ? 0x20 : header[index];
+    }
+    assert.equal(actualChecksum, expectedChecksum, `${label} member checksum mismatch`);
     const name = decodeUtf8(header.subarray(0, 100), `${label} member name`).replace(/\0.*$/s, "");
     const prefix = decodeUtf8(header.subarray(345, 500), `${label} member prefix`).replace(/\0.*$/s, "");
     const fullName = prefix ? `${prefix}/${name}` : name;
@@ -192,9 +355,13 @@ function tarMembers(archive, label = "source archive") {
     const start = cursor + 512;
     const end = start + size;
     assert.ok(end <= payload.byteLength, `${fullName} is truncated`);
+    const paddedEnd = start + Math.ceil(size / 512) * 512;
+    assert.ok(paddedEnd <= payload.byteLength, `${fullName} padding is truncated`);
+    assert.equal(payload.subarray(end, paddedEnd).every((byte) => byte === 0), true, `${fullName} has nonzero padding`);
     members.push({ name: fullName, payload: payload.subarray(start, end), type });
-    cursor = start + Math.ceil(size / 512) * 512;
+    cursor = paddedEnd;
   }
+  assert.equal(terminated, true, `${label} has no canonical two-zero-block termination`);
   assert.ok(members.length > 0, `${label} has no file members`);
   return members;
 }
@@ -311,6 +478,128 @@ async function firstPartyBrowserSources() {
 }
 
 
+test("ZIP scanner rejects malformed end records, hidden entries, metadata disagreement, and bombs", async () => {
+  const wheel = await readFile(join(appRoot, "public/downloads", agentWheelName));
+  const endOffset = findZipEndRecord(wheel);
+  const centralOffset = wheel.readUInt32LE(endOffset + 16);
+  const firstNameLength = wheel.readUInt16LE(centralOffset + 28);
+  const firstExtraLength = wheel.readUInt16LE(centralOffset + 30);
+  const firstCommentLength = wheel.readUInt16LE(centralOffset + 32);
+  const firstCentralLength = 46 + firstNameLength + firstExtraLength + firstCommentLength;
+  const firstLocalOffset = wheel.readUInt32LE(centralOffset + 42);
+
+  const trailing = Buffer.concat([wheel, Buffer.from("trailing")]);
+  assert.throws(() => zipMembers(trailing, "trailing wheel"), /end record|trailing/i);
+
+  const badComment = Buffer.from(wheel);
+  badComment.writeUInt16LE(1, endOffset + 20);
+  assert.throws(() => zipMembers(badComment, "bad-comment wheel"), /comment|end record/i);
+
+  const badCentralSize = Buffer.from(wheel);
+  badCentralSize.writeUInt32LE(wheel.readUInt32LE(endOffset + 12) + 1, endOffset + 12);
+  assert.throws(() => zipMembers(badCentralSize, "bad-central-size wheel"), /central directory/i);
+
+  const zip64Sentinel = Buffer.from(wheel);
+  zip64Sentinel.writeUInt32LE(0xffffffff, endOffset + 12);
+  assert.throws(() => zipMembers(zip64Sentinel, "ZIP64 wheel"), /ZIP64/i);
+
+  const hiddenEntry = wheel.subarray(centralOffset, centralOffset + firstCentralLength);
+  const hiddenCentral = Buffer.concat([wheel.subarray(0, endOffset), hiddenEntry, wheel.subarray(endOffset)]);
+  const hiddenEnd = endOffset + hiddenEntry.byteLength;
+  hiddenCentral.writeUInt32LE(wheel.readUInt32LE(endOffset + 12) + hiddenEntry.byteLength, hiddenEnd + 12);
+  assert.throws(() => zipMembers(hiddenCentral, "hidden-central-entry wheel"), /central directory|entry count/i);
+
+  const localMethodMismatch = Buffer.from(wheel);
+  localMethodMismatch.writeUInt16LE(wheel.readUInt16LE(centralOffset + 10) === 8 ? 0 : 8, firstLocalOffset + 8);
+  assert.throws(() => zipMembers(localMethodMismatch, "local-method wheel"), /compression|local header/i);
+
+  const badCrc = Buffer.from(wheel);
+  badCrc.writeUInt32LE(0, centralOffset + 16);
+  badCrc.writeUInt32LE(0, firstLocalOffset + 14);
+  assert.throws(() => zipMembers(badCrc, "bad-CRC wheel"), /CRC/i);
+
+  const outOfBounds = Buffer.from(wheel);
+  outOfBounds.writeUInt32LE(outOfBounds.byteLength + 1, endOffset + 16);
+  assert.throws(() => zipMembers(outOfBounds, "out-of-bounds wheel"), /bounds|central directory/i);
+
+  const directory = syntheticZip([
+    { name: "heel/model.py", payload: Buffer.from("VALUE = 1\n") },
+    { name: "heel/private/", mode: 0o040755, payload: Buffer.alloc(0), compression: 0 },
+  ]);
+  assert.throws(() => zipMembers(directory, "directory wheel"), /regular file|directory/i);
+
+  const bomb = syntheticZip([{
+    name: "heel/bomb.py",
+    payload: Buffer.alloc(maxReleaseMemberBytes + 1),
+    declaredSize: 1,
+  }]);
+  assert.throws(() => zipMembers(bomb, "compressed bomb wheel"), /member size limit|decompression/i);
+});
+
+
+test("TAR scanner rejects corrupt checksums, padding, termination, and private members", () => {
+  const valid = syntheticTar([{ name: "heel_sim-1.1.0/heel/model.py", payload: Buffer.from("VALUE = 1\n") }]);
+  const raw = gunzipSync(valid);
+
+  const badChecksum = Buffer.from(raw);
+  badChecksum[0] ^= 1;
+  assert.throws(() => tarMembers(gzipSync(badChecksum), "bad-checksum source"), /checksum/i);
+
+  const size = Number.parseInt(raw.subarray(124, 136).toString("ascii").replace(/\0.*$/s, "").trim(), 8);
+  const badPadding = Buffer.from(raw);
+  badPadding[512 + size] = 1;
+  assert.throws(() => tarMembers(gzipSync(badPadding), "bad-padding source"), /padding/i);
+
+  const firstEndBlock = 512 + Math.ceil(size / 512) * 512;
+  const singleEndBlock = gzipSync(raw.subarray(0, firstEndBlock + 512));
+  assert.throws(() => tarMembers(singleEndBlock, "single-end-block source"), /two zero blocks|termination/i);
+
+  const trailingPayload = Buffer.from(raw);
+  trailingPayload[trailingPayload.byteLength - 1] = 1;
+  assert.throws(() => tarMembers(gzipSync(trailingPayload), "trailing-data source"), /trailing|termination/i);
+
+  const privateSource = syntheticTar([
+    { name: "heel_sim-1.1.0/heel/model.py", payload: Buffer.from("VALUE = 1\n") },
+    { name: "heel_sim-1.1.0/docs/saas/PRODUCT.md", payload: Buffer.from("private\n") },
+  ]);
+  assert.throws(
+    () => classifyReleaseMembers(tarMembers(privateSource), {
+      label: "mutated source",
+      rootPrefix: "heel_sim-1.1.0/",
+    }),
+    /commercial boundary/,
+  );
+});
+
+
+test("TAR decompression budget includes bounded headers and padding", () => {
+  const records = Array.from({ length: 6 }, (_, index) => ({
+    name: `heel_sim-1.1.0/heel/payload_${index}.py`,
+    payload: Buffer.alloc(maxReleaseMemberBytes),
+  }));
+  assert.equal(tarMembers(syntheticTar(records), "limit source").length, records.length);
+});
+
+
+test("ZIP member classification rejects an actual private-member archive", () => {
+  const privateWheel = syntheticZip([
+    { name: "heel/model.py", payload: Buffer.from("VALUE = 1\n") },
+    { name: "heel/saas/auth.py", payload: Buffer.from("private = True\n") },
+  ]);
+  const records = [...zipMembers(privateWheel, "mutated wheel")]
+    .map(([name, payload]) => ({ name, payload, type: "0" }));
+  assert.throws(() => classifyReleaseMembers(records, { label: "mutated wheel" }), /commercial boundary/);
+});
+
+
+test("release reads are descriptor-bound and no-follow", async () => {
+  const source = await readFile(join(appRoot, "scripts/prepare-runtime.mjs"), "utf8");
+  assert.match(source, /O_NOFOLLOW/);
+  assert.match(source, /handle\.stat\(/);
+  assert.match(source, /handle\.read\(/);
+});
+
+
 test("ships exactly the classified, digest-pinned Heel Agent downloads", async () => {
   const names = (await readdir(downloadsRoot)).sort();
   assert.deepEqual(names, expectedDownloadNames);
@@ -320,7 +609,8 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
   assert.deepEqual(Object.keys(manifest).sort(), ["artifacts", "schema_version", "version"]);
   assert.equal(manifest.schema_version, "heel.open-core-artifacts.v1");
   assert.equal(manifest.version, "1.1.0");
-  assert.deepEqual(manifest.artifacts.map(({ name }) => name).sort(), [agentWheelName, agentSourceName]);
+  assert.deepEqual(manifest.artifacts.map(({ name }) => name), [agentWheelName, agentSourceName]);
+  await validateReleaseDownloads(downloadsRoot);
 
   const artifacts = new Map();
   for (const expected of manifest.artifacts) {
@@ -423,10 +713,13 @@ test("runtime preparation validates committed downloads without rewriting them",
   const unexpectedRoot = await mkdtemp(join(appRoot, ".heel-unexpected-downloads-"));
   const corruptRoot = await mkdtemp(join(appRoot, ".heel-corrupt-downloads-"));
   const symlinkRoot = await mkdtemp(join(appRoot, ".heel-symlink-downloads-"));
+  const reversedRoot = await mkdtemp(join(appRoot, ".heel-reversed-downloads-"));
   context.after(async () => {
-    await Promise.all([validRoot, unexpectedRoot, corruptRoot, symlinkRoot].map((root) => rm(root, { recursive: true, force: true })));
+    await Promise.all([validRoot, unexpectedRoot, corruptRoot, symlinkRoot, reversedRoot]
+      .map((root) => rm(root, { recursive: true, force: true })));
   });
-  await Promise.all([validRoot, unexpectedRoot, corruptRoot, symlinkRoot].map((root) => cp(sourceRoot, root, { recursive: true })));
+  await Promise.all([validRoot, unexpectedRoot, corruptRoot, symlinkRoot, reversedRoot]
+    .map((root) => cp(sourceRoot, root, { recursive: true })));
 
   const before = await Promise.all(expectedDownloadNames.map((name) => readFile(join(validRoot, name))));
   await validateReleaseDownloads(validRoot);
@@ -442,6 +735,11 @@ test("runtime preparation validates committed downloads without rewriting them",
   await rm(join(symlinkRoot, agentSourceName));
   await symlink(join(sourceRoot, agentSourceName), join(symlinkRoot, agentSourceName));
   await assert.rejects(validateReleaseDownloads(symlinkRoot), /symbolic link/);
+
+  const reversedManifest = JSON.parse(await readFile(join(reversedRoot, agentManifestName), "utf8"));
+  reversedManifest.artifacts.reverse();
+  await writeFile(join(reversedRoot, agentManifestName), JSON.stringify(reversedManifest) + "\n");
+  await assert.rejects(validateReleaseDownloads(reversedRoot), /order|exact artifacts/);
 });
 
 

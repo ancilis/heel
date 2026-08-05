@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
 import { createHash, randomBytes } from "node:crypto";
+import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
 import { dirname, join, parse, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -71,13 +72,52 @@ async function readRegular(path, label) {
 
 async function readBoundedRegular(path, label, maximumBytes) {
   await assertNoSymlinkComponents(path, label);
-  const status = await lstat(path);
-  if (status.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
-  if (!status.isFile()) throw new Error(`${label} must be a regular file`);
-  if (!Number.isSafeInteger(status.size) || status.size <= 0 || status.size > maximumBytes) {
-    throw new Error(`${label} has an invalid size`);
+  const beforeOpen = await lstat(path, { bigint: true });
+  if (beforeOpen.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
+  if (!beforeOpen.isFile()) throw new Error(`${label} must be a regular file`);
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = await handle.stat({ bigint: true });
+    if (
+      !opened.isFile()
+      || opened.dev !== beforeOpen.dev
+      || opened.ino !== beforeOpen.ino
+    ) {
+      throw new Error(`${label} was substituted while being opened`);
+    }
+    if (opened.size <= 0n || opened.size > BigInt(maximumBytes)) {
+      throw new Error(`${label} has an invalid size`);
+    }
+    const payload = Buffer.alloc(Number(opened.size));
+    let offset = 0;
+    while (offset < payload.byteLength) {
+      const { bytesRead } = await handle.read(payload, offset, payload.byteLength - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    const probe = Buffer.alloc(1);
+    const { bytesRead: extraBytes } = await handle.read(probe, 0, 1, offset);
+    const afterRead = await handle.stat({ bigint: true });
+    const afterPath = await lstat(path, { bigint: true });
+    if (
+      offset !== payload.byteLength
+      || extraBytes !== 0
+      || afterRead.dev !== opened.dev
+      || afterRead.ino !== opened.ino
+      || afterRead.size !== opened.size
+      || afterRead.mtimeNs !== opened.mtimeNs
+      || afterRead.ctimeNs !== opened.ctimeNs
+      || afterPath.isSymbolicLink()
+      || afterPath.dev !== opened.dev
+      || afterPath.ino !== opened.ino
+    ) {
+      throw new Error(`${label} changed or was substituted while being read`);
+    }
+    return payload;
+  } finally {
+    if (handle) await handle.close();
   }
-  return readFile(path);
 }
 
 
@@ -168,30 +208,25 @@ export async function validateReleaseDownloads(downloadsRoot) {
   }
 
   const expectedArtifactNames = [RELEASE_WHEEL_NAME, RELEASE_SOURCE_NAME];
-  const artifactNames = [];
-  for (const artifact of manifest.artifacts) {
+  for (const [index, artifact] of manifest.artifacts.entries()) {
     assertExactObject(artifact, ["name", "sha256", "size"], "release artifact");
+    if (artifact.name !== expectedArtifactNames[index]) {
+      throw new Error("release manifest artifact order does not match the exact artifacts");
+    }
     if (
-      !expectedArtifactNames.includes(artifact.name)
-      || artifactNames.includes(artifact.name)
-      || !Number.isSafeInteger(artifact.size)
+      !Number.isSafeInteger(artifact.size)
       || artifact.size <= 0
       || artifact.size > MAX_RELEASE_ARCHIVE_BYTES
       || !/^[0-9a-f]{64}$/.test(artifact.sha256)
     ) {
       throw new Error("release artifact contains unpinned values");
     }
-    artifactNames.push(artifact.name);
     const payload = await readBoundedRegular(
       join(root, artifact.name),
       `release artifact ${artifact.name}`,
       MAX_RELEASE_ARCHIVE_BYTES,
     );
     assertIntegrity(payload, artifact, `release artifact ${artifact.name}`);
-  }
-  artifactNames.sort();
-  if (artifactNames.some((name, index) => name !== expectedArtifactNames[index])) {
-    throw new Error("release manifest does not list the exact artifacts");
   }
   return manifest;
 }
