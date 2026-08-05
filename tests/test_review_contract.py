@@ -221,6 +221,19 @@ class ReviewContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "engine_version"):
             validate_review_envelope(envelope)
 
+    def test_envelope_validator_rejects_non_string_engine_version(self):
+        envelope = self._build()
+        envelope["engine_version"] = [ENGINE_VERSION]
+        body = {
+            key: value for key, value in envelope.items()
+            if key not in {"review_id", "result_hash"}
+        }
+        envelope["result_hash"] = stable_json_hash(body)
+        envelope["review_id"] = "review_" + envelope["result_hash"][:20]
+
+        with self.assertRaisesRegex(ValueError, "engine_version"):
+            validate_review_envelope(envelope)
+
     def test_execution_modes_have_truthful_mode_specific_privacy(self):
         self.assertIsInstance(EXECUTION_MODES, frozenset)
         self.assertEqual(EXECUTION_MODES,

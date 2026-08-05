@@ -74,8 +74,11 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _absolute_without_resolving(path: Path) -> Path:
-    expanded = path.expanduser()
-    return expanded if expanded.is_absolute() else Path.cwd() / expanded
+    expanded = os.fspath(path.expanduser())
+    normalized = Path(os.path.normpath(os.path.abspath(expanded)))
+    if any(part in {".", ".."} for part in normalized.parts):
+        raise ValueError("Heel home path must not contain dot components")
+    return normalized
 
 
 def _raise_unsafe_component(parent_fd: int, name: str, error: OSError) -> None:
@@ -96,10 +99,14 @@ def _open_child_directory(parent_fd: int, name: str, *, create: bool) -> int | N
     except FileNotFoundError:
         if not create:
             return None
+        created = False
         try:
             os.mkdir(name, 0o700, dir_fd=parent_fd)
+            created = True
         except FileExistsError:
             pass
+        if created:
+            os.fsync(parent_fd)
         try:
             return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
         except OSError as error:
@@ -122,6 +129,43 @@ def _stored_review_error(filename: str) -> StoredReviewError:
     return StoredReviewError(f"stored review {filename!r} is corrupt or invalid")
 
 
+def _cleanup_temporary(
+    reviews_fd: int,
+    filename: str,
+    primary_error: BaseException | None = None,
+) -> None:
+    try:
+        os.unlink(filename, dir_fd=reviews_fd)
+    except FileNotFoundError:
+        return
+    except BaseException as cleanup_error:
+        if primary_error is None:
+            raise
+        primary_error.add_note(f"temporary review cleanup failed: {cleanup_error}")
+        return
+
+    try:
+        os.fsync(reviews_fd)
+    except BaseException as cleanup_error:
+        if primary_error is None:
+            raise
+        primary_error.add_note(
+            f"temporary review cleanup directory fsync failed: {cleanup_error}"
+        )
+
+
+def _close_descriptor(
+    descriptor: int,
+    primary_error: BaseException | None = None,
+) -> None:
+    try:
+        os.close(descriptor)
+    except BaseException as close_error:
+        if primary_error is None:
+            raise
+        primary_error.add_note(f"temporary review descriptor close failed: {close_error}")
+
+
 class LocalProjectStore:
     """Save and retrieve reviews below one POSIX descriptor-anchored Heel home."""
 
@@ -129,6 +173,8 @@ class LocalProjectStore:
         _require_secure_storage_capabilities()
         selected = Path(heel_home()) if root is None else Path(root)
         self.root = _absolute_without_resolving(selected)
+        if any(part in {".", ".."} for part in self.root.parts):
+            raise ValueError("Heel home path must not contain dot components")
         if self.root == Path(self.root.anchor):
             raise ValueError("Heel home must not be a filesystem root")
         self.reviews = self.root / "reviews"
@@ -176,7 +222,9 @@ class LocalProjectStore:
             reviews_fd = opened_reviews
             if enforce_modes:
                 _enforce_mode(root_fd, 0o700, "Heel home")
+                os.fsync(root_fd)
                 _enforce_mode(reviews_fd, 0o700, "Heel reviews directory")
+                os.fsync(reviews_fd)
             yield reviews_fd
         finally:
             if reviews_fd >= 0:
@@ -242,12 +290,9 @@ class LocalProjectStore:
                 continue
             try:
                 _enforce_mode(descriptor, 0o600, "temporary review file")
-            except BaseException:
-                os.close(descriptor)
-                try:
-                    os.unlink(filename, dir_fd=reviews_fd)
-                except FileNotFoundError:
-                    pass
+            except BaseException as error:
+                _close_descriptor(descriptor, error)
+                _cleanup_temporary(reviews_fd, filename, error)
                 raise
             return descriptor, filename
         raise FileExistsError("could not allocate an exclusive review temp file")
@@ -264,6 +309,7 @@ class LocalProjectStore:
                 raise SecureStorageUnavailable("could not create the secure reviews directory")
             self._reject_unsafe_target(reviews_fd, filename)
             descriptor, temporary = self._create_temporary(reviews_fd, review_id)
+            primary_error: BaseException | None = None
             try:
                 with os.fdopen(
                     descriptor,
@@ -288,12 +334,16 @@ class LocalProjectStore:
                     ) from error
                 temporary = ""
                 _enforce_mode(descriptor, 0o600, "final review file")
+                os.fsync(descriptor)
                 os.fsync(reviews_fd)
+            except BaseException as error:
+                primary_error = error
+                raise
             finally:
                 if descriptor >= 0:
-                    os.close(descriptor)
+                    _close_descriptor(descriptor, primary_error)
                 if temporary:
-                    os.unlink(temporary, dir_fd=reviews_fd)
+                    _cleanup_temporary(reviews_fd, temporary, primary_error)
         return self.reviews / filename
 
     def get_review(self, review_id: str) -> dict[str, Any] | None:

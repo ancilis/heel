@@ -7,7 +7,7 @@ import unittest
 from collections.abc import Mapping
 from unittest import mock
 
-from heel.review_contract import stable_json
+from heel.review_contract import stable_json, stable_json_hash
 from heel.review_service import review_openapi
 
 
@@ -146,10 +146,17 @@ class LocalProjectStoreTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = _physical_temp(tmp) / "heel-home"
+            root.mkdir()
+            (root / "reviews").mkdir()
             store = LocalProjectStore(root)
-            with mock.patch(
-                "heel.local_projects.os.fsync", side_effect=OSError("file fsync failed")
-            ):
+            real_fsync = os.fsync
+
+            def fail_file_fsync(descriptor):
+                if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise OSError("file fsync failed")
+                return real_fsync(descriptor)
+
+            with mock.patch("heel.local_projects.os.fsync", side_effect=fail_file_fsync):
                 with self.assertRaisesRegex(OSError, "file fsync failed"):
                     store.save_review(_golden_envelope())
             self.assertEqual(_review_files(root), [])
@@ -172,22 +179,210 @@ class LocalProjectStoreTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = _physical_temp(tmp) / "heel-home"
+            root.mkdir()
+            (root / "reviews").mkdir()
             store = LocalProjectStore(root)
-            calls = 0
+            real_fsync = os.fsync
+            real_replace = os.replace
+            replaced = False
+
+            def record_replace(*args, **kwargs):
+                nonlocal replaced
+                result = real_replace(*args, **kwargs)
+                replaced = True
+                return result
 
             def fail_directory_fsync(descriptor):
-                nonlocal calls
-                calls += 1
-                if calls == 2:
+                if replaced and stat.S_ISDIR(os.fstat(descriptor).st_mode):
                     raise OSError("directory fsync failed")
+                return real_fsync(descriptor)
 
-            with mock.patch(
-                "heel.local_projects.os.fsync", side_effect=fail_directory_fsync
+            with (
+                mock.patch("heel.local_projects.os.replace", side_effect=record_replace),
+                mock.patch(
+                    "heel.local_projects.os.fsync", side_effect=fail_directory_fsync
+                ),
             ):
                 with self.assertRaisesRegex(OSError, "directory fsync failed"):
                     store.save_review(_golden_envelope())
             self.assertEqual(
                 _review_files(root), [_golden_envelope()["review_id"] + ".json"]
+            )
+
+    def test_first_save_fsyncs_created_path_and_modes_in_order(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = _physical_temp(tmp)
+            root = parent / "heel-home"
+            store = LocalProjectStore(root)
+            real_mkdir = os.mkdir
+            real_fchmod = os.fchmod
+            real_fsync = os.fsync
+            real_replace = os.replace
+            events = []
+
+            def descriptor_label(descriptor):
+                status = os.fstat(descriptor)
+                for label, path in (
+                    ("parent", parent),
+                    ("root", root),
+                    ("reviews", root / "reviews"),
+                ):
+                    if path.exists():
+                        candidate = path.stat()
+                        if (status.st_dev, status.st_ino) == (
+                            candidate.st_dev,
+                            candidate.st_ino,
+                        ):
+                            return label
+                return "file"
+
+            def record_mkdir(name, mode=0o777, *, dir_fd=None):
+                events.append(("mkdir", name))
+                return real_mkdir(name, mode, dir_fd=dir_fd)
+
+            def record_fchmod(descriptor, mode):
+                events.append(("fchmod", descriptor_label(descriptor)))
+                return real_fchmod(descriptor, mode)
+
+            def record_fsync(descriptor):
+                events.append(("fsync", descriptor_label(descriptor)))
+                return real_fsync(descriptor)
+
+            def record_replace(source, destination, **kwargs):
+                events.append(("replace", destination))
+                return real_replace(source, destination, **kwargs)
+
+            with (
+                mock.patch("heel.local_projects.os.mkdir", side_effect=record_mkdir),
+                mock.patch("heel.local_projects.os.fchmod", side_effect=record_fchmod),
+                mock.patch("heel.local_projects.os.fsync", side_effect=record_fsync),
+                mock.patch("heel.local_projects.os.replace", side_effect=record_replace),
+            ):
+                store.save_review(_golden_envelope())
+
+            filename = _golden_envelope()["review_id"] + ".json"
+            self.assertEqual(events, [
+                ("mkdir", "heel-home"),
+                ("fsync", "parent"),
+                ("mkdir", "reviews"),
+                ("fsync", "root"),
+                ("fchmod", "root"),
+                ("fsync", "root"),
+                ("fchmod", "reviews"),
+                ("fsync", "reviews"),
+                ("fchmod", "file"),
+                ("fsync", "file"),
+                ("replace", filename),
+                ("fchmod", "file"),
+                ("fsync", "file"),
+                ("fsync", "reviews"),
+            ])
+
+    def test_parent_fsync_failure_stops_first_save_before_descending(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _physical_temp(tmp) / "heel-home"
+            store = LocalProjectStore(root)
+            with mock.patch(
+                "heel.local_projects.os.fsync",
+                side_effect=OSError("parent fsync failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "parent fsync failed"):
+                    store.save_review(_golden_envelope())
+            self.assertTrue(root.is_dir())
+            self.assertFalse((root / "reviews").exists())
+
+    def test_directory_mode_fsync_failure_stops_before_temporary_file(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _physical_temp(tmp) / "heel-home"
+            root.mkdir(mode=0o755)
+            (root / "reviews").mkdir(mode=0o755)
+            store = LocalProjectStore(root)
+            with mock.patch(
+                "heel.local_projects.os.fsync",
+                side_effect=OSError("mode fsync failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "mode fsync failed"):
+                    store.save_review(_golden_envelope())
+            self.assertEqual(_review_files(root), [])
+
+    def test_cleanup_fsync_failure_preserves_original_save_failure(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _physical_temp(tmp) / "heel-home"
+            root.mkdir()
+            (root / "reviews").mkdir()
+            store = LocalProjectStore(root)
+            real_fsync = os.fsync
+            real_unlink = os.unlink
+            cleanup_started = False
+
+            def record_unlink(*args, **kwargs):
+                nonlocal cleanup_started
+                result = real_unlink(*args, **kwargs)
+                cleanup_started = True
+                return result
+
+            def fail_cleanup_fsync(descriptor):
+                if cleanup_started:
+                    raise OSError("cleanup fsync failed")
+                return real_fsync(descriptor)
+
+            with (
+                mock.patch(
+                    "heel.local_projects.os.replace",
+                    side_effect=OSError("replace failed"),
+                ),
+                mock.patch("heel.local_projects.os.unlink", side_effect=record_unlink),
+                mock.patch(
+                    "heel.local_projects.os.fsync", side_effect=fail_cleanup_fsync
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "replace failed") as caught:
+                    store.save_review(_golden_envelope())
+            self.assertEqual(_review_files(root), [])
+            self.assertTrue(
+                any("cleanup fsync failed" in note for note in caught.exception.__notes__)
+            )
+
+    def test_close_failure_preserves_original_and_does_not_skip_cleanup(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _physical_temp(tmp) / "heel-home"
+            root.mkdir()
+            (root / "reviews").mkdir()
+            store = LocalProjectStore(root)
+            real_close = os.close
+            close_failed = False
+
+            def close_then_fail(descriptor):
+                nonlocal close_failed
+                is_file = stat.S_ISREG(os.fstat(descriptor).st_mode)
+                real_close(descriptor)
+                if is_file and not close_failed:
+                    close_failed = True
+                    raise OSError("close failed")
+
+            with (
+                mock.patch(
+                    "heel.local_projects.os.replace",
+                    side_effect=OSError("replace failed"),
+                ),
+                mock.patch("heel.local_projects.os.close", side_effect=close_then_fail),
+            ):
+                with self.assertRaisesRegex(OSError, "replace failed") as caught:
+                    store.save_review(_golden_envelope())
+
+            self.assertEqual(_review_files(root), [])
+            self.assertTrue(
+                any("close failed" in note for note in caught.exception.__notes__)
             )
 
     def test_invalid_and_traversal_review_ids_are_rejected(self):
@@ -328,10 +523,41 @@ class LocalProjectStoreTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             parent = _physical_temp(tmp)
-            with mock.patch.object(Path, "cwd", return_value=parent):
+            with mock.patch("heel.local_projects.os.getcwd", return_value=str(parent)):
                 store = LocalProjectStore(Path("relative-home"))
             path = store.save_review(_golden_envelope())
             self.assertEqual(path.parent, parent / "relative-home" / "reviews")
+
+    def test_dotdot_root_is_lexically_normalized_before_rename_race(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = _physical_temp(tmp)
+            race = parent / "race"
+            race.mkdir()
+            outside = parent / "outside"
+            outside.mkdir()
+            store = LocalProjectStore(race / ".." / "heel-home")
+            real_open = os.open
+            redirected = False
+
+            def racing_open(path, flags, *args, **kwargs):
+                nonlocal redirected
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if path == "race" and not redirected:
+                    race.rename(outside / "race")
+                    redirected = True
+                return descriptor
+
+            with mock.patch("heel.local_projects.os.open", side_effect=racing_open):
+                saved = store.save_review(_golden_envelope())
+
+            expected_root = parent / "heel-home"
+            self.assertFalse(redirected)
+            self.assertEqual(store.root, expected_root)
+            self.assertEqual(saved.parent, expected_root / "reviews")
+            self.assertTrue(saved.is_file())
+            self.assertFalse((outside / "heel-home").exists())
 
     def test_tampered_hash_is_rejected_on_save_read_and_list(self):
         from heel.local_projects import LocalProjectStore, StoredReviewError
@@ -417,6 +643,31 @@ class LocalProjectStoreTests(unittest.TestCase):
                 store.list_reviews()
             self.assertIn(invalid.name, str(caught.exception))
             self.assertIsInstance(caught.exception.__cause__, ValueError)
+
+    def test_malformed_stored_engine_version_has_filename_context(self):
+        from heel.local_projects import LocalProjectStore, StoredReviewError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _physical_temp(tmp)
+            store = LocalProjectStore(root)
+            store.save_review(_golden_envelope())
+            malformed = _golden_envelope()
+            malformed["engine_version"] = ["1.1.0"]
+            body = {
+                key: value
+                for key, value in malformed.items()
+                if key not in {"review_id", "result_hash"}
+            }
+            malformed["result_hash"] = stable_json_hash(body)
+            malformed["review_id"] = "review_" + malformed["result_hash"][:20]
+            path = root / "reviews" / f"{malformed['review_id']}.json"
+            path.write_text(stable_json(malformed) + "\n", encoding="utf-8")
+
+            with self.assertRaises(StoredReviewError) as caught:
+                store.get_review(malformed["review_id"])
+            self.assertIn(path.name, str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, ValueError)
+            self.assertIn("engine_version", str(caught.exception.__cause__))
 
     def test_missing_review_returns_none_and_list_is_deterministic(self):
         from heel.local_projects import LocalProjectStore

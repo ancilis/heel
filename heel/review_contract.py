@@ -262,7 +262,8 @@ def validate_review_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
     result_hash = _validate_hash(item["result_hash"], "result_hash")
     if item["schema_version"] != REVIEW_SCHEMA_VERSION:
         raise ValueError(f"schema_version must be {REVIEW_SCHEMA_VERSION}")
-    if item["engine_version"] not in SUPPORTED_ENGINE_VERSIONS:
+    engine_version = item["engine_version"]
+    if type(engine_version) is not str or engine_version not in SUPPORTED_ENGINE_VERSIONS:
         raise ValueError("engine_version is not supported")
     _require_nonempty_string(item["product_id"], "product_id")
     _validate_hash(item["source_hash"], "source_hash")
