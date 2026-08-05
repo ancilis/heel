@@ -18,9 +18,18 @@ verified target plus a scope valid for that exact target, enforced fail-closed b
 from __future__ import annotations
 
 import json
+import re
+import socket
 import sqlite3
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from heel.findings_sync import (
+    MAX_FINDINGS_SYNC_BYTES,
+    parse_findings_sync_request,
+    stable_json,
+)
 
 from .auth import AuthStore, ThrottledError
 from .billing import BillingStore, StubBilling, SubscriptionManager
@@ -28,13 +37,42 @@ from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
 from .entitlement import EntitlementService, Subscription
 from .jobs import JobPlane
 from .ledger import GlobalCapExceeded, IdempotencyConflict, QuotaExceeded, UsageLedger
+from .findings_sync import (
+    ApprovalExpired,
+    ApprovalRequired,
+    FindingsSyncConflict,
+    FindingsSyncService,
+    SyncPrincipal,
+)
 from .ops import KillSwitchTripped, Metrics, OpsStore
+from .projects import ProjectNotFound, ProjectStore
 from .tenancy import (
     ControlPlaneStore, IntegrationLimitExceeded, Role, SeatLimitExceeded, require,
 )
 from .verification import HostnameReuseExceeded, TargetLimitExceeded, TargetVerifier
 
 MAX_BODY = 64 * 1024
+REQUEST_IO_TIMEOUT_SECONDS = 10
+REQUEST_BODY_TOTAL_DEADLINE_SECONDS = 10
+MAX_CONCURRENT_REQUESTS = 64
+_SYNC_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class _DuplicateJsonKey(ValueError):
+    pass
+
+
+def _duplicate_free_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKey
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value):
+    raise ValueError("non-finite JSON numbers are forbidden")
 
 
 def current_period() -> str:
@@ -71,7 +109,21 @@ class ControlPlane:
         # engine-minted scope reference.
         self.scope_minter = scope_minter
         self.ops = OpsStore(conn)
+        self.projects = ProjectStore(conn)
+        self.findings = FindingsSyncService(
+            conn,
+            projects=self.projects,
+            ledger=self.ledger,
+            ops=self.ops,
+            plan_for_workspace=lambda workspace_id: self.entitlements.effective_plan(
+                self.subscription(workspace_id)
+            ),
+        )
         self.metrics = Metrics()
+        # Every store shares one SQLite connection. Serialize complete HTTP request units so
+        # transaction boundaries and authentication touches cannot interleave across handler
+        # threads. A Postgres deployment replaces this with a per-request pooled connection.
+        self.request_lock = threading.RLock()
 
     def close(self) -> None:
         """Release the shared database connection. Safe to call more than once."""
@@ -111,66 +163,247 @@ class _Handler(BaseHTTPRequestHandler):
     cp: ControlPlane  # set by serve()
     webhook_secret: str | None = None
 
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(REQUEST_IO_TIMEOUT_SECONDS)
+
     # --- plumbing ---
     def log_message(self, *a):  # quiet; the deployment edge does access logging
         pass
 
     def _json(self, status: int, obj: dict, headers: dict | None = None) -> None:
         body = json.dumps(obj).encode()
+        response_headers = dict(headers or {})
+        if getattr(self, "_defer_json_response", False):
+            self._pending_json_response = (status, body, response_headers)
+            return
+        self._write_json(status, body, response_headers)
+
+    def _write_json(self, status: int, body: bytes, headers: dict) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        for k, v in (headers or {}).items():
+        for k, v in headers.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
     def _body(self) -> dict:
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > MAX_BODY:
-            raise ApiError(413, "request body too large")
-        if n == 0:
+        raw = getattr(self, "_buffered_body", b"")
+        if not raw:
             return {}
         try:
-            obj = json.loads(self.rfile.read(n))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            obj = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_duplicate_free_object,
+                parse_constant=_reject_json_constant,
+            )
+        except (
+            _DuplicateJsonKey,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            ValueError,
+        ):
             raise ApiError(400, "invalid JSON body")
         if not isinstance(obj, dict):
             raise ApiError(400, "body must be a JSON object")
         return obj
 
     def _raw_body(self) -> bytes:
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > MAX_BODY:
-            raise ApiError(413, "request body too large")
-        return self.rfile.read(n)
+        return getattr(self, "_buffered_body", b"")
 
-    def _principal(self) -> tuple[str, str | None, tuple[str, Role] | None]:
+    def _header_values(self, name: str) -> list[str]:
+        return list(self.headers.get_all(name) or [])
+
+    @staticmethod
+    def _is_findings_sync_path(parts: list[str]) -> bool:
+        return (
+            len(parts) == 6
+            and parts[0] == "v1"
+            and parts[1] == "workspaces"
+            and parts[3] == "projects"
+            and parts[5] == "findings-sync"
+        )
+
+    def _buffer_request_body(self, method: str, parts: list[str]) -> None:
+        """Validate framing and read request bytes before entering the shared DB lock."""
+        sync_path = self._is_findings_sync_path(parts)
+        transfer_encodings = self._header_values("Transfer-Encoding")
+        if transfer_encodings:
+            raise ApiError(
+                415 if sync_path else 400,
+                "transfer-encoded request bodies are not accepted",
+                code=(
+                    "unsupported_transfer_encoding"
+                    if sync_path
+                    else "ambiguous_request_framing"
+                ),
+            )
+        lengths = self._header_values("Content-Length")
+        if method != "POST":
+            if len(lengths) > 1:
+                raise ApiError(400, "ambiguous request framing", code="ambiguous_request_framing")
+            if lengths:
+                if re.fullmatch(r"[0-9]+", lengths[0], flags=re.ASCII) is None:
+                    raise ApiError(
+                        400, "invalid request content length", code="ambiguous_request_framing"
+                    )
+                if len(lengths[0]) > 20:
+                    raise ApiError(400, "request body is not allowed", code="ambiguous_request_framing")
+                length = int(lengths[0])
+                if length != 0:
+                    raise ApiError(400, "request body is not allowed", code="ambiguous_request_framing")
+            self._buffered_body = b""
+            return
+        if len(lengths) != 1:
+            raise ApiError(400, "one Content-Length is required", code="ambiguous_request_framing")
+        if re.fullmatch(r"[0-9]+", lengths[0], flags=re.ASCII) is None:
+            raise ApiError(
+                400, "invalid request content length", code="ambiguous_request_framing"
+            )
+        if len(lengths[0]) > 20:
+            raise ApiError(
+                413,
+                "findings sync request is too large" if sync_path else "request body too large",
+                **({"code": "findings_sync_request_too_large"} if sync_path else {}),
+            )
+        length = int(lengths[0])
+        maximum = MAX_FINDINGS_SYNC_BYTES if sync_path else MAX_BODY
+        if length > maximum:
+            raise ApiError(
+                413,
+                "findings sync request is too large" if sync_path else "request body too large",
+                **({"code": "findings_sync_request_too_large"} if sync_path else {}),
+            )
+        deadline = time.monotonic() + REQUEST_BODY_TOTAL_DEADLINE_SECONDS
+        remaining = length
+        chunks = []
+        try:
+            while remaining:
+                seconds_left = deadline - time.monotonic()
+                if seconds_left <= 0:
+                    raise socket.timeout
+                self.connection.settimeout(seconds_left)
+                chunk = self.rfile.read1(min(remaining, 64 * 1024))
+                if not chunk:
+                    raise ApiError(400, "incomplete request body", code="incomplete_request_body")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            self.connection.settimeout(REQUEST_IO_TIMEOUT_SECONDS)
+        self._buffered_body = b"".join(chunks)
+
+    def _canonical_parts(self) -> list[str]:
+        raw_path = self.path.split("?", 1)[0]
+        if not raw_path.startswith("/") or "\\" in raw_path:
+            raise ApiError(400, "noncanonical request path", code="noncanonical_path")
+        if raw_path == "/":
+            return []
+        if raw_path.endswith("/") or "//" in raw_path:
+            raise ApiError(400, "noncanonical request path", code="noncanonical_path")
+        parts = raw_path[1:].split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            raise ApiError(400, "noncanonical request path", code="noncanonical_path")
+        if parts and parts[0] in ("v1", "app") and "%" in raw_path:
+            raise ApiError(400, "noncanonical request path", code="noncanonical_path")
+        return parts
+
+    def _findings_sync_body(self, namespace_key: bytes) -> dict:
+        """Read one closed findings payload without decoding or echoing untrusted fields."""
+        content_types = self._header_values("Content-Type")
+        if len(content_types) != 1:
+            raise ApiError(
+                400,
+                "findings sync request headers are ambiguous",
+                code="ambiguous_request_headers",
+            )
+        content_type = content_types[0].split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ApiError(
+                415,
+                "findings sync requires application/json",
+                code="unsupported_media_type",
+            )
+        content_encodings = self._header_values("Content-Encoding")
+        if len(content_encodings) > 1:
+            raise ApiError(
+                400,
+                "findings sync request headers are ambiguous",
+                code="ambiguous_request_headers",
+            )
+        content_encoding = (
+            content_encodings[0].strip().lower() if content_encodings else "identity"
+        )
+        if content_encoding not in ("", "identity"):
+            raise ApiError(
+                415,
+                "compressed findings sync bodies are not accepted",
+                code="unsupported_content_encoding",
+            )
+        raw = self._raw_body()
+        try:
+            source = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ApiError(
+                400,
+                "invalid findings sync request",
+                code="invalid_findings_sync_request",
+            ) from None
+        try:
+            request = parse_findings_sync_request(source, namespace_key)
+        except ValueError as error:
+            code = (
+                "duplicate_json_key"
+                if "duplicate fields" in str(error)
+                else "invalid_findings_sync_request"
+            )
+            raise ApiError(400, "invalid findings sync request", code=code) from None
+        if len(stable_json(request).encode("utf-8")) > MAX_FINDINGS_SYNC_BYTES:
+            raise ApiError(
+                413,
+                "findings sync request is too large",
+                code="findings_sync_request_too_large",
+            )
+        return request
+
+    def _principal(self) -> tuple[str, str | None, tuple[str, str, Role] | None]:
         """Return (kind, user_id, api_key_scope). kind: 'session' | 'api_key' | 'anon'."""
-        authz = self.headers.get("Authorization", "")
+        authorization_values = self._header_values("Authorization")
+        cookie_values = self._header_values("Cookie")
+        if len(authorization_values) > 1 or len(cookie_values) > 1:
+            raise ApiError(400, "ambiguous authentication headers", code="ambiguous_request_headers")
+        authz = authorization_values[0] if authorization_values else ""
+        cookie = cookie_values[0] if cookie_values else ""
+        session_tokens = []
+        for part in cookie.split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == "heel_session" and value:
+                session_tokens.append(value)
+        if len(session_tokens) > 1 or (authz and session_tokens):
+            raise ApiError(400, "ambiguous authentication headers", code="ambiguous_request_headers")
         if authz.startswith("Bearer heel_sk_"):
-            got = self.cp.store.authenticate_api_key(authz[len("Bearer "):])
+            got = self.cp.store.authenticate_api_key_principal(authz[len("Bearer "):])
             if not got:
                 raise ApiError(401, "invalid API key")
             return "api_key", None, got
-        cookie = self.headers.get("Cookie", "")
-        for part in cookie.split(";"):
-            k, _, v = part.strip().partition("=")
-            if k == "heel_session" and v:
-                uid = self.cp.auth.resolve_session(v)
-                if uid:
-                    return "session", uid, None
+        if session_tokens:
+            uid = self.cp.auth.resolve_session(session_tokens[0])
+            if uid:
+                return "session", uid, None
         return "anon", None, None
 
-    def _authorize(self, workspace_id: str, capability: str) -> Role:
+    def _authorized_identity(
+        self, workspace_id: str, capability: str
+    ) -> tuple[str, str, Role]:
         """The single choke point for workspace routes. API keys are workspace-bound and can
         NEVER exercise create_scope (human-only, session principals only)."""
         kind, user_id, key = self._principal()
         if kind == "session":
-            return require(self.cp.store, workspace_id, user_id, capability)
+            role = require(self.cp.store, workspace_id, user_id, capability)
+            return kind, user_id, role
         if kind == "api_key":
-            ws, role = key
+            key_id, ws, role = key
             if ws != workspace_id:
                 raise ApiError(403, "API key is scoped to a different workspace")
             if capability == "create_scope":
@@ -184,8 +417,31 @@ class _Handler(BaseHTTPRequestHandler):
             from .tenancy import role_can
             if not role_can(role, capability):
                 raise ApiError(403, f"API key role {role.value} lacks {capability!r}")
-            return role
+            return kind, key_id, role
         raise ApiError(401, "authentication required")
+
+    def _authorize(self, workspace_id: str, capability: str) -> Role:
+        return self._authorized_identity(workspace_id, capability)[2]
+
+    def _sync_principal(
+        self,
+        workspace_id: str,
+        capability: str,
+        *,
+        human_only: bool = False,
+    ) -> SyncPrincipal:
+        kind, actor_ref, role = self._authorized_identity(workspace_id, capability)
+        if human_only and kind != "session":
+            raise ApiError(
+                403,
+                "a signed-in human session is required",
+                code="human_session_required",
+            )
+        return SyncPrincipal(
+            actor_ref,
+            role,
+            "human_session" if kind == "session" else "api_key",
+        )
 
     # --- routing ---
     def do_GET(self):
@@ -199,7 +455,38 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _route(self, method: str) -> None:
         try:
-            parts = [p for p in self.path.split("?")[0].split("/") if p]
+            self._route_parts = self._canonical_parts()
+            self._buffer_request_body(method, self._route_parts)
+        except ApiError as error:
+            self._json(error.status, error.body)
+            return
+        except (TimeoutError, socket.timeout):
+            self._json(408, {"error": "request body timed out", "code": "request_timeout"})
+            return
+        # Health and metrics are deliberately independent of the SQLite request unit so an
+        # operational probe remains available while another request waits on the database.
+        if method == "GET" and tuple(self._route_parts) in {
+            ("v1", "health"),
+            ("v1", "healthz"),
+            ("v1", "metrics"),
+        }:
+            self._route_serial(method)
+            return
+        self._pending_json_response = None
+        self._defer_json_response = bool(self._route_parts and self._route_parts[0] == "v1")
+        try:
+            with self.cp.request_lock:
+                self._route_serial(method)
+        finally:
+            self._defer_json_response = False
+        pending = self._pending_json_response
+        self._pending_json_response = None
+        if pending is not None:
+            self._write_json(*pending)
+
+    def _route_serial(self, method: str) -> None:
+        try:
+            parts = self._route_parts
             if parts and parts[0] == "app":
                 from . import dashboard
                 if dashboard.handle(self, method, parts):
@@ -268,6 +555,28 @@ class _Handler(BaseHTTPRequestHandler):
                 return lambda: self._ws_key_revoke(wid, tail[1])
             if method == "GET" and len(tail) == 2 and tail[0] == "jobs":
                 return lambda: self._ws_job_get(wid, tail[1])
+            if tail == ("projects",):
+                if method == "POST":
+                    return lambda: self._ws_project_create(wid)
+                if method == "GET":
+                    return lambda: self._ws_projects_list(wid)
+            if len(tail) == 3 and tail[0] == "projects" and tail[2] == "namespace-key":
+                if method == "GET":
+                    return lambda: self._ws_project_namespace_key(wid, tail[1])
+            if len(tail) == 4 and tail[0] == "projects" and tail[2:] == (
+                "findings-sync", "approve"
+            ):
+                if method == "POST":
+                    return lambda: self._ws_findings_approve(wid, tail[1])
+            if len(tail) == 3 and tail[0] == "projects" and tail[2] == "findings-sync":
+                if method == "POST":
+                    return lambda: self._ws_findings_sync(wid, tail[1])
+            if len(tail) == 3 and tail[0] == "projects" and tail[2] == "reviews":
+                if method == "GET":
+                    return lambda: self._ws_findings_reviews(wid, tail[1])
+            if len(tail) == 4 and tail[0] == "projects" and tail[2] == "reviews":
+                if method == "GET":
+                    return lambda: self._ws_findings_review(wid, tail[1], tail[3])
         return None
 
     # --- open endpoints ---
@@ -342,11 +651,12 @@ class _Handler(BaseHTTPRequestHandler):
         elif kind == "api_key":
             # Same live entitlement rule as _authorize: no Feature.API, no hosted API — even
             # for self-introspection, so "paid hosted API access" holds literally everywhere.
-            sub = self.cp.subscription(key[0])
+            _key_id, workspace_id, role = key
+            sub = self.cp.subscription(workspace_id)
             if not self.cp.entitlements.has_feature(sub, Feature.API):
                 raise ApiError(402, "API access is not included in this plan",
                                upgrade_to=self.cp.entitlements.upgrade_target(sub))
-            self._json(200, {"workspace_id": key[0], "role": key[1].value})
+            self._json(200, {"workspace_id": workspace_id, "role": role.value})
         else:
             raise ApiError(401, "authentication required")
 
@@ -376,6 +686,188 @@ class _Handler(BaseHTTPRequestHandler):
         svc = self.cp.entitlements
         self._json(200, {"period": period, "remaining": {
             m.value: svc.remaining(sub, m, period) for m in Meter}})
+
+    @staticmethod
+    def _project_payload(project) -> dict:
+        return {
+            "workspace_id": project.workspace_id,
+            "project_ref": project.project_ref,
+            "name": project.name,
+            "created_by": project.created_by,
+            "created_at": project.created_at,
+        }
+
+    def _ws_project_create(self, wid: str):
+        principal = self._sync_principal(wid, "sync_findings")
+        body = self._body()
+        if set(body) != {"name"} or type(body.get("name")) is not str:
+            raise ApiError(400, "a project name is required", code="invalid_project_request")
+        try:
+            project = self.cp.projects.create(
+                wid,
+                body["name"],
+                created_by=principal.actor_ref,
+            )
+        except (ValueError, ProjectNotFound):
+            raise ApiError(400, "invalid project request", code="invalid_project_request") from None
+        self._json(201, self._project_payload(project))
+
+    def _ws_projects_list(self, wid: str):
+        self._authorize(wid, "view_synced_reviews")
+        self._json(200, {
+            "projects": [
+                self._project_payload(project) for project in self.cp.projects.list(wid)
+            ]
+        })
+
+    def _ws_project_namespace_key(self, wid: str, project_ref: str):
+        self._sync_principal(wid, "sync_findings")
+        try:
+            namespace_key = self.cp.projects.namespace_key(wid, project_ref)
+        except ProjectNotFound:
+            raise ApiError(404, "project not found", code="project_not_found") from None
+        self._json(200, {
+            "project_ref": project_ref,
+            "namespace_key_hex": namespace_key.hex(),
+        })
+
+    def _ws_findings_approve(self, wid: str, project_ref: str):
+        principal = self._sync_principal(
+            wid, "sync_findings", human_only=True,
+        )
+        content_types = self._header_values("Content-Type")
+        content_encodings = self._header_values("Content-Encoding")
+        if (
+            len(content_types) != 1
+            or content_types[0].split(";", 1)[0].strip().lower() != "application/json"
+            or len(content_encodings) > 1
+            or (
+                content_encodings
+                and content_encodings[0].strip().lower() not in ("", "identity")
+            )
+        ):
+            raise ApiError(
+                400,
+                "invalid findings approval request",
+                code="invalid_approval_request",
+            )
+        try:
+            body = self._body()
+        except ApiError:
+            raise ApiError(
+                400,
+                "invalid findings approval request",
+                code="invalid_approval_request",
+            ) from None
+        digest = body.get("request_digest")
+        if (
+            set(body) != {"request_digest"}
+            or type(digest) is not str
+            or _SYNC_DIGEST.fullmatch(digest) is None
+        ):
+            raise ApiError(
+                400,
+                "invalid findings approval request",
+                code="invalid_approval_request",
+            )
+        now = time.time()
+        try:
+            approval = self.cp.findings.approve(
+                wid,
+                project_ref,
+                digest,
+                principal=principal,
+                now=now,
+                expires_at=now + 600,
+            )
+        except ProjectNotFound:
+            raise ApiError(404, "project not found", code="project_not_found") from None
+        self._json(201, {
+            "workspace_id": approval.workspace_id,
+            "project_ref": approval.project_ref,
+            "approval_id": approval.approval_id,
+            "request_digest": approval.request_digest,
+            "approved_by": approval.approved_by,
+            "approved_at": approval.approved_at,
+            "expires_at": approval.expires_at,
+        })
+
+    def _ws_findings_sync(self, wid: str, project_ref: str):
+        principal = self._sync_principal(wid, "sync_findings")
+        try:
+            namespace_key = self.cp.projects.namespace_key(wid, project_ref)
+        except ProjectNotFound:
+            raise ApiError(404, "project not found", code="project_not_found") from None
+        request = self._findings_sync_body(namespace_key)
+        idempotency_keys = self._header_values("Idempotency-Key")
+        if not idempotency_keys or not idempotency_keys[0]:
+            raise ApiError(
+                400,
+                "an Idempotency-Key is required",
+                code="idempotency_key_required",
+            )
+        if len(idempotency_keys) != 1:
+            raise ApiError(
+                400,
+                "Idempotency-Key is ambiguous",
+                code="ambiguous_request_headers",
+            )
+        idempotency_key = idempotency_keys[0]
+        try:
+            receipt = self.cp.findings.accept(
+                wid,
+                project_ref,
+                request,
+                principal=principal,
+                idempotency_key=idempotency_key,
+            )
+        except ApprovalRequired:
+            raise ApiError(
+                403,
+                "explicit findings sync approval is required",
+                code="approval_required",
+            ) from None
+        except ApprovalExpired:
+            raise ApiError(
+                403,
+                "findings sync approval expired",
+                code="approval_expired",
+            ) from None
+        except FindingsSyncConflict as error:
+            message = str(error)
+            if "request project does not match" in message:
+                code = "project_ref_mismatch"
+            elif "idempotency key does not match" in message:
+                code = "idempotency_key_mismatch"
+            else:
+                code = "findings_sync_conflict"
+            raise ApiError(409, "findings sync conflict", code=code) from None
+        except QuotaExceeded as error:
+            sub = self.cp.subscription(wid)
+            raise ApiError(
+                402,
+                "synced review quota exceeded",
+                code="quota_exceeded",
+                meter=error.meter.value,
+                upgrade_to=self.cp.entitlements.upgrade_target(sub),
+            ) from None
+        self._json(201, receipt)
+
+    def _ws_findings_reviews(self, wid: str, project_ref: str):
+        self._authorize(wid, "view_synced_reviews")
+        try:
+            reviews = self.cp.findings.list_reviews(wid, project_ref)
+        except ProjectNotFound:
+            raise ApiError(404, "project not found", code="project_not_found") from None
+        self._json(200, {"reviews": reviews})
+
+    def _ws_findings_review(self, wid: str, project_ref: str, synced_review_id: str):
+        self._authorize(wid, "view_synced_reviews")
+        try:
+            review = self.cp.findings.get_review(wid, project_ref, synced_review_id)
+        except ProjectNotFound:
+            raise ApiError(404, "review not found", code="review_not_found") from None
+        self._json(200, review)
 
     def _seat_limit_reached(self, wid: str) -> bool:
         sub = self.cp.subscription(wid)
@@ -610,11 +1102,40 @@ def _session_cookie(token: str) -> str:
 class _ControlPlaneHTTPServer(ThreadingHTTPServer):
     """HTTP listener that owns the bound control plane after successful construction."""
 
+    request_queue_size = 128
+
     def __init__(self, server_address, handler, cp: ControlPlane):
         self.control_plane = cp
         self._owns_control_plane = False
+        self._request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
         super().__init__(server_address, handler)
         self._owns_control_plane = True
+
+    def process_request(self, request, client_address) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Cache-Control: no-store\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 32\r\n\r\n"
+                    b'{"error":"server request limit"}'
+                )
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
     def server_close(self) -> None:
         try:

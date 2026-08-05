@@ -7,13 +7,9 @@ import { sites } from "./build/sites-vite-plugin";
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 
-const localBindingConfig = {
-  main: "./worker/index.ts",
-  compatibility_flags: ["nodejs_compat"],
-  observability: { enabled: false },
-};
+const VPC_SERVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-export default defineConfig(async () => {
+export default defineConfig(async ({ command }) => {
   // Keep Wrangler and Miniflare state project-local. These are non-secret tool
   // settings; application environment belongs in ignored `.env*` files.
   process.env.WRANGLER_WRITE_LOGS ??= "false";
@@ -22,6 +18,20 @@ export default defineConfig(async () => {
 
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import("@cloudflare/vite-plugin");
+  const controlPlaneServiceId = process.env.HEEL_CONTROL_PLANE_VPC_SERVICE_ID?.trim();
+  if (command === "build" && !VPC_SERVICE_ID.test(controlPlaneServiceId ?? "")) {
+    throw new Error(
+      "HEEL_CONTROL_PLANE_VPC_SERVICE_ID must be a Cloudflare VPC service UUID for production builds",
+    );
+  }
+  const localBindingConfig = {
+    main: "./worker/index.ts",
+    compatibility_flags: ["nodejs_compat"],
+    observability: { enabled: false },
+    vpc_services: controlPlaneServiceId === undefined
+      ? []
+      : [{ binding: "CONTROL_PLANE", service_id: controlPlaneServiceId }],
+  };
 
   return {
     server: isCodexSeatbeltSandbox

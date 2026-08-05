@@ -238,8 +238,10 @@ class ControlPlaneStore:
             raise
         return ApiKeyIssued(kid, workspace_id, role, secret)
 
-    def authenticate_api_key(self, raw_secret: str) -> tuple[str, Role] | None:
-        """Return (workspace_id, role) for a valid, non-revoked key, else None. Tenant-scoped."""
+    def authenticate_api_key_principal(
+        self, raw_secret: str
+    ) -> tuple[str, str, Role] | None:
+        """Return ``(key_id, workspace_id, role)`` for a live key and touch last-used time."""
         kh = hash_api_key(raw_secret)
         row = self.conn.execute(
             "SELECT * FROM api_keys WHERE key_hash=? AND revoked_at IS NULL", (kh,)).fetchone()
@@ -247,7 +249,15 @@ class ControlPlaneStore:
             return None
         self.conn.execute("UPDATE api_keys SET last_used_at=? WHERE key_id=?", (_now(), row["key_id"]))
         self.conn.commit()
-        return row["workspace_id"], Role(row["role"])
+        return row["key_id"], row["workspace_id"], Role(row["role"])
+
+    def authenticate_api_key(self, raw_secret: str) -> tuple[str, Role] | None:
+        """Compatibility view returning ``(workspace_id, role)`` for a live tenant key."""
+        principal = self.authenticate_api_key_principal(raw_secret)
+        if principal is None:
+            return None
+        _key_id, workspace_id, role = principal
+        return workspace_id, role
 
     def revoke_api_key(self, key_id: str) -> None:
         self.conn.execute("UPDATE api_keys SET revoked_at=? WHERE key_id=?", (_now(), key_id))

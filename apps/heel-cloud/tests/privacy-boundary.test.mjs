@@ -192,6 +192,27 @@ function analyzeSource(fileName, text) {
     violations.push(`${relativeName}:${location.line + 1}:${location.character + 1}: ${message}`);
   }
 
+  function reviewedControlPlaneFetchCall(call) {
+    if (
+      !serverWorker
+      || !ts.isCallExpression(call)
+      || call.questionDotToken
+      || call.expression.getText(parsed) !== "env.CONTROL_PLANE.fetch"
+      || call.arguments.length !== 1
+      || enclosingFunctionName(call) !== "proxyControlPlane"
+      || !ts.isAwaitExpression(call.parent)
+      || !ts.isVariableDeclaration(call.parent.parent)
+      || !ts.isIdentifier(call.parent.parent.name)
+      || call.parent.parent.name.text !== "response"
+    ) return false;
+    const request = call.arguments[0];
+    return ts.isNewExpression(request)
+      && request.expression.getText(parsed) === "Request"
+      && request.arguments?.length === 2
+      && request.arguments[0].getText(parsed) === "upstreamUrl"
+      && request.arguments[1].getText(parsed) === "init";
+  }
+
   function allowedFetchReference(node) {
     const expression = node.getText(parsed);
     if (engineWorker && expression === "scope.fetch") {
@@ -205,16 +226,70 @@ function analyzeSource(fileName, text) {
         && ts.isVariableDeclaration(capture.parent)
         && isReviewedBootstrapDeclaration(capture.parent);
     }
-    return serverWorker
-      && ["env.ASSETS.fetch", "handler.fetch"].includes(expression)
-      && ts.isCallExpression(node.parent)
-      && node.parent.expression === node;
+    return serverWorker && ts.isCallExpression(node.parent) && node.parent.expression === node
+      && (
+        ["env.ASSETS.fetch", "handler.fetch"].includes(expression)
+        || reviewedControlPlaneFetchCall(node.parent)
+      );
   }
 
   function allowedFetchCall(node) {
     const expression = node.expression.getText(parsed);
     if (serverWorker && ["env.ASSETS.fetch", "handler.fetch"].includes(expression)) return true;
+    if (reviewedControlPlaneFetchCall(node)) return true;
     return engineWorker && expression === "fetcher" && isReviewedFetcherCall(node);
+  }
+
+  function validateControlPlaneProxyContract() {
+    const sourceText = parsed.getFullText();
+    if (!serverWorker || !sourceText.includes("CONTROL_PLANE")) return;
+    const routeContract = `function controlPlaneRoute(method: string, pathname: string): string | null {
+  if (pathname !== CONTROL_PLANE_PREFIX && !pathname.startsWith(\`\${CONTROL_PLANE_PREFIX}/\`)) {
+    return null;
+  }
+  const upstreamPath = pathname.slice(CONTROL_PLANE_PREFIX.length);
+  if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
+    return upstreamPath;
+  }
+  if (PROJECT_KEY_ROUTE.test(upstreamPath) && method === "GET") return upstreamPath;
+  if (FINDINGS_APPROVAL_ROUTE.test(upstreamPath) && method === "POST") return upstreamPath;
+  if (FINDINGS_SYNC_ROUTE.test(upstreamPath) && method === "POST") return upstreamPath;
+  if (REVIEWS_ROUTE.test(upstreamPath) && method === "GET") return upstreamPath;
+  if (REVIEW_DETAIL_ROUTE.test(upstreamPath) && method === "GET") return upstreamPath;
+  return "";
+}`;
+    if (sourceText.split(routeContract).length - 1 !== 1) {
+      report(parsed, "control-plane route allowlist is not the reviewed exact contract");
+    }
+    for (const fragment of [
+      'const CONTROL_PLANE_PREFIX = "/api/control-plane";',
+      'const CONTROL_PLANE_ORIGIN = "https://heel-control-plane.internal";',
+      'const WORKSPACE_REF = "ws_[0-9a-f]{16}";',
+      'const PROJECT_REF = "prj_[0-9a-f]{32}";',
+      'const SYNCED_REVIEW_REF = "synrev_[0-9a-f]{32}";',
+      "const upstreamUrl = new URL(upstreamPath, CONTROL_PLANE_ORIGIN);",
+      "headers: requestContract.headers,",
+      'redirect: "manual",',
+      "request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength))",
+      "if (response.status >= 300 && response.status <= 399)",
+      'if (requestUrl.search !== "") return proxyError(400, "invalid control plane request", csp);',
+      'if (upstreamPath === "") return proxyError(404, "not found", csp);',
+      "return proxyControlPlane(request, env, csp, upstreamPath);",
+    ]) {
+      if (sourceText.split(fragment).length - 1 !== 1) {
+        report(parsed, `control-plane proxy is missing exact ${fragment}`);
+      }
+    }
+    if (sourceText.split("const headers = new Headers();").length - 1 !== 2) {
+      report(parsed, "control-plane request/response header allowlists are not the reviewed exact contract");
+    }
+    if (
+      sourceText.split(
+        'for (const name of ["Content-Type", "Content-Length", "Retry-After"])',
+      ).length - 1 !== 1
+    ) {
+      report(parsed, "control-plane response header allowlist is not the reviewed exact contract");
+    }
   }
 
   function isReviewedBootstrapDeclaration(declaration) {
@@ -1301,6 +1376,7 @@ function analyzeSource(fileName, text) {
     validateBootstrapRevocationContract();
     validateFindingsProjectionContract();
   }
+  if (serverWorker) validateControlPlaneProxyContract();
   return violations;
 }
 
@@ -2054,6 +2130,88 @@ Object.fromEntries([]);
     ),
     [],
   );
+});
+
+
+test("the privacy analyzer pins the private control-plane fetch and route allowlist", async () => {
+  const worker = await source("worker/index.ts");
+  assert.deepEqual(analyzeSource(join(appRootPath, "worker/index.ts"), worker), []);
+  const mutations = [
+    {
+      label: "fetch location",
+      source: worker.replace(
+        "async function proxyControlPlane(",
+        "async function movedControlPlane(",
+      ),
+      violation: "network sink",
+    },
+    {
+      label: "fetch callee",
+      source: worker.replace(
+        "env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init))",
+        'env.CONTROL_PLANE["fetch"](new Request(upstreamUrl, init))',
+      ),
+      violation: "network sink",
+    },
+    {
+      label: "route broadening",
+      source: worker.replace('  return "";\n}', "  return upstreamPath;\n}"),
+      violation: "route allowlist is not the reviewed exact contract",
+    },
+    {
+      label: "caller-derived upstream query",
+      source: worker.replace(
+        "const upstreamUrl = new URL(upstreamPath, CONTROL_PLANE_ORIGIN);",
+        "const upstreamUrl = new URL(upstreamPath + new URL(request.url).search, CONTROL_PLANE_ORIGIN);",
+      ),
+      violation: "missing exact const upstreamUrl",
+    },
+    {
+      label: "unbounded request body",
+      source: worker.replace(
+        "request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength))",
+        "request.body!",
+      ),
+      violation: "FixedLengthStream",
+    },
+    {
+      label: "request header copying",
+      source: worker.replace("const headers = new Headers();", "const headers = new Headers(source);"),
+      violation: "request/response header allowlists",
+    },
+    {
+      label: "response header copying",
+      source: worker.replace(
+        "function controlPlaneResponse(response: Response, csp: string): Response {\n  const headers = new Headers();",
+        "function controlPlaneResponse(response: Response, csp: string): Response {\n  const headers = new Headers(response.headers);",
+      ),
+      violation: "request/response header allowlists",
+    },
+    {
+      label: "redirect forwarding",
+      source: worker.replace(
+        "if (response.status >= 300 && response.status <= 399)",
+        "if (response.status === 399)",
+      ),
+      violation: "response.status >= 300",
+    },
+    {
+      label: "query acceptance",
+      source: worker.replace(
+        '      if (requestUrl.search !== "") return proxyError(400, "invalid control plane request", csp);\n',
+        "",
+      ),
+      violation: "requestUrl.search",
+    },
+  ];
+  for (const mutation of mutations) {
+    assert.notEqual(mutation.source, worker, `${mutation.label} mutation did not apply`);
+    const violations = analyzeSource(join(appRootPath, "worker/index.ts"), mutation.source);
+    assert.ok(
+      violations.some((violation) => violation.includes(mutation.violation)),
+      `${mutation.label}: ${violations.join("\n")}`,
+    );
+  }
 });
 
 

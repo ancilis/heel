@@ -183,6 +183,10 @@ jobs:
           npm run lint
       - name: Build Cloudflare-compatible production artifact
         working-directory: apps/heel-cloud
+        env:
+          # Syntax-valid non-secret fixture. Production supplies the VPC service
+          # UUID created for the private Heel control-plane tunnel.
+          HEEL_CONTROL_PLANE_VPC_SERVICE_ID: 00000000-0000-4000-8000-000000000001
         run: npm run build
       - name: Inspect production privacy, product, and deployment artifact contracts
         working-directory: apps/heel-cloud

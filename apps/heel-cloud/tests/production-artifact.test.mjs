@@ -46,6 +46,24 @@ const forbiddenReleasePrefixes = [
 const allowedReleaseExtensions = new Set([".in", ".json", ".md", ".py", ".toml", ".txt"]);
 const allowedExtensionlessNames = new Set(["DCO", "LICENSE", "METADATA", "NOTICE", "PKG-INFO", "RECORD", "WHEEL"]);
 
+if (globalThis.FixedLengthStream === undefined) {
+  globalThis.FixedLengthStream = class FixedLengthStream extends TransformStream {
+    constructor(expectedLength) {
+      let received = 0;
+      super({
+        transform(chunk, controller) {
+          received += chunk.byteLength;
+          if (received > expectedLength) throw new TypeError("fixed-length body overflow");
+          controller.enqueue(chunk);
+        },
+        flush() {
+          if (received !== expectedLength) throw new TypeError("fixed-length body underflow");
+        },
+      });
+    }
+  };
+}
+
 
 function crc32(payload) {
   let crc = 0xffffffff;
@@ -1374,7 +1392,7 @@ test("serves the Agent acquisition page only from the canonical route", async ()
 });
 
 
-test("production worker exposes exact headers, request-URL metadata, and no unapproved bindings", async () => {
+test("production worker exposes exact headers, request-URL metadata, and only the private control-plane binding", async () => {
   const [workerConfig, hostingConfig, socialCard] = await Promise.all([
     json(join(serverRoot, "wrangler.json")),
     json(join(distRoot, ".openai/hosting.json")),
@@ -1387,6 +1405,10 @@ test("production worker exposes exact headers, request-URL metadata, and no unap
   assert.deepEqual(workerConfig.vars, {});
   assert.deepEqual(workerConfig.assets, { directory: "../client" });
   assert.deepEqual(workerConfig.observability, { enabled: false });
+  assert.deepEqual(workerConfig.vpc_services, [{
+    binding: "CONTROL_PLANE",
+    service_id: "00000000-0000-4000-8000-000000000001",
+  }]);
   const requiredEmptyCapabilities = [
     "d1_databases",
     "r2_buckets",
@@ -1404,7 +1426,6 @@ test("production worker exposes exact headers, request-URL metadata, and no unap
     "artifacts",
     "worker_loaders",
     "pipelines",
-    "vpc_services",
     "vpc_networks",
     "send_email",
     "mtls_certificates",
@@ -1431,6 +1452,7 @@ test("production worker exposes exact headers, request-URL metadata, and no unap
     "observability",
     "python_modules",
     "vars",
+    "vpc_services",
   ]);
   for (const [field, value] of Object.entries(workerConfig)) {
     if (!approvedConfiguration.has(field)) assertEmptyCapability(value, field);
@@ -1509,4 +1531,399 @@ test("production worker exposes exact headers, request-URL metadata, and no unap
     await localResponse.text(),
     /<meta property="og:image" content="http:\/\/127\.0\.0\.1:8787\/og\.png"\/>/,
   );
+});
+
+
+test("production worker streams only the approved findings control-plane routes", async () => {
+  const artifact = await import(
+    pathToFileURL(join(serverRoot, "index.js")).href + `?findings-proxy=${Date.now()}`
+  );
+  const calls = [];
+  const upstreamBytes = Uint8Array.from([0, 17, 128, 255, 10]);
+  const environment = {
+    ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
+    IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    CONTROL_PLANE: {
+      async fetch(request) {
+        calls.push({
+          body: new Uint8Array(await request.arrayBuffer()),
+          headers: Object.fromEntries(request.headers),
+          method: request.method,
+          redirect: request.redirect,
+          url: request.url,
+        });
+        return new Response(upstreamBytes, {
+          status: 207,
+          headers: {
+            "Access-Control-Allow-Origin": "https://attacker.invalid",
+            "Cache-Control": "public, max-age=3600",
+            Connection: "x-upstream-remove",
+            "Content-Type": "application/octet-stream",
+            Forwarded: "host=private-control-plane.internal",
+            Location: "https://attacker.invalid/capture",
+            "Set-Cookie": "attacker=1",
+            "X-Control-Plane": "reached",
+            "X-Forwarded-Port": "8443",
+            "X-Heel-Internal-Origin": "https://private-control-plane.internal",
+            "X-Upstream-Remove": "connection-token-value",
+          },
+        });
+      },
+    },
+  };
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  const workspace = "ws_0123456789abcdef";
+  const project = `prj_${"a".repeat(32)}`;
+  const review = `synrev_${"b".repeat(32)}`;
+  const approvedRoutes = [
+    ["GET", `/api/control-plane/v1/workspaces/${workspace}/projects`],
+    ["POST", `/api/control-plane/v1/workspaces/${workspace}/projects`],
+    ["GET", `/api/control-plane/v1/workspaces/${workspace}/projects/${project}/namespace-key`],
+    ["POST", `/api/control-plane/v1/workspaces/${workspace}/projects/${project}/findings-sync/approve`],
+    ["POST", `/api/control-plane/v1/workspaces/${workspace}/projects/${project}/findings-sync`],
+    ["GET", `/api/control-plane/v1/workspaces/${workspace}/projects/${project}/reviews`],
+    ["GET", `/api/control-plane/v1/workspaces/${workspace}/projects/${project}/reviews/${review}`],
+  ];
+  const requestBytes = new TextEncoder().encode('{"schema_version":"heel.findings-sync.v1"}');
+
+  for (const [index, [method, path]] of approvedRoutes.entries()) {
+    const hasBody = method === "POST";
+    const credentialHeaders = index % 2 === 0
+      ? { Cookie: "unrelated=discard-me; heel_session=private; preference=discard-me" }
+      : { Authorization: "Bearer heel_sk_private" };
+    const response = await artifact.default.fetch(
+      new Request(`https://proxy.heel.invalid${path}`, {
+        method,
+        body: hasBody ? requestBytes : undefined,
+        headers: {
+          Connection: "keep-alive, x-remove-me",
+          ...(hasBody ? {
+            "Content-Encoding": "identity",
+            "Content-Length": String(requestBytes.byteLength),
+          } : {}),
+          "Content-Security-Policy": "default-src https://attacker.invalid",
+          "Content-Type": "application/json",
+          Forwarded: "for=attacker.invalid;host=attacker.invalid",
+          "Idempotency-Key": `fs1-${"c".repeat(64)}`,
+          "Keep-Alive": "timeout=5",
+          TE: "trailers",
+          "X-Forwarded-For": "192.0.2.1",
+          "X-Forwarded-Host": "attacker.invalid",
+          "X-Forwarded-Port": "444",
+          "X-Forwarded-Proto": "http",
+          "X-Forwarded-Server": "attacker.invalid",
+          "X-Heel-Internal-Origin": "https://attacker.invalid",
+          "X-Private-Metadata": "must-not-cross",
+          "X-Remove-Me": "connection-token-value",
+          ...credentialHeaders,
+        },
+      }),
+      environment,
+      context,
+    );
+    assert.equal(response.status, 207, `${method} ${path}`);
+    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), upstreamBytes, `${method} ${path}`);
+    assert.equal(response.headers.get("content-type"), "application/octet-stream");
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+    assert.match(response.headers.get("content-security-policy") ?? "", /default-src 'self'/);
+    for (const removed of [
+      "connection",
+      "forwarded",
+      "location",
+      "set-cookie",
+      "access-control-allow-origin",
+      "x-control-plane",
+      "x-forwarded-port",
+      "x-heel-internal-origin",
+      "x-upstream-remove",
+    ]) assert.equal(response.headers.get(removed), null, `${removed} leaked from the control plane`);
+
+    const call = calls.at(-1);
+    assert.equal(call.method, method);
+    assert.equal(call.redirect, "manual");
+    assert.equal(
+      call.url,
+      `https://heel-control-plane.internal${path.replace("/api/control-plane", "")}`,
+    );
+    assert.equal(call.headers.authorization, credentialHeaders.Authorization);
+    assert.equal(call.headers.cookie, credentialHeaders.Cookie === undefined ? undefined : "heel_session=private");
+    assert.deepEqual(
+      Object.keys(call.headers).sort(),
+      [
+        ...(credentialHeaders.Authorization === undefined ? ["cookie"] : ["authorization"]),
+        ...(hasBody ? ["content-encoding", "content-length", "content-type"] : []),
+        ...(hasBody && path.endsWith("/findings-sync") ? ["idempotency-key"] : []),
+      ].sort(),
+    );
+    if (hasBody) {
+      assert.equal(call.headers["content-type"], "application/json");
+      assert.equal(call.headers["content-encoding"], "identity");
+      assert.equal(call.headers["content-length"], String(requestBytes.byteLength));
+    }
+    assert.equal(
+      call.headers["idempotency-key"],
+      hasBody && path.endsWith("/findings-sync") ? `fs1-${"c".repeat(64)}` : undefined,
+    );
+    assert.deepEqual(call.body, hasBody ? requestBytes : new Uint8Array(), `${method} ${path}`);
+  }
+
+  assert.equal(calls.length, approvedRoutes.length);
+  environment.CONTROL_PLANE.fetch = async (request) => {
+    calls.push({ redirect: request.redirect, url: request.url });
+    return new Response("private-redirect-marker", {
+      status: 307,
+      headers: { Location: "https://login-attacker.invalid/capture" },
+    });
+  };
+  const redirect = await artifact.default.fetch(
+    new Request(
+      `https://proxy.heel.invalid/api/control-plane/v1/workspaces/${workspace}/projects`,
+    ),
+    environment,
+    context,
+  );
+  assert.equal(redirect.status, 502);
+  assert.equal(redirect.headers.get("location"), null);
+  assert.equal((await redirect.text()).includes("private-redirect-marker"), false);
+  assert.equal(calls.at(-1).redirect, "manual");
+
+  const callsBeforeQuery = calls.length;
+  const query = await artifact.default.fetch(
+    new Request(
+      `https://proxy.heel.invalid/api/control-plane/v1/workspaces/${workspace}/projects?cursor=next`,
+      { headers: { Cookie: "heel_session=private" } },
+    ),
+    environment,
+    context,
+  );
+  assert.equal(query.status, 400);
+  assert.equal(calls.length, callsBeforeQuery, "a query crossed the closed proxy contract");
+});
+
+
+test("findings proxy preserves request and response streaming across the private binding", async () => {
+  const artifact = await import(
+    pathToFileURL(join(serverRoot, "index.js")).href + `?findings-stream=${Date.now()}`
+  );
+  const workspace = "ws_0123456789abcdef";
+  const project = `prj_${"a".repeat(32)}`;
+  const firstRequestChunk = new TextEncoder().encode('{"first":');
+  const secondRequestChunk = new TextEncoder().encode('"second"}');
+  const firstResponseChunk = Uint8Array.from([1, 2, 3]);
+  const secondResponseChunk = Uint8Array.from([4, 5, 6]);
+  let releaseRequest;
+  let releaseResponse;
+  let requestFirstResolve;
+  let requestRest;
+  const requestFirst = new Promise((resolve) => { requestFirstResolve = resolve; });
+  const requestBody = new ReadableStream({
+    start(controller) {
+      controller.enqueue(firstRequestChunk);
+      releaseRequest = () => {
+        controller.enqueue(secondRequestChunk);
+        controller.close();
+      };
+    },
+  });
+  const responseBody = new ReadableStream({
+    start(controller) {
+      controller.enqueue(firstResponseChunk);
+      releaseResponse = () => {
+        controller.enqueue(secondResponseChunk);
+        controller.close();
+      };
+    },
+  });
+  const environment = {
+    ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
+    IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    CONTROL_PLANE: {
+      async fetch(request) {
+        const reader = request.body.getReader();
+        const first = await reader.read();
+        requestFirstResolve(first.value);
+        requestRest = reader.read();
+        return new Response(responseBody, { status: 200 });
+      },
+    },
+  };
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  const responsePromise = artifact.default.fetch(
+    new Request(
+      `https://proxy.heel.invalid/api/control-plane/v1/workspaces/${workspace}`
+      + `/projects/${project}/findings-sync`,
+      {
+        method: "POST",
+        body: requestBody,
+        duplex: "half",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": String(firstRequestChunk.byteLength + secondRequestChunk.byteLength),
+          "Idempotency-Key": `fs1-${"d".repeat(64)}`,
+          Cookie: "heel_session=private",
+        },
+      },
+    ),
+    environment,
+    context,
+  );
+  async function promptly(promise, label) {
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), 1000);
+    });
+    const result = await Promise.race([promise, timeout]);
+    clearTimeout(timer);
+    assert.notEqual(result, null, label);
+    return result;
+  }
+
+  assert.deepEqual(
+    new Uint8Array(await promptly(requestFirst, "the proxy buffered the complete request")),
+    firstRequestChunk,
+  );
+  const response = await promptly(responsePromise, "the proxy waited for the complete request");
+  const responseReader = response.body.getReader();
+  const first = await promptly(
+    responseReader.read(),
+    "the proxy buffered the complete upstream response",
+  );
+  assert.deepEqual(first.value, firstResponseChunk);
+
+  releaseRequest();
+  const rest = await promptly(requestRest, "the private binding did not receive the request tail");
+  assert.deepEqual(rest.value, secondRequestChunk);
+  releaseResponse();
+  const second = await promptly(responseReader.read(), "the client did not receive the response tail");
+  assert.deepEqual(second.value, secondResponseChunk);
+  assert.equal((await responseReader.read()).done, true);
+});
+
+
+test("findings proxy fails closed and leaves anonymous review traffic without a server sink", async () => {
+  const artifact = await import(
+    pathToFileURL(join(serverRoot, "index.js")).href + `?findings-closed=${Date.now()}`
+  );
+  const workerSource = await readFile(join(appRoot, "worker/index.ts"), "utf8");
+  const marker = "raw-customer-review-must-not-echo";
+  const workspace = "ws_0123456789abcdef";
+  const project = `prj_${"a".repeat(32)}`;
+  const approvedPath = (
+    `/api/control-plane/v1/workspaces/${workspace}/projects/${project}/findings-sync`
+  );
+  const baseEnvironment = {
+    ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
+    IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+  };
+  const context = { waitUntil() {}, passThroughOnException() {} };
+
+  const unavailable = await artifact.default.fetch(
+    new Request(`https://proxy.heel.invalid${approvedPath}`, {
+      method: "POST",
+      body: marker,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": String(Buffer.byteLength(marker)),
+        "Idempotency-Key": `fs1-${"e".repeat(64)}`,
+        Cookie: "heel_session=private",
+      },
+    }),
+    baseEnvironment,
+    context,
+  );
+  assert.equal(unavailable.status, 503);
+  assert.equal(unavailable.headers.get("cache-control"), "no-store");
+  assert.equal((await unavailable.text()).includes(marker), false);
+
+  let bindingCalls = 0;
+  const failingEnvironment = {
+    ...baseEnvironment,
+    CONTROL_PLANE: {
+      async fetch() {
+        bindingCalls += 1;
+        throw new Error(marker);
+      },
+    },
+  };
+  const failed = await artifact.default.fetch(
+    new Request(`https://proxy.heel.invalid${approvedPath}`, {
+      method: "POST",
+      body: marker,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": String(Buffer.byteLength(marker)),
+        "Idempotency-Key": `fs1-${"e".repeat(64)}`,
+        Cookie: "heel_session=private",
+      },
+    }),
+    failingEnvironment,
+    context,
+  );
+  assert.equal(failed.status, 502);
+  assert.equal((await failed.text()).includes(marker), false);
+  assert.equal(bindingCalls, 1);
+
+  for (const headers of [
+    { "Content-Type": "application/json", Cookie: "heel_session=private" },
+    {
+      "Content-Type": "application/json",
+      "Content-Length": String(Buffer.byteLength(marker)),
+      "Idempotency-Key": `fs1-${"e".repeat(64)}`,
+      Authorization: "Bearer heel_sk_private",
+      Cookie: "heel_session=private",
+    },
+    {
+      "Content-Type": "application/json",
+      "Content-Length": "02",
+      "Idempotency-Key": `fs1-${"e".repeat(64)}`,
+      Cookie: "heel_session=private",
+    },
+  ]) {
+    const rejected = await artifact.default.fetch(
+      new Request(`https://proxy.heel.invalid${approvedPath}`, {
+        method: "POST",
+        body: marker,
+        headers,
+      }),
+      failingEnvironment,
+      context,
+    );
+    assert.equal(rejected.status, 400);
+  }
+  assert.equal(bindingCalls, 1, "invalid length or mixed credentials reached the private binding");
+
+  for (const [method, path] of [
+    ["DELETE", approvedPath],
+    ["POST", "/api/review"],
+    ["POST", "/api/reviews"],
+    ["POST", "/api/control-plane/v1/reviews"],
+    ["POST", `/api/control-plane/v1/workspaces/${workspace}/runs`],
+  ]) {
+    const response = await artifact.default.fetch(
+      new Request(`https://proxy.heel.invalid${path}`, { method, body: marker }),
+      failingEnvironment,
+      context,
+    );
+    assert.equal(response.status, 404, `${method} ${path}`);
+    assert.equal((await response.text()).includes(marker), false);
+  }
+  assert.equal(bindingCalls, 1, "an unapproved BFF route reached the private binding");
+
+  const anonymous = await artifact.default.fetch(
+    new Request("https://proxy.heel.invalid/"),
+    failingEnvironment,
+    context,
+  );
+  assert.equal(anonymous.status, 200);
+  assert.equal(bindingCalls, 1, "the anonymous local review page reached the private binding");
+
+  assert.match(workerSource, /CONTROL_PLANE/);
+  assert.match(workerSource, /request\.body/);
+  assert.doesNotMatch(workerSource, /\bconsole\.(?:debug|error|info|log|warn)\s*\(/);
+  assert.doesNotMatch(
+    workerSource,
+    /\brequest\.(?:arrayBuffer|blob|clone|formData|json|text)\s*\(/,
+  );
+  assert.doesNotMatch(workerSource, /\bctx\.waitUntil\s*\(/);
 });

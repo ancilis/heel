@@ -40,10 +40,7 @@ def _page(title: str, body: str) -> str:
 
 
 def _form_body(handler) -> dict:
-    n = int(handler.headers.get("Content-Length") or 0)
-    if n > 64 * 1024:
-        return {}
-    data = urllib.parse.parse_qs(handler.rfile.read(n).decode(errors="replace"))
+    data = urllib.parse.parse_qs(handler._raw_body().decode(errors="replace"))
     return {k: v[0] for k, v in data.items()}
 
 
