@@ -117,16 +117,28 @@
 
 **Files:**
 
+- Create: `heel/saas/device_auth.py`
+- Modify: `heel/saas/migrate.py`
+- Modify: `heel/saas/http_api.py`
+- Modify: `apps/heel-cloud/worker/index.ts`
+- Create: `apps/heel-cloud/app/device/page.tsx`
 - Create: `heel/cloud_auth.py`
 - Create: `heel/cloud_client.py`
 - Create: `heel/sync_queue.py`
 - Modify: `heel/cli.py`
 - Modify: `heel/mcp_server.py`
-- Modify: `tests/test_cli.py`
-- Modify: `tests/test_mcp_server.py`
+- Create: `tests/test_saas_device_auth.py`
+- Create: `tests/test_cloud_auth.py`
+- Create: `tests/test_cloud_client.py`
+- Create: `tests/test_sync_queue.py`
+- Create: `tests/test_cli_sync.py`
+- Create: `tests/test_mcp_sync.py`
 - Add focused cloud-client/auth/queue tests.
 
-- [ ] Add device login/status/logout with secure OS-backed token storage where available and permission-restricted local fallback.
+- [ ] Add a strict RFC 8628-shaped start/inspect/explicit-approve/poll/exchange flow. Device codes use a proof challenge, grants bind one user/workspace, access expires after 15 minutes, and refresh tokens rotate with complete family revocation on replay.
+- [ ] Store only domain-separated HMAC token digests under a mandatory production pepper. Re-resolve live workspace membership and role for every device request; device login grants account access but never findings consent.
+- [ ] Add a same-origin browser device confirmation page whose code inspection cannot approve. The decision is a separate click, nonce-bound, CSRF/fetch-metadata guarded, and visibly describes the fixed findings-only capabilities.
+- [ ] Add device login/status/logout with secure OS-backed token storage where available and descriptor-anchored, permission-restricted local fallback.
 - [ ] Add CLI sync prepare, interactive approve, status, and receipt/history commands. Approval is bound to the exact request digest and project and expires after ten minutes; immutable offline retries may refresh transport authorization only for the persisted human-approved digest.
 - [ ] Add MCP prepare, preview, status, receipt, and history tools. MCP cannot mint or transmit human approval and cannot widen the disclosure policy.
 - [ ] Keep API keys unable to approve sync requests.

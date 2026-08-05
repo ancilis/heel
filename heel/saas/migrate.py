@@ -10,6 +10,8 @@ inserts against any DB-API connection — no string-spliced SQL.
 """
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
 import re
 import sqlite3
 import time
@@ -83,6 +85,17 @@ class Migrator:
                 raise MigrationError(f"migration {m.version} ({m.name}) failed: {e}") from e
             applied.append(m.version)
         return applied
+
+
+def read_current_version(conn) -> int:
+    """Read schema state without creating the migration tracker."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone()
+    if row is None:
+        return 0
+    current = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+    return int(current or 0)
 
 
 def copy_table(src: sqlite3.Connection, dst, table: str, *, placeholder: str = "?") -> int:
@@ -212,4 +225,141 @@ CREATE INDEX IF NOT EXISTS idx_sync_approvals_digest
 CREATE INDEX IF NOT EXISTS idx_sync_audit_project
   ON findings_sync_audit(workspace_id, project_ref, ts, event_id)
 """),
+    Migration(4, "device_authorization", """
+CREATE TABLE IF NOT EXISTS device_authorizations(
+  grant_id TEXT PRIMARY KEY,
+  device_code_hash TEXT NOT NULL UNIQUE,
+  user_code_hash TEXT NOT NULL UNIQUE,
+  device_name TEXT NOT NULL,
+  device_challenge TEXT NOT NULL,
+  client_key TEXT NOT NULL,
+  requested_at REAL NOT NULL,
+  expires_at REAL NOT NULL,
+  poll_interval INTEGER NOT NULL,
+  last_polled_at REAL,
+  status TEXT NOT NULL,
+  inspected_by TEXT,
+  confirmation_nonce_hash TEXT,
+  confirmation_expires_at REAL,
+  approved_user_id TEXT,
+  workspace_id TEXT,
+  approved_at REAL,
+  consumed_at REAL);
+CREATE TABLE IF NOT EXISTS device_credentials(
+  device_id TEXT PRIMARY KEY,
+  family_id TEXT NOT NULL UNIQUE,
+  user_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  refresh_absolute_expires_at REAL NOT NULL,
+  last_refreshed_at REAL NOT NULL,
+  revoked_at REAL);
+CREATE TABLE IF NOT EXISTS device_access_tokens(
+  token_hash TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  issued_at REAL NOT NULL,
+  expires_at REAL NOT NULL,
+  revoked_at REAL,
+  FOREIGN KEY(device_id) REFERENCES device_credentials(device_id));
+CREATE TABLE IF NOT EXISTS device_refresh_tokens(
+  token_hash TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  family_id TEXT NOT NULL,
+  issued_at REAL NOT NULL,
+  absolute_expires_at REAL NOT NULL,
+  idle_expires_at REAL NOT NULL,
+  consumed_at REAL,
+  FOREIGN KEY(device_id) REFERENCES device_credentials(device_id));
+CREATE INDEX IF NOT EXISTS idx_device_access_device
+  ON device_access_tokens(device_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_device_refresh_family
+  ON device_refresh_tokens(family_id, issued_at);
+CREATE INDEX IF NOT EXISTS idx_device_authorization_client
+  ON device_authorizations(client_key, requested_at)
+"""),
+    Migration(5, "complete_runtime_schema", """
+CREATE TABLE IF NOT EXISTS signup_events(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, email TEXT, ts REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_signup_ip ON signup_events(ip, ts);
+CREATE TABLE IF NOT EXISTS subscriptions(
+  workspace_id TEXT PRIMARY KEY,
+  provider_customer_id TEXT, provider_subscription_id TEXT,
+  plan_id TEXT NOT NULL, state TEXT NOT NULL, catalog_version TEXT NOT NULL,
+  interval TEXT, version INTEGER NOT NULL DEFAULT 0,
+  current_period_end REAL, cancel_at_period_end INTEGER DEFAULT 0, updated_at REAL);
+CREATE TABLE IF NOT EXISTS billing_events(
+  event_id TEXT PRIMARY KEY, type TEXT, received_at REAL, applied INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS usage_ledger(
+  entry_id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  meter TEXT NOT NULL,
+  period TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  amount INTEGER NOT NULL,
+  reservation_id TEXT,
+  idempotency_key TEXT,
+  ref TEXT,
+  ts REAL NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_idem
+  ON usage_ledger(workspace_id, meter, idempotency_key)
+  WHERE idempotency_key IS NOT NULL AND kind='reserve';
+CREATE INDEX IF NOT EXISTS idx_ledger_usage ON usage_ledger(workspace_id, meter, period);
+CREATE INDEX IF NOT EXISTS idx_ledger_resv ON usage_ledger(reservation_id);
+CREATE TABLE IF NOT EXISTS verified_targets(
+  target_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, hostname TEXT NOT NULL,
+  method TEXT, token TEXT NOT NULL, created_at REAL,
+  verified_at REAL, revoked_at REAL,
+  UNIQUE(workspace_id, hostname));
+CREATE INDEX IF NOT EXISTS idx_vt_ws ON verified_targets(workspace_id);
+CREATE TABLE IF NOT EXISTS jobs(
+  job_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, kind TEXT NOT NULL,
+  state TEXT NOT NULL, target TEXT, scope_ref TEXT, budget TEXT NOT NULL,
+  reservations TEXT NOT NULL, created_at REAL, claimed_at REAL, lease_until REAL,
+  worker_id TEXT, finished_at REAL, outcome TEXT, idempotency_key TEXT);
+CREATE INDEX IF NOT EXISTS idx_jobs_ws ON jobs(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idem
+  ON jobs(workspace_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE TABLE IF NOT EXISTS kill_switches(
+  scope TEXT PRIMARY KEY,
+  reason TEXT NOT NULL, actor TEXT NOT NULL, tripped_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS admin_audit(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor TEXT NOT NULL, action TEXT NOT NULL, subject TEXT, reason TEXT, ts REAL NOT NULL)
+"""),
 ]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Apply or inspect Heel SQLite schema migrations")
+    parser.add_argument("command", choices=("status", "up"))
+    parser.add_argument("database", help="absolute path to the control-plane SQLite database")
+    args = parser.parse_args(argv)
+    path = Path(args.database)
+    if not path.is_absolute() or not path.parent.is_dir() or path.is_symlink():
+        parser.error("database must be a non-symlink absolute path below an existing directory")
+    target = CONTROL_PLANE_MIGRATIONS[-1].version
+    if args.command == "status":
+        if not path.is_file():
+            parser.error("status requires an existing database file")
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            current = read_current_version(connection)
+        finally:
+            connection.close()
+        print(f"current={current} target={target}")
+        return 0 if current == target else 1
+
+    connection = sqlite3.connect(str(path))
+    try:
+        migrator = Migrator(connection, CONTROL_PLANE_MIGRATIONS)
+        applied = migrator.apply_all()
+        print("applied=" + (",".join(str(version) for version in applied) or "none"))
+        print(f"current={migrator.current_version()} target={target}")
+    finally:
+        connection.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

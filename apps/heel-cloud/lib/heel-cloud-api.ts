@@ -13,6 +13,10 @@ const NAMESPACE_KEY = /^[0-9a-f]{64}$/;
 const APPROVAL_REF = /^fsauth_[0-9a-f]{32}$/;
 const ROLE = new Set(["owner", "admin", "member", "viewer", "billing"]);
 const GATE = new Set(["pass", "warn", "block"]);
+const DEVICE_USER_CODE = /^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/;
+const DEVICE_FINGERPRINT = /^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/;
+const DEVICE_CONFIRMATION = /^heel_dcn_[A-Za-z0-9_-]{43}$/;
+const DEVICE_CAPABILITIES = ["sync_findings", "view_synced_reviews"] as const;
 
 export type HeelCloudTransport = (path: string, init: RequestInit) => Promise<Response>;
 
@@ -42,6 +46,15 @@ export interface HeelCloudApproval {
   approvedBy: string;
   approvedAt: number;
   expiresAt: number;
+}
+
+export interface HeelDeviceClaim {
+  userCode: string;
+  deviceName: string;
+  deviceFingerprint: string;
+  capabilities: typeof DEVICE_CAPABILITIES;
+  expiresIn: number;
+  confirmationNonce: string;
 }
 
 export interface HeelCloudReviewSummary {
@@ -161,8 +174,10 @@ const PUBLIC_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   conflict: "This local projection no longer matches its cloud record.",
   invalid_request: "Heel could not safely prepare that cloud request.",
   invalid_response: "Heel Cloud returned an invalid response.",
+  invalid_grant: "That device code is invalid, expired, or already used.",
   quota_exceeded: "This workspace has reached its synced-review allowance.",
   unavailable: "Heel Cloud is temporarily unavailable. Your local result is unchanged.",
+  recent_auth_required: "Sign in again before authorizing a device.",
 });
 const PUBLIC_ERROR_CODES = new Set(Object.keys(PUBLIC_MESSAGES));
 
@@ -232,6 +247,72 @@ export class HeelCloudApi {
       });
     });
     return Object.freeze({ userId: value.user_id, workspaces: Object.freeze(workspaces) as HeelCloudWorkspace[] });
+  }
+
+  async inspectDevice(userCode: string): Promise<HeelDeviceClaim> {
+    if (!DEVICE_USER_CODE.test(userCode)) throw new HeelCloudApiError("invalid_request", 0);
+    const value = await this.#json("/v1/device/verify", "POST", {
+      schema_version: "heel.device-verify.v1",
+      user_code: userCode,
+      action: "inspect",
+    }, 200);
+    if (!exactFields(value, [
+      "schema_version", "status", "user_code", "client_id", "device_name",
+      "device_fingerprint", "capabilities", "expires_in", "confirmation_nonce",
+    ])
+      || value.schema_version !== "heel.device-verify-view.v1"
+      || value.status !== "pending"
+      || value.user_code !== userCode
+      || value.client_id !== "heel-agent"
+      || !closedString(value.device_name, 64)
+      || typeof value.device_fingerprint !== "string"
+      || !DEVICE_FINGERPRINT.test(value.device_fingerprint)
+      || !Array.isArray(value.capabilities)
+      || value.capabilities.length !== DEVICE_CAPABILITIES.length
+      || value.capabilities.some((item, index) => item !== DEVICE_CAPABILITIES[index])
+      || !Number.isSafeInteger(value.expires_in)
+      || (value.expires_in as number) < 0
+      || (value.expires_in as number) > 600
+      || typeof value.confirmation_nonce !== "string"
+      || !DEVICE_CONFIRMATION.test(value.confirmation_nonce)) {
+      throw new HeelCloudApiError("invalid_response", 502);
+    }
+    return Object.freeze({
+      userCode,
+      deviceName: value.device_name,
+      deviceFingerprint: value.device_fingerprint,
+      capabilities: DEVICE_CAPABILITIES,
+      expiresIn: value.expires_in as number,
+      confirmationNonce: value.confirmation_nonce,
+    });
+  }
+
+  async decideDevice(
+    userCode: string,
+    action: "approve" | "deny",
+    confirmationNonce: string,
+    workspaceRef?: string,
+  ): Promise<"approved" | "denied"> {
+    if (
+      !DEVICE_USER_CODE.test(userCode)
+      || !DEVICE_CONFIRMATION.test(confirmationNonce)
+      || (action === "approve" && (workspaceRef === undefined || !WORKSPACE_REF.test(workspaceRef)))
+      || (action === "deny" && workspaceRef !== undefined)
+    ) throw new HeelCloudApiError("invalid_request", 0);
+    const value = await this.#json("/v1/device/verify", "POST", {
+      schema_version: "heel.device-verify.v1",
+      user_code: userCode,
+      action,
+      ...(action === "approve" ? { workspace_id: workspaceRef } : {}),
+      confirmation_nonce: confirmationNonce,
+    }, 200);
+    const status = action === "approve" ? "approved" : "denied";
+    if (!exactFields(value, ["schema_version", "status"])
+      || value.schema_version !== "heel.device-verify-response.v1"
+      || value.status !== status) {
+      throw new HeelCloudApiError("invalid_response", 502);
+    }
+    return status;
   }
 
   async createProject(workspaceRef: string, name: string): Promise<HeelCloudProject> {

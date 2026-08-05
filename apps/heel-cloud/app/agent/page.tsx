@@ -2,9 +2,16 @@
 
 import type { Metadata } from "next";
 import Link from "next/link";
+import releaseManifest from "../../public/downloads/heel-open-core-manifest.json";
 
 
-const WHEEL_SHA256 = "819162b16a0feb167b8299fd980e0545232301bda143f0e5e62d2850333fa0d6";
+const WHEEL_SHA256 = releaseManifest.artifacts.find(
+  ({ name }) => name === "heel_sim-1.2.0-py3-none-any.whl",
+)?.sha256;
+
+if (WHEEL_SHA256 === undefined) {
+  throw new Error("verified Heel Agent wheel is missing from the release manifest");
+}
 
 const INSTALL_AGENT = `python3 -m venv .venv
 .venv/bin/python -m pip install ./heel_sim-1.2.0-py3-none-any.whl`;
@@ -14,7 +21,8 @@ const MCP_CONFIGURATION = `{
     "heel": {
       "command": "/absolute/path/to/download-folder/.venv/bin/heel-mcp",
       "env": {
-        "HEEL_HOME": "/absolute/path/to/private/heel-data"
+        "HEEL_HOME": "/absolute/path/to/private/heel-data",
+        "HEEL_CLOUD_ORIGIN": "https://YOUR_HEEL_DOMAIN"
       }
     }
   }
@@ -43,7 +51,7 @@ export default function AgentQuickstart() {
         </Link>
         <span className="local-status">
           <span aria-hidden="true" />
-          Local stdio · no Heel account
+          Local first · optional cloud continuity
         </span>
       </header>
 
@@ -144,6 +152,36 @@ export default function AgentQuickstart() {
               requires a pre-existing, human-created signed scope. Heel MCP exposes no tool to create,
               widen, or relax a scope. Scope creation is an out-of-band CLI action; do not grant
               agent-controlled shells access to that CLI, HEEL_HOME, or the signing key.
+            </p>
+          </article>
+
+          <article className="quickstart-card">
+            <p className="step-number">05 · Optional continuity</p>
+            <h2>Keep minimized findings across devices</h2>
+            <p>
+              The local review works without an account or network connection. If you want a hosted
+              dashboard and findings history, authorize this machine in your browser, choose a project,
+              and let the agent prepare an immutable findings-only request.
+            </p>
+            <pre><code>{`.venv/bin/heel cloud --origin https://YOUR_HEEL_DOMAIN login
+.venv/bin/heel cloud --origin https://YOUR_HEEL_DOMAIN projects`}</code></pre>
+            <p>
+              Your AI client can call <code>heel_sync_prepare</code>, then show you the preview and local
+              status. Raw OpenAPI and review context stay on this machine; only the exact minimized
+              findings envelope shown at approval is eligible to leave it.
+            </p>
+            <p>
+              To send, leave the AI surface and run the interactive command below in your own terminal.
+              Replace the references and digest with the values from the prepared record.
+            </p>
+            <pre><code>{`.venv/bin/heel cloud sync approve \\
+  --workspace WORKSPACE_REF \\
+  --project PROJECT_REF \\
+  --digest REQUEST_DIGEST`}</code></pre>
+            <p className="quickstart-note">
+              MCP cannot log in, approve, send, retry, refresh, or revoke. Those authority-bearing
+              actions remain human-only CLI or browser steps, and approval covers one exact digest for
+              a short window.
             </p>
           </article>
         </section>

@@ -21,6 +21,7 @@ const wheelName = "heel_browser-1.2.0-py3-none-any.whl";
 const agentWheelName = "heel_sim-1.2.0-py3-none-any.whl";
 const agentSourceName = "heel_sim-1.2.0.tar.gz";
 const agentManifestName = "heel-open-core-manifest.json";
+const edgeAuthSecret = "E".repeat(43);
 const expectedDownloadNames = [agentManifestName, agentWheelName, agentSourceName];
 const internalOriginHeader = "x-heel-internal-origin";
 const scannedTextExtensions = new Set([".css", ".html", ".js", ".json", ".mjs", ".txt"]);
@@ -1311,7 +1312,7 @@ test("recursively scans every deployed executable, text manifest, and wheel memb
     if (carriesReviewedHistoryPath) {
       assert.match(
         label,
-        /^(?:client|server\/ssr)\/assets\/ReviewWorkspace-[A-Za-z0-9_-]+\.js$/,
+        /^(?:client|server\/ssr)\/assets\/(?:ReviewWorkspace|heel-cloud-api)-[A-Za-z0-9_-]+\.js$/,
       );
       assert.match(record.text, /["'`]\/api\/control-plane["'`]/);
       assert.match(record.text, /\/v1\/workspaces\//);
@@ -1391,7 +1392,12 @@ test("serves the Agent acquisition page only from the canonical route", async ()
   assert.match(agentBody, /href="\/downloads\/heel_sim-1\.2\.0-py3-none-any\.whl"/);
   assert.match(agentBody, /href="\/downloads\/heel_sim-1\.2\.0\.tar\.gz"/);
   assert.match(agentBody, /href="\/downloads\/heel-open-core-manifest\.json"/);
-  assert.match(agentBody, /819162b16a0feb167b8299fd980e0545232301bda143f0e5e62d2850333fa0d6/);
+  const agentManifest = JSON.parse(
+    await readFile(join(downloadsRoot, agentManifestName), "utf8"),
+  );
+  const wheelDigest = agentManifest.artifacts.find(({ name }) => name === agentWheelName)?.sha256;
+  assert.equal(typeof wheelDigest, "string");
+  assert.ok(agentBody.includes(wheelDigest));
 
   const agentCsp = agent.headers.get("content-security-policy");
   assert.ok(agentCsp, "/agent must include a Content-Security-Policy");
@@ -1412,6 +1418,28 @@ test("serves the Agent acquisition page only from the canonical route", async ()
 });
 
 
+test("serves the device confirmation entry point with a no-approval initial state", async () => {
+  const artifact = await import(pathToFileURL(join(serverRoot, "index.js")).href + `?device-page=${Date.now()}`);
+  const environment = {
+    ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
+    IMAGES: { input: () => { throw new Error("image transform is not used for the device page"); } },
+    PUBLIC_ORIGIN: "https://heel.example",
+  };
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  const response = await artifact.default.fetch(
+    new Request("https://heel.example/device"), environment, context,
+  );
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(response.headers.get("x-frame-options"), "DENY");
+  assert.match(response.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  const html = await response.text();
+  assert.match(html, /Checking your request/);
+  assert.match(html, /has not approved anything yet/);
+  assert.doesNotMatch(html, /Approve this device/);
+});
+
+
 test("production worker exposes exact headers, request-URL metadata, and only the private control-plane binding", async () => {
   const [workerConfig, hostingConfig, socialCard] = await Promise.all([
     json(join(serverRoot, "wrangler.json")),
@@ -1422,7 +1450,7 @@ test("production worker exposes exact headers, request-URL metadata, and only th
   assert.match(hostingConfig.project_id, /^appgprj_[0-9a-f]{32}$/);
   assert.equal(hostingConfig.d1, null);
   assert.equal(hostingConfig.r2, null);
-  assert.deepEqual(workerConfig.vars, {});
+  assert.deepEqual(workerConfig.vars, { PUBLIC_ORIGIN: "https://heel.example" });
   assert.deepEqual(workerConfig.assets, { directory: "../client" });
   assert.deepEqual(workerConfig.observability, { enabled: false });
   assert.deepEqual(workerConfig.vpc_services, [{
@@ -1563,6 +1591,7 @@ test("production worker streams only the approved findings control-plane routes"
   const environment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
     CONTROL_PLANE: {
       async fetch(request) {
         calls.push({
@@ -1609,7 +1638,7 @@ test("production worker streams only the approved findings control-plane routes"
   for (const [index, [method, path]] of approvedRoutes.entries()) {
     const hasBody = method === "POST";
     const credentialHeaders = index % 2 === 0
-      ? { Cookie: "unrelated=discard-me; heel_session=private; preference=discard-me" }
+      ? { Cookie: "unrelated=discard-me; __Host-heel_session=private; preference=discard-me" }
       : { Authorization: "Bearer heel_sk_private" };
     const response = await artifact.default.fetch(
       new Request(`https://proxy.heel.invalid${path}`, {
@@ -1633,6 +1662,7 @@ test("production worker streams only the approved findings control-plane routes"
           "X-Forwarded-Proto": "http",
           "X-Forwarded-Server": "attacker.invalid",
           "X-Heel-Internal-Origin": "https://attacker.invalid",
+          "X-Heel-Edge-Auth": "attacker-supplied",
           "X-Private-Metadata": "must-not-cross",
           "X-Remove-Me": "connection-token-value",
           ...credentialHeaders,
@@ -1674,8 +1704,10 @@ test("production worker streams only the approved findings control-plane routes"
         ...(credentialHeaders.Authorization === undefined ? ["cookie"] : ["authorization"]),
         ...(hasBody ? ["content-encoding", "content-length", "content-type"] : []),
         ...(hasBody && path.endsWith("/findings-sync") ? ["idempotency-key"] : []),
+        "x-heel-edge-auth",
       ].sort(),
     );
+    assert.equal(call.headers["x-heel-edge-auth"], edgeAuthSecret);
     if (hasBody) {
       assert.equal(call.headers["content-type"], "application/json");
       assert.equal(call.headers["content-encoding"], "identity");
@@ -1712,7 +1744,7 @@ test("production worker streams only the approved findings control-plane routes"
   const query = await artifact.default.fetch(
     new Request(
       `https://proxy.heel.invalid/api/control-plane/v1/workspaces/${workspace}/projects?cursor=next`,
-      { headers: { Cookie: "heel_session=private" } },
+      { headers: { Cookie: "__Host-heel_session=private" } },
     ),
     environment,
     context,
@@ -1730,6 +1762,7 @@ test("production worker carries only Heel session cookies on the exact account r
   const environment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
     CONTROL_PLANE: {
       async fetch(request) {
         calls.push({
@@ -1762,9 +1795,10 @@ test("production worker carries only Heel session cookies on the exact account r
         method: "POST",
         body,
         headers: {
+          "CF-Connecting-IP": "203.0.113.42",
           "Content-Type": "application/json",
           "Content-Length": String(Buffer.byteLength(body)),
-          Cookie: "unrelated=discard; heel_session=stale-session",
+          Cookie: "unrelated=discard; __Host-heel_session=stale-session",
           "X-Customer-Metadata": "never-forward",
         },
       }),
@@ -1774,17 +1808,24 @@ test("production worker carries only Heel session cookies on the exact account r
     assert.equal(response.status, 200, path);
     assert.equal(
       response.headers.get("set-cookie"),
-      "heel_session=private; HttpOnly; SameSite=Lax; Path=/; Secure",
+      "__Host-heel_session=private; HttpOnly; SameSite=Lax; Path=/; Secure",
     );
     const call = calls.at(-1);
     assert.equal(call.url, `https://heel-control-plane.internal${path}`);
     assert.equal(call.headers.cookie, undefined, `${path} forwarded a stale session`);
     assert.equal(call.headers["x-customer-metadata"], undefined);
+    assert.equal(call.headers["x-heel-edge-auth"], edgeAuthSecret);
+    if (path === "/v1/signup") {
+      assert.match(call.headers["x-heel-client-key"] ?? "", /^[0-9a-f]{64}$/);
+      assert.notEqual(call.headers["x-heel-client-key"], "203.0.113.42");
+    } else {
+      assert.equal(call.headers["x-heel-client-key"], undefined);
+    }
   }
 
   const me = await artifact.default.fetch(
     new Request("https://proxy.heel.invalid/api/control-plane/v1/me", {
-      headers: { Cookie: "unrelated=discard; heel_session=private" },
+      headers: { Cookie: "unrelated=discard; __Host-heel_session=private" },
     }),
     environment,
     context,
@@ -1800,7 +1841,7 @@ test("production worker carries only Heel session cookies on the exact account r
       headers: {
         "Content-Type": "application/json",
         "Content-Length": String(Buffer.byteLength(logoutBody)),
-        Cookie: "heel_session=private; unrelated=discard",
+        Cookie: "__Host-heel_session=private; unrelated=discard",
       },
     }),
     environment,
@@ -1809,7 +1850,7 @@ test("production worker carries only Heel session cookies on the exact account r
   assert.equal(logout.status, 200);
   assert.equal(
     logout.headers.get("set-cookie"),
-    "heel_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure",
+    "__Host-heel_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure",
   );
   assert.equal(calls.at(-1).headers.cookie, "heel_session=private");
 
@@ -1849,6 +1890,137 @@ test("production worker carries only Heel session cookies on the exact account r
 });
 
 
+test("production worker exposes only the closed device ceremony and separates browser from machine authority", async () => {
+  const artifact = await import(
+    pathToFileURL(join(serverRoot, "index.js")).href + `?device-proxy=${Date.now()}`
+  );
+  const calls = [];
+  const environment = {
+    ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
+    IMAGES: { input: () => { throw new Error("image transform is not used by device auth"); } },
+    PUBLIC_ORIGIN: "https://proxy.heel.invalid",
+    CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
+    CONTROL_PLANE: {
+      async fetch(request) {
+        calls.push({
+          body: await request.text(),
+          headers: Object.fromEntries(request.headers),
+          method: request.method,
+          url: request.url,
+        });
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    },
+  };
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  const publicRoutes = ["start", "poll", "token", "refresh", "revoke"];
+  for (const route of publicRoutes) {
+    const body = JSON.stringify({ route });
+    const response = await artifact.default.fetch(
+      new Request(`https://proxy.heel.invalid/api/control-plane/v1/device/${route}`, {
+        method: "POST",
+        body,
+        headers: {
+          Authorization: `Bearer heel_at_${"a".repeat(43)}`,
+          Cookie: "__Host-heel_session=must-not-cross",
+          "Content-Type": "application/json",
+          "Content-Encoding": "identity",
+          "Content-Length": String(Buffer.byteLength(body)),
+          "CF-Connecting-IP": "203.0.113.9",
+          Forwarded: "for=attacker.invalid",
+          "X-Heel-Internal-Origin": "https://attacker.invalid",
+        },
+      }),
+      environment,
+      context,
+    );
+    assert.equal(response.status, 200, route);
+    const call = calls.at(-1);
+    assert.equal(call.url, `https://heel-control-plane.internal/v1/device/${route}`);
+    assert.deepEqual(Object.keys(call.headers).sort(), [
+      "content-encoding", "content-length", "content-type",
+      ...(route === "start" ? ["x-heel-client-key"] : []),
+      "x-heel-edge-auth",
+    ].sort());
+    assert.equal(call.headers["x-heel-edge-auth"], edgeAuthSecret);
+    if (route === "start") assert.match(call.headers["x-heel-client-key"], /^[0-9a-f]{64}$/);
+    assert.equal(call.body, body);
+  }
+
+  const verifyBody = JSON.stringify({ action: "inspect" });
+  const verify = await artifact.default.fetch(
+    new Request("https://proxy.heel.invalid/api/control-plane/v1/device/verify", {
+      method: "POST",
+      body: verifyBody,
+      headers: {
+        Cookie: "unrelated=discard; __Host-heel_session=private-session",
+        Origin: "https://proxy.heel.invalid",
+        "Sec-Fetch-Site": "same-origin",
+        "Content-Type": "application/json",
+        "Content-Length": String(Buffer.byteLength(verifyBody)),
+        "X-Heel-Internal-Origin": "https://attacker.invalid",
+      },
+    }),
+    environment,
+    context,
+  );
+  assert.equal(verify.status, 200);
+  assert.deepEqual(calls.at(-1).headers, {
+    "content-encoding": "identity",
+    "content-length": String(Buffer.byteLength(verifyBody)),
+    "content-type": "application/json",
+    cookie: "heel_session=private-session",
+    origin: "https://proxy.heel.invalid",
+    "x-heel-edge-auth": edgeAuthSecret,
+    "x-heel-internal-origin": "same-origin",
+  });
+
+  const beforeCrossSite = calls.length;
+  const crossSite = await artifact.default.fetch(
+    new Request("https://proxy.heel.invalid/api/control-plane/v1/device/verify", {
+      method: "POST",
+      body: verifyBody,
+      headers: {
+        Cookie: "__Host-heel_session=private-session",
+        Origin: "https://attacker.invalid",
+        "Sec-Fetch-Site": "cross-site",
+        "Content-Type": "application/json",
+        "Content-Length": String(Buffer.byteLength(verifyBody)),
+      },
+    }),
+    environment,
+    context,
+  );
+  assert.equal(crossSite.status, 400);
+  assert.equal(calls.length, beforeCrossSite);
+
+  const workspace = "ws_0123456789abcdef";
+  const machine = await artifact.default.fetch(
+    new Request(`https://proxy.heel.invalid/api/control-plane/v1/workspaces/${workspace}/projects`, {
+      headers: { Authorization: `Bearer heel_at_${"b".repeat(43)}` },
+    }),
+    environment,
+    context,
+  );
+  assert.equal(machine.status, 200);
+  assert.equal(calls.at(-1).headers.authorization, `Bearer heel_at_${"b".repeat(43)}`);
+  assert.equal(calls.at(-1).headers.cookie, undefined);
+
+  const forbidden = await artifact.default.fetch(
+    new Request("https://proxy.heel.invalid/api/control-plane/v1/device/admin", {
+      method: "POST",
+      body: "{}",
+      headers: { "Content-Type": "application/json", "Content-Length": "2" },
+    }),
+    environment,
+    context,
+  );
+  assert.equal(forbidden.status, 404);
+});
+
+
 test("findings proxy preserves request and response streaming across the private binding", async () => {
   const artifact = await import(
     pathToFileURL(join(serverRoot, "index.js")).href + `?findings-stream=${Date.now()}`
@@ -1885,6 +2057,7 @@ test("findings proxy preserves request and response streaming across the private
   const environment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
     CONTROL_PLANE: {
       async fetch(request) {
         const reader = request.body.getReader();
@@ -1908,7 +2081,7 @@ test("findings proxy preserves request and response streaming across the private
           "Content-Type": "application/json",
           "Content-Length": String(firstRequestChunk.byteLength + secondRequestChunk.byteLength),
           "Idempotency-Key": `fs1-${"d".repeat(64)}`,
-          Cookie: "heel_session=private",
+          Cookie: "__Host-heel_session=private",
         },
       },
     ),
@@ -1962,6 +2135,7 @@ test("findings proxy fails closed and leaves anonymous review traffic without a 
   const baseEnvironment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
   };
   const context = { waitUntil() {}, passThroughOnException() {} };
 
@@ -1973,7 +2147,7 @@ test("findings proxy fails closed and leaves anonymous review traffic without a 
         "Content-Type": "application/json",
         "Content-Length": String(Buffer.byteLength(marker)),
         "Idempotency-Key": `fs1-${"e".repeat(64)}`,
-        Cookie: "heel_session=private",
+        Cookie: "__Host-heel_session=private",
       },
     }),
     baseEnvironment,
@@ -2001,7 +2175,7 @@ test("findings proxy fails closed and leaves anonymous review traffic without a 
         "Content-Type": "application/json",
         "Content-Length": String(Buffer.byteLength(marker)),
         "Idempotency-Key": `fs1-${"e".repeat(64)}`,
-        Cookie: "heel_session=private",
+        Cookie: "__Host-heel_session=private",
       },
     }),
     failingEnvironment,
@@ -2012,19 +2186,19 @@ test("findings proxy fails closed and leaves anonymous review traffic without a 
   assert.equal(bindingCalls, 1);
 
   for (const headers of [
-    { "Content-Type": "application/json", Cookie: "heel_session=private" },
+    { "Content-Type": "application/json", Cookie: "__Host-heel_session=private" },
     {
       "Content-Type": "application/json",
       "Content-Length": String(Buffer.byteLength(marker)),
       "Idempotency-Key": `fs1-${"e".repeat(64)}`,
       Authorization: "Bearer heel_sk_private",
-      Cookie: "heel_session=private",
+      Cookie: "__Host-heel_session=private",
     },
     {
       "Content-Type": "application/json",
       "Content-Length": "02",
       "Idempotency-Key": `fs1-${"e".repeat(64)}`,
-      Cookie: "heel_session=private",
+      Cookie: "__Host-heel_session=private",
     },
   ]) {
     const rejected = await artifact.default.fetch(

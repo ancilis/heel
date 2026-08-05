@@ -113,17 +113,27 @@ class ControlPlaneStore:
         self.conn.executescript(_SCHEMA)
 
     # --- orgs / workspaces ---
-    def create_org(self, name: str) -> str:
+    def create_org(self, name: str, *, commit: bool = True) -> str:
         oid = _id("org")
         self.conn.execute("INSERT INTO orgs VALUES(?,?,?)", (oid, name, _now()))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return oid
 
-    def create_workspace(self, org_id: str, name: str, plan_id: str, catalog_version: str) -> str:
+    def create_workspace(
+        self,
+        org_id: str,
+        name: str,
+        plan_id: str,
+        catalog_version: str,
+        *,
+        commit: bool = True,
+    ) -> str:
         wid = _id("ws")
         self.conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
                           (wid, org_id, name, plan_id, catalog_version, _now()))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return wid
 
     def get_workspace(self, workspace_id: str):
@@ -136,17 +146,26 @@ class ControlPlaneStore:
         self.conn.commit()
 
     # --- users / memberships ---
-    def create_user(self, email: str) -> str:
+    def create_user(self, email: str, *, commit: bool = True) -> str:
         uid = _id("usr")
         self.conn.execute("INSERT INTO users VALUES(?,?,?)", (uid, email.lower(), _now()))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return uid
 
-    def add_member(self, workspace_id: str, user_id: str, role: Role) -> None:
+    def add_member(
+        self,
+        workspace_id: str,
+        user_id: str,
+        role: Role,
+        *,
+        commit: bool = True,
+    ) -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO memberships VALUES(?,?,?,?)",
             (workspace_id, user_id, role.value, _now()))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def get_role(self, workspace_id: str, user_id: str) -> Role | None:
         row = self.conn.execute(

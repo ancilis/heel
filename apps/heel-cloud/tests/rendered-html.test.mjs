@@ -164,6 +164,10 @@ test("ships server-renderable evidence, local interaction semantics, and accessi
   assert.match(agentPage, /\/absolute\/path\/to\/download-folder\/\.venv\/bin\/heel-mcp/);
   assert.match(agentPage, /mcpServers/);
   assert.match(agentPage, /HEEL_HOME/);
+  assert.match(agentPage, /HEEL_CLOUD_ORIGIN/);
+  assert.match(agentPage, /heel_sync_prepare/);
+  assert.match(agentPage, /heel cloud sync approve/);
+  assert.match(agentPage, /MCP cannot log in, approve, send, retry, refresh, or revoke/i);
   assert.match(agentPage, /PyPI publication is not yet available/i);
   assert.match(agentPage, /credentials or customer data/i);
   assert.match(agentPage, /AI client is separate/i);

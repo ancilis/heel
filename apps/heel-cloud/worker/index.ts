@@ -19,6 +19,8 @@ declare class FixedLengthStream extends TransformStream<Uint8Array, Uint8Array> 
 interface Env {
   ASSETS: AssetFetcher;
   CONTROL_PLANE?: PrivateControlPlaneFetcher;
+  CONTROL_PLANE_EDGE_SECRET?: string;
+  PUBLIC_ORIGIN?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -49,6 +51,19 @@ const SIGNUP_ROUTE = "/v1/signup";
 const LOGIN_ROUTE = "/v1/login";
 const LOGOUT_ROUTE = "/v1/logout";
 const ME_ROUTE = "/v1/me";
+const DEVICE_START_ROUTE = "/v1/device/start";
+const DEVICE_VERIFY_ROUTE = "/v1/device/verify";
+const DEVICE_POLL_ROUTE = "/v1/device/poll";
+const DEVICE_TOKEN_ROUTE = "/v1/device/token";
+const DEVICE_REFRESH_ROUTE = "/v1/device/refresh";
+const DEVICE_REVOKE_ROUTE = "/v1/device/revoke";
+const PUBLIC_DEVICE_ROUTES = new Set([
+  DEVICE_START_ROUTE,
+  DEVICE_POLL_ROUTE,
+  DEVICE_TOKEN_ROUTE,
+  DEVICE_REFRESH_ROUTE,
+  DEVICE_REVOKE_ROUTE,
+]);
 const WORKSPACE_REF = "ws_[0-9a-f]{16}";
 const PROJECT_REF = "prj_[0-9a-f]{32}";
 const SYNCED_REVIEW_REF = "synrev_[0-9a-f]{32}";
@@ -69,7 +84,9 @@ const REVIEW_DETAIL_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/reviews/${SYNCED_REVIEW_REF}$`,
 );
 const MAX_CONTROL_PLANE_BODY_BYTES = 256 * 1024;
+const MAX_DEVICE_BODY_BYTES = 8 * 1024;
 const API_KEY_AUTHORIZATION = /^Bearer heel_sk_[A-Za-z0-9_-]+$/;
+const DEVICE_AUTHORIZATION = /^Bearer heel_at_[A-Za-z0-9_-]{43}$/;
 const SESSION_TOKEN = /^[A-Za-z0-9_-]+$/;
 const IDEMPOTENCY_KEY = /^fs1-[0-9a-f]{64}$/;
 
@@ -106,7 +123,11 @@ class InvalidControlPlaneRequest extends Error {}
 function controlPlaneCredentials(source: Headers): Headers {
   const headers = new Headers();
   const authorization = source.get("Authorization")?.trim() ?? "";
-  if (authorization !== "" && !API_KEY_AUTHORIZATION.test(authorization)) {
+  if (
+    authorization !== ""
+    && !API_KEY_AUTHORIZATION.test(authorization)
+    && !DEVICE_AUTHORIZATION.test(authorization)
+  ) {
     throw new InvalidControlPlaneRequest();
   }
   const sessions = (source.get("Cookie") ?? "")
@@ -118,7 +139,7 @@ function controlPlaneCredentials(source: Headers): Headers {
         ? { name: candidate, value: "" }
         : { name: candidate.slice(0, separator), value: candidate.slice(separator + 1) };
     })
-    .filter(({ name, value }) => name === "heel_session" && value !== "")
+    .filter(({ name, value }) => name === "__Host-heel_session" && value !== "")
     .map(({ value }) => value);
   if (
     sessions.length > 1
@@ -134,10 +155,47 @@ function controlPlaneRequestHeaders(
   source: Headers,
   method: string,
   upstreamPath: string,
+  configuredPublicOrigin: string | undefined,
+  edgeClientKey: string | undefined,
+  edgeAuthSecret: string,
 ): { headers: Headers; contentLength: number } {
-  const headers = upstreamPath === SIGNUP_ROUTE || upstreamPath === LOGIN_ROUTE
-    ? new Headers()
-    : controlPlaneCredentials(source);
+  let headers: Headers;
+  if (
+    upstreamPath === SIGNUP_ROUTE
+    || upstreamPath === LOGIN_ROUTE
+    || PUBLIC_DEVICE_ROUTES.has(upstreamPath)
+  ) {
+    // Anonymous endpoints never receive ambient browser or machine credentials.
+    headers = new Headers();
+  } else if (upstreamPath === DEVICE_VERIFY_ROUTE) {
+    const origin = source.get("Origin") ?? "";
+    const fetchSite = source.get("Sec-Fetch-Site") ?? "";
+    let expectedOrigin = "";
+    try {
+      const parsed = new URL(configuredPublicOrigin ?? "");
+      if (
+        configuredPublicOrigin !== parsed.origin
+        || (parsed.protocol !== "https:" && parsed.hostname !== "127.0.0.1" && parsed.hostname !== "localhost")
+      ) throw new Error("invalid public origin");
+      expectedOrigin = parsed.origin;
+    } catch {
+      throw new InvalidControlPlaneRequest();
+    }
+    if (origin !== expectedOrigin || fetchSite !== "same-origin") {
+      throw new InvalidControlPlaneRequest();
+    }
+    headers = controlPlaneCredentials(source);
+    if (!headers.has("Cookie") || headers.has("Authorization")) {
+      throw new InvalidControlPlaneRequest();
+    }
+    // Derived by the edge after the browser-origin and credential checks above. Caller input
+    // with this name is never copied because every upstream header is allowlisted from scratch.
+    headers.set("X-Heel-Internal-Origin", "same-origin");
+    headers.set("Origin", expectedOrigin);
+  } else {
+    headers = controlPlaneCredentials(source);
+  }
+  headers.set("X-Heel-Edge-Auth", edgeAuthSecret);
   if (method !== "POST") return { headers, contentLength: 0 };
   if (source.has("Transfer-Encoding")) throw new InvalidControlPlaneRequest();
 
@@ -152,13 +210,22 @@ function controlPlaneRequestHeaders(
     throw new InvalidControlPlaneRequest();
   }
   const contentLength = Number(declaredLength);
-  if (!Number.isSafeInteger(contentLength) || contentLength > MAX_CONTROL_PLANE_BODY_BYTES) {
+  const maximum = upstreamPath.startsWith("/v1/device/")
+    ? MAX_DEVICE_BODY_BYTES
+    : MAX_CONTROL_PLANE_BODY_BYTES;
+  if (!Number.isSafeInteger(contentLength) || contentLength > maximum) {
     throw new InvalidControlPlaneRequest();
   }
 
   headers.set("Content-Type", "application/json");
   headers.set("Content-Encoding", "identity");
   headers.set("Content-Length", declaredLength);
+  if (upstreamPath === DEVICE_START_ROUTE || upstreamPath === SIGNUP_ROUTE) {
+    if (edgeClientKey === undefined || !/^[0-9a-f]{64}$/.test(edgeClientKey)) {
+      throw new InvalidControlPlaneRequest();
+    }
+    headers.set("X-Heel-Client-Key", edgeClientKey);
+  }
   if (FINDINGS_SYNC_ROUTE.test(upstreamPath)) {
     const idempotencyKey = source.get("Idempotency-Key")?.trim() ?? "";
     if (!IDEMPOTENCY_KEY.test(idempotencyKey)) throw new InvalidControlPlaneRequest();
@@ -182,7 +249,7 @@ function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""
       if (match === undefined || match === null) throw new Error("invalid session response");
       headers.set(
         "Set-Cookie",
-        `heel_session=${match[1]}; HttpOnly; SameSite=Lax; Path=/; Secure`,
+        `__Host-heel_session=${match[1]}; HttpOnly; SameSite=Lax; Path=/; Secure`,
       );
     } else if (upstreamPath === LOGOUT_ROUTE) {
       if (setCookie !== "heel_session=; Max-Age=0; Path=/") {
@@ -190,7 +257,7 @@ function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""
       }
       headers.set(
         "Set-Cookie",
-        "heel_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure",
+        "__Host-heel_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure",
       );
     }
   }
@@ -216,6 +283,10 @@ function controlPlaneRoute(method: string, pathname: string): string | null {
   if ((upstreamPath === SIGNUP_ROUTE || upstreamPath === LOGIN_ROUTE || upstreamPath === LOGOUT_ROUTE)
     && method === "POST") return upstreamPath;
   if (upstreamPath === ME_ROUTE && method === "GET") return upstreamPath;
+  if (
+    (PUBLIC_DEVICE_ROUTES.has(upstreamPath) || upstreamPath === DEVICE_VERIFY_ROUTE)
+    && method === "POST"
+  ) return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
   }
@@ -236,9 +307,47 @@ async function proxyControlPlane(
   if (env.CONTROL_PLANE === undefined) {
     return proxyError(503, "control plane unavailable", csp);
   }
+  const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET?.trim() ?? "";
+  if (!/^[A-Za-z0-9_-]{43,86}$/.test(edgeAuthSecret)) {
+    return proxyError(503, "control plane unavailable", csp);
+  }
+  let edgeClientKey: string | undefined;
+  if (upstreamPath === DEVICE_START_ROUTE || upstreamPath === SIGNUP_ROUTE) {
+    const requestUrl = new URL(request.url);
+    let clientAddress = request.headers.get("CF-Connecting-IP")?.trim() ?? "";
+    if (
+      clientAddress === ""
+      && (requestUrl.hostname === "127.0.0.1" || requestUrl.hostname === "localhost")
+    ) clientAddress = "127.0.0.1";
+    if (!/^[0-9A-Fa-f:.]{2,64}$/.test(clientAddress)) {
+      return proxyError(400, "invalid control plane request", csp);
+    }
+    const rateLimitKey = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(edgeAuthSecret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const digest = await crypto.subtle.sign(
+      "HMAC",
+      rateLimitKey,
+      new TextEncoder().encode(`heel-client-rate-limit\0${upstreamPath}\0${clientAddress}`),
+    );
+    edgeClientKey = Array.from(new Uint8Array(digest), (byte) =>
+      byte.toString(16).padStart(2, "0")
+    ).join("");
+  }
   let requestContract;
   try {
-    requestContract = controlPlaneRequestHeaders(request.headers, request.method, upstreamPath);
+    requestContract = controlPlaneRequestHeaders(
+      request.headers,
+      request.method,
+      upstreamPath,
+      env.PUBLIC_ORIGIN,
+      edgeClientKey,
+      edgeAuthSecret,
+    );
   } catch (error) {
     if (error instanceof InvalidControlPlaneRequest) {
       return proxyError(400, "invalid control plane request", csp);
@@ -315,7 +424,11 @@ const worker = {
       return withSecurityHeaders(response, csp);
     }
 
-    return withSecurityHeaders(await handler.fetch(securedRequest, env, ctx), csp);
+    return withSecurityHeaders(
+      await handler.fetch(securedRequest, env, ctx),
+      csp,
+      url.pathname === "/device",
+    );
   },
 };
 

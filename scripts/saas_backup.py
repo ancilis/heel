@@ -32,27 +32,35 @@ def backup(live: str, dest: str) -> int:
 
 
 def verify(path: str) -> int:
-    from heel.saas.ledger import UsageLedger
-    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, read_current_version
     from heel.saas.reconcile import reconcile
 
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-        print("FAIL: integrity_check")
-        return 1
-    # A restored copy is a scratch instance (runbook): bring schema current, then require clean.
-    applied = Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
-    if applied:
-        print(f"note: applied migrations {applied} on the restored copy")
-    rep = reconcile(conn, UsageLedger(conn))
-    if not rep.clean:
-        print(f"FAIL: reconcile not clean: mismatches={rep.plan_mismatches} "
-              f"unknown={rep.unknown_subscription_workspaces} "
-              f"dangling={rep.dangling_reservations}")
-        return 1
-    print("VERIFY PASS: integrity ok, schema current, reconcile clean")
-    return 0
+    try:
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            print("FAIL: integrity_check")
+            return 1
+        current = read_current_version(conn)
+        target = CONTROL_PLANE_MIGRATIONS[-1].version
+        if current != target:
+            print(f"FAIL: schema pending: current={current} target={target}")
+            return 1
+
+        class _ReadOnlyLedger:
+            def refund(self, _reservation_id):
+                raise RuntimeError("restore verification never repairs")
+
+        rep = reconcile(conn, _ReadOnlyLedger())
+        if not rep.clean:
+            print(f"FAIL: reconcile not clean: mismatches={rep.plan_mismatches} "
+                  f"unknown={rep.unknown_subscription_workspaces} "
+                  f"dangling={rep.dangling_reservations}")
+            return 1
+        print("VERIFY PASS: integrity ok, schema current, reconcile clean")
+        return 0
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

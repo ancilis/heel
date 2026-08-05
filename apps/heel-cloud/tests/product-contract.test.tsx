@@ -190,6 +190,16 @@ describe("Heel anonymous launch review", () => {
     expect(section?.textContent).toMatch(/no account or package registry is required/i);
   });
 
+  test("markets a usable free launch without pretending paid checkout exists", () => {
+    render(<Home />);
+
+    expect(screen.getByText(/free early access now/i)).toBeTruthy();
+    expect(screen.getAllByText(/coming soon/i)).toHaveLength(2);
+    expect(document.body.textContent).toContain("$49/month");
+    expect(document.body.textContent).toContain("$199/month");
+    expect(document.body.textContent).toMatch(/no payment is accepted/i);
+  });
+
   test("offers the verified Agent artifacts and exact local install command", () => {
     render(<McpQuickstart />);
 
@@ -233,6 +243,18 @@ describe("Heel anonymous launch review", () => {
       /scope creation is an out-of-band cli action; do not grant agent-controlled shells access to that cli, heel_home, or the signing key/i,
     )).toBeTruthy();
     expect(document.body.textContent).not.toMatch(/an agent cannot create, widen, or relax one/i);
+  });
+
+  test("makes optional findings continuity usable without giving the agent human authority", () => {
+    render(<McpQuickstart />);
+
+    expect(screen.getByText(/local first · optional cloud continuity/i)).toBeTruthy();
+    expect(document.body.textContent).toContain("HEEL_CLOUD_ORIGIN");
+    expect(document.body.textContent).toContain("heel cloud --origin https://YOUR_HEEL_DOMAIN login");
+    expect(document.body.textContent).toContain("heel_sync_prepare");
+    expect(document.body.textContent).toContain("heel cloud sync approve");
+    expect(screen.getByText(/mcp cannot log in, approve, send, retry, refresh, or revoke/i)).toBeTruthy();
+    expect(screen.getByText(/raw openapi and review context stay on this machine/i)).toBeTruthy();
   });
 
   test("shows source bytes and rejects oversize input before worker messaging", async () => {

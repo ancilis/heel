@@ -34,7 +34,7 @@ export default function Home() {
 
       <section className="availability" id="availability" aria-labelledby="availability-title">
         <p className="eyebrow">Start local · add continuity when useful</p>
-        <h2 id="availability-title">Useful before signup. Predictable after.</h2>
+        <h2 id="availability-title">Free early access now. Paid teams next.</h2>
         <div className="price-grid">
           <article>
             <strong>Free</strong>
@@ -43,15 +43,18 @@ export default function Home() {
           </article>
           <article>
             <strong>Pro</strong>
-            <span>$49/month</span>
+            <span>Coming soon · $49/month</span>
             <p>25 synced reviews, 3 seats, exports, and email support.</p>
           </article>
           <article>
             <strong>Team</strong>
-            <span>$199/month</span>
+            <span>Coming soon · $199/month</span>
             <p>100 synced reviews, 10 seats, role controls, and priority support.</p>
           </article>
         </div>
+        <p className="quickstart-note">
+          Free early access is usable today. No payment is accepted until live billing is ready.
+        </p>
       </section>
     </main>
   );

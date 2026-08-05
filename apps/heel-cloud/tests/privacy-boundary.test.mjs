@@ -283,6 +283,10 @@ function analyzeSource(fileName, text) {
   if ((upstreamPath === SIGNUP_ROUTE || upstreamPath === LOGIN_ROUTE || upstreamPath === LOGOUT_ROUTE)
     && method === "POST") return upstreamPath;
   if (upstreamPath === ME_ROUTE && method === "GET") return upstreamPath;
+  if (
+    (PUBLIC_DEVICE_ROUTES.has(upstreamPath) || upstreamPath === DEVICE_VERIFY_ROUTE)
+    && method === "POST"
+  ) return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
   }
@@ -303,6 +307,19 @@ function analyzeSource(fileName, text) {
       'const LOGIN_ROUTE = "/v1/login";',
       'const LOGOUT_ROUTE = "/v1/logout";',
       'const ME_ROUTE = "/v1/me";',
+      'const DEVICE_START_ROUTE = "/v1/device/start";',
+      'const DEVICE_VERIFY_ROUTE = "/v1/device/verify";',
+      'const DEVICE_POLL_ROUTE = "/v1/device/poll";',
+      'const DEVICE_TOKEN_ROUTE = "/v1/device/token";',
+      'const DEVICE_REFRESH_ROUTE = "/v1/device/refresh";',
+      'const DEVICE_REVOKE_ROUTE = "/v1/device/revoke";',
+      `const PUBLIC_DEVICE_ROUTES = new Set([
+  DEVICE_START_ROUTE,
+  DEVICE_POLL_ROUTE,
+  DEVICE_TOKEN_ROUTE,
+  DEVICE_REFRESH_ROUTE,
+  DEVICE_REVOKE_ROUTE,
+]);`,
       'const WORKSPACE_REF = "ws_[0-9a-f]{16}";',
       'const PROJECT_REF = "prj_[0-9a-f]{32}";',
       'const SYNCED_REVIEW_REF = "synrev_[0-9a-f]{32}";',
@@ -311,8 +328,8 @@ function analyzeSource(fileName, text) {
       'redirect: "manual",',
       "request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength))",
       "if (response.status >= 300 && response.status <= 399)",
-      '`heel_session=${match[1]}; HttpOnly; SameSite=Lax; Path=/; Secure`',
-      '"heel_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure"',
+      '`__Host-heel_session=${match[1]}; HttpOnly; SameSite=Lax; Path=/; Secure`',
+      '"__Host-heel_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure"',
       'if (requestUrl.search !== "") return proxyError(400, "invalid control plane request", csp);',
       'if (upstreamPath === "") return proxyError(404, "not found", csp);',
       "return proxyControlPlane(request, env, csp, upstreamPath);",

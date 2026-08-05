@@ -78,14 +78,15 @@ class AuthStore:
                                   else int(env.get("HEEL_SIGNUP_MAX_GLOBAL", SIGNUP_MAX_GLOBAL)))
 
     # --- passwords ---
-    def set_password(self, user_id: str, password: str) -> None:
+    def set_password(self, user_id: str, password: str, *, commit: bool = True) -> None:
         if len(password) < 10:
             raise ValueError("password must be at least 10 characters")
         salt = secrets.token_bytes(16)
         self.conn.execute(
             "INSERT OR REPLACE INTO credentials VALUES(?,?,?,?,?)",
             (user_id, salt.hex(), hash_password(password, salt), PBKDF2_ITERATIONS, _now()))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def verify_password(self, user_id: str, password: str) -> bool:
         row = self.conn.execute(
@@ -151,13 +152,14 @@ class AuthStore:
             raise
 
     # --- sessions ---
-    def create_session(self, user_id: str) -> Session:
+    def create_session(self, user_id: str, *, commit: bool = True) -> Session:
         token = f"heel_ses_{secrets.token_urlsafe(32)}"
         sid = f"ses_{secrets.token_hex(8)}"
         now = _now()
         self.conn.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?)",
                           (sid, user_id, hash_api_key(token), now, now, None))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return Session(sid, user_id, token)
 
     def resolve_session(self, token: str) -> str | None:

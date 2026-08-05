@@ -9,8 +9,11 @@ import argparse
 import getpass
 import json
 import os
+import platform
 import stat
 import sys
+import time
+import webbrowser
 
 from . import __version__
 from . import scope as scopemod
@@ -28,6 +31,7 @@ from .store import Store
 _SAFE_REVIEW_FAILURE = (
     "Heel OpenAPI review failed: input could not be read or reviewed safely."
 )
+_SAFE_CLOUD_FAILURE = "Heel Cloud could not complete the request safely."
 _OPENAPI_READ_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
@@ -101,6 +105,320 @@ def _review_openapi_file(path: str, *, as_json: bool) -> int:
         return 2
 
     sys.stdout.write(rendered)
+    return 0
+
+
+def _cloud_services(origin: str):
+    """Construct the one-origin machine continuity boundary lazily."""
+    from .cloud_auth import CredentialStore
+    from .cloud_client import CloudClient
+    from .local_projects import LocalProjectStore
+    from .sync_queue import SyncQueue
+
+    store = CredentialStore(origin)
+    return CloudClient(origin, store), SyncQueue(), LocalProjectStore()
+
+
+def _cloud_login(client, *, device_name: str | None = None, open_browser: bool = True) -> int:
+    from .cloud_client import CloudClientError
+
+    selected_name = (device_name or platform.node() or "Heel device").strip()[:64]
+    try:
+        login = client.start_device_login(selected_name)
+        print(f"Open {login.verification_uri}")
+        print(f"Enter code: {login.user_code}")
+        print("Heel will receive findings-sync access only after you approve in the browser.")
+        if open_browser:
+            try:
+                webbrowser.open(login.verification_uri, new=2)
+            except Exception:
+                pass
+        deadline = time.monotonic() + login.expires_in
+        interval = login.interval
+        while time.monotonic() < deadline:
+            time.sleep(interval)
+            try:
+                poll = client.poll_device_login(login)
+            except CloudClientError as error:
+                if error.code == "slow_down" and error.interval is not None:
+                    interval = error.interval
+                    continue
+                raise
+            if poll.status == "pending":
+                interval = poll.interval or interval
+                continue
+            if poll.status != "approved":
+                print(f"Device authorization {poll.status}.", file=sys.stderr)
+                return 2
+            exchange = client.exchange_device_login(login)
+            print(json.dumps({
+                "authenticated": True,
+                "workspace_ref": exchange.workspace_id,
+                "capabilities": list(exchange.capabilities),
+            }, indent=2))
+            return 0
+        print("Device authorization expired.", file=sys.stderr)
+        return 2
+    except CloudClientError as error:
+        print(f"{_SAFE_CLOUD_FAILURE} ({error.code})", file=sys.stderr)
+        return 1
+
+
+def _cloud_status(client) -> int:
+    from .cloud_client import CloudClientError
+
+    try:
+        status = client.account_status()
+    except CloudClientError as error:
+        if error.code == "auth_required":
+            print(json.dumps({"authenticated": False}, indent=2))
+            return 1
+        print(f"{_SAFE_CLOUD_FAILURE} ({error.code})", file=sys.stderr)
+        return 1
+    print(json.dumps({
+        "authenticated": True,
+        "device_id": status.device_id,
+        "workspace_ref": status.workspace_ref,
+        "role": status.role,
+        "capabilities": list(status.capabilities),
+    }, indent=2))
+    return 0
+
+
+def _cloud_projects(client, workspace_ref: str | None) -> int:
+    from .cloud_client import CloudClientError
+
+    try:
+        workspace = workspace_ref or client.account_status().workspace_ref
+        projects = client.list_projects(workspace)
+    except CloudClientError as error:
+        print(f"{_SAFE_CLOUD_FAILURE} ({error.code})", file=sys.stderr)
+        return 1
+    print(json.dumps({"workspace_ref": workspace, "projects": [
+        {
+            "project_ref": project.project_ref,
+            "name": project.name,
+            "created_by": project.created_by,
+            "created_at": project.created_at,
+        }
+        for project in projects
+    ]}, indent=2))
+    return 0
+
+
+def _cloud_sync_prepare(
+    client, queue, projects, review_id: str, workspace_ref: str, project_ref: str
+) -> int:
+    from .findings_sync import project_findings_sync
+    from .review_contract import validate_review_envelope
+
+    try:
+        review = projects.get_review(review_id)
+        if review is None:
+            raise ValueError("review not found")
+        review = validate_review_envelope(review)
+        namespace_key = client.namespace_key(workspace_ref, project_ref)
+        request = project_findings_sync(review, project_ref, namespace_key)
+        record = queue.prepare(request, namespace_key, workspace_ref)
+    except Exception:
+        print(_SAFE_CLOUD_FAILURE, file=sys.stderr)
+        return 1
+    print(json.dumps({
+        "state": "prepared",
+        "workspace_ref": record.workspace_ref,
+        "project_ref": record.project_ref,
+        "request_digest": record.request_digest,
+        "request": request,
+        "privacy": "source documents and local review context stay on this machine",
+        "next": (
+            "Run heel cloud sync approve --workspace <workspace> --project <project> "
+            f"--digest {record.request_digest} in an interactive terminal."
+        ),
+    }, indent=2))
+    return 0
+
+
+def _schedule_cloud_retry(queue, lease, error_code: str) -> None:
+    code = (
+        "approval_expired"
+        if error_code == "approval_expired"
+        else "transport_error"
+        if error_code in {"unavailable", "temporarily_unavailable", "rate_limited"}
+        else "server_rejected"
+    )
+    try:
+        queue.schedule_retry(lease, time.time() + 30, code)
+    except Exception:
+        pass
+
+
+def _cloud_sync_send(client, queue, lease) -> int:
+    from .cloud_client import CloudClientError
+
+    record = lease.record
+    active_authority = lease
+    if (
+        record.human_approval is None
+        or record.human_approval.expires_at <= time.time()
+    ):
+        print("The local approval expired; run the interactive approve command again.", file=sys.stderr)
+        return 2
+    try:
+        approval = client.approve_findings(
+            record.workspace_ref, record.project_ref, record.request_digest
+        )
+        bound = queue.bind_transport_approval(lease, approval)
+        if bound is None:
+            raise RuntimeError("sync lease was lost")
+        active_authority = bound
+        namespace_key = client.namespace_key(record.workspace_ref, record.project_ref)
+        renewed = queue.renew(bound)
+        if renewed is None:
+            raise RuntimeError("sync lease was lost")
+        active_authority = renewed
+        if renewed.record.human_approval.expires_at <= time.time():
+            print(
+                "The local approval expired; run the interactive approve command again.",
+                file=sys.stderr,
+            )
+            return 2
+        permit = queue.begin_transmission(renewed)
+        if permit is None:
+            raise RuntimeError("sync transmission authority was lost")
+        active_authority = permit
+        receipt = client.sync_findings(permit, namespace_key)
+        if not queue.complete(permit, receipt):
+            raise RuntimeError("sync lease was lost")
+    except CloudClientError as error:
+        _schedule_cloud_retry(queue, active_authority, error.code)
+        print(f"{_SAFE_CLOUD_FAILURE} ({error.code})", file=sys.stderr)
+        return 1
+    except Exception:
+        _schedule_cloud_retry(queue, active_authority, "unavailable")
+        print(_SAFE_CLOUD_FAILURE, file=sys.stderr)
+        return 1
+    print(json.dumps({
+        "state": "synced",
+        "workspace_ref": record.workspace_ref,
+        "project_ref": record.project_ref,
+        "request_digest": record.request_digest,
+        "receipt": receipt,
+    }, indent=2))
+    return 0
+
+
+def _cloud_sync_approve(
+    client, queue, workspace_ref: str, project_ref: str, request_digest: str
+) -> int:
+    from .sync_queue import HumanSyncApproval
+
+    record = queue.get(workspace_ref, project_ref, request_digest)
+    if record is None:
+        print("Prepared findings sync was not found.", file=sys.stderr)
+        return 1
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("Interactive terminal input and output are required for sync approval.", file=sys.stderr)
+        return 2
+    print("Heel will send exactly this canonical findings-only JSON:")
+    print(record.request_json)
+    print(f"Cloud origin: {client.cloud_base_url}")
+    print(f"Workspace: {record.workspace_ref}")
+    print(f"Project: {record.project_ref}")
+    print(f"SHA-256 digest: {record.request_digest}")
+    print(
+        "This never includes raw OpenAPI, routes, descriptions, examples, answers, "
+        "reasons, secrets, or credentials."
+    )
+    phrase = f"SYNC {record.request_digest[:12]}"
+    typed = input(f"Type {phrase} to approve for up to 10 minutes: ")
+    if typed != phrase:
+        print("Approval phrase did not match; nothing was sent.", file=sys.stderr)
+        return 2
+    approved_at = time.time()
+    try:
+        queue.record_human_approval(HumanSyncApproval(
+            record.workspace_ref,
+            record.project_ref,
+            record.request_digest,
+            approved_at,
+            approved_at + 600,
+        ))
+        lease = queue.claim(
+            record.workspace_ref, record.project_ref, record.request_digest
+        )
+        if lease is None:
+            raise RuntimeError("approved sync was not claimable")
+    except Exception:
+        print(_SAFE_CLOUD_FAILURE, file=sys.stderr)
+        return 1
+    return _cloud_sync_send(client, queue, lease)
+
+
+def _sync_record_public(record) -> dict:
+    now = time.time()
+    if record.receipt is not None:
+        state = "synced"
+    elif record.human_approval is None or record.human_approval.expires_at <= now:
+        state = "prepared"
+    elif record.retry.lease_expires_at is not None and record.retry.lease_expires_at > now:
+        state = "sending"
+    elif record.retry.next_attempt_at is not None:
+        state = "retry_ready" if record.retry.next_attempt_at <= now else "retry_scheduled"
+    else:
+        state = "approved"
+    return {
+        "state": state,
+        "workspace_ref": record.workspace_ref,
+        "project_ref": record.project_ref,
+        "request_digest": record.request_digest,
+        "attempts": record.retry.attempts,
+        "last_error_code": record.retry.last_error_code,
+        "receipt": record.receipt,
+    }
+
+
+def _cloud_sync_status(queue, workspace_ref: str, project_ref: str | None, digest: str | None) -> int:
+    if (project_ref is None) != (digest is None):
+        print("--project and --digest must be provided together.", file=sys.stderr)
+        return 2
+    try:
+        records = (
+            [queue.get(workspace_ref, project_ref, digest)]
+            if project_ref is not None and digest is not None
+            else queue.list(workspace_ref)
+        )
+        public = [_sync_record_public(record) for record in records if record is not None]
+    except Exception:
+        print(_SAFE_CLOUD_FAILURE, file=sys.stderr)
+        return 1
+    print(json.dumps({"syncs": public}, indent=2))
+    return 0
+
+
+def _cloud_sync_retry(client, queue, workspace_ref: str, project_ref: str, digest: str) -> int:
+    try:
+        lease = queue.claim(workspace_ref, project_ref, digest)
+    except Exception:
+        lease = None
+    if lease is None:
+        print("No live human-approved sync is ready to retry.", file=sys.stderr)
+        return 2
+    return _cloud_sync_send(client, queue, lease)
+
+
+def _cloud_reviews(client, workspace_ref: str, project_ref: str) -> int:
+    from .cloud_client import CloudClientError
+
+    try:
+        reviews = client.list_history(workspace_ref, project_ref)
+    except CloudClientError as error:
+        print(f"{_SAFE_CLOUD_FAILURE} ({error.code})", file=sys.stderr)
+        return 1
+    print(json.dumps({
+        "workspace_ref": workspace_ref,
+        "project_ref": project_ref,
+        "reviews": list(reviews),
+    }, indent=2))
     return 0
 
 
@@ -444,6 +762,57 @@ def main(argv=None):
         help="emit the canonical heel.review.v1 JSON envelope",
     )
 
+    cloud = sub.add_parser(
+        "cloud",
+        help="connect the local Heel agent to findings-only hosted continuity",
+    )
+    cloud.add_argument(
+        "--origin",
+        default=os.environ.get("HEEL_CLOUD_ORIGIN"),
+        help="canonical Heel Cloud origin (or set HEEL_CLOUD_ORIGIN)",
+    )
+    cloud_sub = cloud.add_subparsers(dest="cloudcmd", required=True)
+    cloud_login = cloud_sub.add_parser("login", help="authorize this machine in the browser")
+    cloud_login.add_argument("--device-name")
+    cloud_login.add_argument(
+        "--no-open", action="store_true", help="print the verification URL without opening it"
+    )
+    cloud_sub.add_parser("status", help="show the live device/workspace authorization")
+    cloud_sub.add_parser("logout", help="revoke this device grant and delete local credentials")
+    cloud_projects = cloud_sub.add_parser("projects", help="list authorized cloud projects")
+    cloud_projects.add_argument("--workspace")
+    cloud_reviews = cloud_sub.add_parser("reviews", help="list findings-only hosted history")
+    cloud_reviews.add_argument("--workspace", required=True)
+    cloud_reviews.add_argument("--project", required=True)
+    cloud_sync = cloud_sub.add_parser("sync", help="prepare and explicitly approve findings-only sync")
+    cloud_sync_sub = cloud_sync.add_subparsers(dest="syncmd", required=True)
+    sync_prepare = cloud_sync_sub.add_parser(
+        "prepare", help="prepare an immutable findings-only request; sends no findings"
+    )
+    sync_prepare.add_argument("--review", required=True)
+    sync_prepare.add_argument("--workspace", required=True)
+    sync_prepare.add_argument("--project", required=True)
+    sync_approve = cloud_sync_sub.add_parser(
+        "approve", help="interactive human approval and send for one exact digest"
+    )
+    sync_approve.add_argument("--workspace", required=True)
+    sync_approve.add_argument("--project", required=True)
+    sync_approve.add_argument("--digest", required=True)
+    sync_retry = cloud_sync_sub.add_parser(
+        "retry", help="retry a still-live, previously human-approved exact digest"
+    )
+    sync_retry.add_argument("--workspace", required=True)
+    sync_retry.add_argument("--project", required=True)
+    sync_retry.add_argument("--digest", required=True)
+    sync_status = cloud_sync_sub.add_parser("status", help="show local sync state")
+    sync_status.add_argument("--workspace", required=True)
+    sync_status.add_argument("--project")
+    sync_status.add_argument("--digest")
+    sync_receipt = cloud_sync_sub.add_parser("receipt", help="show one local validated receipt")
+    sync_receipt.add_argument("--workspace", required=True)
+    sync_receipt.add_argument("--project", required=True)
+    sync_receipt.add_argument("--digest", required=True)
+
     init = sub.add_parser("init", help="initialize local Heel artifacts")
     init.add_argument("--from-openapi", dest="from_openapi", help="local OpenAPI JSON/YAML file to convert into a ProductModel draft")
     init.add_argument("--out", required=True, help="ProductModel JSON output path")
@@ -547,6 +916,62 @@ def main(argv=None):
         return 0
     if args.cmd == "review" and args.reviewcmd == "openapi":
         return _review_openapi_file(args.path, as_json=args.as_json)
+    if args.cmd == "cloud":
+        if not args.origin:
+            print(
+                "Heel Cloud origin is required; set HEEL_CLOUD_ORIGIN or pass --origin.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            client, queue, projects = _cloud_services(args.origin)
+            if args.cloudcmd == "login":
+                return _cloud_login(
+                    client,
+                    device_name=args.device_name,
+                    open_browser=not args.no_open,
+                )
+            if args.cloudcmd == "status":
+                return _cloud_status(client)
+            if args.cloudcmd == "logout":
+                client.logout()
+                print(json.dumps({"authenticated": False, "revoked": True}, indent=2))
+                return 0
+            if args.cloudcmd == "projects":
+                return _cloud_projects(client, args.workspace)
+            if args.cloudcmd == "reviews":
+                return _cloud_reviews(client, args.workspace, args.project)
+            if args.cloudcmd == "sync" and args.syncmd == "prepare":
+                return _cloud_sync_prepare(
+                    client, queue, projects, args.review, args.workspace, args.project
+                )
+            if args.cloudcmd == "sync" and args.syncmd == "approve":
+                return _cloud_sync_approve(
+                    client, queue, args.workspace, args.project, args.digest
+                )
+            if args.cloudcmd == "sync" and args.syncmd == "retry":
+                return _cloud_sync_retry(
+                    client, queue, args.workspace, args.project, args.digest
+                )
+            if args.cloudcmd == "sync" and args.syncmd == "status":
+                return _cloud_sync_status(
+                    queue, args.workspace, args.project, args.digest
+                )
+            if args.cloudcmd == "sync" and args.syncmd == "receipt":
+                record = queue.get(args.workspace, args.project, args.digest)
+                if record is None or record.receipt is None:
+                    print("A validated receipt was not found.", file=sys.stderr)
+                    return 1
+                print(json.dumps({
+                    "workspace_ref": record.workspace_ref,
+                    "project_ref": record.project_ref,
+                    "request_digest": record.request_digest,
+                    "receipt": record.receipt,
+                }, indent=2))
+                return 0
+        except Exception:
+            print(_SAFE_CLOUD_FAILURE, file=sys.stderr)
+            return 1
     if args.cmd == "init":
         if not args.from_openapi:
             print("OpenAPI import: FAIL (--from-openapi is required for init)")

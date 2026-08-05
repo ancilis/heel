@@ -1,16 +1,23 @@
 # ADR-0003 — Billing provider: Stripe
 
-Status: Accepted · Date: 2026-07-13 · Decider: Fable (autonomous, delegated)
+Status: Accepted for a later paid launch; free-launch amendment 2026-08-04 · Date: 2026-07-13 · Decider: Fable (autonomous, delegated)
 
 ## Decision
 Use **Stripe** (Billing + Checkout + Customer Portal + webhooks + Tax config points). Rejected:
 Paddle/Lemon Squeezy (Merchant-of-Record simplifies tax but higher fees, weaker metered-usage and
 test-clock tooling); homegrown billing (explicitly disallowed by spec §5).
 
-## Implementation status (honest)
+## Free-launch decision
+
+Production currently runs `HEEL_BILLING_MODE=free_launch` with `DisabledBilling`.
+Free is the only available plan, Pro and Team are marked coming soon, checkout returns
+unavailable, billing routes are not exposed by the public Worker, and no payment is
+accepted. Stripe is therefore not a blocker for free early access.
+
+## Later paid-launch implementation status
 Implemented and tested today: the subscription state machine, webhook signature verification +
 dedupe/ordering guards (fail-closed without a secret), the append-only usage ledger, env-injected
-price-ID lookup (`live_price_id`), and `StubBilling` driving the full lifecycle offline. **The live
+price-ID lookup (`live_price_id`), and `StubBilling` driving the full lifecycle in tests only. **The live
 Stripe adapter, catalog→Stripe sync, Customer Portal wiring, and test-clock CI are NOT implemented**
 — they are the contract below, gated on owner keys (OWNER_ACTIONS). Self-serve paid checkout is not
 live until the owner lands them.
@@ -29,7 +36,7 @@ live until the owner lands them.
   cancel-now / cancel-at-period-end, grace/dunning, payment failure, refund/chargeback. The state
   machine and stub exercise these transitions offline; the live Stripe flows remain owner-gated.
 - **Verification:** Stripe **test mode + test clocks** exercised in CI once `STRIPE_TEST_KEY` exists
-  (owner action). Until then, a deterministic `StubBilling` adapter drives the full state machine and
-  all lifecycle tests offline.
+  (future paid-launch action). Until then, a deterministic `StubBilling` adapter drives lifecycle
+  tests offline while production remains on `DisabledBilling`.
 
 ## No production IDs/prices/secrets in the repo. Verified by a CI guard.

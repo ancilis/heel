@@ -98,9 +98,123 @@ code {
 .review-workspace,
 .mcp-section,
 .availability,
-.mcp-quickstart {
+.mcp-quickstart,
+.device-page {
   width: min(calc(100% - 48px), 1180px);
   margin-inline: auto;
+}
+
+.device-page {
+  display: grid;
+  min-height: 100vh;
+  align-content: start;
+  gap: clamp(42px, 8vw, 84px);
+  padding-block: 26px 72px;
+}
+
+.device-card {
+  width: min(100%, 680px);
+  padding: clamp(28px, 6vw, 56px);
+  border: 1px solid var(--line-strong);
+  border-radius: 18px;
+  background: var(--surface);
+  box-shadow: 8px 8px 0 var(--signal), var(--shadow);
+}
+
+.device-card h1 {
+  margin: 0;
+  font-size: clamp(36px, 7vw, 62px);
+  letter-spacing: -0.055em;
+  line-height: 0.98;
+  text-wrap: balance;
+}
+
+.device-card > p:not(.eyebrow, .form-error) {
+  color: var(--ink-soft);
+}
+
+.device-form {
+  display: grid;
+  gap: 16px;
+  margin-top: 28px;
+}
+
+.device-form label,
+.device-workspace {
+  display: grid;
+  gap: 7px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.device-form input,
+.device-workspace select {
+  min-height: 50px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background: white;
+  color: var(--ink);
+}
+
+.device-form .device-code {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: clamp(22px, 5vw, 32px);
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.device-boundary,
+.device-privacy {
+  padding: 16px 18px;
+  border-left: 4px solid var(--teal);
+  background: #e9f5f0;
+}
+
+.device-claim {
+  display: grid;
+  gap: 1px;
+  margin-block: 28px 18px;
+  background: var(--line);
+}
+
+.device-claim > div {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.45fr) 1fr;
+  gap: 18px;
+  padding: 14px 16px;
+  background: var(--paper);
+}
+
+.device-claim dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.device-claim dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-weight: 720;
+}
+
+.device-privacy p {
+  margin: 8px 0 0;
+  color: var(--ink-soft);
+}
+
+.device-workspace {
+  margin-top: 22px;
+}
+
+.device-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 24px;
 }
 
 .site-header {

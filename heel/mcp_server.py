@@ -19,6 +19,7 @@ Enforcement (all server-side, regardless of what the caller requests):
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 
@@ -71,6 +72,15 @@ _REVIEW_TOOL_TEXT = {
     "heel_get_review": "Heel returned the requested locally saved review.",
     "heel_explain_finding": "Heel returned the exact requested finding explanation.",
     "heel_export_review": "Heel created the requested local review export.",
+}
+_SYNC_TOOL_TEXT = {
+    "heel_cloud_status": "Heel returned the live cloud authorization status.",
+    "heel_cloud_projects": "Heel returned authorized cloud projects.",
+    "heel_sync_prepare": "Heel prepared an immutable findings-only request locally; nothing was synced.",
+    "heel_sync_preview": "Heel returned the exact locally prepared findings-only request.",
+    "heel_sync_status": "Heel returned local findings-sync state.",
+    "heel_cloud_reviews": "Heel returned hosted findings-only review history.",
+    "heel_sync_receipt": "Heel returned the validated local findings-sync receipt.",
 }
 
 # Tools exposed over MCP. Scope-mutation tools are ABSENT by construction (§10.1).
@@ -197,7 +207,102 @@ REVIEW_TOOL_SCHEMAS = [
     },
 ]
 REVIEW_TOOL_NAMES = {tool["name"] for tool in REVIEW_TOOL_SCHEMAS}
-TOOL_SCHEMAS = EXISTING_TOOL_SCHEMAS + REVIEW_TOOL_SCHEMAS
+
+SYNC_TOOL_SCHEMAS = [
+    {
+        "name": "heel_cloud_status",
+        "description": "Read this device's live Heel Cloud workspace authorization. Cannot login or mutate authorization.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "heel_cloud_projects",
+        "description": "List authorized Heel Cloud projects for one workspace. Read-only.",
+        "inputSchema": {
+            "type": "object", "required": ["workspace_ref"],
+            "properties": {"workspace_ref": {"type": "string", "pattern": r"^ws_[0-9a-f]{16}$"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "heel_sync_prepare",
+        "description": (
+            "Project one saved local review into the closed findings-only contract and persist "
+            "it locally without approval or upload. A human must use the interactive CLI to send."
+        ),
+        "inputSchema": {
+            "type": "object", "required": ["review_id", "workspace_ref", "project_ref"],
+            "properties": {
+                "review_id": {"type": "string", "pattern": r"^review_[0-9a-f]{20}$"},
+                "workspace_ref": {"type": "string", "pattern": r"^ws_[0-9a-f]{16}$"},
+                "project_ref": {"type": "string", "pattern": r"^prj_[0-9a-f]{32}$"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "heel_sync_preview",
+        "description": "Read one exact locally prepared findings-only request. No approval or upload.",
+        "inputSchema": {
+            "type": "object", "required": ["workspace_ref", "project_ref", "request_digest"],
+            "properties": {
+                "workspace_ref": {"type": "string", "pattern": r"^ws_[0-9a-f]{16}$"},
+                "project_ref": {"type": "string", "pattern": r"^prj_[0-9a-f]{32}$"},
+                "request_digest": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "heel_sync_status",
+        "description": "Read local findings-sync state for a workspace or one exact prepared digest.",
+        "inputSchema": {
+            "oneOf": [
+                {
+                    "type": "object", "required": ["workspace_ref"],
+                    "properties": {"workspace_ref": {"type": "string", "pattern": r"^ws_[0-9a-f]{16}$"}},
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object", "required": ["workspace_ref", "project_ref", "request_digest"],
+                    "properties": {
+                        "workspace_ref": {"type": "string", "pattern": r"^ws_[0-9a-f]{16}$"},
+                        "project_ref": {"type": "string", "pattern": r"^prj_[0-9a-f]{32}$"},
+                        "request_digest": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                    },
+                    "additionalProperties": False,
+                },
+            ]
+        },
+    },
+    {
+        "name": "heel_cloud_reviews",
+        "description": "Read hosted findings-only history for one authorized project.",
+        "inputSchema": {
+            "type": "object", "required": ["workspace_ref", "project_ref"],
+            "properties": {
+                "workspace_ref": {"type": "string", "pattern": r"^ws_[0-9a-f]{16}$"},
+                "project_ref": {"type": "string", "pattern": r"^prj_[0-9a-f]{32}$"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "heel_sync_receipt",
+        "description": "Read one locally validated findings-sync receipt. Read-only.",
+        "inputSchema": {
+            "type": "object", "required": ["workspace_ref", "project_ref", "request_digest"],
+            "properties": {
+                "workspace_ref": {"type": "string", "pattern": r"^ws_[0-9a-f]{16}$"},
+                "project_ref": {"type": "string", "pattern": r"^prj_[0-9a-f]{32}$"},
+                "request_digest": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+            },
+            "additionalProperties": False,
+        },
+    },
+]
+SYNC_TOOL_NAMES = {tool["name"] for tool in SYNC_TOOL_SCHEMAS}
+STRICT_TOOL_NAMES = REVIEW_TOOL_NAMES | SYNC_TOOL_NAMES
+TOOL_SCHEMAS = EXISTING_TOOL_SCHEMAS + REVIEW_TOOL_SCHEMAS + SYNC_TOOL_SCHEMAS
 TOOL_NAMES = {t["name"] for t in TOOL_SCHEMAS}
 
 
@@ -317,10 +422,21 @@ def _review_tool_text(name: str, *, failed: bool = False) -> str:
     return f"{prefix} {_UNTRUSTED_STRUCTURED_CONTENT_NOTICE}."
 
 
+def _strict_tool_text(name: str, *, failed: bool = False) -> str:
+    if name in REVIEW_TOOL_NAMES:
+        return _review_tool_text(name, failed=failed)
+    prefix = (
+        "Heel could not complete the cloud continuity tool call."
+        if failed
+        else _SYNC_TOOL_TEXT[name]
+    )
+    return f"{prefix} {_UNTRUSTED_STRUCTURED_CONTENT_NOTICE}."
+
+
 def _success_tool_result(name: str, result) -> dict:
     text = (
-        _review_tool_text(name)
-        if name in REVIEW_TOOL_NAMES
+        _strict_tool_text(name)
+        if name in STRICT_TOOL_NAMES
         else _json_text(result, default=str)
     )
     return {
@@ -330,8 +446,8 @@ def _success_tool_result(name: str, result) -> dict:
 
 
 def _tool_error_result(name: str, error: ToolError) -> dict:
-    if name in REVIEW_TOOL_NAMES:
-        text = _review_tool_text(name, failed=True)
+    if name in STRICT_TOOL_NAMES:
+        text = _strict_tool_text(name, failed=True)
     else:
         text = f"REJECTED: {error}"
     return {
@@ -355,11 +471,15 @@ class HeelServer:
         store: Store | None = None,
         classify_enabled: bool = False,
         projects: LocalProjectStore | None = None,
+        cloud_client=None,
+        sync_queue=None,
     ):
         self.store = store or Store()
         self.runs: dict[str, object] = {}
         self.classify_enabled = classify_enabled
         self._projects = projects
+        self._cloud_client = cloud_client
+        self._sync_queue = sync_queue
 
     @property
     def projects(self) -> LocalProjectStore:
@@ -367,6 +487,42 @@ class HeelServer:
         if self._projects is None:
             self._projects = LocalProjectStore()
         return self._projects
+
+    @property
+    def cloud_client(self):
+        """Create the fixed-route cloud client only when an explicit cloud tool needs it."""
+        if self._cloud_client is None:
+            origin = os.environ.get("HEEL_CLOUD_ORIGIN")
+            if not origin:
+                raise ToolError(
+                    "Heel Cloud is not configured; set HEEL_CLOUD_ORIGIN and login with the CLI",
+                    code="not_configured",
+                )
+            try:
+                from .cloud_auth import CredentialStore
+                from .cloud_client import CloudClient
+
+                self._cloud_client = CloudClient(origin, CredentialStore(origin))
+            except Exception:
+                raise ToolError(
+                    "Heel Cloud is not configured safely",
+                    code="not_configured",
+                ) from None
+        return self._cloud_client
+
+    @property
+    def sync_queue(self):
+        if self._sync_queue is None:
+            try:
+                from .sync_queue import SyncQueue
+
+                self._sync_queue = SyncQueue()
+            except Exception:
+                raise ToolError(
+                    "the local findings-sync queue is unavailable",
+                    code="local_storage_unavailable",
+                ) from None
+        return self._sync_queue
 
     def _security_log(self, caller: str, action: str, detail: dict):
         ContainmentLog(self.store, "security", caller).append(action, detail)
@@ -619,6 +775,202 @@ class HeelServer:
             self._invalid_review_input()
         return {"format": args["format"], "content": content}
 
+    # -- findings-only cloud continuity (MCP is never an approval authority) -- #
+    @staticmethod
+    def _cloud_failure(error):
+        from .cloud_client import CloudClientError
+
+        if isinstance(error, ToolError):
+            raise error
+        if isinstance(error, CloudClientError):
+            raise ToolError("Heel Cloud request failed", code=error.code) from None
+        raise ToolError("Heel Cloud request failed", code="unavailable") from None
+
+    @staticmethod
+    def _sync_state(record) -> dict:
+        now = time.time()
+        if record.receipt is not None:
+            state = "synced"
+        elif record.human_approval is None or record.human_approval.expires_at <= now:
+            state = "prepared"
+        elif record.retry.lease_expires_at is not None and record.retry.lease_expires_at > now:
+            state = "sending"
+        elif record.retry.next_attempt_at is not None:
+            state = (
+                "retry_ready"
+                if record.retry.next_attempt_at <= now
+                else "retry_scheduled"
+            )
+        else:
+            state = "approved"
+        return {
+            "state": state,
+            "workspace_ref": record.workspace_ref,
+            "project_ref": record.project_ref,
+            "request_digest": record.request_digest,
+            "attempts": record.retry.attempts,
+            "last_error_code": record.retry.last_error_code,
+            "receipt": record.receipt,
+        }
+
+    def heel_cloud_status(self, args, caller):
+        self._validate_exact_args(args, fields=())
+        try:
+            status = self.cloud_client.account_status()
+        except Exception as error:
+            self._cloud_failure(error)
+        return {
+            "authenticated": True,
+            "device_id": status.device_id,
+            "workspace_ref": status.workspace_ref,
+            "role": status.role,
+            "capabilities": list(status.capabilities),
+        }
+
+    def heel_cloud_projects(self, args, caller):
+        self._validate_exact_args(
+            args, fields=("workspace_ref",), string_fields=("workspace_ref",)
+        )
+        try:
+            projects = self.cloud_client.list_projects(args["workspace_ref"])
+        except Exception as error:
+            self._cloud_failure(error)
+        return {
+            "workspace_ref": args["workspace_ref"],
+            "projects": [
+                {
+                    "project_ref": project.project_ref,
+                    "name": project.name,
+                    "created_by": project.created_by,
+                    "created_at": project.created_at,
+                }
+                for project in projects
+            ],
+        }
+
+    def heel_sync_prepare(self, args, caller):
+        self._validate_exact_args(
+            args,
+            fields=("review_id", "workspace_ref", "project_ref"),
+            string_fields=("review_id", "workspace_ref", "project_ref"),
+        )
+        review = self._load_review(args["review_id"])
+        try:
+            from .findings_sync import project_findings_sync
+
+            key = self.cloud_client.namespace_key(
+                args["workspace_ref"], args["project_ref"]
+            )
+            request = project_findings_sync(review, args["project_ref"], key)
+            record = self.sync_queue.prepare(request, key, args["workspace_ref"])
+        except Exception as error:
+            self._cloud_failure(error)
+        self._security_log(caller, "prepare_findings_sync", {
+            "review_id": args["review_id"],
+            "workspace_ref": record.workspace_ref,
+            "project_ref": record.project_ref,
+            "request_digest": record.request_digest,
+        })
+        return {
+            "state": "prepared",
+            "workspace_ref": record.workspace_ref,
+            "project_ref": record.project_ref,
+            "request_digest": record.request_digest,
+            "request": request,
+            "privacy": "source documents and local review context stay on this machine",
+            "next": "A human may inspect and approve this exact digest in the interactive Heel CLI.",
+        }
+
+    def heel_sync_preview(self, args, caller):
+        self._validate_exact_args(
+            args,
+            fields=("workspace_ref", "project_ref", "request_digest"),
+            string_fields=("workspace_ref", "project_ref", "request_digest"),
+        )
+        try:
+            record = self.sync_queue.get(
+                args["workspace_ref"], args["project_ref"], args["request_digest"]
+            )
+            if record is None:
+                raise ToolError("prepared findings sync was not found", code="not_found")
+            request = json.loads(record.request_json)
+        except ToolError:
+            raise
+        except Exception:
+            raise ToolError("local findings-sync data is invalid", code="invalid_input") from None
+        return {
+            **self._sync_state(record),
+            "request": request,
+            "privacy": "source documents and local review context stay on this machine",
+        }
+
+    def heel_sync_status(self, args, caller):
+        if type(args) is not dict or frozenset(args) not in {
+            frozenset(("workspace_ref",)),
+            frozenset(("workspace_ref", "project_ref", "request_digest")),
+        }:
+            raise ToolError(
+                "arguments must contain exactly the documented fields",
+                code="invalid_input",
+            )
+        if any(type(value) is not str or not value.strip() for value in args.values()):
+            raise ToolError(
+                "documented string arguments must be nonempty strings",
+                code="invalid_input",
+            )
+        try:
+            records = (
+                [self.sync_queue.get(
+                    args["workspace_ref"], args["project_ref"], args["request_digest"]
+                )]
+                if "project_ref" in args
+                else self.sync_queue.list(args["workspace_ref"])
+            )
+        except Exception:
+            raise ToolError("local findings-sync data is invalid", code="invalid_input") from None
+        return {"syncs": [
+            self._sync_state(record) for record in records if record is not None
+        ]}
+
+    def heel_cloud_reviews(self, args, caller):
+        self._validate_exact_args(
+            args,
+            fields=("workspace_ref", "project_ref"),
+            string_fields=("workspace_ref", "project_ref"),
+        )
+        try:
+            reviews = self.cloud_client.list_history(
+                args["workspace_ref"], args["project_ref"]
+            )
+        except Exception as error:
+            self._cloud_failure(error)
+        return {
+            "workspace_ref": args["workspace_ref"],
+            "project_ref": args["project_ref"],
+            "reviews": list(reviews),
+        }
+
+    def heel_sync_receipt(self, args, caller):
+        self._validate_exact_args(
+            args,
+            fields=("workspace_ref", "project_ref", "request_digest"),
+            string_fields=("workspace_ref", "project_ref", "request_digest"),
+        )
+        try:
+            record = self.sync_queue.get(
+                args["workspace_ref"], args["project_ref"], args["request_digest"]
+            )
+        except Exception:
+            raise ToolError("local findings-sync data is invalid", code="invalid_input") from None
+        if record is None or record.receipt is None:
+            raise ToolError("validated findings-sync receipt was not found", code="not_found")
+        return {
+            "workspace_ref": record.workspace_ref,
+            "project_ref": record.project_ref,
+            "request_digest": record.request_digest,
+            "receipt": record.receipt,
+        }
+
     # -- MCP dispatch -------------------------------------------------------- #
     def call_tool(self, name, args, caller):
         if name not in TOOL_NAMES:
@@ -630,7 +982,7 @@ class HeelServer:
         # Preserve the legacy direct-call convention where falsey arguments meant an empty
         # object. Review tools instead receive the exact value so their strict v1 validation
         # cannot be bypassed with ``None`` or an empty array.
-        handler_args = args if name in REVIEW_TOOL_NAMES else (args or {})
+        handler_args = args if name in STRICT_TOOL_NAMES else (args or {})
         return getattr(self, name)(handler_args, caller)
 
     def dispatch(self, method, params, session):

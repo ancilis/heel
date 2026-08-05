@@ -19,15 +19,31 @@ export default defineConfig(async ({ command }) => {
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import("@cloudflare/vite-plugin");
   const controlPlaneServiceId = process.env.HEEL_CONTROL_PLANE_VPC_SERVICE_ID?.trim();
+  const publicOrigin = process.env.HEEL_PUBLIC_ORIGIN?.trim();
   if (command === "build" && !VPC_SERVICE_ID.test(controlPlaneServiceId ?? "")) {
     throw new Error(
       "HEEL_CONTROL_PLANE_VPC_SERVICE_ID must be a Cloudflare VPC service UUID for production builds",
     );
   }
+  if (command === "build") {
+    let validPublicOrigin = false;
+    try {
+      const parsed = new URL(publicOrigin ?? "");
+      validPublicOrigin = parsed.protocol === "https:" && parsed.origin === publicOrigin;
+    } catch {
+      validPublicOrigin = false;
+    }
+    if (!validPublicOrigin) {
+      throw new Error("HEEL_PUBLIC_ORIGIN must be one canonical HTTPS origin for production builds");
+    }
+  }
+  const publicVars: Record<string, string> = {};
+  if (publicOrigin !== undefined) publicVars.PUBLIC_ORIGIN = publicOrigin;
   const localBindingConfig = {
     main: "./worker/index.ts",
     compatibility_flags: ["nodejs_compat"],
     observability: { enabled: false },
+    vars: publicVars,
     vpc_services: controlPlaneServiceId === undefined
       ? []
       : [{ binding: "CONTROL_PLANE", service_id: controlPlaneServiceId }],

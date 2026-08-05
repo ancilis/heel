@@ -17,13 +17,19 @@ verified target plus a scope valid for that exact target, enforced fail-closed b
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import logging
+import os
 import re
+import secrets
 import socket
 import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 from heel.findings_sync import (
     MAX_FINDINGS_SYNC_BYTES,
@@ -32,8 +38,26 @@ from heel.findings_sync import (
 )
 
 from .auth import AuthStore, ThrottledError
-from .billing import BillingStore, StubBilling, SubscriptionManager
+from .billing import (
+    Billing,
+    BillingStore,
+    BillingUnavailable,
+    DisabledBilling,
+    StubBilling,
+    SubscriptionManager,
+)
 from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
+from .device_auth import (
+    DEVICE_CAPABILITIES,
+    DeviceAuthStore,
+    DeviceDenied,
+    DeviceExpired,
+    DevicePending,
+    DeviceRateLimited,
+    DeviceTokens,
+    RefreshReuseDetected,
+    SlowDown,
+)
 from .entitlement import EntitlementService, Subscription
 from .jobs import JobPlane
 from .ledger import GlobalCapExceeded, IdempotencyConflict, QuotaExceeded, UsageLedger
@@ -47,14 +71,18 @@ from .findings_sync import (
 from .ops import KillSwitchTripped, Metrics, OpsStore
 from .projects import ProjectNotFound, ProjectStore
 from .tenancy import (
-    ControlPlaneStore, IntegrationLimitExceeded, Role, SeatLimitExceeded, require,
+    ControlPlaneStore, IntegrationLimitExceeded, Role, SeatLimitExceeded, hash_api_key, require,
 )
 from .verification import HostnameReuseExceeded, TargetLimitExceeded, TargetVerifier
 
 MAX_BODY = 64 * 1024
+MAX_DEVICE_BODY = 8 * 1024
 REQUEST_IO_TIMEOUT_SECONDS = 10
 REQUEST_BODY_TOTAL_DEADLINE_SECONDS = 10
 MAX_CONCURRENT_REQUESTS = 64
+REQUEST_DRAIN_TIMEOUT_SECONDS = 30
+
+_LOGGER = logging.getLogger("heel.saas.control_plane")
 _SYNC_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -86,18 +114,70 @@ class ApiError(Exception):
         self.body = {"error": message, **extra}
 
 
+class DeviceApiError(ApiError):
+    """Closed device-flow error: stable code only, never a reflected detail string."""
+
+    def __init__(self, status: int, code: str, *, interval: int | None = None):
+        Exception.__init__(self, code)
+        self.status = status
+        self.body = {"schema_version": "heel.device-error.v1", "code": code}
+        if interval is not None:
+            self.body["interval"] = interval
+
+
 class ControlPlane:
     """All stores on one SQLite connection; the unit the HTTP layer serves."""
 
     def __init__(self, path: str = ":memory:", *, dns_txt=None, http_get=None,
-                 scope_validator=None, scope_minter=None):
+                 scope_validator=None, scope_minter=None,
+                 device_token_pepper: bytes | None = None,
+                 enable_device_auth: bool | None = None,
+                 public_origin: str | None = None,
+                 billing: Billing | None = None,
+                 trust_edge_client_key: bool = False,
+                 edge_auth_secret: str | None = None):
+        configured_pepper = bool(os.environ.get("HEEL_DEVICE_TOKEN_PEPPER_B64"))
+        device_enabled = (
+            enable_device_auth
+            if enable_device_auth is not None
+            else device_token_pepper is not None or configured_pepper
+        )
+        selected_origin = public_origin or os.environ.get("HEEL_PUBLIC_ORIGIN", "")
+        if device_enabled:
+            if device_token_pepper is None and not configured_pepper:
+                raise RuntimeError(
+                    "device authorization requires HEEL_DEVICE_TOKEN_PEPPER_B64"
+                )
+            parsed_origin = urlsplit(selected_origin)
+            if (
+                not selected_origin
+                or selected_origin != f"{parsed_origin.scheme}://{parsed_origin.netloc}"
+                or parsed_origin.scheme not in {"http", "https"}
+                or parsed_origin.hostname is None
+                or (
+                    parsed_origin.scheme == "http"
+                    and parsed_origin.hostname not in {"127.0.0.1", "localhost", "::1"}
+                )
+            ):
+                raise RuntimeError(
+                    "device authorization requires a canonical HEEL_PUBLIC_ORIGIN"
+                )
         self.store = ControlPlaneStore(path)
         conn = self.store.conn
         self.auth = AuthStore(conn)
+        self.device_auth = (
+            DeviceAuthStore(conn, pepper=device_token_pepper) if device_enabled else None
+        )
+        self.public_origin = selected_origin if device_enabled else None
+        self.device_verification_uri = (
+            selected_origin + "/device" if device_enabled else None
+        )
         self.ledger = UsageLedger(conn)
         self.billing_store = BillingStore(conn)
         self.subs = SubscriptionManager(self.billing_store)
-        self.billing = StubBilling()
+        self.billing = billing if billing is not None else StubBilling()
+        self.trust_edge_client_key = bool(trust_edge_client_key)
+        self.edge_auth_secret = edge_auth_secret
         self.entitlements = EntitlementService(self.ledger)
         self.verifier = TargetVerifier(conn, dns_txt=dns_txt, http_get=http_get)
         self.jobs = JobPlane(conn, scope_validator=scope_validator,
@@ -120,6 +200,8 @@ class ControlPlane:
             ),
         )
         self.metrics = Metrics()
+        self.draining = False
+        self.required_schema_version: int | None = None
         # Every store shares one SQLite connection. Serialize complete HTTP request units so
         # transaction boundaries and authentication touches cannot interleave across handler
         # threads. A Postgres deployment replaces this with a per-request pooled connection.
@@ -184,6 +266,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        request_id = getattr(self, "_request_id", None)
+        if request_id is not None:
+            self.send_header("X-Heel-Request-Id", request_id)
         for k, v in headers.items():
             self.send_header(k, v)
         self.end_headers()
@@ -209,6 +294,22 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(obj, dict):
             raise ApiError(400, "body must be a JSON object")
         return obj
+
+    def _device_body(self) -> dict:
+        """Decode one closed device-flow request without echoing any supplied value."""
+        content_types = self._header_values("Content-Type")
+        encodings = self._header_values("Content-Encoding")
+        if (
+            len(content_types) != 1
+            or content_types[0].split(";", 1)[0].strip().lower() != "application/json"
+            or len(encodings) > 1
+            or (encodings and encodings[0].strip().lower() not in ("", "identity"))
+        ):
+            raise DeviceApiError(400, "invalid_request")
+        try:
+            return self._body()
+        except ApiError:
+            raise DeviceApiError(400, "invalid_request") from None
 
     def _raw_body(self) -> bytes:
         return getattr(self, "_buffered_body", b"")
@@ -269,7 +370,12 @@ class _Handler(BaseHTTPRequestHandler):
                 **({"code": "findings_sync_request_too_large"} if sync_path else {}),
             )
         length = int(lengths[0])
-        maximum = MAX_FINDINGS_SYNC_BYTES if sync_path else MAX_BODY
+        device_path = len(parts) == 3 and parts[:2] == ["v1", "device"]
+        maximum = (
+            MAX_FINDINGS_SYNC_BYTES
+            if sync_path
+            else MAX_DEVICE_BODY if device_path else MAX_BODY
+        )
         if length > maximum:
             raise ApiError(
                 413,
@@ -367,8 +473,8 @@ class _Handler(BaseHTTPRequestHandler):
             )
         return request
 
-    def _principal(self) -> tuple[str, str | None, tuple[str, str, Role] | None]:
-        """Return (kind, user_id, api_key_scope). kind: 'session' | 'api_key' | 'anon'."""
+    def _principal(self):
+        """Resolve one session, device token, API key, or anonymous principal."""
         authorization_values = self._header_values("Authorization")
         cookie_values = self._header_values("Cookie")
         if len(authorization_values) > 1 or len(cookie_values) > 1:
@@ -387,11 +493,22 @@ class _Handler(BaseHTTPRequestHandler):
             if not got:
                 raise ApiError(401, "invalid API key")
             return "api_key", None, got
+        if authz.startswith("Bearer heel_at_"):
+            got = self._device_store().resolve_access(authz[len("Bearer "):])
+            if not got:
+                raise ApiError(401, "invalid device token", code="invalid_grant")
+            return "device_session", got.user_id, got
         if session_tokens:
             uid = self.cp.auth.resolve_session(session_tokens[0])
             if uid:
                 return "session", uid, None
         return "anon", None, None
+
+    def _device_store(self) -> DeviceAuthStore:
+        store = self.cp.device_auth
+        if store is None:
+            raise DeviceApiError(503, "temporarily_unavailable")
+        return store
 
     def _authorized_identity(
         self, workspace_id: str, capability: str
@@ -418,6 +535,14 @@ class _Handler(BaseHTTPRequestHandler):
             if not role_can(role, capability):
                 raise ApiError(403, f"API key role {role.value} lacks {capability!r}")
             return kind, key_id, role
+        if kind == "device_session":
+            device = key
+            if device.workspace_id != workspace_id:
+                raise ApiError(403, "device is scoped to a different workspace")
+            if capability not in DEVICE_CAPABILITIES:
+                raise ApiError(403, "device lacks the requested capability")
+            role = require(self.cp.store, workspace_id, user_id, capability)
+            return kind, device.device_id, role
         raise ApiError(401, "authentication required")
 
     def _authorize(self, workspace_id: str, capability: str) -> Role:
@@ -431,7 +556,7 @@ class _Handler(BaseHTTPRequestHandler):
         human_only: bool = False,
     ) -> SyncPrincipal:
         kind, actor_ref, role = self._authorized_identity(workspace_id, capability)
-        if human_only and kind != "session":
+        if human_only and kind not in {"session", "device_session"}:
             raise ApiError(
                 403,
                 "a signed-in human session is required",
@@ -440,7 +565,11 @@ class _Handler(BaseHTTPRequestHandler):
         return SyncPrincipal(
             actor_ref,
             role,
-            "human_session" if kind == "session" else "api_key",
+            (
+                "human_session"
+                if kind == "session"
+                else "device_session" if kind == "device_session" else "api_key"
+            ),
         )
 
     # --- routing ---
@@ -454,6 +583,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._route("DELETE")
 
     def _route(self, method: str) -> None:
+        self._request_id = secrets.token_hex(16)
         try:
             self._route_parts = self._canonical_parts()
             self._buffer_request_body(method, self._route_parts)
@@ -463,6 +593,20 @@ class _Handler(BaseHTTPRequestHandler):
         except (TimeoutError, socket.timeout):
             self._json(408, {"error": "request body timed out", "code": "request_timeout"})
             return
+        operational_paths = {
+            ("v1", "health"),
+            ("v1", "healthz"),
+            ("v1", "readyz"),
+            ("v1", "metrics"),
+        }
+        if self.cp.edge_auth_secret is not None and tuple(self._route_parts) not in operational_paths:
+            supplied = self._header_values("X-Heel-Edge-Auth")
+            if (
+                len(supplied) != 1
+                or not hmac.compare_digest(supplied[0], self.cp.edge_auth_secret)
+            ):
+                self._json(401, {"error": "private edge authorization required"})
+                return
         # Health and metrics are deliberately independent of the SQLite request unit so an
         # operational probe remains available while another request waits on the database.
         if method == "GET" and tuple(self._route_parts) in {
@@ -513,7 +657,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(403, {"error": str(e)})
         except ThrottledError as e:
             self._json(429, {"error": str(e)})
-        except Exception:
+        except Exception as error:
+            _LOGGER.error(json.dumps({
+                "event": "control_plane_internal_error",
+                "exception_type": type(error).__name__,
+                "method": getattr(self, "command", "UNKNOWN"),
+                "request_id": getattr(self, "_request_id", "unavailable"),
+            }, sort_keys=True, separators=(",", ":")))
             self._json(500, {"error": "internal error"})
 
     def _match(self, method: str, p: list[str]):
@@ -530,6 +680,12 @@ class _Handler(BaseHTTPRequestHandler):
             ("POST", ("login",)): self._login,
             ("POST", ("logout",)): self._logout,
             ("GET", ("me",)): self._me,
+            ("POST", ("device", "start")): self._device_start,
+            ("POST", ("device", "verify")): self._device_verify,
+            ("POST", ("device", "poll")): self._device_poll,
+            ("POST", ("device", "token")): self._device_token,
+            ("POST", ("device", "refresh")): self._device_refresh,
+            ("POST", ("device", "revoke")): self._device_revoke,
             ("POST", ("billing", "webhook")): self._webhook,
         }
         if (method, tuple(rest)) in flat:
@@ -584,11 +740,24 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "catalog_version": CATALOG_VERSION})
 
     def _readyz(self):
+        if self.cp.draining:
+            raise ApiError(503, "control plane draining")
         try:
             self.cp.store.conn.execute("SELECT 1")
+            if self.cp.required_schema_version is not None:
+                current = self.cp.store.conn.execute(
+                    "SELECT MAX(version) FROM schema_migrations"
+                ).fetchone()[0]
+                if current != self.cp.required_schema_version:
+                    raise ApiError(503, "database schema unavailable")
+        except ApiError:
+            raise
         except Exception:
             raise ApiError(503, "database unavailable")
-        self._json(200, {"ready": True})
+        self._json(200, {
+            "ready": True,
+            "schema_version": self.cp.required_schema_version,
+        })
 
     def _metrics(self):
         body = self.cp.metrics.render().encode()
@@ -599,27 +768,285 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _plans(self):
+        paid_checkout_available = not isinstance(self.cp.billing, DisabledBilling)
         self._json(200, {"catalog_version": CATALOG_VERSION, "plans": [
-            {"id": pl.id, "name": pl.name, "price_month_cents": pl.price_month_cents}
+            {
+                "id": pl.id,
+                "name": pl.name,
+                "price_month_cents": pl.price_month_cents,
+                "availability": (
+                    "available" if pl.id == "free" or paid_checkout_available else "coming_soon"
+                ),
+            }
             for pl in self_serve_plans()]})
+
+    @staticmethod
+    def _device_token_payload(tokens: DeviceTokens) -> dict:
+        return {
+            "schema_version": "heel.device-token-response.v1",
+            "token_type": "Bearer",
+            "access_token": tokens.access_token,
+            "expires_in": tokens.expires_in,
+            "refresh_token": tokens.refresh_token,
+            "refresh_expires_in": tokens.refresh_expires_in,
+            "device_id": tokens.device_id,
+            "workspace_id": tokens.workspace_id,
+            "capabilities": list(tokens.capabilities),
+        }
+
+    def _device_start(self):
+        body = self._device_body()
+        if (
+            set(body) != {"schema_version", "client_id", "device_name", "device_challenge"}
+            or body.get("schema_version") != "heel.device-start.v1"
+            or body.get("client_id") != "heel-agent"
+            or type(body.get("device_name")) is not str
+            or type(body.get("device_challenge")) is not str
+        ):
+            raise DeviceApiError(400, "invalid_request")
+        try:
+            supplied_client_key = self.headers.get("X-Heel-Client-Key", "")
+            client_key = (
+                supplied_client_key
+                if re.fullmatch(r"[0-9a-f]{64}", supplied_client_key)
+                else hashlib.sha256(
+                    ("direct-device-start\0" + self.client_address[0]).encode("utf-8")
+                ).hexdigest()
+            )
+            started = self._device_store().start(
+                body["device_name"], body["device_challenge"], client_key=client_key,
+            )
+        except DeviceRateLimited:
+            raise DeviceApiError(429, "rate_limited") from None
+        except ValueError:
+            raise DeviceApiError(400, "invalid_request") from None
+        self._json(201, {
+            "schema_version": "heel.device-start-response.v1",
+            "device_code": started.device_code,
+            "user_code": started.user_code,
+            "verification_uri": self.cp.device_verification_uri,
+            "expires_in": started.expires_in,
+            "interval": started.interval,
+        })
+
+    def _require_device_verify_session(self) -> str:
+        kind, user_id, _ = self._principal()
+        if kind != "session":
+            raise DeviceApiError(401, "auth_required")
+        internal_same_origin = self.headers.get("X-Heel-Internal-Origin") == "same-origin"
+        preserved_origin = self.headers.get("Origin") == self.cp.public_origin
+        if not (internal_same_origin and preserved_origin):
+            raise DeviceApiError(403, "not_authorized")
+
+        # Device authorization is a sensitive account action. Refuse a browser authentication
+        # older than fifteen minutes so an unattended long-lived session cannot add a device.
+        cookie = self.headers.get("Cookie", "")
+        token = next(
+            (
+                value
+                for part in cookie.split(";")
+                for key, _, value in [part.strip().partition("=")]
+                if key == "heel_session"
+            ),
+            "",
+        )
+        session = self.cp.store.conn.execute(
+            "SELECT created_at FROM sessions WHERE token_hash=? AND revoked_at IS NULL",
+            (hash_api_key(token),),
+        ).fetchone()
+        if session is None or time.time() - session["created_at"] > 15 * 60:
+            raise DeviceApiError(403, "recent_auth_required")
+        return user_id
+
+    def _device_verify(self):
+        user_id = self._require_device_verify_session()
+        body = self._device_body()
+        action = body.get("action")
+        user_code = body.get("user_code")
+        if body.get("schema_version") != "heel.device-verify.v1" or type(user_code) is not str:
+            raise DeviceApiError(400, "invalid_request")
+        if action == "inspect":
+            if set(body) != {"schema_version", "user_code", "action"}:
+                raise DeviceApiError(400, "invalid_request")
+            try:
+                claim = self._device_store().inspect(user_code, user_id)
+            except DeviceExpired:
+                raise DeviceApiError(410, "expired_token") from None
+            except PermissionError:
+                raise DeviceApiError(400, "invalid_request") from None
+            self._json(200, {
+                "schema_version": "heel.device-verify-view.v1",
+                "status": "pending",
+                "user_code": user_code,
+                "client_id": "heel-agent",
+                "device_name": claim.device_name,
+                "device_fingerprint": claim.device_fingerprint,
+                "capabilities": list(DEVICE_CAPABILITIES),
+                "expires_in": claim.expires_in,
+                "confirmation_nonce": claim.confirmation_nonce,
+            })
+            return
+        if action == "approve":
+            if set(body) != {
+                "schema_version", "user_code", "action", "workspace_id",
+                "confirmation_nonce",
+            }:
+                raise DeviceApiError(400, "invalid_request")
+            workspace_id = body.get("workspace_id")
+            nonce = body.get("confirmation_nonce")
+            if type(workspace_id) is not str or type(nonce) is not str:
+                raise DeviceApiError(400, "invalid_request")
+            try:
+                require(self.cp.store, workspace_id, user_id, "sync_findings")
+            except PermissionError:
+                raise DeviceApiError(403, "not_authorized") from None
+        elif action == "deny":
+            if set(body) != {"schema_version", "user_code", "action", "confirmation_nonce"}:
+                raise DeviceApiError(400, "invalid_request")
+            workspace_id = None
+            nonce = body.get("confirmation_nonce")
+            if type(nonce) is not str:
+                raise DeviceApiError(400, "invalid_request")
+        else:
+            raise DeviceApiError(400, "invalid_request")
+        try:
+            self._device_store().decide(
+                user_code,
+                nonce,
+                user_id,
+                action=action,
+                workspace_id=workspace_id,
+            )
+        except PermissionError:
+            raise DeviceApiError(400, "invalid_request") from None
+        self._json(200, {
+            "schema_version": "heel.device-verify-response.v1",
+            "status": "approved" if action == "approve" else "denied",
+        })
+
+    def _device_poll(self):
+        body = self._device_body()
+        if (
+            set(body) != {"schema_version", "device_code", "device_verifier"}
+            or body.get("schema_version") != "heel.device-poll.v1"
+            or type(body.get("device_code")) is not str
+            or type(body.get("device_verifier")) is not str
+        ):
+            raise DeviceApiError(400, "invalid_request")
+        try:
+            result = self._device_store().poll(body["device_code"], body["device_verifier"])
+        except SlowDown as error:
+            raise DeviceApiError(429, "slow_down", interval=error.interval) from None
+        except PermissionError:
+            raise DeviceApiError(401, "invalid_grant") from None
+        payload = {
+            "schema_version": "heel.device-poll-response.v1",
+            "status": result.status,
+        }
+        if result.status == "pending":
+            payload.update({"expires_in": result.expires_in, "interval": result.interval})
+        self._json(200, payload)
+
+    def _device_token(self):
+        body = self._device_body()
+        if (
+            set(body) != {"schema_version", "grant_type", "device_code", "device_verifier"}
+            or body.get("schema_version") != "heel.device-token.v1"
+            or body.get("grant_type") != "urn:ietf:params:oauth:grant-type:device_code"
+            or type(body.get("device_code")) is not str
+            or type(body.get("device_verifier")) is not str
+        ):
+            raise DeviceApiError(400, "invalid_request")
+        try:
+            tokens = self._device_store().exchange(body["device_code"], body["device_verifier"])
+        except DevicePending:
+            raise DeviceApiError(409, "authorization_pending") from None
+        except DeviceDenied:
+            raise DeviceApiError(403, "access_denied") from None
+        except DeviceExpired:
+            raise DeviceApiError(410, "expired_token") from None
+        except PermissionError:
+            raise DeviceApiError(401, "invalid_grant") from None
+        try:
+            require(self.cp.store, tokens.workspace_id,
+                    self._device_store().resolve_access(tokens.access_token).user_id,
+                    "sync_findings")
+        except (PermissionError, AttributeError):
+            self._device_store().revoke(tokens.refresh_token)
+            raise DeviceApiError(403, "access_denied")
+        self._json(200, self._device_token_payload(tokens))
+
+    def _device_refresh(self):
+        body = self._device_body()
+        if (
+            set(body) != {"schema_version", "grant_type", "refresh_token"}
+            or body.get("schema_version") != "heel.device-refresh.v1"
+            or body.get("grant_type") != "refresh_token"
+            or type(body.get("refresh_token")) is not str
+        ):
+            raise DeviceApiError(400, "invalid_request")
+        try:
+            tokens = self._device_store().refresh(body["refresh_token"])
+        except RefreshReuseDetected:
+            raise DeviceApiError(401, "refresh_reuse_detected") from None
+        except PermissionError:
+            raise DeviceApiError(401, "invalid_grant") from None
+        principal = self._device_store().resolve_access(tokens.access_token)
+        try:
+            if principal is None:
+                raise PermissionError
+            require(self.cp.store, tokens.workspace_id, principal.user_id, "sync_findings")
+        except PermissionError:
+            self._device_store().revoke(tokens.refresh_token)
+            raise DeviceApiError(403, "access_denied")
+        self._json(200, self._device_token_payload(tokens))
+
+    def _device_revoke(self):
+        body = self._device_body()
+        if (
+            set(body) != {"schema_version", "refresh_token"}
+            or body.get("schema_version") != "heel.device-revoke.v1"
+            or type(body.get("refresh_token")) is not str
+        ):
+            raise DeviceApiError(400, "invalid_request")
+        self._device_store().revoke(body["refresh_token"])
+        self._json(200, {"schema_version": "heel.device-revoke-response.v1", "ok": True})
 
     def _signup(self):
         b = self._body()
         email, password = str(b.get("email", "")).strip(), str(b.get("password", ""))
         if "@" not in email:
             raise ApiError(400, "valid email required")
-        # Trial-farming brake: per-IP + platform-wide signup throttle (429). The direct socket
-        # address is used; a TLS edge that proxies must be configured as the deployment's
-        # trusted source of client addresses before X-Forwarded-For is ever honored.
-        self.cp.auth.throttle_signup(self.client_address[0], email)
-        if self.cp.user_by_email(email):
-            raise ApiError(409, "account already exists")
-        uid = self.cp.store.create_user(email)
-        self.cp.auth.set_password(uid, password)   # raises ValueError if weak
-        org = self.cp.store.create_org(email)
-        wid = self.cp.store.create_workspace(org, "default", "free", CATALOG_VERSION)
-        self.cp.store.add_member(wid, uid, Role.OWNER)
-        ses = self.cp.auth.create_session(uid)
+        if len(password) < 10:
+            raise ApiError(400, "password must be at least 10 characters")
+        # The production edge derives a one-way per-client key from its trusted transport
+        # metadata. Direct/local servers continue to use the socket address and never honor
+        # caller-supplied forwarding headers.
+        client_key = self.client_address[0]
+        if self.cp.trust_edge_client_key:
+            supplied = self.headers.get("X-Heel-Client-Key", "")
+            if re.fullmatch(r"[0-9a-f]{64}", supplied) is None:
+                raise ApiError(400, "trusted client key required")
+            client_key = supplied
+        self.cp.auth.throttle_signup(client_key, email)
+        connection = self.cp.store.conn
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self.cp.user_by_email(email):
+                raise ApiError(409, "account already exists")
+            uid = self.cp.store.create_user(email, commit=False)
+            self.cp.auth.set_password(uid, password, commit=False)
+            org = self.cp.store.create_org(email, commit=False)
+            wid = self.cp.store.create_workspace(
+                org, "default", "free", CATALOG_VERSION, commit=False
+            )
+            self.cp.store.add_member(wid, uid, Role.OWNER, commit=False)
+            ses = self.cp.auth.create_session(uid, commit=False)
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
         self._json(201, {"user_id": uid, "workspace_id": wid},
                    {"Set-Cookie": _session_cookie(ses.token)})
 
@@ -657,6 +1084,19 @@ class _Handler(BaseHTTPRequestHandler):
                 raise ApiError(402, "API access is not included in this plan",
                                upgrade_to=self.cp.entitlements.upgrade_target(sub))
             self._json(200, {"workspace_id": workspace_id, "role": role.value})
+        elif kind == "device_session":
+            device = key
+            role = self.cp.store.get_role(device.workspace_id, uid)
+            if role is None:
+                raise ApiError(401, "device access is no longer authorized",
+                               code="invalid_grant")
+            self._json(200, {
+                "principal": "device_session",
+                "device_id": device.device_id,
+                "workspace_id": device.workspace_id,
+                "role": role.value,
+                "capabilities": list(DEVICE_CAPABILITIES),
+            })
         else:
             raise ApiError(401, "authentication required")
 
@@ -1061,7 +1501,11 @@ class _Handler(BaseHTTPRequestHandler):
         interval = str(b.get("interval", "month"))
         if interval not in ("month", "year"):
             raise ApiError(400, "interval must be month or year")
-        self._json(200, self.cp.billing.create_checkout(wid, plan, interval))
+        try:
+            checkout = self.cp.billing.create_checkout(wid, plan, interval)
+        except BillingUnavailable:
+            raise ApiError(503, "paid checkout is not configured") from None
+        self._json(200, checkout)
 
     # --- billing webhook (signature-verified, no auth principal) ---
     def _webhook(self):
@@ -1107,11 +1551,30 @@ class _ControlPlaneHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address, handler, cp: ControlPlane):
         self.control_plane = cp
         self._owns_control_plane = False
+        self._close_callbacks = []
         self._request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
+        self._drain_condition = threading.Condition()
+        self._active_requests = 0
         super().__init__(server_address, handler)
         self._owns_control_plane = True
 
+    def add_close_callback(self, callback) -> None:
+        self._close_callbacks.append(callback)
+
     def process_request(self, request, client_address) -> None:
+        if self.control_plane.draining:
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Cache-Control: no-store\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 34\r\n\r\n"
+                    b'{"error":"control plane draining"}'
+                )
+            finally:
+                self.shutdown_request(request)
+            return
         if not self._request_slots.acquire(blocking=False):
             try:
                 request.sendall(
@@ -1125,9 +1588,14 @@ class _ControlPlaneHTTPServer(ThreadingHTTPServer):
             finally:
                 self.shutdown_request(request)
             return
+        with self._drain_condition:
+            self._active_requests += 1
         try:
             super().process_request(request, client_address)
         except Exception:
+            with self._drain_condition:
+                self._active_requests -= 1
+                self._drain_condition.notify_all()
             self._request_slots.release()
             raise
 
@@ -1135,14 +1603,46 @@ class _ControlPlaneHTTPServer(ThreadingHTTPServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
+            with self._drain_condition:
+                self._active_requests -= 1
+                self._drain_condition.notify_all()
             self._request_slots.release()
 
+    def wait_for_request_drain(self, timeout: float = REQUEST_DRAIN_TIMEOUT_SECONDS) -> bool:
+        """Wait for already-accepted requests without admitting new work."""
+        deadline = time.monotonic() + timeout
+        with self._drain_condition:
+            while self._active_requests:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._drain_condition.wait(remaining)
+            return True
+
     def server_close(self) -> None:
+        self.control_plane.draining = True
         try:
             super().server_close()
+            drained = self.wait_for_request_drain()
+            if not drained:
+                _LOGGER.error(json.dumps({
+                    "active_requests": self._active_requests,
+                    "event": "control_plane_drain_timeout",
+                    "timeout_seconds": REQUEST_DRAIN_TIMEOUT_SECONDS,
+                }, sort_keys=True, separators=(",", ":")))
         finally:
             if self._owns_control_plane:
-                self.control_plane.close()
+                try:
+                    try:
+                        self.control_plane.store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except Exception:
+                        pass
+                    self.control_plane.close()
+                finally:
+                    self._owns_control_plane = False
+            callbacks, self._close_callbacks = self._close_callbacks, []
+            for callback in reversed(callbacks):
+                callback()
 
 
 def serve(cp: ControlPlane, host: str = "127.0.0.1", port: int = 0,

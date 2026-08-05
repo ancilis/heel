@@ -98,6 +98,64 @@ describe("HeelCloudApi", () => {
     ]);
   });
 
+  test("inspects then explicitly decides a closed device claim", async () => {
+    const userCode = "ABCD-EFGH";
+    const nonce = `heel_dcn_${"a".repeat(43)}`;
+    const { api, transport } = apiWith([
+      jsonResponse({
+        schema_version: "heel.device-verify-view.v1",
+        status: "pending",
+        user_code: userCode,
+        client_id: "heel-agent",
+        device_name: "Alice's MacBook",
+        device_fingerprint: "7J4D-QW9K",
+        capabilities: ["sync_findings", "view_synced_reviews"],
+        expires_in: 421,
+        confirmation_nonce: nonce,
+      }),
+      jsonResponse({ schema_version: "heel.device-verify-response.v1", status: "approved" }),
+    ]);
+
+    await expect(api.inspectDevice(userCode)).resolves.toMatchObject({
+      userCode,
+      deviceName: "Alice's MacBook",
+      deviceFingerprint: "7J4D-QW9K",
+      confirmationNonce: nonce,
+    });
+    await expect(api.decideDevice(userCode, "approve", nonce, workspaceRef)).resolves.toBe("approved");
+    expect(transport.mock.calls.map(([path]) => path)).toEqual([
+      "/api/control-plane/v1/device/verify",
+      "/api/control-plane/v1/device/verify",
+    ]);
+    expect(JSON.parse(transport.mock.calls[0][1].body as string)).toEqual({
+      schema_version: "heel.device-verify.v1", user_code: userCode, action: "inspect",
+    });
+    expect(JSON.parse(transport.mock.calls[1][1].body as string)).toEqual({
+      schema_version: "heel.device-verify.v1",
+      user_code: userCode,
+      action: "approve",
+      workspace_id: workspaceRef,
+      confirmation_nonce: nonce,
+    });
+  });
+
+  test("rejects malformed device claims and never decides without a confirmation nonce", async () => {
+    const { api } = apiWith([jsonResponse({
+      schema_version: "heel.device-verify-view.v1",
+      status: "pending",
+      user_code: "ABCD-EFGH",
+      client_id: "heel-agent",
+      device_name: "CLI",
+      device_fingerprint: "7J4D-QW9K",
+      capabilities: ["sync_findings", "view_synced_reviews", "admin"],
+      expires_in: 421,
+      confirmation_nonce: `heel_dcn_${"a".repeat(43)}`,
+    })]);
+    await expect(api.inspectDevice("ABCD-EFGH")).rejects.toMatchObject({ code: "invalid_response" });
+    await expect(api.decideDevice("ABCD-EFGH", "approve", "", workspaceRef))
+      .rejects.toMatchObject({ code: "invalid_request" });
+  });
+
   test("binds approval and findings transport to exact bytes without adding client approval claims", async () => {
     const requestDigest = "c".repeat(64);
     const requestJson = JSON.stringify({ schema_version: "heel.findings-sync.v1" });

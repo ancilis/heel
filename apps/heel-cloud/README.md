@@ -1,56 +1,73 @@
 # Heel Cloud
 
-The commercial Heel customer application. This anonymous milestone ships an
-evidence-first browser workspace: a real committed finding is visible on first
-render, and a visitor can run the sanitized sample or paste/drop an OpenAPI JSON
-document without an account. The canonical Python engine runs in a dedicated Web
-Worker from an integrity-pinned, same-origin Pyodide runtime and Heel wheel.
+Heel Cloud is the deployable website and optional findings-continuity service for Heel.
+The current launch is an evidence-first browser workspace for free early access. Free
+is the only available plan, Pro and Team are shown as coming soon, checkout is
+disabled, and no payment is accepted.
 
-Raw OpenAPI source and guided answers remain in component/worker memory. They
-are never uploaded, synchronized, placed in a URL, or written to durable browser
-storage. A visitor may explicitly save only a validated result envelope in that
-device's IndexedDB and export validated JSON or Markdown locally. The analyzer
-makes zero network calls after its same-origin runtime assets are loaded.
+No public deployment has occurred from this repository.
 
-This is a private acceptance preview. It is not a claim that the public browser
-alpha is deployed or launch-ready: interactive browser acceptance, explicit
-public-access approval, and public deployment remain separate gates. This
-milestone has no authentication, cloud save, hosted review API, server customer
-persistence, database, object storage, billing, analytics, or error-reporting
-SDK.
+## What customers can use
 
-The deployable app already includes the exact verified Agent files advertised on `/agent`:
+- The browser review works immediately without an account. It loads the pinned,
+  same-origin Python runtime and reviews a sample or an OpenAPI 3.0/3.1 JSON document
+  in a Web Worker.
+- Raw OpenAPI, guided answers, and full review context stay in browser memory and are
+  never uploaded. A customer can optionally save a validated result locally in that
+  browser and export it locally.
+- The downloadable CLI and stdio MCP server also run locally. They do not require a
+  Heel account for local review.
+- A customer may opt into cloud continuity. Account and project setup are explicit;
+  CLI/MCP machines use browser-mediated device authorization. Every sync requires an
+  exact findings-only projection and a short-lived approval. Raw OpenAPI and full
+  review context are never part of the sync request.
+- Free workspaces may store up to three new synced review projections per catalog
+  period. Paid Pro and Team capabilities are not available during free launch.
+
+The browser experience works on supported Windows browsers. The machine credential
+fallback and durable machine sync queue require POSIX descriptor and file-locking
+semantics; Windows CLI/MCP cloud continuity is not launch-supported.
+
+The exact verified Agent files advertised on `/agent` are:
 
 - `/downloads/heel_sim-1.2.0-py3-none-any.whl`
 - `/downloads/heel_sim-1.2.0.tar.gz`
 - `/downloads/heel-open-core-manifest.json`
 
-The build validates their exact set, sizes, digests, and Apache-only archive members without
-regenerating them. CI clean-installs the committed wheel and completes a real initialized MCP review.
-Public customer deployment, PyPI publication, and the current public repository export are separate
-release-owner actions and are not complete.
+## Production topology
 
-The base local CLI/MCP is Apache-2.0 and has no commercial usage limit. Hosted findings
-synchronization and remote MCP are paid Heel Cloud features; they are not enabled in this anonymous
-milestone. Windows secure local project storage is not supported at launch; the browser workspace
-remains available without that store.
+The public artifact targets a Cloudflare Worker. Its proxy has an exact method/path
+allowlist and reaches the Python control plane only through a Cloudflare VPC service
+binding. It does not provide a general-purpose reverse proxy.
+
+The control plane runs `python -m heel.saas.server` as one non-root process. The
+production contract is deliberately single-node:
+
+- SQLite on a persistent volume, with WAL and `synchronous=FULL`;
+- one adjacent nonblocking process lock at `<database>.lock`;
+- a canonical HTTPS `HEEL_PUBLIC_ORIGIN`;
+- required device-token, API-key, and edge-auth secrets;
+- `HEEL_BILLING_MODE=free_launch`, backed by disabled checkout;
+- no public control-plane host port.
+
+`deploy/compose.yaml` starts the private control plane and `cloudflared`. It uses
+`expose`, not `ports`. The public Worker converts the public
+`__Host-heel_session` cookie to the private `heel_session` cookie, strips ambient
+credentials and forwarding headers, adds the shared edge-auth secret, and forwards
+only allowlisted control-plane operations.
+
+## Build and verification
 
 ## Node versions
 
 - Production and hosting: Node.js `>=24.13.1`
 - Security verification: Node.js 25+; Node.js 26 is recommended
 
-The production floor covers the synchronous module hooks used by runtime
-preparation. The browser security test additionally requires the network-aware
-Node permission model. Use a supported Node 26 release for CI security checks;
-the application itself does not require the short-lived Node 25 line in
-production.
+The Python package supports Python 3.11+; release reproducibility uses Python 3.13.
 
-## Local checks
+From the repository root:
 
 ```bash
-npm ci --ignore-scripts --no-audit --no-fund
-cd ../..
 env PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1 \
   python3.13 -m pip --isolated install \
   --require-hashes --only-binary=:all: \
@@ -59,27 +76,71 @@ python3.13 scripts/build_open_core_release.py \
   --output apps/heel-cloud/public/downloads --check
 HEEL_REQUIRE_STANDARD_BUILD=1 \
   python3.13 -m unittest tests.test_open_core_release -v
-python3 scripts/build_browser_engine.py --output apps/heel-cloud/browser-engine --check
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+python3 -m unittest \
+  tests.test_saas_server \
+  tests.test_saas_deployment \
+  tests.test_saas_device_auth \
+  tests.test_saas_findings_http_api -v
+python3 scripts/build_browser_engine.py \
+  --output apps/heel-cloud/browser-engine --check
 python3 scripts/build_browser_sample.py --check
-python3 -m unittest tests.test_browser_engine_build tests.test_browser_review \
-  tests.test_browser_sample tests.test_browser_native_parity -v
+python3 -m unittest \
+  tests.test_browser_engine_build \
+  tests.test_browser_review \
+  tests.test_browser_sample \
+  tests.test_browser_native_parity -v
+```
+
+Then build the Worker artifact with the real public origin and Cloudflare VPC
+service UUID:
+
+```bash
 cd apps/heel-cloud
+npm ci --ignore-scripts --no-audit --no-fund
 node --test tests/browser-engine.test.mjs
 npm run test:unit
 npm run typecheck
 npm run lint
-npm run build
+HEEL_PUBLIC_ORIGIN=https://YOUR_HEEL_DOMAIN \
+HEEL_CONTROL_PLANE_VPC_SERVICE_ID=YOUR_VPC_SERVICE_UUID \
+  npm run build
 npm run test:node
 ```
 
-The release-tool install and release gate require Python 3.13 to match CI. The browser-only Python
-checks remain supported on the project-wide Python 3.11+ range.
+The build verifies the committed Agent downloads without regenerating them.
 
-The production-artifact test runs after the build and verifies the transformed,
-digest-pinned same-origin runtime; recursively scans deployed executables,
-manifests, browser-wheel members, and the Agent wheel/source archive; enforces exact response CSP/security
-headers and empty cloud capabilities; rejects source maps, CDN fallbacks, and
-credentials; and proves that 1200×630 social metadata uses the request URL rather
-than caller-controlled host headers. These automated checks do not replace the
-outstanding keyboard, narrow-viewport, request-inspection, timing, and deployment
-acceptance run.
+## Deployment
+
+1. Copy `deploy/.env.production.example` to the ignored
+   `deploy/.env.production` and fill it through the deployment secret manager.
+2. Provision the domain, Cloudflare Tunnel, and VPC service. The VPC service UUID
+   supplied to the Worker build must identify the private control-plane service.
+3. Set the Worker's `CONTROL_PLANE_EDGE_SECRET` to the same canonical base64url
+   value used as `HEEL_EDGE_AUTH_SECRET_B64` by the control plane.
+4. Validate and start the private services:
+
+   ```bash
+   docker compose --env-file deploy/.env.production \
+     -f deploy/compose.yaml config
+   docker compose --env-file deploy/.env.production \
+     -f deploy/compose.yaml up -d --build
+   docker compose --env-file deploy/.env.production \
+     -f deploy/compose.yaml ps
+   ```
+
+5. After the Worker account, domain, VPC binding, public origin, and Worker secret
+   exist, deploy from `apps/heel-cloud`:
+
+   ```bash
+   HEEL_PUBLIC_ORIGIN=https://YOUR_HEEL_DOMAIN \
+   HEEL_CONTROL_PLANE_VPC_SERVICE_ID=YOUR_VPC_SERVICE_UUID \
+     npm run deploy:dry-run
+   HEEL_PUBLIC_ORIGIN=https://YOUR_HEEL_DOMAIN \
+   HEEL_CONTROL_PLANE_VPC_SERVICE_ID=YOUR_VPC_SERVICE_UUID \
+     npm run deploy
+   ```
+
+These are the repository's deployment commands, not evidence of a completed public
+deployment. The Docker image was not executed in this workspace because a Docker
+daemon was unavailable.

@@ -6,7 +6,7 @@ SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
 Boots the real HTTP server on an ephemeral loopback port and drives the golden path:
 signup → dashboard → synthetic run → target verify (stub DNS) → verified run guard →
-checkout stub → kill switch → health/metrics. Exits non-zero on the first failure.
+disabled paid checkout → kill switch → health/metrics. Exits non-zero on the first failure.
 Run: python3 scripts/saas_smoke.py [db_path]
 """
 from __future__ import annotations
@@ -18,13 +18,15 @@ import threading
 
 sys.path.insert(0, ".")
 from heel.saas.http_api import ControlPlane, serve  # noqa: E402
+from heel.saas.billing import DisabledBilling  # noqa: E402
 
 RECORDS = {}
 
 
 def main(db_path: str = ":memory:") -> int:
     cp = ControlPlane(db_path, dns_txt=lambda n: RECORDS.get(n, []),
-                      scope_validator=lambda ws, ref, tgt: ref == "smoke-scope")
+                      scope_validator=lambda ws, ref, tgt: ref == "smoke-scope",
+                      billing=DisabledBilling())
     server = serve(cp)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -81,7 +83,11 @@ def main(db_path: str = ":memory:") -> int:
 
     status, body, _ = req("POST", f"/v1/workspaces/{wid}/billing/checkout",
                           {"plan": "pro", "interval": "month"}, hdr)
-    steps_ok &= check("checkout stub", status == 200 and "url" in json.dumps(body), body)
+    steps_ok &= check(
+        "paid checkout disabled",
+        status == 503 and "stub.local" not in json.dumps(body),
+        body,
+    )
 
     cp.ops.trip(wid, actor="smoke", reason="drill")
     status, _, _ = req("POST", f"/v1/workspaces/{wid}/runs", {}, hdr)

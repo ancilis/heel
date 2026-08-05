@@ -1,0 +1,56 @@
+name: heel
+
+services:
+  control-plane:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.control-plane
+    image: heel-control-plane:1.2.0
+    restart: unless-stopped
+    stop_grace_period: 35s
+    env_file:
+      - .env.production
+    environment:
+      HEEL_DATABASE_PATH: /var/lib/heel/control-plane.sqlite3
+      HEEL_CONTROL_PLANE_HOST: 0.0.0.0
+      HEEL_CONTROL_PLANE_PORT: "8080"
+      HEEL_PRIVATE_NETWORK_ACK: private-vpc-only
+      HEEL_BILLING_MODE: free_launch
+    expose:
+      - "8080"
+    volumes:
+      - heel-control-plane-data:/var/lib/heel
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import http.client; c=http.client.HTTPConnection('127.0.0.1',8080,timeout=3); c.request('GET','/v1/readyz'); r=c.getresponse(); r.read(); raise SystemExit(0 if r.status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  cloudflared:
+    image: ${HEEL_CLOUDFLARED_IMAGE:?set a reviewed immutable cloudflared image digest}
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${HEEL_CLOUDFLARE_TUNNEL_TOKEN:?set the remotely managed Tunnel token}
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  heel-control-plane-data:
+    name: heel-control-plane-data

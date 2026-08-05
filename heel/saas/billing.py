@@ -185,6 +185,24 @@ class Billing:
         raise NotImplementedError
 
 
+class BillingUnavailable(RuntimeError):
+    """Paid checkout is deliberately unavailable in this deployment."""
+
+
+class DisabledBilling(Billing):
+    """Fail-closed production adapter for a free-launch deployment.
+
+    This is intentionally distinct from ``StubBilling``: a production process must never hand a
+    customer a synthetic checkout URL or imply that payment was accepted.
+    """
+
+    def price_id(self, plan: Plan, interval: str) -> str:
+        raise BillingUnavailable("paid checkout is not configured")
+
+    def create_checkout(self, workspace_id: str, plan: Plan, interval: str) -> dict:
+        raise BillingUnavailable("paid checkout is not configured")
+
+
 class StubBilling(Billing):
     """Deterministic offline billing for local/CI. Emits the same event shape a real provider would,
     so the full lifecycle (checkout→active→past_due→canceled, upgrade/downgrade) is testable."""
