@@ -2,7 +2,14 @@
 
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from "react";
 import {
   BrowserReviewClient,
   BrowserReviewClientError,
@@ -25,16 +32,70 @@ import { QuestionList, questionAnswerKey } from "./QuestionList";
 
 
 type ReviewPhase = "example" | "loading_engine" | "reviewing" | "complete" | "failed" | "cancelled";
+type ReviewProvenance = "example" | "custom" | "history";
+type ReviewRequestSnapshot = Readonly<{
+  kind: "initial";
+  source: string;
+  provenance: Exclude<ReviewProvenance, "history">;
+}> | Readonly<{
+  kind: "rerun";
+  source: string;
+  baseline: ReviewEnvelopeV1;
+  answers: ReviewAnswer[];
+  before: ReviewEnvelopeV1;
+  provenance: Exclude<ReviewProvenance, "history">;
+}>;
+
+const COLLECTION_PAGE_SIZE = 20;
+
+
+function ProgressiveList<T>({
+  items,
+  label,
+  renderItem,
+}: {
+  items: T[];
+  label: string;
+  renderItem(item: T, index: number): ReactNode;
+}) {
+  const [visible, setVisible] = useState(COLLECTION_PAGE_SIZE);
+  const shown = items.slice(0, visible);
+  return (
+    <>
+      <ul>{shown.map(renderItem)}</ul>
+      {visible < items.length ? (
+        <button
+          className="text-button load-more"
+          type="button"
+          onClick={() => setVisible((current) => Math.min(current + COLLECTION_PAGE_SIZE, items.length))}
+        >
+          Load more {label} ({items.length - visible} remaining)
+        </button>
+      ) : null}
+    </>
+  );
+}
 
 
 function topFinding(review: ReviewEnvelopeV1) {
-  const reachable = review.findings.filter((finding) => finding.reachable);
-  const candidates = reachable.length > 0 ? reachable : review.findings;
-  return [...candidates].sort((left, right) => {
-    const severity = Number(right.severity === "block") - Number(left.severity === "block");
-    if (severity !== 0) return severity;
-    return left.surface_id.localeCompare(right.surface_id, "en-US");
-  })[0] ?? null;
+  const reachableOnly = review.findings.some((finding) => finding.reachable);
+  let bestIndex = -1;
+  review.findings.forEach((finding, index) => {
+    if (reachableOnly && !finding.reachable) return;
+    if (bestIndex < 0) {
+      bestIndex = index;
+      return;
+    }
+    const current = review.findings[bestIndex];
+    const severity = Number(current.severity === "block") - Number(finding.severity === "block");
+    if (severity < 0 || (severity === 0 && finding.surface_id.localeCompare(current.surface_id, "en-US") < 0)) {
+      bestIndex = index;
+    }
+  });
+  return {
+    finding: bestIndex < 0 ? null : review.findings[bestIndex],
+    index: bestIndex,
+  };
 }
 
 
@@ -57,6 +118,7 @@ function statusMessage(phase: ReviewPhase, review: ReviewEnvelopeV1): string {
 
 export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelopeV1 }) {
   const [result, setResult] = useState(initialReview);
+  const [provenance, setProvenance] = useState<ReviewProvenance>("example");
   const [source, setSource] = useState(SAMPLE_OPENAPI_SOURCE);
   const [reviewSource, setReviewSource] = useState<string | null>(SAMPLE_OPENAPI_SOURCE);
   const [reviewBaseline, setReviewBaseline] = useState<ReviewEnvelopeV1 | null>(initialReview);
@@ -69,12 +131,15 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
   const [receipt, setReceipt] = useState<ReviewAnswerReceiptV1 | null>(null);
   const [changes, setChanges] = useState<{ findings: number; questions: number } | null>(null);
   const [history, setHistory] = useState<StoredLocalReviewV1[]>([]);
-  const [storageMessage, setStorageMessage] = useState("");
+  const [storageNotice, setStorageNotice] = useState<{ reviewId: string; message: string } | null>(null);
+  const [retryAvailable, setRetryAvailable] = useState(false);
   const clientRef = useRef<BrowserReviewClient | null>(null);
   const storeRef = useRef<LocalReviewStore | null>(null);
   const inputHeadingRef = useRef<HTMLDivElement>(null);
   const errorRef = useRef<HTMLDivElement>(null);
-  const lastRequestKindRef = useRef<"initial" | "rerun">("initial");
+  const requestGenerationRef = useRef(0);
+  const requestActiveRef = useRef(false);
+  const retryRequestRef = useRef<ReviewRequestSnapshot | null>(null);
 
   useEffect(() => {
     const client = new BrowserReviewClient();
@@ -83,20 +148,27 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
     storeRef.current = store;
     const unsubscribe = client.subscribe((status) => {
       setEngineStatus(status);
-      if (status === "reviewing") setPhase("reviewing");
+      if (status === "reviewing" && requestActiveRef.current) setPhase("reviewing");
     });
     void client.whenReady().then(
       () => setEngineStatus("ready"),
       () => setEngineStatus("failed"),
     );
-    void store.list().then(setHistory);
+    void store.list().then(setHistory, () => {
+      setStorageNotice({
+        reviewId: initialReview.review_id,
+        message: "Local storage is unavailable. Your current result remains in memory.",
+      });
+    });
     return () => {
+      requestGenerationRef.current += 1;
+      requestActiveRef.current = false;
       unsubscribe();
       client.dispose();
       clientRef.current = null;
       storeRef.current = null;
     };
-  }, []);
+  }, [initialReview.review_id]);
 
   useEffect(() => {
     if (inputOpen) inputHeadingRef.current?.focus();
@@ -106,49 +178,90 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
     if (error) errorRef.current?.focus();
   }, [error]);
 
-  const finding = useMemo(() => topFinding(result), [result]);
+  const primary = useMemo(() => topFinding(result), [result]);
+  const finding = primary.finding;
+  const additionalFindings = useMemo(
+    () => result.findings.filter((_item, index) => index !== primary.index),
+    [result, primary.index],
+  );
   const regression = finding === null ? null : result.suggested_regressions.find((item) => (
     item.surface_id === finding.surface_id && item.scenario_hint === finding.risk
   )) ?? null;
   const disabled = phase === "loading_engine" || phase === "reviewing";
-  const jsonExport = reviewToJson(result);
-  const markdownExport = reviewToMarkdown(result, receipt);
+  const jsonExport = useMemo(() => reviewToJson(result), [result]);
+  const markdownExport = useMemo(() => reviewToMarkdown(result, receipt), [result, receipt]);
+  const provenanceLabel = provenance === "custom"
+    ? "Your completed review"
+    : provenance === "history"
+      ? "Saved local review"
+      : "Completed example review";
 
-  async function refreshHistory(): Promise<void> {
+  async function refreshHistory(reviewId: string): Promise<void> {
     const store = storeRef.current;
-    if (store !== null) setHistory(await store.list());
+    try {
+      if (store === null) throw new Error("local store is unavailable");
+      setHistory(await store.list());
+    } catch {
+      setStorageNotice({
+        reviewId,
+        message: "Local storage is unavailable. Your current result remains in memory.",
+      });
+    }
   }
 
-  async function execute(nextSource: string): Promise<void> {
+  async function runRequest(request: ReviewRequestSnapshot): Promise<void> {
     const client = clientRef.current;
     if (client === null) {
       setError("The browser-local review engine is still starting. Try again in a moment.");
       return;
     }
-    const bytes = new TextEncoder().encode(nextSource).byteLength;
-    if (bytes > MAX_BROWSER_INPUT_BYTES) {
-      setError("That document exceeds Heel's 2 MiB limit for browser review.");
-      return;
+    if (request.kind === "initial") {
+      const bytes = new TextEncoder().encode(request.source).byteLength;
+      if (bytes > MAX_BROWSER_INPUT_BYTES) {
+        setError("That document exceeds Heel's 2 MiB limit for browser review.");
+        return;
+      }
+      if (request.source.trim().length === 0) {
+        setError("Paste or choose an OpenAPI JSON document first.");
+        return;
+      }
     }
-    if (nextSource.trim().length === 0) {
-      setError("Paste or choose an OpenAPI JSON document first.");
-      return;
-    }
+    const generation = ++requestGenerationRef.current;
+    requestActiveRef.current = true;
+    retryRequestRef.current = request;
+    setRetryAvailable(true);
     setError("");
-    setReceipt(null);
-    setChanges(null);
+    if (request.kind === "initial") {
+      setReceipt(null);
+      setChanges(null);
+    }
     setPhase(client.status === "loading_engine" ? "loading_engine" : "reviewing");
-    lastRequestKindRef.current = "initial";
     try {
-      const completed = await client.review(nextSource);
+      const completed = request.kind === "initial"
+        ? await client.review(request.source)
+        : await client.rerun(request.source, request.baseline, request.answers);
+      if (generation !== requestGenerationRef.current) return;
+      requestActiveRef.current = false;
+      retryRequestRef.current = null;
+      setRetryAvailable(false);
       setResult(completed.envelope);
-      setReviewSource(nextSource);
-      setReviewBaseline(completed.envelope);
-      setCanRerun(true);
-      setAnswers(new Map());
+      setProvenance(request.provenance);
+      if (request.kind === "initial") {
+        setReviewSource(request.source);
+        setReviewBaseline(completed.envelope);
+        setCanRerun(true);
+        setAnswers(new Map());
+      } else {
+        setChanges({
+          findings: completed.envelope.summary.findings - request.before.summary.findings,
+          questions: completed.envelope.summary.questions - request.before.summary.questions,
+        });
+      }
       setReceipt(completed.receipt);
       setPhase("complete");
     } catch (caught) {
+      if (generation !== requestGenerationRef.current) return;
+      requestActiveRef.current = false;
       if (caught instanceof BrowserReviewClientError && caught.code === "review_cancelled") {
         setPhase("cancelled");
       } else {
@@ -162,49 +275,39 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
     setInputOpen(false);
     setSource(SAMPLE_OPENAPI_SOURCE);
     setAnswers(new Map());
-    void execute(SAMPLE_OPENAPI_SOURCE);
+    void runRequest({ kind: "initial", source: SAMPLE_OPENAPI_SOURCE, provenance: "example" });
   }
 
   function analyzeMine(): void {
+    requestGenerationRef.current += 1;
+    requestActiveRef.current = false;
+    retryRequestRef.current = null;
+    setRetryAvailable(false);
     setInputOpen(true);
     setSource("");
     setAnswers(new Map());
     setReceipt(null);
     setChanges(null);
     setError("");
+    setPhase(provenance === "example" ? "example" : "complete");
   }
 
-  async function rerunWithAnswers(): Promise<void> {
-    const client = clientRef.current;
+  function rerunWithAnswers(): void {
     const submitted = [...answers.values()];
     if (
-      client === null
-      || reviewSource === null
+      reviewSource === null
       || reviewBaseline === null
       || !canRerun
       || submitted.length === 0
     ) return;
-    setError("");
-    setPhase(client.status === "loading_engine" ? "loading_engine" : "reviewing");
-    const before = result;
-    lastRequestKindRef.current = "rerun";
-    try {
-      const completed = await client.rerun(reviewSource, reviewBaseline, submitted);
-      setResult(completed.envelope);
-      setReceipt(completed.receipt);
-      setChanges({
-        findings: completed.envelope.summary.findings - before.summary.findings,
-        questions: completed.envelope.summary.questions - before.summary.questions,
-      });
-      setPhase("complete");
-    } catch (caught) {
-      if (caught instanceof BrowserReviewClientError && caught.code === "review_cancelled") {
-        setPhase("cancelled");
-      } else {
-        setError(publicFailure(caught));
-        setPhase("failed");
-      }
-    }
+    void runRequest({
+      kind: "rerun",
+      source: reviewSource,
+      baseline: reviewBaseline,
+      answers: submitted.map((answer) => ({ ...answer })),
+      before: result,
+      provenance: provenance === "custom" ? "custom" : "example",
+    });
   }
 
   function answerQuestion(answer: ReviewAnswer): void {
@@ -216,17 +319,17 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
   }
 
   function cancelReview(): void {
+    requestGenerationRef.current += 1;
+    requestActiveRef.current = false;
     clientRef.current?.cancel();
     setPhase("cancelled");
   }
 
   function retryReview(): void {
+    const request = retryRequestRef.current;
+    if (request === null) return;
     clientRef.current?.restart();
-    if (lastRequestKindRef.current === "rerun") {
-      void rerunWithAnswers();
-    } else {
-      void execute(source);
-    }
+    void runRequest(request);
   }
 
   function prepareDownload(
@@ -245,25 +348,70 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
   }
 
   async function saveResult(): Promise<void> {
-    const stored = await storeRef.current?.save(result);
-    if (stored) {
-      setStorageMessage("Validated result saved on this device only.");
-      await refreshHistory();
-    } else {
-      setStorageMessage("Local storage is unavailable. Your current result remains in memory.");
+    if (disabled) return;
+    const reviewId = result.review_id;
+    try {
+      const store = storeRef.current;
+      if (store === null) throw new Error("local store is unavailable");
+      const stored = await store.save(result);
+      if (!stored) throw new Error("local save was unavailable");
+      setStorageNotice({ reviewId, message: "Validated result saved on this device only." });
+      await refreshHistory(reviewId);
+    } catch {
+      setStorageNotice({
+        reviewId,
+        message: "Local storage is unavailable. Your current result remains in memory.",
+      });
     }
   }
 
   async function deleteResult(reviewId: string): Promise<void> {
-    const removed = await storeRef.current?.delete(reviewId);
-    if (!removed) setStorageMessage("Local storage is unavailable. No in-memory result was lost.");
-    await refreshHistory();
+    if (disabled) return;
+    const visibleReviewId = result.review_id;
+    try {
+      const store = storeRef.current;
+      if (store === null || !await store.delete(reviewId)) throw new Error("local delete was unavailable");
+      await refreshHistory(visibleReviewId);
+    } catch {
+      setStorageNotice({
+        reviewId: visibleReviewId,
+        message: "Local storage is unavailable. No in-memory result was lost.",
+      });
+    }
   }
 
   async function clearHistory(): Promise<void> {
-    const cleared = await storeRef.current?.clear();
-    if (!cleared) setStorageMessage("Local storage is unavailable. No in-memory result was lost.");
-    await refreshHistory();
+    if (disabled) return;
+    const reviewId = result.review_id;
+    try {
+      const store = storeRef.current;
+      if (store === null || !await store.clear()) throw new Error("local clear was unavailable");
+      await refreshHistory(reviewId);
+    } catch {
+      setStorageNotice({
+        reviewId,
+        message: "Local storage is unavailable. No in-memory result was lost.",
+      });
+    }
+  }
+
+  function openHistory(item: StoredLocalReviewV1): void {
+    if (disabled) return;
+    requestGenerationRef.current += 1;
+    requestActiveRef.current = false;
+    retryRequestRef.current = null;
+    setRetryAvailable(false);
+    setResult(item.envelope);
+    setProvenance("history");
+    setReviewSource(null);
+    setReviewBaseline(null);
+    setCanRerun(false);
+    setAnswers(new Map());
+    setReceipt(null);
+    setChanges(null);
+    setError("");
+    setStorageNotice(null);
+    setPhase("complete");
   }
 
   return (
@@ -316,7 +464,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
       <section className="review-workspace" id="review" aria-labelledby="workspace-title">
       <div className="workspace-bar">
         <div>
-          <p className="eyebrow">Completed example review</p>
+          <p className="eyebrow">{provenanceLabel}</p>
           <h2 id="workspace-title">See the evidence before you install anything.</h2>
         </div>
       </div>
@@ -328,7 +476,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
             disabled={disabled}
             onSourceChange={setSource}
             onError={setError}
-            onSubmit={() => void execute(source)}
+            onSubmit={() => void runRequest({ kind: "initial", source, provenance: "custom" })}
           />
         </div>
       ) : null}
@@ -343,7 +491,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
       {disabled ? (
         <button className="text-button" type="button" onClick={cancelReview}>Cancel review</button>
       ) : null}
-      {phase === "failed" || phase === "cancelled" ? (
+      {(phase === "failed" || phase === "cancelled") && retryAvailable ? (
         <button className="button button-secondary" type="button" onClick={retryReview}>Retry locally</button>
       ) : null}
 
@@ -355,35 +503,59 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
         <section className="evidence-panel" aria-labelledby="controls-title">
           <p className="eyebrow">Controls</p>
           <h3 id="controls-title">Recommended controls</h3>
-          <ul>
-            {result.recommended_controls.map((control) => (
-              <li key={`${control.surface_type}:${control.surface_id}:${control.risk}`}>
+          <ProgressiveList
+            key={`${result.review_id}:controls`}
+            items={result.recommended_controls}
+            label="recommended controls"
+            renderItem={(control, index) => (
+              <li key={`${control.surface_type}:${control.surface_id}:${control.risk}:${index}`}>
                 <strong>{control.control}</strong>
                 <span>{control.surface_id} · {control.reason}</span>
               </li>
-            ))}
-          </ul>
+            )}
+          />
         </section>
         <section className="evidence-panel" aria-labelledby="regressions-title">
           <p className="eyebrow">Keep the fix</p>
           <h3 id="regressions-title">Suggested regressions</h3>
-          <ul>
-            {result.suggested_regressions.map((item) => (
-              <li key={`${item.surface_type}:${item.surface_id}:${item.name}`}>
+          <ProgressiveList
+            key={`${result.review_id}:regressions`}
+            items={result.suggested_regressions}
+            label="suggested regressions"
+            renderItem={(item, index) => (
+              <li key={`${item.surface_type}:${item.surface_id}:${item.name}:${index}`}>
                 <code>{item.name}</code>
                 <span>{item.scenario_hint} · {item.safety}</span>
               </li>
-            ))}
-          </ul>
+            )}
+          />
         </section>
+        {additionalFindings.length > 0 ? (
+          <section className="evidence-panel evidence-panel-wide" aria-labelledby="additional-findings-title">
+            <p className="eyebrow">Complete evidence</p>
+            <h3 id="additional-findings-title">Additional findings</h3>
+            <ProgressiveList
+              key={`${result.review_id}:findings`}
+              items={additionalFindings}
+              label="additional findings"
+              renderItem={(item, index) => (
+                <li key={`${item.surface_type}:${item.surface_id}:${item.risk}:${index}`}>
+                  <strong>{item.risk.replaceAll("_", " ")}</strong>
+                  <span>{item.surface_id} · {item.reason} · Control: {item.control}</span>
+                </li>
+              )}
+            />
+          </section>
+        ) : null}
       </div>
 
       <QuestionList
+        key={result.review_id}
         questions={result.questions}
         answers={answers}
         disabled={disabled || !canRerun}
         onAnswer={answerQuestion}
-        onRerun={() => void rerunWithAnswers()}
+        onRerun={rerunWithAnswers}
       />
       {reviewSource === null ? (
         <p className="history-source-note">
@@ -437,10 +609,12 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
               Download Markdown
             </a>
           </div>
-          <button className="button button-primary" type="button" onClick={() => void saveResult()}>
+          <button className="button button-primary" type="button" onClick={() => void saveResult()} disabled={disabled}>
             Save result on this device
           </button>
-          {storageMessage ? <p className="storage-message" aria-live="polite">{storageMessage}</p> : null}
+          {storageNotice?.reviewId === result.review_id ? (
+            <p className="storage-message" aria-live="polite">{storageNotice.message}</p>
+          ) : null}
         </section>
       </div>
 
@@ -450,7 +624,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
             <p className="eyebrow">Optional, device local</p>
             <h3 id="history-title">Local result history</h3>
           </div>
-          <button className="text-button" type="button" onClick={() => void clearHistory()}>
+          <button className="text-button" type="button" onClick={() => void clearHistory()} disabled={disabled}>
             Clear local history
           </button>
         </div>
@@ -461,22 +635,18 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
                 <button
                   className="history-open"
                   type="button"
-                  onClick={() => {
-                    setResult(item.envelope);
-                    setReviewSource(null);
-                    setReviewBaseline(null);
-                    setCanRerun(false);
-                    setAnswers(new Map());
-                    setReceipt(null);
-                    setChanges(null);
-                    setError("");
-                    setPhase("complete");
-                  }}
+                  disabled={disabled}
+                  onClick={() => openHistory(item)}
                 >
                   <strong>{item.envelope.product_id}</strong>
                   <span>{item.envelope.gate_status} · {item.envelope.summary.findings} findings</span>
                 </button>
-                <button className="text-button" type="button" onClick={() => void deleteResult(item.envelope.review_id)}>
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => void deleteResult(item.envelope.review_id)}
+                >
                   Delete {item.envelope.product_id}
                 </button>
               </li>

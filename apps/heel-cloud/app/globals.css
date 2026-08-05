@@ -669,6 +669,14 @@ code {
   font-size: 13px;
 }
 
+.evidence-panel-wide {
+  grid-column: 1 / -1;
+}
+
+.load-more {
+  margin-top: 10px;
+}
+
 .questions-card,
 .answer-receipt,
 .history-card {

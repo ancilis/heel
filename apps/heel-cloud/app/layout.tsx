@@ -11,8 +11,9 @@ const description =
 
 
 function requestOrigin(values: Headers): string | null {
+  const directHost = values.get("host")?.trim();
   const forwardedHost = values.get("x-forwarded-host")?.split(",", 1)[0]?.trim();
-  const host = forwardedHost || values.get("host")?.trim();
+  const host = directHost || forwardedHost;
   if (!host || /[\s/?#\\@]/.test(host)) return null;
   const forwardedProtocol = values.get("x-forwarded-proto")?.split(",", 1)[0]?.trim();
   const protocol = forwardedProtocol === "http" || forwardedProtocol === "https"

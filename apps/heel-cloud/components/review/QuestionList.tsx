@@ -2,6 +2,7 @@
 
 "use client";
 
+import { useState } from "react";
 import type { ReviewAnswer, ReviewAnswerField, ReviewAnswerValue } from "../../lib/review-presentation";
 import type { ReviewQuestionV1 } from "../../lib/review-v1";
 
@@ -16,6 +17,7 @@ const ANSWERS: Array<{ value: ReviewAnswerValue; label: string }> = [
   { value: "not_enforced", label: "Not enforced" },
   { value: "unknown", label: "Unknown" },
 ];
+const QUESTION_PAGE_SIZE = 20;
 
 
 export function questionAnswerKey(question: Pick<ReviewQuestionV1, "surface" | "field">): string {
@@ -36,6 +38,7 @@ export function QuestionList({
   onAnswer(answer: ReviewAnswer): void;
   onRerun(): void;
 }) {
+  const [visible, setVisible] = useState(QUESTION_PAGE_SIZE);
   if (questions.length === 0) {
     return (
       <section className="questions-card" aria-labelledby="questions-title">
@@ -52,11 +55,11 @@ export function QuestionList({
         Answers stay in memory and rerun the same local Python engine.
       </p>
       <div className="question-list">
-        {questions.map((question) => {
+        {questions.slice(0, visible).map((question, index) => {
           const supported = SUPPORTED_FIELDS.has(question.field as ReviewAnswerField);
           if (!supported) {
             return (
-              <article className="question question-unsupported" key={question.id}>
+              <article className="question question-unsupported" key={`${question.id}:${index}`}>
                 <span className="question-field">{question.field}</span>
                 <strong>{question.prompt}</strong>
                 <p>Not answerable from this OpenAPI — retained as visible uncertainty.</p>
@@ -66,7 +69,7 @@ export function QuestionList({
           const field = question.field as ReviewAnswerField;
           const selected = answers.get(questionAnswerKey(question))?.value;
           return (
-            <fieldset className="question" key={question.id}>
+            <fieldset className="question" key={`${question.id}:${index}`}>
               <legend>{question.prompt}</legend>
               <span className="question-surface">{question.surface} · {field}</span>
               <div className="answer-options">
@@ -74,7 +77,7 @@ export function QuestionList({
                   <label key={answer.value}>
                     <input
                       type="radio"
-                      name={`answer-${question.id}`}
+                      name={`answer-${question.id}-${index}`}
                       value={answer.value}
                       checked={selected === answer.value}
                       disabled={disabled}
@@ -89,6 +92,15 @@ export function QuestionList({
           );
         })}
       </div>
+      {visible < questions.length ? (
+        <button
+          className="text-button load-more"
+          type="button"
+          onClick={() => setVisible((current) => Math.min(current + QUESTION_PAGE_SIZE, questions.length))}
+        >
+          Load more confidence questions ({questions.length - visible} remaining)
+        </button>
+      ) : null}
       <button
         className="button button-secondary"
         type="button"

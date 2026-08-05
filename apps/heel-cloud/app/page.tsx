@@ -24,8 +24,11 @@ export default function Home() {
         <p className="eyebrow">Agent-first when you want it</p>
         <h2 id="mcp-title">The same review from your local AI surface.</h2>
         <p>
-          Heel&apos;s current MCP server runs over local stdio. Use the browser now,
-          or install <code>heel-mcp</code> for an agent-controlled workflow on your machine.
+          The <code>heel-sim</code> source checkout includes the <code>heel-mcp</code>
+          executable for an agent-controlled local stdio workflow. It is not currently
+          published to a package registry. <a href="https://github.com/ancilis/heel/blob/main/docs/MCP_QUICKSTART.md">
+            Open local MCP setup
+          </a>.
         </p>
       </section>
 

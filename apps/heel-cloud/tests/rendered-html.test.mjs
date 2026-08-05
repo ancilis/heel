@@ -109,11 +109,14 @@ test("uses Heel identity and marks original source as commercial", async () => {
   assert.match(layout, /generateMetadata/);
   assert.match(layout, /x-forwarded-host/);
   assert.match(layout, /\$\{origin\}\/og\.png/);
+  assert.ok(
+    layout.indexOf('values.get("host")') < layout.indexOf('values.get("x-forwarded-host")'),
+    "the direct Host header must take precedence over forwarded host input",
+  );
   assert.equal(socialCard.readUInt32BE(16), 1200);
   assert.equal(socialCard.readUInt32BE(20), 630);
-  assert.match(readme, /browser-local/i);
   assert.match(readme, /never uploaded/i);
-  assert.match(readme, /Task 5/);
+  assert.match(readme, /evidence-first browser workspace/i);
 
   const files = await sourceFiles(appRoot);
   for (const file of files) {
@@ -142,8 +145,10 @@ test("ships server-renderable evidence, local interaction semantics, and accessi
   assert.match(workspace, /tabIndex=\{-1\}/);
   assert.match(input, /TextDecoder\("utf-8", \{ fatal: true \}\)/);
   assert.match(input, /onDrop=/);
+  assert.match(input, /aria-live="polite"/);
   assert.match(workspace, /Save result on this device/);
   assert.match(workspace, /Clear local history/);
+  assert.match(workspace, /useMemo\(\(\) => reviewToJson\(result\), \[result\]\)/);
   assert.match(sample, /agent_surface_overscope/);
 
   assert.doesNotMatch(productSource, /sign.?up.{0,30}(review|analy)/i);

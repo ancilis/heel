@@ -2,7 +2,7 @@
 
 "use client";
 
-import { useRef, useState, type ChangeEvent, type DragEvent, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type DragEvent, type KeyboardEvent } from "react";
 import { MAX_BROWSER_INPUT_BYTES } from "../../lib/browser-review-client";
 
 
@@ -37,11 +37,22 @@ export function OpenApiInput({
   onSubmit,
 }: OpenApiInputProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const mountedRef = useRef(true);
+  const readEpochRef = useRef(0);
   const [acknowledged, setAcknowledged] = useState(false);
   const [selectedFile, setSelectedFile] = useState("");
   const bytes = new TextEncoder().encode(source).byteLength;
 
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      readEpochRef.current += 1;
+    };
+  }, []);
+
   async function acceptFile(file: File | undefined): Promise<void> {
+    const readEpoch = ++readEpochRef.current;
     if (!file) return;
     if (!file.name.toLowerCase().endsWith(".json")) {
       setSelectedFile("");
@@ -55,12 +66,14 @@ export function OpenApiInput({
     }
     try {
       const contents = await readFileBytes(file);
+      if (!mountedRef.current || readEpoch !== readEpochRef.current) return;
       const decoded = new TextDecoder("utf-8", { fatal: true }).decode(contents);
       onSourceChange(decoded);
       setAcknowledged(false);
       setSelectedFile(`${file.name} · ${file.size.toLocaleString("en-US")} bytes`);
       onError("");
     } catch {
+      if (!mountedRef.current || readEpoch !== readEpochRef.current) return;
       setSelectedFile("");
       onError("That file is not valid UTF-8 and cannot be reviewed safely.");
     }
@@ -119,7 +132,11 @@ export function OpenApiInput({
         spellCheck={false}
         disabled={disabled}
       />
-      {selectedFile ? <p className="selected-file">Selected locally: {selectedFile}</p> : null}
+      {selectedFile ? (
+        <p className="selected-file" role="status" aria-live="polite" aria-label="Selected file">
+          Selected locally: {selectedFile}
+        </p>
+      ) : null}
       <div
         className="drop-zone"
         role="button"
