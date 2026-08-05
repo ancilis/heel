@@ -22,6 +22,47 @@ def minimal_spec(**overrides):
 
 
 class TestOpenAPIImport(unittest.TestCase):
+    def test_paths_keys_must_be_routes_or_lowercase_extensions(self):
+        from heel.openapi_import import OpenAPIImportError, product_model_from_openapi
+
+        for bad_key in ("records", "X-vendor", 7):
+            with self.subTest(bad_key=bad_key):
+                with self.assertRaises(OpenAPIImportError):
+                    product_model_from_openapi(minimal_spec(paths={bad_key: {}}))
+
+        model = product_model_from_openapi(minimal_spec(paths={
+            "x-vendor-documentation": ["ignored", "extension", "value"],
+        }))
+        self.assertEqual(model["endpoints_routes"], [])
+
+    def test_malformed_operations_are_rejected_directly_and_through_local_refs(self):
+        from heel.openapi_import import OpenAPIImportError, product_model_from_openapi
+
+        malformed_path_items = {
+            "get is not object": {"get": []},
+            "post is not object": {"post": "invalid"},
+            "operation id empty": {"get": {"operationId": ""}},
+            "operation id blank": {"get": {"operationId": "  "}},
+            "operation id non-string": {"get": {"operationId": 7}},
+            "tags not list": {"get": {"tags": "Exports"}},
+            "tag empty": {"get": {"tags": [""]}},
+            "tag blank": {"get": {"tags": [" "]}},
+            "tag non-string": {"get": {"tags": [7]}},
+        }
+
+        for label, path_item in malformed_path_items.items():
+            for location in ("direct", "local ref"):
+                if location == "direct":
+                    spec = minimal_spec(paths={"/bad": path_item})
+                else:
+                    spec = minimal_spec(
+                        components={"pathItems": {"Bad": path_item}},
+                        paths={"/bad": {"$ref": "#/components/pathItems/Bad"}},
+                    )
+                with self.subTest(label=label, location=location):
+                    with self.assertRaises(OpenAPIImportError):
+                        product_model_from_openapi(spec)
+
     def test_openapi_root_structure_fails_closed(self):
         from heel.openapi_import import OpenAPIImportError, product_model_from_openapi
 
@@ -184,6 +225,134 @@ class TestOpenAPIImport(unittest.TestCase):
         endpoint = model["endpoints_routes"][0]
         self.assertEqual(endpoint["tenant_scope"], "tenant")
         self.assertEqual(endpoint["tenant_filter"], "declared")
+
+    def test_missing_extension_sentinels_remain_missing(self):
+        from heel.openapi_import import product_model_from_openapi
+
+        sentinels = (
+            "missing", "none", "false", "disabled", "off", "no", "weak",
+            "client", "client_only", "", "   ", " MISSING ",
+        )
+        for sentinel in sentinels:
+            with self.subTest(sentinel=repr(sentinel)):
+                model = product_model_from_openapi(minimal_spec(paths={
+                    "/records": {"get": {
+                        "operationId": "listRecords",
+                        "x-heel-tenant-scope": sentinel,
+                        "x-heel-plan": sentinel,
+                        "x-heel-data-class": sentinel,
+                    }},
+                }))
+
+                endpoint = model["endpoints_routes"][0]
+                for field in (
+                    "tenant_scope", "tenant_filter", "required_plan", "data_class",
+                ):
+                    self.assertNotIn(field, endpoint)
+                self.assertEqual(model["data_classes"], [])
+                self.assertEqual(
+                    {hint["field"] for hint in model["import_question_hints"]},
+                    {"tenant_filter", "entitlement_check"},
+                )
+
+    def test_control_identifiers_use_exact_aliases_after_normalization(self):
+        from heel.openapi_import import product_model_from_openapi
+
+        entitlement_aliases = (
+            "entitlement", "entitlement_check", "server_side_entitlement_check",
+        )
+        rate_aliases = (
+            "rate", "rate_limit", "tenant_rate_limit", "server_side_rate_limit",
+        )
+        for alias in entitlement_aliases:
+            with self.subTest(kind="entitlement", alias=alias):
+                model = product_model_from_openapi(minimal_spec(paths={
+                    "/records": {"get": {
+                        "operationId": "listRecords",
+                        "x-heel-control": alias,
+                    }},
+                }))
+                endpoint = model["endpoints_routes"][0]
+                self.assertEqual(endpoint["controls"], [alias])
+                self.assertEqual(endpoint["entitlement_check"], "declared")
+                self.assertNotIn("rate_limit", endpoint)
+
+        for alias in rate_aliases:
+            with self.subTest(kind="rate", alias=alias):
+                model = product_model_from_openapi(minimal_spec(paths={
+                    "/records": {"get": {
+                        "operationId": "listRecords",
+                        "x-heel-control": alias,
+                    }},
+                }))
+                endpoint = model["endpoints_routes"][0]
+                self.assertEqual(endpoint["controls"], [alias])
+                self.assertEqual(endpoint["rate_limit"], "declared")
+                self.assertNotIn("entitlement_check", endpoint)
+
+        normalized = product_model_from_openapi(minimal_spec(paths={
+            "/records": {"get": {
+                "operationId": "listRecords",
+                "x-heel-control": [
+                    " Server-Side Entitlement Check ", "Tenant Rate-Limit",
+                ],
+            }},
+        }))["endpoints_routes"][0]
+        self.assertEqual(normalized["controls"], [
+            "server_side_entitlement_check", "tenant_rate_limit",
+        ])
+        self.assertEqual(normalized["entitlement_check"], "declared")
+        self.assertEqual(normalized["rate_limit"], "declared")
+
+    def test_control_sentinels_and_misleading_names_do_not_count(self):
+        from heel.openapi_import import product_model_from_openapi
+
+        model = product_model_from_openapi(minimal_spec(paths={
+            "/exports": {"get": {
+                "operationId": "exportRecords",
+                "x-heel-tenant-scope": "tenant",
+                "x-heel-control": [
+                    "missing", "none", "false", "disabled", "off", "no",
+                    "weak", "client", "client_only", "",
+                    "missing_entitlement_check", "rate_limit_missing",
+                ],
+            }},
+        }))
+
+        endpoint = model["endpoints_routes"][0]
+        self.assertEqual(
+            endpoint["controls"],
+            ["missing_entitlement_check", "rate_limit_missing"],
+        )
+        self.assertNotIn("entitlement_check", endpoint)
+        self.assertNotIn("rate_limit", endpoint)
+        export = model["exports"][0]
+        self.assertEqual(export["entitlement_check"], "missing")
+        self.assertEqual(export["rate_limit"], "missing")
+
+    def test_invalid_heel_extension_types_are_rejected(self):
+        from heel.openapi_import import OpenAPIImportError, product_model_from_openapi
+
+        invalid = {
+            "tenant null": ("x-heel-tenant-scope", None),
+            "tenant bool": ("x-heel-tenant-scope", True),
+            "plan list": ("x-heel-plan", ["team"]),
+            "data class map": ("x-heel-data-class", {"name": "private"}),
+            "control integer": ("x-heel-control", 7),
+            "control bool": ("x-heel-control", True),
+            "control list member": ("x-heel-control", ["rate_limit", 7]),
+            "control map key": ("x-heel-control", {7: True}),
+            "control map value": ("x-heel-control", {"rate_limit": "true"}),
+        }
+        for label, (extension, value) in invalid.items():
+            with self.subTest(label=label):
+                with self.assertRaises(OpenAPIImportError):
+                    product_model_from_openapi(minimal_spec(paths={
+                        "/records": {"get": {
+                            "operationId": "listRecords",
+                            extension: value,
+                        }},
+                    }))
 
     def test_structured_question_hints_cover_every_warning_form(self):
         from heel.openapi_import import import_openapi_file

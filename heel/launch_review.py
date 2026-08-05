@@ -14,6 +14,7 @@ import subprocess
 from typing import Any, Mapping
 
 from .importers import ProductModelError, load_product_model, validate_product_model
+from .review_rules import is_broad_scope
 
 
 SURFACE_FIELDS = [
@@ -36,7 +37,6 @@ SURFACE_FIELDS = [
 
 _MISSING_VALUES = {"", "missing", "none", "false", "disabled", "off", "no", "weak", "client", "client_only"}
 _LOW_REACH_PLANS = {"trial", "free", "starter", "basic"}
-_HIGH_SCOPE_VALUES = {"all", "*", "admin", "full_access", "read_write_all", "global", "all_tenants"}
 _SCOPE_RANK = {
     "own_tenant": 1,
     "tenant": 1,
@@ -357,10 +357,10 @@ def _coupon_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> list[Ris
 
 def _oauth_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> list[RiskFinding]:
     scope_value = str(_first(props, "scope", "granted_scope", "oauth_scope") or "").strip().lower()
-    granted = {s.lower() for s in _to_list(_first(props, "granted_scopes", "scopes"))}
-    needed = {s.lower() for s in _to_list(_first(props, "needed_scopes", "required_scopes", "intended_scopes"))}
-    scope_all = scope_value in _HIGH_SCOPE_VALUES
-    granted_high_scope = bool(granted & _HIGH_SCOPE_VALUES)
+    granted = {s.strip().lower() for s in _to_list(_first(props, "granted_scopes", "scopes"))}
+    needed = {s.strip().lower() for s in _to_list(_first(props, "needed_scopes", "required_scopes", "intended_scopes"))}
+    scope_all = is_broad_scope(scope_value)
+    granted_high_scope = any(is_broad_scope(scope) for scope in granted)
     excess = bool(granted and needed and not granted.issubset(needed))
     if not (scope_all or granted_high_scope or excess):
         return []
@@ -544,7 +544,10 @@ def _to_list(value: Any) -> list[str]:
 
 
 def _scope_wider(granted: str, intended: str) -> bool:
-    return _SCOPE_RANK.get(granted, 0) > _SCOPE_RANK.get(intended, 0) or granted in _HIGH_SCOPE_VALUES and granted != intended
+    return (
+        _SCOPE_RANK.get(granted, 0) > _SCOPE_RANK.get(intended, 0)
+        or is_broad_scope(granted) and granted != intended
+    )
 
 
 def _text(props: Mapping[str, Any], *names: str) -> str:

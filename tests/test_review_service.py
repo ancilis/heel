@@ -116,26 +116,101 @@ class ReviewServiceTests(unittest.TestCase):
             for finding in result["findings"]
         ))
 
-    def test_imported_all_scope_creates_oauth_overbreadth_finding(self):
+    def test_missing_extension_sentinels_do_not_suppress_questions_or_findings(self):
+        from heel.review_service import review_openapi
+
+        sentinels = (
+            "missing", "none", "false", "disabled", "off", "no", "weak",
+            "client", "client_only", "", "   ",
+        )
+        for sentinel in sentinels:
+            with self.subTest(sentinel=repr(sentinel)):
+                result = review_openapi({
+                    "openapi": "3.1.0",
+                    "info": {"title": "Missing Metadata", "version": "1"},
+                    "paths": {"/records": {"get": {
+                        "operationId": "listRecords",
+                        "x-heel-tenant-scope": sentinel,
+                        "x-heel-plan": sentinel,
+                    }}},
+                })
+
+                self.assertGreaterEqual(
+                    {question["field"] for question in result["questions"]},
+                    {"tenant_filter", "entitlement_check"},
+                )
+                self.assertTrue(any(
+                    finding["risk"] == "endpoint_without_tenant_filter"
+                    for finding in result["findings"]
+                ))
+
+    def test_misleading_control_names_do_not_suppress_export_findings(self):
         from heel.review_service import review_openapi
 
         result = review_openapi({
             "openapi": "3.1.0",
-            "info": {"title": "OAuth Scope", "version": "1"},
-            "paths": {"/oauth/apps": {"post": {
-                "operationId": "createOAuthApp",
-                "security": [{"OAuthAll": ["all"]}],
+            "info": {"title": "Misleading Controls", "version": "1"},
+            "paths": {"/exports": {"get": {
+                "operationId": "exportRecords",
                 "x-heel-tenant-scope": "tenant",
-                "x-heel-plan": "team",
+                "x-heel-control": [
+                    "missing", "missing_entitlement_check", "rate_limit_missing",
+                ],
             }}},
         })
 
-        finding = next(
-            item for item in result["findings"]
-            if item["risk"] == "oauth_scope_overbroad"
+        self.assertTrue(any(
+            question["field"] == "entitlement_check"
+            for question in result["questions"]
+        ))
+        risks = {finding["risk"] for finding in result["findings"]}
+        self.assertGreaterEqual(risks, {
+            "export_without_entitlement", "export_without_tenant_quota",
+        })
+
+    def test_shared_broad_scope_vocabulary_is_exact(self):
+        from heel.review_rules import BROAD_SCOPE_VALUES, is_broad_scope
+
+        expected = {
+            "*", "all", "admin", "full", "full_access", "read_write_all",
+            "global", "all_tenants", "read:all", "write:all",
+        }
+        self.assertEqual(BROAD_SCOPE_VALUES, frozenset(expected))
+        for scope in expected:
+            with self.subTest(scope=scope):
+                self.assertTrue(is_broad_scope(f" {scope.upper()} "))
+        for scope in ("read", "write", "administrator", "missing", ""):
+            with self.subTest(scope=scope):
+                self.assertFalse(is_broad_scope(scope))
+
+    def test_each_shared_broad_scope_creates_oauth_overbreadth_finding(self):
+        from heel.review_service import review_openapi
+
+        scopes = (
+            "*", "all", "admin", "full", "full_access", "read_write_all",
+            "global", "all_tenants", "read:all", "write:all",
         )
-        self.assertEqual(finding["surface_type"], "integration_oauth_apps")
-        self.assertEqual(finding["control"], "OAuth scope minimization and approval")
+        for scope in scopes:
+            with self.subTest(scope=scope):
+                result = review_openapi({
+                    "openapi": "3.1.0",
+                    "info": {"title": "OAuth Scope", "version": "1"},
+                    "paths": {"/oauth/apps": {"post": {
+                        "operationId": "createOAuthApp",
+                        "security": [{"OAuthAll": [scope]}],
+                        "x-heel-tenant-scope": "tenant",
+                        "x-heel-plan": "team",
+                    }}},
+                })
+
+                finding = next(
+                    item for item in result["findings"]
+                    if item["risk"] == "oauth_scope_overbroad"
+                )
+                self.assertEqual(finding["surface_type"], "integration_oauth_apps")
+                self.assertEqual(
+                    finding["control"], "OAuth scope minimization and approval"
+                )
 
     def test_local_path_item_ref_contributes_review_findings(self):
         from heel.review_service import review_openapi

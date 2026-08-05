@@ -13,6 +13,7 @@ import re
 from typing import Any, Mapping
 
 from .importers import LIST_FIELDS, PRODUCT_MODEL_VERSION, validate_product_model
+from .review_rules import is_broad_scope
 
 
 class OpenAPIImportError(ValueError):
@@ -28,6 +29,21 @@ _SECRET_VALUE_RE = re.compile(
 _METHODS = {"get", "put", "post", "delete", "patch", "head", "options", "trace"}
 _OPENAPI_VERSION_RE = re.compile(r"3\.(?:0|1)\.\d+\Z")
 _PATH_ITEM_REF_PREFIX = "#/components/pathItems/"
+_HEEL_STRING_EXTENSIONS = (
+    "x-heel-tenant-scope", "x-heel-plan", "x-heel-data-class",
+)
+_MISSING_EXTENSION_VALUES = {
+    "", "missing", "none", "false", "disabled", "off", "no", "weak",
+    "client", "client_only",
+}
+_CONTROL_ALIASES = {
+    "entitlement": frozenset({
+        "entitlement", "entitlement_check", "server_side_entitlement_check",
+    }),
+    "rate": frozenset({
+        "rate", "rate_limit", "tenant_rate_limit", "server_side_rate_limit",
+    }),
+}
 
 
 def import_openapi_file(path: str) -> dict:
@@ -85,16 +101,35 @@ def product_model_from_openapi(spec: Mapping[str, Any], source: str = "openapi:i
     operation_locations: dict[str, str] = {}
     _security_controls(spec, model, warnings, question_hints)
 
-    for route, path_item in sorted(paths.items()):
-        path_item = _resolve_path_item(spec, path_item, route=str(route))
-        for method, operation in sorted(path_item.items()):
-            if str(method).lower() not in _METHODS or not isinstance(operation, Mapping):
+    route_items: list[tuple[str, Any]] = []
+    for route, path_item in paths.items():
+        if not isinstance(route, str):
+            raise OpenAPIImportError("paths keys must be strings beginning with /")
+        if route.startswith("x-"):
+            continue
+        if not route.startswith("/"):
+            raise OpenAPIImportError(f"paths key {route!r} must begin with /")
+        route_items.append((route, path_item))
+
+    for route, path_item_value in sorted(route_items):
+        path_item = _resolve_path_item(spec, path_item_value, route=route)
+        for method, operation in sorted(path_item.items(), key=lambda item: str(item[0])):
+            normalized_method = str(method).lower()
+            if normalized_method not in _METHODS:
                 continue
+            if not isinstance(operation, Mapping):
+                raise OpenAPIImportError(
+                    f"operation {normalized_method.upper()} {route} must be an object"
+                )
             op = dict(operation)
-            tags = [str(t) for t in op.get("tags", []) if str(t)]
+            _validate_operation(op, method=normalized_method, route=route)
+            op = _normalize_heel_extensions(
+                op, method=normalized_method, route=route,
+            )
+            tags = list(op.get("tags", []))
             for tag in tags:
                 product_areas.setdefault(tag, {"id": tag, "source": "openapi-tag"})
-            entry = _route_entry(str(route), str(method).upper(), op, tags)
+            entry = _route_entry(route, normalized_method.upper(), op, tags)
             operation_id = entry["operation_id"]
             location = f"{entry['method']} {entry['route']}"
             if operation_id in operation_locations:
@@ -139,6 +174,89 @@ def _validate_openapi_document(
     if not isinstance(paths, Mapping):
         raise OpenAPIImportError("paths must be an object")
     return info, paths
+
+
+def _validate_operation(
+    operation: Mapping[str, Any], *, method: str, route: str,
+) -> None:
+    location = f"{method.upper()} {route}"
+    if "operationId" in operation:
+        operation_id = operation["operationId"]
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise OpenAPIImportError(f"operationId for {location} must be a nonempty string")
+    if "tags" in operation:
+        tags = operation["tags"]
+        if not isinstance(tags, list) or any(
+            not isinstance(tag, str) or not tag.strip() for tag in tags
+        ):
+            raise OpenAPIImportError(f"tags for {location} must be a list of nonempty strings")
+
+
+def _normalize_heel_extensions(
+    operation: Mapping[str, Any], *, method: str, route: str,
+) -> dict[str, Any]:
+    normalized = dict(operation)
+    location = f"{method.upper()} {route}"
+    for extension in _HEEL_STRING_EXTENSIONS:
+        if extension not in operation:
+            continue
+        raw = operation[extension]
+        if not isinstance(raw, str):
+            raise OpenAPIImportError(
+                f"{extension} for {location} must be a string"
+            )
+        value = raw.strip()
+        if value.lower() in _MISSING_EXTENSION_VALUES:
+            normalized.pop(extension, None)
+        else:
+            normalized[extension] = value
+
+    if "x-heel-control" in operation:
+        controls = _normalize_controls(operation["x-heel-control"], location=location)
+        if controls:
+            normalized["x-heel-control"] = controls
+        else:
+            normalized.pop("x-heel-control", None)
+    return normalized
+
+
+def _normalize_controls(raw: Any, *, location: str) -> list[str]:
+    values: list[str]
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, list):
+        if any(not isinstance(value, str) for value in raw):
+            raise OpenAPIImportError(
+                f"x-heel-control for {location} list values must be strings"
+            )
+        values = list(raw)
+    elif isinstance(raw, Mapping):
+        if any(
+            not isinstance(key, str) or type(enabled) is not bool
+            for key, enabled in raw.items()
+        ):
+            raise OpenAPIImportError(
+                f"x-heel-control for {location} must map strings to booleans"
+            )
+        values = [key for key, enabled in raw.items() if enabled]
+    else:
+        raise OpenAPIImportError(
+            f"x-heel-control for {location} must be a string, list of strings, "
+            "or string-to-boolean map"
+        )
+
+    controls = {
+        _normalize_control_identifier(value)
+        for value in values
+    }
+    return sorted(
+        control for control in controls
+        if control and control not in _MISSING_EXTENSION_VALUES
+    )
+
+
+def _normalize_control_identifier(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
 
 
 def _resolve_path_item(
@@ -218,7 +336,7 @@ def _security_controls(
         if scheme.get("type") == "oauth2":
             scopes = _oauth_scheme_scopes(scheme)
             control["scopes"] = scopes
-            if _has_broad_scope(scopes):
+            if any(is_broad_scope(scope) for scope in scopes):
                 _add_warning(
                     warnings,
                     question_hints,
@@ -301,7 +419,7 @@ def _map_operation(
         else:
             scopes = _operation_oauth_scopes(operation)
             model["integration_oauth_apps"].append({**entry, "id": entry["operation_id"], "kind": "oauth_app", "scopes": scopes})
-            if _has_broad_scope(scopes):
+            if any(is_broad_scope(scope) for scope in scopes):
                 _add_warning(
                     warnings,
                     question_hints,
@@ -385,13 +503,7 @@ def _controls(operation: Mapping[str, Any]) -> list[str]:
     raw = operation.get("x-heel-control")
     if raw is None:
         return []
-    if isinstance(raw, str):
-        return [raw]
-    if isinstance(raw, list):
-        return [str(v) for v in raw if str(v)]
-    if isinstance(raw, Mapping):
-        return sorted(str(k) for k, v in raw.items() if v)
-    return [str(raw)]
+    return list(raw)
 
 
 def _operation_text(entry: Mapping[str, Any], operation: Mapping[str, Any]) -> str:
@@ -444,11 +556,7 @@ def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
 
 
 def _has_control(controls: list[str], needle: str) -> bool:
-    return any(needle in c.lower() for c in controls)
-
-
-def _has_broad_scope(scopes: list[str]) -> bool:
-    return any(s.strip().lower() in {"*", "all", "admin", "full_access", "read:all", "write:all"} for s in scopes)
+    return any(control in _CONTROL_ALIASES.get(needle, ()) for control in controls)
 
 
 def _safe_id(value: str) -> str:
