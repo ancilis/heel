@@ -1,13 +1,22 @@
 """Fail-closed boundary tests for the Apache-only Heel release contract."""
 from __future__ import annotations
 
+import base64
+import csv
+from email import policy
+from email.parser import BytesParser
+import gzip
+import hashlib
+import importlib.metadata
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -19,6 +28,42 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "release/open-core-v1.json"
+BUILDER = ROOT / "scripts/build_open_core_release.py"
+WHEEL = "heel_sim-1.1.0-py3-none-any.whl"
+SDIST = "heel_sim-1.1.0.tar.gz"
+ARTIFACT_MANIFEST = "heel-open-core-manifest.json"
+DIST_INFO = "heel_sim-1.1.0.dist-info"
+RECORD_PATH = f"{DIST_INFO}/RECORD"
+FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+EXPECTED_METADATA = (
+    "Metadata-Version: 2.4\n"
+    "Name: heel-sim\n"
+    "Version: 1.1.0\n"
+    "Summary: Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.\n"
+    "Requires-Python: >=3.11\n"
+    "License-Expression: Apache-2.0\n"
+    "License-File: LICENSE\n"
+    "License-File: NOTICE\n"
+    "\n"
+).encode("utf-8")
+EXPECTED_WHEEL_METADATA = (
+    "Wheel-Version: 1.0\n"
+    "Generator: heel-open-core-release\n"
+    "Root-Is-Purelib: true\n"
+    "Tag: py3-none-any\n"
+    "\n"
+).encode("utf-8")
+EXPECTED_ENTRY_POINTS = (
+    "[console_scripts]\n"
+    "heel = heel.cli:main\n"
+    "heel-mcp = heel.mcp_server:main\n"
+    "heel-rest = heel.rest:serve\n"
+).encode("utf-8")
+EXPECTED_GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff"
+MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
+MAX_MEMBER_BYTES = 4 * 1024 * 1024
+MAX_TOTAL_MEMBER_BYTES = 24 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 128
 # Task5 CI must install the PyPA ``build`` frontend, then run this exact command.
 STANDARD_BUILD_CI_COMMAND = (
     "HEEL_REQUIRE_STANDARD_BUILD=1 "
@@ -230,7 +275,340 @@ def _assert_contract_path_is_safe(
     )
 
 
+def _run_release_builder(
+    output: Path,
+    *,
+    builder: Path = BUILDER,
+    check: bool = False,
+    hash_seed: str = "1",
+    locale: str = "C",
+    process_umask: int = 0o022,
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
+    environment.update(
+        {
+            "LANG": locale,
+            "LC_ALL": locale,
+            "PYTHONHASHSEED": hash_seed,
+            "PYTHONNOUSERSITE": "1",
+        }
+    )
+    launcher = (
+        "import os,runpy,sys;"
+        "mask=int(sys.argv.pop(1),8);"
+        "script=sys.argv[1];"
+        "sys.argv=sys.argv[1:];"
+        "os.umask(mask);"
+        "runpy.run_path(script,run_name='__main__')"
+    )
+    command = [
+        sys.executable,
+        "-I",
+        "-c",
+        launcher,
+        f"{process_umask:o}",
+        str(builder),
+        "--output",
+        str(output),
+    ]
+    if check:
+        command.append("--check")
+    return subprocess.run(
+        command,
+        cwd=output.parent,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def _copy_public_builder_snapshot(destination: Path) -> None:
+    contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+    paths = {"scripts/build_open_core_release.py"}
+    for field in ("build_files", "documents", "licenses", "package_data", "python_modules"):
+        paths.update(contract[field])
+    for relative_name in sorted(paths):
+        source = ROOT / relative_name
+        target = destination / relative_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            target.symlink_to(os.readlink(source))
+        else:
+            shutil.copy2(source, target)
+
+
+def _assert_safe_archive_name(test_case: unittest.TestCase, name: str) -> None:
+    normalized = PurePosixPath(name)
+    test_case.assertNotIn("\\", name, name)
+    test_case.assertFalse(normalized.is_absolute(), name)
+    test_case.assertNotIn("..", normalized.parts, name)
+    test_case.assertEqual(normalized.as_posix(), name)
+    test_case.assertTrue(normalized.parts, name)
+    lower_name = name.lower()
+    test_case.assertFalse(
+        lower_name == ".env" or "/.env" in lower_name,
+        name,
+    )
+    test_case.assertFalse(
+        lower_name.endswith((".key", ".pem", ".crt", ".cer", ".p12", ".pfx")),
+        name,
+    )
+
+
+def _assert_public_payload(
+    test_case: unittest.TestCase,
+    name: str,
+    payload: bytes,
+) -> None:
+    _assert_safe_archive_name(test_case, name)
+    test_case.assertLessEqual(len(payload), MAX_MEMBER_BYTES, name)
+    if name.endswith("MANIFEST.in"):
+        test_case.assertEqual(payload.count(b"LICENSE-COMMERCIAL"), 1, name)
+        test_case.assertNotIn(b"LicenseRef-Heel-Commercial", payload, name)
+        return
+    for marker in FORBIDDEN_DISTRIBUTED_CONTENT_MARKERS:
+        test_case.assertNotIn(marker, payload, name)
+    for pattern in (
+        rb"AKIA[0-9A-Z]{16}",
+        rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
+        rb"(?i)(?:api[_-]?key|secret|token)\s*[:=]\s*['\"][A-Za-z0-9+/=_-]{24,}",
+    ):
+        test_case.assertIsNone(re.search(pattern, payload), name)
+
+
+def _record_digest(payload: bytes) -> str:
+    digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest())
+    return "sha256=" + digest.rstrip(b"=").decode("ascii")
+
+
+def _assert_record_is_valid(
+    test_case: unittest.TestCase,
+    payloads: dict[str, bytes],
+    *,
+    exact_order: bool,
+) -> None:
+    rows = list(csv.reader(io.StringIO(payloads[RECORD_PATH].decode("utf-8"))))
+    expected_paths = [*sorted(path for path in payloads if path != RECORD_PATH), RECORD_PATH]
+    if exact_order:
+        test_case.assertEqual([row[0] for row in rows], expected_paths)
+    else:
+        test_case.assertEqual({row[0] for row in rows}, set(expected_paths))
+        test_case.assertEqual(rows[-1][0], RECORD_PATH)
+    test_case.assertEqual(len(rows), len({row[0] for row in rows}))
+    for row in rows[:-1]:
+        test_case.assertEqual(len(row), 3, row)
+        name, digest, size = row
+        test_case.assertEqual(digest, _record_digest(payloads[name]), name)
+        test_case.assertNotIn("=", digest.removeprefix("sha256="), name)
+        test_case.assertEqual(size, str(len(payloads[name])), name)
+    test_case.assertEqual(rows[-1], [RECORD_PATH, "", ""])
+
+
+def _assert_wheel_is_bounded_and_canonical(
+    test_case: unittest.TestCase,
+    wheel_path: Path,
+    expected_names: set[str],
+) -> dict[str, bytes]:
+    raw = wheel_path.read_bytes()
+    test_case.assertLessEqual(len(raw), MAX_ARCHIVE_BYTES)
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        test_case.assertEqual(archive.comment, b"")
+        infos = archive.infolist()
+        test_case.assertLessEqual(len(infos), MAX_ARCHIVE_MEMBERS)
+        names = [info.filename for info in infos]
+        test_case.assertEqual(names, [*sorted(expected_names - {RECORD_PATH}), RECORD_PATH])
+        test_case.assertEqual(len(names), len(set(names)))
+        payloads: dict[str, bytes] = {}
+        total_size = 0
+        for info in infos:
+            _assert_safe_archive_name(test_case, info.filename)
+            test_case.assertFalse(info.is_dir(), info.filename)
+            test_case.assertEqual(info.date_time, FIXED_ZIP_TIMESTAMP, info.filename)
+            test_case.assertEqual(info.compress_type, zipfile.ZIP_STORED, info.filename)
+            test_case.assertEqual(info.flag_bits, 0, info.filename)
+            test_case.assertEqual(info.extra, b"", info.filename)
+            test_case.assertEqual(info.comment, b"", info.filename)
+            test_case.assertLessEqual(info.extract_version, 20, info.filename)
+            test_case.assertEqual(info.create_system, 3, info.filename)
+            test_case.assertEqual(info.external_attr >> 16, stat.S_IFREG | 0o644, info.filename)
+            test_case.assertLessEqual(info.file_size, MAX_MEMBER_BYTES, info.filename)
+            test_case.assertEqual(info.compress_size, info.file_size, info.filename)
+            payload = archive.read(info)
+            test_case.assertEqual(info.CRC, __import__("zlib").crc32(payload) & 0xFFFFFFFF)
+            payloads[info.filename] = payload
+            total_size += len(payload)
+
+            local_header = raw[info.header_offset:info.header_offset + 30]
+            test_case.assertEqual(len(local_header), 30, info.filename)
+            fields = struct.unpack("<IHHHHHIIIHH", local_header)
+            test_case.assertEqual(fields[0], 0x04034B50, info.filename)
+            test_case.assertLessEqual(fields[1], 20, info.filename)
+            test_case.assertEqual(fields[2:6], (0, 0, 0, 33), info.filename)
+            test_case.assertEqual(fields[6:9], (info.CRC, info.file_size, info.file_size))
+            name_length, extra_length = fields[9:11]
+            encoded_name = raw[
+                info.header_offset + 30:info.header_offset + 30 + name_length
+            ]
+            test_case.assertEqual(encoded_name, info.filename.encode("utf-8"))
+            test_case.assertEqual(extra_length, 0, info.filename)
+        test_case.assertLessEqual(total_size, MAX_TOTAL_MEMBER_BYTES)
+    _assert_record_is_valid(test_case, payloads, exact_order=True)
+    return payloads
+
+
+def _normalized_wheel(
+    test_case: unittest.TestCase,
+    wheel_path: Path,
+    expected_names: set[str],
+    *,
+    canonical: bool,
+) -> tuple[dict[str, bytes], tuple[tuple[str, tuple[str, ...]], ...]]:
+    if canonical:
+        payloads = _assert_wheel_is_bounded_and_canonical(
+            test_case,
+            wheel_path,
+            expected_names,
+        )
+    else:
+        raw = wheel_path.read_bytes()
+        test_case.assertLessEqual(len(raw), MAX_ARCHIVE_BYTES)
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            infos = archive.infolist()
+            names = [info.filename for info in infos]
+            test_case.assertEqual(set(names), expected_names)
+            test_case.assertEqual(len(names), len(set(names)))
+            payloads = {}
+            total_size = 0
+            for info in infos:
+                _assert_safe_archive_name(test_case, info.filename)
+                test_case.assertFalse(info.flag_bits & 0x1, info.filename)
+                test_case.assertLessEqual(info.file_size, MAX_MEMBER_BYTES, info.filename)
+                payloads[info.filename] = archive.read(info)
+                total_size += info.file_size
+            test_case.assertLessEqual(total_size, MAX_TOTAL_MEMBER_BYTES)
+        _assert_record_is_valid(test_case, payloads, exact_order=False)
+    message = BytesParser(policy=policy.default).parsebytes(
+        payloads[f"{DIST_INFO}/METADATA"]
+    )
+    wheel_message = BytesParser(policy=policy.default).parsebytes(
+        payloads[f"{DIST_INFO}/WHEEL"]
+    )
+    metadata = tuple(
+        (name, tuple(message.get_all(name, [])))
+        for name in (
+            "Metadata-Version",
+            "Name",
+            "Version",
+            "Summary",
+            "Requires-Python",
+            "License-File",
+        )
+    ) + tuple(
+        (f"WHEEL:{name}", tuple(wheel_message.get_all(name, [])))
+        for name in ("Wheel-Version", "Root-Is-Purelib", "Tag")
+    )
+    substantive = {
+        name: payload
+        for name, payload in payloads.items()
+        if name not in {f"{DIST_INFO}/METADATA", f"{DIST_INFO}/WHEEL", RECORD_PATH}
+    }
+    return substantive, metadata
+
+
+def _tree_state(path: Path) -> dict[str, tuple[int, int, int, bytes | str | None]]:
+    if not path.exists() and not path.is_symlink():
+        return {}
+    state: dict[str, tuple[int, int, int, bytes | str | None]] = {}
+    for candidate in [path, *sorted(path.rglob("*"))]:
+        relative = "." if candidate == path else candidate.relative_to(path).as_posix()
+        status = candidate.lstat()
+        content: bytes | str | None = None
+        if stat.S_ISREG(status.st_mode):
+            content = candidate.read_bytes()
+        elif stat.S_ISLNK(status.st_mode):
+            content = os.readlink(candidate)
+        state[relative] = (status.st_mode, status.st_size, status.st_mtime_ns, content)
+    return state
+
+
+def _isolated_environment(root: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
+    environment.update(
+        {
+            "HEEL_HOME": str(root / "heel-home"),
+            "HOME": str(root / "home"),
+            "PIP_CONFIG_FILE": os.devnull,
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PIP_NO_CACHE_DIR": "1",
+            "PYTHONNOUSERSITE": "1",
+        }
+    )
+    return environment
+
+
+def _provision_local_build_tools(
+    venv_python: Path,
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+) -> None:
+    purelib_result = subprocess.run(
+        [
+            str(venv_python),
+            "-I",
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('purelib'))",
+        ],
+        cwd=cwd,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    purelib = Path(purelib_result.stdout.strip())
+    for distribution_name in ("setuptools", "wheel"):
+        distribution = importlib.metadata.distribution(distribution_name)
+        distribution_root = Path(distribution.locate_file(""))
+        for package_path in distribution.files or ():
+            relative = PurePosixPath(str(package_path))
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            source = Path(distribution.locate_file(package_path))
+            if not source.is_file():
+                continue
+            source.relative_to(distribution_root)
+            destination = purelib.joinpath(*relative.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
+
 class OpenCoreReleaseTests(unittest.TestCase):
+    def _assert_mutated_snapshot_is_rejected(
+        self,
+        mutation,
+        expected_message: str,
+    ) -> None:
+        self.assertTrue(BUILDER.is_file(), "scripts/build_open_core_release.py is missing")
+        with tempfile.TemporaryDirectory(prefix="heel-open-core-mutation-") as temporary:
+            temporary_path = Path(temporary).resolve()
+            source = temporary_path / "source"
+            source.mkdir()
+            _copy_public_builder_snapshot(source)
+            mutation(source)
+            result = _run_release_builder(
+                temporary_path / "output",
+                builder=source / "scripts/build_open_core_release.py",
+            )
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn(expected_message.lower(), output.lower())
+
     def _run_standard_build_gate_without_frontend(
         self,
         *,
@@ -431,6 +809,709 @@ class OpenCoreReleaseTests(unittest.TestCase):
             output,
         )
         self.assertNotIn("skipped", output)
+
+    def test_build_is_deterministic_and_exact(self):
+        self.assertTrue(BUILDER.is_file(), "scripts/build_open_core_release.py is missing")
+        contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        expected_wheel_names = {
+            *contract["python_modules"],
+            *contract["package_data"],
+            f"{DIST_INFO}/METADATA",
+            f"{DIST_INFO}/WHEEL",
+            f"{DIST_INFO}/entry_points.txt",
+            f"{DIST_INFO}/licenses/LICENSE",
+            f"{DIST_INFO}/licenses/NOTICE",
+            f"{DIST_INFO}/top_level.txt",
+            RECORD_PATH,
+        }
+        sdist_relative_names = {
+            *contract["build_files"],
+            *contract["documents"],
+            *contract["licenses"],
+            *contract["package_data"],
+            *contract["python_modules"],
+            "PKG-INFO",
+        }
+
+        with tempfile.TemporaryDirectory(prefix="heel-open-core-artifacts-") as temporary:
+            temporary_path = Path(temporary).resolve()
+            first = temporary_path / "first"
+            second = temporary_path / "second"
+            first_result = _run_release_builder(
+                first,
+                hash_seed="1",
+                locale="C",
+                process_umask=0o022,
+            )
+            second_result = _run_release_builder(
+                second,
+                hash_seed="8675309",
+                locale="en_US.UTF-8",
+                process_umask=0o077,
+            )
+            self.assertEqual(
+                first_result.returncode,
+                0,
+                first_result.stdout + first_result.stderr,
+            )
+            self.assertEqual(
+                second_result.returncode,
+                0,
+                second_result.stdout + second_result.stderr,
+            )
+            expected_artifacts = {WHEEL, SDIST, ARTIFACT_MANIFEST}
+            self.assertEqual({path.name for path in first.iterdir()}, expected_artifacts)
+            self.assertEqual({path.name for path in second.iterdir()}, expected_artifacts)
+            for name in expected_artifacts:
+                self.assertEqual((first / name).read_bytes(), (second / name).read_bytes(), name)
+                self.assertEqual(stat.S_IMODE((first / name).stat().st_mode), 0o644, name)
+
+            wheel_payloads = _assert_wheel_is_bounded_and_canonical(
+                self,
+                first / WHEEL,
+                expected_wheel_names,
+            )
+            self.assertEqual(wheel_payloads[f"{DIST_INFO}/METADATA"], EXPECTED_METADATA)
+            self.assertEqual(
+                wheel_payloads[f"{DIST_INFO}/WHEEL"],
+                EXPECTED_WHEEL_METADATA,
+            )
+            self.assertEqual(
+                wheel_payloads[f"{DIST_INFO}/entry_points.txt"],
+                EXPECTED_ENTRY_POINTS,
+            )
+            self.assertEqual(wheel_payloads[f"{DIST_INFO}/top_level.txt"], b"heel\n")
+            self.assertEqual(
+                wheel_payloads[f"{DIST_INFO}/licenses/LICENSE"],
+                (ROOT / "LICENSE").read_bytes(),
+            )
+            self.assertEqual(
+                wheel_payloads[f"{DIST_INFO}/licenses/NOTICE"],
+                (ROOT / "NOTICE").read_bytes(),
+            )
+            for name, payload in wheel_payloads.items():
+                _assert_public_payload(self, name, payload)
+
+            sdist_raw = (first / SDIST).read_bytes()
+            self.assertLessEqual(len(sdist_raw), MAX_ARCHIVE_BYTES)
+            self.assertEqual(sdist_raw[:10], EXPECTED_GZIP_HEADER)
+            tar_raw = gzip.decompress(sdist_raw)
+            self.assertLessEqual(len(tar_raw), MAX_TOTAL_MEMBER_BYTES + 65536)
+            self.assertEqual(len(tar_raw) % tarfile.RECORDSIZE, 0)
+            self.assertTrue(tar_raw.endswith(b"\0" * 1024))
+            prefix = "heel_sim-1.1.0/"
+            with tarfile.open(fileobj=io.BytesIO(sdist_raw), mode="r:gz") as archive:
+                members = archive.getmembers()
+                self.assertLessEqual(len(members), MAX_ARCHIVE_MEMBERS)
+                names = [member.name for member in members]
+                expected_names = [prefix + name for name in sorted(sdist_relative_names)]
+                self.assertEqual(names, expected_names)
+                self.assertEqual(len(names), len(set(names)))
+                total_size = 0
+                for member in members:
+                    self.assertEqual(member.type, tarfile.REGTYPE, member.name)
+                    self.assertFalse(member.pax_headers, member.name)
+                    self.assertFalse(member.sparse, member.name)
+                    self.assertEqual(member.linkname, "", member.name)
+                    self.assertEqual(member.mode, 0o644, member.name)
+                    self.assertEqual(member.mtime, 0, member.name)
+                    self.assertEqual(member.uid, 0, member.name)
+                    self.assertEqual(member.gid, 0, member.name)
+                    self.assertEqual(member.uname, "", member.name)
+                    self.assertEqual(member.gname, "", member.name)
+                    self.assertEqual(member.devmajor, 0, member.name)
+                    self.assertEqual(member.devminor, 0, member.name)
+                    self.assertLessEqual(member.size, MAX_MEMBER_BYTES, member.name)
+                    header = tar_raw[member.offset:member.offset + tarfile.BLOCKSIZE]
+                    self.assertEqual(header[257:263], b"ustar\x00", member.name)
+                    extracted = archive.extractfile(member)
+                    self.assertIsNotNone(extracted, member.name)
+                    payload = extracted.read()
+                    self.assertEqual(len(payload), member.size, member.name)
+                    total_size += len(payload)
+                    _assert_public_payload(self, member.name, payload)
+                    relative_name = member.name.removeprefix(prefix)
+                    if relative_name == "PKG-INFO":
+                        self.assertEqual(payload, EXPECTED_METADATA)
+                    else:
+                        self.assertEqual(payload, (ROOT / relative_name).read_bytes())
+                self.assertLessEqual(total_size, MAX_TOTAL_MEMBER_BYTES)
+            self.assertNotIn("heel/heldout/test_targets.json", sdist_relative_names)
+            self.assertNotIn(
+                "heel/scenarios_lib/research_owasp.json",
+                sdist_relative_names,
+            )
+            self.assertNotIn("scripts/build_open_core_release.py", sdist_relative_names)
+
+            archives = []
+            for name in (WHEEL, SDIST):
+                payload = (first / name).read_bytes()
+                archives.append(
+                    {
+                        "name": name,
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "size": len(payload),
+                    }
+                )
+            expected_manifest = {
+                "artifacts": sorted(archives, key=lambda artifact: artifact["name"]),
+                "schema_version": "heel.open-core-artifacts.v1",
+                "version": "1.1.0",
+            }
+            manifest_bytes = (first / ARTIFACT_MANIFEST).read_bytes()
+            self.assertEqual(
+                manifest_bytes,
+                (
+                    json.dumps(
+                        expected_manifest,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+
+    def test_builder_rejects_contract_source_and_import_mutations(self):
+        def contract_path(source: Path) -> Path:
+            return source / "release/open-core-v1.json"
+
+        def canonical_contract(source: Path) -> dict:
+            return json.loads(contract_path(source).read_text(encoding="utf-8"))
+
+        def write_contract(source: Path, contract: dict) -> None:
+            contract_path(source).write_text(
+                json.dumps(
+                    contract,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        def duplicate_nested_key(source: Path) -> None:
+            path = contract_path(source)
+            text = path.read_text(encoding="utf-8")
+            needle = '"heel":"heel.cli:main"'
+            path.write_text(
+                text.replace(needle, needle + "," + needle, 1),
+                encoding="utf-8",
+            )
+
+        def non_finite(source: Path, token: str) -> None:
+            path = contract_path(source)
+            text = path.read_text(encoding="utf-8")
+            path.write_text(
+                text.replace('"version":"1.1.0"', f'"version":{token}', 1),
+                encoding="utf-8",
+            )
+
+        def unknown_field(source: Path) -> None:
+            contract = canonical_contract(source)
+            contract["unexpected"] = "closed"
+            write_contract(source, contract)
+
+        def wrong_type(source: Path) -> None:
+            contract = canonical_contract(source)
+            contract["python_modules"] = "heel/cli.py"
+            write_contract(source, contract)
+
+        def noncanonical(source: Path) -> None:
+            contract_path(source).write_text(
+                json.dumps(canonical_contract(source), indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        def schema_mismatch(source: Path) -> None:
+            contract = canonical_contract(source)
+            contract["schema_version"] = "heel.open-core-release.v2"
+            write_contract(source, contract)
+
+        def contract_version_mismatch(source: Path) -> None:
+            contract = canonical_contract(source)
+            contract["version"] = "1.1.1"
+            write_contract(source, contract)
+
+        def pyproject_version_mismatch(source: Path) -> None:
+            path = source / "pyproject.toml"
+            text = path.read_text(encoding="utf-8")
+            path.write_text(text.replace('version = "1.1.0"', 'version = "1.1.1"', 1))
+
+        def package_version_mismatch(source: Path) -> None:
+            path = source / "heel/__init__.py"
+            text = path.read_text(encoding="utf-8")
+            path.write_text(text.replace('__version__ = "1.1.0"', '__version__ = "1.1.1"'))
+
+        def backslash_contract_path(source: Path) -> None:
+            contract = canonical_contract(source)
+            contract["python_modules"][0] = r"heel\__init__.py"
+            write_contract(source, contract)
+
+        def unclassified_module(source: Path) -> None:
+            (source / "heel/TEST.py").write_text("VALUE = 'not public'\n", encoding="utf-8")
+
+        def proprietary_import(source: Path, statement: str) -> None:
+            path = source / "heel/cli.py"
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write("\n" + statement + "\n")
+
+        def symlinked_source(source: Path) -> None:
+            path = source / "heel/cli.py"
+            path.unlink()
+            path.symlink_to(source / "heel/model.py")
+
+        def symlinked_parent(source: Path) -> None:
+            package = source / "heel"
+            real_package = source / "real-heel"
+            package.rename(real_package)
+            package.symlink_to(real_package, target_is_directory=True)
+
+        mutations = (
+            ("recursive duplicate key", duplicate_nested_key, "duplicate key"),
+            ("NaN", lambda source: non_finite(source, "NaN"), "non-finite"),
+            ("Infinity", lambda source: non_finite(source, "Infinity"), "non-finite"),
+            ("unknown field", unknown_field, "exact fields"),
+            ("wrong type", wrong_type, "list of strings"),
+            ("noncanonical JSON", noncanonical, "canonical"),
+            ("schema mismatch", schema_mismatch, "schema version"),
+            ("contract version mismatch", contract_version_mismatch, "version mismatch"),
+            ("pyproject version mismatch", pyproject_version_mismatch, "pyproject version"),
+            ("package version mismatch", package_version_mismatch, "heel.__version__"),
+            ("backslash path", backslash_contract_path, "backslash"),
+            ("future TEST module", unclassified_module, "unclassified top-level module"),
+            (
+                "absolute proprietary import",
+                lambda source: proprietary_import(source, "import heel.saas"),
+                "forbidden local import: heel.saas",
+            ),
+            (
+                "relative proprietary module import",
+                lambda source: proprietary_import(source, "from .saas import auth"),
+                "forbidden local import: heel.saas",
+            ),
+            (
+                "relative proprietary name import",
+                lambda source: proprietary_import(source, "from . import saas"),
+                "forbidden local import: heel.saas",
+            ),
+            ("symlinked source", symlinked_source, "symbolic link"),
+            ("symlinked source parent", symlinked_parent, "symbolic link"),
+        )
+        for label, mutation, expected_message in mutations:
+            with self.subTest(label):
+                self._assert_mutated_snapshot_is_rejected(mutation, expected_message)
+
+    def test_builder_rejects_unsafe_output_and_check_is_read_only(self):
+        self.assertTrue(BUILDER.is_file(), "scripts/build_open_core_release.py is missing")
+        with tempfile.TemporaryDirectory(prefix="heel-open-core-output-") as temporary:
+            temporary_path = Path(temporary).resolve()
+            baseline = temporary_path / "baseline"
+            build_result = _run_release_builder(baseline)
+            self.assertEqual(
+                build_result.returncode,
+                0,
+                build_result.stdout + build_result.stderr,
+            )
+
+            before_valid_check = _tree_state(baseline)
+            valid_check = _run_release_builder(baseline, check=True)
+            self.assertEqual(
+                valid_check.returncode,
+                0,
+                valid_check.stdout + valid_check.stderr,
+            )
+            self.assertIn("artifacts are current", valid_check.stdout)
+            self.assertEqual(_tree_state(baseline), before_valid_check)
+
+            missing_output = temporary_path / "missing-output"
+            missing_check = _run_release_builder(missing_output, check=True)
+            self.assertNotEqual(missing_check.returncode, 0)
+            self.assertFalse(missing_output.exists())
+
+            def run_check_mutation(label: str, mutation, expected_message: str) -> None:
+                case = temporary_path / ("case-" + label)
+                shutil.copytree(baseline, case)
+                mutation(case)
+                before = _tree_state(case)
+                result = _run_release_builder(case, check=True)
+                output = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn(expected_message, output.lower())
+                self.assertEqual(_tree_state(case), before)
+
+            def remove_wheel(case: Path) -> None:
+                (case / WHEEL).unlink()
+
+            def stale_wheel(case: Path) -> None:
+                path = case / WHEEL
+                path.write_bytes(path.read_bytes() + b"stale")
+
+            def unexpected_member(case: Path) -> None:
+                (case / "unexpected.txt").write_text("not published\n", encoding="utf-8")
+
+            def symlinked_member(case: Path) -> None:
+                target = temporary_path / "symlink-target.whl"
+                target.write_bytes((case / WHEEL).read_bytes())
+                (case / WHEEL).unlink()
+                (case / WHEEL).symlink_to(target)
+
+            def nonregular_member(case: Path) -> None:
+                (case / ARTIFACT_MANIFEST).unlink()
+                (case / ARTIFACT_MANIFEST).mkdir()
+
+            for label, mutation, expected_message in (
+                ("missing", remove_wheel, "missing"),
+                ("stale", stale_wheel, "stale"),
+                ("unexpected", unexpected_member, "unexpected"),
+                ("symlink", symlinked_member, "symbolic link"),
+                ("nonregular", nonregular_member, "regular file"),
+            ):
+                with self.subTest(check=label):
+                    run_check_mutation(label, mutation, expected_message)
+
+            real_output = temporary_path / "real-output"
+            real_output.mkdir()
+            symlink_output = temporary_path / "symlink-output"
+            symlink_output.symlink_to(real_output, target_is_directory=True)
+            symlink_root_result = _run_release_builder(symlink_output)
+            self.assertNotEqual(symlink_root_result.returncode, 0)
+            self.assertIn(
+                "symbolic link",
+                (symlink_root_result.stdout + symlink_root_result.stderr).lower(),
+            )
+            self.assertEqual(list(real_output.iterdir()), [])
+
+            real_parent = temporary_path / "real-parent"
+            real_parent.mkdir()
+            symlink_parent = temporary_path / "symlink-parent"
+            symlink_parent.symlink_to(real_parent, target_is_directory=True)
+            parent_result = _run_release_builder(symlink_parent / "artifacts")
+            self.assertNotEqual(parent_result.returncode, 0)
+            self.assertIn(
+                "symbolic link",
+                (parent_result.stdout + parent_result.stderr).lower(),
+            )
+            self.assertFalse((real_parent / "artifacts").exists())
+
+            artifact_output = temporary_path / "artifact-symlink"
+            artifact_output.mkdir()
+            artifact_target = temporary_path / "artifact-target"
+            artifact_target.write_bytes(b"do not overwrite")
+            (artifact_output / WHEEL).symlink_to(artifact_target)
+            artifact_result = _run_release_builder(artifact_output)
+            self.assertNotEqual(artifact_result.returncode, 0)
+            self.assertIn(
+                "symbolic link",
+                (artifact_result.stdout + artifact_result.stderr).lower(),
+            )
+            self.assertEqual(artifact_target.read_bytes(), b"do not overwrite")
+
+    def test_clean_wheel_and_sdist_installs_reproduce_the_public_package(self):
+        self.assertTrue(BUILDER.is_file(), "scripts/build_open_core_release.py is missing")
+        contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        expected_names = {
+            *contract["python_modules"],
+            *contract["package_data"],
+            f"{DIST_INFO}/METADATA",
+            f"{DIST_INFO}/WHEEL",
+            f"{DIST_INFO}/entry_points.txt",
+            f"{DIST_INFO}/licenses/LICENSE",
+            f"{DIST_INFO}/licenses/NOTICE",
+            f"{DIST_INFO}/top_level.txt",
+            RECORD_PATH,
+        }
+        import_names = [
+            "heel" if path == "heel/__init__.py" else path[:-3].replace("/", ".")
+            for path in contract["python_modules"]
+        ]
+
+        with tempfile.TemporaryDirectory(prefix="heel-open-core-install-") as temporary:
+            temporary_path = Path(temporary).resolve()
+            artifacts = temporary_path / "artifacts"
+            workspace = temporary_path / "outside-repository"
+            workspace.mkdir()
+            environment = _isolated_environment(temporary_path)
+            (temporary_path / "home").mkdir()
+            build_result = _run_release_builder(artifacts)
+            self.assertEqual(
+                build_result.returncode,
+                0,
+                build_result.stdout + build_result.stderr,
+            )
+
+            wheel_venv = temporary_path / "wheel-venv"
+            subprocess.run(
+                [sys.executable, "-m", "venv", str(wheel_venv)],
+                cwd=workspace,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            wheel_python = wheel_venv / "bin/python"
+            preinstall = subprocess.run(
+                [
+                    str(wheel_python),
+                    "-I",
+                    "-c",
+                    "import importlib.util; assert importlib.util.find_spec('heel') is None",
+                ],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(preinstall.returncode, 0, preinstall.stdout + preinstall.stderr)
+            wheel_install = subprocess.run(
+                [
+                    str(wheel_python),
+                    "-m",
+                    "pip",
+                    "--isolated",
+                    "install",
+                    "--no-index",
+                    "--no-deps",
+                    "--no-cache-dir",
+                    str(artifacts / WHEEL),
+                ],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(
+                wheel_install.returncode,
+                0,
+                wheel_install.stdout + wheel_install.stderr,
+            )
+            import_script = (
+                "import importlib,importlib.util;"
+                f"modules={import_names!r};"
+                "[importlib.import_module(name) for name in modules];"
+                "import heel;"
+                "assert heel.__version__ == '1.1.0';"
+                "assert importlib.util.find_spec('heel.saas') is None"
+            )
+            imported = subprocess.run(
+                [str(wheel_python), "-I", "-c", import_script],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
+
+            specification = workspace / "sample-openapi.json"
+            specification.write_text(
+                json.dumps(
+                    {
+                        "openapi": "3.1.0",
+                        "info": {"title": "Synthetic Projects API", "version": "1.0.0"},
+                        "paths": {
+                            "/projects": {
+                                "get": {
+                                    "operationId": "listProjects",
+                                    "responses": {"200": {"description": "Synthetic"}},
+                                }
+                            }
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            cli = subprocess.run(
+                [
+                    str(wheel_venv / "bin/heel"),
+                    "review",
+                    "openapi",
+                    str(specification),
+                    "--json",
+                ],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(cli.returncode, 0, cli.stdout + cli.stderr)
+            cli_review = json.loads(cli.stdout)
+            self.assertEqual(cli_review["schema_version"], "heel.review.v1")
+            self.assertEqual(cli_review["privacy"]["network_calls"], False)
+
+            messages = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "release-test", "version": "1.0"},
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {},
+                },
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            ]
+            mcp = subprocess.run(
+                [str(wheel_venv / "bin/heel-mcp")],
+                cwd=workspace,
+                env=environment,
+                input="".join(
+                    json.dumps(message, separators=(",", ":")) + "\n"
+                    for message in messages
+                ),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(mcp.returncode, 0, mcp.stdout + mcp.stderr)
+            responses = [json.loads(line) for line in mcp.stdout.splitlines() if line]
+            self.assertEqual(len(responses), 2, responses)
+            self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "heel")
+            self.assertIn(
+                "heel_review_openapi",
+                {tool["name"] for tool in responses[1]["result"]["tools"]},
+            )
+
+            source_venv = temporary_path / "source-venv"
+            source_venv_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "venv",
+                    str(source_venv),
+                ],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(
+                source_venv_result.returncode,
+                0,
+                source_venv_result.stdout + source_venv_result.stderr,
+            )
+            source_python = source_venv / "bin/python"
+            _provision_local_build_tools(
+                source_python,
+                cwd=workspace,
+                environment=environment,
+            )
+            build_tool_probe = subprocess.run(
+                [
+                    str(source_python),
+                    "-I",
+                    "-c",
+                    (
+                        "import importlib.util,setuptools,wheel;"
+                        "assert int(setuptools.__version__.split('.',1)[0]) >= 68;"
+                        "assert importlib.util.find_spec('heel') is None"
+                    ),
+                ],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                build_tool_probe.returncode,
+                0,
+                build_tool_probe.stdout + build_tool_probe.stderr,
+            )
+            source_install = subprocess.run(
+                [
+                    str(source_python),
+                    "-m",
+                    "pip",
+                    "--isolated",
+                    "install",
+                    "--no-index",
+                    "--no-deps",
+                    "--no-build-isolation",
+                    "--no-cache-dir",
+                    str(artifacts / SDIST),
+                ],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(
+                source_install.returncode,
+                0,
+                source_install.stdout + source_install.stderr,
+            )
+            source_import = subprocess.run(
+                [str(source_python), "-I", "-c", import_script],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(
+                source_import.returncode,
+                0,
+                source_import.stdout + source_import.stderr,
+            )
+
+            rebuilt = temporary_path / "rebuilt"
+            rebuilt.mkdir()
+            rebuild = subprocess.run(
+                [
+                    str(source_python),
+                    "-m",
+                    "pip",
+                    "--isolated",
+                    "wheel",
+                    "--no-index",
+                    "--no-deps",
+                    "--no-build-isolation",
+                    "--no-cache-dir",
+                    "--wheel-dir",
+                    str(rebuilt),
+                    str(artifacts / SDIST),
+                ],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(rebuild.returncode, 0, rebuild.stdout + rebuild.stderr)
+            rebuilt_wheels = list(rebuilt.glob("*.whl"))
+            self.assertEqual(len(rebuilt_wheels), 1, rebuilt_wheels)
+            custom_normalized = _normalized_wheel(
+                self,
+                artifacts / WHEEL,
+                expected_names,
+                canonical=True,
+            )
+            rebuilt_normalized = _normalized_wheel(
+                self,
+                rebuilt_wheels[0],
+                expected_names,
+                canonical=False,
+            )
+            self.assertEqual(rebuilt_normalized, custom_normalized)
 
     @unittest.skipUnless(
         STANDARD_BUILD_FRONTEND_AVAILABLE or STANDARD_BUILD_REQUIRED,
