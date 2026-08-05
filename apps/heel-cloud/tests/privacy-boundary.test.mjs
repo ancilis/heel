@@ -181,7 +181,28 @@ function analyzeSource(fileName, text) {
     report(reportNode, `network sink alias ${target.text}`);
   }
 
+  function isCapabilityIdentifierReference(node) {
+    if (!networkCapabilities.has(node.text)) return false;
+    let current = node.parent;
+    while (current && !ts.isSourceFile(current)) {
+      if (ts.isTypeNode(current)) return false;
+      current = current.parent;
+    }
+    const parent = node.parent;
+    if (ts.isPropertyAccessExpression(parent) && parent.name === node) return false;
+    if (
+      ts.isNamedDeclaration(parent)
+      && parent.name === node
+      && !ts.isShorthandPropertyAssignment(parent)
+    ) return false;
+    return true;
+  }
+
   function visit(node) {
+    if (ts.isIdentifier(node) && isCapabilityIdentifierReference(node)) {
+      report(node, `network sink capability reference ${node.text}`);
+    }
+
     if (ts.isVariableDeclaration(node) && node.initializer) {
       if (ts.isIdentifier(node.name)) {
         recordAlias(node.name, node.initializer, node);
@@ -222,7 +243,9 @@ function analyzeSource(fileName, text) {
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const name = memberName(node);
       const root = rootName(node);
-      if (name === "fetch" && !allowedFetchReference(node)) report(node, "unapproved fetch capability reference");
+      if (networkCapabilities.has(name ?? "") && !allowedFetchReference(node)) {
+        report(node, `network sink capability reference ${name}`);
+      }
       if (["localStorage", "sessionStorage", "caches", "CacheStorage"].includes(name ?? "")) {
         report(node, `durable/cache capability ${name}`);
       }
@@ -307,6 +330,76 @@ nested("/leak", {body: source});
   const violations = analyzeSource(join(appRootPath, "components/nested/propagated-alias.ts"), mutation);
   assert.ok(violations.some((violation) => violation.includes("network sink alias sink")), violations.join("\n"));
   assert.ok(violations.some((violation) => violation.includes("network sink alias nested")), violations.join("\n"));
+});
+
+
+test("the privacy analyzer rejects property and object carriers at capability acquisition", () => {
+  const mutations = [
+    `
+const source = "private";
+const holder = {};
+holder.sink = fetch;
+holder.sink("/leak", {body: source});
+`,
+    `
+const source = "private";
+const holder = {sink: fetch};
+holder.sink("/leak", {body: source});
+`,
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, `components/nested/property-carrier-${index}.ts`),
+      mutation,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("network sink capability reference fetch")),
+      violations.join("\n"),
+    );
+  }
+});
+
+
+test("the privacy analyzer rejects array, closure, return, and argument carriers", () => {
+  const mutations = [
+    `const holder = [fetch]; holder[0]("/leak");`,
+    `const holder = () => fetch; holder()("/leak");`,
+    `function holder() { return fetch; } holder()("/leak");`,
+    `const carry = (authority) => authority; carry(fetch)("/leak");`,
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, `components/nested/authority-carrier-${index}.ts`),
+      mutation,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("network sink capability reference fetch")),
+      violations.join("\n"),
+    );
+  }
+});
+
+
+test("the privacy analyzer permits only the reviewed engine and server fetch sites", () => {
+  const engine = `
+const scope = globalThis;
+const bootstrapFetch = scope.fetch.bind(scope);
+async function fetchLocal(fetcher, path) { return fetcher(path); }
+`;
+  const server = `
+async function route(request, env, ctx) {
+  const asset = await env.ASSETS.fetch(request);
+  return handler.fetch(asset, env, ctx);
+}
+`;
+  assert.deepEqual(
+    analyzeSource(join(appRootPath, "workers/heel-review.worker.ts"), engine),
+    [],
+  );
+  assert.deepEqual(
+    analyzeSource(join(appRootPath, "worker/index.ts"), server),
+    [],
+  );
 });
 
 
