@@ -12,7 +12,10 @@
 
 ## File structure
 
-- `release/open-core-v1.json` — canonical allowlist of public modules, package data, documentation, licenses, console scripts, and release version.
+- `release/open-core-v1.json` — canonical allowlist of public build files, modules, package data, documentation, licenses, console scripts, and release version.
+- `release/open-core/README.md` — release-specific product/install guide with no monorepo-only commands.
+- `release/open-core/MCP_QUICKSTART.md` — self-contained local MCP setup and valid protocol handshake.
+- `release/open-core/SECURITY.md` — exact local trust boundary and disclosure instructions.
 - `scripts/build_open_core_release.py` — deterministic allowlist consumer; builds wheel, source tarball, and canonical manifest; supports `--check`.
 - `tests/test_open_core_release.py` — mutation, archive-content, metadata, clean-install, and real MCP-handshake proof.
 - `pyproject.toml` — normal Python builds discover only the top-level `heel` package, never `heel.saas`.
@@ -27,6 +30,9 @@
 
 **Files:**
 - Create: `release/open-core-v1.json`
+- Create: `release/open-core/README.md`
+- Create: `release/open-core/MCP_QUICKSTART.md`
+- Create: `release/open-core/SECURITY.md`
 - Create: `tests/test_open_core_release.py`
 - Modify: `pyproject.toml`
 - Modify: `MANIFEST.in`
@@ -43,11 +49,11 @@ FORBIDDEN_PREFIXES = (
 def test_release_contract_is_an_exact_public_allowlist(self):
     contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
     self.assertEqual(set(contract), {
-        "console_scripts", "documents", "licenses", "package_data",
+        "build_files", "console_scripts", "documents", "licenses", "package_data",
         "python_modules", "schema_version", "version",
     })
     self.assertEqual(contract["schema_version"], "heel.open-core-release.v1")
-    paths = contract["python_modules"] + contract["package_data"] + contract["documents"] + contract["licenses"]
+    paths = contract["build_files"] + contract["python_modules"] + contract["package_data"] + contract["documents"] + contract["licenses"]
     self.assertEqual(len(paths), len(set(paths)))
     for path in paths:
         self.assertEqual(PurePosixPath(path).as_posix(), path)
@@ -71,32 +77,25 @@ Create `release/open-core-v1.json` with canonical JSON and these values:
 
 ```json
 {
+  "build_files": [
+    "MANIFEST.in",
+    "pyproject.toml",
+    "release/open-core-v1.json"
+  ],
   "console_scripts": {
     "heel": "heel.cli:main",
     "heel-mcp": "heel.mcp_server:main",
     "heel-rest": "heel.rest:serve"
   },
   "documents": [
-    "ARCHITECTURE.md",
-    "CHANGELOG.md",
-    "CONTRIBUTING.md",
-    "DECISIONS.md",
-    "README.md",
-    "SECURITY.md",
-    "TRUST.md",
-    "docs/ENTITLEMENTS.md",
-    "docs/LAUNCH_REVIEW.md",
-    "docs/MCP_QUICKSTART.md",
-    "docs/MODES.md",
-    "docs/OPENAPI_IMPORT.md",
-    "docs/REGRESSIONS.md"
+    "release/open-core/MCP_QUICKSTART.md",
+    "release/open-core/README.md",
+    "release/open-core/SECURITY.md"
   ],
   "licenses": ["DCO", "LICENSE", "NOTICE"],
   "package_data": [
     "heel/heldout/targets.json",
-    "heel/heldout/test_targets.json",
-    "heel/scenarios_lib/community.json",
-    "heel/scenarios_lib/research_owasp.json"
+    "heel/scenarios_lib/community.json"
   ],
   "python_modules": [
     "heel/__init__.py",
@@ -162,17 +161,28 @@ include-package-data = false
 packages = ["heel"]
 
 [tool.setuptools.package-data]
-heel = ["scenarios_lib/*.json", "heldout/*.json"]
+heel = ["heldout/targets.json", "scenarios_lib/community.json"]
 ```
+
+Set the project readme to `release/open-core/README.md`. The release-specific README and MCP
+quickstart must be self-contained: no local link may leave the release allowlist, and no fenced
+command may require `apps/`, `web/`, `tests/`, `docs/saas`, `heel/saas`, the stale public GitHub
+branch, or an unavailable PyPI package. Their five-minute path creates a tiny sanitized OpenAPI JSON
+file inline, installs from the local wheel/source archive, and uses the real three-message MCP
+handshake.
+
+Remove the stale `[project.urls]` table until the public repository or production Heel site is
+current. Do not put `ancilis/heel` in release metadata while that repository still serves the old
+Arceo source.
 
 Replace `MANIFEST.in` with explicit public includes and a final defensive prune:
 
 ```text
-include ARCHITECTURE.md CHANGELOG.md CONTRIBUTING.md DCO DECISIONS.md LICENSE NOTICE README.md SECURITY.md TRUST.md
-include docs/ENTITLEMENTS.md docs/LAUNCH_REVIEW.md docs/MCP_QUICKSTART.md docs/MODES.md docs/OPENAPI_IMPORT.md docs/REGRESSIONS.md
+include DCO LICENSE NOTICE
+include release/open-core/README.md release/open-core/MCP_QUICKSTART.md release/open-core/SECURITY.md
 include heel/*.py
-include heel/heldout/*.json
-include heel/scenarios_lib/*.json
+include heel/heldout/targets.json
+include heel/scenarios_lib/community.json
 prune heel/saas
 prune docs/saas
 prune docs/superpowers
@@ -193,7 +203,7 @@ Expected: `PASS`.
 Commit:
 
 ```bash
-git add release/open-core-v1.json tests/test_open_core_release.py pyproject.toml MANIFEST.in
+git add release/open-core-v1.json release/open-core tests/test_open_core_release.py pyproject.toml MANIFEST.in
 git commit -m "test: freeze Apache open-core release boundary"
 ```
 
@@ -264,7 +274,9 @@ Required builder behavior:
 3. Compare the contract's `heel/*.py` entries with the actual top-level `heel/*.py` set and fail on an unclassified new module.
 4. Parse every public Python module with `ast`; reject any import whose resolved local package starts with `heel.saas` or `.saas`.
 5. Build a `ZIP_STORED` wheel with fixed modes/timestamps, licenses under `heel_sim-1.1.0.dist-info/licenses/`, exact metadata, entry points, and a sorted PEP 376 `RECORD`.
-6. Build a gzip-compressed tar source tree rooted at `heel_sim-1.1.0/`, with uid/gid 0, empty owner/group names, mode `0644`, mtime 0, and gzip header mtime 0.
+6. Build a gzip-compressed tar source tree rooted at `heel_sim-1.1.0/`, containing every allowlisted
+   `build_files`, source, data, document, and license entry, with uid/gid 0, empty owner/group names,
+   mode `0644`, mtime 0, and gzip header mtime 0.
 7. Emit canonical `heel.open-core-artifacts.v1` JSON containing version plus name/size/SHA-256 for both archives.
 8. Write with descriptor-safe atomic replacement and reject symlinked output roots/components.
 9. `--check` compares exact committed bytes without rewriting them.
@@ -291,6 +303,12 @@ subprocess.run([
 ```
 
 Then send newline-delimited `initialize`, `notifications/initialized`, and `tools/list` messages to the installed `heel-mcp`; assert the initialize response names `heel` and the tool list contains `heel_review_openapi`.
+
+Create a second clean environment and install `heel_sim-1.1.0.tar.gz` offline with
+`--no-index --no-deps --no-build-isolation`. Rebuild a wheel from that source archive and compare
+its normalized member names, contents, metadata, entry points, and `RECORD` hashes with the
+allowlist-built wheel. The source archive is not accepted if it is merely a snapshot that cannot
+install and reproduce the same package members.
 
 - [ ] **Step 5: Run release tests and commit**
 
@@ -483,6 +501,8 @@ This plan is complete only when all of the following are true:
 
 - A customer can download the exact current Heel Agent wheel from `/mcp`, install it, and complete a real MCP handshake without a source checkout or PyPI.
 - Wheel and sdist are byte-reproducible, hash-pinned, and independently member-inspected.
+- The source archive contains its exact public build contract and installs offline into the same
+  normalized wheel member set.
 - `heel.saas`, hosted application code, private docs, commercial markers, and credentials are absent.
 - `find_spec("heel.saas")` is `None` in the clean installed environment.
 - CI and PyPI publishing use the same allowlist and artifact tests.
