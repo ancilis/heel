@@ -111,8 +111,6 @@ jobs:
         run: npm run build
       - name: Inspect production privacy, product, and deployment artifact contracts
         working-directory: apps/heel-cloud
-        run: >-
-          node --test
-          tests/privacy-boundary.test.mjs
-          tests/rendered-html.test.mjs
-          tests/production-artifact.test.mjs
+        # The package wildcard includes every top-level *.test.mjs gate so new
+        # production checks cannot be omitted by an explicit CI file list.
+        run: npm run test:node

@@ -8,21 +8,19 @@ import "./globals.css";
 const title = "Heel — Find launch blockers before customers do";
 const description =
   "Turn an OpenAPI document into reachable SaaS abuse evidence, controls, and regression tests without uploading it.";
+const internalOriginHeader = "x-heel-internal-origin";
 
 
 function requestOrigin(values: Headers): string | null {
-  const directHost = values.get("host")?.trim();
-  const forwardedHost = values.get("x-forwarded-host")?.split(",", 1)[0]?.trim();
-  const host = directHost || forwardedHost;
-  if (!host || /[\s/?#\\@]/.test(host)) return null;
-  const forwardedProtocol = values.get("x-forwarded-proto")?.split(",", 1)[0]?.trim();
-  const protocol = forwardedProtocol === "http" || forwardedProtocol === "https"
-    ? forwardedProtocol
-    : host.startsWith("localhost") || host.startsWith("127.0.0.1")
-      ? "http"
-      : "https";
+  const trustedOrigin = values.get(internalOriginHeader)?.trim();
+  if (!trustedOrigin) return null;
   try {
-    return new URL(`${protocol}://${host}`).origin;
+    const parsed = new URL(trustedOrigin);
+    if (
+      trustedOrigin !== parsed.origin
+      || (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    ) return null;
+    return parsed.origin;
   } catch {
     return null;
   }

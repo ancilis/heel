@@ -45,13 +45,14 @@ npm run test:unit
 npm run typecheck
 npm run lint
 npm run build
-node --test tests/privacy-boundary.test.mjs tests/rendered-html.test.mjs \
-  tests/production-artifact.test.mjs
+npm run test:node
 ```
 
-The production-artifact test runs after the build and verifies the exact runtime
-and wheel digests, same-origin bootstrap, response CSP/security headers, empty
-cloud-persistence bindings, absence of source maps and credential files, and the
-host-derived 1200×630 social metadata. These automated checks do not replace the
+The production-artifact test runs after the build and verifies the transformed,
+digest-pinned same-origin runtime; recursively scans deployed executables,
+manifests, and browser-wheel members; enforces exact response CSP/security
+headers and empty cloud capabilities; rejects source maps, CDN fallbacks, and
+credentials; and proves that 1200×630 social metadata uses the request URL rather
+than caller-controlled host headers. These automated checks do not replace the
 outstanding keyboard, narrow-viewport, request-inspection, timing, and deployment
 acceptance run.

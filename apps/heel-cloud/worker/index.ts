@@ -71,9 +71,14 @@ const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const nonce = crypto.randomUUID().replaceAll("-", "");
     const csp = contentSecurityPolicy(nonce);
+    const trustedOrigin = new URL(request.url).origin;
     const requestHeaders = new Headers(request.headers);
     // Vinext/Next reads the request CSP nonce and applies it to framework scripts.
     requestHeaders.set("Content-Security-Policy", csp);
+    // This private header is derived here and overwritten on every request. App
+    // metadata must never reconstruct public URLs from caller-controlled Host or
+    // forwarding headers.
+    requestHeaders.set("x-heel-internal-origin", trustedOrigin);
     const securedRequest = new Request(request, { headers: requestHeaders });
     const url = new URL(securedRequest.url);
 

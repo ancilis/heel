@@ -14,6 +14,9 @@ const PYODIDE_SOURCE = "https://github.com/pyodide/pyodide/tree/ac57031be7564f86
 const CPYTHON_VERSION = "3.14.2";
 const CPYTHON_SOURCE = "https://github.com/python/cpython/tree/df793163d5821791d4e7caf88885a2c11a107986";
 const WHEEL_NAME = "heel_browser-1.1.0-py3-none-any.whl";
+const PYODIDE_CDN_FALLBACK = "`https://cdn.jsdelivr.net/pyodide/v${U}/full/`";
+const SAME_ORIGIN_PYODIDE_FALLBACK = '"/heel-runtime/"';
+const PYODIDE_SOURCE_MAP_DIRECTIVE = "\n//# sourceMappingURL=pyodide.mjs.map";
 const THIRD_PARTY_LICENSES = Object.freeze({
   "LICENSE.CPYTHON-PSF-2.0.txt": Object.freeze({
     size: 13804,
@@ -96,6 +99,33 @@ function assertExactObject(value, keys, label) {
 function assertIntegrity(payload, expected, label) {
   if (payload.byteLength !== expected.size) throw new Error(`${label} size mismatch`);
   if (sha256(payload) !== expected.sha256) throw new Error(`${label} digest mismatch`);
+}
+
+
+function replaceExactlyOnce(source, expected, replacement, label) {
+  const parts = source.split(expected);
+  if (parts.length !== 2) {
+    throw new Error(`${label} replacement count must be exactly one`);
+  }
+  return parts.join(replacement);
+}
+
+
+function transformPyodideModule(payload) {
+  let source = payload.toString("utf8");
+  source = replaceExactlyOnce(
+    source,
+    PYODIDE_CDN_FALLBACK,
+    SAME_ORIGIN_PYODIDE_FALLBACK,
+    "Pyodide CDN fallback",
+  );
+  source = replaceExactlyOnce(
+    source,
+    PYODIDE_SOURCE_MAP_DIRECTIVE,
+    "",
+    "Pyodide source map directive",
+  );
+  return Buffer.from(source, "utf8");
 }
 
 
@@ -241,6 +271,10 @@ export async function prepareRuntime(options = {}) {
     validateHeelEngine(engineRoot),
     validateLegalAssets(legalRoot),
   ]);
+  const preparedPyodideAssets = {
+    ...pyodideAssets,
+    "pyodide.mjs": transformPyodideModule(pyodideAssets["pyodide.mjs"]),
+  };
 
   const pyodideLicense = legalAssets["LICENSE.PYODIDE-MPL-2.0.txt"];
   const cpythonLicense = legalAssets["LICENSE.CPYTHON-PSF-2.0.txt"];
@@ -274,7 +308,10 @@ export async function prepareRuntime(options = {}) {
     heel: heel.manifest,
     notices: noticeFiles,
     pyodide: {
-      assets: Object.fromEntries(Object.entries(PYODIDE_ASSETS).map(([name, value]) => [name, value])),
+      assets: Object.fromEntries(Object.entries(preparedPyodideAssets).map(([name, payload]) => [name, {
+        sha256: sha256(payload),
+        size: payload.byteLength,
+      }])),
       license: "MPL-2.0",
       source: PYODIDE_SOURCE,
       version: PYODIDE_VERSION,
@@ -282,7 +319,7 @@ export async function prepareRuntime(options = {}) {
     schema_version: "heel.browser-runtime-manifest.v1",
   };
   const outputPayloads = {
-    ...pyodideAssets,
+    ...preparedPyodideAssets,
     "LICENSE.CPYTHON-PSF-2.0.txt": cpythonLicense,
     "LICENSE.PYODIDE-MPL-2.0.txt": pyodideLicense,
     "THIRD_PARTY_NOTICES.txt": notice,

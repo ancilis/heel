@@ -43,13 +43,17 @@ const licenseFiles = {
     size: 15648,
   },
 };
-const pyodideAssets = {
+const upstreamPyodideAssets = {
   "pyodide.asm.mjs": [1249447, "1a9775427ef6e8abaa7db88ece0515422d1886915ae5c9093776410c865dfd8d"],
   "pyodide.asm.wasm": [9596462, "e7f8fac36f8bf11085309cbc5c829b3ec3057c18bf1d73b05a6741612d63cdbf"],
   "pyodide-lock.json": [113804, "c963d22858f6bcb8f41586a2142f03905ab370c88ea22a86a2736e95fac2a8f3"],
   "pyodide.mjs": [17880, "5cfc46f5dcbaf2a16f26e2363f441873eb424762609cc03db00d6a2ace4d00e5"],
   "python_stdlib.zip": [2545106, "444c770dfd75a32097fc0a7d5c1413fd3140601f49c3a1f2e9af0376fcd124b4"],
 };
+const upstreamCdnFallback = "`https://cdn.jsdelivr.net/pyodide/v${U}/full/`";
+const sameOriginCdnFallback = '"/heel-runtime/"';
+const upstreamSourceMapDirective = "//# sourceMappingURL=pyodide.mjs.map";
+const preparedPyodideAsset = [17813, "be311e4c0ef3d22edd4fee1309a69cc6571e9980e80c40a113776cb225de355e"];
 const expectedRuntimeFiles = [
   "LICENSE.PYODIDE-MPL-2.0.txt",
   "LICENSE.CPYTHON-PSF-2.0.txt",
@@ -81,6 +85,19 @@ async function importPrepareModule() {
 
 function sha256(payload) {
   return createHash("sha256").update(payload).digest("hex");
+}
+
+
+function expectedPreparedPyodide(upstream) {
+  const source = upstream.toString("utf8");
+  assert.equal(source.split(upstreamCdnFallback).length - 1, 1, "upstream CDN fallback count");
+  assert.equal(source.split(upstreamSourceMapDirective).length - 1, 1, "upstream map directive count");
+  return Buffer.from(
+    source
+      .replace(upstreamCdnFallback, sameOriginCdnFallback)
+      .replace(`\n${upstreamSourceMapDirective}`, ""),
+    "utf8",
+  );
 }
 
 
@@ -357,6 +374,8 @@ function installNetworkConfinement() {
 
 
 test("prepares only integrity-pinned local engine and Pyodide runtime assets", async () => {
+  const vendoredPyodideBefore = await readFile(join(appRoot, "node_modules/pyodide/pyodide.mjs"));
+  const expectedPyodide = expectedPreparedPyodide(vendoredPyodideBefore);
   const prepared = prepareRuntime();
   assert.equal(prepared.status, 0, prepared.stderr);
   assert.deepEqual((await readdir(runtimeRoot)).sort(), expectedRuntimeFiles);
@@ -371,6 +390,8 @@ test("prepares only integrity-pinned local engine and Pyodide runtime assets", a
     packageLock,
     readme,
     gitignore,
+    shippedPyodide,
+    vendoredPyodideAfter,
   ] = await Promise.all([
     readFile(join(runtimeRoot, "runtime-manifest.json"), "utf8").then(JSON.parse),
     readFile(join(engineRoot, "manifest.json"), "utf8").then(JSON.parse),
@@ -381,6 +402,8 @@ test("prepares only integrity-pinned local engine and Pyodide runtime assets", a
     readFile(join(appRoot, "package-lock.json"), "utf8").then(JSON.parse),
     readFile(join(appRoot, "README.md"), "utf8"),
     readFile(join(appRoot, ".gitignore"), "utf8"),
+    readFile(join(runtimeRoot, "pyodide.mjs")),
+    readFile(join(appRoot, "node_modules/pyodide/pyodide.mjs")),
   ]);
 
   assert.equal(runtimeManifest.schema_version, "heel.browser-runtime-manifest.v1");
@@ -392,12 +415,24 @@ test("prepares only integrity-pinned local engine and Pyodide runtime assets", a
     source: cpythonSource,
     version: "3.14.2",
   });
+  const expectedAssets = { ...upstreamPyodideAssets };
+  assert.deepEqual([expectedPyodide.byteLength, sha256(expectedPyodide)], preparedPyodideAsset);
+  expectedAssets["pyodide.mjs"] = preparedPyodideAsset;
   assert.deepEqual(
     Object.fromEntries(Object.entries(runtimeManifest.pyodide.assets).map(([name, value]) => [
       name,
       [value.size, value.sha256],
     ])),
-    pyodideAssets,
+    expectedAssets,
+  );
+  assert.deepEqual(shippedPyodide, expectedPyodide);
+  assert.notDeepEqual(shippedPyodide, vendoredPyodideBefore);
+  assert.deepEqual(vendoredPyodideAfter, vendoredPyodideBefore);
+  assert.doesNotMatch(shippedPyodide.toString("utf8"), /cdn\.jsdelivr\.net|sourceMappingURL=/i);
+  assert.equal(
+    shippedPyodide.toString("utf8").split(sameOriginCdnFallback).length - 1,
+    1,
+    "prepared module must contain exactly one same-origin fallback",
   );
   assert.deepEqual(runtimeManifest.heel, engineManifest);
   assert.deepEqual(Object.keys(runtimeManifest.notices).sort(), ["cpython", "pyodide", "third_party"]);

@@ -96,14 +96,14 @@ npm run test:unit
 npm run typecheck
 npm run lint
 npm run build
-node --test tests/privacy-boundary.test.mjs tests/rendered-html.test.mjs \
-  tests/production-artifact.test.mjs
+npm run test:node
 ```
 
-The final artifact inspection verifies the shipped runtime digests, same-origin worker bootstrap,
-security headers, empty persistence bindings, absence of source maps and credential files, and the
-host-derived 1200×630 social metadata. It does not replace the outstanding interactive browser or
-deployment acceptance gates.
+The final artifact inspection verifies the transformed, digest-pinned same-origin runtime; recursively
+scans deployed executables, manifests, and browser-wheel members; enforces exact security headers and
+empty cloud capabilities; rejects source maps, CDN fallbacks, and credentials; and proves that 1200×630
+social metadata uses the request URL rather than caller-controlled host headers. It does not replace
+the outstanding interactive browser or deployment acceptance gates.
 
 Run the broader synthetic proof from the same clone:
 

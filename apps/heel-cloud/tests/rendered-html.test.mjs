@@ -92,10 +92,11 @@ test("keeps the anonymous app free of server-side customer capabilities", async 
   );
 });
 
-test("uses Heel identity and marks original source as commercial", async () => {
-  const [page, layout, readme, socialCard] = await Promise.all([
+test("uses Heel identity, trusted request-origin metadata, and commercial source", async () => {
+  const [page, layout, worker, readme, socialCard] = await Promise.all([
     readFile(new URL("app/page.tsx", appRoot), "utf8"),
     readFile(new URL("app/layout.tsx", appRoot), "utf8"),
+    readFile(new URL("worker/index.ts", appRoot), "utf8"),
     readFile(new URL("README.md", appRoot), "utf8"),
     readFile(new URL("public/og.png", appRoot)),
   ]);
@@ -107,12 +108,11 @@ test("uses Heel identity and marks original source as commercial", async () => {
   );
   assert.match(layout, /const title = "Heel/);
   assert.match(layout, /generateMetadata/);
-  assert.match(layout, /x-forwarded-host/);
+  assert.match(layout, /x-heel-internal-origin/);
   assert.match(layout, /\$\{origin\}\/og\.png/);
-  assert.ok(
-    layout.indexOf('values.get("host")') < layout.indexOf('values.get("x-forwarded-host")'),
-    "the direct Host header must take precedence over forwarded host input",
-  );
+  assert.doesNotMatch(layout, /values\.get\(["'](?:host|x-forwarded-host|x-forwarded-proto)["']\)/);
+  assert.match(worker, /new URL\(request\.url\)\.origin/);
+  assert.match(worker, /requestHeaders\.set\([\s\S]*x-heel-internal-origin/);
   assert.equal(socialCard.readUInt32BE(16), 1200);
   assert.equal(socialCard.readUInt32BE(20), 630);
   assert.match(readme, /never uploaded/i);
