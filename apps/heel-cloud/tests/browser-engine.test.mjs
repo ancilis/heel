@@ -26,6 +26,7 @@ const repositoryRoot = resolve(appRoot, "../..");
 const prepareScript = join(appRoot, "scripts/prepare-runtime.mjs");
 const runtimeRoot = join(appRoot, "public/heel-runtime");
 const engineRoot = join(appRoot, "browser-engine");
+const legalRoot = join(appRoot, "legal/third-party");
 const permissionRunner = join(appRoot, "tests/browser-engine-permission-runner.mjs");
 const wheelName = "heel_browser-1.1.0-py3-none-any.whl";
 const pyodideSource = "https://github.com/pyodide/pyodide/tree/ac57031be7564f864d061cb37c5c152e59f83ad4";
@@ -524,6 +525,58 @@ test("runtime preparation rejects tampering, symlinks, unpinned versions, and un
     await writeFile(unexpected, "unexpected");
     await assert.rejects(prepare(), /unexpected runtime path/i);
     await rm(unexpected);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+
+test("loads third-party licenses only from digest-pinned tracked assets", async () => {
+  const prepared = prepareRuntime();
+  assert.equal(prepared.status, 0, prepared.stderr);
+  const { prepareRuntime: prepare } = await importPrepareModule();
+  const temporary = await realpath(await mkdtemp(join(tmpdir(), "heel-license-security-")));
+  try {
+    const filenames = [
+      "LICENSE.CPYTHON-PSF-2.0.txt",
+      "LICENSE.PYODIDE-MPL-2.0.txt",
+    ];
+    const tamperedLegal = join(temporary, "tampered-legal");
+    await mkdir(tamperedLegal);
+    for (const filename of filenames) {
+      await copyFile(join(runtimeRoot, filename), join(tamperedLegal, filename));
+    }
+    await writeFile(join(tamperedLegal, filenames[0]), "tampered", { flag: "a" });
+
+    const linkedLegal = join(temporary, "linked-legal");
+    await symlink(runtimeRoot, linkedLegal);
+    const linkedLeafLegal = join(temporary, "linked-leaf-legal");
+    await mkdir(linkedLeafLegal);
+    await copyFile(join(runtimeRoot, filenames[0]), join(linkedLeafLegal, filenames[0]));
+    await symlink(
+      join(runtimeRoot, filenames[1]),
+      join(linkedLeafLegal, filenames[1]),
+    );
+
+    const attempts = await Promise.allSettled([
+      prepare({ legalRoot: tamperedLegal, outputRoot: join(temporary, "tampered-output") }),
+      prepare({ legalRoot: linkedLegal, outputRoot: join(temporary, "linked-output") }),
+      prepare({ legalRoot: linkedLeafLegal, outputRoot: join(temporary, "linked-leaf-output") }),
+    ]);
+    for (const attempt of attempts) {
+      assert.equal(attempt.status, "rejected", "untrusted legal assets were accepted");
+      assert.match(attempt.reason.message, /digest|size|symbolic link/i);
+    }
+
+    const source = await readFile(prepareScript, "utf8");
+    assert.doesNotMatch(source, /_GZIP_BASE64/);
+    assert.deepEqual((await readdir(legalRoot)).sort(), filenames);
+    for (const filename of filenames) {
+      assert.deepEqual(
+        await readFile(join(runtimeRoot, filename)),
+        await readFile(join(legalRoot, filename)),
+      );
+    }
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
