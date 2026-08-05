@@ -4,7 +4,7 @@ Task: Add a clear differentiation section to README.md and docs/POSITIONING.md.
 
 Create `docs/POSITIONING.md`.
 
-Explain Arceo compared to:
+Explain Heel compared to:
 
 - penetration testing / AppSec scanners
 - functional QA
@@ -14,8 +14,8 @@ Explain Arceo compared to:
 - model red-team tools
 
 Core message:
-Arceo is not a replacement for any of these.
-Arceo fills the missing product-abuse rehearsal step:
+Heel is not a replacement for any of these.
+Heel fills the missing product-abuse rehearsal step:
 
 - abuse of intended features
 - legitimate customer misuse
@@ -32,16 +32,16 @@ Add table columns:
 - When it runs
 - Typical signal
 - What it misses
-- How Arceo complements it
+- How Heel complements it
 
 Add examples:
 
 - QA says export button works.
 - AppSec says endpoint has no injection bug.
 - Fraud platform may catch abuse after traffic appears.
-- Arceo asks whether the export business flow can be used by a trial user to harvest more data than intended.
+- Heel asks whether the export business flow can be used by a trial user to harvest more data than intended.
 
 Acceptance criteria:
 
-- A skeptical reader understands why Arceo is a distinct category.
-- The docs do not attack adjacent tools; they position Arceo as complementary.
+- A skeptical reader understands why Heel is a distinct category.
+- The docs do not attack adjacent tools; they position Heel as complementary.

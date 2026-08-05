@@ -1,6 +1,6 @@
 {
   "schema_version": "ProductModel.v0.1",
-  "product_id": "arceo-saas-demo",
+  "product_id": "heel-saas-demo",
   "source": "local example SaaS demo adapter; sanitized metadata only",
   "generated_at": "2026-07-05T00:00:00Z",
   "environments": [
@@ -351,13 +351,13 @@
     {
       "id": "scope_required",
       "status": "present",
-      "applies_to": "imported:arceo-saas-demo"
+      "applies_to": "imported:heel-saas-demo"
     }
   ],
   "canary_accounts": [
-    "canary-free-owner@arceo.local",
-    "canary-pro-admin@arceo.local",
-    "canary-enterprise-viewer@arceo.local"
+    "canary-free-owner@heel.local",
+    "canary-pro-admin@heel.local",
+    "canary-enterprise-viewer@heel.local"
   ],
   "safety_notes": [
     "local/canary-only demo metadata; no live probing and no external services",

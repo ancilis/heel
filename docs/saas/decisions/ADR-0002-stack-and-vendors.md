@@ -16,7 +16,7 @@ deploy needs owner credentials (blockers), so choices must have excellent *local
 | Billing | **Stripe** (see ADR-0003) | Paddle, Lemon Squeezy | Default candidate; test-clock + sandbox fidelity; customer portal. |
 | Queue/workers | **SQLite-backed durable queue** locally (`JobPlane`: lease/reap/settle); managed queue or Postgres SKIP LOCKED in prod behind an interface | Redis/Celery, Temporal | Fewer vendors; the local queue is zero-infra and fully testable; prod swap is an adapter. |
 | Secrets | Env + validated loader locally; **cloud secret manager** in prod | Committed config | Never commit secrets; rotation runbook. |
-| Frontend | **Server-rendered hosted app** (`arceo/saas/dashboard.py`) for v1; a dedicated hosted Next.js app is future commercial code | Relabel existing `web/` | `web/` is the engine's Apache-2.0 snapshot control room (ADR-0001); the hosted UI must be new commercial code, not a relicense of open code. |
+| Frontend | **Server-rendered hosted app** (`heel/saas/dashboard.py`) for v1; a dedicated hosted Next.js app is future commercial code | Relabel existing `web/` | `web/` is the engine's Apache-2.0 snapshot control room (ADR-0001); the hosted UI must be new commercial code, not a relicense of open code. |
 | Hosting | Owner-selected (a container host for app + workers). Documented, not provisioned. | — | Requires owner accounts. |
 
 ## Local-first principle

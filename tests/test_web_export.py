@@ -8,10 +8,10 @@ import unittest
 class TestWarRoomSnapshot(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._old_home = os.environ.get("ARCEO_HOME")
+        cls._old_home = os.environ.get("HEEL_HOME")
         cls._tmp = tempfile.TemporaryDirectory()
-        os.environ["ARCEO_HOME"] = cls._tmp.name
-        from arceo.web_export import build_snapshot
+        os.environ["HEEL_HOME"] = cls._tmp.name
+        from heel.web_export import build_snapshot
 
         cls.snapshot = build_snapshot()
 
@@ -19,9 +19,9 @@ class TestWarRoomSnapshot(unittest.TestCase):
     def tearDownClass(cls):
         cls._tmp.cleanup()
         if cls._old_home is None:
-            os.environ.pop("ARCEO_HOME", None)
+            os.environ.pop("HEEL_HOME", None)
         else:
-            os.environ["ARCEO_HOME"] = cls._old_home
+            os.environ["HEEL_HOME"] = cls._old_home
 
     def test_snapshot_contains_war_room_sections(self):
         for section in (
@@ -71,7 +71,7 @@ class TestWarRoomSnapshot(unittest.TestCase):
         self.assertTrue(all(i["prohibited_fields_removed_confirmed"] for i in incidents["sanitized_incidents"]))
 
     def test_build_snapshot_is_deterministic(self):
-        from arceo.web_export import build_snapshot
+        from heel.web_export import build_snapshot
 
         again = build_snapshot()
         self.assertEqual(

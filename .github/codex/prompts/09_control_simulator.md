@@ -4,11 +4,11 @@ Task: Add a control simulator that estimates which controls would block or reduc
 
 Create:
 
-- arceo/control_simulator.py
+- heel/control_simulator.py
 - CLI:
-  - arceo controls simulate --vector <vector_id>
-  - arceo controls simulate --finding-json <file>
-  - arceo controls simulate --run <run_id>
+  - heel controls simulate --vector <vector_id>
+  - heel controls simulate --finding-json <file>
+  - heel controls simulate --run <run_id>
 - docs/CONTROL_SIMULATOR.md
 - tests
 
@@ -71,4 +71,4 @@ Docs:
 
 Acceptance criteria:
 
-- Arceo helps teams choose fixes, not just identify issues.
+- Heel helps teams choose fixes, not just identify issues.

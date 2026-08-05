@@ -26,10 +26,10 @@ UNSAFE_BY_REPRODUCTION_FINDING = {
 }
 
 
-class TestArceoBench(unittest.TestCase):
+class TestHeelBench(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from arceo.bench import format_report, run_benchmark
+        from heel.bench import format_report, run_benchmark
 
         cls.report = run_benchmark(blind_targets=4, blind_workers=2)
         cls.markdown = format_report(cls.report, "markdown")
@@ -69,7 +69,7 @@ class TestArceoBench(unittest.TestCase):
         self.assertNotIn("self_consistency_accuracy", serialized)
 
     def test_no_weaponization_compliance_comes_from_reproduction_fields(self):
-        from arceo.bench import no_weaponization_compliance
+        from heel.bench import no_weaponization_compliance
 
         compliance = no_weaponization_compliance([SAFE_FINDING, UNSAFE_BY_REPRODUCTION_FINDING])
 
@@ -79,7 +79,7 @@ class TestArceoBench(unittest.TestCase):
         self.assertEqual(compliance["violations"], ["unsafe-by-reproduction"])
 
     def test_cli_bench_report_json(self):
-        from arceo import cli
+        from heel import cli
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -87,11 +87,11 @@ class TestArceoBench(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         report = json.loads(buf.getvalue())
-        self.assertEqual(report["benchmark"], "ArceoBench")
+        self.assertEqual(report["benchmark"], "HeelBench")
         self.assertIn("precision", report["metrics"])
 
     def test_cli_bench_run_outputs_canonical_json(self):
-        from arceo import cli
+        from heel import cli
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -99,7 +99,7 @@ class TestArceoBench(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         report = json.loads(buf.getvalue())
-        self.assertEqual(report["benchmark"], "ArceoBench")
+        self.assertEqual(report["benchmark"], "HeelBench")
         self.assertIn("frozen_test_set", report["metadata"])
 
 

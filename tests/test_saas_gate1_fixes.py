@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
-os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+os.environ.setdefault("HEEL_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("HEEL_SIGNUP_MAX_GLOBAL", "100000")
 
 import hashlib
 import hmac
@@ -16,11 +16,11 @@ import threading
 import time
 import unittest
 
-from arceo.saas.billing import BillingStore, SubState
-from arceo.saas.catalog import CATALOG_VERSION, Meter
-from arceo.saas.http_api import ControlPlane, current_period, serve
-from arceo.saas.jobs import JobPlane, RunBudget
-from arceo.saas.ledger import UsageLedger
+from heel.saas.billing import BillingStore, SubState
+from heel.saas.catalog import CATALOG_VERSION, Meter
+from heel.saas.http_api import ControlPlane, current_period, serve
+from heel.saas.jobs import JobPlane, RunBudget
+from heel.saas.ledger import UsageLedger
 
 PW = "correct-horse-battery"
 SECRET = "whsec_gate1"
@@ -73,7 +73,7 @@ class Gate1HttpTests(unittest.TestCase):
                                          {"email": email, "password": PW}, port=port)
         self.assertEqual(status, 201)
         token = cookies.split(";")[0].split("=", 1)[1]
-        return body["workspace_id"], {"Cookie": f"arceo_session={token}"}
+        return body["workspace_id"], {"Cookie": f"heel_session={token}"}
 
     def test_idempotent_replay_creates_exactly_one_job(self):
         wid, hdr = self.signup("replay@example.com")
@@ -113,7 +113,7 @@ class Gate1HttpTests(unittest.TestCase):
               "catalog_version": CATALOG_VERSION}
         payload = json.dumps(ev).encode()
         status, _, _ = self.req("POST", "/v1/billing/webhook", ev,
-                                {"X-Arceo-Billing-Signature": _sign(payload, SECRET),
+                                {"X-Heel-Billing-Signature": _sign(payload, SECRET),
                                  "Content-Type": "application/json"})
         # req() re-serializes identically (same dict order), so the signature matches
         self.assertEqual(status, 200)
@@ -148,7 +148,7 @@ class Gate1ConcurrencyTests(unittest.TestCase):
         must not overshoot the integrations quota (Sol Gate-1 round-5 #2)."""
         import os
         import tempfile
-        from arceo.saas.tenancy import (
+        from heel.saas.tenancy import (
             ControlPlaneStore, IntegrationLimitExceeded, Role,
         )
         with tempfile.TemporaryDirectory() as d:
@@ -201,9 +201,9 @@ class Gate1ConcurrencyTests(unittest.TestCase):
             status, body, cookies = req("POST", "/v1/signup",
                                         {"email": "burn@example.com", "password": PW})
             wid = body["workspace_id"]
-            hdr = {"Cookie": f"arceo_session={cookies.split(';')[0].split('=', 1)[1]}"}
+            hdr = {"Cookie": f"heel_session={cookies.split(';')[0].split('=', 1)[1]}"}
             ch = cp.verifier.start(wid, "t.example.com")
-            records["_arceo.t.example.com"] = [f"arceo-verify={ch.token}"]
+            records["_heel.t.example.com"] = [f"heel-verify={ch.token}"]
             self.assertTrue(cp.verifier.check(wid, "t.example.com"))
             run = {"verified": True, "target": "t.example.com", "idempotency_key": "burned"}
             # no scope_ref → job plane refuses → reservations refunded, key burned
@@ -227,7 +227,7 @@ class Gate1AbuseBoundTests(unittest.TestCase):
     platform circuit breaker, and the cross-workspace hostname cap."""
 
     def test_signup_throttle_per_ip_and_global(self):
-        from arceo.saas.auth import AuthStore, ThrottledError
+        from heel.saas.auth import AuthStore, ThrottledError
         auth = AuthStore(_conn(), signup_max_per_ip=3, signup_max_global=5)
         for i in range(3):
             auth.throttle_signup("10.0.0.1", f"a{i}@example.com")
@@ -293,9 +293,9 @@ class Gate1AbuseBoundTests(unittest.TestCase):
     def test_global_verified_runs_circuit_breaker(self):
         """Many workspaces, each within its own quota, still hit the platform-wide cap —
         the automatic breaker that bounds AGGREGATE liability."""
-        from arceo.saas.catalog import get_plan
-        from arceo.saas.entitlement import EntitlementService, Subscription
-        from arceo.saas.ledger import GlobalCapExceeded
+        from heel.saas.catalog import get_plan
+        from heel.saas.entitlement import EntitlementService, Subscription
+        from heel.saas.ledger import GlobalCapExceeded
         ledger = UsageLedger(_conn())
         svc = EntitlementService(ledger, global_runs_cap=1000, global_verified_runs_cap=3)
         period = "2026-07"
@@ -312,27 +312,27 @@ class Gate1AbuseBoundTests(unittest.TestCase):
                         period, verified=False)
 
     def test_hostname_reuse_capped_across_workspaces(self):
-        from arceo.saas.verification import HostnameReuseExceeded, TargetVerifier
+        from heel.saas.verification import HostnameReuseExceeded, TargetVerifier
         records = {}
         v = TargetVerifier(_conn(), dns_txt=lambda name: records.get(name, []),
                            max_workspaces_per_hostname=2)
         for ws in ("ws1", "ws2"):
             ch = v.start(ws, "shared.example.com")
-            records["_arceo.shared.example.com"] = [f"arceo-verify={ch.token}"]
+            records["_heel.shared.example.com"] = [f"heel-verify={ch.token}"]
             self.assertTrue(v.check(ws, "shared.example.com"))
         ch = v.start("ws3", "shared.example.com")
-        records["_arceo.shared.example.com"] = [f"arceo-verify={ch.token}"]
+        records["_heel.shared.example.com"] = [f"heel-verify={ch.token}"]
         with self.assertRaises(HostnameReuseExceeded):
             v.check("ws3", "shared.example.com")
         # re-verifying an existing holder is unaffected
         ch = v.start("ws1", "shared.example.com")
-        records["_arceo.shared.example.com"] = [f"arceo-verify={ch.token}"]
+        records["_heel.shared.example.com"] = [f"heel-verify={ch.token}"]
         self.assertTrue(v.check("ws1", "shared.example.com"))
 
 
 class Gate1JobPlaneTests(unittest.TestCase):
     def _enqueue(self, jobs, ledger, ws, n):
-        from arceo.saas.catalog import get_plan
+        from heel.saas.catalog import get_plan
         plan = get_plan("team")
         out = []
         for i in range(n):
@@ -379,8 +379,8 @@ class Gate1JobPlaneTests(unittest.TestCase):
     def test_refunded_reservation_key_is_burned(self):
         """A refunded reservation is terminal: replaying its idempotency key must raise, not
         hand back quota-free capacity (Sol Gate-1 round-5 #1)."""
-        from arceo.saas.catalog import get_plan
-        from arceo.saas.ledger import IdempotencyConflict
+        from heel.saas.catalog import get_plan
+        from heel.saas.ledger import IdempotencyConflict
         ledger = UsageLedger(_conn())
         plan = get_plan("free")
         r = ledger.reserve(plan, "ws1", Meter.RUNS, 1, "2026-07", idempotency_key="k1")
@@ -396,7 +396,7 @@ class Gate1JobPlaneTests(unittest.TestCase):
     def test_enqueue_race_conflict_leaves_no_open_transaction(self):
         """The losing side of an idempotency-insert race must roll back, return the winner's
         job, and leave the connection usable (Sol Gate-1 round-5 #3)."""
-        from arceo.saas.catalog import get_plan
+        from heel.saas.catalog import get_plan
         conn = _conn()
         ledger = UsageLedger(conn)
         jobs = JobPlane(conn)
@@ -441,7 +441,7 @@ class Gate1JobPlaneTests(unittest.TestCase):
         conn = _conn()
         ledger = UsageLedger(conn)
         jobs = JobPlane(conn)
-        from arceo.saas.catalog import get_plan
+        from heel.saas.catalog import get_plan
         r = ledger.reserve(get_plan("team"), "ws1", Meter.RUNS, 1, "2026-07",
                            idempotency_key="k1")
         j1 = jobs.enqueue("ws1", kind="synthetic", reservation_ids=[r.reservation_id],

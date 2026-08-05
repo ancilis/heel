@@ -1,15 +1,15 @@
 # OpenAPI Import MVP
 
-Arceo can create a ProductModel draft from a local OpenAPI file:
+Heel can create a ProductModel draft from a local OpenAPI file:
 
 ```bash
-arceo init --from-openapi openapi.json --out product_model.json
-arceo import openapi openapi.json --out product_model.json
+heel init --from-openapi openapi.json --out product_model.json
+heel import openapi openapi.json --out product_model.json
 ```
 
 The importer is a starting point for SaaS abuse rehearsal. It turns API surface
 metadata into a safe model draft that operators should enrich with pricing,
-auth, telemetry, entitlement, and canary data before running Arceo.
+auth, telemetry, entitlement, and canary data before running Heel.
 
 ## Safety Posture
 
@@ -24,7 +24,7 @@ before any imported-model rehearsal run.
 
 ## Mapping
 
-The MVP uses route text, operation ids, tags, security schemes, and `x-arceo-*`
+The MVP uses route text, operation ids, tags, security schemes, and `x-heel-*`
 vendor extensions:
 
 - `export`, `download`, or `bulk` paths become export affordances.
@@ -38,12 +38,12 @@ vendor extensions:
 
 Supported vendor extensions:
 
-- `x-arceo-plan`
-- `x-arceo-tenant-scope`
-- `x-arceo-meter`
-- `x-arceo-data-class`
-- `x-arceo-control`
-- `x-arceo-agent-tool`
+- `x-heel-plan`
+- `x-heel-tenant-scope`
+- `x-heel-meter`
+- `x-heel-data-class`
+- `x-heel-control`
+- `x-heel-agent-tool`
 
 ## Before
 

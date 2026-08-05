@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PRODUCT_MODEL = ROOT / "examples" / "saas_demo" / "product_model.json"
 sys.path.insert(0, str(ROOT))
 
-from arceo import cli  # noqa: E402
+from heel import cli  # noqa: E402
 
 
 def _run_cli(argv: list[str], *, echo: bool = True) -> tuple[int, str]:
@@ -65,10 +65,10 @@ def demo_bench() -> int:
 
 def demo_regressions() -> int:
     print("mode: synthetic")
-    print("safety: temporary ARCEO_HOME; synthetic target only; no live probing or network calls")
-    original_home = os.environ.get("ARCEO_HOME")
-    with tempfile.TemporaryDirectory(prefix="arceo-demo-regressions-") as home:
-        os.environ["ARCEO_HOME"] = home
+    print("safety: temporary HEEL_HOME; synthetic target only; no live probing or network calls")
+    original_home = os.environ.get("HEEL_HOME")
+    with tempfile.TemporaryDirectory(prefix="heel-demo-regressions-") as home:
+        os.environ["HEEL_HOME"] = home
         try:
             rc, scope_doc = _run_cli_json([
                 "scope",
@@ -142,14 +142,14 @@ def demo_regressions() -> int:
             print(f"regression_run: {result['run_id']}")
         finally:
             if original_home is None:
-                os.environ.pop("ARCEO_HOME", None)
+                os.environ.pop("HEEL_HOME", None)
             else:
-                os.environ["ARCEO_HOME"] = original_home
+                os.environ["HEEL_HOME"] = original_home
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Run deterministic local Arceo demo workflows")
+    ap = argparse.ArgumentParser(description="Run deterministic local Heel demo workflows")
     ap.add_argument("workflow", choices=["import", "launch-review", "regressions", "bench"])
     args = ap.parse_args(argv)
     if args.workflow == "import":

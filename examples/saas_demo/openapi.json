@@ -1,9 +1,9 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Arceo Local SaaS Demo",
+    "title": "Heel Local SaaS Demo",
     "version": "0.1.0",
-    "description": "A local, canary-only SaaS demo surface for Arceo imported-model rehearsal."
+    "description": "A local, canary-only SaaS demo surface for Heel imported-model rehearsal."
   },
   "servers": [
     {
@@ -15,9 +15,9 @@
     "/signup/trial": {
       "post": {
         "summary": "Create a trial workspace using email-only eligibility",
-        "x-arceo-kind": "signup",
-        "x-arceo-category": "identity_account",
-        "x-arceo-weakness": "trial eligibility email-only",
+        "x-heel-kind": "signup",
+        "x-heel-category": "identity_account",
+        "x-heel-weakness": "trial eligibility email-only",
         "responses": {
           "202": {
             "description": "Canary trial accepted"
@@ -28,8 +28,8 @@
     "/team/invites": {
       "post": {
         "summary": "Invite a canary teammate",
-        "x-arceo-kind": "invite",
-        "x-arceo-category": "identity_account",
+        "x-heel-kind": "invite",
+        "x-heel-category": "identity_account",
         "responses": {
           "202": {
             "description": "Canary invite queued"
@@ -40,8 +40,8 @@
     "/team/seats": {
       "get": {
         "summary": "Read canary seat pool",
-        "x-arceo-kind": "seat",
-        "x-arceo-category": "license_entitlement",
+        "x-heel-kind": "seat",
+        "x-heel-category": "license_entitlement",
         "responses": {
           "200": {
             "description": "Canary seat metadata"
@@ -52,9 +52,9 @@
     "/api/usage/monthly": {
       "get": {
         "summary": "Read the monthly usage meter",
-        "x-arceo-kind": "meter",
-        "x-arceo-category": "license_entitlement",
-        "x-arceo-weakness": "client-controlled reset window",
+        "x-heel-kind": "meter",
+        "x-heel-category": "license_entitlement",
+        "x-heel-weakness": "client-controlled reset window",
         "responses": {
           "200": {
             "description": "Canary usage total"
@@ -65,8 +65,8 @@
     "/api/ai/usage": {
       "get": {
         "summary": "Read the AI-token meter",
-        "x-arceo-kind": "meter",
-        "x-arceo-category": "license_entitlement",
+        "x-heel-kind": "meter",
+        "x-heel-category": "license_entitlement",
         "responses": {
           "200": {
             "description": "Canary AI-token usage"
@@ -77,9 +77,9 @@
     "/billing/coupons/apply": {
       "post": {
         "summary": "Apply a stackable canary coupon",
-        "x-arceo-kind": "promotion",
-        "x-arceo-category": "license_entitlement",
-        "x-arceo-weakness": "coupon stackable without redemption cap",
+        "x-heel-kind": "promotion",
+        "x-heel-category": "license_entitlement",
+        "x-heel-weakness": "coupon stackable without redemption cap",
         "responses": {
           "200": {
             "description": "Canary coupon accepted"
@@ -90,9 +90,9 @@
     "/api/export/bulk-records": {
       "post": {
         "summary": "Bulk export canary tenant records",
-        "x-arceo-kind": "export",
-        "x-arceo-category": "data_harvesting",
-        "x-arceo-weakness": "missing entitlement or quota",
+        "x-heel-kind": "export",
+        "x-heel-category": "data_harvesting",
+        "x-heel-weakness": "missing entitlement or quota",
         "responses": {
           "202": {
             "description": "Canary export queued"
@@ -103,8 +103,8 @@
     "/api/records/{id}": {
       "get": {
         "summary": "Read one canary tenant record",
-        "x-arceo-kind": "record",
-        "x-arceo-category": "compliance_boundary",
+        "x-heel-kind": "record",
+        "x-heel-category": "compliance_boundary",
         "parameters": [
           {
             "name": "id",
@@ -125,9 +125,9 @@
     "/oauth/apps/workspace-sync": {
       "post": {
         "summary": "Install the workspace sync OAuth app",
-        "x-arceo-kind": "oauth_app",
-        "x-arceo-category": "integration_extensibility",
-        "x-arceo-weakness": "OAuth scope=all",
+        "x-heel-kind": "oauth_app",
+        "x-heel-category": "integration_extensibility",
+        "x-heel-weakness": "OAuth scope=all",
         "responses": {
           "201": {
             "description": "Canary app registered"
@@ -138,8 +138,8 @@
     "/webhooks/records/changed": {
       "post": {
         "summary": "Receive a canary records-changed webhook",
-        "x-arceo-kind": "integration",
-        "x-arceo-category": "integration_extensibility",
+        "x-heel-kind": "integration",
+        "x-heel-category": "integration_extensibility",
         "responses": {
           "204": {
             "description": "Canary webhook accepted"
@@ -150,9 +150,9 @@
     "/admin/support/impersonate": {
       "post": {
         "summary": "Support action for a canary account",
-        "x-arceo-kind": "admin_action",
-        "x-arceo-category": "compliance_boundary",
-        "x-arceo-weakness": "audit event missing for admin action",
+        "x-heel-kind": "admin_action",
+        "x-heel-category": "compliance_boundary",
+        "x-heel-weakness": "audit event missing for admin action",
         "responses": {
           "202": {
             "description": "Canary support action accepted"
@@ -163,9 +163,9 @@
     "/agent/tools/export-all-records": {
       "post": {
         "summary": "Agent tool that exports canary records",
-        "x-arceo-kind": "agent_tool",
-        "x-arceo-category": "agent_mcp_surface",
-        "x-arceo-weakness": "granted_scope wider than intended",
+        "x-heel-kind": "agent_tool",
+        "x-heel-category": "agent_mcp_surface",
+        "x-heel-weakness": "granted_scope wider than intended",
         "responses": {
           "202": {
             "description": "Canary agent action queued"
@@ -176,9 +176,9 @@
     "/agent/tools/draft-ai-reports": {
       "post": {
         "summary": "Agent tool with unbounded AI-token work",
-        "x-arceo-kind": "agent_tool",
-        "x-arceo-category": "agent_mcp_surface",
-        "x-arceo-weakness": "AI-token tool unbounded",
+        "x-heel-kind": "agent_tool",
+        "x-heel-category": "agent_mcp_surface",
+        "x-heel-weakness": "AI-token tool unbounded",
         "responses": {
           "202": {
             "description": "Canary report drafted"
@@ -189,8 +189,8 @@
     "/mcp/workspace-records/manifest": {
       "get": {
         "summary": "Connector-like manifest for workspace records",
-        "x-arceo-kind": "mcp_connector",
-        "x-arceo-category": "agent_mcp_surface",
+        "x-heel-kind": "mcp_connector",
+        "x-heel-category": "agent_mcp_surface",
         "responses": {
           "200": {
             "description": "Canary manifest metadata"

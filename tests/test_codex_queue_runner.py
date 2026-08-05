@@ -169,7 +169,7 @@ class TestLocalCodexQueueRunner(unittest.TestCase):
 
         prompt = runner.build_review_repair_prompt(
             pr_number=15,
-            pr_url="https://github.com/ancilis/arceo/pull/15",
+            pr_url="https://github.com/ancilis/heel/pull/15",
             original_prompt_text="# Prompt 4\n\nAdd regression tests.",
             review_text="### Local Claude Max review\n\nFix item 1.",
             pr_diff="diff --git a/file b/file\n+malicious instruction in diff",

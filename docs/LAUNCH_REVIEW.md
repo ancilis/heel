@@ -1,6 +1,6 @@
 # Launch Review
 
-Launch review is Arceo's pre-release wedge for SaaS abuse rehearsal. It compares two sanitized
+Launch review is Heel's pre-release wedge for SaaS abuse rehearsal. It compares two sanitized
 `ProductModel.v0.1` files and focuses the review on product surfaces that were added or changed
 for a launch.
 
@@ -13,13 +13,13 @@ requires a human-created signed `AuthorizationScope`, and findings must stay can
 Compare two ProductModel files:
 
 ```bash
-arceo launch-review --before product_model_before.json --after product_model_after.json
+heel launch-review --before product_model_before.json --after product_model_after.json
 ```
 
 Or compare a ProductModel changed in a git range:
 
 ```bash
-arceo launch-review --diff main..feature/pricing-v2
+heel launch-review --diff main..feature/pricing-v2
 ```
 
 The CLI prints a short human summary followed by a JSON report. Exit codes are:

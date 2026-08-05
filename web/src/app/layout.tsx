@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Arceo — control room",
+  title: "Heel — control room",
   description: "Rehearse SaaS abuse before launch and continuously after.",
 };
 

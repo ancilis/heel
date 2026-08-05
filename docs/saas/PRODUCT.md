@@ -1,9 +1,9 @@
-# ARCEO Hosted — Product Definition
+# HEEL Hosted — Product Definition
 
 Status: Phase-1 baseline · Date: 2026-07-13 · Owner: Fable build (autonomous, delegated)
 
 ## What it is
-ARCEO Hosted is the managed service on top of the open-source ARCEO engine. Teams rehearse
+HEEL Hosted is the managed service on top of the open-source HEEL engine. Teams rehearse
 incident-response and control validation against synthetic targets and, after proof-of-control
 verification, against their own verified targets — without operating the engine, workers, or storage
 themselves. The open-source engine stays free and self-hostable; the hosted product sells operation,
@@ -27,7 +27,7 @@ not the engine (ADR-0001).
 ## What is sold (and what is not)
 Sold: hosted rehearsal runs (metered), verified-target capacity, concurrency, retention, seats,
 integrations, enterprise capabilities, support. See `PRICING_AND_ENTITLEMENTS.md` and
-`arceo/saas/catalog.py` (source of truth).
+`heel/saas/catalog.py` (source of truth).
 Not sold: the engine itself (Apache-2.0), UI decoration, or access to anything that bypasses the
 safety spine.
 

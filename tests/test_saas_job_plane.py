@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
-os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+os.environ.setdefault("HEEL_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("HEEL_SIGNUP_MAX_GLOBAL", "100000")
 
 import http.client
 import json
@@ -12,11 +12,11 @@ import sqlite3
 import threading
 import unittest
 
-from arceo.saas.egress import EgressPolicy
-from arceo.saas.http_api import ControlPlane, serve
-from arceo.saas.jobs import JobPlane, RunBudget
-from arceo.saas.ledger import UsageLedger
-from arceo.saas.verification import TargetVerifier, valid_hostname
+from heel.saas.egress import EgressPolicy
+from heel.saas.http_api import ControlPlane, serve
+from heel.saas.jobs import JobPlane, RunBudget
+from heel.saas.ledger import UsageLedger
+from heel.saas.verification import TargetVerifier, valid_hostname
 
 PW = "correct-horse-battery"
 
@@ -42,7 +42,7 @@ class VerifierTests(unittest.TestCase):
         ch = v.start("ws1", "App.Example.COM.")
         self.assertEqual(ch.hostname, "app.example.com")
         self.assertFalse(v.check("ws1", "app.example.com"))       # not published yet
-        records["_arceo.app.example.com"] = [f"arceo-verify={ch.token}"]
+        records["_heel.app.example.com"] = [f"heel-verify={ch.token}"]
         self.assertTrue(v.check("ws1", "app.example.com"))
         self.assertTrue(v.is_verified("ws1", "app.example.com"))
         self.assertEqual(v.verified_count("ws1"), 1)
@@ -55,7 +55,7 @@ class VerifierTests(unittest.TestCase):
         pages = {}
         v = TargetVerifier(_conn(), http_get=lambda url: pages.get(url, ""))
         ch = v.start("ws1", "site.example.org")
-        pages[ch.http_url] = f"arceo-verify={ch.token}\n"
+        pages[ch.http_url] = f"heel-verify={ch.token}\n"
         self.assertTrue(v.check("ws1", "site.example.org"))
         with self.assertRaises(ValueError):
             v.start("ws1", "127.0.0.1")
@@ -95,7 +95,7 @@ class JobPlaneTests(unittest.TestCase):
         self.jobs = JobPlane(conn, scope_validator=lambda ws, ref, tgt: ref == f"scope-ok-{ws}-{tgt}")
 
     def _resv(self, ws="ws1"):
-        from arceo.saas.catalog import Meter, get_plan
+        from heel.saas.catalog import Meter, get_plan
         return self.ledger.reserve(get_plan("pro"), ws, Meter.RUNS, 1, "2026-07")
 
     def test_synthetic_lifecycle_consumes_on_success(self):
@@ -110,7 +110,7 @@ class JobPlaneTests(unittest.TestCase):
         self.assertIsNone(self.jobs.get("ws2", job.job_id))       # tenant-scoped read
 
     def test_failure_refunds(self):
-        from arceo.saas.catalog import Meter
+        from heel.saas.catalog import Meter
         r = self._resv()
         used_before = self.ledger.usage("ws1", Meter.RUNS, "2026-07")
         job = self.jobs.enqueue("ws1", kind="synthetic", reservation_ids=[r.reservation_id])
@@ -208,7 +208,7 @@ class HttpRunPathTests(unittest.TestCase):
         body = json.loads(r.read())
         token = r.getheader("Set-Cookie").split(";")[0].split("=", 1)[1]
         conn.close()
-        return body["workspace_id"], {"Cookie": f"arceo_session={token}"}
+        return body["workspace_id"], {"Cookie": f"heel_session={token}"}
 
     def test_verify_target_then_verified_run(self):
         wid, hdr = self.signup("runner@example.com")
@@ -219,7 +219,7 @@ class HttpRunPathTests(unittest.TestCase):
         self.assertEqual(self.req("POST", f"/v1/workspaces/{wid}/runs",
                                   {"verified": True, "target": "app.example.com",
                                    "scope_ref": "scope-ok-1"}, hdr)[0], 403)
-        self.records["_arceo.app.example.com"] = [f"arceo-verify={ch['token']}"]
+        self.records["_heel.app.example.com"] = [f"heel-verify={ch['token']}"]
         status, body = self.req("POST", f"/v1/workspaces/{wid}/targets/check",
                                 {"hostname": "app.example.com"}, hdr)
         self.assertTrue(body["verified"])
@@ -251,7 +251,7 @@ class HttpRunPathTests(unittest.TestCase):
         wid, hdr = self.signup("limits@example.com")
         status, ch = self.req("POST", f"/v1/workspaces/{wid}/targets",
                               {"hostname": "one.example.com"}, hdr)
-        self.records["_arceo.one.example.com"] = [f"arceo-verify={ch['token']}"]
+        self.records["_heel.one.example.com"] = [f"heel-verify={ch['token']}"]
         self.req("POST", f"/v1/workspaces/{wid}/targets/check",
                  {"hostname": "one.example.com"}, hdr)
         # free tier: 1 verified target
@@ -285,7 +285,7 @@ class ScopeMintPathTests(unittest.TestCase):
 
     def _verify(self, wid, hdr, host):
         _, ch = self.req("POST", f"/v1/workspaces/{wid}/targets", {"hostname": host}, hdr)
-        self.records[f"_arceo.{host}"] = [f"arceo-verify={ch['token']}"]
+        self.records[f"_heel.{host}"] = [f"heel-verify={ch['token']}"]
         self.req("POST", f"/v1/workspaces/{wid}/targets/check", {"hostname": host}, hdr)
 
     def test_mint_requires_stepup_reason_and_verified_target(self):
@@ -327,8 +327,8 @@ class ScopeMintPathTests(unittest.TestCase):
         wid, hdr = self.signup("parallel@example.com")   # free: 1 verified target
         _, ch1 = self.req("POST", f"/v1/workspaces/{wid}/targets", {"hostname": "a.example.com"}, hdr)
         _, ch2 = self.req("POST", f"/v1/workspaces/{wid}/targets", {"hostname": "b.example.com"}, hdr)
-        self.records["_arceo.a.example.com"] = [f"arceo-verify={ch1['token']}"]
-        self.records["_arceo.b.example.com"] = [f"arceo-verify={ch2['token']}"]
+        self.records["_heel.a.example.com"] = [f"heel-verify={ch1['token']}"]
+        self.records["_heel.b.example.com"] = [f"heel-verify={ch2['token']}"]
         status, body = self.req("POST", f"/v1/workspaces/{wid}/targets/check",
                                 {"hostname": "a.example.com"}, hdr)
         self.assertTrue(body["verified"])
@@ -364,7 +364,7 @@ class ScopeMintPathTests(unittest.TestCase):
                 wid, hdr = self.signup("nominter@example.com")
                 _, ch = self.req("POST", f"/v1/workspaces/{wid}/targets",
                                  {"hostname": "app.example.com"}, hdr)
-                records["_arceo.app.example.com"] = [f"arceo-verify={ch['token']}"]
+                records["_heel.app.example.com"] = [f"heel-verify={ch['token']}"]
                 self.req("POST", f"/v1/workspaces/{wid}/targets/check",
                          {"hostname": "app.example.com"}, hdr)
                 status, _ = self.req("POST", f"/v1/workspaces/{wid}/scopes",

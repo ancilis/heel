@@ -1,4 +1,4 @@
-# Arceo — one-command bring-up (spec §11). Pure stdlib: no installs needed.
+# Heel — one-command bring-up (spec §11). Pure stdlib: no installs needed.
 PY ?= python3
 
 .PHONY: demo demo-import demo-launch-review demo-regressions demo-bench test mcp rest ui ui-data scenarios clean help saas-smoke saas-backup saas-restore-verify saas-site
@@ -8,7 +8,7 @@ help:
 	@echo "make demo-import - validate the sanitized local SaaS ProductModel (imported mode)"
 	@echo "make demo-launch-review - exercise the static SaaS launch-review path (staging mode)"
 	@echo "make demo-regressions - create and run a synthetic abuse regression"
-	@echo "make demo-bench - render a fast local ArceoBench report"
+	@echo "make demo-bench - render a fast local HeelBench report"
 	@echo "make test   - acceptance + safety tests (auth gate, scope tamper-evidence, coverage)"
 	@echo "make mcp    - run the MCP server (stdio JSON-RPC) for a real MCP client"
 	@echo "make rest   - run the thin REST API (same auth gate) on :8780"
@@ -44,22 +44,22 @@ saas-restore-verify:
 	$(PY) scripts/saas_backup.py verify $(OUT)
 
 saas-site:
-	$(PY) -c "from arceo.saas.site import build; print(*build('build/site'), sep='\n')"
+	$(PY) -c "from heel.saas.site import build; print(*build('build/site'), sep='\n')"
 
 mcp:
-	$(PY) -m arceo.mcp_server
+	$(PY) -m heel.mcp_server
 
 rest:
-	$(PY) -m arceo.rest
+	$(PY) -m heel.rest
 
 ui-data:
-	$(PY) -m arceo.web_export
+	$(PY) -m heel.web_export
 
 ui: ui-data
 	cd web && npm install --no-audit --no-fund && npm run dev
 
 scenarios:
-	$(PY) -m arceo.cli scenarios
+	$(PY) -m heel.cli scenarios
 
 clean:
-	find . -name '__pycache__' -type d -prune -exec rm -rf {} + ; rm -rf .arceo
+	find . -name '__pycache__' -type d -prune -exec rm -rf {} + ; rm -rf .heel

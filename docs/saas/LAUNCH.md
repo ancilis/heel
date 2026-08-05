@@ -1,4 +1,4 @@
-# ARCEO Hosted — Launch Readiness
+# HEEL Hosted — Launch Readiness
 
 ## Gate status (honest)
 Launch is **NOT ready**. Remaining blocker classes:
@@ -12,7 +12,7 @@ Launch is **NOT ready**. Remaining blocker classes:
 Nothing below is bypassable while blocker #1 stands.
 
 ## What IS done and verified (2026-07-13, full suite 331 tests OK)
-- Open-core boundary (Apache core + proprietary `arceo/saas/`), SPDX headers, LICENSE-COMMERCIAL.
+- Open-core boundary (Apache core + proprietary `heel/saas/`), SPDX headers, LICENSE-COMMERCIAL.
 - Typed versioned catalog; tenancy/roles/invites/hashed API keys behind one `require()` choke
   point; atomic usage ledger (reserve/consume/refund, idempotency, race-proof quotas);
   server-side entitlement authority; billing state machine with signed/replay-safe webhooks.

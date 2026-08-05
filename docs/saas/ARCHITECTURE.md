@@ -1,4 +1,4 @@
-# ARCEO Hosted — Architecture
+# HEEL Hosted — Architecture
 
 Two separated planes over the open-source engine. Everything runs locally with zero external
 accounts; prod adapters swap in behind interfaces.
@@ -10,7 +10,7 @@ test suite. Production adapters (live Stripe, Postgres, managed queue, deployed 
 implemented yet, and nothing below should be read as a claim that they are. Stripe price IDs are
 injected via env (`live_price_id`) so no production ID lives in code.
 
-## Control plane (`arceo/saas/`)
+## Control plane (`heel/saas/`)
 - **Identity & tenancy:** orgs/workspaces, memberships, invites. Roles: owner, admin,
   member/operator, billing, viewer. Sessions, scoped service accounts, hashed+scoped API keys.
 - **Entitlement service** (`entitlement.py`) — the single server-side authority. Consumed by UI, API,

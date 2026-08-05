@@ -2,7 +2,7 @@
 """
 End-to-end smoke test for the hosted control plane (COMMERCIAL layer).
 
-SPDX-License-Identifier: LicenseRef-Arceo-Commercial
+SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
 Boots the real HTTP server on an ephemeral loopback port and drives the golden path:
 signup → dashboard → synthetic run → target verify (stub DNS) → verified run guard →
@@ -17,7 +17,7 @@ import sys
 import threading
 
 sys.path.insert(0, ".")
-from arceo.saas.http_api import ControlPlane, serve  # noqa: E402
+from heel.saas.http_api import ControlPlane, serve  # noqa: E402
 
 RECORDS = {}
 
@@ -65,7 +65,7 @@ def main(db_path: str = ":memory:") -> int:
     status, ch, _ = req("POST", f"/v1/workspaces/{wid}/targets",
                         {"hostname": "smoke.example.com"}, hdr)
     steps_ok &= check("target challenge", status == 201, ch)
-    RECORDS["_arceo.smoke.example.com"] = [f"arceo-verify={ch['token']}"]
+    RECORDS["_heel.smoke.example.com"] = [f"heel-verify={ch['token']}"]
     status, body, _ = req("POST", f"/v1/workspaces/{wid}/targets/check",
                           {"hostname": "smoke.example.com"}, hdr)
     steps_ok &= check("target verified", body.get("verified") is True)

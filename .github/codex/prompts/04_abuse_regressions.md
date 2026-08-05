@@ -1,17 +1,17 @@
 # Prompt 4 — Add abuse regression tests
 
-Task: Turn Arceo findings into permanent abuse regression tests.
+Task: Turn Heel findings into permanent abuse regression tests.
 
 Create:
 
-- arceo/regressions.py
+- heel/regressions.py
 - CLI commands:
-  - arceo regress add --run <run_id> --vector <vector_id> --name <name>
-  - arceo regress list
-  - arceo regress run --target <target_id_or_imported_model> --scope <scope_id>
-  - arceo regress export --format json
-- storage support in arceo/store.py
-- tests in tests/test_arceo.py or tests/test_regressions.py
+  - heel regress add --run <run_id> --vector <vector_id> --name <name>
+  - heel regress list
+  - heel regress run --target <target_id_or_imported_model> --scope <scope_id>
+  - heel regress export --format json
+- storage support in heel/store.py
+- tests in tests/test_heel.py or tests/test_regressions.py
 - docs/REGRESSIONS.md
 
 Behavior:
@@ -47,8 +47,8 @@ Do not create weaponized repro steps.
 CLI UX example:
 
 ```bash
-arceo regress add --run run-abc --vector av:run-abc:7 --name free_trial_serial_signup
-arceo regress run --scope scope-123 --target staging-saas
+heel regress add --run run-abc --vector av:run-abc:7 --name free_trial_serial_signup
+heel regress run --scope scope-123 --target staging-saas
 ```
 
 Tests:

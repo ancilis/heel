@@ -1,15 +1,15 @@
-# Arceo Commercial License (hosted layer)
+# Heel Commercial License (hosted layer)
 
 DRAFT — NOT LEGAL ADVICE. Flagged for owner counsel review (see docs/saas/OWNER_ACTIONS.md).
 
-The open-source **engine** in the `arceo/` package (excluding `arceo/saas/`) is licensed under the
+The open-source **engine** in the `heel/` package (excluding `heel/saas/`) is licensed under the
 **Apache License 2.0** (see `LICENSE` and `NOTICE`). Nothing here changes that grant.
 
-Files carrying `SPDX-License-Identifier: LicenseRef-Arceo-Commercial` — currently everything under
-`arceo/saas/` and the hosted portions of `web/` — are the **proprietary hosted layer**. They are:
+Files carrying `SPDX-License-Identifier: LicenseRef-Heel-Commercial` — currently everything under
+`heel/saas/` and the hosted portions of `web/` — are the **proprietary hosted layer**. They are:
 
 - NOT covered by the Apache-2.0 grant;
-- provided for evaluation and internal use in connection with an Arceo hosted subscription;
+- provided for evaluation and internal use in connection with an Heel hosted subscription;
 - not to be redistributed, sublicensed, or offered as a competing hosted service without a written
   commercial agreement with the copyright holder (Ancilis).
 

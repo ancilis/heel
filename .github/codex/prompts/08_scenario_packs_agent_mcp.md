@@ -3,7 +3,7 @@
 Task: Reorganize agent/MCP abuse scenarios as a named optional pack while keeping them enabled for agentic targets.
 
 Why:
-Arceo should be understood as SaaS abuse rehearsal generally. Agent/MCP abuse is an important surface, not the whole product.
+Heel should be understood as SaaS abuse rehearsal generally. Agent/MCP abuse is an important surface, not the whole product.
 
 Changes:
 
@@ -17,8 +17,8 @@ Changes:
 - Update scenario definitions to include pack name.
 - Update list_scenarios filtering to support pack filter.
 - Update CLI:
-  - arceo scenarios --pack agent_mcp
-  - arceo run --packs core_saas,agent_mcp
+  - heel scenarios --pack agent_mcp
+  - heel run --packs core_saas,agent_mcp
 - Keep current behavior by default:
   - all relevant packs run
   - agent/MCP scenarios only apply when target has agent surface
@@ -35,7 +35,7 @@ Tests:
 Docs:
 
 - Explain:
-  “Arceo covers SaaS abuse broadly. Agent/MCP is a premium pack for products with agentic surfaces.”
+  “Heel covers SaaS abuse broadly. Agent/MCP is a premium pack for products with agentic surfaces.”
 - Add examples:
   - over-scoped tools
   - confused deputy

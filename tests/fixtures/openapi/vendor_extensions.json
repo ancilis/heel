@@ -9,29 +9,29 @@
       "get": {
         "tags": ["Finance"],
         "operationId": "exportInvoices",
-        "x-arceo-plan": "enterprise",
-        "x-arceo-tenant-scope": "tenant",
-        "x-arceo-data-class": "canary_invoices",
-        "x-arceo-control": ["entitlement_check", "rate_limit"]
+        "x-heel-plan": "enterprise",
+        "x-heel-tenant-scope": "tenant",
+        "x-heel-data-class": "canary_invoices",
+        "x-heel-control": ["entitlement_check", "rate_limit"]
       }
     },
     "/billing/usage": {
       "get": {
         "tags": ["Billing"],
         "operationId": "usageMeter",
-        "x-arceo-meter": "invoice_exports"
+        "x-heel-meter": "invoice_exports"
       }
     },
     "/agent/tools/export": {
       "post": {
         "tags": ["Agent"],
         "operationId": "agentExport",
-        "x-arceo-agent-tool": {
+        "x-heel-agent-tool": {
           "tool": "export_invoices",
           "intended_scope": "tenant",
           "granted_scope": "tenant"
         },
-        "x-arceo-tenant-scope": "tenant"
+        "x-heel-tenant-scope": "tenant"
       }
     }
   }

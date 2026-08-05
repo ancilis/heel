@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
-os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+os.environ.setdefault("HEEL_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("HEEL_SIGNUP_MAX_GLOBAL", "100000")
 
 import http.client
 import json
@@ -12,14 +12,14 @@ import sqlite3
 import threading
 import unittest
 
-from arceo.saas.auth import (
+from heel.saas.auth import (
     LOCKOUT_THRESHOLD, AuthStore, Session, ThrottledError,
 )
-from arceo.saas.http_api import ControlPlane, serve
-from arceo.saas.migrate import (
+from heel.saas.http_api import ControlPlane, serve
+from heel.saas.migrate import (
     CONTROL_PLANE_MIGRATIONS, Migration, MigrationError, Migrator, copy_table, translate,
 )
-from arceo.saas.tenancy import Role
+from heel.saas.tenancy import Role
 
 PW = "correct-horse-battery"
 
@@ -120,7 +120,7 @@ class HttpApiTests(unittest.TestCase):
                                          {"email": email, "password": PW})
         self.assertEqual(status, 201)
         token = cookies.split(";")[0].split("=", 1)[1]
-        return body["user_id"], body["workspace_id"], {"Cookie": f"arceo_session={token}"}
+        return body["user_id"], body["workspace_id"], {"Cookie": f"heel_session={token}"}
 
     def pin_plan(self, wid, plan_id="pro"):
         """Pin a workspace to a paid plan directly in the store (tests only)."""
@@ -144,7 +144,7 @@ class HttpApiTests(unittest.TestCase):
         status, _, cookies = self.req("POST", "/v1/login",
                                       {"email": "alice@example.com", "password": PW})
         self.assertEqual(status, 200)
-        self.assertIn("arceo_session=", cookies)
+        self.assertIn("heel_session=", cookies)
 
     def test_tenant_isolation(self):
         _, wid_a, _ = self.signup("isoa@example.com")
@@ -237,7 +237,7 @@ class HttpApiTests(unittest.TestCase):
         sig = hmac.new(b"whsec_test", f"{ts}.".encode() + payload, hashlib.sha256).hexdigest()
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         conn.request("POST", "/v1/billing/webhook", payload,
-                     {"X-Arceo-Billing-Signature": f"t={ts},v1={sig}"})
+                     {"X-Heel-Billing-Signature": f"t={ts},v1={sig}"})
         r = conn.getresponse()
         disposition = json.loads(r.read())
         conn.close()

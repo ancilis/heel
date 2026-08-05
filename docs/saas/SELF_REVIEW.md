@@ -23,10 +23,10 @@ still be re-reviewed by Sol once Codex is upgraded.
    `tenancy.require()` reads role from the DB. Confirmed.
 
 4. **[NO FINDING · dead checkboxes] Config-gated enterprise features.** SSO/SCIM/data-region/private-
-   runners return `has_feature=False` and status `contact_sales` until `ARCEO_FEATURE_*=1` is set
+   runners return `has_feature=False` and status `contact_sales` until `HEEL_FEATURE_*=1` is set
    (`entitlement.feature_status`). Test covers both states.
 
-5. **[NO FINDING · secrets] No hard-coded production price/product IDs or secrets** in `arceo/saas/`.
+5. **[NO FINDING · secrets] No hard-coded production price/product IDs or secrets** in `heel/saas/`.
    `StubBilling` ids contain "stub"; live ids are read from env via `live_price_id` and raise if unset.
    Guard test: `test_no_hardcoded_price_ids`, `test_live_price_id_requires_env`.
 

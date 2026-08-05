@@ -1,8 +1,8 @@
 # Master instruction for every Codex task
 
-You are working in the `ancilis/arceo` repository.
+You are working in the `ancilis/heel` repository.
 
-Goal: evolve Arceo from a synthetic-first abuse-simulation engine into a safe, adapter-driven abuse rehearsal platform for SaaS products, usable before launch and for existing products.
+Goal: evolve Heel from a synthetic-first abuse-simulation engine into a safe, adapter-driven abuse rehearsal platform for SaaS products, usable before launch and for existing products.
 
 Non-negotiable safety constraints:
 
@@ -25,22 +25,22 @@ Before editing, inspect:
 - TRUST.md
 - EVAL.md
 - DECISIONS.md
-- arceo/contracts.py
-- arceo/mcp_server.py
-- arceo/orchestrator.py
-- arceo/scenarios.py
-- arceo/agents.py
-- arceo/targets.py
-- arceo/backtest.py
-- tests/test_arceo.py
+- heel/contracts.py
+- heel/mcp_server.py
+- heel/orchestrator.py
+- heel/scenarios.py
+- heel/agents.py
+- heel/targets.py
+- heel/backtest.py
+- tests/test_heel.py
 
 Important existing constraints:
 
-- Arceo is MCP-first.
+- Heel is MCP-first.
 - Scope creation is human-only and out-of-band.
 - The MCP server exposes execution/read tools only and deliberately has no scope mutation tool.
 - v1 uses a pure Python stdlib core and zero runtime dependencies.
-- The current scenario system is declarative and supports JSON scenario packs under `arceo/scenarios_lib/*.json`.
+- The current scenario system is declarative and supports JSON scenario packs under `heel/scenarios_lib/*.json`.
 - The evaluation story must remain honest: distinguish synthetic self-consistency, blind lower bound, held-out localization, held-out attribution, precision, and calibration.
 
 Deliver a clean PR-sized change with tests and docs.

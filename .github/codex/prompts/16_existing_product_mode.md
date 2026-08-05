@@ -1,16 +1,16 @@
 # Prompt 16 — Add existing-product mode
 
-Task: Add explicit existing-product mode to Arceo.
+Task: Add explicit existing-product mode to Heel.
 
 Create:
 
-- arceo/modes.py
+- heel/modes.py
 - CLI support:
-  - arceo run --mode synthetic
-  - arceo run --mode launch-review
-  - arceo run --mode staging
-  - arceo run --mode existing-imported
-  - arceo run --mode incident-regression
+  - heel run --mode synthetic
+  - heel run --mode launch-review
+  - heel run --mode staging
+  - heel run --mode existing-imported
+  - heel run --mode incident-regression
 - docs/MODES.md
 - tests
 

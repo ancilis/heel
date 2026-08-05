@@ -3,17 +3,17 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
-os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+os.environ.setdefault("HEEL_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("HEEL_SIGNUP_MAX_GLOBAL", "100000")
 
 import time
 import unittest
 
-from arceo.saas.catalog import CATALOG_VERSION, Meter, get_plan
-from arceo.saas.http_api import ControlPlane
-from arceo.saas.jobs import JobPlane
-from arceo.saas.reconcile import STALE_RESERVATION_S, reconcile
-from arceo.saas.tenancy import Role
+from heel.saas.catalog import CATALOG_VERSION, Meter, get_plan
+from heel.saas.http_api import ControlPlane
+from heel.saas.jobs import JobPlane
+from heel.saas.reconcile import STALE_RESERVATION_S, reconcile
+from heel.saas.tenancy import Role
 
 
 class ReconcileTests(unittest.TestCase):

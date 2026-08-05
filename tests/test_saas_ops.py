@@ -3,16 +3,16 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
-os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+os.environ.setdefault("HEEL_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("HEEL_SIGNUP_MAX_GLOBAL", "100000")
 
 import http.client
 import json
 import threading
 import unittest
 
-from arceo.saas.http_api import ControlPlane, serve
-from arceo.saas.ops import KillSwitchTripped, Metrics, OpsStore
+from heel.saas.http_api import ControlPlane, serve
+from heel.saas.ops import KillSwitchTripped, Metrics, OpsStore
 
 PW = "correct-horse-battery"
 
@@ -49,7 +49,7 @@ class MetricsTests(unittest.TestCase):
         m.inc("a_total")
         m.inc("a_total", 2)
         self.assertEqual(m.get("a_total"), 3)
-        self.assertIn("arceo_a_total 3\n", m.render())
+        self.assertIn("heel_a_total 3\n", m.render())
 
 
 class OpsHttpTests(unittest.TestCase):
@@ -89,7 +89,7 @@ class OpsHttpTests(unittest.TestCase):
         b = json.loads(r.read())
         token = r.getheader("Set-Cookie").split(";")[0].split("=", 1)[1]
         conn.close()
-        wid, hdr = b["workspace_id"], {"Cookie": f"arceo_session={token}"}
+        wid, hdr = b["workspace_id"], {"Cookie": f"heel_session={token}"}
         self.assertEqual(self.req("POST", f"/v1/workspaces/{wid}/runs", {}, hdr)[0], 202)
         before = self.cp.metrics.get("runs_enqueued_total")
         self.assertGreaterEqual(before, 1)

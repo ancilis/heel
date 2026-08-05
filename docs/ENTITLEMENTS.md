@@ -1,7 +1,7 @@
 # Entitlement Graph
 
-The entitlement graph is Arceo's static model/import layer for SaaS entitlement abuse. It turns an
-operator-authored `ProductModel.v0.1` into typed entitlement edges, then emits normal Arceo
+The entitlement graph is Heel's static model/import layer for SaaS entitlement abuse. It turns an
+operator-authored `ProductModel.v0.1` into typed entitlement edges, then emits normal Heel
 `Affordance` objects that the existing declarative scenario engine can evaluate.
 
 It is not active exploitation. It does not call routes, execute agent tools, fetch exports, create
@@ -11,7 +11,7 @@ cannot create, widen, relax, or mutate scopes.
 
 ## Core Types
 
-`arceo.entitlements` defines four enum families:
+`heel.entitlements` defines four enum families:
 
 | type | values |
 |---|---|
@@ -43,7 +43,7 @@ The initial graph emits these signals:
 Query helpers return the main edge families:
 
 ```python
-from arceo.entitlements import EntitlementGraph
+from heel.entitlements import EntitlementGraph
 
 graph = EntitlementGraph.from_product_model(product_model)
 graph.find_cross_plan_edges()
@@ -108,7 +108,7 @@ without including secrets, real customer records, live payment data, or executab
 
 `target_from_product_model()` now includes entitlement-derived affordances automatically. A run
 against `imported:acme-crm` still reports `metric_kind: imported_model_rehearsal`: there is no
-planted ground truth, so Arceo does not claim coverage, precision, or calibration for the model.
+planted ground truth, so Heel does not claim coverage, precision, or calibration for the model.
 
 ## Safety Boundary
 

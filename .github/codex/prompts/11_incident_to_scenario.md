@@ -1,14 +1,14 @@
 # Prompt 11 — Add incident-to-scenario
 
-Task: Add an incident-to-scenario workflow that converts a sanitized abuse incident into a reusable Arceo scenario and regression.
+Task: Add an incident-to-scenario workflow that converts a sanitized abuse incident into a reusable Heel scenario and regression.
 
 Create:
 
-- arceo/incident.py
+- heel/incident.py
 - CLI:
-  - arceo incident import <incident.json>
-  - arceo incident draft-scenario <incident_id>
-  - arceo incident add-regression <incident_id>
+  - heel incident import <incident.json>
+  - heel incident draft-scenario <incident_id>
+  - heel incident add-regression <incident_id>
 - docs/INCIDENTS.md
 - examples/incidents/
 - tests
@@ -44,8 +44,8 @@ Behavior:
   - regression draft
 - Do not auto-enable a scenario without operator confirmation.
 - Store generated scenario under a local draft path first:
-  - arceo/scenarios_lib/drafts/<incident_id>.json
-  - or .arceo/drafts/<incident_id>.json
+  - heel/scenarios_lib/drafts/<incident_id>.json
+  - or .heel/drafts/<incident_id>.json
 - Provide a review command that prints exactly what would be added.
 
 Tests:
@@ -65,4 +65,4 @@ Docs:
 
 Acceptance criteria:
 
-- Arceo can learn from real incidents without storing sensitive data or weaponized details.
+- Heel can learn from real incidents without storing sensitive data or weaponized details.

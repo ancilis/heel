@@ -1,4 +1,4 @@
-# ARCEO SaaS — Build State Ledger
+# HEEL SaaS — Build State Ledger
 
 Durable, resumable state for the autonomous SaaS build. A fresh Fable session resumes
 by reading this file, verifying the claimed state, and continuing from the first
@@ -10,9 +10,9 @@ unproven gate.
 
 ## Base and worktree
 - Base SHA: `2b623a85fad329e8659d1cffb21fb1ed368918fc` (`origin/main`, tip merged rebrand + p09–p19 uplift).
-- Feature branch: `saas/arceo-build`.
-- Worktree: `/Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build`.
-- Rationale: the initial checkout (`codex/rebrand-arceo` @ `ef6b1bd`) was a **divergent duplicate rename, 45 commits behind** `origin/main` and missing the entire product-model/adapter uplift (`entitlements.py`, `economics.py`, `importers.py`, `openapi_import.py`, `control_simulator.py`, `bench.py`, `incident.py`, `modes.py`, …). Building on it would have been building on an obsolete branch. `origin/main` is the coherent upstream.
+- Feature branch: `saas/heel-build`.
+- Worktree: `/Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-heel-build`.
+- Rationale: the initial checkout (`codex/rebrand-heel` @ `ef6b1bd`) was a **divergent duplicate rename, 45 commits behind** `origin/main` and missing the entire product-model/adapter uplift (`entitlements.py`, `economics.py`, `importers.py`, `openapi_import.py`, `control_simulator.py`, `bench.py`, `incident.py`, `modes.py`, …). Building on it would have been building on an obsolete branch. `origin/main` is the coherent upstream.
 
 ## Preservation decisions
 - Untracked owner work in the original checkout (`launch/`, `docs/RESEARCH_LIBRARY_EXPANSION_PROMPT.md`) is **left untouched** in `/Users/hellohelloalbus/heel`. The new worktree is a separate directory; nothing there is moved, reset, or absorbed.
@@ -23,12 +23,12 @@ unproven gate.
 - Pure-stdlib, zero runtime deps (DECISIONS D-001).
 
 ## Reusable core (verified present)
-- `arceo/scope.py` — HMAC-signed, human-only `AuthorizationScope` (the safety spine). No write path over MCP/REST/agent.
-- `arceo/entitlements.py` — entitlement *graph* over the tested ProductModel (NOT SaaS billing; distinct concern).
-- `arceo/targets.py` — synthetic targets with planted ground truth.
-- `arceo/store.py` — SQLite persistence: runs, findings, append-only hash-chained containment log.
-- `arceo/rest.py`, `arceo/mcp_server.py` — loopback-only surfaces (must NOT be exposed as the SaaS API).
-- `arceo/web_export.py` — static snapshot exporter (must NOT run against tenant/prod data).
+- `heel/scope.py` — HMAC-signed, human-only `AuthorizationScope` (the safety spine). No write path over MCP/REST/agent.
+- `heel/entitlements.py` — entitlement *graph* over the tested ProductModel (NOT SaaS billing; distinct concern).
+- `heel/targets.py` — synthetic targets with planted ground truth.
+- `heel/store.py` — SQLite persistence: runs, findings, append-only hash-chained containment log.
+- `heel/rest.py`, `heel/mcp_server.py` — loopback-only surfaces (must NOT be exposed as the SaaS API).
+- `heel/web_export.py` — static snapshot exporter (must NOT run against tenant/prod data).
 
 ## Phase status
 | Phase | Description | Status |
@@ -100,7 +100,7 @@ Sol gates 1–4 pass. Suite state at Gate-1 PASS: 360 tests OK, smoke PASS (d8cf
   (OWNER_ACTIONS).
 
 ## Phase 7 evidence (2026-07-13)
-- `arceo/saas/ops.py` — global/per-workspace kill switches denying new run enqueues (503) with
+- `heel/saas/ops.py` — global/per-workspace kill switches denying new run enqueues (503) with
   mandatory reason + append-only `admin_audit`; thread-safe metrics counters with text exposition.
 - HTTP: `/v1/healthz`, `/v1/readyz` (DB probe), `/v1/metrics`; `runs_enqueued_total` /
   `quota_exceeded_total` counters wired at the enqueue choke point.
@@ -109,7 +109,7 @@ Sol gates 1–4 pass. Suite state at Gate-1 PASS: 360 tests OK, smoke PASS (d8cf
 - Tests: `tests/test_saas_ops.py` (5).
 
 ## Phase 6 evidence (2026-07-13)
-- `arceo/saas/site.py` — static site generator (index, pricing, docs, security, terms, privacy).
+- `heel/saas/site.py` — static site generator (index, pricing, docs, security, terms, privacy).
   Pricing/quotas rendered FROM `catalog.py` so the site cannot disagree with enforcement; every
   marketing claim maps to an enforcing module; legal pages carry a visible "template — requires
   counsel review" banner (owner action). Never touches tenant data.
@@ -119,7 +119,7 @@ Sol gates 1–4 pass. Suite state at Gate-1 PASS: 360 tests OK, smoke PASS (d8cf
   secret/tenant material in output.
 
 ## Phase 5 evidence (2026-07-13)
-- `arceo/saas/dashboard.py` — server-rendered `/app` on the same control plane and session auth:
+- `heel/saas/dashboard.py` — server-rendered `/app` on the same control plane and session auth:
   signup/login/logout forms (throttle-aware), dashboard with plan/state, usage bars, synthetic-run
   button, target add/check with published-record instructions, onboarding checklist. All output
   html-escaped (XSS test); anonymous access redirects to login; API keys cannot use /app.
@@ -127,18 +127,18 @@ Sol gates 1–4 pass. Suite state at Gate-1 PASS: 360 tests OK, smoke PASS (d8cf
 
 ## Phase 4 evidence (2026-07-13)
 - Quotas/ledger/dunning already landed in Phase 1 (`ledger.py`, `billing.py`; period buckets make
-  monthly rollover implicit). New: `arceo/saas/reconcile.py` — nightly-runnable invariant report:
+  monthly rollover implicit). New: `heel/saas/reconcile.py` — nightly-runnable invariant report:
   workspace plan-pin vs subscription mismatch, subscriptions for unknown workspaces, stale
   unsettled reservations (auto-refund under `repair=True` only when >24 h old AND no live job),
   unapplied webhook-event count. Repairs are customer-favorable only (refunds, never charges).
 - Tests: `tests/test_saas_reconcile.py` (5).
 
 ## Phase 3 evidence (2026-07-13)
-- `arceo/saas/verification.py` — DNS TXT / HTTP-file ownership challenges, injected resolvers,
+- `heel/saas/verification.py` — DNS TXT / HTTP-file ownership challenges, injected resolvers,
   24 h challenge TTL, 30-day re-verify window, revocation, per-workspace verified count.
-- `arceo/saas/egress.py` — default-deny allowlist; only the run's verified target, ports 80/443;
+- `heel/saas/egress.py` — default-deny allowlist; only the run's verified target, ports 80/443;
   post-resolution private/loopback/link-local IP refusal (DNS-rebinding block).
-- `arceo/saas/jobs.py` — reserve-at-enqueue settlement (consume on success, refund on
+- `heel/saas/jobs.py` — reserve-at-enqueue settlement (consume on success, refund on
   failure/lease expiry via reaper), worker leases + heartbeat, immutable RunBudget (60 s wall
   clock, token cap, egress limited to verified target). Verified jobs fail closed: verified
   target + engine-minted scope reference required; no validator configured → disabled.
@@ -147,11 +147,11 @@ Sol gates 1–4 pass. Suite state at Gate-1 PASS: 360 tests OK, smoke PASS (d8cf
 - Tests: `tests/test_saas_job_plane.py` (14).
 
 ## Phase 2 evidence (2026-07-13)
-- `arceo/saas/auth.py` — PBKDF2 (600k iters) passwords, hashed opaque sessions with TTL+idle
+- `heel/saas/auth.py` — PBKDF2 (600k iters) passwords, hashed opaque sessions with TTL+idle
   expiry, per-email lockout throttle.
-- `arceo/saas/migrate.py` — ordered versioned migrations + `schema_migrations` tracking,
+- `heel/saas/migrate.py` — ordered versioned migrations + `schema_migrations` tracking,
   sqlite/postgres dialect translate, parametrized `copy_table` export.
-- `arceo/saas/http_api.py` — loopback-default JSON control plane; every workspace route through
+- `heel/saas/http_api.py` — loopback-default JSON control plane; every workspace route through
   `tenancy.require`; API keys workspace-bound, never owner/admin, never `create_scope`
   (human-only preserved); verified runs 501 until Phase 3; signed webhook + plan re-pin;
   quota 402 with upgrade hint.

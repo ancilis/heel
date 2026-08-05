@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
-os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+os.environ.setdefault("HEEL_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("HEEL_SIGNUP_MAX_GLOBAL", "100000")
 
 import http.client
 import threading
 import unittest
 import urllib.parse
 
-from arceo.saas.http_api import ControlPlane, serve
+from heel.saas.http_api import ControlPlane, serve
 
 PW = "correct-horse-battery"
 
@@ -49,7 +49,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(status, 303)
         self.assertEqual(loc, "/app")
         token = cookie.split(";")[0].split("=", 1)[1]
-        return {"Cookie": f"arceo_session={token}"}
+        return {"Cookie": f"heel_session={token}"}
 
     def test_forms_render(self):
         for path in ("/app/signup-form", "/app/login-form"):
@@ -77,8 +77,8 @@ class DashboardTests(unittest.TestCase):
         self.req("POST", "/app/target", {"hostname": "dash.example.com"}, hdr)
         _, body, _, _ = self.req("GET", "/app", headers=hdr)
         self.assertIn("pending", body)
-        token = body.split("arceo-verify=")[1].split("<")[0]
-        self.records["_arceo.dash.example.com"] = [f"arceo-verify={token}"]
+        token = body.split("heel-verify=")[1].split("<")[0]
+        self.records["_heel.dash.example.com"] = [f"heel-verify={token}"]
         self.req("POST", "/app/target-check", {"hostname": "dash.example.com"}, hdr)
         _, body, _, _ = self.req("GET", "/app", headers=hdr)
         self.assertIn("verified", body)

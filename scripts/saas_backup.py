@@ -2,7 +2,7 @@
 """
 Control-plane backup / restore-verify (COMMERCIAL layer).
 
-SPDX-License-Identifier: LicenseRef-Arceo-Commercial
+SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
 Uses SQLite's online backup API (safe while the server runs) and verifies every restore:
 migrations must report nothing pending and the reconciliation report must be clean before a
@@ -32,9 +32,9 @@ def backup(live: str, dest: str) -> int:
 
 
 def verify(path: str) -> int:
-    from arceo.saas.ledger import UsageLedger
-    from arceo.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
-    from arceo.saas.reconcile import reconcile
+    from heel.saas.ledger import UsageLedger
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+    from heel.saas.reconcile import reconcile
 
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row

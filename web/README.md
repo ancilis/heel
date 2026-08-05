@@ -1,6 +1,6 @@
-# Arceo War Room Dashboard
+# Heel War Room Dashboard
 
-This Next.js app renders the deterministic Arceo snapshot at `public/data/snapshot.json`. It is a
+This Next.js app renders the deterministic Heel snapshot at `public/data/snapshot.json`. It is a
 thin UI over the pure-stdlib Python exporter; it does not call live targets, mint scopes, widen
 scopes, or run probes.
 

@@ -1,16 +1,16 @@
 # Prompt 1 — Reposition from “pre-launch only” to “continuous abuse rehearsal”
 
-Task: Reposition Arceo from “pre-launch only” to “continuous abuse rehearsal for SaaS,” while preserving the pre-launch wedge.
+Task: Reposition Heel from “pre-launch only” to “continuous abuse rehearsal for SaaS,” while preserving the pre-launch wedge.
 
 Update README.md, ARCHITECTURE.md, SECURITY.md, TRUST.md, and pyproject.toml wording.
 
 Desired positioning:
 
-- Arceo is abuse rehearsal for SaaS.
+- Heel is abuse rehearsal for SaaS.
 - It helps teams rehearse customer, integration, bot, and agent abuse before launch and throughout production life.
 - Pre-launch launch review remains the sharpest default use case.
 - Existing products are supported through authorized, contained, canary-only runs against staging, imported product models, sanitized telemetry, or explicitly authorized production-like targets.
-- Do not imply Arceo safely runs arbitrary active probes against production without operator approval.
+- Do not imply Heel safely runs arbitrary active probes against production without operator approval.
 - Make “production-ready” precise: production-ready safety/auth/eval spine; beta real-target adapter coverage until adapters mature.
 
 Specific edits:
@@ -18,7 +18,7 @@ Specific edits:
 1. README.md:
    - Replace the single “before you ship” framing with “before launch and continuously after.”
    - Add a short section: “Pre-launch, post-launch, and after incidents.”
-   - Add a “What Arceo is not” section or expand existing wording:
+   - Add a “What Heel is not” section or expand existing wording:
      - not a pentest replacement
      - not functional QA
      - not runtime fraud decisioning
@@ -29,7 +29,7 @@ Specific edits:
      - QA/functional testing
      - fraud/bot platform
      - model red-team
-     - Arceo
+     - Heel
    - Keep the strong launch-day examples, but add examples for existing products:
      - trial farming already happening
      - seat sharing on mature accounts
@@ -66,7 +66,7 @@ Specific edits:
 
 5. DECISIONS.md:
    - Add a new decision:
-     “D-033 — Arceo supports pre-launch and existing-product abuse rehearsal.”
+     “D-033 — Heel supports pre-launch and existing-product abuse rehearsal.”
    - Explain why pre-launch is the wedge but existing products widen adoption.
    - Explain the safety consequences.
 

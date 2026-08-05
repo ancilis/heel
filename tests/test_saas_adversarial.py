@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("ARCEO_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
-os.environ.setdefault("ARCEO_SIGNUP_MAX_GLOBAL", "100000")
+os.environ.setdefault("HEEL_SIGNUP_MAX_PER_IP", "100000")   # suite shares one loopback IP
+os.environ.setdefault("HEEL_SIGNUP_MAX_GLOBAL", "100000")
 
 import concurrent.futures
 import hashlib
@@ -20,9 +20,9 @@ import threading
 import time
 import unittest
 
-from arceo.saas.catalog import Meter, get_plan
-from arceo.saas.http_api import ControlPlane, serve
-from arceo.saas.ledger import QuotaExceeded
+from heel.saas.catalog import Meter, get_plan
+from heel.saas.http_api import ControlPlane, serve
+from heel.saas.ledger import QuotaExceeded
 
 PW = "correct-horse-battery"
 
@@ -62,7 +62,7 @@ class AdversarialTests(unittest.TestCase):
         b = json.loads(r.read())
         token = r.getheader("Set-Cookie").split(";")[0].split("=", 1)[1]
         conn.close()
-        return b["workspace_id"], {"Cookie": f"arceo_session={token}"}, token
+        return b["workspace_id"], {"Cookie": f"heel_session={token}"}, token
 
     def pin_plan(self, wid, plan_id="pro"):
         """Pin a workspace to a paid plan directly in the store (tests only)."""
@@ -73,12 +73,12 @@ class AdversarialTests(unittest.TestCase):
     # --- auth bypass ---
     def test_forged_and_mutated_credentials_rejected(self):
         wid, hdr, token = self.signup("adv1@example.com")
-        for cookie in ("arceo_session=arceo_ses_forged", f"arceo_session={token[:-2]}xx",
-                       "arceo_session=", "other=1"):
+        for cookie in ("heel_session=heel_ses_forged", f"heel_session={token[:-2]}xx",
+                       "heel_session=", "other=1"):
             status, _ = self.req("GET", f"/v1/workspaces/{wid}/summary",
                                  headers={"Cookie": cookie})
             self.assertEqual(status, 401, cookie)
-        for authz in ("Bearer arceo_sk_forged", "Bearer ", "Basic Zm9v"):
+        for authz in ("Bearer heel_sk_forged", "Bearer ", "Basic Zm9v"):
             status, _ = self.req("GET", f"/v1/workspaces/{wid}/summary",
                                  headers={"Authorization": authz})
             self.assertEqual(status, 401, authz)
@@ -132,14 +132,14 @@ class AdversarialTests(unittest.TestCase):
 
         ts = str(int(time.time()))
         s, b = self.req("POST", "/v1/billing/webhook", raw=payload,
-                        headers={"X-Arceo-Billing-Signature": sig(ts)})
+                        headers={"X-Heel-Billing-Signature": sig(ts)})
         self.assertEqual((s, b["disposition"]), (200, "applied"))
         s, b = self.req("POST", "/v1/billing/webhook", raw=payload,
-                        headers={"X-Arceo-Billing-Signature": sig(ts)})
+                        headers={"X-Heel-Billing-Signature": sig(ts)})
         self.assertNotEqual(b.get("disposition"), "applied")   # duplicate event id
         stale = str(int(time.time()) - 3600)
         s, _ = self.req("POST", "/v1/billing/webhook", raw=payload,
-                        headers={"X-Arceo-Billing-Signature": sig(stale)})
+                        headers={"X-Heel-Billing-Signature": sig(stale)})
         self.assertEqual(s, 400)                                # outside replay window
 
     def test_duplicate_idempotent_run_charged_once(self):
@@ -148,7 +148,7 @@ class AdversarialTests(unittest.TestCase):
             s, _ = self.req("POST", f"/v1/workspaces/{wid}/runs",
                             {"idempotency_key": "same-key"}, hdr)
             self.assertEqual(s, 202)
-        from arceo.saas.http_api import current_period
+        from heel.saas.http_api import current_period
         self.assertEqual(
             self.cp.ledger.usage(wid, Meter.RUNS, current_period()), 1)
 
@@ -160,7 +160,7 @@ class AdversarialTests(unittest.TestCase):
         import sqlite3
         import tempfile
 
-        from arceo.saas.ledger import UsageLedger
+        from heel.saas.ledger import UsageLedger
         db = os.path.join(tempfile.mkdtemp(), "race.db")
         UsageLedger(sqlite3.connect(db))     # create schema
         plan = get_plan("free")   # RUNS quota 25
@@ -198,7 +198,7 @@ class AdversarialTests(unittest.TestCase):
         import sqlite3
         import tempfile
 
-        from arceo.saas.verification import TargetLimitExceeded, TargetVerifier
+        from heel.saas.verification import TargetLimitExceeded, TargetVerifier
         db = os.path.join(tempfile.mkdtemp(), "vrace.db")
         records = {}
         seed_conn = sqlite3.connect(db)
@@ -208,7 +208,7 @@ class AdversarialTests(unittest.TestCase):
         hosts = [f"h{i}.example.com" for i in range(12)]
         for h in hosts:
             ch = seed.start(wid, h)
-            records[f"_arceo.{h}"] = [f"arceo-verify={ch.token}"]
+            records[f"_heel.{h}"] = [f"heel-verify={ch.token}"]
         seed_conn.close()
         verified, blocked, lock = [], [], threading.Lock()
 
@@ -236,7 +236,7 @@ class AdversarialTests(unittest.TestCase):
         import os
         import tempfile
 
-        from arceo.saas.tenancy import ControlPlaneStore, Role, SeatLimitExceeded
+        from heel.saas.tenancy import ControlPlaneStore, Role, SeatLimitExceeded
         db = os.path.join(tempfile.mkdtemp(), "srace.db")
         seed = ControlPlaneStore(db)
         org = seed.create_org("o")

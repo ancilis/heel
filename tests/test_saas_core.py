@@ -6,16 +6,16 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from arceo.saas.catalog import (
+from heel.saas.catalog import (
     CATALOG_VERSION, CONFIG_GATED_FEATURES, CUSTOM, Feature, Meter, all_plans,
     get_plan, self_serve_plans,
 )
-from arceo.saas.tenancy import (
+from heel.saas.tenancy import (
     ControlPlaneStore, Role, role_can, require, hash_api_key,
 )
-from arceo.saas.ledger import UsageLedger, QuotaExceeded
-from arceo.saas.entitlement import EntitlementService, Subscription
-from arceo.saas.billing import (
+from heel.saas.ledger import UsageLedger, QuotaExceeded
+from heel.saas.entitlement import EntitlementService, Subscription
+from heel.saas.billing import (
     BillingStore, SubscriptionManager, StubBilling, SubState,
     verify_webhook_signature, WebhookVerificationError, live_price_id,
 )
@@ -43,7 +43,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_no_hardcoded_price_ids(self):
         # Price env var names exist; actual ids are NEVER in code.
-        self.assertEqual(get_plan("pro").price_env_var, "ARCEO_STRIPE_PRICE_PRO")
+        self.assertEqual(get_plan("pro").price_env_var, "HEEL_STRIPE_PRICE_PRO")
 
     def test_quota_monotonic_by_tier(self):
         runs = [get_plan(p).quota(Meter.RUNS) for p in ("free", "pro", "team")]
@@ -78,7 +78,7 @@ class TenancyTests(unittest.TestCase):
 
     def test_api_key_hashed_and_scoped(self):
         issued = self.s.issue_api_key(self.ws, Role.MEMBER, "ci")
-        self.assertTrue(issued.secret.startswith("arceo_sk_"))
+        self.assertTrue(issued.secret.startswith("heel_sk_"))
         # stored value is a hash, not the secret
         row = self.s.conn.execute("SELECT key_hash FROM api_keys WHERE key_id=?",
                                   (issued.key_id,)).fetchone()
@@ -93,7 +93,7 @@ class TenancyTests(unittest.TestCase):
         self.assertIsNone(self.s.authenticate_api_key(issued.secret))
 
     def test_bad_api_key_rejected(self):
-        self.assertIsNone(self.s.authenticate_api_key("arceo_sk_not_real"))
+        self.assertIsNone(self.s.authenticate_api_key("heel_sk_not_real"))
 
     def test_invite_flow(self):
         token = self.s.create_invite(self.ws, "new@acme.test", Role.MEMBER)
@@ -309,7 +309,7 @@ class BillingTests(unittest.TestCase):
         self.assertIn("stub", self.stub.price_id(get_plan("pro"), "month"))
 
     def test_live_price_id_requires_env(self):
-        os.environ.pop("ARCEO_STRIPE_PRICE_PRO_MONTH", None)
+        os.environ.pop("HEEL_STRIPE_PRICE_PRO_MONTH", None)
         with self.assertRaises(KeyError):
             live_price_id(get_plan("pro"), "month")
 
@@ -319,7 +319,7 @@ class CatalogVersioningTests(unittest.TestCase):
     must never silently change a grandfathered subscription (functional, not nominal)."""
 
     def test_pinned_version_resolves_grandfathered_plans(self):
-        from arceo.saas import catalog as cat
+        from heel.saas import catalog as cat
         old = dict(cat._PLANS)
         cheaper_pro = cat.Plan(
             id="pro", name="Pro", price_month_cents=2900, price_year_cents=29000,
@@ -335,7 +335,7 @@ class CatalogVersioningTests(unittest.TestCase):
             del cat._CATALOGS["2099-01-01"]
 
     def test_entitlements_computed_from_pinned_version(self):
-        from arceo.saas import catalog as cat
+        from heel.saas import catalog as cat
         old = dict(cat._PLANS)
         big_pro = cat.Plan(
             id="pro", name="Pro", price_month_cents=4900, price_year_cents=49000,

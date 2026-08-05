@@ -1,4 +1,4 @@
-# ARCEO Hosted — Runbooks (v1)
+# HEEL Hosted — Runbooks (v1)
 
 Each runbook is executable today against the local control plane; the owner-credential steps are
 marked. Every intervention that changes state must go through `OpsStore` so it lands in the
@@ -8,7 +8,7 @@ append-only `admin_audit` table with actor + reason.
 Use when: runaway spend, abuse in progress, upstream provider incident.
 1. Trip: `OpsStore.trip('global'|<workspace_id>, actor=<you>, reason=<ticket>)`. Effect is
    immediate: new run enqueues return 503; running jobs finish under their existing budgets.
-2. Verify: `POST /v1/workspaces/<id>/runs` returns 503; `arceo_quota_exceeded_total` stops moving.
+2. Verify: `POST /v1/workspaces/<id>/runs` returns 503; `heel_quota_exceeded_total` stops moving.
 3. Communicate (owner): status page + affected-tenant email.
 4. Clear with `OpsStore.clear(scope, actor=, reason=)` once the cause is closed. Audit both ends.
 
@@ -28,7 +28,7 @@ Use when: runaway spend, abuse in progress, upstream provider incident.
 ## Key rotation
 - API key: customer mints a replacement via `POST /v1/workspaces/{id}/api-keys`, cuts over, then
   `DELETE /v1/workspaces/{id}/api-keys/{old}`. Zero downtime; old key dies at revoke.
-- Server pepper (`ARCEO_API_KEY_PEPPER`): rotating it invalidates ALL stored key/invite/session
+- Server pepper (`HEEL_API_KEY_PEPPER`): rotating it invalidates ALL stored key/invite/session
   hashes at once — treat as an incident action, force re-login, and have customers re-mint keys.
 - Webhook secret: set the new secret at the provider and in the deployment env together (owner).
 

@@ -5,8 +5,8 @@ import os
 import tempfile
 import unittest
 
-from arceo.saas.catalog import CATALOG_VERSION, get_plan
-from arceo.saas.site import build, render_pricing
+from heel.saas.catalog import CATALOG_VERSION, get_plan
+from heel.saas.site import build, render_pricing
 
 
 class SiteTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class SiteTests(unittest.TestCase):
         page = render_pricing()
         pro = get_plan("pro")
         self.assertIn(f"${pro.price_month_cents // 100}/mo", page)
-        from arceo.saas.catalog import Meter
+        from heel.saas.catalog import Meter
         self.assertIn(str(pro.quota(Meter.RUNS)), page)
         self.assertIn("Contact sales", page)          # enterprise
         self.assertIn(CATALOG_VERSION, self.read("pricing.html"))
@@ -50,7 +50,7 @@ class SiteTests(unittest.TestCase):
         for p in self.files:
             with open(p) as f:
                 content = f.read()
-            for needle in ("arceo_sk_", "arceo_ses_", "workspace_id=ws_", "ARCEO_API_KEY_PEPPER"):
+            for needle in ("heel_sk_", "heel_ses_", "workspace_id=ws_", "HEEL_API_KEY_PEPPER"):
                 self.assertNotIn(needle, content, p)
 
 

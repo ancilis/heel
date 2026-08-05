@@ -1,6 +1,6 @@
-# ARCEO — Pricing & Entitlements
+# HEEL — Pricing & Entitlements
 
-The **code** in `arceo/saas/catalog.py` is the source of truth. This document explains the shape
+The **code** in `heel/saas/catalog.py` is the source of truth. This document explains the shape
 and the unit economics. Prices are USD, monthly unless noted; annual = 10× monthly (2 months free).
 
 ## Metered value (what we charge for — durable, costly)
@@ -51,7 +51,7 @@ Every free unit is atomically capped. Worst-case monthly cost per free workspace
 
 Result: free-tier liability is a **calculable, bounded** number per workspace AND in aggregate:
 an automatic platform circuit breaker caps platform-wide run and verified-run reservations per
-period inside the ledger transaction (`ARCEO_GLOBAL_RUNS_CAP`, `ARCEO_GLOBAL_VERIFIED_RUNS_CAP`),
+period inside the ledger transaction (`HEEL_GLOBAL_RUNS_CAP`, `HEEL_GLOBAL_VERIFIED_RUNS_CAP`),
 answering 503 — never a surprise bill — once tripped. See `docs/saas/PRODUCT.md` §cost-model.
 
 ## Overage behavior

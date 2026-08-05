@@ -1,21 +1,21 @@
-"""Tests for the hosted control-plane core (arceo.saas): catalog, entitlement, ledger,
+"""Tests for the hosted control-plane core (heel.saas): catalog, entitlement, ledger,
 tenancy, billing. Offline, stdlib-only, deterministic."""
 import sqlite3
 import threading
 import time
 import unittest
 
-from arceo.saas.billing import (
+from heel.saas.billing import (
     BillingStore, StubBilling, SubscriptionManager, SubState,
     WebhookVerificationError, live_price_id, verify_webhook_signature,
 )
-from arceo.saas.catalog import (
+from heel.saas.catalog import (
     CATALOG_VERSION, CONFIG_GATED_FEATURES, CUSTOM, Feature, Meter,
     all_plans, get_plan, self_serve_plans,
 )
-from arceo.saas.entitlement import EntitlementService, Subscription
-from arceo.saas.ledger import QuotaExceeded, UsageLedger
-from arceo.saas.tenancy import ControlPlaneStore, Role, hash_api_key, require, role_can
+from heel.saas.entitlement import EntitlementService, Subscription
+from heel.saas.ledger import QuotaExceeded, UsageLedger
+from heel.saas.tenancy import ControlPlaneStore, Role, hash_api_key, require, role_can
 
 import hashlib
 import hmac
@@ -57,7 +57,7 @@ class TestCatalog(unittest.TestCase):
 
     def test_no_hardcoded_stripe_ids(self):
         for p in all_plans():
-            self.assertTrue(p.price_env_var.startswith("ARCEO_STRIPE_PRICE_"))
+            self.assertTrue(p.price_env_var.startswith("HEEL_STRIPE_PRICE_"))
 
     def test_enterprise_gated_features_only_on_enterprise(self):
         for pid in ("free", "pro", "team"):
@@ -232,22 +232,22 @@ class TestTenancy(unittest.TestCase):
 
     def test_api_key_hashed_scoped_revocable(self):
         issued = self.store.issue_api_key(self.ws, Role.MEMBER, "ci")
-        self.assertTrue(issued.secret.startswith("arceo_sk_"))
+        self.assertTrue(issued.secret.startswith("heel_sk_"))
         row = self.store.conn.execute("SELECT key_hash FROM api_keys").fetchone()
         self.assertNotIn(issued.secret, row["key_hash"])
         self.assertEqual(self.store.authenticate_api_key(issued.secret),
                          (self.ws, Role.MEMBER))
-        self.assertIsNone(self.store.authenticate_api_key("arceo_sk_wrong"))
+        self.assertIsNone(self.store.authenticate_api_key("heel_sk_wrong"))
         self.store.revoke_api_key(issued.key_id)
         self.assertIsNone(self.store.authenticate_api_key(issued.secret))
 
     def test_api_key_pepper_changes_hash(self):
         h1 = hash_api_key("s")
-        os.environ["ARCEO_API_KEY_PEPPER"] = "pep"
+        os.environ["HEEL_API_KEY_PEPPER"] = "pep"
         try:
             self.assertNotEqual(hash_api_key("s"), h1)
         finally:
-            del os.environ["ARCEO_API_KEY_PEPPER"]
+            del os.environ["HEEL_API_KEY_PEPPER"]
 
     def test_workspace_plan_pins_catalog_version(self):
         self.store.set_workspace_plan(self.ws, "pro", CATALOG_VERSION)
@@ -313,14 +313,14 @@ class TestBilling(unittest.TestCase):
 
     def test_live_price_id_from_env_only(self):
         pro = get_plan("pro")
-        os.environ.pop("ARCEO_STRIPE_PRICE_PRO_MONTH", None)
+        os.environ.pop("HEEL_STRIPE_PRICE_PRO_MONTH", None)
         with self.assertRaises(KeyError):
             live_price_id(pro, "month")
-        os.environ["ARCEO_STRIPE_PRICE_PRO_MONTH"] = "price_env_123"
+        os.environ["HEEL_STRIPE_PRICE_PRO_MONTH"] = "price_env_123"
         try:
             self.assertEqual(live_price_id(pro, "month"), "price_env_123")
         finally:
-            del os.environ["ARCEO_STRIPE_PRICE_PRO_MONTH"]
+            del os.environ["HEEL_STRIPE_PRICE_PRO_MONTH"]
 
     def test_stub_price_ids_clearly_fake(self):
         self.assertIn("stub", self.stub.price_id(get_plan("pro"), "month"))

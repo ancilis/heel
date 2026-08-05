@@ -1,4 +1,4 @@
-# ARCEO Hosted — Threat Model
+# HEEL Hosted — Threat Model
 
 Scope: the hosted control + execution planes over the open-source engine. Status: design + the
 implemented control-plane core; execution-plane controls are designed, not yet built (Phase 3).

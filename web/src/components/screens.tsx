@@ -51,7 +51,7 @@ export function Overview({ s, go }: { s: any; go: (k: string) => void }) {
   ];
   return (
     <div className="space-y-4">
-      <Panel title="Arceo Abuse War Room" sub="Operator control room for safe SaaS abuse rehearsal: economics first, controls second, regression coverage always visible."
+      <Panel title="Heel Abuse War Room" sub="Operator control room for safe SaaS abuse rehearsal: economics first, controls second, regression coverage always visible."
         right={<div className="flex gap-1"><Tag color="#34d399">synthetic</Tag><Tag color="#60a5fa">imported</Tag><Tag color="#fbbf24">staging</Tag></div>}>
         <div className="grid grid-cols-2 md:grid-cols-3 gap-2.5">
           {tiles.map(t => <button key={t.k} onClick={() => go(t.screen)} className="text-left"><Stat label={t.label} value={t.value} sub={t.sub} tone={(t as any).tone} /></button>)}
@@ -367,7 +367,7 @@ export function BlindEval({ s }: { s: any }) {
   return (
     <div className="space-y-4">
       <Panel title="Blind-target evaluation — the honest real-detection metric"
-        sub="Planted weaknesses use encodings authored independently of the seed probes (arceo/blind.py). Parallel fan-out over many blind targets. This is real detection accuracy — NOT the self-consistency coverage.">
+        sub="Planted weaknesses use encodings authored independently of the seed probes (heel/blind.py). Parallel fan-out over many blind targets. This is real detection accuracy — NOT the self-consistency coverage.">
         <div className="flex items-center gap-6 flex-wrap">
           <div className="text-center">
             <Donut value={b.real_recall_pooled} color="#fb7185" label="real recall" />
@@ -398,7 +398,7 @@ export function HeldOut({ s }: { s: any }) {
   return (
     <div className="space-y-4">
       <Panel title="Held-out evaluation — independently-authored targets (the strongest honesty test)"
-        sub="Targets authored by a separate LLM swarm given only the abuse taxonomy — blind to Arceo's probe vocabulary (docs/HELDOUT_PROVENANCE.md). Proper dev/test discipline: the semantic catalog was tuned on DEV; the TEST split was frozen and never inspected — its number is the unbiased one.">
+        sub="Targets authored by a separate LLM swarm given only the abuse taxonomy — blind to Heel's probe vocabulary (docs/HELDOUT_PROVENANCE.md). Proper dev/test discipline: the semantic catalog was tuned on DEV; the TEST split was frozen and never inspected — its number is the unbiased one.">
         <div className="flex items-center gap-6 flex-wrap">
           <div className="text-center"><Donut value={tex.recall} color="#6b7280" label="exact (test)" />
             <div className="text-[10px] text-muted tabnum mt-1">{tex.found}/{tex.planted}</div></div>
@@ -414,7 +414,7 @@ export function HeldOut({ s }: { s: any }) {
         </div>
         <div className="mt-3 text-[11px] text-dim">Two honest gaps shown, not hidden: <span className="text-text">dev→test</span> (overfitting) and <span className="text-text">localization→attribution</span> (~{Math.round((1 - tsem.attribution_recall / Math.max(tsem.recall, 0.01)) * 100)}% of flagged affordances get the wrong category). Exact matching barely generalizes (test {fmt(tex.recall, 2)}); semantic families recover ~{Math.round(tsem.recall / Math.max(tex.recall, 0.01))}× — only by widening real-vocabulary coverage, never by writing probes against known plants. CIs are target-level cluster bootstraps. Not near 1.0 — the honest ceiling.</div>
       </Panel>
-      <Panel title="TEST recall by category (unbiased)" sub="Where Arceo generalizes vs where it has gaps, on targets it never saw.">
+      <Panel title="TEST recall by category (unbiased)" sub="Where Heel generalizes vs where it has gaps, on targets it never saw.">
         <HBars items={Object.entries(tsem.recall_by_category).map(([c, v]) => {
           const [f, t] = (v as string).split("/").map(Number);
           return { label: catShort(c), value: t ? Math.round((f / t) * 100) : 0, color: CAT_COLOR[c], tag: <span className="tabnum text-[10px] text-muted w-10">{v as string}</span> };
@@ -465,7 +465,7 @@ export function Scopes({ s }: { s: any }) {
           </div>
         </div>
       ))}
-      <div className="text-[11px] text-muted mt-1">To create a scope: <code className="text-accent">arceo scope create --target … --operator you --confirm</code></div>
+      <div className="text-[11px] text-muted mt-1">To create a scope: <code className="text-accent">heel scope create --target … --operator you --confirm</code></div>
     </Panel>
   );
 }
@@ -476,7 +476,7 @@ export function Containment({ s, target, setTarget }: { s: any; target: string; 
   const color: Record<string, string> = { probe: "#6b7280", finding: "#fb7185", run_start: "#60a5fa", run_complete: "#34d399",
     handoff: "#a78bfa", opportunistic_probe: "#34d399", discovered_scenario: "#f59e0b", reject_run: "#ef4444", reject_unknown_tool: "#ef4444" };
   return (
-    <Panel title="Containment log" sub="Immutable, hash-chained (HMAC) record of exactly what Arceo did — with the invoking caller. Tamper-evident."
+    <Panel title="Containment log" sub="Immutable, hash-chained (HMAC) record of exactly what Heel did — with the invoking caller. Tamper-evident."
       right={<div className="flex items-center gap-2"><Verdict pass={t.containment_valid} labels={["chain valid", "broken"]} /><TargetToggle target={target} set={setTarget} /></div>}>
       <div className="space-y-0.5 max-h-[60vh] overflow-y-auto">
         {t.containment.map((e: any, i: number) => (
@@ -500,7 +500,7 @@ export function Integration({ s }: { s: any }) {
       <div className="grid md:grid-cols-3 gap-3">
         <Stat label="MCP server" value={`${s.meta.server} v${s.meta.version}`} tone="accent" />
         <Stat label="tools exposed" value={s.meta.tools.length} sub="consumption/execution only" />
-        <Stat label="discovery model" value={s.meta.model} sub="swappable: ARCEO_MODEL=anthropic" />
+        <Stat label="discovery model" value={s.meta.model} sub="swappable: HEEL_MODEL=anthropic" />
       </div>
       <Panel title="Registered MCP tool schema" sub="No scope-creation/widening tool exists — by construction (§10.1).">
         <div className="space-y-1.5">
@@ -510,7 +510,7 @@ export function Integration({ s }: { s: any }) {
               <div className="text-[11px] text-muted mt-0.5">{tl.description}</div>
             </div>
           ))}
-          {["arceo_create_scope", "arceo_widen_scope"].map(n => (
+          {["heel_create_scope", "heel_widen_scope"].map(n => (
             <div key={n} className="rounded-md border border-bad/30 bg-bad/5 px-3 py-1.5 text-[11px] text-bad tabnum">
               ✗ {n} — absent by construction (human-only, out-of-band)
             </div>

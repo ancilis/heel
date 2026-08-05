@@ -1,4 +1,4 @@
-# ARCEO Hosted — Operations (design + current state)
+# HEEL Hosted — Operations (design + current state)
 
 ## Current runnable commands (local, zero external accounts)
 - Bootstrap: `python3 -m venv .venv && . .venv/bin/activate` (core has zero deps; nothing to install).
@@ -19,8 +19,8 @@
 
 ## Deployment commands (wrappers to build in Phase 8; require owner accounts)
 - `make bootstrap` · `make verify` · `make deploy-staging` · `make smoke` · `make rollback`
-- Migrations: `python3 -m arceo.saas.migrate up|down`.
-- Billing sync: `python3 -m arceo.saas.billing sync` (creates Stripe Products/Prices from the catalog).
+- Migrations: `python3 -m heel.saas.migrate up|down`.
+- Billing sync: `python3 -m heel.saas.billing sync` (creates Stripe Products/Prices from the catalog).
 
 ## Cost & capacity model
 Per-workspace free-tier liability is bounded by the ledger ceilings (25 total / 5 verified runs, 1
