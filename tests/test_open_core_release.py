@@ -7,6 +7,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -18,6 +19,11 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "release/open-core-v1.json"
+# Task5 CI must install the PyPA ``build`` frontend, then run this exact command.
+STANDARD_BUILD_CI_COMMAND = (
+    "HEEL_REQUIRE_STANDARD_BUILD=1 "
+    "python -m unittest tests.test_open_core_release -v"
+)
 FORBIDDEN_PREFIXES = (
     "apps/",
     "deploy/",
@@ -142,6 +148,18 @@ global-exclude *.pyc
 """
 
 
+def _standard_build_frontend_available() -> bool:
+    """Return whether ``python -m build`` has a real importable entry point."""
+    try:
+        return importlib.util.find_spec("build.__main__") is not None
+    except (AttributeError, ImportError):
+        return False
+
+
+STANDARD_BUILD_FRONTEND_AVAILABLE = _standard_build_frontend_available()
+STANDARD_BUILD_REQUIRED = os.environ.get("HEEL_REQUIRE_STANDARD_BUILD") == "1"
+
+
 def _copy_tracked_snapshot(destination: Path) -> None:
     """Copy tracked files plus newly allowlisted release inputs for pre-commit builds."""
     result = subprocess.run(
@@ -169,7 +187,85 @@ def _copy_tracked_snapshot(destination: Path) -> None:
             shutil.copy2(source, target)
 
 
+def _assert_contract_path_is_safe(
+    test_case: unittest.TestCase,
+    path: str,
+    *,
+    root: Path = ROOT,
+) -> None:
+    """Require a canonical path whose components never traverse a symlink."""
+    normalized = PurePosixPath(path)
+    test_case.assertNotIn("\\", path, f"{path}: backslash separators are forbidden")
+    test_case.assertEqual(normalized.as_posix(), path)
+    test_case.assertFalse(normalized.is_absolute(), path)
+    test_case.assertFalse(path.startswith(FORBIDDEN_PREFIXES), path)
+    test_case.assertNotIn("..", normalized.parts)
+    test_case.assertTrue(normalized.parts, f"{path}: empty path is forbidden")
+
+    candidate = root
+    status = None
+    for index, part in enumerate(normalized.parts):
+        candidate = candidate / part
+        try:
+            status = candidate.lstat()
+        except OSError as error:
+            test_case.fail(
+                f"{path}: inaccessible path component {part!r}: "
+                f"{type(error).__name__}"
+            )
+        test_case.assertFalse(
+            stat.S_ISLNK(status.st_mode),
+            f"{path}: symlink component {part!r} is forbidden",
+        )
+        if index < len(normalized.parts) - 1:
+            test_case.assertTrue(
+                stat.S_ISDIR(status.st_mode),
+                f"{path}: parent component {part!r} is not a directory",
+            )
+
+    test_case.assertIsNotNone(status, path)
+    test_case.assertTrue(
+        stat.S_ISREG(status.st_mode),
+        f"{path}: listed source is not a regular file",
+    )
+
+
 class OpenCoreReleaseTests(unittest.TestCase):
+    def _run_standard_build_gate_without_frontend(
+        self,
+        *,
+        required: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory(prefix="heel-build-namespace-") as temporary:
+            namespace_root = Path(temporary)
+            (namespace_root / "build").mkdir()
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = os.pathsep.join(
+                (str(namespace_root), str(ROOT))
+            )
+            if required:
+                environment["HEEL_REQUIRE_STANDARD_BUILD"] = "1"
+            else:
+                environment.pop("HEEL_REQUIRE_STANDARD_BUILD", None)
+            return subprocess.run(
+                [
+                    sys.executable,
+                    "-S",
+                    "-m",
+                    "unittest",
+                    (
+                        "tests.test_open_core_release.OpenCoreReleaseTests."
+                        "test_standard_setuptools_artifacts_preserve_public_boundary"
+                    ),
+                    "-v",
+                ],
+                cwd=namespace_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
     def test_release_contract_is_an_exact_public_allowlist(self):
         self.assertTrue(CONTRACT.is_file(), "release/open-core-v1.json is missing")
         contract_text = CONTRACT.read_text(encoding="utf-8")
@@ -209,12 +305,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
         )
         self.assertEqual(len(paths), len(set(paths)))
         for path in paths:
-            normalized = PurePosixPath(path)
-            self.assertEqual(normalized.as_posix(), path)
-            self.assertFalse(normalized.is_absolute(), path)
-            self.assertFalse(path.startswith(FORBIDDEN_PREFIXES), path)
-            self.assertNotIn("..", normalized.parts)
-            self.assertTrue((ROOT / path).is_file(), path)
+            _assert_contract_path_is_safe(self, path)
 
         actual_python_modules = {
             path.relative_to(ROOT).as_posix()
@@ -284,12 +375,75 @@ class OpenCoreReleaseTests(unittest.TestCase):
                 self.assertNotIn(marker, text, f"{source}: {marker}")
 
         self.assertEqual(missing_links, {})
+        readme = (ROOT / "release/open-core/README.md").read_text(encoding="utf-8")
+        readme_prose = " ".join(readme.split())
+        self.assertIn(
+            "`heel-mcp` itself does not upload the OpenAPI document",
+            readme_prose,
+        )
+        self.assertIn(
+            "AI client or model provider may receive or upload the document before invoking Heel",
+            readme_prose,
+        )
+        self.assertIn("Heel cannot enforce that upstream boundary", readme_prose)
+
+    def test_contract_path_validation_rejects_backslashes(self):
+        with self.assertRaisesRegex(AssertionError, "backslash"):
+            _assert_contract_path_is_safe(self, r"heel\cli.py")
+
+    def test_contract_path_validation_rejects_symlinked_components(self):
+        with tempfile.TemporaryDirectory(prefix="heel-contract-symlink-") as temporary:
+            root = Path(temporary)
+            (root / "real.py").write_text("pass\n", encoding="utf-8")
+            (root / "heel").mkdir()
+            (root / "heel/cli.py").symlink_to(root / "real.py")
+            with self.assertRaisesRegex(AssertionError, "symlink"):
+                _assert_contract_path_is_safe(self, "heel/cli.py", root=root)
+
+            parent_root = root / "parent-case"
+            parent_root.mkdir()
+            real_package = root / "real-package"
+            real_package.mkdir()
+            (real_package / "cli.py").write_text("pass\n", encoding="utf-8")
+            (parent_root / "heel").symlink_to(real_package, target_is_directory=True)
+            with self.assertRaisesRegex(AssertionError, "symlink"):
+                _assert_contract_path_is_safe(
+                    self,
+                    "heel/cli.py",
+                    root=parent_root,
+                )
+
+    def test_namespace_only_build_package_skips_optional_frontend_integration(self):
+        result = self._run_standard_build_gate_without_frontend(required=False)
+        output = result.stdout + result.stderr
+
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("skipped", output)
+        self.assertIn("build.__main__", output)
+
+    def test_required_standard_build_fails_when_frontend_is_absent(self):
+        result = self._run_standard_build_gate_without_frontend(required=True)
+        output = result.stdout + result.stderr
+
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertIn(
+            "HEEL_REQUIRE_STANDARD_BUILD=1 requires importable build.__main__",
+            output,
+        )
+        self.assertNotIn("skipped", output)
 
     @unittest.skipUnless(
-        importlib.util.find_spec("build") is not None,
-        "the optional local 'build' package is required for archive integration",
+        STANDARD_BUILD_FRONTEND_AVAILABLE or STANDARD_BUILD_REQUIRED,
+        "optional integration requires importable build.__main__; Task5 CI: "
+        + STANDARD_BUILD_CI_COMMAND,
     )
     def test_standard_setuptools_artifacts_preserve_public_boundary(self):
+        self.assertTrue(
+            STANDARD_BUILD_FRONTEND_AVAILABLE,
+            "HEEL_REQUIRE_STANDARD_BUILD=1 requires importable build.__main__; "
+            "install the PyPA build frontend. Task5 CI: "
+            + STANDARD_BUILD_CI_COMMAND,
+        )
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
         dist_info = "heel_sim-1.1.0.dist-info"
 
