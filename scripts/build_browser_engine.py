@@ -184,16 +184,24 @@ REVIEWED_DATA_METHOD_CALLS = {
 FORBIDDEN_DYNAMIC_NAMES = frozenset({
     "__builtins__",
     "__import__",
+    "breakpoint",
     "builtins",
     "compile",
+    "credits",
     "delattr",
     "eval",
     "exec",
+    "exit",
     "getattr",
     "globals",
+    "help",
     "importlib",
+    "input",
+    "license",
     "locals",
     "open",
+    "print",
+    "quit",
     "setattr",
     "vars",
 })
@@ -362,6 +370,11 @@ def _validate_reviewed_module_uses(
                     raise BrowserEngineBuildError(
                         f"browser module uses unreviewed module attribute: {rendered}"
                     )
+                if isinstance(node.ctx, (ast.Store, ast.Del)):
+                    raise BrowserEngineBuildError(
+                        "browser module rebinds reviewed module attribute: "
+                        f"{module}.{attributes[0]}"
+                    )
         elif (
             isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)
@@ -397,17 +410,58 @@ def _validate_reviewed_module_uses(
             )
 
 
+def _local_definitions(tree: ast.Module) -> frozenset[str]:
+    return frozenset(
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    )
+
+
+def _validate_reviewed_binding_provenance(
+    tree: ast.Module,
+    module_bindings: frozenset[str],
+    imported_symbols: frozenset[str],
+) -> None:
+    # This protects authority provenance in reviewed source; it does not turn
+    # the source checker into an arbitrary-Python or bytecode malware sandbox.
+    protected_bindings = (
+        REVIEWED_BUILTIN_CALLS
+        | module_bindings
+        | imported_symbols
+        | _local_definitions(tree)
+    )
+    for node in ast.walk(tree):
+        rebound: tuple[str, ...] = ()
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+        ):
+            rebound = (node.id,)
+        elif isinstance(node, ast.arg):
+            rebound = (node.arg,)
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            rebound = (node.name,)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            rebound = tuple(node.names)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+            rebound = (node.name,)
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            rebound = (node.rest,)
+        for name in rebound:
+            if name in protected_bindings:
+                raise BrowserEngineBuildError(
+                    f"browser module rebinds reviewed binding: {name}"
+                )
+
+
 def _validate_reviewed_calls(
     tree: ast.Module,
     module: str,
     module_bindings: frozenset[str],
     imported_symbols: frozenset[str],
 ) -> frozenset[str]:
-    local_call_targets = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
+    local_call_targets = _local_definitions(tree)
     reviewed_name_targets = (
         REVIEWED_BUILTIN_CALLS | local_call_targets | imported_symbols
     )
@@ -534,6 +588,11 @@ def _prove_import_closure() -> None:
                 raise BrowserEngineBuildError(
                     f"browser module uses forbidden dynamic primitive: {forbidden}"
                 )
+        _validate_reviewed_binding_provenance(
+            tree,
+            module_bindings,
+            imported_symbols,
+        )
         _validate_reviewed_module_uses(tree, module_bindings)
         observed_builtin_calls.update(
             _validate_reviewed_calls(

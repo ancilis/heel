@@ -325,6 +325,93 @@ class BrowserEngineBuildTests(unittest.TestCase):
         )
         self.assertEqual(reviewed_calls.returncode, 0, reviewed_calls.stderr)
 
+    def test_reviewed_binding_provenance_cannot_be_reassigned(self):
+        mutations = {
+            "Fable builtin rebound": "len = breakpoint\nlen()",
+            "Fable imported function rebound": (
+                "stable_json = breakpoint\nstable_json()"
+            ),
+            "Fable module attribute rebound": (
+                "import re\nre.compile = breakpoint\nre.compile()"
+            ),
+            "module attribute rebound to data": "import re\nre.compile = None",
+            "Fable local function rebound": (
+                "def heel_local():\n"
+                "    return None\n"
+                "heel_local = breakpoint\n"
+                "heel_local()"
+            ),
+            "Fable data method spoof": (
+                "class HeelList:\n"
+                "    append = help\n"
+                "HeelList().append()"
+            ),
+            "parameter shadows builtin": "def heel_shadow(len):\n    return len",
+            "comprehension shadows builtin": "[None for len in ()]",
+            "loop shadows import": "for stable_json in ():\n    pass",
+            "with shadows builtin": "with stable_json as len:\n    pass",
+            "except shadows builtin": (
+                "try:\n"
+                "    raise ValueError('heel')\n"
+                "except ValueError as len:\n"
+                "    pass"
+            ),
+            "named expression shadows builtin": "(len := stable_json)",
+            "global targets builtin": "def heel_global():\n    global len",
+            "nonlocal targets local definition": (
+                "def heel_outer():\n"
+                "    def len():\n"
+                "        return None\n"
+                "    def heel_inner():\n"
+                "        nonlocal len"
+            ),
+            "delete imported binding": "del stable_json",
+            "delete local binding": (
+                "def heel_local():\n    return None\ndel heel_local"
+            ),
+            "delete builtin binding": "del len",
+            "delete module attribute": "import re\ndel re.compile",
+        }
+        ambient_names = (
+            "breakpoint",
+            "help",
+            "input",
+            "exit",
+            "quit",
+            "license",
+            "credits",
+            "print",
+            "open",
+        )
+        mutations.update({
+            f"ambient {name} reference": f"heel_alias = {name}"
+            for name in ambient_names
+        })
+
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                completed = self._run_builder_with_browser_review_mutation(mutation)
+                self.assertNotEqual(completed.returncode, 0, mutation)
+                self.assertRegex(
+                    completed.stderr,
+                    r"ambient capability|reviewed binding|reviewed module attribute|"
+                    r"forbidden dynamic primitive",
+                )
+
+        reviewed_declarations = self._run_builder_with_browser_review_mutation(
+            "def heel_provenance_function():\n"
+            "    return len(())\n"
+            "class HeelProvenanceClass:\n"
+            "    pass\n"
+            "heel_provenance_function()\n"
+            "HeelProvenanceClass()"
+        )
+        self.assertEqual(
+            reviewed_declarations.returncode,
+            0,
+            reviewed_declarations.stderr,
+        )
+
     def test_builder_produces_only_the_proven_browser_closure_and_metadata(self):
         wheel, _manifest = self._require_build()
         with zipfile.ZipFile(wheel) as archive:
