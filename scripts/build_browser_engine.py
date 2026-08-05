@@ -78,6 +78,109 @@ REVIEWED_FROM_IMPORTS = {
     (1, "review_service"): frozenset({"review_openapi"}),
     (1, "static_review"): frozenset({"review_product_models"}),
 }
+# Bare calls have no ambient authority: only these closure-derived builtins,
+# same-module definitions, and exact reviewed imports may be called by name.
+REVIEWED_BUILTIN_CALLS = frozenset({
+    "ValueError",
+    "all",
+    "any",
+    "bool",
+    "dict",
+    "enumerate",
+    "float",
+    "frozenset",
+    "isinstance",
+    "len",
+    "list",
+    "ord",
+    "set",
+    "sorted",
+    "str",
+    "sum",
+    "super",
+    "tuple",
+    "type",
+})
+# Attribute calls are either exact reviewed module capabilities, the single
+# super().__init__ pattern, or these per-module data methods. Lambda, subscript,
+# call-result, conditional, and every other indirect call target are rejected.
+REVIEWED_DATA_METHOD_CALLS = {
+    "__init__": frozenset(),
+    "browser_review": frozenset({
+        "append",
+        "encode",
+        "extend",
+        "items",
+        "lower",
+        "pop",
+    }),
+    "openapi_model": frozenset({
+        "append",
+        "extend",
+        "fromkeys",
+        "fullmatch",
+        "get",
+        "items",
+        "join",
+        "keys",
+        "lower",
+        "pop",
+        "search",
+        "setdefault",
+        "startswith",
+        "strip",
+        "update",
+        "upper",
+        "values",
+    }),
+    "product_model": frozenset({
+        "append",
+        "extend",
+        "get",
+        "items",
+        "join",
+        "search",
+        "strip",
+    }),
+    "review_answers": frozenset({
+        "append",
+        "encode",
+        "get",
+        "items",
+        "join",
+        "lower",
+        "setdefault",
+        "startswith",
+        "strip",
+        "update",
+        "upper",
+    }),
+    "review_contract": frozenset({
+        "append",
+        "encode",
+        "fullmatch",
+        "get",
+        "hexdigest",
+        "items",
+        "sort",
+        "strip",
+    }),
+    "review_rules": frozenset({"lower", "strip"}),
+    "review_service": frozenset({"append", "get", "to_dict", "update"}),
+    "static_review": frozenset({
+        "add",
+        "append",
+        "extend",
+        "get",
+        "isalnum",
+        "issubset",
+        "join",
+        "lower",
+        "split",
+        "strip",
+        "to_dict",
+    }),
+}
 FORBIDDEN_DYNAMIC_NAMES = frozenset({
     "__builtins__",
     "__import__",
@@ -190,8 +293,9 @@ def _validate_reviewed_imports(
     tree: ast.Module,
     relative_path: str,
     pending: list[str],
-) -> frozenset[str]:
+) -> tuple[frozenset[str], frozenset[str]]:
     module_bindings: set[str] = set()
+    imported_symbols: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -227,9 +331,11 @@ def _validate_reviewed_imports(
                     raise BrowserEngineBuildError(
                         f"browser module imports unreviewed symbol: {module}.{alias.name}"
                     )
+                if module != "__future__":
+                    imported_symbols.add(alias.name)
             if node.level == 1:
                 pending.append(module)
-    return frozenset(module_bindings)
+    return frozenset(module_bindings), frozenset(imported_symbols)
 
 
 def _validate_reviewed_module_uses(
@@ -291,6 +397,59 @@ def _validate_reviewed_module_uses(
             )
 
 
+def _validate_reviewed_calls(
+    tree: ast.Module,
+    module: str,
+    module_bindings: frozenset[str],
+    imported_symbols: frozenset[str],
+) -> frozenset[str]:
+    local_call_targets = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    reviewed_name_targets = (
+        REVIEWED_BUILTIN_CALLS | local_call_targets | imported_symbols
+    )
+    reviewed_data_methods = REVIEWED_DATA_METHOD_CALLS[module]
+    observed_builtin_calls: set[str] = set()
+    observed_data_methods: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        if isinstance(target, ast.Name):
+            if target.id not in reviewed_name_targets:
+                raise BrowserEngineBuildError(
+                    f"browser module uses unreviewed call target: {target.id}"
+                )
+            if target.id in REVIEWED_BUILTIN_CALLS:
+                observed_builtin_calls.add(target.id)
+            continue
+        if isinstance(target, ast.Attribute):
+            if _module_attribute_path(target, module_bindings) is not None:
+                continue
+            if _reviewed_private_attribute(target):
+                continue
+            if target.attr not in reviewed_data_methods:
+                raise BrowserEngineBuildError(
+                    f"browser module uses unreviewed call target: attribute.{target.attr}"
+                )
+            observed_data_methods.add(target.attr)
+            continue
+        raise BrowserEngineBuildError(
+            "browser module uses unreviewed call target shape: "
+            f"{type(target).__name__}"
+        )
+    if observed_data_methods != reviewed_data_methods:
+        unused = sorted(reviewed_data_methods - observed_data_methods)
+        raise BrowserEngineBuildError(
+            "browser call policy contains unused data method: "
+            f"{module}.{unused[0]}"
+        )
+    return frozenset(observed_builtin_calls)
+
+
 def _assert_no_symlink_components(
     path: Path,
     label: str,
@@ -350,6 +509,7 @@ def _prove_import_closure() -> None:
     }
     pending = ["__init__", "browser_review"]
     observed: set[str] = set()
+    observed_builtin_calls: set[str] = set()
     while pending:
         module = pending.pop()
         if module in observed:
@@ -363,7 +523,11 @@ def _prove_import_closure() -> None:
         except SyntaxError as error:
             raise BrowserEngineBuildError(f"browser module cannot be parsed: {relative_path}") from error
         observed.add(module)
-        module_bindings = _validate_reviewed_imports(tree, relative_path, pending)
+        module_bindings, imported_symbols = _validate_reviewed_imports(
+            tree,
+            relative_path,
+            pending,
+        )
         for node in ast.walk(tree):
             forbidden = _forbidden_dynamic_primitive(node)
             if forbidden is not None:
@@ -371,10 +535,23 @@ def _prove_import_closure() -> None:
                     f"browser module uses forbidden dynamic primitive: {forbidden}"
                 )
         _validate_reviewed_module_uses(tree, module_bindings)
+        observed_builtin_calls.update(
+            _validate_reviewed_calls(
+                tree,
+                module,
+                module_bindings,
+                imported_symbols,
+            )
+        )
     if observed != allowed_modules:
         unused = sorted(allowed_modules - observed)
         raise BrowserEngineBuildError(
             f"browser wheel allowlist contains unused module: {unused[0]}"
+        )
+    if observed_builtin_calls != REVIEWED_BUILTIN_CALLS:
+        unused = sorted(REVIEWED_BUILTIN_CALLS - observed_builtin_calls)
+        raise BrowserEngineBuildError(
+            f"browser call policy contains unused builtin: {unused[0]}"
         )
 
 

@@ -290,6 +290,41 @@ class BrowserEngineBuildTests(unittest.TestCase):
             reviewed_capabilities.stderr,
         )
 
+    def test_calls_require_positive_reviewed_authority(self):
+        mutations = {
+            "breakpoint": "breakpoint()",
+            "help": "help()",
+            "input": "input()",
+            "exit": "exit()",
+            "quit": "quit()",
+            "license": "license()",
+            "credits": "credits()",
+            "print": "print('heel')",
+            "open": "open('/tmp/heel-browser-policy', 'w')",
+            "unknown bare callable": "heel_unknown_callable()",
+            "unknown data method": "heel_unknown.run()",
+            "immediate lambda call": "(lambda: None)()",
+            "subscript-selected call": "[lambda: None][0]()",
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                completed = self._run_builder_with_browser_review_mutation(mutation)
+                self.assertNotEqual(completed.returncode, 0, mutation)
+                self.assertRegex(
+                    completed.stderr,
+                    r"unreviewed call target|forbidden dynamic primitive",
+                )
+
+        reviewed_calls = self._run_builder_with_browser_review_mutation(
+            "def heel_reviewed_local(value):\n"
+            "    return len(value)\n"
+            "heel_reviewed_local([])\n"
+            "stable_json({})\n"
+            "heel_values = []\n"
+            "heel_values.append('heel')"
+        )
+        self.assertEqual(reviewed_calls.returncode, 0, reviewed_calls.stderr)
+
     def test_builder_produces_only_the_proven_browser_closure_and_metadata(self):
         wheel, _manifest = self._require_build()
         with zipfile.ZipFile(wheel) as archive:
