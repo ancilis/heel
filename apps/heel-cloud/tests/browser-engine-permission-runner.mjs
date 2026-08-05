@@ -7,6 +7,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { WASI } from "node:wasi";
 import { Worker } from "node:worker_threads";
 
 
@@ -17,13 +18,18 @@ const wheelName = "heel_browser-1.1.0-py3-none-any.whl";
 const wheelPath = join(runtimeRoot, wheelName);
 
 
-function assertAccessDenied(label, operation) {
+function assertDenied(label, operation, expectedCodes = ["ERR_ACCESS_DENIED"]) {
   try {
     const result = operation();
-    if (result?.error?.code === "ERR_ACCESS_DENIED") return;
-    assert.fail(`${label} was not denied by Node permissions`);
+    assert.ok(
+      expectedCodes.includes(result?.error?.code),
+      `${label} was not denied by Node permissions`,
+    );
+    return result.error.code;
   } catch (error) {
-    assert.equal(error?.code, "ERR_ACCESS_DENIED", `${label}: ${error}`);
+    if (error?.code === "ERR_ASSERTION") throw error;
+    assert.ok(expectedCodes.includes(error?.code), `${label}: ${error}`);
+    return error.code;
   }
 }
 
@@ -36,6 +42,30 @@ assert.equal(process.permission.has("fs.write", appRoot), false);
 for (const scope of ["addons", "child", "net", "wasi", "worker"]) {
   assert.equal(process.permission.has(scope), false, `${scope} permission must be denied`);
 }
+const expectedEnvironment = {
+  HEEL_PERMISSION_CHILD: "browser-security-test",
+  LANG: "C",
+  LC_ALL: "C",
+  NODE_NO_WARNINGS: "1",
+  TZ: "UTC",
+};
+assert.equal(process.env.NODE_OPTIONS, undefined);
+assert.equal(process.env.NODE_PATH, undefined);
+for (const name of Object.keys(process.env)) {
+  if (!(name in expectedEnvironment)) delete process.env[name];
+}
+assert.deepEqual({ ...process.env }, expectedEnvironment);
+
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const { expected, outsideAddon, outsideRead, outsideWrite, sample } = JSON.parse(input);
+assert.equal(typeof expected, "string");
+assert.equal(typeof outsideAddon, "string");
+assert.equal(typeof outsideRead, "string");
+assert.equal(typeof outsideWrite, "string");
+assert.equal(typeof sample, "string");
+assert.equal(process.permission.has("fs.read", outsideRead), false);
+assert.equal(process.permission.has("fs.write", outsideWrite), false);
 
 await assert.rejects(
   new Promise((resolveConnection, rejectConnection) => {
@@ -48,18 +78,19 @@ await assert.rejects(
   }),
   { code: "ERR_ACCESS_DENIED" },
 );
-assertAccessDenied("child process", () => spawnSync(process.execPath, ["--version"]));
-assertAccessDenied("worker", () => new Worker("0", { eval: true }));
+assertDenied("child process", () => spawnSync(process.execPath, ["--version"]));
+assertDenied("worker", () => new Worker("0", { eval: true }));
+await assert.rejects(readFile(outsideRead), { code: "ERR_ACCESS_DENIED" });
 await assert.rejects(
-  writeFile(join(appRoot, ".permission-write-must-fail"), "denied"),
+  writeFile(outsideWrite, "denied"),
   { code: "ERR_ACCESS_DENIED" },
 );
-
-let input = "";
-for await (const chunk of process.stdin) input += chunk;
-const { expected, sample } = JSON.parse(input);
-assert.equal(typeof expected, "string");
-assert.equal(typeof sample, "string");
+assertDenied("WASI", () => new WASI({ version: "preview1" }));
+assertDenied(
+  "native addon",
+  () => process.dlopen({ exports: {} }, outsideAddon),
+  ["ERR_DLOPEN_DISABLED", "ERR_ACCESS_DENIED"],
+);
 
 const bindingRequests = [];
 Object.defineProperty(process, "binding", {
@@ -102,7 +133,8 @@ process.stdout.write(JSON.stringify({
   actual,
   bindingRequests,
   cpythonVersion,
-  denied: ["net", "child", "worker", "fs.write"],
+  denied: ["net", "child", "worker", "fs.read", "fs.write", "wasi", "addons"],
+  environment: { ...process.env },
   runtimeReadAllowed: process.permission.has("fs.read", runtimeRoot),
   wsReadAllowed: process.permission.has("fs.read", wsRoot),
 }));

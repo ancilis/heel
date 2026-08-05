@@ -695,22 +695,56 @@ test("executes the real wheel in a Node permission-confined process", async () =
       `${forbidden} must not be granted to the browser security child`,
     );
   }
-  const confined = spawnSync(process.execPath, permissionArguments, {
-    cwd: appRoot,
-    encoding: "utf8",
-    input: JSON.stringify({ expected: native.stdout, sample }),
-    timeout: 30_000,
-  });
-  assert.equal(confined.status, 0, confined.stderr);
-  const result = JSON.parse(confined.stdout);
-  assert.equal(result.actual, native.stdout);
-  assert.deepEqual(result.bindingRequests, ["constants"]);
-  assert.equal(result.cpythonVersion, "3.14.2");
-  assert.deepEqual(result.denied, ["net", "child", "worker", "fs.write"]);
-  assert.equal(result.runtimeReadAllowed, true);
-  assert.equal(result.wsReadAllowed, true);
-  await assert.rejects(
-    readFile(join(appRoot, ".permission-write-must-fail")),
-    { code: "ENOENT" },
-  );
+  const controlledEnvironment = {
+    HEEL_PERMISSION_CHILD: "browser-security-test",
+    LANG: "C",
+    LC_ALL: "C",
+    NODE_NO_WARNINGS: "1",
+    TZ: "UTC",
+  };
+  assert.equal(controlledEnvironment.NODE_OPTIONS, undefined);
+  assert.equal(controlledEnvironment.NODE_PATH, undefined);
+  const outsideRoot = await realpath(await mkdtemp(join(tmpdir(), "heel-permission-outside-")));
+  const outsideRead = join(outsideRoot, "read-sentinel.txt");
+  const outsideWrite = join(outsideRoot, "write-must-fail.txt");
+  const outsideAddon = join(outsideRoot, "addon-must-not-load.node");
+  await writeFile(outsideRead, "outside read sentinel");
+  await writeFile(outsideAddon, "outside addon sentinel");
+  try {
+    const confined = spawnSync(process.execPath, permissionArguments, {
+      cwd: appRoot,
+      encoding: "utf8",
+      env: controlledEnvironment,
+      input: JSON.stringify({
+        expected: native.stdout,
+        outsideAddon,
+        outsideRead,
+        outsideWrite,
+        sample,
+      }),
+      timeout: 30_000,
+    });
+    assert.equal(confined.status, 0, confined.stderr);
+    const result = JSON.parse(confined.stdout);
+    assert.equal(result.actual, native.stdout);
+    assert.deepEqual(result.bindingRequests, ["constants"]);
+    assert.equal(result.cpythonVersion, "3.14.2");
+    assert.deepEqual(result.denied, [
+      "net",
+      "child",
+      "worker",
+      "fs.read",
+      "fs.write",
+      "wasi",
+      "addons",
+    ]);
+    assert.deepEqual(result.environment, controlledEnvironment);
+    assert.equal(result.runtimeReadAllowed, true);
+    assert.equal(result.wsReadAllowed, true);
+    assert.equal(await readFile(outsideRead, "utf8"), "outside read sentinel");
+    assert.equal(await readFile(outsideAddon, "utf8"), "outside addon sentinel");
+    await assert.rejects(readFile(outsideWrite), { code: "ENOENT" });
+  } finally {
+    await rm(outsideRoot, { recursive: true, force: true });
+  }
 });
