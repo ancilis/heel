@@ -70,6 +70,23 @@ function withoutQuestion(
 }
 
 
+function withQuestions(
+  envelope: Record<string, unknown>,
+  keys: Array<[surface: string, field: string]>,
+): Record<string, unknown> {
+  const allowed = new Set(keys.map(([surface, field]) => `${surface}\u0000${field}`));
+  const value = structuredClone(envelope);
+  value.questions = (value.questions as Array<Record<string, unknown>>).filter(
+    (question) => allowed.has(`${question.surface}\u0000${question.field}`),
+  );
+  value.summary = {
+    ...(value.summary as Record<string, unknown>),
+    questions: (value.questions as unknown[]).length,
+  };
+  return rehash(value);
+}
+
+
 describe("parseReviewEnvelopeV1", () => {
   test("accepts and detaches the exact content-addressed browser-local envelope", () => {
     const source = browserEnvelope();
@@ -140,12 +157,12 @@ describe("deriveAnswerReceipt", () => {
     const vocabulary = parseReviewPresentationVocabulary(presentationFixture);
     expect(vocabulary).toEqual(presentationFixture);
 
-    const before = parseReviewEnvelopeV1(browserEnvelope());
     const answer = {
       surface: "downloadbulkexport",
       field: "tenant_filter",
       value: "enforced",
     } as const;
+    const before = parseReviewEnvelopeV1(withQuestions(browserEnvelope(), [[answer.surface, answer.field]]));
     const after = parseReviewEnvelopeV1(withoutQuestion(before as unknown as Record<string, unknown>, answer.surface, answer.field));
 
     expect(deriveAnswerReceipt(before, after, [answer], vocabulary)).toEqual({
@@ -154,6 +171,39 @@ describe("deriveAnswerReceipt", () => {
       confidence: "improved",
       items: [{ ...answer, receipt: "applied" }],
     });
+  });
+
+  test("keeps confidence preliminary for mixed enforced and unknown answers", () => {
+    const before = parseReviewEnvelopeV1(withQuestions(browserEnvelope(), [
+      ["downloadbulkexport", "tenant_filter"],
+      ["downloadbulkexport", "rate_limit"],
+    ]));
+    const after = parseReviewEnvelopeV1(withoutQuestion(
+      before as unknown as Record<string, unknown>,
+      "downloadbulkexport",
+      "tenant_filter",
+    ));
+
+    expect(deriveAnswerReceipt(before, after, [
+      { surface: "downloadbulkexport", field: "tenant_filter", value: "enforced" },
+      { surface: "downloadbulkexport", field: "rate_limit", value: "unknown" },
+    ])).toMatchObject({ confidence: "preliminary" });
+  });
+
+  test("keeps confidence preliminary when enforced answers leave unrelated questions unanswered", () => {
+    const before = parseReviewEnvelopeV1(withQuestions(browserEnvelope(), [
+      ["downloadbulkexport", "tenant_filter"],
+      ["runagenttool", "entitlement_check"],
+    ]));
+    const after = parseReviewEnvelopeV1(withoutQuestion(
+      before as unknown as Record<string, unknown>,
+      "downloadbulkexport",
+      "tenant_filter",
+    ));
+
+    expect(deriveAnswerReceipt(before, after, [
+      { surface: "downloadbulkexport", field: "tenant_filter", value: "enforced" },
+    ])).toMatchObject({ confidence: "preliminary" });
   });
 
   test.each([

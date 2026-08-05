@@ -206,12 +206,19 @@ export function deriveAnswerReceipt(
   });
 
   const hasConfirmedGap = answers.some((answer) => answer.value === "not_enforced");
+  const hasUnknown = answers.some((answer) => answer.value === "unknown");
   const hasApplied = answers.some((answer) => answer.value === "enforced");
-  const confidence = hasConfirmedGap
-    ? vocabulary.confidence.not_enforced
-    : hasApplied && after.questions.length < before.questions.length
-      ? vocabulary.confidence.enforced_reduced_questions_without_confirmed_gap
-      : vocabulary.confidence.unanswered_or_unknown;
+  let confidence: ReviewAnswerReceiptV1["confidence"] = vocabulary.confidence.unanswered_or_unknown;
+  if (hasConfirmedGap) {
+    confidence = vocabulary.confidence.not_enforced;
+  } else if (
+    !hasUnknown
+    && after.questions.length === 0
+    && hasApplied
+    && after.questions.length < before.questions.length
+  ) {
+    confidence = vocabulary.confidence.enforced_reduced_questions_without_confirmed_gap;
+  }
   return {
     schema_version: vocabulary.schema_version,
     assumption: vocabulary.assumption,

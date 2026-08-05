@@ -64,6 +64,27 @@ async function rawStoredValue(factory: IDBFactory, reviewId: string): Promise<un
 }
 
 
+function transactionComplete(transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error("IndexedDB transaction failed"));
+    transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB transaction aborted"));
+  });
+}
+
+
+async function injectStoredValue(factory: IDBFactory, value: unknown): Promise<void> {
+  const database = await requestResult(factory.open(LOCAL_REVIEW_DATABASE));
+  try {
+    const transaction = database.transaction(LOCAL_REVIEW_STORE, "readwrite");
+    transaction.objectStore(LOCAL_REVIEW_STORE).put(value);
+    await transactionComplete(transaction);
+  } finally {
+    database.close();
+  }
+}
+
+
 describe("LocalReviewStore", () => {
   test("persists only a validated local-only envelope wrapper", async () => {
     const factory = new IDBFactory();
@@ -146,6 +167,31 @@ describe("LocalReviewStore", () => {
     await expect(store.get(`review_${"0".repeat(20)}`)).resolves.toBeNull();
     await expect(store.delete(`review_${"0".repeat(20)}`)).resolves.toBe(false);
     await expect(store.clear()).resolves.toBe(false);
+  });
+
+  test("rejects an oversized valid injected envelope before local hash validation", async () => {
+    const targetBytes = 4_207_478;
+    const seed = envelope("x");
+    const seedBytes = new TextEncoder().encode(JSON.stringify(seed)).byteLength;
+    const oversized = envelope("x".repeat(1 + targetBytes - seedBytes));
+    expect(new TextEncoder().encode(JSON.stringify(oversized)).byteLength).toBe(targetBytes);
+
+    const factory = new IDBFactory();
+    const store = new LocalReviewStore({ indexedDB: factory });
+    const retained = envelope("retained");
+    await expect(store.save(retained)).resolves.toBe(true);
+    await injectStoredValue(factory, {
+      schema_version: "heel.local-review.v1",
+      envelope: oversized,
+      saved_at: 1_800_000_000_000,
+      sync_state: "local_only",
+    });
+
+    await expect(store.get(oversized.review_id as string)).resolves.toBeNull();
+    const records = await store.list();
+    expect(records.map((record) => record.envelope.review_id)).toEqual([
+      retained.review_id,
+    ]);
   });
 
   test("uses a bounded default count even if callers request an invalid limit", () => {

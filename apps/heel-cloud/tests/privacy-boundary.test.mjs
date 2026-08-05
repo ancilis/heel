@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { extname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
+import ts from "typescript";
 
 
 const appRoot = new URL("../", import.meta.url);
+const appRootPath = fileURLToPath(appRoot);
+const browserSourceRoots = ["app", "components", "lib", "workers", "worker"];
+const excludedDirectories = new Set([
+  ".next", ".vinext", ".wrangler", "coverage", "dist", "generated",
+  "node_modules", "out", "public", "tests", "vendor",
+]);
+const sourceExtensions = new Set([".js", ".jsx", ".mjs", ".ts", ".tsx"]);
 
 
 async function source(path) {
@@ -13,31 +24,228 @@ async function source(path) {
 }
 
 
+async function discoverOriginalSources(rootPath, roots = browserSourceRoots) {
+  const files = [];
+  async function walk(directory) {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory() && excludedDirectories.has(entry.name)) continue;
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) await walk(path);
+      else if (
+        sourceExtensions.has(extname(entry.name))
+        && !/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(entry.name)
+      ) files.push(path);
+    }
+  }
+  for (const root of roots) await walk(join(rootPath, root));
+  return files.sort();
+}
+
+
+function constantString(node) {
+  if (ts.isStringLiteralLike(node)) return node.text;
+  if (ts.isParenthesizedExpression(node)) return constantString(node.expression);
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = constantString(node.left);
+    const right = constantString(node.right);
+    return left === null || right === null ? null : left + right;
+  }
+  return null;
+}
+
+
+function memberName(node) {
+  if (ts.isIdentifier(node)) return node.text;
+  if (ts.isPropertyAccessExpression(node)) return node.name.text;
+  if (ts.isElementAccessExpression(node) && node.argumentExpression) {
+    return constantString(node.argumentExpression);
+  }
+  return null;
+}
+
+
+function rootName(node) {
+  let current = node;
+  while (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+    current = current.expression;
+  }
+  return ts.isIdentifier(current) ? current.text : null;
+}
+
+
+function enclosingFunctionName(node) {
+  let current = node.parent;
+  while (current) {
+    if (ts.isFunctionDeclaration(current) && current.name) return current.name.text;
+    current = current.parent;
+  }
+  return null;
+}
+
+
+function containsSensitiveInput(node) {
+  let found = false;
+  function visit(current) {
+    if (ts.isIdentifier(current) && /^(?:source|rawSource|answers|answersJson|answers_json)$/.test(current.text)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(current, visit);
+  }
+  visit(node);
+  return found;
+}
+
+
+function analyzeSource(fileName, text) {
+  const parsed = ts.createSourceFile(
+    fileName,
+    text,
+    ts.ScriptTarget.Latest,
+    true,
+    fileName.endsWith("x") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
+  const relativeName = relative(appRootPath, fileName).replaceAll("\\", "/");
+  const violations = [];
+  const networkCapabilities = new Set(["fetch", "XMLHttpRequest", "WebSocket", "EventSource", "sendBeacon"]);
+  const ambientRoots = new Set(["globalThis", "window", "self", "navigator"]);
+  const engineWorker = relativeName === "workers/heel-review.worker.ts";
+  const serverWorker = relativeName === "worker/index.ts";
+
+  function report(node, message) {
+    const location = parsed.getLineAndCharacterOfPosition(node.getStart(parsed));
+    violations.push(`${relativeName}:${location.line + 1}:${location.character + 1}: ${message}`);
+  }
+
+  function allowedFetchReference(node) {
+    const expression = node.getText(parsed);
+    if (engineWorker && expression === "scope.fetch") {
+      const bind = node.parent;
+      const capture = ts.isPropertyAccessExpression(bind)
+        && bind.name.text === "bind"
+        ? bind.parent
+        : null;
+      return capture !== null
+        && ts.isCallExpression(capture)
+        && capture.parent !== undefined
+        && ts.isVariableDeclaration(capture.parent)
+        && ts.isIdentifier(capture.parent.name)
+        && capture.parent.name.text === "bootstrapFetch";
+    }
+    return serverWorker && ["env.ASSETS.fetch", "handler.fetch"].includes(expression);
+  }
+
+  function allowedFetchCall(node) {
+    const expression = node.expression.getText(parsed);
+    if (serverWorker && ["env.ASSETS.fetch", "handler.fetch"].includes(expression)) return true;
+    return engineWorker
+      && expression === "fetcher"
+      && enclosingFunctionName(node) === "fetchLocal"
+      && node.arguments.length >= 1
+      && ts.isIdentifier(node.arguments[0])
+      && node.arguments[0].text === "path";
+  }
+
+  function visit(node) {
+    if (
+      ts.isExpressionStatement(node)
+      && ts.isStringLiteral(node.expression)
+      && node.expression.text === "use server"
+    ) report(node, "server action directive in browser source");
+
+    if (ts.isElementAccessExpression(node) && node.argumentExpression) {
+      const root = rootName(node);
+      if (ambientRoots.has(root) && constantString(node.argumentExpression) === null) {
+        report(node, "dynamic ambient capability access");
+      }
+    }
+
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const name = memberName(node);
+      const root = rootName(node);
+      if (name === "fetch" && !allowedFetchReference(node)) report(node, "unapproved fetch capability reference");
+      if (["localStorage", "sessionStorage", "caches", "CacheStorage"].includes(name ?? "")) {
+        report(node, `durable/cache capability ${name}`);
+      }
+      if (root === "console") report(node, "console capability in customer boundary");
+      if (root === "globalThis" && name === "indexedDB" && relativeName !== "lib/local-reviews.ts") {
+        report(node, "IndexedDB capability outside the result-only store");
+      }
+    }
+
+    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      const name = memberName(node.expression);
+      const root = rootName(node.expression);
+      const args = [...(node.arguments ?? [])];
+      if (networkCapabilities.has(name ?? "") && !allowedFetchCall(node)) {
+        report(node, `network sink ${name}`);
+      }
+      if (name === "fetcher" && !allowedFetchCall(node)) report(node, "unapproved bootstrap fetch alias");
+      if (root === "console") report(node, "console sink in customer boundary");
+      if (/analytics|telemetry|track|capture/i.test(name ?? "")) report(node, `analytics sink ${name}`);
+      if (
+        ["URL", "pushState", "replaceState", "setItem", "put", "add"].includes(name ?? "")
+        && args.some(containsSensitiveInput)
+      ) report(node, `${name} receives customer source or answers`);
+      if (name === "postMessage" && args.some(containsSensitiveInput)) {
+        const allowed = relativeName === "lib/browser-review-client.ts"
+          || relativeName === "workers/heel-review.worker.ts";
+        if (!allowed) report(node, "customer input crosses an unapproved message boundary");
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(parsed);
+  return violations;
+}
+
+
 test("keeps customer source in the worker message path and out of durable or network sinks", async () => {
-  const [client, localReviews, presentation, reviewContract, browserWorker] = await Promise.all([
-    source("lib/browser-review-client.ts"),
-    source("lib/local-reviews.ts"),
-    source("lib/review-presentation.ts"),
-    source("lib/review-v1.ts"),
-    source("workers/heel-review.worker.ts"),
-  ]);
-  const allCustomerBoundarySource = [client, localReviews, presentation, reviewContract, browserWorker].join("\n");
+  const files = await discoverOriginalSources(appRootPath);
+  assert.ok(files.some((file) => file.endsWith("lib/browser-review-client.ts")));
+  assert.ok(files.some((file) => file.endsWith("workers/heel-review.worker.ts")));
+  const violations = [];
+  for (const file of files) violations.push(...analyzeSource(file, await readFile(file, "utf8")));
+  assert.deepEqual(violations, []);
 
-  assert.doesNotMatch(allCustomerBoundarySource, /\blocalStorage\b|\bsessionStorage\b|\bcaches\s*\.|\bCacheStorage\b/);
-  assert.doesNotMatch(allCustomerBoundarySource, /navigator\.sendBeacon|analytics|telemetry|error[-_ ]report/i);
-  assert.doesNotMatch(allCustomerBoundarySource, /["']use server["']|server action/i);
-  assert.doesNotMatch(allCustomerBoundarySource, /\bconsole\s*\./);
-  assert.doesNotMatch(allCustomerBoundarySource, /https?:\/\//i);
-
-  assert.doesNotMatch(client, /\bfetch\s*\(|XMLHttpRequest|WebSocket|EventSource|indexedDB|\bcaches\b/);
-  assert.doesNotMatch(localReviews, /\bfetch\s*\(|XMLHttpRequest|WebSocket|EventSource|\bURL\b/);
-  assert.doesNotMatch(localReviews, /\b(source|answers_json)\s*:/);
+  const localReviews = await source("lib/local-reviews.ts");
   assert.match(localReviews, /sync_state:\s*["']local_only["']/);
+});
 
-  assert.match(client, /postMessage\(JSON\.stringify\(/);
-  assert.match(browserWorker, /typeof event\.data !== ["']string["']/);
-  assert.match(browserWorker, /postMessage\(JSON\.stringify\(/);
-  assert.doesNotMatch(browserWorker, /postMessage\(\s*source|fetch\([^)]*source|send\([^)]*source/i);
+
+test("the privacy analyzer detects constant-computed global network mutation", () => {
+  const mutation = `
+const source = "private";
+globalThis["fet" + "ch"]("/leak", {body: source});
+`;
+  const violations = analyzeSource(join(appRootPath, "components/nested/mutation.ts"), mutation);
+  assert.ok(violations.some((violation) => violation.includes("network sink fetch")), violations.join("\n"));
+});
+
+
+test("recursive source discovery finds nested originals and excludes tests and vendor trees", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "heel-privacy-walker-"));
+  try {
+    await mkdir(join(temporary, "app/deep/feature"), { recursive: true });
+    await mkdir(join(temporary, "app/node_modules/vendor"), { recursive: true });
+    await writeFile(join(temporary, "app/deep/feature/new-source.ts"), "export const value = 1;", "utf8");
+    await writeFile(join(temporary, "app/deep/feature/new-source.test.ts"), "ignored", "utf8");
+    await writeFile(join(temporary, "app/node_modules/vendor/hidden.ts"), "ignored", "utf8");
+
+    const files = await discoverOriginalSources(temporary, ["app"]);
+    assert.deepEqual(files.map((file) => relative(temporary, file)), [
+      join("app", "deep", "feature", "new-source.ts"),
+    ]);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 });
 
 

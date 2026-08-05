@@ -9,6 +9,7 @@ export const LOCAL_REVIEW_STORE = "completed-reviews-v1";
 export const MAX_LOCAL_REVIEWS = 50;
 const DATABASE_VERSION = 1;
 const SAVED_AT_INDEX = "saved-at";
+const MAX_LOCAL_SCAN_RECORDS = MAX_LOCAL_REVIEWS * 4;
 
 export interface StoredLocalReviewV1 {
   schema_version: "heel.local-review.v1";
@@ -71,7 +72,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 
+function isBoundedJson(value: unknown): boolean {
+  try {
+    const encoded = JSON.stringify(value);
+    return typeof encoded === "string"
+      && new TextEncoder().encode(encoded).byteLength <= MAX_BROWSER_RESULT_BYTES;
+  } catch {
+    return false;
+  }
+}
+
+
 function parseStoredReview(value: unknown): StoredLocalReviewV1 {
+  if (!isBoundedJson(value)) throw new Error("stored review exceeds the local size limit");
   if (!isRecord(value)) throw new Error("stored review must be an object");
   const actual = Object.keys(value).sort();
   const expected = ["schema_version", "envelope", "saved_at", "sync_state"].sort();
@@ -84,6 +97,7 @@ function parseStoredReview(value: unknown): StoredLocalReviewV1 {
   if (!Number.isSafeInteger(value.saved_at) || (value.saved_at as number) < 0) {
     throw new Error("stored review has an invalid saved_at value");
   }
+  if (!isBoundedJson(value.envelope)) throw new Error("stored envelope exceeds the local size limit");
   return {
     schema_version: "heel.local-review.v1",
     envelope: parseReviewEnvelopeV1(value.envelope),
@@ -109,7 +123,7 @@ export class LocalReviewStore {
 
   async save(value: unknown): Promise<boolean> {
     const envelope = parseReviewEnvelopeV1(value);
-    if (new TextEncoder().encode(JSON.stringify(envelope)).byteLength > MAX_BROWSER_RESULT_BYTES) {
+    if (!isBoundedJson(envelope)) {
       throw new Error("review result exceeds the local storage size limit");
     }
     const savedAt = this.#now();
@@ -120,6 +134,7 @@ export class LocalReviewStore {
       saved_at: savedAt,
       sync_state: "local_only",
     };
+    if (!isBoundedJson(stored)) throw new Error("review wrapper exceeds the local storage size limit");
     const database = await this.#openOrNull();
     if (database === null) return false;
     try {
@@ -140,17 +155,9 @@ export class LocalReviewStore {
     if (database === null) return [];
     try {
       const transaction = database.transaction(LOCAL_REVIEW_STORE, "readonly");
-      const values = await requestResult(transaction.objectStore(LOCAL_REVIEW_STORE).index(SAVED_AT_INDEX).getAll());
+      const valid = await this.#readBounded(transaction);
       await transactionComplete(transaction);
-      const valid: StoredLocalReviewV1[] = [];
-      for (const value of values) {
-        try {
-          valid.push(parseStoredReview(value));
-        } catch {
-          // A malformed local record is ignored; it never reaches the product surface.
-        }
-      }
-      return valid.sort((left, right) => right.saved_at - left.saved_at).slice(0, this.#maxItems);
+      return valid;
     } catch {
       return [];
     } finally {
@@ -213,6 +220,32 @@ export class LocalReviewStore {
     const keys = await requestResult(store.index(SAVED_AT_INDEX).getAllKeys());
     for (const key of keys.slice(0, Math.max(0, keys.length - this.#maxItems))) store.delete(key);
     await transactionComplete(transaction);
+  }
+
+  #readBounded(transaction: IDBTransaction): Promise<StoredLocalReviewV1[]> {
+    return new Promise((resolve, reject) => {
+      const valid: StoredLocalReviewV1[] = [];
+      let visited = 0;
+      const request = transaction
+        .objectStore(LOCAL_REVIEW_STORE)
+        .index(SAVED_AT_INDEX)
+        .openCursor(null, "prev");
+      request.onerror = () => reject(request.error ?? new Error("browser storage cursor failed"));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor === null || valid.length >= this.#maxItems || visited >= MAX_LOCAL_SCAN_RECORDS) {
+          resolve(valid);
+          return;
+        }
+        visited += 1;
+        try {
+          valid.push(parseStoredReview(cursor.value));
+        } catch {
+          // A malformed or oversized local record never reaches the product surface.
+        }
+        cursor.continue();
+      };
+    });
   }
 }
 

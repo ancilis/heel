@@ -16,6 +16,7 @@ export const MAX_BROWSER_ANSWERS_BYTES = MAX_REVIEW_ANSWERS_BYTES;
 export const MAX_BROWSER_RESULT_BYTES = 4 * 1024 * 1024;
 const MAX_WORKER_MESSAGE_BYTES = MAX_BROWSER_RESULT_BYTES * 2 + 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_BOOT_TIMEOUT_MS = 20_000;
 
 export type BrowserReviewStatus =
   | "loading_engine"
@@ -50,9 +51,19 @@ interface ActiveRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
-interface BrowserReviewClientOptions {
+interface QueuedRequest {
+  source: string;
+  answers: ReviewAnswer[];
+  answersJson: string;
+  before: ReviewEnvelopeV1 | null;
+  resolve(value: BrowserReviewResult): void;
+  reject(error: BrowserReviewClientError): void;
+}
+
+export interface BrowserReviewClientOptions {
   workerFactory?: () => ReviewWorkerLike;
   timeoutMs?: number;
+  bootTimeoutMs?: number;
 }
 
 
@@ -138,6 +149,7 @@ function normalizeAnswers(value: readonly ReviewAnswer[]): ReviewAnswer[] {
 export class BrowserReviewClient {
   readonly #workerFactory: () => ReviewWorkerLike;
   readonly #timeoutMs: number;
+  readonly #bootTimeoutMs: number;
   readonly #listeners = new Set<(status: BrowserReviewStatus) => void>();
   readonly #readyWaiters = new Set<{
     resolve(): void;
@@ -147,6 +159,8 @@ export class BrowserReviewClient {
   #status: BrowserReviewStatus = "loading_engine";
   #engineReady = false;
   #active: ActiveRequest | null = null;
+  #queued: QueuedRequest | null = null;
+  #bootTimer: ReturnType<typeof setTimeout> | null = null;
   #retainedInput: RetainedBrowserInput | null = null;
   #requestSequence = 0;
   #disposed = false;
@@ -154,8 +168,14 @@ export class BrowserReviewClient {
   constructor(options: BrowserReviewClientOptions = {}) {
     this.#workerFactory = options.workerFactory ?? defaultWorkerFactory;
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    if (!Number.isSafeInteger(this.#timeoutMs) || this.#timeoutMs <= 0) {
-      throw new Error("timeoutMs must be a positive safe integer");
+    this.#bootTimeoutMs = options.bootTimeoutMs ?? DEFAULT_BOOT_TIMEOUT_MS;
+    if (
+      !Number.isSafeInteger(this.#timeoutMs)
+      || this.#timeoutMs <= 0
+      || !Number.isSafeInteger(this.#bootTimeoutMs)
+      || this.#bootTimeoutMs <= 0
+    ) {
+      throw new Error("review and boot timeouts must be positive safe integers");
     }
     this.#spawnWorker();
   }
@@ -197,23 +217,41 @@ export class BrowserReviewClient {
   }
 
   cancel(): void {
-    if (this.#active === null) return;
-    this.#failActive("review_cancelled", true);
+    if (this.#active !== null) {
+      this.#failActive("review_cancelled", true);
+      return;
+    }
+    if (this.#queued !== null) {
+      const queued = this.#queued;
+      this.#queued = null;
+      queued.reject(new BrowserReviewClientError("review_cancelled"));
+      this.#rejectReadyWaiters("engine_unavailable");
+      this.#detachAndTerminate();
+      this.#setStatus("failed");
+    }
   }
 
   restart(): void {
     if (this.#disposed) return;
     if (this.#active !== null) this.#failActive("engine_failed", false);
+    if (this.#queued !== null) {
+      const queued = this.#queued;
+      this.#queued = null;
+      queued.reject(new BrowserReviewClientError("engine_failed"));
+    }
     this.#replaceWorker();
   }
 
   dispose(): void {
     this.#disposed = true;
     if (this.#active !== null) this.#failActive("review_cancelled", false);
+    if (this.#queued !== null) {
+      const queued = this.#queued;
+      this.#queued = null;
+      queued.reject(new BrowserReviewClientError("review_cancelled"));
+    }
     this.#detachAndTerminate();
-    const error = new BrowserReviewClientError("engine_unavailable");
-    for (const waiter of this.#readyWaiters) waiter.reject(error);
-    this.#readyWaiters.clear();
+    this.#rejectReadyWaiters("engine_unavailable");
     this.#setStatus("failed");
   }
 
@@ -235,7 +273,9 @@ export class BrowserReviewClient {
         throw new BrowserReviewClientError("answers_too_large");
       }
       if (before !== null && answers.length === 0) throw new BrowserReviewClientError("invalid_answers");
-      if (this.#active !== null) throw new BrowserReviewClientError("review_in_progress");
+      if (this.#active !== null || this.#queued !== null) {
+        throw new BrowserReviewClientError("review_in_progress");
+      }
     } catch (error) {
       return Promise.reject(
         error instanceof BrowserReviewClientError
@@ -243,42 +283,47 @@ export class BrowserReviewClient {
           : new BrowserReviewClientError("invalid_answers"),
       );
     }
-    if (!this.#engineReady) {
-      return this.whenReady().then(() => this.#startRequest(source, answers, answersJson, before));
-    }
-    return this.#startRequest(source, answers, answersJson, before);
-  }
-
-  #startRequest(
-    source: string,
-    answers: ReviewAnswer[],
-    answersJson: string,
-    before: ReviewEnvelopeV1 | null,
-  ): Promise<BrowserReviewResult> {
-    if (this.#active !== null) return Promise.reject(new BrowserReviewClientError("review_in_progress"));
-    const worker = this.#worker;
-    if (worker === null || !this.#engineReady) {
-      return Promise.reject(new BrowserReviewClientError("engine_unavailable"));
-    }
-
-    const id = `request_${++this.#requestSequence}`;
     this.#retainedInput = { source, answers: answers.map((answer) => ({ ...answer })) };
-    this.#setStatus("reviewing");
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => this.#failActive("review_timeout", true), this.#timeoutMs);
-      this.#active = { id, before, answers, resolve, reject, timer };
-      try {
-        worker.postMessage(JSON.stringify({
-          type: "review",
-          protocol_version: WORKER_PROTOCOL_VERSION,
-          request_id: id,
-          source,
-          answers_json: answersJson,
-        }));
-      } catch {
-        this.#failActive("engine_failed", true);
+      const queued = { source, answers, answersJson, before, resolve, reject };
+      if (this.#engineReady) {
+        this.#beginRequest(queued);
+      } else if (this.#worker === null || this.#status === "failed") {
+        reject(new BrowserReviewClientError("engine_unavailable"));
+      } else {
+        this.#queued = queued;
       }
     });
+  }
+
+  #beginRequest(request: QueuedRequest): void {
+    const worker = this.#worker;
+    if (this.#active !== null || worker === null || !this.#engineReady) {
+      request.reject(new BrowserReviewClientError("engine_unavailable"));
+      return;
+    }
+    const id = `request_${++this.#requestSequence}`;
+    this.#setStatus("reviewing");
+    const timer = setTimeout(() => this.#failActive("review_timeout", true), this.#timeoutMs);
+    this.#active = {
+      id,
+      before: request.before,
+      answers: request.answers,
+      resolve: request.resolve,
+      reject: request.reject,
+      timer,
+    };
+    try {
+      worker.postMessage(JSON.stringify({
+        type: "review",
+        protocol_version: WORKER_PROTOCOL_VERSION,
+        request_id: id,
+        source: request.source,
+        answers_json: request.answersJson,
+      }));
+    } catch {
+      this.#failActive("engine_failed", true);
+    }
   }
 
   #spawnWorker(): void {
@@ -289,59 +334,62 @@ export class BrowserReviewClient {
       this.#worker = worker;
       worker.onmessage = (event) => this.#handleMessage(event.data);
       worker.onerror = () => this.#handleCrash();
+      this.#bootTimer = setTimeout(
+        () => this.#failBoot("engine_unavailable"),
+        this.#bootTimeoutMs,
+      );
     } catch {
       this.#worker = null;
       this.#setStatus("failed");
-      const error = new BrowserReviewClientError("engine_unavailable");
-      for (const waiter of this.#readyWaiters) waiter.reject(error);
-      this.#readyWaiters.clear();
+      this.#rejectReadyWaiters("engine_unavailable");
     }
   }
 
   #handleMessage(message: unknown): void {
     if (typeof message !== "string") {
-      this.#failActive("worker_protocol", true);
+      this.#protocolFailure();
       return;
     }
     if (new TextEncoder().encode(message).byteLength > MAX_WORKER_MESSAGE_BYTES) {
-      this.#failActive("result_too_large", true);
+      if (this.#engineReady) this.#failActive("result_too_large", true);
+      else this.#failBoot("engine_unavailable");
       return;
     }
     let decoded: unknown;
     try {
       decoded = JSON.parse(message);
     } catch {
-      this.#failActive("worker_protocol", true);
+      this.#protocolFailure();
       return;
     }
     const record = messageRecord(decoded);
     if (record === null || record.protocol_version !== WORKER_PROTOCOL_VERSION || typeof record.type !== "string") {
-      this.#failActive("worker_protocol", true);
+      this.#protocolFailure();
       return;
     }
     if (record.type === "ready") {
       if (!exactFields(record, ["type", "protocol_version"]) || this.#active !== null) {
-        this.#failActive("worker_protocol", true);
+        this.#protocolFailure();
         return;
       }
+      this.#clearBootTimer();
       this.#engineReady = true;
       this.#setStatus("ready");
       for (const waiter of this.#readyWaiters) waiter.resolve();
       this.#readyWaiters.clear();
+      if (this.#queued !== null) {
+        const queued = this.#queued;
+        this.#queued = null;
+        this.#beginRequest(queued);
+      }
       return;
     }
     if (record.type === "fatal") {
       if (!exactFields(record, ["type", "protocol_version", "code", "message"])) {
-        this.#failActive("worker_protocol", true);
+        this.#protocolFailure();
         return;
       }
-      this.#failActive("engine_unavailable", false);
-      this.#engineReady = false;
-      this.#setStatus("failed");
-      const error = new BrowserReviewClientError("engine_unavailable");
-      for (const waiter of this.#readyWaiters) waiter.reject(error);
-      this.#readyWaiters.clear();
-      this.#detachAndTerminate();
+      this.#failBoot("engine_unavailable");
       return;
     }
     const active = this.#active;
@@ -385,8 +433,32 @@ export class BrowserReviewClient {
 
   #handleCrash(): void {
     if (this.#disposed) return;
-    if (this.#active !== null) this.#failActive("engine_failed", true);
+    if (!this.#engineReady) this.#failBoot("engine_failed");
+    else if (this.#active !== null) this.#failActive("engine_failed", true);
     else this.#replaceWorker();
+  }
+
+  #failBoot(code: string): void {
+    this.#clearBootTimer();
+    if (this.#active !== null) {
+      const active = this.#active;
+      clearTimeout(active.timer);
+      this.#active = null;
+      active.reject(new BrowserReviewClientError(code));
+    }
+    if (this.#queued !== null) {
+      const queued = this.#queued;
+      this.#queued = null;
+      queued.reject(new BrowserReviewClientError(code));
+    }
+    this.#rejectReadyWaiters(code);
+    this.#detachAndTerminate();
+    this.#setStatus("failed");
+  }
+
+  #protocolFailure(): void {
+    if (this.#engineReady) this.#failActive("worker_protocol", true);
+    else this.#failBoot("engine_unavailable");
   }
 
   #failActive(code: string, restart: boolean): void {
@@ -406,6 +478,7 @@ export class BrowserReviewClient {
   }
 
   #detachAndTerminate(): void {
+    this.#clearBootTimer();
     const worker = this.#worker;
     this.#worker = null;
     this.#engineReady = false;
@@ -414,6 +487,19 @@ export class BrowserReviewClient {
       worker.onerror = null;
       worker.terminate();
     }
+  }
+
+  #clearBootTimer(): void {
+    if (this.#bootTimer !== null) {
+      clearTimeout(this.#bootTimer);
+      this.#bootTimer = null;
+    }
+  }
+
+  #rejectReadyWaiters(code: string): void {
+    const error = new BrowserReviewClientError(code);
+    for (const waiter of this.#readyWaiters) waiter.reject(error);
+    this.#readyWaiters.clear();
   }
 
   #setStatus(status: BrowserReviewStatus): void {
