@@ -10,6 +10,7 @@ from heel.review_contract import (
     build_review_envelope,
     stable_json,
     stable_json_hash,
+    validate_review_envelope,
 )
 
 
@@ -183,6 +184,27 @@ class ReviewContractTests(unittest.TestCase):
                 if key not in {"review_id", "result_hash"}}
         self.assertEqual(envelope["result_hash"], stable_json_hash(body))
         self.assertEqual(envelope["review_id"], "review_" + envelope["result_hash"][:20])
+
+    def test_envelope_validator_checks_schema_integrity_and_detaches(self):
+        envelope = self._build()
+        validated = validate_review_envelope(envelope)
+        self.assertEqual(validated, envelope)
+        self.assertIsNot(validated, envelope)
+        self.assertIsNot(validated["findings"], envelope["findings"])
+
+        validated["findings"][0]["reason"] = "mutated"
+        self.assertNotEqual(validated, envelope)
+
+    def test_envelope_validator_rejects_unknown_fields_and_content_tampering(self):
+        unknown = self._build()
+        unknown["raw_openapi"] = {"paths": {}}
+        with self.assertRaisesRegex(ValueError, "v1 fields"):
+            validate_review_envelope(unknown)
+
+        tampered = self._build()
+        tampered["product_id"] = "tampered"
+        with self.assertRaisesRegex(ValueError, "result_hash"):
+            validate_review_envelope(tampered)
 
     def test_execution_modes_have_truthful_mode_specific_privacy(self):
         self.assertIsInstance(EXECUTION_MODES, frozenset)

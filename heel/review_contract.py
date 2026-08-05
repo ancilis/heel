@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import re
@@ -14,6 +15,28 @@ EXECUTION_MODES = frozenset({"browser_local", "machine_local", "cloud_isolated"}
 
 _JS_SAFE_INTEGER = 2**53 - 1
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+_REVIEW_ID = re.compile(r"review_[0-9a-f]{20}\Z")
+_ENVELOPE_FIELDS = (
+    "review_id",
+    "result_hash",
+    "schema_version",
+    "engine_version",
+    "product_id",
+    "source_hash",
+    "model_hash",
+    "baseline_hash",
+    "execution_mode",
+    "gate_status",
+    "summary",
+    "findings",
+    "recommended_controls",
+    "suggested_regressions",
+    "questions",
+    "safety",
+    "privacy",
+)
+_SUMMARY_FIELDS = ("findings", "blockers", "questions")
+_PRIVACY_FIELDS = ("execution", "network_calls", "uploaded", "sync_intent")
 _FINDING_FIELDS = (
     "surface_type",
     "surface_id",
@@ -122,6 +145,12 @@ def _require_boolean(value: Any, path: str) -> bool:
     return value
 
 
+def _require_nonnegative_integer(value: Any, path: str) -> int:
+    if type(value) is not int or value < 0 or value > _JS_SAFE_INTEGER:
+        raise ValueError(f"{path} must be a nonnegative JavaScript-safe integer")
+    return value
+
+
 def _require_exact_fields(record: dict[str, Any], fields: tuple[str, ...], path: str) -> None:
     actual = frozenset(record)
     expected = frozenset(fields)
@@ -206,6 +235,116 @@ def _validate_hash(value: Any, path: str, *, allow_none: bool = False) -> str | 
     return value
 
 
+def validate_review_id(value: Any) -> str:
+    """Validate the exact content-addressed identifier syntax used by v1 reviews."""
+    if type(value) is not str or _REVIEW_ID.fullmatch(value) is None:
+        raise ValueError("review_id must match review_[0-9a-f]{20}")
+    return value
+
+
+def _finding_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        0 if item["severity"] == "block" else 1,
+        item["surface_type"],
+        item["surface_id"],
+        item["risk"],
+        stable_json(item),
+    )
+
+
+def validate_review_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Validate and detach a complete content-addressed ``heel.review.v1`` envelope."""
+    item = _require_object(_normalize_json(envelope, "envelope"), "envelope")
+    _require_exact_fields(item, _ENVELOPE_FIELDS, "envelope")
+
+    review_id = validate_review_id(item["review_id"])
+    result_hash = _validate_hash(item["result_hash"], "result_hash")
+    if item["schema_version"] != REVIEW_SCHEMA_VERSION:
+        raise ValueError(f"schema_version must be {REVIEW_SCHEMA_VERSION}")
+    _require_nonempty_string(item["engine_version"], "engine_version")
+    _require_nonempty_string(item["product_id"], "product_id")
+    _validate_hash(item["source_hash"], "source_hash")
+    _validate_hash(item["model_hash"], "model_hash")
+    _validate_hash(item["baseline_hash"], "baseline_hash", allow_none=True)
+
+    execution_mode = item["execution_mode"]
+    if type(execution_mode) is not str or execution_mode not in EXECUTION_MODES:
+        raise ValueError(f"unsupported execution_mode: {execution_mode}")
+    gate_status = item["gate_status"]
+    if type(gate_status) is not str or gate_status not in {"pass", "warn", "block"}:
+        raise ValueError("gate_status must be pass, warn, or block")
+
+    findings = _validate_findings(item["findings"], "findings")
+    controls = _validate_findings(item["recommended_controls"], "recommended_controls")
+    regressions = _validate_regressions(
+        item["suggested_regressions"], "suggested_regressions"
+    )
+    questions = _validate_questions(item["questions"])
+    safety = _validate_safety(item["safety"])
+
+    if findings != sorted(findings, key=_finding_sort_key):
+        raise ValueError("findings must use canonical v1 ordering")
+    for name, records in (
+        ("recommended_controls", controls),
+        ("suggested_regressions", regressions),
+        ("questions", questions),
+    ):
+        if records != sorted(records, key=stable_json):
+            raise ValueError(f"{name} must use canonical v1 ordering")
+
+    blockers = sum(finding["severity"] == "block" for finding in findings)
+    expected_gate = "block" if blockers else "warn" if findings else "pass"
+    if gate_status != expected_gate:
+        raise ValueError(f"gate_status must be {expected_gate} for the supplied findings")
+
+    summary = _require_object(item["summary"], "summary")
+    _require_exact_fields(summary, _SUMMARY_FIELDS, "summary")
+    normalized_summary = {
+        field: _require_nonnegative_integer(summary[field], f"summary.{field}")
+        for field in _SUMMARY_FIELDS
+    }
+    expected_summary = {
+        "findings": len(findings),
+        "blockers": blockers,
+        "questions": len(questions),
+    }
+    if normalized_summary != expected_summary:
+        raise ValueError("summary does not match the envelope contents")
+
+    privacy = _require_object(item["privacy"], "privacy")
+    _require_exact_fields(privacy, _PRIVACY_FIELDS, "privacy")
+    normalized_privacy = {
+        "execution": _require_nonempty_string(privacy["execution"], "privacy.execution"),
+        "network_calls": _require_boolean(privacy["network_calls"], "privacy.network_calls"),
+        "uploaded": _require_boolean(privacy["uploaded"], "privacy.uploaded"),
+        "sync_intent": _require_nonempty_string(
+            privacy["sync_intent"], "privacy.sync_intent"
+        ),
+    }
+    expected_privacy = {
+        "execution": execution_mode,
+        "network_calls": False,
+        "uploaded": execution_mode == "cloud_isolated",
+        "sync_intent": "sanitized_model" if execution_mode == "cloud_isolated" else "none",
+    }
+    if normalized_privacy != expected_privacy:
+        raise ValueError("privacy contradicts the execution_mode v1 contract")
+    if safety["network_calls"] != normalized_privacy["network_calls"]:
+        raise ValueError("safety and privacy network_calls must agree")
+
+    body = {
+        key: value for key, value in item.items()
+        if key not in {"review_id", "result_hash"}
+    }
+    expected_hash = stable_json_hash(body)
+    if not hmac.compare_digest(result_hash, expected_hash):
+        raise ValueError("result_hash does not match the review envelope contents")
+    expected_review_id = "review_" + expected_hash[:20]
+    if not hmac.compare_digest(review_id, expected_review_id):
+        raise ValueError("review_id does not match the result_hash")
+    return item
+
+
 def build_review_envelope(
     review: dict[str, Any], *, source_hash: str, model_hash: str,
     baseline_hash: str | None, execution_mode: str,
@@ -243,13 +382,7 @@ def build_review_envelope(
             f"launch_gate_status must be {expected_gate} for the supplied findings"
         )
 
-    findings.sort(key=lambda item: (
-        0 if item["severity"] == "block" else 1,
-        item["surface_type"],
-        item["surface_id"],
-        item["risk"],
-        stable_json(item),
-    ))
+    findings.sort(key=_finding_sort_key)
     controls.sort(key=stable_json)
     regressions.sort(key=stable_json)
     normalized_questions.sort(key=stable_json)

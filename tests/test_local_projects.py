@@ -1,0 +1,335 @@
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+import unittest
+from unittest import mock
+
+from heel.review_contract import stable_json
+from heel.review_service import review_openapi
+
+
+ROOT = Path(__file__).resolve().parents[1]
+OPENAPI_FIXTURE = ROOT / "tests/fixtures/openapi/saas_api.json"
+GOLDEN_FIXTURE = ROOT / "tests/fixtures/reviews/sample_review_v1.json"
+
+
+def _golden_envelope():
+    return json.loads(GOLDEN_FIXTURE.read_text(encoding="utf-8"))
+
+
+def _sample_spec():
+    return json.loads(OPENAPI_FIXTURE.read_text(encoding="utf-8"))
+
+
+def _review_for(product_id):
+    return review_openapi({
+        "openapi": "3.1.0",
+        "info": {"title": product_id, "version": "1"},
+        "paths": {},
+    })
+
+
+class LocalProjectStoreTests(unittest.TestCase):
+    def test_review_round_trip_uses_canonical_heel_home_and_sorted_json(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"HEEL_HOME": tmp}):
+                store = LocalProjectStore()
+                envelope = _golden_envelope()
+                saved = store.save_review(envelope)
+
+                expected = Path(tmp) / "reviews" / f"{envelope['review_id']}.json"
+                self.assertEqual(saved, expected)
+                self.assertEqual(store.get_review(envelope["review_id"]), envelope)
+                self.assertEqual(
+                    store.list_reviews(),
+                    [{
+                        "review_id": envelope["review_id"],
+                        "product_id": envelope["product_id"],
+                        "gate_status": envelope["gate_status"],
+                    }],
+                )
+                self.assertEqual(list(Path(tmp).rglob("*.json")), [expected])
+                self.assertEqual(
+                    expected.read_text(encoding="utf-8"),
+                    stable_json(envelope) + "\n",
+                )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits required")
+    def test_store_locks_directories_and_review_files_to_owner(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent) / "heel-home"
+            store = LocalProjectStore(root)
+            path = store.save_review(_golden_envelope())
+
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE((root / "reviews").stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_invalid_and_traversal_review_ids_are_rejected(self):
+        from heel.local_projects import LocalProjectStore
+
+        invalid_ids = (
+            "review_abc",
+            "review_" + "a" * 19,
+            "review_" + "A" * 20,
+            "review_" + "a" * 21,
+            "../review_" + "a" * 20,
+            "review_" + "a" * 20 + "/../../escape",
+            "/tmp/review_" + "a" * 20,
+            "review_" + "a" * 19 + "g",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalProjectStore(Path(tmp))
+            for review_id in invalid_ids:
+                with self.subTest(review_id=review_id):
+                    envelope = _golden_envelope()
+                    envelope["review_id"] = review_id
+                    with self.assertRaisesRegex(ValueError, "review_id"):
+                        store.save_review(envelope)
+                    with self.assertRaisesRegex(ValueError, "review_id"):
+                        store.get_review(review_id)
+            self.assertFalse((Path(tmp).parent / "escape.json").exists())
+
+    def test_valid_shape_but_wrong_content_address_is_rejected(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalProjectStore(Path(tmp))
+            envelope = _golden_envelope()
+            envelope["review_id"] = "review_" + "a" * 20
+            with self.assertRaisesRegex(ValueError, "review_id"):
+                store.save_review(envelope)
+
+    def test_symlinked_review_target_is_rejected_for_save_read_and_list(self):
+        from heel.local_projects import LocalProjectStore
+
+        if not hasattr(os, "symlink"):
+            self.skipTest("symbolic links unavailable")
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
+            root = Path(tmp)
+            reviews = root / "reviews"
+            reviews.mkdir()
+            envelope = _golden_envelope()
+            outside_path = Path(outside) / "review.json"
+            outside_path.write_text(stable_json(envelope) + "\n", encoding="utf-8")
+            target = reviews / f"{envelope['review_id']}.json"
+            try:
+                target.symlink_to(outside_path)
+            except OSError as exc:
+                self.skipTest(f"symbolic links unavailable: {exc}")
+
+            store = LocalProjectStore(root)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                store.get_review(envelope["review_id"])
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                store.list_reviews()
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                store.save_review(envelope)
+            self.assertEqual(json.loads(outside_path.read_text(encoding="utf-8")), envelope)
+
+    def test_symlinked_reviews_directory_is_rejected(self):
+        from heel.local_projects import LocalProjectStore
+
+        if not hasattr(os, "symlink"):
+            self.skipTest("symbolic links unavailable")
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
+            reviews = Path(tmp) / "reviews"
+            try:
+                reviews.symlink_to(Path(outside), target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symbolic links unavailable: {exc}")
+            store = LocalProjectStore(Path(tmp))
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                store.list_reviews()
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                store.save_review(_golden_envelope())
+
+    def test_tampered_hash_is_rejected_on_save_read_and_list(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalProjectStore(Path(tmp))
+            envelope = _golden_envelope()
+            tampered = json.loads(json.dumps(envelope))
+            tampered["product_id"] = "tampered-product"
+            with self.assertRaisesRegex(ValueError, "result_hash"):
+                store.save_review(tampered)
+
+            path = store.save_review(envelope)
+            path.write_text(stable_json(tampered) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "result_hash"):
+                store.get_review(envelope["review_id"])
+            with self.assertRaisesRegex(ValueError, "result_hash"):
+                store.list_reviews()
+
+    def test_corrupt_stored_json_fails_visibly(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalProjectStore(Path(tmp))
+            envelope = _golden_envelope()
+            reviews = Path(tmp) / "reviews"
+            reviews.mkdir()
+            path = reviews / f"{envelope['review_id']}.json"
+            path.write_text("{not valid JSON\n", encoding="utf-8")
+
+            with self.assertRaises(json.JSONDecodeError):
+                store.get_review(envelope["review_id"])
+            with self.assertRaises(json.JSONDecodeError):
+                store.list_reviews()
+
+    def test_missing_review_returns_none_and_list_is_deterministic(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalProjectStore(Path(tmp))
+            self.assertIsNone(store.get_review("review_" + "0" * 20))
+            self.assertEqual(store.list_reviews(), [])
+
+            reviews = [_review_for("Zulu Product"), _review_for("Alpha Product")]
+            for envelope in reversed(reviews):
+                store.save_review(envelope)
+            expected = sorted(({
+                "review_id": envelope["review_id"],
+                "product_id": envelope["product_id"],
+                "gate_status": envelope["gate_status"],
+            } for envelope in reviews), key=lambda item: item["review_id"])
+            self.assertEqual(store.list_reviews(), expected)
+
+    def test_saved_and_returned_reviews_are_detached_from_caller_mutation(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalProjectStore(Path(tmp))
+            envelope = _golden_envelope()
+            expected = json.loads(json.dumps(envelope))
+            store.save_review(envelope)
+
+            envelope["product_id"] = "caller-mutated"
+            envelope["findings"][0]["reason"] = "caller-mutated"
+            loaded = store.get_review(expected["review_id"])
+            self.assertEqual(loaded, expected)
+
+            loaded["product_id"] = "return-mutated"
+            loaded["findings"][0]["reason"] = "return-mutated"
+            self.assertEqual(store.get_review(expected["review_id"]), expected)
+
+    def test_sample_review_persists_only_envelope_not_raw_openapi_content(self):
+        from heel.local_projects import LocalProjectStore
+
+        marker = "INTERNAL ROUTE DESCRIPTION: customer source content"
+        spec = _sample_spec()
+        spec["paths"]["/api/export/bulk"]["get"]["description"] = marker
+        envelope = review_openapi(spec)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalProjectStore(Path(tmp))
+            path = store.save_review(envelope)
+            persisted = path.read_text(encoding="utf-8")
+
+            self.assertEqual(json.loads(persisted), envelope)
+            self.assertNotIn(marker, persisted)
+            self.assertNotIn('"paths"', persisted)
+
+
+class ReviewExportTests(unittest.TestCase):
+    def test_markdown_is_deterministic_and_contains_required_review_details(self):
+        from heel.review_export import review_to_markdown
+
+        envelope = _golden_envelope()
+        reordered = {key: value for key, value in reversed(envelope.items())}
+        markdown = review_to_markdown(envelope)
+
+        self.assertEqual(markdown, review_to_markdown(reordered))
+        self.assertTrue(markdown.startswith(
+            f"# Heel launch review: {envelope['product_id']}\n"
+        ))
+        self.assertIn(f"Gate: **{envelope['gate_status'].upper()}**", markdown)
+        self.assertIn(f"Findings: {envelope['summary']['findings']}", markdown)
+        self.assertIn(f"Blockers: {envelope['summary']['blockers']}", markdown)
+        finding = envelope["findings"][0]
+        self.assertIn(f"Severity: **{finding['severity'].upper()}**", markdown)
+        self.assertIn(f"{finding['surface_type']} / {finding['surface_id']}", markdown)
+        self.assertIn(finding["reason"], markdown)
+        self.assertIn(f"Recommended control: {finding['control']}", markdown)
+        self.assertIn("analyzed locally", markdown)
+        self.assertIn("not uploaded", markdown)
+
+    def test_cloud_markdown_does_not_claim_local_analysis_or_no_upload(self):
+        from heel.review_export import review_to_markdown
+
+        markdown = review_to_markdown(
+            review_openapi(_sample_spec(), execution_mode="cloud_isolated")
+        )
+        self.assertIn("isolated cloud worker", markdown)
+        self.assertIn("sanitized model was uploaded", markdown)
+        self.assertNotIn("analyzed locally", markdown)
+        self.assertNotIn("not uploaded", markdown)
+
+    def test_markdown_escapes_embedded_html(self):
+        from heel.review_contract import build_review_envelope
+        from heel.review_export import review_to_markdown
+
+        review = {
+            "product_id": "<script>alert(1)</script>",
+            "launch_gate_status": "block",
+            "new_abuse_affordances": [{
+                "surface_type": "exports",
+                "surface_id": "<img src=x onerror=alert(1)>",
+                "risk": "missing_control",
+                "severity": "block",
+                "control": "<b>tenant gate</b>",
+                "reason": "<svg onload=alert(1)>",
+                "reachable": True,
+            }],
+            "recommended_controls": [],
+            "suggested_regression_tests": [],
+            "safety": {
+                "mode": "static ProductModel diff",
+                "live_probing": False,
+                "network_calls": False,
+                "requires_signed_scope_for_live_or_staging_runs": True,
+                "canary_only": True,
+            },
+        }
+        envelope = build_review_envelope(
+            review,
+            source_hash="a" * 64,
+            model_hash="b" * 64,
+            baseline_hash=None,
+            execution_mode="machine_local",
+            questions=[],
+        )
+        markdown = review_to_markdown(envelope)
+
+        for raw_html in ("<script>", "<img", "<b>", "<svg"):
+            self.assertNotIn(raw_html, markdown)
+        self.assertIn("&lt;script&gt;", markdown)
+        self.assertIn("&lt;svg", markdown)
+
+    def test_json_export_is_valid_sorted_deterministic_and_integrity_checked(self):
+        from heel.review_export import review_to_json, review_to_markdown
+
+        envelope = _golden_envelope()
+        reordered = {key: value for key, value in reversed(envelope.items())}
+        exported = review_to_json(envelope)
+        self.assertEqual(exported, review_to_json(reordered))
+        self.assertEqual(exported, stable_json(envelope) + "\n")
+        self.assertEqual(json.loads(exported), envelope)
+
+        tampered = json.loads(json.dumps(envelope))
+        tampered["gate_status"] = "pass"
+        with self.assertRaises(ValueError):
+            review_to_json(tampered)
+        with self.assertRaises(ValueError):
+            review_to_markdown(tampered)
+
+
+if __name__ == "__main__":
+    unittest.main()
