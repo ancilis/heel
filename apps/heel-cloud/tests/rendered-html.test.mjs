@@ -145,7 +145,7 @@ test("ships server-renderable evidence, local interaction semantics, and accessi
   assert.doesNotMatch(page, /Preparing Heel|loading-shell/);
   assert.match(productSource, /Run the sample/);
   assert.match(productSource, /Analyze mine/);
-  assert.match(productSource, /Runs here, not on our server/);
+  assert.match(productSource, /Source analysis runs here, not on our server/);
   assert.match(workspace, /aria-live="polite"/);
   assert.match(workspace, /role="alert"/);
   assert.match(workspace, /tabIndex=\{-1\}/);

@@ -14,7 +14,7 @@ export default function Home() {
         </a>
         <span className="local-status">
           <span aria-hidden="true" />
-          Runs here, not on our server
+          Source analysis runs here, not on our server
         </span>
       </header>
 
@@ -33,9 +33,25 @@ export default function Home() {
       </section>
 
       <section className="availability" id="availability" aria-labelledby="availability-title">
-        <p className="eyebrow">Clear boundary, clear price</p>
-        <h2 id="availability-title">Local browser, CLI, and base MCP stay free.</h2>
-        <p>Heel Cloud paid beta starts at $49/month. Collaboration capabilities are coming later.</p>
+        <p className="eyebrow">Start local · add continuity when useful</p>
+        <h2 id="availability-title">Useful before signup. Predictable after.</h2>
+        <div className="price-grid">
+          <article>
+            <strong>Free</strong>
+            <span>$0 · no card</span>
+            <p>Browser, CLI, base MCP, and 3 findings-only cloud reviews each month.</p>
+          </article>
+          <article>
+            <strong>Pro</strong>
+            <span>$49/month</span>
+            <p>25 synced reviews, 3 seats, exports, and email support.</p>
+          </article>
+          <article>
+            <strong>Team</strong>
+            <span>$199/month</span>
+            <p>100 synced reviews, 10 seats, role controls, and priority support.</p>
+          </article>
+        </div>
       </section>
     </main>
   );

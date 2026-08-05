@@ -45,6 +45,10 @@ const RESPONSE_HEADERS = Object.freeze({
 
 const CONTROL_PLANE_PREFIX = "/api/control-plane";
 const CONTROL_PLANE_ORIGIN = "https://heel-control-plane.internal";
+const SIGNUP_ROUTE = "/v1/signup";
+const LOGIN_ROUTE = "/v1/login";
+const LOGOUT_ROUTE = "/v1/logout";
+const ME_ROUTE = "/v1/me";
 const WORKSPACE_REF = "ws_[0-9a-f]{16}";
 const PROJECT_REF = "prj_[0-9a-f]{32}";
 const SYNCED_REVIEW_REF = "synrev_[0-9a-f]{32}";
@@ -131,7 +135,9 @@ function controlPlaneRequestHeaders(
   method: string,
   upstreamPath: string,
 ): { headers: Headers; contentLength: number } {
-  const headers = controlPlaneCredentials(source);
+  const headers = upstreamPath === SIGNUP_ROUTE || upstreamPath === LOGIN_ROUTE
+    ? new Headers()
+    : controlPlaneCredentials(source);
   if (method !== "POST") return { headers, contentLength: 0 };
   if (source.has("Transfer-Encoding")) throw new InvalidControlPlaneRequest();
 
@@ -161,11 +167,32 @@ function controlPlaneRequestHeaders(
   return { headers, contentLength };
 }
 
-function controlPlaneResponse(response: Response, csp: string): Response {
+function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""): Response {
   const headers = new Headers();
   for (const name of ["Content-Type", "Content-Length", "Retry-After"]) {
     const value = response.headers.get(name);
     if (value !== null) headers.set(name, value);
+  }
+  if (response.status >= 200 && response.status <= 299) {
+    const setCookie = response.headers.get("Set-Cookie");
+    if (upstreamPath === SIGNUP_ROUTE || upstreamPath === LOGIN_ROUTE) {
+      const match = setCookie?.match(
+        /^heel_session=([A-Za-z0-9_-]+); HttpOnly; SameSite=Lax; Path=\/$/,
+      );
+      if (match === undefined || match === null) throw new Error("invalid session response");
+      headers.set(
+        "Set-Cookie",
+        `heel_session=${match[1]}; HttpOnly; SameSite=Lax; Path=/; Secure`,
+      );
+    } else if (upstreamPath === LOGOUT_ROUTE) {
+      if (setCookie !== "heel_session=; Max-Age=0; Path=/") {
+        throw new Error("invalid session response");
+      }
+      headers.set(
+        "Set-Cookie",
+        "heel_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure",
+      );
+    }
   }
   return withSecurityHeaders(new Response(response.body, {
     headers,
@@ -186,6 +213,9 @@ function controlPlaneRoute(method: string, pathname: string): string | null {
     return null;
   }
   const upstreamPath = pathname.slice(CONTROL_PLANE_PREFIX.length);
+  if ((upstreamPath === SIGNUP_ROUTE || upstreamPath === LOGIN_ROUTE || upstreamPath === LOGOUT_ROUTE)
+    && method === "POST") return upstreamPath;
+  if (upstreamPath === ME_ROUTE && method === "GET") return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
   }
@@ -239,7 +269,7 @@ async function proxyControlPlane(
     if (response.status >= 300 && response.status <= 399) {
       return proxyError(502, "control plane request failed", csp);
     }
-    return controlPlaneResponse(response, csp);
+    return controlPlaneResponse(response, csp, upstreamPath);
   } catch {
     return proxyError(502, "control plane request failed", csp);
   }

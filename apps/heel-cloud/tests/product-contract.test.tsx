@@ -755,4 +755,26 @@ describe("Heel anonymous launch review", () => {
     expect(container.textContent).toContain("Only validated results may be explicitly saved on this device");
     expect(container.textContent).toContain("No sync intent");
   });
+
+  test("restores continuity-trigger focus only after the inert modal unmounts", async () => {
+    vi.stubGlobal("Worker", class {
+      onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+      onerror: ((event: ErrorEvent) => void) | null = null;
+      postMessage() {}
+      terminate() {}
+    });
+    render(<Home />);
+    const trigger = screen.getByRole("button", { name: /Keep findings across devices/i });
+    trigger.focus();
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole("dialog");
+    const background = trigger.closest<HTMLElement>("#review")!;
+    expect(background.inert).toBe(true);
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(background.inert).toBeFalsy();
+    expect(trigger.ownerDocument.activeElement).toBe(trigger);
+  });
 });

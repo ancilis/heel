@@ -1306,7 +1306,27 @@ test("recursively scans every deployed executable, text manifest, and wheel memb
       /https?:\/\/(?:cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com|esm\.sh|pypi\.org|files\.pythonhosted\.org)/i,
       label,
     );
-    assert.doesNotMatch(record.text, /["'`]\/(?:api\/)?reviews?(?:\/|[?"'`])/i, label);
+    const carriesReviewedHistoryPath = ["`/reviews`", '"/reviews"', "'/reviews'"]
+      .some((literal) => record.text.includes(literal));
+    if (carriesReviewedHistoryPath) {
+      assert.match(
+        label,
+        /^(?:client|server\/ssr)\/assets\/ReviewWorkspace-[A-Za-z0-9_-]+\.js$/,
+      );
+      assert.match(record.text, /["'`]\/api\/control-plane["'`]/);
+      assert.match(record.text, /\/v1\/workspaces\//);
+      assert.match(record.text, /credentials\s*:\s*["'`]same-origin["'`]/);
+      assert.match(record.text, /cache\s*:\s*["'`]no-store["'`]/);
+    }
+    const withoutReviewedHistoryPath = record.text
+      .replaceAll("`/reviews`", "")
+      .replaceAll('"/reviews"', "")
+      .replaceAll("'/reviews'", "");
+    assert.doesNotMatch(
+      withoutReviewedHistoryPath,
+      /["'`]\/(?:api\/)?reviews?(?:\/|[?"'`])/i,
+      label,
+    );
     assert.doesNotMatch(
       record.text,
       /(?:from\s*["']@sentry\/|import\s*\(\s*["']@sentry\/|require\s*\(\s*["']@sentry\/|sentry\.init\s*\(|posthog\.(?:init|capture)\s*\(|datadogRum\.|newrelic\.start|rollbar\.init|bugsnag\.start|segment\.io\/v1|mixpanel\.init\s*\(|amplitude\.init\s*\()/i,
@@ -1699,6 +1719,133 @@ test("production worker streams only the approved findings control-plane routes"
   );
   assert.equal(query.status, 400);
   assert.equal(calls.length, callsBeforeQuery, "a query crossed the closed proxy contract");
+});
+
+
+test("production worker carries only Heel session cookies on the exact account routes", async () => {
+  const artifact = await import(
+    pathToFileURL(join(serverRoot, "index.js")).href + `?account-proxy=${Date.now()}`
+  );
+  const calls = [];
+  const environment = {
+    ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
+    IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    CONTROL_PLANE: {
+      async fetch(request) {
+        calls.push({
+          body: await request.text(),
+          headers: Object.fromEntries(request.headers),
+          method: request.method,
+          url: request.url,
+        });
+        const pathname = new URL(request.url).pathname;
+        const setCookie = pathname === "/v1/logout"
+          ? "heel_session=; Max-Age=0; Path=/"
+          : pathname === "/v1/signup" || pathname === "/v1/login"
+            ? "heel_session=private; HttpOnly; SameSite=Lax; Path=/"
+            : null;
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: {
+            "Content-Type": "application/json",
+            ...(setCookie === null ? {} : { "Set-Cookie": setCookie }),
+          },
+        });
+      },
+    },
+  };
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  const body = JSON.stringify({ email: "founder@example.com", password: "correct-horse-staple-42" });
+
+  for (const path of ["/v1/signup", "/v1/login"]) {
+    const response = await artifact.default.fetch(
+      new Request(`https://proxy.heel.invalid/api/control-plane${path}`, {
+        method: "POST",
+        body,
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": String(Buffer.byteLength(body)),
+          Cookie: "unrelated=discard; heel_session=stale-session",
+          "X-Customer-Metadata": "never-forward",
+        },
+      }),
+      environment,
+      context,
+    );
+    assert.equal(response.status, 200, path);
+    assert.equal(
+      response.headers.get("set-cookie"),
+      "heel_session=private; HttpOnly; SameSite=Lax; Path=/; Secure",
+    );
+    const call = calls.at(-1);
+    assert.equal(call.url, `https://heel-control-plane.internal${path}`);
+    assert.equal(call.headers.cookie, undefined, `${path} forwarded a stale session`);
+    assert.equal(call.headers["x-customer-metadata"], undefined);
+  }
+
+  const me = await artifact.default.fetch(
+    new Request("https://proxy.heel.invalid/api/control-plane/v1/me", {
+      headers: { Cookie: "unrelated=discard; heel_session=private" },
+    }),
+    environment,
+    context,
+  );
+  assert.equal(me.status, 200);
+  assert.equal(calls.at(-1).headers.cookie, "heel_session=private");
+
+  const logoutBody = "{}";
+  const logout = await artifact.default.fetch(
+    new Request("https://proxy.heel.invalid/api/control-plane/v1/logout", {
+      method: "POST",
+      body: logoutBody,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": String(Buffer.byteLength(logoutBody)),
+        Cookie: "heel_session=private; unrelated=discard",
+      },
+    }),
+    environment,
+    context,
+  );
+  assert.equal(logout.status, 200);
+  assert.equal(
+    logout.headers.get("set-cookie"),
+    "heel_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure",
+  );
+  assert.equal(calls.at(-1).headers.cookie, "heel_session=private");
+
+  environment.CONTROL_PLANE.fetch = async () => new Response("{}", {
+    headers: {
+      "Content-Type": "application/json",
+      "Set-Cookie": "attacker=exfiltrate; Domain=attacker.invalid",
+    },
+  });
+  const malformedCookie = await artifact.default.fetch(
+    new Request("https://proxy.heel.invalid/api/control-plane/v1/login", {
+      method: "POST",
+      body,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": String(Buffer.byteLength(body)),
+      },
+    }),
+    environment,
+    context,
+  );
+  assert.equal(malformedCookie.status, 502);
+  assert.equal(malformedCookie.headers.get("set-cookie"), null);
+
+  for (const [method, path] of [
+    ["GET", "/v1/login"],
+    ["POST", "/v1/me"],
+    ["GET", "/v1/logout"],
+  ]) {
+    const rejected = await artifact.default.fetch(
+      new Request(`https://proxy.heel.invalid/api/control-plane${path}`, { method }),
+      environment,
+      context,
+    );
+    assert.equal(rejected.status, 404, `${method} ${path}`);
+  }
 });
 
 

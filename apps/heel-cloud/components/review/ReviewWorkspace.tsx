@@ -26,6 +26,7 @@ import type { ReviewAnswer, ReviewAnswerReceiptV1 } from "../../lib/review-prese
 import type { ReviewEnvelopeV1 } from "../../lib/review-v1";
 import { SAMPLE_OPENAPI_SOURCE } from "../../lib/sample-openapi";
 import { FindingView } from "./FindingView";
+import { FindingsSyncDialog } from "./FindingsSyncDialog";
 import { OpenApiInput } from "./OpenApiInput";
 import { PrivacyReceipt } from "./PrivacyReceipt";
 import { QuestionList, questionAnswerKey } from "./QuestionList";
@@ -134,6 +135,8 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
   const [history, setHistory] = useState<StoredLocalReviewV1[]>([]);
   const [storageNotice, setStorageNotice] = useState<{ reviewId: string; message: string } | null>(null);
   const [retryAvailable, setRetryAvailable] = useState(false);
+  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
+  const [cloudContinuityReviewId, setCloudContinuityReviewId] = useState<string | null>(null);
   const clientRef = useRef<BrowserReviewClient | null>(null);
   const storeRef = useRef<LocalReviewStore | null>(null);
   const inputHeadingRef = useRef<HTMLDivElement>(null);
@@ -141,6 +144,8 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
   const requestGenerationRef = useRef(0);
   const requestActiveRef = useRef(false);
   const retryRequestRef = useRef<ReviewRequestSnapshot | null>(null);
+  const continuityButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreContinuityFocusRef = useRef(false);
 
   useEffect(() => {
     const client = new BrowserReviewClient();
@@ -178,6 +183,13 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
   useEffect(() => {
     if (error) errorRef.current?.focus();
   }, [error]);
+
+  useEffect(() => {
+    if (!syncDialogOpen && restoreContinuityFocusRef.current) {
+      restoreContinuityFocusRef.current = false;
+      continuityButtonRef.current?.focus();
+    }
+  }, [syncDialogOpen]);
 
   const primary = useMemo(() => topFinding(result), [result]);
   const finding = primary.finding;
@@ -418,6 +430,11 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
     setPhase("complete");
   }
 
+  function closeSyncDialog(): void {
+    restoreContinuityFocusRef.current = true;
+    setSyncDialogOpen(false);
+  }
+
   return (
     <>
       <section className="hero">
@@ -470,6 +487,20 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
         <div>
           <p className="eyebrow">{provenanceLabel}</p>
           <h2 id="workspace-title">See the evidence before you install anything.</h2>
+        </div>
+        <div className="workspace-actions cloud-continuity-action">
+          <span>{cloudContinuityReviewId === result.review_id
+            ? "This review's findings are kept in Heel Cloud"
+            : "This review is currently local only"}</span>
+          <button
+            ref={continuityButtonRef}
+            className="button button-secondary"
+            type="button"
+            onClick={() => setSyncDialogOpen(true)}
+            disabled={disabled}
+          >
+            Keep findings across devices
+          </button>
         </div>
       </div>
 
@@ -660,6 +691,15 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
         )}
       </section>
       </section>
+      {syncDialogOpen ? (
+        <FindingsSyncDialog
+          key={result.review_id}
+          open
+          review={result}
+          onClose={closeSyncDialog}
+          onSynced={() => setCloudContinuityReviewId(result.review_id)}
+        />
+      ) : null}
     </>
   );
 }

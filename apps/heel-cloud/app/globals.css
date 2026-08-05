@@ -897,11 +897,35 @@ fieldset.question {
   color: var(--signal-dark);
 }
 
-.availability p:last-child {
-  max-width: 700px;
-  margin: 22px 0 0;
+.price-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 28px;
+}
+
+.price-grid article {
+  display: grid;
+  gap: 6px;
+  padding: 20px;
+  border: 1px solid rgb(39 64 0 / 0.35);
+  border-radius: 12px;
+  background: rgb(255 255 255 / 0.52);
+}
+
+.price-grid strong {
+  font-size: 21px;
+}
+
+.price-grid span {
+  color: var(--signal-dark);
+  font-weight: 820;
+}
+
+.price-grid p {
+  margin: 4px 0 0;
   color: #304500;
-  font-weight: 650;
+  font-size: 14px;
 }
 
 .mcp-quickstart {
@@ -999,6 +1023,235 @@ fieldset.question {
   border-top: 1px solid var(--line);
 }
 
+.cloud-continuity-action {
+  min-width: min(100%, 280px);
+  align-items: flex-end;
+  flex-direction: column;
+}
+
+.cloud-continuity-action > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.sync-dialog-backdrop {
+  position: fixed;
+  z-index: 50;
+  display: grid;
+  overflow-y: auto;
+  padding: clamp(14px, 4vw, 48px);
+  background: rgb(6 21 17 / 0.72);
+  inset: 0;
+  place-items: start center;
+}
+
+.sync-dialog {
+  position: relative;
+  width: min(100%, 860px);
+  padding: clamp(24px, 5vw, 48px);
+  border: 1px solid var(--line-strong);
+  border-radius: 20px;
+  background: var(--surface);
+  box-shadow: 0 28px 90px rgb(0 0 0 / 0.28);
+}
+
+.sync-dialog h2 {
+  max-width: 680px;
+  margin: 0;
+  font-size: clamp(36px, 6vw, 64px);
+  letter-spacing: -0.055em;
+  line-height: 0.98;
+}
+
+.sync-dialog h3 {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: -0.025em;
+}
+
+.sync-dialog-lede {
+  max-width: 680px;
+  margin: 20px 0 28px;
+  color: var(--ink-soft);
+  font-size: 18px;
+}
+
+.sync-dialog-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: grid;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 28px;
+  line-height: 1;
+  place-items: center;
+}
+
+.sync-dialog-body,
+.account-form,
+.project-create,
+.sync-preview,
+.cloud-history {
+  display: grid;
+  gap: 18px;
+}
+
+.account-form,
+.project-create,
+.sync-preview,
+.cloud-history {
+  padding: clamp(20px, 4vw, 30px);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--paper);
+}
+
+.account-form {
+  max-width: 520px;
+}
+
+.account-form label,
+.project-create label,
+.project-select,
+.cloud-account-row label {
+  display: grid;
+  gap: 6px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.account-form input,
+.project-create input,
+.project-select select,
+.cloud-account-row select {
+  min-height: 48px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.cloud-account-row {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 20px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.cloud-account-row label,
+.project-select {
+  min-width: min(100%, 360px);
+}
+
+.sync-status {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 10px;
+  align-items: center;
+  padding: 13px 15px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper);
+  color: var(--ink-soft);
+  font-weight: 690;
+}
+
+.sync-status small {
+  grid-column: 2;
+  color: var(--muted);
+}
+
+.sync-status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--warn);
+}
+
+.sync-status-synced .sync-status-dot {
+  background: var(--teal);
+  box-shadow: 0 0 0 4px rgb(11 103 83 / 0.13);
+}
+
+.sync-preview {
+  border-color: var(--teal);
+  background: #f7fff4;
+}
+
+.sync-preview-list,
+.cloud-history-list {
+  display: grid;
+  gap: 10px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.sync-preview-list li,
+.cloud-history-list li {
+  display: grid;
+  gap: 5px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+}
+
+.sync-preview-list span,
+.cloud-history-list span,
+.cloud-role-note {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.sync-exact-json {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.sync-exact-json h4 {
+  margin: 0;
+}
+
+.sync-exact-json pre {
+  max-height: 15rem;
+  margin: 0;
+  padding: 0.85rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  background: var(--ink);
+  color: #f4f7f1;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.cloud-history {
+  margin-top: 8px;
+  background: var(--surface);
+}
+
+.cloud-history-list li > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
 @media (max-width: 900px) {
   .hero {
     grid-template-columns: 1fr;
@@ -1028,7 +1281,8 @@ fieldset.question {
 
   .quickstart-hero,
   .quickstart-privacy,
-  .quickstart-steps {
+  .quickstart-steps,
+  .price-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1086,6 +1340,25 @@ fieldset.question {
   .workspace-bar,
   .history-heading,
   .input-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .cloud-continuity-action {
+    align-items: stretch;
+  }
+
+  .sync-dialog-backdrop {
+    padding: 0;
+  }
+
+  .sync-dialog {
+    min-height: 100%;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .cloud-account-row {
     align-items: stretch;
     flex-direction: column;
   }
