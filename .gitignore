@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 *.pyo
+# Legacy pre-Heel state quarantine; may contain signing keys and signed scopes.
+.arceo/
 .heel/
 *.db
 .DS_Store

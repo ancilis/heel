@@ -6,6 +6,17 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FORMER_BRAND_NAMES = ("Arc" + "eo", "arc" + "eo", "ARC" + "EO")
+LEGACY_STATE_QUARANTINE = "." + "arc" + "eo/"
+
+
+def tracked_paths() -> list[str]:
+    return subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.decode().split("\0")
 
 
 class HeelBrandingTests(unittest.TestCase):
@@ -43,16 +54,38 @@ class HeelBrandingTests(unittest.TestCase):
 
         self.assertEqual(setuptools["packages"]["find"]["include"], ["heel*"])
 
-    def test_tracked_product_files_have_no_former_brand_references(self):
-        old_names = ("Arc" + "eo", "arc" + "eo", "ARC" + "EO")
-        tracked = subprocess.run(
-            ["git", "ls-files", "-z"],
+    def test_legacy_state_directory_is_quarantined(self):
+        ignore_lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        result = subprocess.run(
+            ["git", "check-ignore", LEGACY_STATE_QUARANTINE + "signing.key"],
             cwd=ROOT,
-            check=True,
             capture_output=True,
-        ).stdout.decode().split("\0")
+            text=True,
+        )
+
+        self.assertEqual(ignore_lines.count(LEGACY_STATE_QUARANTINE), 1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), LEGACY_STATE_QUARANTINE + "signing.key")
+
+    def test_changelog_install_command_uses_distribution_name(self):
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+        self.assertIn("pip install heel-sim", changelog)
+        self.assertNotIn("pip install heel`", changelog)
+
+    def test_tracked_product_paths_have_no_former_brand_references(self):
+        offenders = [
+            relative_name
+            for relative_name in filter(None, tracked_paths())
+            if not relative_name.startswith("docs/superpowers/")
+            and any(name in relative_name for name in FORMER_BRAND_NAMES)
+        ]
+
+        self.assertEqual(offenders, [])
+
+    def test_tracked_product_files_have_no_former_brand_references(self):
         offenders = []
-        for relative_name in filter(None, tracked):
+        for relative_name in filter(None, tracked_paths()):
             if relative_name.startswith("docs/superpowers/"):
                 continue
             path = ROOT / relative_name
@@ -62,7 +95,12 @@ class HeelBrandingTests(unittest.TestCase):
                 text = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 continue
-            if any(name in text for name in old_names):
+            if relative_name == ".gitignore":
+                text = "\n".join(
+                    line for line in text.splitlines()
+                    if line != LEGACY_STATE_QUARANTINE
+                )
+            if any(name in text for name in FORMER_BRAND_NAMES):
                 offenders.append(relative_name)
 
         self.assertEqual(offenders, [])
