@@ -83,7 +83,9 @@ function rootName(node) {
 function enclosingFunctionName(node) {
   let current = node.parent;
   while (current) {
-    if (ts.isFunctionDeclaration(current) && current.name) return current.name.text;
+    if (ts.isFunctionLike(current)) {
+      return ts.isFunctionDeclaration(current) && current.name ? current.name.text : null;
+    }
     current = current.parent;
   }
   return null;
@@ -118,6 +120,7 @@ function analyzeSource(fileName, text) {
   const ambientRoots = new Set([
     "document", "frames", "globalThis", "navigator", "parent", "self", "top", "window",
   ]);
+  const runtimeAuthorityMembers = new Set(["contentDocument", "contentWindow", "defaultView"]);
   const sinkAliases = new Set();
   const engineWorker = relativeName === "workers/heel-review.worker.ts";
   const serverWorker = relativeName === "worker/index.ts";
@@ -178,7 +181,7 @@ function analyzeSource(fileName, text) {
   function enclosingFunctionDeclaration(node) {
     let current = node.parent;
     while (current) {
-      if (ts.isFunctionDeclaration(current)) return current;
+      if (ts.isFunctionLike(current)) return ts.isFunctionDeclaration(current) ? current : null;
       current = current.parent;
     }
     return null;
@@ -458,6 +461,153 @@ function analyzeSource(fileName, text) {
     return false;
   }
 
+  function allowedFetchLocalReference(node) {
+    const call = node.parent;
+    if (
+      !ts.isCallExpression(call)
+      || call.expression !== node
+      || call.questionDotToken
+      || call.arguments.length !== 1
+      || enclosingFunctionName(call) !== "boot"
+    ) return false;
+    const argument = call.arguments[0];
+    return ts.isIdentifier(argument)
+      && reviewedRuntimeUrlDeclaration(argument.text);
+  }
+
+  function reviewedRuntimeUrlDeclaration(name) {
+    if (!["RUNTIME_MANIFEST_URL", "WHEEL_URL"].includes(name)) return false;
+    const declarations = [];
+    function inspect(current) {
+      if (
+        ts.isVariableDeclaration(current)
+        && ts.isIdentifier(current.name)
+        && current.name.text === name
+      ) declarations.push(current);
+      ts.forEachChild(current, inspect);
+    }
+    inspect(parsed);
+    if (declarations.length !== 1) return false;
+    const declaration = declarations[0];
+    const statement = declaration.parent.parent;
+    if (
+      !ts.isVariableDeclarationList(declaration.parent)
+      || (declaration.parent.flags & ts.NodeFlags.Const) === 0
+      || !ts.isVariableStatement(statement)
+      || statement.parent !== parsed
+    ) return false;
+    if (name === "RUNTIME_MANIFEST_URL") {
+      return ts.isStringLiteralLike(declaration.initializer)
+        && declaration.initializer.text === "/heel-runtime/runtime-manifest.json";
+    }
+    return declaration.initializer?.getText(parsed) === "`${RUNTIME_ROOT}${WHEEL_FILENAME}`";
+  }
+
+  function exactBootstrapRevocation(statement) {
+    if (!ts.isExpressionStatement(statement) || !ts.isBinaryExpression(statement.expression)) return false;
+    const expression = statement.expression;
+    return expression.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && ts.isIdentifier(expression.left)
+      && expression.left.text === "bootstrapFetch"
+      && expression.right.kind === ts.SyntaxKind.NullKeyword;
+  }
+
+  function exactBooleanAssignment(statement, name, value) {
+    if (!ts.isExpressionStatement(statement) || !ts.isBinaryExpression(statement.expression)) return false;
+    const expression = statement.expression;
+    return expression.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && ts.isIdentifier(expression.left)
+      && expression.left.text === name
+      && expression.right.kind === (value ? ts.SyntaxKind.TrueKeyword : ts.SyntaxKind.FalseKeyword);
+  }
+
+  function directCallStatement(statement, name) {
+    return ts.isExpressionStatement(statement)
+      && ts.isCallExpression(statement.expression)
+      && !statement.expression.questionDotToken
+      && ts.isIdentifier(statement.expression.expression)
+      && statement.expression.expression.text === name;
+  }
+
+  function containsReviewedFetchLocalCall(node) {
+    let found = false;
+    function inspect(current) {
+      if (
+        ts.isCallExpression(current)
+        && ts.isIdentifier(current.expression)
+        && current.expression.text === "fetchLocal"
+        && allowedFetchLocalReference(current.expression)
+      ) {
+        found = true;
+        return;
+      }
+      if (!found) ts.forEachChild(current, inspect);
+    }
+    inspect(node);
+    return found;
+  }
+
+  function validateBootstrapRevocationContract() {
+    const bootFunctions = [];
+    const bootstrapDeclarations = [];
+    const allRevocations = [];
+    function inspect(current) {
+      if (ts.isFunctionDeclaration(current) && current.name?.text === "boot") {
+        bootFunctions.push(current);
+      }
+      if (
+        ts.isVariableDeclaration(current)
+        && ts.isIdentifier(current.name)
+        && current.name.text === "bootstrapFetch"
+      ) bootstrapDeclarations.push(current);
+      if (ts.isExpressionStatement(current) && exactBootstrapRevocation(current)) {
+        allRevocations.push(current);
+      }
+      ts.forEachChild(current, inspect);
+    }
+    inspect(parsed);
+
+    let valid = bootstrapDeclarations.length === 1
+      && isReviewedBootstrapDeclaration(bootstrapDeclarations[0])
+      && bootFunctions.length === 1
+      && allRevocations.length === 2;
+    const boot = bootFunctions[0];
+    if (
+      !boot?.body
+      || boot.parameters.length !== 0
+      || !boot.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)
+      || boot.type?.getText(parsed) !== "Promise<void>"
+    ) valid = false;
+    const tryStatements = boot?.body?.statements.filter(ts.isTryStatement) ?? [];
+    if (tryStatements.length !== 1 || tryStatements[0].finallyBlock || !tryStatements[0].catchClause) {
+      valid = false;
+    } else {
+      const reviewedTry = tryStatements[0];
+      const success = [...reviewedTry.tryBlock.statements];
+      const failure = [...reviewedTry.catchClause.block.statements];
+      const successRevoke = success.findIndex(exactBootstrapRevocation);
+      const failureRevoke = failure.findIndex(exactBootstrapRevocation);
+      const guardNetwork = success.findIndex((statement) => directCallStatement(statement, "guardAmbientNetwork"));
+      const ready = success.findIndex((statement) => exactBooleanAssignment(statement, "acceptingInput", true));
+      const failed = failure.findIndex((statement) => exactBooleanAssignment(statement, "acceptingInput", false));
+      const fatalSend = failure.findIndex((statement) => directCallStatement(statement, "send"));
+      const lastFetch = success.reduce(
+        (last, statement, index) => containsReviewedFetchLocalCall(statement) ? index : last,
+        -1,
+      );
+      valid &&= success.filter(exactBootstrapRevocation).length === 1
+        && failure.filter(exactBootstrapRevocation).length === 1
+        && lastFetch >= 0
+        && guardNetwork > lastFetch
+        && successRevoke > guardNetwork
+        && ready > successRevoke
+        && failed >= 0
+        && failureRevoke > failed
+        && fatalSend > failureRevoke;
+    }
+    if (!valid) report(boot ?? parsed, "bootstrap fetch revocation contract is not exact");
+  }
+
   function containsAmbientReference(node) {
     let found = false;
     function inspect(current) {
@@ -546,18 +696,27 @@ function analyzeSource(fileName, text) {
       && isRuntimeIdentifierReference(node)
       && !allowedFetcherReference(node)
     ) report(node, "bootstrap fetch authority reference fetcher");
+    if (
+      engineWorker
+      && ts.isIdentifier(node)
+      && node.text === "fetchLocal"
+      && isRuntimeIdentifierReference(node)
+      && !allowedFetchLocalReference(node)
+    ) report(node, "fetchLocal authority reference is not an exact reviewed boot call");
 
     if (ts.isVariableDeclaration(node) && node.initializer) {
       if (ts.isIdentifier(node.name)) {
         recordAlias(node.name, node.initializer, node);
-      } else if (
-        ts.isObjectBindingPattern(node.name)
-        && ambientRoots.has(rootName(node.initializer) ?? "")
-      ) {
+      } else if (ts.isObjectBindingPattern(node.name)) {
         for (const element of node.name.elements) {
+          const propertyName = bindingPropertyName(element);
+          if (runtimeAuthorityMembers.has(propertyName ?? "")) {
+            report(element, `runtime Window/document authority carrier ${propertyName}`);
+          }
           if (
-            ts.isIdentifier(element.name)
-            && networkCapabilities.has(bindingPropertyName(element) ?? "")
+            ambientRoots.has(rootName(node.initializer) ?? "")
+            && ts.isIdentifier(element.name)
+            && networkCapabilities.has(propertyName ?? "")
           ) {
             sinkAliases.add(element.name.text);
             report(element, `network sink alias ${element.name.text}`);
@@ -590,6 +749,9 @@ function analyzeSource(fileName, text) {
       const reflectiveAuthority = reflectiveMethodAuthority(node);
       if (reflectiveAuthority !== null) {
         report(node, `reflective method authority reference ${reflectiveAuthority}`);
+      }
+      if (runtimeAuthorityMembers.has(name ?? "")) {
+        report(node, `runtime Window/document authority carrier ${name}`);
       }
       if (networkCapabilities.has(name ?? "") && !allowedFetchReference(node)) {
         report(node, `network sink capability reference ${name}`);
@@ -633,6 +795,7 @@ function analyzeSource(fileName, text) {
     ts.forEachChild(node, visit);
   }
   visit(parsed);
+  if (engineWorker) validateBootstrapRevocationContract();
   return violations;
 }
 
@@ -851,6 +1014,28 @@ sink("/leak", {body: source});
 });
 
 
+test("the privacy analyzer rejects DOM-derived Window and document carriers regardless of base", () => {
+  const mutations = [
+    `const element = {} as HTMLElement; const {fetch: sink} = element.ownerDocument.defaultView;`,
+    `const frame = {} as HTMLIFrameElement; const root = frame.contentWindow;`,
+    `const frame = {} as HTMLIFrameElement; const root = frame["content" + "Document"];`,
+    `const element = {} as HTMLElement; const root = element.ownerDocument["default" + "View"];`,
+    `const element = {} as HTMLElement; const {["default" + "View"]: root} = element.ownerDocument;`,
+    `const frame = {} as HTMLIFrameElement; const {contentWindow: root} = frame;`,
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, `components/nested/dom-window-carrier-${index}.ts`),
+      mutation,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("runtime Window/document authority carrier")),
+      `${index}: ${violations.join("\n")}`,
+    );
+  }
+});
+
+
 test("the privacy analyzer rejects destructuring and copying the reviewed worker scope alias", () => {
   const mutations = [
     `const key = "fetch"; const {[key]: sink} = scope;`,
@@ -949,8 +1134,96 @@ async function fetchLocal(path: string): Promise<Response> {
 });
 
 
+test("the privacy analyzer rejects every unreviewed fetchLocal reference and call shape", () => {
+  const mutations = [
+    `void fetchLocal(RUNTIME_ROOT + "pyodide.mjs?source=" + encodeURIComponent(request.source));`,
+    `const alias = fetchLocal;`,
+    `function pass(value) {} pass(fetchLocal);`,
+    `function expose() { return fetchLocal; }`,
+    `fetchLocal?.(WHEEL_URL);`,
+    `({fetchLocal})["fetch" + "Local"](WHEEL_URL);`,
+    `fetchLocal("/heel-runtime/runtime-manifest.json");`,
+    `async function boot() { const delayed = () => fetchLocal(WHEEL_URL); }`,
+    `async function boot() { const WHEEL_URL = RUNTIME_ROOT + request.source; await fetchLocal(WHEEL_URL); }`,
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, "workers/heel-review.worker.ts"),
+      mutation,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("fetchLocal authority reference")),
+      `${index}: ${violations.join("\n")}`,
+    );
+  }
+});
+
+
+test("the privacy analyzer rejects the exact post-boot fetchLocal mutation and missing revocations", async () => {
+  const worker = await source("workers/heel-review.worker.ts");
+  assert.equal(worker.match(/bootstrapFetch = null;/g)?.length, 2);
+  assert.deepEqual(analyzeSource(join(appRootPath, "workers/heel-review.worker.ts"), worker), []);
+
+  const mutation = worker
+    .replaceAll("    bootstrapFetch = null;\n", "")
+    .replace(
+      "    const response = reviewEntry(request.source, request.answers_json);",
+      `    void fetchLocal(RUNTIME_ROOT + "pyodide.mjs?source=" + encodeURIComponent(request.source));
+    const response = reviewEntry(request.source, request.answers_json);`,
+    );
+  const mutationViolations = analyzeSource(
+    join(appRootPath, "workers/heel-review.worker.ts"),
+    mutation,
+  );
+  assert.ok(
+    mutationViolations.some((violation) => violation.includes("fetchLocal authority reference")),
+    mutationViolations.join("\n"),
+  );
+  assert.ok(
+    mutationViolations.some((violation) => violation.includes("bootstrap fetch revocation contract")),
+    mutationViolations.join("\n"),
+  );
+
+  const missingSuccess = worker.replace(
+    "    guardAmbientNetwork();\n    bootstrapFetch = null;",
+    "    guardAmbientNetwork();",
+  );
+  const missingFailure = worker.replace(
+    "    acceptingInput = false;\n    bootstrapFetch = null;",
+    "    acceptingInput = false;",
+  );
+  for (const [index, candidate] of [missingSuccess, missingFailure].entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, "workers/heel-review.worker.ts"),
+      candidate,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("bootstrap fetch revocation contract")),
+      `${index}: ${violations.join("\n")}`,
+    );
+  }
+
+  const shadowedConstant = worker.replace(
+    "async function boot(): Promise<void> {",
+    `async function boot(WHEEL_URL = "/heel-runtime/leak"): Promise<void> {`,
+  );
+  const shadowViolations = analyzeSource(
+    join(appRootPath, "workers/heel-review.worker.ts"),
+    shadowedConstant,
+  );
+  assert.ok(
+    shadowViolations.some((violation) => violation.includes("bootstrap fetch revocation contract")),
+    shadowViolations.join("\n"),
+  );
+});
+
+
 test("the privacy analyzer permits only the reviewed engine and server fetch sites", () => {
   const engine = `
+const RUNTIME_ROOT = "/heel-runtime/";
+const RUNTIME_MANIFEST_URL = "/heel-runtime/runtime-manifest.json";
+const WHEEL_FILENAME = "heel.whl";
+const WHEEL_URL = \`\${RUNTIME_ROOT}\${WHEEL_FILENAME}\`;
 const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
 let bootstrapFetch: typeof fetch | null = scope.fetch.bind(scope);
 async function fetchLocal(path: string): Promise<Response> {
@@ -977,7 +1250,21 @@ function guardAmbientNetwork() {
   }
 }
 scope.onmessage = () => {};
-async function boot() { bootstrapFetch = null; }
+let acceptingInput = false;
+async function boot(): Promise<void> {
+  try {
+    await fetchLocal(RUNTIME_MANIFEST_URL);
+    await fetchLocal(WHEEL_URL);
+    guardAmbientNetwork();
+    bootstrapFetch = null;
+    acceptingInput = true;
+    send({type: "ready"});
+  } catch {
+    acceptingInput = false;
+    bootstrapFetch = null;
+    send({type: "fatal"});
+  }
+}
 `;
   const server = `
 async function route(request, env, ctx) {
