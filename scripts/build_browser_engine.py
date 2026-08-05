@@ -34,19 +34,50 @@ MODULE_PATHS = (
     "heel/review_service.py",
     "heel/static_review.py",
 )
-ALLOWED_STDLIB_IMPORTS = frozenset({
-    "__future__",
-    "copy",
-    "dataclasses",
-    "hashlib",
-    "hmac",
-    "json",
-    "math",
-    "re",
-    "typing",
-})
 # This is a trusted-source capability policy for the reviewed browser closure,
 # not a malware sandbox for arbitrary Python or precompiled bytecode.
+# Each import form and module attribute is derived from the current source closure.
+# Additions require source review plus executable mutation coverage; imported module
+# objects may not be aliased, copied, or rebound.
+REVIEWED_MODULE_ATTRIBUTES = {
+    "copy": frozenset({"deepcopy"}),
+    "hashlib": frozenset({"sha256"}),
+    "hmac": frozenset({"compare_digest"}),
+    "json": frozenset({"JSONDecodeError", "dumps", "loads"}),
+    "math": frozenset({"isfinite"}),
+    "re": frozenset({"compile", "match", "sub"}),
+}
+REVIEWED_FROM_IMPORTS = {
+    (0, "__future__"): frozenset({"annotations"}),
+    (0, "dataclasses"): frozenset({"dataclass", "field"}),
+    (0, "typing"): frozenset({"Any", "Mapping"}),
+    (1, "openapi_model"): frozenset({
+        "OpenAPIImportError",
+        "QUESTION_PROMPTS",
+        "operation_surface_id",
+        "product_model_from_openapi",
+    }),
+    (1, "product_model"): frozenset({
+        "LIST_FIELDS",
+        "PRODUCT_MODEL_VERSION",
+        "ProductModelError",
+        "validate_product_model",
+    }),
+    (1, "review_answers"): frozenset({
+        "ReviewAnswerError",
+        "apply_review_answers",
+        "parse_review_answers",
+    }),
+    (1, "review_contract"): frozenset({
+        "build_review_envelope",
+        "stable_json",
+        "stable_json_hash",
+        "validate_review_envelope",
+    }),
+    (1, "review_rules"): frozenset({"is_broad_scope"}),
+    (1, "review_service"): frozenset({"review_openapi"}),
+    (1, "static_review"): frozenset({"review_product_models"}),
+}
 FORBIDDEN_DYNAMIC_NAMES = frozenset({
     "__builtins__",
     "__import__",
@@ -123,9 +154,141 @@ def _forbidden_dynamic_primitive(node: ast.AST) -> str | None:
         return node.attr
     if isinstance(node, ast.Subscript):
         key = _static_string(node.slice)
-        if key in FORBIDDEN_DYNAMIC_ATTRIBUTES:
+        if key is not None and (
+            key.startswith("_") or key in FORBIDDEN_DYNAMIC_ATTRIBUTES
+        ):
             return key
     return None
+
+
+def _reviewed_private_attribute(node: ast.Attribute) -> bool:
+    return (
+        node.attr == "__init__"
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "super"
+        and not node.value.args
+        and not node.value.keywords
+    )
+
+
+def _module_attribute_path(
+    node: ast.Attribute,
+    module_bindings: frozenset[str],
+) -> tuple[str, tuple[str, ...]] | None:
+    attributes: list[str] = []
+    value: ast.expr = node
+    while isinstance(value, ast.Attribute):
+        attributes.append(value.attr)
+        value = value.value
+    if not isinstance(value, ast.Name) or value.id not in module_bindings:
+        return None
+    return value.id, tuple(reversed(attributes))
+
+
+def _validate_reviewed_imports(
+    tree: ast.Module,
+    relative_path: str,
+    pending: list[str],
+) -> frozenset[str]:
+    module_bindings: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name not in REVIEWED_MODULE_ATTRIBUTES:
+                    dependency = alias.name.split(".", 1)[0]
+                    raise BrowserEngineBuildError(
+                        f"browser module imports unreviewed dependency: {dependency}"
+                    )
+                if alias.asname is not None:
+                    raise BrowserEngineBuildError(
+                        f"browser module uses unreviewed import alias: {alias.asname}"
+                    )
+                module_bindings.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level not in {0, 1} or (node.level == 1 and not module):
+                raise BrowserEngineBuildError(
+                    f"browser module has unsupported relative import: {relative_path}"
+                )
+            import_key = (node.level, module)
+            allowed_symbols = REVIEWED_FROM_IMPORTS.get(import_key)
+            if allowed_symbols is None:
+                dependency = module.split(".", 1)[0]
+                raise BrowserEngineBuildError(
+                    f"browser module imports unreviewed dependency: {dependency}"
+                )
+            for alias in node.names:
+                if alias.asname is not None:
+                    raise BrowserEngineBuildError(
+                        f"browser module uses unreviewed import alias: {alias.asname}"
+                    )
+                if alias.name.startswith("_") or alias.name not in allowed_symbols:
+                    raise BrowserEngineBuildError(
+                        f"browser module imports unreviewed symbol: {module}.{alias.name}"
+                    )
+            if node.level == 1:
+                pending.append(module)
+    return frozenset(module_bindings)
+
+
+def _validate_reviewed_module_uses(
+    tree: ast.Module,
+    module_bindings: frozenset[str],
+) -> None:
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("_") and not _reviewed_private_attribute(node):
+                raise BrowserEngineBuildError(
+                    f"browser module uses unreviewed private attribute: {node.attr}"
+                )
+            rooted_attribute = _module_attribute_path(node, module_bindings)
+            if rooted_attribute is not None:
+                module, attributes = rooted_attribute
+                allowed_attributes = REVIEWED_MODULE_ATTRIBUTES[module]
+                if len(attributes) != 1 or attributes[0] not in allowed_attributes:
+                    rendered = ".".join((module, *attributes))
+                    raise BrowserEngineBuildError(
+                        f"browser module uses unreviewed module attribute: {rendered}"
+                    )
+        elif (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in module_bindings
+        ):
+            parent = parents.get(node)
+            if not isinstance(parent, ast.Attribute) or parent.value is not node:
+                raise BrowserEngineBuildError(
+                    f"browser module uses unreviewed module reference: {node.id}"
+                )
+        elif (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node.id in module_bindings
+        ):
+            raise BrowserEngineBuildError(
+                f"browser module rebinds reviewed module: {node.id}"
+            )
+        elif isinstance(node, ast.arg) and node.arg in module_bindings:
+            raise BrowserEngineBuildError(
+                f"browser module rebinds reviewed module: {node.arg}"
+            )
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name in module_bindings
+        ):
+            raise BrowserEngineBuildError(
+                f"browser module rebinds reviewed module: {node.name}"
+            )
+        elif isinstance(node, ast.ExceptHandler) and node.name in module_bindings:
+            raise BrowserEngineBuildError(
+                f"browser module rebinds reviewed module: {node.name}"
+            )
 
 
 def _assert_no_symlink_components(
@@ -200,32 +363,14 @@ def _prove_import_closure() -> None:
         except SyntaxError as error:
             raise BrowserEngineBuildError(f"browser module cannot be parsed: {relative_path}") from error
         observed.add(module)
+        module_bindings = _validate_reviewed_imports(tree, relative_path, pending)
         for node in ast.walk(tree):
             forbidden = _forbidden_dynamic_primitive(node)
             if forbidden is not None:
                 raise BrowserEngineBuildError(
                     f"browser module uses forbidden dynamic primitive: {forbidden}"
                 )
-            if isinstance(node, ast.Import):
-                imported = {alias.name.split(".", 1)[0] for alias in node.names}
-                unexpected = imported - ALLOWED_STDLIB_IMPORTS
-                if unexpected:
-                    raise BrowserEngineBuildError(
-                        f"browser module imports unreviewed dependency: {sorted(unexpected)[0]}"
-                    )
-            elif isinstance(node, ast.ImportFrom):
-                if node.level:
-                    if node.level != 1 or not node.module:
-                        raise BrowserEngineBuildError(
-                            f"browser module has unsupported relative import: {relative_path}"
-                        )
-                    pending.append(node.module.split(".", 1)[0])
-                else:
-                    imported = (node.module or "").split(".", 1)[0]
-                    if imported not in ALLOWED_STDLIB_IMPORTS:
-                        raise BrowserEngineBuildError(
-                            f"browser module imports unreviewed dependency: {imported}"
-                        )
+        _validate_reviewed_module_uses(tree, module_bindings)
     if observed != allowed_modules:
         unused = sorted(allowed_modules - observed)
         raise BrowserEngineBuildError(

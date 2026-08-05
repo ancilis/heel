@@ -220,6 +220,76 @@ class BrowserEngineBuildTests(unittest.TestCase):
         )
         self.assertEqual(legitimate_compile.returncode, 0, legitimate_compile.stderr)
 
+    def test_imports_and_module_attributes_are_a_positive_capability_allowlist(self):
+        mutations = {
+            "Fable re builtins export": (
+                "from re import __builtins__ as b\n"
+                "b[''.join(['__im', 'port__'])]('socket')"
+            ),
+            "Fable re dictionary export": (
+                "from re import __dict__ as namespace\n"
+                "namespace[''.join(['__built', 'ins__'])]"
+                "[''.join(['__im', 'port__'])]('socket')"
+            ),
+            "Fable dataclasses sys export": (
+                "from dataclasses import sys\n"
+                "sys.modules['importlib'].import_module('socket')"
+            ),
+            "nested re module export": (
+                "import re\n"
+                "re.enum.sys.modules['importlib'].import_module('socket')"
+            ),
+            "nested json module export": (
+                "import json\n"
+                "json.codecs.sys.modules['importlib'].import_module('socket')"
+            ),
+            "local module builtins export": (
+                "from .review_contract import __builtins__ as b\n"
+                "b[''.join(['__im', 'port__'])]('socket')"
+            ),
+            "direct module alias": "import re as regex\nregex.compile('heel')",
+            "copied module alias": "import re\nregex = re\nregex.compile('heel')",
+            "reviewed module rebinding": "import re\nre = None",
+            "reviewed symbol alias": "from typing import Any as Anything",
+            "unreviewed direct symbol": "from re import compile\ncompile('heel')",
+            "unreviewed private attribute": "(lambda: None).__name__",
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                completed = self._run_builder_with_browser_review_mutation(mutation)
+                self.assertNotEqual(completed.returncode, 0, mutation)
+                self.assertRegex(
+                    completed.stderr,
+                    r"reviewed|forbidden dynamic primitive",
+                )
+
+        reviewed_capabilities = self._run_builder_with_browser_review_mutation(
+            "import copy\n"
+            "import hashlib\n"
+            "import hmac\n"
+            "import json\n"
+            "import math\n"
+            "import re\n"
+            "from dataclasses import dataclass, field\n"
+            "from typing import Any, Mapping\n"
+            "from .review_contract import stable_json\n"
+            "copy.deepcopy({})\n"
+            "hashlib.sha256(b'heel')\n"
+            "hmac.compare_digest(b'heel', b'heel')\n"
+            "json.loads('{}')\n"
+            "json.dumps({})\n"
+            "json.JSONDecodeError\n"
+            "math.isfinite(1.0)\n"
+            "re.compile('heel')\n"
+            "re.sub('h', 'H', 'heel')\n"
+            "re.match('h', 'heel')"
+        )
+        self.assertEqual(
+            reviewed_capabilities.returncode,
+            0,
+            reviewed_capabilities.stderr,
+        )
+
     def test_builder_produces_only_the_proven_browser_closure_and_metadata(self):
         wheel, _manifest = self._require_build()
         with zipfile.ZipFile(wheel) as archive:
