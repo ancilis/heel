@@ -7,6 +7,7 @@ from heel.review_contract import (
     ENGINE_VERSION,
     EXECUTION_MODES,
     REVIEW_SCHEMA_VERSION,
+    SUPPORTED_ENGINE_VERSIONS,
     build_review_envelope,
     stable_json,
     stable_json_hash,
@@ -207,6 +208,7 @@ class ReviewContractTests(unittest.TestCase):
             validate_review_envelope(tampered)
 
     def test_envelope_validator_rejects_other_engine_even_when_rehashed(self):
+        self.assertEqual(SUPPORTED_ENGINE_VERSIONS, frozenset({ENGINE_VERSION}))
         envelope = self._build()
         envelope["engine_version"] = "0.0.0"
         body = {

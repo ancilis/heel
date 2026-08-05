@@ -11,6 +11,7 @@ from typing import Any
 
 REVIEW_SCHEMA_VERSION = "heel.review.v1"
 ENGINE_VERSION = "1.1.0"
+SUPPORTED_ENGINE_VERSIONS = frozenset({ENGINE_VERSION})
 EXECUTION_MODES = frozenset({"browser_local", "machine_local", "cloud_isolated"})
 
 _JS_SAFE_INTEGER = 2**53 - 1
@@ -261,8 +262,8 @@ def validate_review_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
     result_hash = _validate_hash(item["result_hash"], "result_hash")
     if item["schema_version"] != REVIEW_SCHEMA_VERSION:
         raise ValueError(f"schema_version must be {REVIEW_SCHEMA_VERSION}")
-    if item["engine_version"] != ENGINE_VERSION:
-        raise ValueError(f"engine_version must be {ENGINE_VERSION}")
+    if item["engine_version"] not in SUPPORTED_ENGINE_VERSIONS:
+        raise ValueError("engine_version is not supported")
     _require_nonempty_string(item["product_id"], "product_id")
     _validate_hash(item["source_hash"], "source_hash")
     _validate_hash(item["model_hash"], "model_hash")

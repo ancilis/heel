@@ -1,14 +1,29 @@
 """Deterministic, integrity-checked exports for Heel review envelopes."""
 from __future__ import annotations
 
-import html
+import string
 from typing import Any, Mapping
+import unicodedata
 
 from .review_contract import stable_json, validate_review_envelope
 
 
-def _safe_text(value: str) -> str:
-    return html.escape(value, quote=True)
+_COMMONMARK_PUNCTUATION = frozenset(string.punctuation)
+_COLLAPSED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _markdown_plaintext(value: str) -> str:
+    """Collapse controls and escape every ASCII punctuation mark CommonMark can parse."""
+    encoded = []
+    for character in value:
+        if unicodedata.category(character) in _COLLAPSED_CATEGORIES:
+            if not encoded or encoded[-1] != " ":
+                encoded.append(" ")
+            continue
+        if character in _COMMONMARK_PUNCTUATION:
+            encoded.append("\\")
+        encoded.append(character)
+    return "".join(encoded)
 
 
 def review_to_markdown(envelope: Mapping[str, Any]) -> str:
@@ -16,18 +31,21 @@ def review_to_markdown(envelope: Mapping[str, Any]) -> str:
     review = validate_review_envelope(dict(envelope))
     summary = review["summary"]
     lines = [
-        f"# Heel launch review: {_safe_text(review['product_id'])}",
+        f"# Heel launch review: {_markdown_plaintext(review['product_id'])}",
         "",
-        f"Review: `{_safe_text(review['review_id'])}`",
-        f"Gate: **{review['gate_status'].upper()}**",
+        f"Review: {_markdown_plaintext(review['review_id'])}",
+        f"Gate: **{_markdown_plaintext(review['gate_status'].upper())}**",
         f"Findings: {summary['findings']} · Blockers: {summary['blockers']}",
     ]
     if review["execution_mode"] in {"browser_local", "machine_local"}:
-        lines.append("Privacy: analyzed locally; source content was not uploaded.")
+        lines.append(
+            "Privacy: Envelope declares local analysis, no upload, "
+            "and no analyzer network calls."
+        )
     else:
         lines.append(
-            "Privacy: analyzed in an isolated cloud worker; "
-            "an explicitly sanitized model was uploaded."
+            "Privacy: Envelope declares isolated cloud analysis, sanitized-model upload, "
+            "and no analyzer network calls."
         )
 
     lines.extend(["", "## Findings", ""])
@@ -35,16 +53,16 @@ def review_to_markdown(envelope: Mapping[str, Any]) -> str:
         lines.extend(["No findings.", ""])
     for index, finding in enumerate(review["findings"], 1):
         surface = (
-            f"{_safe_text(finding['surface_type'])} / "
-            f"{_safe_text(finding['surface_id'])}"
+            f"{_markdown_plaintext(finding['surface_type'])} / "
+            f"{_markdown_plaintext(finding['surface_id'])}"
         )
         lines.extend([
             f"### {index}. {surface}",
             "",
-            f"- Severity: **{finding['severity'].upper()}**",
+            f"- Severity: **{_markdown_plaintext(finding['severity'].upper())}**",
             f"- Surface: {surface}",
-            f"- Reason: {_safe_text(finding['reason'])}",
-            f"- Recommended control: {_safe_text(finding['control'])}",
+            f"- Reason: {_markdown_plaintext(finding['reason'])}",
+            f"- Recommended control: {_markdown_plaintext(finding['control'])}",
             "",
         ])
     return "\n".join(lines).rstrip() + "\n"
