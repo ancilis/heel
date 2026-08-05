@@ -4,9 +4,9 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Heel — browser-local SaaS abuse review",
+  title: "Heel — Find launch blockers before customers do",
   description:
-    "Review an OpenAPI document for reachable SaaS abuse paths without uploading it.",
+    "Turn an OpenAPI document into reachable SaaS abuse evidence, controls, and regression tests without uploading it.",
 };
 
 export default function RootLayout({

@@ -116,6 +116,38 @@ test("uses Heel identity and marks original source as commercial", async () => {
   }
 });
 
+test("ships server-renderable evidence, local interaction semantics, and accessible responsive styles", async () => {
+  const [page, workspace, input, privacy, sample, css] = await Promise.all([
+    readFile(new URL("app/page.tsx", appRoot), "utf8"),
+    readFile(new URL("components/review/ReviewWorkspace.tsx", appRoot), "utf8"),
+    readFile(new URL("components/review/OpenApiInput.tsx", appRoot), "utf8"),
+    readFile(new URL("components/review/PrivacyReceipt.tsx", appRoot), "utf8"),
+    readFile(new URL("data/sample-review.v1.json", appRoot), "utf8"),
+    readFile(new URL("app/globals.css", appRoot), "utf8"),
+  ]);
+
+  const productSource = `${page}\n${workspace}\n${input}\n${privacy}`;
+  assert.doesNotMatch(page, /Preparing Heel|loading-shell/);
+  assert.match(productSource, /Run the sample/);
+  assert.match(productSource, /Analyze mine/);
+  assert.match(productSource, /Runs here, not on our server/);
+  assert.match(workspace, /aria-live="polite"/);
+  assert.match(workspace, /role="alert"/);
+  assert.match(workspace, /tabIndex=\{-1\}/);
+  assert.match(input, /TextDecoder\("utf-8", \{ fatal: true \}\)/);
+  assert.match(input, /onDrop=/);
+  assert.match(workspace, /Save result on this device/);
+  assert.match(workspace, /Clear local history/);
+  assert.match(sample, /agent_surface_overscope/);
+
+  assert.doesNotMatch(productSource, /sign.?up.{0,30}(review|analy)/i);
+  assert.doesNotMatch(productSource, /testimonial|customers trust|accuracy rate|cloud save/i);
+  assert.match(css, /:focus-visible/);
+  assert.match(css, /min-height:\s*44px/);
+  assert.match(css, /prefers-reduced-motion:\s*reduce/);
+  assert.match(css, /@media\s*\(max-width:\s*720px\)/);
+});
+
 test("documents a non-emitting TypeScript validation command", async () => {
   const [packageJson, readme] = await Promise.all([
     readFile(new URL("package.json", appRoot), "utf8").then(JSON.parse),

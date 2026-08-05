@@ -1,0 +1,115 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Northstar Workspace API",
+    "version": "2026-08"
+  },
+  "components": {
+    "securitySchemes": {
+      "WorkspaceKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Workspace-Key"
+      },
+      "OAuthAll": {
+        "type": "oauth2",
+        "flows": {
+          "clientCredentials": {
+            "tokenUrl": "https://auth.example.invalid/token",
+            "scopes": {
+              "all": "All workspace operations"
+            }
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/api/export/bulk": {
+      "get": {
+        "tags": [
+          "Exports"
+        ],
+        "operationId": "downloadBulkExport",
+        "summary": "Download a workspace export",
+        "x-heel-tenant-scope": "tenant",
+        "x-heel-plan": "team"
+      }
+    },
+    "/oauth/apps": {
+      "post": {
+        "tags": [
+          "Integrations"
+        ],
+        "operationId": "createOAuthApp",
+        "summary": "Create an OAuth application",
+        "security": [
+          {
+            "OAuthAll": [
+              "all"
+            ]
+          }
+        ],
+        "x-heel-tenant-scope": "tenant",
+        "x-heel-plan": "enterprise"
+      }
+    },
+    "/signup/trial": {
+      "post": {
+        "tags": [
+          "Growth"
+        ],
+        "operationId": "startTrial",
+        "summary": "Start a product trial",
+        "x-heel-tenant-scope": "tenant",
+        "x-heel-plan": "free"
+      }
+    },
+    "/billing/usage/meter": {
+      "get": {
+        "tags": [
+          "Billing"
+        ],
+        "operationId": "readUsageMeter",
+        "summary": "Read metered workspace usage",
+        "x-heel-tenant-scope": "tenant",
+        "x-heel-plan": "pro"
+      }
+    },
+    "/members/seats": {
+      "post": {
+        "tags": [
+          "Identity"
+        ],
+        "operationId": "inviteSeat",
+        "summary": "Invite a workspace member",
+        "x-heel-tenant-scope": "tenant",
+        "x-heel-plan": "team"
+      }
+    },
+    "/admin/support/impersonate": {
+      "post": {
+        "tags": [
+          "Support"
+        ],
+        "operationId": "supportImpersonate",
+        "summary": "Begin an audited support session",
+        "x-heel-tenant-scope": "tenant",
+        "x-heel-plan": "enterprise"
+      }
+    },
+    "/agent/tools/run": {
+      "post": {
+        "tags": [
+          "Agent"
+        ],
+        "operationId": "runAgentTool",
+        "summary": "Run a workspace automation tool",
+        "x-heel-agent-tool": {
+          "intended_scope": "tenant",
+          "granted_scope": "global"
+        }
+      }
+    }
+  }
+}

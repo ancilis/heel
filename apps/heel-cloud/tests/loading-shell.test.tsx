@@ -6,13 +6,14 @@ import Home from "../app/page";
 
 afterEach(cleanup);
 
-describe("Heel loading shell", () => {
-  it("announces the browser-local workspace while it prepares", () => {
+describe("Heel server-rendered product shell", () => {
+  it("announces useful example evidence while the local engine prepares", () => {
     render(<Home />);
 
     const status = screen.getByRole("status");
     expect(status.getAttribute("aria-live")).toBe("polite");
-    expect(screen.getByRole("heading", { name: "Preparing Heel" })).toBeTruthy();
-    expect(status.textContent).toContain("Your document stays in this browser");
+    expect(screen.getByRole("heading", { name: /find the launch blocker/i })).toBeTruthy();
+    expect(status.textContent).toContain("Example review complete");
+    expect(screen.getAllByText(/global beyond intended tenant/i).length).toBeGreaterThan(0);
   });
 });
