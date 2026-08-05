@@ -130,45 +130,18 @@ class UsageLedger:
             raise ValueError("reserve amount must be positive")
         try:
             self.conn.execute("BEGIN IMMEDIATE")
-            # Idempotent replay: return the existing reservation, do not double-count.
-            if idempotency_key is not None:
-                prior = self.conn.execute(
-                    """SELECT * FROM usage_ledger WHERE workspace_id=? AND meter=?
-                       AND idempotency_key=? AND kind='reserve'""",
-                    (workspace_id, meter.value, idempotency_key)).fetchone()
-                if prior:
-                    refunded = self.conn.execute(
-                        "SELECT 1 FROM usage_ledger WHERE reservation_id=? AND kind='refund'",
-                        (prior["reservation_id"],)).fetchone()
-                    self.conn.execute("COMMIT")
-                    if refunded:
-                        # Terminal: the reservation was released. Replaying its key must not
-                        # return quota-free capacity — the key is burned.
-                        raise IdempotencyConflict(
-                            f"idempotency key {idempotency_key!r} belongs to a refunded "
-                            "reservation; retry with a new key")
-                    return Reservation(prior["reservation_id"], workspace_id, meter,
-                                       prior["amount"], prior["period"])
-            q = plan.quota(meter)
-            if q != CUSTOM:
-                used = self.usage(workspace_id, meter, period)
-                if used + amount > q:
-                    self.conn.execute("ROLLBACK")
-                    raise QuotaExceeded(meter, amount, used, q)
-            if global_cap is not None:
-                gused = self.global_usage(meter, period)
-                if gused + amount > global_cap:
-                    self.conn.execute("ROLLBACK")
-                    raise GlobalCapExceeded(meter, gused, global_cap)
-            rid = f"resv_{secrets.token_hex(8)}"
-            self.conn.execute(
-                "INSERT INTO usage_ledger VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (f"led_{secrets.token_hex(8)}", workspace_id, meter.value, period, "reserve",
-                 amount, rid, idempotency_key, ref, _now()))
+            reservation = self.reserve_in_transaction(
+                plan,
+                workspace_id,
+                meter,
+                amount,
+                period,
+                idempotency_key=idempotency_key,
+                ref=ref,
+                global_cap=global_cap,
+            )
             self.conn.execute("COMMIT")
-            return Reservation(rid, workspace_id, meter, amount, period)
-        except (GlobalCapExceeded, QuotaExceeded):
-            raise
+            return reservation
         except Exception:
             try:
                 self.conn.execute("ROLLBACK")
@@ -176,44 +149,101 @@ class UsageLedger:
                 pass
             raise
 
+    def reserve_in_transaction(
+        self,
+        plan: Plan,
+        workspace_id: str,
+        meter: Meter,
+        amount: int,
+        period: str,
+        *,
+        idempotency_key: str | None = None,
+        ref: str | None = None,
+        global_cap: int | None = None,
+    ) -> Reservation:
+        """Reserve quota inside a transaction owned by the caller.
+
+        This method never begins, commits, or rolls back. It lets a higher-level service make the
+        ledger entry atomic with its own durable records while ``reserve`` remains the standalone
+        compatibility wrapper.
+        """
+        if amount <= 0:
+            raise ValueError("reserve amount must be positive")
+        if not self.conn.in_transaction:
+            raise RuntimeError("reserve_in_transaction requires an active transaction")
+        if idempotency_key is not None:
+            prior = self.conn.execute(
+                """SELECT * FROM usage_ledger WHERE workspace_id=? AND meter=?
+                   AND idempotency_key=? AND kind='reserve'""",
+                (workspace_id, meter.value, idempotency_key)).fetchone()
+            if prior:
+                refunded = self.conn.execute(
+                    "SELECT 1 FROM usage_ledger WHERE reservation_id=? AND kind='refund'",
+                    (prior["reservation_id"],)).fetchone()
+                if refunded:
+                    raise IdempotencyConflict(
+                        f"idempotency key {idempotency_key!r} belongs to a refunded "
+                        "reservation; retry with a new key")
+                return Reservation(
+                    prior["reservation_id"], workspace_id, meter, prior["amount"], prior["period"])
+        quota = plan.quota(meter)
+        if quota != CUSTOM:
+            used = self.usage(workspace_id, meter, period)
+            if used + amount > quota:
+                raise QuotaExceeded(meter, amount, used, quota)
+        if global_cap is not None:
+            global_used = self.global_usage(meter, period)
+            if global_used + amount > global_cap:
+                raise GlobalCapExceeded(meter, global_used, global_cap)
+        reservation_id = f"resv_{secrets.token_hex(8)}"
+        self.conn.execute(
+            "INSERT INTO usage_ledger VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (f"led_{secrets.token_hex(8)}", workspace_id, meter.value, period, "reserve",
+             amount, reservation_id, idempotency_key, ref, _now()))
+        return Reservation(reservation_id, workspace_id, meter, amount, period)
+
     def _settle(self, reservation_id: str, kind: str) -> bool:
         """Append a consume/refund row for a reservation, once. Returns False if already settled
         that way (idempotent). Refund also blocked if already refunded."""
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            resv = self.conn.execute(
-                "SELECT * FROM usage_ledger WHERE reservation_id=? AND kind='reserve'",
-                (reservation_id,)).fetchone()
-            if not resv:
-                self.conn.execute("ROLLBACK")
-                raise KeyError(f"unknown reservation {reservation_id}")
-            already = self.conn.execute(
-                "SELECT kind FROM usage_ledger WHERE reservation_id=? AND kind IN ('consume','refund')",
-                (reservation_id,)).fetchall()
-            settled_kinds = {r["kind"] for r in already}
-            if "refund" in settled_kinds:
-                # A refunded reservation is terminal — cannot consume or double-refund.
-                self.conn.execute("ROLLBACK")
-                return False
-            if kind == "refund" and "consume" in settled_kinds:
-                # Consumed reservations are terminal too: the costly work already ran, no refund.
-                self.conn.execute("ROLLBACK")
-                return False
-            if kind in settled_kinds:
-                self.conn.execute("ROLLBACK")
-                return False
-            self.conn.execute(
-                "INSERT INTO usage_ledger VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (f"led_{secrets.token_hex(8)}", resv["workspace_id"], resv["meter"], resv["period"],
-                 kind, resv["amount"], reservation_id, None, resv["ref"], _now()))
+            settled = self._settle_in_transaction(reservation_id, kind)
             self.conn.execute("COMMIT")
-            return True
+            return settled
         except Exception:
             try:
                 self.conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
             raise
+
+    def _settle_in_transaction(self, reservation_id: str, kind: str) -> bool:
+        if not self.conn.in_transaction:
+            raise RuntimeError("settlement requires an active transaction")
+        resv = self.conn.execute(
+            "SELECT * FROM usage_ledger WHERE reservation_id=? AND kind='reserve'",
+            (reservation_id,)).fetchone()
+        if not resv:
+            raise KeyError(f"unknown reservation {reservation_id}")
+        already = self.conn.execute(
+            "SELECT kind FROM usage_ledger WHERE reservation_id=? AND kind IN ('consume','refund')",
+            (reservation_id,)).fetchall()
+        settled_kinds = {row["kind"] for row in already}
+        if "refund" in settled_kinds:
+            return False
+        if kind == "refund" and "consume" in settled_kinds:
+            return False
+        if kind in settled_kinds:
+            return False
+        self.conn.execute(
+            "INSERT INTO usage_ledger VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (f"led_{secrets.token_hex(8)}", resv["workspace_id"], resv["meter"], resv["period"],
+             kind, resv["amount"], reservation_id, None, resv["ref"], _now()))
+        return True
+
+    def consume_in_transaction(self, reservation_id: str) -> bool:
+        """Consume a reservation inside the caller's active transaction."""
+        return self._settle_in_transaction(reservation_id, "consume")
 
     def consume(self, reservation_id: str) -> bool:
         """Settle a reservation as used (quota stays consumed). Idempotent."""

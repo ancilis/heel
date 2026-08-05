@@ -91,9 +91,9 @@ class MigratorTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
         m = Migrator(conn, CONTROL_PLANE_MIGRATIONS)
-        self.assertEqual(m.apply_all(), [1, 2])
+        self.assertEqual(m.apply_all(), [1, 2, 3])
         self.assertEqual(m.apply_all(), [])
-        self.assertEqual(m.current_version(), 2)
+        self.assertEqual(m.current_version(), 3)
         # schema actually exists
         conn.execute("SELECT user_id FROM users")
         conn.execute("SELECT session_id FROM sessions")

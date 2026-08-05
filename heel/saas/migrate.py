@@ -135,4 +135,81 @@ CREATE TABLE IF NOT EXISTS sessions(
 CREATE TABLE IF NOT EXISTS login_failures(
   email TEXT PRIMARY KEY, count INTEGER NOT NULL, first_at REAL, last_at REAL)
 """),
+    Migration(3, "findings_sync_continuity", """
+CREATE TABLE IF NOT EXISTS projects(
+  workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, name TEXT NOT NULL,
+  created_by TEXT NOT NULL, created_at REAL NOT NULL,
+  PRIMARY KEY(workspace_id, project_ref),
+  UNIQUE(project_ref),
+  FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id));
+CREATE TABLE IF NOT EXISTS project_namespace_keys(
+  workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, namespace_key_hex TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  PRIMARY KEY(workspace_id, project_ref),
+  FOREIGN KEY(workspace_id, project_ref) REFERENCES projects(workspace_id, project_ref));
+CREATE TABLE IF NOT EXISTS synced_reviews(
+  workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, synced_review_id TEXT NOT NULL,
+  projection_hash TEXT NOT NULL, projection_json TEXT NOT NULL, gate_status TEXT NOT NULL,
+  findings_count INTEGER NOT NULL, blockers_count INTEGER NOT NULL, created_at REAL NOT NULL,
+  PRIMARY KEY(workspace_id, project_ref, synced_review_id),
+  UNIQUE(workspace_id, project_ref, projection_hash),
+  FOREIGN KEY(workspace_id, project_ref) REFERENCES projects(workspace_id, project_ref));
+CREATE TABLE IF NOT EXISTS project_findings(
+  workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, finding_id TEXT NOT NULL,
+  surface_ref TEXT NOT NULL, surface_type TEXT NOT NULL, risk_code TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  PRIMARY KEY(workspace_id, project_ref, finding_id),
+  FOREIGN KEY(workspace_id, project_ref) REFERENCES projects(workspace_id, project_ref));
+CREATE TABLE IF NOT EXISTS synced_review_findings(
+  workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, synced_review_id TEXT NOT NULL,
+  finding_id TEXT NOT NULL, ordinal INTEGER NOT NULL, control_code TEXT NOT NULL,
+  severity TEXT NOT NULL, reachable INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, project_ref, synced_review_id, finding_id),
+  UNIQUE(workspace_id, project_ref, synced_review_id, ordinal),
+  FOREIGN KEY(workspace_id, project_ref, synced_review_id)
+    REFERENCES synced_reviews(workspace_id, project_ref, synced_review_id),
+  FOREIGN KEY(workspace_id, project_ref, finding_id)
+    REFERENCES project_findings(workspace_id, project_ref, finding_id));
+CREATE TABLE IF NOT EXISTS findings_source_observations(
+  workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, source_result_ref TEXT NOT NULL,
+  synced_review_id TEXT NOT NULL, engine_version TEXT NOT NULL, execution_mode TEXT NOT NULL,
+  observed_at REAL NOT NULL,
+  PRIMARY KEY(workspace_id, project_ref, source_result_ref),
+  FOREIGN KEY(workspace_id, project_ref, synced_review_id)
+    REFERENCES synced_reviews(workspace_id, project_ref, synced_review_id));
+CREATE TABLE IF NOT EXISTS findings_sync_approvals(
+  workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, approval_id TEXT NOT NULL,
+  request_digest TEXT NOT NULL, approved_by TEXT NOT NULL, approved_at REAL NOT NULL,
+  expires_at REAL NOT NULL,
+  PRIMARY KEY(workspace_id, project_ref, approval_id),
+  UNIQUE(approval_id),
+  FOREIGN KEY(workspace_id, project_ref) REFERENCES projects(workspace_id, project_ref));
+CREATE TABLE IF NOT EXISTS findings_sync_receipts(
+  workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, request_digest TEXT NOT NULL,
+  request_json TEXT NOT NULL, receipt_id TEXT NOT NULL, synced_review_id TEXT NOT NULL,
+  source_result_ref TEXT NOT NULL, approval_id TEXT NOT NULL,
+  disposition TEXT NOT NULL, metered INTEGER NOT NULL, accepted_at TEXT NOT NULL,
+  receipt_json TEXT NOT NULL,
+  PRIMARY KEY(workspace_id, project_ref, request_digest),
+  UNIQUE(receipt_id),
+  FOREIGN KEY(workspace_id, project_ref, synced_review_id)
+    REFERENCES synced_reviews(workspace_id, project_ref, synced_review_id));
+CREATE TABLE IF NOT EXISTS findings_sync_audit(
+  workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, event_id TEXT NOT NULL,
+  action TEXT NOT NULL, actor_ref TEXT NOT NULL, request_digest TEXT NOT NULL,
+  synced_review_id TEXT, ts REAL NOT NULL,
+  PRIMARY KEY(workspace_id, project_ref, event_id),
+  UNIQUE(event_id),
+  FOREIGN KEY(workspace_id, project_ref) REFERENCES projects(workspace_id, project_ref));
+CREATE INDEX IF NOT EXISTS idx_projects_workspace
+  ON projects(workspace_id, created_at, project_ref);
+CREATE INDEX IF NOT EXISTS idx_sync_reviews_project
+  ON synced_reviews(workspace_id, project_ref, created_at, synced_review_id);
+CREATE INDEX IF NOT EXISTS idx_sync_sources_review
+  ON findings_source_observations(workspace_id, project_ref, synced_review_id);
+CREATE INDEX IF NOT EXISTS idx_sync_approvals_digest
+  ON findings_sync_approvals(workspace_id, project_ref, request_digest, expires_at);
+CREATE INDEX IF NOT EXISTS idx_sync_audit_project
+  ON findings_sync_audit(workspace_id, project_ref, ts, event_id)
+"""),
 ]
