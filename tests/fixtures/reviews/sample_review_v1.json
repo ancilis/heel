@@ -1,0 +1,450 @@
+{
+  "baseline_hash": "4d86c01f77bd7f5c005cfd5acfc90d86b53a003e727c72537d891324304071c0",
+  "engine_version": "1.1.0",
+  "execution_mode": "machine_local",
+  "findings": [
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new createoauthapp endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "createoauthapp",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "server-side entitlement check",
+      "reachable": false,
+      "reason": "new downloadbulkexport export reachable without server-side entitlement check",
+      "risk": "export_without_entitlement",
+      "severity": "warn",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant quota",
+      "reachable": false,
+      "reason": "new downloadbulkexport export lacks tenant quota or rate limit",
+      "risk": "export_without_tenant_quota",
+      "severity": "warn",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new inviteseat endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "inviteseat",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new readusagemeter endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "readusagemeter",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new runagenttool endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "runagenttool",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new starttrial endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "starttrial",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new supportimpersonate endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "supportimpersonate",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "server-side entitlement check",
+      "reachable": false,
+      "reason": "new downloadbulkexport export reachable without server-side entitlement check",
+      "risk": "export_without_entitlement",
+      "severity": "warn",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "exports"
+    },
+    {
+      "control": "tenant quota",
+      "reachable": false,
+      "reason": "new downloadbulkexport export lacks tenant quota or rate limit",
+      "risk": "export_without_tenant_quota",
+      "severity": "warn",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "exports"
+    },
+    {
+      "control": "admin role gate and audit event",
+      "reachable": false,
+      "reason": "new supportimpersonate support/admin action lacks role or audit controls",
+      "risk": "admin_action_without_role_or_audit_control",
+      "severity": "warn",
+      "surface_id": "supportimpersonate",
+      "surface_type": "support_admin_actions"
+    }
+  ],
+  "gate_status": "warn",
+  "model_hash": "9596881c2e5ce187480172873ecd76b6ed9803e7d31938280c24f4a202f5a756",
+  "privacy": {
+    "execution": "machine_local",
+    "network_calls": false,
+    "sync_intent": "none",
+    "uploaded": false
+  },
+  "product_id": "acme-platform-api",
+  "questions": [
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:1a07490066e7",
+      "prompt": "Which plan or entitlement protects /billing/usage/meter?",
+      "required": false,
+      "surface": "/billing/usage/meter"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:41a659e5d72e",
+      "prompt": "Which plan or entitlement protects /admin/support/impersonate?",
+      "required": false,
+      "surface": "/admin/support/impersonate"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:50f9383a03e8",
+      "prompt": "Which plan or entitlement protects /oauth/apps?",
+      "required": false,
+      "surface": "/oauth/apps"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:78a8831f8bee",
+      "prompt": "Which plan or entitlement protects /members/seats?",
+      "required": false,
+      "surface": "/members/seats"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:830b617fc6e1",
+      "prompt": "Which plan or entitlement protects /agent/tools/run?",
+      "required": false,
+      "surface": "/agent/tools/run"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:a090be496db2",
+      "prompt": "Which plan or entitlement protects /signup/trial?",
+      "required": false,
+      "surface": "/signup/trial"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:c7c126f5e7d2",
+      "prompt": "Which plan or entitlement protects /api/export/bulk?",
+      "required": false,
+      "surface": "/api/export/bulk"
+    },
+    {
+      "field": "product_rule",
+      "id": "product_rule:4d342b184c43",
+      "prompt": "broad OAuth scope declared by security scheme OAuthAll",
+      "required": false,
+      "surface": "product"
+    },
+    {
+      "field": "product_rule",
+      "id": "product_rule:89683aa462af",
+      "prompt": "export route without declared rate or entitlement control: /api/export/bulk",
+      "required": false,
+      "surface": "product"
+    },
+    {
+      "field": "product_rule",
+      "id": "product_rule:e031d006ca1d",
+      "prompt": "agent-like endpoint lacks scope metadata: /agent/tools/run",
+      "required": false,
+      "surface": "product"
+    },
+    {
+      "field": "product_rule",
+      "id": "product_rule:f033dd7c8e60",
+      "prompt": "broad OAuth scope on /oauth/apps",
+      "required": false,
+      "surface": "product"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:116e9b13d8aa",
+      "prompt": "How is tenant access enforced for /admin/support/impersonate?",
+      "required": false,
+      "surface": "/admin/support/impersonate"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:1d60ecd748fd",
+      "prompt": "How is tenant access enforced for /api/export/bulk?",
+      "required": false,
+      "surface": "/api/export/bulk"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:3102a94ed3e9",
+      "prompt": "How is tenant access enforced for /agent/tools/run?",
+      "required": false,
+      "surface": "/agent/tools/run"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:9128cb5a06d3",
+      "prompt": "How is tenant access enforced for /signup/trial?",
+      "required": false,
+      "surface": "/signup/trial"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:ac3cb44bf0b6",
+      "prompt": "How is tenant access enforced for /billing/usage/meter?",
+      "required": false,
+      "surface": "/billing/usage/meter"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:bc57f4417c82",
+      "prompt": "How is tenant access enforced for /oauth/apps?",
+      "required": false,
+      "surface": "/oauth/apps"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:c13f4c8daed5",
+      "prompt": "How is tenant access enforced for /members/seats?",
+      "required": false,
+      "surface": "/members/seats"
+    }
+  ],
+  "recommended_controls": [
+    {
+      "control": "admin role gate and audit event",
+      "reachable": false,
+      "reason": "new supportimpersonate support/admin action lacks role or audit controls",
+      "risk": "admin_action_without_role_or_audit_control",
+      "severity": "warn",
+      "surface_id": "supportimpersonate",
+      "surface_type": "support_admin_actions"
+    },
+    {
+      "control": "server-side entitlement check",
+      "reachable": false,
+      "reason": "new downloadbulkexport export reachable without server-side entitlement check",
+      "risk": "export_without_entitlement",
+      "severity": "warn",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "server-side entitlement check",
+      "reachable": false,
+      "reason": "new downloadbulkexport export reachable without server-side entitlement check",
+      "risk": "export_without_entitlement",
+      "severity": "warn",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "exports"
+    },
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new createoauthapp endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "createoauthapp",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new inviteseat endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "inviteseat",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new readusagemeter endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "readusagemeter",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new runagenttool endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "runagenttool",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new starttrial endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "starttrial",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant filter",
+      "reachable": false,
+      "reason": "new supportimpersonate endpoint lacks server-side tenant filtering",
+      "risk": "endpoint_without_tenant_filter",
+      "severity": "warn",
+      "surface_id": "supportimpersonate",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant quota",
+      "reachable": false,
+      "reason": "new downloadbulkexport export lacks tenant quota or rate limit",
+      "risk": "export_without_tenant_quota",
+      "severity": "warn",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "control": "tenant quota",
+      "reachable": false,
+      "reason": "new downloadbulkexport export lacks tenant quota or rate limit",
+      "risk": "export_without_tenant_quota",
+      "severity": "warn",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "exports"
+    }
+  ],
+  "result_hash": "de6fd93264cf2765ff49699abd9b61b0070a7392e779e4024a3a79b88be9b5e0",
+  "review_id": "review_de6fd93264cf2765ff49",
+  "safety": {
+    "canary_only": true,
+    "live_probing": false,
+    "mode": "static ProductModel diff",
+    "network_calls": false,
+    "requires_signed_scope_for_live_or_staging_runs": true
+  },
+  "schema_version": "heel.review.v1",
+  "source_hash": "5d949fbd2b11b47aa9c3d9097aee46b198670ebce5a7a9016dd8ccc70346a649",
+  "suggested_regressions": [
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_createoauthapp_endpoint_without_tenant_filter",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "endpoint_without_tenant_filter",
+      "surface_id": "createoauthapp",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_downloadbulkexport_export_without_entitlement",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "export_without_entitlement",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_downloadbulkexport_export_without_entitlement",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "export_without_entitlement",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "exports"
+    },
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_downloadbulkexport_export_without_tenant_quota",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "export_without_tenant_quota",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_downloadbulkexport_export_without_tenant_quota",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "export_without_tenant_quota",
+      "surface_id": "downloadbulkexport",
+      "surface_type": "exports"
+    },
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_inviteseat_endpoint_without_tenant_filter",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "endpoint_without_tenant_filter",
+      "surface_id": "inviteseat",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_readusagemeter_endpoint_without_tenant_filter",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "endpoint_without_tenant_filter",
+      "surface_id": "readusagemeter",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_runagenttool_endpoint_without_tenant_filter",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "endpoint_without_tenant_filter",
+      "surface_id": "runagenttool",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_starttrial_endpoint_without_tenant_filter",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "endpoint_without_tenant_filter",
+      "surface_id": "starttrial",
+      "surface_type": "endpoints_routes"
+    },
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_supportimpersonate_admin_action_without_role_or_audit_control",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "admin_action_without_role_or_audit_control",
+      "surface_id": "supportimpersonate",
+      "surface_type": "support_admin_actions"
+    },
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_supportimpersonate_endpoint_without_tenant_filter",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "endpoint_without_tenant_filter",
+      "surface_id": "supportimpersonate",
+      "surface_type": "endpoints_routes"
+    }
+  ],
+  "summary": {
+    "blockers": 0,
+    "findings": 11,
+    "questions": 18
+  }
+}

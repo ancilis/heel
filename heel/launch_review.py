@@ -382,7 +382,9 @@ def _admin_action_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> li
     audit_missing = _bad_control(_first(props, "audit_logged", "audit_event", "audit_event_id"))
     if not required and not audit_missing:
         return []
-    role_mismatch = reachable and reachable != required and reachable in {"member", "user", "support"}
+    role_mismatch = bool(
+        reachable and reachable != required and reachable in {"member", "user", "support"}
+    )
     if not (role_mismatch or audit_missing):
         return []
     severity = "block" if role_mismatch and audit_missing else "warn"
