@@ -1340,7 +1340,10 @@ test("production worker exposes exact headers, request-URL metadata, and no unap
     json(join(distRoot, ".openai/hosting.json")),
     readFile(join(clientRoot, "og.png")),
   ]);
-  assert.deepEqual(hostingConfig, { d1: null, r2: null });
+  assert.deepEqual(Object.keys(hostingConfig).sort(), ["d1", "project_id", "r2"]);
+  assert.match(hostingConfig.project_id, /^appgprj_[0-9a-f]{32}$/);
+  assert.equal(hostingConfig.d1, null);
+  assert.equal(hostingConfig.r2, null);
   assert.deepEqual(workerConfig.vars, {});
   assert.deepEqual(workerConfig.assets, { directory: "../client" });
   assert.deepEqual(workerConfig.observability, { enabled: false });

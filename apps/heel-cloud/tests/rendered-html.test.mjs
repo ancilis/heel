@@ -68,7 +68,10 @@ test("keeps the anonymous app free of server-side customer capabilities", async 
   assert.equal(packageJson.devDependencies["drizzle-kit"], undefined);
   assert.equal(packageJson.scripts.predev, "node scripts/prepare-runtime.mjs");
   assert.equal(packageJson.scripts.prebuild, "node scripts/prepare-runtime.mjs");
-  assert.deepEqual(hosting, { d1: null, r2: null });
+  assert.deepEqual(Object.keys(hosting).sort(), ["d1", "project_id", "r2"]);
+  assert.match(hosting.project_id, /^appgprj_[0-9a-f]{32}$/);
+  assert.equal(hosting.d1, null);
+  assert.equal(hosting.r2, null);
 
   for (const path of [
     "app/_sites-preview/",
