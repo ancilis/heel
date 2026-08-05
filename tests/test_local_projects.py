@@ -31,17 +31,23 @@ def _review_for(product_id):
     })
 
 
+def _physical_temp(path):
+    """Avoid macOS's /var -> /private/var alias in ordinary-path test cases."""
+    return Path(path).resolve(strict=True)
+
+
 class LocalProjectStoreTests(unittest.TestCase):
     def test_review_round_trip_uses_canonical_heel_home_and_sorted_json(self):
         from heel.local_projects import LocalProjectStore
 
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(os.environ, {"HEEL_HOME": tmp}):
+            root = _physical_temp(tmp)
+            with mock.patch.dict(os.environ, {"HEEL_HOME": str(root)}):
                 store = LocalProjectStore()
                 envelope = _golden_envelope()
                 saved = store.save_review(envelope)
 
-                expected = Path(tmp) / "reviews" / f"{envelope['review_id']}.json"
+                expected = root / "reviews" / f"{envelope['review_id']}.json"
                 self.assertEqual(saved, expected)
                 self.assertEqual(store.get_review(envelope["review_id"]), envelope)
                 self.assertEqual(
@@ -52,7 +58,7 @@ class LocalProjectStoreTests(unittest.TestCase):
                         "gate_status": envelope["gate_status"],
                     }],
                 )
-                self.assertEqual(list(Path(tmp).rglob("*.json")), [expected])
+                self.assertEqual(list(root.rglob("*.json")), [expected])
                 self.assertEqual(
                     expected.read_text(encoding="utf-8"),
                     stable_json(envelope) + "\n",
@@ -63,7 +69,7 @@ class LocalProjectStoreTests(unittest.TestCase):
         from heel.local_projects import LocalProjectStore
 
         with tempfile.TemporaryDirectory() as parent:
-            root = Path(parent) / "heel-home"
+            root = _physical_temp(parent) / "heel-home"
             store = LocalProjectStore(root)
             path = store.save_review(_golden_envelope())
 
@@ -85,7 +91,8 @@ class LocalProjectStoreTests(unittest.TestCase):
             "review_" + "a" * 19 + "g",
         )
         with tempfile.TemporaryDirectory() as tmp:
-            store = LocalProjectStore(Path(tmp))
+            root = _physical_temp(tmp)
+            store = LocalProjectStore(root)
             for review_id in invalid_ids:
                 with self.subTest(review_id=review_id):
                     envelope = _golden_envelope()
@@ -94,13 +101,13 @@ class LocalProjectStoreTests(unittest.TestCase):
                         store.save_review(envelope)
                     with self.assertRaisesRegex(ValueError, "review_id"):
                         store.get_review(review_id)
-            self.assertFalse((Path(tmp).parent / "escape.json").exists())
+            self.assertFalse((root.parent / "escape.json").exists())
 
     def test_valid_shape_but_wrong_content_address_is_rejected(self):
         from heel.local_projects import LocalProjectStore
 
         with tempfile.TemporaryDirectory() as tmp:
-            store = LocalProjectStore(Path(tmp))
+            store = LocalProjectStore(_physical_temp(tmp))
             envelope = _golden_envelope()
             envelope["review_id"] = "review_" + "a" * 20
             with self.assertRaisesRegex(ValueError, "review_id"):
@@ -112,11 +119,11 @@ class LocalProjectStoreTests(unittest.TestCase):
         if not hasattr(os, "symlink"):
             self.skipTest("symbolic links unavailable")
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
-            root = Path(tmp)
+            root = _physical_temp(tmp)
             reviews = root / "reviews"
             reviews.mkdir()
             envelope = _golden_envelope()
-            outside_path = Path(outside) / "review.json"
+            outside_path = _physical_temp(outside) / "review.json"
             outside_path.write_text(stable_json(envelope) + "\n", encoding="utf-8")
             target = reviews / f"{envelope['review_id']}.json"
             try:
@@ -139,22 +146,82 @@ class LocalProjectStoreTests(unittest.TestCase):
         if not hasattr(os, "symlink"):
             self.skipTest("symbolic links unavailable")
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
-            reviews = Path(tmp) / "reviews"
+            root = _physical_temp(tmp)
+            outside_root = _physical_temp(outside)
+            reviews = root / "reviews"
             try:
-                reviews.symlink_to(Path(outside), target_is_directory=True)
+                reviews.symlink_to(outside_root, target_is_directory=True)
             except OSError as exc:
                 self.skipTest(f"symbolic links unavailable: {exc}")
-            store = LocalProjectStore(Path(tmp))
             with self.assertRaisesRegex(ValueError, "symbolic link"):
-                store.list_reviews()
+                LocalProjectStore(root)
+            self.assertEqual(list(outside_root.iterdir()), [])
+
+    def test_explicit_symlinked_root_is_rejected_without_writing_outside(self):
+        from heel.local_projects import LocalProjectStore
+
+        if not hasattr(os, "symlink"):
+            self.skipTest("symbolic links unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = _physical_temp(tmp)
+            outside = parent / "outside"
+            outside.mkdir()
+            symlink_root = parent / "heel-home"
+            symlink_root.symlink_to(outside, target_is_directory=True)
+
             with self.assertRaisesRegex(ValueError, "symbolic link"):
-                store.save_review(_golden_envelope())
+                LocalProjectStore(symlink_root)
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_default_store_rejects_symlinked_heel_home_without_writing_outside(self):
+        from heel.local_projects import LocalProjectStore
+
+        if not hasattr(os, "symlink"):
+            self.skipTest("symbolic links unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = _physical_temp(tmp)
+            outside = parent / "outside"
+            outside.mkdir()
+            symlink_root = parent / "heel-home"
+            symlink_root.symlink_to(outside, target_is_directory=True)
+
+            with mock.patch.dict(os.environ, {"HEEL_HOME": str(symlink_root)}):
+                with self.assertRaisesRegex(ValueError, "symbolic link"):
+                    LocalProjectStore()
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_symlinked_intermediate_ancestor_is_rejected_without_writing_outside(self):
+        from heel.local_projects import LocalProjectStore
+
+        if not hasattr(os, "symlink"):
+            self.skipTest("symbolic links unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = _physical_temp(tmp)
+            outside = parent / "outside"
+            outside.mkdir()
+            intermediate = parent / "linked-parent"
+            intermediate.symlink_to(outside, target_is_directory=True)
+            root = intermediate / "heel-home"
+
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                LocalProjectStore(root)
+            self.assertFalse((outside / "heel-home").exists())
+
+    def test_relative_real_root_remains_supported(self):
+        from heel.local_projects import LocalProjectStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = _physical_temp(tmp)
+            with mock.patch.object(Path, "cwd", return_value=parent):
+                store = LocalProjectStore(Path("relative-home"))
+            path = store.save_review(_golden_envelope())
+            self.assertEqual(path.parent, parent / "relative-home" / "reviews")
 
     def test_tampered_hash_is_rejected_on_save_read_and_list(self):
         from heel.local_projects import LocalProjectStore
 
         with tempfile.TemporaryDirectory() as tmp:
-            store = LocalProjectStore(Path(tmp))
+            store = LocalProjectStore(_physical_temp(tmp))
             envelope = _golden_envelope()
             tampered = json.loads(json.dumps(envelope))
             tampered["product_id"] = "tampered-product"
@@ -172,9 +239,10 @@ class LocalProjectStoreTests(unittest.TestCase):
         from heel.local_projects import LocalProjectStore
 
         with tempfile.TemporaryDirectory() as tmp:
-            store = LocalProjectStore(Path(tmp))
+            root = _physical_temp(tmp)
+            store = LocalProjectStore(root)
             envelope = _golden_envelope()
-            reviews = Path(tmp) / "reviews"
+            reviews = root / "reviews"
             reviews.mkdir()
             path = reviews / f"{envelope['review_id']}.json"
             path.write_text("{not valid JSON\n", encoding="utf-8")
@@ -188,7 +256,7 @@ class LocalProjectStoreTests(unittest.TestCase):
         from heel.local_projects import LocalProjectStore
 
         with tempfile.TemporaryDirectory() as tmp:
-            store = LocalProjectStore(Path(tmp))
+            store = LocalProjectStore(_physical_temp(tmp))
             self.assertIsNone(store.get_review("review_" + "0" * 20))
             self.assertEqual(store.list_reviews(), [])
 
@@ -206,7 +274,7 @@ class LocalProjectStoreTests(unittest.TestCase):
         from heel.local_projects import LocalProjectStore
 
         with tempfile.TemporaryDirectory() as tmp:
-            store = LocalProjectStore(Path(tmp))
+            store = LocalProjectStore(_physical_temp(tmp))
             envelope = _golden_envelope()
             expected = json.loads(json.dumps(envelope))
             store.save_review(envelope)
@@ -229,7 +297,7 @@ class LocalProjectStoreTests(unittest.TestCase):
         envelope = review_openapi(spec)
 
         with tempfile.TemporaryDirectory() as tmp:
-            store = LocalProjectStore(Path(tmp))
+            store = LocalProjectStore(_physical_temp(tmp))
             path = store.save_review(envelope)
             persisted = path.read_text(encoding="utf-8")
 

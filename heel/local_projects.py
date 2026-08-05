@@ -9,7 +9,7 @@ import tempfile
 from typing import Any, Mapping
 
 from .review_contract import stable_json, validate_review_envelope, validate_review_id
-from .scope import ensure_home
+from .scope import heel_home
 
 
 def _chmod_best_effort(path: Path, mode: int) -> None:
@@ -28,29 +28,53 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _absolute_without_resolving(path: Path) -> Path:
+    expanded = path.expanduser()
+    return expanded if expanded.is_absolute() else Path.cwd() / expanded
+
+
+def _reject_symlink_components(path: Path) -> None:
+    """Reject every existing link in a path without following or resolving it."""
+    if not path.is_absolute():
+        raise ValueError("Heel home must be represented as an absolute path")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        if part == "..":
+            current = current.parent
+            continue
+        if part == ".":
+            continue
+        current = current / part
+        try:
+            status = current.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(status.st_mode):
+            raise ValueError(f"path component must not be a symbolic link: {current}")
+
+
 class LocalProjectStore:
     """Save and retrieve reviews below one selected Heel home directory."""
 
     def __init__(self, root: Path | None = None):
-        self.root = Path(ensure_home()) if root is None else Path(root)
+        selected = Path(heel_home()) if root is None else Path(root)
+        self.root = _absolute_without_resolving(selected)
         self.reviews = self.root / "reviews"
+        _reject_symlink_components(self.reviews)
 
     def _review_path(self, review_id: str) -> Path:
         return self.reviews / f"{validate_review_id(review_id)}.json"
 
     def _reviews_directory(self, *, create: bool) -> bool:
-        if self.reviews.is_symlink():
-            raise ValueError("reviews directory must not be a symbolic link")
+        _reject_symlink_components(self.reviews)
         if not self.reviews.exists():
             if not create:
                 return False
             self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
             _chmod_best_effort(self.root, 0o700)
-            if self.reviews.is_symlink():
-                raise ValueError("reviews directory must not be a symbolic link")
+            _reject_symlink_components(self.reviews)
             self.reviews.mkdir(mode=0o700, exist_ok=True)
-        if self.reviews.is_symlink():
-            raise ValueError("reviews directory must not be a symbolic link")
+        _reject_symlink_components(self.reviews)
         if not self.reviews.is_dir():
             raise ValueError("reviews path must be a directory")
         _chmod_best_effort(self.root, 0o700)
