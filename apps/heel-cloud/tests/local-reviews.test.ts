@@ -133,6 +133,45 @@ describe("LocalReviewStore", () => {
     expect(MAX_LOCAL_REVIEWS).toBeGreaterThanOrEqual(3);
   });
 
+  test("trims with a bounded cursor without materializing every key", async () => {
+    const factory = new IDBFactory();
+    let time = 0;
+    const store = new LocalReviewStore({
+      indexedDB: factory,
+      maxItems: 2,
+      now: () => ++time,
+    });
+    await expect(store.save(envelope("seed"))).resolves.toBe(true);
+
+    const database = await requestResult(factory.open(LOCAL_REVIEW_DATABASE));
+    const index = database
+      .transaction(LOCAL_REVIEW_STORE, "readonly")
+      .objectStore(LOCAL_REVIEW_STORE)
+      .index("saved-at");
+    const prototype = Object.getPrototypeOf(index) as {
+      getAllKeys: IDBIndex["getAllKeys"];
+      openCursor: IDBIndex["openCursor"];
+    };
+    database.close();
+    const originalGetAllKeys = prototype.getAllKeys;
+    const originalOpenCursor = prototype.openCursor;
+    let cursorCalls = 0;
+    prototype.getAllKeys = () => { throw new Error("unbounded getAllKeys is forbidden"); };
+    prototype.openCursor = function (...args: Parameters<IDBIndex["openCursor"]>) {
+      cursorCalls += 1;
+      return originalOpenCursor.apply(this as unknown as IDBIndex, args);
+    };
+    try {
+      await expect(store.save(envelope("second"))).resolves.toBe(true);
+      await expect(store.save(envelope("third"))).resolves.toBe(true);
+      expect(cursorCalls).toBeGreaterThan(0);
+      await expect(store.list()).resolves.toHaveLength(2);
+    } finally {
+      prototype.getAllKeys = originalGetAllKeys;
+      prototype.openCursor = originalOpenCursor;
+    }
+  });
+
   test("supports delete and clear without adding a cloud sync state", async () => {
     const store = new LocalReviewStore({ indexedDB: new IDBFactory() });
     const first = envelope("first");

@@ -26,16 +26,41 @@ function canonicalJson(value: unknown): string {
 }
 
 
-function browserEnvelope(): Record<string, unknown> {
+function browserEnvelope(productId?: string): Record<string, unknown> {
   const body = structuredClone(sampleEnvelope) as unknown as Record<string, unknown>;
   delete body.review_id;
   delete body.result_hash;
   body.execution_mode = "browser_local";
+  if (productId !== undefined) body.product_id = productId;
   body.privacy = {
     execution: "browser_local",
     network_calls: false,
     uploaded: false,
     sync_intent: "none",
+  };
+  const resultHash = createHash("sha256").update(canonicalJson(body), "utf8").digest("hex");
+  return {
+    review_id: `review_${resultHash.slice(0, 20)}`,
+    result_hash: resultHash,
+    ...body,
+  };
+}
+
+
+function withoutQuestion(
+  envelope: Record<string, unknown>,
+  surface: string,
+  field: string,
+): Record<string, unknown> {
+  const body = structuredClone(envelope);
+  delete body.review_id;
+  delete body.result_hash;
+  body.questions = (body.questions as Array<Record<string, unknown>>).filter(
+    (question) => question.surface !== surface || question.field !== field,
+  );
+  body.summary = {
+    ...(body.summary as Record<string, unknown>),
+    questions: (body.questions as unknown[]).length,
   };
   const resultHash = createHash("sha256").update(canonicalJson(body), "utf8").digest("hex");
   return {
@@ -128,11 +153,7 @@ describe("BrowserReviewClient", () => {
     });
     let readinessFailure: BrowserReviewClientError | null = null;
     void client.whenReady().catch((error: BrowserReviewClientError) => { readinessFailure = error; });
-    const queued = client.review("queued-private-source", [{
-      surface: "downloadbulkexport",
-      field: "rate_limit",
-      value: "unknown",
-    }]);
+    const queued = client.review("queued-private-source");
     let queuedFailure: BrowserReviewClientError | null = null;
     void queued.catch((error: BrowserReviewClientError) => { queuedFailure = error; });
 
@@ -297,6 +318,22 @@ describe("BrowserReviewClient", () => {
     expect(client.status).toBe("complete");
   });
 
+  test("listener exceptions never interrupt readiness, queued work, or other listeners", async () => {
+    const worker = new FakeWorker();
+    const client = new BrowserReviewClient({ workerFactory: () => worker });
+    const statuses: string[] = [];
+    client.subscribe(() => { throw new Error("listener failure"); });
+    client.subscribe((status) => { statuses.push(status); });
+    const pending = client.review("listener-safe-source");
+
+    expect(() => ready(worker)).not.toThrow();
+    const request = JSON.parse(worker.sent.at(-1)!);
+    result(worker, request.request_id);
+    await expect(pending).resolves.toBeDefined();
+    expect(statuses).toEqual(["ready", "reviewing", "complete"]);
+    await expect(client.whenReady()).resolves.toBeUndefined();
+  });
+
   test("rejects concurrent reviews and ignores stale request identifiers", async () => {
     const worker = new FakeWorker();
     const client = new BrowserReviewClient({ workerFactory: () => worker });
@@ -415,7 +452,114 @@ describe("BrowserReviewClient", () => {
     expect(client.retainedInput?.source).toBe("retained-large-result-source");
   });
 
-  test("reruns against the retained pre-envelope and derives the receipt in the main thread", async () => {
+  test.each(["toString", "constructor", "__proto__"])(
+    "rejects inherited public error name %s in constructors and worker messages",
+    async (inheritedCode) => {
+      const direct = new BrowserReviewClientError(inheritedCode);
+      expect(direct.code).toBe("review_failed");
+      expect(typeof direct.publicMessage).toBe("string");
+
+      const worker = new FakeWorker();
+      const client = new BrowserReviewClient({ workerFactory: () => worker });
+      ready(worker);
+      await client.whenReady();
+      const pending = client.review(`prototype-${inheritedCode}`);
+      const request = JSON.parse(worker.sent.at(-1)!);
+      worker.emit(JSON.stringify({
+        type: "error",
+        protocol_version: WORKER_PROTOCOL_VERSION,
+        request_id: request.request_id,
+        code: inheritedCode,
+        message: "redacted",
+      }));
+      await expect(pending).rejects.toMatchObject({
+        code: "review_failed",
+        publicMessage: expect.any(String),
+      });
+    },
+  );
+
+  test("rejects answers on an initial review before worker messaging", async () => {
+    const worker = new FakeWorker();
+    const client = new BrowserReviewClient({ workerFactory: () => worker });
+    ready(worker);
+    await client.whenReady();
+
+    await expect(client.review("source", [{
+      surface: "downloadbulkexport",
+      field: "rate_limit",
+      value: "unknown",
+    }])).rejects.toMatchObject({ code: "invalid_answers" });
+    expect(worker.sent).toEqual([]);
+  });
+
+  test("binds cumulative reruns to the last successful initial source and envelope", async () => {
+    const worker = new FakeWorker();
+    const client = new BrowserReviewClient({ workerFactory: () => worker });
+    ready(worker);
+    await client.whenReady();
+    const before = parseReviewEnvelopeV1(browserEnvelope());
+    const firstAnswer = {
+      surface: "downloadbulkexport",
+      field: "tenant_filter",
+      value: "enforced",
+    } as const;
+    const secondAnswer = {
+      surface: "downloadbulkexport",
+      field: "rate_limit",
+      value: "unknown",
+    } as const;
+
+    await expect(client.rerun("same-source", before, [firstAnswer])).rejects.toMatchObject({
+      code: "invalid_answers",
+    });
+
+    const initial = client.review("same-source");
+    const initialRequest = JSON.parse(worker.sent.at(-1)!);
+    result(worker, initialRequest.request_id, before as unknown as Record<string, unknown>);
+    const initialResult = await initial;
+    expect(initialResult).toMatchObject({ receipt: null });
+    (initialResult.envelope as unknown as Record<string, unknown>).review_id = "review_00000000000000000000";
+
+    const sentAfterInitial = worker.sent.length;
+    await expect(client.rerun("different-source", before, [firstAnswer])).rejects.toMatchObject({
+      code: "invalid_answers",
+    });
+    const differentBefore = parseReviewEnvelopeV1(browserEnvelope("different-product"));
+    await expect(client.rerun("same-source", differentBefore, [firstAnswer])).rejects.toMatchObject({
+      code: "invalid_answers",
+    });
+    expect(worker.sent).toHaveLength(sentAfterInitial);
+
+    const afterFirst = withoutQuestion(
+      before as unknown as Record<string, unknown>,
+      firstAnswer.surface,
+      firstAnswer.field,
+    );
+    const first = client.rerun("same-source", before, [firstAnswer]);
+    const firstRequest = JSON.parse(worker.sent.at(-1)!);
+    result(worker, firstRequest.request_id, afterFirst);
+    await expect(first).resolves.toMatchObject({
+      receipt: { items: [{ ...firstAnswer, receipt: "applied" }] },
+    });
+
+    const cumulativeAnswers = [firstAnswer, secondAnswer];
+    const second = client.rerun("same-source", before, cumulativeAnswers);
+    const secondRequest = JSON.parse(worker.sent.at(-1)!);
+    expect(JSON.parse(secondRequest.answers_json)).toEqual(cumulativeAnswers);
+    result(worker, secondRequest.request_id, afterFirst);
+    await expect(second).resolves.toMatchObject({
+      receipt: {
+        confidence: "preliminary",
+        items: [
+          { ...secondAnswer, receipt: "unanswered" },
+          { ...firstAnswer, receipt: "applied" },
+        ],
+      },
+    });
+  });
+
+  test("rejects a rerun result whose product identity differs from its baseline", async () => {
     const worker = new FakeWorker();
     const client = new BrowserReviewClient({ workerFactory: () => worker });
     ready(worker);
@@ -423,19 +567,20 @@ describe("BrowserReviewClient", () => {
     const before = parseReviewEnvelopeV1(browserEnvelope());
     const answer = {
       surface: "downloadbulkexport",
-      field: "rate_limit",
-      value: "unknown",
+      field: "tenant_filter",
+      value: "enforced",
     } as const;
 
-    const pending = client.rerun("same-source", before, [answer]);
-    const request = JSON.parse(worker.sent.at(-1)!);
-    expect(JSON.parse(request.answers_json)).toEqual([answer]);
-    result(worker, request.request_id, before as unknown as Record<string, unknown>);
-    const completed = await pending;
-    expect(completed.receipt).toMatchObject({
-      confidence: "preliminary",
-      items: [{ ...answer, receipt: "unanswered" }],
-    });
+    const initial = client.review("identity-bound-source");
+    const initialRequest = JSON.parse(worker.sent.at(-1)!);
+    result(worker, initialRequest.request_id, before as unknown as Record<string, unknown>);
+    await initial;
+
+    const rerun = client.rerun("identity-bound-source", before, [answer]);
+    const rerunRequest = JSON.parse(worker.sent.at(-1)!);
+    const unrelatedAfter = withoutQuestion(browserEnvelope("unrelated-product"), answer.surface, answer.field);
+    result(worker, rerunRequest.request_id, unrelatedAfter);
+    await expect(rerun).rejects.toMatchObject({ code: "worker_protocol" });
   });
 
   test("redacts synchronous postMessage failures and restarts cleanly", async () => {

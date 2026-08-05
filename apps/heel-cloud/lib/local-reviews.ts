@@ -217,9 +217,28 @@ export class LocalReviewStore {
   async #trim(database: IDBDatabase): Promise<void> {
     const transaction = database.transaction(LOCAL_REVIEW_STORE, "readwrite");
     const store = transaction.objectStore(LOCAL_REVIEW_STORE);
-    const keys = await requestResult(store.index(SAVED_AT_INDEX).getAllKeys());
-    for (const key of keys.slice(0, Math.max(0, keys.length - this.#maxItems))) store.delete(key);
+    const count = await requestResult(store.count());
+    const excess = Math.max(0, count - this.#maxItems);
+    if (excess > 0) await this.#deleteOldest(store.index(SAVED_AT_INDEX), excess);
     await transactionComplete(transaction);
+  }
+
+  #deleteOldest(index: IDBIndex, count: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let deleted = 0;
+      const request = index.openCursor(null, "next");
+      request.onerror = () => reject(request.error ?? new Error("browser storage cursor failed"));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor === null || deleted >= count) {
+          resolve();
+          return;
+        }
+        cursor.delete();
+        deleted += 1;
+        cursor.continue();
+      };
+    });
   }
 
   #readBounded(transaction: IDBTransaction): Promise<StoredLocalReviewV1[]> {

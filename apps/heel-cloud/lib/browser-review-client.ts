@@ -45,6 +45,7 @@ export interface RetainedBrowserInput {
 
 interface ActiveRequest {
   id: string;
+  source: string;
   before: ReviewEnvelopeV1 | null;
   answers: ReviewAnswer[];
   resolve(value: BrowserReviewResult): void;
@@ -59,6 +60,11 @@ interface QueuedRequest {
   before: ReviewEnvelopeV1 | null;
   resolve(value: BrowserReviewResult): void;
   reject(error: BrowserReviewClientError): void;
+}
+
+interface ReviewBaseline {
+  source: string;
+  envelope: ReviewEnvelopeV1;
 }
 
 export interface BrowserReviewClientOptions {
@@ -87,6 +93,12 @@ const PUBLIC_ERRORS: Readonly<Record<string, string>> = Object.freeze({
   result_too_large: "The review result exceeds the safe browser limit.",
   worker_protocol: "The browser-local review returned an invalid response.",
 });
+const PUBLIC_ERROR_CODES = new Set(Object.keys(PUBLIC_ERRORS));
+
+
+function isPublicErrorCode(code: string): boolean {
+  return PUBLIC_ERROR_CODES.has(code);
+}
 
 
 export class BrowserReviewClientError extends Error {
@@ -94,10 +106,11 @@ export class BrowserReviewClientError extends Error {
   readonly publicMessage: string;
 
   constructor(code: string) {
-    const publicMessage = PUBLIC_ERRORS[code] ?? PUBLIC_ERRORS.review_failed;
+    const safeCode = isPublicErrorCode(code) ? code : "review_failed";
+    const publicMessage = PUBLIC_ERRORS[safeCode];
     super(publicMessage);
     this.name = "BrowserReviewClientError";
-    this.code = PUBLIC_ERRORS[code] ? code : "review_failed";
+    this.code = safeCode;
     this.publicMessage = publicMessage;
   }
 }
@@ -164,6 +177,7 @@ export class BrowserReviewClient {
   #bootTimer: ReturnType<typeof setTimeout> | null = null;
   #bootRetriesRemaining = MAX_AUTOMATIC_BOOT_RETRIES;
   #retainedInput: RetainedBrowserInput | null = null;
+  #baseline: ReviewBaseline | null = null;
   #requestSequence = 0;
   #disposed = false;
 
@@ -215,7 +229,25 @@ export class BrowserReviewClient {
     before: ReviewEnvelopeV1,
     answers: readonly ReviewAnswer[],
   ): Promise<BrowserReviewResult> {
-    return this.#request(source, answers, parseReviewEnvelopeV1(before));
+    let parsedBefore: ReviewEnvelopeV1;
+    try {
+      parsedBefore = parseReviewEnvelopeV1(before);
+      if (
+        this.#baseline === null
+        || source !== this.#baseline.source
+        || parsedBefore.review_id !== this.#baseline.envelope.review_id
+        || parsedBefore.result_hash !== this.#baseline.envelope.result_hash
+      ) {
+        throw new BrowserReviewClientError("invalid_answers");
+      }
+    } catch (error) {
+      return Promise.reject(
+        error instanceof BrowserReviewClientError
+          ? error
+          : new BrowserReviewClientError("invalid_answers"),
+      );
+    }
+    return this.#request(source, answers, parsedBefore);
   }
 
   cancel(): void {
@@ -276,6 +308,7 @@ export class BrowserReviewClient {
         throw new BrowserReviewClientError("answers_too_large");
       }
       if (before !== null && answers.length === 0) throw new BrowserReviewClientError("invalid_answers");
+      if (before === null && answers.length !== 0) throw new BrowserReviewClientError("invalid_answers");
       if (this.#active !== null || this.#queued !== null) {
         throw new BrowserReviewClientError("review_in_progress");
       }
@@ -310,6 +343,7 @@ export class BrowserReviewClient {
     const timer = setTimeout(() => this.#failActive("review_timeout", true), this.#timeoutMs);
     this.#active = {
       id,
+      source: request.source,
       before: request.before,
       answers: request.answers,
       resolve: request.resolve,
@@ -403,7 +437,7 @@ export class BrowserReviewClient {
         this.#failActive("worker_protocol", true);
         return;
       }
-      const code = typeof record.code === "string" && PUBLIC_ERRORS[record.code]
+      const code = typeof record.code === "string" && isPublicErrorCode(record.code)
         ? record.code
         : "review_failed";
       this.#failActive(code, true);
@@ -423,9 +457,24 @@ export class BrowserReviewClient {
     }
     try {
       const envelope = parseReviewEnvelopeV1(JSON.parse(record.result_json));
+      if (
+        active.before !== null
+        && (
+          envelope.product_id !== active.before.product_id
+          || envelope.source_hash !== active.before.source_hash
+        )
+      ) {
+        throw new Error("rerun result identity does not match its baseline");
+      }
       const receipt = active.before === null
         ? null
         : deriveAnswerReceipt(active.before, envelope, active.answers);
+      if (active.before === null) {
+        this.#baseline = {
+          source: active.source,
+          envelope: parseReviewEnvelopeV1(envelope),
+        };
+      }
       clearTimeout(active.timer);
       this.#active = null;
       this.#setStatus("complete");
@@ -513,6 +562,12 @@ export class BrowserReviewClient {
 
   #setStatus(status: BrowserReviewStatus): void {
     this.#status = status;
-    for (const listener of this.#listeners) listener(status);
+    for (const listener of this.#listeners) {
+      try {
+        listener(status);
+      } catch {
+        // Subscriber failures never control the review state machine.
+      }
+    }
   }
 }
