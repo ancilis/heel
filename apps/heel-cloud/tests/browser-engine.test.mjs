@@ -9,7 +9,7 @@ import { copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } f
 import http from "node:http";
 import http2 from "node:http2";
 import https from "node:https";
-import { registerHooks } from "node:module";
+import { registerHooks, syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -173,7 +173,7 @@ function installNetworkConfinement() {
       if (ownDescriptor) Object.defineProperty(owner, name, ownDescriptor);
       else delete owner[name];
     });
-    const installed = { construct, denied, label, name, owner };
+    const installed = { construct, denied, label, name, original, owner };
     return installed;
   }
 
@@ -208,6 +208,21 @@ function installNetworkConfinement() {
     "node:dns/promises.Resolver",
     { construct: true },
   ));
+  syncBuiltinESMExports();
+  const builtinEsmModules = [
+    { defaultExport: http, names: ["get", "request"], specifier: "node:http" },
+    { defaultExport: https, names: ["get", "request"], specifier: "node:https" },
+    { defaultExport: net, names: ["connect", "createConnection"], specifier: "node:net" },
+    { defaultExport: tls, names: ["connect"], specifier: "node:tls" },
+    { defaultExport: dgram, names: ["createSocket"], specifier: "node:dgram" },
+    { defaultExport: http2, names: ["connect"], specifier: "node:http2" },
+    { defaultExport: dns, names: [...dnsMethods, "Resolver"], specifier: "node:dns" },
+    {
+      defaultExport: dnsPromises,
+      names: [...dnsMethods, "Resolver"],
+      specifier: "node:dns/promises",
+    },
+  ];
 
   const globalGuards = [
     guard(globalThis, "fetch", "global.fetch"),
@@ -254,6 +269,44 @@ function installNetworkConfinement() {
     guard,
     methodGuards,
     globalGuards,
+    async proveBuiltinEsmGuards() {
+      for (const { defaultExport, names, specifier } of builtinEsmModules) {
+        const namespace = await import(specifier);
+        for (const name of names) {
+          const installed = methodGuards.find((candidate) => (
+            candidate.owner === defaultExport && candidate.name === name
+          ));
+          assert.ok(installed, `${specifier}.${name} has no matching confinement guard`);
+          assert.equal(
+            namespace[name],
+            installed.denied,
+            `${specifier}.${name} named ESM export bypasses confinement`,
+          );
+          const before = attempts.length;
+          assert.throws(
+            () => installed.construct
+              ? Reflect.construct(namespace[name], [])
+              : Reflect.apply(namespace[name], namespace, []),
+            new RegExp(networkDeniedMessage),
+            `${specifier}.${name}`,
+          );
+          assert.deepEqual(attempts.slice(before), [installed.label]);
+        }
+      }
+    },
+    async proveBuiltinEsmRestoration() {
+      for (const { defaultExport, names, specifier } of builtinEsmModules) {
+        const namespace = await import(specifier);
+        for (const name of names) {
+          const installed = methodGuards.find((candidate) => (
+            candidate.owner === defaultExport && candidate.name === name
+          ));
+          assert.equal(defaultExport[name], installed.original, `${specifier}.${name} default restore`);
+          assert.equal(namespace[name], installed.original, `${specifier}.${name} named ESM restore`);
+          assert.notEqual(namespace[name], installed.denied, `${specifier}.${name} retained denial guard`);
+        }
+      }
+    },
     async proveModuleGuards() {
       const wsModule = await import("ws");
       assert.equal(wsModule.__heelNetworkDenied, true);
@@ -290,6 +343,7 @@ function installNetworkConfinement() {
     restore() {
       moduleHooks.deregister();
       for (const restore of restorers.reverse()) restore();
+      syncBuiltinESMExports();
       if (previousStateDescriptor) {
         Object.defineProperty(globalThis, stateSymbol, previousStateDescriptor);
       } else {
@@ -447,6 +501,7 @@ test("executes the real local wheel in Pyodide with outbound network disabled", 
       ...confinement.methodGuards,
       ...confinement.globalGuards,
     ]);
+    await confinement.proveBuiltinEsmGuards();
     await confinement.proveModuleGuards();
     confinement.resetAttempts();
 
@@ -500,5 +555,6 @@ test("executes the real local wheel in Pyodide with outbound network disabled", 
     );
   } finally {
     confinement.restore();
+    await confinement.proveBuiltinEsmRestoration();
   }
 });
