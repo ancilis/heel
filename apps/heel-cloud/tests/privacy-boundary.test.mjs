@@ -120,10 +120,67 @@ function analyzeSource(fileName, text) {
   const ambientRoots = new Set([
     "document", "frames", "globalThis", "navigator", "parent", "self", "top", "window",
   ]);
-  const runtimeAuthorityMembers = new Set(["contentDocument", "contentWindow", "defaultView"]);
+  const runtimeAuthorityMembers = new Set([
+    "contentDocument", "contentWindow", "defaultView", "ownerDocument",
+  ]);
   const sinkAliases = new Set();
   const engineWorker = relativeName === "workers/heel-review.worker.ts";
   const serverWorker = relativeName === "worker/index.ts";
+  const constStringInitializers = new Map();
+
+  function collectConstStringInitializers(node) {
+    if (
+      ts.isVariableDeclaration(node)
+      && ts.isIdentifier(node.name)
+      && node.initializer
+      && ts.isVariableDeclarationList(node.parent)
+      && (node.parent.flags & ts.NodeFlags.Const) !== 0
+    ) {
+      const existing = constStringInitializers.get(node.name.text) ?? [];
+      existing.push(node.initializer);
+      constStringInitializers.set(node.name.text, existing);
+    }
+    ts.forEachChild(node, collectConstStringInitializers);
+  }
+  collectConstStringInitializers(parsed);
+
+  function resolvedConstantStrings(node, seen = new Set()) {
+    if (ts.isStringLiteralLike(node)) return new Set([node.text]);
+    if (ts.isParenthesizedExpression(node)) return resolvedConstantStrings(node.expression, seen);
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const values = new Set();
+      for (const left of resolvedConstantStrings(node.left, seen)) {
+        for (const right of resolvedConstantStrings(node.right, seen)) {
+          if (values.size < 32) values.add(left + right);
+        }
+      }
+      return values;
+    }
+    if (!ts.isIdentifier(node) || seen.has(node.text)) return new Set();
+    const nestedSeen = new Set(seen).add(node.text);
+    const values = new Set();
+    for (const initializer of constStringInitializers.get(node.text) ?? []) {
+      for (const value of resolvedConstantStrings(initializer, nestedSeen)) {
+        if (values.size < 32) values.add(value);
+      }
+    }
+    return values;
+  }
+
+  function resolvedMemberNames(node) {
+    if (ts.isPropertyAccessExpression(node)) return new Set([node.name.text]);
+    if (ts.isElementAccessExpression(node) && node.argumentExpression) {
+      return resolvedConstantStrings(node.argumentExpression);
+    }
+    return new Set();
+  }
+
+  function bindingPropertyNames(element) {
+    const property = element.propertyName ?? element.name;
+    if (ts.isComputedPropertyName(property)) return resolvedConstantStrings(property.expression);
+    if (ts.isIdentifier(property) || ts.isStringLiteralLike(property)) return new Set([property.text]);
+    return new Set();
+  }
 
   function report(node, message) {
     const location = parsed.getLineAndCharacterOfPosition(node.getStart(parsed));
@@ -267,16 +324,11 @@ function analyzeSource(fileName, text) {
       return null;
     }
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
-      const name = memberName(node);
-      if (networkCapabilities.has(name ?? "") && !allowedFetchReference(node)) return name;
+      for (const name of resolvedMemberNames(node)) {
+        if (networkCapabilities.has(name) && !allowedFetchReference(node)) return name;
+      }
     }
     return null;
-  }
-
-  function bindingPropertyName(element) {
-    const property = element.propertyName ?? element.name;
-    if (ts.isComputedPropertyName(property)) return constantString(property.expression);
-    return ts.isIdentifier(property) || ts.isStringLiteralLike(property) ? property.text : null;
   }
 
   function recordAlias(target, sourceNode, reportNode = target) {
@@ -475,19 +527,41 @@ function analyzeSource(fileName, text) {
       && reviewedRuntimeUrlDeclaration(argument.text);
   }
 
-  function reviewedRuntimeUrlDeclaration(name) {
-    if (!["RUNTIME_MANIFEST_URL", "WHEEL_URL"].includes(name)) return false;
-    const declarations = [];
+  function bindingDeclaresName(name, target) {
+    if (ts.isIdentifier(name)) return name.text === target;
+    if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
+      return name.elements.some((element) => (
+        ts.isBindingElement(element) && bindingDeclaresName(element.name, target)
+      ));
+    }
+    return false;
+  }
+
+  function lexicalBindings(name) {
+    const bindings = [];
     function inspect(current) {
       if (
-        ts.isVariableDeclaration(current)
-        && ts.isIdentifier(current.name)
-        && current.name.text === name
-      ) declarations.push(current);
+        (ts.isVariableDeclaration(current) || ts.isParameter(current))
+        && bindingDeclaresName(current.name, name)
+      ) bindings.push(current);
+      if (
+        (ts.isFunctionDeclaration(current) || ts.isClassDeclaration(current))
+        && current.name?.text === name
+      ) bindings.push(current);
+      if (
+        (ts.isImportClause(current) || ts.isImportSpecifier(current) || ts.isNamespaceImport(current))
+        && current.name?.text === name
+      ) bindings.push(current);
       ts.forEachChild(current, inspect);
     }
     inspect(parsed);
-    if (declarations.length !== 1) return false;
+    return bindings;
+  }
+
+  function reviewedRuntimeUrlDeclaration(name) {
+    if (!["RUNTIME_MANIFEST_URL", "WHEEL_URL"].includes(name)) return false;
+    const declarations = lexicalBindings(name);
+    if (declarations.length !== 1 || !ts.isVariableDeclaration(declarations[0])) return false;
     const declaration = declarations[0];
     const statement = declaration.parent.parent;
     if (
@@ -501,6 +575,21 @@ function analyzeSource(fileName, text) {
         && declaration.initializer.text === "/heel-runtime/runtime-manifest.json";
     }
     return declaration.initializer?.getText(parsed) === "`${RUNTIME_ROOT}${WHEEL_FILENAME}`";
+  }
+
+  function allowedBootReference(node) {
+    const call = node.parent;
+    if (
+      !ts.isCallExpression(call)
+      || call.expression !== node
+      || call.questionDotToken
+      || call.arguments.length !== 0
+      || !ts.isVoidExpression(call.parent)
+      || !ts.isExpressionStatement(call.parent.parent)
+      || call.parent.parent.parent !== parsed
+    ) return false;
+    const statement = call.parent.parent;
+    return parsed.statements.at(-1) === statement;
   }
 
   function exactBootstrapRevocation(statement) {
@@ -521,6 +610,29 @@ function analyzeSource(fileName, text) {
       && expression.right.kind === (value ? ts.SyntaxKind.TrueKeyword : ts.SyntaxKind.FalseKeyword);
   }
 
+  function booleanAssignmentValue(node, name) {
+    if (
+      !ts.isBinaryExpression(node)
+      || !ts.isAssignmentOperator(node.operatorToken.kind)
+    ) return null;
+    let targetsName = false;
+    function inspectTarget(current) {
+      if (ts.isIdentifier(current) && current.text === name) targetsName = true;
+      else if (!targetsName) ts.forEachChild(current, inspectTarget);
+    }
+    inspectTarget(node.left);
+    if (!targetsName) return null;
+    if (
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && ts.isIdentifier(node.left)
+      && node.left.text === name
+    ) {
+      if (node.right.kind === ts.SyntaxKind.TrueKeyword) return true;
+      if (node.right.kind === ts.SyntaxKind.FalseKeyword) return false;
+    }
+    return "other";
+  }
+
   function directCallStatement(statement, name) {
     return ts.isExpressionStatement(statement)
       && ts.isCallExpression(statement.expression)
@@ -529,28 +641,62 @@ function analyzeSource(fileName, text) {
       && statement.expression.expression.text === name;
   }
 
-  function containsReviewedFetchLocalCall(node) {
-    let found = false;
-    function inspect(current) {
+  function sendMessageType(node) {
+    if (
+      !ts.isCallExpression(node)
+      || node.questionDotToken
+      || !ts.isIdentifier(node.expression)
+      || node.expression.text !== "send"
+      || node.arguments.length !== 1
+      || !ts.isObjectLiteralExpression(node.arguments[0])
+    ) return null;
+    const typeProperty = node.arguments[0].properties.find((property) => (
+      ts.isPropertyAssignment(property)
+      && (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name))
+      && property.name.text === "type"
+    ));
+    return typeProperty
+      && ts.isPropertyAssignment(typeProperty)
+      && ts.isStringLiteralLike(typeProperty.initializer)
+      ? typeProperty.initializer.text
+      : null;
+  }
+
+  function directSendStatement(statement, type) {
+    if (
+      !ts.isExpressionStatement(statement)
+      || sendMessageType(statement.expression) !== type
+      || !ts.isCallExpression(statement.expression)
+      || !ts.isObjectLiteralExpression(statement.expression.arguments[0])
+    ) return false;
+    const payload = statement.expression.arguments[0];
+    const expected = type === "ready"
+      ? new Map([
+        ["type", `"ready"`],
+        ["protocol_version", "WORKER_PROTOCOL_VERSION"],
+      ])
+      : new Map([
+        ["type", `"fatal"`],
+        ["protocol_version", "WORKER_PROTOCOL_VERSION"],
+        ["code", `"engine_unavailable"`],
+        ["message", "PUBLIC_ERRORS.engine_unavailable"],
+      ]);
+    if (payload.properties.length !== expected.size) return false;
+    for (const property of payload.properties) {
       if (
-        ts.isCallExpression(current)
-        && ts.isIdentifier(current.expression)
-        && current.expression.text === "fetchLocal"
-        && allowedFetchLocalReference(current.expression)
-      ) {
-        found = true;
-        return;
-      }
-      if (!found) ts.forEachChild(current, inspect);
+        !ts.isPropertyAssignment(property)
+        || !(ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name))
+        || property.initializer.getText(parsed) !== expected.get(property.name.text)
+      ) return false;
     }
-    inspect(node);
-    return found;
+    return true;
   }
 
   function validateBootstrapRevocationContract() {
     const bootFunctions = [];
     const bootstrapDeclarations = [];
     const allRevocations = [];
+    const bootReferences = [];
     function inspect(current) {
       if (ts.isFunctionDeclaration(current) && current.name?.text === "boot") {
         bootFunctions.push(current);
@@ -563,24 +709,44 @@ function analyzeSource(fileName, text) {
       if (ts.isExpressionStatement(current) && exactBootstrapRevocation(current)) {
         allRevocations.push(current);
       }
+      if (
+        ts.isIdentifier(current)
+        && current.text === "boot"
+        && isRuntimeIdentifierReference(current)
+      ) bootReferences.push(current);
       ts.forEachChild(current, inspect);
     }
     inspect(parsed);
 
-    let valid = bootstrapDeclarations.length === 1
-      && isReviewedBootstrapDeclaration(bootstrapDeclarations[0])
-      && bootFunctions.length === 1
-      && allRevocations.length === 2;
+    const runtimeUrlsValid = ["RUNTIME_MANIFEST_URL", "WHEEL_URL"]
+      .every(reviewedRuntimeUrlDeclaration);
+    if (!runtimeUrlsValid) report(parsed, "runtime URL constant binding is not unique and exact");
+
     const boot = bootFunctions[0];
-    if (
-      !boot?.body
-      || boot.parameters.length !== 0
-      || !boot.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)
-      || boot.type?.getText(parsed) !== "Promise<void>"
-    ) valid = false;
+    const exactBootDeclaration = bootFunctions.length === 1
+      && boot?.body
+      && boot.parameters.length === 0
+      && boot.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)
+      && boot.type?.getText(parsed) === "Promise<void>";
+    const bootAuthorityValid = exactBootDeclaration
+      && bootReferences.length === 1
+      && allowedBootReference(bootReferences[0]);
+    if (!bootAuthorityValid) report(boot ?? parsed, "boot authority reference contract is not exact");
+
+    let revocationValid = bootstrapDeclarations.length === 1
+      && isReviewedBootstrapDeclaration(bootstrapDeclarations[0])
+      && exactBootDeclaration
+      && allRevocations.length === 2;
+    let readinessValid = exactBootDeclaration;
     const tryStatements = boot?.body?.statements.filter(ts.isTryStatement) ?? [];
-    if (tryStatements.length !== 1 || tryStatements[0].finallyBlock || !tryStatements[0].catchClause) {
-      valid = false;
+    if (
+      boot?.body?.statements.length !== 1
+      || tryStatements.length !== 1
+      || tryStatements[0].finallyBlock
+      || !tryStatements[0].catchClause
+    ) {
+      revocationValid = false;
+      readinessValid = false;
     } else {
       const reviewedTry = tryStatements[0];
       const success = [...reviewedTry.tryBlock.statements];
@@ -589,23 +755,69 @@ function analyzeSource(fileName, text) {
       const failureRevoke = failure.findIndex(exactBootstrapRevocation);
       const guardNetwork = success.findIndex((statement) => directCallStatement(statement, "guardAmbientNetwork"));
       const ready = success.findIndex((statement) => exactBooleanAssignment(statement, "acceptingInput", true));
+      const readySend = success.findIndex((statement) => directSendStatement(statement, "ready"));
       const failed = failure.findIndex((statement) => exactBooleanAssignment(statement, "acceptingInput", false));
-      const fatalSend = failure.findIndex((statement) => directCallStatement(statement, "send"));
-      const lastFetch = success.reduce(
-        (last, statement, index) => containsReviewedFetchLocalCall(statement) ? index : last,
-        -1,
-      );
-      valid &&= success.filter(exactBootstrapRevocation).length === 1
+      const fatalSend = failure.findIndex((statement) => directSendStatement(statement, "fatal"));
+      const acceptingAssignments = [];
+      const readySends = [];
+      const abruptExits = [];
+      const fetchLocalReferences = [];
+      const guardNetworkCalls = [];
+      function inspectBoot(current) {
+        if (ts.isBinaryExpression(current)) {
+          const value = booleanAssignmentValue(current, "acceptingInput");
+          if (value !== null) acceptingAssignments.push([current, value]);
+        }
+        if (ts.isCallExpression(current)) {
+          if (sendMessageType(current) === "ready") readySends.push(current);
+          if (ts.isIdentifier(current.expression) && current.expression.text === "guardAmbientNetwork") {
+            guardNetworkCalls.push(current);
+          }
+        }
+        if (
+          ts.isReturnStatement(current)
+          || ts.isBreakStatement(current)
+          || ts.isContinueStatement(current)
+        ) abruptExits.push(current);
+        if (
+          ts.isIdentifier(current)
+          && current.text === "fetchLocal"
+          && isRuntimeIdentifierReference(current)
+        ) fetchLocalReferences.push(current);
+        ts.forEachChild(current, inspectBoot);
+      }
+      inspectBoot(boot.body);
+      const fetchArguments = fetchLocalReferences.map((reference) => (
+        ts.isCallExpression(reference.parent)
+        && reference.parent.expression === reference
+        && reference.parent.arguments.length === 1
+        && ts.isIdentifier(reference.parent.arguments[0])
+          ? reference.parent.arguments[0].text
+          : null
+      ));
+      revocationValid &&= runtimeUrlsValid
+        && success.filter(exactBootstrapRevocation).length === 1
         && failure.filter(exactBootstrapRevocation).length === 1
-        && lastFetch >= 0
-        && guardNetwork > lastFetch
-        && successRevoke > guardNetwork
-        && ready > successRevoke
+        && fetchLocalReferences.length === 2
+        && fetchLocalReferences.every(allowedFetchLocalReference)
+        && fetchArguments.filter((name) => name === "RUNTIME_MANIFEST_URL").length === 1
+        && fetchArguments.filter((name) => name === "WHEEL_URL").length === 1
+        && guardNetworkCalls.length === 1
+        && guardNetwork >= 0
+        && successRevoke === guardNetwork + 1
         && failed >= 0
-        && failureRevoke > failed
-        && fatalSend > failureRevoke;
+        && failureRevoke === failed + 1
+        && fatalSend === failureRevoke + 1;
+      readinessValid &&= acceptingAssignments.length === 2
+        && acceptingAssignments.filter(([, value]) => value === true).length === 1
+        && acceptingAssignments.filter(([, value]) => value === false).length === 1
+        && readySends.length === 1
+        && abruptExits.length === 0
+        && ready === successRevoke + 1
+        && readySend === ready + 1;
     }
-    if (!valid) report(boot ?? parsed, "bootstrap fetch revocation contract is not exact");
+    if (!revocationValid) report(boot ?? parsed, "bootstrap fetch revocation contract is not exact");
+    if (!readinessValid) report(boot ?? parsed, "boot readiness contract is not exact");
   }
 
   function containsAmbientReference(node) {
@@ -624,10 +836,11 @@ function analyzeSource(fileName, text) {
   function networkNameWithin(node) {
     let found = null;
     function inspect(current) {
-      const value = constantString(current);
-      if (value !== null && networkCapabilities.has(value)) {
-        found = value;
-        return;
+      for (const value of resolvedConstantStrings(current)) {
+        if (networkCapabilities.has(value)) {
+          found = value;
+          return;
+        }
       }
       if (found === null) ts.forEachChild(current, inspect);
     }
@@ -703,20 +916,28 @@ function analyzeSource(fileName, text) {
       && isRuntimeIdentifierReference(node)
       && !allowedFetchLocalReference(node)
     ) report(node, "fetchLocal authority reference is not an exact reviewed boot call");
+    if (
+      engineWorker
+      && ts.isIdentifier(node)
+      && node.text === "boot"
+      && isRuntimeIdentifierReference(node)
+      && !allowedBootReference(node)
+    ) report(node, "boot authority reference is not the terminal reviewed call");
 
     if (ts.isVariableDeclaration(node) && node.initializer) {
       if (ts.isIdentifier(node.name)) {
         recordAlias(node.name, node.initializer, node);
       } else if (ts.isObjectBindingPattern(node.name)) {
         for (const element of node.name.elements) {
-          const propertyName = bindingPropertyName(element);
-          if (runtimeAuthorityMembers.has(propertyName ?? "")) {
-            report(element, `runtime Window/document authority carrier ${propertyName}`);
+          const propertyNames = bindingPropertyNames(element);
+          for (const propertyName of propertyNames) {
+            if (runtimeAuthorityMembers.has(propertyName)) {
+              report(element, `runtime Window/document authority carrier ${propertyName}`);
+            }
           }
           if (
-            ambientRoots.has(rootName(node.initializer) ?? "")
-            && ts.isIdentifier(element.name)
-            && networkCapabilities.has(propertyName ?? "")
+            ts.isIdentifier(element.name)
+            && [...propertyNames].some((propertyName) => networkCapabilities.has(propertyName))
           ) {
             sinkAliases.add(element.name.text);
             report(element, `network sink alias ${element.name.text}`);
@@ -745,16 +966,19 @@ function analyzeSource(fileName, text) {
 
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const name = memberName(node);
+      const names = resolvedMemberNames(node);
       const root = rootName(node);
       const reflectiveAuthority = reflectiveMethodAuthority(node);
       if (reflectiveAuthority !== null) {
         report(node, `reflective method authority reference ${reflectiveAuthority}`);
       }
-      if (runtimeAuthorityMembers.has(name ?? "")) {
-        report(node, `runtime Window/document authority carrier ${name}`);
-      }
-      if (networkCapabilities.has(name ?? "") && !allowedFetchReference(node)) {
-        report(node, `network sink capability reference ${name}`);
+      for (const resolvedName of names) {
+        if (runtimeAuthorityMembers.has(resolvedName)) {
+          report(node, `runtime Window/document authority carrier ${resolvedName}`);
+        }
+        if (networkCapabilities.has(resolvedName) && !allowedFetchReference(node)) {
+          report(node, `network sink capability reference ${resolvedName}`);
+        }
       }
       if (["localStorage", "sessionStorage", "caches", "CacheStorage"].includes(name ?? "")) {
         report(node, `durable/cache capability ${name}`);
@@ -767,6 +991,7 @@ function analyzeSource(fileName, text) {
 
     if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
       const name = memberName(node.expression);
+      const names = resolvedMemberNames(node.expression);
       const root = rootName(node.expression);
       const args = [...(node.arguments ?? [])];
       if (ts.isCallExpression(node)) {
@@ -776,8 +1001,10 @@ function analyzeSource(fileName, text) {
       if (ts.isIdentifier(node.expression) && sinkAliases.has(node.expression.text)) {
         report(node, `network sink alias ${node.expression.text}`);
       }
-      if (networkCapabilities.has(name ?? "") && !allowedFetchCall(node)) {
-        report(node, `network sink ${name}`);
+      for (const resolvedName of names) {
+        if (networkCapabilities.has(resolvedName) && !allowedFetchCall(node)) {
+          report(node, `network sink ${resolvedName}`);
+        }
       }
       if (name === "fetcher" && !allowedFetchCall(node)) report(node, "unapproved bootstrap fetch alias");
       if (root === "console") report(node, "console sink in customer boundary");
@@ -1036,6 +1263,60 @@ test("the privacy analyzer rejects DOM-derived Window and document carriers rega
 });
 
 
+test("the privacy analyzer resolves direct const keys for DOM carriers and network sinks", () => {
+  const mutations = [
+    `
+const documentCarrier = element.ownerDocument as Record<string, unknown>;
+const viewKey = "default" + "View";
+const root = documentCarrier[viewKey] as Record<string, unknown>;
+const sinkKey = "fetch";
+const sink = root[sinkKey];
+sink("/leak");
+`,
+    `
+const windowKey = "content" + "Window";
+const root = frame[windowKey] as Record<string, unknown>;
+const sinkKey = "fet" + "ch";
+root[sinkKey]("/leak");
+`,
+    `
+const documentKey = "contentDocument";
+const {[documentKey]: documentCarrier} = frame;
+const viewKey = "defaultView";
+const {[viewKey]: root} = documentCarrier;
+const sinkKey = "fetch";
+const {[sinkKey]: sink} = root;
+sink("/leak");
+`,
+  ];
+  for (const [index, mutation] of mutations.entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, `components/nested/const-dom-carrier-${index}.ts`),
+      mutation,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("runtime Window/document authority carrier")),
+      `${index}: ${violations.join("\n")}`,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes("network sink")),
+      `${index}: ${violations.join("\n")}`,
+    );
+  }
+
+  const safe = `
+const valueKey = "val" + "ue";
+const value = record[valueKey];
+const contentTypeKey = "content" + "Type";
+const contentType = response[contentTypeKey];
+`;
+  assert.deepEqual(
+    analyzeSource(join(appRootPath, "components/nested/const-safe-key.ts"), safe),
+    [],
+  );
+});
+
+
 test("the privacy analyzer rejects destructuring and copying the reviewed worker scope alias", () => {
   const mutations = [
     `const key = "fetch"; const {[key]: sink} = scope;`,
@@ -1218,6 +1499,66 @@ test("the privacy analyzer rejects the exact post-boot fetchLocal mutation and m
 });
 
 
+test("the privacy analyzer rejects composed boot reentry, URL shadowing, and early readiness", async () => {
+  const worker = await source("workers/heel-review.worker.ts");
+  const shadow = `    const {RUNTIME_MANIFEST_URL} = {
+      RUNTIME_MANIFEST_URL: RUNTIME_ROOT + "runtime-manifest.json?source=" + encodeURIComponent(leakedSource),
+    };
+`;
+  const earlyReady = `    {
+      acceptingInput = true;
+      send({ type: "ready", protocol_version: WORKER_PROTOCOL_VERSION });
+      return;
+    }
+`;
+  const composite = worker
+    .replace("let reviewing = false;", `let reviewing = false;\nlet leakedSource = "";`)
+    .replace("    const manifestResponse", `${shadow}    const manifestResponse`)
+    .replace("    guardDynamicPackages(pyodide);", `${earlyReady}    guardDynamicPackages(pyodide);`)
+    .replace(
+      "    request = parseRequest(event.data);",
+      `    request = parseRequest(event.data);
+    leakedSource = request.source;
+    void boot();`,
+    );
+  const compositeViolations = analyzeSource(
+    join(appRootPath, "workers/heel-review.worker.ts"),
+    composite,
+  );
+  for (const expected of [
+    "runtime URL constant binding",
+    "boot authority reference",
+    "boot readiness contract",
+  ]) {
+    assert.ok(
+      compositeViolations.some((violation) => violation.includes(expected)),
+      `${expected}: ${compositeViolations.join("\n")}`,
+    );
+  }
+
+  const variants = [
+    [worker.replace("    const manifestResponse", `${shadow}    const manifestResponse`), "runtime URL constant binding"],
+    [worker.replace("    request = parseRequest(event.data);", "    request = parseRequest(event.data);\n    void boot();"), "boot authority reference"],
+    [worker.replace("    guardDynamicPackages(pyodide);", `${earlyReady}    guardDynamicPackages(pyodide);`), "boot readiness contract"],
+    [worker.replace("    guardDynamicPackages(pyodide);", "    acceptingInput ||= true;\n    guardDynamicPackages(pyodide);"), "boot readiness contract"],
+    [worker.replace(
+      `    send({ type: "ready", protocol_version: WORKER_PROTOCOL_VERSION });`,
+      `    send({ type: "ready", protocol_version: WORKER_PROTOCOL_VERSION, source: leakedSource });`,
+    ), "boot readiness contract"],
+  ];
+  for (const [index, [candidate, expected]] of variants.entries()) {
+    const violations = analyzeSource(
+      join(appRootPath, "workers/heel-review.worker.ts"),
+      candidate,
+    );
+    assert.ok(
+      violations.some((violation) => violation.includes(expected)),
+      `${index}: ${violations.join("\n")}`,
+    );
+  }
+});
+
+
 test("the privacy analyzer permits only the reviewed engine and server fetch sites", () => {
   const engine = `
 const RUNTIME_ROOT = "/heel-runtime/";
@@ -1258,13 +1599,19 @@ async function boot(): Promise<void> {
     guardAmbientNetwork();
     bootstrapFetch = null;
     acceptingInput = true;
-    send({type: "ready"});
+    send({type: "ready", protocol_version: WORKER_PROTOCOL_VERSION});
   } catch {
     acceptingInput = false;
     bootstrapFetch = null;
-    send({type: "fatal"});
+    send({
+      type: "fatal",
+      protocol_version: WORKER_PROTOCOL_VERSION,
+      code: "engine_unavailable",
+      message: PUBLIC_ERRORS.engine_unavailable,
+    });
   }
 }
+void boot();
 `;
   const server = `
 async function route(request, env, ctx) {
