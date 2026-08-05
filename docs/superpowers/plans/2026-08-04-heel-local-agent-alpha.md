@@ -167,6 +167,7 @@ import json
 import unittest
 
 from heel.review_contract import (
+    EXECUTION_MODES,
     REVIEW_SCHEMA_VERSION,
     build_review_envelope,
     stable_json_hash,
@@ -193,12 +194,21 @@ class ReviewContractTests(unittest.TestCase):
             "suggested_regression_tests": [],
             "safety": {"network_calls": False, "live_probing": False},
         }
-        one = build_review_envelope(review, source_hash="abc", questions=[])
-        two = build_review_envelope(review, source_hash="abc", questions=[])
+        one = build_review_envelope(
+            review, source_hash="source", model_hash="model", baseline_hash="baseline",
+            execution_mode="machine_local", questions=[],
+        )
+        two = build_review_envelope(
+            review, source_hash="source", model_hash="model", baseline_hash="baseline",
+            execution_mode="machine_local", questions=[],
+        )
         self.assertEqual(one, two)
         self.assertEqual(one["schema_version"], REVIEW_SCHEMA_VERSION)
+        self.assertEqual(EXECUTION_MODES, {"browser_local", "machine_local", "cloud_isolated"})
+        self.assertEqual(one["execution_mode"], "machine_local")
+        self.assertEqual(one["review_id"], "review_" + one["result_hash"][:20])
         self.assertEqual(one["privacy"], {
-            "execution": "local",
+            "execution": "machine_local",
             "network_calls": False,
             "uploaded": False,
             "sync_intent": "none",
@@ -214,8 +224,14 @@ class ReviewContractTests(unittest.TestCase):
             "changed_surfaces": [], "new_abuse_affordances": [],
             "high_risk_missing_controls": [], "recommended_controls": [],
             "suggested_regression_tests": [], "safety": {},
-        }, source_hash="abc", questions=[])
+        }, source_hash="source", model_hash="model", baseline_hash="baseline",
+           execution_mode="browser_local", questions=[])
         self.assertEqual(json.loads(json.dumps(envelope)), envelope)
+
+    def test_unknown_execution_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "execution_mode"):
+            build_review_envelope({}, source_hash="source", model_hash="model",
+                                  baseline_hash=None, execution_mode="remote_magic", questions=[])
 ```
 
 - [ ] **Step 2: Run the tests and verify the missing module failure**
@@ -238,6 +254,8 @@ from typing import Any, Mapping, Sequence
 
 
 REVIEW_SCHEMA_VERSION = "heel.review.v1"
+ENGINE_VERSION = "1.1.0"
+EXECUTION_MODES = {"browser_local", "machine_local", "cloud_isolated"}
 
 
 def stable_json(value: Any) -> str:
@@ -249,8 +267,12 @@ def stable_json_hash(value: Any) -> str:
 
 
 def build_review_envelope(
-    review: Mapping[str, Any], *, source_hash: str, questions: Sequence[Mapping[str, Any]]
+    review: Mapping[str, Any], *, source_hash: str, model_hash: str,
+    baseline_hash: str | None, execution_mode: str,
+    questions: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    if execution_mode not in EXECUTION_MODES:
+        raise ValueError(f"unsupported execution_mode: {execution_mode}")
     findings = [dict(item) for item in review.get("new_abuse_affordances", [])]
     findings.sort(key=lambda item: (
         0 if item.get("severity") == "block" else 1,
@@ -258,17 +280,14 @@ def build_review_envelope(
         str(item.get("surface_id", "")),
         str(item.get("risk", "")),
     ))
-    identity = {
+    envelope = {
+        "schema_version": REVIEW_SCHEMA_VERSION,
+        "engine_version": ENGINE_VERSION,
         "product_id": str(review.get("product_id", "")),
         "source_hash": source_hash,
-        "findings": findings,
-        "questions": [dict(item) for item in questions],
-    }
-    return {
-        "schema_version": REVIEW_SCHEMA_VERSION,
-        "review_id": "review_" + stable_json_hash(identity)[:20],
-        "product_id": identity["product_id"],
-        "source_hash": source_hash,
+        "model_hash": model_hash,
+        "baseline_hash": baseline_hash,
+        "execution_mode": execution_mode,
         "gate_status": str(review.get("launch_gate_status", "pass")),
         "summary": {
             "findings": len(findings),
@@ -281,19 +300,21 @@ def build_review_envelope(
         "questions": [dict(item) for item in questions],
         "safety": dict(review.get("safety", {})),
         "privacy": {
-            "execution": "local",
+            "execution": execution_mode,
             "network_calls": False,
             "uploaded": False,
             "sync_intent": "none",
         },
     }
+    result_hash = stable_json_hash(envelope)
+    return {"review_id": "review_" + result_hash[:20], "result_hash": result_hash, **envelope}
 ```
 
 - [ ] **Step 4: Run the contract tests**
 
 Run: `python3 -m unittest tests.test_review_contract -v`
 
-Expected: 3 tests PASS.
+Expected: 4 tests PASS.
 
 - [ ] **Step 5: Commit the contract**
 
@@ -427,7 +448,14 @@ def review_openapi(spec: Mapping[str, Any]) -> dict[str, Any]:
     baseline = empty_product_model(model["product_id"])
     review = review_product_models(baseline, model).to_dict()
     questions = questions_from_warnings(list(model.get("import_warnings", [])))
-    return build_review_envelope(review, source_hash=stable_json_hash(spec), questions=questions)
+    return build_review_envelope(
+        review,
+        source_hash=stable_json_hash(spec),
+        model_hash=stable_json_hash(model),
+        baseline_hash=stable_json_hash(baseline),
+        execution_mode="machine_local",
+        questions=questions,
+    )
 ```
 
 In `heel/openapi_import.py`, change accepted vendor extensions from `x-arceo-*` to `x-heel-*`; do not add URL fetching or any network dependency.
