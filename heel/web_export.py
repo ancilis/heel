@@ -17,7 +17,7 @@ import uuid
 from . import scope as scopemod
 from .containment import verify_chain
 from .contracts import DataHandlingMode
-from .mcp_server import TOOL_SCHEMAS, HeelServer
+from .mcp_server import TOOL_SCHEMAS, HeelServer, ToolError
 from .model import get_model
 from .scenarios import all_seed_scenarios, load_json_scenarios
 from .store import Store
@@ -349,7 +349,17 @@ def _build_snapshot() -> dict:
     ]
     gate = []
     for label, args, tool in attempts:
-        resp = server.dispatch("tools/call", {"name": tool, "arguments": args}, session)
+        try:
+            resp = server.dispatch(
+                "tools/call", {"name": tool, "arguments": args}, session
+            )
+        except ToolError as error:
+            # Unknown tools are protocol errors at the wire boundary and direct-call errors
+            # in process. Preserve the snapshot's common rejected-attempt representation.
+            resp = {
+                "isError": True,
+                "structuredContent": {"error": str(error), "code": error.code},
+            }
         gate.append({"label": label, "rejected": bool(resp.get("isError")),
                      "message": (resp.get("structuredContent") or {}).get("error", "")[:120]})
     chain_ok, chain_msg = verify_chain(store)

@@ -50,7 +50,11 @@ MCP_SCHEMA_VERSION = "heel.mcp.v1"
 MAX_OPENAPI_PAYLOAD_BYTES = 2 * 1024 * 1024
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_RESULT_BYTES = 1024 * 1024
-MAX_RESPONSE_BYTES = MAX_RESULT_BYTES
+# Legacy MCP clients consume both the JSON text content and structuredContent. A raw result
+# can therefore appear twice in the CallToolResult, with bounded JSON wrapper/escaping overhead.
+MAX_CALL_TOOL_RESULT_BYTES = 2 * MAX_RESULT_BYTES + 64 * 1024
+# A valid request id can occupy most of a bounded input frame and must be echoed on success.
+MAX_RESPONSE_BYTES = MAX_CALL_TOOL_RESULT_BYTES + MAX_FRAME_BYTES + 64 * 1024
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 100_000
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-11-25")
@@ -313,6 +317,18 @@ def _review_tool_text(name: str, *, failed: bool = False) -> str:
     return f"{prefix} {_UNTRUSTED_STRUCTURED_CONTENT_NOTICE}."
 
 
+def _success_tool_result(name: str, result) -> dict:
+    text = (
+        _review_tool_text(name)
+        if name in REVIEW_TOOL_NAMES
+        else _json_text(result, default=str)
+    )
+    return {
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": result,
+    }
+
+
 def _tool_error_result(name: str, error: ToolError) -> dict:
     if name in REVIEW_TOOL_NAMES:
         text = _review_tool_text(name, failed=True)
@@ -500,9 +516,38 @@ class HeelServer:
             envelope = validate_review_envelope(
                 review_openapi(spec, execution_mode="machine_local")
             )
-            self.projects.save_review(envelope)
         except (
             OpenAPIImportError,
+            SecureStorageUnavailable,
+            StoredReviewError,
+            OSError,
+            UnicodeError,
+            ValueError,
+        ):
+            self._invalid_review_input(
+                "OpenAPI review could not be processed or saved safely"
+            )
+
+        # The review is persisted only after its exact success CallToolResult is known to fit.
+        # This keeps saved reviews and success audits atomic with transport-visible success.
+        try:
+            success_fits = _json_within_limit(
+                _success_tool_result("heel_review_openapi", envelope),
+                MAX_RESULT_BYTES,
+            )
+        except (RecursionError, TypeError, UnicodeError, ValueError):
+            self._invalid_review_input(
+                "OpenAPI review could not be processed or saved safely"
+            )
+        if not success_fits:
+            raise ToolError(
+                "tool result exceeds the 1 MiB transport limit; use a smaller input or narrower query",
+                code="result_too_large",
+            )
+
+        try:
+            self.projects.save_review(envelope)
+        except (
             SecureStorageUnavailable,
             StoredReviewError,
             OSError,
@@ -637,6 +682,10 @@ class HeelServer:
                 raise ToolError("invalid tool params", code="invalid_params")
             if "arguments" in params and type(params["arguments"]) is not dict:
                 raise ToolError("invalid tool params", code="invalid_params")
+            if name not in TOOL_NAMES:
+                # Lifecycle and argument validation have completed. Keep this outside the
+                # execution catcher so the JSON-RPC boundary maps it to -32602.
+                self.call_tool(name, params.get("arguments") or {}, caller)
             try:
                 arguments = params["arguments"] if "arguments" in params else {}
                 result = self.call_tool(name, arguments, caller)
@@ -648,15 +697,12 @@ class HeelServer:
                     raise RuntimeError("tool returned a non-JSON result") from None
                 if not result_fits:
                     return _tool_result_too_large(name)
-                text = (
-                    _review_tool_text(name)
-                    if name in REVIEW_TOOL_NAMES
-                    else _json_text(result, default=str)
-                )
-                return {
-                    "content": [{"type": "text", "text": text}],
-                    "structuredContent": result,
-                }
+                call_tool_result = _success_tool_result(name, result)
+                if not _json_within_limit(
+                    call_tool_result, MAX_CALL_TOOL_RESULT_BYTES, default=str
+                ):
+                    return _tool_result_too_large(name)
+                return call_tool_result
             except ToolError as e:
                 return _tool_error_result(name, e)
         raise ToolError(f"unknown method {method}", code="method_not_found")
@@ -736,16 +782,6 @@ def handle_line(server, session, line: str | bytes):
         return _cap_response(_error_response(rid, -32600, "invalid request"), rid)
 
     try:
-        if method == "tools/call":
-            tool_name = params.get("name")
-            if type(tool_name) is str and tool_name and tool_name not in TOOL_NAMES:
-                # At the JSON-RPC boundary, an unknown tool is a protocol-level invalid-param
-                # error. call_tool still owns the security audit and its direct-call contract.
-                server.call_tool(
-                    tool_name,
-                    params.get("arguments") if type(params.get("arguments")) is dict else {},
-                    session.get("caller", "unauthenticated:no-handshake"),
-                )
         result = server.dispatch(method, params, session)
         if is_notification:
             return None
