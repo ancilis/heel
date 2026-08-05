@@ -146,6 +146,26 @@ function findZipEndRecord(archive) {
 }
 
 
+function zipCentralEntries(archive) {
+  const endOffset = findZipEndRecord(archive);
+  const count = archive.readUInt16LE(endOffset + 10);
+  const centralOffset = archive.readUInt32LE(endOffset + 16);
+  const entries = [];
+  let cursor = centralOffset;
+  for (let index = 0; index < count; index += 1) {
+    const nameLength = archive.readUInt16LE(cursor + 28);
+    const extraLength = archive.readUInt16LE(cursor + 30);
+    const commentLength = archive.readUInt16LE(cursor + 32);
+    entries.push({
+      centralOffset: cursor,
+      localOffset: archive.readUInt32LE(cursor + 42),
+    });
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+  return { centralOffset, endOffset, entries };
+}
+
+
 function sha256(payload) {
   return createHash("sha256").update(payload).digest("hex");
 }
@@ -210,6 +230,7 @@ function zipMembers(archive, label = "wheel") {
     }
   }
   assert.notEqual(endRecord, -1, `${label} has no structurally final ZIP end record or has trailing data`);
+  assert.equal(archive.readUInt16LE(endRecord + 20), 0, `${label} must not contain an end-record comment`);
   assert.equal(archive.readUInt16LE(endRecord + 4), 0, `${label} is multi-disk`);
   assert.equal(archive.readUInt16LE(endRecord + 6), 0, `${label} is multi-disk`);
   const diskEntryCount = archive.readUInt16LE(endRecord + 8);
@@ -228,6 +249,7 @@ function zipMembers(archive, label = "wheel") {
   let cursor = centralOffset;
   const members = new Map();
   const seenNames = new Set();
+  const localSpans = [];
   let expandedBytes = 0;
 
   for (let index = 0; index < entryCount; index += 1) {
@@ -285,6 +307,7 @@ function zipMembers(archive, label = "wheel") {
     const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
     assert.ok(compressedSize <= centralOffset - dataOffset, `${name} compressed data is out of bounds`);
     const compressed = archive.subarray(dataOffset, dataOffset + compressedSize);
+    localSpans.push({ end: dataOffset + compressedSize, name, start: localOffset });
     let payload;
     if (compression === 0) payload = compressed;
     else if (compression === 8) {
@@ -301,6 +324,19 @@ function zipMembers(archive, label = "wheel") {
   }
   assert.equal(cursor, centralEnd, `${label} central directory has hidden entries or disagrees with its entry count`);
   assert.equal(members.size, entryCount, `${label} did not consume every central entry`);
+  localSpans.sort((left, right) => left.start - right.start);
+  let coveredUntil = 0;
+  for (const span of localSpans) {
+    assert.equal(
+      span.start,
+      coveredUntil,
+      span.start < coveredUntil
+        ? `${label}:${span.name} overlaps another local record`
+        : `${label}:${span.name} leaves an unreferenced prefix or gap`,
+    );
+    coveredUntil = span.end;
+  }
+  assert.equal(coveredUntil, centralOffset, `${label} leaves an unreferenced gap before its central directory`);
   return members;
 }
 
@@ -534,6 +570,39 @@ test("ZIP scanner rejects malformed end records, hidden entries, metadata disagr
     declaredSize: 1,
   }]);
   assert.throws(() => zipMembers(bomb, "compressed bomb wheel"), /member size limit|decompression/i);
+});
+
+
+test("ZIP scanner rejects comments and every unreferenced byte before the central directory", async () => {
+  const wheel = await readFile(join(appRoot, "public/downloads", agentWheelName));
+  const original = zipCentralEntries(wheel);
+
+  const comment = Buffer.from("private-comment");
+  const commented = Buffer.concat([wheel, comment]);
+  commented.writeUInt16LE(comment.byteLength, original.endOffset + 20);
+  assert.throws(() => zipMembers(commented, "commented wheel"), /comment/i);
+
+  const prefix = Buffer.from("private-prefix");
+  const prefixed = Buffer.concat([prefix, wheel]);
+  const prefixedEnd = original.endOffset + prefix.byteLength;
+  prefixed.writeUInt32LE(original.centralOffset + prefix.byteLength, prefixedEnd + 16);
+  for (const entry of original.entries) {
+    prefixed.writeUInt32LE(
+      entry.localOffset + prefix.byteLength,
+      entry.centralOffset + prefix.byteLength + 42,
+    );
+  }
+  assert.throws(() => zipMembers(prefixed, "prefixed wheel"), /prefix|gap|unreferenced/i);
+
+  const gap = Buffer.from("private-gap");
+  const gapped = Buffer.concat([
+    wheel.subarray(0, original.centralOffset),
+    gap,
+    wheel.subarray(original.centralOffset),
+  ]);
+  const gappedEnd = original.endOffset + gap.byteLength;
+  gapped.writeUInt32LE(original.centralOffset + gap.byteLength, gappedEnd + 16);
+  assert.throws(() => zipMembers(gapped, "gapped wheel"), /gap|unreferenced/i);
 });
 
 
