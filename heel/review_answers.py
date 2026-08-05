@@ -5,7 +5,7 @@ import copy
 import json
 from typing import Any
 
-from .openapi_model import QUESTION_PROMPTS, operation_surface_id
+from .openapi_model import operation_surface_id
 
 
 MAX_REVIEW_ANSWERS_BYTES = 64 * 1024
@@ -14,7 +14,7 @@ MAX_REVIEW_ANSWER_DEPTH = 8
 
 _ANSWER_FIELDS = frozenset({"surface", "field", "value"})
 _SUPPORTED_FIELDS = frozenset({
-    "tenant_filter", "entitlement_check", "product_rule",
+    "tenant_filter", "entitlement_check", "rate_limit", "product_rule",
 })
 _ANSWER_VALUES = frozenset({"enforced", "not_enforced", "unknown"})
 _HTTP_METHODS = frozenset({
@@ -153,15 +153,13 @@ def apply_review_answers(
         matches = question_index.get((surface, field), [])
         if len(matches) != 1:
             raise ReviewAnswerError("answer does not identify one supported question")
+        if field == "product_rule":
+            raise ReviewAnswerError("product-rule answers cannot be applied safely")
         if surface == "product":
             raise ReviewAnswerError("product-level answers cannot be applied safely")
         operation_matches = targets.get(surface, [])
         if len(operation_matches) != 1:
             raise ReviewAnswerError("answer does not identify one existing operation")
-        if field == "product_rule" and matches[0]["prompt"] != QUESTION_PROMPTS[
-            "export_missing_controls"
-        ]:
-            raise ReviewAnswerError("this product rule cannot be enriched safely")
         if answer["value"] != "enforced":
             continue
 
@@ -170,8 +168,8 @@ def apply_review_answers(
             _declare_tenant_scope(operation)
         elif field == "entitlement_check":
             _declare_controls(operation, {_ENTITLEMENT_CONTROL})
-        elif field == "product_rule":
-            _declare_controls(operation, {_ENTITLEMENT_CONTROL, _RATE_CONTROL})
+        elif field == "rate_limit":
+            _declare_controls(operation, {_RATE_CONTROL})
         else:  # Defensive in case the supported set and dispatch ever diverge.
             raise ReviewAnswerError("answer field cannot be enriched safely")
     return enriched

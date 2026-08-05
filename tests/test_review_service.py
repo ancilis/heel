@@ -45,11 +45,11 @@ class ReviewServiceTests(unittest.TestCase):
         })
         question_fields = {question["field"] for question in result["questions"]}
         self.assertGreaterEqual(question_fields, {
-            "tenant_filter", "entitlement_check", "product_rule",
+            "tenant_filter", "entitlement_check", "rate_limit", "product_rule",
         })
         prompts = "\n".join(question["prompt"] for question in result["questions"])
         self.assertIn(
-            "Which server-side entitlement and rate controls protect this export operation?",
+            "Which server-side rate limit protects this export operation?",
             prompts,
         )
         self.assertIn(
@@ -273,6 +273,7 @@ class ReviewServiceTests(unittest.TestCase):
         by_field = {question["field"]: question for question in result["questions"]}
         tenant_warning = "missing tenant metadata for /exports"
         entitlement_warning = "missing entitlement metadata for /exports"
+        rate_warning = "missing rate-limit metadata for /exports"
         self.assertEqual(by_field["tenant_filter"], {
             "id": "tenant_filter:" + stable_json_hash([
                 "missing_tenant_metadata", "tenant_filter", "GET", "/exports",
@@ -291,6 +292,16 @@ class ReviewServiceTests(unittest.TestCase):
             "field": "entitlement_check",
             "surface": "exportusers",
             "prompt": "Which plan or entitlement protects this operation?",
+            "required": False,
+        })
+        self.assertEqual(by_field["rate_limit"], {
+            "id": "rate_limit:" + stable_json_hash([
+                "export_missing_rate_limit", "rate_limit", "GET", "/exports",
+                "exportusers", rate_warning,
+            ])[:12],
+            "field": "rate_limit",
+            "surface": "exportusers",
+            "prompt": "Which server-side rate limit protects this export operation?",
             "required": False,
         })
         for question in result["questions"]:

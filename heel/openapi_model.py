@@ -39,8 +39,8 @@ QUESTION_PROMPTS = {
     "missing_tenant_metadata": "How is tenant access enforced for this operation?",
     "missing_entitlement_metadata": "Which plan or entitlement protects this operation?",
     "broad_oauth_scope": "Which least-privilege OAuth scopes should protect this surface?",
-    "export_missing_controls": (
-        "Which server-side entitlement and rate controls protect this export operation?"
+    "export_missing_rate_limit": (
+        "Which server-side rate limit protects this export operation?"
     ),
     "agent_scope_metadata_missing": (
         "What intended and granted scopes constrain this agent operation?"
@@ -352,16 +352,13 @@ def _map_operation(
         export["entitlement_check"] = "declared" if has_entitlement else "missing"
         export["rate_limit"] = "declared" if has_rate else "missing"
         model["exports"].append(export)
-        if not (has_entitlement and has_rate):
+        if not has_rate:
             _add_warning(
                 warnings,
                 question_hints,
-                code="export_missing_controls",
-                field="product_rule",
-                message=(
-                    "export route without declared rate or entitlement control: "
-                    f"{entry['route']}"
-                ),
+                code="export_missing_rate_limit",
+                field="rate_limit",
+                message=f"missing rate-limit metadata for {entry['route']}",
                 entry=entry,
             )
 

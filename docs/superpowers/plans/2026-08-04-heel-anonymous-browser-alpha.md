@@ -119,6 +119,7 @@ git commit -m "build: scaffold Heel cloud app"
 - Create: `heel/browser_review.py`
 - Create: `tests/test_browser_review.py`
 - Create: `tests/test_review_answers.py`
+- Create: `tests/fixtures/reviews/browser_answer_presentation_v1.json`
 - Modify: `heel/importers.py`
 - Modify: `heel/launch_review.py`
 - Modify: `heel/openapi_import.py`
@@ -150,8 +151,8 @@ Also prove:
 - duplicate keys, non-object roots, lone surrogates/invalid Unicode text, excessive bytes, excessive nesting/nodes, remote `$ref`, malformed OpenAPI, and secret-bearing examples fail closed with stable public error codes; malformed original UTF-8 bytes are tested later at the browser's fatal `TextDecoder` boundary because they cannot be represented by the Python `str` API;
 - exception text never contains the submitted source, secret values, or Python traceback;
 - declarative operation answers such as `tenant_filter: enforced`, `entitlement_check: enforced`, and `rate_limit: enforced` enrich a deep copy, remove the corresponding operation question/risk after rerun, and never weaken an existing declaration;
-- `not_enforced` and `unknown` never add or remove a control: `not_enforced` preserves the finding/question and yields a typed UI receipt of `confirmed_gap`; `unknown` preserves them and yields `unanswered`; neither changes the strict engine envelope or its hashes;
-- presentation semantics deterministically label every missing declaration as an assumption ("not declared in this OpenAPI; not proof the control is absent") and calculate only a UI-local confidence label: `preliminary` while any question is unanswered/unknown, `confirmed_gaps` when any answer is not enforced, and `improved` only when enforced answers reduce the question count and no confirmed gap exists;
+- `not_enforced` and `unknown` never add or remove a control and preserve the finding/question, so neither changes the strict engine envelope or its hashes;
+- a small versioned fixture, `tests/fixtures/reviews/browser_answer_presentation_v1.json`, establishes the exact Task 4 UI-only vocabulary: receipts `applied`, `confirmed_gap`, and `unanswered`; assumption `not declared in this OpenAPI; not proof the control is absent`; confidence `preliminary`, `confirmed_gaps`, and `improved`. Task 2 does not calculate or transport a receipt in Python or the worker payload;
 - unknown question/surface/field/value, contradictory duplicates, excessive answer count/size, and product-level answers that cannot be applied safely fail closed;
 - `socket`, `urllib`, subprocess execution, filesystem reads/writes, local project storage, MCP, REST, and SaaS imports are absent from the browser dependency closure, not merely uncalled.
 
@@ -175,7 +176,7 @@ Keep file loading/writing in `heel/openapi_import.py`, Git/subprocess helpers in
 
 - [ ] **Step 4: Implement minimal declarative answer enrichment**
 
-`heel/review_answers.py` accepts a bounded JSON array keyed by the existing operation `surface` and explicit fields. It may add only known static declarations to a deep copy of the spec when the value is `enforced`: tenant scope, server-side entitlement, and server-side rate limit. `not_enforced` and `unknown` are validated but perform no model mutation, so the corresponding finding/question remains. The module cannot delete declarations, answer product-level/broad-OAuth questions ambiguously, create paths, change targets, introduce `$ref`, or authorize live behavior. The adapter reruns the same canonical review against the enriched in-memory copy and returns only a normal `heel.review.v1` envelope; unanswered/unsupported questions remain visible. There is no answer receipt in the Python or worker transport.
+`heel/review_answers.py` accepts a bounded JSON array keyed by the exact existing operation `(surface, field)` question. It may add only one known static declaration to a deep copy for each `enforced` answer: `tenant_filter` adds tenant scope, `entitlement_check` adds only server-side entitlement, and `rate_limit` adds only server-side rate limiting. Export question generation asks entitlement and rate-limit questions independently and only while the corresponding declaration is missing. Generic `product_rule` answers never assert either control. `not_enforced` and `unknown` are validated but perform no model mutation, so the corresponding finding/question remains. The module cannot delete declarations, answer product-level/broad-OAuth/agent questions, create paths, change targets, introduce `$ref`, or authorize live behavior. The adapter reruns the same canonical review against the enriched in-memory copy and returns only a normal `heel.review.v1` envelope; unanswered/unsupported questions remain visible. There is no answer receipt in the Python or worker transport.
 
 - [ ] **Step 5: Implement the minimal adapter**
 
@@ -196,7 +197,7 @@ Parse source and answers with duplicate-key detection, enforce the existing stru
 - [ ] **Step 6: Run native parity and safety tests**
 
 ```bash
-python3 -m unittest tests.test_browser_review tests.test_review_answers tests.test_review_service tests.test_review_contract tests.test_openapi_import tests.test_launch_review -v
+python3 -m unittest tests.test_browser_review tests.test_review_answers tests.test_review_service tests.test_review_contract tests.test_openapi_import tests.test_heel.TestLaunchReview -v
 ```
 
 Expected: all pass.
@@ -204,7 +205,7 @@ Expected: all pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add heel/product_model.py heel/openapi_model.py heel/static_review.py heel/review_answers.py heel/browser_review.py heel/importers.py heel/launch_review.py heel/openapi_import.py heel/review_service.py tests/test_browser_review.py tests/test_review_answers.py
+git add heel/product_model.py heel/openapi_model.py heel/static_review.py heel/review_answers.py heel/browser_review.py heel/importers.py heel/launch_review.py heel/openapi_import.py heel/review_service.py tests/test_browser_review.py tests/test_review_answers.py tests/fixtures/reviews/browser_answer_presentation_v1.json
 git commit -m "feat: expose the Heel browser review kernel"
 ```
 
@@ -310,7 +311,7 @@ git commit -m "build: package Heel for private browser execution"
 
 - [ ] **Step 1: Write failing strict-contract tests**
 
-Create a typed `ReviewEnvelopeV1` plus `parseReviewEnvelopeV1(value: unknown)`. Test exact top-level/nested fields, schema and engine version, safe integers, finite numbers, lowercase SHA-256 hashes, result-hash integrity, summary counts, deterministic sort constraints, the static safety receipt, and exact browser-local privacy values. Unknown fields and malformed/untrusted worker output must fail closed. Also define and test `deriveAnswerReceipt(before, after, submittedAnswers)`: every answer must match a real pre-review question; `enforced` requires that question to disappear after rerun, while `not_enforced`/`unknown` require it to remain. It returns the exact UI-only applied/confirmed-gap/unanswered items and confidence label or fails closed on inconsistency.
+Create a typed `ReviewEnvelopeV1` plus `parseReviewEnvelopeV1(value: unknown)`. Test exact top-level/nested fields, schema and engine version, safe integers, finite numbers, lowercase SHA-256 hashes, result-hash integrity, summary counts, deterministic sort constraints, the static safety receipt, and exact browser-local privacy values. Unknown fields and malformed/untrusted worker output must fail closed. Also define and test `deriveAnswerReceipt(before, after, submittedAnswers)`: every answer must match a real pre-review question; `enforced` requires that question to disappear after rerun, while `not_enforced`/`unknown` require it to remain. Load `tests/fixtures/reviews/browser_answer_presentation_v1.json` as the contract source and assert the exact UI-only applied/confirmed-gap/unanswered items, assumption, and confidence labels; fail closed on inconsistency.
 
 - [ ] **Step 2: Write failing lifecycle and privacy tests**
 
@@ -328,7 +329,7 @@ Expected: failures because the strict contract, client, presentation projection,
 
 - [ ] **Step 4: Implement the strict TypeScript validator and presentation projection**
 
-Keep both dependency-free. Treat every worker response, submitted answer array, derived receipt, and IndexedDB value as untrusted. Do not duplicate review rules; TypeScript validates and presents the Python engine's envelope only. `review-presentation.ts` is the single authoritative receipt path: the main-thread client retains the validated pre-rerun envelope and submitted answers, validates the returned post-rerun envelope, then calls `deriveAnswerReceipt(before, after, answers)`. The worker transports only the envelope JSON. `review-presentation.ts` owns the exact assumption and UI-confidence vocabulary defined in Task 2 tests; these labels are never inserted into or represented as fields of `heel.review.v1`.
+Keep both dependency-free. Treat every worker response, submitted answer array, derived receipt, and IndexedDB value as untrusted. Do not duplicate review rules; TypeScript validates and presents the Python engine's envelope only. `review-presentation.ts` is the single authoritative receipt path: the main-thread client retains the validated pre-rerun envelope and submitted answers, validates the returned post-rerun envelope, then calls `deriveAnswerReceipt(before, after, answers)`. It consumes the exact versioned vocabulary in `tests/fixtures/reviews/browser_answer_presentation_v1.json`; the worker transports only the envelope JSON. These UI-only labels are never inserted into or represented as fields of `heel.review.v1`.
 
 - [ ] **Step 5: Implement the dedicated module worker**
 

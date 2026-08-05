@@ -363,7 +363,7 @@ class TestOpenAPIImport(unittest.TestCase):
         self.assertEqual({hint["code"] for hint in hints}, {
             "agent_scope_metadata_missing",
             "broad_oauth_scope",
-            "export_missing_controls",
+            "export_missing_rate_limit",
             "missing_entitlement_metadata",
             "missing_tenant_metadata",
         })
@@ -375,7 +375,7 @@ class TestOpenAPIImport(unittest.TestCase):
             {
                 "agent_scope_metadata_missing": 1,
                 "broad_oauth_scope": 2,
-                "export_missing_controls": 1,
+                "export_missing_rate_limit": 1,
                 "missing_entitlement_metadata": 7,
                 "missing_tenant_metadata": 7,
             },
@@ -391,7 +391,7 @@ class TestOpenAPIImport(unittest.TestCase):
             {
                 "agent_scope_metadata_missing": "product_rule",
                 "broad_oauth_scope": "product_rule",
-                "export_missing_controls": "product_rule",
+                "export_missing_rate_limit": "rate_limit",
                 "missing_entitlement_metadata": "entitlement_check",
                 "missing_tenant_metadata": "tenant_filter",
             },
@@ -403,15 +403,15 @@ class TestOpenAPIImport(unittest.TestCase):
             self.assertIn(hint["message"], model["import_warnings"])
 
         export_hint = next(
-            hint for hint in hints if hint["code"] == "export_missing_controls"
+            hint for hint in hints if hint["code"] == "export_missing_rate_limit"
         )
         self.assertEqual(export_hint, {
-            "code": "export_missing_controls",
-            "field": "product_rule",
+            "code": "export_missing_rate_limit",
+            "field": "rate_limit",
             "method": "GET",
             "route": "/api/export/bulk",
             "operation_id": "downloadbulkexport",
-            "message": "export route without declared rate or entitlement control: /api/export/bulk",
+            "message": "missing rate-limit metadata for /api/export/bulk",
         })
         document_hint = next(
             hint for hint in hints
@@ -475,7 +475,7 @@ class TestOpenAPIImport(unittest.TestCase):
 
         self.assertIn("missing tenant metadata", warnings)
         self.assertIn("missing entitlement metadata", warnings)
-        self.assertIn("export route without declared rate or entitlement control", warnings)
+        self.assertIn("missing rate-limit metadata", warnings)
         self.assertIn("broad OAuth scope", warnings)
         self.assertIn("agent-like endpoint lacks scope metadata", warnings)
 

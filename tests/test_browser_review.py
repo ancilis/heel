@@ -164,7 +164,7 @@ class BrowserReviewTests(unittest.TestCase):
         answers = [
             {"surface": "exportusers", "field": "tenant_filter", "value": "enforced"},
             {"surface": "exportusers", "field": "entitlement_check", "value": "enforced"},
-            {"surface": "exportusers", "field": "product_rule", "value": "enforced"},
+            {"surface": "exportusers", "field": "rate_limit", "value": "enforced"},
         ]
 
         after = json.loads(review_openapi_json(source, json.dumps(answers)))

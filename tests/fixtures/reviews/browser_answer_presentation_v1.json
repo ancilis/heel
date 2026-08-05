@@ -1,0 +1,14 @@
+{
+  "schema_version": "heel.review-presentation.v1",
+  "assumption": "not declared in this OpenAPI; not proof the control is absent",
+  "answer_receipts": {
+    "enforced": "applied",
+    "not_enforced": "confirmed_gap",
+    "unknown": "unanswered"
+  },
+  "confidence": {
+    "unanswered_or_unknown": "preliminary",
+    "not_enforced": "confirmed_gaps",
+    "enforced_reduced_questions_without_confirmed_gap": "improved"
+  }
+}

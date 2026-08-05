@@ -113,7 +113,7 @@
     }
   ],
   "gate_status": "warn",
-  "model_hash": "fcdcccef43892f287908762d096f79ff50d285045e26b34b50dd4ef051ed3bf1",
+  "model_hash": "2cac7533a9029dc9390e75bd1ca54201a32db0f28fd25985b67093a169cb416f",
   "privacy": {
     "execution": "machine_local",
     "network_calls": false,
@@ -193,9 +193,9 @@
       "surface": "product"
     },
     {
-      "field": "product_rule",
-      "id": "product_rule:ef41a10d8029",
-      "prompt": "Which server-side entitlement and rate controls protect this export operation?",
+      "field": "rate_limit",
+      "id": "rate_limit:65f70de9e8d9",
+      "prompt": "Which server-side rate limit protects this export operation?",
       "required": false,
       "surface": "downloadbulkexport"
     },
@@ -359,8 +359,8 @@
       "surface_type": "exports"
     }
   ],
-  "result_hash": "4f685e36114c61246fd31028f116cb6eb65c445bb065c6d2e6084f04c102f036",
-  "review_id": "review_4f685e36114c61246fd3",
+  "result_hash": "e28e8af69dcb6c1971a8c836e9a158e823b22f8578b512cecff5491c515df9a3",
+  "review_id": "review_e28e8af69dcb6c1971a8",
   "safety": {
     "canary_only": true,
     "live_probing": false,

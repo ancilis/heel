@@ -1,6 +1,12 @@
 import copy
 import json
+from pathlib import Path
 import unittest
+
+
+PRESENTATION_FIXTURE = (
+    Path(__file__).parent / "fixtures/reviews/browser_answer_presentation_v1.json"
+)
 
 
 def _spec(operation=None, **overrides):
@@ -81,7 +87,7 @@ class ReviewAnswerTests(unittest.TestCase):
         })
         self.assertEqual(enriched["servers"], spec["servers"])
 
-    def test_export_product_rule_adds_entitlement_and_rate_limit_together(self):
+    def test_entitlement_answer_adds_only_entitlement_control(self):
         from heel.review_answers import apply_review_answers
         from heel.review_service import review_openapi
 
@@ -92,7 +98,7 @@ class ReviewAnswerTests(unittest.TestCase):
         before = review_openapi(spec, execution_mode="browser_local")
         answers = [{
             "surface": "exportusers",
-            "field": "product_rule",
+            "field": "entitlement_check",
             "value": "enforced",
         }]
 
@@ -100,18 +106,90 @@ class ReviewAnswerTests(unittest.TestCase):
         controls = enriched["paths"]["/exports"]["get"]["x-heel-control"]
         after = review_openapi(enriched, execution_mode="browser_local")
 
-        self.assertEqual(controls, [
-            "server_side_entitlement_check",
-            "server_side_rate_limit",
-        ])
-        self.assertFalse(any(
-            question["surface"] == "exportusers"
-            for question in after["questions"]
-        ))
-        self.assertFalse(any(
-            finding["surface_id"] == "exportusers"
-            for finding in after["findings"]
-        ))
+        self.assertEqual(controls, ["server_side_entitlement_check"])
+        self.assertEqual(
+            {
+                question["field"] for question in after["questions"]
+                if question["surface"] == "exportusers"
+            },
+            {"rate_limit"},
+        )
+        risks = {
+            finding["risk"] for finding in after["findings"]
+            if finding["surface_id"] == "exportusers"
+        }
+        self.assertNotIn("export_without_entitlement", risks)
+        self.assertIn("export_without_tenant_quota", risks)
+
+    def test_rate_limit_answer_adds_only_rate_limit_control(self):
+        from heel.review_answers import apply_review_answers
+        from heel.review_service import review_openapi
+
+        spec = _spec(operation={
+            "operationId": "exportUsers",
+            "x-heel-tenant-scope": "tenant",
+        })
+        before = review_openapi(spec, execution_mode="browser_local")
+
+        enriched = apply_review_answers(spec, [{
+            "surface": "exportusers",
+            "field": "rate_limit",
+            "value": "enforced",
+        }], before["questions"])
+        after = review_openapi(enriched, execution_mode="browser_local")
+
+        self.assertEqual(
+            enriched["paths"]["/exports"]["get"]["x-heel-control"],
+            ["server_side_rate_limit"],
+        )
+        self.assertEqual(
+            {
+                question["field"] for question in after["questions"]
+                if question["surface"] == "exportusers"
+            },
+            {"entitlement_check"},
+        )
+        risks = {
+            finding["risk"] for finding in after["findings"]
+            if finding["surface_id"] == "exportusers"
+        }
+        self.assertIn("export_without_entitlement", risks)
+        self.assertNotIn("export_without_tenant_quota", risks)
+
+    def test_export_questions_track_each_missing_control_exactly(self):
+        from heel.review_service import review_openapi
+
+        cases = {
+            "both missing": (None, {"entitlement_check", "rate_limit"}),
+            "entitlement only": (
+                ["entitlement_check"], {"rate_limit"},
+            ),
+            "rate only": (["rate_limit"], {"entitlement_check"}),
+            "both present": ([], set()),
+        }
+        for label, (controls, expected_fields) in cases.items():
+            operation = {
+                "operationId": "exportUsers",
+                "x-heel-tenant-scope": "tenant",
+            }
+            if label == "both present":
+                operation["x-heel-control"] = [
+                    "entitlement_check", "rate_limit",
+                ]
+            elif controls is not None:
+                operation["x-heel-control"] = controls
+
+            with self.subTest(label=label):
+                result = review_openapi(
+                    _spec(operation=operation), execution_mode="browser_local"
+                )
+                self.assertEqual(
+                    {
+                        question["field"] for question in result["questions"]
+                        if question["surface"] == "exportusers"
+                    },
+                    expected_fields,
+                )
 
     def test_missing_sentinel_can_be_strengthened_but_real_declarations_are_unchanged(self):
         from heel.review_answers import apply_review_answers
@@ -139,15 +217,16 @@ class ReviewAnswerTests(unittest.TestCase):
 
         spec = _spec()
         questions = _questions(spec)
-        for value in ("not_enforced", "unknown"):
-            with self.subTest(value=value):
-                enriched = apply_review_answers(spec, [{
-                    "surface": "exportusers",
-                    "field": "tenant_filter",
-                    "value": value,
-                }], questions)
-                self.assertEqual(enriched, spec)
-                self.assertIsNot(enriched, spec)
+        for field in ("tenant_filter", "entitlement_check", "rate_limit"):
+            for value in ("not_enforced", "unknown"):
+                with self.subTest(field=field, value=value):
+                    enriched = apply_review_answers(spec, [{
+                        "surface": "exportusers",
+                        "field": field,
+                        "value": value,
+                    }], questions)
+                    self.assertEqual(enriched, spec)
+                    self.assertIsNot(enriched, spec)
 
     def test_answer_application_has_stable_ordering(self):
         from heel.review_answers import apply_review_answers
@@ -155,7 +234,7 @@ class ReviewAnswerTests(unittest.TestCase):
         spec = _spec()
         questions = _questions(spec)
         answers = [
-            {"surface": "exportusers", "field": "product_rule", "value": "enforced"},
+            {"surface": "exportusers", "field": "rate_limit", "value": "enforced"},
             {"surface": "exportusers", "field": "tenant_filter", "value": "enforced"},
         ]
 
@@ -198,7 +277,7 @@ class ReviewAnswerTests(unittest.TestCase):
                 "surface": "other", "field": "tenant_filter", "value": "enforced",
             },
             "unknown field": {
-                "surface": "exportusers", "field": "rate_limit", "value": "enforced",
+                "surface": "exportusers", "field": "quota", "value": "enforced",
             },
             "unknown value": {
                 "surface": "exportusers", "field": "tenant_filter", "value": "yes",
@@ -252,6 +331,7 @@ class ReviewAnswerTests(unittest.TestCase):
 
         ambiguous = _spec(operation={
             "operationId": "exportOAuthUsers",
+            "x-heel-agent-tool": True,
             "security": [{"OAuthAll": ["all"]}],
         })
         ambiguous_answer = [{
@@ -264,6 +344,44 @@ class ReviewAnswerTests(unittest.TestCase):
         ), 2)
         with self.assertRaises(ReviewAnswerError):
             apply_review_answers(ambiguous, ambiguous_answer, _questions(ambiguous))
+
+    def test_generic_product_rule_never_adds_export_controls(self):
+        from heel.review_answers import ReviewAnswerError, apply_review_answers
+
+        spec = _spec(operation={
+            "operationId": "exportOAuthUsers",
+            "x-heel-tenant-scope": "tenant",
+            "security": [{"OAuthAll": ["all"]}],
+        })
+        answer = [{
+            "surface": "exportoauthusers",
+            "field": "product_rule",
+            "value": "enforced",
+        }]
+
+        with self.assertRaises(ReviewAnswerError):
+            apply_review_answers(spec, answer, _questions(spec))
+        self.assertNotIn("x-heel-control", spec["paths"]["/exports"]["get"])
+
+    def test_browser_answer_presentation_vocabulary_is_exact_and_versioned(self):
+        fixture = json.loads(PRESENTATION_FIXTURE.read_text(encoding="utf-8"))
+
+        self.assertEqual(fixture, {
+            "schema_version": "heel.review-presentation.v1",
+            "assumption": (
+                "not declared in this OpenAPI; not proof the control is absent"
+            ),
+            "answer_receipts": {
+                "enforced": "applied",
+                "not_enforced": "confirmed_gap",
+                "unknown": "unanswered",
+            },
+            "confidence": {
+                "unanswered_or_unknown": "preliminary",
+                "not_enforced": "confirmed_gaps",
+                "enforced_reduced_questions_without_confirmed_gap": "improved",
+            },
+        })
 
     def test_answers_cannot_create_paths_change_targets_or_introduce_refs(self):
         from heel.review_answers import ReviewAnswerError, apply_review_answers
