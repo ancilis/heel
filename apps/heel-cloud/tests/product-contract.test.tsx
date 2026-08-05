@@ -140,7 +140,7 @@ describe("Heel anonymous launch review", () => {
     expect(container.textContent).toMatch(/launch_review_runagenttool_agent_surface_overscope/i);
     expect(within(hero as HTMLElement).getByRole("button", { name: /run the sample/i })).toBeTruthy();
     expect(within(hero as HTMLElement).getByRole("button", { name: /analyze mine/i })).toBeTruthy();
-    expect(screen.getByRole("link", { name: /use heel with an agent/i })).toBeTruthy();
+    expect(screen.getByRole("link", { name: /use heel with an agent/i }).getAttribute("href")).toBe("/mcp");
     expect(within(hero as HTMLElement).getByText(/launch_review_runagenttool_agent_surface_overscope/i)).toBeTruthy();
 
     expect(container.textContent).toMatch(/runs here, not on our server/i);
@@ -179,9 +179,7 @@ describe("Heel anonymous launch review", () => {
   test("links the truthful source-checkout MCP setup and executable", () => {
     render(<Home />);
     const setup = screen.getByRole("link", { name: /open local mcp setup/i });
-    expect(setup.getAttribute("href")).toBe(
-      "https://github.com/ancilis/heel/blob/main/docs/MCP_QUICKSTART.md",
-    );
+    expect(setup.getAttribute("href")).toBe("/mcp");
     const section = screen.getByRole("heading", { name: /same review from your local ai surface/i }).closest("section");
     expect(section?.textContent).toContain("heel-sim");
     expect(section?.textContent).toContain("heel-mcp");
@@ -341,6 +339,21 @@ describe("Heel anonymous launch review", () => {
 
     await act(async () => read.resolve(new TextEncoder().encode("older").buffer));
     expect(onSourceChange).not.toHaveBeenCalled();
+    expect(screen.queryByRole("status", { name: /selected file/i })).toBeNull();
+  });
+
+  test("restarting custom input invalidates a pending empty-source file read", async () => {
+    const read = deferred<ArrayBuffer>();
+    render(<Home />);
+    fireEvent.click(screen.getByRole("button", { name: /analyze mine/i }));
+    const file = { name: "stale.json", size: 5, arrayBuffer: () => read.promise } as File;
+    fireEvent.drop(screen.getByRole("button", { name: /drop openapi json/i }), {
+      dataTransfer: { files: [file] },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /analyze mine/i }));
+    await act(async () => read.resolve(new TextEncoder().encode("stale").buffer));
+    expect((screen.getByLabelText(/paste openapi json/i) as HTMLTextAreaElement).value).toBe("");
     expect(screen.queryByRole("status", { name: /selected file/i })).toBeNull();
   });
 

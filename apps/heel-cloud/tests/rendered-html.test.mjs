@@ -126,8 +126,9 @@ test("uses Heel identity and marks original source as commercial", async () => {
 });
 
 test("ships server-renderable evidence, local interaction semantics, and accessible responsive styles", async () => {
-  const [page, workspace, input, privacy, sample, css] = await Promise.all([
+  const [page, mcpPage, workspace, input, privacy, sample, css] = await Promise.all([
     readFile(new URL("app/page.tsx", appRoot), "utf8"),
+    readFile(new URL("app/mcp/page.tsx", appRoot), "utf8").catch(() => ""),
     readFile(new URL("components/review/ReviewWorkspace.tsx", appRoot), "utf8"),
     readFile(new URL("components/review/OpenApiInput.tsx", appRoot), "utf8"),
     readFile(new URL("components/review/PrivacyReceipt.tsx", appRoot), "utf8"),
@@ -150,6 +151,16 @@ test("ships server-renderable evidence, local interaction semantics, and accessi
   assert.match(workspace, /Clear local history/);
   assert.match(workspace, /useMemo\(\(\) => reviewToJson\(result\), \[result\]\)/);
   assert.match(sample, /agent_surface_overscope/);
+  assert.match(page, /href="\/mcp"/);
+  assert.match(mcpPage, /heel-sim/);
+  assert.match(mcpPage, /\.venv\/bin\/python -m pip install \./);
+  assert.match(mcpPage, /\/absolute\/path\/to\/heel\/\.venv\/bin\/heel-mcp/);
+  assert.match(mcpPage, /mcpServers/);
+  assert.match(mcpPage, /HEEL_HOME/);
+  assert.match(mcpPage, /not published to PyPI/i);
+  assert.match(mcpPage, /credentials or customer data/i);
+  assert.match(mcpPage, /AI client is separate/i);
+  assert.doesNotMatch(mcpPage, /python3 -m pip install heel-sim/);
 
   assert.doesNotMatch(productSource, /sign.?up.{0,30}(review|analy)/i);
   assert.doesNotMatch(productSource, /testimonial|customers trust|accuracy rate|cloud save/i);

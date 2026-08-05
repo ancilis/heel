@@ -26,7 +26,7 @@ export default function Home() {
         <p>
           The <code>heel-sim</code> source checkout includes the <code>heel-mcp</code>
           executable for an agent-controlled local stdio workflow. It is not currently
-          published to a package registry. <a href="https://github.com/ancilis/heel/blob/main/docs/MCP_QUICKSTART.md">
+          published to a package registry. <a href="/mcp">
             Open local MCP setup
           </a>.
         </p>

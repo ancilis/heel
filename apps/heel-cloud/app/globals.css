@@ -97,7 +97,8 @@ code {
 .hero,
 .review-workspace,
 .mcp-section,
-.availability {
+.availability,
+.mcp-quickstart {
   width: min(calc(100% - 48px), 1180px);
   margin-inline: auto;
 }
@@ -903,6 +904,101 @@ fieldset.question {
   font-weight: 650;
 }
 
+.mcp-quickstart {
+  padding-block: clamp(54px, 8vw, 96px);
+}
+
+.quickstart-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 36px;
+  align-items: end;
+}
+
+.quickstart-hero h1 {
+  max-width: 800px;
+  margin: 0;
+  font-size: clamp(46px, 7vw, 82px);
+  letter-spacing: -0.06em;
+  line-height: 0.96;
+}
+
+.quickstart-hero p:not(.eyebrow) {
+  max-width: 720px;
+  margin: 24px 0 0;
+  color: var(--ink-soft);
+  font-size: 19px;
+}
+
+.quickstart-privacy {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.3fr) minmax(0, 1fr);
+  gap: 24px;
+  padding: 24px;
+  margin-top: 42px;
+  border-left: 6px solid var(--signal);
+  background: var(--teal-deep);
+  color: white;
+}
+
+.quickstart-privacy p {
+  margin: 0;
+  color: #dbece6;
+}
+
+.quickstart-steps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.quickstart-card {
+  min-width: 0;
+  padding: clamp(22px, 4vw, 34px);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.quickstart-card h2 {
+  margin: 0;
+  font-size: clamp(24px, 3vw, 34px);
+  letter-spacing: -0.04em;
+  line-height: 1.05;
+}
+
+.quickstart-card > p:not(.step-number) {
+  color: var(--muted);
+}
+
+.step-number {
+  margin: 0 0 10px;
+  color: var(--teal);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.quickstart-card pre {
+  overflow-x: auto;
+  padding: 18px;
+  margin: 20px 0 0;
+  border-radius: 10px;
+  background: var(--ink);
+  color: #eff6f1;
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre;
+}
+
+.quickstart-note {
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
 @media (max-width: 900px) {
   .hero {
     grid-template-columns: 1fr;
@@ -924,6 +1020,20 @@ fieldset.question {
   .mcp-section,
   .availability {
     width: min(calc(100% - 28px), 1180px);
+  }
+
+  .mcp-quickstart {
+    width: min(calc(100% - 28px), 1180px);
+  }
+
+  .quickstart-hero,
+  .quickstart-privacy,
+  .quickstart-steps {
+    grid-template-columns: 1fr;
+  }
+
+  .quickstart-hero .button {
+    width: 100%;
   }
 
   .site-header {

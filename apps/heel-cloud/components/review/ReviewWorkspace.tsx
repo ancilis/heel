@@ -124,6 +124,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
   const [reviewBaseline, setReviewBaseline] = useState<ReviewEnvelopeV1 | null>(initialReview);
   const [canRerun, setCanRerun] = useState(false);
   const [inputOpen, setInputOpen] = useState(false);
+  const [inputResetGeneration, setInputResetGeneration] = useState(0);
   const [phase, setPhase] = useState<ReviewPhase>("example");
   const [engineStatus, setEngineStatus] = useState<BrowserReviewStatus>("loading_engine");
   const [error, setError] = useState("");
@@ -283,6 +284,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
     requestActiveRef.current = false;
     retryRequestRef.current = null;
     setRetryAvailable(false);
+    setInputResetGeneration((current) => current + 1);
     setInputOpen(true);
     setSource("");
     setAnswers(new Map());
@@ -433,7 +435,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
             <button className="button button-secondary" type="button" onClick={analyzeMine} disabled={disabled}>
               Analyze mine
             </button>
-            <a className="text-link" href="#mcp">Use Heel with an agent</a>
+            <a className="text-link" href="/mcp">Use Heel with an agent</a>
           </div>
           <ul className="boundary-list" aria-label="Product boundaries">
             <li>Static review only</li>
@@ -474,6 +476,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
       {inputOpen ? (
         <div ref={inputHeadingRef} tabIndex={-1} className="input-focus-target">
           <OpenApiInput
+            key={inputResetGeneration}
             source={source}
             disabled={disabled}
             onSourceChange={setSource}
