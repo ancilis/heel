@@ -26,7 +26,7 @@ export default function Home() {
         <p>
           The first-party Apache-2.0 <code>heel-sim</code> download includes the
           {" "}<code>heel-mcp</code> executable for an agent-controlled local stdio workflow.
-          No account or package registry is required. <a href="/mcp">
+          No account or package registry is required. <a href="/agent">
             Open local MCP setup
           </a>.
         </p>

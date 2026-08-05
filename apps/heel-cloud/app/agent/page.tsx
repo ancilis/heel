@@ -33,7 +33,7 @@ export const metadata: Metadata = {
 };
 
 
-export default function McpQuickstart() {
+export default function AgentQuickstart() {
   return (
     <main className="quickstart-main">
       <header className="site-header">

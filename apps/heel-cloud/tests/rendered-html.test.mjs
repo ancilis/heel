@@ -120,6 +120,8 @@ test("uses Heel identity, trusted request-origin metadata, and commercial source
   assert.equal(socialCard.readUInt32BE(20), 630);
   assert.match(readme, /never uploaded/i);
   assert.match(readme, /evidence-first browser workspace/i);
+  assert.match(readme, /Agent files advertised on `\/agent`/);
+  assert.doesNotMatch(readme, /Agent files served from `\/agent`/);
 
   const files = await sourceFiles(appRoot);
   for (const file of files) {
@@ -129,9 +131,9 @@ test("uses Heel identity, trusted request-origin metadata, and commercial source
 });
 
 test("ships server-renderable evidence, local interaction semantics, and accessible responsive styles", async () => {
-  const [page, mcpPage, workspace, input, privacy, sample, css] = await Promise.all([
+  const [page, agentPage, workspace, input, privacy, sample, css] = await Promise.all([
     readFile(new URL("app/page.tsx", appRoot), "utf8"),
-    readFile(new URL("app/mcp/page.tsx", appRoot), "utf8").catch(() => ""),
+    readFile(new URL("app/agent/page.tsx", appRoot), "utf8").catch(() => ""),
     readFile(new URL("components/review/ReviewWorkspace.tsx", appRoot), "utf8"),
     readFile(new URL("components/review/OpenApiInput.tsx", appRoot), "utf8"),
     readFile(new URL("components/review/PrivacyReceipt.tsx", appRoot), "utf8"),
@@ -154,16 +156,18 @@ test("ships server-renderable evidence, local interaction semantics, and accessi
   assert.match(workspace, /Clear local history/);
   assert.match(workspace, /useMemo\(\(\) => reviewToJson\(result\), \[result\]\)/);
   assert.match(sample, /agent_surface_overscope/);
-  assert.match(page, /href="\/mcp"/);
-  assert.match(mcpPage, /heel-sim/);
-  assert.match(mcpPage, /\.venv\/bin\/python -m pip install \./);
-  assert.match(mcpPage, /\/absolute\/path\/to\/download-folder\/\.venv\/bin\/heel-mcp/);
-  assert.match(mcpPage, /mcpServers/);
-  assert.match(mcpPage, /HEEL_HOME/);
-  assert.match(mcpPage, /PyPI publication is not yet available/i);
-  assert.match(mcpPage, /credentials or customer data/i);
-  assert.match(mcpPage, /AI client is separate/i);
-  assert.doesNotMatch(mcpPage, /python3 -m pip install heel-sim/);
+  assert.match(page, /href="\/agent"/);
+  assert.doesNotMatch(page, /href="\/mcp"/);
+  await assertMissing("app/mcp/");
+  assert.match(agentPage, /heel-sim/);
+  assert.match(agentPage, /\.venv\/bin\/python -m pip install \./);
+  assert.match(agentPage, /\/absolute\/path\/to\/download-folder\/\.venv\/bin\/heel-mcp/);
+  assert.match(agentPage, /mcpServers/);
+  assert.match(agentPage, /HEEL_HOME/);
+  assert.match(agentPage, /PyPI publication is not yet available/i);
+  assert.match(agentPage, /credentials or customer data/i);
+  assert.match(agentPage, /AI client is separate/i);
+  assert.doesNotMatch(agentPage, /python3 -m pip install heel-sim/);
 
   assert.doesNotMatch(productSource, /sign.?up.{0,30}(review|analy)/i);
   assert.doesNotMatch(productSource, /testimonial|customers trust|accuracy rate|cloud save/i);

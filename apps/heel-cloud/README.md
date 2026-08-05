@@ -19,7 +19,7 @@ milestone has no authentication, cloud save, hosted review API, server customer
 persistence, database, object storage, billing, analytics, or error-reporting
 SDK.
 
-The deployable app already includes the exact verified Agent files served from `/mcp`:
+The deployable app already includes the exact verified Agent files advertised on `/agent`:
 
 - `/downloads/heel_sim-1.1.1-py3-none-any.whl`
 - `/downloads/heel_sim-1.1.1.tar.gz`

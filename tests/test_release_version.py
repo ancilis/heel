@@ -64,7 +64,7 @@ class ReleaseVersionContractTests(unittest.TestCase):
             ROOT / "README.md",
             ROOT / "docs/MCP_QUICKSTART.md",
             ROOT / "apps/heel-cloud/README.md",
-            ROOT / "apps/heel-cloud/app/mcp/page.tsx",
+            ROOT / "apps/heel-cloud/app/agent/page.tsx",
             ROOT / ".github/workflows/ci.yml",
             ROOT / ".github/workflows/publish.yml",
         ]

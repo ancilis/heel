@@ -36,7 +36,7 @@ agent can talk its way past). Pure Python standard library, **zero dependencies*
 ## Five-minute local launch review
 
 The Heel Cloud app now carries the verified Agent wheel, source archive, and manifest on its own
-origin. Open `/mcp`, choose **Download Heel Agent 1.1.1**, and save
+origin. Open `/agent`, choose **Download Heel Agent 1.1.1**, and save
 `/downloads/heel_sim-1.1.1-py3-none-any.whl` in an empty working directory. Then install it into an
 isolated environment and review a sanitized OpenAPI document you own:
 

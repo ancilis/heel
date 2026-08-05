@@ -435,7 +435,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
             <button className="button button-secondary" type="button" onClick={analyzeMine} disabled={disabled}>
               Analyze mine
             </button>
-            <a className="text-link" href="/mcp">Use Heel with an agent</a>
+            <a className="text-link" href="/agent">Use Heel with an agent</a>
           </div>
           <ul className="boundary-list" aria-label="Product boundaries">
             <li>Static review only</li>

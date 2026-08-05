@@ -9,7 +9,7 @@ import test from "node:test";
 
 
 const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
-const pageUrl = new URL("../app/mcp/page.tsx", import.meta.url);
+const pageUrl = new URL("../app/agent/page.tsx", import.meta.url);
 const shellQuote = (value) => `'${value.replaceAll("'", `'"'"'`)}'`;
 
 

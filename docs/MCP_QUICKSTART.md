@@ -11,7 +11,7 @@ UTF-8 JSON file no larger than 2 MiB.
 
 ## Install the current Agent
 
-The primary acquisition path is Heel Cloud's `/mcp` page. Choose **Download Heel Agent 1.1.1**;
+The primary acquisition path is Heel Cloud's `/agent` page. Choose **Download Heel Agent 1.1.1**;
 the same-origin wheel is `/downloads/heel_sim-1.1.1-py3-none-any.whl`. In the directory where you
 saved it, run:
 

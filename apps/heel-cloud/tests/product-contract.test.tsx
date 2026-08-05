@@ -55,7 +55,7 @@ vi.mock("../lib/local-reviews", async (importOriginal) => {
 });
 
 import Home from "../app/page";
-import McpQuickstart from "../app/mcp/page";
+import McpQuickstart from "../app/agent/page";
 import { OpenApiInput } from "../components/review/OpenApiInput";
 import { ReviewWorkspace } from "../components/review/ReviewWorkspace";
 
@@ -143,7 +143,7 @@ describe("Heel anonymous launch review", () => {
     expect(container.textContent).toMatch(/launch_review_runagenttool_agent_surface_overscope/i);
     expect(within(hero as HTMLElement).getByRole("button", { name: /run the sample/i })).toBeTruthy();
     expect(within(hero as HTMLElement).getByRole("button", { name: /analyze mine/i })).toBeTruthy();
-    expect(screen.getByRole("link", { name: /use heel with an agent/i }).getAttribute("href")).toBe("/mcp");
+    expect(screen.getByRole("link", { name: /use heel with an agent/i }).getAttribute("href")).toBe("/agent");
     expect(within(hero as HTMLElement).getByText(/launch_review_runagenttool_agent_surface_overscope/i)).toBeTruthy();
 
     expect(container.textContent).toMatch(/runs here, not on our server/i);
@@ -182,7 +182,7 @@ describe("Heel anonymous launch review", () => {
   test("links the truthful first-party MCP download and executable", () => {
     render(<Home />);
     const setup = screen.getByRole("link", { name: /open local mcp setup/i });
-    expect(setup.getAttribute("href")).toBe("/mcp");
+    expect(setup.getAttribute("href")).toBe("/agent");
     const section = screen.getByRole("heading", { name: /same review from your local ai surface/i }).closest("section");
     expect(section?.textContent).toContain("heel-sim");
     expect(section?.textContent).toContain("heel-mcp");

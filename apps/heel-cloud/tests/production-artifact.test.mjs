@@ -1334,6 +1334,46 @@ test("recursively scans every deployed executable, text manifest, and wheel memb
 });
 
 
+test("serves the Agent acquisition page only from the canonical route", async () => {
+  const artifact = await import(pathToFileURL(join(serverRoot, "index.js")).href + `?routes=${Date.now()}`);
+  const environment = {
+    ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
+    IMAGES: { input: () => { throw new Error("image transform is not used for the Agent page"); } },
+  };
+  const context = { waitUntil() {}, passThroughOnException() {} };
+
+  const agent = await artifact.default.fetch(
+    new Request("https://routes.heel.invalid/agent"),
+    environment,
+    context,
+  );
+  assert.equal(agent.status, 200, "/agent must serve the customer acquisition page");
+  const agentBody = await agent.text();
+  assert.match(agentBody, /<h1>Run Heel from your AI client\.<\/h1>/);
+  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.1\.1-py3-none-any\.whl"/);
+  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.1\.1\.tar\.gz"/);
+  assert.match(agentBody, /href="\/downloads\/heel-open-core-manifest\.json"/);
+  assert.match(agentBody, /f0553450bc33da704a6ea7bb70d9ec4f851de80744e6614b447ab7e9c48b7f29/);
+
+  const agentCsp = agent.headers.get("content-security-policy");
+  assert.ok(agentCsp, "/agent must include a Content-Security-Policy");
+  const agentDirectives = parseCsp(agentCsp);
+  assert.deepEqual(agentDirectives.get("default-src"), ["'self'"]);
+  assert.deepEqual(agentDirectives.get("frame-ancestors"), ["'none'"]);
+  assert.match(agentDirectives.get("script-src")?.[1] ?? "", /^'nonce-[0-9a-f]{32}'$/);
+  assert.equal(agent.headers.get("strict-transport-security"), "max-age=31536000; includeSubDomains");
+  assert.equal(agent.headers.get("x-content-type-options"), "nosniff");
+
+  const formerMcpRoute = await artifact.default.fetch(
+    new Request("https://routes.heel.invalid/mcp"),
+    environment,
+    context,
+  );
+  assert.equal(formerMcpRoute.status, 404, "/mcp must not remain as a local alias or redirect");
+  assert.equal(formerMcpRoute.headers.get("location"), null, "/mcp must not redirect to /agent");
+});
+
+
 test("production worker exposes exact headers, request-URL metadata, and no unapproved bindings", async () => {
   const [workerConfig, hostingConfig, socialCard] = await Promise.all([
     json(join(serverRoot, "wrangler.json")),
