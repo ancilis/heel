@@ -509,28 +509,35 @@ class TestRestSharesAuthGate(Base):  # spec §2 — REST is a thin client over t
             # 1) scope creation via REST is impossible (405)
             with self.assertRaises(urllib.error.HTTPError) as e:
                 post("/scopes", {"target_allowlist": ["evil.com"]})
-            self.assertEqual(e.exception.code, 405)
+            with e.exception as response:
+                self.assertEqual(response.code, 405)
             # 2) in-scope run works (200)
-            self.assertEqual(post("/runs", {"scope_id": self.scope.scope_id, "target": "synthetic-saas"}).status, 200)
+            with post("/runs", {"scope_id": self.scope.scope_id,
+                                "target": "synthetic-saas"}) as response:
+                self.assertEqual(response.status, 200)
             # 3) out-of-allowlist run rejected (403), same as MCP
             with self.assertRaises(urllib.error.HTTPError) as e:
                 post("/runs", {"scope_id": self.scope.scope_id, "target": "evil.com"})
-            self.assertEqual(e.exception.code, 403)
+            with e.exception as response:
+                self.assertEqual(response.code, 403)
 
             # 4) DNS-rebinding blocked: a non-loopback Host header is rejected (403)
             req = urllib.request.Request(f"http://127.0.0.1:{port}/scopes", headers={"Host": "attacker.example.com"})
             with self.assertRaises(urllib.error.HTTPError) as e:
                 urllib.request.urlopen(req)
-            self.assertEqual(e.exception.code, 403)
+            with e.exception as response:
+                self.assertEqual(response.code, 403)
 
             # 5) CSRF blocked: a request carrying an Origin header is rejected (403)
             req = urllib.request.Request(f"http://127.0.0.1:{port}/runs", data=b"{}", method="POST",
                                          headers={"Origin": "https://evil.example.com"})
             with self.assertRaises(urllib.error.HTTPError) as e:
                 urllib.request.urlopen(req)
-            self.assertEqual(e.exception.code, 403)
+            with e.exception as response:
+                self.assertEqual(response.code, 403)
         finally:
             httpd.shutdown()
+            httpd.server_close()
 
     def test_data_home_is_locked_down(self):
         import stat

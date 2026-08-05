@@ -161,8 +161,14 @@ class AdversarialTests(unittest.TestCase):
         import tempfile
 
         from heel.saas.ledger import UsageLedger
-        db = os.path.join(tempfile.mkdtemp(), "race.db")
-        UsageLedger(sqlite3.connect(db))     # create schema
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        db = os.path.join(temp_dir.name, "race.db")
+        setup_conn = sqlite3.connect(db)
+        try:
+            UsageLedger(setup_conn)     # create schema
+        finally:
+            setup_conn.close()
         plan = get_plan("free")   # RUNS quota 25
         wid = "ws_race_iso"
         ok, denied = [], []
@@ -186,9 +192,13 @@ class AdversarialTests(unittest.TestCase):
             list(ex.map(grab, range(60)))
         self.assertEqual(len(ok), 25)
         self.assertEqual(len(denied), 35)
-        check = UsageLedger(sqlite3.connect(db))
-        check.conn.row_factory = sqlite3.Row
-        self.assertEqual(check.usage(wid, Meter.RUNS, "2099-01"), 25)
+        check_conn = sqlite3.connect(db)
+        try:
+            check = UsageLedger(check_conn)
+            check.conn.row_factory = sqlite3.Row
+            self.assertEqual(check.usage(wid, Meter.RUNS, "2099-01"), 25)
+        finally:
+            check_conn.close()
 
     def test_concurrent_target_checks_never_verify_past_quota(self):
         # Sol Gate-1 round-3 regression: two checks that both observed headroom must not both
@@ -199,9 +209,12 @@ class AdversarialTests(unittest.TestCase):
         import tempfile
 
         from heel.saas.verification import TargetLimitExceeded, TargetVerifier
-        db = os.path.join(tempfile.mkdtemp(), "vrace.db")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        db = os.path.join(temp_dir.name, "vrace.db")
         records = {}
         seed_conn = sqlite3.connect(db)
+        self.addCleanup(seed_conn.close)
         seed_conn.row_factory = sqlite3.Row
         seed = TargetVerifier(seed_conn, dns_txt=lambda n: records.get(n, []))
         wid = "ws_vrace"
@@ -237,8 +250,11 @@ class AdversarialTests(unittest.TestCase):
         import tempfile
 
         from heel.saas.tenancy import ControlPlaneStore, Role, SeatLimitExceeded
-        db = os.path.join(tempfile.mkdtemp(), "srace.db")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        db = os.path.join(temp_dir.name, "srace.db")
         seed = ControlPlaneStore(db)
+        self.addCleanup(seed.conn.close)
         org = seed.create_org("o")
         wid = seed.create_workspace(org, "w", "pro", "v")   # pro: 3 seats
         seed.add_member(wid, "u_owner", Role.OWNER)
@@ -264,7 +280,11 @@ class AdversarialTests(unittest.TestCase):
             list(ex.map(accept, tokens))
         self.assertEqual(len(joined), 2, joined)          # owner + 2 = 3 seats
         self.assertEqual(len(refused), 8)
-        self.assertEqual(len(ControlPlaneStore(db).members(wid)), 3)
+        check = ControlPlaneStore(db)
+        try:
+            self.assertEqual(len(check.members(wid)), 3)
+        finally:
+            check.conn.close()
 
     def test_api_key_stops_working_after_downgrade(self):
         # Sol Gate-1 round-3 regression: hosted API access is a live entitlement, not a

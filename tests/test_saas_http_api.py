@@ -24,9 +24,40 @@ from heel.saas.tenancy import Role
 PW = "correct-horse-battery"
 
 
+class HostedResourceLifecycleTests(unittest.TestCase):
+    def test_failed_bind_does_not_take_control_plane_ownership(self):
+        occupied_cp = ControlPlane()
+        occupied = serve(occupied_cp)
+        self.addCleanup(occupied.server_close)
+        contender = ControlPlane()
+        self.addCleanup(contender.close)
+
+        with self.assertRaises(OSError):
+            serve(contender, port=occupied.server_address[1])
+
+        try:
+            result = contender.store.conn.execute("SELECT 1").fetchone()[0]
+        except sqlite3.ProgrammingError:
+            result = None
+        self.assertEqual(result, 1)
+
+    def test_server_close_releases_all_hosted_resources_idempotently(self):
+        cp = ControlPlane()
+        server = serve(cp)
+        listening_socket = server.socket
+
+        server.server_close()
+        server.server_close()
+
+        self.assertEqual(listening_socket.fileno(), -1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            cp.store.conn.execute("SELECT 1")
+
+
 class AuthStoreTests(unittest.TestCase):
     def setUp(self):
         self.auth = AuthStore(sqlite3.connect(":memory:"))
+        self.addCleanup(self.auth.conn.close)
 
     def test_password_roundtrip_and_weak_rejected(self):
         self.auth.set_password("u1", PW)
@@ -58,6 +89,7 @@ class AuthStoreTests(unittest.TestCase):
 class MigratorTests(unittest.TestCase):
     def test_apply_all_idempotent_and_ordered(self):
         conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
         m = Migrator(conn, CONTROL_PLANE_MIGRATIONS)
         self.assertEqual(m.apply_all(), [1, 2])
         self.assertEqual(m.apply_all(), [])
@@ -68,6 +100,7 @@ class MigratorTests(unittest.TestCase):
 
     def test_rejects_bad_ordering(self):
         conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
         bad = [Migration(2, "b", "CREATE TABLE t(a)"), Migration(1, "a", "CREATE TABLE s(a)")]
         with self.assertRaises(MigrationError):
             Migrator(conn, bad)
@@ -80,6 +113,8 @@ class MigratorTests(unittest.TestCase):
     def test_copy_table(self):
         src = sqlite3.connect(":memory:")
         dst = sqlite3.connect(":memory:")
+        self.addCleanup(src.close)
+        self.addCleanup(dst.close)
         for c in (src, dst):
             Migrator(c, CONTROL_PLANE_MIGRATIONS).apply_all()
         src.execute("INSERT INTO users VALUES('u1','a@b.c',0)")

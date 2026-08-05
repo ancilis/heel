@@ -53,6 +53,7 @@ class CatalogTests(unittest.TestCase):
 class TenancyTests(unittest.TestCase):
     def setUp(self):
         self.s = ControlPlaneStore()
+        self.addCleanup(self.s.conn.close)
         self.org = self.s.create_org("Acme")
         self.ws = self.s.create_workspace(self.org, "Acme WS", "free", CATALOG_VERSION)
         self.owner = self.s.create_user("owner@acme.test")
@@ -109,6 +110,7 @@ class TenancyTests(unittest.TestCase):
 class LedgerTests(unittest.TestCase):
     def setUp(self):
         self.ledger = UsageLedger.in_memory()
+        self.addCleanup(self.ledger.conn.close)
         self.plan = get_plan("free")  # runs=25
         self.ws = "ws_test"
 
@@ -164,13 +166,15 @@ class LedgerTests(unittest.TestCase):
         import tempfile
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
 
         def new_ledger():
             c = sqlite3.connect(tmp.name, check_same_thread=False, timeout=5)
             c.row_factory = sqlite3.Row
             return UsageLedger(c)
 
-        new_ledger()  # create schema once
+        seed = new_ledger()  # create schema once
+        seed.conn.close()
         successes, errors = [], []
         lock = threading.Lock()
 
@@ -185,6 +189,8 @@ class LedgerTests(unittest.TestCase):
             except Exception as e:  # surface unexpected (e.g. lock) failures instead of hiding them
                 with lock:
                     errors.append(repr(e))
+            finally:
+                led.conn.close()
 
         threads = [threading.Thread(target=worker) for _ in range(40)]
         for t in threads:
@@ -193,13 +199,17 @@ class LedgerTests(unittest.TestCase):
             t.join()
         self.assertEqual(errors, [], f"unexpected reserve errors: {errors[:3]}")
         self.assertEqual(sum(successes), 25)
-        self.assertEqual(new_ledger().usage("ws_race", Meter.RUNS, PERIOD), 25)
-        os.unlink(tmp.name)
+        check = new_ledger()
+        try:
+            self.assertEqual(check.usage("ws_race", Meter.RUNS, PERIOD), 25)
+        finally:
+            check.conn.close()
 
 
 class EntitlementTests(unittest.TestCase):
     def setUp(self):
         self.ledger = UsageLedger.in_memory()
+        self.addCleanup(self.ledger.conn.close)
         self.ent = EntitlementService(self.ledger, config_features=frozenset())
 
     def sub(self, plan_id, state="active"):
@@ -255,6 +265,7 @@ class EntitlementTests(unittest.TestCase):
 class BillingTests(unittest.TestCase):
     def setUp(self):
         self.store = BillingStore.in_memory()
+        self.addCleanup(self.store.conn.close)
         self.mgr = SubscriptionManager(self.store)
         self.stub = StubBilling()
 
@@ -343,7 +354,9 @@ class CatalogVersioningTests(unittest.TestCase):
             features=old["pro"].features, support="email")
         cat._CATALOGS["2099-02-02"] = {**old, "pro": big_pro}
         try:
-            svc = EntitlementService(UsageLedger.in_memory(), config_features=frozenset())
+            ledger = UsageLedger.in_memory()
+            self.addCleanup(ledger.conn.close)
+            svc = EntitlementService(ledger, config_features=frozenset())
             pinned = Subscription("ws1", "pro", "active", "2099-02-02")
             current = Subscription("ws2", "pro", "active", CATALOG_VERSION)
             self.assertEqual(svc.quota(pinned, Meter.SEATS), 99)

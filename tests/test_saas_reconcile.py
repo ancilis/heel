@@ -19,6 +19,7 @@ from heel.saas.tenancy import Role
 class ReconcileTests(unittest.TestCase):
     def setUp(self):
         self.cp = ControlPlane()
+        self.addCleanup(self.cp.close)
         self.conn = self.cp.store.conn
         org = self.cp.store.create_org("t")
         self.wid = self.cp.store.create_workspace(org, "w", "free", CATALOG_VERSION)

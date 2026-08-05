@@ -68,6 +68,7 @@ class TestCatalog(unittest.TestCase):
 class TestLedger(unittest.TestCase):
     def setUp(self):
         self.ledger = UsageLedger.in_memory()
+        self.addCleanup(self.ledger.conn.close)
         self.pro = get_plan("pro")
 
     def test_reserve_counts_and_quota_blocks(self):
@@ -126,9 +127,11 @@ class TestLedger(unittest.TestCase):
         """Two threads racing for the last unit of quota: exactly one must win."""
         import tempfile
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
         self.addCleanup(os.unlink, tmp.name)
         path = tmp.name
         keeper = sqlite3.connect(path, check_same_thread=False)
+        self.addCleanup(keeper.close)
         keeper.row_factory = sqlite3.Row
         ledger_main = UsageLedger(keeper)
         free = get_plan("free")
@@ -145,6 +148,8 @@ class TestLedger(unittest.TestCase):
                 results.append("ok")
             except QuotaExceeded:
                 results.append("blocked")
+            finally:
+                c.close()
 
         ts = [threading.Thread(target=worker) for _ in range(2)]
         [t.start() for t in ts]
@@ -155,7 +160,9 @@ class TestLedger(unittest.TestCase):
 
 class TestEntitlements(unittest.TestCase):
     def setUp(self):
-        self.svc = EntitlementService(UsageLedger.in_memory(), config_features=frozenset())
+        self.ledger = UsageLedger.in_memory()
+        self.addCleanup(self.ledger.conn.close)
+        self.svc = EntitlementService(self.ledger, config_features=frozenset())
 
     def test_inactive_states_fall_back_to_free(self):
         for state in ("canceled", "unpaid", "incomplete"):
@@ -167,7 +174,9 @@ class TestEntitlements(unittest.TestCase):
         ent = sub("enterprise")
         self.assertFalse(self.svc.has_feature(ent, Feature.SSO))
         self.assertEqual(self.svc.feature_status(ent, Feature.SSO), "contact_sales")
-        configured = EntitlementService(UsageLedger.in_memory(),
+        configured_ledger = UsageLedger.in_memory()
+        self.addCleanup(configured_ledger.conn.close)
+        configured = EntitlementService(configured_ledger,
                                         config_features=frozenset({Feature.SSO}))
         self.assertTrue(configured.has_feature(ent, Feature.SSO))
         self.assertEqual(configured.feature_status(ent, Feature.SSO), "enabled")
@@ -198,6 +207,7 @@ class TestEntitlements(unittest.TestCase):
 class TestTenancy(unittest.TestCase):
     def setUp(self):
         self.store = ControlPlaneStore()
+        self.addCleanup(self.store.conn.close)
         self.org = self.store.create_org("Acme")
         self.ws = self.store.create_workspace(self.org, "prod", "free", CATALOG_VERSION)
         self.owner = self.store.create_user("owner@acme.test")
@@ -258,6 +268,7 @@ class TestTenancy(unittest.TestCase):
 class TestBilling(unittest.TestCase):
     def setUp(self):
         self.store = BillingStore.in_memory()
+        self.addCleanup(self.store.conn.close)
         self.mgr = SubscriptionManager(self.store)
         self.stub = StubBilling()
 
@@ -327,7 +338,9 @@ class TestBilling(unittest.TestCase):
 
     def test_entitlements_follow_billing_state(self):
         """End-to-end: webhook drives state; entitlement service answers from it."""
-        svc = EntitlementService(UsageLedger.in_memory(), config_features=frozenset())
+        ledger = UsageLedger.in_memory()
+        self.addCleanup(ledger.conn.close)
+        svc = EntitlementService(ledger, config_features=frozenset())
         self._apply("ws", "active", "pro")
         st = self.store.get("ws")
         s = Subscription("ws", st.plan_id, st.state, st.catalog_version)

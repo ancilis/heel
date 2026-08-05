@@ -19,7 +19,9 @@ PW = "correct-horse-battery"
 
 class OpsStoreTests(unittest.TestCase):
     def setUp(self):
-        self.ops = ControlPlane().ops
+        self.cp = ControlPlane()
+        self.addCleanup(self.cp.close)
+        self.ops = self.cp.ops
 
     def test_workspace_and_global_switches(self):
         self.ops.check("ws1")   # clean: no raise

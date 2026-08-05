@@ -39,6 +39,7 @@ class VerifierTests(unittest.TestCase):
     def test_dns_and_http_challenge_flow(self):
         records = {}
         v = TargetVerifier(_conn(), dns_txt=lambda name: records.get(name, []))
+        self.addCleanup(v.conn.close)
         ch = v.start("ws1", "App.Example.COM.")
         self.assertEqual(ch.hostname, "app.example.com")
         self.assertFalse(v.check("ws1", "app.example.com"))       # not published yet
@@ -54,6 +55,7 @@ class VerifierTests(unittest.TestCase):
     def test_http_method_and_bad_hosts(self):
         pages = {}
         v = TargetVerifier(_conn(), http_get=lambda url: pages.get(url, ""))
+        self.addCleanup(v.conn.close)
         ch = v.start("ws1", "site.example.org")
         pages[ch.http_url] = f"heel-verify={ch.token}\n"
         self.assertTrue(v.check("ws1", "site.example.org"))
@@ -62,6 +64,7 @@ class VerifierTests(unittest.TestCase):
 
     def test_no_resolver_means_no_verification(self):
         v = TargetVerifier(_conn())
+        self.addCleanup(v.conn.close)
         v.start("ws1", "a.example.com")
         self.assertFalse(v.check("ws1", "a.example.com"))
 
@@ -90,9 +93,10 @@ class EgressTests(unittest.TestCase):
 
 class JobPlaneTests(unittest.TestCase):
     def setUp(self):
-        conn = _conn()
-        self.ledger = UsageLedger(conn)
-        self.jobs = JobPlane(conn, scope_validator=lambda ws, ref, tgt: ref == f"scope-ok-{ws}-{tgt}")
+        self.conn = _conn()
+        self.addCleanup(self.conn.close)
+        self.ledger = UsageLedger(self.conn)
+        self.jobs = JobPlane(self.conn, scope_validator=lambda ws, ref, tgt: ref == f"scope-ok-{ws}-{tgt}")
 
     def _resv(self, ws="ws1"):
         from heel.saas.catalog import Meter, get_plan
@@ -165,6 +169,7 @@ class JobPlaneTests(unittest.TestCase):
 
     def test_no_validator_disables_verified(self):
         plane = JobPlane(_conn(), scope_validator=None)
+        self.addCleanup(plane.conn.close)
         with self.assertRaises(PermissionError):
             plane.enqueue("ws1", kind="verified", reservation_ids=["x"],
                           target="a.example.com", target_is_verified=True,

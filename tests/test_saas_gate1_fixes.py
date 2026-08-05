@@ -153,7 +153,8 @@ class Gate1ConcurrencyTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "cp.db")
-            ControlPlaneStore(path)  # create schema
+            setup = ControlPlaneStore(path)  # create schema
+            setup.conn.close()
             results = []
             barrier = threading.Barrier(8)
 
@@ -165,6 +166,8 @@ class Gate1ConcurrencyTests(unittest.TestCase):
                     results.append("ok")
                 except IntegrationLimitExceeded:
                     results.append("limit")
+                finally:
+                    store.conn.close()
 
             threads = [threading.Thread(target=worker) for _ in range(8)]
             for t in threads:
@@ -172,12 +175,15 @@ class Gate1ConcurrencyTests(unittest.TestCase):
             for t in threads:
                 t.join()
             check = ControlPlaneStore(path)
-            active = check.conn.execute(
-                "SELECT COUNT(*) AS n FROM api_keys WHERE workspace_id='wsK' "
-                "AND revoked_at IS NULL").fetchone()["n"]
-            self.assertEqual(active, 3)
-            self.assertEqual(results.count("ok"), 3)
-            self.assertEqual(results.count("limit"), 5)
+            try:
+                active = check.conn.execute(
+                    "SELECT COUNT(*) AS n FROM api_keys WHERE workspace_id='wsK' "
+                    "AND revoked_at IS NULL").fetchone()["n"]
+                self.assertEqual(active, 3)
+                self.assertEqual(results.count("ok"), 3)
+                self.assertEqual(results.count("limit"), 5)
+            finally:
+                check.conn.close()
 
     def test_refunded_key_replay_over_http_is_409(self):
         """HTTP path of round-5 #1: a verified request that reserves then refunds (missing
@@ -229,6 +235,7 @@ class Gate1AbuseBoundTests(unittest.TestCase):
     def test_signup_throttle_per_ip_and_global(self):
         from heel.saas.auth import AuthStore, ThrottledError
         auth = AuthStore(_conn(), signup_max_per_ip=3, signup_max_global=5)
+        self.addCleanup(auth.conn.close)
         for i in range(3):
             auth.throttle_signup("10.0.0.1", f"a{i}@example.com")
         with self.assertRaises(ThrottledError):
@@ -297,6 +304,7 @@ class Gate1AbuseBoundTests(unittest.TestCase):
         from heel.saas.entitlement import EntitlementService, Subscription
         from heel.saas.ledger import GlobalCapExceeded
         ledger = UsageLedger(_conn())
+        self.addCleanup(ledger.conn.close)
         svc = EntitlementService(ledger, global_runs_cap=1000, global_verified_runs_cap=3)
         period = "2026-07"
         for i in range(3):
@@ -316,6 +324,7 @@ class Gate1AbuseBoundTests(unittest.TestCase):
         records = {}
         v = TargetVerifier(_conn(), dns_txt=lambda name: records.get(name, []),
                            max_workspaces_per_hostname=2)
+        self.addCleanup(v.conn.close)
         for ws in ("ws1", "ws2"):
             ch = v.start(ws, "shared.example.com")
             records["_heel.shared.example.com"] = [f"heel-verify={ch.token}"]
@@ -343,6 +352,7 @@ class Gate1JobPlaneTests(unittest.TestCase):
 
     def test_claim_enforces_concurrency_entitlement(self):
         conn = _conn()
+        self.addCleanup(conn.close)
         ledger = UsageLedger(conn)
         jobs = JobPlane(conn, concurrency_limit=lambda ws: 1)
         self._enqueue(jobs, ledger, "ws1", 3)
@@ -354,6 +364,7 @@ class Gate1JobPlaneTests(unittest.TestCase):
 
     def test_claim_skips_saturated_workspace_but_serves_others(self):
         conn = _conn()
+        self.addCleanup(conn.close)
         ledger = UsageLedger(conn)
         jobs = JobPlane(conn, concurrency_limit=lambda ws: 1)
         self._enqueue(jobs, ledger, "ws1", 2)
@@ -365,6 +376,7 @@ class Gate1JobPlaneTests(unittest.TestCase):
 
     def test_retention_purge_deletes_old_finished_jobs(self):
         conn = _conn()
+        self.addCleanup(conn.close)
         ledger = UsageLedger(conn)
         jobs = JobPlane(conn, concurrency_limit=None)
         (job,) = self._enqueue(jobs, ledger, "ws1", 1)
@@ -382,6 +394,7 @@ class Gate1JobPlaneTests(unittest.TestCase):
         from heel.saas.catalog import get_plan
         from heel.saas.ledger import IdempotencyConflict
         ledger = UsageLedger(_conn())
+        self.addCleanup(ledger.conn.close)
         plan = get_plan("free")
         r = ledger.reserve(plan, "ws1", Meter.RUNS, 1, "2026-07", idempotency_key="k1")
         ledger.refund(r.reservation_id)
@@ -398,6 +411,7 @@ class Gate1JobPlaneTests(unittest.TestCase):
         job, and leave the connection usable (Sol Gate-1 round-5 #3)."""
         from heel.saas.catalog import get_plan
         conn = _conn()
+        self.addCleanup(conn.close)
         ledger = UsageLedger(conn)
         jobs = JobPlane(conn)
         r = ledger.reserve(get_plan("team"), "ws1", Meter.RUNS, 1, "2026-07",
@@ -439,6 +453,7 @@ class Gate1JobPlaneTests(unittest.TestCase):
 
     def test_enqueue_replay_race_returns_single_job(self):
         conn = _conn()
+        self.addCleanup(conn.close)
         ledger = UsageLedger(conn)
         jobs = JobPlane(conn)
         from heel.saas.catalog import get_plan

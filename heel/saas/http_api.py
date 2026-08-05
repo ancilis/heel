@@ -73,6 +73,10 @@ class ControlPlane:
         self.ops = OpsStore(conn)
         self.metrics = Metrics()
 
+    def close(self) -> None:
+        """Release the shared database connection. Safe to call more than once."""
+        self.store.conn.close()
+
     def subscription(self, workspace_id: str) -> Subscription:
         ws = self.store.get_workspace(workspace_id)
         if ws is None:
@@ -603,8 +607,29 @@ def _session_cookie(token: str) -> str:
     return f"heel_session={token}; HttpOnly; SameSite=Lax; Path=/"
 
 
+class _ControlPlaneHTTPServer(ThreadingHTTPServer):
+    """HTTP listener that owns the bound control plane after successful construction."""
+
+    def __init__(self, server_address, handler, cp: ControlPlane):
+        self.control_plane = cp
+        self._owns_control_plane = False
+        super().__init__(server_address, handler)
+        self._owns_control_plane = True
+
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            if self._owns_control_plane:
+                self.control_plane.close()
+
+
 def serve(cp: ControlPlane, host: str = "127.0.0.1", port: int = 0,
-          *, webhook_secret: str | None = None) -> ThreadingHTTPServer:
-    """Create (not run) the server; caller drives serve_forever/shutdown. Loopback default."""
+          *, webhook_secret: str | None = None) -> _ControlPlaneHTTPServer:
+    """Create the server and transfer ``cp`` ownership to it.
+
+    The caller drives ``serve_forever``/``shutdown``. ``server_close`` releases both the
+    loopback listener and the control plane's shared database connection.
+    """
     handler = type("Handler", (_Handler,), {"cp": cp, "webhook_secret": webhook_secret})
-    return ThreadingHTTPServer((host, port), handler)
+    return _ControlPlaneHTTPServer((host, port), handler, cp)
