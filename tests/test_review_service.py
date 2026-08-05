@@ -37,6 +37,19 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertIn(result["gate_status"], {"warn", "block"})
         self.assertTrue(result["findings"][0]["reason"])
         self.assertTrue(result["findings"][0]["control"])
+        risks = {finding["risk"] for finding in result["findings"]}
+        self.assertGreaterEqual(risks, {
+            "endpoint_without_tenant_filter",
+            "export_without_entitlement",
+            "oauth_scope_overbroad",
+        })
+        question_fields = {question["field"] for question in result["questions"]}
+        self.assertGreaterEqual(question_fields, {
+            "tenant_filter", "entitlement_check", "product_rule",
+        })
+        prompts = "\n".join(question["prompt"] for question in result["questions"])
+        self.assertIn("GET /api/export/bulk", prompts)
+        self.assertIn("broad OAuth scope declared by security scheme OAuthAll", prompts)
         self.assertEqual(result["execution_mode"], "machine_local")
         self.assertEqual(result["privacy"], {
             "execution": "machine_local",
@@ -56,6 +69,91 @@ class ReviewServiceTests(unittest.TestCase):
 
         spec = _sample_spec()
         self.assertEqual(review_openapi(spec), review_openapi(_reverse_mappings(spec)))
+
+    def test_mapping_control_order_produces_identical_result_hash(self):
+        from heel.review_service import review_openapi
+
+        def spec_with_controls(items):
+            return {
+                "openapi": "3.1.0",
+                "info": {"title": "Control Order", "version": "1"},
+                "paths": {"/records": {"get": {
+                    "operationId": "listRecords",
+                    "x-heel-control": dict(items),
+                }}},
+            }
+
+        first = review_openapi(spec_with_controls([
+            ("rate_limit", True),
+            ("entitlement_check", True),
+        ]))
+        second = review_openapi(spec_with_controls([
+            ("entitlement_check", True),
+            ("rate_limit", True),
+        ]))
+
+        self.assertEqual(first["model_hash"], second["model_hash"])
+        self.assertEqual(first["result_hash"], second["result_hash"])
+
+    def test_declared_tenant_metadata_suppresses_question_and_finding(self):
+        from heel.review_service import review_openapi
+
+        result = review_openapi({
+            "openapi": "3.1.0",
+            "info": {"title": "Tenant Aware", "version": "1"},
+            "paths": {"/records": {"get": {
+                "operationId": "listRecords",
+                "x-heel-tenant-scope": "tenant",
+                "x-heel-plan": "team",
+            }}},
+        })
+
+        self.assertFalse(any(
+            question["field"] == "tenant_filter" for question in result["questions"]
+        ))
+        self.assertFalse(any(
+            finding["risk"] == "endpoint_without_tenant_filter"
+            for finding in result["findings"]
+        ))
+
+    def test_imported_all_scope_creates_oauth_overbreadth_finding(self):
+        from heel.review_service import review_openapi
+
+        result = review_openapi({
+            "openapi": "3.1.0",
+            "info": {"title": "OAuth Scope", "version": "1"},
+            "paths": {"/oauth/apps": {"post": {
+                "operationId": "createOAuthApp",
+                "security": [{"OAuthAll": ["all"]}],
+                "x-heel-tenant-scope": "tenant",
+                "x-heel-plan": "team",
+            }}},
+        })
+
+        finding = next(
+            item for item in result["findings"]
+            if item["risk"] == "oauth_scope_overbroad"
+        )
+        self.assertEqual(finding["surface_type"], "integration_oauth_apps")
+        self.assertEqual(finding["control"], "OAuth scope minimization and approval")
+
+    def test_local_path_item_ref_contributes_review_findings(self):
+        from heel.review_service import review_openapi
+
+        result = review_openapi({
+            "openapi": "3.1.0",
+            "info": {"title": "Referenced Paths", "version": "1"},
+            "components": {"pathItems": {"Records": {
+                "get": {"operationId": "listRecords"},
+            }}},
+            "paths": {"/records": {"$ref": "#/components/pathItems/Records"}},
+        })
+
+        self.assertTrue(any(
+            finding["surface_id"] == "listrecords"
+            and finding["risk"] == "endpoint_without_tenant_filter"
+            for finding in result["findings"]
+        ))
 
     def test_browser_local_preserves_substantive_review_with_truthful_identity(self):
         from heel.review_service import review_openapi
@@ -93,17 +191,23 @@ class ReviewServiceTests(unittest.TestCase):
         tenant_warning = "missing tenant metadata for /exports"
         entitlement_warning = "missing entitlement metadata for /exports"
         self.assertEqual(by_field["tenant_filter"], {
-            "id": "tenant_filter:" + stable_json_hash(["/exports", tenant_warning])[:12],
+            "id": "tenant_filter:" + stable_json_hash([
+                "missing_tenant_metadata", "tenant_filter", "GET", "/exports",
+                "exportusers", tenant_warning,
+            ])[:12],
             "field": "tenant_filter",
             "surface": "/exports",
-            "prompt": "How is tenant access enforced for /exports?",
+            "prompt": "How is tenant access enforced for GET /exports (operation exportusers)?",
             "required": False,
         })
         self.assertEqual(by_field["entitlement_check"], {
-            "id": "entitlement_check:" + stable_json_hash(["/exports", entitlement_warning])[:12],
+            "id": "entitlement_check:" + stable_json_hash([
+                "missing_entitlement_metadata", "entitlement_check", "GET", "/exports",
+                "exportusers", entitlement_warning,
+            ])[:12],
             "field": "entitlement_check",
             "surface": "/exports",
-            "prompt": "Which plan or entitlement protects /exports?",
+            "prompt": "Which plan or entitlement protects GET /exports (operation exportusers)?",
             "required": False,
         })
         for question in result["questions"]:
@@ -124,6 +228,52 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(broad_scope["surface"], "product")
         self.assertFalse(broad_scope["required"])
         self.assertRegex(broad_scope["id"], r"^product_rule:[0-9a-f]{12}$")
+
+    def test_document_warning_question_uses_product_context_semantics(self):
+        from heel.review_contract import stable_json_hash
+        from heel.review_service import review_openapi
+
+        message = "broad OAuth scope declared by security scheme OAuthAll"
+        result = review_openapi({
+            "openapi": "3.1.0",
+            "info": {"title": "OAuth Document", "version": "1"},
+            "paths": {},
+            "components": {"securitySchemes": {"OAuthAll": {
+                "type": "oauth2",
+                "flows": {"clientCredentials": {
+                    "scopes": {"all": "Broad access"},
+                }},
+            }}},
+        })
+
+        self.assertEqual(result["questions"], [{
+            "id": "product_rule:" + stable_json_hash([
+                "broad_oauth_scope", "product_rule", "product", "product",
+                "product", message,
+            ])[:12],
+            "field": "product_rule",
+            "surface": "product",
+            "prompt": message,
+            "required": False,
+        }])
+
+    def test_same_route_methods_produce_distinct_semantic_questions(self):
+        from heel.review_service import review_openapi
+
+        result = review_openapi({
+            "openapi": "3.1.0",
+            "info": {"title": "Method Context", "version": "1"},
+            "paths": {"/records": {
+                "get": {"operationId": "listRecords"},
+                "post": {"operationId": "createRecords"},
+            }},
+        })
+
+        self.assertEqual(result["summary"]["questions"], 4)
+        self.assertEqual(len({question["id"] for question in result["questions"]}), 4)
+        prompts = "\n".join(question["prompt"] for question in result["questions"])
+        for expected in ("GET /records", "POST /records", "listrecords", "createrecords"):
+            self.assertIn(expected, prompts)
 
     def test_empty_harmless_api_passes(self):
         from heel.review_service import review_openapi
@@ -310,6 +460,45 @@ class LaunchReviewProducerRegressionTests(unittest.TestCase):
             "requires_signed_scope_for_live_or_staging_runs": True,
             "canary_only": True,
         })
+
+    def test_duplicate_modeled_surface_ids_are_rejected_on_both_sides(self):
+        from heel.importers import ProductModelError
+        from heel.launch_review import review_product_models
+
+        for duplicate_side in ("before", "after"):
+            before = self._baseline()
+            after = json.loads(json.dumps(before))
+            target = before if duplicate_side == "before" else after
+            target["endpoints_routes"] = [
+                {"id": "duplicate", "tenant_filter": "missing"},
+                {"id": "duplicate", "tenant_filter": "declared"},
+            ]
+            with self.subTest(duplicate_side=duplicate_side):
+                with self.assertRaisesRegex(ProductModelError, "duplicate modeled surface id"):
+                    review_product_models(before, after)
+
+    def test_duplicate_surface_cannot_overwrite_a_blocking_finding(self):
+        from heel.importers import ProductModelError
+        from heel.launch_review import review_product_models
+
+        baseline = self._baseline()
+        model = json.loads(json.dumps(baseline))
+        model["exports"] = [
+            {
+                "id": "bulk_export",
+                "entitlement_check": "missing",
+                "rate_limit": "missing",
+                "reachable_by_plan": "trial",
+            },
+            {
+                "id": "bulk_export",
+                "entitlement_check": "declared",
+                "rate_limit": "declared",
+            },
+        ]
+
+        with self.assertRaisesRegex(ProductModelError, "duplicate modeled surface id"):
+            review_product_models(baseline, model)
 
 
 if __name__ == "__main__":

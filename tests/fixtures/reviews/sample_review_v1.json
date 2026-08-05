@@ -94,6 +94,15 @@
       "surface_type": "exports"
     },
     {
+      "control": "OAuth scope minimization and approval",
+      "reachable": false,
+      "reason": "new createoauthapp OAuth app grants overbroad scope",
+      "risk": "oauth_scope_overbroad",
+      "severity": "warn",
+      "surface_id": "createoauthapp",
+      "surface_type": "integration_oauth_apps"
+    },
+    {
       "control": "admin role gate and audit event",
       "reachable": false,
       "reason": "new supportimpersonate support/admin action lacks role or audit controls",
@@ -104,7 +113,7 @@
     }
   ],
   "gate_status": "warn",
-  "model_hash": "9596881c2e5ce187480172873ecd76b6ed9803e7d31938280c24f4a202f5a756",
+  "model_hash": "fcdcccef43892f287908762d096f79ff50d285045e26b34b50dd4ef051ed3bf1",
   "privacy": {
     "execution": "machine_local",
     "network_calls": false,
@@ -115,132 +124,141 @@
   "questions": [
     {
       "field": "entitlement_check",
-      "id": "entitlement_check:1a07490066e7",
-      "prompt": "Which plan or entitlement protects /billing/usage/meter?",
-      "required": false,
-      "surface": "/billing/usage/meter"
-    },
-    {
-      "field": "entitlement_check",
-      "id": "entitlement_check:41a659e5d72e",
-      "prompt": "Which plan or entitlement protects /admin/support/impersonate?",
-      "required": false,
-      "surface": "/admin/support/impersonate"
-    },
-    {
-      "field": "entitlement_check",
-      "id": "entitlement_check:50f9383a03e8",
-      "prompt": "Which plan or entitlement protects /oauth/apps?",
-      "required": false,
-      "surface": "/oauth/apps"
-    },
-    {
-      "field": "entitlement_check",
-      "id": "entitlement_check:78a8831f8bee",
-      "prompt": "Which plan or entitlement protects /members/seats?",
-      "required": false,
-      "surface": "/members/seats"
-    },
-    {
-      "field": "entitlement_check",
-      "id": "entitlement_check:830b617fc6e1",
-      "prompt": "Which plan or entitlement protects /agent/tools/run?",
+      "id": "entitlement_check:09ccebb48144",
+      "prompt": "Which plan or entitlement protects POST /agent/tools/run (operation runagenttool)?",
       "required": false,
       "surface": "/agent/tools/run"
     },
     {
       "field": "entitlement_check",
-      "id": "entitlement_check:a090be496db2",
-      "prompt": "Which plan or entitlement protects /signup/trial?",
+      "id": "entitlement_check:31b17d57348f",
+      "prompt": "Which plan or entitlement protects POST /members/seats (operation inviteseat)?",
+      "required": false,
+      "surface": "/members/seats"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:439b4abb639b",
+      "prompt": "Which plan or entitlement protects GET /api/export/bulk (operation downloadbulkexport)?",
+      "required": false,
+      "surface": "/api/export/bulk"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:7816716ce52f",
+      "prompt": "Which plan or entitlement protects GET /billing/usage/meter (operation readusagemeter)?",
+      "required": false,
+      "surface": "/billing/usage/meter"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:8afba0afb7db",
+      "prompt": "Which plan or entitlement protects POST /admin/support/impersonate (operation supportimpersonate)?",
+      "required": false,
+      "surface": "/admin/support/impersonate"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:a7678a6a458b",
+      "prompt": "Which plan or entitlement protects POST /signup/trial (operation starttrial)?",
       "required": false,
       "surface": "/signup/trial"
     },
     {
       "field": "entitlement_check",
-      "id": "entitlement_check:c7c126f5e7d2",
-      "prompt": "Which plan or entitlement protects /api/export/bulk?",
+      "id": "entitlement_check:d94dd76ca7ca",
+      "prompt": "Which plan or entitlement protects POST /oauth/apps (operation createoauthapp)?",
       "required": false,
-      "surface": "/api/export/bulk"
+      "surface": "/oauth/apps"
     },
     {
       "field": "product_rule",
-      "id": "product_rule:4d342b184c43",
+      "id": "product_rule:285d4df2f7ab",
+      "prompt": "broad OAuth scope on /oauth/apps [POST /oauth/apps; operation createoauthapp]",
+      "required": false,
+      "surface": "/oauth/apps"
+    },
+    {
+      "field": "product_rule",
+      "id": "product_rule:4445cee2d9d0",
+      "prompt": "agent-like endpoint lacks scope metadata: /agent/tools/run [POST /agent/tools/run; operation runagenttool]",
+      "required": false,
+      "surface": "/agent/tools/run"
+    },
+    {
+      "field": "product_rule",
+      "id": "product_rule:72d6062aa8b6",
       "prompt": "broad OAuth scope declared by security scheme OAuthAll",
       "required": false,
       "surface": "product"
     },
     {
       "field": "product_rule",
-      "id": "product_rule:89683aa462af",
-      "prompt": "export route without declared rate or entitlement control: /api/export/bulk",
-      "required": false,
-      "surface": "product"
-    },
-    {
-      "field": "product_rule",
-      "id": "product_rule:e031d006ca1d",
-      "prompt": "agent-like endpoint lacks scope metadata: /agent/tools/run",
-      "required": false,
-      "surface": "product"
-    },
-    {
-      "field": "product_rule",
-      "id": "product_rule:f033dd7c8e60",
-      "prompt": "broad OAuth scope on /oauth/apps",
-      "required": false,
-      "surface": "product"
-    },
-    {
-      "field": "tenant_filter",
-      "id": "tenant_filter:116e9b13d8aa",
-      "prompt": "How is tenant access enforced for /admin/support/impersonate?",
-      "required": false,
-      "surface": "/admin/support/impersonate"
-    },
-    {
-      "field": "tenant_filter",
-      "id": "tenant_filter:1d60ecd748fd",
-      "prompt": "How is tenant access enforced for /api/export/bulk?",
+      "id": "product_rule:ef41a10d8029",
+      "prompt": "export route without declared rate or entitlement control: /api/export/bulk [GET /api/export/bulk; operation downloadbulkexport]",
       "required": false,
       "surface": "/api/export/bulk"
     },
     {
       "field": "tenant_filter",
-      "id": "tenant_filter:3102a94ed3e9",
-      "prompt": "How is tenant access enforced for /agent/tools/run?",
+      "id": "tenant_filter:1031a9437228",
+      "prompt": "How is tenant access enforced for POST /agent/tools/run (operation runagenttool)?",
       "required": false,
       "surface": "/agent/tools/run"
     },
     {
       "field": "tenant_filter",
-      "id": "tenant_filter:9128cb5a06d3",
-      "prompt": "How is tenant access enforced for /signup/trial?",
+      "id": "tenant_filter:48c0c3a6d5ad",
+      "prompt": "How is tenant access enforced for POST /admin/support/impersonate (operation supportimpersonate)?",
       "required": false,
-      "surface": "/signup/trial"
+      "surface": "/admin/support/impersonate"
     },
     {
       "field": "tenant_filter",
-      "id": "tenant_filter:ac3cb44bf0b6",
-      "prompt": "How is tenant access enforced for /billing/usage/meter?",
+      "id": "tenant_filter:8fa54dcbbaee",
+      "prompt": "How is tenant access enforced for POST /members/seats (operation inviteseat)?",
+      "required": false,
+      "surface": "/members/seats"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:cc99ccbd90df",
+      "prompt": "How is tenant access enforced for GET /billing/usage/meter (operation readusagemeter)?",
       "required": false,
       "surface": "/billing/usage/meter"
     },
     {
       "field": "tenant_filter",
-      "id": "tenant_filter:bc57f4417c82",
-      "prompt": "How is tenant access enforced for /oauth/apps?",
+      "id": "tenant_filter:ce989ffd3a38",
+      "prompt": "How is tenant access enforced for GET /api/export/bulk (operation downloadbulkexport)?",
       "required": false,
-      "surface": "/oauth/apps"
+      "surface": "/api/export/bulk"
     },
     {
       "field": "tenant_filter",
-      "id": "tenant_filter:c13f4c8daed5",
-      "prompt": "How is tenant access enforced for /members/seats?",
+      "id": "tenant_filter:ef15af8f4666",
+      "prompt": "How is tenant access enforced for POST /signup/trial (operation starttrial)?",
       "required": false,
-      "surface": "/members/seats"
+      "surface": "/signup/trial"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:f61f00feac61",
+      "prompt": "How is tenant access enforced for POST /oauth/apps (operation createoauthapp)?",
+      "required": false,
+      "surface": "/oauth/apps"
     }
   ],
   "recommended_controls": [
+    {
+      "control": "OAuth scope minimization and approval",
+      "reachable": false,
+      "reason": "new createoauthapp OAuth app grants overbroad scope",
+      "risk": "oauth_scope_overbroad",
+      "severity": "warn",
+      "surface_id": "createoauthapp",
+      "surface_type": "integration_oauth_apps"
+    },
     {
       "control": "admin role gate and audit event",
       "reachable": false,
@@ -341,8 +359,8 @@
       "surface_type": "exports"
     }
   ],
-  "result_hash": "de6fd93264cf2765ff49699abd9b61b0070a7392e779e4024a3a79b88be9b5e0",
-  "review_id": "review_de6fd93264cf2765ff49",
+  "result_hash": "4f127cdda3bd1286568479adec3116eeb2b0f41047b28c97f4f2cf23deefe87b",
+  "review_id": "review_4f127cdda3bd12865684",
   "safety": {
     "canary_only": true,
     "live_probing": false,
@@ -360,6 +378,14 @@
       "scenario_hint": "endpoint_without_tenant_filter",
       "surface_id": "createoauthapp",
       "surface_type": "endpoints_routes"
+    },
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_createoauthapp_oauth_scope_overbroad",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "oauth_scope_overbroad",
+      "surface_id": "createoauthapp",
+      "surface_type": "integration_oauth_apps"
     },
     {
       "expected_status": "blocked",
@@ -444,7 +470,7 @@
   ],
   "summary": {
     "blockers": 0,
-    "findings": 11,
+    "findings": 12,
     "questions": 18
   }
 }

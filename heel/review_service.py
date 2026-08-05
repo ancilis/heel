@@ -1,7 +1,6 @@
 """Pure in-memory OpenAPI review orchestration for local execution."""
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from .importers import LIST_FIELDS, PRODUCT_MODEL_VERSION
@@ -10,7 +9,6 @@ from .openapi_import import product_model_from_openapi
 from .review_contract import build_review_envelope, stable_json_hash
 
 
-_WARNING_ROUTE = re.compile(r"for (?P<route>/\S+)$")
 _BASELINE_SAFETY_NOTE = (
     "Synthetic empty baseline for local OpenAPI review; no live probing."
 )
@@ -30,23 +28,28 @@ def empty_product_model(product_id: str) -> dict[str, Any]:
     return model
 
 
-def questions_from_warnings(warnings: list[str]) -> list[dict[str, Any]]:
-    """Convert importer warnings to deterministic strict-v1 question records."""
+def questions_from_hints(hints: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert structured importer hints to deterministic strict-v1 questions."""
     questions = []
-    for warning in sorted(set(warnings)):
-        route_match = _WARNING_ROUTE.search(warning)
-        route = route_match.group("route") if route_match else "product"
-        if warning.startswith("missing tenant metadata"):
-            field = "tenant_filter"
-            prompt = f"How is tenant access enforced for {route}?"
-        elif warning.startswith("missing entitlement metadata"):
-            field = "entitlement_check"
-            prompt = f"Which plan or entitlement protects {route}?"
+    for hint in sorted(hints, key=stable_json_hash):
+        code = str(hint["code"])
+        field = str(hint["field"])
+        method = str(hint["method"])
+        route = str(hint["route"])
+        operation_id = str(hint["operation_id"])
+        message = str(hint["message"])
+        semantic_context = [code, field, method, route, operation_id, message]
+        operation_context = f"{method} {route} (operation {operation_id})"
+        if field == "tenant_filter":
+            prompt = f"How is tenant access enforced for {operation_context}?"
+        elif field == "entitlement_check":
+            prompt = f"Which plan or entitlement protects {operation_context}?"
+        elif method == route == operation_id == "product":
+            prompt = message
         else:
-            field = "product_rule"
-            prompt = warning
+            prompt = f"{message} [{method} {route}; operation {operation_id}]"
         questions.append({
-            "id": f"{field}:{stable_json_hash([route, warning])[:12]}",
+            "id": f"{field}:{stable_json_hash(semantic_context)[:12]}",
             "field": field,
             "surface": route,
             "prompt": prompt,
@@ -62,7 +65,7 @@ def review_openapi(
     model = product_model_from_openapi(spec, source="openapi:inline-local")
     baseline = empty_product_model(model["product_id"])
     review = review_product_models(baseline, model).to_dict()
-    questions = questions_from_warnings(list(model.get("import_warnings", [])))
+    questions = questions_from_hints(list(model.get("import_question_hints", [])))
     return build_review_envelope(
         review,
         source_hash=stable_json_hash(spec),

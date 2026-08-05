@@ -214,8 +214,8 @@ def _validate_or_raise(model: Mapping[str, Any], label: str) -> None:
 def _changed_surfaces(before: Mapping[str, Any], after: Mapping[str, Any]) -> list[ChangedSurface]:
     changed: list[ChangedSurface] = []
     for field_name in SURFACE_FIELDS:
-        before_items = _items_by_id(before.get(field_name, []))
-        after_items = _items_by_id(after.get(field_name, []))
+        before_items = _items_by_id(before.get(field_name, []), field_name)
+        after_items = _items_by_id(after.get(field_name, []), field_name)
         for sid in sorted(after_items):
             after_item = after_items[sid]
             before_item = before_items.get(sid)
@@ -360,8 +360,9 @@ def _oauth_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> list[Risk
     granted = {s.lower() for s in _to_list(_first(props, "granted_scopes", "scopes"))}
     needed = {s.lower() for s in _to_list(_first(props, "needed_scopes", "required_scopes", "intended_scopes"))}
     scope_all = scope_value in _HIGH_SCOPE_VALUES
+    granted_high_scope = bool(granted & _HIGH_SCOPE_VALUES)
     excess = bool(granted and needed and not granted.issubset(needed))
-    if not (scope_all or excess):
+    if not (scope_all or granted_high_scope or excess):
         return []
     auto = _truthy(_first(props, "auto_approved", "auto_install", "default_approved"))
     low_role = str(_first(props, "installable_by_role", "reachable_by_role", "role") or "").lower() in {"member", "user", "anyone", "anonymous"}
@@ -466,13 +467,17 @@ def _suggested_regressions(risks: list[RiskFinding]) -> list[SuggestedRegression
     return out
 
 
-def _items_by_id(value: Any) -> dict[str, dict[str, Any]]:
+def _items_by_id(value: Any, surface_type: str) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     if not isinstance(value, list):
         return out
     for idx, item in enumerate(value):
         props = dict(item) if isinstance(item, Mapping) else {"value": item}
         sid = _surface_id(props, idx)
+        if sid in out:
+            raise ProductModelError(
+                f"{surface_type} contains duplicate modeled surface id: {sid}"
+            )
         out[sid] = _ordered(props)
     return out
 

@@ -26,6 +26,8 @@ _SECRET_VALUE_RE = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer\s+[A-Za-z0-9._~+/=-]{12,})"
 )
 _METHODS = {"get", "put", "post", "delete", "patch", "head", "options", "trace"}
+_OPENAPI_VERSION_RE = re.compile(r"3\.(?:0|1)\.\d+\Z")
+_PATH_ITEM_REF_PREFIX = "#/components/pathItems/"
 
 
 def import_openapi_file(path: str) -> dict:
@@ -59,11 +61,9 @@ def load_openapi(path: str) -> dict:
 
 
 def product_model_from_openapi(spec: Mapping[str, Any], source: str = "openapi:inline") -> dict:
-    if not isinstance(spec, Mapping):
-        raise OpenAPIImportError("OpenAPI document must be an object")
+    info, paths = _validate_openapi_document(spec)
     _reject_secret_examples(spec)
-    info = spec.get("info") if isinstance(spec.get("info"), Mapping) else {}
-    product_id = _safe_id(str(info.get("x-heel-product-id") or info.get("title") or "openapi-product"))
+    product_id = _safe_id(str(info.get("x-heel-product-id") or info["title"]))
     model = {field: [] for field in LIST_FIELDS}
     model.update({
         "schema_version": PRODUCT_MODEL_VERSION,
@@ -76,16 +76,17 @@ def product_model_from_openapi(spec: Mapping[str, Any], source: str = "openapi:i
         ],
         "product_areas": [],
         "import_warnings": [],
+        "import_question_hints": [],
     })
 
     warnings: list[str] = []
+    question_hints: list[dict[str, str]] = []
     product_areas: dict[str, dict] = {}
-    _security_controls(spec, model, warnings)
+    operation_locations: dict[str, str] = {}
+    _security_controls(spec, model, warnings, question_hints)
 
-    paths = spec.get("paths") if isinstance(spec.get("paths"), Mapping) else {}
     for route, path_item in sorted(paths.items()):
-        if not isinstance(path_item, Mapping):
-            continue
+        path_item = _resolve_path_item(spec, path_item, route=str(route))
         for method, operation in sorted(path_item.items()):
             if str(method).lower() not in _METHODS or not isinstance(operation, Mapping):
                 continue
@@ -94,15 +95,102 @@ def product_model_from_openapi(spec: Mapping[str, Any], source: str = "openapi:i
             for tag in tags:
                 product_areas.setdefault(tag, {"id": tag, "source": "openapi-tag"})
             entry = _route_entry(str(route), str(method).upper(), op, tags)
+            operation_id = entry["operation_id"]
+            location = f"{entry['method']} {entry['route']}"
+            if operation_id in operation_locations:
+                raise OpenAPIImportError(
+                    f"duplicate operation id after normalization: {operation_id} "
+                    f"at {operation_locations[operation_id]} and {location}"
+                )
+            operation_locations[operation_id] = location
             model["endpoints_routes"].append(entry)
-            _map_operation(model, entry, op, warnings)
+            _map_operation(model, entry, op, warnings, question_hints)
 
     model["product_areas"] = sorted(product_areas.values(), key=lambda p: p["id"])
     model["import_warnings"] = _unique(warnings)
+    model["import_question_hints"] = sorted(
+        question_hints,
+        key=lambda hint: tuple(hint[field] for field in (
+            "code", "field", "method", "route", "operation_id", "message",
+        )),
+    )
     result = validate_product_model(model)
     if not result.ok:
         raise OpenAPIImportError("; ".join(result.errors))
     return model
+
+
+def _validate_openapi_document(
+    spec: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    if not isinstance(spec, Mapping):
+        raise OpenAPIImportError("OpenAPI document must be an object")
+    version = spec.get("openapi")
+    if not isinstance(version, str) or _OPENAPI_VERSION_RE.fullmatch(version) is None:
+        raise OpenAPIImportError("openapi must declare a supported 3.0.x or 3.1.x version string")
+    info = spec.get("info")
+    if not isinstance(info, Mapping):
+        raise OpenAPIImportError("info must be an object")
+    for field_name in ("title", "version"):
+        value = info.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise OpenAPIImportError(f"info.{field_name} must be a nonempty string")
+    paths = spec.get("paths")
+    if not isinstance(paths, Mapping):
+        raise OpenAPIImportError("paths must be an object")
+    return info, paths
+
+
+def _resolve_path_item(
+    spec: Mapping[str, Any], value: Any, *, route: str,
+    ref_chain: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise OpenAPIImportError(f"path item for {route} must be an object")
+    if "$ref" not in value:
+        return dict(value)
+
+    ref = value["$ref"]
+    if not isinstance(ref, str) or not ref.startswith(_PATH_ITEM_REF_PREFIX):
+        raise OpenAPIImportError(
+            f"path item for {route} may only reference local components.pathItems"
+        )
+    token = ref[len(_PATH_ITEM_REF_PREFIX):]
+    if not token or "/" in token:
+        raise OpenAPIImportError(f"path item for {route} has an invalid local reference")
+    name = _unescape_json_pointer_token(token)
+    if ref in ref_chain:
+        raise OpenAPIImportError(f"path item for {route} contains a cyclic local reference")
+
+    components = spec.get("components")
+    path_items = components.get("pathItems") if isinstance(components, Mapping) else None
+    target = path_items.get(name) if isinstance(path_items, Mapping) else None
+    if not isinstance(target, Mapping):
+        raise OpenAPIImportError(
+            f"path item for {route} references a missing or non-object component"
+        )
+
+    resolved = _resolve_path_item(
+        spec, target, route=route, ref_chain=(*ref_chain, ref),
+    )
+    resolved.update({key: child for key, child in value.items() if key != "$ref"})
+    return resolved
+
+
+def _unescape_json_pointer_token(token: str) -> str:
+    output: list[str] = []
+    index = 0
+    while index < len(token):
+        character = token[index]
+        if character != "~":
+            output.append(character)
+            index += 1
+            continue
+        if index + 1 >= len(token) or token[index + 1] not in {"0", "1"}:
+            raise OpenAPIImportError("path item reference contains an invalid JSON Pointer escape")
+        output.append("~" if token[index + 1] == "0" else "/")
+        index += 2
+    return "".join(output)
 
 
 def write_product_model(model: Mapping[str, Any], out_path: str) -> None:
@@ -114,7 +202,10 @@ def write_product_model(model: Mapping[str, Any], out_path: str) -> None:
         fh.write("\n")
 
 
-def _security_controls(spec: Mapping[str, Any], model: dict, warnings: list[str]) -> None:
+def _security_controls(
+    spec: Mapping[str, Any], model: dict, warnings: list[str],
+    question_hints: list[dict[str, str]],
+) -> None:
     components = spec.get("components") if isinstance(spec.get("components"), Mapping) else {}
     schemes = components.get("securitySchemes") if isinstance(components.get("securitySchemes"), Mapping) else {}
     for name, scheme in sorted(schemes.items()):
@@ -128,20 +219,43 @@ def _security_controls(spec: Mapping[str, Any], model: dict, warnings: list[str]
             scopes = _oauth_scheme_scopes(scheme)
             control["scopes"] = scopes
             if _has_broad_scope(scopes):
-                warnings.append(f"broad OAuth scope declared by security scheme {name}")
+                _add_warning(
+                    warnings,
+                    question_hints,
+                    code="broad_oauth_scope",
+                    field="product_rule",
+                    message=f"broad OAuth scope declared by security scheme {name}",
+                )
         model["declared_controls"].append(control)
 
 
-def _map_operation(model: dict, entry: dict, operation: Mapping[str, Any], warnings: list[str]) -> None:
+def _map_operation(
+    model: dict, entry: dict, operation: Mapping[str, Any], warnings: list[str],
+    question_hints: list[dict[str, str]],
+) -> None:
     text = _operation_text(entry, operation)
     controls = _controls(operation)
     has_tenant_scope = bool(entry.get("tenant_scope"))
     has_entitlement = bool(entry.get("required_plan") or _has_control(controls, "entitlement"))
     has_rate = _has_control(controls, "rate")
     if not has_tenant_scope:
-        warnings.append(f"missing tenant metadata for {entry['route']}")
+        _add_warning(
+            warnings,
+            question_hints,
+            code="missing_tenant_metadata",
+            field="tenant_filter",
+            message=f"missing tenant metadata for {entry['route']}",
+            entry=entry,
+        )
     if not has_entitlement:
-        warnings.append(f"missing entitlement metadata for {entry['route']}")
+        _add_warning(
+            warnings,
+            question_hints,
+            code="missing_entitlement_metadata",
+            field="entitlement_check",
+            message=f"missing entitlement metadata for {entry['route']}",
+            entry=entry,
+        )
     if controls:
         declared = {
             "id": f"operation:{entry['operation_id']}:controls",
@@ -157,7 +271,17 @@ def _map_operation(model: dict, entry: dict, operation: Mapping[str, Any], warni
         export["rate_limit"] = "declared" if has_rate else "missing"
         model["exports"].append(export)
         if not (has_entitlement and has_rate):
-            warnings.append(f"export route without declared rate or entitlement control: {entry['route']}")
+            _add_warning(
+                warnings,
+                question_hints,
+                code="export_missing_controls",
+                field="product_rule",
+                message=(
+                    "export route without declared rate or entitlement control: "
+                    f"{entry['route']}"
+                ),
+                entry=entry,
+            )
 
     if _contains_any(text, ("signup", "trial")):
         model["identity_auth_flows"].append({**entry, "id": entry["operation_id"], "kind": "signup"})
@@ -178,7 +302,14 @@ def _map_operation(model: dict, entry: dict, operation: Mapping[str, Any], warni
             scopes = _operation_oauth_scopes(operation)
             model["integration_oauth_apps"].append({**entry, "id": entry["operation_id"], "kind": "oauth_app", "scopes": scopes})
             if _has_broad_scope(scopes):
-                warnings.append(f"broad OAuth scope on {entry['route']}")
+                _add_warning(
+                    warnings,
+                    question_hints,
+                    code="broad_oauth_scope",
+                    field="product_rule",
+                    message=f"broad OAuth scope on {entry['route']}",
+                    entry=entry,
+                )
 
     if _contains_any(text, ("admin", "support")):
         model["support_admin_actions"].append({**entry, "id": entry["operation_id"], "kind": "admin_action"})
@@ -190,11 +321,39 @@ def _map_operation(model: dict, entry: dict, operation: Mapping[str, Any], warni
             item.update({str(k): v for k, v in agent_tool.items()})
         model["agent_tools"].append(item)
         if not (item.get("intended_scope") and item.get("granted_scope")):
-            warnings.append(f"agent-like endpoint lacks scope metadata: {entry['route']}")
+            _add_warning(
+                warnings,
+                question_hints,
+                code="agent_scope_metadata_missing",
+                field="product_rule",
+                message=f"agent-like endpoint lacks scope metadata: {entry['route']}",
+                entry=entry,
+            )
 
     data_class = operation.get("x-heel-data-class")
     if data_class and data_class not in model["data_classes"]:
         model["data_classes"].append(data_class)
+
+
+def _add_warning(
+    warnings: list[str], question_hints: list[dict[str, str]], *,
+    code: str, field: str, message: str, entry: Mapping[str, Any] | None = None,
+) -> None:
+    warnings.append(message)
+    if entry is None:
+        method = route = operation_id = "product"
+    else:
+        method = str(entry["method"])
+        route = str(entry["route"])
+        operation_id = str(entry["operation_id"])
+    question_hints.append({
+        "code": code,
+        "field": field,
+        "method": method,
+        "route": route,
+        "operation_id": operation_id,
+        "message": message,
+    })
 
 
 def _route_entry(route: str, method: str, operation: Mapping[str, Any], tags: list[str]) -> dict:
@@ -217,6 +376,8 @@ def _route_entry(route: str, method: str, operation: Mapping[str, Any], tags: li
         entry["entitlement_check"] = "declared"
     if _has_control(controls, "rate"):
         entry["rate_limit"] = "declared"
+    if entry.get("tenant_scope"):
+        entry["tenant_filter"] = "declared"
     return {k: v for k, v in entry.items() if v not in (None, "", [])}
 
 
@@ -229,7 +390,7 @@ def _controls(operation: Mapping[str, Any]) -> list[str]:
     if isinstance(raw, list):
         return [str(v) for v in raw if str(v)]
     if isinstance(raw, Mapping):
-        return [str(k) for k, v in raw.items() if v]
+        return sorted(str(k) for k, v in raw.items() if v)
     return [str(raw)]
 
 
