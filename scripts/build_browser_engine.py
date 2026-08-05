@@ -18,7 +18,7 @@ import zipfile
 
 
 ROOT = Path(os.path.abspath(__file__)).parents[1]
-ENGINE_VERSION = "1.1.1"
+ENGINE_VERSION = "1.2.0"
 WHEEL_NAME = f"heel_browser-{ENGINE_VERSION}-py3-none-any.whl"
 DIST_INFO = f"heel_browser-{ENGINE_VERSION}.dist-info"
 RECORD_PATH = f"{DIST_INFO}/RECORD"
@@ -26,6 +26,7 @@ FIXED_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 MODULE_PATHS = (
     "heel/__init__.py",
     "heel/browser_review.py",
+    "heel/findings_sync.py",
     "heel/openapi_model.py",
     "heel/product_model.py",
     "heel/review_answers.py",
@@ -42,7 +43,7 @@ MODULE_PATHS = (
 REVIEWED_MODULE_ATTRIBUTES = {
     "copy": frozenset({"deepcopy"}),
     "hashlib": frozenset({"sha256"}),
-    "hmac": frozenset({"compare_digest"}),
+    "hmac": frozenset({"compare_digest", "new"}),
     "json": frozenset({"JSONDecodeError", "dumps", "loads"}),
     "math": frozenset({"isfinite"}),
     "re": frozenset({"compile", "match", "sub"}),
@@ -89,6 +90,7 @@ REVIEWED_BUILTIN_CALLS = frozenset({
     "enumerate",
     "float",
     "frozenset",
+    "int",
     "isinstance",
     "len",
     "list",
@@ -113,6 +115,18 @@ REVIEWED_DATA_METHOD_CALLS = {
         "items",
         "lower",
         "pop",
+    }),
+    "findings_sync": frozenset({
+        "add",
+        "append",
+        "encode",
+        "extend",
+        "fullmatch",
+        "groups",
+        "hexdigest",
+        "items",
+        "pop",
+        "sort",
     }),
     "openapi_model": frozenset({
         "append",
@@ -644,7 +658,7 @@ def _prove_import_closure() -> None:
         _module_name(path)
         for path in MODULE_PATHS
     }
-    pending = ["__init__", "browser_review"]
+    pending = ["__init__", "browser_review", "findings_sync"]
     observed: set[str] = set()
     observed_builtin_calls: set[str] = set()
     while pending:

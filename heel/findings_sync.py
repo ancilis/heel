@@ -255,7 +255,7 @@ def _require_exact_fields(
         raise ValueError(f"{path} must contain exactly the v1 fields")
 
 
-def _require_pattern(value: Any, pattern: re.Pattern[str], path: str) -> str:
+def _require_pattern(value: Any, pattern: Any, path: str) -> str:
     if type(value) is not str or pattern.fullmatch(value) is None:
         raise ValueError(f"{path} has invalid syntax")
     return value

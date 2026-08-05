@@ -11,8 +11,8 @@ from heel.review_contract import ENGINE_VERSION, SUPPORTED_ENGINE_VERSIONS
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.1.1"
-PREVIOUS_VERSION = "1.1.0"
+VERSION = "1.2.0"
+LEGACY_VERSIONS = frozenset({"1.1.0", "1.1.1"})
 AGENT_WHEEL = f"heel_sim-{VERSION}-py3-none-any.whl"
 AGENT_SDIST = f"heel_sim-{VERSION}.tar.gz"
 BROWSER_WHEEL = f"heel_browser-{VERSION}-py3-none-any.whl"
@@ -25,14 +25,23 @@ class ReleaseVersionContractTests(unittest.TestCase):
             (ROOT / "release/open-core-v1.json").read_text(encoding="utf-8")
         )
         server = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))
+        app_package = json.loads(
+            (ROOT / "apps/heel-cloud/package.json").read_text(encoding="utf-8")
+        )
+        app_lock = json.loads(
+            (ROOT / "apps/heel-cloud/package-lock.json").read_text(encoding="utf-8")
+        )
 
         self.assertEqual(__version__, VERSION)
         self.assertEqual(ENGINE_VERSION, VERSION)
-        self.assertEqual(SUPPORTED_ENGINE_VERSIONS, {PREVIOUS_VERSION, VERSION})
+        self.assertEqual(SUPPORTED_ENGINE_VERSIONS, LEGACY_VERSIONS | {VERSION})
         self.assertEqual(pyproject["project"]["version"], VERSION)
         self.assertEqual(descriptor["version"], VERSION)
         self.assertEqual(server["version"], VERSION)
         self.assertEqual(server["packages"][0]["version"], VERSION)
+        self.assertEqual(app_package["version"], VERSION)
+        self.assertEqual(app_lock["version"], VERSION)
+        self.assertEqual(app_lock["packages"][""]["version"], VERSION)
 
     def test_committed_release_directories_contain_only_current_named_artifacts(self):
         downloads = ROOT / "apps/heel-cloud/public/downloads"
@@ -71,8 +80,11 @@ class ReleaseVersionContractTests(unittest.TestCase):
         combined = "\n".join(path.read_text(encoding="utf-8") for path in paths)
         self.assertIn(AGENT_WHEEL, combined)
         self.assertIn(AGENT_SDIST, combined)
-        self.assertNotIn("heel_sim-1.1.0", combined)
-        self.assertIn("## [1.1.1]: 2026-08-04", (ROOT / "CHANGELOG.md").read_text())
+        for legacy_version in LEGACY_VERSIONS:
+            self.assertNotIn(f"heel_sim-{legacy_version}", combined)
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## [1.2.0]: 2026-08-04", changelog)
+        self.assertIn("## [1.1.1]: 2026-08-04", changelog)
 
 
 if __name__ == "__main__":

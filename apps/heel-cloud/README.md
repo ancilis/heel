@@ -21,8 +21,8 @@ SDK.
 
 The deployable app already includes the exact verified Agent files advertised on `/agent`:
 
-- `/downloads/heel_sim-1.1.1-py3-none-any.whl`
-- `/downloads/heel_sim-1.1.1.tar.gz`
+- `/downloads/heel_sim-1.2.0-py3-none-any.whl`
+- `/downloads/heel_sim-1.2.0.tar.gz`
 - `/downloads/heel-open-core-manifest.json`
 
 The build validates their exact set, sizes, digests, and Apache-only archive members without

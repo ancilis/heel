@@ -29,16 +29,16 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "release/open-core-v1.json"
 BUILDER = ROOT / "scripts/build_open_core_release.py"
-WHEEL = "heel_sim-1.1.1-py3-none-any.whl"
-SDIST = "heel_sim-1.1.1.tar.gz"
+WHEEL = "heel_sim-1.2.0-py3-none-any.whl"
+SDIST = "heel_sim-1.2.0.tar.gz"
 ARTIFACT_MANIFEST = "heel-open-core-manifest.json"
-DIST_INFO = "heel_sim-1.1.1.dist-info"
+DIST_INFO = "heel_sim-1.2.0.dist-info"
 RECORD_PATH = f"{DIST_INFO}/RECORD"
 FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 EXPECTED_METADATA = (
     "Metadata-Version: 2.4\n"
     "Name: heel-sim\n"
-    "Version: 1.1.1\n"
+    "Version: 1.2.0\n"
     "Summary: Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.\n"
     "Requires-Python: >=3.11\n"
     "License-Expression: Apache-2.0\n"
@@ -140,6 +140,7 @@ EXPECTED_CONTRACT = {
         "heel/control_simulator.py",
         "heel/economics.py",
         "heel/entitlements.py",
+        "heel/findings_sync.py",
         "heel/heldout_eval.py",
         "heel/importers.py",
         "heel/incident.py",
@@ -170,7 +171,7 @@ EXPECTED_CONTRACT = {
         "heel/web_export.py",
     ],
     "schema_version": "heel.open-core-release.v1",
-    "version": "1.1.1",
+    "version": "1.2.0",
 }
 EXPECTED_MANIFEST = """include DCO LICENSE NOTICE
 include heel/*.py
@@ -1011,15 +1012,23 @@ class OpenCoreReleaseTests(unittest.TestCase):
                 sdist_raw,
                 MAX_TOTAL_MEMBER_BYTES + 65536,
             )
-            self.assertEqual(len(tar_raw) % tarfile.RECORDSIZE, 0)
+            self.assertEqual(len(tar_raw) % tarfile.BLOCKSIZE, 0)
             self.assertTrue(tar_raw.endswith(b"\0" * 1024))
-            prefix = "heel_sim-1.1.1/"
+            prefix = "heel_sim-1.2.0/"
             with tarfile.open(fileobj=io.BytesIO(sdist_raw), mode="r:gz") as archive:
                 members = _bounded_tar_members_for_test(self, archive)
                 names = [member.name for member in members]
                 expected_names = [prefix + name for name in sorted(sdist_relative_names)]
                 self.assertEqual(names, expected_names)
                 self.assertEqual(len(names), len(set(names)))
+                final_member = members[-1]
+                canonical_end = (
+                    final_member.offset_data
+                    + ((final_member.size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE)
+                    * tarfile.BLOCKSIZE
+                    + 2 * tarfile.BLOCKSIZE
+                )
+                self.assertEqual(len(tar_raw), canonical_end)
                 total_size = 0
                 for member in members:
                     self.assertEqual(member.type, tarfile.REGTYPE, member.name)
@@ -1078,7 +1087,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
             expected_manifest = {
                 "artifacts": sorted(archives, key=lambda artifact: artifact["name"]),
                 "schema_version": "heel.open-core-artifacts.v1",
-                "version": "1.1.1",
+                "version": "1.2.0",
             }
             manifest_bytes = _read_bounded_path(
                 first / ARTIFACT_MANIFEST,
@@ -1132,7 +1141,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
             path = contract_path(source)
             text = path.read_text(encoding="utf-8")
             path.write_text(
-                text.replace('"version":"1.1.1"', f'"version":{token}', 1),
+                text.replace('"version":"1.2.0"', f'"version":{token}', 1),
                 encoding="utf-8",
             )
 
@@ -1159,13 +1168,13 @@ class OpenCoreReleaseTests(unittest.TestCase):
 
         def contract_version_mismatch(source: Path) -> None:
             contract = canonical_contract(source)
-            contract["version"] = "1.1.2"
+            contract["version"] = "1.2.1"
             write_contract(source, contract)
 
         def pyproject_version_mismatch(source: Path) -> None:
             path = source / "pyproject.toml"
             text = path.read_text(encoding="utf-8")
-            path.write_text(text.replace('version = "1.1.1"', 'version = "1.1.2"', 1))
+            path.write_text(text.replace('version = "1.2.0"', 'version = "1.2.1"', 1))
 
         def proprietary_license(source: Path) -> None:
             path = source / "pyproject.toml"
@@ -1194,7 +1203,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
         def package_version_mismatch(source: Path) -> None:
             path = source / "heel/__init__.py"
             text = path.read_text(encoding="utf-8")
-            path.write_text(text.replace('__version__ = "1.1.1"', '__version__ = "1.1.2"'))
+            path.write_text(text.replace('__version__ = "1.2.0"', '__version__ = "1.2.1"'))
 
         def backslash_contract_path(source: Path) -> None:
             contract = canonical_contract(source)
@@ -1522,7 +1531,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
                 f"modules={import_names!r};"
                 "[importlib.import_module(name) for name in modules];"
                 "import heel;"
-                "assert heel.__version__ == '1.1.1';"
+                "assert heel.__version__ == '1.2.0';"
                 "assert importlib.util.find_spec('heel.saas') is None"
             )
             imported = subprocess.run(
@@ -1752,7 +1761,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
             + STANDARD_BUILD_CI_COMMAND,
         )
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
-        dist_info = "heel_sim-1.1.1.dist-info"
+        dist_info = "heel_sim-1.2.0.dist-info"
 
         with tempfile.TemporaryDirectory(prefix="heel-open-core-build-") as temporary:
             temporary_path = Path(temporary)

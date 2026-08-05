@@ -11,16 +11,16 @@ UTF-8 JSON file no larger than 2 MiB.
 
 ## Install the current Agent
 
-The primary acquisition path is Heel Cloud's `/agent` page. Choose **Download Heel Agent 1.1.1**;
-the same-origin wheel is `/downloads/heel_sim-1.1.1-py3-none-any.whl`. In the directory where you
+The primary acquisition path is Heel Cloud's `/agent` page. Choose **Download Heel Agent 1.2.0**;
+the same-origin wheel is `/downloads/heel_sim-1.2.0-py3-none-any.whl`. In the directory where you
 saved it, run:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.1.1-py3-none-any.whl
+.venv/bin/python -m pip install ./heel_sim-1.2.0-py3-none-any.whl
 ```
 
-The wheel, `heel_sim-1.1.1.tar.gz`, and `heel-open-core-manifest.json` are already part of the
+The wheel, `heel_sim-1.2.0.tar.gz`, and `heel-open-core-manifest.json` are already part of the
 deployable Heel Cloud build. Public customer access still depends on the approved deployment.
 `heel-sim` is not yet published to PyPI, and the current public repository export is a release-owner
 action that is not complete. Maintainers may install from this private source checkout, but customer

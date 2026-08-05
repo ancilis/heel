@@ -4,10 +4,10 @@ import type { Metadata } from "next";
 import Link from "next/link";
 
 
-const WHEEL_SHA256 = "f0553450bc33da704a6ea7bb70d9ec4f851de80744e6614b447ab7e9c48b7f29";
+const WHEEL_SHA256 = "819162b16a0feb167b8299fd980e0545232301bda143f0e5e62d2850333fa0d6";
 
 const INSTALL_AGENT = `python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.1.1-py3-none-any.whl`;
+.venv/bin/python -m pip install ./heel_sim-1.2.0-py3-none-any.whl`;
 
 const MCP_CONFIGURATION = `{
   "mcpServers": {
@@ -50,7 +50,7 @@ export default function AgentQuickstart() {
       <article className="mcp-quickstart">
         <header className="quickstart-hero">
           <div>
-            <p className="eyebrow">Heel Agent 1.1.1 · local MCP quickstart</p>
+            <p className="eyebrow">Heel Agent 1.2.0 · local MCP quickstart</p>
             <h1>Run Heel from your AI client.</h1>
             <p>
               Download the verified <code>heel-sim</code> wheel, then point any stdio-capable
@@ -83,14 +83,14 @@ export default function AgentQuickstart() {
               <a
                 className="button button-primary"
                 download
-                href="/downloads/heel_sim-1.1.1-py3-none-any.whl"
+                href="/downloads/heel_sim-1.2.0-py3-none-any.whl"
               >
-                Download Heel Agent 1.1.1
+                Download Heel Agent 1.2.0
               </a>
               <a
                 className="button button-secondary"
                 download
-                href="/downloads/heel_sim-1.1.1.tar.gz"
+                href="/downloads/heel_sim-1.2.0.tar.gz"
               >
                 Download source archive
               </a>

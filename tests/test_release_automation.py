@@ -9,8 +9,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github/workflows/ci.yml"
 PUBLISH = ROOT / ".github/workflows/publish.yml"
-WHEEL = "heel_sim-1.1.1-py3-none-any.whl"
-SDIST = "heel_sim-1.1.1.tar.gz"
+WHEEL = "heel_sim-1.2.0-py3-none-any.whl"
+SDIST = "heel_sim-1.2.0.tar.gz"
 MANIFEST = "heel-open-core-manifest.json"
 RELEASE_REQUIREMENTS = ROOT / "release/requirements-release.txt"
 

@@ -14,7 +14,7 @@ import { Worker } from "node:worker_threads";
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeRoot = join(appRoot, "public/heel-runtime");
 const wsRoot = join(appRoot, "node_modules/ws");
-const wheelName = "heel_browser-1.1.1-py3-none-any.whl";
+const wheelName = "heel_browser-1.2.0-py3-none-any.whl";
 const wheelPath = join(runtimeRoot, wheelName);
 
 

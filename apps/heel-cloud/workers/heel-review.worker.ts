@@ -10,11 +10,11 @@ import type {
 
 const WORKER_PROTOCOL_VERSION = "heel.browser-worker.v1";
 const PYODIDE_VERSION = "314.0.3";
-const ENGINE_VERSION = "1.1.1";
+const ENGINE_VERSION = "1.2.0";
 const RUNTIME_ROOT = "/heel-runtime/";
 const RUNTIME_MODULE_URL = "/heel-runtime/pyodide.mjs";
 const RUNTIME_MANIFEST_URL = "/heel-runtime/runtime-manifest.json";
-const WHEEL_FILENAME = "heel_browser-1.1.1-py3-none-any.whl";
+const WHEEL_FILENAME = "heel_browser-1.2.0-py3-none-any.whl";
 const WHEEL_URL = `${RUNTIME_ROOT}${WHEEL_FILENAME}`;
 const MAX_BROWSER_INPUT_BYTES = 2 * 1024 * 1024;
 const MAX_BROWSER_ANSWERS_BYTES = 64 * 1024;

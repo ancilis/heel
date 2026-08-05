@@ -12,7 +12,7 @@ Create an isolated environment, then install the wheel supplied with this releas
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install ./heel_sim-1.1.1-py3-none-any.whl
+python -m pip install ./heel_sim-1.2.0-py3-none-any.whl
 heel --version
 ```
 

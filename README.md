@@ -36,13 +36,13 @@ agent can talk its way past). Pure Python standard library, **zero dependencies*
 ## Five-minute local launch review
 
 The Heel Cloud app now carries the verified Agent wheel, source archive, and manifest on its own
-origin. Open `/agent`, choose **Download Heel Agent 1.1.1**, and save
-`/downloads/heel_sim-1.1.1-py3-none-any.whl` in an empty working directory. Then install it into an
+origin. Open `/agent`, choose **Download Heel Agent 1.2.0**, and save
+`/downloads/heel_sim-1.2.0-py3-none-any.whl` in an empty working directory. Then install it into an
 isolated environment and review a sanitized OpenAPI document you own:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.1.1-py3-none-any.whl
+.venv/bin/python -m pip install ./heel_sim-1.2.0-py3-none-any.whl
 export HEEL_HOME="$PWD/.heel-local"
 .venv/bin/heel review openapi ./sanitized-openapi.json
 ```
@@ -316,7 +316,7 @@ or escape a signed authorization scope.* See **[TRUST.md](TRUST.md)** and **[SEC
 
 ## Status
 
-**Status: production-ready spine, beta adapters (v1.1.1).** Core coverage runs on Python 3.11 to
+**Status: production-ready spine, beta adapters (v1.2.0).** Core coverage runs on Python 3.11 to
 3.13 with zero runtime dependencies and four completed red-team passes. The core authorization gate,
 containment model, and evaluation ladder are the production-ready spine. Real-target adapters remain
 beta until adapter coverage and operator controls mature. The anonymous browser workspace remains a

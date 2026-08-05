@@ -5,7 +5,8 @@ import { describe, expect, test } from "vitest";
 
 import sampleEnvelope from "../../../tests/fixtures/reviews/sample_review_v1.json";
 import presentationFixture from "../../../tests/fixtures/reviews/browser_answer_presentation_v1.json";
-import legacyEnvelope from "./legacy-review-1.1.0.fixture.json";
+import legacyEnvelope110 from "./legacy-review-1.1.0.fixture.json";
+import legacyEnvelope111 from "./legacy-review-1.1.1.fixture.json";
 import {
   parseCurrentReviewEnvelopeV1,
   parseReviewEnvelopeV1,
@@ -98,7 +99,7 @@ describe("parseReviewEnvelopeV1", () => {
     expect(parsed).not.toBe(source);
     expect(parsed.findings).not.toBe(source.findings);
     expect(parsed.schema_version).toBe("heel.review.v1");
-    expect(parsed.engine_version).toBe("1.1.1");
+    expect(parsed.engine_version).toBe("1.2.0");
     expect(parsed.execution_mode).toBe("browser_local");
     expect(parsed.privacy).toEqual({
       execution: "browser_local",
@@ -152,18 +153,21 @@ describe("parseReviewEnvelopeV1", () => {
     expect(() => parseReviewEnvelopeV1(idTampered)).toThrow(/review id/i);
   });
 
-  test("preserves a genuine 1.1.0 envelope while current-only boundaries reject it", () => {
-    const parsed = parseReviewEnvelopeV1(legacyEnvelope);
+  test.each([
+    ["1.1.0", legacyEnvelope110],
+    ["1.1.1", legacyEnvelope111],
+  ])("preserves a genuine %s envelope while current-only boundaries reject it", (version, legacy) => {
+    const parsed = parseReviewEnvelopeV1(legacy);
 
-    expect(parsed).toEqual(legacyEnvelope);
-    expect(parsed.engine_version).toBe("1.1.0");
-    expect(() => parseCurrentReviewEnvelopeV1(legacyEnvelope)).toThrow(/engine_version/i);
-    expect(parseCurrentReviewEnvelopeV1(browserEnvelope()).engine_version).toBe("1.1.1");
+    expect(parsed).toEqual(legacy);
+    expect(parsed.engine_version).toBe(version);
+    expect(() => parseCurrentReviewEnvelopeV1(legacy)).toThrow(/engine_version/i);
+    expect(parseCurrentReviewEnvelopeV1(browserEnvelope()).engine_version).toBe("1.2.0");
   });
 
   test("rejects an unknown next engine version even when its hash is recomputed", () => {
     const unknown = structuredClone(browserEnvelope());
-    unknown.engine_version = "1.1.2";
+    unknown.engine_version = "1.2.1";
 
     expect(() => parseReviewEnvelopeV1(rehash(unknown))).toThrow(/engine_version/i);
   });

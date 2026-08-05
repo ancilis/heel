@@ -68,28 +68,28 @@ jobs:
           python scripts/build_open_core_release.py --output dist --check
           HEEL_REQUIRE_STANDARD_BUILD=1 python -m unittest tests.test_open_core_release -v
           python scripts/build_open_core_release.py --output dist --check
-          cmp dist/heel_sim-1.1.1-py3-none-any.whl \
-            apps/heel-cloud/public/downloads/heel_sim-1.1.1-py3-none-any.whl
-          cmp dist/heel_sim-1.1.1.tar.gz \
-            apps/heel-cloud/public/downloads/heel_sim-1.1.1.tar.gz
+          cmp dist/heel_sim-1.2.0-py3-none-any.whl \
+            apps/heel-cloud/public/downloads/heel_sim-1.2.0-py3-none-any.whl
+          cmp dist/heel_sim-1.2.0.tar.gz \
+            apps/heel-cloud/public/downloads/heel_sim-1.2.0.tar.gz
           cmp dist/heel-open-core-manifest.json \
             apps/heel-cloud/public/downloads/heel-open-core-manifest.json
       - name: Stage only the verified publishable files
         run: |
           mkdir publish release-evidence
-          cp dist/heel_sim-1.1.1-py3-none-any.whl publish/
-          cp dist/heel_sim-1.1.1.tar.gz publish/
+          cp dist/heel_sim-1.2.0-py3-none-any.whl publish/
+          cp dist/heel_sim-1.2.0.tar.gz publish/
           cp dist/heel-open-core-manifest.json \
             release-evidence/heel-open-core-manifest.json
           python -m twine check \
-            publish/heel_sim-1.1.1-py3-none-any.whl \
-            publish/heel_sim-1.1.1.tar.gz
+            publish/heel_sim-1.2.0-py3-none-any.whl \
+            publish/heel_sim-1.2.0.tar.gz
           python - <<'PY'
           from pathlib import Path
 
           expected = [
-              "heel_sim-1.1.1-py3-none-any.whl",
-              "heel_sim-1.1.1.tar.gz",
+              "heel_sim-1.2.0-py3-none-any.whl",
+              "heel_sim-1.2.0.tar.gz",
           ]
           assert sorted(path.name for path in Path("publish").iterdir()) == expected
           assert [path.name for path in Path("release-evidence").iterdir()] == [
@@ -104,8 +104,8 @@ jobs:
           retention-days: 1
           compression-level: 0
           path: |
-            publish/heel_sim-1.1.1-py3-none-any.whl
-            publish/heel_sim-1.1.1.tar.gz
+            publish/heel_sim-1.2.0-py3-none-any.whl
+            publish/heel_sim-1.2.0.tar.gz
             release-evidence/heel-open-core-manifest.json
 
   publish:
@@ -143,20 +143,20 @@ jobs:
               raise SystemExit("release manifest is not canonical JSON")
           if manifest.get("schema_version") != "heel.open-core-artifacts.v1":
               raise SystemExit("unexpected release manifest schema")
-          if manifest.get("version") != "1.1.1" or set(manifest) != {
+          if manifest.get("version") != "1.2.0" or set(manifest) != {
               "artifacts", "schema_version", "version"
           }:
               raise SystemExit("unexpected release manifest fields")
           expected_names = {
-              "heel_sim-1.1.1-py3-none-any.whl",
-              "heel_sim-1.1.1.tar.gz",
+              "heel_sim-1.2.0-py3-none-any.whl",
+              "heel_sim-1.2.0.tar.gz",
           }
           artifacts = manifest.get("artifacts")
           if not isinstance(artifacts, list):
               raise SystemExit("release manifest artifacts must be a list")
           if [record.get("name") for record in artifacts] != [
-              "heel_sim-1.1.1-py3-none-any.whl",
-              "heel_sim-1.1.1.tar.gz",
+              "heel_sim-1.2.0-py3-none-any.whl",
+              "heel_sim-1.2.0.tar.gz",
           ]:
               raise SystemExit("release manifest artifact order mismatch")
           if any(set(record) != {"name", "sha256", "size"} for record in artifacts):
@@ -181,8 +181,8 @@ jobs:
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: |
-            release/publish/heel_sim-1.1.1-py3-none-any.whl
-            release/publish/heel_sim-1.1.1.tar.gz
+            release/publish/heel_sim-1.2.0-py3-none-any.whl
+            release/publish/heel_sim-1.2.0.tar.gz
       - name: Publish to PyPI with Trusted Publishing
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:

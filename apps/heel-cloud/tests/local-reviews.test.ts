@@ -5,7 +5,8 @@ import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, test } from "vitest";
 
 import sampleEnvelope from "../../../tests/fixtures/reviews/sample_review_v1.json";
-import legacyEnvelope from "./legacy-review-1.1.0.fixture.json";
+import legacyEnvelope110 from "./legacy-review-1.1.0.fixture.json";
+import legacyEnvelope111 from "./legacy-review-1.1.1.fixture.json";
 import {
   LOCAL_REVIEW_DATABASE,
   LOCAL_REVIEW_STORE,
@@ -116,32 +117,47 @@ function storedEnvelope(productId: string, savedAt: number): Record<string, unkn
 
 
 describe("LocalReviewStore", () => {
-  test("retains genuine 1.1.0 history through get, list, save, and trimming", async () => {
+  test("retains genuine 1.1.0 and 1.1.1 history through get, list, save, and trimming", async () => {
     const factory = new IDBFactory();
-    const store = new LocalReviewStore({ indexedDB: factory, maxItems: 2, now: () => 30 });
+    const store = new LocalReviewStore({ indexedDB: factory, maxItems: 3, now: () => 30 });
     await expect(store.list()).resolves.toEqual([]);
-    await injectStoredValue(factory, {
-      schema_version: "heel.local-review.v1",
-      envelope: legacyEnvelope,
-      saved_at: 10,
-      sync_state: "local_only",
-    });
+    await injectStoredValues(factory, [
+      {
+        schema_version: "heel.local-review.v1",
+        envelope: legacyEnvelope110,
+        saved_at: 10,
+        sync_state: "local_only",
+      },
+      {
+        schema_version: "heel.local-review.v1",
+        envelope: legacyEnvelope111,
+        saved_at: 20,
+        sync_state: "local_only",
+      },
+    ]);
 
-    const loaded = await store.get(legacyEnvelope.review_id);
-    expect(loaded).toMatchObject({
-      envelope: { engine_version: "1.1.0", review_id: legacyEnvelope.review_id },
+    const loaded110 = await store.get(legacyEnvelope110.review_id);
+    const loaded111 = await store.get(legacyEnvelope111.review_id);
+    expect(loaded110).toMatchObject({
+      envelope: { engine_version: "1.1.0", review_id: legacyEnvelope110.review_id },
     });
-    expect(JSON.parse(reviewToJson(loaded?.envelope)).engine_version).toBe("1.1.0");
-    expect(reviewToMarkdown(loaded?.envelope)).toContain("legacy\\-1\\-1\\-0");
+    expect(loaded111).toMatchObject({
+      envelope: { engine_version: "1.1.1", review_id: legacyEnvelope111.review_id },
+    });
+    expect(JSON.parse(reviewToJson(loaded110?.envelope)).engine_version).toBe("1.1.0");
+    expect(JSON.parse(reviewToJson(loaded111?.envelope)).engine_version).toBe("1.1.1");
+    expect(reviewToMarkdown(loaded110?.envelope)).toContain("legacy\\-1\\-1\\-0");
     await expect(store.list()).resolves.toMatchObject([
-      { envelope: { engine_version: "1.1.0", review_id: legacyEnvelope.review_id } },
+      { envelope: { engine_version: "1.1.1", review_id: legacyEnvelope111.review_id } },
+      { envelope: { engine_version: "1.1.0", review_id: legacyEnvelope110.review_id } },
     ]);
 
     const current = envelope("current-after-upgrade");
     await expect(store.save(current)).resolves.toBe(true);
     await expect(store.list()).resolves.toMatchObject([
-      { envelope: { engine_version: "1.1.1", review_id: current.review_id } },
-      { envelope: { engine_version: "1.1.0", review_id: legacyEnvelope.review_id } },
+      { envelope: { engine_version: "1.2.0", review_id: current.review_id } },
+      { envelope: { engine_version: "1.1.1", review_id: legacyEnvelope111.review_id } },
+      { envelope: { engine_version: "1.1.0", review_id: legacyEnvelope110.review_id } },
     ]);
   });
 

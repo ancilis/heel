@@ -75,7 +75,7 @@ jobs:
             PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1 \
             /tmp/heel-release/bin/python -m pip --isolated install \
             --no-index --no-deps --no-cache-dir \
-            apps/heel-cloud/public/downloads/heel_sim-1.1.1-py3-none-any.whl
+            apps/heel-cloud/public/downloads/heel_sim-1.2.0-py3-none-any.whl
           install -d -m 700 /tmp/heel-ci-workspace /tmp/heel-ci-home
           /tmp/heel-release/bin/python -I - <<'PY'
           import importlib.util
@@ -116,12 +116,12 @@ jobs:
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: heel-open-core-1.1.1
+          name: heel-open-core-1.2.0
           if-no-files-found: error
           retention-days: 7
           path: |
-            apps/heel-cloud/public/downloads/heel_sim-1.1.1-py3-none-any.whl
-            apps/heel-cloud/public/downloads/heel_sim-1.1.1.tar.gz
+            apps/heel-cloud/public/downloads/heel_sim-1.2.0-py3-none-any.whl
+            apps/heel-cloud/public/downloads/heel_sim-1.2.0.tar.gz
             apps/heel-cloud/public/downloads/heel-open-core-manifest.json
 
   ui:

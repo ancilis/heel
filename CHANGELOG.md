@@ -22,6 +22,22 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
+## [1.2.0]: 2026-08-04
+
+Privacy-minimized findings continuity contracts for Heel Cloud. Raw OpenAPI source and guided
+answers remain local; the public core can derive and validate only the canonical, project-scoped
+finding projection that later consent and transport layers are permitted to handle.
+
+### Added
+- Project-scoped, content-addressed findings projections with stable request digests and exact
+  receipt validation.
+- Closed finding/control vocabulary, project-pseudonymous source and surface references, and
+  browser/Agent artifact coverage for the projection module.
+
+### Compatibility
+- Genuine 1.1.0 and 1.1.1 `heel.review.v1` history remains readable and content-addressed under the
+  unchanged schema; current release artifacts and newly generated reviews identify version 1.2.0.
+
 ## [1.1.1]: 2026-08-04
 
 Launch-ready Heel Cloud and local-agent distribution with deterministic, digest-pinned browser and

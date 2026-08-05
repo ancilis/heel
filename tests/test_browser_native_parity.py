@@ -9,6 +9,10 @@ import subprocess
 import unittest
 
 from heel.review_contract import validate_review_envelope
+from heel.findings_sync import (
+    parse_findings_sync_request,
+    project_findings_sync,
+)
 from heel.review_service import review_openapi
 
 
@@ -17,9 +21,11 @@ APP = ROOT / "apps/heel-cloud"
 FIXTURE = ROOT / "tests/fixtures/openapi/saas_api.json"
 ENGINE = APP / "browser-engine"
 PYODIDE = APP / "node_modules/pyodide"
-WHEEL_NAME = "heel_browser-1.1.1-py3-none-any.whl"
+WHEEL_NAME = "heel_browser-1.2.0-py3-none-any.whl"
 MANIFEST = ENGINE / "manifest.json"
 WHEEL = ENGINE / WHEEL_NAME
+PROJECT_REF = "prj_0123456789abcdef0123456789abcdef"
+NAMESPACE_KEY = bytes(range(32))
 SUBSTANTIVE_FIELDS = (
     "schema_version",
     "engine_version",
@@ -57,8 +63,8 @@ const [wheel, manifest, source] = await Promise.all([
 ]);
 if (
   manifest.schema_version !== "heel.browser-engine-manifest.v1"
-  || manifest.engine_version !== "1.1.1"
-  || manifest.wheel.filename !== "heel_browser-1.1.1-py3-none-any.whl"
+  || manifest.engine_version !== "1.2.0"
+  || manifest.wheel.filename !== "heel_browser-1.2.0-py3-none-any.whl"
   || manifest.wheel.size !== wheel.byteLength
   || manifest.wheel.sha256 !== createHash("sha256").update(wheel).digest("hex")
 ) throw new Error("committed browser wheel does not match its manifest");
@@ -73,12 +79,31 @@ const pyodide = await runtime.loadPyodide({
 });
 const sitePackages = pyodide.runPython("import sysconfig; sysconfig.get_paths()['purelib']");
 pyodide.unpackArchive(new Uint8Array(wheel), "wheel", { extractDir: sitePackages });
+pyodide.runPython(
+  "from heel.findings_sync import project_findings_sync, parse_findings_sync_request\n"
+  + "assert callable(project_findings_sync) and callable(parse_findings_sync_request)",
+);
 pyodide.globals.set("heel_source", source);
 try {
   const actual = pyodide.runPython(
     "from heel.browser_review import review_openapi_json\nreview_openapi_json(heel_source)",
   );
-  process.stdout.write(actual);
+  pyodide.globals.set("heel_review_json", actual);
+  try {
+    const projected = pyodide.runPython(
+      "import json\n"
+      + "from heel.findings_sync import project_findings_sync, parse_findings_sync_request\n"
+      + "from heel.review_contract import stable_json\n"
+      + "heel_request = project_findings_sync(json.loads(heel_review_json), "
+      + "'prj_0123456789abcdef0123456789abcdef', bytes(range(32)))\n"
+      + "heel_request_json = stable_json(heel_request)\n"
+      + "assert parse_findings_sync_request(heel_request_json, bytes(range(32))) == heel_request\n"
+      + "heel_request_json",
+    );
+    process.stdout.write(`${actual}\n${projected}`);
+  } finally {
+    pyodide.globals.delete("heel_review_json");
+  }
 } finally {
   pyodide.globals.delete("heel_source");
 }
@@ -165,8 +190,20 @@ class BrowserNativeParityTests(unittest.TestCase):
         )
         if completed.returncode != 0:
             raise AssertionError(completed.stderr or completed.stdout)
-        cls.browser_text = completed.stdout
-        cls.browser = validate_review_envelope(json.loads(completed.stdout))
+        lines = completed.stdout.splitlines()
+        if len(lines) != 2:
+            raise AssertionError("browser parity runner returned an unexpected payload")
+        cls.browser_text, cls.browser_projection_text = lines
+        cls.browser = validate_review_envelope(json.loads(cls.browser_text))
+        cls.browser_projection = parse_findings_sync_request(
+            cls.browser_projection_text,
+            NAMESPACE_KEY,
+        )
+        cls.native_projection = project_findings_sync(
+            cls.browser,
+            PROJECT_REF,
+            NAMESPACE_KEY,
+        )
 
     def test_actual_committed_pyodide_wheel_matches_native_substantive_contract(self):
         for field in SUBSTANTIVE_FIELDS:
@@ -198,6 +235,13 @@ class BrowserNativeParityTests(unittest.TestCase):
         self.assertNotEqual(self.native["result_hash"], self.browser["result_hash"])
         self.assertNotEqual(self.native["review_id"], self.browser["review_id"])
         self.assertEqual(self.browser_text, _canonical_json(self.browser))
+
+    def test_actual_pyodide_wheel_projects_and_parses_the_native_findings_contract(self):
+        self.assertEqual(self.browser_projection, self.native_projection)
+        self.assertEqual(
+            self.browser_projection_text,
+            _canonical_json(self.native_projection),
+        )
 
 
 if __name__ == "__main__":

@@ -24,14 +24,14 @@ import zlib
 
 ROOT = Path(os.path.abspath(__file__)).parents[1]
 CONTRACT_PATH = "release/open-core-v1.json"
-RELEASE_VERSION = "1.1.1"
-WHEEL_NAME = "heel_sim-1.1.1-py3-none-any.whl"
-SDIST_NAME = "heel_sim-1.1.1.tar.gz"
+RELEASE_VERSION = "1.2.0"
+WHEEL_NAME = "heel_sim-1.2.0-py3-none-any.whl"
+SDIST_NAME = "heel_sim-1.2.0.tar.gz"
 MANIFEST_NAME = "heel-open-core-manifest.json"
 ARTIFACT_NAMES = (WHEEL_NAME, SDIST_NAME, MANIFEST_NAME)
-DIST_INFO = "heel_sim-1.1.1.dist-info"
+DIST_INFO = "heel_sim-1.2.0.dist-info"
 RECORD_PATH = f"{DIST_INFO}/RECORD"
-SDIST_PREFIX = "heel_sim-1.1.1/"
+SDIST_PREFIX = "heel_sim-1.2.0/"
 FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 FIXED_TAR_MTIME = 0
 EXPECTED_GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff"
@@ -97,7 +97,7 @@ FORBIDDEN_CONTENT = (
 METADATA = (
     "Metadata-Version: 2.4\n"
     "Name: heel-sim\n"
-    "Version: 1.1.1\n"
+    "Version: 1.2.0\n"
     "Summary: Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.\n"
     "Requires-Python: >=3.11\n"
     "License-Expression: Apache-2.0\n"
@@ -648,7 +648,21 @@ def _build_sdist(contract: dict[str, object], sources: dict[str, bytes]) -> tupl
             info.mtime = FIXED_TAR_MTIME
             info.size = len(payload)
             archive.addfile(info, io.BytesIO(payload))
-    tar_payload = tar_output.getvalue()
+    padded_tar_payload = tar_output.getvalue()
+    member_bytes = sum(
+        tarfile.BLOCKSIZE
+        + ((len(payload) + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE)
+        * tarfile.BLOCKSIZE
+        for payload in payloads.values()
+    )
+    canonical_tar_size = member_bytes + 2 * tarfile.BLOCKSIZE
+    if (
+        len(padded_tar_payload) < canonical_tar_size
+        or any(padded_tar_payload[member_bytes:canonical_tar_size])
+        or any(padded_tar_payload[canonical_tar_size:])
+    ):
+        raise OpenCoreBuildError("generated source archive has noncanonical termination")
+    tar_payload = padded_tar_payload[:canonical_tar_size]
     gzip_output = io.BytesIO()
     with gzip.GzipFile(
         filename="",
@@ -825,7 +839,7 @@ def _validate_sdist(sdist: bytes, expected_payloads: dict[str, bytes]) -> None:
         raise OpenCoreBuildError("source archive gzip CRC mismatch")
     if expected_size != len(tar_payload) & 0xFFFFFFFF:
         raise OpenCoreBuildError("source archive gzip size mismatch")
-    if len(tar_payload) % tarfile.RECORDSIZE != 0 or not tar_payload.endswith(b"\0" * 1024):
+    if len(tar_payload) % tarfile.BLOCKSIZE != 0 or not tar_payload.endswith(b"\0" * 1024):
         raise OpenCoreBuildError("source archive tar padding is noncanonical")
     try:
         with tarfile.open(fileobj=io.BytesIO(tar_payload), mode="r:") as archive:
@@ -833,6 +847,18 @@ def _validate_sdist(sdist: bytes, expected_payloads: dict[str, bytes]) -> None:
             expected_order = [SDIST_PREFIX + path for path in sorted(expected_payloads)]
             if [member.name for member in members] != expected_order:
                 raise OpenCoreBuildError("source archive member order mismatch")
+            if members:
+                final_member = members[-1]
+                canonical_end = (
+                    final_member.offset_data
+                    + ((final_member.size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE)
+                    * tarfile.BLOCKSIZE
+                    + 2 * tarfile.BLOCKSIZE
+                )
+                if canonical_end != len(tar_payload):
+                    raise OpenCoreBuildError(
+                        "source archive has data after its canonical termination"
+                    )
             total = 0
             for member in members:
                 _safe_archive_name(member.name)

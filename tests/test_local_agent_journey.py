@@ -285,10 +285,10 @@ class LocalAgentJourneyTests(unittest.TestCase):
 
         self.assertIn("heel review openapi", readme)
         self.assertIn(
-            ".venv/bin/python -m pip install ./heel_sim-1.1.1-py3-none-any.whl",
+            ".venv/bin/python -m pip install ./heel_sim-1.2.0-py3-none-any.whl",
             readme,
         )
-        self.assertIn("/downloads/heel_sim-1.1.1-py3-none-any.whl", readme)
+        self.assertIn("/downloads/heel_sim-1.2.0-py3-none-any.whl", readme)
         self.assertIn("not yet published", readme.lower())
         self.assertNotIn("git clone https://github.com/ancilis/heel", readme)
         self.assertIn("python3 -m pip install heel-sim", quickstart)

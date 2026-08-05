@@ -10,8 +10,8 @@ from typing import Any
 
 
 REVIEW_SCHEMA_VERSION = "heel.review.v1"
-ENGINE_VERSION = "1.1.1"
-SUPPORTED_ENGINE_VERSIONS = frozenset({"1.1.0", ENGINE_VERSION})
+ENGINE_VERSION = "1.2.0"
+SUPPORTED_ENGINE_VERSIONS = frozenset({"1.1.0", "1.1.1", ENGINE_VERSION})
 EXECUTION_MODES = frozenset({"browser_local", "machine_local", "cloud_isolated"})
 
 _JS_SAFE_INTEGER = 2**53 - 1

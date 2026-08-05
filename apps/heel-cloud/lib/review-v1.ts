@@ -3,11 +3,12 @@
 /** Dependency-free validation for the untrusted Python worker response. */
 
 export const REVIEW_SCHEMA_VERSION = "heel.review.v1" as const;
-export const REVIEW_ENGINE_VERSION = "1.1.1" as const;
-export type ReviewEngineVersion = "1.1.0" | typeof REVIEW_ENGINE_VERSION;
+export const REVIEW_ENGINE_VERSION = "1.2.0" as const;
+export type ReviewEngineVersion = "1.1.0" | "1.1.1" | typeof REVIEW_ENGINE_VERSION;
 
 const SUPPORTED_REVIEW_ENGINE_VERSIONS = new Set<ReviewEngineVersion>([
   "1.1.0",
+  "1.1.1",
   REVIEW_ENGINE_VERSION,
 ]);
 

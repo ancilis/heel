@@ -10,8 +10,8 @@ else is built and testable locally without them. Ordered by launch criticality.
    non-self reviewer, disable administrator bypass, and restrict deployments to protected release
    tags. Configure the PyPI Trusted Publisher for the exact owner/repository, `publish.yml`, and
    `pypi` environment. After the current source is pushed and CI passes, create the new immutable
-   `v1.1.1` tag and stable (not draft or prerelease) GitHub Release. The workflow then verifies,
-   attests, and publishes only the named 1.1.1 wheel and source archive.
+   `v1.2.0` tag and stable (not draft or prerelease) GitHub Release. The workflow then verifies,
+   attests, and publishes only the named 1.2.0 wheel and source archive.
 2. **Legal counsel review** of Terms, Privacy, AUP, target-authorization policy, DPA, refund terms,
    and the open-core / commercial-license split (ADR-0001). Draft docs are in `docs/saas/legal/`
    (marked DRAFT — NOT LEGAL ADVICE).
