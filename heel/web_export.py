@@ -1,8 +1,11 @@
 """
-Heel — web snapshot exporter. Runs the full synthetic flow over the MCP capability and writes
-one JSON the control-room UI renders. Pure stdlib; deterministic.
+Heel — snapshot exporter. Runs the full synthetic flow over the MCP capability and writes
+one deterministic JSON snapshot.
 
-    python3 -m heel.web_export [out_path]   # default web/public/data/snapshot.json
+    python3 -m heel.web_export [out_path]   # default ./heel-snapshot.json
+
+When ``out_path`` names a parent directory, Heel creates that explicit parent. A bare filename
+is written in the current working directory.
 """
 from __future__ import annotations
 
@@ -392,9 +395,14 @@ def _build_snapshot() -> dict:
 
 
 def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "public", "data", "snapshot.json")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
+    explicit_output = len(sys.argv) > 1
+    out = sys.argv[1] if explicit_output else os.path.join(
+        os.getcwd(), "heel-snapshot.json"
+    )
+    if explicit_output:
+        parent = os.path.dirname(out)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
     with open(out, "w") as fh:
         json.dump(build_snapshot(), fh, indent=1, default=str)
     print(f"wrote {out} ({os.path.getsize(out) // 1024} KB)")
