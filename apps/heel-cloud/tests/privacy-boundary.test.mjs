@@ -116,6 +116,7 @@ function analyzeSource(fileName, text) {
   const violations = [];
   const networkCapabilities = new Set(["fetch", "XMLHttpRequest", "WebSocket", "EventSource", "sendBeacon"]);
   const ambientRoots = new Set(["globalThis", "window", "self", "navigator"]);
+  const sinkAliases = new Set();
   const engineWorker = relativeName === "workers/heel-review.worker.ts";
   const serverWorker = relativeName === "worker/index.ts";
 
@@ -139,7 +140,10 @@ function analyzeSource(fileName, text) {
         && ts.isIdentifier(capture.parent.name)
         && capture.parent.name.text === "bootstrapFetch";
     }
-    return serverWorker && ["env.ASSETS.fetch", "handler.fetch"].includes(expression);
+    return serverWorker
+      && ["env.ASSETS.fetch", "handler.fetch"].includes(expression)
+      && ts.isCallExpression(node.parent)
+      && node.parent.expression === node;
   }
 
   function allowedFetchCall(node) {
@@ -153,7 +157,55 @@ function analyzeSource(fileName, text) {
       && node.arguments[0].text === "path";
   }
 
+  function capabilitySource(node) {
+    if (ts.isIdentifier(node)) {
+      if (networkCapabilities.has(node.text) || sinkAliases.has(node.text)) return node.text;
+      return null;
+    }
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const name = memberName(node);
+      if (networkCapabilities.has(name ?? "") && !allowedFetchReference(node)) return name;
+    }
+    return null;
+  }
+
+  function bindingPropertyName(element) {
+    const property = element.propertyName ?? element.name;
+    if (ts.isComputedPropertyName(property)) return constantString(property.expression);
+    return ts.isIdentifier(property) || ts.isStringLiteralLike(property) ? property.text : null;
+  }
+
+  function recordAlias(target, sourceNode, reportNode = target) {
+    if (!ts.isIdentifier(target) || capabilitySource(sourceNode) === null) return;
+    sinkAliases.add(target.text);
+    report(reportNode, `network sink alias ${target.text}`);
+  }
+
   function visit(node) {
+    if (ts.isVariableDeclaration(node) && node.initializer) {
+      if (ts.isIdentifier(node.name)) {
+        recordAlias(node.name, node.initializer, node);
+      } else if (
+        ts.isObjectBindingPattern(node.name)
+        && ambientRoots.has(rootName(node.initializer) ?? "")
+      ) {
+        for (const element of node.name.elements) {
+          if (
+            ts.isIdentifier(element.name)
+            && networkCapabilities.has(bindingPropertyName(element) ?? "")
+          ) {
+            sinkAliases.add(element.name.text);
+            report(element, `network sink alias ${element.name.text}`);
+          }
+        }
+      }
+    }
+
+    if (
+      ts.isBinaryExpression(node)
+      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+    ) recordAlias(node.left, node.right, node);
+
     if (
       ts.isExpressionStatement(node)
       && ts.isStringLiteral(node.expression)
@@ -184,6 +236,9 @@ function analyzeSource(fileName, text) {
       const name = memberName(node.expression);
       const root = rootName(node.expression);
       const args = [...(node.arguments ?? [])];
+      if (ts.isIdentifier(node.expression) && sinkAliases.has(node.expression.text)) {
+        report(node, `network sink alias ${node.expression.text}`);
+      }
       if (networkCapabilities.has(name ?? "") && !allowedFetchCall(node)) {
         report(node, `network sink ${name}`);
       }
@@ -227,6 +282,31 @@ globalThis["fet" + "ch"]("/leak", {body: source});
 `;
   const violations = analyzeSource(join(appRootPath, "components/nested/mutation.ts"), mutation);
   assert.ok(violations.some((violation) => violation.includes("network sink fetch")), violations.join("\n"));
+});
+
+
+test("the privacy analyzer detects an executable direct fetch alias", () => {
+  const mutation = `
+const source = "private";
+const sink = fetch;
+sink("/leak", {body: source});
+`;
+  const violations = analyzeSource(join(appRootPath, "components/nested/alias-mutation.ts"), mutation);
+  assert.ok(violations.some((violation) => violation.includes("network sink alias sink")), violations.join("\n"));
+});
+
+
+test("the privacy analyzer follows computed-global destructuring and assignment aliases", () => {
+  const mutation = `
+const source = "private";
+const { ["fet" + "ch"]: sink } = globalThis;
+let nested;
+nested = sink;
+nested("/leak", {body: source});
+`;
+  const violations = analyzeSource(join(appRootPath, "components/nested/propagated-alias.ts"), mutation);
+  assert.ok(violations.some((violation) => violation.includes("network sink alias sink")), violations.join("\n"));
+  assert.ok(violations.some((violation) => violation.includes("network sink alias nested")), violations.join("\n"));
 });
 
 

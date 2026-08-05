@@ -115,7 +115,7 @@ describe("BrowserReviewClient", () => {
     await expect(client.whenReady()).rejects.toMatchObject({ code: "engine_unavailable" });
   });
 
-  test("bounds a never-ready boot and rejects its queued review without leaked timers", async () => {
+  test("automatically retries one never-ready boot and reviews after the replacement is ready", async () => {
     vi.useFakeTimers();
     const workers: FakeWorker[] = [];
     const client = new BrowserReviewClient({
@@ -126,6 +126,8 @@ describe("BrowserReviewClient", () => {
         return worker;
       },
     });
+    let readinessFailure: BrowserReviewClientError | null = null;
+    void client.whenReady().catch((error: BrowserReviewClientError) => { readinessFailure = error; });
     const queued = client.review("queued-private-source", [{
       surface: "downloadbulkexport",
       field: "rate_limit",
@@ -143,14 +145,23 @@ describe("BrowserReviewClient", () => {
     expect(vi.getTimerCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(51);
     expect(queuedFailure).toMatchObject({ code: "engine_unavailable" });
+    expect(readinessFailure).toMatchObject({ code: "engine_unavailable" });
 
     expect(workers[0].terminated).toBe(true);
-    expect(client.status).toBe("failed");
+    expect(workers).toHaveLength(2);
+    expect(client.status).toBe("loading_engine");
+    expect(vi.getTimerCount()).toBe(1);
+
+    ready(workers[1]);
+    await client.whenReady();
     expect(vi.getTimerCount()).toBe(0);
-    await expect(client.whenReady()).rejects.toMatchObject({ code: "engine_unavailable" });
+    const retried = client.review("replacement-source");
+    const request = JSON.parse(workers[1].sent.at(-1)!);
+    result(workers[1], request.request_id);
+    await expect(retried).resolves.toBeDefined();
   });
 
-  test("bounds bare readiness and can explicitly recover after boot timeout", async () => {
+  test("exhausts a finite boot retry without a worker or timer loop and explicit restart resets it", async () => {
     vi.useFakeTimers();
     const workers: FakeWorker[] = [];
     const client = new BrowserReviewClient({
@@ -161,24 +172,40 @@ describe("BrowserReviewClient", () => {
         return worker;
       },
     });
-    let readinessFailure: BrowserReviewClientError | null = null;
-    void client.whenReady().catch((error: BrowserReviewClientError) => { readinessFailure = error; });
+    let firstReadinessFailure: BrowserReviewClientError | null = null;
+    void client.whenReady().catch((error: BrowserReviewClientError) => { firstReadinessFailure = error; });
     await vi.advanceTimersByTimeAsync(26);
-    expect(readinessFailure).toMatchObject({ code: "engine_unavailable" });
-    expect(workers).toHaveLength(1);
+    expect(firstReadinessFailure).toMatchObject({ code: "engine_unavailable" });
+    expect(workers).toHaveLength(2);
     expect(workers[0].terminated).toBe(true);
+    expect(client.status).toBe("loading_engine");
+    expect(vi.getTimerCount()).toBe(1);
+
+    let secondReadinessFailure: BrowserReviewClientError | null = null;
+    void client.whenReady().catch((error: BrowserReviewClientError) => { secondReadinessFailure = error; });
+    await vi.advanceTimersByTimeAsync(26);
+    expect(secondReadinessFailure).toMatchObject({ code: "engine_unavailable" });
+    expect(workers).toHaveLength(2);
+    expect(workers[1].terminated).toBe(true);
+    expect(client.status).toBe("failed");
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(workers).toHaveLength(2);
     expect(vi.getTimerCount()).toBe(0);
 
     client.restart();
-    expect(workers).toHaveLength(2);
+    expect(workers).toHaveLength(3);
     expect(client.status).toBe("loading_engine");
-    ready(workers[1]);
+    await vi.advanceTimersByTimeAsync(26);
+    expect(workers).toHaveLength(4);
+    expect(workers[2].terminated).toBe(true);
+    ready(workers[3]);
     await client.whenReady();
     expect(client.status).toBe("ready");
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  test("cancels a queued pre-ready review by terminating boot and retaining its input", async () => {
+  test("cancels a queued pre-ready review and immediately boots a usable replacement", async () => {
     vi.useFakeTimers();
     const workers: FakeWorker[] = [];
     const client = new BrowserReviewClient({
@@ -189,6 +216,8 @@ describe("BrowserReviewClient", () => {
         return worker;
       },
     });
+    let readinessFailure: BrowserReviewClientError | null = null;
+    void client.whenReady().catch((error: BrowserReviewClientError) => { readinessFailure = error; });
     const queued = client.review("cancel-before-ready");
     let cancelled: BrowserReviewClientError | null = null;
     void queued.catch((error: BrowserReviewClientError) => { cancelled = error; });
@@ -196,10 +225,20 @@ describe("BrowserReviewClient", () => {
     await Promise.resolve();
 
     expect(cancelled).toMatchObject({ code: "review_cancelled" });
+    expect(readinessFailure).toMatchObject({ code: "engine_unavailable" });
     expect(workers[0].terminated).toBe(true);
-    expect(client.status).toBe("failed");
+    expect(workers).toHaveLength(2);
+    expect(client.status).toBe("loading_engine");
     expect(client.retainedInput?.source).toBe("cancel-before-ready");
+    expect(vi.getTimerCount()).toBe(1);
+
+    ready(workers[1]);
+    await client.whenReady();
     expect(vi.getTimerCount()).toBe(0);
+    const recovered = client.review("after-cancel");
+    const request = JSON.parse(workers[1].sent.at(-1)!);
+    result(workers[1], request.request_id);
+    await expect(recovered).resolves.toBeDefined();
   });
 
   test("terminal worker failure rejects an active review and clears every timer", async () => {

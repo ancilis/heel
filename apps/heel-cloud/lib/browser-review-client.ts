@@ -17,6 +17,7 @@ export const MAX_BROWSER_RESULT_BYTES = 4 * 1024 * 1024;
 const MAX_WORKER_MESSAGE_BYTES = MAX_BROWSER_RESULT_BYTES * 2 + 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_BOOT_TIMEOUT_MS = 20_000;
+const MAX_AUTOMATIC_BOOT_RETRIES = 1;
 
 export type BrowserReviewStatus =
   | "loading_engine"
@@ -161,6 +162,7 @@ export class BrowserReviewClient {
   #active: ActiveRequest | null = null;
   #queued: QueuedRequest | null = null;
   #bootTimer: ReturnType<typeof setTimeout> | null = null;
+  #bootRetriesRemaining = MAX_AUTOMATIC_BOOT_RETRIES;
   #retainedInput: RetainedBrowserInput | null = null;
   #requestSequence = 0;
   #disposed = false;
@@ -226,13 +228,14 @@ export class BrowserReviewClient {
       this.#queued = null;
       queued.reject(new BrowserReviewClientError("review_cancelled"));
       this.#rejectReadyWaiters("engine_unavailable");
-      this.#detachAndTerminate();
-      this.#setStatus("failed");
+      this.#bootRetriesRemaining = MAX_AUTOMATIC_BOOT_RETRIES;
+      this.#replaceWorker();
     }
   }
 
   restart(): void {
     if (this.#disposed) return;
+    this.#bootRetriesRemaining = MAX_AUTOMATIC_BOOT_RETRIES;
     if (this.#active !== null) this.#failActive("engine_failed", false);
     if (this.#queued !== null) {
       const queued = this.#queued;
@@ -374,6 +377,7 @@ export class BrowserReviewClient {
       }
       this.#clearBootTimer();
       this.#engineReady = true;
+      this.#bootRetriesRemaining = MAX_AUTOMATIC_BOOT_RETRIES;
       this.#setStatus("ready");
       for (const waiter of this.#readyWaiters) waiter.resolve();
       this.#readyWaiters.clear();
@@ -389,7 +393,7 @@ export class BrowserReviewClient {
         this.#protocolFailure();
         return;
       }
-      this.#failBoot("engine_unavailable");
+      this.#failBoot("engine_unavailable", !this.#engineReady);
       return;
     }
     const active = this.#active;
@@ -438,7 +442,7 @@ export class BrowserReviewClient {
     else this.#replaceWorker();
   }
 
-  #failBoot(code: string): void {
+  #failBoot(code: string, allowRetry = true): void {
     this.#clearBootTimer();
     if (this.#active !== null) {
       const active = this.#active;
@@ -453,7 +457,12 @@ export class BrowserReviewClient {
     }
     this.#rejectReadyWaiters(code);
     this.#detachAndTerminate();
-    this.#setStatus("failed");
+    if (allowRetry && !this.#disposed && this.#bootRetriesRemaining > 0) {
+      this.#bootRetriesRemaining -= 1;
+      this.#spawnWorker();
+    } else {
+      this.#setStatus("failed");
+    }
   }
 
   #protocolFailure(): void {
