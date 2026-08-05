@@ -14,6 +14,16 @@ const PYODIDE_SOURCE = "https://github.com/pyodide/pyodide/tree/ac57031be7564f86
 const CPYTHON_VERSION = "3.14.2";
 const CPYTHON_SOURCE = "https://github.com/python/cpython/tree/df793163d5821791d4e7caf88885a2c11a107986";
 const WHEEL_NAME = "heel_browser-1.1.0-py3-none-any.whl";
+const RELEASE_WHEEL_NAME = "heel_sim-1.1.0-py3-none-any.whl";
+const RELEASE_SOURCE_NAME = "heel_sim-1.1.0.tar.gz";
+const RELEASE_MANIFEST_NAME = "heel-open-core-manifest.json";
+const RELEASE_DOWNLOAD_NAMES = Object.freeze([
+  RELEASE_MANIFEST_NAME,
+  RELEASE_WHEEL_NAME,
+  RELEASE_SOURCE_NAME,
+]);
+const MAX_RELEASE_ARCHIVE_BYTES = 32 * 1024 * 1024;
+const MAX_RELEASE_MANIFEST_BYTES = 16 * 1024;
 const PYODIDE_CDN_FALLBACK = "`https://cdn.jsdelivr.net/pyodide/v${U}/full/`";
 const SAME_ORIGIN_PYODIDE_FALLBACK = '"/heel-runtime/"';
 const PYODIDE_SOURCE_MAP_DIRECTIVE = "\n//# sourceMappingURL=pyodide.mjs.map";
@@ -59,6 +69,18 @@ async function readRegular(path, label) {
 }
 
 
+async function readBoundedRegular(path, label, maximumBytes) {
+  await assertNoSymlinkComponents(path, label);
+  const status = await lstat(path);
+  if (status.isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
+  if (!status.isFile()) throw new Error(`${label} must be a regular file`);
+  if (!Number.isSafeInteger(status.size) || status.size <= 0 || status.size > maximumBytes) {
+    throw new Error(`${label} has an invalid size`);
+  }
+  return readFile(path);
+}
+
+
 async function assertNoSymlinkComponents(path, label, { allowMissing = false } = {}) {
   const absolute = resolve(path);
   const root = parse(absolute).root;
@@ -99,6 +121,79 @@ function assertExactObject(value, keys, label) {
 function assertIntegrity(payload, expected, label) {
   if (payload.byteLength !== expected.size) throw new Error(`${label} size mismatch`);
   if (sha256(payload) !== expected.sha256) throw new Error(`${label} digest mismatch`);
+}
+
+
+export async function validateReleaseDownloads(downloadsRoot) {
+  const root = resolve(downloadsRoot);
+  await validateDirectoryRoot(root, "release downloads");
+  const entries = await readdir(root, { withFileTypes: true });
+  const actualNames = entries.map(({ name }) => name).sort();
+  if (
+    actualNames.length !== RELEASE_DOWNLOAD_NAMES.length
+    || actualNames.some((name, index) => name !== RELEASE_DOWNLOAD_NAMES[index])
+  ) {
+    const unexpected = actualNames.find((name) => !RELEASE_DOWNLOAD_NAMES.includes(name));
+    throw new Error(unexpected ? `unexpected release download: ${unexpected}` : "release downloads are incomplete");
+  }
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    await assertNoSymlinkComponents(path, `release download ${entry.name}`);
+    if (entry.isSymbolicLink()) throw new Error(`release download ${entry.name} must not be a symbolic link`);
+    if (!entry.isFile()) throw new Error(`release download ${entry.name} must be a regular file`);
+  }
+
+  const manifestBytes = await readBoundedRegular(
+    join(root, RELEASE_MANIFEST_NAME),
+    "release manifest",
+    MAX_RELEASE_MANIFEST_BYTES,
+  );
+  let manifest;
+  try {
+    manifest = JSON.parse(manifestBytes.toString("utf8"));
+  } catch {
+    throw new Error("release manifest is invalid JSON");
+  }
+  if (manifestBytes.toString("utf8") !== canonicalJson(manifest) + "\n") {
+    throw new Error("release manifest is not canonical JSON");
+  }
+  assertExactObject(manifest, ["artifacts", "schema_version", "version"], "release manifest");
+  if (
+    manifest.schema_version !== "heel.open-core-artifacts.v1"
+    || manifest.version !== "1.1.0"
+    || !Array.isArray(manifest.artifacts)
+    || manifest.artifacts.length !== 2
+  ) {
+    throw new Error("release manifest contains unpinned values");
+  }
+
+  const expectedArtifactNames = [RELEASE_WHEEL_NAME, RELEASE_SOURCE_NAME];
+  const artifactNames = [];
+  for (const artifact of manifest.artifacts) {
+    assertExactObject(artifact, ["name", "sha256", "size"], "release artifact");
+    if (
+      !expectedArtifactNames.includes(artifact.name)
+      || artifactNames.includes(artifact.name)
+      || !Number.isSafeInteger(artifact.size)
+      || artifact.size <= 0
+      || artifact.size > MAX_RELEASE_ARCHIVE_BYTES
+      || !/^[0-9a-f]{64}$/.test(artifact.sha256)
+    ) {
+      throw new Error("release artifact contains unpinned values");
+    }
+    artifactNames.push(artifact.name);
+    const payload = await readBoundedRegular(
+      join(root, artifact.name),
+      `release artifact ${artifact.name}`,
+      MAX_RELEASE_ARCHIVE_BYTES,
+    );
+    assertIntegrity(payload, artifact, `release artifact ${artifact.name}`);
+  }
+  artifactNames.sort();
+  if (artifactNames.some((name, index) => name !== expectedArtifactNames[index])) {
+    throw new Error("release manifest does not list the exact artifacts");
+  }
+  return manifest;
 }
 
 
@@ -257,6 +352,9 @@ export async function prepareRuntime(options = {}) {
   const legalRoot = options.legalRoot
     ? resolve(options.legalRoot)
     : join(appRoot, "legal/third-party");
+  const downloadsRoot = options.downloadsRoot
+    ? resolve(options.downloadsRoot)
+    : join(appRoot, "public/downloads");
   const outputRoot = options.outputRoot
     ? resolve(options.outputRoot)
     : join(appRoot, "public/heel-runtime");
@@ -265,6 +363,7 @@ export async function prepareRuntime(options = {}) {
     validateDirectoryRoot(pyodideRoot, "Pyodide root"),
     validateDirectoryRoot(engineRoot, "Heel engine root"),
     validateDirectoryRoot(legalRoot, "third-party legal root"),
+    validateReleaseDownloads(downloadsRoot),
   ]);
   const [pyodideAssets, heel, legalAssets] = await Promise.all([
     validatePyodide(pyodideRoot),

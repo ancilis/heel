@@ -2,19 +2,26 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { lstat, readFile, readdir } from "node:fs/promises";
+import { cp, lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { extname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
-import { inflateRawSync } from "node:zlib";
+import { gunzipSync, inflateRawSync } from "node:zlib";
+
+import { validateReleaseDownloads } from "../scripts/prepare-runtime.mjs";
 
 
 const appRoot = fileURLToPath(new URL("../", import.meta.url));
 const distRoot = join(appRoot, "dist");
 const clientRoot = join(distRoot, "client");
 const runtimeRoot = join(clientRoot, "heel-runtime");
+const downloadsRoot = join(clientRoot, "downloads");
 const serverRoot = join(distRoot, "server");
 const wheelName = "heel_browser-1.1.0-py3-none-any.whl";
+const agentWheelName = "heel_sim-1.1.0-py3-none-any.whl";
+const agentSourceName = "heel_sim-1.1.0.tar.gz";
+const agentManifestName = "heel-open-core-manifest.json";
+const expectedDownloadNames = [agentManifestName, agentWheelName, agentSourceName];
 const internalOriginHeader = "x-heel-internal-origin";
 const scannedTextExtensions = new Set([".css", ".html", ".js", ".json", ".mjs", ".txt"]);
 const executableExtensions = new Set([".js", ".mjs"]);
@@ -22,6 +29,21 @@ const generatedPrerenderFiles = [
   "server/ssr/vinext-server.json",
   "server/vinext-server.json",
 ];
+const maxReleaseArchiveBytes = 32 * 1024 * 1024;
+const maxReleaseMemberBytes = 4 * 1024 * 1024;
+const maxReleaseMembers = 128;
+const maxReleaseExpandedBytes = 24 * 1024 * 1024;
+const forbiddenReleasePrefixes = [
+  "apps/",
+  "deploy/",
+  "docs/saas/",
+  "docs/superpowers/",
+  "heel/saas/",
+  "tests/",
+  "web/",
+];
+const allowedReleaseExtensions = new Set([".in", ".json", ".md", ".py", ".toml", ".txt"]);
+const allowedExtensionlessNames = new Set(["DCO", "LICENSE", "METADATA", "NOTICE", "PKG-INFO", "RECORD", "WHEEL"]);
 
 
 function sha256(payload) {
@@ -66,7 +88,16 @@ function decodeUtf8(payload, label) {
 }
 
 
-function zipMembers(archive) {
+function assertSafeArchivePath(name, label) {
+  assert.ok(name && !name.startsWith("/") && !name.includes("\\"), `${label} has an unsafe path`);
+  assert.equal(name.includes("\0"), false, `${label} contains NUL`);
+  const parts = name.split("/");
+  assert.equal(parts.some((part) => part === "" || part === "." || part === ".."), false, `${label} traverses directories`);
+}
+
+
+function zipMembers(archive, label = "wheel") {
+  assert.ok(archive.byteLength <= maxReleaseArchiveBytes, `${label} exceeds the archive size limit`);
   const minimumEndRecord = 22;
   let endRecord = -1;
   for (let offset = archive.byteLength - minimumEndRecord; offset >= 0; offset -= 1) {
@@ -75,15 +106,18 @@ function zipMembers(archive) {
       break;
     }
   }
-  assert.notEqual(endRecord, -1, "wheel has no ZIP end record");
-  assert.equal(archive.readUInt16LE(endRecord + 4), 0, "multi-disk wheel");
-  assert.equal(archive.readUInt16LE(endRecord + 6), 0, "multi-disk wheel");
+  assert.notEqual(endRecord, -1, `${label} has no ZIP end record`);
+  assert.equal(archive.readUInt16LE(endRecord + 4), 0, `${label} is multi-disk`);
+  assert.equal(archive.readUInt16LE(endRecord + 6), 0, `${label} is multi-disk`);
   const entryCount = archive.readUInt16LE(endRecord + 10);
+  assert.ok(entryCount > 0 && entryCount <= maxReleaseMembers, `${label} has an invalid member count`);
   let cursor = archive.readUInt32LE(endRecord + 16);
   const members = new Map();
+  let expandedBytes = 0;
 
   for (let index = 0; index < entryCount; index += 1) {
-    assert.equal(archive.readUInt32LE(cursor), 0x02014b50, `wheel central entry ${index}`);
+    assert.equal(archive.readUInt32LE(cursor), 0x02014b50, `${label} central entry ${index}`);
+    const creatorSystem = archive.readUInt16LE(cursor + 4) >> 8;
     const flags = archive.readUInt16LE(cursor + 8);
     const compression = archive.readUInt16LE(cursor + 10);
     const compressedSize = archive.readUInt32LE(cursor + 20);
@@ -91,11 +125,20 @@ function zipMembers(archive) {
     const nameLength = archive.readUInt16LE(cursor + 28);
     const extraLength = archive.readUInt16LE(cursor + 30);
     const commentLength = archive.readUInt16LE(cursor + 32);
+    const externalAttributes = archive.readUInt32LE(cursor + 38);
     const localOffset = archive.readUInt32LE(cursor + 42);
-    const name = decodeUtf8(archive.subarray(cursor + 46, cursor + 46 + nameLength), `wheel member ${index}`);
+    const name = decodeUtf8(archive.subarray(cursor + 46, cursor + 46 + nameLength), `${label} member ${index}`);
     assert.equal(flags & 1, 0, `${name} is encrypted`);
-    assert.ok(name && !name.startsWith("/") && !name.split("/").includes(".."), `${name} is unsafe`);
+    assertSafeArchivePath(name.replace(/\/$/, ""), `${label}:${name}`);
     assert.equal(members.has(name), false, `${name} is duplicated`);
+    if (creatorSystem === 3) {
+      const fileType = (externalAttributes >>> 16) & 0o170000;
+      assert.notEqual(fileType, 0o120000, `${name} is a symbolic link`);
+      assert.ok(fileType === 0 || fileType === 0o100000 || fileType === 0o040000, `${name} is not a regular file`);
+    }
+    assert.ok(uncompressedSize <= maxReleaseMemberBytes, `${name} exceeds the member size limit`);
+    expandedBytes += uncompressedSize;
+    assert.ok(expandedBytes <= maxReleaseExpandedBytes, `${label} exceeds the expanded size limit`);
     assert.equal(archive.readUInt32LE(localOffset), 0x04034b50, `${name} local header`);
     const localNameLength = archive.readUInt16LE(localOffset + 26);
     const localExtraLength = archive.readUInt16LE(localOffset + 28);
@@ -112,6 +155,87 @@ function zipMembers(archive) {
   }
   assert.equal(members.size > 0, true, "wheel has no file members");
   return members;
+}
+
+
+function parseTarNumber(field, label) {
+  const text = field.toString("ascii").replace(/\0.*$/s, "").trim();
+  assert.match(text, /^[0-7]+$/, `${label} is not an octal TAR number`);
+  return Number.parseInt(text, 8);
+}
+
+
+function tarMembers(archive, label = "source archive") {
+  assert.ok(archive.byteLength <= maxReleaseArchiveBytes, `${label} exceeds the archive size limit`);
+  const payload = gunzipSync(archive, { maxOutputLength: maxReleaseExpandedBytes + 1024 });
+  const members = [];
+  const names = new Set();
+  let cursor = 0;
+  let expandedBytes = 0;
+  while (cursor + 512 <= payload.byteLength) {
+    const header = payload.subarray(cursor, cursor + 512);
+    if (header.every((byte) => byte === 0)) break;
+    assert.ok(members.length < maxReleaseMembers, `${label} exceeds the member count limit`);
+    assert.equal(header.subarray(257, 263).toString("ascii"), "ustar\0", `${label} member is not USTAR`);
+    const name = decodeUtf8(header.subarray(0, 100), `${label} member name`).replace(/\0.*$/s, "");
+    const prefix = decodeUtf8(header.subarray(345, 500), `${label} member prefix`).replace(/\0.*$/s, "");
+    const fullName = prefix ? `${prefix}/${name}` : name;
+    assertSafeArchivePath(fullName, `${label}:${fullName}`);
+    assert.equal(names.has(fullName), false, `${fullName} is duplicated`);
+    names.add(fullName);
+    const type = header[156] === 0 ? "0" : String.fromCharCode(header[156]);
+    assert.equal(type, "0", `${fullName} is not a regular file`);
+    const size = parseTarNumber(header.subarray(124, 136), `${fullName} size`);
+    assert.ok(size <= maxReleaseMemberBytes, `${fullName} exceeds the member size limit`);
+    expandedBytes += size;
+    assert.ok(expandedBytes <= maxReleaseExpandedBytes, `${label} exceeds the expanded size limit`);
+    const start = cursor + 512;
+    const end = start + size;
+    assert.ok(end <= payload.byteLength, `${fullName} is truncated`);
+    members.push({ name: fullName, payload: payload.subarray(start, end), type });
+    cursor = start + Math.ceil(size / 512) * 512;
+  }
+  assert.ok(members.length > 0, `${label} has no file members`);
+  return members;
+}
+
+
+function classifyReleaseMembers(records, { label, rootPrefix = "" }) {
+  assert.ok(records.length > 0 && records.length <= maxReleaseMembers, `${label} has an invalid member count`);
+  const names = new Set();
+  let expandedBytes = 0;
+  for (const record of records) {
+    assertSafeArchivePath(record.name, `${label}:${record.name}`);
+    assert.equal(names.has(record.name), false, `${label}:${record.name} is duplicated`);
+    names.add(record.name);
+    assert.equal(record.type ?? "0", "0", `${label}:${record.name} is not a regular file`);
+    assert.ok(record.payload.byteLength <= maxReleaseMemberBytes, `${label}:${record.name} exceeds the member size limit`);
+    expandedBytes += record.payload.byteLength;
+    assert.ok(expandedBytes <= maxReleaseExpandedBytes, `${label} exceeds the expanded size limit`);
+
+    assert.ok(!rootPrefix || record.name.startsWith(rootPrefix), `${label}:${record.name} escapes its release root`);
+    const releasePath = rootPrefix ? record.name.slice(rootPrefix.length) : record.name;
+    assertSafeArchivePath(releasePath, `${label}:${record.name}`);
+    for (const prefix of forbiddenReleasePrefixes) {
+      assert.equal(releasePath.startsWith(prefix), false, `${label}:${record.name} crosses the commercial boundary`);
+    }
+    const basename = releasePath.split("/").at(-1);
+    const extension = extname(basename).toLowerCase();
+    assert.ok(
+      allowedReleaseExtensions.has(extension) || allowedExtensionlessNames.has(basename),
+      `${label}:${record.name} has an unexpected extension`,
+    );
+    assert.notEqual(extension, ".map", `${label}:${record.name} is a source map`);
+    const source = decodeUtf8(record.payload, `${label}:${record.name}`);
+    if (releasePath === "MANIFEST.in") {
+      assert.equal(source.match(/LICENSE-COMMERCIAL/g)?.length, 1, `${label}:${record.name}`);
+      assert.doesNotMatch(source, /LicenseRef-Heel-Commercial/, `${label}:${record.name}`);
+    } else {
+      assert.doesNotMatch(source, /LicenseRef-Heel-Commercial|LICENSE-COMMERCIAL/, `${label}:${record.name}`);
+    }
+    assert.doesNotMatch(source, /(?:\/\/[#@]|\/\*#)\s*sourceMappingURL=/i, `${label}:${record.name}`);
+    assertNoCredentials(source, `${label}:${record.name}`);
+  }
 }
 
 
@@ -141,6 +265,7 @@ function assertNoCredentials(source, label) {
     /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
     /\bxox[baprs]-[A-Za-z0-9-]{12,}\b/,
     /\bBearer\s+eyJ[A-Za-z0-9_-]{12,}\./,
+    /\b(?:api[_-]?key|secret|token)\s*[:=]\s*["'][A-Za-z0-9+/=_-]{24,}["']/i,
   ]) assert.doesNotMatch(source, credential, label);
 }
 
@@ -184,6 +309,140 @@ async function firstPartyBrowserSources() {
     worker: await readFile(paths[1], "utf8"),
   };
 }
+
+
+test("ships exactly the classified, digest-pinned Heel Agent downloads", async () => {
+  const names = (await readdir(downloadsRoot)).sort();
+  assert.deepEqual(names, expectedDownloadNames);
+
+  const manifestPayload = await readFile(join(downloadsRoot, agentManifestName));
+  const manifest = JSON.parse(decodeUtf8(manifestPayload, `downloads/${agentManifestName}`));
+  assert.deepEqual(Object.keys(manifest).sort(), ["artifacts", "schema_version", "version"]);
+  assert.equal(manifest.schema_version, "heel.open-core-artifacts.v1");
+  assert.equal(manifest.version, "1.1.0");
+  assert.deepEqual(manifest.artifacts.map(({ name }) => name).sort(), [agentWheelName, agentSourceName]);
+
+  const artifacts = new Map();
+  for (const expected of manifest.artifacts) {
+    assert.deepEqual(Object.keys(expected).sort(), ["name", "sha256", "size"]);
+    assert.match(expected.sha256, /^[0-9a-f]{64}$/);
+    assert.ok(Number.isSafeInteger(expected.size) && expected.size > 0 && expected.size <= maxReleaseArchiveBytes);
+    const payload = await readFile(join(downloadsRoot, expected.name));
+    assert.equal(payload.byteLength, expected.size, `${expected.name} size`);
+    assert.equal(sha256(payload), expected.sha256, `${expected.name} digest`);
+    artifacts.set(expected.name, payload);
+  }
+
+  const wheelRecords = [...zipMembers(artifacts.get(agentWheelName), "Heel Agent wheel")]
+    .map(([name, payload]) => ({ name, payload, type: "0" }));
+  classifyReleaseMembers(wheelRecords, { label: "Heel Agent wheel" });
+  const sourceRecords = tarMembers(artifacts.get(agentSourceName), "Heel Agent source archive");
+  classifyReleaseMembers(sourceRecords, {
+    label: "Heel Agent source archive",
+    rootPrefix: "heel_sim-1.1.0/",
+  });
+});
+
+
+test("release member classification rejects private paths and hostile archive shapes", () => {
+  const safeWheel = { name: "heel/model.py", payload: Buffer.from("VALUE = 1\n"), type: "0" };
+  const safeSource = {
+    name: "heel_sim-1.1.0/heel/model.py",
+    payload: Buffer.from("VALUE = 1\n"),
+    type: "0",
+  };
+  const mutations = [
+    {
+      label: "wheel commercial module",
+      records: [safeWheel, { ...safeWheel, name: "heel/saas/auth.py" }],
+      options: { label: "mutated wheel" },
+      message: /commercial boundary/,
+    },
+    {
+      label: "source private documentation",
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.1.0/docs/saas/PRODUCT.md" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.1.0/" },
+      message: /commercial boundary/,
+    },
+    {
+      label: "duplicate",
+      records: [safeWheel, { ...safeWheel }],
+      options: { label: "mutated wheel" },
+      message: /duplicated/,
+    },
+    {
+      label: "traversal",
+      records: [safeWheel, { ...safeWheel, name: "heel/../saas/auth.py" }],
+      options: { label: "mutated wheel" },
+      message: /traverses directories/,
+    },
+    {
+      label: "symlink",
+      records: [safeWheel, { ...safeWheel, name: "heel/link.py", type: "2" }],
+      options: { label: "mutated wheel" },
+      message: /not a regular file/,
+    },
+    {
+      label: "device",
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.1.0/heel/device.py", type: "3" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.1.0/" },
+      message: /not a regular file/,
+    },
+    {
+      label: "credential",
+      records: [{ ...safeWheel, payload: Buffer.from("TOKEN = 'ghp_12345678901234567890'\n") }],
+      options: { label: "mutated wheel" },
+      message: /mutated wheel/,
+    },
+    {
+      label: "source map directive",
+      records: [{ ...safeWheel, payload: Buffer.from("//# sourceMappingURL=private.map\n") }],
+      options: { label: "mutated wheel" },
+      message: /mutated wheel/,
+    },
+    {
+      label: "unexpected extension",
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.1.0/private.pem" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.1.0/" },
+      message: /unexpected extension/,
+    },
+  ];
+  for (const mutation of mutations) {
+    assert.throws(
+      () => classifyReleaseMembers(mutation.records, mutation.options),
+      mutation.message,
+      mutation.label,
+    );
+  }
+});
+
+
+test("runtime preparation validates committed downloads without rewriting them", async (context) => {
+  const sourceRoot = join(appRoot, "public/downloads");
+  const validRoot = await mkdtemp(join(appRoot, ".heel-valid-downloads-"));
+  const unexpectedRoot = await mkdtemp(join(appRoot, ".heel-unexpected-downloads-"));
+  const corruptRoot = await mkdtemp(join(appRoot, ".heel-corrupt-downloads-"));
+  const symlinkRoot = await mkdtemp(join(appRoot, ".heel-symlink-downloads-"));
+  context.after(async () => {
+    await Promise.all([validRoot, unexpectedRoot, corruptRoot, symlinkRoot].map((root) => rm(root, { recursive: true, force: true })));
+  });
+  await Promise.all([validRoot, unexpectedRoot, corruptRoot, symlinkRoot].map((root) => cp(sourceRoot, root, { recursive: true })));
+
+  const before = await Promise.all(expectedDownloadNames.map((name) => readFile(join(validRoot, name))));
+  await validateReleaseDownloads(validRoot);
+  const after = await Promise.all(expectedDownloadNames.map((name) => readFile(join(validRoot, name))));
+  assert.deepEqual(after, before, "download validation rewrote committed release bytes");
+
+  await writeFile(join(unexpectedRoot, "private.pem"), "not a release artifact\n");
+  await assert.rejects(validateReleaseDownloads(unexpectedRoot), /unexpected release download/);
+
+  await writeFile(join(corruptRoot, agentWheelName), "corrupt\n");
+  await assert.rejects(validateReleaseDownloads(corruptRoot), /size mismatch|digest mismatch/);
+
+  await rm(join(symlinkRoot, agentSourceName));
+  await symlink(join(sourceRoot, agentSourceName), join(symlinkRoot, agentSourceName));
+  await assert.rejects(validateReleaseDownloads(symlinkRoot), /symbolic link/);
+});
 
 
 test("ships the transformed integrity-pinned wheel and Pyodide runtime behind same-origin paths", async () => {
