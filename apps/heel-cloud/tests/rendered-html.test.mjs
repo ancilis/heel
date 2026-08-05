@@ -3,14 +3,14 @@
 import assert from "node:assert/strict";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { extname, join } from "node:path";
+import { extname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 const appRoot = new URL("../", import.meta.url);
 const commercialHeader = "SPDX-License-Identifier: LicenseRef-Heel-Commercial";
 const sourceExtensions = new Set([".css", ".js", ".jsx", ".mjs", ".ts", ".tsx"]);
-const ignoredSourceDirectories = new Set([
+const ignoredRootDirectories = new Set([
   ".next",
   ".vinext",
   ".wrangler",
@@ -26,18 +26,18 @@ async function assertMissing(relativePath) {
   await assert.rejects(access(new URL(relativePath, appRoot)));
 }
 
-async function sourceFiles(directoryUrl) {
+async function sourceFiles(directoryUrl, rootUrl = directoryUrl) {
   const entries = await readdir(directoryUrl, { withFileTypes: true });
   const files = [];
 
   for (const entry of entries) {
-    if (ignoredSourceDirectories.has(entry.name)) {
+    if (directoryUrl.href === rootUrl.href && ignoredRootDirectories.has(entry.name)) {
       continue;
     }
 
     const entryUrl = new URL(`${entry.name}${entry.isDirectory() ? "/" : ""}`, directoryUrl);
     if (entry.isDirectory()) {
-      files.push(...(await sourceFiles(entryUrl)));
+      files.push(...(await sourceFiles(entryUrl, rootUrl)));
     } else if (sourceExtensions.has(extname(entry.name))) {
       files.push(entryUrl);
     }
@@ -133,28 +133,34 @@ test("lints tracked build source and ignores compiler state", async () => {
   assert.match(gitignore, /^\*\.tsbuildinfo$/m);
 });
 
-test("commercial source discovery skips every generated output tree", async () => {
+test("commercial source discovery skips generated roots but checks nested namesakes", async () => {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "heel-source-boundary-"));
 
   try {
     await writeFile(join(fixtureRoot, "tracked.ts"), commercialHeader, "utf8");
-    for (const directory of [
-      ".next",
-      ".vinext",
-      ".wrangler",
-      "coverage",
-      "dist",
-      "node_modules",
-      "out",
-      "outputs",
-      "work",
-    ]) {
+    const generatedDirectories = [...ignoredRootDirectories];
+    const nestedSources = generatedDirectories.map((directory) => `app/${directory}/source.ts`);
+
+    for (const directory of generatedDirectories) {
       await mkdir(join(fixtureRoot, directory), { recursive: true });
       await writeFile(join(fixtureRoot, directory, "generated.ts"), "generated", "utf8");
+      await mkdir(join(fixtureRoot, "app", directory), { recursive: true });
+      await writeFile(join(fixtureRoot, "app", directory, "source.ts"), "unlicensed", "utf8");
     }
 
     const files = await sourceFiles(pathToFileURL(`${fixtureRoot}/`));
-    assert.deepEqual(files.map((file) => file.pathname.split("/").at(-1)), ["tracked.ts"]);
+    const relativeFiles = files
+      .map((file) => relative(fixtureRoot, fileURLToPath(file)).replaceAll("\\", "/"))
+      .sort();
+    assert.deepEqual(relativeFiles, [...nestedSources, "tracked.ts"].sort());
+
+    const unlicensedFiles = [];
+    for (const file of files) {
+      if (!(await readFile(file, "utf8")).includes(commercialHeader)) {
+        unlicensedFiles.push(relative(fixtureRoot, fileURLToPath(file)).replaceAll("\\", "/"));
+      }
+    }
+    assert.deepEqual(unlicensedFiles.sort(), nestedSources.sort());
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true });
   }
