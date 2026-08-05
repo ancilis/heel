@@ -39,6 +39,7 @@ export function OpenApiInput({
   const inputRef = useRef<HTMLInputElement>(null);
   const mountedRef = useRef(true);
   const readEpochRef = useRef(0);
+  const previousSourceRef = useRef(source);
   const [acknowledged, setAcknowledged] = useState(false);
   const [selectedFile, setSelectedFile] = useState("");
   const bytes = new TextEncoder().encode(source).byteLength;
@@ -50,6 +51,13 @@ export function OpenApiInput({
       readEpochRef.current += 1;
     };
   }, []);
+
+  useEffect(() => {
+    if (source !== previousSourceRef.current) {
+      previousSourceRef.current = source;
+      readEpochRef.current += 1;
+    }
+  }, [source]);
 
   async function acceptFile(file: File | undefined): Promise<void> {
     const readEpoch = ++readEpochRef.current;
@@ -68,6 +76,7 @@ export function OpenApiInput({
       const contents = await readFileBytes(file);
       if (!mountedRef.current || readEpoch !== readEpochRef.current) return;
       const decoded = new TextDecoder("utf-8", { fatal: true }).decode(contents);
+      previousSourceRef.current = decoded;
       onSourceChange(decoded);
       setAcknowledged(false);
       setSelectedFile(`${file.name} · ${file.size.toLocaleString("en-US")} bytes`);
@@ -124,6 +133,8 @@ export function OpenApiInput({
         id="openapi-source"
         value={source}
         onChange={(event) => {
+          readEpochRef.current += 1;
+          previousSourceRef.current = event.target.value;
           onSourceChange(event.target.value);
           setAcknowledged(false);
           setSelectedFile("");

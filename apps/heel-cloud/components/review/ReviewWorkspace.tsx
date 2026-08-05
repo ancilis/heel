@@ -371,6 +371,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
     try {
       const store = storeRef.current;
       if (store === null || !await store.delete(reviewId)) throw new Error("local delete was unavailable");
+      setStorageNotice((current) => current?.reviewId === reviewId ? null : current);
       await refreshHistory(visibleReviewId);
     } catch {
       setStorageNotice({
@@ -386,6 +387,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
     try {
       const store = storeRef.current;
       if (store === null || !await store.clear()) throw new Error("local clear was unavailable");
+      setStorageNotice(null);
       await refreshHistory(reviewId);
     } catch {
       setStorageNotice({

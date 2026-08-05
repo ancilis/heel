@@ -298,6 +298,52 @@ describe("Heel anonymous launch review", () => {
     expect(onError).not.toHaveBeenCalled();
   });
 
+  test("typing invalidates an older asynchronous file read", async () => {
+    const read = deferred<ArrayBuffer>();
+    const onSourceChange = vi.fn();
+    render(
+      <OpenApiInput
+        source=""
+        disabled={false}
+        onSourceChange={onSourceChange}
+        onError={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+    const file = { name: "older.json", size: 5, arrayBuffer: () => read.promise } as File;
+    fireEvent.drop(screen.getByRole("button", { name: /drop openapi json/i }), {
+      dataTransfer: { files: [file] },
+    });
+    fireEvent.change(screen.getByLabelText(/paste openapi json/i), { target: { value: "newer typed source" } });
+    expect(onSourceChange).toHaveBeenCalledTimes(1);
+    expect(onSourceChange).toHaveBeenLastCalledWith("newer typed source");
+
+    await act(async () => read.resolve(new TextEncoder().encode("older").buffer));
+    expect(onSourceChange).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("status", { name: /selected file/i })).toBeNull();
+  });
+
+  test("a same-mount source reset invalidates an older asynchronous file read", async () => {
+    const read = deferred<ArrayBuffer>();
+    const onSourceChange = vi.fn();
+    const props = {
+      disabled: false,
+      onSourceChange,
+      onError: vi.fn(),
+      onSubmit: vi.fn(),
+    };
+    const view = render(<OpenApiInput {...props} source="before reset" />);
+    const file = { name: "older.json", size: 5, arrayBuffer: () => read.promise } as File;
+    fireEvent.drop(screen.getByRole("button", { name: /drop openapi json/i }), {
+      dataTransfer: { files: [file] },
+    });
+    view.rerender(<OpenApiInput {...props} source="reset by parent" />);
+
+    await act(async () => read.resolve(new TextEncoder().encode("older").buffer));
+    expect(onSourceChange).not.toHaveBeenCalled();
+    expect(screen.queryByRole("status", { name: /selected file/i })).toBeNull();
+  });
+
   test("rejects non-JSON names and reports exact oversized file identity before decoding", async () => {
     render(<Home />);
     fireEvent.click(screen.getByRole("button", { name: /analyze mine/i }));
@@ -535,6 +581,32 @@ describe("Heel anonymous launch review", () => {
     save.mockRejectedValueOnce(new Error("quota wrapper failure"));
     fireEvent.click(screen.getByRole("button", { name: /save result on this device/i }));
     expect(await screen.findByText(/local storage is unavailable/i)).toBeTruthy();
+  });
+
+  test("clears the visible review save confirmation after deleting that saved review", async () => {
+    list.mockResolvedValue([{
+      schema_version: "heel.local-review.v1",
+      envelope: sampleReview,
+      saved_at: 1_700_000_000_000,
+      sync_state: "local_only",
+    }]);
+    render(<Home />);
+    fireEvent.click(screen.getByRole("button", { name: /save result on this device/i }));
+    expect(await screen.findByText(/validated result saved on this device only/i)).toBeTruthy();
+
+    fireEvent.click(await screen.findByRole("button", { name: /delete northstar-workspace-api/i }));
+    await waitFor(() => expect(remove).toHaveBeenCalledWith(sampleReview.review_id));
+    expect(screen.queryByText(/validated result saved on this device only/i)).toBeNull();
+  });
+
+  test("clears the visible review save confirmation after clearing local history", async () => {
+    render(<Home />);
+    fireEvent.click(screen.getByRole("button", { name: /save result on this device/i }));
+    expect(await screen.findByText(/validated result saved on this device only/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /clear local history/i }));
+    await waitFor(() => expect(clear).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/validated result saved on this device only/i)).toBeNull();
   });
 
   test("bounds large review collections and progressively reveals each collection", () => {
