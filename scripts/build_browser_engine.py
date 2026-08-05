@@ -45,12 +45,87 @@ ALLOWED_STDLIB_IMPORTS = frozenset({
     "re",
     "typing",
 })
-FORBIDDEN_DYNAMIC_CALLS = frozenset({"__import__", "compile", "eval", "exec", "open"})
-FORBIDDEN_DYNAMIC_NAMESPACES = frozenset({"__builtins__", "builtins", "importlib"})
+# This is a trusted-source capability policy for the reviewed browser closure,
+# not a malware sandbox for arbitrary Python or precompiled bytecode.
+FORBIDDEN_DYNAMIC_NAMES = frozenset({
+    "__builtins__",
+    "__import__",
+    "builtins",
+    "compile",
+    "delattr",
+    "eval",
+    "exec",
+    "getattr",
+    "globals",
+    "importlib",
+    "locals",
+    "open",
+    "setattr",
+    "vars",
+})
+FORBIDDEN_DYNAMIC_ATTRIBUTES = frozenset({
+    "__base__",
+    "__bases__",
+    "__builtins__",
+    "__class__",
+    "__closure__",
+    "__code__",
+    "__dict__",
+    "__func__",
+    "__getattr__",
+    "__getattribute__",
+    "__globals__",
+    "__import__",
+    "__loader__",
+    "__mro__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__spec__",
+    "__subclasses__",
+    "compile",
+    "delattr",
+    "eval",
+    "exec",
+    "getattr",
+    "globals",
+    "locals",
+    "open",
+    "setattr",
+    "vars",
+})
 
 
 class BrowserEngineBuildError(RuntimeError):
     pass
+
+
+def _static_string(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _static_string(node.left)
+        right = _static_string(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _forbidden_dynamic_primitive(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name) and node.id in FORBIDDEN_DYNAMIC_NAMES:
+        return node.id
+    if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_DYNAMIC_ATTRIBUTES:
+        if (
+            node.attr == "compile"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "re"
+        ):
+            return None
+        return node.attr
+    if isinstance(node, ast.Subscript):
+        key = _static_string(node.slice)
+        if key in FORBIDDEN_DYNAMIC_ATTRIBUTES:
+            return key
+    return None
 
 
 def _assert_no_symlink_components(
@@ -126,17 +201,10 @@ def _prove_import_closure() -> None:
             raise BrowserEngineBuildError(f"browser module cannot be parsed: {relative_path}") from error
         observed.add(module)
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id in FORBIDDEN_DYNAMIC_CALLS
-            ):
+            forbidden = _forbidden_dynamic_primitive(node)
+            if forbidden is not None:
                 raise BrowserEngineBuildError(
-                    f"browser module uses forbidden dynamic primitive: {node.func.id}"
-                )
-            if isinstance(node, ast.Name) and node.id in FORBIDDEN_DYNAMIC_NAMESPACES:
-                raise BrowserEngineBuildError(
-                    f"browser module uses forbidden dynamic primitive: {node.id}"
+                    f"browser module uses forbidden dynamic primitive: {forbidden}"
                 )
             if isinstance(node, ast.Import):
                 imported = {alias.name.split(".", 1)[0] for alias in node.names}

@@ -186,12 +186,39 @@ class BrowserEngineBuildTests(unittest.TestCase):
             "builtins bypass": "builtins.__import__('socket')",
             "importlib bypass": "importlib.import_module('socket')",
             "builtins mapping bypass": "__builtins__['__import__']('socket')",
+            "Fable globals bypass": (
+                "globals()['__builtins__']['__import__']('socket')"
+            ),
+            "Fable lambda globals bypass": (
+                "(lambda: None).__globals__['__builtins__']['eval']('1 + 1')"
+            ),
+            "getattr builtins bypass": (
+                "getattr(__builtins__, '__import__')('socket')"
+            ),
+            "function globals bypass": (
+                "def heel_escape():\n"
+                "    return None\n"
+                "heel_escape.__globals__['__builtins__']['open']('/tmp/escape', 'w')"
+            ),
+            "class subclasses bypass": "().__class__.__base__.__subclasses__()",
+            "reconstructed mapping keys": (
+                "globals()['__built' + 'ins__']['__im' + 'port__']('socket')"
+            ),
+            "locals bypass": "locals()['__builtins__']['eval']('1 + 1')",
+            "vars bypass": "vars(__builtins__)['exec']('value = 1')",
+            "setattr reflection": "setattr(object(), 'escape', 1)",
+            "delattr reflection": "delattr(object(), 'escape')",
         }
         for label, mutation in mutations.items():
             with self.subTest(label=label):
                 completed = self._run_builder_with_browser_review_mutation(mutation)
                 self.assertNotEqual(completed.returncode, 0, mutation)
                 self.assertIn("forbidden dynamic primitive", completed.stderr)
+
+        legitimate_compile = self._run_builder_with_browser_review_mutation(
+            "import re\nre.compile('heel')"
+        )
+        self.assertEqual(legitimate_compile.returncode, 0, legitimate_compile.stderr)
 
     def test_builder_produces_only_the_proven_browser_closure_and_metadata(self):
         wheel, _manifest = self._require_build()
