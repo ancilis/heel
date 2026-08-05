@@ -8,7 +8,7 @@
 
 **Launch decisions:**
 
-- `surface_ref` and `source.result_hash` are client-asserted opaque provenance. Heel validates their format and internal canonical consistency but makes no server-attestation claim.
+- `surface_ref` and `source.result_ref` are client-asserted, project-pseudonymous provenance. `source.result_ref` is a project-keyed HMAC of the local review `result_hash`; the raw result hash never crosses the local boundary or enables cross-project correlation. Heel validates their format and internal canonical consistency but makes no server-attestation claim.
 - Browser traffic reaches the Python control plane through a same-origin BFF/proxy with request-body logging disabled. Customer review storage does not move into the Cloudflare worker.
 - Web sessions may approve through an explicit dialog. Machine sync requires device authentication plus an interactive CLI approval. API keys and MCP can prepare/read but cannot approve.
 - Each project receives one immutable 32-byte namespace key for launch. A compromised namespace requires an explicit destructive namespace reset or new project; silent rotation is forbidden because it would break finding identity continuity.
@@ -39,7 +39,7 @@
 - [ ] Implement strict receipt parsing for `heel.findings-sync-receipt.v1`.
 - [ ] Commit Python golden fixtures for the approved one-finding and pass cases.
 - [ ] Add the module to both public build allowlists and rebuild/check the browser and open-core artifacts.
-- [ ] Gate: equivalent browser/machine findings have the same projection hash and IDs but preserve distinct source result hashes; a different project key changes all pseudonyms.
+- [ ] Gate: equivalent browser/machine findings have the same projection hash and IDs but preserve distinct project-pseudonymous source result references; a different project key changes all pseudonyms.
 
 ## Task 2: Add independent browser validation and projection preview
 
@@ -75,7 +75,7 @@
 - [ ] Provision one immutable per-project namespace key and return it only to authorized project clients. Never log or accept it in sync payloads.
 - [ ] Add `SYNCED_REVIEWS` quotas: Hosted Free 3/month, Pro 25/month, Team 100/month. Add `sync_findings` and `view_synced_reviews` capabilities with the approved role matrix.
 - [ ] Refactor ledger reservation so projection, findings, provenance, quota, receipt, and audit commit or roll back in one database transaction. Check the operational kill switch before admission.
-- [ ] Enforce uniqueness for source result hashes, projection hashes, finding IDs, and idempotency digests inside `(workspace, project)`.
+- [ ] Enforce uniqueness for project-pseudonymous source result references, projection hashes, finding IDs, and idempotency digests inside `(workspace, project)`.
 - [ ] Gate: exact retry returns the byte-equivalent receipt and charges once; same source/different projection returns 409; same projection/different source reuses the synced review and finding rows, creates one provenance event, and consumes no second projection quota.
 
 ## Task 4: Expose the authenticated same-origin API
@@ -136,7 +136,7 @@
 
 - [ ] Run Python unit, adversarial, migration, tenant, replay/race, quota rollback, retention/deletion, CLI, MCP, open-core artifact, and browser-engine artifact suites.
 - [ ] Run web unit, privacy/network-spy, typecheck, lint, production build, and production-artifact suites.
-- [ ] Run a clean end-to-end scenario in which browser and machine reviews of equivalent substantive input retain distinct source result hashes but converge on the same server `synced_review_id`, projection hash, and finding IDs.
+- [ ] Run a clean end-to-end scenario in which browser and machine reviews of equivalent substantive input retain distinct project-pseudonymous source result references but converge on the same server `synced_review_id`, projection hash, and finding IDs.
 - [ ] Inspect HTTP bodies, offline queues, database rows, audit events, application logs, and analytics to prove only the approved projection/provenance fields crossed the boundary.
 - [ ] Independently review tenant isolation, consent authority, claims language, and raw-data absence.
 - [ ] Stop this phase only when the same authorized project/history is visible from the App and Agent and all boundaries fail closed. Billing-provider integration, general marketing, and public launch deployment remain separate launch tasks.
