@@ -24,9 +24,9 @@ export default function Home() {
         <p className="eyebrow">Agent-first when you want it</p>
         <h2 id="mcp-title">The same review from your local AI surface.</h2>
         <p>
-          The <code>heel-sim</code> source checkout includes the <code>heel-mcp</code>
-          executable for an agent-controlled local stdio workflow. It is not currently
-          published to a package registry. <a href="/mcp">
+          The first-party Apache-2.0 <code>heel-sim</code> download includes the
+          {" "}<code>heel-mcp</code> executable for an agent-controlled local stdio workflow.
+          No account or package registry is required. <a href="/mcp">
             Open local MCP setup
           </a>.
         </p>

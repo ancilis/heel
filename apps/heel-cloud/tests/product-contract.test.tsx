@@ -2,6 +2,8 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import sampleOpenApi from "../data/sample-openapi.json";
@@ -177,22 +179,48 @@ describe("Heel anonymous launch review", () => {
     expect(screen.getByText("Saved local review")).toBeTruthy();
   });
 
-  test("links the truthful source-checkout MCP setup and executable", () => {
+  test("links the truthful first-party MCP download and executable", () => {
     render(<Home />);
     const setup = screen.getByRole("link", { name: /open local mcp setup/i });
     expect(setup.getAttribute("href")).toBe("/mcp");
     const section = screen.getByRole("heading", { name: /same review from your local ai surface/i }).closest("section");
     expect(section?.textContent).toContain("heel-sim");
     expect(section?.textContent).toContain("heel-mcp");
-    expect(section?.textContent).toMatch(/source checkout/i);
-    expect(section?.textContent).not.toMatch(/pip install|pypi/i);
+    expect(section?.textContent).toMatch(/first-party apache-2\.0/i);
+    expect(section?.textContent).toMatch(/no account or package registry is required/i);
+  });
+
+  test("offers the verified Agent artifacts and exact local install command", () => {
+    render(<McpQuickstart />);
+
+    const wheel = screen.getByRole("link", { name: "Download Heel Agent 1.1.0" });
+    expect(wheel.getAttribute("href")).toBe("/downloads/heel_sim-1.1.0-py3-none-any.whl");
+    expect(wheel.hasAttribute("download")).toBe(true);
+    const source = screen.getByRole("link", { name: /download source archive/i });
+    expect(source.getAttribute("href")).toBe("/downloads/heel_sim-1.1.0.tar.gz");
+    expect(source.hasAttribute("download")).toBe(true);
+
+    const manifest = JSON.parse(readFileSync(
+      resolve(process.cwd(), "public/downloads/heel-open-core-manifest.json"),
+      "utf8",
+    )) as { artifacts: Array<{ name: string; sha256: string }> };
+    const wheelArtifact = manifest.artifacts.find((artifact) => artifact.name.endsWith(".whl"));
+    expect(wheelArtifact).toBeTruthy();
+    expect(document.body.textContent).toContain(wheelArtifact?.sha256);
+    expect(document.body.textContent).toContain("python3 -m venv .venv");
+    expect(document.body.textContent).toContain(
+      ".venv/bin/python -m pip install ./heel_sim-1.1.0-py3-none-any.whl",
+    );
+    expect(document.body.textContent).not.toMatch(
+      /not yet available as a public download|licensed source checkout|public main branch/i,
+    );
   });
 
   test("states the MCP release, platform, privacy, and execution boundaries", () => {
     render(<McpQuickstart />);
 
     expect(screen.getByText(/base mcp core is apache-2\.0 licensed and free/i)).toBeTruthy();
-    expect(screen.getByText(/not yet available as a public download/i)).toBeTruthy();
+    expect(screen.getByText(/pypi publication is not yet available/i)).toBeTruthy();
     expect(screen.getByText(/python 3\.11 or newer/i)).toBeTruthy();
     expect(screen.getByText(/posix filesystem/i)).toBeTruthy();
     expect(screen.getByText(/windows is not currently supported/i)).toBeTruthy();

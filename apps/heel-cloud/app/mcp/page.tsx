@@ -4,14 +4,15 @@ import type { Metadata } from "next";
 import Link from "next/link";
 
 
-const INSTALL_FROM_SOURCE = `cd /absolute/path/to/heel
-python3 -m venv .venv
-.venv/bin/python -m pip install .`;
+const WHEEL_SHA256 = "1b2c6bad7d7464e6e63bb0e336e434716a9630267e314b1a9c44e120d959f018";
+
+const INSTALL_AGENT = `python3 -m venv .venv
+.venv/bin/python -m pip install ./heel_sim-1.1.0-py3-none-any.whl`;
 
 const MCP_CONFIGURATION = `{
   "mcpServers": {
     "heel": {
-      "command": "/absolute/path/to/heel/.venv/bin/heel-mcp",
+      "command": "/absolute/path/to/download-folder/.venv/bin/heel-mcp",
       "env": {
         "HEEL_HOME": "/absolute/path/to/private/heel-data"
       }
@@ -23,12 +24,12 @@ const VERIFY_SERVER = `printf '%s\\n' \\
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"heel-quickstart-check","version":"1.0"}}}' \\
   '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \\
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \\
-  | /absolute/path/to/heel/.venv/bin/heel-mcp`;
+  | .venv/bin/heel-mcp`;
 
 
 export const metadata: Metadata = {
   title: "Local MCP setup — Heel",
-  description: "Connect Heel's local stdio MCP server to an AI client from an official release source package.",
+  description: "Download Heel Agent and connect its local stdio MCP server to an AI client.",
 };
 
 
@@ -49,11 +50,11 @@ export default function McpQuickstart() {
       <article className="mcp-quickstart">
         <header className="quickstart-hero">
           <div>
-            <p className="eyebrow">MCP quickstart · release source package</p>
+            <p className="eyebrow">Heel Agent 1.1.0 · local MCP quickstart</p>
             <h1>Run Heel from your AI client.</h1>
             <p>
-              Install the <code>heel-sim</code> distribution from the official release source package,
-              then point any stdio-capable MCP client at the <code>heel-mcp</code> executable.
+              Download the verified <code>heel-sim</code> wheel, then point any stdio-capable
+              MCP client at the installed <code>heel-mcp</code> executable.
             </p>
           </div>
           <Link className="button button-secondary" href="/">Back to browser review</Link>
@@ -73,19 +74,37 @@ export default function McpQuickstart() {
         <section className="quickstart-steps" aria-label="Local MCP setup steps">
           <article className="quickstart-card">
             <p className="step-number">01 · Install</p>
-            <h2>Install from the release source</h2>
+            <h2>Download and install Heel Agent</h2>
             <p>
-              Heel&apos;s base MCP core is Apache-2.0 licensed and free to run locally. The current
-              MCP release source package is not yet available as a public download. Do not use the
-              public main branch as a substitute; run these commands only after obtaining and extracting
-              the official release package.
+              Heel&apos;s base MCP core is Apache-2.0 licensed and free to run locally. Download the
+              exact first-party wheel below; the source archive is provided alongside it for inspection.
+            </p>
+            <div className="hero-actions" aria-label="Heel Agent downloads">
+              <a
+                className="button button-primary"
+                download
+                href="/downloads/heel_sim-1.1.0-py3-none-any.whl"
+              >
+                Download Heel Agent 1.1.0
+              </a>
+              <a
+                className="button button-secondary"
+                download
+                href="/downloads/heel_sim-1.1.0.tar.gz"
+              >
+                Download source archive
+              </a>
+              <a href="/downloads/heel-open-core-manifest.json">View artifact manifest</a>
+            </div>
+            <p className="quickstart-note">
+              Wheel SHA-256: <code>{WHEEL_SHA256}</code>
             </p>
             <p>
-              <code>heel-sim</code> is not published to PyPI. Python 3.11 or newer is required.
+              PyPI publication is not yet available. Python 3.11 or newer is required.
               Secure project storage requires a POSIX filesystem with descriptor-relative operations
               and no-follow support. Windows is not currently supported for MCP local project storage.
             </p>
-            <pre><code>{INSTALL_FROM_SOURCE}</code></pre>
+            <pre><code>{INSTALL_AGENT}</code></pre>
           </article>
 
           <article className="quickstart-card">

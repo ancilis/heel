@@ -154,10 +154,10 @@ test("ships server-renderable evidence, local interaction semantics, and accessi
   assert.match(page, /href="\/mcp"/);
   assert.match(mcpPage, /heel-sim/);
   assert.match(mcpPage, /\.venv\/bin\/python -m pip install \./);
-  assert.match(mcpPage, /\/absolute\/path\/to\/heel\/\.venv\/bin\/heel-mcp/);
+  assert.match(mcpPage, /\/absolute\/path\/to\/download-folder\/\.venv\/bin\/heel-mcp/);
   assert.match(mcpPage, /mcpServers/);
   assert.match(mcpPage, /HEEL_HOME/);
-  assert.match(mcpPage, /not published to PyPI/i);
+  assert.match(mcpPage, /PyPI publication is not yet available/i);
   assert.match(mcpPage, /credentials or customer data/i);
   assert.match(mcpPage, /AI client is separate/i);
   assert.doesNotMatch(mcpPage, /python3 -m pip install heel-sim/);

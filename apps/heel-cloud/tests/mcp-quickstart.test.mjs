@@ -10,33 +10,60 @@ import test from "node:test";
 
 const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const pageUrl = new URL("../app/mcp/page.tsx", import.meta.url);
+const shellQuote = (value) => `'${value.replaceAll("'", `'"'"'`)}'`;
 
 
-test("the displayed MCP verification performs a real handshake against current Heel", async () => {
+test("the displayed install and verification perform a real handshake against the release wheel", async () => {
   const source = await readFile(pageUrl, "utf8");
-  const match = source.match(/const VERIFY_SERVER = `([\s\S]*?)`;/);
-  assert.ok(match, "MCP page must expose the exact verification command");
-  const displayedCommand = match[1].replaceAll("\\\\", "\\");
-  const executable = "/absolute/path/to/heel/.venv/bin/heel-mcp";
-  assert.match(displayedCommand, new RegExp(executable.replaceAll("/", "\\/")));
-  const currentCommand = displayedCommand.replace(executable, "python3 -m heel.mcp_server");
-  const heelHome = await mkdtemp(join(await realpath(repoRoot), ".heel-mcp-quickstart-"));
+  const installMatch = source.match(/const INSTALL_AGENT = `([\s\S]*?)`;/);
+  const verifyMatch = source.match(/const VERIFY_SERVER = `([\s\S]*?)`;/);
+  assert.ok(installMatch, "MCP page must expose the exact Agent install command");
+  assert.ok(verifyMatch, "MCP page must expose the exact verification command");
+  const displayedInstall = installMatch[1].replaceAll("\\\\", "\\");
+  const displayedVerify = verifyMatch[1].replaceAll("\\\\", "\\");
+  assert.equal(
+    displayedInstall,
+    "python3 -m venv .venv\n.venv/bin/python -m pip install ./heel_sim-1.1.0-py3-none-any.whl",
+  );
+  assert.match(displayedVerify, /\| \.venv\/bin\/heel-mcp$/);
+  const wheel = join(repoRoot, "apps/heel-cloud/public/downloads/heel_sim-1.1.0-py3-none-any.whl");
+  const workingDirectory = await mkdtemp(join(await realpath(repoRoot), ".heel-mcp-quickstart-"));
+  const currentInstall = displayedInstall.replace(
+    "./heel_sim-1.1.0-py3-none-any.whl",
+    shellQuote(wheel),
+  );
 
   try {
-    const result = spawnSync("/bin/sh", ["-c", currentCommand], {
-      cwd: repoRoot,
+    const environment = {
+      ...process.env,
+      HEEL_HOME: join(workingDirectory, "heel-home"),
+      PIP_CONFIG_FILE: "/dev/null",
+      PIP_DISABLE_PIP_VERSION_CHECK: "1",
+      PIP_NO_INDEX: "1",
+      PIP_NO_CACHE_DIR: "1",
+      PYTHONNOUSERSITE: "1",
+    };
+    delete environment.PYTHONPATH;
+    const install = spawnSync("/bin/sh", ["-c", currentInstall], {
+      cwd: workingDirectory,
       encoding: "utf8",
-      env: { ...process.env, HEEL_HOME: heelHome },
+      env: environment,
     });
-    assert.equal(result.status, 0, result.stderr || result.stdout);
-    const responses = result.stdout.trim().split("\n").map((line) => JSON.parse(line));
-    assert.equal(responses.length, 2, result.stdout);
+    assert.equal(install.status, 0, install.stderr || install.stdout);
+    const verification = spawnSync("/bin/sh", ["-c", displayedVerify], {
+      cwd: workingDirectory,
+      encoding: "utf8",
+      env: environment,
+    });
+    assert.equal(verification.status, 0, verification.stderr || verification.stdout);
+    const responses = verification.stdout.trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(responses.length, 2, verification.stdout);
     assert.equal(responses[0]?.result?.serverInfo?.name, "heel");
     assert.ok(
       responses[1]?.result?.tools?.some((tool) => tool.name === "heel_review_openapi"),
-      result.stdout,
+      verification.stdout,
     );
   } finally {
-    await rm(heelHome, { recursive: true, force: true });
+    await rm(workingDirectory, { recursive: true, force: true });
   }
 });
