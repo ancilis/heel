@@ -45,6 +45,8 @@ ALLOWED_STDLIB_IMPORTS = frozenset({
     "re",
     "typing",
 })
+FORBIDDEN_DYNAMIC_CALLS = frozenset({"__import__", "compile", "eval", "exec", "open"})
+FORBIDDEN_DYNAMIC_NAMESPACES = frozenset({"__builtins__", "builtins", "importlib"})
 
 
 class BrowserEngineBuildError(RuntimeError):
@@ -97,6 +99,18 @@ def _prove_import_closure() -> None:
             raise BrowserEngineBuildError(f"browser module cannot be parsed: {relative_path}") from error
         observed.add(module)
         for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in FORBIDDEN_DYNAMIC_CALLS
+            ):
+                raise BrowserEngineBuildError(
+                    f"browser module uses forbidden dynamic primitive: {node.func.id}"
+                )
+            if isinstance(node, ast.Name) and node.id in FORBIDDEN_DYNAMIC_NAMESPACES:
+                raise BrowserEngineBuildError(
+                    f"browser module uses forbidden dynamic primitive: {node.id}"
+                )
             if isinstance(node, ast.Import):
                 imported = {alias.name.split(".", 1)[0] for alias in node.names}
                 unexpected = imported - ALLOWED_STDLIB_IMPORTS

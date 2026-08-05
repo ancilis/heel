@@ -102,6 +102,34 @@ class BrowserEngineBuildTests(unittest.TestCase):
         self.assertTrue(manifest.is_file(), "builder did not produce the engine manifest")
         return wheel, manifest
 
+    def _run_builder_with_browser_review_mutation(self, mutation: str) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            fixture_builder = fixture / "scripts" / BUILDER.name
+            fixture_builder.parent.mkdir()
+            shutil.copy2(BUILDER, fixture_builder)
+            for relative_path in (*MODULE_PATHS, "LICENSE", "NOTICE"):
+                destination = fixture / relative_path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative_path, destination)
+            browser_review = fixture / "heel/browser_review.py"
+            browser_review.write_text(
+                browser_review.read_text(encoding="utf-8") + f"\n{mutation}\n",
+                encoding="utf-8",
+            )
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(fixture_builder),
+                    "--output",
+                    str(fixture / "output"),
+                ],
+                cwd=fixture,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+
     def test_actual_local_import_closure_is_the_exact_wheel_module_allowlist(self):
         closure = (
             _local_import_closure("__init__")
@@ -147,6 +175,23 @@ class BrowserEngineBuildTests(unittest.TestCase):
 
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("unreviewed dependency: os", completed.stderr)
+
+    def test_dynamic_import_evaluation_and_native_io_primitives_are_rejected(self):
+        mutations = {
+            "dynamic import": "__import__('socket')",
+            "eval": "eval('1 + 1')",
+            "exec": "exec('value = 1')",
+            "compile": "compile('1 + 1', '<browser>', 'eval')",
+            "open": "open('/tmp/heel-browser-policy', 'w')",
+            "builtins bypass": "builtins.__import__('socket')",
+            "importlib bypass": "importlib.import_module('socket')",
+            "builtins mapping bypass": "__builtins__['__import__']('socket')",
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                completed = self._run_builder_with_browser_review_mutation(mutation)
+                self.assertNotEqual(completed.returncode, 0, mutation)
+                self.assertIn("forbidden dynamic primitive", completed.stderr)
 
     def test_builder_produces_only_the_proven_browser_closure_and_metadata(self):
         wheel, _manifest = self._require_build()
