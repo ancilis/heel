@@ -772,6 +772,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
                 allow_nan=False,
             ) + "\n",
         )
+
         self.assertEqual(
             set(contract),
             {
@@ -841,6 +842,19 @@ class OpenCoreReleaseTests(unittest.TestCase):
             (ROOT / "MANIFEST.in").read_text(encoding="utf-8"),
             EXPECTED_MANIFEST,
         )
+
+    def test_checked_in_runner_identity_artifact_matches_public_source_api(self):
+        """The downloadable wheel and sdist must not lag pairing/signer source."""
+        downloads = ROOT / "apps" / "heel-cloud" / "public" / "downloads"
+        source = (ROOT / "heel" / "runner" / "identity.py").read_bytes()
+        for required in (b"def runner_phrase_words", b"class SystemSecureSigner"):
+            self.assertIn(required, source)
+        with zipfile.ZipFile(downloads / WHEEL) as wheel:
+            self.assertEqual(wheel.read("heel/runner/identity.py"), source)
+        with tarfile.open(downloads / SDIST, "r:gz") as archive:
+            stream = archive.extractfile("heel_sim-1.2.0/heel/runner/identity.py")
+            self.assertIsNotNone(stream)
+            self.assertEqual(stream.read(), source)
 
     def test_release_docs_are_self_contained_and_avoid_private_commands(self):
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))

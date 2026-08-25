@@ -90,8 +90,12 @@ const DEVICE_AUTHORIZATION = /^Bearer heel_at_[A-Za-z0-9_-]{43}$/;
 const SESSION_TOKEN = /^[A-Za-z0-9_-]+$/;
 const IDEMPOTENCY_KEY = /^fs1-[0-9a-f]{64}$/;
 const RUNNER_PAIRING_EXCHANGE = "/v1/runner-pairings/exchange";
-const RUNNER_PAIRING_ACTIVATE = /^\/v1\/runner-pairings\/(?:pending|rotation)_[0-9a-f]{32}\/activate$/;
-const RUNNER_PAIRING_MANAGE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runner-pairings(?:/(?:pending|rotation)_[0-9a-f]{32}(?:/approve)?)?$`);
+const RUNNER_PAIRING_ACTIVATE = /^\/v1\/runner-pairings\/pending_[0-9a-f]{32}\/activate$/;
+const RUNNER_PAIRING_MANAGE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runner-pairings(?:/pending_[0-9a-f]{32}(?:/approve)?)?$`);
+const RUNNER_ROTATION_START = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/rotate$`);
+const RUNNER_ROTATION_APPROVE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/rotations/rotation_[0-9a-f]{32}/approve$`);
+const RUNNER_REVOKE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}$`);
+const RUNNER_ROTATION_PUBLIC = /^\/v1\/runner-rotations\/rotation_[0-9a-f]{32}\/(?:activate|poll)$/;
 const RUNNER_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}(?:/claim|/runs/[A-Za-z0-9_-]{1,128}/(?:heartbeat|progress|result|stop-ack))$`);
 const RUNNER_HEADERS = ["X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature"];
 
@@ -166,8 +170,8 @@ function controlPlaneRequestHeaders(
 ): { headers: Headers; contentLength: number } {
   let headers: Headers;
   const runnerControl = RUNNER_CONTROL.test(upstreamPath);
-  const runnerPairingPublic = upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath);
-  const runnerPairingHuman = RUNNER_PAIRING_MANAGE.test(upstreamPath);
+  const runnerPairingPublic = upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath) || RUNNER_ROTATION_PUBLIC.test(upstreamPath);
+  const runnerPairingHuman = RUNNER_PAIRING_MANAGE.test(upstreamPath) || RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath) || RUNNER_REVOKE.test(upstreamPath);
   if (runnerControl) {
     if (method !== "POST" || source.has("Authorization") || source.has("Cookie")) throw new InvalidControlPlaneRequest();
     headers = new Headers();
@@ -318,8 +322,10 @@ function controlPlaneRoute(method: string, pathname: string): string | null {
     (PUBLIC_DEVICE_ROUTES.has(upstreamPath) || upstreamPath === DEVICE_VERIFY_ROUTE)
     && method === "POST"
   ) return upstreamPath;
-  if ((upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath)) && method === "POST") return upstreamPath;
+  if ((upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath) || RUNNER_ROTATION_PUBLIC.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
+  if ((RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath)) && method === "POST") return upstreamPath;
+  if (RUNNER_REVOKE.test(upstreamPath) && method === "DELETE") return upstreamPath;
   if (RUNNER_CONTROL.test(upstreamPath) && method === "POST") return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
