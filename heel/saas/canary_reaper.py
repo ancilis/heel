@@ -82,7 +82,12 @@ class CanaryReaper:
         return connection
 
     def _service(self, connection: sqlite3.Connection) -> CanaryRunService:
-        service = CanaryRunService(connection, signing=self.signing, clock=self.clock)
+        service = CanaryRunService(
+            connection,
+            signing=self.signing,
+            clock=self.clock,
+            initialize_schema=False,
+        )
         # CanaryRunService defaults to a request-oriented wait.  The maintenance loop yields
         # quickly instead of holding shutdown/readiness behind another writer.
         connection.execute("PRAGMA busy_timeout=250")
@@ -92,7 +97,10 @@ class CanaryReaper:
         self, connection: sqlite3.Connection,
     ) -> CanaryDisclosureService:
         service = CanaryDisclosureService(
-            connection, signing=self.signing, clock=self.clock,
+            connection,
+            signing=self.signing,
+            clock=self.clock,
+            initialize_schema=False,
         )
         connection.execute("PRAGMA busy_timeout=250")
         return service

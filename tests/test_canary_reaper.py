@@ -108,6 +108,68 @@ def test_reaper_yields_quickly_when_an_http_writer_holds_the_database_lock():
         assert time.monotonic() - started < 1
 
 
+def test_repeated_cycles_never_run_schema_ddl_or_widen_connection_pragmas(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        database, clock, signing, _approved = _durable_running_setup(Path(tmp))
+        real_connect = sqlite3.connect
+        statements: list[str] = []
+        authorizer_events: list[tuple[int, str | None, str | None]] = []
+
+        def traced_connect(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            connection.set_trace_callback(statements.append)
+
+            def authorize(action, arg1, arg2, _database, _trigger):
+                authorizer_events.append((action, arg1, arg2))
+                return sqlite3.SQLITE_OK
+
+            connection.set_authorizer(authorize)
+            return connection
+
+        monkeypatch.setattr("heel.saas.canary_reaper.sqlite3.connect", traced_connect)
+        reaper = CanaryReaper(str(database), signing=signing, clock=clock)
+        reaper.run_once()
+        reaper.run_once()
+
+        ddl_actions = {
+            sqlite3.SQLITE_ALTER_TABLE,
+            sqlite3.SQLITE_CREATE_INDEX,
+            sqlite3.SQLITE_CREATE_TABLE,
+            sqlite3.SQLITE_CREATE_TEMP_INDEX,
+            sqlite3.SQLITE_CREATE_TEMP_TABLE,
+            sqlite3.SQLITE_CREATE_TEMP_TRIGGER,
+            sqlite3.SQLITE_CREATE_TEMP_VIEW,
+            sqlite3.SQLITE_CREATE_TRIGGER,
+            sqlite3.SQLITE_CREATE_VIEW,
+            sqlite3.SQLITE_DROP_INDEX,
+            sqlite3.SQLITE_DROP_TABLE,
+            sqlite3.SQLITE_DROP_TEMP_INDEX,
+            sqlite3.SQLITE_DROP_TEMP_TABLE,
+            sqlite3.SQLITE_DROP_TEMP_TRIGGER,
+            sqlite3.SQLITE_DROP_TEMP_VIEW,
+            sqlite3.SQLITE_DROP_TRIGGER,
+            sqlite3.SQLITE_DROP_VIEW,
+        }
+        assert [event for event in authorizer_events if event[0] in ddl_actions] == []
+        pragmas = [
+            (str(name).lower(), None if value is None else str(value).lower())
+            for action, name, value in authorizer_events
+            if action == sqlite3.SQLITE_PRAGMA
+        ]
+        assert [item for item in pragmas if item[0] == "journal_mode"] == []
+        assert pragmas.count(("foreign_keys", "on")) == 2
+        assert len([item for item in pragmas if item == ("busy_timeout", "250")]) >= 2
+        assert [
+            item for item in pragmas
+            if item[0] == "busy_timeout" and item[1] != "250"
+        ] == []
+        normalized = [statement.lstrip().upper() for statement in statements]
+        assert not any(
+            statement.startswith(("CREATE ", "ALTER ", "DROP "))
+            for statement in normalized
+        )
+
+
 def test_stale_heartbeat_is_stopped_then_minimally_finalized_without_a_runner_receipt():
     with tempfile.TemporaryDirectory() as tmp:
         database, clock, signing, _approved = _durable_running_setup(Path(tmp))
