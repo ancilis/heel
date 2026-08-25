@@ -211,7 +211,7 @@ class ProductionConfigurationTests(unittest.TestCase):
                 version = restarted.control_plane.store.conn.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0]
-                self.assertEqual(version, 8)
+                self.assertEqual(version, 9)
             finally:
                 restarted.server_close()
 

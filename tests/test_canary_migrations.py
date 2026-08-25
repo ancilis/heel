@@ -30,7 +30,7 @@ class CanaryMigrationTests(unittest.TestCase):
         )
 
     def test_migration_six_creates_tenant_bound_unique_tables(self):
-        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 8)
+        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 9)
         tables = (
             "canary_environments", "canary_runners", "canary_runner_keys",
             "canary_consumed_nonces", "canary_approval_projections",
@@ -144,8 +144,8 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
         conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
         conn.commit()
-        self.assertEqual(migration.apply_all(), [6, 7, 8])
-        self.assertEqual(migration.current_version(), 8)
+        self.assertEqual(migration.apply_all(), [6, 7, 8, 9])
+        self.assertEqual(migration.current_version(), 9)
         self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):
