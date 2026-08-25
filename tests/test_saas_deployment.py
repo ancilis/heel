@@ -18,6 +18,8 @@ class DeploymentBundleTests(unittest.TestCase):
         self.assertIn("HEALTHCHECK", source)
         self.assertIn("/v1/readyz", source)
         self.assertNotIn("pip install heel-sim", source)
+        self.assertIn("cryptography==45.0.7", source)
+        self.assertIn("--only-binary=:all:", source)
 
     def test_compose_keeps_origin_private_single_node_and_on_a_durable_volume(self):
         source = (ROOT / "deploy/compose.yaml").read_text(encoding="utf-8")

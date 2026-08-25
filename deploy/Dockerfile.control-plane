@@ -12,7 +12,7 @@ RUN groupadd --system --gid 10001 heel \
 WORKDIR /app
 COPY --chown=root:root heel /app/heel
 COPY --chown=root:root LICENSE-COMMERCIAL.md /app/LICENSE-COMMERCIAL.md
-RUN pip install --no-cache-dir cryptography==45.0.7
+RUN pip install --no-cache-dir --only-binary=:all: cryptography==45.0.7
 
 USER heel
 EXPOSE 8080

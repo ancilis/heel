@@ -97,9 +97,8 @@ def sign_envelope(private_key, key_id: str, payload: bytes) -> dict[str, str]:
         raise ValueError("signing key ID does not match the supplied private key")
     signature = private_key.sign(payload)
     return {
-        "alg": "Ed25519",
-        "key_id": key_id,
-        "signature": base64.b64encode(signature).decode("ascii"),
+        "signing_key_id": key_id,
+        "signature_b64": base64.b64encode(signature).decode("ascii"),
     }
 
 
@@ -109,11 +108,9 @@ def verify_envelope(keys: dict[str, object], signed: dict[str, str], payload: by
 
     if not isinstance(keys, dict) or not isinstance(signed, dict) or not isinstance(payload, bytes):
         raise TypeError("keys, signed envelope, and bytes payload are required")
-    if set(signed) != {"alg", "key_id", "signature"}:
+    if set(signed) != {"signing_key_id", "signature_b64"}:
         raise ValueError("signed envelope must contain exact fields")
-    if signed.get("alg") != "Ed25519":
-        raise ValueError("unsupported signature algorithm")
-    key_id = signed.get("key_id")
+    key_id = signed.get("signing_key_id")
     if not isinstance(key_id, str) or key_id not in keys:
         raise ValueError("signing key is not trusted")
     key = keys[key_id]
@@ -122,7 +119,7 @@ def verify_envelope(keys: dict[str, object], signed: dict[str, str], payload: by
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
     if key_id != ed25519_key_id(key.public_bytes(Encoding.Raw, PublicFormat.Raw)):
         raise ValueError("trusted signing key identifier does not match its public key")
-    signature_value = signed.get("signature")
+    signature_value = signed.get("signature_b64")
     if not isinstance(signature_value, str):
         raise ValueError("signature is required")
     try:

@@ -2,6 +2,7 @@ import base64
 import hashlib
 import unittest
 
+from heel.canary_contracts import canonical_bytes, canonical_digest, validate_execution_grant
 from heel.crypto import (
     SigningAuthority,
     ed25519_key_id,
@@ -54,8 +55,9 @@ class CryptoTests(unittest.TestCase):
     def test_envelope_signs_exact_payload_and_verifies(self):
         payload = b"\x00canonical bytes"
         signed = sign_envelope(self.private, self.authority.key_id, payload)
-        self.assertEqual(signed["key_id"], self.authority.key_id)
-        self.assertEqual(len(base64.b64decode(signed["signature"], validate=True)), 64)
+        self.assertEqual(set(signed), {"signing_key_id", "signature_b64"})
+        self.assertEqual(signed["signing_key_id"], self.authority.key_id)
+        self.assertEqual(len(base64.b64decode(signed["signature_b64"], validate=True)), 64)
         verify_envelope(
             {self.authority.key_id: self.authority.public_key}, signed, payload)
 
@@ -65,7 +67,7 @@ class CryptoTests(unittest.TestCase):
         other = SigningAuthority.generate()
         with self.assertRaises(ValueError):
             verify_envelope({"wrong": load_public_key_base64(_b64(self.public_bytes))}, signed, payload)
-        tampered_key_id = {**signed, "key_id": "wrong"}
+        tampered_key_id = {**signed, "signing_key_id": "wrong"}
         with self.assertRaises(ValueError):
             verify_envelope({"wrong": self.authority.public_key}, tampered_key_id, payload)
         with self.assertRaises(ValueError):
@@ -76,6 +78,24 @@ class CryptoTests(unittest.TestCase):
                 signed,
                 payload + b"x",
             )
+
+    def test_execution_grant_uses_the_frozen_signature_envelope(self):
+        from tests.test_canary_contracts import grant
+
+        record = grant()
+        payload = {key: value for key, value in record.items()
+                   if key not in {"grant_digest", "signing_key_id", "signature_b64"}}
+        record["grant_digest"] = canonical_digest(payload)
+        record.update(self.authority.sign(canonical_bytes(payload)))
+        validated = validate_execution_grant(record)
+        verify_envelope(
+            {self.authority.key_id: self.authority.public_key},
+            {
+                "signing_key_id": validated["signing_key_id"],
+                "signature_b64": validated["signature_b64"],
+            },
+            canonical_bytes(payload),
+        )
 
     def test_immutable_authority_signs_with_derived_identifier(self):
         self.assertEqual(self.authority.key_id, ed25519_key_id(self.public_bytes))

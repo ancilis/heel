@@ -40,7 +40,11 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Acceptance + safety tests (pure stdlib — no install needed)
+      - name: Install pinned runner cryptography wheel
+        run: >-
+          env PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1
+          python -m pip --isolated install --only-binary=:all: cryptography==45.0.7
+      - name: Acceptance + safety tests (runner crypto installed)
         run: python -m unittest discover -s tests -p 'test_*.py' -v
       - name: One-command demo (auth gate + honest backtests)
         run: python run_demo.py

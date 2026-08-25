@@ -12,6 +12,7 @@ class CanaryMigrationTests(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys=ON")
         self.addCleanup(self.conn.close)
         Migrator(self.conn, CONTROL_PLANE_MIGRATIONS).apply_all()
 
@@ -61,6 +62,39 @@ class CanaryMigrationTests(unittest.TestCase):
             for plan_id in ("free", "pro", "team", "enterprise"):
                 self.assertEqual(get_plan(plan_id, version).quota(Meter.ACTIVE_RUNNERS), 0)
                 self.assertEqual(get_plan(plan_id, version).quota(Meter.CANARY_RUNS), 0)
+
+    def test_canary_foreign_keys_reject_cross_workspace_or_project_references(self):
+        def execute(sql, values):
+            self.conn.execute(sql, values)
+
+        execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("env-1", "ws-1", "prj-1", "https://one.example", "staging", "verified", 1))
+        execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("env-2", "ws-2", "prj-2", "https://two.example", "staging", "verified", 1))
+        execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner-1", "ws-1", "runner", "active", 1))
+        execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner-2", "ws-2", "runner", "active", 1))
+        with self.assertRaises(sqlite3.IntegrityError):
+            execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)", ("key-cross", "ws-1", "runner-2", "pk-cross", "active", 1, None))
+        execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)", ("key-1", "ws-1", "runner-1", "pk-1", "active", 1, None))
+        with self.assertRaises(sqlite3.IntegrityError):
+            execute("INSERT INTO canary_consumed_nonces VALUES(?,?,?,?,?)", ("nonce-cross", "ws-1", "runner-2", 1, 2))
+        execute("INSERT INTO canary_approval_projections VALUES(?,?,?,?,?,?,?,?,?)", ("approval-1", "ws-1", "prj-1", "env-1", "runner-1", "a" * 64, "{}", 1, 2))
+        with self.assertRaises(sqlite3.IntegrityError):
+            execute("INSERT INTO canary_approval_projections VALUES(?,?,?,?,?,?,?,?,?)", ("approval-cross", "ws-1", "prj-1", "env-2", "runner-1", "b" * 64, "{}", 1, 2))
+        with self.assertRaises(sqlite3.IntegrityError):
+            execute("INSERT INTO canary_execution_grants VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("grant-cross", "ws-1", "prj-1", "approval-1", "env-2", "runner-1", "nonce-gc", "c" * 64, "approved", 2, 1,))
+        execute("INSERT INTO canary_execution_grants VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("grant-1", "ws-1", "prj-1", "approval-1", "env-1", "runner-1", "nonce-g1", "d" * 64, "approved", 2, 1,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            execute("INSERT INTO canary_runs VALUES(?,?,?,?,?,?,?,?,?)", ("run-cross", "ws-1", "prj-1", "grant-1", "env-2", "runner-1", "approved", 1, 1))
+        execute("INSERT INTO canary_runs VALUES(?,?,?,?,?,?,?,?,?)", ("run-1", "ws-1", "prj-1", "grant-1", "env-1", "runner-1", "approved", 1, 1))
+        for table, columns, values in (
+            ("canary_run_events", "event_id,workspace_id,project_ref,run_id,sequence,event_type,payload_digest,created_at", ("event-cross", "ws-2", "prj-2", "run-1", 0, "claimed", "e" * 64, 1)),
+            ("canary_operational_receipts", "run_id,workspace_id,project_ref,receipt_digest,receipt_json,created_at,updated_at", ("run-1", "ws-2", "prj-2", "f" * 64, "{}", 1, 1)),
+            ("canary_disclosure_permits", "permit_id,workspace_id,project_ref,run_id,projection_digest,status,expires_at,created_at", ("permit-cross", "ws-2", "prj-2", "run-1", "g" * 64, "active", 2, 1)),
+            ("canary_findings_projections", "finding_id,workspace_id,project_ref,run_id,projection_digest,projection_json,created_at", ("finding-cross", "ws-2", "prj-2", "run-1", "h" * 64, "{}", 1)),
+            ("canary_audit_records", "audit_id,workspace_id,project_ref,run_id,subject_ref,action,actor,payload_digest,created_at", ("audit-cross", "ws-2", "prj-2", "run-1", "run-1", "approved", "owner", "i" * 64, 1)),
+        ):
+            with self.subTest(table=table), self.assertRaises(sqlite3.IntegrityError):
+                execute(f"INSERT INTO {table}({columns}) VALUES({','.join('?' for _ in values)})", values)
+        execute("INSERT INTO canary_audit_records VALUES(?,?,?,?,?,?,?,?,?)", ("audit-1", "ws-1", "prj-1", "run-1", "run-1", "approved", "owner", "i" * 64, 1))
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):
         plan = get_plan("free")
