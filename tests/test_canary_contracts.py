@@ -152,7 +152,7 @@ def permit() -> dict:
 
 def context_binding() -> dict:
     unsigned = {
-        "binding_id": "rcb_" + "a" * 32,
+        "schema_version": RUNNER_CONTEXT_BINDING_SCHEMA, "binding_id": "rcb_" + "a" * 32,
         "workspace_id": "ws", "project_id": "prj",
         "environment": environment(),
         "runner_binding": {"runner_id": "r", "runner_key_id": "rk", "public_key_digest": HASH},
@@ -160,7 +160,7 @@ def context_binding() -> dict:
         "issued_at_ms": 1, "expires_at_ms": 60_001,
     }
     value = {
-        "schema_version": RUNNER_CONTEXT_BINDING_SCHEMA, **unsigned,
+        **unsigned,
         "binding_digest": canonical_digest(unsigned), "signing_key_id": "cloud",
         "signature_b64": SIG,
     }

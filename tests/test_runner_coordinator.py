@@ -631,6 +631,16 @@ def test_default_heartbeat_cadence_has_margin_below_gate_staleness_limit():
     assert service.heartbeat_interval <= 0.4
 
 
+def test_runner_service_does_not_claim_work_until_context_acquisition_is_ready():
+    class PendingContextCoordinator:
+        def __init__(self): self.claims = 0
+        def ensure_runner_context(self): return False
+        def claim(self): self.claims += 1; return None
+    coordinator = PendingContextCoordinator()
+    assert RunnerService(coordinator=coordinator, executor=object(), idle_poll_interval=2.0).run_once() is False
+    assert coordinator.claims == 0
+
+
 def test_stopped_valid_terminal_projection_is_sent_after_bounded_ack_and_unwind(tmp_path):
     coordinator, _, _, _, _, _, _ = _coordinator(
         tmp_path,

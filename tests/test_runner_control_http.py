@@ -112,7 +112,11 @@ def test_context_methods_use_claim_chain_and_closed_context_routes():
             nonce = base64.b64encode(bytes([len(self.requests)]) * 32).decode()
             if path.endswith("/contexts/list"):
                 return 200, {"X-Heel-Runner-Next-Nonce": nonce}, {"schema_version": "heel.runner-context-list-result.v1", "server_time_ms": 1, "contexts": [], "has_more": False}
-            return 200, {"X-Heel-Runner-Next-Nonce": nonce}, {"schema_version": "heel.runner-context-claim-result.v1", "context_binding": {}, "claimed_at_ms": 1}
+            unsigned = {"schema_version": "heel.runner-context-binding.v1", "binding_id": "rcb_" + "a" * 32,
+                        "workspace_id": "ws", "project_id": "project", "environment": {"environment_id": "env_" + "a" * 32, "origin": "https://staging.example.com", "environment_class": "staging", "verification_record_digest": "a" * 64},
+                        "runner_binding": {"runner_id": "runner", "runner_key_id": KEY_ID, "public_key_digest": "a" * 64},
+                        "authorization": {"user_id": "owner", "role": "owner"}, "issued_at_ms": 0, "expires_at_ms": 60_000}
+            return 200, {"X-Heel-Runner-Next-Nonce": nonce}, {"schema_version": "heel.runner-context-claim-result.v1", "context_binding": {**unsigned, "binding_digest": canonical_digest(unsigned), "signing_key_id": "cloud", "signature_b64": base64.b64encode(b"s" * 64).decode()}, "claimed_at_ms": 1}
     transport, signer = ContextTransport(), Signer()
     control = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer, clock=lambda: 1000, transport=transport, nonce_source=lambda _: base64.b64encode(b"n" * 32).decode())
     assert control.list_contexts()["contexts"] == []
@@ -122,6 +126,18 @@ def test_context_methods_use_claim_chain_and_closed_context_routes():
         "/v1/workspaces/ws/runners/runner/contexts/rcb_" + "a" * 32 + "/claim",
     ]
     assert [item[1]["X-Heel-Runner-Sequence"] for item in transport.requests] == ["1", "2"]
+
+
+def test_context_methods_reject_extra_or_unsigned_claim_artifacts():
+    class BadContextTransport:
+        def post(self, path, *, headers=None, body=b""):
+            del path, headers, body
+            return 200, {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"n" * 32).decode()}, {
+                "schema_version": "heel.runner-context-claim-result.v1", "context_binding": {}, "claimed_at_ms": 1,
+            }
+    control = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=Signer(), clock=lambda: 1000, transport=BadContextTransport(), nonce_source=lambda _: base64.b64encode(b"n" * 32).decode())
+    with pytest.raises(ValueError, match="invalid runner context response"):
+        control.claim_context("rcb_" + "a" * 32, "a" * 64)
 
 def test_sequences_are_independent_per_run_capability_and_stop_ack_is_heartbeat():
     control, transport, signer = client()

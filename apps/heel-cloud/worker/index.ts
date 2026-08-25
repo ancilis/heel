@@ -265,7 +265,11 @@ function controlPlaneRequestHeaders(
   const runnerPairingPublic = upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath) || RUNNER_ROTATION_PUBLIC.test(upstreamPath);
   const runnerPairingHuman = RUNNER_PAIRING_MANAGE.test(upstreamPath) || RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath) || RUNNER_REVOKE.test(upstreamPath);
   if (runnerControl) {
-    if (method !== "POST" || source.has("Authorization") || source.has("Cookie")) throw new InvalidControlPlaneRequest();
+    // Runner proof headers are an isolated protocol: a caller cannot nominate a
+    // hop-by-hop/header-smuggling field or impersonate an edge-derived origin.
+    if (method !== "POST" || source.has("Authorization") || source.has("Cookie")
+      || source.has("Connection") || source.has("TE") || source.has("Transfer-Encoding")
+      || source.has("Content-Encoding") || source.has("X-Heel-Internal-Origin")) throw new InvalidControlPlaneRequest();
     headers = new Headers();
     for (const name of RUNNER_HEADERS) {
       const value = singletonHeader(source, name);

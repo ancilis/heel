@@ -24,7 +24,12 @@ it("uses closed create list revoke routes for browser context authorization", as
     calls.push(`${init.method}:${path}`);
     if (init.method === "GET") return jsonResponse({ schema_version: "heel.runner-context-binding-dashboard.v1", server_time_ms: 1, runners: [{ runner_id: runner, runner_key_id: "key", display_name: "Runner", fingerprint: digest, runner_version: "1", adapter_versions: [], status: "active" }], bindings: [] });
     if (String(path).endsWith("/revoke")) return jsonResponse({ schema_version: "heel.runner-context-binding-revoked.v1", binding_id: binding, status: "revoked", revoked_at_ms: 1 });
-    return jsonResponse({ schema_version: "heel.runner-context-binding-created.v1", context_binding: {} }, 201);
+    return jsonResponse({ schema_version: "heel.runner-context-binding-created.v1", context_binding: {
+      schema_version: "heel.runner-context-binding.v1", binding_id: binding, workspace_id: workspace, project_id: project,
+      environment: { environment_id: "env_0123456789abcdef0123456789abcdef", origin: "https://staging.example.com", environment_class: "staging", verification_record_digest: digest },
+      runner_binding: { runner_id: runner, runner_key_id: "key", public_key_digest: digest }, authorization: { user_id: "owner", role: "owner" },
+      issued_at_ms: 1, expires_at_ms: 60_001, binding_digest: digest, signing_key_id: "cloud", signature_b64: Buffer.from("s".repeat(64)).toString("base64"),
+    } }, 201);
   }});
   const dashboard = await api.listRunnerContextBindings(workspace, project);
   await api.createRunnerContextBinding(workspace, project, { environmentId: "env_0123456789abcdef0123456789abcdef", verificationRecordDigest: digest, runnerId: dashboard.runners[0].runnerId, runnerKeyId: "key" });

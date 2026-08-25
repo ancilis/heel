@@ -17,7 +17,7 @@ from heel.runner.catalog import CATALOG_IDS
 from heel.runner.compiler import CanaryCompiler
 from heel.runner.identity import RunnerIdentity, SecureSigner, runner_phrase_words
 from heel.runner.openapi_routes import RouteInventory
-from heel.runner.store import RunnerContext, RunnerStore, UnsupportedSecureStorageError
+from heel.runner.store import RunnerContext, RunnerStore, RunnerStoreError, UnsupportedSecureStorageError
 from heel.runner.vault import (
     MAX_COMMAND_OUTPUT_BYTES,
     EphemeralVault,
@@ -64,16 +64,18 @@ def test_cloud_context_sidecar_requires_domain_signature_and_is_immutable(tmp_pa
     store, identity, signer = store_and_identity(tmp_path)
     authority = SigningAuthority.generate()
     unsigned = {
-        "binding_id": "rcb_" + "a" * 32, "workspace_id": identity.workspace_id,
+        "schema_version": "heel.runner-context-binding.v1", "binding_id": "rcb_" + "a" * 32, "workspace_id": identity.workspace_id,
         "project_id": "prj_123456789", "environment": {"environment_id": "env_123456789", "origin": "https://staging.acme.dev", "environment_class": "staging", "verification_record_digest": "0" * 64},
         "runner_binding": {"runner_id": identity.runner_id, "runner_key_id": identity.key_id, "public_key_digest": identity.fingerprint},
         "authorization": {"user_id": "owner", "role": "owner"}, "issued_at_ms": 1, "expires_at_ms": 60_001,
     }
-    artifact = {"schema_version": "heel.runner-context-binding.v1", **unsigned,
-                "binding_digest": canonical_digest(unsigned)}
+    artifact = {**unsigned, "binding_digest": canonical_digest(unsigned)}
     artifact.update(authority.sign(b"heel.runner-context-binding.v1\0" + canonical_bytes(unsigned)))
     assert store.install_cloud_context_binding(artifact, identity=identity, signer=signer, signer_label="test-signer", trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1) == store.load_context()
     assert store.load_cloud_context_binding()["binding_id"] == artifact["binding_id"]
+    assert store.verify_cloud_context_binding(identity=identity, trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1)["binding_id"] == artifact["binding_id"]
+    with pytest.raises(RunnerStoreError, match="invalid cloud context"):
+        store.verify_cloud_context_binding(identity=identity, trusted_cloud_keys={"other": authority.public_key}, now_ms=1)
     artifact["binding_id"] = "rcb_" + "b" * 32
     with pytest.raises(ValueError):
         store.install_cloud_context_binding(artifact, identity=identity, signer=signer, signer_label="test-signer", trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1)

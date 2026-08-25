@@ -1213,6 +1213,9 @@ class _Handler(BaseHTTPRequestHandler):
         # or payload/path disagreement can enter the PoP verifier.
         if "?" in self.path or "#" in self.path or "%" in self.path or self.command != "POST":
             raise RunnerAuthError("invalid runner authentication")
+        if operation.startswith("context-") and self.cp.grant_authority is None:
+            self._json(503, {"schema_version": "heel.runner-context-error.v1", "code": "runner_context_unavailable"})
+            return
         try:
             maximum = (
                 128 if operation == "context-list"
@@ -1299,6 +1302,8 @@ class _Handler(BaseHTTPRequestHandler):
         except RunnerContextError:
             raise RunnerAuthError("invalid runner authentication") from None
         except (CanaryRunError, CanaryDisclosureError):
+            if operation.startswith("context-"):
+                raise RunnerAuthError("invalid runner authentication") from None
             raise
         except (ValueError, RunnerAuthError, LookupError):
             raise RunnerAuthError("invalid runner authentication") from None
@@ -2160,50 +2165,44 @@ class _Handler(BaseHTTPRequestHandler):
         return self.cp.runner_contexts
 
     def _ws_runner_context_create(self, wid: str, project_ref: str) -> None:
-        actor, role, _ = self._recent_owner_admin_context(wid)
         try:
+            actor, role, _ = self._recent_owner_admin_context(wid)
             body = parse_json(self._raw_body(), max_bytes=2048)
             if canonical_bytes(body) != self._raw_body():
                 raise ValueError
             binding = self._runner_context_service().create(wid, project_ref, body, actor=actor, role=role)
-        except (TypeError, ValueError, RunnerContextError):
+        except RunnerContextError:
             raise
+        except ApiError as error:
+            if error.body.get("code") in {"same_origin_required", "recent_auth_required"}:
+                raise RunnerContextError(error.body["code"]) from None
+            raise
+        except (TypeError, ValueError):
+            raise RunnerContextError("invalid_runner_context_binding") from None
         self._json(201, {"schema_version": "heel.runner-context-binding-created.v1", "context_binding": binding})
 
     def _ws_runner_context_revoke(self, wid: str, project_ref: str, binding_id: str) -> None:
-        actor, role, _ = self._recent_owner_admin_context(wid)
         try:
+            actor, role, _ = self._recent_owner_admin_context(wid)
             body = parse_json(self._raw_body(), max_bytes=256)
             if canonical_bytes(body) != self._raw_body():
                 raise ValueError
             result = self._runner_context_service().revoke(wid, project_ref, binding_id, actor=actor, role=role, request=body)
-        except (TypeError, ValueError, RunnerContextError):
+        except RunnerContextError:
             raise
+        except ApiError as error:
+            if error.body.get("code") in {"same_origin_required", "recent_auth_required"}:
+                raise RunnerContextError(error.body["code"]) from None
+            raise
+        except (TypeError, ValueError):
+            raise RunnerContextError("invalid_runner_context_binding") from None
         self._json(200, result)
 
     def _ws_runner_context_list(self, wid: str, project_ref: str) -> None:
-        self._recent_owner_admin_context(wid)
-        now = int(time.time() * 1000)
-        rows = self.cp.store.conn.execute(
-            "SELECT r.runner_id,r.display_name,k.key_id,k.public_key,i.identity_json,b.rcb_id,b.binding_digest,"
-            "b.environment_id,b.environment_origin,b.environment_class,b.verification_record_digest,b.runner_id AS binding_runner_id,"
-            "b.runner_key_id,b.status,b.issued_at_ms,b.expires_at_ms,b.first_claimed_at_ms "
-            "FROM canary_runner_context_bindings b JOIN canary_runners r ON r.workspace_id=b.workspace_id AND r.runner_id=b.runner_id "
-            "JOIN canary_runner_keys k ON k.workspace_id=b.workspace_id AND k.runner_id=b.runner_id AND k.key_id=b.runner_key_id "
-            "LEFT JOIN canary_runner_identity_records i ON i.workspace_id=r.workspace_id AND i.runner_id=r.runner_id "
-            "WHERE b.workspace_id=? AND b.project_ref=? ORDER BY b.issued_at_ms,b.rcb_id",
-            (wid, project_ref),
-        ).fetchall()
-        runners: dict[tuple[str, str], dict] = {}
-        bindings: list[dict] = []
-        for row in rows:
-            identity = json.loads(row["identity_json"]) if row["identity_json"] else {}
-            key = (row["runner_id"], row["key_id"])
-            runners.setdefault(key, {"runner_id": row["runner_id"], "runner_key_id": row["key_id"],
-                "display_name": row["display_name"], "fingerprint": hashlib.sha256(load_public_key_base64(row["public_key"]).public_bytes(Encoding.Raw, PublicFormat.Raw)).hexdigest(),
-                "runner_version": identity.get("runner_version", ""), "adapter_versions": identity.get("adapter_versions", []), "status": "active"})
-            bindings.append({"binding_id": row["rcb_id"], "binding_digest": row["binding_digest"], "environment_id": row["environment_id"], "origin": row["environment_origin"], "environment_class": row["environment_class"], "verification_record_digest": row["verification_record_digest"], "runner_id": row["binding_runner_id"], "runner_key_id": row["runner_key_id"], "status": row["status"], "issued_at_ms": row["issued_at_ms"], "expires_at_ms": row["expires_at_ms"], "first_claimed_at_ms": row["first_claimed_at_ms"]})
-        self._json(200, {"schema_version": "heel.runner-context-binding-dashboard.v1", "server_time_ms": now, "runners": list(runners.values()), "bindings": bindings})
+        kind, user_id, _ = self._principal()
+        if kind != "session" or user_id is None:
+            raise RunnerContextError("runner_context_binding_not_found")
+        self._json(200, self._runner_context_service().list_for_human(wid, project_ref, actor=user_id))
 
     def _ws_canary_approve(self, wid: str, project_ref: str, run_id: str) -> None:
         actor, role, recent_auth_at_ms = self._recent_owner_admin_context(wid)

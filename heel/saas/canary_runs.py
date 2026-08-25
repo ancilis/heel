@@ -329,7 +329,8 @@ class CanaryRunService:
             raise CanaryRunError("invalid_projection_signature") from None
         return row
 
-    def submit_projection(self, projection: object, *, uploaded_by: str, _transaction_owned: bool = False) -> dict[str, object]:
+    def submit_projection(self, projection: object, *, uploaded_by: str, _transaction_owned: bool = False,
+                          _actor_class: str = "human") -> dict[str, object]:
         """Store a human submission, or participate in a caller-owned runner PoP transaction."""
         uploaded_by = _identifier(uploaded_by, "invalid_projection_actor")
         try:
@@ -401,12 +402,10 @@ class CanaryRunService:
                 ),
             )
             run = self._run(validated["workspace_id"], validated["project_id"], run_id)
-            self._append_event(
-                run, "prepared", actor_class="human", actor_id=uploaded_by,
-            )
+            self._append_event(run, "prepared", actor_class=_actor_class, actor_id=uploaded_by)
             self._audit(
                 run, "prepared", subject_ref=validated["projection_id"],
-                actor_class="human", actor_id=uploaded_by,
+                actor_class=_actor_class, actor_id=uploaded_by,
                 payload={"projection_digest": validated["projection_digest"]},
             )
             self.conn.execute(
@@ -416,11 +415,11 @@ class CanaryRunService:
             )
             run = self._run(validated["workspace_id"], validated["project_id"], run_id)
             self._append_event(
-                run, "awaiting_execution_approval", actor_class="human", actor_id=uploaded_by,
+                run, "awaiting_execution_approval", actor_class=_actor_class, actor_id=uploaded_by,
             )
             self._audit(
                 run, "awaiting_execution_approval", subject_ref=validated["projection_id"],
-                actor_class="human", actor_id=uploaded_by,
+                actor_class=_actor_class, actor_id=uploaded_by,
                 payload={"projection_digest": validated["projection_digest"]},
             )
             if not _transaction_owned:
@@ -462,17 +461,31 @@ class CanaryRunService:
             or uploaded_by_runner_id != binding_row["runner_id"]
         ):
             raise CanaryRunError("canary_authority_unavailable")
-        result = self.submit_projection(
-            validated, uploaded_by=uploaded_by_runner_id, _transaction_owned=True,
-        )
+        prior = self.conn.execute(
+            "SELECT approval_id,run_id,uploaded_by,projection_json FROM canary_approval_projections "
+            "WHERE workspace_id=? AND project_ref=? AND (approval_id=? OR projection_digest=?)",
+            (validated["workspace_id"], validated["project_id"], validated["projection_id"], validated["projection_digest"]),
+        ).fetchone()
+        if prior is not None:
+            if prior["uploaded_by"] != uploaded_by_runner_id or prior["projection_json"] != canonical_bytes(validated).decode():
+                raise CanaryRunError("projection_conflict")
+            link = self.conn.execute(
+                "SELECT rcb_id,projection_digest FROM canary_runner_context_projection_links WHERE workspace_id=? AND project_ref=? AND approval_id=? AND run_id=?",
+                (binding_row["workspace_id"], binding_row["project_ref"], prior["approval_id"], prior["run_id"]),
+            ).fetchone()
+            if link is None or link["rcb_id"] != binding_row["rcb_id"] or link["projection_digest"] != validated["projection_digest"]:
+                raise CanaryRunError("projection_conflict")
+            return {"schema_version": "heel.canary-projection-submitted.v1", "approval_id": prior["approval_id"],
+                    "run_id": prior["run_id"], "status": "awaiting_execution_approval", "projection_digest": validated["projection_digest"]}
+        result = self.submit_projection(validated, uploaded_by=uploaded_by_runner_id, _transaction_owned=True, _actor_class="runner")
         self.conn.execute(
-            "INSERT OR IGNORE INTO canary_runner_context_projection_links("
-            "workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id,rcb_id,projection_digest,created_at_ms) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO canary_runner_context_projection_links("
+            "workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,projection_digest,created_at_ms) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
                 binding_row["workspace_id"], binding_row["project_ref"], result["approval_id"],
                 result["run_id"], binding_row["environment_id"], binding_row["runner_id"],
-                binding_row["runner_key_id"], binding_row["rcb_id"], result["projection_digest"],
+                binding_row["runner_key_id"], binding_row["rcb_id"], binding_row["binding_digest"], result["projection_digest"],
                 self._now_ms(),
             ),
         )
@@ -639,16 +652,22 @@ class CanaryRunService:
                 "JOIN canary_runner_context_bindings b ON b.workspace_id=l.workspace_id "
                 "AND b.project_ref=l.project_ref AND b.environment_id=l.environment_id "
                 "AND b.runner_id=l.runner_id AND b.runner_key_id=l.runner_key_id AND b.rcb_id=l.rcb_id "
+                "AND b.binding_digest=l.binding_digest "
                 "WHERE l.workspace_id=? AND l.project_ref=? AND l.approval_id=? AND l.run_id=?",
                 (workspace_id, project_ref, approval["approval_id"], run_id),
             ).fetchone()
-            if binding is not None and (
-                binding["status"] != "active" or int(binding["expires_at_ms"]) <= now
-                or binding["environment_id"] != approval["environment_id"]
-                or binding["runner_id"] != approval["runner_id"]
-                or binding["runner_key_id"] != approval["runner_key_id"]
-            ):
-                raise CanaryRunError("canary_authority_unavailable")
+            if binding is not None:
+                if (binding["environment_id"] != approval["environment_id"]
+                        or binding["runner_id"] != approval["runner_id"]
+                        or binding["runner_key_id"] != approval["runner_key_id"]):
+                    raise CanaryRunError("canary_authority_unavailable")
+                from .runner_contexts import RunnerContextBindingService, RunnerContextError
+                try:
+                    RunnerContextBindingService(self.conn, signing=self.signing).active_binding_for_projection_in_transaction(
+                        workspace_id, binding["runner_id"], binding["runner_key_id"], binding["rcb_id"], binding["binding_digest"],
+                    )
+                except RunnerContextError:
+                    raise CanaryRunError("canary_authority_unavailable") from None
             generation = self._control_generation()
             if generation != expected_kill_switch_generation:
                 raise CanaryRunError("kill_switch_changed")

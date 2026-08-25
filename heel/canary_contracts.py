@@ -446,7 +446,7 @@ def validate_runner_context_binding(value: Any) -> dict[str, Any]:
         _fail("invalid context binding expiry")
     unsigned = {
         key: obj[key] for key in (
-            "binding_id", "workspace_id", "project_id", "environment", "runner_binding",
+            "schema_version", "binding_id", "workspace_id", "project_id", "environment", "runner_binding",
             "authorization", "issued_at_ms", "expires_at_ms",
         )
     }

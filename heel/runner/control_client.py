@@ -24,6 +24,7 @@ from heel.canary_contracts import (
     validate_runner_context_list,
     validate_runner_context_claim,
     validate_runner_approval_projection_submit,
+    validate_runner_context_binding,
 )
 from heel.crypto import ed25519_key_id, verify_envelope
 
@@ -512,6 +513,43 @@ class RunnerControlClient:
                     or not isinstance(response[1], dict) or not isinstance(response[2], dict)
                     or set(response[2]) == set() or response[2].get("schema_version") != schema):
                 raise ValueError("invalid runner context response")
+            payload = response[2]
+            try:
+                if schema == "heel.runner-context-list-result.v1":
+                    if set(payload) != {"schema_version", "server_time_ms", "contexts", "has_more"}:
+                        raise ValueError
+                    if type(payload["server_time_ms"]) is not int or payload["server_time_ms"] < 0 or type(payload["has_more"]) is not bool:
+                        raise ValueError
+                    contexts = payload["contexts"]
+                    if not isinstance(contexts, list) or len(contexts) > 16:
+                        raise ValueError
+                    previous = None
+                    for item in contexts:
+                        if not isinstance(item, dict) or set(item) != {"binding_id", "binding_digest", "project_id", "environment_id", "origin", "environment_class", "verification_record_digest", "expires_at_ms", "claimed"}:
+                            raise ValueError
+                        validate_runner_context_claim({"schema_version": "heel.runner-context-claim.v1", "binding_id": item["binding_id"], "binding_digest": item["binding_digest"]})
+                        if (type(item["project_id"]) is not str or not item["project_id"] or type(item["environment_id"]) is not str or not item["environment_id"]
+                                or type(item["origin"]) is not str or not item["origin"] or item["environment_class"] not in {"staging", "sandbox"}
+                                or type(item["verification_record_digest"]) is not str or len(item["verification_record_digest"]) != 64
+                                or type(item["expires_at_ms"]) is not int or item["expires_at_ms"] < 0 or type(item["claimed"]) is not bool):
+                            raise ValueError
+                        order = (item["expires_at_ms"], item["binding_id"])
+                        if previous is not None and order < previous:
+                            raise ValueError
+                        previous = order
+                elif schema == "heel.runner-context-claim-result.v1":
+                    if set(payload) != {"schema_version", "context_binding", "claimed_at_ms"} or type(payload["claimed_at_ms"]) is not int or payload["claimed_at_ms"] < 0:
+                        raise ValueError
+                    binding = validate_runner_context_binding(payload["context_binding"])
+                    if binding["workspace_id"] != self.workspace_id or binding["runner_binding"]["runner_id"] != self.runner_id:
+                        raise ValueError
+                elif schema == "heel.canary-projection-submitted.v1":
+                    if set(payload) != {"schema_version", "approval_id", "run_id", "status", "projection_digest"} or payload["status"] != "awaiting_execution_approval":
+                        raise ValueError
+                    if not all(type(payload[key]) is str and payload[key] for key in ("approval_id", "run_id", "projection_digest")):
+                        raise ValueError
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("invalid runner context response") from None
             next_nonce = response[1].get("X-Heel-Runner-Next-Nonce")
             if not self._b64_32(next_nonce):
                 raise ValueError("invalid runner context response")

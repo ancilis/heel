@@ -94,6 +94,28 @@ export interface RunnerContextBindingDashboard {
   runners: readonly RunnerContextRunner[]; bindings: readonly RunnerContextBindingRecord[];
 }
 
+function parseRunnerContextBinding(value: unknown): RunnerContextBindingRecord {
+  if (!exact(value, ["schema_version", "binding_id", "workspace_id", "project_id", "environment", "runner_binding", "authorization", "issued_at_ms", "expires_at_ms", "binding_digest", "signing_key_id", "signature_b64"])
+    || value.schema_version !== "heel.runner-context-binding.v1" || !/^rcb_[0-9a-f]{32}$/.test(String(value.binding_id))
+    || !identifier(value.workspace_id) || !identifier(value.project_id) || !digest(value.binding_digest)
+    || !identifier(value.signing_key_id) || typeof value.signature_b64 !== "string" || !BASE64_SIGNATURE.test(value.signature_b64)
+    || !integer(value.issued_at_ms) || !integer(value.expires_at_ms) || value.expires_at_ms <= value.issued_at_ms
+    || !exact(value.environment, ["environment_id", "origin", "environment_class", "verification_record_digest"])
+    || !ENVIRONMENT_REF.test(String(value.environment.environment_id)) || typeof value.environment.origin !== "string"
+    || !["staging", "sandbox"].includes(String(value.environment.environment_class)) || !digest(value.environment.verification_record_digest)
+    || !exact(value.runner_binding, ["runner_id", "runner_key_id", "public_key_digest"])
+    || !identifier(value.runner_binding.runner_id) || !identifier(value.runner_binding.runner_key_id) || !digest(value.runner_binding.public_key_digest)
+    || !exact(value.authorization, ["user_id", "role"]) || !identifier(value.authorization.user_id)
+    || !["owner", "admin"].includes(String(value.authorization.role))) invalidResponse();
+  return deepFreeze({ bindingId: value.binding_id as string, bindingDigest: value.binding_digest as string,
+    environmentId: value.environment.environment_id as string, origin: value.environment.origin as string,
+    environmentClass: value.environment.environment_class as "staging" | "sandbox",
+    verificationRecordDigest: value.environment.verification_record_digest as string,
+    runnerId: value.runner_binding.runner_id as string, runnerKeyId: value.runner_binding.runner_key_id as string,
+    status: "active", issuedAtMs: value.issued_at_ms as number, expiresAtMs: value.expires_at_ms as number,
+    firstClaimedAtMs: null });
+}
+
 export interface VerifiedEnvironmentRecord {
   schemaVersion: "VerifiedEnvironment.v1";
   environmentId: string;
@@ -594,14 +616,19 @@ export class CanaryApi {
     return deepFreeze({ runners, bindings });
   }
 
-  async createRunnerContextBinding(workspaceRef: string, projectRef: string, input: { environmentId: string; verificationRecordDigest: string; runnerId: string; runnerKeyId: string }): Promise<void> {
+  async createRunnerContextBinding(workspaceRef: string, projectRef: string, input: { environmentId: string; verificationRecordDigest: string; runnerId: string; runnerKeyId: string }): Promise<RunnerContextBindingRecord> {
     if (!ENVIRONMENT_REF.test(input.environmentId) || !digest(input.verificationRecordDigest) || !identifier(input.runnerId) || !identifier(input.runnerKeyId)) invalidRequest();
-    await this.#json(projectPath(workspaceRef, projectRef, "/runner-context-bindings"), "POST", { schema_version: "heel.runner-context-binding-create.v1", environment_id: input.environmentId, verification_record_digest: input.verificationRecordDigest, runner_id: input.runnerId, runner_key_id: input.runnerKeyId }, 201);
+    const value = await this.#json(projectPath(workspaceRef, projectRef, "/runner-context-bindings"), "POST", { schema_version: "heel.runner-context-binding-create.v1", environment_id: input.environmentId, verification_record_digest: input.verificationRecordDigest, runner_id: input.runnerId, runner_key_id: input.runnerKeyId }, 201);
+    if (!exact(value, ["schema_version", "context_binding"]) || value.schema_version !== "heel.runner-context-binding-created.v1") invalidResponse();
+    return parseRunnerContextBinding(value.context_binding);
   }
 
   async revokeRunnerContextBinding(workspaceRef: string, projectRef: string, bindingId: string): Promise<void> {
     if (!/^rcb_[0-9a-f]{32}$/.test(bindingId)) invalidRequest();
-    await this.#json(projectPath(workspaceRef, projectRef, `/runner-context-bindings/${bindingId}/revoke`), "POST", { schema_version: "heel.runner-context-binding-revoke.v1", reason_code: "operator_requested" }, 200);
+    const value = await this.#json(projectPath(workspaceRef, projectRef, `/runner-context-bindings/${bindingId}/revoke`), "POST", { schema_version: "heel.runner-context-binding-revoke.v1", reason_code: "operator_requested" }, 200);
+    if (!exact(value, ["schema_version", "binding_id", "status", "revoked_at_ms"])
+      || value.schema_version !== "heel.runner-context-binding-revoked.v1" || value.binding_id !== bindingId
+      || value.status !== "revoked" || !integer(value.revoked_at_ms)) invalidResponse();
   }
 
   async submitApprovalProjection(workspaceRef: string, projectRef: string, projection: unknown): Promise<Readonly<CanaryApprovalSummary>> {

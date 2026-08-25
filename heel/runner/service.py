@@ -206,6 +206,12 @@ class RunnerService:
         return controller.request("local_emergency_stop") or controller.initiated.is_set()
 
     def run_once(self) -> bool:
+        # A paired Cloud runner must first obtain one signed browser authorization.  Legacy
+        # coordinators and explicitly bound static contexts have no acquisition hook.
+        ensure_context = getattr(self.coordinator, "ensure_runner_context", None)
+        if ensure_context is not None:
+            if not callable(ensure_context) or ensure_context() is not True:
+                return False
         lease = self.coordinator.claim()
         if lease is None:
             return False

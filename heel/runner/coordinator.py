@@ -27,7 +27,7 @@ from heel.runner.execution import (
 )
 from heel.runner.identity import RunnerIdentity, SecureSigner
 from heel.runner.service import ClaimLease
-from heel.runner.store import RunnerContext, RunnerStore
+from heel.runner.store import RunnerContext, RunnerStore, RunnerStoreError
 
 
 _MAX_AUTHENTICATED_GATE_AGE_SECONDS = 0.5
@@ -156,13 +156,39 @@ class RunnerCoordinator:
             trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
         )
 
+    def ensure_runner_context(self) -> bool:
+        """Acquire one Cloud authorization before work polling, without synthesizing context."""
+        try:
+            self.store.verify_cloud_context_binding(
+                identity=self.identity, trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
+            )
+            return True
+        except RunnerStoreError:
+            if self.store.has_cloud_context_binding():
+                raise ValueError("cloud context binding no longer verifies") from None
+            # A pre-existing static context remains a deliberate local-only workflow.
+            try:
+                self.store.load_context()
+            except RunnerStoreError:
+                pass
+            else:
+                return True
+        listed = self.control.list_contexts()
+        contexts = listed["contexts"]
+        if len(contexts) == 0:
+            return False
+        if len(contexts) != 1:
+            raise ValueError("ambiguous cloud runner contexts")
+        item = contexts[0]
+        claimed = self.control.claim_context(item["binding_id"], item["binding_digest"])
+        self.install_cloud_context_binding(claimed["context_binding"], signer_label="cloud-context")
+        return True
+
     def submit_cloud_context_approval(self, approval_projection: object) -> dict[str, Any]:
         """Use the serialized claim chain to submit a plan bound to the installed Cloud artifact."""
-        binding = self.store.load_cloud_context_binding()
-        binding = validate_runner_context_binding(binding)
-        now = self._now_ms()
-        if binding["issued_at_ms"] > now + 30_000 or now >= binding["expires_at_ms"]:
-            raise ValueError("cloud context binding is expired")
+        binding = self.store.verify_cloud_context_binding(
+            identity=self.identity, trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
+        )
         return self.control.submit_context_approval_projection(
             binding["binding_id"], binding["binding_digest"], approval_projection,
         )

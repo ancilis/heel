@@ -137,7 +137,7 @@ class RunnerContextBindingService:
             if expires - now < CONTEXT_MIN_TTL_MS:
                 raise RunnerContextError("expired")
             unsigned = {
-                "binding_id": "rcb_" + secrets.token_hex(16), "workspace_id": workspace_id,
+                "schema_version": "heel.runner-context-binding.v1", "binding_id": "rcb_" + secrets.token_hex(16), "workspace_id": workspace_id,
                 "project_id": project_id,
                 "environment": {"environment_id": request["environment_id"], "origin": row["origin"],
                                 "environment_class": row["environment_class"],
@@ -147,7 +147,7 @@ class RunnerContextBindingService:
                 "authorization": {"user_id": actor, "role": authorized_role},
                 "issued_at_ms": now, "expires_at_ms": expires,
             }
-            artifact = {"schema_version": "heel.runner-context-binding.v1", **unsigned}
+            artifact = dict(unsigned)
             artifact["binding_digest"] = canonical_digest(unsigned)
             artifact.update(self.signing.sign(CONTEXT_DOMAIN + canonical_bytes(unsigned)))
             artifact = validate_runner_context_binding(artifact)
@@ -220,6 +220,47 @@ class RunnerContextBindingService:
                 self.conn.rollback()
             raise
 
+    def list_for_human(self, workspace_id: str, project_id: str, *, actor: object) -> dict:
+        """Session-only dashboard view; reading has no recent-auth or origin requirement."""
+        if type(actor) is not str or not actor:
+            raise RunnerContextError("runner_context_binding_not_found")
+        membership = self.conn.execute(
+            "SELECT 1 FROM memberships WHERE workspace_id=? AND user_id=?", (workspace_id, actor),
+        ).fetchone()
+        if membership is None:
+            raise RunnerContextError("runner_context_binding_not_found")
+        now = self._now_ms()
+        runner_rows = self.conn.execute(
+            "SELECT r.runner_id,r.display_name,k.key_id,k.public_key,i.identity_json "
+            "FROM canary_runners r JOIN canary_runner_keys k ON k.workspace_id=r.workspace_id AND k.runner_id=r.runner_id "
+            "JOIN canary_runner_identity_records i ON i.workspace_id=r.workspace_id AND i.runner_id=r.runner_id "
+            "WHERE r.workspace_id=? AND r.status='active' AND k.status='active' AND k.revoked_at IS NULL "
+            "ORDER BY r.runner_id,k.key_id", (workspace_id,),
+        ).fetchall()
+        binding_rows = self.conn.execute(
+            "SELECT * FROM canary_runner_context_bindings WHERE workspace_id=? AND project_ref=? ORDER BY issued_at_ms,rcb_id",
+            (workspace_id, project_id),
+        ).fetchall()
+        runners: list[dict] = []
+        for row in runner_rows:
+            try:
+                identity = json.loads(row["identity_json"])
+                public = load_public_key_base64(row["public_key"]).public_bytes(Encoding.Raw, PublicFormat.Raw)
+            except (TypeError, ValueError):
+                continue
+            if identity.get("state") != "active" or identity.get("public_key", {}).get("key_id") != row["key_id"]:
+                continue
+            runners.append({"runner_id": row["runner_id"], "runner_key_id": row["key_id"],
+                "display_name": row["display_name"], "fingerprint": hashlib.sha256(public).hexdigest(),
+                "runner_version": identity.get("runner_version", ""), "adapter_versions": identity.get("adapter_versions", []), "status": "active"})
+        return {"schema_version": "heel.runner-context-binding-dashboard.v1", "server_time_ms": now,
+                "runners": runners, "bindings": [{"binding_id": row["rcb_id"], "binding_digest": row["binding_digest"],
+                    "environment_id": row["environment_id"], "origin": row["environment_origin"],
+                    "environment_class": row["environment_class"], "verification_record_digest": row["verification_record_digest"],
+                    "runner_id": row["runner_id"], "runner_key_id": row["runner_key_id"], "status": row["status"],
+                    "issued_at_ms": row["issued_at_ms"], "expires_at_ms": row["expires_at_ms"],
+                    "first_claimed_at_ms": row["first_claimed_at_ms"]} for row in binding_rows]}
+
     def list_for_runner_in_transaction(self, workspace_id: str, runner_id: str, runner_key_id: str) -> dict:
         if not self.conn.in_transaction:
             raise RuntimeError("runner context list requires caller transaction")
@@ -232,13 +273,15 @@ class RunnerContextBindingService:
         ).fetchall()
         contexts = []
         for row in rows[:16]:
-            artifact = validate_runner_context_binding(json.loads(row["binding_json"]))
+            # Listing is discovery metadata only. The signed artifact is released only by
+            # the PoP-protected claim response, so a list cannot become an install channel.
+            validate_runner_context_binding(json.loads(row["binding_json"]))
             contexts.append({
                 "binding_id": row["rcb_id"], "binding_digest": row["binding_digest"],
                 "project_id": row["project_ref"], "environment_id": row["environment_id"],
                 "origin": row["environment_origin"], "environment_class": row["environment_class"],
                 "verification_record_digest": row["verification_record_digest"], "expires_at_ms": row["expires_at_ms"],
-                "claimed": row["first_claimed_at_ms"] is not None, "context_binding": artifact,
+                "claimed": row["first_claimed_at_ms"] is not None,
             })
         return {"schema_version": "heel.runner-context-list-result.v1", "server_time_ms": now, "contexts": contexts, "has_more": len(rows) > 16}
 
@@ -268,7 +311,7 @@ class RunnerContextBindingService:
                 (now, binding_id),
             )
             self._event(row, "claimed", "runner", runner_id)
-        return {"schema_version": "heel.runner-context-claim-result.v1", "context_binding": artifact, "claimed_at_ms": now}
+        return {"schema_version": "heel.runner-context-claim-result.v1", "claimed_at_ms": now}
 
     def active_binding_for_projection_in_transaction(
         self, workspace_id: str, runner_id: str, runner_key_id: str, binding_id: str, binding_digest: str,
@@ -279,10 +322,11 @@ class RunnerContextBindingService:
         now = self._now_ms()
         self._expire_in_transaction(now)
         row = self.conn.execute(
-            "SELECT b.* FROM canary_runner_context_bindings b "
+            "SELECT b.*,k.public_key,i.identity_json FROM canary_runner_context_bindings b "
             "JOIN canary_environments e ON e.workspace_id=b.workspace_id AND e.project_ref=b.project_ref AND e.environment_id=b.environment_id "
             "JOIN canary_runners r ON r.workspace_id=b.workspace_id AND r.runner_id=b.runner_id "
             "JOIN canary_runner_keys k ON k.workspace_id=b.workspace_id AND k.runner_id=b.runner_id AND k.key_id=b.runner_key_id "
+            "JOIN canary_runner_identity_records i ON i.workspace_id=b.workspace_id AND i.runner_id=b.runner_id "
             "WHERE b.workspace_id=? AND b.runner_id=? AND b.runner_key_id=? AND b.rcb_id=? AND b.binding_digest=? "
             "AND b.status='active' AND b.expires_at_ms>? AND e.status='verified' AND e.revoked_at IS NULL "
             "AND e.proof_expires_at IS NOT NULL AND e.proof_expires_at*1000>? "
@@ -292,5 +336,18 @@ class RunnerContextBindingService:
             (workspace_id, runner_id, runner_key_id, binding_id, binding_digest, now, now),
         ).fetchone()
         if row is None:
+            raise RunnerContextError("runner_context_binding_not_found")
+        try:
+            public = load_public_key_base64(row["public_key"]).public_bytes(Encoding.Raw, PublicFormat.Raw)
+            identity = json.loads(row["identity_json"])
+        except (TypeError, ValueError):
+            raise RunnerContextError("runner_context_binding_not_found") from None
+        if (
+            hashlib.sha256(public).hexdigest() != row["public_key_digest"]
+            or identity.get("state") != "active"
+            or identity.get("runner_id") != runner_id
+            or identity.get("workspace_id") != workspace_id
+            or identity.get("public_key", {}).get("key_id") != runner_key_id
+        ):
             raise RunnerContextError("runner_context_binding_not_found")
         return row
