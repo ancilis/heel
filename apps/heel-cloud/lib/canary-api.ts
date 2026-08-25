@@ -80,6 +80,11 @@ export interface CanaryApprovalSummary {
   egress: string;
 }
 
+export interface CanaryPendingApprovalRequest extends CanaryApprovalSummary {
+  submittedAtMs: number;
+  expiresAtMs: number;
+}
+
 export interface RunnerContextBindingRecord {
   bindingId: string; bindingDigest: string; environmentId: string; origin: string;
   environmentClass: "staging" | "sandbox"; verificationRecordDigest: string;
@@ -654,6 +659,29 @@ export class CanaryApi {
     });
   }
 
+  async listPendingApprovalRequests(workspaceRef: string, projectRef: string, signal?: AbortSignal): Promise<{ request: Readonly<CanaryPendingApprovalRequest> | null; hasMore: boolean }> {
+    const value = await this.#json(projectPath(workspaceRef, projectRef, "/canary-approval-requests"), "GET", undefined, 200, {}, signal);
+    if (!exact(value, ["schema_version", "server_time_ms", "requests", "has_more"])
+      || value.schema_version !== "heel.canary-approval-request-list.v1" || !integer(value.server_time_ms)
+      || !Array.isArray(value.requests) || value.requests.length > 1 || typeof value.has_more !== "boolean") invalidResponse();
+    if (value.requests.length === 0) return deepFreeze({ request: null, hasMore: value.has_more });
+    const item = value.requests[0];
+    if (!exact(item, ["approval_id", "run_id", "projection_digest", "status", "submitted_at_ms", "expires_at_ms", "origin", "hostname", "routes", "scenarios", "request_budget", "duration_seconds", "egress"])
+      || !identifier(item.approval_id) || typeof item.run_id !== "string" || !RUN_REF.test(item.run_id)
+      || !digest(item.projection_digest) || item.status !== "awaiting_execution_approval" || !integer(item.submitted_at_ms)
+      || !integer(item.expires_at_ms) || item.expires_at_ms <= item.submitted_at_ms || typeof item.origin !== "string"
+      || typeof item.hostname !== "string" || !/^[a-z0-9.-]{1,253}$/.test(item.hostname)
+      || !Array.isArray(item.routes) || item.routes.length > 20 || !item.routes.every((route) => typeof route === "string" && /^(?:GET|HEAD) \/[A-Za-z0-9_~%/.{}:-]{1,512}$/.test(route))
+      || !Array.isArray(item.scenarios) || item.scenarios.length > 4 || !item.scenarios.every(identifier)
+      || !integer(item.request_budget, 1, 20) || !integer(item.duration_seconds, 1, 60)
+      || item.egress !== `${item.hostname}:443`) invalidResponse();
+    return deepFreeze({ request: { approvalId: item.approval_id as string, runId: item.run_id as string,
+      projectionDigest: item.projection_digest as string, origin: item.origin as string, hostname: item.hostname as string,
+      routes: item.routes as string[], scenarios: item.scenarios as string[], requestBudget: item.request_budget as number,
+      durationSeconds: item.duration_seconds as number, egress: item.egress as string,
+      submittedAtMs: item.submitted_at_ms as number, expiresAtMs: item.expires_at_ms as number }, hasMore: value.has_more as boolean });
+  }
+
   async approveRun(workspaceRef: string, projectRef: string, runRef: string, approval: {
     projectionDigest: string;
     hostnameRetype: string;
@@ -680,8 +708,8 @@ export class CanaryApi {
     return deepFreeze({ runId: runRef, grantId: value.grant_id as string, reservationId: value.reservation_id as string, grant: value.grant });
   }
 
-  async getRun(workspaceRef: string, projectRef: string, runRef: string): Promise<CanaryRunDashboard> {
-    return parseRunDashboard(await this.#json(runPath(workspaceRef, projectRef, runRef), "GET", undefined, 200), runRef);
+  async getRun(workspaceRef: string, projectRef: string, runRef: string, signal?: AbortSignal): Promise<CanaryRunDashboard> {
+    return parseRunDashboard(await this.#json(runPath(workspaceRef, projectRef, runRef), "GET", undefined, 200, {}, signal), runRef);
   }
 
   async listEvents(workspaceRef: string, projectRef: string, runRef: string): Promise<readonly Readonly<JsonRecord>[]> {
@@ -810,15 +838,15 @@ export class CanaryApi {
     if (!exact(value, ["schema_version", "status"]) || value.schema_version !== "heel.runner-pairing-approved.v1" || value.status !== "approved") invalidResponse();
   }
 
-  async #json(path: string, method: "GET" | "POST", body: unknown, expectedStatus: number, extraHeaders: Record<string, string> = {}): Promise<JsonRecord> {
-    const response = await this.#send(path, method, body, extraHeaders);
+  async #json(path: string, method: "GET" | "POST", body: unknown, expectedStatus: number, extraHeaders: Record<string, string> = {}, signal?: AbortSignal): Promise<JsonRecord> {
+    const response = await this.#send(path, method, body, extraHeaders, signal);
     if (response.status !== expectedStatus) throw await this.#error(response);
     const value = await this.#parsed(response);
     if (!record(value)) invalidResponse();
     return value;
   }
 
-  async #send(path: string, method: "GET" | "POST", body: unknown, extraHeaders: Record<string, string>): Promise<Response> {
+  async #send(path: string, method: "GET" | "POST", body: unknown, extraHeaders: Record<string, string>, signal?: AbortSignal): Promise<Response> {
     if (!path.startsWith(`${CONTROL_PLANE_PREFIX}/v1/`) || path.includes("?") || path.includes("#")) invalidRequest();
     const headers = new Headers({ Accept: "application/json", ...extraHeaders });
     let payload: string | undefined;
@@ -829,6 +857,9 @@ export class CanaryApi {
     }
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(new Error("canary request timeout")), this.#timeoutMs);
+    const abort = () => timeout.abort(new Error("canary request cancelled"));
+    if (signal?.aborted) abort();
+    signal?.addEventListener("abort", abort, { once: true });
     try {
       return await this.#transport(path, {
         body: payload,
@@ -843,6 +874,7 @@ export class CanaryApi {
       throw new CanaryApiError("unavailable", 0);
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
     }
   }
 

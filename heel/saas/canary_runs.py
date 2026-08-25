@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import secrets
 import sqlite3
@@ -1743,6 +1744,66 @@ class CanaryRunService:
             "stop_acknowledged_at_ms": row["stop_acknowledged_at_ms"],
             "stop_ack_late": bool(row["stop_ack_late"]),
         }
+
+    def list_pending_approval_requests(self, workspace_id: str, project_ref: str, actor: str) -> dict[str, object]:
+        """Closed, read-only discovery for browser approval; corrupt rows fail as a whole."""
+        if type(actor) is not str or not actor:
+            raise LookupError("project not found")
+        if self.conn.execute("SELECT 1 FROM memberships WHERE workspace_id=? AND user_id=?", (workspace_id, actor)).fetchone() is None:
+            raise LookupError("project not found")
+        if self.conn.execute("SELECT 1 FROM projects WHERE workspace_id=? AND project_ref=?", (workspace_id, project_ref)).fetchone() is None:
+            raise LookupError("project not found")
+        now = self._now_ms()
+        rows = self.conn.execute(
+            "SELECT a.*,r.status AS run_status,r.workspace_id AS run_workspace_id,r.project_ref AS run_project_ref,"
+            "r.approval_id AS run_approval_id,r.environment_id AS run_environment_id,r.runner_id AS run_runner_id,r.runner_key_id AS run_runner_key_id "
+            "FROM canary_approval_projections a JOIN canary_runs r ON r.workspace_id=a.workspace_id AND r.project_ref=a.project_ref AND r.approval_id=a.approval_id AND r.run_id=a.run_id "
+            "WHERE a.workspace_id=? AND a.project_ref=? AND a.status='awaiting_execution_approval' AND r.status='awaiting_execution_approval' AND a.expires_at>? "
+            "ORDER BY a.created_at DESC,a.run_id ASC LIMIT 2", (workspace_id, project_ref, now),
+        ).fetchall()
+        requests: list[dict[str, object]] = []
+        for row in rows:
+            try:
+                if (row["workspace_id"] != workspace_id or row["project_ref"] != project_ref or row["run_workspace_id"] != workspace_id
+                        or row["run_project_ref"] != project_ref or row["run_approval_id"] != row["approval_id"]
+                        or row["run_environment_id"] != row["environment_id"] or row["run_runner_id"] != row["runner_id"]
+                        or row["run_runner_key_id"] != row["runner_key_id"] or type(row["projection_json"]) is not str):
+                    raise ValueError
+                raw = row["projection_json"].encode("utf-8")
+                if len(raw) > 65536:
+                    raise ValueError
+                projection = validate_approval_projection(json.loads(row["projection_json"]))
+                if canonical_bytes(projection) != raw or (projection["projection_id"], projection["workspace_id"], projection["project_id"], projection["projection_digest"], projection["signing_key_id"]) != (row["approval_id"], row["workspace_id"], row["project_ref"], row["projection_digest"], row["signing_key_id"]):
+                    raise ValueError
+                if (projection["environment"]["environment_id"] != row["environment_id"] or projection["runner"]["runner_id"] != row["runner_id"]
+                        or projection["runner"]["runner_key_id"] != row["runner_key_id"]):
+                    raise ValueError
+                self._projection_authority(projection, now)
+                links = self.conn.execute(
+                    "SELECT l.*,b.status AS binding_status,b.expires_at_ms,b.environment_origin,b.environment_class,b.verification_record_digest,b.public_key_digest,k.public_key,k.status AS key_status,k.revoked_at,i.identity_json "
+                    "FROM canary_runner_context_projection_links l JOIN canary_runner_context_bindings b ON b.workspace_id=l.workspace_id AND b.project_ref=l.project_ref AND b.environment_id=l.environment_id AND b.runner_id=l.runner_id AND b.runner_key_id=l.runner_key_id AND b.rcb_id=l.rcb_id AND b.binding_digest=l.binding_digest "
+                    "JOIN canary_runner_keys k ON k.workspace_id=b.workspace_id AND k.runner_id=b.runner_id AND k.key_id=b.runner_key_id JOIN canary_runner_identity_records i ON i.workspace_id=b.workspace_id AND i.runner_id=b.runner_id "
+                    "WHERE l.workspace_id=? AND l.project_ref=? AND l.approval_id=? AND l.run_id=?", (workspace_id, project_ref, row["approval_id"], row["run_id"]),
+                ).fetchall()
+                if len(links) > 1:
+                    raise ValueError
+                if row["uploaded_by"] == row["runner_id"] and not links:
+                    raise ValueError
+                if links:
+                    link = links[0]
+                    public = load_public_key_base64(link["public_key"]).public_bytes(Encoding.Raw, PublicFormat.Raw)
+                    identity = json.loads(link["identity_json"])
+                    if (link["binding_status"] != "active" or int(link["expires_at_ms"]) <= now or link["environment_id"] != row["environment_id"]
+                            or link["runner_id"] != row["runner_id"] or link["runner_key_id"] != row["runner_key_id"] or link["projection_digest"] != row["projection_digest"]
+                            or link["environment_origin"] != projection["environment"]["origin"] or link["environment_class"] != projection["environment"]["environment_class"]
+                            or link["verification_record_digest"] != projection["environment"]["verification_record_digest"] or link["key_status"] != "active" or link["revoked_at"] is not None
+                            or hashlib.sha256(public).hexdigest() != link["public_key_digest"] or identity.get("state") != "active" or identity.get("public_key", {}).get("key_id") != link["runner_key_id"]):
+                        raise ValueError
+                hostname = projection["egress"]["hostname"]
+                requests.append({"approval_id": row["approval_id"], "run_id": row["run_id"], "projection_digest": row["projection_digest"], "status": "awaiting_execution_approval", "submitted_at_ms": row["created_at"], "expires_at_ms": row["expires_at"], "origin": projection["environment"]["origin"], "hostname": hostname, "routes": [f"{item['method']} {item['route_template']}" for item in projection["actions"]], "scenarios": [item["scenario_id"] for item in projection["scenarios"]], "request_budget": projection["budgets"]["maximum_requests"], "duration_seconds": math.ceil(projection["budgets"]["wall_timeout_ms"] / 1000), "egress": f"{hostname}:443"})
+            except (KeyError, TypeError, ValueError, LookupError):
+                raise CanaryRunError("canary_authority_unavailable") from None
+        return {"schema_version": "heel.canary-approval-request-list.v1", "server_time_ms": now, "requests": requests[:1], "has_more": len(rows) > 1}
 
     def list_events(self, workspace_id: str, project_ref: str, run_id: str) -> list[dict]:
         self._run(workspace_id, project_ref, run_id)

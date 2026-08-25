@@ -985,6 +985,8 @@ class _Handler(BaseHTTPRequestHandler):
                     return lambda: self._ws_runner_context_revoke(wid, project_ref, tail[3])
                 if len(tail) == 3 and tail[2] == "canary-approval-projections" and method == "POST":
                     return lambda: self._ws_canary_projection_submit(wid, project_ref)
+                if len(tail) == 3 and tail[2] == "canary-approval-requests" and method == "GET":
+                    return lambda: self._ws_canary_approval_requests(wid, project_ref)
                 if len(tail) >= 4 and tail[2] == "canary-runs":
                     run_id = tail[3]
                     if len(tail) == 4 and method == "GET":
@@ -2158,6 +2160,23 @@ class _Handler(BaseHTTPRequestHandler):
         except LookupError:
             raise CanaryRunError("canary_authority_unavailable") from None
         self._json(201, result)
+
+    def _ws_canary_approval_requests(self, wid: str, project_ref: str) -> None:
+        if ("?" in self.path or "#" in self.path or "%" in self.path
+                or self._header_values("Content-Length") or self._header_values("Transfer-Encoding")
+                or self._header_values("Content-Encoding")):
+            raise ApiError(404, "project not found", code="project_not_found")
+        kind, actor, _ = self._principal()
+        if kind == "anon" or actor is None:
+            raise ApiError(401, "authentication required")
+        if kind != "session":
+            raise ApiError(404, "project not found", code="project_not_found")
+        runs, _ = self._human_canary_services()
+        try:
+            result = runs.list_pending_approval_requests(wid, project_ref, actor)
+        except LookupError:
+            raise ApiError(404, "project not found", code="project_not_found") from None
+        self._json(200, result)
 
     def _runner_context_service(self) -> RunnerContextBindingService:
         if self.cp.runner_contexts is None:

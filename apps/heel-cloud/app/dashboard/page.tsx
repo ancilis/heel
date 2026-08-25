@@ -10,7 +10,7 @@ import { ApprovalDialog } from "../../components/canary/ApprovalDialog";
 import { DisclosureDialog } from "../../components/canary/DisclosureDialog";
 import { RunProgress, type RunPhase } from "../../components/canary/RunProgress";
 import {
-  CanaryApi, CanaryApiError, type CanaryApprovalSummary, type CanaryDisclosureMetadata,
+  CanaryApi, CanaryApiError, type CanaryApprovalSummary, type CanaryDisclosureMetadata, type CanaryPendingApprovalRequest,
   type CanaryRunDashboard, type RunnerContextBindingDashboard, type VerifiedEnvironmentRecord,
 } from "../../lib/canary-api";
 import { HeelCloudApi, HeelCloudApiError, type HeelCloudProject } from "../../lib/heel-cloud-api";
@@ -88,6 +88,7 @@ export default function Dashboard() {
   const [disclosureOpen, setDisclosureOpen] = useState(false);
   const [selectedRunner, setSelectedRunner] = useState("");
   const [selectedBindingEnvironment, setSelectedBindingEnvironment] = useState("");
+  const [pendingHasMore, setPendingHasMore] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -114,13 +115,49 @@ export default function Dashboard() {
   }, [connection]);
 
   useEffect(() => {
+    if (connection.phase !== "ready" || approval !== null || working) return;
+    let cancelled = false;
+    let inFlight = false;
+    let controller: AbortController | null = null;
+    const discover = async (): Promise<void> => {
+      if (cancelled || inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      controller = new AbortController();
+      try {
+        const pending = await canaryApi.listPendingApprovalRequests(connection.context.workspaceRef, connection.context.project.projectRef, controller.signal);
+        if (cancelled) return;
+        setPendingHasMore(pending.hasMore);
+        const request = pending.request;
+        if (request === null) return;
+        const status = await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, request.runId, controller.signal);
+        if (cancelled || status.run.runId !== request.runId || status.run.approvalId !== request.approvalId || status.run.status !== "awaiting_execution_approval") return;
+        setApproval(request as CanaryPendingApprovalRequest);
+        setRun(status);
+      } catch (error) {
+        if (!cancelled && !(error instanceof CanaryApiError && error.code === "unavailable")) setNotice(messageOf(error));
+      } finally { inFlight = false; controller = null; }
+    };
+    const visibility = () => { if (document.visibilityState === "visible") void discover(); };
+    void discover();
+    const timer = setInterval(() => void discover(), 2_000);
+    document.addEventListener("visibilitychange", visibility);
+    return () => { cancelled = true; controller?.abort(); clearInterval(timer); document.removeEventListener("visibilitychange", visibility); };
+  }, [approval, connection, working]);
+
+  useEffect(() => {
     if (connection.phase !== "ready" || approval === null || run === null
       || ["terminal", "cancelled", "expired"].includes(run.run.status)) return;
     let cancelled = false;
     const timer = setInterval(() => {
       void canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId)
-        .then((next) => { if (!cancelled) setRun(next); })
-        .catch((error: unknown) => { if (!cancelled) setNotice(messageOf(error)); });
+        .then((next) => { if (!cancelled) {
+          setRun(next);
+          if (["cancelled", "expired"].includes(next.run.status)) { setApproval(null); setRun(null); }
+        } })
+        .catch((error: unknown) => { if (!cancelled) {
+          if (error instanceof CanaryApiError && error.status === 404) { setApproval(null); setRun(null); }
+          else setNotice(messageOf(error));
+        } });
     }, 1_000);
     return () => { cancelled = true; clearInterval(timer); };
   }, [approval, connection, run]);
@@ -282,6 +319,7 @@ export default function Dashboard() {
 
       {context && context.projects.length > 1 ? <label className="dashboard-context">Project<select disabled={working} onChange={(event) => void selectProject(event.target.value)} value={context.project.projectRef}>{context.projects.map((project) => <option key={project.projectRef} value={project.projectRef}>{project.name}</option>)}</select></label> : null}
       {notice ? <p className="next-action" role="status">{notice}</p> : null}
+      {pendingHasMore ? <p className="next-action" role="status">Another pending approval is waiting after this one.</p> : null}
 
       <div className="dashboard-grid"><div>
         <ActivationCard completedSteps={completedSteps} environmentOrigin={executable?.origin}

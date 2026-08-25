@@ -647,6 +647,9 @@ function analyzeSource(fileName, text) {
   }
 
   function allowedAmbientRootReference(node) {
+    if (relativeName === "app/dashboard/page.tsx" && node.text === "document"
+      && ts.isPropertyAccessExpression(node.parent) && node.parent.expression === node
+      && ["visibilityState", "addEventListener", "removeEventListener"].includes(node.parent.name.text)) return true;
     if (
       ((["lib/local-reviews.ts", "lib/findings-sync-queue.ts"].includes(relativeName)
           && memberName(node.parent) === "indexedDB")

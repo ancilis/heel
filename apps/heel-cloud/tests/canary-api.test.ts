@@ -41,6 +41,18 @@ it("uses closed create list revoke routes for browser context authorization", as
   ]);
 });
 
+it("discovers only a closed pending approval summary", async () => {
+  const api = new CanaryApi({ transport: async () => jsonResponse({
+    schema_version: "heel.canary-approval-request-list.v1", server_time_ms: 1, has_more: false,
+    requests: [{ approval_id: "ap_canary", run_id: run, projection_digest: digest, status: "awaiting_execution_approval",
+      submitted_at_ms: 1, expires_at_ms: 2, origin: "https://staging.acme.dev", hostname: "staging.acme.dev",
+      routes: ["GET /api/canary"], scenarios: ["scenario"], request_budget: 1, duration_seconds: 1, egress: "staging.acme.dev:443" }],
+  }) });
+  const value = await api.listPendingApprovalRequests(workspace, project);
+  assert.equal(value.request?.runId, run);
+  assert.equal(value.request?.projectionDigest, digest);
+});
+
 
 function jsonResponse(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
   const body = JSON.stringify(value);

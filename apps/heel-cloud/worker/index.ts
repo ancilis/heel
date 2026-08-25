@@ -91,6 +91,9 @@ const RUNNER_CONTEXT_REVOKE_ROUTE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}
 const CANARY_APPROVAL_PROJECTION_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-approval-projections$`,
 );
+const CANARY_APPROVAL_REQUESTS_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-approval-requests$`,
+);
 const CANARY_RUN_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}$`,
 );
@@ -158,6 +161,7 @@ function isHumanCanaryRoute(method: string, upstreamPath: string): boolean {
   if (RUNNER_CONTEXT_BINDINGS_ROUTE.test(upstreamPath)) return method === "GET" || method === "POST";
   if (RUNNER_CONTEXT_REVOKE_ROUTE.test(upstreamPath)) return method === "POST";
   if (CANARY_APPROVAL_PROJECTION_ROUTE.test(upstreamPath)) return method === "POST";
+  if (CANARY_APPROVAL_REQUESTS_ROUTE.test(upstreamPath)) return method === "GET";
   if (CANARY_RUN_ROUTE.test(upstreamPath)) return method === "GET";
   if (CANARY_RUN_EVENTS_ROUTE.test(upstreamPath)) return method === "GET";
   if (CANARY_RUN_APPROVE_ROUTE.test(upstreamPath)) return method === "POST";
@@ -292,6 +296,9 @@ function controlPlaneRequestHeaders(
     if (source.has("Authorization")) throw new InvalidControlPlaneRequest();
     headers = controlPlaneCredentials(source);
     if (!headers.has("Cookie") || headers.has("Authorization")) throw new InvalidControlPlaneRequest();
+    if (CANARY_APPROVAL_REQUESTS_ROUTE.test(upstreamPath) && (source.has("Transfer-Encoding") || source.has("TE") || source.has("Content-Encoding") || source.has("Content-Length"))) {
+      throw new InvalidControlPlaneRequest();
+    }
     if (method === "POST") {
       const origin = source.get("Origin") ?? "";
       if (origin !== configuredPublicOrigin || source.get("Sec-Fetch-Site") !== "same-origin") {
@@ -564,6 +571,15 @@ async function proxyControlPlane(
     const response = await env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init));
     if (response.status >= 300 && response.status <= 399) {
       return proxyError(502, "control plane request failed", csp);
+    }
+    if (CANARY_APPROVAL_REQUESTS_ROUTE.test(upstreamPath) && response.status >= 200 && response.status <= 299) {
+      const declared = singletonHeader(response.headers, "Content-Length");
+      if (declared === null || !/^(?:0|[1-9][0-9]*)$/.test(declared) || Number(declared) > 69632) {
+        return proxyError(502, "control plane request failed", csp);
+      }
+      const body = new Uint8Array(await response.arrayBuffer());
+      if (body.byteLength !== Number(declared)) return proxyError(502, "control plane request failed", csp);
+      return controlPlaneResponse(new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers }), csp, upstreamPath);
     }
     return controlPlaneResponse(response, csp, upstreamPath);
   } catch {
