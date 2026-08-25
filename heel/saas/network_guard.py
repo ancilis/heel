@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+from .iana_root_tlds import IANA_ROOT_TLDS
+
 
 CHALLENGE_PATH = "/.well-known/heel-verify.txt"
 HTTPS_PORT = 443
@@ -104,6 +106,8 @@ def normalize_verified_origin(origin: str) -> str:
         raise OriginValidationError("hostname has invalid label hyphenation")
     if host in _SPECIAL_NAMES or host.endswith(_SPECIAL_SUFFIXES) or host.startswith("xn--") or ".xn--" in host:
         raise OriginValidationError("special or IDNA hostname is forbidden")
+    if labels[-1] == "arpa" or labels[-1] not in IANA_ROOT_TLDS:
+        raise OriginValidationError("hostname is not under a public root-zone TLD")
     return f"https://{host}"
 
 

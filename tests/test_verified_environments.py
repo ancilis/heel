@@ -23,6 +23,12 @@ from heel.saas.network_guard import (
     normalize_verified_origin,
     select_safe_addresses,
 )
+from heel.saas.iana_root_tlds import (
+    IANA_ROOT_TLDS,
+    IANA_TLD_LINE_COUNT,
+    IANA_TLD_SHA256,
+    IANA_TLD_VERSION,
+)
 from heel.saas.catalog import CATALOG_VERSION
 from heel.saas.verification import (
     EnvironmentCooldown, OWNERSHIP_ATTESTATION, TargetLimitExceeded, VerifiedEnvironmentService,
@@ -69,6 +75,18 @@ def verifier(**changes):
 )
 def test_normalize_exact_https_origin(origin, expected):
     assert normalize_verified_origin(origin) == expected
+
+
+def test_normalize_requires_frozen_iana_public_root_zone_tld():
+    assert IANA_TLD_VERSION == "2026082301"
+    assert IANA_TLD_SHA256 == "1e296954a3bbe1525756893e68e3b5917604c299a696b2e59390a8a2e99289ef"
+    assert IANA_TLD_LINE_COUNT == 1439
+    assert {"com", "zip"} <= IANA_ROOT_TLDS
+    assert normalize_verified_origin("https://staging.example.com") == "https://staging.example.com"
+    assert normalize_verified_origin("https://launch.zip") == "https://launch.zip"
+    for origin in ("https://staging.private", "https://staging.intranet", "https://staging.acmeinternal", "https://service.arpa"):
+        with pytest.raises(OriginValidationError):
+            normalize_verified_origin(origin)
 
 
 @pytest.mark.parametrize(
@@ -424,6 +442,39 @@ def test_environment_start_requires_exact_user_attestation_fields():
     assert row["attestation_text"] == OWNERSHIP_ATTESTATION
     assert row["attestation_version"] == "v1"
     assert row["attestation_acknowledgement"] == "accepted"
+    conn.close()
+
+
+def test_dns_txt_cannot_verify_nonpublic_root_zone_origin():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+
+    class FakePublicDNS:
+        calls = []
+        def __call__(self, hostname):
+            self.calls.append(("address", hostname))
+            return ["93.184.216.34"]
+        def txt(self, hostname):
+            self.calls.append(("txt", hostname))
+            return ["heel-verify=would-be-exact-token"]
+
+    dns = FakePublicDNS()
+    service = VerifiedEnvironmentService(conn, dns_txt=dns)
+    with pytest.raises(ValueError, match="exact public https origin"):
+        service.start(
+            "ws", "prj", "https://staging.private", "staging", actor="owner", proof_method="dns-txt",
+            attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+            attestation_acknowledgement="accepted",
+        )
+    assert dns.calls == []
+    assert conn.execute("SELECT count(*) FROM canary_environments").fetchone()[0] == 0
+    assert not service.is_executable("ws", "prj", "env_private")
     conn.close()
 
 
