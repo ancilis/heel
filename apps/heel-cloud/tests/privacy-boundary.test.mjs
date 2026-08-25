@@ -291,7 +291,7 @@ function analyzeSource(fileName, text) {
   if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
   if ((RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (RUNNER_REVOKE.test(upstreamPath) && method === "DELETE") return upstreamPath;
-  if (RUNNER_CONTROL.test(upstreamPath) && method === "POST") return upstreamPath;
+  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
   }
@@ -328,6 +328,10 @@ function analyzeSource(fileName, text) {
       'const WORKSPACE_REF = "ws_[0-9a-f]{16}";',
       'const PROJECT_REF = "prj_[0-9a-f]{32}";',
       'const SYNCED_REVIEW_REF = "synrev_[0-9a-f]{32}";',
+      'const MAX_RUNNER_CLAIM_BODY_BYTES = 256;',
+      'const MAX_RUNNER_CONTROL_BODY_BYTES = 36 * 1024;',
+      'const MAX_RUNNER_RESYNC_BODY_BYTES = 2 * 1024;',
+      'const MAX_RUNNER_PAIRING_BODY_BYTES = 16 * 1024;',
       "const upstreamUrl = new URL(upstreamPath, CONTROL_PLANE_ORIGIN);",
       "headers: requestContract.headers,",
       'redirect: "manual",',

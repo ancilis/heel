@@ -843,18 +843,28 @@ class OpenCoreReleaseTests(unittest.TestCase):
             EXPECTED_MANIFEST,
         )
 
-    def test_checked_in_runner_identity_artifact_matches_public_source_api(self):
-        """The downloadable wheel and sdist must not lag pairing/signer source."""
+    def test_checked_in_runner_artifacts_match_the_current_public_pairing_and_recovery_api(self):
+        """The downloadable wheel and sdist must not lag any public runner API."""
         downloads = ROOT / "apps" / "heel-cloud" / "public" / "downloads"
-        source = (ROOT / "heel" / "runner" / "identity.py").read_bytes()
-        for required in (b"def runner_phrase_words", b"class SystemSecureSigner"):
-            self.assertIn(required, source)
+        sources = {
+            f"heel/runner/{name}": (ROOT / "heel" / "runner" / name).read_bytes()
+            for name in ("__init__.py", "identity.py", "control_client.py")
+        }
+        for required in (
+            b"def runner_phrase_words", b"class SystemSecureSigner",
+            b"def create_runner_pairing_material", b"def bind_runner_identity",
+        ):
+            self.assertIn(required, sources["heel/runner/identity.py"])
+        for required in (b"class PendingRunnerResync", b"class RecoveredRunnerChain"):
+            self.assertIn(required, sources["heel/runner/control_client.py"])
         with zipfile.ZipFile(downloads / WHEEL) as wheel:
-            self.assertEqual(wheel.read("heel/runner/identity.py"), source)
+            for name, source in sources.items():
+                self.assertEqual(wheel.read(name), source)
         with tarfile.open(downloads / SDIST, "r:gz") as archive:
-            stream = archive.extractfile("heel_sim-1.2.0/heel/runner/identity.py")
-            self.assertIsNotNone(stream)
-            self.assertEqual(stream.read(), source)
+            for name, source in sources.items():
+                stream = archive.extractfile(f"heel_sim-1.2.0/{name}")
+                self.assertIsNotNone(stream)
+                self.assertEqual(stream.read(), source)
 
     def test_release_docs_are_self_contained_and_avoid_private_commands(self):
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))

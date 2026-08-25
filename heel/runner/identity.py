@@ -10,6 +10,7 @@ import hashlib
 import os
 import secrets
 import subprocess
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
@@ -205,6 +206,99 @@ class RunnerIdentity:
             "RunnerIdentity(runner_id={!r}, workspace_id={!r}, key_id={!r}, "
             "fingerprint={!r})"
         ).format(self.runner_id, self.workspace_id, self.key_id, self.fingerprint)
+
+
+@dataclass(frozen=True, repr=False)
+class RunnerPairingMaterial:
+    """Public pairing payload prepared before the cloud allocates a runner ID.
+
+    The signer remains an opaque local capability; callers can display and send the
+    public fields, but cannot derive or export its private material.
+    """
+
+    display_name: str
+    runner_version: str
+    adapters: dict[str, str]
+    public_key_b64: str
+    fingerprint: str
+    key_id: str
+    pairing_phrase: tuple[str, ...]
+    _signer: SecureSigner
+
+    def exchange_request(self, invitation_token: str) -> dict[str, object]:
+        if type(invitation_token) is not str or not invitation_token:
+            raise ValueError("invitation token is required")
+        return {
+            "schema_version": "heel.runner-pairing-exchange.v2",
+            "invitation_token": invitation_token,
+            "public_key_b64": self.public_key_b64,
+            "pairing_phrase": " ".join(self.pairing_phrase),
+            "display_name": self.display_name,
+            "runner_version": self.runner_version,
+            "adapters": dict(self.adapters),
+        }
+
+
+def _display_name(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("runner display name is required")
+    normalized = unicodedata.normalize("NFC", value)
+    if (not 1 <= len(normalized) <= 64 or len(normalized.encode("utf-8")) > 128
+            or normalized != normalized.strip()
+            or any(unicodedata.category(char) == "Cc" or 0xD800 <= ord(char) <= 0xDFFF
+                   for char in normalized)):
+        raise ValueError("invalid runner display name")
+    return normalized
+
+
+def create_runner_pairing_material(
+    display_name: str,
+    runner_version: str,
+    adapters: dict[str, str],
+    signer: SecureSigner,
+    *,
+    words: Sequence[str] | None = None,
+    random_source: Callable[[int], bytes] = secrets.token_bytes,
+) -> RunnerPairingMaterial:
+    """Prepare v2 exchange material before the control plane allocates ``runner_id``."""
+    display_name = _display_name(display_name)
+    if type(runner_version) is not str or not runner_version:
+        raise ValueError("runner version is required")
+    if not isinstance(adapters, dict) or not all(type(k) is str and k and type(v) is str and v
+                                                 for k, v in adapters.items()):
+        raise ValueError("adapters must be a string map")
+    vocabulary = _validate_words(runner_phrase_words() if words is None else words)
+    public_key = signer.public_key
+    if not isinstance(public_key, bytes) or len(public_key) != 32:
+        raise ValueError("runner signer must expose a 32-byte Ed25519 public key")
+    key_id = ed25519_key_id(public_key)
+    if signer.key_id != key_id:
+        raise ValueError("runner signer key ID does not match its public key")
+    entropy = random_source(12)
+    if not isinstance(entropy, bytes) or len(entropy) != 12:
+        raise ValueError("runner random source must return exactly requested bytes")
+    phrase = tuple(vocabulary[int.from_bytes(entropy[index:index + 2], "big") % 2048]
+                   for index in range(0, 12, 2))
+    return RunnerPairingMaterial(
+        display_name=display_name, runner_version=runner_version, adapters=dict(sorted(adapters.items())),
+        public_key_b64=base64.b64encode(public_key).decode("ascii"),
+        fingerprint=hashlib.sha256(public_key).hexdigest(), key_id=key_id,
+        pairing_phrase=phrase, _signer=signer,
+    )
+
+
+def bind_runner_identity(material: RunnerPairingMaterial, *, workspace_id: str, runner_id: str) -> RunnerIdentity:
+    """Bind server-issued identity coordinates only after successful activation."""
+    if not isinstance(material, RunnerPairingMaterial):
+        raise ValueError("runner pairing material is required")
+    if not all(type(item) is str and item for item in (workspace_id, runner_id)):
+        raise ValueError("runner identity fields must be non-empty strings")
+    return RunnerIdentity(
+        runner_id=runner_id, workspace_id=workspace_id, runner_version=material.runner_version,
+        adapter_versions=dict(material.adapters), public_key_b64=material.public_key_b64,
+        fingerprint=material.fingerprint, key_id=material.key_id,
+        pairing_phrase=material.pairing_phrase,
+    )
 
 
 def _validate_words(words: Sequence[str]) -> tuple[str, ...]:

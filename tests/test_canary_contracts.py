@@ -26,6 +26,11 @@ from heel.canary_contracts import (
     validate_disclosure_permit,
     validate_execution_grant,
     validate_operational_run,
+    validate_runner_claim_request,
+    validate_runner_heartbeat_request,
+    validate_runner_progress_request,
+    validate_runner_result_request,
+    validate_runner_stop_ack_request,
     validate_runner_identity,
     validate_test_manifest,
 )
@@ -144,6 +149,47 @@ def permit() -> dict:
 
 
 class CanaryContractTests(unittest.TestCase):
+    def test_runner_request_wrappers_are_closed_and_validate_operational_projection(self):
+        claim = {"schema_version": "heel.runner-claim-request.v1"}
+        self.assertEqual(validate_runner_claim_request(claim), claim)
+        with self.assertRaises(ContractError):
+            validate_runner_claim_request({**claim, "run_id": "run"})
+
+        phases = {
+            validate_runner_heartbeat_request: "claimed",
+            validate_runner_progress_request: "running",
+            validate_runner_result_request: "terminal",
+            validate_runner_stop_ack_request: "stop_requested",
+        }
+        schemas = {
+            validate_runner_heartbeat_request: "heartbeat",
+            validate_runner_progress_request: "progress",
+            validate_runner_result_request: "result",
+            validate_runner_stop_ack_request: "stop-ack",
+        }
+        for validator, phase in phases.items():
+            projection = operational()
+            projection["lifecycle_phase"] = phase
+            if phase == "claimed":
+                projection["timestamps"]["claimed_at_ms"] = 1
+            elif phase == "running":
+                projection["timestamps"].update({"claimed_at_ms": 1, "started_at_ms": 1})
+            elif phase == "terminal":
+                projection["execution_disposition"] = "completed"
+                projection["timestamps"].update({"claimed_at_ms": 1, "started_at_ms": 1, "terminal_at_ms": 1})
+            else:
+                projection["timestamps"].update({"claimed_at_ms": 1, "started_at_ms": 1, "stop_requested_at_ms": 1, "stop_acknowledged_at_ms": 1})
+                projection["stop_reason"] = "cloud_stop"
+            projection = _digest(projection, "projection_digest")
+            request = {"schema_version": f"heel.runner-{schemas[validator]}-request.v1", "run_id": "run", "operational_projection": projection}
+            with self.subTest(operation=schemas[validator]):
+                self.assertEqual(validator(request), request)
+                private = copy.deepcopy(request)
+                private["operational_projection"]["headers"] = {"authorization": "secret"}
+                with self.assertRaises(ContractError):
+                    validator(private)
+                with self.assertRaises(ContractError):
+                    validator({**request, "findings": []})
     def test_parse_json_rejects_nonportable_and_ambiguous_input(self):
         bad = [b'{"a":1,"a":2}', b'{"a":true}', b'{"a":1.0}', b'{"a":NaN}', b'{"a":9007199254740992}', b'{"a":"\\ud800"}', b'{"e\\u0301":1,"\\u00e9":2}', b'\xff']
         for raw in bad:

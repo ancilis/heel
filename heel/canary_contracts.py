@@ -19,6 +19,11 @@ APPROVAL_PROJECTION_SCHEMA = "heel.approval-manifest-projection.v1"
 RUNNER_IDENTITY_SCHEMA = "heel.runner-identity.v1"
 EXECUTION_GRANT_SCHEMA = "heel.execution-grant.v1"
 OPERATIONAL_RUN_SCHEMA = "heel.operational-run-projection.v1"
+RUNNER_CLAIM_REQUEST_SCHEMA = "heel.runner-claim-request.v1"
+RUNNER_HEARTBEAT_REQUEST_SCHEMA = "heel.runner-heartbeat-request.v1"
+RUNNER_PROGRESS_REQUEST_SCHEMA = "heel.runner-progress-request.v1"
+RUNNER_RESULT_REQUEST_SCHEMA = "heel.runner-result-request.v1"
+RUNNER_STOP_ACK_REQUEST_SCHEMA = "heel.runner-stop-ack-request.v1"
 CANARY_FINDINGS_SCHEMA = "heel.canary-findings-projection.v1"
 DISCLOSURE_PERMIT_SCHEMA = "heel.disclosure-permit.v1"
 
@@ -492,6 +497,55 @@ def validate_operational_run(value: Any) -> dict[str, Any]:
     if counters["requests_started"] > 20 or counters["requests_completed"] > counters["requests_started"] or counters["actions_contained"] > counters["requests_started"] or counters["actions_contained"] > 20 or counters["retries_used"] > 1 or counters["remaining_requests"] > 20 or counters["requests_started"] + counters["remaining_requests"] > 20 or counters["remaining_wall_ms"] > 60000:
         _fail("operational counter ceiling")
     versions = _object(obj["versions"], {"runner_version", "engine_version", "adapter_versions"}); _id_fields(versions, ("runner_version", "engine_version")); _version_list(versions["adapter_versions"]); _enum(obj["error_category"], _ERRORS); _enum(obj["stop_reason"], _STOPS); _enum_list(obj["containment_codes"], _CONTAINMENT); _integer(obj["redaction_count"], lower=0); _signature(obj, "projection_digest"); return copy.deepcopy(obj)
+
+
+def validate_runner_claim_request(value: Any) -> dict[str, Any]:
+    """Validate the one closed, bodyless runner-claim request envelope."""
+    obj = _contract(value, 256)
+    obj = _object(obj, {"schema_version"})
+    _enum(obj["schema_version"], {RUNNER_CLAIM_REQUEST_SCHEMA})
+    return copy.deepcopy(obj)
+
+
+def _runner_operation_request(value: Any, *, schema: str, phases: set[str], stop_ack: bool = False) -> dict[str, Any]:
+    # 36 KiB is the transport ceiling.  The nested operational projection remains
+    # independently frozen at 32 KiB by validate_operational_run.
+    obj = _contract(value, 36 * 1024)
+    obj = _object(obj, {"schema_version", "run_id", "operational_projection"})
+    _enum(obj["schema_version"], {schema})
+    _id_fields(obj, ("run_id",))
+    projection = validate_operational_run(obj["operational_projection"])
+    if projection["run_id"] != obj["run_id"]:
+        _fail("runner request run ID mismatch")
+    if projection["lifecycle_phase"] not in phases:
+        _fail("invalid runner request lifecycle")
+    if stop_ack:
+        if projection["timestamps"]["stop_acknowledged_at_ms"] is None:
+            _fail("stop acknowledgement timestamp required")
+        if projection["stop_reason"] == "none":
+            _fail("stop acknowledgement reason required")
+    obj["operational_projection"] = projection
+    return copy.deepcopy(obj)
+
+
+def validate_runner_heartbeat_request(value: Any) -> dict[str, Any]:
+    return _runner_operation_request(value, schema=RUNNER_HEARTBEAT_REQUEST_SCHEMA,
+                                     phases={"claimed", "running", "stop_requested", "finalizing"})
+
+
+def validate_runner_progress_request(value: Any) -> dict[str, Any]:
+    return _runner_operation_request(value, schema=RUNNER_PROGRESS_REQUEST_SCHEMA,
+                                     phases={"claimed", "running", "stop_requested", "finalizing"})
+
+
+def validate_runner_result_request(value: Any) -> dict[str, Any]:
+    return _runner_operation_request(value, schema=RUNNER_RESULT_REQUEST_SCHEMA,
+                                     phases={"terminal"})
+
+
+def validate_runner_stop_ack_request(value: Any) -> dict[str, Any]:
+    return _runner_operation_request(value, schema=RUNNER_STOP_ACK_REQUEST_SCHEMA,
+                                     phases={"stop_requested", "finalizing", "terminal"}, stop_ack=True)
 
 
 def validate_canary_findings(value: Any) -> dict[str, Any]:

@@ -85,6 +85,10 @@ const REVIEW_DETAIL_ROUTE = new RegExp(
 );
 const MAX_CONTROL_PLANE_BODY_BYTES = 256 * 1024;
 const MAX_DEVICE_BODY_BYTES = 8 * 1024;
+const MAX_RUNNER_CLAIM_BODY_BYTES = 256;
+const MAX_RUNNER_CONTROL_BODY_BYTES = 36 * 1024;
+const MAX_RUNNER_RESYNC_BODY_BYTES = 2 * 1024;
+const MAX_RUNNER_PAIRING_BODY_BYTES = 16 * 1024;
 const API_KEY_AUTHORIZATION = /^Bearer heel_sk_[A-Za-z0-9_-]+$/;
 const DEVICE_AUTHORIZATION = /^Bearer heel_at_[A-Za-z0-9_-]{43}$/;
 const SESSION_TOKEN = /^[A-Za-z0-9_-]+$/;
@@ -97,7 +101,9 @@ const RUNNER_ROTATION_APPROVE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/run
 const RUNNER_REVOKE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}$`);
 const RUNNER_ROTATION_PUBLIC = /^\/v1\/runner-rotations\/rotation_[0-9a-f]{32}\/(?:activate|poll)$/;
 const RUNNER_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}(?:/claim|/runs/[A-Za-z0-9_-]{1,128}/(?:heartbeat|progress|result|stop-ack))$`);
+const RUNNER_RESYNC = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/resync/(?:start|complete)$`);
 const RUNNER_HEADERS = ["X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature"];
+const RUNNER_RESYNC_HEADERS = ["X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Signature"];
 
 function contentSecurityPolicy(nonce: string): string {
   return [
@@ -128,6 +134,19 @@ function withSecurityHeaders(response: Response, csp: string, noStore = false): 
 }
 
 class InvalidControlPlaneRequest extends Error {}
+
+function singletonHeader(source: Headers, name: string): string | null {
+  // Cloudflare Headers preserves duplicate fields through getAll.  The web-test
+  // implementation merges them, for which a comma is invalid for every runner
+  // proof field and therefore remains fail-closed.
+  const cloudflare = source as Headers & { getAll?: (header: string) => string[] };
+  if (typeof cloudflare.getAll === "function") {
+    const values = cloudflare.getAll(name);
+    return values.length === 1 ? values[0] : null;
+  }
+  const value = source.get(name);
+  return value === null || value.includes(",") ? null : value;
+}
 
 function controlPlaneCredentials(source: Headers): Headers {
   const headers = new Headers();
@@ -170,14 +189,24 @@ function controlPlaneRequestHeaders(
 ): { headers: Headers; contentLength: number } {
   let headers: Headers;
   const runnerControl = RUNNER_CONTROL.test(upstreamPath);
+  const runnerResync = RUNNER_RESYNC.test(upstreamPath);
   const runnerPairingPublic = upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath) || RUNNER_ROTATION_PUBLIC.test(upstreamPath);
   const runnerPairingHuman = RUNNER_PAIRING_MANAGE.test(upstreamPath) || RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath) || RUNNER_REVOKE.test(upstreamPath);
   if (runnerControl) {
     if (method !== "POST" || source.has("Authorization") || source.has("Cookie")) throw new InvalidControlPlaneRequest();
     headers = new Headers();
     for (const name of RUNNER_HEADERS) {
-      const value = source.get(name);
-      if (value === null || source.getAll(name).length !== 1) throw new InvalidControlPlaneRequest();
+      const value = singletonHeader(source, name);
+      if (value === null) throw new InvalidControlPlaneRequest();
+      headers.set(name, value);
+    }
+  } else if (runnerResync) {
+    if (method !== "POST" || source.has("Authorization") || source.has("Cookie")
+      || source.has("X-Heel-Runner-Nonce") || source.has("X-Heel-Runner-Sequence")) throw new InvalidControlPlaneRequest();
+    headers = new Headers();
+    for (const name of RUNNER_RESYNC_HEADERS) {
+      const value = singletonHeader(source, name);
+      if (value === null) throw new InvalidControlPlaneRequest();
       headers.set(name, value);
     }
   } else if (runnerPairingPublic) {
@@ -241,9 +270,15 @@ function controlPlaneRequestHeaders(
     throw new InvalidControlPlaneRequest();
   }
   const contentLength = Number(declaredLength);
-  const maximum = upstreamPath.startsWith("/v1/device/")
-    ? MAX_DEVICE_BODY_BYTES
-    : MAX_CONTROL_PLANE_BODY_BYTES;
+  const maximum = runnerControl
+    ? (upstreamPath.endsWith("/claim") ? MAX_RUNNER_CLAIM_BODY_BYTES : MAX_RUNNER_CONTROL_BODY_BYTES)
+    : runnerResync
+      ? MAX_RUNNER_RESYNC_BODY_BYTES
+      : (runnerPairingPublic || runnerPairingHuman)
+        ? MAX_RUNNER_PAIRING_BODY_BYTES
+        : upstreamPath.startsWith("/v1/device/")
+          ? MAX_DEVICE_BODY_BYTES
+          : MAX_CONTROL_PLANE_BODY_BYTES;
   if (!Number.isSafeInteger(contentLength) || contentLength > maximum) {
     throw new InvalidControlPlaneRequest();
   }
@@ -326,7 +361,7 @@ function controlPlaneRoute(method: string, pathname: string): string | null {
   if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
   if ((RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (RUNNER_REVOKE.test(upstreamPath) && method === "DELETE") return upstreamPath;
-  if (RUNNER_CONTROL.test(upstreamPath) && method === "POST") return upstreamPath;
+  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
   }
