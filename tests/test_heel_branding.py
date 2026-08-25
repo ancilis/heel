@@ -55,7 +55,7 @@ class HeelBrandingTests(unittest.TestCase):
             },
         )
 
-    def test_setuptools_discovers_only_the_public_top_level_package(self):
+    def test_setuptools_discovers_only_the_public_packages(self):
         with (ROOT / "pyproject.toml").open("rb") as fh:
             setuptools = tomllib.load(fh)["tool"]["setuptools"]
 
@@ -63,7 +63,7 @@ class HeelBrandingTests(unittest.TestCase):
             setuptools,
             {
                 "include-package-data": False,
-                "packages": ["heel"],
+                "packages": ["heel", "heel.runner"],
                 "package-data": {
                     "heel": [
                         "heldout/targets.json",
