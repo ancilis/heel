@@ -89,7 +89,7 @@ class CanaryMigrationTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         self.addCleanup(conn.close)
-        Migrator(conn, CONTROL_PLANE_MIGRATIONS[:12]).apply_all()
+        Migrator(conn, CONTROL_PLANE_MIGRATIONS[:11]).apply_all()
         conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
         conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
         conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", 1))
@@ -114,7 +114,7 @@ class CanaryMigrationTests(unittest.TestCase):
         ledger("runner_heartbeat:run", 2, "runner_heartbeat", "/v1/workspaces/ws/runners/runner/runs/run/stop-ack")
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13])
         self.assertEqual([tuple(row) for row in conn.execute(
             "SELECT chain_name,next_sequence,generation FROM canary_runner_chain_cursors ORDER BY chain_name"
         )], [("heartbeat:run", 2, 0), ("progress:run", 3, 0), ("stop-ack:run", 3, 0)])
