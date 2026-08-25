@@ -19,10 +19,12 @@ import signal
 import sqlite3
 import stat
 import threading
+from types import MethodType
 from typing import Mapping
 from urllib.parse import urlsplit
 
 from .billing import DisabledBilling
+from .canary_reaper import CanaryReaper, CanaryReaperError
 from heel.crypto import SigningAuthority, load_private_key_base64, load_public_key_set
 from .http_api import ControlPlane, serve
 from .migrate import CONTROL_PLANE_MIGRATIONS, Migrator
@@ -251,6 +253,7 @@ def build_server(config: ProductionConfiguration):
         ) from exc
     database_lock = _SingleProcessDatabaseLock.acquire(config.database_path)
     control_plane = None
+    server = None
     try:
         migration_connection = sqlite3.connect(config.database_path)
         try:
@@ -285,13 +288,89 @@ def build_server(config: ProductionConfiguration):
         control_plane.store.conn.execute("PRAGMA synchronous=FULL")
         control_plane.required_schema_version = CONTROL_PLANE_MIGRATIONS[-1].version
         server = serve(control_plane, config.host, config.port)
-        server.add_close_callback(database_lock.close)
+        server.reaper_failure = None
+        server.reaper_ready = False
+
+        def reaper_failed(error: BaseException) -> None:
+            # The existing readiness endpoint already fails closed while draining.  Marking the
+            # whole node draining also prevents a dead lifecycle authority from accepting new
+            # grants before an operator restarts the single-node deployment.
+            server.reaper_failure = error
+            server.reaper_ready = False
+            control_plane.draining = True
+
+        reaper = CanaryReaper(
+            config.database_path,
+            signing=config.grant_authority,
+            on_unexpected_death=reaper_failed,
+        )
+        server.canary_reaper = reaper
+        try:
+            reaper.start()
+        except Exception as error:
+            # The listener has only been bound, never returned as ready.  Its ordinary close path
+            # owns the control plane until the production lifecycle wrapper is installed.
+            server.server_close()
+            server = None
+            control_plane = None
+            raise ProductionConfigurationError(
+                "canary lifecycle coordinator failed to start"
+            ) from error
+        server.reaper_ready = True
+        _install_production_close(server, reaper, database_lock)
         return server
     except Exception:
-        if control_plane is not None:
+        if server is not None:
+            server.server_close()
+        elif control_plane is not None:
             control_plane.close()
         database_lock.close()
         raise
+
+
+def _install_production_close(server, reaper: CanaryReaper, database_lock) -> None:
+    """Install the production-only close order without changing direct/test ControlPlane use."""
+    close_lock = threading.Lock()
+    closed = False
+
+    def production_server_close(bound_server) -> None:
+        nonlocal closed
+        with close_lock:
+            if closed:
+                return
+            bound_server.control_plane.draining = True
+            # Close the listener first, then wait for accepted request handlers.  Calling the
+            # direct base implementation avoids http_api's generic owner close, which would close
+            # SQLite before the reaper is joined.
+            from socketserver import TCPServer
+            TCPServer.server_close(bound_server)
+            drained = bound_server.wait_for_request_drain()
+            if not drained:
+                _LOGGER.error(json.dumps({
+                    "event": "control_plane_drain_timeout",
+                }, sort_keys=True, separators=(",", ":")))
+            if not reaper.stop():
+                raise CanaryReaperError(
+                    "canary lifecycle coordinator did not stop within the shutdown bound"
+                )
+            bound_server.reaper_ready = False
+            try:
+                try:
+                    bound_server.control_plane.store.conn.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    )
+                except Exception:
+                    pass
+                bound_server.control_plane.close()
+                bound_server._owns_control_plane = False
+                callbacks, bound_server._close_callbacks = bound_server._close_callbacks, []
+                for callback in reversed(callbacks):
+                    callback()
+            finally:
+                database_lock.close()
+            closed = True
+
+    server.server_close = MethodType(production_server_close, server)
 
 
 def main() -> int:

@@ -15,6 +15,9 @@ from heel.saas.jobs import JobPlane
 from heel.saas.reconcile import STALE_RESERVATION_S, reconcile
 from heel.saas.tenancy import Role
 
+from canary_test_support import NOW_MS, PROJECT, RUNNER, WORKSPACE, operational_projection
+from test_canary_lifecycle import running_setup
+
 
 class ReconcileTests(unittest.TestCase):
     def setUp(self):
@@ -62,6 +65,101 @@ class ReconcileTests(unittest.TestCase):
     def test_fresh_reservation_not_flagged(self):
         self.cp.ledger.reserve(get_plan("free"), self.wid, Meter.RUNS, 1, "2026-07")
         self.assertTrue(reconcile(self.conn, self.cp.ledger).clean)
+
+    def test_live_canary_reservation_is_owned_by_the_canary_lifecycle(self):
+        conn, clock, _runner, coordinator, approved, _claim = running_setup()
+        self.addCleanup(conn.close)
+        reservation_id = approved["reservation_id"]
+
+        report = reconcile(
+            conn, coordinator.ledger,
+            now=clock.value + STALE_RESERVATION_S + 1, repair=True,
+        )
+
+        self.assertNotIn(reservation_id, report.dangling_reservations)
+        self.assertNotIn(reservation_id, report.refunded)
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM usage_ledger WHERE reservation_id=? AND kind='refund'",
+            (reservation_id,),
+        ).fetchone()[0], 0)
+
+    def test_terminal_canary_is_refunded_only_when_signed_receipt_proves_zero_requests(self):
+        conn, clock, runner, coordinator, approved, _claim = running_setup()
+        self.addCleanup(conn.close)
+        grant = approved["grant"]
+        coordinator.result(
+            WORKSPACE, PROJECT, grant["run_id"], RUNNER,
+            operational_projection(
+                runner, grant, sequence=0, phase="terminal", requests_started=0,
+                disposition="incomplete", error_category="containment_rejected",
+                updated_at_ms=NOW_MS + 500,
+            ),
+        )
+        reservation_id = approved["reservation_id"]
+        conn.execute(
+            "DELETE FROM usage_ledger WHERE reservation_id=? AND kind='refund'",
+            (reservation_id,),
+        )
+        conn.execute("UPDATE canary_runs SET quota_state='reserved'")
+        conn.commit()
+
+        report = reconcile(
+            conn, coordinator.ledger,
+            now=clock.value + STALE_RESERVATION_S + 1, repair=True,
+        )
+        self.assertIn(reservation_id, report.refunded)
+
+        # Removing the validated operational receipt removes the proof needed for an automatic
+        # refund. Reconciliation reports the inconsistency without guessing an outcome.
+        conn.execute(
+            "DELETE FROM usage_ledger WHERE reservation_id=? AND kind='refund'",
+            (reservation_id,),
+        )
+        conn.execute("DELETE FROM canary_operational_receipts")
+        conn.commit()
+        second = reconcile(
+            conn, coordinator.ledger,
+            now=clock.value + STALE_RESERVATION_S + 1, repair=True,
+        )
+        self.assertIn(reservation_id, second.dangling_reservations)
+        self.assertNotIn(reservation_id, second.refunded)
+
+    def test_proven_terminal_platform_fault_is_compensated_exactly_once(self):
+        conn, clock, runner, coordinator, approved, _claim = running_setup()
+        self.addCleanup(conn.close)
+        grant = approved["grant"]
+        coordinator.progress(
+            WORKSPACE, PROJECT, grant["run_id"], RUNNER,
+            operational_projection(
+                runner, grant, sequence=0, phase="running", requests_started=1,
+                updated_at_ms=NOW_MS + 200,
+            ),
+        )
+        coordinator.result(
+            WORKSPACE, PROJECT, grant["run_id"], RUNNER,
+            operational_projection(
+                runner, grant, sequence=1, phase="terminal", requests_started=1,
+                disposition="failed", error_category="platform_fault",
+                updated_at_ms=NOW_MS + 500,
+            ),
+        )
+        reservation_id = approved["reservation_id"]
+        conn.execute(
+            "DELETE FROM usage_ledger WHERE reservation_id=? "
+            "AND kind='platform_fault_refund'", (reservation_id,),
+        )
+        conn.execute("UPDATE canary_runs SET quota_state='consumed'")
+        conn.commit()
+
+        first = reconcile(conn, coordinator.ledger, now=clock.value, repair=True)
+        second = reconcile(conn, coordinator.ledger, now=clock.value, repair=True)
+
+        self.assertIn(reservation_id, first.compensated)
+        self.assertEqual(second.compensated, [])
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM usage_ledger WHERE reservation_id=? "
+            "AND kind='platform_fault_refund'", (reservation_id,),
+        ).fetchone()[0], 1)
 
 
 if __name__ == "__main__":

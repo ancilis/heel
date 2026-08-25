@@ -184,8 +184,97 @@ class ProductionConfigurationTests(unittest.TestCase):
                 mode = server.control_plane.store.conn.execute("PRAGMA journal_mode").fetchone()[0]
                 self.assertEqual(mode.lower(), "wal")
                 self.assertTrue(Path(config.database_path).is_file())
+                self.assertTrue(server.reaper_ready)
+                self.assertTrue(server.canary_reaper.alive)
+                self.assertFalse(server.canary_reaper.thread.daemon)
             finally:
                 server.server_close()
+
+        self.assertFalse(server.canary_reaper.alive)
+
+    def test_reaper_startup_failure_closes_listener_database_and_process_lock(self):
+        from heel.saas.canary_reaper import CanaryReaperError
+        from heel.saas.server import (
+            ProductionConfiguration,
+            ProductionConfigurationError,
+            build_server,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            config = ProductionConfiguration.from_environment(self.valid_environment(root))
+            with mock.patch(
+                "heel.saas.server.CanaryReaper.start",
+                side_effect=CanaryReaperError("cycle failed"),
+            ), self.assertRaises(ProductionConfigurationError):
+                build_server(config)
+
+            # A failed construction released both ownership layers; a clean retry is possible.
+            server = build_server(config)
+            server.server_close()
+
+    def test_unexpected_reaper_death_removes_readiness_and_is_not_silently_abandoned(self):
+        from heel.saas.server import ProductionConfiguration, build_server
+
+        class ReaperDouble:
+            def __init__(self, _path, *, on_unexpected_death, **_kwargs):
+                self.on_unexpected_death = on_unexpected_death
+                self.alive = False
+                self.thread = threading.Thread(target=lambda: None, daemon=False)
+                self.stopped = False
+
+            def start(self):
+                self.alive = True
+
+            def die(self):
+                self.alive = False
+                self.on_unexpected_death(RuntimeError("reaper died"))
+
+            def stop(self, *, timeout=5):
+                self.stopped = True
+                self.alive = False
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            config = ProductionConfiguration.from_environment(self.valid_environment(root))
+            with mock.patch("heel.saas.server.CanaryReaper", ReaperDouble):
+                server = build_server(config)
+                self.assertTrue(server.reaper_ready)
+                server.canary_reaper.die()
+                self.assertFalse(server.reaper_ready)
+                self.assertTrue(server.control_plane.draining)
+                self.assertIsInstance(server.reaper_failure, RuntimeError)
+                server.server_close()
+                self.assertTrue(server.canary_reaper.stopped)
+
+    def test_server_close_joins_reaper_before_checkpointing_and_closing_control_plane(self):
+        from heel.saas.server import ProductionConfiguration, build_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            server = build_server(
+                ProductionConfiguration.from_environment(self.valid_environment(root))
+            )
+            order = []
+            original_stop = server.canary_reaper.stop
+            original_close = server.control_plane.close
+
+            def stop(*, timeout=5):
+                order.append("reaper")
+                return original_stop(timeout=timeout)
+
+            def close():
+                order.append("control-plane")
+                return original_close()
+
+            server.canary_reaper.stop = stop
+            server.control_plane.close = close
+            server.server_close()
+
+            self.assertEqual(order, ["reaper", "control-plane"])
+            with self.assertRaises(sqlite3.ProgrammingError):
+                server.control_plane.store.conn.execute("SELECT 1")
 
     def test_database_has_one_process_owner_and_persists_across_restart(self):
         from heel.saas.server import (
