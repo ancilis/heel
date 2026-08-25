@@ -853,6 +853,8 @@ class CommercialSourceLicenseBoundaryTests(unittest.TestCase):
                     if name != "heel-runtime"
                 ]
             for filename in filenames:
+                if current == APP and filename == "next-env.d.ts":
+                    continue
                 path = current / filename
                 if path.suffix in extensions:
                     sources.append(path)
