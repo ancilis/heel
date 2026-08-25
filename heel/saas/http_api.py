@@ -37,7 +37,9 @@ from heel.findings_sync import (
     parse_findings_sync_request,
     stable_json,
 )
-from heel.canary_contracts import canonical_bytes, parse_json
+from heel.canary_contracts import (canonical_bytes, parse_json, validate_runner_claim_request,
+    validate_runner_heartbeat_request, validate_runner_progress_request,
+    validate_runner_result_request, validate_runner_stop_ack_request)
 
 from .auth import AuthStore, ThrottledError
 from .billing import (
@@ -1022,15 +1024,13 @@ class _Handler(BaseHTTPRequestHandler):
         if "?" in self.path or "#" in self.path or "%" in self.path or self.command != "POST":
             raise RunnerAuthError("invalid runner authentication")
         try:
-            parsed = parse_json(self._raw_body(), max_bytes=MAX_BODY)
-            if not isinstance(parsed, dict) or (run_id is not None and parsed.get("run_id") not in {None, run_id}):
+            parsed = parse_json(self._raw_body(), max_bytes=256 if operation == "claim" else 36 * 1024)
+            validators = {"claim": validate_runner_claim_request, "heartbeat": validate_runner_heartbeat_request,
+                          "progress": validate_runner_progress_request, "result": validate_runner_result_request,
+                          "stop-ack": validate_runner_stop_ack_request}
+            parsed = validators[operation](parsed)
+            if canonical_bytes(parsed) != self._raw_body() or (run_id is not None and parsed["run_id"] != run_id):
                 raise RunnerAuthError("invalid runner authentication")
-            if run_id is not None:
-                parsed = {**parsed, "run_id": run_id}
-                # Only the canonical exact raw bytes are signed; a body that omits its route
-                # run ID is never silently rewritten for verification.
-                if canonical_bytes(parsed) != self._raw_body():
-                    raise RunnerAuthError("invalid runner authentication")
             all_headers = {name: self._header_values(name) for name in ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature", "Authorization", "Cookie")}
             response, nonce = self._runner_store().authenticate_and_consume(
                 workspace_id=wid, runner_id=runner_id, capability=capability, path=self.path,
