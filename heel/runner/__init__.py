@@ -10,13 +10,17 @@ from .control_client import (
     PendingRunnerResync, RecoveredRunnerChain, RunnerControlClient,
     RunnerRotationActivated,
 )
-from .catalog import AUTH_PROFILES, CATALOG, CATALOG_IDS
+from .catalog import AUTH_PROFILES, CATALOG, CATALOG_IDS, SEMANTIC_ROLES
 from .compiler import CanaryCompiler, CompileResult
-from .openapi_routes import RouteInventory
-from .store import RunnerStore, UnsupportedSecureStorageError, new_credential_handle_id
+from .openapi_routes import RouteInventory, normalize_route_template
+from .store import (
+    RunnerContext, RunnerStore, RunnerStoreError, UnsupportedSecureStorageError,
+    new_credential_handle_id,
+)
 from .vault import (
     EphemeralVault, KeychainVault, SecretServiceVault, UnavailableVault,
-    VaultUnavailable,
+    VaultUnavailable, ephemeral_environment_name, read_inherited_secret,
+    validate_credential_secret,
 )
 
 __all__ = [
@@ -26,8 +30,10 @@ __all__ = [
     "runner_phrase_words", "validate_pairing_phrase", "RunnerControlClient",
     "PendingRunnerResync", "RecoveredRunnerChain",
     "RunnerRotationActivated",
-    "AUTH_PROFILES", "CATALOG", "CATALOG_IDS", "CanaryCompiler", "CompileResult",
-    "RouteInventory", "RunnerStore", "UnsupportedSecureStorageError",
+    "AUTH_PROFILES", "CATALOG", "CATALOG_IDS", "SEMANTIC_ROLES",
+    "CanaryCompiler", "CompileResult", "RouteInventory", "normalize_route_template",
+    "RunnerContext", "RunnerStore", "RunnerStoreError", "UnsupportedSecureStorageError",
     "new_credential_handle_id", "EphemeralVault", "KeychainVault",
     "SecretServiceVault", "UnavailableVault", "VaultUnavailable",
+    "ephemeral_environment_name", "read_inherited_secret", "validate_credential_secret",
 ]

@@ -12,6 +12,7 @@ import io
 import json
 import os
 import platform
+import select
 import stat
 import sys
 import time
@@ -38,12 +39,30 @@ _SAFE_RUNNER_IMPORT_FAILURE = "Heel runner OpenAPI import failed."
 _SAFE_RUNNER_CREDENTIAL_FAILURE = "Heel runner credential could not be stored safely."
 _SAFE_RUNNER_MAPPING_FAILURE = "Heel runner mapping could not be saved safely."
 _SAFE_RUNNER_LIVE_FAILURE = "Heel runner live preparation is unavailable."
+_SAFE_RUNNER_COMMAND_FAILURE = "Heel runner command was rejected."
 _OPENAPI_READ_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_NONBLOCK", 0)
 )
+
+
+class _RunnerArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        kwargs["allow_abbrev"] = False
+        super().__init__(*args, **kwargs)
+
+
+def _runner_secret_shaped_argument(value: str) -> bool:
+    if not value.startswith("--"):
+        return False
+    option = value.split("=", 1)[0].lower()
+    if option == "--secret-fd":
+        return False
+    return any(marker in option for marker in (
+        "secret", "password", "token", "authorization", "api-key", "apikey", "cookie",
+    ))
 
 
 def _reject_duplicate_json_keys(pairs):
@@ -131,94 +150,123 @@ def _runner_import_openapi(path: str) -> int:
     except Exception:
         print(_SAFE_RUNNER_IMPORT_FAILURE, file=sys.stderr)
         return 2
-    print(json.dumps({
-        "methods": sorted({route["method"] for route in routes}),
-        "routes": len(routes),
-    }, sort_keys=True))
+    print(json.dumps({"route_count": len(routes)}, sort_keys=True))
     return 0
 
 
 def _runner_secret_from_fd(descriptor: int) -> bytes:
-    from .runner.vault import EphemeralVault
+    from .runner.vault import read_inherited_secret
 
-    return EphemeralVault(fd=descriptor).load("0" * 32)
+    return read_inherited_secret(descriptor)
 
 
 def _runner_credential_add(args) -> int:
-    from .runner.store import new_credential_handle_id
     from .runner.vault import select_vault
 
-    handle_id = args.handle_id or new_credential_handle_id()
     try:
         store = _runner_store()
-        if any(
-            item["credential_handle_id"] == handle_id
-            for item in store.list_credentials()
-        ):
-            raise ValueError("duplicate credential handle")
-        vault = select_vault(
-            args.vault,
-            env_name=args.env_name,
-            fd=args.secret_fd,
-        )
-        if args.vault.startswith("ephemeral-"):
-            # Resolve once now so a missing/oversized source cannot create metadata
-            # that appears live-ready. The value is never attached to the record.
-            vault.load(handle_id)
+        if args.backend.startswith("ephemeral-"):
+            if args.secret_fd is not None:
+                raise ValueError("ephemeral registration stores only a source convention")
+            source_kind = (
+                "environment" if args.backend == "ephemeral-env" else "inherited_fd"
+            )
+            store.register_ephemeral_credential(
+                semantic_role=args.role,
+                auth_profile=args.profile,
+                source_kind=source_kind,
+                label=args.label,
+            )
         else:
-            if args.env_name is not None:
-                raise ValueError("OS vault input must use getpass or an inherited FD")
             if args.secret_fd is not None:
                 secret = _runner_secret_from_fd(args.secret_fd)
             else:
                 if not sys.stdin.isatty():
                     raise ValueError("interactive secret input requires a TTY")
                 secret = getpass.getpass("Canary credential: ").encode("utf-8")
-            vault.store(handle_id, secret)
-        record = store.add_credential(
-            label=args.label,
-            auth_profile=args.profile,
-            handle_id=handle_id,
-        )
+            vault = select_vault(args.backend)
+            store.create_os_credential(
+                semantic_role=args.role,
+                auth_profile=args.profile,
+                label=args.label,
+                vault=vault,
+                secret=secret,
+            )
+            secret = b""
     except Exception:
         print(_SAFE_RUNNER_CREDENTIAL_FAILURE, file=sys.stderr)
         return 2
-    print(json.dumps(record, sort_keys=True))
+    print(json.dumps({"registered_count": 1}, sort_keys=True))
     return 0
 
 
-def _runner_fixture_bindings(values: list[str]) -> list[dict[str, str]]:
-    bindings: list[dict[str, str]] = []
-    for value in values:
-        if "=" not in value:
-            raise ValueError("fixture binding must use NAME=LOCAL_ID")
-        parameter_name, fixture_id = value.split("=", 1)
-        bindings.append({"parameter_name": parameter_name, "fixture_id": fixture_id})
-    return bindings
+def _runner_fixture_bindings(descriptor: int | None, *, required: bool) -> dict[str, str]:
+    if descriptor is None:
+        if not required:
+            return {}
+        if not sys.stdin.isatty():
+            raise ValueError("fixture bindings require an inherited FD")
+        payload = getpass.getpass("Fixture bindings JSON: ").encode("utf-8")
+    else:
+        if isinstance(descriptor, bool) or descriptor < 3 or not os.get_inheritable(descriptor):
+            raise ValueError("fixture bindings require an inherited FD")
+        duplicate = os.dup(descriptor)
+        try:
+            os.set_inheritable(duplicate, False)
+            chunks: list[bytes] = []
+            remaining = 16 * 1024 + 1
+            deadline = time.monotonic() + 2
+            while remaining:
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    raise ValueError("fixture binding FD timed out")
+                ready, _, _ = select.select([duplicate], [], [], wait)
+                if not ready:
+                    raise ValueError("fixture binding FD timed out")
+                chunk = os.read(duplicate, min(4096, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+        finally:
+            os.close(duplicate)
+    if len(payload) > 16 * 1024:
+        raise ValueError("fixture bindings exceed local limit")
+    value = json.loads(payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+    if (
+        not isinstance(value, dict)
+        or len(value) > 20
+        or any(type(key) is not str or type(item) is not str for key, item in value.items())
+    ):
+        raise ValueError("fixture bindings must be a closed string map")
+    payload = b""
+    return value
 
 
 def _runner_map(args) -> int:
-    from .runner.catalog import CATALOG_BY_ID
-
     try:
-        catalog = CATALOG_BY_ID[args.scenario]
-        record = _runner_store().save_mapping({
-            "scenario_id": args.scenario,
-            "method": args.method,
-            "route_template": args.route,
-            "semantic_auth_role": catalog["semantic_auth_role"],
-            "auth_profile": catalog["auth_profile"],
-            "credential_handle_id": args.handle_id,
-            "fixture_bindings": _runner_fixture_bindings(args.fixture),
-        })
+        store = _runner_store()
+        route = next(
+            item for item in store.list_routes()
+            if item["method"] == args.method and item["route_template"] == args.route
+        )
+        fixtures = _runner_fixture_bindings(
+            args.fixture_fd, required=bool(route["placeholders"]),
+        )
+        store.save_mapping(
+            args.scenario,
+            method=args.method,
+            route_template=args.route,
+            fixture_bindings=fixtures,
+        )
+        mappings = store.list_mappings()
     except Exception:
         print(_SAFE_RUNNER_MAPPING_FAILURE, file=sys.stderr)
         return 2
     print(json.dumps({
-        "auth_profile": record["auth_profile"],
-        "method": record["method"],
-        "route_template": record["route_template"],
-        "semantic_role": record["semantic_auth_role"],
+        "mapping_count": len(mappings),
+        "scenario_ids": [item["scenario_id"] for item in mappings],
     }, sort_keys=True))
     return 0
 
@@ -228,6 +276,7 @@ def _runner_prepare(args) -> int:
         store = _runner_store()
         routes = store.list_routes()
         mappings = store.list_mappings()
+        credentials = store.list_credentials()
     except Exception:
         if args.live:
             print(_SAFE_RUNNER_LIVE_FAILURE, file=sys.stderr)
@@ -236,79 +285,51 @@ def _runner_prepare(args) -> int:
         return 2
     if not args.live:
         print(json.dumps({
-            "live": False,
-            "mapped_scenarios": len(mappings),
-            "network_calls": False,
-            "ready_for_live": len(mappings) == 4,
-            "routes": len(routes),
+            "credential_count": len(credentials),
+            "mapping_count": len(mappings),
+            "route_count": len(routes),
+            "scenario_ids": [item["scenario_id"] for item in mappings],
         }, sort_keys=True))
         return 0
 
     # Task 5 is a local compilation boundary. It creates no network authority and
     # uploads nothing; later control-plane tasks consume the safe projection.
     try:
-        from .runner.catalog import CATALOG_IDS
         from .runner.compiler import CanaryCompiler
-        from .runner.identity import SystemSecureSigner
+        from .runner.identity import RunnerIdentity, SystemSecureSigner, runner_phrase_words
         from .runner.vault import select_vault
 
-        required = (
-            args.workspace, args.project, args.environment_id,
-            args.verification_digest, args.origin, args.runner_id,
-            args.signer_label,
+        binding = store.load_binding()
+        bound_identity = binding["identity"]
+        signer = SystemSecureSigner(binding["signer_label"])
+        identity = RunnerIdentity(
+            runner_id=bound_identity["runner_id"],
+            workspace_id=bound_identity["workspace_id"],
+            runner_version=bound_identity["runner_version"],
+            adapter_versions=dict(bound_identity["adapter_versions"]),
+            public_key_b64=bound_identity["public_key_b64"],
+            fingerprint=bound_identity["fingerprint"],
+            key_id=bound_identity["runner_key_id"],
+            pairing_phrase=runner_phrase_words()[:6],
         )
-        if any(value is None for value in required) or len(mappings) != 4:
-            raise ValueError("live preparation inputs are incomplete")
-        signer = SystemSecureSigner(args.signer_label)
-        vault = select_vault(args.vault, env_name=args.env_name, fd=args.secret_fd)
-        CanaryCompiler(signer, now_ms=int(time.time() * 1000), store=store, vault=vault).prepare_live()
-        mapping_table = {item["scenario_id"]: item for item in mappings}
-        handles = {
-            scenario_id: mapping_table[scenario_id]["credential_handle_id"]
-            for scenario_id in CATALOG_IDS
-        }
-        if any(value is None for value in handles.values()):
-            raise ValueError("credential handles are incomplete")
-        fixtures = {
-            scenario_id: {
-                item["parameter_name"]: item["fixture_id"]
-                for item in mapping_table[scenario_id]["fixture_bindings"]
-            }
-            for scenario_id in CATALOG_IDS
-        }
-        result = CanaryCompiler(
-            signer, now_ms=int(time.time() * 1000), store=store, vault=vault,
-        ).compile_routes(
-            routes,
-            {
-                "workspace_id": args.workspace,
-                "project_id": args.project,
-                "environment": {
-                    "environment_id": args.environment_id,
-                    "verification_record_digest": args.verification_digest,
-                    "origin": args.origin,
-                    "environment_class": args.environment_class,
-                },
-                "runner": {
-                    "runner_id": args.runner_id,
-                    "runner_key_id": signer.key_id,
-                    "minimum_runner_version": "1",
-                },
-                "compiler": {"compiler_version": "1", "engine_version": "1"},
-            },
-            mappings=mapping_table,
-            credential_handle_ids=handles,
-            fixture_ids=fixtures,
+        selected = [item["scenario_id"] for item in mappings]
+        compiler = CanaryCompiler(
+            store=store, identity=identity, signer=signer,
+            now_ms=int(time.time() * 1000),
         )
+        vaults = {}
+        for backend in {item["backend"] for item in credentials}:
+            if backend in {"macos_keychain", "linux_secret_service"}:
+                vaults[backend] = select_vault(backend)
+        compiler.prepare_live(selected, vaults=vaults)
+        result = compiler.compile(selected)
     except Exception:
         print(_SAFE_RUNNER_LIVE_FAILURE, file=sys.stderr)
         return 2
     print(json.dumps({
-        "live": True,
         "manifest_digest": result.manifest["manifest_digest"],
-        "network_calls": False,
-        "projection": result.projection,
-        "uploaded": False,
+        "projection_digest": result.projection["projection_digest"],
+        "scenario_ids": [item["scenario_id"] for item in result.manifest["scenarios"]],
     }, sort_keys=True))
     return 0
 
@@ -936,13 +957,14 @@ def _report(srv: HeelServer, run_id: str, caller: str, economic: bool = False,
 
 def main(argv=None):
     selected_argv = list(sys.argv[1:] if argv is None else argv)
-    if selected_argv[:1] == ["runner"] and any(
-        value == "--secret" or value.startswith("--secret=")
-        for value in selected_argv
+    if "runner" in selected_argv and any(
+        _runner_secret_shaped_argument(value) for value in selected_argv
     ):
         print(_SAFE_RUNNER_CREDENTIAL_FAILURE, file=sys.stderr)
         return 2
-    ap = argparse.ArgumentParser(prog="heel", description="Heel: agent-native abuse-simulation tool")
+    ap = argparse.ArgumentParser(
+        prog="heel", description="Heel: agent-native abuse-simulation tool", allow_abbrev=False,
+    )
     ap.add_argument("--version", action="version", version=f"heel {__version__}")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("doctor", help="self-check: install, data dir, signing-key posture, capability")
@@ -976,8 +998,11 @@ def main(argv=None):
 
     runner = sub.add_parser(
         "runner", help="prepare customer-local verified canary rehearsals",
+        allow_abbrev=False,
     )
-    runner_sub = runner.add_subparsers(dest="runnercmd", required=True)
+    runner_sub = runner.add_subparsers(
+        dest="runnercmd", required=True, parser_class=_RunnerArgumentParser,
+    )
     runner_import = runner_sub.add_parser(
         "import-openapi", help="import only a minimized local GET/HEAD route inventory",
     )
@@ -986,22 +1011,27 @@ def main(argv=None):
         "credential", help="manage opaque local canary credential handles",
     )
     runner_credential_sub = runner_credential.add_subparsers(
-        dest="runnercredentialcmd", required=True,
+        dest="runnercredentialcmd", required=True, parser_class=_RunnerArgumentParser,
     )
     runner_credential_add = runner_credential_sub.add_parser(
         "add", help="store a canary credential in a secure or ephemeral provider",
     )
     runner_credential_add.add_argument(
         "--profile", required=True,
-        choices=("anonymous", "bearer", "cookie_jar", "x_api_key"),
+        choices=("bearer", "cookie_jar", "x_api_key"),
+    )
+    runner_credential_add.add_argument(
+        "--role", required=True,
+        choices=(
+            "authenticated", "object_owner", "non_owner", "lower_privilege",
+            "higher_privilege", "lower_plan", "higher_plan",
+        ),
     )
     runner_credential_add.add_argument("--label", required=True)
-    runner_credential_add.add_argument("--handle-id")
     runner_credential_add.add_argument(
-        "--vault", required=True,
+        "--backend", required=True,
         choices=("keychain", "secret-service", "ephemeral-env", "ephemeral-fd"),
     )
-    runner_credential_add.add_argument("--env-name")
     runner_credential_add.add_argument("--secret-fd", type=int)
     runner_map = runner_sub.add_parser(
         "map", help="bind one immutable scenario to one imported read route",
@@ -1015,26 +1045,11 @@ def main(argv=None):
     )
     runner_map.add_argument("--method", required=True, choices=("GET", "HEAD"))
     runner_map.add_argument("--route", required=True)
-    runner_map.add_argument("--handle-id")
-    runner_map.add_argument("--fixture", action="append", default=[])
+    runner_map.add_argument("--fixture-fd", type=int)
     runner_prepare = runner_sub.add_parser(
         "prepare", help="review readiness or compile one local immutable rehearsal",
     )
     runner_prepare.add_argument("--live", action="store_true")
-    runner_prepare.add_argument("--workspace")
-    runner_prepare.add_argument("--project")
-    runner_prepare.add_argument("--environment-id")
-    runner_prepare.add_argument("--environment-class", choices=("staging", "sandbox"), default="staging")
-    runner_prepare.add_argument("--verification-digest")
-    runner_prepare.add_argument("--origin")
-    runner_prepare.add_argument("--runner-id")
-    runner_prepare.add_argument("--signer-label")
-    runner_prepare.add_argument(
-        "--vault", choices=("keychain", "secret-service", "ephemeral-env", "ephemeral-fd"),
-        default="keychain" if platform.system() == "Darwin" else "secret-service",
-    )
-    runner_prepare.add_argument("--env-name")
-    runner_prepare.add_argument("--secret-fd", type=int)
 
     cloud = sub.add_parser(
         "cloud",
@@ -1172,14 +1187,14 @@ def main(argv=None):
     control_input.add_argument("--finding-json", help="path to one finding JSON object")
     control_input.add_argument("--run", help="stored run id to simulate")
 
-    if selected_argv[:1] == ["runner"]:
+    if "runner" in selected_argv:
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 args = ap.parse_args(selected_argv)
         except SystemExit as error:
             if error.code == 0:
                 return 0
-            print("Heel runner command was rejected.", file=sys.stderr)
+            print(_SAFE_RUNNER_COMMAND_FAILURE, file=sys.stderr)
             return 2
     else:
         args = ap.parse_args(selected_argv)

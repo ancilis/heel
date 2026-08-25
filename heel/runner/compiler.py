@@ -1,9 +1,9 @@
-"""Deterministic local compiler for immutable Heel canary rehearsals."""
+"""Deterministic local compiler for immutable differential canary rehearsals."""
 from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from heel.canary_contracts import (
@@ -14,10 +14,12 @@ from heel.canary_contracts import (
     validate_approval_projection,
     validate_test_manifest,
 )
+from heel.runner.identity import RunnerIdentity, SecureSigner
 
-from .catalog import CATALOG, CATALOG_BY_ID, CATALOG_IDS
+from .catalog import CATALOG_BY_ID, CATALOG_IDS
 from .openapi_routes import RouteInventory
-from .store import UnsupportedSecureStorageError
+from .store import RunnerStore, UnsupportedSecureStorageError
+from .vault import EphemeralVault, VaultUnavailable, validate_credential_secret
 
 
 BUDGETS = {
@@ -32,6 +34,8 @@ RETRY_POLICY = {
     "retryable_failure_codes": ["connect_error", "timeout"],
 }
 LOCAL_EVIDENCE_RETENTION_SECONDS = 24 * 60 * 60
+COMPILER_VERSION = "1"
+ENGINE_VERSION = "1"
 
 
 @dataclass(frozen=True)
@@ -40,203 +44,188 @@ class CompileResult:
     projection: dict[str, Any]
 
 
-def _mapping_table(value: Any) -> dict[str, Mapping[str, Any]]:
-    if isinstance(value, Mapping):
-        table = dict(value)
-    elif isinstance(value, list):
-        table = {
-            item["scenario_id"]: item
-            for item in value
-            if isinstance(item, Mapping) and "scenario_id" in item
-        }
-        if len(table) != len(value):
-            raise ValueError("scenario mappings must be unique objects")
-    else:
-        raise ValueError("explicit scenario mappings are required")
-    if set(table) != set(CATALOG_IDS):
-        raise ValueError("all four immutable launch scenarios must be mapped exactly once")
-    if not all(isinstance(item, Mapping) for item in table.values()):
-        raise ValueError("scenario mappings must be objects")
-    return table
+def _selected_scenarios(value: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError("selected scenarios must be an ordered subset")
+    selected = tuple(value)
+    if not selected or len(selected) > len(CATALOG_IDS):
+        raise ValueError("selected scenarios must be a nonempty ordered subset")
+    if any(type(item) is not str or item not in CATALOG_BY_ID for item in selected):
+        raise ValueError("unknown launch scenario")
+    if len(set(selected)) != len(selected):
+        raise ValueError("selected scenarios must be unique")
+    expected = tuple(item for item in CATALOG_IDS if item in set(selected))
+    if selected != expected:
+        raise ValueError("selected scenarios must retain catalog order")
+    return selected
 
 
-def _fixture_bindings(
-    scenario_id: str,
-    placeholders: list[str],
-    fixture_ids: Mapping[str, Mapping[str, str]],
-) -> list[dict[str, str]]:
-    supplied = fixture_ids.get(scenario_id, {})
-    if not isinstance(supplied, Mapping) or set(supplied) != set(placeholders):
-        if placeholders or supplied:
-            raise ValueError("exact local fixture bindings are required for every route placeholder")
-        return []
-    bindings = []
-    for parameter_name in sorted(placeholders):
-        fixture_id = supplied[parameter_name]
-        if (
-            type(fixture_id) is not str
-            or not fixture_id
-            or len(fixture_id.encode("utf-8")) > 128
-            or any(ord(character) < 33 or ord(character) > 126 for character in fixture_id)
-        ):
-            raise ValueError("fixture IDs must be bounded local identifiers")
-        bindings.append({"parameter_name": parameter_name, "fixture_id": fixture_id})
-    return bindings
+def _binding_identity(identity: RunnerIdentity) -> dict[str, Any]:
+    return {
+        "runner_id": identity.runner_id,
+        "workspace_id": identity.workspace_id,
+        "runner_version": identity.runner_version,
+        "adapter_versions": dict(sorted(identity.adapter_versions.items())),
+        "public_key_b64": identity.public_key_b64,
+        "fingerprint": identity.fingerprint,
+        "runner_key_id": identity.key_id,
+    }
 
 
 class CanaryCompiler:
-    """Compile locally authoritative manifests and privacy-minimized approvals."""
+    """Compile only state already pinned to one local context and runner identity."""
 
-    def __init__(self, signer=None, *, now_ms: int = 0, store=None, vault=None):
+    def __init__(
+        self,
+        *,
+        store: RunnerStore,
+        identity: RunnerIdentity,
+        signer: SecureSigner,
+        now_ms: int = 0,
+    ):
+        if not isinstance(store, RunnerStore):
+            raise ValueError("context-bound RunnerStore is required")
+        if not isinstance(identity, RunnerIdentity) or not isinstance(signer, SecureSigner):
+            raise ValueError("actual paired runner identity and signer are required")
         if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
             raise ValueError("compile timestamp must be a non-negative integer")
+        try:
+            public_key = base64.b64decode(identity.public_key_b64, validate=True)
+        except (TypeError, ValueError):
+            raise ValueError("runner identity public key is invalid") from None
+        if signer.key_id != identity.key_id or signer.public_key != public_key:
+            raise ValueError("runner signer does not match paired identity")
+        expected_versions = {
+            scenario_id: CATALOG_BY_ID[scenario_id]["adapter_version"]
+            for scenario_id in CATALOG_IDS
+        }
+        if dict(identity.adapter_versions) != expected_versions:
+            raise ValueError("runner adapter version does not match launch catalog")
+        binding = store.load_binding()
+        if binding["identity"] != _binding_identity(identity):
+            raise ValueError("runner identity does not match bound context")
+        self.store = store
+        self.identity = identity
         self.signer = signer
         self.now_ms = now_ms
-        self.store = store
-        self.vault = vault
 
     @staticmethod
     def inventory(specification: Mapping[str, Any]) -> RouteInventory:
         return RouteInventory(specification)
 
+    def _inputs(
+        self, selected: tuple[str, ...],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        mappings = {item["scenario_id"]: item for item in self.store.list_mappings()}
+        credentials = {
+            item["semantic_role"]: item
+            for item in self.store.list_credentials()
+            if item["state"] == "active"
+        }
+        missing = [scenario_id for scenario_id in selected if scenario_id not in mappings]
+        if missing:
+            raise ValueError("every selected scenario requires an explicit mapping")
+        return mappings, credentials
+
     def compile(
         self,
-        specification: Mapping[str, Any],
-        base: Mapping[str, Any],
+        selected_scenarios: Sequence[str],
         *,
-        mappings: Any,
-        credential_handle_ids: Mapping[str, str],
-        fixture_ids: Mapping[str, Mapping[str, str]] | None = None,
-        credential_labels: Mapping[str, str] | None = None,
         projection_id: str | None = None,
+        persist: bool = True,
     ) -> CompileResult:
-        del credential_labels  # Local labels are intentionally outside both contracts.
-        return self.compile_routes(
-            RouteInventory(specification).read_routes(),
-            base,
-            mappings=mappings,
-            credential_handle_ids=credential_handle_ids,
-            fixture_ids=fixture_ids,
-            projection_id=projection_id,
-        )
-
-    def compile_routes(
-        self,
-        routes: list[Mapping[str, Any]],
-        base: Mapping[str, Any],
-        *,
-        mappings: Any,
-        credential_handle_ids: Mapping[str, str],
-        fixture_ids: Mapping[str, Mapping[str, str]] | None = None,
-        projection_id: str | None = None,
-    ) -> CompileResult:
-        if self.signer is None or not callable(getattr(self.signer, "sign", None)):
-            raise ValueError("runner secure signer is required")
-        key_id = getattr(self.signer, "key_id", None)
-        if type(key_id) is not str or not key_id:
-            raise ValueError("runner secure signer key ID is required")
-        if not isinstance(base, Mapping):
-            raise ValueError("manifest base must be an object")
-        table = _mapping_table(mappings)
-        route_table = {
-            (route.get("method"), route.get("route_template")): route
-            for route in routes if isinstance(route, Mapping)
-        }
-        if len(route_table) != len(routes):
-            raise ValueError("route inventory must contain unique routes")
-        fixture_ids = {} if fixture_ids is None else fixture_ids
-        if not isinstance(fixture_ids, Mapping):
-            raise ValueError("fixture bindings must be an object")
-        if not set(fixture_ids) <= set(CATALOG_IDS):
-            raise ValueError("fixture scenario is not in the immutable launch catalog")
-        if not isinstance(credential_handle_ids, Mapping) or set(credential_handle_ids) != set(CATALOG_IDS):
-            raise ValueError("all four semantic roles require exact local credential handles")
+        selected = _selected_scenarios(selected_scenarios)
+        mappings, credential_records = self._inputs(selected)
+        context = self.store.load_context()
 
         scenarios: list[dict[str, Any]] = []
         actions: list[dict[str, Any]] = []
-        credentials: list[dict[str, str]] = []
-        for ordinal, catalog in enumerate(CATALOG):
-            scenario_id = catalog["scenario_id"]
-            mapping = table[scenario_id]
-            minimal_fields = {"method", "route_template"}
-            stored_fields = {
-                "scenario_id", "method", "route_template", "semantic_auth_role",
-                "auth_profile", "credential_handle_id", "fixture_bindings",
-            }
-            if set(mapping) not in {frozenset(minimal_fields), frozenset(stored_fields)}:
-                raise ValueError("scenario mapping fields must match a closed local schema")
-            if set(mapping) == stored_fields and (
-                mapping["scenario_id"] != scenario_id
-                or mapping["semantic_auth_role"] != catalog["semantic_auth_role"]
-                or mapping["auth_profile"] != catalog["auth_profile"]
-                or mapping["credential_handle_id"] != credential_handle_ids[scenario_id]
-            ):
-                raise ValueError("stored scenario mapping does not match the immutable catalog")
-            method = mapping.get("method")
-            route_template = mapping.get("route_template")
-            if method not in {"GET", "HEAD"}:
-                raise ValueError("canary mappings permit GET or HEAD only")
-            route = route_table.get((method, route_template))
-            if route is None:
-                raise ValueError("mapped route is not present in the local read inventory")
+        credentials: dict[str, dict[str, str]] = {}
+        for scenario_ordinal, scenario_id in enumerate(selected):
+            catalog = CATALOG_BY_ID[scenario_id]
+            mapping = mappings[scenario_id]
+            method = mapping["method"]
+            if method not in catalog["allowed_methods"]:
+                suffix = "GET only" if catalog["allowed_methods"] == ("GET",) else "GET or HEAD"
+                raise ValueError(f"scenario mapping permits {suffix}")
+            roles = catalog["semantic_roles"]
+            role_records: dict[str, dict[str, Any]] = {}
+            for role in roles:
+                if role == "anonymous":
+                    continue
+                record = credential_records.get(role)
+                if record is None:
+                    raise ValueError("every nonanonymous semantic role requires a credential")
+                role_records[role] = record
+            selected_profiles = {record["auth_profile"] for record in role_records.values()}
+            if len(selected_profiles) != 1:
+                raise ValueError("comparison roles require the same nonanonymous auth profile")
+            profile = next(iter(selected_profiles))
+            fixture_bindings = [dict(item) for item in mapping["fixture_bindings"]]
             scenarios.append({
-                "ordinal": ordinal,
+                "ordinal": scenario_ordinal,
                 "scenario_id": scenario_id,
                 "adapter_version": catalog["adapter_version"],
             })
-            actions.append({
-                "ordinal": ordinal,
-                "scenario_id": scenario_id,
-                "adapter_version": catalog["adapter_version"],
-                "method": method,
-                "route_template": route_template,
-                "fixture_bindings": _fixture_bindings(
-                    scenario_id, list(route.get("placeholders", [])), fixture_ids,
-                ),
-                "semantic_auth_role": catalog["semantic_auth_role"],
-                "auth_profile": catalog["auth_profile"],
-                "assertion_class": catalog["assertion_class"],
-                "allowed_status_codes": list(catalog["allowed_status_codes"]),
-                "allowed_body_shapes": list(catalog["allowed_body_shapes"]),
-                "side_effect_class": "read_only",
-            })
-            credentials.append({
-                "semantic_role": catalog["semantic_auth_role"],
-                "credential_handle_id": credential_handle_ids[scenario_id],
-                "auth_profile": catalog["auth_profile"],
-            })
-        credentials.sort(key=lambda item: (
-            item["semantic_role"], item["auth_profile"], item["credential_handle_id"]
-        ))
+            for role in roles:
+                auth_profile = "anonymous" if role == "anonymous" else profile
+                actions.append({
+                    "ordinal": len(actions),
+                    "scenario_id": scenario_id,
+                    "adapter_version": catalog["adapter_version"],
+                    "method": method,
+                    "route_template": mapping["route_template"],
+                    "fixture_bindings": [dict(item) for item in fixture_bindings],
+                    "semantic_auth_role": role,
+                    "auth_profile": auth_profile,
+                    "assertion_class": catalog["assertion_class"],
+                    "allowed_status_codes": list(catalog["allowed_status_codes"]),
+                    "allowed_body_shapes": list(catalog["allowed_body_shapes"]),
+                    "side_effect_class": catalog["side_effect_class"],
+                })
+                if role != "anonymous":
+                    record = role_records[role]
+                    credentials[role] = {
+                        "semantic_role": role,
+                        "credential_handle_id": record["credential_handle_id"],
+                        "auth_profile": record["auth_profile"],
+                    }
 
-        try:
-            workspace_id = base["workspace_id"]
-            project_id = base["project_id"]
-            environment = dict(base["environment"])
-            runner_base = dict(base["runner"])
-            compiler = dict(base["compiler"])
-        except (KeyError, TypeError, ValueError):
-            raise ValueError("manifest base is incomplete") from None
-        if runner_base.get("runner_key_id") != key_id:
-            raise ValueError("runner signer does not match the manifest runner key")
-        origin = environment.get("origin")
-        split = urlsplit(origin) if isinstance(origin, str) else None
-        if split is None or split.scheme != "https" or split.port is not None or not split.hostname:
-            raise ValueError("manifest origin must be an exact HTTPS origin")
-
-        manifest = {
+        environment = {
+            "environment_id": context.environment_id,
+            "verification_record_digest": context.verification_record_digest,
+            "origin": context.origin,
+            "environment_class": context.environment_class,
+        }
+        hostname = urlsplit(context.origin).hostname
+        assert hostname is not None
+        runner = {
+            "runner_id": self.identity.runner_id,
+            "runner_key_id": self.identity.key_id,
+            "minimum_runner_version": self.identity.runner_version,
+        }
+        compiler = {
+            "compiler_version": COMPILER_VERSION,
+            "engine_version": ENGINE_VERSION,
+        }
+        manifest: dict[str, Any] = {
             "schema_version": TEST_MANIFEST_SCHEMA,
-            "workspace_id": workspace_id,
-            "project_id": project_id,
+            "workspace_id": context.workspace_id,
+            "project_id": context.project_id,
             "environment": environment,
-            "runner": runner_base,
+            "runner": runner,
             "compiler": compiler,
             "scenarios": scenarios,
             "actions": actions,
-            "credential_bindings": credentials,
+            "credential_bindings": sorted(
+                credentials.values(),
+                key=lambda item: (
+                    item["semantic_role"], item["auth_profile"], item["credential_handle_id"],
+                ),
+            ),
             "budgets": dict(BUDGETS),
             "egress": {
-                "hostname": split.hostname,
+                "hostname": hostname,
                 "port": 443,
                 "redirect_policy": "deny",
             },
@@ -252,24 +241,24 @@ class CanaryCompiler:
         manifest["manifest_digest"] = canonical_digest(manifest)
         manifest = validate_test_manifest(manifest)
 
-        projection_actions = [
-            {
-                key: value for key, value in action.items()
-                if key not in {"fixture_bindings", "auth_profile"}
-            }
-            for action in actions
-        ]
+        projection_actions = [{
+            key: value
+            for key, value in action.items()
+            if key not in {"fixture_bindings", "auth_profile"}
+        } for action in actions]
         unsigned = {
             "schema_version": APPROVAL_PROJECTION_SCHEMA,
             "projection_id": projection_id or f"projection_{manifest['manifest_digest'][:24]}",
-            "workspace_id": workspace_id,
-            "project_id": project_id,
+            "workspace_id": context.workspace_id,
+            "project_id": context.project_id,
             "environment": environment,
             "runner": {
-                "runner_id": runner_base["runner_id"],
-                "runner_key_id": runner_base["runner_key_id"],
-                "runner_version": runner_base["minimum_runner_version"],
-                "adapter_versions": sorted({item["adapter_version"] for item in scenarios}),
+                "runner_id": self.identity.runner_id,
+                "runner_key_id": self.identity.key_id,
+                "runner_version": self.identity.runner_version,
+                "adapter_versions": sorted({
+                    self.identity.adapter_versions[scenario_id] for scenario_id in selected
+                }),
             },
             "compiler": compiler,
             "scenarios": scenarios,
@@ -280,22 +269,59 @@ class CanaryCompiler:
             "compiled_at_ms": self.now_ms,
             "manifest_digest": manifest["manifest_digest"],
         }
-        projection_digest = canonical_digest(unsigned)
         signature = self.signer.sign(canonical_bytes(unsigned))
         if not isinstance(signature, bytes) or len(signature) != 64:
             raise ValueError("runner signer must return a 64-byte Ed25519 signature")
         projection = {
             **unsigned,
-            "projection_digest": projection_digest,
-            "signing_key_id": key_id,
+            "projection_digest": canonical_digest(unsigned),
+            "signing_key_id": self.identity.key_id,
             "signature_b64": base64.b64encode(signature).decode("ascii"),
         }
         projection = validate_approval_projection(projection)
-        return CompileResult(manifest=manifest, projection=projection)
+        result = CompileResult(manifest=manifest, projection=projection)
+        if persist:
+            self.store.save_approved_pair(manifest, projection)
+        return result
 
-    def prepare_live(self) -> dict[str, bool]:
-        if self.vault is None or getattr(self.vault, "supported", False) is not True:
+    def prepare_live(
+        self,
+        selected_scenarios: Sequence[str],
+        *,
+        vaults: Mapping[str, object] | None = None,
+    ) -> dict[str, int]:
+        selected = _selected_scenarios(selected_scenarios)
+        _, records = self._inputs(selected)
+        context = self.store.load_context()
+        vaults = {} if vaults is None else vaults
+        required_roles = {
+            role
+            for scenario_id in selected
+            for role in CATALOG_BY_ID[scenario_id]["semantic_roles"]
+            if role != "anonymous"
+        }
+        try:
+            for role in sorted(required_roles):
+                record = records.get(role)
+                if record is None:
+                    raise VaultUnavailable("credential metadata is unavailable")
+                if record["backend"] in {"ephemeral_env", "ephemeral_fd"}:
+                    vault = EphemeralVault(
+                        record["credential_handle_id"], source_kind=record["source_kind"],
+                    )
+                else:
+                    vault = vaults.get(record["backend"])
+                    if (
+                        vault is None
+                        or getattr(vault, "supported", False) is not True
+                        or getattr(vault, "backend_id", None) != record["backend"]
+                    ):
+                        raise VaultUnavailable("credential backend is unavailable")
+                secret = vault.load(record["credential_handle_id"])
+                validate_credential_secret(record["auth_profile"], secret, context.origin)
+                secret = b""
+        except (ValueError, VaultUnavailable):
             raise UnsupportedSecureStorageError(
-                "live preparation requires a supported secure credential vault"
-            )
-        return {"prepared": True}
+                "every live comparison credential must resolve from its exact secure backend"
+            ) from None
+        return {"credential_count": len(required_roles)}
