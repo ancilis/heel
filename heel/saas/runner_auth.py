@@ -138,6 +138,53 @@ CREATE TABLE IF NOT EXISTS canary_runner_audit_records(
 UPDATE canary_runners SET status='disabled' WHERE status='active';
 """
 
+# A new in-process ControlPlane has no runner-auth rows to preserve.  Build its tables directly
+# at the v11 shape instead of creating v9 then replaying a destructive rename/copy migration.
+# Existing durable databases are upgraded exclusively by the append-only migration list above.
+RUNNER_AUTH_RUNTIME_SCHEMA = """
+CREATE TABLE IF NOT EXISTS canary_runner_pairings(
+  pairing_id TEXT PRIMARY KEY CHECK(length(pairing_id) BETWEEN 1 AND 128),
+  workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+  invitation_hash TEXT NOT NULL UNIQUE CHECK(length(invitation_hash)=64 AND invitation_hash NOT GLOB '*[^0-9a-f]*'),
+  phrase TEXT, public_key TEXT, fingerprint TEXT, key_id TEXT, runner_version TEXT,
+  adapters_json TEXT, activation_challenge TEXT,
+  status TEXT NOT NULL CHECK(status IN ('invited','pending','approved','activated','expired')),
+  created_at REAL NOT NULL, expires_at REAL NOT NULL, approved_at REAL, activated_at REAL, approved_by TEXT,
+  UNIQUE(workspace_id, runner_id), FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id));
+CREATE TABLE IF NOT EXISTS canary_runner_nonce_chains(
+  workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
+  nonce_hash TEXT NOT NULL CHECK(length(nonce_hash)=64 AND nonce_hash NOT GLOB '*[^0-9a-f]*'),
+  next_sequence INTEGER NOT NULL CHECK(next_sequence >= 1), expires_at REAL NOT NULL,
+  PRIMARY KEY(workspace_id,runner_id,chain_name),
+  FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+CREATE TABLE IF NOT EXISTS canary_runner_request_ledger(
+  workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
+  sequence INTEGER NOT NULL CHECK(sequence >= 1), request_digest TEXT NOT NULL,
+  response_json TEXT NOT NULL, next_nonce TEXT NOT NULL, created_at REAL NOT NULL,
+  nonce_hash TEXT, key_id TEXT, capability TEXT CHECK(capability IN ('runner_claim','runner_heartbeat','runner_progress','runner_result')),
+  method TEXT CHECK(method='POST'), path TEXT, timestamp_ms INTEGER CHECK(timestamp_ms >= 0),
+  signed_request_digest TEXT, body_digest TEXT, response_ciphertext TEXT, next_nonce_ciphertext TEXT,
+  PRIMARY KEY(workspace_id,runner_id,chain_name,sequence),
+  FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+CREATE TABLE IF NOT EXISTS canary_runner_rotations(
+  pairing_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+  phrase TEXT NOT NULL, public_key TEXT NOT NULL, fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64 AND fingerprint NOT GLOB '*[^0-9a-f]*'),
+  key_id TEXT NOT NULL, runner_version TEXT NOT NULL, adapters_json TEXT NOT NULL, activation_challenge TEXT,
+  status TEXT NOT NULL CHECK(status IN ('rotation_pending','rotation_approved','rotated','expired')),
+  created_at REAL NOT NULL, expires_at REAL NOT NULL, approved_at REAL, activated_at REAL, approved_by TEXT,
+  FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+CREATE TABLE IF NOT EXISTS canary_runner_identity_records(
+  workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, identity_json TEXT NOT NULL,
+  identity_digest TEXT NOT NULL CHECK(length(identity_digest)=64 AND identity_digest NOT GLOB '*[^0-9a-f]*'),
+  updated_at REAL NOT NULL, PRIMARY KEY(workspace_id,runner_id), UNIQUE(identity_digest),
+  FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+CREATE TABLE IF NOT EXISTS canary_runner_audit_records(
+  audit_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+  action TEXT NOT NULL CHECK(action IN ('runner_revoked','runner_rotated','runner_activated')),
+  actor TEXT NOT NULL, reason_code TEXT, created_at REAL NOT NULL,
+  FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+"""
+
 
 class RunnerAuthError(PermissionError):
     """Uniform external runner-auth failure."""
@@ -210,6 +257,14 @@ def ensure_runner_auth_schema(conn: sqlite3.Connection) -> None:
     """Runtime schema parity through migration eleven, with no dependence on a pepper."""
     if not isinstance(conn, sqlite3.Connection):
         raise TypeError("runner authentication requires a SQLite connection")
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_runner_pairings'"
+    ).fetchone()
+    if exists is None:
+        conn.executescript(RUNNER_AUTH_RUNTIME_SCHEMA)
+        return
+    # A durable legacy database is never rebuilt by runtime construction. The migrator remains
+    # the only upgrade authority; these additive statements retain compatibility while it runs.
     conn.executescript(RUNNER_AUTH_SCHEMA)
     _ensure_hardened_ledger_schema(conn)
     _ensure_lifecycle_tables(conn)

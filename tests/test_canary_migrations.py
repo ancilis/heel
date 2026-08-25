@@ -85,6 +85,44 @@ class CanaryMigrationTests(unittest.TestCase):
         Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
         self.assertEqual(conn.execute("SELECT status FROM canary_runners WHERE runner_id='skeleton'").fetchone()[0], "disabled")
 
+    def test_direct_control_plane_runtime_uses_final_runner_foreign_keys(self):
+        from heel.saas.http_api import ControlPlane
+
+        control = ControlPlane()
+        self.addCleanup(control.close)
+        conn = control.store.conn
+        org = control.store.create_org("org")
+        one = control.store.create_workspace(org, "one", "free", CATALOG_VERSION)
+        two = control.store.create_workspace(org, "two", "free", CATALOG_VERSION)
+        conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner-one", one, "one", "active", 1))
+        conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner-two", two, "two", "active", 1)); conn.commit()
+        for table in ("canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records"):
+            self.assertTrue(conn.execute(f"PRAGMA foreign_key_list({table})").fetchall(), table)
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO canary_runner_pairings(pairing_id,workspace_id,runner_id,invitation_hash,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?)", ("orphan", "missing", "", "a" * 64, "invited", 1, 2))
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (one, "runner-two", "claim", "a" * 64, 1, 2))
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO canary_runner_identity_records VALUES(?,?,?,?,?)", (one, "runner-two", "{}", "a" * 64, 1))
+
+    def test_direct_control_plane_runner_schema_matches_migration_eleven_sql_and_keys(self):
+        from heel.saas.http_api import ControlPlane
+
+        migrated = sqlite3.connect(":memory:")
+        self.addCleanup(migrated.close)
+        Migrator(migrated, CONTROL_PLANE_MIGRATIONS).apply_all()
+        control = ControlPlane()
+        self.addCleanup(control.close)
+        runtime = control.store.conn
+        tables = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records")
+        for table in tables:
+            with self.subTest(table=table):
+                migrated_sql = migrated.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
+                runtime_sql = runtime.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
+                self.assertEqual("".join(migrated_sql.split()), "".join(runtime_sql.split()))
+                self.assertEqual([tuple(row) for row in migrated.execute(f"PRAGMA foreign_key_list({table})")], [tuple(row) for row in runtime.execute(f"PRAGMA foreign_key_list({table})")])
+                self.assertEqual([tuple(row) for row in migrated.execute(f"PRAGMA index_list({table})")], [tuple(row) for row in runtime.execute(f"PRAGMA index_list({table})")])
+
     def test_current_catalog_only_has_new_meters(self):
         current_free = get_plan("free", CATALOG_VERSION)
         self.assertEqual(current_free.quota(Meter.ACTIVE_RUNNERS), 1)

@@ -218,3 +218,39 @@ def test_runner_request_uses_a_fresh_connection_and_never_joins_human_write():
             assert opened and all(conn is not cp.store.conn for conn in opened)
         finally:
             cp.close()
+
+
+def test_real_http_heartbeat_bypasses_held_human_request_lock():
+    """Run-operation paths have eight components and must never wait on the Python human lock."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = str(Path(directory) / "control.sqlite")
+        cp = ControlPlane(path, runner_auth_pepper=b"r" * 32)
+        server = serve(cp); served = threading.Thread(target=server.serve_forever, daemon=True); served.start()
+        try:
+            org = cp.store.create_org("org")
+            workspace = cp.store.create_workspace(org, "ws", "free", "2026-08")
+            private = Ed25519PrivateKey.generate()
+            public = base64.b64encode(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+            raw = base64.b64decode(public); key_id = ed25519_key_id(raw); nonce = "n" * 44
+            cp.store.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", workspace, "runner", "active", time.time()))
+            cp.store.conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", public, "active", time.time()))
+            cp.store.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace, "runner", "runner_heartbeat:run", cp.runner_auth._hash("nonce", nonce), 1, time.time() + 60))
+            identity = cp.runner_auth._identity_record(workspace_id=workspace, runner_id="runner", public_key=public, fingerprint=hashlib.sha256(raw).hexdigest(), key_id=key_id, runner_version="v1", adapters_json="{}", paired_by="owner", paired_at=time.time(), heartbeat_at=time.time())
+            cp.runner_auth._save_identity(identity, instant=time.time()); cp.store.conn.commit()
+            body = canonical_bytes({"run_id": "run"})
+            route = f"/v1/workspaces/{workspace}/runners/runner/runs/run/heartbeat"
+            timestamp = int(time.time() * 1000)
+            proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace, "runner_id":"runner", "key_id":key_id, "capability":"runner_heartbeat", "method":"POST", "path":route, "body_sha256":hashlib.sha256(body).hexdigest(), "timestamp_ms":timestamp, "server_nonce":nonce, "sequence":1}
+            headers = {"Content-Type":"application/json", "X-Heel-Runner-Id":"runner", "X-Heel-Runner-Key-Id":key_id, "X-Heel-Runner-Timestamp-Ms":str(timestamp), "X-Heel-Runner-Nonce":nonce, "X-Heel-Runner-Sequence":"1", "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))).decode()}
+            done, result = threading.Event(), []
+            def heartbeat():
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+                conn.request("POST", route, body, headers)
+                response = conn.getresponse(); result.append(response.status); response.read(); conn.close(); done.set()
+            with cp.request_lock:
+                request = threading.Thread(target=heartbeat); request.start()
+                assert done.wait(.75), "runner heartbeat waited on the human request lock"
+            request.join(1)
+            assert result == [200]
+        finally:
+            server.shutdown(); server.server_close(); cp.close()

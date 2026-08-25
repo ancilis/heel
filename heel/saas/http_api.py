@@ -753,7 +753,7 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         return bool(len(p) >= 6 and p[1] == "workspaces" and p[3] == "runners" and (
             (len(p) == 6 and p[5] == "claim") or
-            (len(p) == 9 and p[5] == "runs" and p[8] in {"heartbeat", "progress", "result", "stop-ack"})
+            (len(p) == 8 and p[5] == "runs" and p[7] in {"heartbeat", "progress", "result", "stop-ack"})
         ))
 
     def _route_serial(self, method: str) -> None:
