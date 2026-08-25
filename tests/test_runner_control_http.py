@@ -139,6 +139,42 @@ def test_resync_recovers_an_existing_chain_and_replays_only_the_same_signed_comp
         store.complete_resync(workspace_id=workspace, runner_id="runner", path=complete_path, raw_body=changed, headers=headers)
 
 
+def test_http_resync_uses_current_key_and_replays_the_exact_completed_exchange():
+    """Recovery has its own unsigned-by-browser HTTP surface and durable replay receipt."""
+    with tempfile.TemporaryDirectory() as directory:
+        cp = ControlPlane(str(Path(directory) / "control.sqlite"), runner_auth_pepper=b"r" * 32)
+        server = serve(cp); thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            org = cp.store.create_org("org"); workspace = cp.store.create_workspace(org, "ws", "free", "2026-08")
+            private = Ed25519PrivateKey.generate(); raw_key = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            public, key_id = base64.b64encode(raw_key).decode(), ed25519_key_id(raw_key)
+            now = time.time(); timestamp = int(now * 1000)
+            cp.store.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", workspace, "runner", "active", now))
+            cp.store.conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", public, "active", now))
+            cp.store.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace, "runner", "claim", cp.runner_auth._hash("nonce", "lost"), 4, now + 60))
+            cp.store.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace, "runner", "claim", 4, 0, now)); cp.store.conn.commit()
+
+            def post(path, body, schema, domain):
+                proof = {"schema_version":schema, "workspace_id":workspace, "runner_id":"runner", "key_id":key_id, "method":"POST", "path":path, "body_sha256":hashlib.sha256(body).hexdigest(), "timestamp_ms":timestamp}
+                headers = {"Content-Type":"application/json", "X-Heel-Runner-Id":"runner", "X-Heel-Runner-Key-Id":key_id, "X-Heel-Runner-Timestamp-Ms":str(timestamp), "X-Heel-Runner-Signature":base64.b64encode(private.sign(domain + canonical_bytes(proof))).decode()}
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1]); conn.request("POST", path, body, headers)
+                response = conn.getresponse(); payload = json.loads(response.read()); status = response.status; conn.close()
+                return status, payload
+
+            chain, client_nonce = {"operation":"claim", "run_id":None}, base64.b64encode(b"c" * 32).decode()
+            start_path = f"/v1/workspaces/{workspace}/runners/runner/resync/start"
+            start = canonical_bytes({"schema_version":"heel.runner-resync-start.v1", "chain":chain, "client_nonce_b64":client_nonce})
+            status, challenge = post(start_path, start, "heel.runner-resync-start-proof.v1", b"heel.runner-resync-start-pop.v1\0")
+            assert status == 200 and challenge["next_sequence"] == 4
+            complete_path = f"/v1/workspaces/{workspace}/runners/runner/resync/complete"
+            complete = canonical_bytes({"schema_version":"heel.runner-resync-complete.v1", "challenge_id":challenge["challenge_id"], "chain":chain, "client_nonce_b64":client_nonce, "server_challenge_b64":challenge["server_challenge_b64"]})
+            status, recovered = post(complete_path, complete, "heel.runner-resync-complete-proof.v1", b"heel.runner-resync-complete-pop.v1\0")
+            assert status == 200 and recovered["next_sequence"] == 4
+            assert post(complete_path, complete, "heel.runner-resync-complete-proof.v1", b"heel.runner-resync-complete-pop.v1\0") == (200, recovered)
+        finally:
+            server.shutdown(); server.server_close(); cp.close()
+
+
 def test_http_pairing_exchange_returns_runner_only_challenge_for_activation():
     cp = ControlPlane(device_token_pepper=b"d" * 32, runner_auth_pepper=b"r" * 32,
                       enable_device_auth=True, public_origin="https://heel.test")
