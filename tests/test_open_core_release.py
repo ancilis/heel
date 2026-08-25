@@ -168,8 +168,13 @@ EXPECTED_CONTRACT = {
         "heel/review_rules.py",
         "heel/review_service.py",
         "heel/runner/__init__.py",
+        "heel/runner/catalog.py",
+        "heel/runner/compiler.py",
         "heel/runner/control_client.py",
         "heel/runner/identity.py",
+        "heel/runner/openapi_routes.py",
+        "heel/runner/store.py",
+        "heel/runner/vault.py",
         "heel/scenario_validate.py",
         "heel/scenarios.py",
         "heel/scope.py",
@@ -848,7 +853,10 @@ class OpenCoreReleaseTests(unittest.TestCase):
         downloads = ROOT / "apps" / "heel-cloud" / "public" / "downloads"
         sources = {
             f"heel/runner/{name}": (ROOT / "heel" / "runner" / name).read_bytes()
-            for name in ("__init__.py", "identity.py", "control_client.py")
+            for name in (
+                "__init__.py", "catalog.py", "compiler.py", "control_client.py",
+                "identity.py", "openapi_routes.py", "store.py", "vault.py",
+            )
         }
         for required in (
             b"def runner_phrase_words", b"class SystemSecureSigner",

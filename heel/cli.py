@@ -6,7 +6,9 @@ explicit human confirmation and remains unavailable through the MCP and REST sur
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
+import io
 import json
 import os
 import platform
@@ -32,6 +34,10 @@ _SAFE_REVIEW_FAILURE = (
     "Heel OpenAPI review failed: input could not be read or reviewed safely."
 )
 _SAFE_CLOUD_FAILURE = "Heel Cloud could not complete the request safely."
+_SAFE_RUNNER_IMPORT_FAILURE = "Heel runner OpenAPI import failed."
+_SAFE_RUNNER_CREDENTIAL_FAILURE = "Heel runner credential could not be stored safely."
+_SAFE_RUNNER_MAPPING_FAILURE = "Heel runner mapping could not be saved safely."
+_SAFE_RUNNER_LIVE_FAILURE = "Heel runner live preparation is unavailable."
 _OPENAPI_READ_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
@@ -105,6 +111,205 @@ def _review_openapi_file(path: str, *, as_json: bool) -> int:
         return 2
 
     sys.stdout.write(rendered)
+    return 0
+
+
+def _runner_store():
+    from .runner.store import RunnerStore
+
+    return RunnerStore()
+
+
+def _runner_import_openapi(path: str) -> int:
+    """Persist only the minimized local GET/HEAD inventory, never the document."""
+    from .runner.openapi_routes import RouteInventory
+
+    try:
+        inventory = RouteInventory(_load_bounded_openapi(path))
+        routes = inventory.read_routes()
+        _runner_store().replace_routes(routes, source_digest=inventory.source_digest)
+    except Exception:
+        print(_SAFE_RUNNER_IMPORT_FAILURE, file=sys.stderr)
+        return 2
+    print(json.dumps({
+        "methods": sorted({route["method"] for route in routes}),
+        "routes": len(routes),
+    }, sort_keys=True))
+    return 0
+
+
+def _runner_secret_from_fd(descriptor: int) -> bytes:
+    from .runner.vault import EphemeralVault
+
+    return EphemeralVault(fd=descriptor).load("0" * 32)
+
+
+def _runner_credential_add(args) -> int:
+    from .runner.store import new_credential_handle_id
+    from .runner.vault import select_vault
+
+    handle_id = args.handle_id or new_credential_handle_id()
+    try:
+        store = _runner_store()
+        if any(
+            item["credential_handle_id"] == handle_id
+            for item in store.list_credentials()
+        ):
+            raise ValueError("duplicate credential handle")
+        vault = select_vault(
+            args.vault,
+            env_name=args.env_name,
+            fd=args.secret_fd,
+        )
+        if args.vault.startswith("ephemeral-"):
+            # Resolve once now so a missing/oversized source cannot create metadata
+            # that appears live-ready. The value is never attached to the record.
+            vault.load(handle_id)
+        else:
+            if args.env_name is not None:
+                raise ValueError("OS vault input must use getpass or an inherited FD")
+            if args.secret_fd is not None:
+                secret = _runner_secret_from_fd(args.secret_fd)
+            else:
+                if not sys.stdin.isatty():
+                    raise ValueError("interactive secret input requires a TTY")
+                secret = getpass.getpass("Canary credential: ").encode("utf-8")
+            vault.store(handle_id, secret)
+        record = store.add_credential(
+            label=args.label,
+            auth_profile=args.profile,
+            handle_id=handle_id,
+        )
+    except Exception:
+        print(_SAFE_RUNNER_CREDENTIAL_FAILURE, file=sys.stderr)
+        return 2
+    print(json.dumps(record, sort_keys=True))
+    return 0
+
+
+def _runner_fixture_bindings(values: list[str]) -> list[dict[str, str]]:
+    bindings: list[dict[str, str]] = []
+    for value in values:
+        if "=" not in value:
+            raise ValueError("fixture binding must use NAME=LOCAL_ID")
+        parameter_name, fixture_id = value.split("=", 1)
+        bindings.append({"parameter_name": parameter_name, "fixture_id": fixture_id})
+    return bindings
+
+
+def _runner_map(args) -> int:
+    from .runner.catalog import CATALOG_BY_ID
+
+    try:
+        catalog = CATALOG_BY_ID[args.scenario]
+        record = _runner_store().save_mapping({
+            "scenario_id": args.scenario,
+            "method": args.method,
+            "route_template": args.route,
+            "semantic_auth_role": catalog["semantic_auth_role"],
+            "auth_profile": catalog["auth_profile"],
+            "credential_handle_id": args.handle_id,
+            "fixture_bindings": _runner_fixture_bindings(args.fixture),
+        })
+    except Exception:
+        print(_SAFE_RUNNER_MAPPING_FAILURE, file=sys.stderr)
+        return 2
+    print(json.dumps({
+        "auth_profile": record["auth_profile"],
+        "method": record["method"],
+        "route_template": record["route_template"],
+        "semantic_role": record["semantic_auth_role"],
+    }, sort_keys=True))
+    return 0
+
+
+def _runner_prepare(args) -> int:
+    try:
+        store = _runner_store()
+        routes = store.list_routes()
+        mappings = store.list_mappings()
+    except Exception:
+        if args.live:
+            print(_SAFE_RUNNER_LIVE_FAILURE, file=sys.stderr)
+        else:
+            print("Heel runner preparation failed.", file=sys.stderr)
+        return 2
+    if not args.live:
+        print(json.dumps({
+            "live": False,
+            "mapped_scenarios": len(mappings),
+            "network_calls": False,
+            "ready_for_live": len(mappings) == 4,
+            "routes": len(routes),
+        }, sort_keys=True))
+        return 0
+
+    # Task 5 is a local compilation boundary. It creates no network authority and
+    # uploads nothing; later control-plane tasks consume the safe projection.
+    try:
+        from .runner.catalog import CATALOG_IDS
+        from .runner.compiler import CanaryCompiler
+        from .runner.identity import SystemSecureSigner
+        from .runner.vault import select_vault
+
+        required = (
+            args.workspace, args.project, args.environment_id,
+            args.verification_digest, args.origin, args.runner_id,
+            args.signer_label,
+        )
+        if any(value is None for value in required) or len(mappings) != 4:
+            raise ValueError("live preparation inputs are incomplete")
+        signer = SystemSecureSigner(args.signer_label)
+        vault = select_vault(args.vault, env_name=args.env_name, fd=args.secret_fd)
+        CanaryCompiler(signer, now_ms=int(time.time() * 1000), store=store, vault=vault).prepare_live()
+        mapping_table = {item["scenario_id"]: item for item in mappings}
+        handles = {
+            scenario_id: mapping_table[scenario_id]["credential_handle_id"]
+            for scenario_id in CATALOG_IDS
+        }
+        if any(value is None for value in handles.values()):
+            raise ValueError("credential handles are incomplete")
+        fixtures = {
+            scenario_id: {
+                item["parameter_name"]: item["fixture_id"]
+                for item in mapping_table[scenario_id]["fixture_bindings"]
+            }
+            for scenario_id in CATALOG_IDS
+        }
+        result = CanaryCompiler(
+            signer, now_ms=int(time.time() * 1000), store=store, vault=vault,
+        ).compile_routes(
+            routes,
+            {
+                "workspace_id": args.workspace,
+                "project_id": args.project,
+                "environment": {
+                    "environment_id": args.environment_id,
+                    "verification_record_digest": args.verification_digest,
+                    "origin": args.origin,
+                    "environment_class": args.environment_class,
+                },
+                "runner": {
+                    "runner_id": args.runner_id,
+                    "runner_key_id": signer.key_id,
+                    "minimum_runner_version": "1",
+                },
+                "compiler": {"compiler_version": "1", "engine_version": "1"},
+            },
+            mappings=mapping_table,
+            credential_handle_ids=handles,
+            fixture_ids=fixtures,
+        )
+    except Exception:
+        print(_SAFE_RUNNER_LIVE_FAILURE, file=sys.stderr)
+        return 2
+    print(json.dumps({
+        "live": True,
+        "manifest_digest": result.manifest["manifest_digest"],
+        "network_calls": False,
+        "projection": result.projection,
+        "uploaded": False,
+    }, sort_keys=True))
     return 0
 
 
@@ -730,6 +935,13 @@ def _report(srv: HeelServer, run_id: str, caller: str, economic: bool = False,
 
 
 def main(argv=None):
+    selected_argv = list(sys.argv[1:] if argv is None else argv)
+    if selected_argv[:1] == ["runner"] and any(
+        value == "--secret" or value.startswith("--secret=")
+        for value in selected_argv
+    ):
+        print(_SAFE_RUNNER_CREDENTIAL_FAILURE, file=sys.stderr)
+        return 2
     ap = argparse.ArgumentParser(prog="heel", description="Heel: agent-native abuse-simulation tool")
     ap.add_argument("--version", action="version", version=f"heel {__version__}")
     sub = ap.add_subparsers(dest="cmd")
@@ -761,6 +973,68 @@ def main(argv=None):
         action="store_true",
         help="emit the canonical heel.review.v1 JSON envelope",
     )
+
+    runner = sub.add_parser(
+        "runner", help="prepare customer-local verified canary rehearsals",
+    )
+    runner_sub = runner.add_subparsers(dest="runnercmd", required=True)
+    runner_import = runner_sub.add_parser(
+        "import-openapi", help="import only a minimized local GET/HEAD route inventory",
+    )
+    runner_import.add_argument("path", metavar="PATH")
+    runner_credential = runner_sub.add_parser(
+        "credential", help="manage opaque local canary credential handles",
+    )
+    runner_credential_sub = runner_credential.add_subparsers(
+        dest="runnercredentialcmd", required=True,
+    )
+    runner_credential_add = runner_credential_sub.add_parser(
+        "add", help="store a canary credential in a secure or ephemeral provider",
+    )
+    runner_credential_add.add_argument(
+        "--profile", required=True,
+        choices=("anonymous", "bearer", "cookie_jar", "x_api_key"),
+    )
+    runner_credential_add.add_argument("--label", required=True)
+    runner_credential_add.add_argument("--handle-id")
+    runner_credential_add.add_argument(
+        "--vault", required=True,
+        choices=("keychain", "secret-service", "ephemeral-env", "ephemeral-fd"),
+    )
+    runner_credential_add.add_argument("--env-name")
+    runner_credential_add.add_argument("--secret-fd", type=int)
+    runner_map = runner_sub.add_parser(
+        "map", help="bind one immutable scenario to one imported read route",
+    )
+    runner_map.add_argument(
+        "--scenario", required=True,
+        choices=(
+            "anonymous_authenticated_read", "object_ownership_read",
+            "role_bound_read", "plan_entitlement_read",
+        ),
+    )
+    runner_map.add_argument("--method", required=True, choices=("GET", "HEAD"))
+    runner_map.add_argument("--route", required=True)
+    runner_map.add_argument("--handle-id")
+    runner_map.add_argument("--fixture", action="append", default=[])
+    runner_prepare = runner_sub.add_parser(
+        "prepare", help="review readiness or compile one local immutable rehearsal",
+    )
+    runner_prepare.add_argument("--live", action="store_true")
+    runner_prepare.add_argument("--workspace")
+    runner_prepare.add_argument("--project")
+    runner_prepare.add_argument("--environment-id")
+    runner_prepare.add_argument("--environment-class", choices=("staging", "sandbox"), default="staging")
+    runner_prepare.add_argument("--verification-digest")
+    runner_prepare.add_argument("--origin")
+    runner_prepare.add_argument("--runner-id")
+    runner_prepare.add_argument("--signer-label")
+    runner_prepare.add_argument(
+        "--vault", choices=("keychain", "secret-service", "ephemeral-env", "ephemeral-fd"),
+        default="keychain" if platform.system() == "Darwin" else "secret-service",
+    )
+    runner_prepare.add_argument("--env-name")
+    runner_prepare.add_argument("--secret-fd", type=int)
 
     cloud = sub.add_parser(
         "cloud",
@@ -898,7 +1172,17 @@ def main(argv=None):
     control_input.add_argument("--finding-json", help="path to one finding JSON object")
     control_input.add_argument("--run", help="stored run id to simulate")
 
-    args = ap.parse_args(argv)
+    if selected_argv[:1] == ["runner"]:
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                args = ap.parse_args(selected_argv)
+        except SystemExit as error:
+            if error.code == 0:
+                return 0
+            print("Heel runner command was rejected.", file=sys.stderr)
+            return 2
+    else:
+        args = ap.parse_args(selected_argv)
     if args.cmd is None:
         ap.print_help()
         return 0
@@ -916,6 +1200,15 @@ def main(argv=None):
         return 0
     if args.cmd == "review" and args.reviewcmd == "openapi":
         return _review_openapi_file(args.path, as_json=args.as_json)
+    if args.cmd == "runner":
+        if args.runnercmd == "import-openapi":
+            return _runner_import_openapi(args.path)
+        if args.runnercmd == "credential" and args.runnercredentialcmd == "add":
+            return _runner_credential_add(args)
+        if args.runnercmd == "map":
+            return _runner_map(args)
+        if args.runnercmd == "prepare":
+            return _runner_prepare(args)
     if args.cmd == "cloud":
         if not args.origin:
             print(
