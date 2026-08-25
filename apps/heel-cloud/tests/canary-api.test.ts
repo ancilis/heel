@@ -68,6 +68,7 @@ it("mirrors Task7 route-summary byte bounds and forbidden route grammar", async 
   });
   const valid = [
     "GET /safe!$&'()*+,;=@",
+    "GET /line\u2028separator", "HEAD /paragraph\u2029separator",
     `HEAD /${"a".repeat(512)}`,
     `GET /${"é".repeat(511)}a`,
   ];
@@ -77,7 +78,7 @@ it("mirrors Task7 route-summary byte bounds and forbidden route grammar", async 
   for (const invalid of [
     `GET /${"a".repeat(1024)}`,
     `GET /${"é".repeat(512)}`,
-    "GET /safe\u0001", "GET /safe?query", "GET /safe#fragment", "GET /safe//child", "POST /safe",
+    "GET /safe\u0001", "GET /safe\ud800", "GET /safe?query", "GET /safe#fragment", "GET /safe//child", "POST /safe",
   ]) {
     const invalidApi = new CanaryApi({ transport: async () => pending([invalid]) });
     await assert.rejects(() => invalidApi.listPendingApprovalRequests(workspace, project), CanaryApiError);

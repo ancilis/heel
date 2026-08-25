@@ -74,6 +74,16 @@ def test_cloud_context_sidecar_requires_domain_signature_and_is_immutable(tmp_pa
     assert store.install_cloud_context_binding(artifact, identity=identity, signer=signer, signer_label="test-signer", trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1) == store.load_context()
     assert store.load_cloud_context_binding()["binding_id"] == artifact["binding_id"]
     assert store.verify_cloud_context_binding(identity=identity, trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1)["binding_id"] == artifact["binding_id"]
+    renewal_unsigned = {
+        **unsigned, "binding_id": "rcb_" + "b" * 32,
+            "issued_at_ms": 2, "expires_at_ms": 60_002,
+    }
+    renewal = {**renewal_unsigned, "binding_digest": canonical_digest(renewal_unsigned)}
+    renewal.update(authority.sign(b"heel.runner-context-binding.v1\0" + canonical_bytes(renewal_unsigned)))
+    with pytest.raises(RunnerStoreError, match="cannot be replaced"):
+        store.install_cloud_context_binding(renewal, identity=identity, signer=signer, signer_label="test-signer", trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=2)
+    assert store.install_cloud_context_binding(renewal, identity=identity, signer=signer, signer_label="test-signer", trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_001) == store.load_context()
+    assert store.verify_cloud_context_binding(identity=identity, trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_001)["binding_id"] == renewal["binding_id"]
     with pytest.raises(RunnerStoreError, match="invalid cloud context"):
         store.verify_cloud_context_binding(identity=identity, trusted_cloud_keys={"other": authority.public_key}, now_ms=1)
     artifact["binding_id"] = "rcb_" + "b" * 32

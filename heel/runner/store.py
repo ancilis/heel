@@ -742,8 +742,34 @@ class RunnerStore:
     def install_cloud_context_binding(
         self, artifact: object, *, identity: RunnerIdentity, signer: SecureSigner,
         signer_label: str, trusted_cloud_keys: Mapping[str, object], now_ms: int,
+        renewal_authority_lost: bool = False,
     ) -> RunnerContext:
         """Verify and atomically retain a Cloud authorization beside the immutable context."""
+        binding, context = self._validated_cloud_context_binding(
+            artifact, identity=identity, trusted_cloud_keys=trusted_cloud_keys, now_ms=now_ms,
+        )
+        self.bind_context(context, identity=identity, signer=signer, signer_label=signer_label)
+        with self._transaction(exclusive=True) as context_fd:
+            existing = _read_json(context_fd, "cloud-context-binding.json", None)
+            if existing is not None and existing != binding:
+                old, old_context = self._validated_cloud_context_binding(
+                    existing, identity=identity, trusted_cloud_keys=trusted_cloud_keys, now_ms=now_ms,
+                    require_current=False,
+                )
+                old_current = old["issued_at_ms"] <= now_ms + 30_000 and now_ms < old["expires_at_ms"]
+                if (old_context != context or (old_current and not renewal_authority_lost)
+                        or binding["binding_id"] == old["binding_id"] or binding["binding_digest"] == old["binding_digest"]
+                        or binding["issued_at_ms"] <= old["issued_at_ms"] or binding["expires_at_ms"] <= old["expires_at_ms"]):
+                    raise RunnerStoreError("cloud context binding cannot be replaced")
+                _write_json(context_fd, "cloud-context-binding.json", binding)
+            elif existing is None:
+                _write_json(context_fd, "cloud-context-binding.json", binding)
+        return context
+
+    def _validated_cloud_context_binding(
+        self, artifact: object, *, identity: RunnerIdentity, trusted_cloud_keys: Mapping[str, object],
+        now_ms: int, require_current: bool = True,
+    ) -> tuple[dict[str, Any], RunnerContext]:
         try:
             binding = validate_runner_context_binding(artifact)
         except (TypeError, ValueError):
@@ -752,42 +778,20 @@ class RunnerStore:
             raise RunnerStoreError("cloud context authority is unavailable")
         if type(now_ms) is not int or isinstance(now_ms, bool):
             raise RunnerStoreError("invalid cloud context time")
-        unsigned = {key: binding[key] for key in (
-            "schema_version", "binding_id", "workspace_id", "project_id", "environment", "runner_binding",
-            "authorization", "issued_at_ms", "expires_at_ms",
-        )}
+        unsigned = {key: binding[key] for key in ("schema_version", "binding_id", "workspace_id", "project_id", "environment", "runner_binding", "authorization", "issued_at_ms", "expires_at_ms")}
         try:
-            verify_envelope(dict(trusted_cloud_keys), {
-                "signing_key_id": binding["signing_key_id"], "signature_b64": binding["signature_b64"],
-            }, _CONTEXT_DOMAIN + canonical_bytes(unsigned))
-        except (TypeError, ValueError):
-            raise RunnerStoreError("invalid cloud context signature") from None
-        runner = binding["runner_binding"]
-        try:
+            verify_envelope(dict(trusted_cloud_keys), {"signing_key_id": binding["signing_key_id"], "signature_b64": binding["signature_b64"]}, _CONTEXT_DOMAIN + canonical_bytes(unsigned))
             public = base64.b64decode(identity.public_key_b64, validate=True)
         except (TypeError, ValueError):
-            raise RunnerStoreError("invalid local runner identity") from None
-        if (
-            binding["workspace_id"] != identity.workspace_id or runner["runner_id"] != identity.runner_id
-            or runner["runner_key_id"] != identity.key_id or hashlib.sha256(public).hexdigest() != runner["public_key_digest"]
-            or binding["issued_at_ms"] > now_ms + 30_000 or now_ms >= binding["expires_at_ms"]
-        ):
+            raise RunnerStoreError("invalid cloud context signature") from None
+        runner, environment = binding["runner_binding"], binding["environment"]
+        if (binding["workspace_id"] != identity.workspace_id or runner["runner_id"] != identity.runner_id
+                or runner["runner_key_id"] != identity.key_id or len(public) != 32
+                or hashlib.sha256(public).hexdigest() != runner["public_key_digest"]
+                or binding["issued_at_ms"] > now_ms + 30_000
+                or (require_current and now_ms >= binding["expires_at_ms"])):
             raise RunnerStoreError("cloud context binding does not match local runner")
-        environment = binding["environment"]
-        context = RunnerContext(
-            workspace_id=binding["workspace_id"], project_id=binding["project_id"],
-            environment_id=environment["environment_id"], origin=environment["origin"],
-            verification_record_digest=environment["verification_record_digest"],
-            environment_class=environment["environment_class"],
-        )
-        self.bind_context(context, identity=identity, signer=signer, signer_label=signer_label)
-        with self._transaction(exclusive=True) as context_fd:
-            existing = _read_json(context_fd, "cloud-context-binding.json", None)
-            if existing is not None and existing != binding:
-                raise RunnerStoreError("cloud context binding cannot be replaced")
-            if existing is None:
-                _write_json(context_fd, "cloud-context-binding.json", binding)
-        return context
+        return binding, RunnerContext(workspace_id=binding["workspace_id"], project_id=binding["project_id"], environment_id=environment["environment_id"], origin=environment["origin"], verification_record_digest=environment["verification_record_digest"], environment_class=environment["environment_class"])
 
     def load_cloud_context_binding(self) -> dict[str, Any]:
         with self._transaction(exclusive=False) as context_fd:

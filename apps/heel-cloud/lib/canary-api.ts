@@ -219,7 +219,7 @@ function closedString(value: unknown, maximum = 512): value is string {
 
 function validApprovalRouteSummary(value: unknown): value is string {
   if (typeof value !== "string") return false;
-  const matched = /^(GET|HEAD) (\/.*)$/u.exec(value);
+  const matched = /^(GET|HEAD) (\/[\s\S]*)$/u.exec(value);
   if (matched === null) return false;
   const route = matched[2];
   return route.normalize("NFC") === route

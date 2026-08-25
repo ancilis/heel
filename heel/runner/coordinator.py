@@ -171,13 +171,46 @@ class RunnerCoordinator:
             self.install_cloud_context_binding(claimed["context_binding"], signer_label="cloud-context")
             return True
         try:
-            self.store.verify_cloud_context_binding(
+            current = self.store.verify_cloud_context_binding(
                 identity=self.identity, trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
+            )
+            listed = self.control.list_contexts()
+            contexts = listed["contexts"]
+            if len(contexts) == 1 and (contexts[0]["binding_id"], contexts[0]["binding_digest"]) == (
+                current["binding_id"], current["binding_digest"],
+            ):
+                return True
+            if len(contexts) == 0:
+                return False
+            if len(contexts) != 1:
+                raise ValueError("ambiguous cloud runner contexts")
+            item = contexts[0]
+            claimed = self.control.claim_context(item["binding_id"], item["binding_digest"])
+            self.store.install_cloud_context_binding(
+                claimed["context_binding"], identity=self.identity, signer=self.signer,
+                signer_label="cloud-context", trusted_cloud_keys=self.trusted_grant_keys,
+                now_ms=self._now_ms(), renewal_authority_lost=True,
             )
             return True
         except RunnerStoreError:
             if self.store.has_cloud_context_binding():
-                raise ValueError("cloud context binding no longer verifies") from None
+                listed = self.control.list_contexts()
+                contexts = listed["contexts"]
+                if len(contexts) == 0:
+                    return False
+                if len(contexts) != 1:
+                    raise ValueError("ambiguous cloud runner contexts")
+                item = contexts[0]
+                claimed = self.control.claim_context(item["binding_id"], item["binding_digest"])
+                try:
+                    self.store.install_cloud_context_binding(
+                        claimed["context_binding"], identity=self.identity, signer=self.signer,
+                        signer_label="cloud-context", trusted_cloud_keys=self.trusted_grant_keys,
+                        now_ms=self._now_ms(), renewal_authority_lost=True,
+                    )
+                except RunnerStoreError:
+                    raise ValueError("cloud context binding no longer verifies") from None
+                return True
             # A pre-existing static context remains a deliberate local-only workflow.
             try:
                 self.store.load_context()
