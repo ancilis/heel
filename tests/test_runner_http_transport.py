@@ -8,12 +8,17 @@ import pytest
 
 from heel.runner.adapters import PreparedAction
 from heel.runner.http_transport import (
+    AttemptPermit,
+    BoundedResponseEvidence,
     CancellationToken,
+    EvidenceContext,
+    RetryPolicy,
     TargetHTTPSClient,
     TransportFailure,
     normalize_target_origin,
     select_public_addresses,
 )
+from heel.runner.redaction import Redactor
 
 
 PUBLIC = "93.184.216.34"
@@ -134,7 +139,7 @@ class TLS:
 
 
 def client(
-    *, payloads=None, resolver=None, sockets=None, clock=None, gate=None,
+    *, payloads=None, resolver=None, sockets=None, clock=None,
     preflight=(PUBLIC,), maximum_response_bytes=256 * 1024,
 ):
     tls_sockets = [TLSSocket(value) for value in (payloads or [response()])]
@@ -146,9 +151,52 @@ def client(
         sockets=sockets,
         tls=TLS(sockets),
         clock=clock or Clock(),
-        fresh_gate=gate or (lambda: True),
         maximum_response_bytes=maximum_response_bytes,
     ), sockets
+
+
+class EvidenceSink:
+    def __init__(self):
+        self.records = []
+
+    def __call__(self, record):
+        assert isinstance(record, BoundedResponseEvidence)
+        self.records.append(record)
+        return "ev1_" + f"{len(self.records):064x}"
+
+
+def authorized(
+    target,
+    action=None,
+    *,
+    credential=None,
+    cancellation=None,
+    retry_policy=None,
+    remaining_requests=2,
+    before_attempt=None,
+    evidence_sink=None,
+    redactor=None,
+):
+    action = action or prepared()
+    evidence_sink = evidence_sink or EvidenceSink()
+    configured = []
+    if isinstance(credential, str):
+        configured.append(credential)
+    elif isinstance(credential, dict):
+        configured.extend(credential.values())
+    return target.request(
+        action,
+        credential=credential,
+        cancellation=cancellation or CancellationToken(),
+        retry_policy=retry_policy or RetryPolicy(1, ("connect_error", "timeout")),
+        remaining_requests=remaining_requests,
+        before_attempt=before_attempt or (
+            lambda attempt, previous_failure_code: AttemptPermit(105.0)
+        ),
+        evidence_context=EvidenceContext(0, "/health"),
+        evidence_sink=evidence_sink,
+        redactor=redactor or Redactor(tuple(configured)),
+    )
 
 
 def assert_code(code, callable_):
@@ -225,7 +273,7 @@ def test_request_is_exact_direct_pinned_tls_and_auth_is_closed(profile, credenti
     old = os.environ.copy()
     os.environ.update(HTTPS_PROXY="http://proxy.invalid", ALL_PROXY="socks://proxy.invalid")
     try:
-        result = target.request(prepared(profile=profile), credential=credential)
+        result = authorized(target, prepared(profile=profile), credential=credential)
     finally:
         os.environ.clear()
         os.environ.update(old)
@@ -244,33 +292,121 @@ def test_request_is_exact_direct_pinned_tls_and_auth_is_closed(profile, credenti
     )
 
 
-def test_dns_is_full_set_pinned_and_rechecked_before_retry_with_one_global_retry():
+def test_dns_is_full_set_pinned_and_rechecked_before_authorized_retry():
     resolver = Resolver([[PUBLIC], [PUBLIC], [PUBLIC]])
     tls_sockets = [TLSSocket(response()), TLSSocket(response())]
     sockets = Sockets(tls_sockets, failures=(OSError("connect"), None, OSError("connect")))
-    gates = []
     target = TargetHTTPSClient(
         origin="https://staging.example.com", preflight_addresses=[PUBLIC],
         resolver=resolver, sockets=sockets, tls=TLS(sockets), clock=Clock(),
-        fresh_gate=lambda: gates.append("gate") or True,
     )
-    result = target.request(prepared())
+    attempts = []
+    result = authorized(
+        target,
+        before_attempt=lambda attempt, previous: (
+            attempts.append((attempt, previous)) or AttemptPermit(105.0)
+        ),
+    )
     assert result.requests_made == 2
-    assert len(resolver.calls) == 2 and gates == ["gate", "gate"]
-    assert_code("connect_error", lambda: target.request(prepared()))
-    assert len(resolver.calls) == 3
+    assert len(resolver.calls) == 2
+    assert attempts == [(1, None), (2, "connect_error")]
+
+
+def test_retry_policy_is_immutable_exact_and_zero_disables_retry():
+    policy = RetryPolicy.from_mapping({
+        "maximum_retries": 0,
+        "retryable_failure_codes": ["connect_error", "timeout"],
+    })
+    assert policy == RetryPolicy(0, ("connect_error", "timeout"))
+    with pytest.raises((AttributeError, TypeError)):
+        policy.maximum_retries = 1  # type: ignore[misc]
+    for invalid in (
+        {"maximum_retries": 2, "retryable_failure_codes": ["connect_error"]},
+        {"maximum_retries": 1, "retryable_failure_codes": ["tls_error"]},
+        {"maximum_retries": 1, "retryable_failure_codes": ["timeout", "connect_error"]},
+        {"maximum_retries": 1, "retryable_failure_codes": ["timeout"], "extra": 1},
+    ):
+        with pytest.raises(ValueError):
+            RetryPolicy.from_mapping(invalid)
+
+    sockets = Sockets([], failures=(OSError("connect"), OSError("second")))
+    target, _ = client(sockets=sockets)
+    calls = []
+    assert_code("connect_error", lambda: authorized(
+        target,
+        retry_policy=policy,
+        before_attempt=lambda attempt, previous: (
+            calls.append((attempt, previous)) or AttemptPermit(105.0)
+        ),
+    ))
+    assert calls == [(1, None)] and len(sockets.calls) == 1
+
+
+def test_remaining_request_budget_blocks_zero_and_never_widens_last_request():
+    target, sockets = client(sockets=Sockets([], failures=(OSError("connect"),)))
+    callback_calls = []
+    assert_code("gate_rejected", lambda: authorized(
+        target,
+        remaining_requests=0,
+        before_attempt=lambda attempt, previous: callback_calls.append(attempt),
+    ))
+    assert callback_calls == [] and sockets.calls == []
+
+    sockets = Sockets([], failures=(OSError("connect"), OSError("retry")))
+    target, _ = client(sockets=sockets)
+    assert_code("connect_error", lambda: authorized(target, remaining_requests=1))
+    assert len(sockets.calls) == 1
+
+
+@pytest.mark.parametrize("changed_authority", ["grant_expired", "kill_switch", "proof_expired"])
+def test_executor_authority_is_rechecked_before_retry_dns_or_socket(changed_authority):
+    resolver = Resolver([[PUBLIC], [PUBLIC]])
+    sockets = Sockets([], failures=(OSError("connect"), None))
+    target, _ = client(resolver=resolver, sockets=sockets)
+    calls = []
+
+    def before_attempt(attempt, previous):
+        calls.append((attempt, previous))
+        if attempt == 2:
+            failure = TransportFailure("gate_rejected")
+            failure.authority_code = changed_authority
+            raise failure
+        return AttemptPermit(105.0)
+
+    with pytest.raises(TransportFailure) as raised:
+        authorized(target, before_attempt=before_attempt)
+    assert raised.value.code == "gate_rejected"
+    assert getattr(raised.value, "authority_code") == changed_authority
+    assert calls == [(1, None), (2, "connect_error")]
+    assert len(resolver.calls) == 1 and len(sockets.calls) == 1
+
+
+def test_required_authority_arguments_are_non_bypassable_before_network():
+    target, sockets = client()
+    with pytest.raises(TypeError):
+        target.request(prepared())
+    assert sockets.calls == []
+
+
+def test_transport_failure_carries_executor_gate_and_stop_metadata_without_reflection():
+    failure = TransportFailure("gate_rejected")
+    assert failure.gate_error is None and failure.stop_reason == "none"
+    failure.gate_error = "proof_expired"
+    failure.stop_reason = "cloud_stop"
+    assert failure.gate_error == "proof_expired" and failure.stop_reason == "cloud_stop"
+    assert "proof_expired" not in str(failure) and "cloud_stop" not in repr(failure)
 
 
 def test_dns_drift_mixed_answer_and_peer_mismatch_fail_closed():
     target, _ = client(resolver=Resolver([["1.1.1.1"]]))
-    assert_code("dns_changed", lambda: target.request(prepared()))
+    assert_code("dns_changed", lambda: authorized(target))
 
     mixed, _ = client(resolver=Resolver([[PUBLIC, "10.0.0.1"]]))
-    assert_code("unsafe_dns", lambda: mixed.request(prepared()))
+    assert_code("unsafe_dns", lambda: authorized(mixed))
 
     sockets = Sockets([TLSSocket(response(), peer="1.1.1.1")])
     peer, _ = client(sockets=sockets)
-    assert_code("peer_mismatch", lambda: peer.request(prepared()))
+    assert_code("peer_mismatch", lambda: authorized(peer))
 
 
 @pytest.mark.parametrize(
@@ -284,6 +420,7 @@ def test_dns_drift_mixed_answer_and_peer_mismatch_fail_closed():
         b"HTTP/1.1 200 OK\r\nBad Header: x\r\nContent-Length: 0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nX-Test: x\x01\r\nContent-Length: 0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\nx",
+        b"HTTP/1.1 200 OK\r\nContent-Length: " + b"9" * 5000 + b"\r\n\r\n",
         response(body=b"[]"),
         response(body=b"text"),
         response(body=b"{}", extra=b"x"),
@@ -291,27 +428,155 @@ def test_dns_drift_mixed_answer_and_peer_mismatch_fail_closed():
 )
 def test_strict_response_framing_and_shape_rejections(payload):
     target, _ = client(payloads=[payload])
-    assert_code("response_rejected", lambda: target.request(prepared()))
+    assert_code("response_rejected", lambda: authorized(target))
 
 
 def test_head_requires_zero_body_and_routes_are_exact_relative_reads():
     target, _ = client(payloads=[response(body=b"")])
-    assert target.request(prepared(method="HEAD")).body_shape == "absent"
+    assert authorized(target, prepared(method="HEAD")).body_shape == "absent"
     for route in (
         "https://other.example/x", "//other.example/x", "/a//b", "/a/../b",
         "/x?y=1", "/x#f", "/x%2f", "/x\\y",
     ):
         target, _ = client()
-        assert_code("invalid_route", lambda route=route, target=target: target.request(prepared(route=route)))
+        assert_code("invalid_route", lambda route=route, target=target: authorized(target, prepared(route=route)))
+
+
+def test_head_accepts_bounded_content_length_metadata_but_rejects_any_actual_body():
+    metadata_only = (
+        b"HTTP/1.1 200 OK\r\nContent-Length: 123\r\n"
+        b"Content-Type: application/json\r\n\r\n"
+    )
+    sink = EvidenceSink()
+    target, _ = client(payloads=[metadata_only])
+    result = authorized(target, prepared(method="HEAD"), evidence_sink=sink)
+    assert result.body_shape == "absent" and result.response_bytes == 0
+    assert sink.records[0].raw_body == b""
+
+    without_metadata = b"HTTP/1.1 204 No Content\r\nX-Safe: yes\r\n\r\n"
+    target, _ = client(payloads=[without_metadata])
+    assert authorized(target, prepared(method="HEAD")).body_shape == "absent"
+
+    with_body = metadata_only + b"x"
+    target, _ = client(payloads=[with_body])
+    assert_code("response_rejected", lambda: authorized(target, prepared(method="HEAD")))
+
+
+def test_completed_response_is_written_only_to_required_local_evidence_sink():
+    secret = "reflected-secret-value"
+    body = ('{"token":"' + secret + '"}').encode()
+    payload = (
+        f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n"
+        "Set-Cookie: sid=response-cookie\r\n\r\n"
+    ).encode() + body
+    sink = EvidenceSink()
+    target, _ = client(payloads=[payload])
+    result = authorized(
+        target,
+        prepared(profile="bearer"),
+        credential=secret,
+        evidence_sink=sink,
+        redactor=Redactor((secret,)),
+    )
+    assert result.evidence_ref == "ev1_" + "1".zfill(64)
+    assert result.redaction_count == 2
+    assert set(result.__dataclass_fields__) == {
+        "status_code", "body_shape", "response_bytes", "requests_made",
+        "evidence_ref", "redaction_count",
+    }
+    record = sink.records[0]
+    assert record.action_ordinal == 0 and record.attempt == 1
+    assert record.method == "GET" and record.route_template == "/health"
+    assert record.raw_headers.startswith(b"HTTP/1.1 200 OK") and record.raw_body == body
+    assert b"Authorization" not in record.raw_headers
+    assert secret not in repr(result)
+
+
+def test_full_task5_credential_bound_is_counted_in_response_without_cloud_reflection():
+    secret = "s" * (16 * 1024)
+    body = ('{"echo":"' + secret + '"}').encode()
+    sink = EvidenceSink()
+    target, _ = client(payloads=[response(body=body)])
+    result = authorized(
+        target,
+        prepared(profile="bearer"),
+        credential=secret,
+        evidence_sink=sink,
+        redactor=Redactor((secret,)),
+    )
+    assert result.redaction_count == 1 and result.evidence_ref.startswith("ev1_")
+    assert secret.encode() in sink.records[0].raw_body
+    assert secret not in repr(result)
+
+
+def test_evidence_template_must_match_the_exact_prepared_action_route():
+    action = PreparedAction(
+        scenario_id="object_ownership_read",
+        adapter_version="1",
+        method="GET",
+        route="/items/local-id",
+        semantic_auth_role="object_owner",
+        auth_profile="bearer",
+        side_effect_class="read_only",
+    )
+    target, _ = client()
+    sink = EvidenceSink()
+    result = target.request(
+        action,
+        credential="credential",
+        cancellation=CancellationToken(),
+        retry_policy=RetryPolicy(0, ()),
+        remaining_requests=1,
+        before_attempt=lambda attempt, previous: AttemptPermit(105.0),
+        evidence_context=EvidenceContext(7, "/items/{id}"),
+        evidence_sink=sink,
+        redactor=Redactor(("credential",)),
+    )
+    assert result.status_code == 200 and sink.records[0].route_template == "/items/{id}"
+
+    target, sockets = client()
+    with pytest.raises(TransportFailure) as raised:
+        target.request(
+            action,
+            credential="credential",
+            cancellation=CancellationToken(),
+            retry_policy=RetryPolicy(0, ()),
+            remaining_requests=1,
+            before_attempt=lambda attempt, previous: AttemptPermit(105.0),
+            evidence_context=EvidenceContext(7, "/other/{id}"),
+            evidence_sink=sink,
+            redactor=Redactor(("credential",)),
+        )
+    assert raised.value.code == "gate_rejected" and sockets.calls == []
+
+
+def test_completed_but_unsupported_body_is_stored_locally_before_rejection():
+    sink = EvidenceSink()
+    target, _ = client(payloads=[response(body=b"[]")])
+    assert_code("response_rejected", lambda: authorized(target, evidence_sink=sink))
+    assert len(sink.records) == 1 and sink.records[0].raw_body == b"[]"
+
+
+def test_evidence_sink_failure_is_constant_and_never_reflects_raw_response():
+    secret = "raw-local-only-secret"
+    target, _ = client(payloads=[response(body=("{\"x\":\"" + secret + "\"}").encode())])
+
+    def failing_sink(record):
+        raise RuntimeError(record.raw_body.decode())
+
+    with pytest.raises(TransportFailure) as raised:
+        authorized(target, evidence_sink=failing_sink, redactor=Redactor((secret,)))
+    assert raised.value.code == "evidence_rejected"
+    assert secret not in str(raised.value) and secret not in repr(raised.value)
 
 
 def test_response_header_and_body_caps_are_streaming_bounds():
     headers = b"HTTP/1.1 200 OK\r\nX-Large: " + b"x" * 16_384 + b"\r\nContent-Length: 0\r\n\r\n"
     target, _ = client(payloads=[headers])
-    assert_code("response_rejected", lambda: target.request(prepared()))
+    assert_code("response_rejected", lambda: authorized(target))
     body = b'{' + b'"x":"' + b"a" * 257 + b'"}'
     target, _ = client(payloads=[response(body=body)], maximum_response_bytes=256)
-    assert_code("response_too_large", lambda: target.request(prepared()))
+    assert_code("response_too_large", lambda: authorized(target))
 
 
 def test_response_ceiling_cannot_be_raised_after_construction():
@@ -330,19 +595,18 @@ def test_one_absolute_deadline_covers_dns_through_body_and_timeout_is_constant()
             return answer
 
     target, _ = client(resolver=LateResolver(), clock=clock)
-    assert_code("timeout", lambda: target.request(prepared()))
+    assert_code("timeout", lambda: authorized(target))
 
 
-def test_absolute_deadline_also_bounds_fresh_gate_without_reclassifying_timeout():
+def test_absolute_deadline_is_clamped_by_executor_permit():
     clock = Clock()
-
-    def late_gate():
-        clock.value = 105.0
-        return True
-
-    target, sockets = client(clock=clock, gate=late_gate)
-    assert_code("timeout", lambda: target.request(prepared()))
-    assert sockets.calls == []
+    target, sockets = client(clock=clock)
+    result = authorized(
+        target,
+        before_attempt=lambda attempt, previous: AttemptPermit(100.25),
+    )
+    assert result.status_code == 200
+    assert sockets.calls[0][1] == pytest.approx(0.25)
 
 
 def test_production_resolver_requests_absolute_dual_stack_results(monkeypatch):
@@ -375,7 +639,9 @@ def test_cancellation_shutdowns_and_closes_registered_inflight_socket():
     cancellation = CancellationToken()
     failures = []
     thread = threading.Thread(
-        target=lambda: failures.append(pytest.raises(TransportFailure, target.request, prepared(), cancellation=cancellation)),
+        target=lambda: failures.append(pytest.raises(
+            TransportFailure, authorized, target, cancellation=cancellation,
+        )),
         daemon=True,
     )
     thread.start()
@@ -404,7 +670,7 @@ def test_cancellation_during_dns_returns_without_waiting_for_the_resolver():
 
     def invoke():
         try:
-            target.request(prepared(), cancellation=cancellation)
+            authorized(target, cancellation=cancellation)
         except TransportFailure as exc:
             failures.append(exc)
 
@@ -423,12 +689,12 @@ def test_transport_rejects_parallel_request_without_opening_second_socket():
     release = threading.Event()
     sockets = Sockets([TLSSocket(response(), block=release)])
     target, _ = client(sockets=sockets)
-    first = threading.Thread(target=lambda: target.request(prepared()), daemon=True)
+    first = threading.Thread(target=lambda: authorized(target), daemon=True)
     first.start()
     for _ in range(1000):
         if sockets.calls:
             break
-    assert_code("concurrency_exceeded", lambda: target.request(prepared()))
+    assert_code("concurrency_exceeded", lambda: authorized(target))
     release.set()
     first.join(2)
     assert len(sockets.calls) == 1

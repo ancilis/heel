@@ -40,8 +40,11 @@ def test_common_token_forms_are_redacted_without_reflection(sample):
 def test_redaction_is_output_bounded_and_configuration_is_closed():
     output, _ = Redactor().redact("x" * 100_000)
     assert len(output.encode("utf-8")) <= 4096
+    maximum_secret = "s" * (16 * 1024)
+    redactor = Redactor((maximum_secret,))
+    assert redactor.count_bytes(b"prefix" + maximum_secret.encode() + b"suffix") == 1
     with pytest.raises(ValueError):
-        Redactor(("x" * 300,))
+        Redactor(("x" * (16 * 1024 + 1),))
     with pytest.raises(ValueError):
         Redactor(tuple(str(index).zfill(4) for index in range(65)))
     with pytest.raises(ValueError):

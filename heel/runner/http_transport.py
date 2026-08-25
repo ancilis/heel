@@ -13,6 +13,7 @@ import hashlib
 import inspect
 import ipaddress
 import json
+import math
 import re
 import socket
 import ssl
@@ -23,7 +24,9 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-from .adapters import PreparedAction
+from .adapters import ADAPTER_REGISTRY, PreparedAction
+from .openapi_routes import normalize_route_template
+from .redaction import Redactor
 
 
 HTTPS_PORT = 443
@@ -50,11 +53,13 @@ _DENY_CORPUS = tuple(ipaddress.ip_network(value) for value in (
 ))
 _FAILURE_CODES = frozenset({
     "cancelled", "concurrency_exceeded", "connect_error", "dns_changed", "gate_rejected",
-    "invalid_auth", "invalid_origin", "invalid_route", "peer_mismatch", "response_rejected",
-    "response_too_large", "timeout", "tls_error", "unsafe_dns",
+    "evidence_rejected", "invalid_auth", "invalid_origin", "invalid_route", "peer_mismatch",
+    "response_rejected", "response_too_large", "timeout", "tls_error", "unsafe_dns",
 })
 _HEADER_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", flags=re.ASCII)
 _COOKIE_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}", flags=re.ASCII)
+_EVIDENCE_REFERENCE = re.compile(r"ev1_[0-9a-f]{64}", flags=re.ASCII)
+_ROUTE_PLACEHOLDER = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]{0,63}\}", flags=re.ASCII)
 
 IANA_TLD_VERSION = "2026082301"
 IANA_TLD_SHA256 = "1e296954a3bbe1525756893e68e3b5917604c299a696b2e59390a8a2e99289ef"
@@ -75,13 +80,15 @@ IANA_ROOT_TLDS = frozenset(line.lower() for line in _IANA_LINES[1:])
 class TransportFailure(Exception):
     """One closed non-reflective target-transport failure."""
 
-    __slots__ = ("code", "requests_made")
+    __slots__ = ("code", "requests_made", "gate_error", "stop_reason")
 
     def __init__(self, code: str, *, requests_made: int = 0):
         if code not in _FAILURE_CODES:
             raise ValueError("transport failure code is not closed")
         self.code = code
         self.requests_made = requests_made
+        self.gate_error: str | None = None
+        self.stop_reason = "none"
         super().__init__(code)
 
     def __repr__(self) -> str:
@@ -290,11 +297,140 @@ class CancellationToken:
 
 
 @dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    maximum_retries: int
+    retryable_failure_codes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        codes_are_closed = (
+            type(self.retryable_failure_codes) is tuple
+            and len(self.retryable_failure_codes) <= 2
+            and all(
+                type(code) is str and code in {"connect_error", "timeout"}
+                for code in self.retryable_failure_codes
+            )
+        )
+        if (
+            isinstance(self.maximum_retries, bool)
+            or not isinstance(self.maximum_retries, int)
+            or not 0 <= self.maximum_retries <= 1
+            or not codes_are_closed
+            or (
+                codes_are_closed
+                and tuple(sorted(set(self.retryable_failure_codes)))
+                != self.retryable_failure_codes
+            )
+        ):
+            raise ValueError("retry policy is not the closed grant policy")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> RetryPolicy:
+        if not isinstance(value, Mapping) or set(value) != {
+            "maximum_retries", "retryable_failure_codes",
+        }:
+            raise ValueError("retry policy is not the closed grant policy")
+        codes = value["retryable_failure_codes"]
+        if not isinstance(codes, list):
+            raise ValueError("retry policy codes must come from the validated grant")
+        return cls(value["maximum_retries"], tuple(codes))
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptPermit:
+    deadline: float
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.deadline, bool)
+            or not isinstance(self.deadline, (int, float))
+            or not math.isfinite(self.deadline)
+            or self.deadline <= 0
+        ):
+            raise ValueError("attempt permit deadline is invalid")
+        object.__setattr__(self, "deadline", float(self.deadline))
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceContext:
+    action_ordinal: int
+    route_template: str
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.action_ordinal, bool)
+            or not isinstance(self.action_ordinal, int)
+            or self.action_ordinal < 0
+        ):
+            raise ValueError("evidence action ordinal is invalid")
+        normalized, _ = normalize_route_template(self.route_template)
+        if normalized != self.route_template:
+            raise ValueError("evidence route template is not canonical")
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedResponseEvidence:
+    action_ordinal: int
+    scenario_id: str
+    semantic_auth_role: str
+    method: str
+    route_template: str
+    attempt: int
+    status_code: int
+    raw_headers: bytes
+    raw_body: bytes
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.action_ordinal, bool)
+            or not isinstance(self.action_ordinal, int)
+            or self.action_ordinal < 0
+            or isinstance(self.attempt, bool)
+            or not isinstance(self.attempt, int)
+            or self.attempt < 1
+            or isinstance(self.status_code, bool)
+            or not isinstance(self.status_code, int)
+            or not 100 <= self.status_code <= 599
+            or self.method not in {"GET", "HEAD"}
+            or type(self.scenario_id) is not str
+            or type(self.semantic_auth_role) is not str
+            or type(self.raw_headers) is not bytes
+            or type(self.raw_body) is not bytes
+            or len(self.raw_headers) > MAX_HEADER_BYTES
+            or len(self.raw_body) > DEFAULT_BODY_BYTES
+        ):
+            raise ValueError("bounded response evidence is invalid")
+        normalized, _ = normalize_route_template(self.route_template)
+        if normalized != self.route_template:
+            raise ValueError("bounded response evidence route is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class TargetResponse:
     status_code: int
     body_shape: str
     response_bytes: int
     requests_made: int
+    evidence_ref: str = "ev1_" + "0" * 64
+    redaction_count: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.status_code, bool)
+            or not isinstance(self.status_code, int)
+            or not 100 <= self.status_code <= 599
+            or self.body_shape not in {"absent", "json_object"}
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in (self.response_bytes, self.requests_made, self.redaction_count)
+            )
+            or self.response_bytes > DEFAULT_BODY_BYTES
+            or not 1 <= self.requests_made <= 2
+            or self.redaction_count > 1024
+            or type(self.evidence_ref) is not str
+            or len(self.evidence_ref) != 68
+            or _EVIDENCE_REFERENCE.fullmatch(self.evidence_ref) is None
+        ):
+            raise ValueError("target response is invalid")
 
 
 def _remaining(clock: Callable[[], float], deadline: float) -> float:
@@ -337,7 +473,23 @@ def _bounded_call(
 def _valid_route(action: PreparedAction) -> str:
     if not isinstance(action, PreparedAction) or action.method not in {"GET", "HEAD"}:
         raise TransportFailure("invalid_route")
-    if action.side_effect_class != "read_only" or type(action.route) is not str:
+    adapter = ADAPTER_REGISTRY.get(action.scenario_id)
+    if (
+        adapter is None
+        or action.adapter_version != adapter["adapter_version"]
+        or action.method not in adapter["allowed_methods"]
+        or action.semantic_auth_role not in adapter["semantic_roles"]
+        or action.side_effect_class != "read_only"
+        or (
+            action.semantic_auth_role == "anonymous"
+            and action.auth_profile != "anonymous"
+        )
+        or (
+            action.semantic_auth_role != "anonymous"
+            and action.auth_profile not in {"bearer", "cookie_jar", "x_api_key"}
+        )
+        or type(action.route) is not str
+    ):
         raise TransportFailure("invalid_route")
     route = action.route
     try:
@@ -359,6 +511,12 @@ def _valid_route(action: PreparedAction) -> str:
     return route
 
 
+def _matches_evidence_template(route: str, template: str) -> bool:
+    pattern = re.escape(template)
+    pattern = _ROUTE_PLACEHOLDER.sub("[^/]+", pattern.replace("\\{", "{").replace("\\}", "}"))
+    return re.fullmatch(pattern, route) is not None
+
+
 def _credential_header(profile: str, credential: object) -> bytes:
     if profile == "anonymous":
         if credential is not None:
@@ -371,7 +529,7 @@ def _credential_header(profile: str, credential: object) -> bytes:
             encoded = credential.encode("ascii")
         except UnicodeError:
             raise TransportFailure("invalid_auth") from None
-        if not encoded or len(encoded) > 8192 or any(byte < 0x21 or byte > 0x7E for byte in encoded):
+        if not encoded or len(encoded) > 16 * 1024 or any(byte < 0x21 or byte > 0x7E for byte in encoded):
             raise TransportFailure("invalid_auth")
         prefix = b"Authorization: Bearer " if profile == "bearer" else b"X-API-Key: "
         return prefix + encoded + b"\r\n"
@@ -396,7 +554,10 @@ def _credential_header(profile: str, credential: object) -> bytes:
             ):
                 raise TransportFailure("invalid_auth")
             pairs.append(name + "=" + value)
-        return ("Cookie: " + "; ".join(pairs) + "\r\n").encode("ascii")
+        encoded = ("Cookie: " + "; ".join(pairs) + "\r\n").encode("ascii")
+        if len(encoded) > 16 * 1024 + len(b"Cookie: \r\n"):
+            raise TransportFailure("invalid_auth")
+        return encoded
     raise TransportFailure("invalid_auth")
 
 
@@ -431,11 +592,16 @@ def _parse_headers(raw: bytes, *, method: str, maximum_response_bytes: int) -> t
     if "transfer-encoding" in fields or "content-encoding" in fields:
         raise TransportFailure("response_rejected")
     content_length = fields.get("content-length")
-    if content_length is None or not content_length.isascii() or not content_length.isdecimal():
+    if content_length is None and method == "HEAD":
+        return status, 0
+    if (
+        content_length is None
+        or len(content_length) > 20
+        or not content_length.isascii()
+        or not content_length.isdecimal()
+    ):
         raise TransportFailure("response_rejected")
     length = int(content_length)
-    if method == "HEAD" and length != 0:
-        raise TransportFailure("response_rejected")
     if length > maximum_response_bytes:
         raise TransportFailure("response_too_large")
     return status, length
@@ -480,7 +646,6 @@ class TargetHTTPSClient:
         sockets: Any = None,
         tls: Any = None,
         clock: Callable[[], float] = time.monotonic,
-        fresh_gate: Callable[[], bool] | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         maximum_response_bytes: int = DEFAULT_BODY_BYTES,
     ):
@@ -516,12 +681,9 @@ class TargetHTTPSClient:
             raise ValueError("socket transport must accept cancellation") from None
         self.tls = tls or TLSTransport()
         self.clock = clock
-        self.fresh_gate = fresh_gate or (lambda: True)
         self._timeout_seconds = float(timeout_seconds)
         self._maximum_response_bytes = maximum_response_bytes
         self._request_lock = threading.Lock()
-        self._retry_lock = threading.Lock()
-        self._retry_available = True
 
     @property
     def timeout_seconds(self) -> float:
@@ -531,32 +693,11 @@ class TargetHTTPSClient:
     def maximum_response_bytes(self) -> int:
         return self._maximum_response_bytes
 
-    def _use_retry(self) -> bool:
-        with self._retry_lock:
-            if not self._retry_available:
-                return False
-            self._retry_available = False
-            return True
-
     def _gate_and_resolve(
         self, deadline: float, cancellation: CancellationToken,
     ) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
         cancellation.raise_if_cancelled()
         _remaining(self.clock, deadline)
-        try:
-            allowed = _bounded_call(
-                self.fresh_gate,
-                clock=self.clock,
-                deadline=deadline,
-                cancellation=cancellation,
-            )
-        except TransportFailure:
-            raise
-        except BaseException:
-            raise TransportFailure("gate_rejected") from None
-        if allowed is not True:
-            raise TransportFailure("gate_rejected")
-        cancellation.raise_if_cancelled()
         try:
             answer = _bounded_call(
                 lambda: self.resolver(self.hostname, deadline=deadline),
@@ -581,6 +722,11 @@ class TargetHTTPSClient:
         request_bytes: bytes,
         deadline: float,
         cancellation: CancellationToken,
+        *,
+        attempt: int,
+        evidence_context: EvidenceContext,
+        evidence_sink: Callable[[BoundedResponseEvidence], str],
+        redactor: Redactor,
     ) -> TargetResponse:
         selected = self._gate_and_resolve(deadline, cancellation)
         raw_socket = tls_socket = None
@@ -653,14 +799,15 @@ class TargetHTTPSClient:
                 method=action.method,
                 maximum_response_bytes=self.maximum_response_bytes,
             )
+            expected_body_length = 0 if action.method == "HEAD" else content_length
             body = bytearray(response[header_end + 4:])
-            if len(body) > content_length:
+            if len(body) > expected_body_length:
                 raise TransportFailure("response_rejected")
-            while len(body) < content_length:
+            while len(body) < expected_body_length:
                 cancellation.raise_if_cancelled()
                 tls_socket.settimeout(_remaining(self.clock, deadline))
                 try:
-                    chunk = tls_socket.recv(min(4096, content_length - len(body)))
+                    chunk = tls_socket.recv(min(4096, expected_body_length - len(body)))
                 except (socket.timeout, TimeoutError):
                     raise TransportFailure("timeout") from None
                 except OSError:
@@ -681,8 +828,43 @@ class TargetHTTPSClient:
                 raise TransportFailure("connect_error") from None
             if trailing:
                 raise TransportFailure("response_rejected")
-            shape = _body_shape(bytes(body), method=action.method)
-            return TargetResponse(status, shape, len(body), 1)
+            raw_headers = bytes(response[:header_end])
+            raw_body = bytes(body)
+            try:
+                redaction_count = redactor.count_bytes(raw_headers, raw_body)
+                evidence = BoundedResponseEvidence(
+                    action_ordinal=evidence_context.action_ordinal,
+                    scenario_id=action.scenario_id,
+                    semantic_auth_role=action.semantic_auth_role,
+                    method=action.method,
+                    route_template=evidence_context.route_template,
+                    attempt=attempt,
+                    status_code=status,
+                    raw_headers=raw_headers,
+                    raw_body=raw_body,
+                )
+                evidence_ref = _bounded_call(
+                    lambda: evidence_sink(evidence),
+                    clock=self.clock,
+                    deadline=deadline,
+                    cancellation=cancellation,
+                )
+            except TransportFailure as exc:
+                if exc.code == "cancelled":
+                    raise
+                raise TransportFailure("evidence_rejected") from None
+            except BaseException:
+                raise TransportFailure("evidence_rejected") from None
+            if (
+                type(evidence_ref) is not str
+                or len(evidence_ref) != 68
+                or _EVIDENCE_REFERENCE.fullmatch(evidence_ref) is None
+            ):
+                raise TransportFailure("evidence_rejected")
+            shape = _body_shape(raw_body, method=action.method)
+            return TargetResponse(
+                status, shape, len(raw_body), 1, evidence_ref, redaction_count,
+            )
         finally:
             for closable in (tls_socket, raw_socket):
                 if closable is not None:
@@ -696,10 +878,31 @@ class TargetHTTPSClient:
         self,
         action: PreparedAction,
         *,
-        credential: object = None,
-        cancellation: CancellationToken | None = None,
+        credential: object,
+        cancellation: CancellationToken,
+        retry_policy: RetryPolicy,
+        remaining_requests: int,
+        before_attempt: Callable[[int, str | None], AttemptPermit],
+        evidence_context: EvidenceContext,
+        evidence_sink: Callable[[BoundedResponseEvidence], str],
+        redactor: Redactor,
     ) -> TargetResponse:
         route = _valid_route(action)
+        if (
+            not isinstance(cancellation, CancellationToken)
+            or not isinstance(retry_policy, RetryPolicy)
+            or isinstance(remaining_requests, bool)
+            or not isinstance(remaining_requests, int)
+            or not 0 <= remaining_requests <= 20
+            or not callable(before_attempt)
+            or not isinstance(evidence_context, EvidenceContext)
+            or not callable(evidence_sink)
+            or not isinstance(redactor, Redactor)
+            or not _matches_evidence_template(route, evidence_context.route_template)
+        ):
+            raise TransportFailure("gate_rejected")
+        if remaining_requests == 0:
+            raise TransportFailure("gate_rejected")
         auth = _credential_header(action.auth_profile, credential)
         request_bytes = (
             f"{action.method} {route} HTTP/1.1\r\n"
@@ -708,36 +911,73 @@ class TargetHTTPSClient:
             "Accept-Encoding: identity\r\n"
             "Connection: close\r\n"
         ).encode("ascii") + auth + b"\r\n"
-        cancellation = cancellation or CancellationToken()
         cancellation.raise_if_cancelled()
         if not self._request_lock.acquire(blocking=False):
             raise TransportFailure("concurrency_exceeded")
-        deadline = self.clock() + self.timeout_seconds
+        request_deadline = self.clock() + self.timeout_seconds
         attempts = 0
+        previous_failure_code: str | None = None
         try:
             while True:
-                attempts += 1
+                next_attempt = attempts + 1
                 try:
-                    result = self._one_attempt(action, request_bytes, deadline, cancellation)
-                    return TargetResponse(
-                        result.status_code, result.body_shape, result.response_bytes, attempts,
+                    permit = _bounded_call(
+                        lambda: before_attempt(next_attempt, previous_failure_code),
+                        clock=self.clock,
+                        deadline=request_deadline,
+                        cancellation=cancellation,
                     )
                 except TransportFailure as exc:
-                    retryable = exc.code in {"connect_error", "timeout"}
+                    exc.requests_made = attempts
+                    raise
+                except BaseException:
+                    raise TransportFailure("gate_rejected", requests_made=attempts) from None
+                if not isinstance(permit, AttemptPermit) or permit.deadline <= self.clock():
+                    raise TransportFailure("gate_rejected", requests_made=attempts)
+                attempts = next_attempt
+                attempt_deadline = min(request_deadline, permit.deadline)
+                try:
+                    result = self._one_attempt(
+                        action,
+                        request_bytes,
+                        attempt_deadline,
+                        cancellation,
+                        attempt=attempts,
+                        evidence_context=evidence_context,
+                        evidence_sink=evidence_sink,
+                        redactor=redactor,
+                    )
+                    return TargetResponse(
+                        result.status_code,
+                        result.body_shape,
+                        result.response_bytes,
+                        attempts,
+                        result.evidence_ref,
+                        result.redaction_count,
+                    )
+                except TransportFailure as exc:
+                    retryable = (
+                        exc.code in {"connect_error", "timeout"}
+                        and exc.code in retry_policy.retryable_failure_codes
+                    )
                     if (
                         retryable
                         and not cancellation.cancelled
-                        and self.clock() < deadline
-                        and self._use_retry()
+                        and self.clock() < request_deadline
+                        and attempts - 1 < retry_policy.maximum_retries
+                        and attempts < remaining_requests
                     ):
+                        previous_failure_code = exc.code
                         continue
-                    raise TransportFailure(exc.code, requests_made=attempts) from None
+                    exc.requests_made = attempts
+                    raise
         finally:
             self._request_lock.release()
 
 
 __all__ = [
-    "BoundedResolver", "CancellationToken", "IANA_ROOT_TLDS", "SocketTransport",
-    "TLSTransport", "TargetHTTPSClient", "TargetResponse", "TransportFailure",
-    "normalize_target_origin", "select_public_addresses",
+    "AttemptPermit", "BoundedResolver", "BoundedResponseEvidence", "CancellationToken",
+    "EvidenceContext", "IANA_ROOT_TLDS", "RetryPolicy", "SocketTransport", "TLSTransport",
+    "TargetHTTPSClient", "TargetResponse", "TransportFailure", "normalize_target_origin",
+    "select_public_addresses",
 ]

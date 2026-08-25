@@ -10,7 +10,8 @@ from typing import Any
 MAX_INPUT_BYTES = 256 * 1024
 MAX_OUTPUT_BYTES = 4096
 MAX_CONFIGURED_SECRETS = 64
-MAX_SECRET_BYTES = 256
+MAX_SECRET_BYTES = 16 * 1024
+MAX_CONFIGURED_BYTES = 256 * 1024
 MAX_JSON_DEPTH = 16
 MAX_JSON_NODES = 1024
 MAX_SAFE_INTEGER = (1 << 53) - 1
@@ -59,6 +60,7 @@ class Redactor:
         if len(configured) > MAX_CONFIGURED_SECRETS:
             raise ValueError("configured secret count exceeds bound")
         normalized: list[str] = []
+        configured_bytes = 0
         for secret in configured:
             if type(secret) is not str:
                 raise ValueError("configured secret must be text")
@@ -68,7 +70,10 @@ class Redactor:
                 raise ValueError("configured secret must be valid UTF-8") from None
             if size < 4 or size > MAX_SECRET_BYTES:
                 raise ValueError("configured secret length is outside the closed bound")
+            configured_bytes += size
             normalized.append(secret)
+        if configured_bytes > MAX_CONFIGURED_BYTES:
+            raise ValueError("configured secret bytes exceed bound")
         if len(set(normalized)) != len(normalized):
             raise ValueError("configured secrets must be unique")
         self._configured = tuple(sorted(normalized, key=lambda item: (-len(item), item)))
@@ -132,6 +137,22 @@ class Redactor:
             sanitized, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
         )
         return _bounded_text(serialized), count
+
+    def count_bytes(self, *chunks: bytes) -> int:
+        """Count redactions in bounded local evidence without returning response text."""
+        if not chunks:
+            raise ValueError("redaction byte count requires local evidence")
+        total = 0
+        for chunk in chunks:
+            if type(chunk) is not bytes:
+                raise TypeError("redaction evidence must be bytes")
+            if len(chunk) > MAX_INPUT_BYTES:
+                raise ValueError("redaction evidence exceeds bound")
+            _, count = self.redact(chunk.decode("utf-8", errors="replace"))
+            total += count
+            if total > MAX_JSON_NODES:
+                raise ValueError("redaction count exceeds bound")
+        return total
 
 
 def _safe_json(value: Any, redactor: Redactor, *, state: list[int], depth: int) -> tuple[Any, int]:
