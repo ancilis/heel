@@ -5,7 +5,7 @@ from heel.saas.catalog import (
     CATALOG_VERSION, LEGACY_CATALOG_VERSION, PRE_CANARY_CATALOG_VERSION, Meter, get_plan,
 )
 from heel.saas.ledger import IdempotencyConflict, UsageLedger
-from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, MigrationError, Migrator
 
 
 class CanaryMigrationTests(unittest.TestCase):
@@ -85,8 +85,10 @@ class CanaryMigrationTests(unittest.TestCase):
         self.seed_root("ws-1", "prj-1")
         self.seed_root("ws-2", "prj-2")
         execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("env-1", "ws-1", "prj-1", "https://one.example", "staging", "verified", 1))
+        execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("env-1-alt", "ws-1", "prj-1", "https://one-alt.example", "staging", "verified", 1))
         execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("env-2", "ws-2", "prj-2", "https://two.example", "staging", "verified", 1))
         execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner-1", "ws-1", "runner", "active", 1))
+        execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner-1-alt", "ws-1", "runner", "active", 1))
         execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner-2", "ws-2", "runner", "active", 1))
         with self.assertRaises(sqlite3.IntegrityError):
             execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)", ("key-cross", "ws-1", "runner-2", "pk-cross", "active", 1, None))
@@ -95,10 +97,18 @@ class CanaryMigrationTests(unittest.TestCase):
             execute("INSERT INTO canary_consumed_nonces VALUES(?,?,?,?,?)", ("nonce-cross", "ws-1", "runner-2", 1, 2))
         execute("INSERT INTO canary_approval_projections VALUES(?,?,?,?,?,?,?,?,?)", ("approval-1", "ws-1", "prj-1", "env-1", "runner-1", "a" * 64, "{}", 1, 2))
         with self.assertRaises(sqlite3.IntegrityError):
+            execute("INSERT INTO canary_execution_grants VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("grant-mixed-environment", "ws-1", "prj-1", "approval-1", "env-1-alt", "runner-1", "nonce-gme", "m" * 64, "approved", 2, 1))
+        with self.assertRaises(sqlite3.IntegrityError):
+            execute("INSERT INTO canary_execution_grants VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("grant-mixed-runner", "ws-1", "prj-1", "approval-1", "env-1", "runner-1-alt", "nonce-gmr", "n" * 64, "approved", 2, 1))
+        with self.assertRaises(sqlite3.IntegrityError):
             execute("INSERT INTO canary_approval_projections VALUES(?,?,?,?,?,?,?,?,?)", ("approval-cross", "ws-1", "prj-1", "env-2", "runner-1", "b" * 64, "{}", 1, 2))
         with self.assertRaises(sqlite3.IntegrityError):
             execute("INSERT INTO canary_execution_grants VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("grant-cross", "ws-1", "prj-1", "approval-1", "env-2", "runner-1", "nonce-gc", "c" * 64, "approved", 2, 1,))
         execute("INSERT INTO canary_execution_grants VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("grant-1", "ws-1", "prj-1", "approval-1", "env-1", "runner-1", "nonce-g1", "d" * 64, "approved", 2, 1,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            execute("INSERT INTO canary_runs VALUES(?,?,?,?,?,?,?,?,?)", ("run-mixed-environment", "ws-1", "prj-1", "grant-1", "env-1-alt", "runner-1", "approved", 1, 1))
+        with self.assertRaises(sqlite3.IntegrityError):
+            execute("INSERT INTO canary_runs VALUES(?,?,?,?,?,?,?,?,?)", ("run-mixed-runner", "ws-1", "prj-1", "grant-1", "env-1", "runner-1-alt", "approved", 1, 1))
         with self.assertRaises(sqlite3.IntegrityError):
             execute("INSERT INTO canary_runs VALUES(?,?,?,?,?,?,?,?,?)", ("run-cross", "ws-1", "prj-1", "grant-1", "env-2", "runner-1", "approved", 1, 1))
         execute("INSERT INTO canary_runs VALUES(?,?,?,?,?,?,?,?,?)", ("run-1", "ws-1", "prj-1", "grant-1", "env-1", "runner-1", "approved", 1, 1))
@@ -112,6 +122,31 @@ class CanaryMigrationTests(unittest.TestCase):
             with self.subTest(table=table), self.assertRaises(sqlite3.IntegrityError):
                 execute(f"INSERT INTO {table}({columns}) VALUES({','.join('?' for _ in values)})", values)
         execute("INSERT INTO canary_audit_records VALUES(?,?,?,?,?,?,?,?,?)", ("audit-1", "ws-1", "prj-1", "run-1", "run-1", "approved", "owner", "i" * 64, 1))
+
+    def test_failed_migration_six_is_atomic_and_retries_after_repair(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        prior = Migrator(conn, CONTROL_PLANE_MIGRATIONS[:5])
+        self.assertEqual(prior.apply_all(), [1, 2, 3, 4, 5])
+        rows = (
+            ("refund-1", "ws", "canary_runs", "2026-08", "platform_fault_refund", -1, "resv-1", None, None, 1),
+            ("refund-2", "ws", "canary_runs", "2026-08", "platform_fault_refund", -1, "resv-1", None, None, 2),
+        )
+        conn.executemany("INSERT INTO usage_ledger VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
+        migration = Migrator(conn, CONTROL_PLANE_MIGRATIONS)
+        with self.assertRaises(MigrationError):
+            migration.apply_all()
+        self.assertEqual(migration.current_version(), 5)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")}
+        self.assertNotIn("reason", columns)
+        self.assertIsNone(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_environments'"
+        ).fetchone())
+        conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
+        conn.commit()
+        self.assertEqual(migration.apply_all(), [6])
+        self.assertEqual(migration.current_version(), 6)
+        self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):
         plan = get_plan("free")

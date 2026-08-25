@@ -75,6 +75,7 @@ class Migrator:
         applied = []
         for m in self.pending():
             try:
+                self.conn.execute("BEGIN IMMEDIATE" if self.dialect == "sqlite" else "BEGIN")
                 for stmt in translate(m.sql, self.dialect).split(";"):
                     if stmt.strip():
                         self.conn.execute(stmt)

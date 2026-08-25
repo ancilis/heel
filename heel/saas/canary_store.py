@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS canary_approval_projections(
   expires_at REAL NOT NULL,
   UNIQUE(workspace_id, project_ref, projection_digest),
   UNIQUE(workspace_id, project_ref, approval_id),
+  UNIQUE(workspace_id, project_ref, approval_id, environment_id, runner_id),
   FOREIGN KEY(workspace_id, project_ref, environment_id)
     REFERENCES canary_environments(workspace_id, project_ref, environment_id),
   FOREIGN KEY(workspace_id, runner_id)
@@ -79,12 +80,16 @@ CREATE TABLE IF NOT EXISTS canary_execution_grants(
   created_at REAL NOT NULL,
   UNIQUE(nonce_hash),
   UNIQUE(workspace_id, project_ref, grant_id),
+  UNIQUE(workspace_id, project_ref, grant_id, environment_id, runner_id),
   FOREIGN KEY(workspace_id, project_ref, approval_id)
     REFERENCES canary_approval_projections(workspace_id, project_ref, approval_id),
   FOREIGN KEY(workspace_id, project_ref, environment_id)
     REFERENCES canary_environments(workspace_id, project_ref, environment_id),
   FOREIGN KEY(workspace_id, runner_id)
-    REFERENCES canary_runners(workspace_id, runner_id));
+    REFERENCES canary_runners(workspace_id, runner_id),
+  FOREIGN KEY(workspace_id, project_ref, approval_id, environment_id, runner_id)
+    REFERENCES canary_approval_projections(
+      workspace_id, project_ref, approval_id, environment_id, runner_id));
 CREATE TABLE IF NOT EXISTS canary_runs(
   run_id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
@@ -101,7 +106,10 @@ CREATE TABLE IF NOT EXISTS canary_runs(
   FOREIGN KEY(workspace_id, project_ref, environment_id)
     REFERENCES canary_environments(workspace_id, project_ref, environment_id),
   FOREIGN KEY(workspace_id, runner_id)
-    REFERENCES canary_runners(workspace_id, runner_id));
+    REFERENCES canary_runners(workspace_id, runner_id),
+  FOREIGN KEY(workspace_id, project_ref, grant_id, environment_id, runner_id)
+    REFERENCES canary_execution_grants(
+      workspace_id, project_ref, grant_id, environment_id, runner_id));
 CREATE TABLE IF NOT EXISTS canary_run_events(
   event_id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
