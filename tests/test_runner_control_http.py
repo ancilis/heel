@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 import pytest
 
-from heel.canary_contracts import canonical_bytes, validate_runner_identity
+from heel.canary_contracts import canonical_bytes, canonical_digest, validate_runner_identity
 from heel.crypto import ed25519_key_id
 from heel.runner.control_client import RunnerControlClient
 from heel.saas.canary_store import CanaryStore
@@ -322,7 +322,11 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
             projection["workspace_id"] = workspace
             projection["lifecycle_phase"] = "claimed"
             projection["timestamps"]["claimed_at_ms"] = 1
-            projection = _digest(projection, "projection_digest")
+            payload = {key: value for key, value in projection.items()
+                       if key not in {"projection_digest", "signing_key_id", "signature_b64"}}
+            projection["projection_digest"] = canonical_digest(payload)
+            projection["signing_key_id"] = key_id
+            projection["signature_b64"] = base64.b64encode(private.sign(canonical_bytes(payload))).decode()
             body = canonical_bytes({"schema_version": "heel.runner-heartbeat-request.v1", "run_id": "run", "operational_projection": projection})
             route = f"/v1/workspaces/{workspace}/runners/runner/runs/run/heartbeat"
             timestamp = int(time.time() * 1000)
@@ -332,11 +336,29 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
             def heartbeat():
                 conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
                 conn.request("POST", route, body, headers)
-                response = conn.getresponse(); result.append(response.status); response.read(); conn.close(); done.set()
+                response = conn.getresponse(); result.append((response.status, response.getheader("X-Heel-Runner-Next-Nonce"))); response.read(); conn.close(); done.set()
             with cp.request_lock:
                 request = threading.Thread(target=heartbeat); request.start()
                 assert done.wait(.75), "runner heartbeat waited on the human request lock"
             request.join(1)
-            assert result == [200]
+            assert result[0][0] == 200 and result[0][1]
+            other = Ed25519PrivateKey.generate()
+            wrong_projection = json.loads(json.dumps(projection))
+            wrong_projection["signing_key_id"] = ed25519_key_id(other.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+            wrong_payload = {key: value for key, value in wrong_projection.items()
+                             if key not in {"projection_digest", "signing_key_id", "signature_b64"}}
+            wrong_projection["signature_b64"] = base64.b64encode(other.sign(canonical_bytes(wrong_payload))).decode()
+            wrong_body = canonical_bytes({"schema_version": "heel.runner-heartbeat-request.v1", "run_id": "run", "operational_projection": wrong_projection})
+            wrong_proof = {**proof, "body_sha256": hashlib.sha256(wrong_body).hexdigest(), "server_nonce": result[0][1], "sequence": 2}
+            wrong_headers = {**headers, "X-Heel-Runner-Nonce":result[0][1], "X-Heel-Runner-Sequence":"2", "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(wrong_proof))).decode()}
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1]); conn.request("POST", route, wrong_body, wrong_headers)
+            assert conn.getresponse().status == 401; conn.close()
+            tampered_projection = json.loads(json.dumps(projection))
+            tampered_projection["counters"]["remaining_requests"] = 2  # digest/signature no longer attest this body.
+            tampered_body = canonical_bytes({"schema_version": "heel.runner-heartbeat-request.v1", "run_id": "run", "operational_projection": tampered_projection})
+            tampered_proof = {**proof, "body_sha256": hashlib.sha256(tampered_body).hexdigest(), "server_nonce": result[0][1], "sequence": 2}
+            tampered_headers = {**headers, "X-Heel-Runner-Nonce":result[0][1], "X-Heel-Runner-Sequence":"2", "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(tampered_proof))).decode()}
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1]); conn.request("POST", route, tampered_body, tampered_headers)
+            assert conn.getresponse().status == 401; conn.close()
         finally:
             server.shutdown(); server.server_close(); cp.close()

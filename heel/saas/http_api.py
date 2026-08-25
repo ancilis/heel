@@ -40,6 +40,7 @@ from heel.findings_sync import (
 from heel.canary_contracts import (canonical_bytes, parse_json, validate_runner_claim_request,
     validate_runner_heartbeat_request, validate_runner_progress_request,
     validate_runner_result_request, validate_runner_stop_ack_request)
+from heel.crypto import load_public_key_base64, verify_envelope
 
 from .auth import AuthStore, ThrottledError
 from .billing import (
@@ -1025,10 +1026,11 @@ class _Handler(BaseHTTPRequestHandler):
                                      runner_id: str, projection: dict) -> bool:
         """Bind a closed runner receipt to the immutable run/grant graph, not its labels."""
         row = conn.execute(
-            "SELECT r.workspace_id,r.project_ref,r.grant_id,g.grant_digest,a.projection_digest,a.projection_json "
+            "SELECT r.workspace_id,r.project_ref,r.grant_id,g.grant_digest,a.projection_digest,a.projection_json,k.key_id,k.public_key "
             "FROM canary_runs r JOIN canary_execution_grants g ON "
             "g.workspace_id=r.workspace_id AND g.project_ref=r.project_ref AND g.grant_id=r.grant_id "
             "JOIN canary_approval_projections a ON a.workspace_id=g.workspace_id AND a.project_ref=g.project_ref AND a.approval_id=g.approval_id "
+            "JOIN canary_runner_keys k ON k.workspace_id=r.workspace_id AND k.runner_id=r.runner_id AND k.status='active' AND k.revoked_at IS NULL "
             "WHERE r.workspace_id=? AND r.runner_id=? AND r.run_id=? AND g.runner_id=? AND a.runner_id=?",
             (workspace_id, runner_id, projection["run_id"], runner_id, runner_id),
         ).fetchone()
@@ -1038,14 +1040,27 @@ class _Handler(BaseHTTPRequestHandler):
             approval = json.loads(row["projection_json"])
         except (TypeError, ValueError):
             return False
-        return all((
+        if not all((
             projection["workspace_id"] == row["workspace_id"],
             projection["project_id"] == row["project_ref"],
             projection["grant_id"] == row["grant_id"],
             projection["grant_digest"] == row["grant_digest"],
             projection["approval_projection_digest"] == row["projection_digest"],
             projection["manifest_digest"] == approval.get("manifest_digest"),
-        ))
+            projection["signing_key_id"] == row["key_id"],
+        )):
+            return False
+        try:
+            payload = {key: value for key, value in projection.items()
+                       if key not in {"projection_digest", "signing_key_id", "signature_b64"}}
+            verify_envelope(
+                {row["key_id"]: load_public_key_base64(row["public_key"])},
+                {"signing_key_id": projection["signing_key_id"], "signature_b64": projection["signature_b64"]},
+                canonical_bytes(payload),
+            )
+        except (TypeError, ValueError):
+            return False
+        return True
 
     def _runner_request(self, wid: str, runner_id: str, capability: str, run_id: str | None, operation: str) -> None:
         # Runner paths are fixed and strict: no URI aliases, bearer headers, URL parameters,
