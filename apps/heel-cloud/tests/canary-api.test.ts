@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
+// @vitest-environment node
 
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import test from "node:test";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
-import { CanaryApi, CanaryApiError } from "../lib/canary-api.ts";
+import { CanaryApi, CanaryApiError } from "../lib/canary-api";
 
 
 const workspace = "ws_0123456789abcdef";
@@ -65,7 +66,9 @@ function statusValue(overrides: Record<string, unknown> = {}): Record<string, un
 }
 
 
-test("CanaryApi exposes named methods only and sends same-origin closed requests", async () => {
+describe("CanaryApi and exact edge integration", () => {
+
+it("CanaryApi exposes named methods only and sends same-origin closed requests", async () => {
   const calls: Array<[string, RequestInit]> = [];
   const transport = async (path: string, init: RequestInit): Promise<Response> => {
     calls.push([path, init]);
@@ -90,7 +93,7 @@ test("CanaryApi exposes named methods only and sends same-origin closed requests
 });
 
 
-test("getRun rejects extra fields, malformed JSON, and oversized declared responses", async () => {
+it("getRun rejects extra fields, malformed JSON, and oversized declared responses", async () => {
   for (const response of [
     jsonResponse(statusValue({ surprise: true })),
     new Response("{", { status: 200, headers: { "Content-Type": "application/json" } }),
@@ -106,7 +109,7 @@ test("getRun rejects extra fields, malformed JSON, and oversized declared respon
 });
 
 
-test("approveRun pins the immutable body, idempotency, and control generation", async () => {
+it("approveRun pins the immutable body, idempotency, and control generation", async () => {
   let call: [string, RequestInit] | undefined;
   const api = new CanaryApi({ transport: async (path, init) => {
     call = [path, init];
@@ -164,7 +167,7 @@ test("approveRun pins the immutable body, idempotency, and control generation", 
 });
 
 
-test("submitApprovalProjection accepts only the frozen local manifest projection and returns a safe summary", async () => {
+it("submitApprovalProjection accepts only the frozen local manifest projection and returns a safe summary", async () => {
   const projection = {
     schema_version: "heel.approval-manifest-projection.v1",
     projection_id: "ap_canary",
@@ -200,7 +203,7 @@ test("submitApprovalProjection accepts only the frozen local manifest projection
 });
 
 
-test("environment activation validates exact public records including proof versions", async () => {
+it("environment activation validates exact public records including proof versions", async () => {
   const value = {
     schema_version: "VerifiedEnvironment.v1",
     environment_id: "env_0123456789abcdef0123456789abcdef",
@@ -233,7 +236,7 @@ test("environment activation validates exact public records including proof vers
 });
 
 
-test("canary actions use fixed routes and closed disclosure metadata", async () => {
+it("canary actions use fixed routes and closed disclosure metadata", async () => {
   const calls: Array<[string, RequestInit]> = [];
   const responses = [
     jsonResponse({ schema_version: "heel.canary-run-events.v1", run_id: run, events: [] }),
@@ -278,7 +281,7 @@ test("canary actions use fixed routes and closed disclosure metadata", async () 
 });
 
 
-test("stable canary errors never reflect server text", async () => {
+it("stable canary errors never reflect server text", async () => {
   const api = new CanaryApi({ transport: async () => jsonResponse({
     schema_version: "heel.canary-error.v1",
     code: "hostname_confirmation_mismatch",
@@ -304,24 +307,27 @@ test("stable canary errors never reflect server text", async () => {
 });
 
 
-test("timeouts abort the transport and stay unavailable", async () => {
-  let observed: AbortSignal | null = null;
-  const api = new CanaryApi({ timeoutMs: 5, transport: async (_path, init) => {
-    observed = init.signal as AbortSignal;
-    await new Promise((_resolve, reject) => observed!.addEventListener("abort", () => reject(observed!.reason), { once: true }));
+it("timeouts abort the transport and stay unavailable", async () => {
+  const signals: AbortSignal[] = [];
+  const transport = vi.fn(async (_path: string, init: RequestInit): Promise<Response> => {
+    const signal = init.signal as AbortSignal;
+    signals.push(signal);
+    await new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
     throw new Error("unreachable");
-  } });
+  });
+  const api = new CanaryApi({ timeoutMs: 5, transport });
   await assert.rejects(api.getRun(workspace, project, run), (error: unknown) => {
     assert.ok(error instanceof CanaryApiError);
     assert.equal(error.code, "unavailable");
     return true;
   });
-  assert.equal(observed?.aborted, true);
+  expect(transport).toHaveBeenCalledOnce();
+  expect(signals[0]?.aborted).toBe(true);
 });
 
 
-test("worker source declares every exact canary authority route and result upload cap", async () => {
-  const worker = await readFile(new URL("../worker/index.ts", import.meta.url), "utf8");
+it("worker source declares every exact canary authority route and result upload cap", async () => {
+  const worker = await readFile(join(process.cwd(), "worker/index.ts"), "utf8");
   for (const fragment of [
     "const CANARY_APPROVAL_PROJECTION_ROUTE = new RegExp(",
     "const CANARY_RUN_ROUTE = new RegExp(",
@@ -337,22 +343,25 @@ test("worker source declares every exact canary authority route and result uploa
 });
 
 
-test("runner UI never places one-use invitation material in shell argv or URLs", async () => {
-  const runnerPage = await readFile(new URL("../app/runner/page.tsx", import.meta.url), "utf8");
+it("runner UI keeps invitation material out of argv, URLs, and ambient browser authority", async () => {
+  const runnerPage = await readFile(join(process.cwd(), "app/runner/page.tsx"), "utf8");
   assert.equal(runnerPage.includes("--invitation"), false);
   assert.equal(runnerPage.includes("?invitation="), false);
+  assert.equal(runnerPage.includes("window"), false);
+  assert.equal(runnerPage.includes("navigator"), false);
+  assert.match(runnerPage, /heel runner pair --cloud <origin>/);
   assert.match(runnerPage, /read --silent|paste it only when the runner prompts/i);
 });
 
 
-test("actual worker isolates human canary and runner-result authority headers and routes", async (context) => {
-  const source = await readFile(new URL("../worker/index.ts", import.meta.url), "utf8");
+it("actual worker isolates human canary and runner-result authority headers and routes", async () => {
+  const source = await readFile(join(process.cwd(), "worker/index.ts"), "utf8");
   const runnable = source
     .replace('import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";', 'const handleImageOptimization = async () => new Response("unused"); const DEFAULT_DEVICE_SIZES: number[] = []; const DEFAULT_IMAGE_SIZES: number[] = [];')
     .replace('import handler from "vinext/server/app-router-entry";', 'const handler = { fetch: async () => new Response("unused", { status: 404 }) };');
   const directory = await mkdtemp(join(tmpdir(), "heel-edge-test-"));
   const modulePath = join(directory, "worker.ts");
-  context.after(() => rm(directory, { recursive: true, force: true }));
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
   await writeFile(modulePath, runnable);
   class LengthStream extends TransformStream<Uint8Array, Uint8Array> {
     constructor(expected: number) {
@@ -364,7 +373,8 @@ test("actual worker isolates human canary and runner-result authority headers an
     }
   }
   (globalThis as typeof globalThis & { FixedLengthStream: typeof LengthStream }).FixedLengthStream = LengthStream;
-  const worker = (await import(`${pathToFileURL(modulePath).href}?v=${Date.now()}`)).default;
+  const moduleUrl = `${pathToFileURL(modulePath).href}?v=${Date.now()}`;
+  const worker = (await import(/* @vite-ignore */ moduleUrl)).default;
   const upstream: Request[] = [];
   const env = {
     CONTROL_PLANE_EDGE_SECRET: "e".repeat(43),
@@ -448,4 +458,6 @@ test("actual worker isolates human canary and runner-result authority headers an
   const invalidNonce = await worker.fetch(new Request(resultPath, { method: "POST", body: uploadBody, headers: runnerHeaders }), invalidNonceEnv, ctx);
   assert.equal(invalidNonce.status, 502);
   assert.equal(invalidNonce.headers.get("x-heel-runner-next-nonce"), null);
+});
+
 });

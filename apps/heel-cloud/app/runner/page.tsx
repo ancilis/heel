@@ -2,7 +2,7 @@
 
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 
 import { CanaryApi, CanaryApiError } from "../../lib/canary-api";
@@ -18,6 +18,7 @@ type PairingView = { pairingId: string; phrase: string; fingerprint: string };
 
 const cloudApi = new HeelCloudApi();
 const canaryApi = new CanaryApi();
+const PAIR_COMMAND = "heel runner pair --cloud <origin>";
 
 
 export default function Runner() {
@@ -29,8 +30,6 @@ export default function Runner() {
   const [fingerprintConfirmed, setFingerprintConfirmed] = useState(false);
   const [working, setWorking] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
-  const [invitationCopied, setInvitationCopied] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -52,10 +51,7 @@ export default function Runner() {
     return () => { cancelled = true; };
   }, []);
 
-  const pairCommand = useMemo(() => {
-    if (invitation === null || typeof window === "undefined") return null;
-    return `heel runner pair --cloud ${window.location.origin}`;
-  }, [invitation]);
+  const pairCommand = invitation === null ? null : PAIR_COMMAND;
 
   async function createInvitation(): Promise<void> {
     if (connection.phase !== "ready") return;
@@ -108,18 +104,6 @@ export default function Runner() {
     }
   }
 
-  async function copyCommand(): Promise<void> {
-    if (pairCommand === null || navigator.clipboard === undefined) return;
-    await navigator.clipboard.writeText(pairCommand);
-    setCopied(true);
-  }
-
-  async function copyInvitation(): Promise<void> {
-    if (invitation === null || navigator.clipboard === undefined) return;
-    await navigator.clipboard.writeText(invitation);
-    setInvitationCopied(true);
-  }
-
   return (
     <main className="runner-page">
       <header className="dashboard-nav">
@@ -144,9 +128,11 @@ export default function Runner() {
           <div className="runner-command-number" aria-hidden="true">01</div><div>
             <p className="canary-kicker">On the runner machine</p><h2 id="runner-command-title">Start pairing</h2>
             {pairCommand === null ? <button className="button button-primary" disabled={working} onClick={() => void createInvitation()} type="button">Create one-time pairing command</button> : <>
-              <div className="command-copy"><code>{pairCommand}</code><button onClick={() => void copyCommand()} type="button">{copied ? "Copied" : "Copy command"}</button></div>
+              <div className="command-copy"><code>{pairCommand}</code></div>
+              <p>Replace <code>&lt;origin&gt;</code> with the Heel address shown in this browser, then select and copy the command.</p>
               <p>When the runner prompts with a silent <code>read --silent</code> input, paste this one-use invitation. It is never placed in shell history, process arguments, or a URL.</p>
-              <div className="command-copy"><code aria-label="One-use invitation code">{invitation}</code><button onClick={() => void copyInvitation()} type="button">{invitationCopied ? "Invitation copied" : "Copy invitation"}</button></div>
+              <div className="command-copy"><code aria-label="One-use invitation code">{invitation}</code></div>
+              <p>Select and copy the invitation separately.</p>
               <p>Paste it only when the runner prompts. The terminal will then return a pairing ID, short phrase, and key fingerprint.</p>
             </>}
           </div>

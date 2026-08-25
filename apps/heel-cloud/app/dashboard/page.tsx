@@ -51,6 +51,26 @@ function idempotencyKey(): `ca1-${string}` {
   return `ca1-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
+async function loadConnection(): Promise<Connection> {
+  try {
+    const session = await cloudApi.me();
+    const workspace = session.workspaces.find((item) => item.role === "owner" || item.role === "admin")
+      ?? session.workspaces[0];
+    if (workspace === undefined) {
+      return { phase: "sign_in", message: "Sign in or create a workspace to begin your first rehearsal." };
+    }
+    const projects = await cloudApi.listProjects(workspace.workspaceRef);
+    if (projects.length === 0) return { phase: "select_project", workspaceRef: workspace.workspaceRef };
+    const environments = await canaryApi.listEnvironments(workspace.workspaceRef, projects[0].projectRef);
+    return { phase: "ready", context: { workspaceRef: workspace.workspaceRef, project: projects[0], projects, environments } };
+  } catch (error) {
+    const message = messageOf(error);
+    return error instanceof HeelCloudApiError && error.code === "auth_required"
+      ? { phase: "sign_in", message }
+      : { phase: "error", message };
+  }
+}
+
 
 export default function Dashboard() {
   const [connection, setConnection] = useState<Connection>({ phase: "checking" });
@@ -65,32 +85,15 @@ export default function Dashboard() {
   const [disclosurePreview, setDisclosurePreview] = useState<DisclosurePreview | null>(null);
   const [disclosureOpen, setDisclosureOpen] = useState(false);
 
-  const connect = useCallback(async (): Promise<void> => {
-    setConnection({ phase: "checking" });
-    try {
-      const session = await cloudApi.me();
-      const workspace = session.workspaces.find((item) => item.role === "owner" || item.role === "admin")
-        ?? session.workspaces[0];
-      if (workspace === undefined) {
-        setConnection({ phase: "sign_in", message: "Sign in or create a workspace to begin your first rehearsal." });
-        return;
-      }
-      const projects = await cloudApi.listProjects(workspace.workspaceRef);
-      if (projects.length === 0) {
-        setConnection({ phase: "select_project", workspaceRef: workspace.workspaceRef });
-        return;
-      }
-      const environments = await canaryApi.listEnvironments(workspace.workspaceRef, projects[0].projectRef);
-      setConnection({ phase: "ready", context: { workspaceRef: workspace.workspaceRef, project: projects[0], projects, environments } });
-    } catch (error) {
-      const message = messageOf(error);
-      setConnection(error instanceof HeelCloudApiError && error.code === "auth_required"
-        ? { phase: "sign_in", message }
-        : { phase: "error", message });
-    }
+  useEffect(() => {
+    let cancelled = false;
+    void loadConnection().then((next) => { if (!cancelled) setConnection(next); });
+    return () => { cancelled = true; };
   }, []);
 
-  useEffect(() => { void connect(); }, [connect]);
+  async function connect(): Promise<void> {
+    setConnection(await loadConnection());
+  }
 
   const refreshEnvironments = useCallback(async (): Promise<void> => {
     if (connection.phase !== "ready") return;
@@ -103,12 +106,12 @@ export default function Dashboard() {
     if (connection.phase !== "ready" || approval === null || run === null
       || ["terminal", "cancelled", "expired"].includes(run.run.status)) return;
     let cancelled = false;
-    const timer = window.setInterval(() => {
+    const timer = setInterval(() => {
       void canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId)
         .then((next) => { if (!cancelled) setRun(next); })
         .catch((error: unknown) => { if (!cancelled) setNotice(messageOf(error)); });
     }, 1_000);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    return () => { cancelled = true; clearInterval(timer); };
   }, [approval, connection, run]);
 
   const executable = connection.phase === "ready"
@@ -250,7 +253,7 @@ export default function Dashboard() {
       <section className="dashboard-intro" aria-labelledby="dashboard-title"><div><p className="canary-kicker">Verified canary rehearsal</p><h1 id="dashboard-title">Cross the boundary <em>before</em> your customers do.</h1><p>Verify one staging environment, pair one local runner, and complete a bounded read-only rehearsal.</p></div>
         <aside className="preview-notice" aria-label="Connection status"><span className="preview-pulse" aria-hidden="true" /><div><strong>{connection.phase === "ready" ? "Ready for customer setup" : "Connect to begin"}</strong><p>{connection.phase === "checking" ? "Checking signed-in context · no request sent" : connection.phase === "ready" ? "Live account state · operational metadata only" : "No sample data is shown"}</p></div></aside></section>
 
-      {connection.phase !== "ready" ? <section className="next-action" role="status"><span aria-hidden="true">↳</span><p><strong>{connection.phase === "checking" ? "Checking your session." : connection.phase === "select_project" ? "Create a project first." : "Connect your signed-in workspace."}</strong> {"message" in connection ? connection.message : "Nothing has been approved or executed."} <button className="text-button" onClick={() => void connect()} type="button">Try again</button></p></section> : null}
+      {connection.phase !== "ready" ? <section className="next-action" role="status"><span aria-hidden="true">↳</span><p><strong>{connection.phase === "checking" ? "Checking your session." : connection.phase === "select_project" ? "Create a project first." : "Connect your signed-in workspace."}</strong> {"message" in connection ? connection.message : "Nothing has been approved or executed."} <button className="text-button" onClick={() => { setConnection({ phase: "checking" }); void connect(); }} type="button">Try again</button></p></section> : null}
 
       {context && context.projects.length > 1 ? <label className="dashboard-context">Project<select disabled={working} onChange={(event) => void selectProject(event.target.value)} value={context.project.projectRef}>{context.projects.map((project) => <option key={project.projectRef} value={project.projectRef}>{project.name}</option>)}</select></label> : null}
       {notice ? <p className="next-action" role="status">{notice}</p> : null}

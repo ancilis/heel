@@ -176,7 +176,7 @@ function closedString(value: unknown, maximum = 512): value is string {
 }
 
 function deepFreeze<T>(value: T): T {
-  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+  if (value !== null && typeof value === "object") {
     for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
     Object.freeze(value);
   }
@@ -319,12 +319,13 @@ function validBudgets(value: unknown): value is JsonRecord {
 }
 
 function validRetry(value: unknown): value is JsonRecord {
-  return exact(value, ["maximum_retries", "retryable_failure_codes"])
-    && integer(value.maximum_retries, 0, 1) && Array.isArray(value.retryable_failure_codes)
-    && value.retryable_failure_codes.length <= 2
-    && value.retryable_failure_codes.every((item) => item === "connect_error" || item === "timeout")
-    && new Set(value.retryable_failure_codes).size === value.retryable_failure_codes.length
-    && value.retryable_failure_codes.every((item, index) => index === 0 || value.retryable_failure_codes[index - 1] < item);
+  if (!exact(value, ["maximum_retries", "retryable_failure_codes"])
+    || !integer(value.maximum_retries, 0, 1)) return false;
+  const failureCodes = value.retryable_failure_codes;
+  return Array.isArray(failureCodes) && failureCodes.length <= 2
+    && failureCodes.every((item) => item === "connect_error" || item === "timeout")
+    && new Set(failureCodes).size === failureCodes.length
+    && failureCodes.every((item, index) => index === 0 || failureCodes[index - 1] < item);
 }
 
 function validEgress(value: unknown, origin: string): value is JsonRecord {
@@ -382,7 +383,9 @@ function validGrant(value: unknown, workspaceRef: string, projectRef: string, ru
   return true;
 }
 
-function validDisclosurePermit(value: unknown, workspaceRef: string, projectRef: string, runRef: string): value is JsonRecord {
+type DisclosurePermitRecord = JsonRecord & { projection: JsonRecord };
+
+function validDisclosurePermit(value: unknown, workspaceRef: string, projectRef: string, runRef: string): value is DisclosurePermitRecord {
   if (!exact(value, [
     "schema_version", "permit_id", "workspace_id", "project_id", "run_id", "grant_id",
     "runner_binding", "projection", "approved_by", "approved_at_ms", "issued_at_ms",
@@ -449,6 +452,28 @@ function validFindings(value: unknown, workspaceRef: string, projectRef: string,
   return totalObservations <= 20;
 }
 
+function validApprovalScenario(value: unknown, index: number): value is JsonRecord {
+  return exact(value, ["ordinal", "scenario_id", "adapter_version"])
+    && value.ordinal === index && identifier(value.scenario_id) && identifier(value.adapter_version);
+}
+
+function validApprovalAction(value: unknown, index: number, scenarios: readonly JsonRecord[]): value is JsonRecord {
+  if (!exact(value, ["ordinal", "scenario_id", "adapter_version", "method", "route_template", "semantic_auth_role", "assertion_class", "allowed_status_codes", "allowed_body_shapes", "side_effect_class"])
+    || value.ordinal !== index || !identifier(value.scenario_id) || !identifier(value.adapter_version)
+    || !scenarios.some((scenario) => scenario.scenario_id === value.scenario_id && scenario.adapter_version === value.adapter_version)
+    || (value.method !== "GET" && value.method !== "HEAD") || !closedString(value.route_template, 1024)
+    || !/^\/(?:[A-Za-z0-9._~!$&'()*+,;=:@{}-]+\/?)*$/.test(value.route_template)
+    || value.route_template.includes("//") || !identifier(value.semantic_auth_role)
+    || !["anonymous_authenticated", "object_ownership", "role_boundary", "plan_entitlement"].includes(String(value.assertion_class))
+    || !sortedUniqueStrings(value.allowed_body_shapes, BODY_SHAPES)
+    || value.side_effect_class !== "read_only") return false;
+  const statuses = value.allowed_status_codes;
+  return Array.isArray(statuses) && statuses.length <= 20
+    && statuses.every((status) => integer(status, 100, 599))
+    && new Set(statuses).size === statuses.length
+    && statuses.every((status, statusIndex) => statusIndex === 0 || statuses[statusIndex - 1] < status);
+}
+
 function validApprovalProjection(value: unknown, workspaceRef: string, projectRef: string): value is JsonRecord {
   if (!exact(value, [
     "schema_version", "projection_id", "workspace_id", "project_id", "environment", "runner",
@@ -462,25 +487,14 @@ function validApprovalProjection(value: unknown, workspaceRef: string, projectRe
     || !identifier(value.runner.runner_version) || !sortedUniqueStrings(value.runner.adapter_versions)
     || value.signing_key_id !== value.runner.runner_key_id
     || !exact(value.compiler, ["compiler_version", "engine_version"])
-    || !identifier(value.compiler.compiler_version) || !identifier(value.compiler.engine_version)
-    || !Array.isArray(value.scenarios) || value.scenarios.length > 4
-    || !value.scenarios.every((item, index) => exact(item, ["ordinal", "scenario_id", "adapter_version"])
-      && item.ordinal === index && identifier(item.scenario_id) && identifier(item.adapter_version))
-    || new Set(value.scenarios.map((item) => (item as JsonRecord).scenario_id)).size !== value.scenarios.length
-    || !Array.isArray(value.actions) || value.actions.length > 20
-    || !value.actions.every((item, index) => exact(item, ["ordinal", "scenario_id", "adapter_version", "method", "route_template", "semantic_auth_role", "assertion_class", "allowed_status_codes", "allowed_body_shapes", "side_effect_class"])
-      && item.ordinal === index && identifier(item.scenario_id) && identifier(item.adapter_version)
-      && value.scenarios.some((scenario) => (scenario as JsonRecord).scenario_id === item.scenario_id && (scenario as JsonRecord).adapter_version === item.adapter_version)
-      && (item.method === "GET" || item.method === "HEAD") && closedString(item.route_template, 1024)
-      && /^\/(?:[A-Za-z0-9._~!$&'()*+,;=:@{}-]+\/?)*$/.test(item.route_template as string)
-      && !(item.route_template as string).includes("//")
-      && identifier(item.semantic_auth_role) && ["anonymous_authenticated", "object_ownership", "role_boundary", "plan_entitlement"].includes(String(item.assertion_class))
-      && Array.isArray(item.allowed_status_codes) && item.allowed_status_codes.length <= 20
-      && item.allowed_status_codes.every((status) => integer(status, 100, 599))
-      && new Set(item.allowed_status_codes).size === item.allowed_status_codes.length
-      && item.allowed_status_codes.every((status, statusIndex) => statusIndex === 0 || item.allowed_status_codes[statusIndex - 1] < status)
-      && sortedUniqueStrings(item.allowed_body_shapes, BODY_SHAPES)
-      && item.side_effect_class === "read_only")
+    || !identifier(value.compiler.compiler_version) || !identifier(value.compiler.engine_version)) return false;
+  const scenarios = value.scenarios;
+  if (!Array.isArray(scenarios) || scenarios.length > 4
+    || !scenarios.every(validApprovalScenario)
+    || new Set(scenarios.map((item) => item.scenario_id)).size !== scenarios.length) return false;
+  const actions = value.actions;
+  if (!Array.isArray(actions) || actions.length > 20
+    || !actions.every((item, index) => validApprovalAction(item, index, scenarios))
     || !validBudgets(value.budgets) || !validEgress(value.egress, value.environment.origin as string)
     || !validRetry(value.retry_policy) || !integer(value.compiled_at_ms)
     || !digest(value.manifest_digest) || !validSignature(value, "projection_digest")) return false;
