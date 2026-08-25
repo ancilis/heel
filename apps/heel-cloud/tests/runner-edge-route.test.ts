@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Heel-Commercial
+
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
 vi.mock("vinext/server/image-optimization", () => ({
