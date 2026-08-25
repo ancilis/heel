@@ -23,6 +23,9 @@ from urllib.parse import urlsplit
 from heel.canary_contracts import (
     canonical_bytes,
     validate_approval_projection,
+    validate_canary_findings,
+    validate_execution_grant,
+    validate_operational_run,
     validate_test_manifest,
 )
 from heel.crypto import ed25519_key_id, load_public_key_base64, verify_envelope
@@ -57,6 +60,10 @@ _LOCK_FLAGS = (
     os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
 )
+_BINARY_WRITE_FLAGS = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 _MAX_METADATA_BYTES = 256 * 1024
 _HANDLE = re.compile(r"^[0-9a-f]{32}$", flags=re.ASCII)
 _DIGEST = re.compile(r"^[0-9a-f]{64}$", flags=re.ASCII)
@@ -66,6 +73,19 @@ _BACKENDS = frozenset({
     "macos_keychain", "linux_secret_service", "ephemeral_env", "ephemeral_fd",
 })
 _STATES = frozenset({"pending", "active", "orphaned"})
+_RUN_STATES = frozenset({"verified", "running", "stop_requested", "finalizing", "terminal"})
+_RUN_TRANSITIONS = {
+    "verified": frozenset({"running", "finalizing"}),
+    "running": frozenset({"stop_requested", "finalizing"}),
+    "stop_requested": frozenset({"finalizing"}),
+    "finalizing": frozenset({"terminal"}),
+    "terminal": frozenset(),
+}
+_RUN_FILENAME = re.compile(r"^[0-9a-f]{64}$", flags=re.ASCII)
+_EVENT_FILENAME = re.compile(r"^[0-9]{20}\.json$", flags=re.ASCII)
+_EVIDENCE_REF = re.compile(r"^ev1_[0-9a-f]{64}$", flags=re.ASCII)
+_MAX_EVIDENCE_HEADER_BYTES = 16 * 1024
+_MAX_EVIDENCE_BODY_BYTES = 256 * 1024
 
 
 def _require_capabilities() -> None:
@@ -314,6 +334,26 @@ def _write_json(directory_fd: int, filename: str, value: Any) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _create_json(directory_fd: int, filename: str, value: Any) -> None:
+    """Create one immutable canonical record without a replace window."""
+    payload = canonical_bytes(value)
+    if len(payload) > _MAX_METADATA_BYTES:
+        raise RunnerStoreError("runner state exceeds size limit")
+    descriptor = os.open(filename, _WRITE_FLAGS, 0o600, dir_fd=directory_fd)
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written < 1:
+                raise OSError("short runner state write")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
 
 
 @contextmanager
@@ -1151,6 +1191,457 @@ class RunnerStore:
         manifest = self.load_manifest(projection["manifest_digest"])
         self._assert_contract_context(manifest, projection)
         return manifest, projection
+
+    @staticmethod
+    def _run_hash(run_id: str) -> str:
+        return hashlib.sha256(_id(run_id, "run ID").encode("utf-8")).hexdigest()
+
+    def run_path(self, run_id: str) -> Path:
+        """Return the opaque local run path; no customer-controlled name becomes a path segment."""
+        return (
+            self.root / "runner" / "contexts" / self.namespace / "runs"
+            / self._run_hash(run_id)
+        )
+
+    @contextmanager
+    def _open_run(self, context_fd: int, run_id: str, *, create: bool) -> Iterator[int]:
+        run_hash = self._run_hash(run_id)
+        runs_fd = _open_child(context_fd, "runs", create=create)
+        if runs_fd is None:
+            raise RunnerStoreError("local run is unavailable")
+        run_fd = -1
+        try:
+            _secure_directory(runs_fd, "Heel runner runs directory")
+            opened = _open_child(runs_fd, run_hash, create=create)
+            if opened is None:
+                raise RunnerStoreError("local run is unavailable")
+            run_fd = opened
+            _secure_directory(run_fd, "Heel local run directory")
+            yield run_fd
+        finally:
+            if run_fd >= 0:
+                os.close(run_fd)
+            os.close(runs_fd)
+
+    def _run_state_locked(self, run_fd: int, run_id: str) -> dict[str, Any]:
+        value = _read_json(run_fd, "state.json", None)
+        fields = {
+            "schema_version", "run_id", "grant_id", "grant_digest", "manifest_digest",
+            "state", "retention_expires_at_ms", "updated_at_ms",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise RunnerStoreError("invalid local run state")
+        if (
+            value["schema_version"] != "heel.local-run-state.v1"
+            or value["run_id"] != run_id
+            or value["state"] not in _RUN_STATES
+        ):
+            raise RunnerStoreError("invalid local run state")
+        _id(value["grant_id"], "grant ID")
+        _digest(value["grant_digest"], "grant digest")
+        _digest(value["manifest_digest"], "manifest digest")
+        for field in ("retention_expires_at_ms", "updated_at_ms"):
+            moment = value[field]
+            if isinstance(moment, bool) or not isinstance(moment, int) or moment < 0:
+                raise RunnerStoreError("invalid local run timestamp")
+        return dict(value)
+
+    def reserve_run(
+        self, grant: Mapping[str, Any], *, retention_expires_at_ms: int,
+    ) -> dict[str, Any]:
+        """Atomically consume one exact grant into a new local run namespace."""
+        grant = validate_execution_grant(grant)
+        if (
+            isinstance(retention_expires_at_ms, bool)
+            or not isinstance(retention_expires_at_ms, int)
+            or retention_expires_at_ms <= grant["issued_at_ms"]
+        ):
+            raise ValueError("invalid local run retention")
+        manifest, projection = self.load_approved_pair(grant["approval"]["projection_id"])
+        context = self.load_context()
+        binding = self.load_binding()["identity"]
+        if (
+            grant["workspace_id"] != context.workspace_id
+            or grant["project_id"] != context.project_id
+            or grant["environment"] != manifest["environment"]
+            or grant["approval"] != {
+                "projection_id": projection["projection_id"],
+                "projection_digest": projection["projection_digest"],
+                "manifest_digest": manifest["manifest_digest"],
+            }
+            or grant["runner_binding"]["runner_id"] != binding["runner_id"]
+            or grant["runner_binding"]["runner_key_id"] != binding["runner_key_id"]
+        ):
+            raise RunnerStoreError("execution grant does not match bound local artifacts")
+        run_id = grant["run_id"]
+        state = {
+            "schema_version": "heel.local-run-state.v1",
+            "run_id": run_id,
+            "grant_id": grant["grant_id"],
+            "grant_digest": grant["grant_digest"],
+            "manifest_digest": manifest["manifest_digest"],
+            "state": "verified",
+            "retention_expires_at_ms": retention_expires_at_ms,
+            "updated_at_ms": grant["issued_at_ms"],
+        }
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=True)
+            assert runs_fd is not None
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                consumed_name = f"grant-{grant['grant_digest']}.json"
+                try:
+                    _create_json(runs_fd, consumed_name, {
+                        "schema_version": "heel.local-grant-consumption.v1",
+                        "grant_id": grant["grant_id"],
+                        "run_id": run_id,
+                        "grant_digest": grant["grant_digest"],
+                    })
+                except FileExistsError:
+                    raise ValueError("execution grant was already consumed") from None
+                run_fd = -1
+                try:
+                    opened = _open_child(runs_fd, self._run_hash(run_id), create=True)
+                    assert opened is not None
+                    run_fd = opened
+                    _secure_directory(run_fd, "Heel local run directory")
+                    if _read_json(run_fd, "state.json", None) is not None:
+                        raise RunnerStoreError("immutable local run collision")
+                    _create_json(run_fd, "grant.json", grant)
+                    _create_json(run_fd, "state.json", state)
+                finally:
+                    if run_fd >= 0:
+                        os.close(run_fd)
+            finally:
+                os.close(runs_fd)
+        return state
+
+    def load_run(self, run_id: str) -> dict[str, Any]:
+        with self._transaction(exclusive=False) as context_fd:
+            with self._open_run(context_fd, run_id, create=False) as run_fd:
+                return self._run_state_locked(run_fd, run_id)
+
+    def load_run_grant(self, run_id: str) -> dict[str, Any]:
+        with self._transaction(exclusive=False) as context_fd:
+            with self._open_run(context_fd, run_id, create=False) as run_fd:
+                self._run_state_locked(run_fd, run_id)
+                grant = _read_json(run_fd, "grant.json", None)
+        try:
+            return validate_execution_grant(grant)
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid stored execution grant") from None
+
+    def transition_run(self, run_id: str, next_state: str, *, now_ms: int) -> dict[str, Any]:
+        if next_state not in _RUN_STATES:
+            raise ValueError("invalid local run state")
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
+            raise ValueError("invalid local run timestamp")
+        with self._transaction(exclusive=True) as context_fd:
+            with self._open_run(context_fd, run_id, create=False) as run_fd:
+                current = self._run_state_locked(run_fd, run_id)
+                if next_state not in _RUN_TRANSITIONS[current["state"]]:
+                    raise RunnerStoreError("illegal local run transition")
+                if now_ms < current["updated_at_ms"]:
+                    raise RunnerStoreError("local run timestamp moved backward")
+                updated = {**current, "state": next_state, "updated_at_ms": now_ms}
+                _write_json(run_fd, "state.json", updated)
+                return updated
+
+    def load_run_events(self, run_id: str) -> list[dict[str, Any]]:
+        with self._transaction(exclusive=False) as context_fd:
+            with self._open_run(context_fd, run_id, create=False) as run_fd:
+                self._run_state_locked(run_fd, run_id)
+                events_fd = _open_child(run_fd, "events", create=False)
+                if events_fd is None:
+                    return []
+                try:
+                    _secure_directory(events_fd, "Heel containment events directory")
+                    names = sorted(os.listdir(events_fd))
+                    if any(_EVENT_FILENAME.fullmatch(name) is None for name in names):
+                        raise RunnerStoreError("invalid containment event filename")
+                    return [_read_json(events_fd, name, None) for name in names]
+                finally:
+                    os.close(events_fd)
+
+    def append_run_event(self, run_id: str, event: Mapping[str, Any]) -> None:
+        sequence = event.get("sequence") if isinstance(event, Mapping) else None
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or not 0 <= sequence < 100_000:
+            raise ValueError("invalid containment event sequence")
+        filename = f"{sequence:020d}.json"
+        with self._transaction(exclusive=True) as context_fd:
+            with self._open_run(context_fd, run_id, create=False) as run_fd:
+                self._run_state_locked(run_fd, run_id)
+                events_fd = _open_child(run_fd, "events", create=True)
+                assert events_fd is not None
+                try:
+                    _secure_directory(events_fd, "Heel containment events directory")
+                    names = sorted(os.listdir(events_fd))
+                    if any(_EVENT_FILENAME.fullmatch(name) is None for name in names):
+                        raise RunnerStoreError("invalid containment event filename")
+                    if sequence != len(names):
+                        raise RunnerStoreError("containment event sequence is not append-only")
+                    try:
+                        _create_json(events_fd, filename, dict(event))
+                    except FileExistsError:
+                        raise RunnerStoreError("containment event already exists") from None
+                finally:
+                    os.close(events_fd)
+
+    def save_final_projections(
+        self,
+        run_id: str,
+        operational_projection: Mapping[str, Any],
+        findings_projection: Mapping[str, Any],
+        local_view: Mapping[str, Any],
+        disclosure_preview: Mapping[str, Any],
+    ) -> None:
+        from heel.runner.companion import validate_disclosure_preview, validate_local_result_view
+
+        operational = validate_operational_run(operational_projection)
+        findings = validate_canary_findings(findings_projection)
+        safe_view = validate_local_result_view(local_view)
+        safe_disclosure = validate_disclosure_preview(disclosure_preview)
+        if (
+            operational["run_id"] != run_id
+            or findings["run_id"] != run_id
+            or operational["grant_id"] != findings["grant_id"]
+            or safe_view["operational_projection"] != operational
+            or safe_view["findings_projection"] != findings
+            or safe_disclosure["projection"] != findings
+        ):
+            raise ValueError("final projections do not bind the local run")
+        with self._transaction(exclusive=True) as context_fd:
+            with self._open_run(context_fd, run_id, create=False) as run_fd:
+                self._run_state_locked(run_fd, run_id)
+                for filename, value in (
+                    ("operational.json", operational),
+                    ("findings.json", findings),
+                    ("local-view.json", safe_view),
+                    ("disclosure-preview.json", safe_disclosure),
+                ):
+                    try:
+                        _create_json(run_fd, filename, value)
+                    except FileExistsError:
+                        existing = _read_json(run_fd, filename, None)
+                        if existing != value:
+                            raise RunnerStoreError("immutable final projection collision") from None
+
+    def load_final_projections(self, run_id: str) -> dict[str, Any]:
+        with self._transaction(exclusive=False) as context_fd:
+            with self._open_run(context_fd, run_id, create=False) as run_fd:
+                self._run_state_locked(run_fd, run_id)
+                result = {
+                    name: _read_json(run_fd, filename, None)
+                    for name, filename in (
+                        ("operational_projection", "operational.json"),
+                        ("findings_projection", "findings.json"),
+                        ("local_view", "local-view.json"),
+                        ("disclosure_preview", "disclosure-preview.json"),
+                    )
+                }
+        if any(value is None for value in result.values()):
+            raise RunnerStoreError("local final projections are unavailable")
+        result["operational_projection"] = validate_operational_run(
+            result["operational_projection"]
+        )
+        result["findings_projection"] = validate_canary_findings(result["findings_projection"])
+        from heel.runner.companion import validate_disclosure_preview, validate_local_result_view
+        result["local_view"] = validate_local_result_view(result["local_view"])
+        result["disclosure_preview"] = validate_disclosure_preview(result["disclosure_preview"])
+        if (
+            result["local_view"]["operational_projection"] != result["operational_projection"]
+            or result["local_view"]["findings_projection"] != result["findings_projection"]
+            or result["disclosure_preview"]["projection"] != result["findings_projection"]
+        ):
+            raise RunnerStoreError("local final projection binding mismatch")
+        return result
+
+    def store_response_evidence(
+        self,
+        run_id: str,
+        *,
+        action_ordinal: int,
+        attempt: int,
+        status_code: int,
+        raw_headers: bytes,
+        raw_body: bytes,
+        expires_at_ms: int,
+    ) -> str:
+        values = (action_ordinal, attempt, status_code, expires_at_ms)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+            raise ValueError("invalid local evidence metadata")
+        if not isinstance(raw_headers, bytes) or not isinstance(raw_body, bytes):
+            raise TypeError("local response evidence must be bytes")
+        if len(raw_headers) > _MAX_EVIDENCE_HEADER_BYTES or len(raw_body) > _MAX_EVIDENCE_BODY_BYTES:
+            raise ValueError("local response evidence exceeds bound")
+        digest_input = b"\0".join((
+            run_id.encode("utf-8"), str(action_ordinal).encode("ascii"),
+            str(attempt).encode("ascii"), str(status_code).encode("ascii"),
+            raw_headers, raw_body,
+        ))
+        reference = "ev1_" + hashlib.sha256(digest_input).hexdigest()
+        payload = len(raw_headers).to_bytes(4, "big") + raw_headers + raw_body
+        with self._transaction(exclusive=True) as context_fd:
+            with self._open_run(context_fd, run_id, create=False) as run_fd:
+                state = self._run_state_locked(run_fd, run_id)
+                if expires_at_ms > state["retention_expires_at_ms"]:
+                    raise ValueError("evidence expiry exceeds manifest retention")
+                evidence_fd = _open_child(run_fd, "evidence", create=True)
+                assert evidence_fd is not None
+                try:
+                    _secure_directory(evidence_fd, "Heel local evidence directory")
+                    binary_name = reference + ".bin"
+                    try:
+                        descriptor = os.open(binary_name, _BINARY_WRITE_FLAGS, 0o600, dir_fd=evidence_fd)
+                    except FileExistsError:
+                        raise RunnerStoreError("immutable local evidence collision") from None
+                    try:
+                        os.fchmod(descriptor, 0o600)
+                        view = memoryview(payload)
+                        while view:
+                            written = os.write(descriptor, view)
+                            if written < 1:
+                                raise OSError("short evidence write")
+                            view = view[written:]
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    _create_json(evidence_fd, reference + ".meta", {
+                        "schema_version": "heel.local-evidence-metadata.v1",
+                        "reference": reference,
+                        "action_ordinal": action_ordinal,
+                        "attempt": attempt,
+                        "status_code": status_code,
+                        "expires_at_ms": expires_at_ms,
+                    })
+                    os.fsync(evidence_fd)
+                finally:
+                    os.close(evidence_fd)
+        return reference
+
+    def load_response_evidence(
+        self, run_id: str, reference: str, *, now_ms: int,
+    ) -> tuple[bytes, bytes]:
+        if type(reference) is not str or _EVIDENCE_REF.fullmatch(reference) is None:
+            raise ValueError("invalid local evidence reference")
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
+            raise ValueError("invalid local evidence read time")
+        with self._transaction(exclusive=False) as context_fd:
+            with self._open_run(context_fd, run_id, create=False) as run_fd:
+                self._run_state_locked(run_fd, run_id)
+                evidence_fd = _open_child(run_fd, "evidence", create=False)
+                if evidence_fd is None:
+                    raise RunnerStoreError("local evidence is unavailable")
+                try:
+                    _secure_directory(evidence_fd, "Heel local evidence directory")
+                    metadata = _read_json(evidence_fd, reference + ".meta", None)
+                    if (
+                        not isinstance(metadata, Mapping)
+                        or set(metadata) != {
+                            "schema_version", "reference", "action_ordinal", "attempt",
+                            "status_code", "expires_at_ms",
+                        }
+                        or metadata["schema_version"] != "heel.local-evidence-metadata.v1"
+                        or metadata["reference"] != reference
+                        or any(
+                            isinstance(metadata[field], bool)
+                            or not isinstance(metadata[field], int)
+                            or metadata[field] < 0
+                            for field in ("action_ordinal", "attempt", "status_code")
+                        )
+                        or isinstance(metadata["expires_at_ms"], bool)
+                        or not isinstance(metadata["expires_at_ms"], int)
+                        or now_ms >= metadata["expires_at_ms"]
+                    ):
+                        raise RunnerStoreError("local evidence is expired or invalid")
+                    descriptor = os.open(reference + ".bin", _READ_FLAGS, dir_fd=evidence_fd)
+                    try:
+                        status = os.fstat(descriptor)
+                        _secure_regular(status, "local response evidence")
+                        if status.st_size > 4 + _MAX_EVIDENCE_HEADER_BYTES + _MAX_EVIDENCE_BODY_BYTES:
+                            raise RunnerStoreError("local evidence exceeds bound")
+                        payload = bytearray()
+                        while len(payload) <= 4 + _MAX_EVIDENCE_HEADER_BYTES + _MAX_EVIDENCE_BODY_BYTES:
+                            chunk = os.read(descriptor, 64 * 1024)
+                            if not chunk:
+                                break
+                            payload.extend(chunk)
+                    finally:
+                        os.close(descriptor)
+                finally:
+                    os.close(evidence_fd)
+        if len(payload) < 4:
+            raise RunnerStoreError("local evidence is invalid")
+        header_length = int.from_bytes(payload[:4], "big")
+        if header_length > _MAX_EVIDENCE_HEADER_BYTES:
+            raise RunnerStoreError("local evidence is invalid")
+        headers = bytes(payload[4:4 + header_length])
+        body = bytes(payload[4 + header_length:])
+        if len(body) > _MAX_EVIDENCE_BODY_BYTES:
+            raise RunnerStoreError("local evidence is invalid")
+        expected = "ev1_" + hashlib.sha256(b"\0".join((
+            run_id.encode("utf-8"), str(metadata["action_ordinal"]).encode("ascii"),
+            str(metadata["attempt"]).encode("ascii"),
+            str(metadata["status_code"]).encode("ascii"), headers, body,
+        ))).hexdigest()
+        if expected != reference:
+            raise RunnerStoreError("local evidence digest mismatch")
+        return headers, body
+
+    @staticmethod
+    def _delete_directory_contents(directory_fd: int) -> None:
+        """Delete only validated owner-controlled files/directories below an anchored fd."""
+        for name in os.listdir(directory_fd):
+            if name in {".", ".."} or "/" in name or "\x00" in name:
+                raise RunnerStoreError("unsafe local retention entry")
+            status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISDIR(status.st_mode):
+                child = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+                try:
+                    _secure_directory(child, "Heel retained run directory")
+                    RunnerStore._delete_directory_contents(child)
+                finally:
+                    os.close(child)
+                os.rmdir(name, dir_fd=directory_fd)
+            else:
+                _secure_regular(status, "Heel retained run file")
+                os.unlink(name, dir_fd=directory_fd)
+
+    def prune_expired_runs(self, *, now_ms: int) -> int:
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
+            raise ValueError("invalid local retention time")
+        removed = 0
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                return 0
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                for name in sorted(os.listdir(runs_fd)):
+                    if _RUN_FILENAME.fullmatch(name) is None:
+                        continue  # immutable grant-consumption markers intentionally remain
+                    run_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=runs_fd)
+                    try:
+                        _secure_directory(run_fd, "Heel retained local run directory")
+                        state = _read_json(run_fd, "state.json", None)
+                        if (
+                            not isinstance(state, Mapping)
+                            or state.get("state") != "terminal"
+                            or isinstance(state.get("retention_expires_at_ms"), bool)
+                            or not isinstance(state.get("retention_expires_at_ms"), int)
+                            or state["retention_expires_at_ms"] > now_ms
+                        ):
+                            continue
+                        self._delete_directory_contents(run_fd)
+                    finally:
+                        os.close(run_fd)
+                    os.rmdir(name, dir_fd=runs_fd)
+                    removed += 1
+                if removed:
+                    os.fsync(runs_fd)
+            finally:
+                os.close(runs_fd)
+        return removed
 
 
 def new_credential_handle_id() -> str:

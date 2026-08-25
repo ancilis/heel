@@ -12,7 +12,21 @@ from .control_client import (
 )
 from .catalog import AUTH_PROFILES, CATALOG, CATALOG_IDS, SEMANTIC_ROLES
 from .compiler import CanaryCompiler, CompileResult
+from .companion import CompanionServer, validate_disclosure_preview, validate_local_result_view
+from .containment import (
+    ContainmentError, ContainmentLog, LOCAL_EVENT_CODES, OPERATIONAL_EVENT_CODES,
+    operational_containment_codes,
+)
+from .execution import (
+    ExecutionBundle, ExecutionGate, ExecutionResult, LocalCanaryExecutor,
+    ValidatedExecutionBundle, validate_execution_bundle,
+)
+from .http_transport import (
+    BoundedResolver, CancellationToken, TargetHTTPSClient, TargetResponse, TransportFailure,
+)
 from .openapi_routes import RouteInventory, normalize_route_template
+from .redaction import Redactor, safe_json_value
+from .service import ClaimLease, Coordinator, LeaseExecutor, RunnerService
 from .store import (
     RunnerContext, RunnerStore, RunnerStoreError, UnsupportedSecureStorageError,
     new_credential_handle_id,
@@ -32,6 +46,13 @@ __all__ = [
     "RunnerRotationActivated",
     "AUTH_PROFILES", "CATALOG", "CATALOG_IDS", "SEMANTIC_ROLES",
     "CanaryCompiler", "CompileResult", "RouteInventory", "normalize_route_template",
+    "CompanionServer", "validate_disclosure_preview", "validate_local_result_view",
+    "ContainmentError", "ContainmentLog", "LOCAL_EVENT_CODES", "OPERATIONAL_EVENT_CODES",
+    "operational_containment_codes", "ExecutionBundle", "ExecutionGate", "ExecutionResult",
+    "LocalCanaryExecutor", "ValidatedExecutionBundle", "validate_execution_bundle",
+    "BoundedResolver", "CancellationToken", "TargetHTTPSClient", "TargetResponse",
+    "TransportFailure", "Redactor", "safe_json_value", "ClaimLease", "Coordinator",
+    "LeaseExecutor", "RunnerService",
     "RunnerContext", "RunnerStore", "RunnerStoreError", "UnsupportedSecureStorageError",
     "new_credential_handle_id", "EphemeralVault", "KeychainVault",
     "SecretServiceVault", "UnavailableVault", "VaultUnavailable",

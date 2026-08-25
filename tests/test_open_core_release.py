@@ -168,11 +168,18 @@ EXPECTED_CONTRACT = {
         "heel/review_rules.py",
         "heel/review_service.py",
         "heel/runner/__init__.py",
+        "heel/runner/adapters.py",
         "heel/runner/catalog.py",
+        "heel/runner/companion.py",
         "heel/runner/compiler.py",
+        "heel/runner/containment.py",
         "heel/runner/control_client.py",
+        "heel/runner/execution.py",
+        "heel/runner/http_transport.py",
         "heel/runner/identity.py",
         "heel/runner/openapi_routes.py",
+        "heel/runner/redaction.py",
+        "heel/runner/service.py",
         "heel/runner/store.py",
         "heel/runner/vault.py",
         "heel/scenario_validate.py",
@@ -854,8 +861,10 @@ class OpenCoreReleaseTests(unittest.TestCase):
         sources = {
             f"heel/runner/{name}": (ROOT / "heel" / "runner" / name).read_bytes()
             for name in (
-                "__init__.py", "catalog.py", "compiler.py", "control_client.py",
-                "identity.py", "openapi_routes.py", "store.py", "vault.py",
+                "__init__.py", "adapters.py", "catalog.py", "companion.py", "compiler.py",
+                "containment.py", "control_client.py", "execution.py", "http_transport.py",
+                "identity.py", "openapi_routes.py", "redaction.py", "service.py", "store.py",
+                "vault.py",
             )
         }
         for required in (
