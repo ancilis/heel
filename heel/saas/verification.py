@@ -344,7 +344,7 @@ class VerifiedEnvironmentService:
                     "UPDATE canary_environments SET environment_class=?,status='pending',attestation_text=?,"
                     "attestation_version=?,attestation_acknowledgement=?,attested_by=?,attested_at=?,proof_method=?,proof_version=?,normalization_version=?,"
                     "challenge_generation=?,challenge_digest=?,challenge_token=?,challenge_created_at=?,challenge_expires_at=?,"
-                    "last_check_at=NULL,last_failure_code=NULL,verified_at=NULL,proof_expires_at=NULL,revoked_at=NULL,"
+                    "last_check_at=NULL,last_failure_code='challenge_replaced',verified_at=NULL,proof_expires_at=NULL,revoked_at=NULL,"
                     "revoked_by=NULL,revoked_reason=NULL WHERE workspace_id=? AND project_ref=? AND environment_id=?",
                     (environment_class, attestation_text, attestation_version, attestation_acknowledgement, actor, now,
                      proof_method, HTTPS_PROOF_VERSION if proof_method == "https-file" else DNS_PROOF_VERSION,
@@ -359,17 +359,25 @@ class VerifiedEnvironmentService:
                                     token, generation, expires_at)
 
     def _record_failure(self, workspace_id: str, project_ref: str, environment_id: str,
-                        generation: int, code: str) -> None:
+                        generation: int, code: str, *, expected_digest: str | None = None,
+                        token: str | None = None) -> None:
         if code not in _FAILURE_CODES:
             code = "internal_error"
+        if (expected_digest is None) != (token is None):
+            raise ValueError("failure challenge identity must include digest and token together")
         with self._db_lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
+                identity_clause = ""
+                values: list[object] = [code, self._now(), workspace_id, project_ref, environment_id, generation]
+                if expected_digest is not None:
+                    identity_clause = " AND challenge_digest=? AND challenge_token=?"
+                    values.extend((expected_digest, token))
                 self.conn.execute(
                     "UPDATE canary_environments SET last_failure_code=?,last_check_at=? "
                     "WHERE workspace_id=? AND project_ref=? AND environment_id=? AND challenge_generation=? "
-                    "AND status='pending' AND revoked_at IS NULL",
-                    (code, self._now(), workspace_id, project_ref, environment_id, generation),
+                    "AND status='pending' AND revoked_at IS NULL" + identity_clause,
+                    values,
                 )
                 self.conn.execute("COMMIT")
             except Exception:
@@ -463,6 +471,10 @@ class VerifiedEnvironmentService:
                     or fresh["attestation_version"] != ATTESTATION_VERSION
                     or fresh["attestation_acknowledgement"] != ATTESTATION_ACKNOWLEDGEMENT):
                     self.conn.execute("ROLLBACK")
+                    self._record_failure(
+                        workspace_id, project_ref, environment_id, generation, "challenge_replaced",
+                        expected_digest=expected_digest, token=token,
+                    )
                     return False
                 if max_verified is not None and self._active_count_locked(workspace_id, project_ref, now) >= max_verified:
                     self.conn.execute("ROLLBACK")
@@ -485,7 +497,17 @@ class VerifiedEnvironmentService:
                 )
                 self.conn.execute("COMMIT")
                 return True
-            except (TargetLimitExceeded, HostnameReuseExceeded):
+            except TargetLimitExceeded:
+                self._record_failure(
+                    workspace_id, project_ref, environment_id, generation, "quota_exceeded",
+                    expected_digest=expected_digest, token=token,
+                )
+                raise
+            except HostnameReuseExceeded:
+                self._record_failure(
+                    workspace_id, project_ref, environment_id, generation, "hostname_reuse_exceeded",
+                    expected_digest=expected_digest, token=token,
+                )
                 raise
             except Exception:
                 self.conn.rollback()

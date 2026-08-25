@@ -6,6 +6,7 @@ import sqlite3
 import http.client
 import json
 import threading
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -31,7 +32,8 @@ from heel.saas.iana_root_tlds import (
 )
 from heel.saas.catalog import CATALOG_VERSION
 from heel.saas.verification import (
-    EnvironmentCooldown, OWNERSHIP_ATTESTATION, TargetLimitExceeded, VerifiedEnvironmentService,
+    EnvironmentCooldown, HostnameReuseExceeded, OWNERSHIP_ATTESTATION, TargetLimitExceeded,
+    VerifiedEnvironmentService,
 )
 from heel.saas.http_api import ControlPlane, serve
 from heel.saas.tenancy import Role
@@ -172,6 +174,35 @@ def test_bounded_dns_txt_uses_absolute_names_and_rejects_private_answers():
         BoundedDNSResolver(resolver=PrivateResolver()).txt("staging.example.com")
 
 
+def test_bounded_dns_consumes_verifier_deadline_for_each_query():
+    class Resolver:
+        def __init__(self): self.calls = []
+        def resolve(self, name, kind, **kwargs):
+            self.calls.append(kwargs)
+            return ["93.184.216.34"] if kind == "A" else []
+    fake = Resolver()
+    bounded = BoundedDNSResolver(resolver=fake, lifetime=1, clock=lambda: 100)
+    bounded("staging.example.com", deadline=100.05)
+    assert [call["lifetime"] for call in fake.calls] == [pytest.approx(0.05), pytest.approx(0.05)]
+
+
+def test_pinned_verifier_passes_remaining_time_to_bounded_dns_contract():
+    class Resolver:
+        def __init__(self): self.calls = []
+        def resolve(self, name, kind, **kwargs):
+            self.calls.append(kwargs)
+            return ["93.184.216.34"] if kind == "A" else []
+    dns = Resolver()
+    bounded = BoundedDNSResolver(resolver=dns, lifetime=1, clock=lambda: 100)
+    tls_socket = FakeTLSSocket(RESPONSE, PIN)
+    guard = PinnedHTTPSVerifier(
+        pin_sha256_hex=PIN, timeout_seconds=0.05, clock=lambda: 0,
+        resolver=bounded, sockets=FakeSockets(tls_socket), tls=FakeTLS(tls_socket),
+    )
+    assert guard.verify("https://example.com") == TOKEN
+    assert [call["lifetime"] for call in dns.calls] == [pytest.approx(0.05), pytest.approx(0.05)]
+
+
 class FakeSocket:
     def __init__(self):
         self.timeout = None
@@ -266,6 +297,33 @@ def test_verify_selects_stable_ip_and_accepts_exact_token():
 def test_verify_rejects_redirect_and_compression(response):
     with pytest.raises(VerificationError):
         verifier(sockets_response=response).verify("https://example.com")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        RESPONSE.replace(b"Content-Type: text/plain", b"Transfer-Encoding : chunked"),
+        RESPONSE.replace(b"Content-Type: text/plain", b"Transfer-Encoding: identity\r\nContent-Type: text/plain"),
+        RESPONSE.replace(b"Content-Type: text/plain", b"Bad Header: text/plain"),
+        RESPONSE.replace(b"Content-Type: text/plain", b"Bad-\x01: text/plain"),
+        RESPONSE.replace(b"Content-Type: text/plain", b"Content-Type: text/plain\x01"),
+        RESPONSE.replace(b"Content-Type: text/plain", b"Content-Type:  text/plain"),
+    ],
+)
+def test_verify_rejects_ambiguous_or_invalid_response_headers(response):
+    with pytest.raises(VerificationError):
+        verifier(sockets_response=response).verify("https://example.com")
+
+
+def test_verify_bounds_generic_resolver_inside_absolute_deadline():
+    def stalled_resolver(hostname):
+        time.sleep(0.25)
+        return ["93.184.216.34"]
+
+    started = time.monotonic()
+    with pytest.raises(VerificationTimeout):
+        PinnedHTTPSVerifier(timeout_seconds=0.05, resolver=stalled_resolver).verify("https://example.com")
+    assert time.monotonic() - started < 0.15
 
 
 def test_verify_rejects_oversize():
@@ -419,6 +477,63 @@ def test_environment_quota_counts_the_whole_workspace_not_one_project():
     token[0] = second.token
     with pytest.raises(TargetLimitExceeded):
         service.check("ws", "two", second.environment_id, max_verified=1)
+    assert conn.execute("SELECT last_failure_code FROM canary_environments WHERE environment_id=?", (second.environment_id,)).fetchone()[0] == "quota_exceeded"
+    conn.close()
+
+
+def test_environment_hostname_reuse_finalization_is_persisted():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.executemany("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", [("one", "org", "one", "free", CATALOG_VERSION, 1), ("two", "org", "two", "free", CATALOG_VERSION, 1)])
+    conn.executemany("INSERT INTO projects VALUES(?,?,?,?,?)", [("one", "prj", "project", "owner", 1), ("two", "prj", "project", "owner", 1)])
+    token = [""]
+    class Proof:
+        def verify(self, origin): return token[0]
+    service = VerifiedEnvironmentService(conn, https_verifier=Proof(), max_workspaces_per_hostname=0)
+    fields = {"attestation_text": OWNERSHIP_ATTESTATION, "attestation_version": "v1", "attestation_acknowledgement": "accepted"}
+    first = service.start("one", "prj", "https://shared.example.com", "staging", actor="owner", **fields)
+    token[0] = first.token
+    # Seed an active other-workspace proof without relaxing the target service's enforcement.
+    conn.execute("UPDATE canary_environments SET status='verified',verified_at=1,proof_expires_at=? WHERE environment_id=?", (time.time() + 3600, first.environment_id))
+    conn.commit()
+    second = service.start("two", "prj", "https://shared.example.com", "staging", actor="owner", **fields)
+    token[0] = second.token
+    with pytest.raises(HostnameReuseExceeded):
+        service.check("two", "prj", second.environment_id)
+    assert conn.execute("SELECT last_failure_code FROM canary_environments WHERE environment_id=?", (second.environment_id,)).fetchone()[0] == "hostname_reuse_exceeded"
+    conn.close()
+
+
+def test_replaced_environment_challenge_is_auditable_without_touching_new_token():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    fields = {"attestation_text": OWNERSHIP_ATTESTATION, "attestation_version": "v1", "attestation_acknowledgement": "accepted"}
+    replacement = [None]
+    class ReplacingProof:
+        def verify(self, origin):
+            replacement[0] = service.start("ws", "prj", origin, "staging", actor="owner", **fields)
+            return original.token
+    service = VerifiedEnvironmentService(conn, https_verifier=ReplacingProof())
+    original = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner", **fields)
+    assert not service.check("ws", "prj", original.environment_id)
+    current = conn.execute("SELECT * FROM canary_environments WHERE environment_id=?", (original.environment_id,)).fetchone()
+    assert current["challenge_generation"] == replacement[0].generation
+    assert current["challenge_token"] == replacement[0].token
+    assert current["last_failure_code"] == "challenge_replaced"
+    public = service.public_record(current)
+    assert public["status"] == "pending"
+    assert "challenge_token" not in public
+    assert replacement[0].token not in json.dumps(public)
     conn.close()
 
 

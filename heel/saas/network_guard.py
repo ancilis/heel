@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import re
 import socket
 import ssl
+import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -143,7 +145,8 @@ def select_safe_addresses(addresses: Iterable[Any]) -> list[ipaddress._BaseAddre
 
 class BoundedDNSResolver:
     """Typed dnspython resolver with explicit answers and time bounds."""
-    def __init__(self, *, lifetime: float = 2.0, resolver: Any = None):
+    def __init__(self, *, lifetime: float = 2.0, resolver: Any = None,
+                 clock: Callable[[], float] = time.monotonic):
         if resolver is None:
             try:
                 import dns.resolver  # type: ignore[import-not-found]
@@ -152,15 +155,32 @@ class BoundedDNSResolver:
             resolver = dns.resolver.Resolver(configure=True)
         self.resolver = resolver
         self.lifetime = lifetime
+        self.clock = clock
 
-    def __call__(self, hostname: str) -> list[str]:
+    def _remaining(self, deadline: float | None) -> float:
+        remaining = self.lifetime
+        if deadline is not None:
+            remaining = min(remaining, deadline - self.clock())
+        if remaining <= 0:
+            raise DNSResolutionTimeout("DNS resolution timed out")
+        return remaining
+
+    def _resolve(self, name: str, record_type: str, *, deadline: float | None):
+        return self.resolver.resolve(
+            name, record_type, lifetime=self._remaining(deadline), search=False, raise_on_no_answer=False,
+        )
+
+    def __call__(self, hostname: str, *, deadline: float | None = None,
+                 timeout_seconds: float | None = None) -> list[str]:
+        if deadline is not None and timeout_seconds is not None:
+            raise ValueError("DNS deadline and timeout are mutually exclusive")
+        if timeout_seconds is not None:
+            deadline = self.clock() + timeout_seconds
         absolute = hostname.rstrip(".") + "."
         answers: list[str] = []
         for record_type in ("A", "AAAA"):
             try:
-                response = self.resolver.resolve(
-                    absolute, record_type, lifetime=self.lifetime, search=False, raise_on_no_answer=False,
-                )
+                response = self._resolve(absolute, record_type, deadline=deadline)
             except Exception as exc:
                 if type(exc).__name__ in {"NXDOMAIN", "NoAnswer"}:
                     continue
@@ -174,15 +194,18 @@ class BoundedDNSResolver:
         select_safe_addresses(answers)
         return answers
 
-    def txt(self, hostname: str) -> list[str]:
+    def txt(self, hostname: str, *, deadline: float | None = None,
+            timeout_seconds: float | None = None) -> list[str]:
         """Resolve only exact ASCII TXT values at ``_heel.<host>.`` after public-IP validation."""
+        if deadline is not None and timeout_seconds is not None:
+            raise ValueError("DNS deadline and timeout are mutually exclusive")
+        if timeout_seconds is not None:
+            deadline = self.clock() + timeout_seconds
         host = hostname.rstrip(".")
-        self(host)
+        self(host, deadline=deadline)
         name = "_heel." + host + "."
         try:
-            response = self.resolver.resolve(
-                name, "TXT", lifetime=self.lifetime, search=False, raise_on_no_answer=False,
-            )
+            response = self._resolve(name, "TXT", deadline=deadline)
         except Exception as exc:
             if type(exc).__name__ in {"NXDOMAIN", "NoAnswer"}:
                 return []
@@ -256,9 +279,37 @@ class PinnedHTTPSVerifier:
             raise VerificationTimeout("verification deadline expired")
         return remaining
 
-    def resolve(self, hostname: str) -> ipaddress._BaseAddress:
+    def _resolve_generic(self, resolver: Callable[[str], Sequence[Any]], hostname: str,
+                         deadline: float) -> Sequence[Any]:
+        """Bound test/custom resolvers without allowing one stalled DNS call to hold a request."""
+        outcome: list[Sequence[Any]] = []
+        failure: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                outcome.append(resolver(hostname))
+            except BaseException as exc:  # propagated on the request thread after a bounded join
+                failure.append(exc)
+
+        worker = threading.Thread(target=run, name="heel-bounded-dns", daemon=True)
+        worker.start()
+        worker.join(self._remaining(deadline))
+        if worker.is_alive():
+            raise VerificationTimeout("DNS resolution deadline expired")
+        if failure:
+            raise failure[0]
+        if not outcome:
+            raise AddressSetValidationError("DNS resolver returned no result")
+        return outcome[0]
+
+    def resolve(self, hostname: str, *, deadline: float | None = None) -> ipaddress._BaseAddress:
+        deadline = self.clock() + self.timeout_seconds if deadline is None else deadline
         try:
-            answer = (self.resolver or BoundedDNSResolver())(hostname)
+            resolver = self.resolver or BoundedDNSResolver()
+            if isinstance(resolver, BoundedDNSResolver):
+                answer = resolver(hostname, timeout_seconds=self._remaining(deadline))
+            else:
+                answer = self._resolve_generic(resolver, hostname, deadline)
             return select_safe_addresses(answer)[0]
         except NetworkGuardError:
             raise
@@ -275,11 +326,19 @@ class PinnedHTTPSVerifier:
             if not line or ":" not in line or line[0].isspace():
                 raise VerificationError("malformed response header")
             name, value = line.split(":", 1)
+            if re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", name) is None:
+                raise VerificationError("invalid response header name")
+            # Allow the one conventional SP after the colon, then reject all whitespace
+            # ambiguity and controls rather than normalizing it away.
+            if value.startswith(" "):
+                value = value[1:]
+            if value != value.strip(" \t") or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+                raise VerificationError("invalid response header value")
             key = name.lower()
             if key in fields:
                 raise VerificationError("ambiguous duplicate response header")
-            fields[key] = value.strip()
-        if "content-encoding" in fields or fields.get("transfer-encoding", "identity").lower() != "identity":
+            fields[key] = value
+        if "content-encoding" in fields or "transfer-encoding" in fields:
             raise VerificationError("compressed or transfer-encoded responses are forbidden")
         length = fields.get("content-length")
         if length is None or not length.isascii() or not length.isdecimal():
@@ -306,7 +365,7 @@ class PinnedHTTPSVerifier:
     def verify(self, origin: str) -> str:
         hostname = normalize_verified_origin(origin)[len("https://"):]
         deadline = self.clock() + self.timeout_seconds
-        selected = self.resolve(hostname)
+        selected = self.resolve(hostname, deadline=deadline)
         selected_ip = selected.compressed
         raw_socket = tls_socket = None
         try:
