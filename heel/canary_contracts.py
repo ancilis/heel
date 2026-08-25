@@ -81,7 +81,10 @@ def _normalize(value: Any, depth: int = 0) -> Any:
         if any(unicodedata.category(char) == "Cc" or 0xD800 <= ord(char) <= 0xDFFF
                for char in value):
             _fail("invalid text")
-        return unicodedata.normalize("NFC", value)
+        normalized = unicodedata.normalize("NFC", value)
+        if len(normalized.encode("utf-8")) > 4096:
+            _fail("string length exceeded")
+        return normalized
     if isinstance(value, list):
         return [_normalize(item, depth + 1) for item in value]
     if isinstance(value, Mapping):
@@ -97,7 +100,7 @@ def _normalize(value: Any, depth: int = 0) -> Any:
     _fail("unsupported value type")
 
 
-def parse_json(raw: bytes, max_bytes: int) -> Any:
+def parse_json(raw: bytes, *, max_bytes: int) -> Any:
     """Parse bounded UTF-8 JSON while preserving no ambiguous representation."""
     if not isinstance(raw, bytes) or isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
         _fail("invalid parser input")
@@ -195,6 +198,26 @@ def _list(value: Any, *, maximum: int, sorted_unique: bool = False) -> list[Any]
     return value
 
 
+def _ordered_records(records: list[Any], key_fields: tuple[str, ...], *, semantic_field: str) -> None:
+    """Require stable record order and one record for each semantic binding."""
+    keys: list[tuple[Any, ...]] = []
+    semantic: set[Any] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            _fail("invalid record ordering")
+        try:
+            key = tuple(record[field] for field in key_fields)
+            identity = record[semantic_field]
+        except KeyError:
+            _fail("invalid record ordering")
+        keys.append(key)
+        if identity in semantic:
+            _fail("duplicate semantic record")
+        semantic.add(identity)
+    if keys != sorted(keys) or len(set(keys)) != len(keys):
+        _fail("records must be sorted and unique")
+
+
 def _id_fields(obj: Mapping[str, Any], fields: tuple[str, ...]) -> None:
     for field in fields:
         _string(obj[field], identifier=True)
@@ -216,7 +239,13 @@ def _valid_hostname(hostname: str) -> bool:
     if not _DNS.fullmatch(hostname) or hostname.startswith("-"):
         return False
     lowered = hostname.lower()
-    forbidden = ("localhost", ".localhost", ".local", ".internal", ".invalid")
+    # HTTPS canary targets must resolve through ordinary public DNS.  Local and
+    # special-use names are never a safe assertion target, even if DNS happens to
+    # resolve them in one environment.
+    forbidden = (
+        "localhost", ".localhost", ".local", ".internal", ".invalid",
+        ".test", ".example", ".onion", ".home.arpa",
+    )
     return not any(lowered == suffix or lowered.endswith(suffix) for suffix in forbidden)
 
 
@@ -244,10 +273,9 @@ def _scenarios(value: Any) -> list[dict[str, Any]]:
     seen = set()
     for ordinal, item in enumerate(entries):
         item = _scenario(item, ordinal)
-        marker = (item["scenario_id"], item["adapter_version"])
-        if marker in seen:
+        if item["scenario_id"] in seen:
             _fail("duplicate scenario")
-        seen.add(marker)
+        seen.add(item["scenario_id"])
     return entries
 
 
@@ -344,12 +372,14 @@ def validate_test_manifest(value: Any) -> dict[str, Any]:
         bindings = _list(action["fixture_bindings"], maximum=20)
         for binding in bindings:
             binding = _object(binding, {"parameter_name", "fixture_id"}); _id_fields(binding, ("parameter_name", "fixture_id"))
+        _ordered_records(bindings, ("parameter_name", "fixture_id"), semantic_field="parameter_name")
         _enum(action["auth_profile"], {"anonymous", "bearer", "cookie_jar", "x_api_key"}); _enum(action["assertion_class"], {"anonymous_authenticated", "object_ownership", "role_boundary", "plan_entitlement"}); _statuses(action["allowed_status_codes"]); _body_shapes(action["allowed_body_shapes"]); _enum(action["side_effect_class"], {"read_only"})
     credentials = _list(obj["credential_bindings"], maximum=20)
     for binding in credentials:
         binding = _object(binding, {"semantic_role", "credential_handle_id", "auth_profile"}); _id_fields(binding, ("semantic_role",))
         if not isinstance(binding["credential_handle_id"], str) or not _HEX32.fullmatch(binding["credential_handle_id"]): _fail("invalid credential binding")
         _enum(binding["auth_profile"], {"anonymous", "bearer", "cookie_jar", "x_api_key"})
+    _ordered_records(credentials, ("semantic_role", "auth_profile", "credential_handle_id"), semantic_field="semantic_role")
     _budgets(obj["budgets"]); _egress(obj["egress"], env); _retry(obj["retry_policy"])
     policy = _object(obj["local_evidence_policy"], {"retention_seconds"}); _integer(policy["retention_seconds"], lower=1)
     _integer(obj["compiled_at_ms"], lower=0); _hash(obj["manifest_digest"])
@@ -423,7 +453,7 @@ def _enum_list(value: Any, choices: set[str], maximum: int = 20) -> list[str]:
 def validate_operational_run(value: Any) -> dict[str, Any]:
     obj = _contract(value, 32 * 1024); _reject_keys(obj, _FORBIDDEN_OPERATIONAL_KEYS); obj = _object(obj, {"schema_version", "run_id", "grant_id", "workspace_id", "project_id", "manifest_digest", "approval_projection_digest", "grant_digest", "event_sequence", "lifecycle_phase", "execution_disposition", "timestamps", "counters", "versions", "error_category", "stop_reason", "containment_codes", "redaction_count", "projection_digest", "signing_key_id", "signature_b64"})
     _enum(obj["schema_version"], {OPERATIONAL_RUN_SCHEMA}); _id_fields(obj, ("run_id", "grant_id", "workspace_id", "project_id")); _hash(obj["manifest_digest"]); _hash(obj["approval_projection_digest"]); _hash(obj["grant_digest"]); _integer(obj["event_sequence"], lower=0); phase = _enum(obj["lifecycle_phase"], {"prepared", "awaiting_execution_approval", "approved", "claimed", "running", "stop_requested", "finalizing", "terminal", "cancelled", "expired"})
-    terminal = phase in {"terminal", "cancelled", "expired"}; disposition = obj["execution_disposition"]
+    terminal = phase == "terminal"; disposition = obj["execution_disposition"]
     if terminal:
         _enum(disposition, {"completed", "incomplete", "failed", "stopped"})
     elif disposition is not None: _fail("preterminal disposition")
@@ -431,8 +461,26 @@ def validate_operational_run(value: Any) -> dict[str, Any]:
     for field, moment in timestamps.items():
         if moment is not None: _integer(moment, lower=0)
     if terminal != (timestamps["terminal_at_ms"] is not None): _fail("terminal timestamp consistency")
+    claimed = timestamps["claimed_at_ms"]; started = timestamps["started_at_ms"]
+    stop_requested = timestamps["stop_requested_at_ms"]; stop_acknowledged = timestamps["stop_acknowledged_at_ms"]
+    updated = timestamps["updated_at_ms"]; terminal_at = timestamps["terminal_at_ms"]
+    if started is not None and (claimed is None or claimed > started): _fail("invalid claim/start ordering")
+    if stop_acknowledged is not None and (stop_requested is None or stop_requested > stop_acknowledged): _fail("invalid stop ordering")
+    if terminal_at is not None:
+        for moment in (claimed, started, stop_requested, stop_acknowledged):
+            if moment is not None and moment > terminal_at: _fail("invalid terminal ordering")
+    if any(moment is not None and moment > updated for moment in (claimed, started, stop_requested, stop_acknowledged, terminal_at)):
+        _fail("updated timestamp precedes event")
+    if phase in {"prepared", "awaiting_execution_approval", "approved"} and any(
+        moment is not None for moment in (claimed, started, stop_requested, stop_acknowledged)
+    ): _fail("invalid pre-claim timestamps")
+    if phase == "claimed" and (claimed is None or started is not None or stop_requested is not None or stop_acknowledged is not None): _fail("invalid claimed timestamps")
+    if phase == "running" and (claimed is None or started is None or stop_requested is not None or stop_acknowledged is not None): _fail("invalid running timestamps")
+    if phase == "stop_requested" and (claimed is None or started is None or stop_requested is None): _fail("invalid stop-request timestamps")
     counters = _object(obj["counters"], {"requests_started", "requests_completed", "response_bytes_read", "actions_contained", "retries_used", "remaining_requests", "remaining_wall_ms"})
     for number in counters.values(): _integer(number, lower=0)
+    if counters["requests_started"] > 20 or counters["requests_completed"] > counters["requests_started"] or counters["actions_contained"] > counters["requests_started"] or counters["actions_contained"] > 20 or counters["retries_used"] > 1 or counters["remaining_requests"] > 20 or counters["requests_started"] + counters["remaining_requests"] > 20 or counters["remaining_wall_ms"] > 60000 or counters["response_bytes_read"] > 256 * 1024:
+        _fail("operational counter ceiling")
     versions = _object(obj["versions"], {"runner_version", "engine_version", "adapter_versions"}); _id_fields(versions, ("runner_version", "engine_version")); _version_list(versions["adapter_versions"]); _enum(obj["error_category"], _ERRORS); _enum(obj["stop_reason"], _STOPS); _enum_list(obj["containment_codes"], _CONTAINMENT); _integer(obj["redaction_count"], lower=0); _signature(obj, "projection_digest"); return copy.deepcopy(obj)
 
 
@@ -440,16 +488,17 @@ def validate_canary_findings(value: Any) -> dict[str, Any]:
     obj = _contract(value, 256 * 1024); _reject_keys(obj, _FORBIDDEN_FINDINGS_KEYS); obj = _object(obj, {"schema_version", "projection_id", "run_id", "grant_id", "workspace_id", "project_id", "environment_id", "manifest_digest", "approval_projection_digest", "grant_digest", "engine_version", "adapter_versions", "started_at_ms", "finished_at_ms", "assessment_outcome", "scenario_results", "containment_codes", "redaction_count", "projection_digest", "signing_key_id", "signature_b64"})
     _enum(obj["schema_version"], {CANARY_FINDINGS_SCHEMA}); _id_fields(obj, ("projection_id", "run_id", "grant_id", "workspace_id", "project_id", "environment_id", "engine_version")); _hash(obj["manifest_digest"]); _hash(obj["approval_projection_digest"]); _hash(obj["grant_digest"]); _version_list(obj["adapter_versions"]); start = _integer(obj["started_at_ms"], lower=0); finish = _integer(obj["finished_at_ms"], lower=0)
     if finish < start: _fail("invalid findings timestamps")
-    _enum(obj["assessment_outcome"], {"blocked", "observed", "inconclusive"}); entries = _list(obj["scenario_results"], maximum=4); seen = set()
+    _enum(obj["assessment_outcome"], {"blocked", "observed", "inconclusive"}); entries = _list(obj["scenario_results"], maximum=4); seen = set(); total_observations = 0
     for ordinal, item in enumerate(entries):
         item = _object(item, {"ordinal", "scenario_id", "adapter_version", "assessment_outcome", "route", "observations", "finding", "containment_codes", "redaction_count", "local_evidence_refs"})
         if _integer(item["ordinal"]) != ordinal: _fail("non-contiguous ordinal")
-        marker = (item["scenario_id"], item["adapter_version"])
-        if marker in seen: _fail("duplicate scenario result")
-        seen.add(marker); _id_fields(item, ("scenario_id", "adapter_version")); _enum(item["assessment_outcome"], {"blocked", "observed", "inconclusive"}); route = _object(item["route"], {"method", "route_template"}); _method(route["method"]); _route(route["route_template"])
+        if item["scenario_id"] in seen: _fail("duplicate scenario result")
+        seen.add(item["scenario_id"]); _id_fields(item, ("scenario_id", "adapter_version")); _enum(item["assessment_outcome"], {"blocked", "observed", "inconclusive"}); route = _object(item["route"], {"method", "route_template"}); _method(route["method"]); _route(route["route_template"])
         observations = _list(item["observations"], maximum=20)
         for observation in observations:
             observation = _object(observation, {"semantic_role", "status_code", "body_shape", "truncation_state"}); _id_fields(observation, ("semantic_role",)); _integer(observation["status_code"], lower=100, upper=599); _enum(observation["body_shape"], {"absent", "empty", "json_object", "json_array", "json_scalar", "text", "binary", "truncated", "invalid"}); _enum(observation["truncation_state"], {"complete", "truncated"})
+        _ordered_records(observations, ("semantic_role", "status_code", "body_shape", "truncation_state"), semantic_field="semantic_role")
+        total_observations += len(observations)
         finding = item["finding"]
         if finding is not None:
             finding = _object(finding, {"title", "reachability_rationale", "confidence", "recommended_control", "regression_suggestion"}); _string(finding["title"], limit=160)
@@ -458,6 +507,7 @@ def validate_canary_findings(value: Any) -> dict[str, Any]:
         _enum_list(item["containment_codes"], _CONTAINMENT); _integer(item["redaction_count"], lower=0); refs = _list(item["local_evidence_refs"], maximum=10, sorted_unique=True)
         for ref in refs:
             if not isinstance(ref, str) or not _EVIDENCE.fullmatch(ref): _fail("invalid evidence reference")
+    if total_observations > 20: _fail("too many observations")
     _enum_list(obj["containment_codes"], _CONTAINMENT); _integer(obj["redaction_count"], lower=0); _signature(obj, "projection_digest"); return copy.deepcopy(obj)
 
 

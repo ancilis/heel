@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import unittest
@@ -147,8 +148,8 @@ class CanaryContractTests(unittest.TestCase):
         bad = [b'{"a":1,"a":2}', b'{"a":true}', b'{"a":1.0}', b'{"a":NaN}', b'{"a":9007199254740992}', b'{"a":"\\ud800"}', b'{"e\\u0301":1,"\\u00e9":2}', b'\xff']
         for raw in bad:
             with self.subTest(raw=raw):
-                with self.assertRaises(ContractError): parse_json(raw, 1024)
-        with self.assertRaises(ContractError): parse_json(b'{}', 1)
+                with self.assertRaises(ContractError): parse_json(raw, max_bytes=1024)
+        with self.assertRaises(ContractError): parse_json(b'{}', max_bytes=1)
 
     def test_canonical_bytes_normalizes_and_orders_without_mutating(self):
         source = {"z": ["e\u0301"], "a": 1}
@@ -196,5 +197,78 @@ class CanaryContractTests(unittest.TestCase):
                 raw = (FIXTURES / name).read_bytes()
                 self.assertEqual(hashlib.sha256(raw).hexdigest(), expected_hash)
                 self.assertTrue(raw.endswith(b"\n"))
-                record = validators[name](parse_json(raw, 256 * 1024))
+                record = validators[name](parse_json(raw, max_bytes=256 * 1024))
                 self.assertEqual(raw, canonical_bytes(record) + b"\n")
+
+    def test_parser_is_keyword_bounded_and_recursively_bounded(self):
+        parameter = inspect.signature(parse_json).parameters["max_bytes"]
+        self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        too_long = "x" * 4097
+        for value in ({"outer": {"value": too_long}}, {too_long: "value"}):
+            with self.subTest(value=list(value)[:1]):
+                with self.assertRaises(ContractError):
+                    canonical_bytes(value)
+        with self.assertRaises(ContractError):
+            parse_json(("{\"x\":\"" + too_long + "\"}").encode(), max_bytes=8192)
+        nested: object = 0
+        for _ in range(17): nested = [nested]
+        with self.assertRaises(ContractError): canonical_bytes(nested)
+
+    def test_special_hostname_and_scenario_identity_collisions_are_rejected(self):
+        for hostname in ("canary.test", "canary.example", "canary.onion", "canary.home.arpa", "canary.internal"):
+            record = manifest()
+            record["environment"]["origin"] = "https://" + hostname
+            record["egress"]["hostname"] = hostname
+            with self.subTest(hostname=hostname):
+                with self.assertRaises(ContractError): validate_test_manifest(_digest(record, "manifest_digest"))
+        record = manifest()
+        record["scenarios"].append({"ordinal": 1, "scenario_id": "s", "adapter_version": "2"})
+        with self.assertRaises(ContractError): validate_test_manifest(_digest(record, "manifest_digest"))
+        record = findings()
+        duplicate = copy.deepcopy(record["scenario_results"][0]); duplicate["ordinal"] = 1; duplicate["adapter_version"] = "2"
+        record["scenario_results"].append(duplicate)
+        with self.assertRaises(ContractError): validate_canary_findings(_digest(record, "projection_digest"))
+
+    def test_operational_phase_timestamps_and_counters_fail_closed(self):
+        cancelled = operational(); cancelled["lifecycle_phase"] = "cancelled"; cancelled["execution_disposition"] = "stopped"; cancelled["timestamps"]["terminal_at_ms"] = 2
+        with self.assertRaises(ContractError): validate_operational_run(_digest(cancelled, "projection_digest"))
+        terminal = operational(); terminal["lifecycle_phase"] = "terminal"; terminal["execution_disposition"] = "completed"; terminal["timestamps"].update({"claimed_at_ms": 4, "started_at_ms": 3, "terminal_at_ms": 2})
+        with self.assertRaises(ContractError): validate_operational_run(_digest(terminal, "projection_digest"))
+        counters = operational(); counters["counters"].update({"requests_started": 21, "requests_completed": 22, "actions_contained": 21, "retries_used": 2, "remaining_requests": 21, "remaining_wall_ms": 60001})
+        with self.assertRaises(ContractError): validate_operational_run(_digest(counters, "projection_digest"))
+
+    def test_projection_collections_are_semantically_unique_and_sorted(self):
+        record = manifest()
+        record["actions"][0]["fixture_bindings"] = [{"parameter_name": "z", "fixture_id": "f2"}, {"parameter_name": "a", "fixture_id": "f1"}]
+        with self.assertRaises(ContractError): validate_test_manifest(_digest(record, "manifest_digest"))
+        record = manifest()
+        record["credential_bindings"] = [{"semantic_role": "z", "credential_handle_id": "1" * 32, "auth_profile": "bearer"}, {"semantic_role": "a", "credential_handle_id": "2" * 32, "auth_profile": "bearer"}]
+        with self.assertRaises(ContractError): validate_test_manifest(_digest(record, "manifest_digest"))
+        record = findings()
+        observations = record["scenario_results"][0]["observations"]
+        observations.extend([{"semantic_role": "z", "status_code": 200, "body_shape": "absent", "truncation_state": "complete"}, {"semantic_role": "a", "status_code": 200, "body_shape": "absent", "truncation_state": "complete"}])
+        with self.assertRaises(ContractError): validate_canary_findings(_digest(record, "projection_digest"))
+
+    def test_findings_total_observation_ceiling_and_recursive_privacy_hold(self):
+        record = findings()
+        second = copy.deepcopy(record["scenario_results"][0]); second.update({"ordinal": 1, "scenario_id": "s2"})
+        second["observations"] = copy.deepcopy(second["observations"]) * 20
+        record["scenario_results"][0]["observations"] *= 2
+        record["scenario_results"].append(second)
+        with self.assertRaises(ContractError): validate_canary_findings(_digest(record, "projection_digest"))
+        secret = "customer-private-value-do-not-echo"
+        private = approval(); private["actions"][0]["nested"] = {"headers": {"x": secret}}
+        with self.assertRaises(ContractError) as error: validate_approval_projection(_digest(private, "projection_digest"))
+        self.assertNotIn(secret, str(error.exception))
+
+    def test_numeric_budget_ceilings_and_deep_detachment_hold(self):
+        for field, value in (("maximum_requests", 0), ("maximum_requests", 21), ("maximum_concurrency", 2), ("action_timeout_ms", 0), ("action_timeout_ms", 5001), ("wall_timeout_ms", 0), ("wall_timeout_ms", 60001)):
+            record = manifest(); record["budgets"][field] = value
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(ContractError): validate_test_manifest(_digest(record, "manifest_digest"))
+        record = manifest()
+        detached = validate_test_manifest(record)
+        detached["environment"]["environment_id"] = "mutated"
+        detached["actions"][0]["allowed_status_codes"].append(201)
+        self.assertEqual(record["environment"]["environment_id"], "env_staging")
+        self.assertEqual(record["actions"][0]["allowed_status_codes"], [200])
