@@ -36,12 +36,15 @@ class ScriptedControlTransport:
         return self.responses.pop(0)
 
 
-def _gate(*, server_time_ms=2_000, generation=7, stop_reason="none", active=True):
+def _gate(
+    *, server_time_ms=2_000, generation=7, stop_reason="none", active=True,
+    proof_expires_at_ms=20_000,
+):
     return {
         "active": active,
         "runner_state": "active",
         "proof_state": "valid",
-        "proof_expires_at_ms": 20_000,
+        "proof_expires_at_ms": proof_expires_at_ms,
         "kill_switch_generation": generation,
         "stop_reason": stop_reason,
         "server_time_ms": server_time_ms,
@@ -147,7 +150,10 @@ def _findings_projection(coordinator, manifest, projection, grant):
     }
 
 
-def _permit(authority, coordinator, grant, findings):
+def _permit(
+    authority, coordinator, grant, findings, *, issued_at_ms=2_000,
+    expires_at_ms=602_000,
+):
     projection_bytes = len(canonical_bytes(findings))
     unsigned = {
         "schema_version": DISCLOSURE_PERMIT_SCHEMA,
@@ -165,7 +171,7 @@ def _permit(authority, coordinator, grant, findings):
             "scenario_count": 0, "finding_count": 0,
         },
         "approved_by": "user_owner_123", "approved_at_ms": 2_000,
-        "issued_at_ms": 2_000, "expires_at_ms": 602_000,
+        "issued_at_ms": issued_at_ms, "expires_at_ms": expires_at_ms,
         "permit_nonce": "permit_nonce_runner_upload",
     }
     return {
@@ -188,6 +194,7 @@ def _coordinator(tmp_path, responses, *, monotonic=lambda: 1.0):
         clock=lambda: 2_000,
         transport=transport,
         nonce_source=lambda key: _nonce(b"c"),
+        trusted_disclosure_keys={authority.key_id: authority.public_key},
     )
     coordinator = RunnerCoordinator(
         control=client,
@@ -198,11 +205,11 @@ def _coordinator(tmp_path, responses, *, monotonic=lambda: 1.0):
         clock_ms=lambda: 2_000,
         monotonic=monotonic,
     )
-    return coordinator, client, transport, manifest, projection, grant
+    return coordinator, client, transport, manifest, projection, grant, authority
 
 
 def test_claim_decodes_closed_bundle_installs_all_run_chains_and_builds_safe_projection(tmp_path):
-    coordinator, _, transport, manifest, projection, grant = _coordinator(
+    coordinator, _, transport, manifest, projection, grant, _ = _coordinator(
         tmp_path,
         lambda manifest, projection, grant: [
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
@@ -234,7 +241,7 @@ def test_claim_decodes_closed_bundle_installs_all_run_chains_and_builds_safe_pro
 
 
 def test_idle_claim_requires_exact_204_empty_body_and_advances_only_claim_chain(tmp_path):
-    coordinator, client, _, _, _, _ = _coordinator(
+    coordinator, client, _, _, _, _, _ = _coordinator(
         tmp_path,
         lambda *_: [(204, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, None)],
     )
@@ -254,14 +261,14 @@ def test_malformed_claim_fails_before_any_local_nonce_state_is_installed(tmp_pat
         mutation(response)
         return [(200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, response)]
 
-    coordinator, client, _, _, _, _ = _coordinator(tmp_path, responses)
+    coordinator, client, _, _, _, _, _ = _coordinator(tmp_path, responses)
     with pytest.raises(ValueError, match="invalid runner claim response"):
         coordinator.claim()
     assert client._chains == {}
 
 
 def test_live_gate_rejects_replayed_server_time_and_regressed_control_generation(tmp_path):
-    coordinator, _, _, _, _, _ = _coordinator(
+    coordinator, _, _, _, _, _, _ = _coordinator(
         tmp_path,
         lambda manifest, projection, grant: [
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
@@ -289,7 +296,7 @@ def test_live_gate_rejects_replayed_server_time_and_regressed_control_generation
 def test_invalid_gate_status_header_or_body_never_mutates_local_chain_state(
     tmp_path, response,
 ):
-    coordinator, client, _, _, _, _ = _coordinator(
+    coordinator, client, _, _, _, _, _ = _coordinator(
         tmp_path,
         lambda manifest, projection, grant: [
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
@@ -309,7 +316,7 @@ def test_invalid_gate_status_header_or_body_never_mutates_local_chain_state(
 
 def test_progress_result_and_stop_ack_decode_only_exact_service_responses(tmp_path):
     now = [1.0]
-    coordinator, _, _, _, _, grant = _coordinator(
+    coordinator, _, _, _, _, grant, _ = _coordinator(
         tmp_path,
         lambda manifest, projection, grant: [
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
@@ -349,7 +356,7 @@ def test_progress_result_and_stop_ack_decode_only_exact_service_responses(tmp_pa
 
 
 def test_execution_adapter_supplies_only_the_live_claim_gate_and_fixed_local_transport(tmp_path):
-    coordinator, _, _, _, _, grant = _coordinator(
+    coordinator, _, _, _, _, grant, _ = _coordinator(
         tmp_path,
         lambda manifest, projection, grant: [
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
@@ -415,7 +422,7 @@ def test_supervisor_uses_the_exact_timestamp_signed_by_the_concrete_stop_ack():
 
 
 def test_heartbeat_and_progress_use_independent_concurrent_nonce_chains(tmp_path):
-    coordinator, client, _, _, projection, grant = _coordinator(
+    coordinator, client, _, _, projection, grant, _ = _coordinator(
         tmp_path,
         lambda manifest, projection, grant: [
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
@@ -475,14 +482,14 @@ def test_findings_upload_is_closed_bounded_and_continues_the_terminal_result_cha
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, receipt_holder),
         ]
 
-    coordinator, _, transport, manifest, projection, grant = _coordinator(tmp_path, responses)
+    coordinator, client, transport, manifest, projection, grant, authority = _coordinator(
+        tmp_path, responses,
+    )
     lease = coordinator.claim()
     assert lease is not None
     terminal = _phase(lease.operational_projection, coordinator.signer, "terminal")
     coordinator.result(grant["run_id"], terminal)
     findings = _findings_projection(coordinator, manifest, projection, grant)
-    authority = SigningAuthority.generate()
-    coordinator.trusted_grant_keys[authority.key_id] = authority.public_key
     permit = _permit(authority, coordinator, grant, findings)
     receipt_holder.update({
         "schema_version": "heel.canary-findings-receipt.v1",
@@ -509,3 +516,185 @@ def test_findings_upload_is_closed_bounded_and_continues_the_terminal_result_cha
         "run_id": grant["run_id"], "permit": permit,
         "findings_projection": findings,
     })
+
+
+def test_delayed_execution_rejects_stale_authenticated_claim_gate_before_executor_use(tmp_path):
+    now = [1.0]
+    coordinator, _, _, _, _, _, _ = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+        ],
+        monotonic=lambda: now[0],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    now[0] = 1.501
+    with pytest.raises(ValueError, match="gate is stale"):
+        coordinator.execution_gate(lease.run_id)
+
+    entered = []
+
+    class DelayedExecutor:
+        def execute(self, bundle, *, transport, gate_source, cancellation, on_progress):
+            del bundle, transport, cancellation, on_progress
+            entered.append(True)
+            gate_source()
+
+    adapter = RunnerExecutionAdapter(
+        coordinator=coordinator, executor=DelayedExecutor(), transport=object(),
+    )
+    with pytest.raises(ValueError, match="gate is stale"):
+        adapter.execute(
+            lease, cancellation=CancellationToken(), on_progress=lambda _: None,
+        )
+    assert entered == [True]
+
+
+def test_authenticated_gate_cannot_outlive_proof_horizon_by_local_elapsed_time(tmp_path):
+    now = [1.0]
+
+    def responses(manifest, projection, grant):
+        response = _claim(manifest, projection, grant)
+        response["gate"] = _gate(proof_expires_at_ms=2_100)
+        return [(200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, response)]
+
+    coordinator, _, _, _, _, _, _ = _coordinator(
+        tmp_path, responses, monotonic=lambda: now[0],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    now[0] = 1.1
+    with pytest.raises(ValueError, match="proof has expired"):
+        coordinator.execution_gate(lease.run_id)
+
+
+@pytest.mark.parametrize("kind", ["forged", "expired", "wrong-key", "wrong-binding"])
+def test_public_findings_upload_reverifies_permit_before_any_transport(
+    tmp_path, kind,
+):
+    coordinator, client, transport, manifest, projection, grant, authority = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, _status(
+                grant["run_id"], approval_id=projection["projection_id"], status="terminal",
+            )),
+        ],
+    )
+    lease = coordinator.claim()
+    terminal = _phase(lease.operational_projection, coordinator.signer, "terminal")
+    coordinator.result(grant["run_id"], terminal)
+    findings = _findings_projection(coordinator, manifest, projection, grant)
+    if kind == "forged":
+        permit = _permit(authority, coordinator, grant, findings)
+        permit["permit_nonce"] = "forged_permit_nonce"
+    elif kind == "expired":
+        permit = _permit(
+            authority, coordinator, grant, findings,
+            issued_at_ms=1_000, expires_at_ms=2_000,
+        )
+    elif kind == "wrong-key":
+        permit = _permit(SigningAuthority.generate(), coordinator, grant, findings)
+    else:
+        unsigned_findings = {
+            key: copy.deepcopy(value) for key, value in findings.items()
+            if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+        }
+        unsigned_findings["grant_id"] = "grant_other_123456789"
+        findings = {
+            **unsigned_findings,
+            "projection_digest": canonical_digest(unsigned_findings),
+            "signing_key_id": coordinator.signer.key_id,
+            "signature_b64": base64.b64encode(
+                coordinator.signer.sign(canonical_bytes(unsigned_findings))
+            ).decode("ascii"),
+        }
+        permit = _permit(
+            authority, coordinator,
+            {**grant, "grant_id": "grant_other_123456789"}, findings,
+        )
+    before = len(transport.requests)
+    with pytest.raises(ValueError):
+        client.upload_findings(
+            run_id=grant["run_id"], permit=permit, findings_projection=findings,
+        )
+    assert len(transport.requests) == before
+
+
+def test_default_heartbeat_cadence_has_margin_below_gate_staleness_limit():
+    service = RunnerService(
+        coordinator=object(), executor=object(), idle_poll_interval=2.0,
+    )
+    assert service.heartbeat_interval <= 0.4
+
+
+def test_stopped_valid_terminal_projection_is_sent_after_bounded_ack_and_unwind(tmp_path):
+    coordinator, _, _, _, _, _, _ = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+        ],
+    )
+    lease = coordinator.claim()
+    results = []
+
+    class StoppingCoordinator:
+        def claim(self):
+            return lease
+
+        def heartbeat(self, run_id, projection):
+            del run_id, projection
+            return ExecutionGate(True, "active", "valid", 20_000, 7, "cloud_stop", 2_001)
+
+        def progress(self, run_id, projection):
+            del run_id, projection
+
+        def stop_ack(self, run_id, projection, *, deadline):
+            del run_id, projection, deadline
+
+        def result(self, run_id, projection):
+            results.append((run_id, validate_operational_run(projection)))
+
+    class StoppedExecutor:
+        def execute(self, claimed, *, cancellation, on_progress):
+            del on_progress
+            assert claimed is lease
+            while not cancellation.cancelled:
+                pass
+            assert cancellation.stop_ack_event.wait(1)
+            stopping = _phase(
+                lease.operational_projection, coordinator.signer, "stop_requested",
+            )
+            unsigned = {
+                key: copy.deepcopy(value) for key, value in stopping.items()
+                if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+            }
+            unsigned["event_sequence"] += 1
+            unsigned["lifecycle_phase"] = "terminal"
+            unsigned["execution_disposition"] = "stopped"
+            unsigned["timestamps"]["stop_acknowledged_at_ms"] = 2_000
+            unsigned["timestamps"]["terminal_at_ms"] = 2_000
+            signature = coordinator.signer.sign(canonical_bytes(unsigned))
+            return {"operational_projection": validate_operational_run({
+                **unsigned, "projection_digest": canonical_digest(unsigned),
+                "signing_key_id": coordinator.signer.key_id,
+                "signature_b64": base64.b64encode(signature).decode("ascii"),
+            })}
+
+        def prepare_stop_ack(self, claimed, projection, stop_reason, proposed_at_ms):
+            del claimed, projection, stop_reason, proposed_at_ms
+            return _phase(
+                lease.operational_projection, coordinator.signer, "stop_requested",
+            )
+
+    RunnerService(
+        coordinator=StoppingCoordinator(), executor=StoppedExecutor(),
+        heartbeat_interval=0.05, idle_poll_interval=2.0,
+    ).run_once()
+    assert len(results) == 1
+    assert results[0][0] == lease.run_id
+    assert results[0][1]["execution_disposition"] == "stopped"

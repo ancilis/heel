@@ -2,6 +2,8 @@ import base64
 import copy
 import hashlib
 import inspect
+import json
+import threading
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -42,7 +44,37 @@ class Transport:
     def __init__(self): self.requests = []; self.responses = []
     def post(self, path, *, headers, body):
         self.requests.append((path, dict(headers), body))
-        return self.responses.pop(0) if self.responses else (200, {"X-Heel-Runner-Next-Nonce": "next"})
+        if self.responses:
+            return self.responses.pop(0)
+        response_headers = {
+            "X-Heel-Runner-Next-Nonce": base64.b64encode(b"n" * 32).decode(),
+        }
+        if path.endswith("/claim"):
+            return 204, response_headers, None
+        if path.endswith("/heartbeat"):
+            return 200, response_headers, {
+                "active": True, "runner_state": "active", "proof_state": "valid",
+                "proof_expires_at_ms": 2_000, "kill_switch_generation": 0,
+                "stop_reason": "none", "server_time_ms": 1_000,
+            }
+        if path.endswith("/stop-ack"):
+            return 200, response_headers, {
+                "accepted": True, "deadline_met": True, "late": False,
+            }
+        request = json.loads(body)
+        projection = request["operational_projection"]
+        phase = "terminal" if path.endswith("/result") else "running"
+        return 200, response_headers, {
+            "schema_version": "heel.canary-run-status.v1", "run_id": request["run_id"],
+            "approval_id": "approval", "grant_id": projection["grant_id"],
+            "status": phase,
+            "execution_disposition": "completed" if phase == "terminal" else None,
+            "error_category": "none", "stop_reason": "none",
+            "source_event_sequence": 1, "quota_state": "reserved",
+            "kill_switch_generation": 0, "stop_generation": 0,
+            "stop_deadline_ms": None, "stop_acknowledged_at_ms": None,
+            "stop_ack_late": False,
+        }
 
 
 def operational_projection(phase: str) -> dict:
@@ -143,7 +175,7 @@ def test_named_control_methods_emit_closed_bodies_and_separate_stop_ack_chain():
                            ("result", "run"), ("stop-ack", "run")]
     assert transport.requests[1][1]["X-Heel-Runner-Nonce"] != transport.requests[4][1]["X-Heel-Runner-Nonce"]
     public = {name for name, method in vars(RunnerControlClient).items() if callable(method) and not name.startswith("_")}
-    assert public == {"claim", "heartbeat", "progress", "result", "stop_ack", "retry_last",
+    assert public == {"claim", "heartbeat", "progress", "result", "stop_ack",
                       "start_resync", "complete_resync", "install_rotation_claim",
                       "upload_findings"}
     assert all(parameter.kind is not inspect.Parameter.VAR_KEYWORD for method in (
@@ -168,6 +200,128 @@ def test_control_validation_fails_before_nonce_signing_or_transport(method_name,
     assert nonces.keys == []
     assert signer.payloads == []
     assert transport.requests == []
+
+
+@pytest.mark.parametrize(("method_name", "projection", "response"), [
+    ("claim", None, (503, {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"a" * 32).decode()}, None)),
+    ("heartbeat", operational_projection("claimed"), (200, {"X-Heel-Runner-Next-Nonce": "bad"}, {})),
+    ("progress", operational_projection("running"), (503, {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"a" * 32).decode()}, {})),
+    ("result", operational_projection("terminal"), (200, {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"a" * 32).decode()}, {"unknown": True})),
+    ("stop_ack", operational_projection("stop_requested"), (200, {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"a" * 32).decode()}, {"accepted": True})),
+])
+def test_every_public_control_operation_rejects_non_exact_response_without_mutation(
+    method_name, projection, response,
+):
+    transport, signer = Transport(), Signer()
+    transport.responses = [response]
+    client = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner",
+        signer=signer, clock=lambda: 1000, transport=transport,
+        nonce_source=NonceSource(),
+    )
+    with pytest.raises(ValueError):
+        if method_name == "claim":
+            client.claim()
+        else:
+            getattr(client, method_name)(
+                run_id="run", operational_projection=copy.deepcopy(projection),
+            )
+    assert client._chains == {}
+    assert client.calls == []
+
+
+def test_resync_install_serializes_behind_inflight_control_and_wins_generation():
+    started, release = threading.Event(), threading.Event()
+    recovered_nonce = base64.b64encode(b"r" * 32).decode()
+
+    class BlockingTransport(Transport):
+        def post(self, path, *, headers, body):
+            self.requests.append((path, dict(headers), body))
+            if path.endswith("/heartbeat"):
+                started.set()
+                assert release.wait(1)
+                return 200, {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"o" * 32).decode()}, {
+                    "active": True, "runner_state": "active", "proof_state": "valid",
+                    "proof_expires_at_ms": 2_000, "kill_switch_generation": 0,
+                    "stop_reason": "none", "server_time_ms": 1_000,
+                }
+            assert path.endswith("/resync/complete")
+            return 200, {}, {
+                "schema_version": "heel.runner-resync-completed.v2",
+                "chain": {"operation": "heartbeat", "run_id": "run"},
+                "next_sequence": 9, "next_nonce_b64": recovered_nonce,
+                "expires_at_ms": 2_000, "generation": 2,
+            }
+
+    transport, signer = BlockingTransport(), Signer()
+    client = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner",
+        signer=signer, clock=lambda: 1000, transport=transport,
+        nonce_source=NonceSource(),
+    )
+    pending = PendingRunnerResync(
+        "rrs_" + "a" * 32, "heartbeat", "run",
+        base64.b64encode(b"c" * 32).decode(), base64.b64encode(b"s" * 32).decode(),
+        8, 2_000, 1,
+    )
+    failures = []
+    control = threading.Thread(target=lambda: client.heartbeat(
+        run_id="run", operational_projection=operational_projection("claimed"),
+    ))
+    recovery = threading.Thread(target=lambda: _capture(failures, client.complete_resync, pending))
+    control.start()
+    assert started.wait(1)
+    recovery.start()
+    assert len(transport.requests) == 1
+    release.set()
+    control.join(1); recovery.join(1)
+    assert failures == []
+    assert client._chains["heartbeat:run"] == (recovered_nonce, 9, 2)
+
+
+def test_rotation_install_serializes_behind_inflight_claim_and_wins_generation():
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingClaimTransport(Transport):
+        def post(self, path, *, headers, body):
+            self.requests.append((path, dict(headers), body))
+            started.set()
+            assert release.wait(1)
+            return 204, {
+                "X-Heel-Runner-Next-Nonce": base64.b64encode(b"o" * 32).decode(),
+            }, None
+
+    transport, signer = BlockingClaimTransport(), Signer()
+    client = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner",
+        signer=signer, clock=lambda: 1000, transport=transport,
+        nonce_source=NonceSource(),
+    )
+    rotated_nonce = base64.b64encode(b"r" * 32).decode()
+    activation = {
+        "schema_version": "heel.runner-rotation-activated.v2", "workspace_id": "ws",
+        "runner_id": "runner", "initial_claim_nonce": rotated_nonce,
+        "initial_claim_sequence": 7, "initial_claim_generation": 3,
+    }
+    failures = []
+    control = threading.Thread(target=client.claim)
+    rotation = threading.Thread(target=lambda: _capture(
+        failures, client.install_rotation_claim, activation,
+    ))
+    control.start()
+    assert started.wait(1)
+    rotation.start()
+    release.set()
+    control.join(1); rotation.join(1)
+    assert failures == []
+    assert client._chains["claim"] == (rotated_nonce, 7, 3)
+
+
+def _capture(failures, method, *args):
+    try:
+        method(*args)
+    except BaseException as exc:
+        failures.append(exc)
 
 
 def test_resync_signs_its_own_closed_envelopes_and_installs_recovered_sequence():

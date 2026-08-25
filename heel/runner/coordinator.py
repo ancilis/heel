@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 import threading
 import time
+from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from heel.canary_contracts import (
@@ -26,6 +27,9 @@ from heel.runner.execution import (
 from heel.runner.identity import RunnerIdentity, SecureSigner
 from heel.runner.service import ClaimLease
 from heel.runner.store import RunnerStore
+
+
+_MAX_AUTHENTICATED_GATE_AGE_SECONDS = 0.5
 
 
 def _signed_projection(unsigned: dict[str, Any], signer: SecureSigner) -> dict[str, Any]:
@@ -82,10 +86,14 @@ class RunnerCoordinator:
         self.store = store
         self.identity = identity
         self.signer = signer
-        self.trusted_grant_keys = dict(trusted_grant_keys)
+        trust = dict(trusted_grant_keys)
+        if dict(control._trusted_disclosure_keys) != trust:
+            raise ValueError("runner control disclosure authority binding is invalid")
+        self.trusted_grant_keys = MappingProxyType(trust)
         self.clock_ms = clock_ms
         self.monotonic = monotonic
         self._gates: dict[str, ExecutionGate] = {}
+        self._gate_receipts: dict[str, float] = {}
         self._bindings: dict[str, tuple[str, str, str]] = {}
         self._terminal_runs: set[str] = set()
         self._lock = threading.Lock()
@@ -96,8 +104,18 @@ class RunnerCoordinator:
             raise ValueError("runner clock returned an invalid timestamp")
         return value
 
+    def _now_monotonic(self) -> float:
+        value = self.monotonic()
+        if (
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value < 0
+        ):
+            raise ValueError("runner monotonic clock returned an invalid timestamp")
+        return float(value)
+
     def claim(self) -> ClaimLease | None:
         response = self.control._claim_closed()
+        received_at = self._now_monotonic()
         if response is None:
             return None
         grant = response["grant"]
@@ -123,6 +141,7 @@ class RunnerCoordinator:
             if response["run_id"] in self._gates:
                 raise ValueError("runner returned an already active claim")
             self._gates[response["run_id"]] = gate
+            self._gate_receipts[response["run_id"]] = received_at
             self._bindings[response["run_id"]] = (
                 grant["grant_id"], projection["projection_id"],
                 projection["projection_digest"],
@@ -176,13 +195,26 @@ class RunnerCoordinator:
 
     def execution_gate(self, run_id: str) -> ExecutionGate:
         """Return the latest authenticated gate snapshot for local attempt authorization."""
-        return self._known_run(run_id)
+        if type(run_id) is not str or not run_id:
+            raise ValueError("active runner claim is required")
+        with self._lock:
+            gate = self._gates.get(run_id)
+            received_at = self._gate_receipts.get(run_id)
+        if gate is None or received_at is None:
+            raise ValueError("active runner claim is required")
+        elapsed = self._now_monotonic() - received_at
+        if elapsed < 0 or elapsed > _MAX_AUTHENTICATED_GATE_AGE_SECONDS:
+            raise ValueError("authenticated runner gate is stale")
+        if elapsed * 1000 >= gate.proof_expires_at_ms - gate.server_time_ms:
+            raise ValueError("authenticated runner gate proof has expired")
+        return gate
 
     def heartbeat(
         self, run_id: str, operational_projection: dict[str, Any],
     ) -> ExecutionGate:
         previous = self._known_run(run_id)
         response = self.control._heartbeat_closed(run_id, operational_projection)
+        received_at = self._now_monotonic()
         gate = ExecutionGate(**response)
         if gate.server_time_ms <= previous.server_time_ms:
             raise ValueError("runner gate server time did not advance")
@@ -193,6 +225,7 @@ class RunnerCoordinator:
             if current != previous:
                 raise RuntimeError("runner gate update raced")
             self._gates[run_id] = gate
+            self._gate_receipts[run_id] = received_at
         return gate
 
     def progress(self, run_id: str, operational_projection: dict[str, Any]) -> object:
@@ -297,7 +330,7 @@ class RunnerCoordinator:
             raise ValueError("disclosure permit is expired or not yet valid")
         try:
             verify_envelope(
-                self.trusted_grant_keys,
+                dict(self.trusted_grant_keys),
                 {
                     "signing_key_id": permit_value["signing_key_id"],
                     "signature_b64": permit_value["signature_b64"],

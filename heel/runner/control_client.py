@@ -6,7 +6,8 @@ import hashlib
 import secrets
 import threading
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from heel.canary_contracts import (
@@ -99,7 +100,8 @@ class RunnerControlClient:
     """Emit only named closed control/recovery envelopes; no generic request API exists."""
 
     def __init__(self, *, origin, workspace_id, runner_id, signer, clock, transport, nonce_source,
-                 resync_random_source=secrets.token_bytes):
+                 resync_random_source=secrets.token_bytes,
+                 trusted_disclosure_keys: Mapping[str, object] | None = None):
         parsed = urlsplit(origin)
         if origin != f"{parsed.scheme}://{parsed.netloc}" or parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("origin must be one exact pathless origin")
@@ -108,11 +110,18 @@ class RunnerControlClient:
         self.origin, self.workspace_id, self.runner_id = origin, workspace_id, runner_id
         self.signer, self.clock, self.transport, self.nonce_source = signer, clock, transport, nonce_source
         self.resync_random_source = resync_random_source
+        if trusted_disclosure_keys is not None and not isinstance(
+            trusted_disclosure_keys, Mapping,
+        ):
+            raise ValueError("trusted disclosure keys must be a mapping")
+        self._trusted_disclosure_keys = MappingProxyType(
+            dict(trusted_disclosure_keys or {})
+        )
         self._chains: dict[str, tuple[str, int, int]] = {}
         self._state_lock = threading.Lock()
         self._chain_locks: dict[str, threading.Lock] = {}
         self._terminal_runs: set[str] = set()
-        self._last: _Call | None = None
+        self._terminal_bindings: dict[str, tuple[str, str, str, str]] = {}
         self.calls: list[_Call] = []
 
     @staticmethod
@@ -160,42 +169,11 @@ class RunnerControlClient:
             headers["X-Heel-Runner-Nonce"] = nonce; headers["X-Heel-Runner-Sequence"] = str(sequence)
         return headers
 
-    def _post_control(self, operation: str, body_payload: dict[str, Any], run_id: str | None, *, retry: bool = False):
-        if retry:
-            if self._last is None: raise ValueError("no request is available to retry")
-            return self._post(self._last)
-        nonce, sequence, generation, chain = self._next_chain(operation, run_id)
-        path, body, timestamp_ms = self._control_path(operation, run_id), canonical_bytes(body_payload), self._timestamp()
-        proof = {"schema_version": "heel.runner-request-proof.v1", "workspace_id": self.workspace_id, "runner_id": self.runner_id, "key_id": self.signer.key_id, "capability": _CAPS[operation], "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms, "server_nonce": nonce, "sequence": sequence}
-        call = _Call(
-            path,
-            self._headers(
-                self._signature(b"heel.runner-pop.v1\0" + canonical_bytes(proof)),
-                timestamp_ms,
-                nonce=nonce,
-                sequence=sequence,
-            ),
-            body,
-            _CAPS[operation],
-            chain,
-            sequence,
-            generation,
-        )
-        self._last = call
-        return self._post(call)
-
-    def _post(self, call: _Call):
-        response = self.transport.post(call.path, headers=call.headers, body=call.body)
-        if not isinstance(response, tuple) or len(response) < 2: raise ValueError("runner transport returned an invalid response")
-        status, headers = response[0], response[1]; self.calls.append(call)
-        next_nonce = headers.get("X-Heel-Runner-Next-Nonce") if isinstance(headers, dict) else None
-        if not isinstance(next_nonce, str) or not next_nonce: raise ValueError("control response omitted next nonce")
-        self._chains[call.chain] = (next_nonce, call.sequence + 1, call.generation)
-        return status, headers
-
     def _post_closed(
         self, call: _Call, operation: str, run_id: str | None,
         *, upload_binding: tuple[dict[str, Any], dict[str, Any], int, int] | None = None,
+        projection_binding: tuple[str, str, str, str] | None = None,
+        include_response_metadata: bool = False,
     ):
         """Decode one closed coordinator response before atomically advancing any cursor."""
         response = self.transport.post(call.path, headers=call.headers, body=call.body)
@@ -222,6 +200,8 @@ class RunnerControlClient:
             if status != 200:
                 raise ValueError(f"invalid runner {operation} response")
             body = self._decode_status(body, run_id, operation)
+            if projection_binding is None or body["grant_id"] != projection_binding[2]:
+                raise ValueError(f"invalid runner {operation} response")
         elif operation == "stop-ack":
             if (
                 status != 200 or not isinstance(body, dict)
@@ -266,7 +246,10 @@ class RunnerControlClient:
             self._chains = staged
             if operation == "result" and body["status"] == "terminal":
                 self._terminal_runs.add(run_id)
+                self._terminal_bindings[run_id] = projection_binding
             self.calls.append(call)
+        if include_response_metadata:
+            return body, status, dict(headers)
         return body
 
     def _operation_lock(self, operation: str, run_id: str | None) -> threading.Lock:
@@ -446,7 +429,9 @@ class RunnerControlClient:
     def _closed_control_locked(
         self, operation: str, run_id: str | None,
         operational_projection: object | None = None,
+        *, include_response_metadata: bool = False,
     ):
+        projection_binding = None
         if operation == "claim":
             request = validate_runner_claim_request({
                 "schema_version": "heel.runner-claim-request.v1",
@@ -459,6 +444,11 @@ class RunnerControlClient:
                 "operational_projection": operational_projection,
             })
             self._verify_projection_signature(request["operational_projection"])
+            projection = request["operational_projection"]
+            projection_binding = (
+                projection["workspace_id"], projection["project_id"],
+                projection["grant_id"], projection["approval_projection_digest"],
+            )
         nonce, sequence, generation, chain = self._next_chain(operation, run_id)
         path, body, timestamp_ms = (
             self._control_path(operation, run_id), canonical_bytes(request), self._timestamp()
@@ -478,16 +468,21 @@ class RunnerControlClient:
             ),
             body, _CAPS[operation], chain, sequence, generation,
         )
-        return self._post_closed(call, operation, run_id)
+        return self._post_closed(
+            call, operation, run_id, projection_binding=projection_binding,
+            include_response_metadata=include_response_metadata,
+        )
 
     def _closed_control(
         self, operation: str, run_id: str | None,
         operational_projection: object | None = None,
+        *, include_response_metadata: bool = False,
     ):
         self._validate_chain(operation, run_id)
         with self._operation_lock(operation, run_id):
             return self._closed_control_locked(
                 operation, run_id, operational_projection,
+                include_response_metadata=include_response_metadata,
             )
 
     def _claim_closed(self):
@@ -512,6 +507,9 @@ class RunnerControlClient:
         with self._state_lock:
             if run_id not in self._terminal_runs:
                 raise ValueError("terminal runner result is required before disclosure")
+            terminal_binding = self._terminal_bindings.get(run_id)
+        if terminal_binding is None:
+            raise ValueError("terminal runner result is required before disclosure")
         try:
             permit_value = validate_disclosure_permit(permit)
             findings = validate_canary_findings(findings_projection)
@@ -524,6 +522,10 @@ class RunnerControlClient:
         if (
             permit_value["workspace_id"] != self.workspace_id
             or permit_value["run_id"] != run_id
+            or (
+                permit_value["workspace_id"], permit_value["project_id"],
+                permit_value["grant_id"], findings["approval_projection_digest"],
+            ) != terminal_binding
             or findings["workspace_id"] != self.workspace_id
             or findings["run_id"] != run_id
             or findings["project_id"] != permit_value["project_id"]
@@ -552,12 +554,32 @@ class RunnerControlClient:
         if len(body) > _MAX_FINDINGS_UPLOAD_BYTES:
             raise ValueError("invalid runner findings upload")
         with self._operation_lock("result", run_id):
+            timestamp_ms = self._timestamp()
+            unsigned_permit = {
+                key: value for key, value in permit_value.items()
+                if key not in {"permit_digest", "signing_key_id", "signature_b64"}
+            }
+            if not (
+                permit_value["issued_at_ms"] <= timestamp_ms
+                < permit_value["expires_at_ms"]
+            ):
+                raise ValueError("disclosure permit is expired or not yet valid")
+            try:
+                verify_envelope(
+                    dict(self._trusted_disclosure_keys),
+                    {
+                        "signing_key_id": permit_value["signing_key_id"],
+                        "signature_b64": permit_value["signature_b64"],
+                    },
+                    canonical_bytes(unsigned_permit),
+                )
+            except (TypeError, ValueError):
+                raise ValueError("invalid disclosure permit authority") from None
             nonce, sequence, generation, chain = self._next_chain("result", run_id)
             path = (
                 f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/runs/"
                 f"{run_id}/result-projection"
             )
-            timestamp_ms = self._timestamp()
             proof = {
                 "schema_version": "heel.runner-request-proof.v1",
                 "workspace_id": self.workspace_id, "runner_id": self.runner_id,
@@ -583,28 +605,43 @@ class RunnerControlClient:
             )
 
     def claim(self):
-        request = validate_runner_claim_request({"schema_version": "heel.runner-claim-request.v1"})
-        return self._post_control("claim", request, None)
+        _, status, headers = self._closed_control(
+            "claim", None, include_response_metadata=True,
+        )
+        return status, headers
 
-    def heartbeat(self, *, run_id, operational_projection): return self._run("heartbeat", run_id, operational_projection)
-    def progress(self, *, run_id, operational_projection): return self._run("progress", run_id, operational_projection)
-    def result(self, *, run_id, operational_projection): return self._run("result", run_id, operational_projection)
-    def stop_ack(self, *, run_id, operational_projection): return self._run("stop-ack", run_id, operational_projection)
+    def heartbeat(self, *, run_id, operational_projection):
+        _, status, headers = self._closed_control(
+            "heartbeat", run_id, operational_projection,
+            include_response_metadata=True,
+        )
+        return status, headers
+
+    def progress(self, *, run_id, operational_projection):
+        _, status, headers = self._closed_control(
+            "progress", run_id, operational_projection,
+            include_response_metadata=True,
+        )
+        return status, headers
+
+    def result(self, *, run_id, operational_projection):
+        _, status, headers = self._closed_control(
+            "result", run_id, operational_projection,
+            include_response_metadata=True,
+        )
+        return status, headers
+
+    def stop_ack(self, *, run_id, operational_projection):
+        _, status, headers = self._closed_control(
+            "stop-ack", run_id, operational_projection,
+            include_response_metadata=True,
+        )
+        return status, headers
 
     def upload_findings(self, *, run_id, permit, findings_projection):
         return self._upload_findings_closed(
             run_id=run_id, permit=permit, findings_projection=findings_projection,
         )
-
-    def _run(self, operation: str, run_id: str, operational_projection: Any):
-        self._validate_chain(operation, run_id)
-        request = _REQUEST_VALIDATORS[operation]({
-            "schema_version": f"heel.runner-{operation}-request.v1",
-            "run_id": run_id,
-            "operational_projection": operational_projection,
-        })
-        self._verify_projection_signature(request["operational_projection"])
-        return self._post_control(operation, request, run_id)
 
     def _verify_projection_signature(self, projection: dict[str, Any]) -> None:
         public_key = getattr(self.signer, "public_key", None)
@@ -624,9 +661,6 @@ class RunnerControlClient:
             canonical_bytes(payload),
         )
 
-    def retry_last(self):
-        return self._post_control("claim", {}, None, retry=True)
-
     def install_rotation_claim(self, response: object) -> RunnerRotationActivated:
         fields = {
             "schema_version", "workspace_id", "runner_id", "initial_claim_nonce",
@@ -645,7 +679,8 @@ class RunnerControlClient:
             response["initial_claim_nonce"], response["initial_claim_sequence"],
             response["initial_claim_generation"],
         )
-        self._install_chain_state("claim", state)
+        with self._operation_lock("claim", None):
+            self._install_chain_state("claim", state)
         return RunnerRotationActivated(
             response["schema_version"], response["workspace_id"], response["runner_id"],
             response["initial_claim_nonce"], response["initial_claim_sequence"],
@@ -681,6 +716,12 @@ class RunnerControlClient:
     def complete_resync(self, pending: PendingRunnerResync) -> RecoveredRunnerChain:
         if not isinstance(pending, PendingRunnerResync): raise ValueError("pending runner resync is required")
         self._validate_chain(pending.operation, pending.run_id)
+        with self._operation_lock(pending.operation, pending.run_id):
+            return self._complete_resync_locked(pending)
+
+    def _complete_resync_locked(
+        self, pending: PendingRunnerResync,
+    ) -> RecoveredRunnerChain:
         chain = {"operation": pending.operation, "run_id": pending.run_id}
         path = f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/resync/complete"
         body = canonical_bytes({"schema_version": "heel.runner-resync-complete.v2", "challenge_id": pending.challenge_id, "chain": chain, "client_nonce_b64": pending.client_nonce_b64, "server_challenge_b64": pending.server_challenge_b64, "generation": pending.generation})
@@ -707,13 +748,10 @@ class RunnerControlClient:
         )
 
     def _install_chain_state(self, chain_name: str, state: tuple[str, int, int]) -> None:
-        current = self._chains.get(chain_name)
-        if current is not None:
-            if state[2] < current[2] or (state[2] == current[2] and state != current):
-                raise ValueError("runner chain generation did not advance")
-            if state[2] == current[2]:
-                return
-        self._chains[chain_name] = state
+        with self._state_lock:
+            staged = dict(self._chains)
+            self._stage_chain(staged, chain_name, state)
+            self._chains = staged
 
     def _random_b64(self) -> str:
         raw = self.resync_random_source(32)

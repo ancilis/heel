@@ -6,6 +6,7 @@ import threading
 import time
 from typing import Any, Callable, Protocol, runtime_checkable
 
+from heel.canary_contracts import validate_operational_run
 from heel.runner.execution import ExecutionGate
 from heel.runner.http_transport import CancellationToken
 
@@ -168,7 +169,7 @@ class RunnerService:
         *,
         coordinator: Coordinator,
         executor: LeaseExecutor,
-        heartbeat_interval: float = 1.0,
+        heartbeat_interval: float = 0.25,
         idle_poll_interval: float = 2.0,
         sleeper: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
@@ -176,8 +177,8 @@ class RunnerService:
     ):
         if not isinstance(heartbeat_interval, (int, float)) or isinstance(heartbeat_interval, bool):
             raise ValueError("heartbeat interval must be numeric")
-        if not 0 < heartbeat_interval <= 1.0:
-            raise ValueError("active heartbeat interval must be no more than one second")
+        if not 0 < heartbeat_interval <= 0.4:
+            raise ValueError("active heartbeat interval must be no more than 0.4 seconds")
         if not isinstance(idle_poll_interval, (int, float)) or isinstance(idle_poll_interval, bool):
             raise ValueError("idle poll interval must be numeric")
         if idle_poll_interval < 2.0:
@@ -319,10 +320,22 @@ class RunnerService:
                 self._active_stop_controller = None
         if heartbeat_thread.is_alive():
             raise RuntimeError("runner heartbeat worker did not stop")
-        if not stop_controller.initiated.is_set() and heartbeat_failure:
+        stopped = stop_controller.initiated.is_set()
+        if not stopped and heartbeat_failure:
             raise RuntimeError("runner heartbeat failed closed") from heartbeat_failure[0]
-        elif not stop_controller.initiated.is_set():
+        if not stopped:
             self.coordinator.result(lease.run_id, snapshot())
+        else:
+            try:
+                terminal = validate_operational_run(snapshot())
+            except (TypeError, ValueError):
+                terminal = None
+            if (
+                terminal is not None
+                and terminal["run_id"] == lease.run_id
+                and terminal["lifecycle_phase"] == "terminal"
+            ):
+                self.coordinator.result(lease.run_id, terminal)
         return True
 
     def serve(self, stop_event: threading.Event) -> None:
