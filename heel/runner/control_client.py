@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 import secrets
 import threading
 from dataclasses import dataclass
@@ -543,7 +544,10 @@ class RunnerControlClient:
                 elif schema == "heel.canary-projection-submitted.v1":
                     if set(payload) != {"schema_version", "approval_id", "run_id", "status", "projection_digest"} or payload["status"] not in {"awaiting_execution_approval", "approved", "cancelled", "expired"}:
                         raise ValueError
-                    if not all(type(payload[key]) is str and payload[key] for key in ("approval_id", "run_id", "projection_digest")):
+                    submitted = request["approval_projection"]
+                    if (type(payload["approval_id"]) is not str or payload["approval_id"] != submitted["projection_id"]
+                            or type(payload["projection_digest"]) is not str or payload["projection_digest"] != submitted["projection_digest"]
+                            or type(payload["run_id"]) is not str or re.fullmatch(r"crun_[0-9a-f]{32}", payload["run_id"]) is None):
                         raise ValueError
             except (KeyError, TypeError, ValueError):
                 raise ValueError("invalid runner context response") from None

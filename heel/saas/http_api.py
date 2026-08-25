@@ -1277,7 +1277,8 @@ class _Handler(BaseHTTPRequestHandler):
                     response = context_runs.submit_projection_from_runner_in_transaction(
                         parsed["approval_projection"], binding, uploaded_by_runner_id=runner_id,
                     )
-                    context_service._event(binding, "projection_submitted", "runner", runner_id)
+                    if getattr(response, "created", False):
+                        context_service._event(binding, "projection_submitted", "runner", runner_id)
                     return response
                 if operation == "result-projection":
                     project_ref = self._runner_run_project(
@@ -2197,6 +2198,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _ws_runner_context_create(self, wid: str, project_ref: str) -> None:
         try:
+            self._runner_context_human_path_exact()
             self._runner_context_human_scope(wid, project_ref)
             actor, role, _ = self._recent_owner_admin_context(wid)
             body = parse_json(self._raw_body(), max_bytes=2048)
@@ -2215,6 +2217,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _ws_runner_context_revoke(self, wid: str, project_ref: str, binding_id: str) -> None:
         try:
+            self._runner_context_human_path_exact()
             self._runner_context_human_scope(wid, project_ref)
             actor, role, _ = self._recent_owner_admin_context(wid)
             body = parse_json(self._raw_body(), max_bytes=256)
@@ -2232,10 +2235,15 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(200, result)
 
     def _ws_runner_context_list(self, wid: str, project_ref: str) -> None:
+        self._runner_context_human_path_exact()
         kind, user_id, _ = self._principal()
         if kind != "session" or user_id is None:
             raise RunnerContextError("runner_context_binding_not_found")
         self._json(200, self._runner_context_service().list_for_human(wid, project_ref, actor=user_id))
+
+    def _runner_context_human_path_exact(self) -> None:
+        if "?" in self.path or "#" in self.path or "%" in self.path:
+            raise RunnerContextError("runner_context_binding_not_found")
 
     def _runner_context_human_scope(self, wid: str, project_ref: str) -> None:
         """Hide foreign/missing project identifiers before sensitive session ceremonies."""

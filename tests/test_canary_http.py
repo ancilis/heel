@@ -209,6 +209,32 @@ def canary_http():
             fixture.close()
 
 
+def test_runner_context_human_routes_reject_raw_path_aliases(canary_http):
+    fixture = canary_http
+    path = f"/v1/workspaces/{fixture.workspace}/projects/{fixture.project}/runner-context-bindings"
+    create = {
+        "schema_version": "heel.runner-context-binding-create.v1", "environment_id": "env_canary",
+        "verification_record_digest": "a" * 64, "runner_id": fixture.runner_id,
+        "runner_key_id": fixture.runner.key_id,
+    }
+    before = fixture.cp.store.conn.execute(
+        "SELECT COUNT(*) FROM canary_runner_context_bindings"
+    ).fetchone()[0]
+    for suffix in ("?cursor=attacker", "#fragment"):
+        status, _, _ = fixture.request("GET", path + suffix, headers=fixture.browser)
+        assert status == 404
+        status, _, _ = fixture.request("POST", path + suffix, headers=fixture.browser, raw=canonical_bytes(create))
+        assert status == 404
+    for suffix in ("%3Falias", "/"):
+        status, _, _ = fixture.request("GET", path + suffix, headers=fixture.browser)
+        assert status == 400
+    status, _, _ = fixture.request("DELETE", path, headers=fixture.browser)
+    assert status == 404
+    assert fixture.cp.store.conn.execute(
+        "SELECT COUNT(*) FROM canary_runner_context_bindings"
+    ).fetchone()[0] == before
+
+
 def test_execution_approval_claim_heartbeat_progress_status_events_are_real(canary_http):
     fixture = canary_http
     projection = approval_projection(

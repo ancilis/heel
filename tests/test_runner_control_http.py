@@ -144,6 +144,51 @@ def test_context_methods_reject_extra_or_unsigned_claim_artifacts():
         control.claim_context("rcb_" + "a" * 32, "a" * 64)
 
 
+def test_context_projection_submit_rejects_substitution_without_advancing_claim_cursor():
+    from test_canary_contracts import approval
+
+    class ContextSigner(Signer):
+        key_id = "rk"
+
+    projection = approval()
+    binding_id, binding_digest = "rcb_" + "a" * 32, "a" * 64
+    valid = {
+        "schema_version": "heel.canary-projection-submitted.v1", "approval_id": projection["projection_id"],
+        "run_id": "crun_" + "b" * 32, "status": "approved",
+        "projection_digest": projection["projection_digest"],
+    }
+    for field, replacement in (
+        ("approval_id", "other"), ("projection_digest", "b" * 64),
+        ("run_id", "run_not_closed"), ("status", "running"),
+    ):
+        class SubmitTransport:
+            def post(self, path, *, headers=None, body=b""):
+                del path, headers, body
+                return 201, {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"n" * 32).decode()}, {
+                    **valid, field: replacement,
+                }
+
+        control = RunnerControlClient(
+            origin="https://control.example", workspace_id="ws", runner_id="r", signer=ContextSigner(),
+            clock=lambda: 1, transport=SubmitTransport(), nonce_source=lambda _: base64.b64encode(b"n" * 32).decode(),
+        )
+        with pytest.raises(ValueError, match="invalid runner context response"):
+            control.submit_context_approval_projection(binding_id, binding_digest, projection)
+        assert "claim" not in control._chains
+
+    class ValidTransport:
+        def post(self, path, *, headers=None, body=b""):
+            del path, headers, body
+            return 201, {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"n" * 32).decode()}, valid
+
+    control = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="r", signer=ContextSigner(),
+        clock=lambda: 1, transport=ValidTransport(), nonce_source=lambda _: base64.b64encode(b"n" * 32).decode(),
+    )
+    assert control.submit_context_approval_projection(binding_id, binding_digest, projection) == valid
+    assert control._chains["claim"][1] == 2
+
+
 def test_context_list_does_not_replace_server_issued_order_with_expiry_order():
     class OrderedTransport:
         def post(self, path, *, headers=None, body=b""):

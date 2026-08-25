@@ -83,6 +83,14 @@ class CanaryRunError(ValueError):
         super().__init__(self.code)
 
 
+class _RunnerProjectionSubmission(dict[str, object]):
+    """Closed response with non-serializing creation state for its PoP caller."""
+
+    def __init__(self, value: dict[str, object], *, created: bool):
+        super().__init__(value)
+        self.created = created
+
+
 class CanaryGate(TypedDict):
     active: bool
     runner_state: str
@@ -463,7 +471,7 @@ class CanaryRunService:
         ):
             raise CanaryRunError("canary_authority_unavailable")
         prior = self.conn.execute(
-            "SELECT approval_id,run_id,uploaded_by,projection_json FROM canary_approval_projections "
+            "SELECT approval_id,run_id,status,projection_digest,uploaded_by,projection_json FROM canary_approval_projections "
             "WHERE workspace_id=? AND project_ref=? AND (approval_id=? OR projection_digest=?)",
             (validated["workspace_id"], validated["project_id"], validated["projection_id"], validated["projection_digest"]),
         ).fetchone()
@@ -471,13 +479,17 @@ class CanaryRunService:
             if prior["uploaded_by"] != uploaded_by_runner_id or prior["projection_json"] != canonical_bytes(validated).decode():
                 raise CanaryRunError("projection_conflict")
             link = self.conn.execute(
-                "SELECT rcb_id,projection_digest FROM canary_runner_context_projection_links WHERE workspace_id=? AND project_ref=? AND approval_id=? AND run_id=?",
+                "SELECT rcb_id,binding_digest,projection_digest FROM canary_runner_context_projection_links WHERE workspace_id=? AND project_ref=? AND approval_id=? AND run_id=?",
                 (binding_row["workspace_id"], binding_row["project_ref"], prior["approval_id"], prior["run_id"]),
             ).fetchone()
-            if link is None or link["rcb_id"] != binding_row["rcb_id"] or link["projection_digest"] != validated["projection_digest"]:
+            if (link is None or link["rcb_id"] != binding_row["rcb_id"]
+                    or link["binding_digest"] != binding_row["binding_digest"]
+                    or link["projection_digest"] != validated["projection_digest"]):
                 raise CanaryRunError("projection_conflict")
-            return {"schema_version": "heel.canary-projection-submitted.v1", "approval_id": prior["approval_id"],
-                    "run_id": prior["run_id"], "status": prior["status"], "projection_digest": prior["projection_digest"]}
+            return _RunnerProjectionSubmission({
+                "schema_version": "heel.canary-projection-submitted.v1", "approval_id": prior["approval_id"],
+                "run_id": prior["run_id"], "status": prior["status"], "projection_digest": prior["projection_digest"],
+            }, created=False)
         result = self.submit_projection(validated, uploaded_by=uploaded_by_runner_id, _transaction_owned=True, _actor_class="runner")
         self.conn.execute(
             "INSERT INTO canary_runner_context_projection_links("
@@ -490,7 +502,7 @@ class CanaryRunService:
                 self._now_ms(),
             ),
         )
-        return result
+        return _RunnerProjectionSubmission(result, created=True)
 
     def _run(self, workspace_id: str, project_ref: str, run_id: str) -> sqlite3.Row:
         row = self.conn.execute(
@@ -657,6 +669,8 @@ class CanaryRunService:
                 "WHERE l.workspace_id=? AND l.project_ref=? AND l.approval_id=? AND l.run_id=?",
                 (workspace_id, project_ref, approval["approval_id"], run_id),
             ).fetchone()
+            if approval["uploaded_by"] == approval["runner_id"] and binding is None:
+                raise CanaryRunError("canary_authority_unavailable")
             if binding is not None:
                 if (binding["environment_id"] != approval["environment_id"]
                         or binding["runner_id"] != approval["runner_id"]
