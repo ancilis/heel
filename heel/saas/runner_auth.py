@@ -13,6 +13,7 @@ import json
 import secrets
 import sqlite3
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
@@ -148,14 +149,16 @@ CREATE TABLE IF NOT EXISTS canary_runner_chain_cursors(
 CREATE TABLE IF NOT EXISTS canary_runner_resync_challenges(
  challenge_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
  client_nonce_hash TEXT NOT NULL, server_challenge_hash TEXT NOT NULL, signed_digest TEXT NOT NULL,
+ client_nonce_ciphertext TEXT NOT NULL, server_challenge_ciphertext TEXT NOT NULL,
  status TEXT NOT NULL CHECK(status IN ('pending','completed','invalidated')), created_at REAL NOT NULL, expires_at REAL NOT NULL,
- completed_response_ciphertext TEXT, completed_at REAL,
+ completed_response_ciphertext TEXT, complete_signed_digest TEXT, completed_at REAL,
  FOREIGN KEY(workspace_id,runner_id,chain_name) REFERENCES canary_runner_chain_cursors(workspace_id,runner_id,chain_name));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runner_key_triple ON canary_runner_keys(workspace_id,runner_id,key_id);
 CREATE INDEX IF NOT EXISTS idx_canary_runner_pairings_expiry ON canary_runner_pairings(expires_at);
 CREATE INDEX IF NOT EXISTS idx_canary_runner_ledger_cleanup ON canary_runner_request_ledger(created_at);
 CREATE INDEX IF NOT EXISTS idx_canary_runner_nonce_expiry ON canary_runner_nonce_chains(expires_at);
 CREATE INDEX IF NOT EXISTS idx_canary_runner_resync_expiry ON canary_runner_resync_challenges(expires_at);
+CREATE INDEX IF NOT EXISTS idx_canary_runner_resync_rate ON canary_runner_resync_challenges(workspace_id,runner_id,created_at);
 """
 
 # A new in-process ControlPlane has no runner-auth rows to preserve.  Build its tables directly
@@ -210,19 +213,25 @@ CREATE TABLE IF NOT EXISTS canary_runner_chain_cursors(
 CREATE TABLE IF NOT EXISTS canary_runner_resync_challenges(
  challenge_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
  client_nonce_hash TEXT NOT NULL, server_challenge_hash TEXT NOT NULL, signed_digest TEXT NOT NULL,
+ client_nonce_ciphertext TEXT NOT NULL, server_challenge_ciphertext TEXT NOT NULL,
  status TEXT NOT NULL CHECK(status IN ('pending','completed','invalidated')), created_at REAL NOT NULL, expires_at REAL NOT NULL,
- completed_response_ciphertext TEXT, completed_at REAL,
+ completed_response_ciphertext TEXT, complete_signed_digest TEXT, completed_at REAL,
  FOREIGN KEY(workspace_id,runner_id,chain_name) REFERENCES canary_runner_chain_cursors(workspace_id,runner_id,chain_name));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runner_key_triple ON canary_runner_keys(workspace_id,runner_id,key_id);
 CREATE INDEX IF NOT EXISTS idx_canary_runner_pairings_expiry ON canary_runner_pairings(expires_at);
 CREATE INDEX IF NOT EXISTS idx_canary_runner_ledger_cleanup ON canary_runner_request_ledger(created_at);
 CREATE INDEX IF NOT EXISTS idx_canary_runner_nonce_expiry ON canary_runner_nonce_chains(expires_at);
 CREATE INDEX IF NOT EXISTS idx_canary_runner_resync_expiry ON canary_runner_resync_challenges(expires_at);
+CREATE INDEX IF NOT EXISTS idx_canary_runner_resync_rate ON canary_runner_resync_challenges(workspace_id,runner_id,created_at);
 """
 
 
 class RunnerAuthError(PermissionError):
     """Uniform external runner-auth failure."""
+
+
+class RunnerAuthRateLimited(RunnerAuthError):
+    """A verified runner exhausted its small recovery-start budget."""
 
 
 @dataclass(frozen=True)
@@ -288,11 +297,11 @@ def _ensure_lifecycle_tables(conn: sqlite3.Connection) -> None:
     """)
 
 
-_RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records")
+_RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records", "canary_runner_chain_cursors", "canary_runner_resync_challenges")
 
 
 def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
-    """Read-only exact v11 schema validation; startup must migrate rather than repair."""
+    """Read-only exact v12 schema validation; startup must migrate rather than repair."""
     if not isinstance(conn, sqlite3.Connection):
         raise TypeError("runner authentication requires a SQLite connection")
     expected = sqlite3.connect(":memory:")
@@ -446,7 +455,11 @@ class RunnerAuthStore:
 
     def exchange(self, invitation: str, public_key_b64: str, phrase: str, *, display_name: str,
                  runner_version: str, adapters: Mapping[str, str]) -> PairingView:
-        if type(display_name) is not str or not display_name or display_name != display_name.strip() or len(display_name.encode()) > 128 or len(display_name) > 64 or any(ord(c) < 32 for c in display_name):
+        if type(display_name) is not str:
+            raise ValueError("invalid runner display name")
+        display_name = unicodedata.normalize("NFC", display_name)
+        if (not display_name or display_name != display_name.strip() or len(display_name.encode()) > 128
+                or len(display_name) > 64 or any(unicodedata.category(char).startswith("C") for char in display_name)):
             raise ValueError("invalid runner display name")
         self._identifier(runner_version, "runner version")
         phrase = self._phrase(phrase)
@@ -521,6 +534,7 @@ class RunnerAuthStore:
             self.conn.execute("INSERT INTO canary_runner_keys(key_id,workspace_id,runner_id,public_key,status,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL)", (row["key_id"], row["workspace_id"], row["runner_id"], row["public_key"], "active", instant))
             nonce = _token()
             self.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (row["workspace_id"], row["runner_id"], "claim", self._hash("nonce", nonce), 1, instant + NONCE_TTL))
+            self.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (row["workspace_id"], row["runner_id"], "claim", 1, 0, instant))
             self._save_identity(self._identity_record(
                 workspace_id=row["workspace_id"], runner_id=row["runner_id"], public_key=row["public_key"],
                 fingerprint=row["fingerprint"], key_id=row["key_id"], runner_version=row["runner_version"],
@@ -544,7 +558,9 @@ class RunnerAuthStore:
             row = self.conn.execute("SELECT 1 FROM canary_runners WHERE workspace_id=? AND runner_id=? AND status='active'", (workspace_id, runner_id)).fetchone()
             if row is None:
                 raise RunnerAuthError("invalid runner")
-            self.conn.execute("INSERT OR REPLACE INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace_id, runner_id, f"{capability}:{run_id}", self._hash("nonce", nonce), 1, instant + NONCE_TTL))
+            chain = f"{capability.removeprefix('runner_')}:{run_id}"
+            self.conn.execute("INSERT OR REPLACE INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace_id, runner_id, chain, self._hash("nonce", nonce), 1, instant + NONCE_TTL))
+            self.conn.execute("INSERT OR REPLACE INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace_id, runner_id, chain, 1, 0, instant))
             self.conn.commit()
         except Exception:
             self.conn.rollback(); raise
@@ -563,6 +579,7 @@ class RunnerAuthStore:
             self.conn.execute("UPDATE canary_runners SET status='revoked' WHERE workspace_id=? AND runner_id=?", (workspace_id, runner_id))
             self.conn.execute("UPDATE canary_runner_keys SET status='revoked', revoked_at=? WHERE workspace_id=? AND runner_id=? AND revoked_at IS NULL", (instant, workspace_id, runner_id))
             self.conn.execute("DELETE FROM canary_runner_nonce_chains WHERE workspace_id=? AND runner_id=?", (workspace_id, runner_id))
+            self.conn.execute("UPDATE canary_runner_resync_challenges SET status='invalidated' WHERE workspace_id=? AND runner_id=? AND status='pending'", (workspace_id, runner_id))
             # A runner loss invalidates only work which has not been claimed; historical and
             # in-flight records remain evidence and are settled by Task 7's lifecycle service.
             self.conn.execute("UPDATE canary_execution_grants SET status='revoked' WHERE workspace_id=? AND runner_id=? AND status IN ('prepared','approved','issued')", (workspace_id, runner_id))
@@ -644,8 +661,10 @@ class RunnerAuthStore:
             self.conn.execute("UPDATE canary_runner_keys SET status='verification_only',revoked_at=? WHERE workspace_id=? AND runner_id=? AND status='active'", (instant + overlap_seconds, row["workspace_id"], row["runner_id"]))
             self.conn.execute("INSERT INTO canary_runner_keys(key_id,workspace_id,runner_id,public_key,status,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL)", (row["key_id"], row["workspace_id"], row["runner_id"], row["public_key"], "active", instant))
             self.conn.execute("DELETE FROM canary_runner_nonce_chains WHERE workspace_id=? AND runner_id=?", (row["workspace_id"], row["runner_id"]))
+            self.conn.execute("UPDATE canary_runner_resync_challenges SET status='invalidated' WHERE workspace_id=? AND runner_id=? AND status='pending'", (row["workspace_id"], row["runner_id"]))
             nonce = _token()
             self.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (row["workspace_id"], row["runner_id"], "claim", self._hash("nonce", nonce), 1, instant + NONCE_TTL))
+            self.conn.execute("INSERT OR REPLACE INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (row["workspace_id"], row["runner_id"], "claim", 1, 0, instant))
             identity = self._load_identity(row["workspace_id"], row["runner_id"])
             previous = sorted(set(identity["rotation"]["previous_key_ids"] + [identity["public_key"]["key_id"]]))
             identity["public_key"] = {"algorithm": "Ed25519", "key_id": row["key_id"], "public_key_b64": row["public_key"]}
@@ -662,8 +681,148 @@ class RunnerAuthStore:
             self.conn.rollback(); raise
         return row["workspace_id"], row["runner_id"], nonce
 
+    @staticmethod
+    def _resync_chain(value: object) -> tuple[str, str | None, str]:
+        if not isinstance(value, dict) or set(value) != {"operation", "run_id"}:
+            raise RunnerAuthError("invalid runner authentication")
+        operation, run_id = value.get("operation"), value.get("run_id")
+        if operation == "claim" and run_id is None:
+            return operation, run_id, "claim"
+        if operation in {"heartbeat", "progress", "result", "stop-ack"} and type(run_id) is str and run_id:
+            return operation, run_id, f"{operation}:{run_id}"
+        raise RunnerAuthError("invalid runner authentication")
+
+    @staticmethod
+    def _b64_32(value: object) -> str:
+        if type(value) is not str:
+            raise RunnerAuthError("invalid runner authentication")
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (ValueError, TypeError):
+            raise RunnerAuthError("invalid runner authentication") from None
+        if len(decoded) != 32 or _b64(decoded) != value:
+            raise RunnerAuthError("invalid runner authentication")
+        return value
+
+    def _resync_proof(self, *, workspace_id: str, runner_id: str, path: str, raw_body: bytes,
+                      headers: Mapping[str, list[str]], proof_schema: str, domain: bytes,
+                      allow_stale: bool = False) -> tuple[sqlite3.Row, str]:
+        required = ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Signature")
+        if any(len(headers.get(name, ())) != 1 for name in required):
+            raise RunnerAuthError("invalid runner authentication")
+        if headers.get("Authorization") or headers.get("Cookie") or headers.get("X-Heel-Runner-Nonce") or headers.get("X-Heel-Runner-Sequence"):
+            raise RunnerAuthError("invalid runner authentication")
+        values = {name: headers[name][0] for name in required}
+        if values["X-Heel-Runner-Id"] != runner_id:
+            raise RunnerAuthError("invalid runner authentication")
+        timestamp = values["X-Heel-Runner-Timestamp-Ms"]
+        if not timestamp.isascii() or not timestamp.isdecimal() or (len(timestamp) > 1 and timestamp.startswith("0")):
+            raise RunnerAuthError("invalid runner authentication")
+        timestamp_ms = int(timestamp)
+        row = self.conn.execute("SELECT * FROM canary_runner_keys WHERE workspace_id=? AND runner_id=? AND key_id=? AND status='active' AND revoked_at IS NULL", (workspace_id, runner_id, values["X-Heel-Runner-Key-Id"])).fetchone()
+        if row is None:
+            raise RunnerAuthError("invalid runner authentication")
+        proof = {"schema_version": proof_schema, "workspace_id": workspace_id, "runner_id": runner_id,
+                 "key_id": values["X-Heel-Runner-Key-Id"], "method": "POST", "path": path,
+                 "body_sha256": hashlib.sha256(raw_body).hexdigest(), "timestamp_ms": timestamp_ms}
+        proof_bytes = domain + canonical_bytes(proof)
+        try:
+            signature = base64.b64decode(values["X-Heel-Runner-Signature"], validate=True)
+            if len(signature) != 64 or _b64(signature) != values["X-Heel-Runner-Signature"]:
+                raise ValueError
+            load_public_key_base64(row["public_key"]).verify(signature, proof_bytes)
+        except (ValueError, InvalidSignature):
+            raise RunnerAuthError("invalid runner authentication") from None
+        if not allow_stale and abs(self._milliseconds(self._now()) - timestamp_ms) > CLOCK_SKEW_MS:
+            raise RunnerAuthError("invalid runner authentication")
+        return row, hashlib.sha256(proof_bytes + signature).hexdigest()
+
+    def start_resync(self, *, workspace_id: str, runner_id: str, path: str, raw_body: bytes,
+                     headers: Mapping[str, list[str]]) -> dict:
+        try:
+            body = parse_json(raw_body, max_bytes=2048)
+            if canonical_bytes(body) != raw_body or set(body) != {"schema_version", "chain", "client_nonce_b64"} or body["schema_version"] != "heel.runner-resync-start.v1":
+                raise RunnerAuthError("invalid runner authentication")
+            operation, run_id, chain = self._resync_chain(body["chain"])
+            client_nonce = self._b64_32(body["client_nonce_b64"])
+            self.conn.execute("BEGIN IMMEDIATE")
+            _, signed_digest = self._resync_proof(workspace_id=workspace_id, runner_id=runner_id, path=path, raw_body=raw_body, headers=headers, proof_schema="heel.runner-resync-start-proof.v1", domain=b"heel.runner-resync-start-pop.v1\0")
+            instant = self._now()
+            cursor = self.conn.execute("SELECT * FROM canary_runner_chain_cursors WHERE workspace_id=? AND runner_id=? AND chain_name=?", (workspace_id, runner_id, chain)).fetchone()
+            if cursor is None:
+                raise RunnerAuthError("invalid runner authentication")
+            nonce_hash = self._hash("resync-client", client_nonce)
+            existing = self.conn.execute("SELECT * FROM canary_runner_resync_challenges WHERE workspace_id=? AND runner_id=? AND chain_name=? AND status='pending' ORDER BY created_at DESC LIMIT 1", (workspace_id, runner_id, chain)).fetchone()
+            if existing is not None:
+                if existing["expires_at"] > instant and (hmac.compare_digest(existing["client_nonce_hash"], nonce_hash) and hmac.compare_digest(existing["signed_digest"], signed_digest)):
+                    aad = f"resync\0{existing['challenge_id']}".encode()
+                    server = self._open(existing["server_challenge_ciphertext"], aad=aad)
+                    self.conn.commit()
+                    return {"schema_version": "heel.runner-resync-challenge.v1", "challenge_id": existing["challenge_id"], "chain": {"operation": operation, "run_id": run_id}, "server_challenge_b64": server, "next_sequence": cursor["next_sequence"], "expires_at_ms": self._milliseconds(existing["expires_at"])}
+                if existing["status"] == "pending" and existing["expires_at"] > instant:
+                    raise RunnerAuthError("invalid runner authentication")
+                self.conn.execute("UPDATE canary_runner_resync_challenges SET status='invalidated' WHERE challenge_id=?", (existing["challenge_id"],))
+            attempts = self.conn.execute("SELECT COUNT(*) FROM canary_runner_resync_challenges WHERE workspace_id=? AND runner_id=? AND created_at>=?", (workspace_id, runner_id, instant - 60)).fetchone()[0]
+            if attempts >= 3:
+                raise RunnerAuthRateLimited("runner recovery rate limited")
+            challenge_id, server = "rrs_" + secrets.token_hex(16), _token()
+            aad = f"resync\0{challenge_id}".encode()
+            expires = instant + 60
+            self.conn.execute("INSERT INTO canary_runner_resync_challenges(challenge_id,workspace_id,runner_id,chain_name,client_nonce_hash,server_challenge_hash,signed_digest,client_nonce_ciphertext,server_challenge_ciphertext,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (challenge_id, workspace_id, runner_id, chain, nonce_hash, self._hash("resync-server", server), signed_digest, self._seal(client_nonce, aad=aad), self._seal(server, aad=aad), "pending", instant, expires))
+            self.conn.commit()
+            return {"schema_version": "heel.runner-resync-challenge.v1", "challenge_id": challenge_id, "chain": {"operation": operation, "run_id": run_id}, "server_challenge_b64": server, "next_sequence": cursor["next_sequence"], "expires_at_ms": self._milliseconds(expires)}
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def complete_resync(self, *, workspace_id: str, runner_id: str, path: str, raw_body: bytes,
+                        headers: Mapping[str, list[str]]) -> dict:
+        try:
+            body = parse_json(raw_body, max_bytes=2048)
+            if canonical_bytes(body) != raw_body or set(body) != {"schema_version", "challenge_id", "chain", "client_nonce_b64", "server_challenge_b64"} or body["schema_version"] != "heel.runner-resync-complete.v1":
+                raise RunnerAuthError("invalid runner authentication")
+            challenge_id = body["challenge_id"]
+            if type(challenge_id) is not str or len(challenge_id) != 36 or not challenge_id.startswith("rrs_") or any(c not in "0123456789abcdef" for c in challenge_id[4:]):
+                raise RunnerAuthError("invalid runner authentication")
+            operation, run_id, chain = self._resync_chain(body["chain"])
+            client_nonce, server_challenge = self._b64_32(body["client_nonce_b64"]), self._b64_32(body["server_challenge_b64"])
+            self.conn.execute("BEGIN IMMEDIATE")
+            challenge = self.conn.execute("SELECT * FROM canary_runner_resync_challenges WHERE challenge_id=? AND workspace_id=? AND runner_id=?", (challenge_id, workspace_id, runner_id)).fetchone()
+            if challenge is None or challenge["chain_name"] != chain or not hmac.compare_digest(challenge["client_nonce_hash"], self._hash("resync-client", client_nonce)) or not hmac.compare_digest(challenge["server_challenge_hash"], self._hash("resync-server", server_challenge)):
+                raise RunnerAuthError("invalid runner authentication")
+            _, signed_digest = self._resync_proof(workspace_id=workspace_id, runner_id=runner_id, path=path, raw_body=raw_body, headers=headers, proof_schema="heel.runner-resync-complete-proof.v1", domain=b"heel.runner-resync-complete-pop.v1\0", allow_stale=challenge["status"] == "completed")
+            instant = self._now()
+            if challenge["status"] == "completed":
+                if not hmac.compare_digest(challenge["complete_signed_digest"] or "", signed_digest):
+                    raise RunnerAuthError("invalid runner authentication")
+                if challenge["completed_at"] is None or challenge["completed_at"] + 600 <= instant:
+                    raise RunnerAuthError("invalid runner authentication")
+                aad = f"resync-completed\0{challenge_id}".encode()
+                response = json_load(self._open(challenge["completed_response_ciphertext"], aad=aad))
+                self.conn.commit()
+                return response
+            if challenge["status"] != "pending" or challenge["expires_at"] <= instant:
+                raise RunnerAuthError("invalid runner authentication")
+            cursor = self.conn.execute("SELECT * FROM canary_runner_chain_cursors WHERE workspace_id=? AND runner_id=? AND chain_name=?", (workspace_id, runner_id, chain)).fetchone()
+            if cursor is None:
+                raise RunnerAuthError("invalid runner authentication")
+            next_nonce, expires = _token(), instant + NONCE_TTL
+            self.conn.execute("INSERT OR REPLACE INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace_id, runner_id, chain, self._hash("nonce", next_nonce), cursor["next_sequence"], expires))
+            self.conn.execute("UPDATE canary_runner_chain_cursors SET generation=generation+1,updated_at=? WHERE workspace_id=? AND runner_id=? AND chain_name=?", (instant, workspace_id, runner_id, chain))
+            response = {"schema_version": "heel.runner-resync-completed.v1", "chain": {"operation": operation, "run_id": run_id}, "next_sequence": cursor["next_sequence"], "next_nonce_b64": next_nonce, "expires_at_ms": self._milliseconds(expires)}
+            aad = f"resync-completed\0{challenge_id}".encode()
+            self.conn.execute("UPDATE canary_runner_resync_challenges SET status='completed',completed_at=?,completed_response_ciphertext=?,complete_signed_digest=? WHERE challenge_id=?", (instant, self._seal(canonical_bytes(response).decode(), aad=aad), signed_digest, challenge_id))
+            self.conn.commit()
+            return response
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
     def authenticate_and_consume(self, *, workspace_id: str, runner_id: str, capability: str, path: str,
-                                 raw_body: bytes, headers: Mapping[str, list[str]], action: Callable[[], dict]) -> tuple[dict, str]:
+                                 raw_body: bytes, headers: Mapping[str, list[str]], action: Callable[[], dict],
+                                 chain_name: str | None = None) -> tuple[dict, str]:
         """Verify a fixed request then atomically record it, rotate its nonce, and act."""
         required = ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature")
         try:
@@ -688,7 +847,7 @@ class RunnerAuthStore:
             row = self.conn.execute("SELECT * FROM canary_runner_keys WHERE workspace_id=? AND runner_id=? AND key_id=? AND status='active' AND revoked_at IS NULL", (workspace_id, runner_id, values["X-Heel-Runner-Key-Id"])).fetchone()
             if row is None:
                 raise RunnerAuthError("invalid runner authentication")
-            chain = "claim" if capability == "runner_claim" else f"{capability}:{parsed.get('run_id', '')}"
+            chain = chain_name or ("claim" if capability == "runner_claim" else f"{capability.removeprefix('runner_')}:{parsed.get('run_id', '')}")
             proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace_id, "runner_id":runner_id, "key_id":values["X-Heel-Runner-Key-Id"], "capability":capability, "method":"POST", "path":path, "body_sha256":body_digest, "timestamp_ms":timestamp, "server_nonce":values["X-Heel-Runner-Nonce"], "sequence":sequence}
             proof_bytes = b"heel.runner-pop.v1\0" + canonical_bytes(proof)
             try:
@@ -735,6 +894,7 @@ class RunnerAuthStore:
             response_ciphertext = self._seal(response_json, aad=aad)
             nonce_ciphertext = self._seal(nonce, aad=aad)
             self.conn.execute("UPDATE canary_runner_nonce_chains SET nonce_hash=?,next_sequence=?,expires_at=? WHERE workspace_id=? AND runner_id=? AND chain_name=?", (self._hash("nonce", nonce), sequence + 1, self._now() + NONCE_TTL, workspace_id, runner_id, chain))
+            self.conn.execute("UPDATE canary_runner_chain_cursors SET next_sequence=?,updated_at=? WHERE workspace_id=? AND runner_id=? AND chain_name=?", (sequence + 1, self._now(), workspace_id, runner_id, chain))
             self.conn.execute("INSERT INTO canary_runner_request_ledger(workspace_id,runner_id,chain_name,sequence,request_digest,response_json,next_nonce,created_at,nonce_hash,key_id,capability,method,path,timestamp_ms,signed_request_digest,body_digest,response_ciphertext,next_nonce_ciphertext) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (workspace_id, runner_id, chain, sequence, signed_digest, "sealed", self._hash("next-nonce", nonce), self._now(), nonce_hash, values["X-Heel-Runner-Key-Id"], capability, "POST", path, timestamp, signed_digest, body_digest, response_ciphertext, nonce_ciphertext))
             self.conn.execute("DELETE FROM canary_runner_request_ledger WHERE created_at<?", (self._now() - 3600,))
             self.conn.commit()

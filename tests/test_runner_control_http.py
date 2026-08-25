@@ -49,13 +49,13 @@ def test_named_methods_use_fixed_workspace_paths_and_exact_pop_headers():
 
 def test_sequences_are_independent_per_run_capability_and_stop_ack_is_heartbeat():
     control, transport, _ = client()
-    control.heartbeat(run_id="one")
-    control.heartbeat(run_id="one")
-    control.progress(run_id="one", progress=10)
-    control.stop_ack(run_id="one")
-    assert [h["X-Heel-Runner-Sequence"] for _, h, _ in transport.requests] == ["1", "2", "1", "3"]
+    control.heartbeat(run_id="one", operational_projection={})
+    control.heartbeat(run_id="one", operational_projection={})
+    control.progress(run_id="one", operational_projection={})
+    control.stop_ack(run_id="one", operational_projection={})
+    assert [h["X-Heel-Runner-Sequence"] for _, h, _ in transport.requests] == ["1", "2", "1", "1"]
     assert transport.requests[-1][0].endswith("/runs/one/stop-ack")
-    assert canonical_bytes({"run_id": "one", "progress": 10}) == transport.requests[2][2]
+    assert canonical_bytes({"schema_version": "heel.runner-progress-request.v1", "run_id": "one", "operational_projection": {}}) == transport.requests[2][2]
 
 def test_refuses_noncanonical_origin_bad_nonce_and_changed_retry():
     with pytest.raises(ValueError, match="pathless origin"):
@@ -64,15 +64,14 @@ def test_refuses_noncanonical_origin_bad_nonce_and_changed_retry():
     with pytest.raises(ValueError, match="nonce"):
         bad.claim()
     control, _, _ = client()
-    control.progress(run_id="one", status="one")
-    with pytest.raises(ValueError, match="changed body"):
-        control.retry_last({"run_id": "one", "status": "two"})
+    control.progress(run_id="one", operational_projection={})
+    control.retry_last()
 
 def test_has_no_public_generic_request_api():
     control, _, _ = client()
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
-    assert public <= {"claim", "heartbeat", "progress", "result", "stop_ack", "retry_last"}
+    assert public <= {"claim", "heartbeat", "progress", "result", "stop_ack", "retry_last", "start_resync", "complete_resync"}
 
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
@@ -103,6 +102,43 @@ def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
     assert receipt[0] == "sealed" and receipt[1] != next_nonce and receipt[2] and receipt[3]
 
 
+def test_resync_recovers_an_existing_chain_and_replays_only_the_same_signed_completion():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY)")
+    workspace = "ws"; conn.execute("INSERT INTO workspaces VALUES(?)", (workspace,))
+    CanaryStore(conn)
+    initialize_runner_auth_schema(conn)
+    instant = [1_000.0]
+    store = RunnerAuthStore(conn, pepper=b"p" * 32, now=lambda: instant[0])
+    private = Ed25519PrivateKey.generate()
+    public = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    key_id = ed25519_key_id(public)
+    conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", workspace, "runner", "active", instant[0]))
+    conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", base64.b64encode(public).decode(), "active", instant[0]))
+    conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace, "runner", "heartbeat:run", store._hash("nonce", "old"), 8, instant[0] + 60))
+    conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace, "runner", "heartbeat:run", 8, 0, instant[0]))
+    conn.commit()
+
+    def signed(domain, schema, path, body):
+        proof = {"schema_version": schema, "workspace_id": workspace, "runner_id": "runner", "key_id": key_id, "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": 1_000_000}
+        return {"X-Heel-Runner-Id":["runner"], "X-Heel-Runner-Key-Id":[key_id], "X-Heel-Runner-Timestamp-Ms":["1000000"], "X-Heel-Runner-Signature":[base64.b64encode(private.sign(domain + canonical_bytes(proof))).decode()], "X-Heel-Runner-Nonce":[], "X-Heel-Runner-Sequence":[], "Authorization":[], "Cookie":[]}
+
+    chain = {"operation":"heartbeat", "run_id":"run"}; client_nonce = base64.b64encode(b"c" * 32).decode()
+    start_path = f"/v1/workspaces/{workspace}/runners/runner/resync/start"
+    start = canonical_bytes({"schema_version":"heel.runner-resync-start.v1", "chain":chain, "client_nonce_b64":client_nonce})
+    challenge = store.start_resync(workspace_id=workspace, runner_id="runner", path=start_path, raw_body=start, headers=signed(b"heel.runner-resync-start-pop.v1\0", "heel.runner-resync-start-proof.v1", start_path, start))
+    assert challenge["next_sequence"] == 8
+    complete_path = f"/v1/workspaces/{workspace}/runners/runner/resync/complete"
+    complete = canonical_bytes({"schema_version":"heel.runner-resync-complete.v1", "challenge_id":challenge["challenge_id"], "chain":chain, "client_nonce_b64":client_nonce, "server_challenge_b64":challenge["server_challenge_b64"]})
+    headers = signed(b"heel.runner-resync-complete-pop.v1\0", "heel.runner-resync-complete-proof.v1", complete_path, complete)
+    recovered = store.complete_resync(workspace_id=workspace, runner_id="runner", path=complete_path, raw_body=complete, headers=headers)
+    assert recovered["next_sequence"] == 8 and base64.b64decode(recovered["next_nonce_b64"], validate=True)
+    assert store.complete_resync(workspace_id=workspace, runner_id="runner", path=complete_path, raw_body=complete, headers=headers) == recovered
+    changed = canonical_bytes({**json.loads(complete), "server_challenge_b64":base64.b64encode(b"x" * 32).decode()})
+    with pytest.raises(RunnerAuthError):
+        store.complete_resync(workspace_id=workspace, runner_id="runner", path=complete_path, raw_body=changed, headers=headers)
+
+
 def test_http_pairing_exchange_returns_runner_only_challenge_for_activation():
     cp = ControlPlane(device_token_pepper=b"d" * 32, runner_auth_pepper=b"r" * 32,
                       enable_device_auth=True, public_origin="https://heel.test")
@@ -124,7 +160,7 @@ def test_http_pairing_exchange_returns_runner_only_challenge_for_activation():
         public = base64.b64encode(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
         from heel.saas.runner_auth import WORDS
         phrase = " ".join(WORDS[:6])
-        status, exchanged, _ = request("POST", "/v1/runner-pairings/exchange", {"schema_version":"heel.runner-pairing-exchange.v1", "invitation_token":invitation["invitation_token"], "public_key_b64":public, "pairing_phrase":phrase, "runner_id":"runner-http", "runner_version":"v1", "adapters":{}})
+        status, exchanged, _ = request("POST", "/v1/runner-pairings/exchange", {"schema_version":"heel.runner-pairing-exchange.v2", "invitation_token":invitation["invitation_token"], "public_key_b64":public, "pairing_phrase":phrase, "display_name":"Runner HTTP", "runner_version":"v1", "adapters":{}})
         assert status == 201 and exchanged["activation_challenge"]
         status, inspect, _ = request("GET", f"/v1/workspaces/{signup['workspace_id']}/runner-pairings/{exchanged['pairing_id']}", {}, browser)
         assert status == 200 and "activation_challenge" not in inspect
@@ -133,13 +169,13 @@ def test_http_pairing_exchange_returns_runner_only_challenge_for_activation():
         activation = b"heel.runner-pairing-activate.v1\0" + canonical_bytes({"pairing_id":exchanged["pairing_id"], "challenge":exchanged["activation_challenge"]})
         signature = base64.b64encode(private.sign(activation)).decode()
         assert request("POST", f"/v1/runner-pairings/{exchanged['pairing_id']}/activate", {"schema_version":"heel.runner-pairing-activate.v1", "signature_b64":signature})[0] == 200
-        record = cp.store.conn.execute("SELECT identity_json,identity_digest FROM canary_runner_identity_records WHERE workspace_id=? AND runner_id=?", (signup["workspace_id"], "runner-http")).fetchone()
+        record = cp.store.conn.execute("SELECT identity_json,identity_digest FROM canary_runner_identity_records WHERE workspace_id=? AND runner_id=?", (signup["workspace_id"], exchanged["runner_id"])).fetchone()
         identity = validate_runner_identity(json.loads(record[0]))
         assert identity["identity_digest"] == record[1]
         assert identity["capabilities"] == ["runner_claim", "runner_heartbeat", "runner_progress", "runner_result"]
         assert identity["pairing"]["fingerprint_confirmation"] == "confirmed"
         identity["rotation"]["previous_key_ids"].append("mutated")
-        assert "mutated" not in cp.runner_auth.identity(signup["workspace_id"], "runner-http")["rotation"]["previous_key_ids"]
+        assert "mutated" not in cp.runner_auth.identity(signup["workspace_id"], exchanged["runner_id"])["rotation"]["previous_key_ids"]
     finally:
         server.shutdown(); server.server_close()
 
@@ -161,21 +197,21 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
         old = Ed25519PrivateKey.generate(); old_public = base64.b64encode(old.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
         from heel.runner.identity import runner_phrase_words
         phrase = " ".join(runner_phrase_words()[:6])
-        _, pending, _ = request("POST", "/v1/runner-pairings/exchange", {"schema_version":"heel.runner-pairing-exchange.v1", "invitation_token":invite["invitation_token"], "public_key_b64":old_public, "pairing_phrase":phrase, "runner_id":"rotating", "runner_version":"v1", "adapters":{}}, {})
+        _, pending, _ = request("POST", "/v1/runner-pairings/exchange", {"schema_version":"heel.runner-pairing-exchange.v2", "invitation_token":invite["invitation_token"], "public_key_b64":old_public, "pairing_phrase":phrase, "display_name":"Rotating runner", "runner_version":"v1", "adapters":{}}, {})
         request("POST", f"/v1/workspaces/{signup['workspace_id']}/runner-pairings/{pending['pairing_id']}/approve", {"schema_version":"heel.runner-pairing-approve.v1", "pairing_phrase":phrase, "fingerprint":pending["fingerprint"]}, browser)
         proof = b"heel.runner-pairing-activate.v1\0" + canonical_bytes({"pairing_id":pending["pairing_id"], "challenge":pending["activation_challenge"]})
         request("POST", f"/v1/runner-pairings/{pending['pairing_id']}/activate", {"schema_version":"heel.runner-pairing-activate.v1", "signature_b64":base64.b64encode(old.sign(proof)).decode()})
         new = Ed25519PrivateKey.generate(); new_public = base64.b64encode(new.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
         old_fingerprint = hashlib.sha256(base64.b64decode(old_public)).hexdigest()
-        status, rotation, _ = request("POST", f"/v1/workspaces/{signup['workspace_id']}/runners/rotating/rotate", {"schema_version":"heel.runner-rotation-start.v1", "previous_fingerprint":old_fingerprint, "public_key_b64":new_public, "pairing_phrase":phrase, "runner_version":"v2", "adapters":{}}, browser)
+        status, rotation, _ = request("POST", f"/v1/workspaces/{signup['workspace_id']}/runners/{pending['runner_id']}/rotate", {"schema_version":"heel.runner-rotation-start.v1", "previous_fingerprint":old_fingerprint, "public_key_b64":new_public, "pairing_phrase":phrase, "runner_version":"v2", "adapters":{}}, browser)
         assert status == 201 and "activation_challenge" not in rotation
         assert request("GET", f"/v1/workspaces/{signup['workspace_id']}/runner-pairings/{rotation['pairing_id']}", {}, browser)[0] == 404
-        assert request("POST", f"/v1/workspaces/{signup['workspace_id']}/runners/rotating/rotations/{rotation['pairing_id']}/approve", {"schema_version":"heel.runner-rotation-approve.v1", "pairing_phrase":phrase, "fingerprint":rotation["fingerprint"]}, browser)[0] == 200
+        assert request("POST", f"/v1/workspaces/{signup['workspace_id']}/runners/{pending['runner_id']}/rotations/{rotation['pairing_id']}/approve", {"schema_version":"heel.runner-rotation-approve.v1", "pairing_phrase":phrase, "fingerprint":rotation["fingerprint"]}, browser)[0] == 200
         status, poll, _ = request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/poll", {})
         assert status == 200 and poll["activation_challenge"]
         proof = b"heel.runner-rotation-activate.v1\0" + canonical_bytes({"pairing_id":rotation["pairing_id"], "challenge":poll["activation_challenge"]})
         assert request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/activate", {"schema_version":"heel.runner-rotation-activate.v1", "signature_b64":base64.b64encode(new.sign(proof)).decode()})[0] == 200
-        identity = cp.runner_auth.identity(signup["workspace_id"], "rotating")
+        identity = cp.runner_auth.identity(signup["workspace_id"], pending["runner_id"])
         assert identity["state"] == "active" and identity["public_key"]["public_key_b64"] == new_public
         assert identity["rotation"]["previous_key_ids"]
     finally:
@@ -235,10 +271,16 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
             raw = base64.b64decode(public); key_id = ed25519_key_id(raw); nonce = "n" * 44
             cp.store.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", workspace, "runner", "active", time.time()))
             cp.store.conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", public, "active", time.time()))
-            cp.store.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace, "runner", "runner_heartbeat:run", cp.runner_auth._hash("nonce", nonce), 1, time.time() + 60))
+            cp.store.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace, "runner", "heartbeat:run", cp.runner_auth._hash("nonce", nonce), 1, time.time() + 60))
+            cp.store.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace, "runner", "heartbeat:run", 1, 0, time.time()))
             identity = cp.runner_auth._identity_record(workspace_id=workspace, runner_id="runner", public_key=public, fingerprint=hashlib.sha256(raw).hexdigest(), key_id=key_id, runner_version="v1", adapters_json="{}", paired_by="owner", paired_at=time.time(), heartbeat_at=time.time())
             cp.runner_auth._save_identity(identity, instant=time.time()); cp.store.conn.commit()
-            body = canonical_bytes({"run_id": "run"})
+            from test_canary_contracts import _digest, operational
+            projection = operational()
+            projection["lifecycle_phase"] = "claimed"
+            projection["timestamps"]["claimed_at_ms"] = 1
+            projection = _digest(projection, "projection_digest")
+            body = canonical_bytes({"schema_version": "heel.runner-heartbeat-request.v1", "run_id": "run", "operational_projection": projection})
             route = f"/v1/workspaces/{workspace}/runners/runner/runs/run/heartbeat"
             timestamp = int(time.time() * 1000)
             proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace, "runner_id":"runner", "key_id":key_id, "capability":"runner_heartbeat", "method":"POST", "path":route, "body_sha256":hashlib.sha256(body).hexdigest(), "timestamp_ms":timestamp, "server_nonce":nonce, "sequence":1}

@@ -51,7 +51,7 @@ from .billing import (
     SubscriptionManager,
 )
 from .canary_store import CanaryStore
-from .runner_auth import RunnerAuthError, RunnerAuthStore, initialize_runner_auth_schema
+from .runner_auth import RunnerAuthError, RunnerAuthRateLimited, RunnerAuthStore, initialize_runner_auth_schema
 from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
 from .device_auth import (
     DEVICE_CAPABILITIES,
@@ -279,11 +279,6 @@ class ControlPlane:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=250")
-            if not shared:
-                try:
-                    conn.execute("PRAGMA journal_mode=WAL")
-                except sqlite3.DatabaseError:
-                    pass
             yield RunnerAuthStore(conn, pepper=self._runner_auth_pepper)
         finally:
             if not shared:
@@ -755,6 +750,7 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         return bool(len(p) >= 6 and p[1] == "workspaces" and p[3] == "runners" and (
             (len(p) == 6 and p[5] == "claim") or
+            (len(p) == 7 and p[5] == "resync" and p[6] in {"start", "complete"}) or
             (len(p) == 8 and p[5] == "runs" and p[7] in {"heartbeat", "progress", "result", "stop-ack"})
         ))
 
@@ -783,6 +779,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(503, {"error": str(e)})
         except HostnameReuseExceeded as e:
             self._json(403, {"error": str(e)})
+        except RunnerAuthRateLimited as e:
+            self._json(429, {"error": str(e)})
+        except RunnerAuthError:
+            self._json(401, {"error": "invalid runner authentication"})
         except PermissionError as e:
             self._json(403, {"error": str(e)})
         except ThrottledError as e:
@@ -860,6 +860,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return lambda: self._runner_revoke(wid, tail[1])
             if method == "POST" and len(tail) == 3 and tail[0] == "runners" and tail[2] == "claim":
                 return lambda: self._runner_request(wid, tail[1], "runner_claim", None, "claim")
+            if method == "POST" and len(tail) == 4 and tail[0] == "runners" and tail[2] == "resync" and tail[3] in {"start", "complete"}:
+                return lambda: self._runner_resync(wid, tail[1], tail[3])
             if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "runs" and tail[4] in {"heartbeat", "progress", "result", "stop-ack"}:
                 capability = "runner_heartbeat" if tail[4] in {"heartbeat", "stop-ack"} else "runner_" + tail[4]
                 return lambda: self._runner_request(wid, tail[1], capability, tail[3], tail[4])
@@ -931,7 +933,7 @@ class _Handler(BaseHTTPRequestHandler):
         except (KeyError, TypeError, ValueError, RunnerAuthError):
             # Exchange must not reveal whether a one-time invitation was known.
             raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
-        self._json(201, {"schema_version": "heel.runner-pairing-pending.v1", "pairing_id": pairing.pairing_id, "fingerprint": pairing.fingerprint, "status": pairing.status, "activation_challenge": pairing.activation_challenge})
+        self._json(201, {"schema_version": "heel.runner-pairing-pending.v1", "pairing_id": pairing.pairing_id, "runner_id": pairing.runner_id, "fingerprint": pairing.fingerprint, "status": pairing.status, "activation_challenge": pairing.activation_challenge})
 
     def _runner_pairing_inspect(self, wid: str, pairing_id: str) -> None:
         self._recent_owner_admin(wid)
@@ -1036,10 +1038,28 @@ class _Handler(BaseHTTPRequestHandler):
                 workspace_id=wid, runner_id=runner_id, capability=capability, path=self.path,
                 raw_body=self._raw_body(), headers=all_headers,
                 action=lambda: {"schema_version": "heel.runner-control-response.v1", "operation": operation, "status": "accepted"},
+                chain_name="claim" if operation == "claim" else f"{operation}:{run_id}",
             )
         except (ValueError, RunnerAuthError):
             raise RunnerAuthError("invalid runner authentication") from None
         self._json(200, response, {"X-Heel-Runner-Next-Nonce": nonce})
+
+    def _runner_resync(self, wid: str, runner_id: str, phase: str) -> None:
+        if "?" in self.path or "#" in self.path or "%" in self.path or self.command != "POST":
+            raise RunnerAuthError("invalid runner authentication")
+        headers = {name: self._header_values(name) for name in (
+            "X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
+            "X-Heel-Runner-Signature", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence",
+            "Authorization", "Cookie")}
+        try:
+            store = self._runner_store()
+            response = (store.start_resync if phase == "start" else store.complete_resync)(
+                workspace_id=wid, runner_id=runner_id, path=self.path,
+                raw_body=self._raw_body(), headers=headers,
+            )
+        except (ValueError, RunnerAuthError):
+            raise
+        self._json(200, response)
 
     # --- open endpoints ---
     def _health(self):
