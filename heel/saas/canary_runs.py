@@ -504,6 +504,78 @@ class CanaryRunService:
         )
         return _RunnerProjectionSubmission(result, created=True)
 
+    def cancel_context_pending_in_transaction(
+        self,
+        binding_row: sqlite3.Row,
+        *,
+        actor_class: str,
+        actor_id: str,
+        reason_code: str,
+        now_ms: int,
+    ) -> int:
+        """Cancel only linked pre-grant work and append its durable run/audit spine."""
+        if not self.conn.in_transaction:
+            raise RuntimeError("runner context cancellation requires caller transaction")
+        if actor_class not in {"human", "system"} or type(actor_id) is not str or not actor_id:
+            raise ValueError("invalid runner context cancellation actor")
+        if reason_code not in {"runner_context_revoked", "runner_context_expired"}:
+            raise ValueError("invalid runner context cancellation reason")
+        rows = self.conn.execute(
+            "SELECT l.approval_id,l.run_id,a.status AS approval_status,r.status AS run_status,"
+            "r.grant_id,r.reservation_id,r.quota_state "
+            "FROM canary_runner_context_projection_links l "
+            "JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id AND a.project_ref=l.project_ref "
+            "AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
+            "JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref AND r.run_id=l.run_id "
+            "WHERE l.workspace_id=? AND l.project_ref=? AND l.environment_id=? AND l.runner_id=? "
+            "AND l.runner_key_id=? AND l.rcb_id=? AND l.binding_digest=? "
+            "ORDER BY l.run_id,l.approval_id",
+            (
+                binding_row["workspace_id"], binding_row["project_ref"], binding_row["environment_id"],
+                binding_row["runner_id"], binding_row["runner_key_id"], binding_row["rcb_id"],
+                binding_row["binding_digest"],
+            ),
+        ).fetchall()
+        cancelled = 0
+        for row in rows:
+            awaiting_projection = row["approval_status"] == "awaiting_execution_approval"
+            pregrant_run = row["run_status"] in {"prepared", "awaiting_execution_approval"}
+            if not awaiting_projection and not pregrant_run:
+                continue
+            if not awaiting_projection or not pregrant_run:
+                raise RuntimeError("linked runner context pregrant state is inconsistent")
+            if row["grant_id"] is not None or row["reservation_id"] is not None or row["quota_state"] != "unreserved":
+                raise RuntimeError("linked runner context pregrant authority is inconsistent")
+            changed_projection = self.conn.execute(
+                "UPDATE canary_approval_projections SET status='cancelled',purge_at=? "
+                "WHERE workspace_id=? AND project_ref=? AND approval_id=? AND run_id=? "
+                "AND status='awaiting_execution_approval'",
+                (now_ms + PROJECTION_RETENTION_MS, binding_row["workspace_id"], binding_row["project_ref"], row["approval_id"], row["run_id"]),
+            )
+            changed_run = self.conn.execute(
+                "UPDATE canary_runs SET status='cancelled',updated_at=max(updated_at,?) "
+                "WHERE workspace_id=? AND project_ref=? AND run_id=? "
+                "AND status IN ('prepared','awaiting_execution_approval')",
+                (now_ms, binding_row["workspace_id"], binding_row["project_ref"], row["run_id"]),
+            )
+            if changed_projection.rowcount != 1 or changed_run.rowcount != 1:
+                raise RuntimeError("linked runner context cancellation lost serialization")
+            updated = self._run(binding_row["workspace_id"], binding_row["project_ref"], row["run_id"])
+            self._append_event(
+                updated, "cancelled", actor_class=actor_class, actor_id=actor_id,
+                reason_code=reason_code,
+            )
+            self._audit(
+                updated, "cancelled", subject_ref=binding_row["rcb_id"], actor_class=actor_class,
+                actor_id=actor_id, reason_code=reason_code,
+                payload={
+                    "runner_context_binding_id": binding_row["rcb_id"],
+                    "runner_context_binding_digest": binding_row["binding_digest"],
+                },
+            )
+            cancelled += 1
+        return cancelled
+
     def _run(self, workspace_id: str, project_ref: str, run_id: str) -> sqlite3.Row:
         row = self.conn.execute(
             "SELECT * FROM canary_runs WHERE workspace_id=? AND project_ref=? AND run_id=?",

@@ -84,6 +84,7 @@ _RUN_TRANSITIONS = {
     "terminal": frozenset(),
 }
 _RUN_FILENAME = re.compile(r"^[0-9a-f]{64}$", flags=re.ASCII)
+_RUN_RESERVATION_FILENAME = re.compile(r"^grant-([0-9a-f]{64})\.json$", flags=re.ASCII)
 _EVENT_FILENAME = re.compile(r"^[0-9]{20}\.json$", flags=re.ASCII)
 _CREATE_TEMP_FILENAME = re.compile(r"^\..+\.[0-9a-f]{24}\.tmp$", flags=re.ASCII)
 _EVIDENCE_REF = re.compile(r"^ev1_[0-9a-f]{64}$", flags=re.ASCII)
@@ -92,6 +93,8 @@ _MAX_EVIDENCE_BODY_BYTES = 256 * 1024
 _RESERVATION_SCHEMA = "heel.local-grant-consumption.v2"
 _FINALS_SCHEMA = "heel.local-final-projections.v1"
 _CONTEXT_DOMAIN = b"heel.runner-context-binding.v1\0"
+_CLOUD_CONTEXT_PROVENANCE_SCHEMA = "heel.cloud-context-provenance.v1"
+_CONTEXT_ROLLOVER_SCHEMA = "heel.runner-context-rollover.v1"
 
 
 def _require_capabilities() -> None:
@@ -201,6 +204,25 @@ class RunnerContext:
             "verification_record_digest": self.verification_record_digest,
             "environment_class": self.environment_class,
         }
+
+
+@dataclass(frozen=True)
+class RunnerContextRolloverEvidence:
+    """Closed observation that permits only a forward proof-generation rollover."""
+
+    old_binding_id: str
+    old_binding_digest: str
+    new_binding_id: str
+    new_binding_digest: str
+    observed_server_time_ms: int
+
+    def __post_init__(self) -> None:
+        _id(self.old_binding_id, "old context binding ID")
+        _digest(self.old_binding_digest, "old context binding digest")
+        _id(self.new_binding_id, "new context binding ID")
+        _digest(self.new_binding_digest, "new context binding digest")
+        if type(self.observed_server_time_ms) is not int or self.observed_server_time_ms < 0:
+            raise ValueError("invalid rollover observation time")
 
 
 def _context_from_dict(value: Any) -> RunnerContext:
@@ -660,9 +682,14 @@ class RunnerStore:
                 os.close(contexts_fd)
 
     @contextmanager
-    def _transaction(self, *, exclusive: bool) -> Iterator[int]:
+    def _transaction(self, *, exclusive: bool, allow_rollover_journal: bool = False) -> Iterator[int]:
         with self._open_context(create=False) as context_fd:
             with _flock(context_fd, ".metadata.lock", exclusive=exclusive):
+                if (
+                    not allow_rollover_journal
+                    and _read_json(context_fd, "context-rollover.json", None) is not None
+                ):
+                    raise RunnerStoreError("cloud context rollover requires recovery")
                 self._validate_binding_locked(context_fd)
                 yield context_fd
 
@@ -678,7 +705,7 @@ class RunnerStore:
         if active["schema_version"] != "heel.active-runner-context.v1":
             raise RunnerStoreError("invalid active runner context")
         self._namespace = _digest(active["namespace"], "runner namespace")
-        with self._transaction(exclusive=False):
+        with self._transaction(exclusive=False, allow_rollover_journal=True):
             pass
 
     def bind_context(
@@ -688,6 +715,7 @@ class RunnerStore:
         identity: RunnerIdentity,
         signer: SecureSigner,
         signer_label: str,
+        publish_active: bool = True,
     ) -> None:
         if not isinstance(context, RunnerContext):
             raise ValueError("RunnerContext is required")
@@ -727,10 +755,11 @@ class RunnerStore:
                                 )
                             if existing is None:
                                 _write_json(context_fd, "binding.json", binding)
-                        _write_json(runner_fd, "active-context.json", {
-                            "schema_version": "heel.active-runner-context.v1",
-                            "namespace": namespace,
-                        })
+                        if publish_active:
+                            _write_json(runner_fd, "active-context.json", {
+                                "schema_version": "heel.active-runner-context.v1",
+                                "namespace": namespace,
+                            })
                     finally:
                         if context_fd >= 0:
                             os.close(context_fd)
@@ -742,7 +771,7 @@ class RunnerStore:
     def install_cloud_context_binding(
         self, artifact: object, *, identity: RunnerIdentity, signer: SecureSigner,
         signer_label: str, trusted_cloud_keys: Mapping[str, object], now_ms: int,
-        renewal_authority_lost: bool = False,
+        rollover_evidence: RunnerContextRolloverEvidence | None = None,
     ) -> RunnerContext:
         """Verify and atomically retain a Cloud authorization beside the immutable context."""
         binding, context = self._validated_cloud_context_binding(
@@ -751,27 +780,269 @@ class RunnerStore:
         # Never create/select a namespace before proving that an existing local
         # Cloud context permits this exact renewal.  A signed artifact is not a
         # general rebind capability.
-        active_context = self.load_context() if self.is_context_bound else None
-        if active_context is not None and active_context != context:
+        was_bound = self.is_context_bound
+        pending_journal: dict[str, Any] | None = None
+        if was_bound:
+            try:
+                active_context = self.load_context()
+            except RunnerStoreError:
+                with self._transaction(exclusive=False, allow_rollover_journal=True) as context_fd:
+                    raw_journal = _read_json(context_fd, "context-rollover.json", None)
+                    if raw_journal is None:
+                        raise
+                    pending_journal = self._validate_context_rollover_journal(
+                        raw_journal, identity=identity, expected_artifact=binding,
+                        expected_evidence=rollover_evidence, expected_context=context,
+                    )
+                    active_context = _context_from_dict(self._binding_locked(context_fd)["context"])
+        else:
+            active_context = None
+        rollover = (active_context is not None and active_context != context) or pending_journal is not None
+        if rollover and not (
+            isinstance(rollover_evidence, RunnerContextRolloverEvidence)
+            and (pending_journal is not None or self._is_proof_generation_rollover(active_context, context))
+        ):
             raise RunnerStoreError("cloud context binding cannot be installed over an active context")
-        if not self.is_context_bound:
-            self.bind_context(context, identity=identity, signer=signer, signer_label=signer_label)
-        with self._transaction(exclusive=True) as context_fd:
-            existing = _read_json(context_fd, "cloud-context-binding.json", None)
-            if existing is not None and existing != binding:
-                old, old_context = self._validated_cloud_context_binding(
-                    existing, identity=identity, trusted_cloud_keys=trusted_cloud_keys, now_ms=now_ms,
-                    require_current=False,
+        provenance = {
+            "schema_version": _CLOUD_CONTEXT_PROVENANCE_SCHEMA,
+            "binding_id": binding["binding_id"],
+            "binding_digest": binding["binding_digest"],
+        }
+        previous_namespace = self._namespace
+        try:
+            # A first Cloud installation never publishes the active selector
+            # until the signed sidecar is durably present and revalidated.
+            if not was_bound:
+                self.bind_context(
+                    context, identity=identity, signer=signer, signer_label=signer_label,
+                    publish_active=False,
                 )
-                old_current = old["issued_at_ms"] <= now_ms + 30_000 and now_ms < old["expires_at_ms"]
-                if (old_context != context or (old_current and not renewal_authority_lost)
-                        or binding["binding_id"] == old["binding_id"] or binding["binding_digest"] == old["binding_digest"]
-                        or binding["issued_at_ms"] <= old["issued_at_ms"] or binding["expires_at_ms"] <= old["expires_at_ms"]):
-                    raise RunnerStoreError("cloud context binding cannot be replaced")
-                _write_json(context_fd, "cloud-context-binding.json", binding)
-            elif existing is None:
-                _write_json(context_fd, "cloud-context-binding.json", binding)
+            with self._transaction(exclusive=True, allow_rollover_journal=rollover) as context_fd:
+                existing = _read_json(context_fd, "cloud-context-binding.json", None)
+                if existing is not None and existing != binding:
+                    old, old_context = self._validated_cloud_context_binding(
+                        existing, identity=identity, trusted_cloud_keys=trusted_cloud_keys, now_ms=now_ms,
+                        require_current=False,
+                    )
+                    valid_forward = self._rollover_evidence_matches(
+                        rollover_evidence, old=old, new=binding,
+                    )
+                    valid_rollover = valid_forward and self._is_proof_generation_rollover(old_context, context)
+                    if (not valid_forward or (old_context != context and not valid_rollover)) or (
+                        binding["binding_id"] == old["binding_id"]
+                        or binding["binding_digest"] == old["binding_digest"]
+                        or binding["issued_at_ms"] <= old["issued_at_ms"]
+                        or binding["expires_at_ms"] <= old["expires_at_ms"]
+                    ):
+                        raise RunnerStoreError("cloud context binding cannot be replaced")
+                    if rollover:
+                        local = self._binding_locked(context_fd)
+                        if self._has_nonterminal_local_run(context_fd):
+                            raise RunnerStoreError("cloud context rollover requires terminal local runs")
+                        replacement = {
+                            "schema_version": local["schema_version"], "namespace": local["namespace"],
+                            "context": context.as_dict(), "identity": local["identity"],
+                            "signer_label": local["signer_label"],
+                        }
+                        if pending_journal is None:
+                            _write_json(
+                                context_fd, "context-rollover.json",
+                                self._context_rollover_journal(
+                                    old=old, new=binding, context=context,
+                                    evidence=rollover_evidence, identity=identity, signer=signer,
+                                ),
+                            )
+                        _write_json(context_fd, "binding.json", replacement)
+                elif rollover:
+                    raise RunnerStoreError("cloud context rollover requires prior cloud authority")
+                existing_provenance = _read_json(context_fd, "cloud-context-provenance.json", None)
+                if existing_provenance is not None and existing_provenance != provenance:
+                    checked_provenance = self._validate_cloud_context_provenance(existing_provenance)
+                    if (
+                        existing is None
+                        or checked_provenance["binding_id"] != existing.get("binding_id")
+                        or checked_provenance["binding_digest"] != existing.get("binding_digest")
+                    ):
+                        raise RunnerStoreError("cloud context provenance does not match sidecar")
+                _write_json(context_fd, "cloud-context-provenance.json", provenance)
+                if existing != binding:
+                    _write_json(context_fd, "cloud-context-binding.json", binding)
+                stored = _read_json(context_fd, "cloud-context-binding.json", None)
+                stored_provenance = _read_json(context_fd, "cloud-context-provenance.json", None)
+                if stored != binding or stored_provenance != provenance:
+                    raise RunnerStoreError("cloud context binding was not durably installed")
+                self._validated_cloud_context_binding(
+                    stored, identity=identity, trusted_cloud_keys=trusted_cloud_keys, now_ms=now_ms,
+                )
+                if rollover:
+                    try:
+                        os.unlink("context-rollover.json", dir_fd=context_fd)
+                    except FileNotFoundError:
+                        raise RunnerStoreError("cloud context rollover journal disappeared") from None
+                    os.fsync(context_fd)
+            if not was_bound:
+                with self._open_runner(create=True) as runner_fd:
+                    assert runner_fd is not None
+                    with _flock(runner_fd, ".runner.lock", exclusive=True):
+                        active = _read_json(runner_fd, "active-context.json", None)
+                        expected_active = {
+                            "schema_version": "heel.active-runner-context.v1",
+                            "namespace": context.namespace,
+                        }
+                        if active is not None and active != expected_active:
+                            raise RunnerStoreError("cloud context binding cannot replace active context")
+                        if active is None:
+                            _write_json(runner_fd, "active-context.json", expected_active)
+        except BaseException:
+            self._namespace = previous_namespace
+            raise
         return context
+
+    @staticmethod
+    def _is_proof_generation_rollover(old: RunnerContext, new: RunnerContext) -> bool:
+        return (
+            old.workspace_id == new.workspace_id and old.project_id == new.project_id
+            and old.environment_id == new.environment_id and old.origin == new.origin
+            and old.environment_class == new.environment_class
+            and old.namespace == new.namespace
+            and old.verification_record_digest != new.verification_record_digest
+        )
+
+    @staticmethod
+    def _rollover_evidence_matches(
+        evidence: RunnerContextRolloverEvidence | None, *, old: Mapping[str, Any], new: Mapping[str, Any],
+    ) -> bool:
+        return bool(
+            isinstance(evidence, RunnerContextRolloverEvidence)
+            and evidence.old_binding_id == old["binding_id"]
+            and evidence.old_binding_digest == old["binding_digest"]
+            and evidence.new_binding_id == new["binding_id"]
+            and evidence.new_binding_digest == new["binding_digest"]
+            and new["issued_at_ms"] <= evidence.observed_server_time_ms + 30_000
+        )
+
+    @staticmethod
+    def _rollover_evidence_dict(evidence: RunnerContextRolloverEvidence) -> dict[str, Any]:
+        return {
+            "old_binding_id": evidence.old_binding_id,
+            "old_binding_digest": evidence.old_binding_digest,
+            "new_binding_id": evidence.new_binding_id,
+            "new_binding_digest": evidence.new_binding_digest,
+            "observed_server_time_ms": evidence.observed_server_time_ms,
+        }
+
+    def _context_rollover_journal(
+        self, *, old: Mapping[str, Any], new: Mapping[str, Any], context: RunnerContext,
+        evidence: RunnerContextRolloverEvidence | None, identity: RunnerIdentity, signer: SecureSigner,
+    ) -> dict[str, Any]:
+        if not isinstance(evidence, RunnerContextRolloverEvidence):
+            raise RunnerStoreError("cloud context rollover requires evidence")
+        _identity_record(identity, signer)
+        unsigned = {
+            "schema_version": _CONTEXT_ROLLOVER_SCHEMA,
+            "old_binding_id": old["binding_id"], "old_binding_digest": old["binding_digest"],
+            "new_binding_id": new["binding_id"], "new_binding_digest": new["binding_digest"],
+            "context": context.as_dict(), "artifact": dict(new),
+            "evidence": self._rollover_evidence_dict(evidence),
+        }
+        return {
+            **unsigned, "signing_key_id": signer.key_id,
+            "signature_b64": base64.b64encode(signer.sign(canonical_bytes(unsigned))).decode("ascii"),
+        }
+
+    def _has_nonterminal_local_run(self, context_fd: int) -> bool:
+        runs_fd = _open_child(context_fd, "runs", create=False)
+        if runs_fd is None:
+            return False
+        try:
+            _secure_directory(runs_fd, "Heel runner runs directory")
+            run_names: set[str] = set()
+            reservation_names: set[str] = set()
+            for run_name in sorted(os.listdir(runs_fd)):
+                if _RUN_FILENAME.fullmatch(run_name) is not None:
+                    run_names.add(run_name)
+                    continue
+                marker = _RUN_RESERVATION_FILENAME.fullmatch(run_name)
+                if marker is None:
+                    raise RunnerStoreError("invalid local run reservation")
+                value = _read_json(runs_fd, run_name, None)
+                try:
+                    if not isinstance(value, Mapping) or set(value) != {
+                        "schema_version", "grant", "initial_state",
+                    } or value["schema_version"] != _RESERVATION_SCHEMA:
+                        raise ValueError
+                    grant = validate_execution_grant(value["grant"])
+                    if grant["grant_digest"] != marker.group(1):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise RunnerStoreError("invalid local run reservation") from None
+                reservation_names.add(self._run_hash(grant["run_id"]))
+            # A durable consumption marker with no run directory is an unfinished
+            # reservation.  It is nonterminal authority, never safe to carry across
+            # a proof-generation rollover.
+            if not reservation_names.issubset(run_names):
+                return True
+            for run_name in sorted(run_names):
+                if run_name not in reservation_names:
+                    raise RunnerStoreError("invalid local run reservation")
+                run_fd = os.open(run_name, _DIRECTORY_FLAGS, dir_fd=runs_fd)
+                try:
+                    _secure_directory(run_fd, "Heel local run directory")
+                    state = _read_json(run_fd, "state.json", None)
+                    if not isinstance(state, Mapping) or type(state.get("run_id")) is not str:
+                        raise RunnerStoreError("invalid local run state")
+                    checked = self._run_state_locked(run_fd, state["run_id"])
+                    if checked["state"] != "terminal":
+                        return True
+                finally:
+                    os.close(run_fd)
+            return False
+        finally:
+            os.close(runs_fd)
+
+    def _validate_context_rollover_journal(
+        self, value: object, *, identity: RunnerIdentity, expected_artifact: Mapping[str, Any],
+        expected_evidence: RunnerContextRolloverEvidence | None, expected_context: RunnerContext,
+    ) -> dict[str, Any]:
+        fields = {
+            "schema_version", "old_binding_id", "old_binding_digest", "new_binding_id",
+            "new_binding_digest", "context", "artifact", "evidence", "signing_key_id", "signature_b64",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields or value["schema_version"] != _CONTEXT_ROLLOVER_SCHEMA:
+            raise RunnerStoreError("invalid cloud context rollover journal")
+        try:
+            evidence = RunnerContextRolloverEvidence(**dict(value["evidence"]))
+            public = load_public_key_base64(identity.public_key_b64)
+            unsigned = {key: value[key] for key in fields - {"signing_key_id", "signature_b64"}}
+            verify_envelope(
+                {identity.key_id: public},
+                {"signing_key_id": value["signing_key_id"], "signature_b64": value["signature_b64"]},
+                canonical_bytes(unsigned),
+            )
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid cloud context rollover journal") from None
+        if (
+            value["artifact"] != dict(expected_artifact)
+            or _context_from_dict(value["context"]) != expected_context
+            or evidence != expected_evidence
+            or value["new_binding_id"] != expected_artifact["binding_id"]
+            or value["new_binding_digest"] != expected_artifact["binding_digest"]
+        ):
+            raise RunnerStoreError("cloud context rollover journal does not match recovery")
+        return dict(value)
+
+    @staticmethod
+    def _validate_cloud_context_provenance(value: object) -> dict[str, str]:
+        fields = {"schema_version", "binding_id", "binding_digest"}
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise RunnerStoreError("invalid cloud context provenance")
+        if value["schema_version"] != _CLOUD_CONTEXT_PROVENANCE_SCHEMA:
+            raise RunnerStoreError("invalid cloud context provenance")
+        return {
+            "schema_version": _CLOUD_CONTEXT_PROVENANCE_SCHEMA,
+            "binding_id": _id(value["binding_id"], "cloud context binding ID"),
+            "binding_digest": _digest(value["binding_digest"], "cloud context binding digest"),
+        }
 
     def _validated_cloud_context_binding(
         self, artifact: object, *, identity: RunnerIdentity, trusted_cloud_keys: Mapping[str, object],
@@ -808,8 +1079,25 @@ class RunnerStore:
             except (TypeError, ValueError):
                 raise RunnerStoreError("invalid cloud context binding") from None
 
+    def load_cloud_context_binding_for_recovery(self) -> dict[str, Any]:
+        """Read a sidecar only to correlate a signed journal recovery; never for execution."""
+        with self._transaction(exclusive=False, allow_rollover_journal=True) as context_fd:
+            value = _read_json(context_fd, "cloud-context-binding.json", None)
+            try:
+                return validate_runner_context_binding(value)
+            except (TypeError, ValueError):
+                raise RunnerStoreError("invalid cloud context binding") from None
+
     def has_cloud_context_binding(self) -> bool:
         with self._transaction(exclusive=False) as context_fd:
+            return _read_json(context_fd, "cloud-context-binding.json", None) is not None
+
+    def has_cloud_context_provenance(self) -> bool:
+        """Whether an active local context was ever selected for Cloud authority."""
+        with self._transaction(exclusive=False, allow_rollover_journal=True) as context_fd:
+            provenance = _read_json(context_fd, "cloud-context-provenance.json", None)
+            if provenance is not None:
+                return True
             return _read_json(context_fd, "cloud-context-binding.json", None) is not None
 
     def verify_cloud_context_binding(
@@ -817,6 +1105,15 @@ class RunnerStore:
     ) -> dict[str, Any]:
         """Reverify the sidecar at every use; disk contents are never a trust decision."""
         binding = self.load_cloud_context_binding()
+        with self._transaction(exclusive=False) as context_fd:
+            provenance = _read_json(context_fd, "cloud-context-provenance.json", None)
+        if provenance is not None:
+            checked_provenance = self._validate_cloud_context_provenance(provenance)
+            if (
+                checked_provenance["binding_id"] != binding["binding_id"]
+                or checked_provenance["binding_digest"] != binding["binding_digest"]
+            ):
+                raise RunnerStoreError("cloud context provenance does not match sidecar")
         if not isinstance(trusted_cloud_keys, Mapping) or not trusted_cloud_keys:
             raise RunnerStoreError("cloud context authority is unavailable")
         if type(now_ms) is not int or isinstance(now_ms, bool):

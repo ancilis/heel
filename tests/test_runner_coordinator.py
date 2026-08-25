@@ -18,6 +18,7 @@ from heel.runner.http_transport import CancellationToken
 from heel.runner.execution import ExecutionBundle, ExecutionGate
 from heel.runner.service import ClaimLease, RunnerService
 from heel.runner.store import RunnerStore
+import heel.runner.store as runner_store_module
 from tests.test_runner_stop import (
     BlockingExecutor, StopCoordinator, compiled_pair, signed_grant,
 )
@@ -272,6 +273,139 @@ def test_first_cloud_context_acquisition_lists_before_binding_a_namespace(tmp_pa
     assert coordinator.ensure_runner_context() is True
     assert calls == ["list", "claim"]
     assert store.is_context_bound
+    # The coordinator records the actual local signer identity, not a generic
+    # Cloud label that would make a resumed binding ambiguous.
+    assert store.load_binding()["signer_label"] == identity.key_id
+
+
+def test_failed_cloud_install_provenance_never_downgrades_to_static_context(tmp_path, monkeypatch):
+    store, identity, signer, _manifest, _projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    unsigned = {
+        "schema_version": "heel.runner-context-binding.v1", "binding_id": "rcb_" + "d" * 32,
+        "workspace_id": identity.workspace_id, "project_id": store.load_context().project_id,
+        "environment": {
+            "environment_id": store.load_context().environment_id,
+            "origin": store.load_context().origin,
+            "environment_class": store.load_context().environment_class,
+            "verification_record_digest": store.load_context().verification_record_digest,
+        },
+        "runner_binding": {"runner_id": identity.runner_id, "runner_key_id": identity.key_id, "public_key_digest": identity.fingerprint},
+        "authorization": {"user_id": "owner", "role": "owner"}, "issued_at_ms": 1, "expires_at_ms": 60_001,
+    }
+    artifact = {**unsigned, "binding_digest": canonical_digest(unsigned)}
+    artifact.update(authority.sign(b"heel.runner-context-binding.v1\0" + canonical_bytes(unsigned)))
+    original_write = runner_store_module._write_json
+
+    def fail_sidecar(directory_fd, filename, value):
+        if filename == "cloud-context-binding.json":
+            raise OSError("injected sidecar failure")
+        return original_write(directory_fd, filename, value)
+
+    monkeypatch.setattr(runner_store_module, "_write_json", fail_sidecar)
+    with pytest.raises(OSError, match="injected sidecar failure"):
+        store.install_cloud_context_binding(
+            artifact, identity=identity, signer=signer, signer_label="test-signer",
+            trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=2_000,
+        )
+    monkeypatch.setattr(runner_store_module, "_write_json", original_write)
+
+    calls = []
+
+    class Transport:
+        def post(self, path, *, headers, body):
+            assert path.endswith("/contexts/list")
+            calls.append(path)
+            return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, {
+                "schema_version": "heel.runner-context-list-result.v1", "server_time_ms": 2_000,
+                "contexts": [], "has_more": False,
+            }
+
+    control = RunnerControlClient(
+        origin="https://control.example", workspace_id=identity.workspace_id,
+        runner_id=identity.runner_id, signer=signer, clock=lambda: 2_000,
+        transport=Transport(), nonce_source=lambda _chain: _nonce(b"c"),
+        trusted_disclosure_keys={authority.key_id: authority.public_key},
+    )
+    coordinator = RunnerCoordinator(
+        control=control, store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key}, clock_ms=lambda: 2_000,
+    )
+
+    assert coordinator.ensure_runner_context() is False
+    assert len(calls) == 1
+
+
+def test_coordinator_rolls_forward_only_from_one_fresh_list_and_matching_claim(tmp_path):
+    store, identity, signer, _manifest, _projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    context = store.load_context()
+
+    def artifact(binding_id, verification_digest, issued_at, expires_at):
+        unsigned = {
+            "schema_version": "heel.runner-context-binding.v1", "binding_id": binding_id,
+            "workspace_id": identity.workspace_id, "project_id": context.project_id,
+            "environment": {
+                "environment_id": context.environment_id, "origin": context.origin,
+                "environment_class": context.environment_class,
+                "verification_record_digest": verification_digest,
+            },
+            "runner_binding": {
+                "runner_id": identity.runner_id, "runner_key_id": identity.key_id,
+                "public_key_digest": identity.fingerprint,
+            },
+            "authorization": {"user_id": "owner", "role": "owner"},
+            "issued_at_ms": issued_at, "expires_at_ms": expires_at,
+        }
+        return {
+            **unsigned, "binding_digest": canonical_digest(unsigned),
+            **authority.sign(b"heel.runner-context-binding.v1\0" + canonical_bytes(unsigned)),
+        }
+
+    old = artifact("rcb_" + "7" * 32, context.verification_record_digest, 1, 60_001)
+    new = artifact("rcb_" + "8" * 32, "8" * 64, 60_002, 120_003)
+    store.install_cloud_context_binding(
+        old, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    )
+    calls = []
+
+    class Transport:
+        def post(self, path, *, headers, body):
+            if path.endswith("/contexts/list"):
+                calls.append("list")
+                return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"r")}, {
+                    "schema_version": "heel.runner-context-list-result.v1", "server_time_ms": 60_002,
+                    "contexts": [{
+                        "binding_id": new["binding_id"], "binding_digest": new["binding_digest"],
+                        "project_id": context.project_id, "environment_id": context.environment_id,
+                        "origin": context.origin, "environment_class": context.environment_class,
+                        "verification_record_digest": "8" * 64, "expires_at_ms": 120_003,
+                        "claimed": False,
+                    }], "has_more": False,
+                }
+            assert path.endswith(f"/contexts/{new['binding_id']}/claim")
+            calls.append("claim")
+            return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"s")}, {
+                "schema_version": "heel.runner-context-claim-result.v1",
+                "context_binding": new, "claimed_at_ms": 60_002,
+            }
+
+    control = RunnerControlClient(
+        origin="https://control.example", workspace_id=identity.workspace_id,
+        runner_id=identity.runner_id, signer=signer, clock=lambda: 60_002,
+        transport=Transport(), nonce_source=lambda _chain: _nonce(b"q"),
+        trusted_disclosure_keys={authority.key_id: authority.public_key},
+    )
+    coordinator = RunnerCoordinator(
+        control=control, store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key}, clock_ms=lambda: 60_002,
+    )
+
+    assert coordinator.ensure_runner_context() is True
+    assert calls == ["list", "claim"]
+    assert store.load_context().verification_record_digest == "8" * 64
+    assert store.load_cloud_context_binding()["binding_id"] == new["binding_id"]
 
 
 def test_claim_decodes_closed_bundle_installs_all_run_chains_and_builds_safe_projection(tmp_path):

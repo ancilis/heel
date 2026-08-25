@@ -16,6 +16,7 @@ from typing import Callable
 
 from .canary_disclosure import CanaryDisclosureService
 from .canary_runs import AUDIT_RETENTION_MS, PROJECTION_RETENTION_MS, CanaryRunService
+from .runner_contexts import RunnerContextBindingService
 
 
 _LOGGER = logging.getLogger("heel.saas.control_plane")
@@ -527,6 +528,9 @@ class CanaryReaper:
         now_ms = max(0, int(float(self.clock()) * 1000))
         service.conn.execute("BEGIN IMMEDIATE")
         try:
+            context_counts = RunnerContextBindingService(
+                service.conn, signing=self.signing, clock=self.clock,
+            ).expire_and_purge_in_transaction(now_ms)
             additional = self._request_authority_stops(service, disclosure, now_ms)
             service.conn.commit()
         except Exception:
@@ -534,6 +538,10 @@ class CanaryReaper:
                 service.conn.rollback()
             raise
         for name, value in additional.items():
+            counts[name] = counts.get(name, 0) + value
+        for name, value in context_counts.items():
+            if name == "next_cursor":
+                continue
             counts[name] = counts.get(name, 0) + value
         return counts
 

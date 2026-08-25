@@ -16,7 +16,6 @@ from heel.canary_contracts import (
     validate_canary_findings,
     validate_disclosure_permit,
     validate_operational_run,
-    validate_runner_context_binding,
 )
 from heel.crypto import verify_envelope
 from heel.runner.control_client import RunnerControlClient
@@ -27,7 +26,9 @@ from heel.runner.execution import (
 )
 from heel.runner.identity import RunnerIdentity, SecureSigner
 from heel.runner.service import ClaimLease
-from heel.runner.store import RunnerContext, RunnerStore, RunnerStoreError
+from heel.runner.store import (
+    RunnerContext, RunnerContextRolloverEvidence, RunnerStore, RunnerStoreError,
+)
 
 
 _MAX_AUTHENTICATED_GATE_AGE_SECONDS = 0.5
@@ -168,7 +169,9 @@ class RunnerCoordinator:
                 raise ValueError("ambiguous cloud runner contexts")
             item = contexts[0]
             claimed = self.control.claim_context(item["binding_id"], item["binding_digest"])
-            self.install_cloud_context_binding(claimed["context_binding"], signer_label="cloud-context")
+            self.install_cloud_context_binding(
+                claimed["context_binding"], signer_label=self.signer.key_id,
+            )
             return True
         try:
             current = self.store.verify_cloud_context_binding(
@@ -186,14 +189,23 @@ class RunnerCoordinator:
                 raise ValueError("ambiguous cloud runner contexts")
             item = contexts[0]
             claimed = self.control.claim_context(item["binding_id"], item["binding_digest"])
+            artifact = claimed["context_binding"]
+            evidence = RunnerContextRolloverEvidence(
+                current["binding_id"], current["binding_digest"], item["binding_id"],
+                item["binding_digest"], listed["server_time_ms"],
+            )
             self.store.install_cloud_context_binding(
-                claimed["context_binding"], identity=self.identity, signer=self.signer,
-                signer_label="cloud-context", trusted_cloud_keys=self.trusted_grant_keys,
-                now_ms=self._now_ms(), renewal_authority_lost=True,
+                artifact, identity=self.identity, signer=self.signer,
+                signer_label=self.signer.key_id, trusted_cloud_keys=self.trusted_grant_keys,
+                now_ms=self._now_ms(), rollover_evidence=evidence,
             )
             return True
         except RunnerStoreError:
-            if self.store.has_cloud_context_binding():
+            if self.store.has_cloud_context_provenance():
+                try:
+                    old = self.store.load_cloud_context_binding_for_recovery()
+                except RunnerStoreError:
+                    old = None
                 listed = self.control.list_contexts()
                 contexts = listed["contexts"]
                 if len(contexts) == 0:
@@ -203,10 +215,17 @@ class RunnerCoordinator:
                 item = contexts[0]
                 claimed = self.control.claim_context(item["binding_id"], item["binding_digest"])
                 try:
+                    artifact = claimed["context_binding"]
+                    evidence = (
+                        RunnerContextRolloverEvidence(
+                            old["binding_id"], old["binding_digest"], item["binding_id"],
+                            item["binding_digest"], listed["server_time_ms"],
+                        ) if old is not None else None
+                    )
                     self.store.install_cloud_context_binding(
-                        claimed["context_binding"], identity=self.identity, signer=self.signer,
-                        signer_label="cloud-context", trusted_cloud_keys=self.trusted_grant_keys,
-                        now_ms=self._now_ms(), renewal_authority_lost=True,
+                        artifact, identity=self.identity, signer=self.signer,
+                        signer_label=self.signer.key_id, trusted_cloud_keys=self.trusted_grant_keys,
+                        now_ms=self._now_ms(), rollover_evidence=evidence,
                     )
                 except RunnerStoreError:
                     raise ValueError("cloud context binding no longer verifies") from None
@@ -226,7 +245,9 @@ class RunnerCoordinator:
             raise ValueError("ambiguous cloud runner contexts")
         item = contexts[0]
         claimed = self.control.claim_context(item["binding_id"], item["binding_digest"])
-        self.install_cloud_context_binding(claimed["context_binding"], signer_label="cloud-context")
+        self.install_cloud_context_binding(
+            claimed["context_binding"], signer_label=self.signer.key_id,
+        )
         return True
 
     def submit_cloud_context_approval(self, approval_projection: object) -> dict[str, Any]:

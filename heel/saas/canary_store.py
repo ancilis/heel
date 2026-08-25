@@ -589,6 +589,15 @@ CREATE TABLE canary_runner_context_events(
 CREATE INDEX idx_runner_context_events_purge ON canary_runner_context_events(purge_at_ms);
 """
 
+# Migration 17 narrows the discoverable runner authority to one active binding across
+# every project/environment.  Context selection is intentionally absent from the runner
+# protocol, so permitting two live bindings would make acquisition permanently ambiguous.
+RUNNER_CONTEXT_ONE_ACTIVE_PER_RUNNER_MIGRATION = r"""
+CREATE UNIQUE INDEX idx_runner_context_one_active_per_runner
+ ON canary_runner_context_bindings(workspace_id,runner_id)
+ WHERE status='active';
+"""
+
 _ENVIRONMENT_COLUMNS = (
     "attestation_text", "attestation_version", "attested_by", "attested_at", "proof_method",
     "proof_version", "normalization_version", "challenge_generation", "challenge_digest",
@@ -642,6 +651,7 @@ def ensure_runner_context_schema(conn: sqlite3.Connection) -> None:
         raise RuntimeError("runner context binding schema is partially initialized")
     if not found:
         conn.executescript(RUNNER_CONTEXT_BINDINGS_MIGRATION)
+        conn.executescript(RUNNER_CONTEXT_ONE_ACTIVE_PER_RUNNER_MIGRATION)
     # A names-only or fragment check is unsafe: a hand-created table can omit the
     # composite FK/check that keeps pairing authorization from becoming broader
     # authority.  Compare the frozen v16 definitions, then independently inspect
@@ -746,6 +756,15 @@ def ensure_runner_context_schema(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if match is None or row is None or row[0] is None or normalize(row[0]) != normalize(match.group(1)):
             raise RuntimeError("runner context binding schema indexes are incomplete")
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_runner_context_one_active_per_runner'"
+    ).fetchone()
+    expected = re.search(
+        r"(CREATE UNIQUE INDEX idx_runner_context_one_active_per_runner\s+ON .*?);",
+        RUNNER_CONTEXT_ONE_ACTIVE_PER_RUNNER_MIGRATION, flags=re.DOTALL,
+    )
+    if expected is None or row is None or row[0] is None or normalize(row[0]) != normalize(expected.group(1)):
+        raise RuntimeError("runner context binding schema indexes are incomplete")
     if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise RuntimeError("runner context binding schema foreign keys are invalid")
 
