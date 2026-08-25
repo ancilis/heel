@@ -748,7 +748,14 @@ class RunnerStore:
         binding, context = self._validated_cloud_context_binding(
             artifact, identity=identity, trusted_cloud_keys=trusted_cloud_keys, now_ms=now_ms,
         )
-        self.bind_context(context, identity=identity, signer=signer, signer_label=signer_label)
+        # Never create/select a namespace before proving that an existing local
+        # Cloud context permits this exact renewal.  A signed artifact is not a
+        # general rebind capability.
+        active_context = self.load_context() if self.is_context_bound else None
+        if active_context is not None and active_context != context:
+            raise RunnerStoreError("cloud context binding cannot be installed over an active context")
+        if not self.is_context_bound:
+            self.bind_context(context, identity=identity, signer=signer, signer_label=signer_label)
         with self._transaction(exclusive=True) as context_fd:
             existing = _read_json(context_fd, "cloud-context-binding.json", None)
             if existing is not None and existing != binding:
