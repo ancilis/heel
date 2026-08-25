@@ -266,7 +266,7 @@ class MacOSKeychainSecretBackend:
             raise RuntimeError("runner OS secret service returned invalid material")
         encoded = base64.b64encode(seed)
         result = _run_bounded_security(
-            ("add-generic-password", "-U", "-s", self.service, "-a", label, "-w"),
+            ("add-generic-password", "-s", self.service, "-a", label, "-w"),
             payload=encoded,
             popen=self._popen,
         )

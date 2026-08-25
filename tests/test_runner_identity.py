@@ -182,6 +182,41 @@ def test_macos_load_is_bounded_and_never_exposes_helper_output(monkeypatch):
     assert secret_marker.decode() not in str(caught.value)
 
 
+def test_macos_first_create_never_overwrites_a_racing_keychain_account(monkeypatch):
+    generated_seed = b"n" * 32
+    existing_seed = b"e" * 32
+    persisted = bytearray(existing_seed)
+    calls = []
+
+    def popen(argv, **kwargs):
+        if argv[1] == "find-generic-password":
+            process = _FakeProcess(argv, returncode=44, stdout=b"")
+        else:
+            if "-U" in argv:
+                persisted[:] = generated_seed
+                process = _FakeProcess(argv, returncode=0, stdout=b"")
+            else:
+                process = _FakeProcess(argv, returncode=45, stdout=b"")
+        calls.append((tuple(argv), kwargs, process))
+        return process
+
+    monkeypatch.setattr("heel.runner.identity._verified_security_path",
+                        lambda: "/usr/bin/security")
+    monkeypatch.setattr("heel.runner.identity.secrets.token_bytes", lambda count: generated_seed)
+
+    with pytest.raises(RuntimeError, match="runner OS secret service unavailable") as caught:
+        SystemSecureSigner("runner-race", backend=MacOSKeychainSecretBackend(popen=popen))
+
+    store_argv, _, store_process = calls[1]
+    assert store_argv == (
+        "/usr/bin/security", "add-generic-password", "-s",
+        "heel.runner.ed25519.v1", "-a", "runner-race", "-w",
+    )
+    assert bytes(store_process.stdin.data) == base64.b64encode(generated_seed)
+    assert bytes(persisted) == existing_seed
+    assert base64.b64encode(generated_seed).decode() not in str(caught.value)
+
+
 def test_linux_first_create_uses_only_verified_helper_and_stdin_for_seed(monkeypatch):
     expected_seed = b"l" * 32
     encoded_seed = base64.b64encode(expected_seed)
