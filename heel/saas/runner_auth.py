@@ -138,6 +138,26 @@ CREATE TABLE IF NOT EXISTS canary_runner_audit_records(
 UPDATE canary_runners SET status='disabled' WHERE status='active';
 """
 
+RUNNER_AUTH_RESYNC_MIGRATION = """
+ALTER TABLE canary_runner_pairings ADD COLUMN display_name TEXT;
+UPDATE canary_runner_pairings SET status='expired' WHERE status IN ('invited','pending','approved');
+CREATE TABLE IF NOT EXISTS canary_runner_chain_cursors(
+ workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
+ next_sequence INTEGER NOT NULL CHECK(next_sequence>=1), generation INTEGER NOT NULL CHECK(generation>=0), updated_at REAL NOT NULL,
+ PRIMARY KEY(workspace_id,runner_id,chain_name), FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+CREATE TABLE IF NOT EXISTS canary_runner_resync_challenges(
+ challenge_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
+ client_nonce_hash TEXT NOT NULL, server_challenge_hash TEXT NOT NULL, signed_digest TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('pending','completed','invalidated')), created_at REAL NOT NULL, expires_at REAL NOT NULL,
+ completed_response_ciphertext TEXT, completed_at REAL,
+ FOREIGN KEY(workspace_id,runner_id,chain_name) REFERENCES canary_runner_chain_cursors(workspace_id,runner_id,chain_name));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runner_key_triple ON canary_runner_keys(workspace_id,runner_id,key_id);
+CREATE INDEX IF NOT EXISTS idx_canary_runner_pairings_expiry ON canary_runner_pairings(expires_at);
+CREATE INDEX IF NOT EXISTS idx_canary_runner_ledger_cleanup ON canary_runner_request_ledger(created_at);
+CREATE INDEX IF NOT EXISTS idx_canary_runner_nonce_expiry ON canary_runner_nonce_chains(expires_at);
+CREATE INDEX IF NOT EXISTS idx_canary_runner_resync_expiry ON canary_runner_resync_challenges(expires_at);
+"""
+
 # A new in-process ControlPlane has no runner-auth rows to preserve.  Build its tables directly
 # at the v11 shape instead of creating v9 then replaying a destructive rename/copy migration.
 # Existing durable databases are upgraded exclusively by the append-only migration list above.
@@ -149,7 +169,7 @@ CREATE TABLE IF NOT EXISTS canary_runner_pairings(
   phrase TEXT, public_key TEXT, fingerprint TEXT, key_id TEXT, runner_version TEXT,
   adapters_json TEXT, activation_challenge TEXT,
   status TEXT NOT NULL CHECK(status IN ('invited','pending','approved','activated','expired')),
-  created_at REAL NOT NULL, expires_at REAL NOT NULL, approved_at REAL, activated_at REAL, approved_by TEXT,
+  created_at REAL NOT NULL, expires_at REAL NOT NULL, approved_at REAL, activated_at REAL, approved_by TEXT, display_name TEXT,
   UNIQUE(workspace_id, runner_id), FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id));
 CREATE TABLE IF NOT EXISTS canary_runner_nonce_chains(
   workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
@@ -183,6 +203,21 @@ CREATE TABLE IF NOT EXISTS canary_runner_audit_records(
   action TEXT NOT NULL CHECK(action IN ('runner_revoked','runner_rotated','runner_activated')),
   actor TEXT NOT NULL, reason_code TEXT, created_at REAL NOT NULL,
   FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+CREATE TABLE IF NOT EXISTS canary_runner_chain_cursors(
+ workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
+ next_sequence INTEGER NOT NULL CHECK(next_sequence>=1), generation INTEGER NOT NULL CHECK(generation>=0), updated_at REAL NOT NULL,
+ PRIMARY KEY(workspace_id,runner_id,chain_name), FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+CREATE TABLE IF NOT EXISTS canary_runner_resync_challenges(
+ challenge_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
+ client_nonce_hash TEXT NOT NULL, server_challenge_hash TEXT NOT NULL, signed_digest TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('pending','completed','invalidated')), created_at REAL NOT NULL, expires_at REAL NOT NULL,
+ completed_response_ciphertext TEXT, completed_at REAL,
+ FOREIGN KEY(workspace_id,runner_id,chain_name) REFERENCES canary_runner_chain_cursors(workspace_id,runner_id,chain_name));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runner_key_triple ON canary_runner_keys(workspace_id,runner_id,key_id);
+CREATE INDEX IF NOT EXISTS idx_canary_runner_pairings_expiry ON canary_runner_pairings(expires_at);
+CREATE INDEX IF NOT EXISTS idx_canary_runner_ledger_cleanup ON canary_runner_request_ledger(created_at);
+CREATE INDEX IF NOT EXISTS idx_canary_runner_nonce_expiry ON canary_runner_nonce_chains(expires_at);
+CREATE INDEX IF NOT EXISTS idx_canary_runner_resync_expiry ON canary_runner_resync_challenges(expires_at);
 """
 
 
@@ -262,6 +297,7 @@ def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
         raise TypeError("runner authentication requires a SQLite connection")
     expected = sqlite3.connect(":memory:")
     try:
+        expected.executescript("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY); CREATE TABLE canary_runners(workspace_id TEXT,runner_id TEXT,UNIQUE(workspace_id,runner_id)); CREATE TABLE canary_runner_keys(workspace_id TEXT,runner_id TEXT,key_id TEXT);")
         expected.executescript(RUNNER_AUTH_RUNTIME_SCHEMA)
         for table in _RUNNER_AUTH_TABLES:
             actual = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
