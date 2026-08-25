@@ -1,11 +1,22 @@
 import base64
 import hashlib
+import sqlite3
+import time
+import http.client
+import json
+import threading
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 import pytest
 
 from heel.canary_contracts import canonical_bytes
 from heel.crypto import ed25519_key_id
 from heel.runner.control_client import RunnerControlClient
+from heel.saas.canary_store import CanaryStore
+from heel.saas.runner_auth import RunnerAuthError, RunnerAuthStore
+from heel.saas.http_api import ControlPlane, serve
 
 PUBLIC_KEY = b"0123456789abcdef0123456789abcdef"
 KEY_ID = ed25519_key_id(PUBLIC_KEY)
@@ -60,3 +71,64 @@ def test_has_no_public_generic_request_api():
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
     assert public <= {"claim", "heartbeat", "progress", "result", "stop_ack", "retry_last"}
+
+
+def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
+    conn = sqlite3.connect(":memory:")
+    CanaryStore(conn)
+    store = RunnerAuthStore(conn, pepper=b"p" * 32)
+    private = Ed25519PrivateKey.generate()
+    raw = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    key_id = ed25519_key_id(raw)
+    now = int(time.time() * 1000)
+    conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("r", "ws", "r", "active", time.time()))
+    conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, "ws", "r", base64.b64encode(raw).decode(), "active", time.time()))
+    nonce = "n" * 44
+    conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", ("ws", "r", "claim", store._hash("nonce", nonce), 1, time.time() + 60))
+    conn.commit()
+    body, path = b"{}", "/v1/workspaces/ws/runners/r/claim"
+    def headers(timestamp=now, signer=private):
+        proof = {"schema_version":"heel.runner-request-proof.v1","workspace_id":"ws","runner_id":"r","key_id":key_id,"capability":"runner_claim","method":"POST","path":path,"body_sha256":hashlib.sha256(body).hexdigest(),"timestamp_ms":timestamp,"server_nonce":nonce,"sequence":1}
+        signature = base64.b64encode(signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))).decode()
+        return {"X-Heel-Runner-Id":["r"],"X-Heel-Runner-Key-Id":[key_id],"X-Heel-Runner-Timestamp-Ms":[str(timestamp)],"X-Heel-Runner-Nonce":[nonce],"X-Heel-Runner-Sequence":["1"],"X-Heel-Runner-Signature":[signature],"Authorization":[],"Cookie":[]}
+    accepted, next_nonce = store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"status": "ok"})
+    assert accepted == {"status": "ok"} and next_nonce
+    assert store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"status": "bad"}) == (accepted, next_nonce)
+    with pytest.raises(RunnerAuthError):
+        store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(now + 1), action=lambda: {"status": "leak"})
+    receipt = conn.execute("SELECT response_json,next_nonce,response_ciphertext,next_nonce_ciphertext FROM canary_runner_request_ledger").fetchone()
+    assert receipt[0] == "sealed" and receipt[1] != next_nonce and receipt[2] and receipt[3]
+
+
+def test_http_pairing_exchange_returns_runner_only_challenge_for_activation():
+    cp = ControlPlane(device_token_pepper=b"d" * 32, runner_auth_pepper=b"r" * 32,
+                      enable_device_auth=True, public_origin="https://heel.test")
+    server = serve(cp)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    def request(method, path, body, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        payload = json.dumps(body, separators=(",", ":")).encode() if method == "POST" else None
+        request_headers = ({"Content-Type":"application/json", **(headers or {})} if method == "POST" else (headers or {}))
+        conn.request(method, path, payload, request_headers)
+        response = conn.getresponse(); raw = response.read(); cookie = response.getheader("Set-Cookie"); conn.close()
+        return response.status, json.loads(raw), cookie
+    try:
+        _, signup, cookie = request("POST", "/v1/signup", {"email":"runner@example.test", "password":"correct-horse-battery"})
+        browser = {"Cookie": cookie.split(";", 1)[0], "Origin":"https://heel.test", "X-Heel-Internal-Origin":"same-origin"}
+        status, invitation, _ = request("POST", f"/v1/workspaces/{signup['workspace_id']}/runner-pairings", {"schema_version":"heel.runner-pairing-invite.v1"}, browser)
+        assert status == 201
+        private = Ed25519PrivateKey.generate()
+        public = base64.b64encode(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+        from heel.saas.runner_auth import WORDS
+        phrase = " ".join(WORDS[:6])
+        status, exchanged, _ = request("POST", "/v1/runner-pairings/exchange", {"schema_version":"heel.runner-pairing-exchange.v1", "invitation_token":invitation["invitation_token"], "public_key_b64":public, "pairing_phrase":phrase, "runner_id":"runner-http", "runner_version":"v1", "adapters":{}})
+        assert status == 201 and exchanged["activation_challenge"]
+        status, inspect, _ = request("GET", f"/v1/workspaces/{signup['workspace_id']}/runner-pairings/{exchanged['pairing_id']}", {}, browser)
+        assert status == 200 and "activation_challenge" not in inspect
+        fingerprint = hashlib.sha256(base64.b64decode(public)).hexdigest()
+        assert request("POST", f"/v1/workspaces/{signup['workspace_id']}/runner-pairings/{exchanged['pairing_id']}/approve", {"schema_version":"heel.runner-pairing-approve.v1", "pairing_phrase":phrase, "fingerprint":fingerprint}, browser)[0] == 200
+        activation = b"heel.runner-pairing-activate.v1\0" + canonical_bytes({"pairing_id":exchanged["pairing_id"], "challenge":exchanged["activation_challenge"]})
+        signature = base64.b64encode(private.sign(activation)).decode()
+        assert request("POST", f"/v1/runner-pairings/{exchanged['pairing_id']}/activate", {"schema_version":"heel.runner-pairing-activate.v1", "signature_b64":signature})[0] == 200
+    finally:
+        server.shutdown(); server.server_close()

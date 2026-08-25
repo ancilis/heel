@@ -58,6 +58,22 @@ CREATE TABLE IF NOT EXISTS canary_runner_rotations(
   approved_at REAL, activated_at REAL, approved_by TEXT);
 """
 
+# Migration nine established the isolated tables.  Migration ten only appends columns: it
+# never rewrites that applied schema, and makes a replay receipt attest the entire verified
+# request rather than merely its body.
+RUNNER_AUTH_HARDENING_MIGRATION = """
+ALTER TABLE canary_runner_request_ledger ADD COLUMN nonce_hash TEXT;
+ALTER TABLE canary_runner_request_ledger ADD COLUMN key_id TEXT;
+ALTER TABLE canary_runner_request_ledger ADD COLUMN capability TEXT;
+ALTER TABLE canary_runner_request_ledger ADD COLUMN method TEXT;
+ALTER TABLE canary_runner_request_ledger ADD COLUMN path TEXT;
+ALTER TABLE canary_runner_request_ledger ADD COLUMN timestamp_ms INTEGER;
+ALTER TABLE canary_runner_request_ledger ADD COLUMN signed_request_digest TEXT;
+ALTER TABLE canary_runner_request_ledger ADD COLUMN body_digest TEXT;
+ALTER TABLE canary_runner_request_ledger ADD COLUMN response_ciphertext TEXT;
+ALTER TABLE canary_runner_request_ledger ADD COLUMN next_nonce_ciphertext TEXT;
+"""
+
 
 class RunnerAuthError(PermissionError):
     """Uniform external runner-auth failure."""
@@ -77,6 +93,7 @@ class PairingView:
     fingerprint: str
     status: str
     expires_at: float
+    activation_challenge: str | None = None
 
 
 def _now() -> float:
@@ -110,6 +127,32 @@ class RunnerAuthStore:
         self.conn, self._pepper, self._now = conn, pepper, now
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(RUNNER_AUTH_SCHEMA)
+        self._ensure_hardened_ledger()
+
+    def _ensure_hardened_ledger(self) -> None:
+        present = {row[1] for row in self.conn.execute("PRAGMA table_info(canary_runner_request_ledger)")}
+        for statement in RUNNER_AUTH_HARDENING_MIGRATION.strip().split(";"):
+            statement = statement.strip()
+            if not statement:
+                continue
+            column = statement.split()[5]
+            if column not in present:
+                self.conn.execute(statement)
+                present.add(column)
+
+    def _seal(self, value: str, *, aad: bytes) -> str:
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        key = hashlib.sha256(b"heel.runner-ledger-aead.v1\0" + self._pepper).digest()
+        nonce = secrets.token_bytes(12)
+        return _b64(nonce + ChaCha20Poly1305(key).encrypt(nonce, value.encode("utf-8"), aad))
+
+    def _open(self, value: str, *, aad: bytes) -> str:
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+        raw = base64.b64decode(value, validate=True)
+        if len(raw) < 29:
+            raise ValueError
+        key = hashlib.sha256(b"heel.runner-ledger-aead.v1\0" + self._pepper).digest()
+        return ChaCha20Poly1305(key).decrypt(raw[:12], raw[12:], aad).decode("utf-8")
 
     def _hash(self, domain: str, value: str) -> str:
         return hmac.new(self._pepper, domain.encode("ascii") + b"\0" + value.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -173,7 +216,7 @@ class RunnerAuthStore:
             self.conn.commit()
         except Exception:
             self.conn.rollback(); raise
-        return PairingView(row["pairing_id"], runner_id, phrase, fingerprint, "pending", row["expires_at"])
+        return PairingView(row["pairing_id"], runner_id, phrase, fingerprint, "pending", row["expires_at"], challenge)
 
     def inspect(self, workspace_id: str, pairing_id: str) -> PairingView:
         row = self.conn.execute("SELECT * FROM canary_runner_pairings WHERE workspace_id=? AND pairing_id=?", (workspace_id, pairing_id)).fetchone()
@@ -347,35 +390,55 @@ class RunnerAuthStore:
             parsed = parse_json(raw_body, max_bytes=MAX_RUNNER_BODY)
             if canonical_bytes(parsed) != raw_body:
                 raise RunnerAuthError("invalid runner authentication")
-            digest = hashlib.sha256(raw_body).hexdigest()
+            body_digest = hashlib.sha256(raw_body).hexdigest()
             self.conn.execute("BEGIN IMMEDIATE")
             row = self.conn.execute("SELECT * FROM canary_runner_keys WHERE workspace_id=? AND runner_id=? AND key_id=? AND status='active' AND revoked_at IS NULL", (workspace_id, runner_id, values["X-Heel-Runner-Key-Id"])).fetchone()
             if row is None:
                 raise RunnerAuthError("invalid runner authentication")
             chain = "claim" if capability == "runner_claim" else f"{capability}:{parsed.get('run_id', '')}"
-            state = self.conn.execute("SELECT * FROM canary_runner_nonce_chains WHERE workspace_id=? AND runner_id=? AND chain_name=?", (workspace_id, runner_id, chain)).fetchone()
-            # first request per per-run/capability chain starts with an issued nonce supplied
-            # by the caller's nonce source only after server has established it; claim starts on activation.
-            if state is None or state["expires_at"] <= self._now() or sequence != state["next_sequence"] or not hmac.compare_digest(state["nonce_hash"], self._hash("nonce", values["X-Heel-Runner-Nonce"])):
-                prior = self.conn.execute("SELECT * FROM canary_runner_request_ledger WHERE workspace_id=? AND runner_id=? AND chain_name=? AND sequence=?", (workspace_id, runner_id, chain, sequence)).fetchone()
-                if prior is not None and hmac.compare_digest(prior["request_digest"], digest):
-                    self.conn.rollback(); return json_load(prior["response_json"]), prior["next_nonce"]
-                raise RunnerAuthError("invalid runner authentication")
-            proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace_id, "runner_id":runner_id, "key_id":values["X-Heel-Runner-Key-Id"], "capability":capability, "method":"POST", "path":path, "body_sha256":digest, "timestamp_ms":timestamp, "server_nonce":values["X-Heel-Runner-Nonce"], "sequence":sequence}
+            proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace_id, "runner_id":runner_id, "key_id":values["X-Heel-Runner-Key-Id"], "capability":capability, "method":"POST", "path":path, "body_sha256":body_digest, "timestamp_ms":timestamp, "server_nonce":values["X-Heel-Runner-Nonce"], "sequence":sequence}
+            proof_bytes = b"heel.runner-pop.v1\0" + canonical_bytes(proof)
             try:
                 signature = base64.b64decode(values["X-Heel-Runner-Signature"], validate=True)
                 if len(signature) != 64 or _b64(signature) != values["X-Heel-Runner-Signature"]:
                     raise ValueError
-                load_public_key_base64(row["public_key"]).verify(signature, b"heel.runner-pop.v1\0" + canonical_bytes(proof))
+                load_public_key_base64(row["public_key"]).verify(signature, proof_bytes)
             except (ValueError, InvalidSignature):
                 raise RunnerAuthError("invalid runner authentication") from None
+            # Crucially, no receipt lookup occurs until all closed request material and PoP
+            # have authenticated. A sequence collision alone is never a replay credential.
+            signed_digest = hashlib.sha256(proof_bytes + signature).hexdigest()
+            nonce_hash = self._hash("nonce", values["X-Heel-Runner-Nonce"])
+            state = self.conn.execute("SELECT * FROM canary_runner_nonce_chains WHERE workspace_id=? AND runner_id=? AND chain_name=?", (workspace_id, runner_id, chain)).fetchone()
+            if state is None or state["expires_at"] <= self._now() or sequence != state["next_sequence"] or not hmac.compare_digest(state["nonce_hash"], nonce_hash):
+                prior = self.conn.execute("SELECT * FROM canary_runner_request_ledger WHERE workspace_id=? AND runner_id=? AND chain_name=? AND sequence=?", (workspace_id, runner_id, chain, sequence)).fetchone()
+                if prior is not None and all((
+                    hmac.compare_digest(prior["signed_request_digest"] or "", signed_digest),
+                    hmac.compare_digest(prior["nonce_hash"] or "", nonce_hash),
+                    hmac.compare_digest(prior["key_id"] or "", values["X-Heel-Runner-Key-Id"]),
+                    hmac.compare_digest(prior["capability"] or "", capability),
+                    prior["method"] == "POST", prior["path"] == path,
+                    prior["timestamp_ms"] == timestamp,
+                    hmac.compare_digest(prior["body_digest"] or "", body_digest),
+                )):
+                    try:
+                        aad = f"{workspace_id}\0{runner_id}\0{chain}\0{sequence}".encode()
+                        response = json_load(self._open(prior["response_ciphertext"], aad=aad))
+                        nonce = self._open(prior["next_nonce_ciphertext"], aad=aad)
+                    except (TypeError, ValueError):
+                        raise RunnerAuthError("invalid runner authentication") from None
+                    self.conn.rollback(); return response, nonce
+                raise RunnerAuthError("invalid runner authentication")
             response = action()
             if not isinstance(response, dict):
                 raise ValueError("runner action must return a response object")
             nonce = _token()
+            aad = f"{workspace_id}\0{runner_id}\0{chain}\0{sequence}".encode()
             response_json = canonical_bytes(response).decode("utf-8")
+            response_ciphertext = self._seal(response_json, aad=aad)
+            nonce_ciphertext = self._seal(nonce, aad=aad)
             self.conn.execute("UPDATE canary_runner_nonce_chains SET nonce_hash=?,next_sequence=?,expires_at=? WHERE workspace_id=? AND runner_id=? AND chain_name=?", (self._hash("nonce", nonce), sequence + 1, self._now() + NONCE_TTL, workspace_id, runner_id, chain))
-            self.conn.execute("INSERT INTO canary_runner_request_ledger VALUES(?,?,?,?,?,?,?,?)", (workspace_id, runner_id, chain, sequence, digest, response_json, nonce, self._now()))
+            self.conn.execute("INSERT INTO canary_runner_request_ledger(workspace_id,runner_id,chain_name,sequence,request_digest,response_json,next_nonce,created_at,nonce_hash,key_id,capability,method,path,timestamp_ms,signed_request_digest,body_digest,response_ciphertext,next_nonce_ciphertext) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (workspace_id, runner_id, chain, sequence, signed_digest, "sealed", self._hash("next-nonce", nonce), self._now(), nonce_hash, values["X-Heel-Runner-Key-Id"], capability, "POST", path, timestamp, signed_digest, body_digest, response_ciphertext, nonce_ciphertext))
             self.conn.execute("DELETE FROM canary_runner_request_ledger WHERE created_at<?", (self._now() - 3600,))
             self.conn.commit()
             return response, nonce

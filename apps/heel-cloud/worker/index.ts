@@ -89,6 +89,11 @@ const API_KEY_AUTHORIZATION = /^Bearer heel_sk_[A-Za-z0-9_-]+$/;
 const DEVICE_AUTHORIZATION = /^Bearer heel_at_[A-Za-z0-9_-]{43}$/;
 const SESSION_TOKEN = /^[A-Za-z0-9_-]+$/;
 const IDEMPOTENCY_KEY = /^fs1-[0-9a-f]{64}$/;
+const RUNNER_PAIRING_EXCHANGE = "/v1/runner-pairings/exchange";
+const RUNNER_PAIRING_ACTIVATE = /^\/v1\/runner-pairings\/(?:pending|rotation)_[0-9a-f]{32}\/activate$/;
+const RUNNER_PAIRING_MANAGE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runner-pairings(?:/(?:pending|rotation)_[0-9a-f]{32}(?:/approve)?)?$`);
+const RUNNER_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}(?:/claim|/runs/[A-Za-z0-9_-]{1,128}/(?:heartbeat|progress|result|stop-ack))$`);
+const RUNNER_HEADERS = ["X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature"];
 
 function contentSecurityPolicy(nonce: string): string {
   return [
@@ -160,6 +165,28 @@ function controlPlaneRequestHeaders(
   edgeAuthSecret: string,
 ): { headers: Headers; contentLength: number } {
   let headers: Headers;
+  const runnerControl = RUNNER_CONTROL.test(upstreamPath);
+  const runnerPairingPublic = upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath);
+  const runnerPairingHuman = RUNNER_PAIRING_MANAGE.test(upstreamPath);
+  if (runnerControl) {
+    if (method !== "POST" || source.has("Authorization") || source.has("Cookie")) throw new InvalidControlPlaneRequest();
+    headers = new Headers();
+    for (const name of RUNNER_HEADERS) {
+      const value = source.get(name);
+      if (value === null || source.getAll(name).length !== 1) throw new InvalidControlPlaneRequest();
+      headers.set(name, value);
+    }
+  } else if (runnerPairingPublic) {
+    if (method !== "POST" || source.has("Authorization") || source.has("Cookie")) throw new InvalidControlPlaneRequest();
+    headers = new Headers();
+  } else if (runnerPairingHuman) {
+    const origin = source.get("Origin") ?? "";
+    if (origin !== configuredPublicOrigin || source.get("Sec-Fetch-Site") !== "same-origin") throw new InvalidControlPlaneRequest();
+    headers = controlPlaneCredentials(source);
+    if (!headers.has("Cookie") || headers.has("Authorization")) throw new InvalidControlPlaneRequest();
+    headers.set("X-Heel-Internal-Origin", "same-origin");
+    headers.set("Origin", origin);
+  } else
   if (
     upstreamPath === SIGNUP_ROUTE
     || upstreamPath === LOGIN_ROUTE
@@ -240,6 +267,10 @@ function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""
     const value = response.headers.get(name);
     if (value !== null) headers.set(name, value);
   }
+  if (RUNNER_CONTROL.test(upstreamPath)) {
+    const nextNonce = response.headers.get("X-Heel-Runner-Next-Nonce");
+    if (nextNonce !== null) headers.set("X-Heel-Runner-Next-Nonce", nextNonce);
+  }
   if (response.status >= 200 && response.status <= 299) {
     const setCookie = response.headers.get("Set-Cookie");
     if (upstreamPath === SIGNUP_ROUTE || upstreamPath === LOGIN_ROUTE) {
@@ -287,6 +318,9 @@ function controlPlaneRoute(method: string, pathname: string): string | null {
     (PUBLIC_DEVICE_ROUTES.has(upstreamPath) || upstreamPath === DEVICE_VERIFY_ROUTE)
     && method === "POST"
   ) return upstreamPath;
+  if ((upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath)) && method === "POST") return upstreamPath;
+  if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
+  if (RUNNER_CONTROL.test(upstreamPath) && method === "POST") return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
   }

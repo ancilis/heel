@@ -844,7 +844,7 @@ class _Handler(BaseHTTPRequestHandler):
         except (KeyError, TypeError, ValueError, RunnerAuthError):
             # Exchange must not reveal whether a one-time invitation was known.
             raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
-        self._json(201, {"schema_version": "heel.runner-pairing-pending.v1", "pairing_id": pairing.pairing_id, "fingerprint": pairing.fingerprint, "status": pairing.status})
+        self._json(201, {"schema_version": "heel.runner-pairing-pending.v1", "pairing_id": pairing.pairing_id, "fingerprint": pairing.fingerprint, "status": pairing.status, "activation_challenge": pairing.activation_challenge})
 
     def _runner_pairing_inspect(self, wid: str, pairing_id: str) -> None:
         self._recent_owner_admin(wid)

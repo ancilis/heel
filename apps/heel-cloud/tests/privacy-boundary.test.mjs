@@ -287,6 +287,9 @@ function analyzeSource(fileName, text) {
     (PUBLIC_DEVICE_ROUTES.has(upstreamPath) || upstreamPath === DEVICE_VERIFY_ROUTE)
     && method === "POST"
   ) return upstreamPath;
+  if ((upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath)) && method === "POST") return upstreamPath;
+  if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
+  if (RUNNER_CONTROL.test(upstreamPath) && method === "POST") return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
   }

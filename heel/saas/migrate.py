@@ -21,7 +21,7 @@ from .canary_store import (
     CANARY_ENVIRONMENT_ATTESTATION_ACK_MIGRATION, CANARY_ENVIRONMENT_VERIFICATION_MIGRATION,
     CANARY_STORE_SCHEMA,
 )
-from .runner_auth import RUNNER_AUTH_SCHEMA
+from .runner_auth import RUNNER_AUTH_HARDENING_MIGRATION, RUNNER_AUTH_SCHEMA
 
 _TRACKING = """
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -342,6 +342,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_canary_fault_refund
     Migration(7, "verified_canary_environment_proofs", CANARY_ENVIRONMENT_VERIFICATION_MIGRATION),
     Migration(8, "verified_canary_environment_attestation_ack", CANARY_ENVIRONMENT_ATTESTATION_ACK_MIGRATION),
     Migration(9, "verified_canary_runner_pairing", RUNNER_AUTH_SCHEMA),
+    Migration(10, "verified_canary_runner_replay_hardening", RUNNER_AUTH_HARDENING_MIGRATION),
 ]
 
 
