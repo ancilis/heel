@@ -28,7 +28,47 @@ class Transport:
     def __init__(self): self.requests = []
     def post(self, path, *, headers=None, body=b""):
         self.requests.append((path, dict(headers or {}), body))
-        return 200, {"X-Heel-Runner-Next-Nonce": "next-" + str(len(self.requests))}
+        response_headers = {
+            "X-Heel-Runner-Next-Nonce": base64.b64encode(
+                bytes([len(self.requests)]) * 32,
+            ).decode(),
+        }
+        if path.endswith("/claim"):
+            return 204, response_headers, None
+        if path.endswith("/heartbeat"):
+            return 200, response_headers, {
+                "active": True,
+                "runner_state": "active",
+                "proof_state": "valid",
+                "proof_expires_at_ms": 2_000,
+                "kill_switch_generation": 0,
+                "stop_reason": "none",
+                "server_time_ms": 1_000,
+            }
+        if path.endswith("/stop-ack"):
+            return 200, response_headers, {
+                "accepted": True, "deadline_met": True, "late": False,
+            }
+        request = json.loads(body)
+        projection = request["operational_projection"]
+        terminal = path.endswith("/result")
+        return 200, response_headers, {
+            "schema_version": "heel.canary-run-status.v1",
+            "run_id": request["run_id"],
+            "approval_id": "approval",
+            "grant_id": projection["grant_id"],
+            "status": "terminal" if terminal else "running",
+            "execution_disposition": "completed" if terminal else None,
+            "error_category": "none",
+            "stop_reason": "none",
+            "source_event_sequence": projection["event_sequence"],
+            "quota_state": "reserved",
+            "kill_switch_generation": 0,
+            "stop_generation": 0,
+            "stop_deadline_ms": None,
+            "stop_acknowledged_at_ms": None,
+            "stop_ack_late": False,
+        }
 
 class Signer:
     key_id = KEY_ID
@@ -38,7 +78,7 @@ class Signer:
 
 def client():
     transport, signer = Transport(), Signer()
-    return RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer, clock=lambda: 1000, transport=transport, nonce_source=lambda key: key[0] + "-first"), transport, signer
+    return RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer, clock=lambda: 1000, transport=transport, nonce_source=lambda key: base64.b64encode(hashlib.sha256(f"{key[0]}:{key[1]}".encode()).digest()).decode()), transport, signer
 
 def client_projection(signer, phase="running"):
     from test_canary_contracts import _digest, operational
@@ -57,8 +97,9 @@ def test_named_methods_use_fixed_workspace_paths_and_exact_pop_headers():
     control.claim()
     path, headers, body = transport.requests[0]
     assert path == "/v1/workspaces/ws/runners/runner/claim"
-    assert {key:value for key,value in headers.items() if key != "X-Heel-Runner-Signature"} == {"Content-Type": "application/json", "X-Heel-Runner-Id": "runner", "X-Heel-Runner-Key-Id": KEY_ID, "X-Heel-Runner-Timestamp-Ms": "1000", "X-Heel-Runner-Nonce": "claim-first", "X-Heel-Runner-Sequence": "1"}
-    expected = {"schema_version": "heel.runner-request-proof.v1", "workspace_id": "ws", "runner_id": "runner", "key_id": KEY_ID, "capability": "runner_claim", "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": 1000, "server_nonce": "claim-first", "sequence": 1}
+    claim_nonce = base64.b64encode(hashlib.sha256(b"claim:None").digest()).decode()
+    assert {key:value for key,value in headers.items() if key != "X-Heel-Runner-Signature"} == {"Content-Type": "application/json", "X-Heel-Runner-Id": "runner", "X-Heel-Runner-Key-Id": KEY_ID, "X-Heel-Runner-Timestamp-Ms": "1000", "X-Heel-Runner-Nonce": claim_nonce, "X-Heel-Runner-Sequence": "1"}
+    expected = {"schema_version": "heel.runner-request-proof.v1", "workspace_id": "ws", "runner_id": "runner", "key_id": KEY_ID, "capability": "runner_claim", "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": 1000, "server_nonce": claim_nonce, "sequence": 1}
     assert signer.payloads == [b"heel.runner-pop.v1\0" + canonical_bytes(expected)]
 
 def test_sequences_are_independent_per_run_capability_and_stop_ack_is_heartbeat():
@@ -71,7 +112,7 @@ def test_sequences_are_independent_per_run_capability_and_stop_ack_is_heartbeat(
     assert transport.requests[-1][0].endswith("/runs/run/stop-ack")
     assert json.loads(transport.requests[2][2])["schema_version"] == "heel.runner-progress-request.v1"
 
-def test_refuses_noncanonical_origin_bad_nonce_and_changed_retry():
+def test_refuses_noncanonical_origin_bad_nonce_and_prohibited_generic_retry():
     with pytest.raises(ValueError, match="pathless origin"):
         RunnerControlClient(origin="https://control.example?x=1", workspace_id="ws", runner_id="r", signer=Signer(), clock=lambda: 0, transport=Transport(), nonce_source=lambda _: "n")
     bad = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="r", signer=Signer(), clock=lambda: 0, transport=Transport(), nonce_source=lambda _: "")
@@ -79,13 +120,13 @@ def test_refuses_noncanonical_origin_bad_nonce_and_changed_retry():
         bad.claim()
     control, _, signer = client()
     control.progress(run_id="run", operational_projection=client_projection(signer))
-    control.retry_last()
+    assert not hasattr(control, "retry_last")
 
 def test_has_no_public_generic_request_api():
     control, _, _ = client()
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
-    assert public <= {"claim", "heartbeat", "progress", "result", "upload_findings", "stop_ack", "retry_last", "start_resync", "complete_resync", "install_rotation_claim"}
+    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim"}
 
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
