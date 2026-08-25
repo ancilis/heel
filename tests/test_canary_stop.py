@@ -45,7 +45,7 @@ def test_stop_is_idempotent_generation_bound_and_ack_deadline_is_durable():
     stored = conn.execute(
         "SELECT stop_acknowledged_at_ms,stop_ack_late FROM canary_runs"
     ).fetchone()
-    assert tuple(stored) == (NOW_MS + 4999, 0)
+    assert tuple(stored) == (NOW_MS, 0)
 
 
 def test_late_stop_ack_succeeds_but_never_claims_deadline_met():
@@ -91,6 +91,30 @@ def test_backdated_runner_ack_cannot_claim_a_missed_cloud_deadline():
     ) == {"accepted": True, "deadline_met": False, "late": True}
 
 
+def test_future_runner_stop_timestamp_is_evidence_not_cloud_liveness_authority():
+    conn, _, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    coordinator.request_stop(
+        WORKSPACE, PROJECT, grant["run_id"], actor="user_owner",
+        reason="cloud_stop", expected_kill_switch_generation=0,
+    )
+    future = NOW_MS + 10 * 365 * 24 * 60 * 60 * 1000
+    acknowledgement = operational_projection(
+        runner, grant, sequence=0, phase="stop_requested", stop_reason="cloud_stop",
+        stop_requested_at_ms=future, stop_acknowledged_at_ms=future,
+        updated_at_ms=future,
+    )
+    assert coordinator.ack_stop(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, acknowledgement,
+    ) == {"accepted": True, "deadline_met": True, "late": False}
+    assert tuple(conn.execute(
+        "SELECT stop_requested_at_ms,stop_acknowledged_at_ms,updated_at FROM canary_runs"
+    ).fetchone()) == (NOW_MS, NOW_MS, NOW_MS)
+    assert tuple(conn.execute(
+        "SELECT created_at,updated_at FROM canary_operational_receipts"
+    ).fetchone()) == (NOW_MS, NOW_MS)
+
+
 def test_stop_ack_treats_runner_stop_timestamp_as_evidence_not_server_authority():
     _, _, runner, coordinator, approved, _ = running_setup()
     grant = approved["grant"]
@@ -106,6 +130,31 @@ def test_stop_ack_treats_runner_stop_timestamp_as_evidence_not_server_authority(
     assert coordinator.ack_stop(
         WORKSPACE, PROJECT, grant["run_id"], RUNNER, runner_local_stop,
     ) == {"accepted": True, "deadline_met": True, "late": False}
+
+
+def test_local_emergency_ack_atomically_freezes_the_runner_originated_stop():
+    conn, _, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    acknowledgement = operational_projection(
+        runner, grant, sequence=0, phase="stop_requested",
+        stop_reason="local_emergency_stop", stop_requested_at_ms=NOW_MS + 300,
+        stop_acknowledged_at_ms=NOW_MS + 300, updated_at_ms=NOW_MS + 300,
+    )
+
+    assert coordinator.ack_stop(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, acknowledgement,
+    ) == {"accepted": True, "deadline_met": True, "late": False}
+    assert tuple(conn.execute(
+        "SELECT status,stop_reason,stop_requested_at_ms,stop_acknowledged_at_ms "
+        "FROM canary_runs"
+    ).fetchone()) == (
+        "stop_requested", "local_emergency_stop", NOW_MS, NOW_MS,
+    )
+    actions = [row[0] for row in conn.execute(
+        "SELECT action FROM canary_audit_records"
+    ).fetchall()]
+    assert actions.count("stop_requested") == 1
+    assert actions.count("stop_acknowledged") == 1
 
 
 def test_stop_ack_persists_when_heartbeat_already_accepted_the_same_snapshot():
@@ -127,9 +176,10 @@ def test_stop_ack_persists_when_heartbeat_already_accepted_the_same_snapshot():
     assert coordinator.ack_stop(
         WORKSPACE, PROJECT, grant["run_id"], RUNNER, snapshot,
     ) == {"accepted": True, "deadline_met": True, "late": False}
-    assert conn.execute(
+    stored_ack = conn.execute(
         "SELECT stop_acknowledged_at_ms FROM canary_runs"
-    ).fetchone()[0] == NOW_MS + 300
+    ).fetchone()[0]
+    assert NOW_MS <= stored_ack < NOW_MS + 300
     assert conn.execute(
         "SELECT COUNT(*) FROM canary_audit_records WHERE action='stop_acknowledged'"
     ).fetchone()[0] == 1

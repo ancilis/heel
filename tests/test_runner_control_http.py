@@ -17,6 +17,7 @@ from heel.canary_contracts import canonical_bytes, canonical_digest, validate_ru
 from heel.crypto import SigningAuthority, ed25519_key_id
 from heel.runner.control_client import RunnerControlClient
 from heel.saas.canary_store import CanaryStore
+from heel.saas.catalog import CATALOG_VERSION
 from heel.saas.runner_auth import RunnerAuthError, RunnerAuthStore, initialize_runner_auth_schema
 from heel.saas.http_api import ControlPlane, serve
 
@@ -515,61 +516,67 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
         server = serve(cp); served = threading.Thread(target=server.serve_forever, daemon=True); served.start()
         try:
             org = cp.store.create_org("org")
-            workspace = cp.store.create_workspace(org, "ws", "free", "2026-08")
+            workspace = cp.store.create_workspace(org, "ws", "free", CATALOG_VERSION)
             private = Ed25519PrivateKey.generate()
             public = base64.b64encode(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
             raw = base64.b64decode(public); key_id = ed25519_key_id(raw)
             cp.store.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", workspace, "runner", "active", time.time()))
             cp.store.conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", public, "active", time.time()))
-            cp.store.conn.commit(); issued = cp.runner_auth.provision_run_chains(workspace, "runner", "run"); nonce = issued["heartbeat"]["next_nonce_b64"]
             stamp, stamp_ms, digest = time.time(), int(time.time() * 1000), "a" * 64
             cp.store.conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", (workspace, "prj", "project", "owner", stamp))
-            cp.store.conn.execute("INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at) VALUES(?,?,?,?,?,?,?)", ("env", workspace, "prj", "https://canary.example.com", "staging", "verified", stamp))
             cp.store.conn.execute(
-                "INSERT INTO canary_approval_projections(approval_id,workspace_id,project_ref,run_id,"
-                "environment_id,runner_id,runner_key_id,manifest_digest,projection_digest,signing_key_id,"
-                "status,projection_json,scenario_ids_json,budgets_json,uploaded_by,approved_by,reason,"
-                "created_at,expires_at,approved_at,purge_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("approval", workspace, "prj", "run", "env", "runner", key_id, digest, digest,
-                 key_id, "approved", json.dumps({"manifest_digest": digest}), "[]", "{}", "owner",
-                 "owner", "test", stamp_ms, stamp_ms + 60_000, stamp_ms, stamp_ms + 120_000),
+                "INSERT INTO users VALUES(?,?,?)", ("owner", "owner@example.test", stamp),
             )
             cp.store.conn.execute(
-                "INSERT INTO canary_execution_grants(grant_id,workspace_id,project_ref,approval_id,"
-                "run_id,environment_id,runner_id,runner_key_id,nonce_hash,grant_digest,grant_json,status,"
-                "reservation_id,meter,period,idempotency_key,issued_at,expires_at,claimed_at,purge_at) "
+                "INSERT INTO memberships VALUES(?,?,?,?)", (workspace, "owner", "owner", stamp),
+            )
+            cp.store.conn.execute(
+                "INSERT INTO canary_environments("
+                "environment_id,workspace_id,project_ref,origin,environment_class,status,created_at,"
+                "attestation_text,attestation_version,attestation_acknowledgement,attested_by,attested_at,"
+                "proof_method,proof_version,normalization_version,challenge_generation,last_check_at,"
+                "verified_at,proof_expires_at,verification_record_digest) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("g", workspace, "prj", "approval", "run", "env", "runner", key_id, "b" * 64,
-                 digest, "{}", "claimed", "reservation", "canary_runs", "2026-08",
-                 "ca1-" + "c" * 64, stamp_ms, stamp_ms + 60_000, stamp_ms, stamp_ms + 120_000),
+                (
+                    "env", workspace, "prj", "https://canary.acme.dev", "staging", "verified",
+                    stamp, "ownership verified; environment classification supplied by you", "v1",
+                    "accepted", "owner", stamp, "https-file", "https-file.v1", "exact-origin.v1",
+                    1, stamp, stamp, stamp + 3600, digest,
+                ),
             )
-            cp.store.conn.execute(
-                "INSERT INTO canary_runs(run_id,workspace_id,project_ref,approval_id,grant_id,"
-                "environment_id,runner_id,runner_key_id,status,error_category,stop_reason,"
-                "source_event_sequence,cloud_event_sequence,last_heartbeat_at_ms,claimed_at_ms,"
-                "stop_generation,stop_ack_late,reservation_id,quota_state,kill_switch_generation,"
-                "created_at,updated_at,purge_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("run", workspace, "prj", "approval", "g", "env", "runner", key_id, "claimed",
-                 "none", "none", -1, 0, stamp_ms, stamp_ms, 0, 0, "reservation", "reserved", 0,
-                 stamp_ms, stamp_ms, stamp_ms + 120_000),
-            )
-            identity = cp.runner_auth._identity_record(workspace_id=workspace, runner_id="runner", public_key=public, fingerprint=hashlib.sha256(raw).hexdigest(), key_id=key_id, runner_version="v1", adapters_json="{}", paired_by="owner", paired_at=time.time(), heartbeat_at=time.time())
+            identity = cp.runner_auth._identity_record(workspace_id=workspace, runner_id="runner", public_key=public, fingerprint=hashlib.sha256(raw).hexdigest(), key_id=key_id, runner_version="1.0.0", adapters_json=json.dumps({"canary":"1.0.0"}), paired_by="owner", paired_at=time.time(), heartbeat_at=time.time())
             cp.runner_auth._save_identity(identity, instant=time.time()); cp.store.conn.commit()
-            from test_canary_contracts import _digest, operational
-            projection = operational()
-            projection["workspace_id"] = workspace
-            projection["lifecycle_phase"] = "claimed"
-            projection["timestamps"]["claimed_at_ms"] = 1
-            payload = {key: value for key, value in projection.items()
-                       if key not in {"projection_digest", "signing_key_id", "signature_b64"}}
-            projection["projection_digest"] = canonical_digest(payload)
-            projection["signing_key_id"] = key_id
-            projection["signature_b64"] = base64.b64encode(private.sign(canonical_bytes(payload))).decode()
-            body = canonical_bytes({"schema_version": "heel.runner-heartbeat-request.v1", "run_id": "run", "operational_projection": projection})
-            route = f"/v1/workspaces/{workspace}/runners/runner/runs/run/heartbeat"
+            from canary_test_support import approval_projection, operational_projection
+            from heel.saas.canary_runs import CanaryRunService
+            runner_signer = SigningAuthority.from_private_key(private, key_id)
+            runs = CanaryRunService(
+                cp.store.conn, signing=cp.grant_authority,
+                runner_auth=cp.runner_auth, initialize_schema=False,
+            )
+            approval = approval_projection(
+                runner_signer, workspace_id=workspace, project_ref="prj",
+                environment_id="env", runner_id="runner", verification_digest=digest,
+            )
+            submitted = runs.submit_projection(approval, uploaded_by="owner")
+            approved = runs.approve(
+                workspace, "prj", submitted["run_id"],
+                projection_digest=approval["projection_digest"], actor="owner", role="owner",
+                reason="Exercise the exact runner heartbeat lock boundary",
+                exact_hostname="canary.acme.dev", recent_auth_at_ms=stamp_ms,
+                idempotency_key="ca1-" + "c" * 64,
+                expected_kill_switch_generation=0,
+            )
+            claimed = runs.claim(workspace, "runner", key_id)
+            run_id = submitted["run_id"]
+            nonce = claimed["chain_states"]["heartbeat"]["next_nonce_b64"]
+            projection = operational_projection(
+                runner_signer, approved["grant"], sequence=0, phase="claimed",
+            )
+            body = canonical_bytes({"schema_version": "heel.runner-heartbeat-request.v1", "run_id": run_id, "operational_projection": projection})
+            route = f"/v1/workspaces/{workspace}/runners/runner/runs/{run_id}/heartbeat"
             timestamp = int(time.time() * 1000)
-            proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace, "runner_id":"runner", "key_id":key_id, "capability":"runner_heartbeat", "method":"POST", "path":route, "body_sha256":hashlib.sha256(body).hexdigest(), "timestamp_ms":timestamp, "server_nonce":nonce, "sequence":1}
-            headers = {"Content-Type":"application/json", "X-Heel-Runner-Id":"runner", "X-Heel-Runner-Key-Id":key_id, "X-Heel-Runner-Timestamp-Ms":str(timestamp), "X-Heel-Runner-Nonce":nonce, "X-Heel-Runner-Sequence":"1", "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))).decode()}
+            proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace, "runner_id":"runner", "key_id":key_id, "capability":"runner_heartbeat", "method":"POST", "path":route, "body_sha256":hashlib.sha256(body).hexdigest(), "timestamp_ms":timestamp, "server_nonce":nonce, "sequence":claimed["chain_states"]["heartbeat"]["next_sequence"]}
+            headers = {"Content-Type":"application/json", "X-Heel-Runner-Id":"runner", "X-Heel-Runner-Key-Id":key_id, "X-Heel-Runner-Timestamp-Ms":str(timestamp), "X-Heel-Runner-Nonce":nonce, "X-Heel-Runner-Sequence":str(proof["sequence"]), "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))).decode()}
             done, result = threading.Event(), []
             def heartbeat():
                 conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
@@ -586,26 +593,27 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
             wrong_payload = {key: value for key, value in wrong_projection.items()
                              if key not in {"projection_digest", "signing_key_id", "signature_b64"}}
             wrong_projection["signature_b64"] = base64.b64encode(other.sign(canonical_bytes(wrong_payload))).decode()
-            wrong_body = canonical_bytes({"schema_version": "heel.runner-heartbeat-request.v1", "run_id": "run", "operational_projection": wrong_projection})
-            wrong_proof = {**proof, "body_sha256": hashlib.sha256(wrong_body).hexdigest(), "server_nonce": result[0][1], "sequence": 2}
+            wrong_body = canonical_bytes({"schema_version": "heel.runner-heartbeat-request.v1", "run_id": run_id, "operational_projection": wrong_projection})
+            wrong_proof = {**proof, "body_sha256": hashlib.sha256(wrong_body).hexdigest(), "server_nonce": result[0][1], "sequence": proof["sequence"] + 1}
             wrong_headers = {**headers, "X-Heel-Runner-Nonce":result[0][1], "X-Heel-Runner-Sequence":"2", "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(wrong_proof))).decode()}
             conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1]); conn.request("POST", route, wrong_body, wrong_headers)
             assert conn.getresponse().status == 401; conn.close()
             tampered_projection = json.loads(json.dumps(projection))
-            tampered_projection["counters"]["remaining_requests"] = 2  # digest/signature no longer attest this body.
-            tampered_body = canonical_bytes({"schema_version": "heel.runner-heartbeat-request.v1", "run_id": "run", "operational_projection": tampered_projection})
-            tampered_proof = {**proof, "body_sha256": hashlib.sha256(tampered_body).hexdigest(), "server_nonce": result[0][1], "sequence": 2}
-            tampered_headers = {**headers, "X-Heel-Runner-Nonce":result[0][1], "X-Heel-Runner-Sequence":"2", "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(tampered_proof))).decode()}
+            tampered_projection["counters"]["remaining_requests"] = 1  # digest/signature no longer attest this body.
+            tampered_body = canonical_bytes({"schema_version": "heel.runner-heartbeat-request.v1", "run_id": run_id, "operational_projection": tampered_projection})
+            tampered_proof = {**proof, "body_sha256": hashlib.sha256(tampered_body).hexdigest(), "server_nonce": result[0][1], "sequence": proof["sequence"] + 1}
+            tampered_headers = {**headers, "X-Heel-Runner-Nonce":result[0][1], "X-Heel-Runner-Sequence":str(tampered_proof["sequence"]), "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(tampered_proof))).decode()}
             conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1]); conn.request("POST", route, tampered_body, tampered_headers)
             assert conn.getresponse().status == 401; conn.close()
-            stop_projection = operational(); stop_projection["workspace_id"] = workspace; stop_projection["lifecycle_phase"] = "stop_requested"; stop_projection["stop_reason"] = "cloud_stop"
-            stop_projection["timestamps"].update({"claimed_at_ms":1, "started_at_ms":1, "stop_requested_at_ms":1, "stop_acknowledged_at_ms":1})
-            stop_payload = {key:value for key,value in stop_projection.items() if key not in {"projection_digest", "signing_key_id", "signature_b64"}}
-            stop_projection["projection_digest"] = canonical_digest(stop_payload); stop_projection["signing_key_id"] = key_id; stop_projection["signature_b64"] = base64.b64encode(private.sign(canonical_bytes(stop_payload))).decode()
-            stop_body = canonical_bytes({"schema_version":"heel.runner-stop-ack-request.v1", "run_id":"run", "operational_projection":stop_projection})
-            stop_route = f"/v1/workspaces/{workspace}/runners/runner/runs/run/stop-ack"; stop_timestamp = int(time.time() * 1000); stop_nonce = issued["stop-ack"]["next_nonce_b64"]
-            stop_proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace, "runner_id":"runner", "key_id":key_id, "capability":"runner_heartbeat", "method":"POST", "path":stop_route, "body_sha256":hashlib.sha256(stop_body).hexdigest(), "timestamp_ms":stop_timestamp, "server_nonce":stop_nonce, "sequence":1}
-            stop_headers = {"Content-Type":"application/json", "X-Heel-Runner-Id":"runner", "X-Heel-Runner-Key-Id":key_id, "X-Heel-Runner-Timestamp-Ms":str(stop_timestamp), "X-Heel-Runner-Nonce":stop_nonce, "X-Heel-Runner-Sequence":"1", "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(stop_proof))).decode()}
+            stop_projection = operational_projection(
+                runner_signer, approved["grant"], sequence=1, phase="stop_requested",
+                stop_reason="cloud_stop", stop_requested_at_ms=stamp_ms,
+                stop_acknowledged_at_ms=stamp_ms,
+            )
+            stop_body = canonical_bytes({"schema_version":"heel.runner-stop-ack-request.v1", "run_id":run_id, "operational_projection":stop_projection})
+            stop_route = f"/v1/workspaces/{workspace}/runners/runner/runs/{run_id}/stop-ack"; stop_timestamp = int(time.time() * 1000); stop_chain = claimed["chain_states"]["stop-ack"]; stop_nonce = stop_chain["next_nonce_b64"]
+            stop_proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace, "runner_id":"runner", "key_id":key_id, "capability":"runner_heartbeat", "method":"POST", "path":stop_route, "body_sha256":hashlib.sha256(stop_body).hexdigest(), "timestamp_ms":stop_timestamp, "server_nonce":stop_nonce, "sequence":stop_chain["next_sequence"]}
+            stop_headers = {"Content-Type":"application/json", "X-Heel-Runner-Id":"runner", "X-Heel-Runner-Key-Id":key_id, "X-Heel-Runner-Timestamp-Ms":str(stop_timestamp), "X-Heel-Runner-Nonce":stop_nonce, "X-Heel-Runner-Sequence":str(stop_proof["sequence"]), "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(stop_proof))).decode()}
             conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1]); conn.request("POST", stop_route, stop_body, stop_headers)
             assert conn.getresponse().status == 409; conn.close()
         finally:

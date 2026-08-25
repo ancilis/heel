@@ -161,7 +161,7 @@ class CanaryHttpFixture:
         stop_reason: str = "none",
         stop_requested_at_ms: int | None = None,
         stop_acknowledged_at_ms: int | None = None,
-        actions_contained: int = 0,
+        actions_contained: int | None = None,
     ) -> dict:
         value = operational_projection(
             self.runner,
@@ -187,7 +187,9 @@ class CanaryHttpFixture:
             "stop_acknowledged_at_ms": stop_acknowledged_at_ms,
             "terminal_at_ms": updated_at_ms if phase == "terminal" else None,
         }
-        value["counters"]["actions_contained"] = actions_contained
+        value["counters"]["actions_contained"] = (
+            requests_started if actions_contained is None else actions_contained
+        )
         unsigned = {
             key: item for key, item in value.items()
             if key not in {"projection_digest", "signing_key_id", "signature_b64"}
@@ -244,7 +246,9 @@ def test_execution_approval_claim_heartbeat_progress_status_events_are_real(cana
     )[2] == approved
     status, _, dashboard = fixture.request("GET", run_path, headers=fixture.browser)
     assert status == 200
-    assert set(dashboard) == {"schema_version", "run", "progress"}
+    assert set(dashboard) == {
+        "schema_version", "approval_control_generation", "run", "progress",
+    }
     assert dashboard["schema_version"] == "heel.canary-run-dashboard.v1"
     assert dashboard["run"]["status"] == "approved"
     assert dashboard["progress"] == {
@@ -377,7 +381,7 @@ def test_execution_approval_claim_heartbeat_progress_status_events_are_real(cana
 
     corrected_progress = fixture.operational(
         approved["grant"], sequence=2, phase="running", requests_started=1,
-        actions_contained=0,
+        actions_contained=1,
     )
     corrected_progress_body = canonical_bytes({
         "schema_version": "heel.runner-progress-request.v1",
@@ -662,6 +666,68 @@ def test_execution_approval_claim_heartbeat_progress_status_events_are_real(cana
         "redaction_count": None,
         "local_result_ready": False,
     }
+
+
+def test_dashboard_exposes_refreshable_approval_control_generation(canary_http):
+    fixture = canary_http
+    connection = fixture.cp.store.conn
+    connection.execute(
+        "INSERT INTO kill_switches(scope,reason,actor,tripped_at) "
+        "VALUES('global','historical','admin',?)",
+        (time.time(),),
+    )
+    connection.execute("DELETE FROM kill_switches WHERE scope='global'")
+    connection.commit()
+    projection = approval_projection(
+        fixture.runner, workspace_id=fixture.workspace, project_ref=fixture.project,
+    )
+    base = f"/v1/workspaces/{fixture.workspace}/projects/{fixture.project}"
+    status, _, submitted = fixture.request(
+        "POST", base + "/canary-approval-projections", projection, fixture.browser,
+    )
+    assert status == 201
+    run_path = base + "/canary-runs/" + submitted["run_id"]
+    status, _, pending = fixture.request("GET", run_path, headers=fixture.browser)
+    assert status == 200
+    assert pending["approval_control_generation"] == 2
+    assert "approval_control_generation" not in pending["run"]
+
+    body = {
+        "schema_version": "heel.canary-execution-approval.v1",
+        "projection_digest": projection["projection_digest"],
+        "hostname_retype": "canary.acme.dev",
+        "reason": "Run the generation-bound staging rehearsal",
+    }
+    stale = fixture.request(
+        "POST", run_path + "/approve", body,
+        {
+            **fixture.browser, "Idempotency-Key": "ca1-" + "8" * 64,
+            "If-Heel-Control-Generation": "0",
+        },
+    )
+    assert stale[0] == 409 and stale[2]["code"] == "canary_state_conflict"
+    assert fixture.request("GET", run_path, headers=fixture.browser)[2][
+        "approval_control_generation"
+    ] == 2
+    status, _, approved = fixture.request(
+        "POST", run_path + "/approve", body,
+        {
+            **fixture.browser, "Idempotency-Key": "ca1-" + "9" * 64,
+            "If-Heel-Control-Generation": "2",
+        },
+    )
+    assert status == 201 and approved["grant"]["kill_switch_generation"] == 2
+
+    connection.execute(
+        "INSERT INTO kill_switches(scope,reason,actor,tripped_at) "
+        "VALUES('global','later','admin',?)",
+        (time.time(),),
+    )
+    connection.execute("DELETE FROM kill_switches WHERE scope='global'")
+    connection.commit()
+    dashboard = fixture.request("GET", run_path, headers=fixture.browser)[2]
+    assert dashboard["approval_control_generation"] == 2
+    assert dashboard["run"]["kill_switch_generation"] == 2
 
 
 def test_canary_mutations_reject_non_browser_principals_and_missing_authority(tmp_path):

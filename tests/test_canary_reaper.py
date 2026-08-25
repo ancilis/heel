@@ -24,7 +24,7 @@ from canary_test_support import (
     seed_authority,
     service,
 )
-from test_canary_lifecycle import running_setup
+from test_canary_lifecycle import resign_operational, running_setup
 
 
 def _durable_running_setup(root: Path):
@@ -106,6 +106,58 @@ def test_reaper_yields_quickly_when_an_http_writer_holds_the_database_lock():
             writer.rollback()
             writer.close()
         assert time.monotonic() - started < 1
+
+
+def test_background_reaper_skips_one_routine_writer_lock_without_firing_death_callback():
+    with tempfile.TemporaryDirectory() as tmp:
+        database, clock, signing, _approved = _durable_running_setup(Path(tmp))
+        callback_errors: list[BaseException] = []
+        reaper = CanaryReaper(
+            str(database), signing=signing, clock=clock,
+            interval_seconds=0.01, on_unexpected_death=callback_errors.append,
+        )
+        reaper.start()
+        writer = sqlite3.connect(database)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            time.sleep(0.40)
+            assert reaper.alive is True
+            assert callback_errors == []
+        finally:
+            writer.rollback()
+            writer.close()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and reaper.failure is not None:
+            time.sleep(0.01)
+        try:
+            assert reaper.alive is True
+            assert reaper.failure is None
+            assert callback_errors == []
+        finally:
+            assert reaper.stop(timeout=2) is True
+
+
+def test_background_reaper_reports_only_after_bounded_consecutive_lock_failures(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        database, clock, signing, _approved = _durable_running_setup(Path(tmp))
+        attempts = 0
+
+        def always_locked(self, service, disclosure=None):
+            nonlocal attempts
+            attempts += 1
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(CanaryReaper, "_cycle", always_locked)
+        callback = threading.Event()
+        reaper = CanaryReaper(
+            str(database), signing=signing, clock=clock,
+            interval_seconds=0.01, on_unexpected_death=lambda _error: callback.set(),
+        )
+        with pytest.raises(Exception, match="startup failed"):
+            reaper.start(timeout=2)
+        assert callback.wait(1) is True
+        assert attempts == reaper.MAX_CONSECUTIVE_LOCK_FAILURES
+        assert isinstance(reaper.failure, sqlite3.OperationalError)
 
 
 def test_repeated_cycles_never_run_schema_ddl_or_widen_connection_pragmas(monkeypatch):
@@ -294,6 +346,150 @@ def test_live_authority_changes_request_a_bounded_stop_without_fabricating_outco
                 assert counts["authority_stops"] == 1
             finally:
                 connection.close()
+
+
+def test_reproof_digest_replacement_is_a_permanent_authority_stop():
+    with tempfile.TemporaryDirectory() as tmp:
+        database, clock, signing, approved = _durable_running_setup(Path(tmp))
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "UPDATE canary_environments SET verification_record_digest=?",
+            ("b" * 64,),
+        )
+        connection.commit()
+        connection.close()
+
+        counts = CanaryReaper(str(database), signing=signing, clock=clock).run_once()
+        connection = sqlite3.connect(database)
+        try:
+            assert tuple(connection.execute(
+                "SELECT status,stop_reason FROM canary_runs"
+            ).fetchone()) == ("stop_requested", "target_revoked")
+            assert counts["authority_stops"] == 1
+            connection.execute(
+                "UPDATE canary_environments SET verification_record_digest=?",
+                (approved["grant"]["environment"]["verification_record_digest"],),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        CanaryReaper(str(database), signing=signing, clock=clock).run_once()
+        connection = sqlite3.connect(database)
+        try:
+            assert tuple(connection.execute(
+                "SELECT status,stop_reason FROM canary_runs"
+            ).fetchone()) == ("stop_requested", "target_revoked")
+        finally:
+            connection.close()
+
+
+def test_future_runner_receipt_time_cannot_hide_a_stale_active_claim():
+    with tempfile.TemporaryDirectory() as tmp:
+        source, clock, runner, coordinator, approved, _claim = running_setup()
+        grant = approved["grant"]
+        future = NOW_MS + 10 * 365 * 24 * 60 * 60 * 1000
+        projection = operational_projection(
+            runner, grant, sequence=0, phase="running", requests_started=1,
+            updated_at_ms=future,
+        )
+        projection["timestamps"].update(
+            claimed_at_ms=future, started_at_ms=future, updated_at_ms=future,
+        )
+        projection = resign_operational(projection, runner)
+        coordinator.progress(
+            WORKSPACE, PROJECT, grant["run_id"], RUNNER,
+            projection,
+        )
+        database = Path(tmp) / "heel.sqlite3"
+        durable = sqlite3.connect(database)
+        source.backup(durable)
+        durable.close()
+        source.close()
+        clock.value += 6
+
+        counts = CanaryReaper(str(database), signing=coordinator.signing, clock=clock).run_once()
+        connection = sqlite3.connect(database)
+        try:
+            assert tuple(connection.execute(
+                "SELECT status,stop_reason,error_category FROM canary_runs"
+            ).fetchone()) == ("stop_requested", "cloud_stop", "cloud_disconnected")
+            assert counts["stale_heartbeats"] == 1
+        finally:
+            connection.close()
+
+
+def test_future_runner_ack_time_cannot_evade_disconnected_finalization():
+    with tempfile.TemporaryDirectory() as tmp:
+        source, clock, runner, coordinator, approved, _claim = running_setup()
+        grant = approved["grant"]
+        coordinator.request_stop(
+            WORKSPACE, PROJECT, grant["run_id"], actor="user_owner",
+            reason="cloud_stop", expected_kill_switch_generation=0,
+        )
+        future = NOW_MS + 10 * 365 * 24 * 60 * 60 * 1000
+        coordinator.ack_stop(
+            WORKSPACE, PROJECT, grant["run_id"], RUNNER,
+            operational_projection(
+                runner, grant, sequence=0, phase="finalizing", requests_started=0,
+                stop_reason="cloud_stop", stop_requested_at_ms=future,
+                stop_acknowledged_at_ms=future, updated_at_ms=future,
+            ),
+        )
+        database = Path(tmp) / "heel.sqlite3"
+        durable = sqlite3.connect(database)
+        source.backup(durable)
+        durable.close()
+        source.close()
+        clock.value += 60
+
+        counts = CanaryReaper(str(database), signing=coordinator.signing, clock=clock).run_once()
+        connection = sqlite3.connect(database)
+        try:
+            assert connection.execute(
+                "SELECT status FROM canary_runs"
+            ).fetchone()[0] == "terminal"
+            assert counts["finalized_disconnected"] == 1
+        finally:
+            connection.close()
+
+
+def test_pending_projection_after_historical_trip_clear_uses_current_generation():
+    with tempfile.TemporaryDirectory() as tmp:
+        source = connect()
+        clock = Clock()
+        runner = seed_authority(source)
+        source.execute(
+            "INSERT INTO kill_switches(scope,reason,actor,tripped_at) VALUES('global','x','a',?)",
+            (clock.value,),
+        )
+        source.execute("DELETE FROM kill_switches WHERE scope='global'")
+        source.commit()
+        coordinator = service(source, clock)
+        submitted = coordinator.submit_projection(
+            approval_projection(runner), uploaded_by="user_owner",
+        )
+        assert source.execute(
+            "SELECT kill_switch_generation FROM canary_runs WHERE run_id=?",
+            (submitted["run_id"],),
+        ).fetchone()[0] == 2
+        database = Path(tmp) / "heel.sqlite3"
+        durable = sqlite3.connect(database)
+        source.backup(durable)
+        durable.close()
+        source.close()
+
+        counts = CanaryReaper(
+            str(database), signing=coordinator.signing, clock=clock,
+        ).run_once()
+        connection = sqlite3.connect(database)
+        try:
+            assert connection.execute(
+                "SELECT status FROM canary_runs WHERE run_id=?", (submitted["run_id"],),
+            ).fetchone()[0] == "awaiting_execution_approval"
+            assert counts["cancelled_projections"] == 0
+        finally:
+            connection.close()
 
 
 def test_authority_loss_revokes_and_refunds_an_unclaimed_grant_in_the_same_cycle():

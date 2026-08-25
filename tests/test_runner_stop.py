@@ -1163,8 +1163,13 @@ def test_real_executor_stop_interrupts_blocked_transport_and_never_starts_next_a
             )
 
     class CoordinatorAfterStart(StopCoordinator):
+        def __init__(self, lease):
+            super().__init__(lease)
+            self.heartbeat_projections = []
+
         def heartbeat(self, run_id, operational_projection):
             self.heartbeats.append(time.monotonic())
+            self.heartbeat_projections.append(operational_projection)
             reason = "cloud_stop" if transport.started.is_set() else "none"
             return ExecutionGate(True, "active", "valid", 20_000, 7, reason, 2_000)
 
@@ -1180,7 +1185,78 @@ def test_real_executor_stop_interrupts_blocked_transport_and_never_starts_next_a
     assert len(transport.calls) == 1
     assert coordinator.acks
     assert coordinator.ack_projections[0]["timestamps"]["stop_acknowledged_at_ms"] is None
+    assert coordinator.ack_projections[0]["event_sequence"] > max(
+        item.get("event_sequence", -1)
+        for item in coordinator.heartbeat_projections
+        if item.get("stop_reason", "none") == "none"
+    )
+    assert "stop_observed" in coordinator.ack_projections[0]["containment_codes"]
     final = store.load_final_projections(grant["run_id"])
     assert final["operational_projection"]["execution_disposition"] == "stopped"
     assert final["operational_projection"]["timestamps"]["stop_acknowledged_at_ms"] is not None
     assert final["findings_projection"]["assessment_outcome"] == "inconclusive"
+
+
+def test_real_executor_local_emergency_stop_transitions_and_allocates_ack_sequence(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+
+    class BlockingTransport:
+        def __init__(self):
+            self.started = threading.Event()
+
+        def request(self, action, *, cancellation, before_attempt, **kwargs):
+            del action, kwargs
+            before_attempt(1, None)
+            self.started.set()
+            while not cancellation.cancelled:
+                time.sleep(0.005)
+            raise TransportFailure("cancelled", requests_made=1)
+
+    transport = BlockingTransport()
+    local = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=time.monotonic,
+    )
+
+    class Adapter:
+        def execute(self, lease, *, cancellation, on_progress):
+            return local.execute(
+                lease.bundle, transport=transport, gate_source=active_gate,
+                cancellation=cancellation, on_progress=on_progress,
+            )
+
+        def prepare_stop_ack(self, lease, projection, stop_reason, proposed_at_ms):
+            return local.prepare_stop_ack(
+                lease.run_id, stop_reason=stop_reason, proposed_at_ms=proposed_at_ms,
+            )
+
+    lease = ClaimLease(
+        grant["run_id"], ExecutionBundle(manifest, projection, grant),
+        {"run_id": grant["run_id"], "lifecycle_phase": "claimed", "event_sequence": 0},
+    )
+    class LocalCoordinator(StopCoordinator):
+        def heartbeat(self, run_id, operational_projection):
+            self.heartbeats.append(time.monotonic())
+            return ExecutionGate(True, "active", "valid", 20_000, 7, "none", 2_000)
+
+    coordinator = LocalCoordinator(lease)
+    service = RunnerService(
+        coordinator=coordinator, executor=Adapter(), heartbeat_interval=0.05,
+        idle_poll_interval=2.0,
+    )
+    worker = threading.Thread(target=service.run_once)
+    worker.start()
+    assert transport.started.wait(1)
+    assert service.request_local_stop() is True
+    worker.join(2)
+    assert not worker.is_alive()
+    assert len(coordinator.ack_projections) == 1
+    acknowledgement = coordinator.ack_projections[0]
+    assert acknowledgement["stop_reason"] == "local_emergency_stop"
+    assert acknowledgement["event_sequence"] > lease.operational_projection["event_sequence"]
+    assert "stop_observed" in acknowledgement["containment_codes"]
+    assert store.load_run(grant["run_id"])["state"] == "terminal"

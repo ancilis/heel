@@ -24,6 +24,7 @@ HEARTBEAT_STALE_MS = 5_000
 STOP_WINDOW_MS = 5_000
 STARTUP_TIMEOUT_SECONDS = 5.0
 STOP_TIMEOUT_SECONDS = 5.0
+MAX_CONSECUTIVE_LOCK_FAILURES = 3
 
 
 class CanaryReaperError(RuntimeError):
@@ -32,6 +33,8 @@ class CanaryReaperError(RuntimeError):
 
 class CanaryReaper:
     """Run short lifecycle/retention transactions on one exact durable database."""
+
+    MAX_CONSECUTIVE_LOCK_FAILURES = MAX_CONSECUTIVE_LOCK_FAILURES
 
     def __init__(
         self,
@@ -112,6 +115,24 @@ class CanaryReaper:
             (workspace_id,),
         ).fetchone() is not None
 
+    @staticmethod
+    def _verification_digest_matches(row: sqlite3.Row, *, require_grant: bool) -> bool:
+        """Compare live proof identity to both immutable signed authority records."""
+        try:
+            approval = json.loads(row["projection_json"])
+            approval_digest = approval["environment"]["verification_record_digest"]
+            grant_digest = None
+            if require_grant:
+                grant = json.loads(row["grant_json"])
+                grant_digest = grant["environment"]["verification_record_digest"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        current = row["verification_record_digest"]
+        return bool(
+            type(current) is str and current == approval_digest
+            and (not require_grant or current == grant_digest)
+        )
+
     def _request_authority_stops(
         self,
         service: CanaryRunService,
@@ -135,13 +156,16 @@ class CanaryReaper:
         pending = connection.execute(
             "SELECT r.*,cr.status AS runner_status,k.status AS key_status,"
             "k.revoked_at AS key_revoked_at,e.status AS proof_status,"
-            "e.proof_expires_at,e.revoked_at AS proof_revoked_at "
+            "e.proof_expires_at,e.revoked_at AS proof_revoked_at,"
+            "e.verification_record_digest,a.projection_json "
             "FROM canary_runs r JOIN canary_runners cr "
             "ON cr.workspace_id=r.workspace_id AND cr.runner_id=r.runner_id "
             "JOIN canary_runner_keys k ON k.workspace_id=r.workspace_id "
             "AND k.runner_id=r.runner_id AND k.key_id=r.runner_key_id "
             "JOIN canary_environments e ON e.workspace_id=r.workspace_id "
             "AND e.project_ref=r.project_ref AND e.environment_id=r.environment_id "
+            "JOIN canary_approval_projections a ON a.workspace_id=r.workspace_id "
+            "AND a.project_ref=r.project_ref AND a.approval_id=r.approval_id "
             "WHERE r.status='awaiting_execution_approval'"
         ).fetchall()
         for row in pending:
@@ -152,6 +176,8 @@ class CanaryReaper:
                 or row["key_revoked_at"] is not None
             ):
                 detail_reason = "runner_revoked"
+            elif not self._verification_digest_matches(row, require_grant=False):
+                detail_reason = "verification_digest_replaced"
             elif (
                 row["proof_status"] != "verified"
                 or row["proof_revoked_at"] is not None
@@ -197,7 +223,8 @@ class CanaryReaper:
         unclaimed = connection.execute(
             "SELECT r.*,cr.status AS runner_status,k.status AS key_status,"
             "k.revoked_at AS key_revoked_at,e.status AS proof_status,"
-            "e.proof_expires_at,e.revoked_at AS proof_revoked_at "
+            "e.proof_expires_at,e.revoked_at AS proof_revoked_at,"
+            "e.verification_record_digest,a.projection_json,g.grant_json "
             "FROM canary_runs r JOIN canary_execution_grants g "
             "ON g.workspace_id=r.workspace_id AND g.project_ref=r.project_ref "
             "AND g.grant_id=r.grant_id JOIN canary_runners cr "
@@ -206,6 +233,8 @@ class CanaryReaper:
             "AND k.runner_id=r.runner_id AND k.key_id=r.runner_key_id "
             "JOIN canary_environments e ON e.workspace_id=r.workspace_id "
             "AND e.project_ref=r.project_ref AND e.environment_id=r.environment_id "
+            "JOIN canary_approval_projections a ON a.workspace_id=r.workspace_id "
+            "AND a.project_ref=r.project_ref AND a.approval_id=r.approval_id "
             "WHERE r.status='approved' AND g.status IN ('prepared','approved','issued')"
         ).fetchall()
         for row in unclaimed:
@@ -216,6 +245,8 @@ class CanaryReaper:
                 or row["key_revoked_at"] is not None
             ):
                 detail_reason = "runner_revoked"
+            elif not self._verification_digest_matches(row, require_grant=True):
+                detail_reason = "verification_digest_replaced"
             elif row["proof_status"] != "verified" or row["proof_revoked_at"] is not None:
                 detail_reason = "target_revoked"
             elif (
@@ -292,15 +323,21 @@ class CanaryReaper:
             )
             counts["authority_revocations"] += 1
         acknowledged = connection.execute(
-            "SELECT r.*,o.receipt_json FROM canary_runs r "
+            "SELECT r.*,o.receipt_json,o.updated_at AS receipt_updated_at FROM canary_runs r "
             "LEFT JOIN canary_operational_receipts o ON o.workspace_id=r.workspace_id "
             "AND o.project_ref=r.project_ref AND o.run_id=r.run_id "
             "WHERE r.status='finalizing' AND r.stop_reason!='none' "
-            "AND r.stop_acknowledged_at_ms IS NOT NULL "
-            "AND COALESCE(r.last_heartbeat_at_ms,r.stop_acknowledged_at_ms,r.updated_at)<=?",
-            (now_ms - HEARTBEAT_STALE_MS,),
+            "AND r.stop_acknowledged_at_ms IS NOT NULL"
         ).fetchall()
         for row in acknowledged:
+            heartbeat_anchor = max(
+                int(value) for value in (
+                    row["last_heartbeat_at_ms"], row["receipt_updated_at"],
+                    row["stop_acknowledged_at_ms"],
+                ) if value is not None
+            )
+            if heartbeat_anchor > now_ms - HEARTBEAT_STALE_MS:
+                continue
             quota_state = row["quota_state"]
             refund_created = False
             if quota_state == "reserved" and row["receipt_json"] is not None:
@@ -370,7 +407,9 @@ class CanaryReaper:
             "SELECT r.*,cr.status AS runner_status,k.status AS key_status,"
             "k.revoked_at AS key_revoked_at,e.status AS proof_status,"
             "e.proof_expires_at,e.revoked_at AS proof_revoked_at,g.status AS grant_status,"
-            "g.expires_at AS grant_expires_at FROM canary_runs r "
+            "g.expires_at AS grant_expires_at,e.verification_record_digest,"
+            "a.projection_json,g.grant_json,o.updated_at AS receipt_updated_at "
+            "FROM canary_runs r "
             "JOIN canary_runners cr ON cr.workspace_id=r.workspace_id "
             "AND cr.runner_id=r.runner_id "
             "JOIN canary_runner_keys k ON k.workspace_id=r.workspace_id "
@@ -379,6 +418,10 @@ class CanaryReaper:
             "AND e.project_ref=r.project_ref AND e.environment_id=r.environment_id "
             "JOIN canary_execution_grants g ON g.workspace_id=r.workspace_id "
             "AND g.project_ref=r.project_ref AND g.grant_id=r.grant_id "
+            "JOIN canary_approval_projections a ON a.workspace_id=r.workspace_id "
+            "AND a.project_ref=r.project_ref AND a.approval_id=r.approval_id "
+            "LEFT JOIN canary_operational_receipts o ON o.workspace_id=r.workspace_id "
+            "AND o.project_ref=r.project_ref AND o.run_id=r.run_id "
             "WHERE r.status IN ('claimed','running','finalizing') AND r.stop_reason='none'"
         ).fetchall()
         for row in rows:
@@ -391,6 +434,9 @@ class CanaryReaper:
                 or row["key_revoked_at"] is not None
             ):
                 stop_reason = detail_reason = "runner_revoked"
+            elif not self._verification_digest_matches(row, require_grant=True):
+                stop_reason, detail_reason = "target_revoked", "verification_digest_replaced"
+                error_category = "version_mismatch"
             elif row["proof_revoked_at"] is not None or row["proof_status"] != "verified":
                 stop_reason = detail_reason = "target_revoked"
             elif (
@@ -407,11 +453,15 @@ class CanaryReaper:
             elif row["grant_status"] != "claimed" or int(row["grant_expires_at"]) <= now_ms:
                 stop_reason, detail_reason = "cloud_stop", "grant_expired"
             else:
-                heartbeat_anchor = next((
-                    int(value) for value in (
-                        row["last_heartbeat_at_ms"], row["started_at_ms"], row["claimed_at_ms"],
-                    ) if value is not None
-                ), None)
+                heartbeat_anchor = max(
+                    (
+                        int(value) for value in (
+                            row["last_heartbeat_at_ms"], row["receipt_updated_at"],
+                            row["claimed_at_ms"],
+                        ) if value is not None
+                    ),
+                    default=None,
+                )
                 if heartbeat_anchor is not None and heartbeat_anchor <= now_ms - HEARTBEAT_STALE_MS:
                     stop_reason, detail_reason = "cloud_stop", "cloud_disconnected"
                     error_category = "cloud_disconnected"
@@ -446,6 +496,19 @@ class CanaryReaper:
             "WHERE status='permitted' AND expires_at<=?", (now_ms,),
         )
         counts["expired_disclosure_permits"] = cursor.rowcount
+        connection.execute(
+            "UPDATE canary_disclosure_requests SET status='awaiting_disclosure_approval',"
+            "updated_at=? WHERE status='permitted' AND EXISTS ("
+            "SELECT 1 FROM canary_disclosure_permits p WHERE "
+            "p.workspace_id=canary_disclosure_requests.workspace_id AND "
+            "p.project_ref=canary_disclosure_requests.project_ref AND "
+            "p.request_id=canary_disclosure_requests.request_id AND p.status='expired') "
+            "AND NOT EXISTS (SELECT 1 FROM canary_disclosure_permits p WHERE "
+            "p.workspace_id=canary_disclosure_requests.workspace_id AND "
+            "p.project_ref=canary_disclosure_requests.project_ref AND "
+            "p.request_id=canary_disclosure_requests.request_id AND p.status='permitted')",
+            (now_ms,),
+        )
         counts["purged_findings"] = disclosure.purge_expired_payloads(now_ms=now_ms)
         connection.execute(
             "UPDATE canary_reaper_state SET lease_owner=NULL,lease_expires_at=NULL,last_run_at=? "
@@ -491,10 +554,36 @@ class CanaryReaper:
             connection = self._connect()
             service = self._service(connection)
             disclosure = self._disclosure_service(connection)
-            self._cycle(service, disclosure)
-            self._startup.set()
-            while not self._stop.wait(self.interval_seconds):
-                self._cycle(service, disclosure)
+            consecutive_lock_failures = 0
+            while not self._stop.is_set():
+                try:
+                    self._cycle(service, disclosure)
+                except sqlite3.OperationalError as error:
+                    code = getattr(error, "sqlite_errorcode", None)
+                    transient_lock = (
+                        (type(code) is int and code & 0xFF in {
+                            sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED,
+                        })
+                        or "locked" in str(error).lower()
+                        or "busy" in str(error).lower()
+                    )
+                    if not transient_lock:
+                        raise
+                    consecutive_lock_failures += 1
+                    if consecutive_lock_failures >= MAX_CONSECUTIVE_LOCK_FAILURES:
+                        raise
+                    _LOGGER.warning(json.dumps({
+                        "event": "canary_reaper_cycle_skipped",
+                        "reason": "sqlite_lock_contention",
+                        "consecutive_failures": consecutive_lock_failures,
+                    }, sort_keys=True, separators=(",", ":")))
+                    if self._stop.wait(self.interval_seconds):
+                        break
+                    continue
+                consecutive_lock_failures = 0
+                self._startup.set()
+                if self._stop.wait(self.interval_seconds):
+                    break
         except BaseException as error:
             failure = error
             with self._state_lock:

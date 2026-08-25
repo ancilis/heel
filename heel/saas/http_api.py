@@ -2142,8 +2142,14 @@ class _Handler(BaseHTTPRequestHandler):
             result = runs.get_status(wid, project_ref, run_id)
         except LookupError:
             raise CanaryDisclosureError("canary_run_not_found") from None
+        approval_generation = (
+            runs._control_generation()
+            if result["status"] == "awaiting_execution_approval"
+            else int(result["kill_switch_generation"])
+        )
         self._json(200, {
             "schema_version": "heel.canary-run-dashboard.v1",
+            "approval_control_generation": approval_generation,
             "run": result,
             "progress": self._canary_dashboard_progress(wid, project_ref, run_id),
         })

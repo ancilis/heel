@@ -237,7 +237,7 @@ def operational_projection(
             "requests_started": requests_started,
             "requests_completed": requests_completed,
             "response_bytes_read": requests_completed * 10,
-            "actions_contained": 0,
+            "actions_contained": requests_started,
             "retries_used": 0,
             "remaining_requests": 2 - requests_started,
             "remaining_wall_ms": max(0, 60000 - sequence),

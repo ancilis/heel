@@ -140,7 +140,7 @@ def _preview(service, grant, findings):
     )
 
 
-def _permit(service, grant, preview):
+def _permit(service, grant, preview, *, recent_auth_at_ms=NOW_MS):
     projection = preview["projection"]
     return service.permit(
         WORKSPACE,
@@ -154,7 +154,7 @@ def _permit(service, grant, preview):
         finding_count=projection["finding_count"],
         actor="user_owner",
         role="owner",
-        recent_auth_at_ms=NOW_MS,
+        recent_auth_at_ms=recent_auth_at_ms,
     )
 
 
@@ -368,7 +368,8 @@ def test_upload_joins_outer_pop_transaction_and_returns_closed_receipt():
 def test_upload_rejects_expired_consumed_and_noncurrent_key_with_stable_codes():
     conn, clock, runner, service, grant, operational = _terminal_setup()
     findings = _findings(runner, grant, operational)
-    permit = _permit(service, grant, _preview(service, grant, findings))
+    preview = _preview(service, grant, findings)
+    permit = _permit(service, grant, preview)
     request = _upload(grant, permit, findings)
 
     clock.value += 601
@@ -378,6 +379,9 @@ def test_upload_rejects_expired_consumed_and_noncurrent_key_with_stable_codes():
     clock.value -= 601
 
     service.upload(WORKSPACE, PROJECT, grant["run_id"], RUNNER, request)
+    with pytest.raises(ValueError) as consumed_ceremony:
+        _permit(service, grant, preview)
+    assert consumed_ceremony.value.code == "permit_consumed"
     with pytest.raises(ValueError) as consumed:
         service.upload(WORKSPACE, PROJECT, grant["run_id"], RUNNER, request)
     assert consumed.value.code == "permit_consumed"
@@ -492,6 +496,55 @@ def test_local_only_is_terminal_and_never_persists_findings():
     with pytest.raises(ValueError) as terminal:
         _permit(service, grant, preview)
     assert terminal.value.code == "canary_state_conflict"
+
+
+def test_expired_permit_is_atomically_replaced_by_a_fresh_recent_owner_ceremony():
+    conn, clock, runner, service, grant, operational = _terminal_setup()
+    findings = _findings(runner, grant, operational)
+    preview = _preview(service, grant, findings)
+    first = _permit(service, grant, preview)
+    clock.value += 601
+
+    replacement = _permit(
+        service, grant, preview, recent_auth_at_ms=int(clock.value * 1000),
+    )
+
+    assert replacement["permit_id"] != first["permit_id"]
+    assert conn.execute(
+        "SELECT status FROM canary_disclosure_permits WHERE permit_id=?",
+        (first["permit_id"],),
+    ).fetchone()[0] == "expired"
+    assert conn.execute(
+        "SELECT status FROM canary_disclosure_permits WHERE permit_id=?",
+        (replacement["permit_id"],),
+    ).fetchone()[0] == "permitted"
+    assert conn.execute(
+        "SELECT status FROM canary_disclosure_requests WHERE request_id=?",
+        (preview["request_id"],),
+    ).fetchone()[0] == "permitted"
+
+
+def test_local_only_remains_available_after_an_unused_permit_expires():
+    conn, clock, runner, service, grant, operational = _terminal_setup()
+    findings = _findings(runner, grant, operational)
+    preview = _preview(service, grant, findings)
+    permit = _permit(service, grant, preview)
+    clock.value += 601
+
+    result = service.local_only(
+        WORKSPACE, PROJECT, grant["run_id"],
+        request_id=preview["request_id"], actor="user_owner",
+    )
+
+    assert result["status"] == "local_only"
+    assert conn.execute(
+        "SELECT status FROM canary_disclosure_permits WHERE permit_id=?",
+        (permit["permit_id"],),
+    ).fetchone()[0] == "expired"
+    assert conn.execute(
+        "SELECT status FROM canary_disclosure_requests WHERE request_id=?",
+        (preview["request_id"],),
+    ).fetchone()[0] == "local_only"
 
 
 def test_legacy_findings_approval_never_substitutes_for_a_canary_permit():

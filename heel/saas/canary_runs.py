@@ -152,6 +152,21 @@ class CanaryRunService:
     def _now_ms(self) -> int:
         return max(0, int(float(self.clock()) * 1000))
 
+    def _server_receipt_time(self, row: sqlite3.Row) -> int:
+        """Advance only from timestamps previously assigned by the control plane."""
+        trusted_fields = {
+            "created_at", "claimed_at_ms", "last_heartbeat_at_ms", "last_gate_at_ms",
+            "stop_requested_at_ms", "stop_acknowledged_at_ms", "terminal_at_ms",
+        }
+        keys = set(row.keys())
+        return max(
+            [self._now_ms()]
+            + [
+                int(row[field]) for field in trusted_fields
+                if field in keys and row[field] is not None
+            ]
+        )
+
     def _workspace_plan(self, workspace_id: str):
         row = self.conn.execute(
             "SELECT w.plan_id AS workspace_plan,w.catalog_version AS workspace_catalog,"
@@ -324,6 +339,9 @@ class CanaryRunService:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             authority = self._projection_authority(validated, now)
+            control_generation = self._control_generation()
+            if self._kill_active(validated["workspace_id"]):
+                raise CanaryRunError("kill_switch_active")
             serialized = canonical_bytes(validated).decode()
             prior = self.conn.execute(
                 "SELECT * FROM canary_approval_projections WHERE workspace_id=? AND project_ref=? "
@@ -371,12 +389,12 @@ class CanaryRunService:
                 "runner_key_id,status,execution_disposition,error_category,stop_reason,"
                 "source_event_sequence,source_projection_digest,cloud_event_sequence,"
                 "stop_generation,stop_ack_late,quota_state,kill_switch_generation,created_at,updated_at,purge_at) "
-                "VALUES(?,?,?,?,NULL,?,?,?,?,NULL,'none','none',-1,NULL,0,0,0,'unreserved',0,?,?,?)",
+                "VALUES(?,?,?,?,NULL,?,?,?,?,NULL,'none','none',-1,NULL,0,0,0,'unreserved',?,?,?,?)",
                 (
                     run_id, validated["workspace_id"], validated["project_id"],
                     validated["projection_id"], validated["environment"]["environment_id"],
                     validated["runner"]["runner_id"], validated["runner"]["runner_key_id"],
-                    "prepared", now, now, now + AUDIT_RETENTION_MS,
+                    "prepared", control_generation, now, now, now + AUDIT_RETENTION_MS,
                 ),
             )
             run = self._run(validated["workspace_id"], validated["project_id"], run_id)
@@ -836,6 +854,99 @@ class CanaryRunService:
             raise LookupError("canary run not found")
         return row
 
+    def _stored_operational_authority(self, row: sqlite3.Row) -> tuple[dict, dict]:
+        """Verify and return the immutable runner approval and Cloud execution grant."""
+        if row["projection_json"] is None or row["grant_json"] is None:
+            raise CanaryRunError("operational_binding_mismatch")
+        try:
+            approval = validate_approval_projection(json.loads(row["projection_json"]))
+            grant = validate_execution_grant(json.loads(row["grant_json"]))
+            self._verify_signature(approval, row["public_key"], "projection_digest")
+            self._verify_signature(grant, self.signing.canonical_public_key, "grant_digest")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise CanaryRunError("operational_binding_mismatch") from None
+        if (
+            approval["projection_digest"] != row["approval_projection_digest"]
+            or approval["manifest_digest"] != row["manifest_digest"]
+            or approval["workspace_id"] != row["workspace_id"]
+            or approval["project_id"] != row["project_ref"]
+            or approval["runner"]["runner_id"] != row["runner_id"]
+            or approval["runner"]["runner_key_id"] != row["runner_key_id"]
+            or grant["grant_id"] != row["grant_id"]
+            or grant["grant_digest"] != row["grant_digest"]
+            or grant["run_id"] != row["run_id"]
+            or grant["workspace_id"] != row["workspace_id"]
+            or grant["project_id"] != row["project_ref"]
+            or grant["approval"]["projection_digest"] != approval["projection_digest"]
+            or grant["approval"]["manifest_digest"] != approval["manifest_digest"]
+            or grant["runner_binding"]["runner_id"] != row["runner_id"]
+            or grant["runner_binding"]["runner_key_id"] != row["runner_key_id"]
+            or grant["environment"] != approval["environment"]
+            or grant["budgets"] != approval["budgets"]
+            or grant["retry_policy"] != approval["retry_policy"]
+        ):
+            raise CanaryRunError("operational_binding_mismatch")
+        return approval, grant
+
+    @staticmethod
+    def _operational_within_budget(value: dict, approval: dict, grant: dict) -> bool:
+        budgets = approval["budgets"]
+        counters = value["counters"]
+        requests_started = counters["requests_started"]
+        return bool(
+            grant["budgets"] == budgets
+            and grant["retry_policy"] == approval["retry_policy"]
+            and requests_started <= budgets["maximum_requests"]
+            and counters["remaining_requests"] == budgets["maximum_requests"] - requests_started
+            and counters["retries_used"] <= grant["retry_policy"]["maximum_retries"]
+            and counters["actions_contained"] + counters["retries_used"] == requests_started
+            and counters["response_bytes_read"]
+            <= counters["requests_completed"] * budgets["maximum_response_bytes"]
+            and counters["remaining_wall_ms"] <= budgets["wall_timeout_ms"]
+        )
+
+    @staticmethod
+    def _verification_digest_matches(row: sqlite3.Row, approval: dict, grant: dict) -> bool:
+        current = row["verification_record_digest"]
+        return bool(
+            type(current) is str
+            and current == approval["environment"]["verification_record_digest"]
+            and current == grant["environment"]["verification_record_digest"]
+        )
+
+    def _persist_authority_stop(
+        self, row: sqlite3.Row, *, reason: str = "target_revoked",
+        detail_reason: str = "verification_digest_replaced",
+    ) -> sqlite3.Row:
+        """Permanently close target authority using only the Cloud receipt clock."""
+        if row["status"] in {"terminal", "cancelled", "expired"} or row["stop_reason"] != "none":
+            return row
+        now = self._server_receipt_time(row)
+        next_status = "finalizing" if row["status"] == "finalizing" else "stop_requested"
+        self.conn.execute(
+            "UPDATE canary_runs SET status=?,error_category='version_mismatch',stop_reason=?,"
+            "stop_generation=?,stop_requested_at_ms=?,stop_deadline_ms=?,updated_at=? "
+            "WHERE workspace_id=? AND project_ref=? AND run_id=? AND stop_reason='none'",
+            (
+                next_status, reason, self._control_generation(), now, now + STOP_DEADLINE_MS,
+                now, row["workspace_id"], row["project_ref"], row["run_id"],
+            ),
+        )
+        updated = self._context(
+            row["workspace_id"], row["project_ref"], row["run_id"], row["runner_id"],
+        )
+        self._append_event(
+            updated, "stop_requested", actor_class="system", actor_id="control-plane",
+            reason_code=detail_reason,
+        )
+        self._audit(
+            updated, "stop_requested", subject_ref=row["run_id"],
+            actor_class="system", actor_id="control-plane", reason_code=detail_reason,
+        )
+        return self._context(
+            row["workspace_id"], row["project_ref"], row["run_id"], row["runner_id"],
+        )
+
     def _validate_operational(self, row: sqlite3.Row, projection: object) -> dict:
         try:
             value = validate_operational_run(projection)
@@ -856,6 +967,9 @@ class CanaryRunService:
             or value["manifest_digest"] != row["manifest_digest"]
         ):
             raise CanaryRunError("operational_binding_mismatch")
+        approval, grant = self._stored_operational_authority(row)
+        if not self._operational_within_budget(value, approval, grant):
+            raise CanaryRunError("invalid_operational_projection")
         return value
 
     def _source_state(self, row: sqlite3.Row, projection: dict) -> str:
@@ -888,8 +1002,10 @@ class CanaryRunService:
                 raise CanaryRunError("operational_time_regression")
         return "new"
 
-    def _store_receipt(self, row: sqlite3.Row, projection: dict) -> None:
-        now = self._now_ms()
+    def _store_receipt(
+        self, row: sqlite3.Row, projection: dict, *, received_at_ms: int | None = None,
+    ) -> None:
+        now = self._server_receipt_time(row) if received_at_ms is None else received_at_ms
         serialized = canonical_bytes(projection).decode()
         self.conn.execute(
             "INSERT INTO canary_operational_receipts("
@@ -932,8 +1048,14 @@ class CanaryRunService:
         context = self._context(row["workspace_id"], row["project_ref"], row["run_id"], row["runner_id"])
         now = self._now_ms()
         generation = self._control_generation()
+        approval, grant = self._stored_operational_authority(context)
+        verification_mismatch = not self._verification_digest_matches(
+            context, approval, grant,
+        )
+        if verification_mismatch:
+            context = self._persist_authority_stop(context)
         runner_state = context["runner_status"] if context["runner_status"] in {"active", "revoked", "replaced"} else "revoked"
-        if context["proof_revoked_at"] is not None or context["proof_status"] == "revoked":
+        if verification_mismatch or context["proof_revoked_at"] is not None or context["proof_status"] == "revoked":
             proof_state = "revoked"
         elif context["proof_expires_at"] is None or int(context["proof_expires_at"] * 1000) <= now:
             proof_state = "expired"
@@ -987,6 +1109,10 @@ class CanaryRunService:
         operation: str,
     ) -> tuple[sqlite3.Row, dict, str]:
         row = self._context(workspace_id, project_ref, run_id, runner_id)
+        approval, grant = self._stored_operational_authority(row)
+        verification_mismatch = not self._verification_digest_matches(row, approval, grant)
+        if verification_mismatch:
+            row = self._persist_authority_stop(row)
         value = self._validate_operational(row, projection)
         phase = value["lifecycle_phase"]
         stop_reason = value["stop_reason"]
@@ -998,6 +1124,16 @@ class CanaryRunService:
             raise CanaryRunError("illegal_run_transition")
         if operation == "result" and phase != "terminal":
             raise CanaryRunError("illegal_run_transition")
+        # A post-stop heartbeat can legitimately carry the last exact pre-stop snapshot.  It is
+        # Cloud liveness only: never overwrite the durable stop or runner receipt.  The shared
+        # source check still rejects equal-sequence/different-digest projections.
+        if operation == "heartbeat" and row["stop_reason"] != "none" and stop_reason == "none":
+            source = self._source_state(row, value)
+            if source == "replay":
+                return row, value, "liveness"
+            raise CanaryRunError("stop_conflict")
+        if verification_mismatch and stop_reason == "none":
+            return row, value, "authority_stop"
         # Heartbeat and progress use independent PoP chains while reporting one shared
         # operational sequence.  A delayed, still-authentic heartbeat is liveness evidence,
         # not authority to roll the durable lifecycle snapshot backwards.
@@ -1019,7 +1155,8 @@ class CanaryRunService:
             raise CanaryRunError("illegal_run_transition")
         old_status = row["status"]
         row = self._consume_if_started(row, value)
-        self._store_receipt(row, value)
+        received_at = self._server_receipt_time(row)
+        self._store_receipt(row, value, received_at_ms=received_at)
         new_status = row["status"]
         if phase == "running" and row["status"] == "claimed":
             new_status = "running"
@@ -1029,9 +1166,10 @@ class CanaryRunService:
             new_status = "finalizing"
         timestamps = value["timestamps"]
         entering_stop = stop_reason != "none" and row["stop_reason"] == "none"
-        stop_requested_at = timestamps["stop_requested_at_ms"] if entering_stop else None
-        stop_deadline = self._now_ms() + STOP_DEADLINE_MS if entering_stop else None
+        stop_requested_at = received_at if entering_stop else None
+        stop_deadline = received_at + STOP_DEADLINE_MS if entering_stop else None
         stop_generation = self._control_generation() if entering_stop else row["stop_generation"]
+        started_at = received_at if timestamps["started_at_ms"] is not None else None
         self.conn.execute(
             "UPDATE canary_runs SET status=?,source_event_sequence=?,source_projection_digest=?,"
             "error_category=?,stop_reason=CASE WHEN ?='none' THEN stop_reason ELSE ? END,"
@@ -1042,8 +1180,7 @@ class CanaryRunService:
             (
                 new_status, value["event_sequence"], value["projection_digest"],
                 value["error_category"], value["stop_reason"], value["stop_reason"],
-                timestamps["started_at_ms"], stop_requested_at, stop_deadline, stop_generation,
-                max(self._now_ms(), timestamps["updated_at_ms"]),
+                started_at, stop_requested_at, stop_deadline, stop_generation, received_at,
                 workspace_id, project_ref, run_id,
             ),
         )
@@ -1087,14 +1224,14 @@ class CanaryRunService:
             row, value, source = self._accept_operational(
                 workspace_id, project_ref, run_id, runner_id, projection, operation="heartbeat",
             )
-            now = self._now_ms()
+            now = self._server_receipt_time(row)
             self.conn.execute(
                 "UPDATE canary_runs SET last_heartbeat_at_ms=? WHERE workspace_id=? "
                 "AND project_ref=? AND run_id=?",
                 (now, workspace_id, project_ref, run_id),
             )
             row = self._context(workspace_id, project_ref, run_id, runner_id)
-            if source != "stale":
+            if source in {"new", "replay"}:
                 self._append_event(
                     row, "heartbeat_accepted", actor_class="runner", actor_id=runner_id,
                     source_event_sequence=value["event_sequence"],
@@ -1119,7 +1256,7 @@ class CanaryRunService:
             row, value, source = self._accept_operational(
                 workspace_id, project_ref, run_id, runner_id, projection, operation="progress",
             )
-            if source != "replay":
+            if source == "new":
                 self._append_event(
                     row, "progress_accepted", actor_class="runner", actor_id=runner_id,
                     source_event_sequence=value["event_sequence"],
@@ -1167,7 +1304,7 @@ class CanaryRunService:
                 raise CanaryRunError("kill_switch_changed")
             if row["status"] not in {"claimed", "running"}:
                 raise CanaryRunError("stop_conflict")
-            now = self._now_ms()
+            now = self._server_receipt_time(row)
             deadline = now + STOP_DEADLINE_MS
             self.conn.execute(
                 "UPDATE canary_runs SET status='stop_requested',stop_reason=?,stop_generation=?,"
@@ -1202,6 +1339,9 @@ class CanaryRunService:
             self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._context(workspace_id, project_ref, run_id, runner_id)
+            approval, grant = self._stored_operational_authority(row)
+            if not self._verification_digest_matches(row, approval, grant):
+                row = self._persist_authority_stop(row)
             value = self._validate_operational(row, projection)
             source = self._source_state(row, value)
             if source == "replay" and row["stop_acknowledged_at_ms"] is not None:
@@ -1209,6 +1349,38 @@ class CanaryRunService:
                 if owns_transaction:
                     self.conn.commit()
                 return {"accepted": True, "deadline_met": not late, "late": late}
+            arrival = self._server_receipt_time(row)
+            runner_originated_stop = bool(
+                row["status"] in {"claimed", "running"}
+                and value["lifecycle_phase"] == "stop_requested"
+                and value["stop_reason"] == "local_emergency_stop"
+            )
+            if runner_originated_stop:
+                generation = self._control_generation()
+                self.conn.execute(
+                    "UPDATE canary_runs SET status='stop_requested',error_category=?,"
+                    "stop_reason='local_emergency_stop',stop_generation=?,"
+                    "stop_requested_at_ms=?,stop_deadline_ms=?,updated_at=? "
+                    "WHERE workspace_id=? AND project_ref=? AND run_id=? "
+                    "AND status IN ('claimed','running') AND stop_reason='none'",
+                    (
+                        value["error_category"], generation, arrival,
+                        arrival + STOP_DEADLINE_MS, arrival,
+                        workspace_id, project_ref, run_id,
+                    ),
+                )
+                row = self._context(workspace_id, project_ref, run_id, runner_id)
+                self._append_event(
+                    row, "stop_requested", actor_class="runner", actor_id=runner_id,
+                    reason_code="local_emergency_stop",
+                    source_event_sequence=value["event_sequence"],
+                )
+                self._audit(
+                    row, "stop_requested", subject_ref=run_id,
+                    actor_class="runner", actor_id=runner_id,
+                    reason_code="local_emergency_stop",
+                )
+                row = self._context(workspace_id, project_ref, run_id, runner_id)
             if row["status"] not in {"stop_requested", "finalizing", "terminal"}:
                 raise CanaryRunError("stop_conflict")
             if value["lifecycle_phase"] not in {"stop_requested", "finalizing"}:
@@ -1220,7 +1392,6 @@ class CanaryRunService:
                 raise CanaryRunError("invalid_stop_ack")
             if value["stop_reason"] != row["stop_reason"]:
                 raise CanaryRunError("invalid_stop_ack")
-            arrival = self._now_ms()
             # The Cloud receipt clock is deadline authority.  Runner-local stop/ack times stay
             # signed evidence, but skew or backdating can neither win nor lose the five-second SLA.
             late = arrival > row["stop_deadline_ms"]
@@ -1235,7 +1406,7 @@ class CanaryRunService:
                 raise CanaryRunError("stop_conflict")
             if not terminal_ack:
                 row = self._consume_if_started(row, value)
-                self._store_receipt(row, value)
+                self._store_receipt(row, value, received_at_ms=arrival)
             next_status = (
                 "terminal" if terminal_ack else
                 "finalizing" if value["lifecycle_phase"] == "finalizing" else row["status"]
@@ -1245,8 +1416,8 @@ class CanaryRunService:
                 "stop_acknowledged_at_ms=?,stop_ack_late=?,updated_at=? "
                 "WHERE workspace_id=? AND project_ref=? AND run_id=?",
                 (
-                    next_status, value["event_sequence"], value["projection_digest"], acknowledged,
-                    int(late), max(self._now_ms(), value["timestamps"]["updated_at_ms"]),
+                    next_status, value["event_sequence"], value["projection_digest"], arrival,
+                    int(late), arrival,
                     workspace_id, project_ref, run_id,
                 ),
             )
@@ -1311,7 +1482,16 @@ class CanaryRunService:
             self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._context(workspace_id, project_ref, run_id, runner_id)
+            approval, grant = self._stored_operational_authority(row)
+            verification_mismatch = not self._verification_digest_matches(row, approval, grant)
+            if verification_mismatch:
+                row = self._persist_authority_stop(row)
             value = self._validate_operational(row, projection)
+            if verification_mismatch and value["stop_reason"] == "none":
+                closed = self.get_status(workspace_id, project_ref, run_id)
+                if owns_transaction:
+                    self.conn.commit()
+                return closed
             source = self._source_state(row, value)
             if source == "replay" and row["status"] == "terminal":
                 result = self.get_status(workspace_id, project_ref, run_id)
@@ -1323,6 +1503,7 @@ class CanaryRunService:
             }:
                 raise CanaryRunError("illegal_run_transition")
             timestamps = value["timestamps"]
+            received_at = self._server_receipt_time(row)
             if (value["stop_reason"] != "none") != (
                 value["execution_disposition"] == "stopped"
             ):
@@ -1332,11 +1513,24 @@ class CanaryRunService:
                 or value["execution_disposition"] != "stopped"
             ):
                 raise CanaryRunError("stop_conflict")
-            if (
-                row["stop_acknowledged_at_ms"] is not None
-                and timestamps["stop_acknowledged_at_ms"] != row["stop_acknowledged_at_ms"]
-            ):
-                raise CanaryRunError("stop_conflict")
+            prior_receipt = self.conn.execute(
+                "SELECT receipt_json FROM canary_operational_receipts WHERE workspace_id=? "
+                "AND project_ref=? AND run_id=?",
+                (workspace_id, project_ref, run_id),
+            ).fetchone()
+            if prior_receipt is not None and prior_receipt["receipt_json"] is not None:
+                try:
+                    prior_value = validate_operational_run(
+                        json.loads(prior_receipt["receipt_json"]),
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise CanaryRunError("operational_binding_mismatch") from None
+                prior_ack_evidence = prior_value["timestamps"]["stop_acknowledged_at_ms"]
+                if (
+                    prior_ack_evidence is not None
+                    and timestamps["stop_acknowledged_at_ms"] != prior_ack_evidence
+                ):
+                    raise CanaryRunError("stop_conflict")
             if (
                 row["stop_requested_at_ms"] is not None
                 and row["stop_acknowledged_at_ms"] is None
@@ -1349,7 +1543,7 @@ class CanaryRunService:
                     "UPDATE canary_runs SET status='finalizing',started_at_ms=COALESCE(started_at_ms,?),"
                     "updated_at=? WHERE workspace_id=? AND project_ref=? AND run_id=?",
                     (
-                        value["timestamps"]["started_at_ms"], self._now_ms(),
+                        received_at, received_at,
                         workspace_id, project_ref, run_id,
                     ),
                 )
@@ -1359,8 +1553,9 @@ class CanaryRunService:
                     source_event_sequence=value["event_sequence"],
                 )
             row = self._settle_terminal_quota(row, value)
-            self._store_receipt(row, value)
-            now = self._now_ms()
+            self._store_receipt(row, value, received_at_ms=received_at)
+            now = received_at
+            received_stop = now if value["stop_reason"] != "none" else None
             self.conn.execute(
                 "UPDATE canary_runs SET status='terminal',execution_disposition=?,error_category=?,"
                 "stop_reason=?,source_event_sequence=?,source_projection_digest=?,"
@@ -1369,9 +1564,8 @@ class CanaryRunService:
                 "updated_at=?,purge_at=? WHERE workspace_id=? AND project_ref=? AND run_id=?",
                 (
                     value["execution_disposition"], value["error_category"], value["stop_reason"],
-                    value["event_sequence"], value["projection_digest"], timestamps["started_at_ms"],
-                    timestamps["stop_requested_at_ms"], timestamps["stop_acknowledged_at_ms"],
-                    timestamps["terminal_at_ms"], max(now, timestamps["updated_at_ms"]),
+                    value["event_sequence"], value["projection_digest"], now,
+                    received_stop, None, now, now,
                     now + AUDIT_RETENTION_MS, workspace_id, project_ref, run_id,
                 ),
             )

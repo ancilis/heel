@@ -419,6 +419,13 @@ class CanaryDisclosureService:
             ).fetchone()
             if request is None:
                 raise CanaryDisclosureError("canary_state_conflict")
+            now = self._now_ms()
+            if request["status"] == "permitted":
+                self._expire_unused_permits(request, now=now)
+                request = self.conn.execute(
+                    "SELECT * FROM canary_disclosure_requests WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
             if request["status"] == "local_only":
                 return {
                     "schema_version": "heel.canary-disclosure-state.v1",
@@ -430,7 +437,6 @@ class CanaryDisclosureService:
                 "awaiting_disclosure_approval",
             }:
                 raise CanaryDisclosureError("canary_state_conflict")
-            now = self._now_ms()
             self.conn.execute(
                 "UPDATE canary_disclosure_requests SET status='local_only',updated_at=? "
                 "WHERE workspace_id=? AND project_ref=? AND request_id=?",
@@ -450,6 +456,39 @@ class CanaryDisclosureService:
                 "status": "local_only",
             }
 
+    def _expire_unused_permits(self, request: sqlite3.Row, *, now: int) -> int:
+        """Expire elapsed one-use permits and atomically reopen their pending choice."""
+        cursor = self.conn.execute(
+            "UPDATE canary_disclosure_permits SET status='expired' "
+            "WHERE workspace_id=? AND project_ref=? AND request_id=? AND run_id=? "
+            "AND status='permitted' AND expires_at<=?",
+            (
+                request["workspace_id"], request["project_ref"],
+                request["request_id"], request["run_id"], now,
+            ),
+        )
+        active = self.conn.execute(
+            "SELECT 1 FROM canary_disclosure_permits WHERE workspace_id=? "
+            "AND project_ref=? AND request_id=? AND run_id=? AND status='permitted' "
+            "AND expires_at>? LIMIT 1",
+            (
+                request["workspace_id"], request["project_ref"],
+                request["request_id"], request["run_id"], now,
+            ),
+        ).fetchone()
+        if cursor.rowcount and active is None and request["status"] == "permitted":
+            self.conn.execute(
+                "UPDATE canary_disclosure_requests "
+                "SET status='awaiting_disclosure_approval',updated_at=? "
+                "WHERE workspace_id=? AND project_ref=? AND request_id=? "
+                "AND status='permitted'",
+                (
+                    now, request["workspace_id"], request["project_ref"],
+                    request["request_id"],
+                ),
+            )
+        return cursor.rowcount
+
     def _existing_permit(
         self,
         request: sqlite3.Row,
@@ -457,22 +496,21 @@ class CanaryDisclosureService:
         actor: str,
         now: int,
     ) -> dict | None:
+        self._expire_unused_permits(request, now=now)
         row = self.conn.execute(
             "SELECT * FROM canary_disclosure_permits WHERE workspace_id=? AND project_ref=? "
-            "AND request_id=? AND run_id=?",
+            "AND request_id=? AND run_id=? AND status='permitted' AND expires_at>? "
+            "ORDER BY issued_at DESC,permit_id DESC LIMIT 1",
             (
                 request["workspace_id"],
                 request["project_ref"],
                 request["request_id"],
                 request["run_id"],
+                now,
             ),
         ).fetchone()
         if row is None:
             return None
-        if row["status"] == "consumed":
-            raise CanaryDisclosureError("permit_consumed")
-        if row["status"] == "expired" or row["expires_at"] <= now:
-            raise CanaryDisclosureError("disclosure_permit_expired")
         if row["status"] != "permitted" or row["approved_by"] != actor:
             raise CanaryDisclosureError("canary_state_conflict")
         try:
@@ -549,6 +587,12 @@ class CanaryDisclosureService:
             ).fetchone()
             if request is None:
                 raise CanaryDisclosureError("disclosure_permit_required")
+            if request["status"] == "permitted":
+                self._expire_unused_permits(request, now=now)
+                request = self.conn.execute(
+                    "SELECT * FROM canary_disclosure_requests WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
             exact = (
                 request["schema_version"] == metadata["schema_version"]
                 and request["projection_digest"] == metadata["projection_digest"]
@@ -563,7 +607,9 @@ class CanaryDisclosureService:
                 raise CanaryDisclosureError("invalid_canary_projection")
             if request["expires_at"] <= now or request["status"] == "expired":
                 raise CanaryDisclosureError("disclosure_permit_expired")
-            if request["status"] in {"permitted", "synchronized"}:
+            if request["status"] == "synchronized":
+                raise CanaryDisclosureError("permit_consumed")
+            if request["status"] == "permitted":
                 existing = self._existing_permit(request, actor=actor, now=now)
                 if existing is not None:
                     return existing

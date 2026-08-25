@@ -5,6 +5,8 @@ import json
 
 import pytest
 
+from heel.canary_contracts import canonical_bytes, canonical_digest
+
 from canary_test_support import (
     Clock,
     NOW,
@@ -30,6 +32,17 @@ def running_setup():
     coordinator, _, approved = submit_and_approve(conn, clock, runner, runner_auth=auth)
     claim = coordinator.claim(WORKSPACE, RUNNER, runner.key_id)
     return conn, clock, runner, coordinator, approved, claim
+
+
+def resign_operational(value, signer):
+    unsigned = {
+        key: item for key, item in value.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    updated = dict(unsigned)
+    updated["projection_digest"] = canonical_digest(unsigned)
+    updated.update(signer.sign(canonical_bytes(unsigned)))
+    return updated
 
 
 def test_heartbeat_and_progress_validate_signature_binding_privacy_and_source_sequence():
@@ -289,6 +302,129 @@ def test_delayed_older_heartbeat_advances_only_liveness_after_newer_progress():
         coordinator.heartbeat(WORKSPACE, PROJECT, grant["run_id"], "runr_other", older)
 
 
+def test_cloud_stop_accepts_exact_pre_stop_snapshot_only_as_liveness():
+    conn, clock, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    running = operational_projection(
+        runner, grant, sequence=0, phase="running", requests_started=1,
+        updated_at_ms=NOW_MS + 200,
+    )
+    coordinator.progress(WORKSPACE, PROJECT, grant["run_id"], RUNNER, running)
+    coordinator.request_stop(
+        WORKSPACE, PROJECT, grant["run_id"], actor="user_owner",
+        reason="cloud_stop", expected_kill_switch_generation=0,
+    )
+    before = tuple(conn.execute(
+        "SELECT source_event_sequence,source_projection_digest FROM canary_runs"
+    ).fetchone())
+    receipt_before = tuple(conn.execute(
+        "SELECT source_event_sequence,receipt_digest,receipt_json "
+        "FROM canary_operational_receipts"
+    ).fetchone())
+    clock.value += 1
+    gate = coordinator.heartbeat(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, running,
+    )
+    assert gate["active"] is False and gate["stop_reason"] == "cloud_stop"
+    assert tuple(conn.execute(
+        "SELECT source_event_sequence,source_projection_digest FROM canary_runs"
+    ).fetchone()) == before
+    assert tuple(conn.execute(
+        "SELECT source_event_sequence,receipt_digest,receipt_json "
+        "FROM canary_operational_receipts"
+    ).fetchone()) == receipt_before
+    assert conn.execute(
+        "SELECT last_heartbeat_at_ms FROM canary_runs"
+    ).fetchone()[0] == NOW_MS + 1000
+
+    changed = copy.deepcopy(running)
+    changed["timestamps"]["updated_at_ms"] += 1
+    changed = resign_operational(changed, runner)
+    with pytest.raises(ValueError):
+        coordinator.heartbeat(WORKSPACE, PROJECT, grant["run_id"], RUNNER, changed)
+
+
+def test_environment_reproof_digest_replacement_permanently_closes_gate():
+    conn, _, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    snapshot = operational_projection(
+        runner, grant, sequence=0, phase="running", requests_started=1,
+        updated_at_ms=NOW_MS + 200,
+    )
+    coordinator.progress(WORKSPACE, PROJECT, grant["run_id"], RUNNER, snapshot)
+    conn.execute(
+        "UPDATE canary_environments SET verification_record_digest=? WHERE environment_id=?",
+        ("b" * 64, grant["environment"]["environment_id"]),
+    )
+    conn.commit()
+    gate = coordinator.heartbeat(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, snapshot,
+    )
+    assert gate["active"] is False
+    assert gate["stop_reason"] == "target_revoked"
+    assert tuple(conn.execute(
+        "SELECT status,stop_reason FROM canary_runs"
+    ).fetchone()) == ("stop_requested", "target_revoked")
+
+    conn.execute(
+        "UPDATE canary_environments SET verification_record_digest=? WHERE environment_id=?",
+        (grant["environment"]["verification_record_digest"], grant["environment"]["environment_id"]),
+    )
+    conn.commit()
+    gate = coordinator.heartbeat(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, snapshot,
+    )
+    assert gate["active"] is False and gate["stop_reason"] == "target_revoked"
+
+
+def test_cloud_lifecycle_timestamps_ignore_runner_future_clock():
+    conn, _, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    future = operational_projection(
+        runner, grant, sequence=0, phase="running", requests_started=1,
+        updated_at_ms=NOW_MS + 10 * 365 * 24 * 60 * 60 * 1000,
+    )
+    coordinator.progress(WORKSPACE, PROJECT, grant["run_id"], RUNNER, future)
+    run = conn.execute(
+        "SELECT started_at_ms,updated_at FROM canary_runs"
+    ).fetchone()
+    receipt = conn.execute(
+        "SELECT created_at,updated_at FROM canary_operational_receipts"
+    ).fetchone()
+    assert tuple(run) == (NOW_MS, NOW_MS)
+    assert tuple(receipt) == (NOW_MS, NOW_MS)
+
+
+@pytest.mark.parametrize("mutation", ["requests", "bytes", "retries", "wall", "equality"])
+def test_operational_counters_are_bounded_by_exact_signed_grant_budget(mutation):
+    conn, _, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    value = operational_projection(
+        runner, grant, sequence=0, phase="running", requests_started=1,
+        updated_at_ms=NOW_MS + 200,
+    )
+    value["counters"]["actions_contained"] = 1
+    if mutation == "requests":
+        value["counters"].update(requests_started=3, actions_contained=3, remaining_requests=0)
+    elif mutation == "bytes":
+        value["counters"].update(
+            requests_completed=1, response_bytes_read=65537,
+        )
+    elif mutation == "retries":
+        value["counters"].update(
+            requests_started=2, actions_contained=1, retries_used=1, remaining_requests=0,
+        )
+    elif mutation == "wall":
+        value["counters"]["remaining_wall_ms"] = 60_001
+    else:
+        value["counters"]["actions_contained"] = 0
+    value = resign_operational(value, runner)
+    with pytest.raises(ValueError):
+        coordinator.progress(WORKSPACE, PROJECT, grant["run_id"], RUNNER, value)
+    assert conn.execute("SELECT quota_state FROM canary_runs").fetchone()[0] == "reserved"
+    assert conn.execute("SELECT COUNT(*) FROM canary_operational_receipts").fetchone()[0] == 0
+
+
 def test_terminal_stopped_disposition_requires_a_stop_reason():
     _, _, runner, coordinator, approved, _ = running_setup()
     grant = approved["grant"]
@@ -328,7 +464,7 @@ def test_stop_reason_and_phase_are_coupled_and_local_stop_is_durable():
     assert status["stop_reason"] == "local_emergency_stop"
     assert tuple(conn.execute(
         "SELECT stop_requested_at_ms,stop_deadline_ms FROM canary_runs"
-    ).fetchone()) == (NOW_MS + 200, NOW_MS + 5000)
+    ).fetchone()) == (NOW_MS, NOW_MS + 5000)
 
 
 def test_cross_tenant_or_wrong_runner_never_reads_run_state():

@@ -68,6 +68,22 @@ class ExecutionGate:
                 raise ValueError("invalid execution gate timestamp or generation")
 
 
+class _SerializedContainmentLog:
+    """Serialize the executor and stop worker onto one append-only local event chain."""
+
+    def __init__(self, delegate: ContainmentLog):
+        self._delegate = delegate
+        self._lock = threading.Lock()
+
+    def load(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return self._delegate.load()
+
+    def append(self, *args, **kwargs) -> dict[str, Any]:
+        with self._lock:
+            return self._delegate.append(*args, **kwargs)
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionBundle:
     manifest: Mapping[str, Any]
@@ -349,6 +365,7 @@ class LocalCanaryExecutor:
         self.clock_ms = clock_ms
         self.monotonic = monotonic
         self._active_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
         self._active_ready = threading.Event()
         self._active_context: dict[str, Any] | None = None
 
@@ -445,7 +462,23 @@ class LocalCanaryExecutor:
             counters = dict(context["counters"])
             redaction_count = context["redaction_state"]["count"]
             log = context["log"]
-        events = log.load()
+        with self._stop_lock:
+            state = self.store.load_run(run_id)
+            if state["state"] == "running":
+                self.store.transition_run(
+                    run_id, "stop_requested",
+                    now_ms=max(self.clock_ms(), state["updated_at_ms"]),
+                )
+            elif state["state"] not in {"stop_requested", "finalizing"}:
+                raise RunnerStoreError("active run cannot acknowledge a stop")
+            events = log.load()
+            if (
+                not events
+                or events[-1]["event_code"] != "stop_observed"
+                or events[-1]["detail_code"] != stop_reason
+            ):
+                log.append("stop_observed", detail_code=stop_reason, counters=counters)
+                events = log.load()
         requested_at = max(started_at, proposed_at_ms)
         remaining_wall = max(
             0,
@@ -539,10 +572,12 @@ class LocalCanaryExecutor:
             self.clock_ms() + manifest["local_evidence_policy"]["retention_seconds"] * 1000
         )
         self.store.reserve_run(grant, retention_expires_at_ms=retention_expires)
-        log = ContainmentLog(
-            store=self.store, signer=self.signer, run_id=grant["run_id"],
-            grant_id=grant["grant_id"], manifest_digest=manifest["manifest_digest"],
-            clock_ms=self.clock_ms,
+        log = _SerializedContainmentLog(
+            ContainmentLog(
+                store=self.store, signer=self.signer, run_id=grant["run_id"],
+                grant_id=grant["grant_id"], manifest_digest=manifest["manifest_digest"],
+                clock_ms=self.clock_ms,
+            )
         )
         log.append("grant_verified", detail_code="grant_exact")
         cancellation = cancellation or CancellationToken()
@@ -776,12 +811,22 @@ class LocalCanaryExecutor:
                     cancellation, "stop_acknowledged_at_ms", None,
                 )
                 try:
-                    state = self.store.load_run(grant["run_id"])["state"]
-                    if state == "running":
-                        self.store.transition_run(
-                            grant["run_id"], "stop_requested", now_ms=self.clock_ms(),
-                        )
-                    log.append("stop_observed", detail_code=stop_reason, counters=counters)
+                    with self._stop_lock:
+                        local_state = self.store.load_run(grant["run_id"])
+                        if local_state["state"] == "running":
+                            self.store.transition_run(
+                                grant["run_id"], "stop_requested",
+                                now_ms=max(self.clock_ms(), local_state["updated_at_ms"]),
+                            )
+                        events = log.load()
+                        if (
+                            not events
+                            or events[-1]["event_code"] != "stop_observed"
+                            or events[-1]["detail_code"] != stop_reason
+                        ):
+                            log.append(
+                                "stop_observed", detail_code=stop_reason, counters=counters,
+                            )
                 except BaseException:
                     disposition, error_category, stop_reason = "failed", "runner_fault", "none"
             elif error_category == "dns_changed":
