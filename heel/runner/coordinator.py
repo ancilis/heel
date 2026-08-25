@@ -155,8 +155,26 @@ class RunnerCoordinator:
             trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
         )
 
+    def _install_claimed_rollover(self, claimed: dict, receipt: object) -> None:
+        """Consume or discard every control-minted receipt on every local outcome."""
+        try:
+            self.control._bind_rollover_receipt_to_store(receipt, self.store)
+            self.store._install_cloud_context_binding_from_control(
+                claimed["context_binding"], identity=self.identity, signer=self.signer,
+                signer_label=self.signer.key_id, trusted_cloud_keys=self.trusted_grant_keys,
+                now_ms=self._now_ms(), rollover_receipt=receipt,
+            )
+        finally:
+            self.control._discard_rollover_receipt(receipt, self.store)
+
     def ensure_runner_context(self) -> bool:
         """Acquire one Cloud authorization before work polling, without synthesizing context."""
+        # A durable signed A→B journal is local authority already accepted by a
+        # prior list/claim receipt.  Finish it before issuing any Cloud request;
+        # otherwise a server that has advanced to C would tempt an unsafe A→C jump.
+        self.store.finish_pending_context_rollover(
+            identity=self.identity, trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
+        )
         # First pairing has no local namespace: list before touching a namespaced sidecar.
         if not self.store.is_context_bound:
             pending_install = self.store._pending_cloud_context_install_for_recovery(
@@ -173,12 +191,7 @@ class RunnerCoordinator:
                     self.install_cloud_context_binding(old, signer_label=self.signer.key_id)
                     return True
                 claimed, receipt = acquired
-                self.control._bind_rollover_receipt_to_store(receipt, self.store)
-                self.store._install_cloud_context_binding_from_control(
-                    claimed["context_binding"], identity=self.identity, signer=self.signer,
-                    signer_label=self.signer.key_id, trusted_cloud_keys=self.trusted_grant_keys,
-                    now_ms=self._now_ms(), rollover_receipt=receipt,
-                )
+                self._install_claimed_rollover(claimed, receipt)
                 return True
             listed = self.control.list_contexts()
             contexts = listed["contexts"]
@@ -208,13 +221,7 @@ class RunnerCoordinator:
                 self.install_cloud_context_binding(current, signer_label=self.signer.key_id)
                 return True
             claimed, receipt = acquired
-            self.control._bind_rollover_receipt_to_store(receipt, self.store)
-            self.store._install_cloud_context_binding_from_control(
-                claimed["context_binding"],
-                identity=self.identity, signer=self.signer,
-                signer_label=self.signer.key_id, trusted_cloud_keys=self.trusted_grant_keys,
-                now_ms=self._now_ms(), rollover_receipt=receipt,
-            )
+            self._install_claimed_rollover(claimed, receipt)
             return True
         except RunnerStoreError:
             if self.store.has_cloud_context_provenance():
@@ -242,12 +249,7 @@ class RunnerCoordinator:
                     raise ValueError("cloud context binding no longer verifies")
                 claimed, receipt = acquired
                 try:
-                    self.control._bind_rollover_receipt_to_store(receipt, self.store)
-                    self.store._install_cloud_context_binding_from_control(
-                        claimed["context_binding"], identity=self.identity, signer=self.signer,
-                        signer_label=self.signer.key_id, trusted_cloud_keys=self.trusted_grant_keys,
-                        now_ms=self._now_ms(), rollover_receipt=receipt,
-                    )
+                    self._install_claimed_rollover(claimed, receipt)
                 except RunnerStoreError:
                     raise ValueError("cloud context binding no longer verifies") from None
                 return True

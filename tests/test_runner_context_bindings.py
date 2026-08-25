@@ -64,6 +64,69 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         finally:
             self.conn.rollback()
 
+    def test_runner_list_expiry_is_scoped_and_never_transitions_another_tenant(self):
+        other_workspace = "ws_other_context"
+        other_project = "prj_other_context"
+        other_runner = "runr_other_context"
+        other_environment = "env_other_context"
+        self.conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org_other_context", "Other", NOW_MS // 1000))
+        self.conn.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+            (other_workspace, "org_other_context", "Other", "free", "2025.01", NOW_MS // 1000),
+        )
+        self.conn.execute(
+            "INSERT INTO projects VALUES(?,?,?,?,?)",
+            (other_workspace, other_project, "Other", "user_owner", NOW_MS // 1000),
+        )
+        self.conn.execute(
+            "INSERT INTO memberships VALUES(?,?,?,?)",
+            (other_workspace, "user_owner", "owner", NOW_MS // 1000),
+        )
+        other_signer = seed_authority(
+            self.conn, workspace_id=other_workspace, project_ref=other_project,
+            environment_id=other_environment, runner_id=other_runner,
+            proof_expires_at=self.clock.value + 2 * 60 * 60,
+        )
+        other = self.service.create(
+            other_workspace, other_project,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": other_environment,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": other_runner,
+             "runner_key_id": other_signer.key_id}, actor="user_owner", role="owner",
+        )
+        self.clock.value += 3 * 60 * 60
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        listed = self.service.list_for_runner_in_transaction(WORKSPACE, RUNNER, self.runner.key_id)
+        self.conn.commit()
+        self.assertEqual(listed["contexts"], [])
+        self.assertEqual(self.conn.execute(
+            "SELECT status FROM canary_runner_context_bindings WHERE rcb_id=?", (other["binding_id"],),
+        ).fetchone()[0], "active")
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM canary_runner_context_events WHERE rcb_id=? AND action='expired'",
+            (other["binding_id"],),
+        ).fetchone()[0], 0)
+
+    def test_generic_approval_expiry_anti_join_binds_the_full_context_link_identity(self):
+        runs = service(self.conn, self.clock)
+        statements: list[str] = []
+        self.conn.set_trace_callback(statements.append)
+        try:
+            runs.expire_and_reconcile()
+        finally:
+            self.conn.set_trace_callback(None)
+        anti_join = next(
+            statement for statement in statements
+            if "FROM canary_runner_context_projection_links l" in statement
+            and "canary_runner_context_bindings b" in statement
+        )
+        for condition in (
+            "b.environment_id=l.environment_id",
+            "b.runner_id=l.runner_id",
+            "b.runner_key_id=l.runner_key_id",
+        ):
+            self.assertIn(condition, anti_join)
+
     def test_runner_cannot_receive_two_active_contexts_across_projects(self):
         self.service.create(
             WORKSPACE, PROJECT,
@@ -102,6 +165,61 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
             "SELECT COUNT(*) FROM canary_runner_context_bindings WHERE workspace_id=? AND runner_id=? AND status='active'",
             (WORKSPACE, RUNNER),
         ).fetchone()[0], 1)
+
+    def test_first_claim_fixes_runner_affinity_and_blocks_later_cross_project_creation(self):
+        binding = self.service.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+             "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+        )
+        self.conn.execute("BEGIN IMMEDIATE")
+        self.service.claim_in_transaction(
+            WORKSPACE, RUNNER, self.runner.key_id, binding["binding_id"],
+            {"schema_version": "heel.runner-context-claim.v1", "binding_id": binding["binding_id"],
+             "binding_digest": binding["binding_digest"]},
+        )
+        self.conn.commit()
+        affinity = self.conn.execute(
+            "SELECT project_ref,environment_id,runner_key_id,established_rcb_id,established_binding_digest "
+            "FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
+            (WORKSPACE, RUNNER),
+        ).fetchone()
+        self.assertEqual(tuple(affinity), (PROJECT, ENVIRONMENT, self.runner.key_id,
+                                           binding["binding_id"], binding["binding_digest"]))
+
+        self.service.revoke(WORKSPACE, PROJECT, binding["binding_id"], actor="user_owner", role="owner")
+        other_project, other_environment = "prj_affinity_other", "env_affinity_other"
+        self.conn.execute(
+            "INSERT INTO projects VALUES(?,?,?,?,?)", (WORKSPACE, other_project, "Other", "user_owner", NOW_MS / 1000),
+        )
+        source = self.conn.execute(
+            "SELECT * FROM canary_environments WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+            (WORKSPACE, PROJECT, ENVIRONMENT),
+        ).fetchone()
+        columns = tuple(source.keys())
+        values = [source[column] for column in columns]
+        values[columns.index("project_ref")] = other_project
+        values[columns.index("environment_id")] = other_environment
+        self.conn.execute(
+            f"INSERT INTO canary_environments({','.join(columns)}) VALUES({','.join('?' for _ in columns)})", values,
+        )
+        self.conn.commit()
+
+        with self.assertRaisesRegex(RunnerContextError, "conflict"):
+            self.service.create(
+                WORKSPACE, other_project,
+                {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": other_environment,
+                 "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+                 "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+            )
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM canary_runner_context_bindings WHERE workspace_id=? AND project_ref=?",
+            (WORKSPACE, other_project),
+        ).fetchone()[0], 0)
+        self.assertEqual(
+            self.service.list_for_human(WORKSPACE, other_project, actor="user_owner")["runners"], [],
+        )
 
     def test_dashboard_hides_runner_occupied_by_another_project_until_revoke(self):
         binding = self.service.create(
@@ -148,6 +266,52 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         self.service.revoke(WORKSPACE, PROJECT, binding["binding_id"], actor="user_owner", role="owner")
         after_revoke = self.service.list_for_human(WORKSPACE, other_project, actor="user_owner")
         self.assertEqual([item["runner_id"] for item in after_revoke["runners"]], [RUNNER])
+
+    def test_dashboard_runner_selector_uses_its_bounded_indexes_without_a_temp_sort(self):
+        """The selector is a polling read; its writer-adjacent work must stay seek-bound."""
+        statements: list[str] = []
+        self.conn.set_trace_callback(statements.append)
+        try:
+            self.service.list_for_human(WORKSPACE, PROJECT, actor="user_owner")
+        finally:
+            self.conn.set_trace_callback(None)
+        selector = next(
+            statement for statement in statements
+            if "FROM canary_runner_keys k INDEXED BY idx_canary_runner_keys_dashboard_selector" in statement
+        )
+        # ``k.runner_id`` equals the joined runner ID, so this is the frozen
+        # runner/key lexical order while letting SQLite walk the exact key index.
+        self.assertIn("ORDER BY k.runner_id,k.key_id LIMIT 17", selector)
+        plan = self.conn.execute("EXPLAIN QUERY PLAN " + selector).fetchall()
+        details = [row[3] for row in plan]
+        self.assertTrue(any("idx_canary_runners_dashboard_selector" in detail for detail in details))
+        self.assertTrue(any("idx_canary_runner_keys_dashboard_selector" in detail for detail in details))
+        self.assertFalse(any("TEMP B-TREE" in detail or "AUTOMATIC" in detail for detail in details))
+        history = next(
+            statement for statement in statements
+            if "FROM canary_runner_context_bindings INDEXED BY idx_runner_context_dashboard_history" in statement
+        )
+        history_details = [row[3] for row in self.conn.execute("EXPLAIN QUERY PLAN " + history)]
+        self.assertTrue(any("idx_runner_context_dashboard_history" in detail for detail in history_details))
+        self.assertFalse(any("SCAN" in detail or "TEMP B-TREE" in detail or "AUTOMATIC" in detail for detail in history_details))
+
+    def test_dashboard_duplicate_active_runner_keys_are_lexically_scanned_and_fail_closed(self):
+        """A malformed two-current-key state must never turn into two authorizable rows."""
+        self.conn.execute(
+            "INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)",
+            (self.cloud.key_id, WORKSPACE, RUNNER, self.cloud.canonical_public_key,
+             "active", NOW_MS / 1000),
+        )
+        self.conn.commit()
+        keys = [row[0] for row in self.conn.execute(
+            "SELECT key_id FROM canary_runner_keys INDEXED BY idx_canary_runner_keys_dashboard_selector "
+            "WHERE workspace_id=? AND runner_id=? AND status='active' AND revoked_at IS NULL "
+            "ORDER BY runner_id,key_id",
+            (WORKSPACE, RUNNER),
+        )]
+        self.assertEqual(keys, sorted(keys))
+        with self.assertRaisesRegex(RunnerContextError, "canary_authority_unavailable"):
+            self.service.list_for_human(WORKSPACE, PROJECT, actor="user_owner")
 
     def test_revoke_marks_state_and_is_visible_to_runner_transaction(self):
         binding = self.service.create(
@@ -214,7 +378,7 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
             )
         self.conn.rollback()
 
-    def test_revoke_cancels_linked_pregrant_run_with_one_run_event_and_audit(self):
+    def test_revoke_defers_linked_pregrant_cancellation_to_the_bounded_reaper(self):
         self.service.create(
             WORKSPACE, PROJECT,
             {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
@@ -233,12 +397,24 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         self.service.revoke(
             WORKSPACE, PROJECT, binding["rcb_id"], actor="user_owner", role="owner",
         )
+        self.assertEqual(tuple(self.conn.execute(
+            "SELECT workspace_id,project_ref,rcb_id,binding_digest,binding_expires_at_ms,last_scanned_run_id "
+            "FROM canary_runner_context_cancellation_queue",
+        ).fetchone()), (
+            WORKSPACE, PROJECT, binding["rcb_id"], binding["binding_digest"], binding["expires_at_ms"], None,
+        ))
         self.assertEqual(self.conn.execute(
             "SELECT status FROM canary_approval_projections WHERE approval_id=?", (submitted["approval_id"],),
-        ).fetchone()[0], "cancelled")
+        ).fetchone()[0], "awaiting_execution_approval")
+        self.conn.execute("BEGIN IMMEDIATE")
+        self.service.cancel_due_batch_in_transaction(self.service._now_ms())
+        self.conn.commit()
         self.assertEqual(self.conn.execute(
             "SELECT status FROM canary_runs WHERE run_id=?", (submitted["run_id"],),
         ).fetchone()[0], "cancelled")
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM canary_runner_context_cancellation_queue",
+        ).fetchone())
         event = self.conn.execute(
             "SELECT event_type,actor_class,actor_id,reason_code FROM canary_run_events WHERE run_id=? AND event_type='cancelled'",
             (submitted["run_id"],),
@@ -254,6 +430,185 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT COUNT(*) FROM canary_run_events WHERE run_id=? AND event_type='cancelled'", (submitted["run_id"],),
         ).fetchone()[0], 1)
+
+    def test_cancellation_stages_binding_then_link_seeks_without_a_scan_or_temp_sort(self):
+        self.service.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+             "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+        )
+        binding = self.conn.execute("SELECT * FROM canary_runner_context_bindings").fetchone()
+        runs = service(self.conn, self.clock)
+        self.conn.execute("BEGIN IMMEDIATE")
+        submitted = runs.submit_projection_from_runner_in_transaction(
+            approval_projection(self.runner), binding, uploaded_by_runner_id=RUNNER,
+        )
+        self.conn.commit()
+        self.service.revoke(WORKSPACE, PROJECT, binding["rcb_id"], actor="user_owner", role="owner")
+
+        statements: list[str] = []
+        self.conn.execute("BEGIN IMMEDIATE")
+        self.conn.set_trace_callback(statements.append)
+        try:
+            counts = self.service.cancel_due_batch_in_transaction(self.service._now_ms())
+        finally:
+            self.conn.set_trace_callback(None)
+            self.conn.rollback()
+        self.assertEqual(counts["cancelled_context_runs"], 1)
+        queue_seek = next(
+            statement for statement in statements
+            if "FROM canary_runner_context_cancellation_queue INDEXED BY idx_runner_context_cancellation_queue_order" in statement
+        )
+        parent_seek = next(
+            statement for statement in statements
+            if "FROM canary_runner_context_bindings INDEXED BY idx_runner_context_binding_cancellation_ref" in statement
+        )
+        link_seek = next(
+            statement for statement in statements
+            if "FROM canary_runner_context_projection_links l INDEXED BY idx_runner_context_links_binding_run" in statement
+        )
+        for statement in (queue_seek, parent_seek, link_seek):
+            details = [row[3] for row in self.conn.execute("EXPLAIN QUERY PLAN " + statement)]
+            self.assertFalse(any("SCAN" in detail or "TEMP B-TREE" in detail or "AUTOMATIC" in detail for detail in details))
+        self.assertEqual(self.conn.execute(
+            "SELECT status FROM canary_runs WHERE run_id=?", (submitted["run_id"],),
+        ).fetchone()[0], "awaiting_execution_approval")
+
+    def test_cancellation_queue_fails_closed_when_a_link_loses_its_run_authority(self):
+        self.service.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+             "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+        )
+        binding = self.conn.execute("SELECT * FROM canary_runner_context_bindings").fetchone()
+        runs = service(self.conn, self.clock)
+        self.conn.execute("BEGIN IMMEDIATE")
+        submitted = runs.submit_projection_from_runner_in_transaction(
+            approval_projection(self.runner), binding, uploaded_by_runner_id=RUNNER,
+        )
+        self.conn.commit()
+        self.service.revoke(WORKSPACE, PROJECT, binding["rcb_id"], actor="user_owner", role="owner")
+
+        # The composite FKs make this impossible in normal operation.  Model an
+        # at-rest corruption to ensure the bounded reaper cannot silently discard
+        # the cancellation queue and lose the context-specific audit spine.
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        self.conn.execute("DELETE FROM canary_runs WHERE run_id=?", (submitted["run_id"],))
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys=ON")
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        with self.assertRaisesRegex(RuntimeError, "cancellation queue link is inconsistent"):
+            self.service.cancel_due_batch_in_transaction(self.service._now_ms())
+        self.conn.rollback()
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM canary_runner_context_cancellation_queue",
+        ).fetchone())
+        self.assertEqual(self.conn.execute(
+            "SELECT status FROM canary_approval_projections WHERE approval_id=?", (submitted["approval_id"],),
+        ).fetchone()[0], "awaiting_execution_approval")
+
+    def test_cancellation_queue_drains_one_hundred_twenty_nine_linked_runs_by_cursor(self):
+        self.service.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+             "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+        )
+        binding = self.conn.execute("SELECT * FROM canary_runner_context_bindings").fetchone()
+        runs = service(self.conn, self.clock)
+
+        def unique_projection(index: int) -> dict:
+            projection = approval_projection(self.runner)
+            projection["projection_id"] = f"ap_{index:032x}"
+            unsigned = {
+                key: value for key, value in projection.items()
+                if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+            }
+            projection["projection_digest"] = canonical_digest(unsigned)
+            projection.update(self.runner.sign(canonical_bytes(unsigned)))
+            return projection
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        for index in range(129):
+            runs.submit_projection_from_runner_in_transaction(
+                unique_projection(index), binding, uploaded_by_runner_id=RUNNER,
+            )
+        self.conn.commit()
+        run_ids = [row[0] for row in self.conn.execute(
+            "SELECT run_id FROM canary_runner_context_projection_links "
+            "WHERE workspace_id=? AND project_ref=? AND rcb_id=? ORDER BY run_id",
+            (WORKSPACE, PROJECT, binding["rcb_id"]),
+        )]
+        self.assertEqual(len(run_ids), 129)
+        self.service.revoke(WORKSPACE, PROJECT, binding["rcb_id"], actor="user_owner", role="owner")
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        first = self.service.cancel_due_batch_in_transaction(self.service._now_ms())
+        self.conn.commit()
+        self.assertEqual(first["cancelled_context_runs"], 128)
+        self.assertEqual(first["runner_context_cancellation_has_more"], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT last_scanned_run_id FROM canary_runner_context_cancellation_queue",
+        ).fetchone()[0], run_ids[127])
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM canary_runs WHERE status='cancelled'",
+        ).fetchone()[0], 128)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM canary_run_events WHERE event_type='cancelled'",
+        ).fetchone()[0], 128)
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        second = self.service.cancel_due_batch_in_transaction(self.service._now_ms())
+        self.conn.commit()
+        self.assertEqual(second["cancelled_context_runs"], 1)
+        self.assertEqual(second["runner_context_cancellation_has_more"], 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM canary_runs WHERE status='cancelled'",
+        ).fetchone()[0], 129)
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM canary_runner_context_cancellation_queue",
+        ).fetchone())
+
+    def test_purge_fails_closed_when_a_terminal_link_loses_its_run_authority(self):
+        self.service.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+             "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+        )
+        binding = self.conn.execute("SELECT * FROM canary_runner_context_bindings").fetchone()
+        runs = service(self.conn, self.clock)
+        self.conn.execute("BEGIN IMMEDIATE")
+        submitted = runs.submit_projection_from_runner_in_transaction(
+            approval_projection(self.runner), binding, uploaded_by_runner_id=RUNNER,
+        )
+        self.conn.commit()
+        self.service.revoke(WORKSPACE, PROJECT, binding["rcb_id"], actor="user_owner", role="owner")
+
+        purge_now = self.service._now_ms() + 31 * 24 * 60 * 60 * 1000
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        self.conn.execute("DELETE FROM canary_runs WHERE run_id=?", (submitted["run_id"],))
+        self.conn.execute(
+            "UPDATE canary_runner_context_bindings SET purge_at_ms=? WHERE rcb_id=?",
+            (purge_now, binding["rcb_id"]),
+        )
+        self.conn.execute(
+            "UPDATE canary_runner_context_events SET purge_at_ms=? WHERE rcb_id=?",
+            (purge_now, binding["rcb_id"]),
+        )
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys=ON")
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        with self.assertRaisesRegex(RuntimeError, "purge has linked corrupt authority"):
+            self.service.expire_and_purge_in_transaction(purge_now)
+        self.conn.rollback()
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM canary_runner_context_bindings WHERE rcb_id=?", (binding["rcb_id"],),
+        ).fetchone())
 
     def test_expiry_cancels_linked_pregrant_run_with_system_audit(self):
         conn = connect()

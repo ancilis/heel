@@ -27,6 +27,37 @@ def test_session_discovery_returns_one_closed_pending_approval_request():
             fixture.close()
 
 
+def test_discovery_uses_the_tenant_pending_order_index_without_a_scan_or_sort():
+    with tempfile.TemporaryDirectory() as directory:
+        fixture = CanaryHttpFixture(Path(directory))
+        try:
+            base = f"/v1/workspaces/{fixture.workspace}/projects/{fixture.project}"
+            projection = approval_projection(
+                fixture.runner, workspace_id=fixture.workspace, project_ref=fixture.project,
+            )
+            assert fixture.request(
+                "POST", base + "/canary-approval-projections", projection, fixture.browser,
+            )[0] == 201
+            statements: list[str] = []
+            fixture.cp.store.conn.set_trace_callback(statements.append)
+            try:
+                fixture.cp.canary_runs.list_pending_approval_requests(
+                    fixture.workspace, fixture.project, fixture.user,
+                )
+            finally:
+                fixture.cp.store.conn.set_trace_callback(None)
+            query = next(
+                statement for statement in statements
+                if "idx_canary_approval_pending_discovery_order" in statement
+            )
+            details = [row[3] for row in fixture.cp.store.conn.execute("EXPLAIN QUERY PLAN " + query)]
+            assert any("idx_canary_approval_pending_discovery_order" in detail for detail in details)
+            assert any("idx_canary_runs_pending_approval_discovery" in detail for detail in details)
+            assert not any("SCAN" in detail or "TEMP B-TREE" in detail or "AUTOMATIC" in detail for detail in details)
+        finally:
+            fixture.close()
+
+
 def test_discovery_rejects_query_body_and_non_session_authority():
     with tempfile.TemporaryDirectory() as directory:
         fixture = CanaryHttpFixture(Path(directory))

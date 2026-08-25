@@ -28,13 +28,17 @@ from canary_test_support import (
 )
 
 
-def test_migrations_sixteen_and_seventeen_preserve_context_schema_and_single_active_runner_rule():
+def test_context_migrations_preserve_binding_reaper_and_affinity_schema():
     from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS
 
-    assert CONTROL_PLANE_MIGRATIONS[-2].version == 16
-    assert CONTROL_PLANE_MIGRATIONS[-2].name == "runner_context_bindings"
-    assert CONTROL_PLANE_MIGRATIONS[-1].version == 17
-    assert CONTROL_PLANE_MIGRATIONS[-1].name == "runner_context_one_active_per_runner"
+    assert CONTROL_PLANE_MIGRATIONS[-4].version == 16
+    assert CONTROL_PLANE_MIGRATIONS[-4].name == "runner_context_bindings"
+    assert CONTROL_PLANE_MIGRATIONS[-3].version == 17
+    assert CONTROL_PLANE_MIGRATIONS[-3].name == "runner_context_one_active_per_runner"
+    assert CONTROL_PLANE_MIGRATIONS[-2].version == 18
+    assert CONTROL_PLANE_MIGRATIONS[-2].name == "runner_context_reaper_indexes"
+    assert CONTROL_PLANE_MIGRATIONS[-1].version == 19
+    assert CONTROL_PLANE_MIGRATIONS[-1].name == "runner_context_affinities"
     conn = connect()
     assert "verification_record_digest" in {
         row[1] for row in conn.execute("PRAGMA table_info(canary_environments)")

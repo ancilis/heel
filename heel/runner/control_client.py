@@ -6,6 +6,7 @@ import hashlib
 import re
 import secrets
 import threading
+from collections import deque
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -44,6 +45,16 @@ _REQUEST_VALIDATORS = {
 class _Call:
     path: str; headers: dict[str, str]; body: bytes; capability: str
     chain: str; sequence: int; generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CallDiagnostic:
+    """Bounded, deliberately non-sensitive local control observability."""
+
+    operation: str
+    status: int
+    sequence: int
+    generation: int
 
 
 @dataclass(frozen=True)
@@ -94,6 +105,11 @@ _STOPS = {
     "target_revoked", "kill_switch",
 }
 _MAX_FINDINGS_UPLOAD_BYTES = 272 * 1024
+_CALL_DIAGNOSTIC_OPERATIONS = frozenset({
+    "claim", "heartbeat", "progress", "result", "stop-ack", "upload-findings",
+    "list-contexts", "claim-context", "submit-context-approval-projection",
+})
+_MAX_CALL_DIAGNOSTICS = 128
 _FINDINGS_RECEIPT_FIELDS = {
     "schema_version", "receipt_id", "workspace_id", "project_id", "run_id",
     "grant_id", "permit_id", "projection_id", "projection_digest", "byte_count",
@@ -101,6 +117,7 @@ _FINDINGS_RECEIPT_FIELDS = {
 }
 _ROLLOVER_RECEIPT_CONSTRUCTOR = object()
 _ROLLOVER_RECEIPT_REGISTRY: dict[bytes, tuple["RunnerControlClient", "_RunnerContextRolloverReceipt", object]] = {}
+_ROLLOVER_RECEIPT_REGISTRY_LOCK = threading.Lock()
 
 
 class _RunnerContextRolloverReceipt:
@@ -153,9 +170,10 @@ class _RunnerContextRolloverReceipt:
 def _registered_rollover_receipt(receipt: object, store: object) -> _RunnerContextRolloverReceipt:
     if not isinstance(receipt, _RunnerContextRolloverReceipt):
         raise ValueError("runner context rollover receipt is invalid")
-    registered = _ROLLOVER_RECEIPT_REGISTRY.get(receipt._receipt_id)
-    if registered is None or registered[1] is not receipt or registered[2] is not store:
-        raise ValueError("runner context rollover receipt is not registered")
+    with _ROLLOVER_RECEIPT_REGISTRY_LOCK:
+        registered = _ROLLOVER_RECEIPT_REGISTRY.get(receipt._receipt_id)
+        if registered is None or registered[1] is not receipt or registered[2] is not store:
+            raise ValueError("runner context rollover receipt is not registered")
     return receipt
 
 
@@ -164,16 +182,15 @@ def _consume_registered_rollover_receipt(
     new_binding_id: str, new_binding_digest: str,
 ) -> dict[str, object]:
     checked = _registered_rollover_receipt(receipt, store)
-    try:
+    with _ROLLOVER_RECEIPT_REGISTRY_LOCK:
+        registered = _ROLLOVER_RECEIPT_REGISTRY.pop(checked._receipt_id, None)
+        if registered is None or registered[1] is not checked or registered[2] is not store:
+            raise ValueError("runner context rollover receipt is not registered")
+        registered[0]._rollover_receipts.pop(checked._receipt_id, None)
         return checked._consume_for(
             store, old_binding_id=old_binding_id, old_binding_digest=old_binding_digest,
             new_binding_id=new_binding_id, new_binding_digest=new_binding_digest,
         )
-    finally:
-        # A valid attempt is one-use even when a subsequent local write faults.
-        registered = _ROLLOVER_RECEIPT_REGISTRY.pop(checked._receipt_id, None)
-        if registered is not None:
-            registered[0]._rollover_receipts.pop(checked._receipt_id, None)
 
 
 class RunnerControlClient:
@@ -204,7 +221,28 @@ class RunnerControlClient:
         self._terminal_bindings: dict[str, tuple[str, str, str, str]] = {}
         self._context_receipt_client_instance = object()
         self._rollover_receipts: dict[bytes, _RunnerContextRolloverReceipt] = {}
-        self.calls: list[_Call] = []
+        self._calls: deque[_CallDiagnostic] = deque(maxlen=_MAX_CALL_DIAGNOSTICS)
+        self._calls_dropped = 0
+
+    @property
+    def calls(self) -> list[_CallDiagnostic]:
+        """A fresh, chronological bounded diagnostic snapshot with no request material."""
+        with self._state_lock:
+            return list(self._calls)
+
+    @property
+    def calls_dropped(self) -> int:
+        with self._state_lock:
+            return self._calls_dropped
+
+    def _append_call_diagnostic_locked(self, operation: str, status: int, call: _Call) -> None:
+        if operation not in _CALL_DIAGNOSTIC_OPERATIONS:
+            raise RuntimeError("invalid runner control diagnostic operation")
+        if len(self._calls) == _MAX_CALL_DIAGNOSTICS:
+            self._calls_dropped += 1
+        self._calls.append(_CallDiagnostic(
+            operation=operation, status=status, sequence=call.sequence, generation=call.generation,
+        ))
 
     @staticmethod
     def _chain(operation: str, run_id: str | None) -> str:
@@ -329,7 +367,7 @@ class RunnerControlClient:
             if operation == "result" and body["status"] == "terminal":
                 self._terminal_runs.add(run_id)
                 self._terminal_bindings[run_id] = projection_binding
-            self.calls.append(call)
+            self._append_call_diagnostic_locked(operation, status, call)
         if include_response_metadata:
             return body, status, dict(headers)
         return body
@@ -572,6 +610,7 @@ class RunnerControlClient:
 
     def _context_control(
         self, path: str, request: dict, *, expected_status: int, schema: str,
+        diagnostic_operation: str,
         include_call: bool = False,
     ) -> dict | tuple[dict, _Call]:
         """Use the existing claim PoP chain for the three fixed pairing-only calls."""
@@ -640,7 +679,7 @@ class RunnerControlClient:
                 if current is not None and current != (nonce, sequence, generation):
                     raise ValueError("runner control chain changed during request")
                 self._chains[chain] = (next_nonce, sequence + 1, generation)
-                self.calls.append(call)
+                self._append_call_diagnostic_locked(diagnostic_operation, response[0], call)
             payload = dict(response[2])
             return (payload, call) if include_call else payload
 
@@ -648,14 +687,14 @@ class RunnerControlClient:
         request = validate_runner_context_list({"schema_version": "heel.runner-context-list.v1"})
         return self._context_control(
             f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/list",
-            request, expected_status=200, schema="heel.runner-context-list-result.v1",
+            request, expected_status=200, schema="heel.runner-context-list-result.v1", diagnostic_operation="list-contexts",
         )
 
     def claim_context(self, binding_id: str, binding_digest: str) -> dict:
         request = validate_runner_context_claim({"schema_version": "heel.runner-context-claim.v1", "binding_id": binding_id, "binding_digest": binding_digest})
         return self._context_control(
             f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/{binding_id}/claim",
-            request, expected_status=200, schema="heel.runner-context-claim-result.v1",
+            request, expected_status=200, schema="heel.runner-context-claim-result.v1", diagnostic_operation="claim-context",
         )
 
     @staticmethod
@@ -673,7 +712,7 @@ class RunnerControlClient:
         listed_request = validate_runner_context_list({"schema_version": "heel.runner-context-list.v1"})
         listed, list_call = self._context_control(
             f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/list",
-            listed_request, expected_status=200, schema="heel.runner-context-list-result.v1", include_call=True,
+            listed_request, expected_status=200, schema="heel.runner-context-list-result.v1", diagnostic_operation="list-contexts", include_call=True,
         )
         contexts = listed["contexts"]
         if len(contexts) == 0:
@@ -689,7 +728,7 @@ class RunnerControlClient:
         })
         claimed, claim_call = self._context_control(
             f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/{item['binding_id']}/claim",
-            claim_request, expected_status=200, schema="heel.runner-context-claim-result.v1", include_call=True,
+            claim_request, expected_status=200, schema="heel.runner-context-claim-result.v1", diagnostic_operation="claim-context", include_call=True,
         )
         binding = validate_runner_context_binding(claimed["context_binding"])
         environment = binding["environment"]
@@ -727,7 +766,18 @@ class RunnerControlClient:
         ):
             raise ValueError("runner context rollover receipt belongs to another control client")
         receipt._bind_store(store)
-        _ROLLOVER_RECEIPT_REGISTRY[receipt._receipt_id] = (self, receipt, store)
+        with _ROLLOVER_RECEIPT_REGISTRY_LOCK:
+            _ROLLOVER_RECEIPT_REGISTRY[receipt._receipt_id] = (self, receipt, store)
+
+    def _discard_rollover_receipt(self, receipt: object, store: object) -> None:
+        """Idempotently drop a genuine receipt after every coordinator install attempt."""
+        if not isinstance(receipt, _RunnerContextRolloverReceipt):
+            return
+        with _ROLLOVER_RECEIPT_REGISTRY_LOCK:
+            registered = _ROLLOVER_RECEIPT_REGISTRY.get(receipt._receipt_id)
+            if registered is not None and registered[0] is self and registered[1] is receipt and registered[2] is store:
+                _ROLLOVER_RECEIPT_REGISTRY.pop(receipt._receipt_id, None)
+            self._rollover_receipts.pop(receipt._receipt_id, None)
 
     def submit_context_approval_projection(self, binding_id: str, binding_digest: str, approval_projection: object) -> dict:
         request = validate_runner_approval_projection_submit({
@@ -737,7 +787,7 @@ class RunnerControlClient:
         })
         return self._context_control(
             f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/{binding_id}/approval-projections",
-            request, expected_status=201, schema="heel.canary-projection-submitted.v1",
+            request, expected_status=201, schema="heel.canary-projection-submitted.v1", diagnostic_operation="submit-context-approval-projection",
         )
 
     def _heartbeat_closed(self, run_id: str, operational_projection: object):

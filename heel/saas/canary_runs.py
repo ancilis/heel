@@ -512,7 +512,7 @@ class CanaryRunService:
         actor_id: str,
         reason_code: str,
         now_ms: int,
-        run_id: str | None = None,
+        run_id: str,
     ) -> int:
         """Cancel only linked pre-grant work and append its durable run/audit spine."""
         if not self.conn.in_transaction:
@@ -521,6 +521,8 @@ class CanaryRunService:
             raise ValueError("invalid runner context cancellation actor")
         if reason_code not in {"runner_context_revoked", "runner_context_expired"}:
             raise ValueError("invalid runner context cancellation reason")
+        if type(run_id) is not str or not run_id:
+            raise ValueError("runner context cancellation run ID is required")
         rows = self.conn.execute(
             "SELECT l.approval_id,l.run_id,a.status AS approval_status,r.status AS run_status,"
             "r.grant_id,r.reservation_id,r.quota_state "
@@ -529,15 +531,16 @@ class CanaryRunService:
             "AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
             "JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref AND r.run_id=l.run_id "
             "WHERE l.workspace_id=? AND l.project_ref=? AND l.environment_id=? AND l.runner_id=? "
-            "AND l.runner_key_id=? AND l.rcb_id=? AND l.binding_digest=? "
-            + ("AND l.run_id=? " if run_id is not None else "") +
-            "ORDER BY l.run_id,l.approval_id",
+            "AND l.runner_key_id=? AND l.rcb_id=? AND l.binding_digest=? AND l.run_id=? "
+            "ORDER BY l.run_id,l.approval_id LIMIT 2",
             (
                 binding_row["workspace_id"], binding_row["project_ref"], binding_row["environment_id"],
                 binding_row["runner_id"], binding_row["runner_key_id"], binding_row["rcb_id"],
                 binding_row["binding_digest"],
-            ) + ((run_id,) if run_id is not None else ()),
+            ) + (run_id,),
         ).fetchall()
+        if len(rows) > 1:
+            raise RuntimeError("linked runner context cancellation is ambiguous")
         cancelled = 0
         for row in rows:
             awaiting_projection = row["approval_status"] == "awaiting_execution_approval"
@@ -1845,7 +1848,8 @@ class CanaryRunService:
         rows = self.conn.execute(
             "SELECT a.*,r.status AS run_status,r.workspace_id AS run_workspace_id,r.project_ref AS run_project_ref,"
             "r.approval_id AS run_approval_id,r.environment_id AS run_environment_id,r.runner_id AS run_runner_id,r.runner_key_id AS run_runner_key_id "
-            "FROM canary_approval_projections a JOIN canary_runs r ON r.workspace_id=a.workspace_id AND r.project_ref=a.project_ref AND r.approval_id=a.approval_id AND r.run_id=a.run_id "
+            "FROM canary_approval_projections a INDEXED BY idx_canary_approval_pending_discovery_order "
+            "JOIN canary_runs r INDEXED BY idx_canary_runs_pending_approval_discovery ON r.workspace_id=a.workspace_id AND r.project_ref=a.project_ref AND r.approval_id=a.approval_id AND r.run_id=a.run_id "
             "WHERE a.workspace_id=? AND a.project_ref=? AND a.status='awaiting_execution_approval' AND r.status='awaiting_execution_approval' AND a.expires_at>? "
             "ORDER BY a.created_at DESC,a.run_id ASC LIMIT 2", (workspace_id, project_ref, now),
         ).fetchall()
@@ -1923,6 +1927,8 @@ class CanaryRunService:
                 "AND expires_at<=? AND NOT EXISTS(SELECT 1 FROM canary_runner_context_projection_links l "
                 "JOIN canary_runner_context_bindings b ON b.workspace_id=l.workspace_id "
                 "AND b.project_ref=l.project_ref AND b.rcb_id=l.rcb_id AND b.binding_digest=l.binding_digest "
+                "AND b.environment_id=l.environment_id AND b.runner_id=l.runner_id "
+                "AND b.runner_key_id=l.runner_key_id "
                 "WHERE l.workspace_id=canary_approval_projections.workspace_id "
                 "AND l.project_ref=canary_approval_projections.project_ref "
                 "AND l.approval_id=canary_approval_projections.approval_id "

@@ -39,6 +39,24 @@ class ScriptedControlTransport:
         return self.responses.pop(0)
 
 
+def test_claimed_rollover_receipt_is_discarded_when_registration_fails():
+    discarded = []
+
+    class Control:
+        def _bind_rollover_receipt_to_store(self, receipt, store):
+            del receipt, store
+            raise RuntimeError("injected registration fault")
+
+        def _discard_rollover_receipt(self, receipt, store):
+            discarded.append((receipt, store))
+
+    coordinator = SimpleNamespace(control=Control(), store=object())
+    receipt = object()
+    with pytest.raises(RuntimeError, match="injected registration fault"):
+        RunnerCoordinator._install_claimed_rollover(coordinator, {"context_binding": {}}, receipt)
+    assert discarded == [(receipt, coordinator.store)]
+
+
 def _gate(
     *, server_time_ms=2_000, generation=7, stop_reason="none", active=True,
     proof_expires_at_ms=20_000,
@@ -408,7 +426,9 @@ def test_pending_first_install_rolls_forward_only_from_fresh_singleton_claim(tmp
 
     recovered_store, recovered = recovery_coordinator(tmp_path / "fresh", b"d")
     assert recovered.ensure_runner_context() is True
-    assert calls == ["list", "claim"] * 4
+    # Recovery completes the locally signed A→B journal before asking Cloud.
+    # The sole later poll observes B exactly; tampered/mixed copies never poll.
+    assert calls == ["list", "claim", "list"]
     assert recovered_store.load_context().verification_record_digest == "2" * 64
     assert recovered_store.load_cloud_context_binding()["binding_id"] == new["binding_id"]
 

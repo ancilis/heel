@@ -104,6 +104,7 @@ class RunnerContextBindingService:
                 (row["rcb_id"], now),
             )
             if result.rowcount == 1:
+                self._enqueue_terminal_cancellation_in_transaction(row)
                 self._event(row, "expired", "system", "control-plane", reason="ttl_elapsed")
                 changed += 1
         return changed
@@ -127,6 +128,85 @@ class RunnerContextBindingService:
             raise RuntimeError("runner context expiry scope is inconsistent")
         return self._expire_rows_in_transaction(rows, now)
 
+    def _has_affinity_schema(self) -> bool:
+        """v16/v17 migration rehearsal still exercises the pre-affinity service."""
+        return self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_runner_context_affinities'"
+        ).fetchone() is not None
+
+    def _has_cancellation_queue_schema(self) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='canary_runner_context_cancellation_queue'"
+        ).fetchone() is not None
+
+    def _enqueue_terminal_cancellation_in_transaction(self, row: sqlite3.Row) -> None:
+        """Queue a terminal binding once, after an O(1) exact-prefix link seek."""
+        if not self._has_cancellation_queue_schema():
+            return
+        self.conn.execute(
+            "INSERT OR IGNORE INTO canary_runner_context_cancellation_queue("
+            "workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,"
+            "binding_expires_at_ms,last_scanned_run_id) "
+            "SELECT ?,?,?,?,?,?,?,?,NULL WHERE EXISTS("
+            "SELECT 1 FROM canary_runner_context_projection_links l INDEXED BY idx_runner_context_links_binding_run "
+            "WHERE l.workspace_id=? AND l.project_ref=? AND l.environment_id=? AND l.runner_id=? "
+            "AND l.runner_key_id=? AND l.rcb_id=? AND l.binding_digest=? LIMIT 1)",
+            (
+                row["workspace_id"], row["project_ref"], row["environment_id"], row["runner_id"],
+                row["runner_key_id"], row["rcb_id"], row["binding_digest"], row["expires_at_ms"],
+                row["workspace_id"], row["project_ref"], row["environment_id"], row["runner_id"],
+                row["runner_key_id"], row["rcb_id"], row["binding_digest"],
+            ),
+        )
+
+    @staticmethod
+    def _affinity_matches_row(affinity: sqlite3.Row, row: sqlite3.Row) -> bool:
+        """The durable first-claim coordinate is deliberately narrower than a proof generation."""
+        return (
+            affinity["runner_key_id"] == row["runner_key_id"]
+            and affinity["project_ref"] == row["project_ref"]
+            and affinity["environment_id"] == row["environment_id"]
+            and affinity["environment_origin"] == row["environment_origin"]
+            and affinity["environment_class"] == row["environment_class"]
+            and affinity["public_key_digest"] == row["public_key_digest"]
+        )
+
+    def _assert_or_establish_affinity_in_transaction(self, row: sqlite3.Row, *, claimed_at_ms: int) -> None:
+        """Create the one-way coordinate before recording a runner's first claim."""
+        affinity = self.conn.execute(
+            "SELECT * FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
+            (row["workspace_id"], row["runner_id"]),
+        ).fetchone()
+        if affinity is not None:
+            if not self._affinity_matches_row(affinity, row):
+                raise RunnerContextError("runner_context_binding_not_found")
+            return
+        if row["first_claimed_at_ms"] is not None:
+            # A claimed binding without its durable coordinate is at-rest corruption,
+            # not a reason to recreate authority from history.
+            raise RunnerContextError("runner_context_binding_not_found")
+        try:
+            self.conn.execute(
+                "INSERT INTO canary_runner_context_affinities("
+                "workspace_id,runner_id,runner_key_id,project_ref,environment_id,environment_origin,environment_class,"
+                "public_key_digest,established_rcb_id,established_binding_digest,established_at_ms) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (row["workspace_id"], row["runner_id"], row["runner_key_id"], row["project_ref"],
+                 row["environment_id"], row["environment_origin"], row["environment_class"],
+                 row["public_key_digest"], row["rcb_id"], row["binding_digest"], claimed_at_ms),
+            )
+        except sqlite3.IntegrityError:
+            # Another serialized claim may have established an affinity immediately
+            # before us; equality is required and the caller's outer transaction
+            # provides the fail-closed rollback on any mismatch.
+            affinity = self.conn.execute(
+                "SELECT * FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
+                (row["workspace_id"], row["runner_id"]),
+            ).fetchone()
+            if affinity is None or not self._affinity_matches_row(affinity, row):
+                raise RunnerContextError("runner_context_binding_not_found") from None
+
     def expire_due_batch_in_transaction(self, now_ms: int, *, limit: int = 128) -> dict[str, int]:
         if not self.conn.in_transaction:
             raise RuntimeError("runner context expiry requires caller transaction")
@@ -135,52 +215,128 @@ class RunnerContextBindingService:
         if type(limit) is not int or not 1 <= limit <= 128:
             raise ValueError("invalid runner context batch limit")
         rows = self.conn.execute(
-            "SELECT * FROM canary_runner_context_bindings WHERE status='active' AND expires_at_ms<=? "
+            "SELECT rcb_id,workspace_id,project_ref,environment_id,runner_id,runner_key_id,binding_digest,status,expires_at_ms,purge_at_ms,revoked_by "
+            "FROM canary_runner_context_bindings INDEXED BY idx_runner_context_active_expiry_order WHERE status='active' AND expires_at_ms<=? "
             "ORDER BY expires_at_ms,rcb_id LIMIT ?", (now_ms, limit + 1),
         ).fetchall()
         return {"expired_runner_contexts": self._expire_rows_in_transaction(rows[:limit], now_ms),
                 "runner_context_expiry_has_more": int(len(rows) > limit)}
 
     def cancel_due_batch_in_transaction(self, now_ms: int, *, limit: int = 128) -> dict[str, int]:
-        """Cancel at most one deterministic linked awaiting run per selected row."""
+        """Drain at most ``limit`` durable terminal-context queue work units."""
         if not self.conn.in_transaction:
             raise RuntimeError("runner context cancellation requires caller transaction")
         if type(now_ms) is not int or not 0 <= now_ms <= 9_007_199_254_740_991:
             raise ValueError("invalid runner context expiry time")
         if type(limit) is not int or not 1 <= limit <= 128:
             raise ValueError("invalid runner context batch limit")
-        rows = self.conn.execute(
-            "SELECT b.*,l.run_id FROM canary_runner_context_bindings b "
-            "JOIN canary_runner_context_projection_links l ON l.workspace_id=b.workspace_id "
-            "AND l.project_ref=b.project_ref AND l.rcb_id=b.rcb_id AND l.binding_digest=b.binding_digest "
-            "JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id AND a.project_ref=l.project_ref "
-            "AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
-            "JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref AND r.run_id=l.run_id "
-            "WHERE b.status IN ('revoked','expired') "
-            "AND a.status='awaiting_execution_approval' AND r.status IN ('prepared','awaiting_execution_approval') "
-            "ORDER BY b.expires_at_ms,b.rcb_id,l.run_id LIMIT ?", (limit + 1,),
-        ).fetchall()
         cancelled = 0
-        for row in rows[:limit]:
-            run_id = row["run_id"]
-            actor_class = "human" if row["status"] == "revoked" else "system"
-            actor_id = row["revoked_by"] if actor_class == "human" else "control-plane"
-            reason = "runner_context_revoked" if actor_class == "human" else "runner_context_expired"
-            cancelled += self._cancel_linked_pending_in_transaction(
-                row, actor_class=actor_class, actor_id=actor_id, reason_code=reason,
-                now_ms=now_ms, run_id=run_id,
+        units = 0
+        if not self._has_cancellation_queue_schema():
+            return {
+                "cancelled_context_projections": 0,
+                "cancelled_context_runs": 0,
+                "context_cancellation_events": 0,
+                "context_cancellation_audits": 0,
+                "runner_context_cancellation_has_more": 0,
+            }
+        while units < limit:
+            queue = self.conn.execute(
+                "SELECT workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,"
+                "binding_digest,binding_expires_at_ms,last_scanned_run_id "
+                "FROM canary_runner_context_cancellation_queue INDEXED BY idx_runner_context_cancellation_queue_order "
+                "WHERE binding_expires_at_ms>0 ORDER BY binding_expires_at_ms,rcb_id LIMIT 1",
+            ).fetchone()
+            if queue is None:
+                break
+            row = self.conn.execute(
+                "SELECT * FROM canary_runner_context_bindings INDEXED BY idx_runner_context_binding_cancellation_ref "
+                "WHERE workspace_id=? AND project_ref=? AND environment_id=? AND runner_id=? "
+                "AND runner_key_id=? AND rcb_id=? AND binding_digest=? AND expires_at_ms=? "
+                "AND status IN ('revoked','expired')",
+                (
+                    queue["workspace_id"], queue["project_ref"], queue["environment_id"],
+                    queue["runner_id"], queue["runner_key_id"], queue["rcb_id"],
+                    queue["binding_digest"], queue["binding_expires_at_ms"],
+                ),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("runner context cancellation queue authority is inconsistent")
+            remaining = limit - units
+            cursor_clause = "AND l.run_id>?" if queue["last_scanned_run_id"] is not None else ""
+            values: list[object] = [
+                queue["workspace_id"], queue["project_ref"], queue["environment_id"],
+                queue["runner_id"], queue["runner_key_id"], queue["rcb_id"], queue["binding_digest"],
+            ]
+            if queue["last_scanned_run_id"] is not None:
+                values.append(queue["last_scanned_run_id"])
+            values.append(remaining + 1)
+            links = self.conn.execute(
+                "SELECT l.run_id,a.status AS approval_status,r.status AS run_status "
+                "FROM canary_runner_context_projection_links l INDEXED BY idx_runner_context_links_binding_run "
+                "LEFT JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id "
+                "AND a.project_ref=l.project_ref AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
+                "LEFT JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref "
+                "AND r.run_id=l.run_id "
+                "WHERE l.workspace_id=? AND l.project_ref=? AND l.environment_id=? AND l.runner_id=? "
+                "AND l.runner_key_id=? AND l.rcb_id=? AND l.binding_digest=? "
+                + cursor_clause + " ORDER BY l.run_id LIMIT ?",
+                values,
+            ).fetchall()
+            if not links:
+                self.conn.execute(
+                    "DELETE FROM canary_runner_context_cancellation_queue WHERE workspace_id=? "
+                    "AND project_ref=? AND rcb_id=? AND binding_digest=?",
+                    (queue["workspace_id"], queue["project_ref"], queue["rcb_id"], queue["binding_digest"]),
+                )
+                units += 1
+                continue
+            examined = links[:remaining]
+            for link in examined:
+                if link["approval_status"] is None or link["run_status"] is None:
+                    raise RuntimeError("runner context cancellation queue link is inconsistent")
+                awaiting = link["approval_status"] == "awaiting_execution_approval"
+                pregrant = link["run_status"] in {"prepared", "awaiting_execution_approval"}
+                if awaiting != pregrant:
+                    raise RuntimeError("runner context cancellation queue link is inconsistent")
+                if awaiting:
+                    actor_class = "human" if row["status"] == "revoked" else "system"
+                    actor_id = row["revoked_by"] if actor_class == "human" else "control-plane"
+                    if type(actor_id) is not str or not actor_id:
+                        raise RuntimeError("runner context cancellation queue actor is inconsistent")
+                    reason = "runner_context_revoked" if actor_class == "human" else "runner_context_expired"
+                    cancelled += self._cancel_linked_pending_in_transaction(
+                        row, actor_class=actor_class, actor_id=actor_id, reason_code=reason,
+                        now_ms=now_ms, run_id=link["run_id"],
+                    )
+            units += len(examined)
+            if len(links) > remaining:
+                self.conn.execute(
+                    "UPDATE canary_runner_context_cancellation_queue SET last_scanned_run_id=? "
+                    "WHERE workspace_id=? AND project_ref=? AND rcb_id=? AND binding_digest=?",
+                    (examined[-1]["run_id"], queue["workspace_id"], queue["project_ref"],
+                     queue["rcb_id"], queue["binding_digest"]),
+                )
+                break
+            self.conn.execute(
+                "DELETE FROM canary_runner_context_cancellation_queue WHERE workspace_id=? "
+                "AND project_ref=? AND rcb_id=? AND binding_digest=?",
+                (queue["workspace_id"], queue["project_ref"], queue["rcb_id"], queue["binding_digest"]),
             )
+        has_more = int(self.conn.execute(
+            "SELECT 1 FROM canary_runner_context_cancellation_queue LIMIT 1"
+        ).fetchone() is not None)
         return {
             "cancelled_context_projections": cancelled,
             "cancelled_context_runs": cancelled,
             "context_cancellation_events": cancelled,
             "context_cancellation_audits": cancelled,
-            "runner_context_cancellation_has_more": int(len(rows) > limit),
+            "runner_context_cancellation_has_more": has_more,
         }
 
     def _cancel_linked_pending_in_transaction(
         self, row: sqlite3.Row, *, actor_class: str, actor_id: str, reason_code: str, now_ms: int,
-        run_id: str | None = None,
+        run_id: str,
     ) -> int:
         """Use the Task-7 append-only event/audit writer on this exact transaction."""
         if not self.conn.in_transaction:
@@ -206,17 +362,17 @@ class RunnerContextBindingService:
         if type(limit) is not int or isinstance(limit, bool) or not 1 <= limit <= 128:
             raise ValueError("invalid runner context purge limit")
         rows = self.conn.execute(
-            "SELECT * FROM canary_runner_context_bindings "
-            "WHERE status IN ('expired','revoked') AND purge_at_ms<=? "
-            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_events e "
+            "SELECT rcb_id,workspace_id,project_ref,binding_digest,purge_at_ms,status FROM canary_runner_context_bindings INDEXED BY idx_runner_context_terminal_purge_order "
+            "WHERE status IN ('revoked','expired') AND purge_at_ms<=? "
+            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_events e INDEXED BY idx_runner_context_events_binding_purge "
             "WHERE e.workspace_id=canary_runner_context_bindings.workspace_id "
             "AND e.project_ref=canary_runner_context_bindings.project_ref "
             "AND e.rcb_id=canary_runner_context_bindings.rcb_id "
             "AND e.binding_digest=canary_runner_context_bindings.binding_digest AND e.purge_at_ms>?) "
-            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_projection_links l "
-            "JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id AND a.project_ref=l.project_ref "
+            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_projection_links l INDEXED BY idx_runner_context_links_binding_run "
+            "JOIN canary_approval_projections a INDEXED BY idx_canary_approval_context_awaiting ON a.workspace_id=l.workspace_id AND a.project_ref=l.project_ref "
             "AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
-            "JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref AND r.run_id=l.run_id "
+            "JOIN canary_runs r INDEXED BY idx_canary_runs_context_pregrant ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref AND r.run_id=l.run_id "
             "WHERE l.workspace_id=canary_runner_context_bindings.workspace_id "
             "AND l.project_ref=canary_runner_context_bindings.project_ref "
             "AND l.rcb_id=canary_runner_context_bindings.rcb_id "
@@ -240,6 +396,18 @@ class RunnerContextBindingService:
             ),
         }
         for row in selected:
+            corrupt = self.conn.execute(
+                "SELECT l.run_id FROM canary_runner_context_projection_links l INDEXED BY idx_runner_context_links_binding_run "
+                "LEFT JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id "
+                "AND a.project_ref=l.project_ref AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
+                "LEFT JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref "
+                "AND r.run_id=l.run_id "
+                "WHERE l.workspace_id=? AND l.project_ref=? AND l.rcb_id=? AND l.binding_digest=? "
+                "AND (a.approval_id IS NULL OR r.run_id IS NULL) LIMIT 1",
+                (row["workspace_id"], row["project_ref"], row["rcb_id"], row["binding_digest"]),
+            ).fetchone()
+            if corrupt is not None:
+                raise RuntimeError("runner context purge has linked corrupt authority")
             pregrant = self.conn.execute(
                 "SELECT 1 FROM canary_runner_context_projection_links l "
                 "JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id AND a.project_ref=l.project_ref "
@@ -251,6 +419,12 @@ class RunnerContextBindingService:
             ).fetchone()
             if pregrant is not None:
                 raise RuntimeError("runner context purge has linked pregrant authority")
+            if self._has_cancellation_queue_schema():
+                self.conn.execute(
+                    "DELETE FROM canary_runner_context_cancellation_queue WHERE workspace_id=? "
+                    "AND project_ref=? AND rcb_id=? AND binding_digest=?",
+                    (row["workspace_id"], row["project_ref"], row["rcb_id"], row["binding_digest"]),
+                )
             links = self.conn.execute(
                 "DELETE FROM canary_runner_context_projection_links WHERE workspace_id=? AND project_ref=? "
                 "AND rcb_id=? AND binding_digest=?",
@@ -262,7 +436,7 @@ class RunnerContextBindingService:
                 (row["workspace_id"], row["project_ref"], row["rcb_id"], row["binding_digest"]),
             )
             bindings = self.conn.execute(
-                "DELETE FROM canary_runner_context_bindings WHERE rcb_id=? AND status IN ('expired','revoked')",
+                "DELETE FROM canary_runner_context_bindings WHERE rcb_id=? AND status IN ('revoked','expired')",
                 (row["rcb_id"],),
             )
             if bindings.rowcount != 1:
@@ -308,6 +482,21 @@ class RunnerContextBindingService:
             ).fetchone() is not None:
                 raise RunnerContextError("conflict")
             public_key = load_public_key_base64(row["public_key"]).public_bytes(Encoding.Raw, PublicFormat.Raw)
+            public_key_digest = hashlib.sha256(public_key).hexdigest()
+            if self._has_affinity_schema():
+                affinity = self.conn.execute(
+                    "SELECT * FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
+                    (workspace_id, request["runner_id"]),
+                ).fetchone()
+                if affinity is not None and (
+                    affinity["runner_key_id"] != request["runner_key_id"]
+                    or affinity["project_ref"] != project_id
+                    or affinity["environment_id"] != request["environment_id"]
+                    or affinity["environment_origin"] != row["origin"]
+                    or affinity["environment_class"] != row["environment_class"]
+                    or affinity["public_key_digest"] != public_key_digest
+                ):
+                    raise RunnerContextError("conflict")
             expires = min(now + CONTEXT_TTL_MS, int(row["proof_expires_at"] * 1000))
             if expires - now < CONTEXT_MIN_TTL_MS:
                 raise RunnerContextError("expired")
@@ -318,7 +507,7 @@ class RunnerContextBindingService:
                                 "environment_class": row["environment_class"],
                                 "verification_record_digest": row["verification_record_digest"]},
                 "runner_binding": {"runner_id": request["runner_id"], "runner_key_id": request["runner_key_id"],
-                                   "public_key_digest": hashlib.sha256(public_key).hexdigest()},
+                                   "public_key_digest": public_key_digest},
                 "authorization": {"user_id": actor, "role": authorized_role},
                 "issued_at_ms": now, "expires_at_ms": expires,
             }
@@ -380,15 +569,12 @@ class RunnerContextBindingService:
                 raise RunnerContextError("runner_context_binding_not_found")
             if row["status"] != "active":
                 raise RunnerContextError("conflict")
-            self._cancel_linked_pending_in_transaction(
-                row, actor_class="human", actor_id=actor,
-                reason_code="runner_context_revoked", now_ms=now,
-            )
             self.conn.execute(
                 "UPDATE canary_runner_context_bindings SET status='revoked',revoked_by=?,revoked_at_ms=?,revoke_reason='operator_requested' WHERE rcb_id=?",
                 (actor, now, binding_id),
             )
             changed = self.conn.execute("SELECT * FROM canary_runner_context_bindings WHERE rcb_id=?", (binding_id,)).fetchone()
+            self._enqueue_terminal_cancellation_in_transaction(changed)
             self._event(changed, "revoked", "human", actor, reason="operator_requested")
             self.conn.commit()
             return {"schema_version": "heel.runner-context-binding-revoked.v1", "binding_id": binding_id, "status": "revoked", "revoked_at_ms": now}
@@ -413,16 +599,22 @@ class RunnerContextBindingService:
         now = self._now_ms()
         runner_rows = self.conn.execute(
             "SELECT r.runner_id,r.display_name,k.key_id,k.public_key,i.identity_json "
-            "FROM canary_runners r JOIN canary_runner_keys k ON k.workspace_id=r.workspace_id AND k.runner_id=r.runner_id "
-            "JOIN canary_runner_identity_records i ON i.workspace_id=r.workspace_id AND i.runner_id=r.runner_id "
-            "WHERE r.workspace_id=? AND r.status='active' AND k.status='active' AND k.revoked_at IS NULL "
-            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_bindings b "
+            # The key access path is ordered by exactly the frozen runner/key
+            # lexical order.  CROSS JOIN keeps that bounded seek outermost.
+            "FROM canary_runner_keys k INDEXED BY idx_canary_runner_keys_dashboard_selector "
+            "CROSS JOIN canary_runners r INDEXED BY idx_canary_runners_dashboard_selector ON r.workspace_id=k.workspace_id AND r.runner_id=k.runner_id "
+            "CROSS JOIN canary_runner_identity_records i ON i.workspace_id=r.workspace_id AND i.runner_id=r.runner_id "
+            "WHERE k.workspace_id=? AND k.status='active' AND k.revoked_at IS NULL AND r.status='active' "
+            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_bindings b INDEXED BY idx_runner_context_runner_status_expiry "
             "WHERE b.workspace_id=r.workspace_id AND b.runner_id=r.runner_id "
             "AND b.status='active' AND b.expires_at_ms>?) "
-            "ORDER BY r.runner_id,k.key_id LIMIT 17", (workspace_id, now),
+            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_affinities a "
+            "WHERE a.workspace_id=r.workspace_id AND a.runner_id=r.runner_id "
+            "AND (a.project_ref<>? OR a.runner_key_id<>k.key_id)) "
+            "ORDER BY k.runner_id,k.key_id LIMIT 17", (workspace_id, now, project_id),
         ).fetchall()
         binding_rows = self.conn.execute(
-            "SELECT * FROM canary_runner_context_bindings WHERE workspace_id=? AND project_ref=? "
+            "SELECT * FROM canary_runner_context_bindings INDEXED BY idx_runner_context_dashboard_history WHERE workspace_id=? AND project_ref=? "
             "ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,issued_at_ms DESC,rcb_id DESC LIMIT 65",
             (workspace_id, project_id),
         ).fetchall()
@@ -517,11 +709,15 @@ class RunnerContextBindingService:
         except (TypeError, ValueError):
             raise RunnerContextError("runner_context_binding_not_found") from None
         if row["first_claimed_at_ms"] is None:
+            if self._has_affinity_schema():
+                self._assert_or_establish_affinity_in_transaction(row, claimed_at_ms=now)
             self.conn.execute(
                 "UPDATE canary_runner_context_bindings SET first_claimed_at_ms=? WHERE rcb_id=? AND first_claimed_at_ms IS NULL",
                 (now, binding_id),
             )
             self._event(row, "claimed", "runner", runner_id)
+        elif self._has_affinity_schema():
+            self._assert_or_establish_affinity_in_transaction(row, claimed_at_ms=now)
         return {"schema_version": "heel.runner-context-claim-result.v1", "context_binding": artifact, "claimed_at_ms": now}
 
     @staticmethod

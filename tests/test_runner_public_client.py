@@ -185,6 +185,28 @@ def test_named_control_methods_emit_closed_bodies_and_separate_stop_ack_chain():
     ) for parameter in inspect.signature(method).parameters.values())
 
 
+def test_control_diagnostics_are_bounded_frozen_and_sensitive_field_free():
+    signer, transport, nonces = Signer(), Transport(), NonceSource()
+    client = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer,
+        clock=lambda: 1000, transport=transport, nonce_source=nonces,
+    )
+    for _ in range(130):
+        client.claim()
+
+    diagnostics = client.calls
+    assert len(diagnostics) == 128
+    assert client.calls_dropped == 2
+    assert [(item.operation, item.status, item.sequence, item.generation) for item in diagnostics[:2]] == [
+        ("claim", 204, 3, 0), ("claim", 204, 4, 0),
+    ]
+    assert all(not hasattr(item, field) for item in diagnostics for field in (
+        "path", "headers", "body", "capability", "chain", "__dict__",
+    ))
+    diagnostics.pop()
+    assert len(client.calls) == 128
+
+
 @pytest.mark.parametrize(("method_name", "projection"), [
     ("heartbeat", (lambda: ({**operational_projection("claimed"), "private": {"headers": {"authorization": "secret"}}}))()),
     ("progress", (lambda: ({**operational_projection("running"), "padding": "x" * (37 * 1024)}))()),

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from heel.canary_contracts import canonical_bytes, canonical_digest
 from heel.crypto import SigningAuthority
 from heel.saas.canary_reaper import CanaryReaper
 from heel.saas.runner_contexts import RunnerContextBindingService
@@ -99,6 +100,95 @@ def test_context_expiry_cancels_linked_pending_run_before_generic_approval_expir
             assert connection.execute(
                 "SELECT COUNT(*) FROM canary_run_events WHERE run_id=? AND event_type='expired'", (submitted["run_id"],),
             ).fetchone()[0] == 0
+        finally:
+            connection.close()
+
+
+def test_context_cancellation_queue_defers_the_one_hundred_twenty_ninth_link_without_generic_expiry_stealing_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        source = connect()
+        clock = Clock()
+        runner = seed_authority(source, proof_expires_at=clock.value + 48 * 60 * 60)
+        signing = SigningAuthority.generate()
+        contexts = RunnerContextBindingService(source, signing=signing, clock=clock)
+        contexts.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": "env_canary",
+             "verification_record_digest": "a" * 64, "runner_id": RUNNER,
+             "runner_key_id": runner.key_id}, actor="user_owner", role="owner",
+        )
+        binding = source.execute("SELECT * FROM canary_runner_context_bindings").fetchone()
+        coordinator = service(source, clock, grant_signer=signing)
+
+        def unique_projection(index: int) -> dict:
+            projection = approval_projection(runner)
+            projection["projection_id"] = f"ap_{index:032x}"
+            unsigned = {
+                key: value for key, value in projection.items()
+                if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+            }
+            projection["projection_digest"] = canonical_digest(unsigned)
+            projection.update(runner.sign(canonical_bytes(unsigned)))
+            return projection
+
+        source.execute("BEGIN IMMEDIATE")
+        linked = [coordinator.submit_projection_from_runner_in_transaction(
+            unique_projection(index), binding, uploaded_by_runner_id=RUNNER,
+        ) for index in range(129)]
+        source.commit()
+        unlinked = coordinator.submit_projection(unique_projection(999), uploaded_by="user_owner")
+
+        database = Path(tmp) / "heel.sqlite3"
+        durable = sqlite3.connect(database)
+        source.backup(durable)
+        durable.close()
+        source.close()
+        clock.value += 25 * 60 * 60
+
+        reaper = CanaryReaper(str(database), signing=signing, clock=clock)
+        reaper.run_once()
+        connection = sqlite3.connect(database)
+        try:
+            linked_ids = tuple(item["run_id"] for item in linked)
+            placeholders = ",".join("?" for _ in linked_ids)
+            statuses = connection.execute(
+                f"SELECT status,COUNT(*) FROM canary_runs WHERE run_id IN ({placeholders}) GROUP BY status",
+                linked_ids,
+            ).fetchall()
+            assert dict(statuses) == {
+                "awaiting_execution_approval": 1,
+                "cancelled": 128,
+            }
+            assert connection.execute(
+                "SELECT status FROM canary_runs WHERE run_id=?", (unlinked["run_id"],),
+            ).fetchone()[0] == "expired"
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM canary_run_events WHERE run_id IN ({placeholders}) "
+                "AND event_type='expired'",
+                linked_ids,
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM canary_run_events WHERE run_id IN ({placeholders}) "
+                "AND event_type='cancelled' AND actor_class='system' AND actor_id='control-plane' "
+                "AND reason_code='runner_context_expired'",
+                linked_ids,
+            ).fetchone()[0] == 128
+        finally:
+            connection.close()
+
+        reaper.run_once()
+        connection = sqlite3.connect(database)
+        try:
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM canary_runs WHERE run_id IN ({placeholders}) AND status='cancelled'",
+                linked_ids,
+            ).fetchone()[0] == 129
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM canary_run_events WHERE run_id IN ({placeholders}) "
+                "AND event_type='cancelled' AND actor_class='system' AND actor_id='control-plane' "
+                "AND reason_code='runner_context_expired'",
+                linked_ids,
+            ).fetchone()[0] == 129
         finally:
             connection.close()
 
