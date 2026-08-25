@@ -175,38 +175,60 @@ def _token() -> str:
 WORDS = runner_phrase_words()
 
 
+def _ensure_hardened_ledger_schema(conn: sqlite3.Connection) -> None:
+    present = {row[1] for row in conn.execute("PRAGMA table_info(canary_runner_request_ledger)")}
+    for statement in RUNNER_AUTH_HARDENING_MIGRATION.strip().split(";"):
+        statement = statement.strip()
+        if not statement:
+            continue
+        column = statement.split()[5]
+        if column not in present:
+            conn.execute(statement)
+            present.add(column)
+
+
+def _ensure_lifecycle_tables(conn: sqlite3.Connection) -> None:
+    """Install v11's additive identity/audit tables for direct runtime construction.
+
+    The migration owns the constrained table rebuild; direct in-memory ControlPlane instances
+    start from an empty v9 schema and require the same observable table/column shape without
+    replaying a destructive migration.
+    """
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS canary_runner_identity_records(
+      workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, identity_json TEXT NOT NULL,
+      identity_digest TEXT NOT NULL CHECK(length(identity_digest)=64 AND identity_digest NOT GLOB '*[^0-9a-f]*'),
+      updated_at REAL NOT NULL, PRIMARY KEY(workspace_id,runner_id), UNIQUE(identity_digest));
+    CREATE TABLE IF NOT EXISTS canary_runner_audit_records(
+      audit_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+      action TEXT NOT NULL CHECK(action IN ('runner_revoked','runner_rotated','runner_activated')),
+      actor TEXT NOT NULL, reason_code TEXT, created_at REAL NOT NULL);
+    """)
+
+
+def ensure_runner_auth_schema(conn: sqlite3.Connection) -> None:
+    """Runtime schema parity through migration eleven, with no dependence on a pepper."""
+    if not isinstance(conn, sqlite3.Connection):
+        raise TypeError("runner authentication requires a SQLite connection")
+    conn.executescript(RUNNER_AUTH_SCHEMA)
+    _ensure_hardened_ledger_schema(conn)
+    _ensure_lifecycle_tables(conn)
+
+
 class RunnerAuthStore:
     def __init__(self, conn: sqlite3.Connection, *, pepper: bytes, now: Callable[[], float] = _now):
         if not isinstance(pepper, bytes) or not 32 <= len(pepper) <= 64:
             raise ValueError("runner authentication pepper must be 32 to 64 bytes")
         self.conn, self._pepper, self._now = conn, pepper, now
         self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(RUNNER_AUTH_SCHEMA)
-        self._ensure_hardened_ledger()
-        self._ensure_lifecycle_schema()
+        ensure_runner_auth_schema(self.conn)
 
     def _ensure_hardened_ledger(self) -> None:
-        present = {row[1] for row in self.conn.execute("PRAGMA table_info(canary_runner_request_ledger)")}
-        for statement in RUNNER_AUTH_HARDENING_MIGRATION.strip().split(";"):
-            statement = statement.strip()
-            if not statement:
-                continue
-            column = statement.split()[5]
-            if column not in present:
-                self.conn.execute(statement)
-                present.add(column)
+        _ensure_hardened_ledger_schema(self.conn)
 
     def _ensure_lifecycle_schema(self) -> None:
         """Runtime parity for new databases; migrated production gets these through v11."""
-        self.conn.executescript("""
-        CREATE TABLE IF NOT EXISTS canary_runner_identity_records(
-          workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, identity_json TEXT NOT NULL,
-          identity_digest TEXT NOT NULL, updated_at REAL NOT NULL,
-          PRIMARY KEY(workspace_id,runner_id), UNIQUE(identity_digest));
-        CREATE TABLE IF NOT EXISTS canary_runner_audit_records(
-          audit_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
-          action TEXT NOT NULL, actor TEXT NOT NULL, reason_code TEXT, created_at REAL NOT NULL);
-        """)
+        _ensure_lifecycle_tables(self.conn)
 
     def _seal(self, value: str, *, aad: bytes) -> str:
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305

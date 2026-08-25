@@ -49,7 +49,7 @@ from .billing import (
     SubscriptionManager,
 )
 from .canary_store import CanaryStore
-from .runner_auth import RUNNER_AUTH_SCHEMA, RunnerAuthError, RunnerAuthStore
+from .runner_auth import RunnerAuthError, RunnerAuthStore, ensure_runner_auth_schema
 from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
 from .device_auth import (
     DEVICE_CAPABILITIES,
@@ -202,7 +202,7 @@ class ControlPlane:
         self.canary_store = CanaryStore(conn)
         # Runtime construction (including unit/demo instances) stays schema-parity with the
         # migration, while authentication itself remains disabled absent a distinct pepper.
-        conn.executescript(RUNNER_AUTH_SCHEMA)
+        ensure_runner_auth_schema(conn)
         # Runner PoP is optional in local/demo construction but production supplies a distinct
         # pepper before starting its listener. It never shares device or API-key hash domains.
         self.runner_auth = (
