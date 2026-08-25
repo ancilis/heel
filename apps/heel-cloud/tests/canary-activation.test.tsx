@@ -16,6 +16,14 @@ afterEach(cleanup);
 
 
 describe("canary activation dashboard", () => {
+  test("keeps approval projections on the paired runner and exposes no browser upload path", () => {
+    const source = readFileSync(resolve(process.cwd(), "app/dashboard/page.tsx"), "utf8");
+    expect(source).toContain("Authorize paired runner");
+    expect(source).toContain("revokeContextBinding");
+    expect(source).toContain("never accepts projection file uploads");
+    expect(source).not.toContain("loadProjection(");
+    expect(source).not.toContain("Choose approval projection");
+  });
   test("leads with four ordered steps and one unambiguous next action", () => {
     render(<Dashboard />);
 

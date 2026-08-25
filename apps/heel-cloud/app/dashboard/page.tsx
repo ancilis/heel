@@ -11,7 +11,7 @@ import { DisclosureDialog } from "../../components/canary/DisclosureDialog";
 import { RunProgress, type RunPhase } from "../../components/canary/RunProgress";
 import {
   CanaryApi, CanaryApiError, type CanaryApprovalSummary, type CanaryDisclosureMetadata,
-  type CanaryRunDashboard, type VerifiedEnvironmentRecord,
+  type CanaryRunDashboard, type RunnerContextBindingDashboard, type VerifiedEnvironmentRecord,
 } from "../../lib/canary-api";
 import { HeelCloudApi, HeelCloudApiError, type HeelCloudProject } from "../../lib/heel-cloud-api";
 
@@ -25,6 +25,7 @@ type Context = {
   project: HeelCloudProject;
   projects: readonly HeelCloudProject[];
   environments: readonly VerifiedEnvironmentRecord[];
+  contextBindings: RunnerContextBindingDashboard;
 };
 
 type Connection =
@@ -62,7 +63,8 @@ async function loadConnection(): Promise<Connection> {
     const projects = await cloudApi.listProjects(workspace.workspaceRef);
     if (projects.length === 0) return { phase: "select_project", workspaceRef: workspace.workspaceRef };
     const environments = await canaryApi.listEnvironments(workspace.workspaceRef, projects[0].projectRef);
-    return { phase: "ready", context: { workspaceRef: workspace.workspaceRef, project: projects[0], projects, environments } };
+    const contextBindings = await canaryApi.listRunnerContextBindings(workspace.workspaceRef, projects[0].projectRef);
+    return { phase: "ready", context: { workspaceRef: workspace.workspaceRef, project: projects[0], projects, environments, contextBindings } };
   } catch (error) {
     const message = messageOf(error);
     return error instanceof HeelCloudApiError && error.code === "auth_required"
@@ -84,6 +86,8 @@ export default function Dashboard() {
   const [run, setRun] = useState<CanaryRunDashboard | null>(null);
   const [disclosurePreview, setDisclosurePreview] = useState<DisclosurePreview | null>(null);
   const [disclosureOpen, setDisclosureOpen] = useState(false);
+  const [selectedRunner, setSelectedRunner] = useState("");
+  const [selectedBindingEnvironment, setSelectedBindingEnvironment] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -100,6 +104,13 @@ export default function Dashboard() {
     const { context } = connection;
     const environments = await canaryApi.listEnvironments(context.workspaceRef, context.project.projectRef);
     setConnection({ phase: "ready", context: { ...context, environments } });
+  }, [connection]);
+
+  const refreshContextBindings = useCallback(async (): Promise<void> => {
+    if (connection.phase !== "ready") return;
+    const { context } = connection;
+    const contextBindings = await canaryApi.listRunnerContextBindings(context.workspaceRef, context.project.projectRef);
+    setConnection({ phase: "ready", context: { ...context, contextBindings } });
   }, [connection]);
 
   useEffect(() => {
@@ -142,8 +153,35 @@ export default function Dashboard() {
     setNotice(null);
     try {
       const environments = await canaryApi.listEnvironments(connection.context.workspaceRef, project.projectRef);
-      setConnection({ phase: "ready", context: { ...connection.context, project, environments } });
+      const contextBindings = await canaryApi.listRunnerContextBindings(connection.context.workspaceRef, project.projectRef);
+      setConnection({ phase: "ready", context: { ...connection.context, project, environments, contextBindings } });
       setApproval(null); setRun(null); setProofChallenge(null); setDisclosurePreview(null);
+    } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
+  }
+
+  async function createContextBinding(): Promise<void> {
+    if (connection.phase !== "ready") return;
+    const environment = connection.context.environments.find((item) => item.environmentId === selectedBindingEnvironment);
+    const runner = connection.context.contextBindings.runners.find((item) => item.runnerId === selectedRunner);
+    if (!environment?.isExecutable || environment.verificationRecordDigest === null || runner === undefined) return;
+    setWorking(true); setNotice(null);
+    try {
+      await canaryApi.createRunnerContextBinding(connection.context.workspaceRef, connection.context.project.projectRef, {
+        environmentId: environment.environmentId, verificationRecordDigest: environment.verificationRecordDigest,
+        runnerId: runner.runnerId, runnerKeyId: runner.runnerKeyId,
+      });
+      await refreshContextBindings();
+      setNotice("Canary access was authorized for this exact paired runner and verified environment.");
+    } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
+  }
+
+  async function revokeContextBinding(bindingId: string): Promise<void> {
+    if (connection.phase !== "ready") return;
+    setWorking(true); setNotice(null);
+    try {
+      await canaryApi.revokeRunnerContextBinding(connection.context.workspaceRef, connection.context.project.projectRef, bindingId);
+      await refreshContextBindings();
+      setNotice("Canary access was revoked. Issued grants and active work were not changed.");
     } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
   }
 
@@ -254,7 +292,12 @@ export default function Dashboard() {
           <label>Proof method<select onChange={(event) => setProofMethod(event.target.value as "https-file" | "dns-txt")} value={proofMethod}><option value="https-file">HTTPS file</option><option value="dns-txt">DNS TXT</option></select></label>
           {proofChallenge ? <><p><code>{proofChallenge.instruction}</code></p><button className="button button-primary" disabled={working} onClick={() => void checkProof()} type="button">Check exact proof</button></> : <button className="button button-primary" disabled={working || !/^https:\/\/[a-z0-9.-]+$/.test(origin.trim())} onClick={() => void startProof()} type="button">Create proof challenge</button>}
         </section> : null}
-        {context && executable && !approval ? <section className="runner-recovery"><p className="canary-kicker">From the paired runner</p><h2>Await the signed rehearsal plan</h2><p>The paired runner submits the immutable plan through its signed context binding. This dashboard never accepts projection file uploads.</p></section> : null}
+        {context && executable && !approval ? <section className="runner-recovery"><p className="canary-kicker">Paired runner authorization</p><h2>Add canary access</h2><p>Authorize one active paired runner for one verified staging or sandbox environment. The runner alone may submit its signed plan; this dashboard never accepts projection file uploads.</p>
+          <label>Verified environment<select disabled={working} onChange={(event) => setSelectedBindingEnvironment(event.target.value)} value={selectedBindingEnvironment}><option value="">Select environment</option>{context.environments.filter((item) => item.isExecutable && item.verificationRecordDigest !== null).map((item) => <option key={item.environmentId} value={item.environmentId}>{item.origin}</option>)}</select></label>
+          <label>Paired runner<select disabled={working} onChange={(event) => setSelectedRunner(event.target.value)} value={selectedRunner}><option value="">Select runner</option>{context.contextBindings.runners.map((item) => <option key={`${item.runnerId}:${item.runnerKeyId}`} value={item.runnerId}>{item.displayName} · {item.fingerprint.slice(0, 12)}</option>)}</select></label>
+          <button className="button button-primary" disabled={working || !selectedBindingEnvironment || !selectedRunner} onClick={() => void createContextBinding()} type="button">Authorize paired runner</button>
+          {context.contextBindings.bindings.length > 0 ? <ul className="context-binding-list">{context.contextBindings.bindings.map((item) => <li key={item.bindingId}><span>{item.origin} · {item.runnerId} · {item.status}</span>{item.status === "active" ? <button disabled={working} onClick={() => void revokeContextBinding(item.bindingId)} type="button">Revoke</button> : null}</li>)}</ul> : null}
+        </section> : null}
       </div>
 
       <aside className="dashboard-rail" aria-label="Rehearsal safety boundaries"><section className="boundary-ledger"><p className="canary-kicker">Always enforced</p><h2>The runner owns target traffic.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Methods</dt><dd>GET + HEAD</dd></div><div><dt>Egress</dt><dd>Staging :443 only</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></section>

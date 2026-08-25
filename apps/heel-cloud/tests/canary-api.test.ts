@@ -16,6 +16,26 @@ const project = "prj_0123456789abcdef0123456789abcdef";
 const run = "crun_0123456789abcdef0123456789abcdef";
 const digest = "a".repeat(64);
 
+it("uses closed create list revoke routes for browser context authorization", async () => {
+  const runner = "runr_0123456789abcdef0123456789abcdef";
+  const binding = "rcb_0123456789abcdef0123456789abcdef";
+  const calls: string[] = [];
+  const api = new CanaryApi({ transport: async (path, init) => {
+    calls.push(`${init.method}:${path}`);
+    if (init.method === "GET") return jsonResponse({ schema_version: "heel.runner-context-binding-dashboard.v1", server_time_ms: 1, runners: [{ runner_id: runner, runner_key_id: "key", display_name: "Runner", fingerprint: digest, runner_version: "1", adapter_versions: [], status: "active" }], bindings: [] });
+    if (String(path).endsWith("/revoke")) return jsonResponse({ schema_version: "heel.runner-context-binding-revoked.v1", binding_id: binding, status: "revoked", revoked_at_ms: 1 });
+    return jsonResponse({ schema_version: "heel.runner-context-binding-created.v1", context_binding: {} }, 201);
+  }});
+  const dashboard = await api.listRunnerContextBindings(workspace, project);
+  await api.createRunnerContextBinding(workspace, project, { environmentId: "env_0123456789abcdef0123456789abcdef", verificationRecordDigest: digest, runnerId: dashboard.runners[0].runnerId, runnerKeyId: "key" });
+  await api.revokeRunnerContextBinding(workspace, project, binding);
+  assert.deepEqual(calls, [
+    `GET:/api/control-plane/v1/workspaces/${workspace}/projects/${project}/runner-context-bindings`,
+    `POST:/api/control-plane/v1/workspaces/${workspace}/projects/${project}/runner-context-bindings`,
+    `POST:/api/control-plane/v1/workspaces/${workspace}/projects/${project}/runner-context-bindings/${binding}/revoke`,
+  ]);
+});
+
 
 function jsonResponse(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
   const body = JSON.stringify(value);

@@ -29,6 +29,17 @@ function request(path: string, headers: Record<string, string>, body = "{}") {
 }
 
 describe("runner edge routes", () => {
+  it("isolates exact context routes on the existing claim proof headers and caps", async () => {
+    const binding = "rcb_0123456789abcdef0123456789abcdef";
+    const headers = { "X-Heel-Runner-Id": runner, "X-Heel-Runner-Key-Id": "key", "X-Heel-Runner-Timestamp-Ms": "1", "X-Heel-Runner-Nonce": "nonce", "X-Heel-Runner-Sequence": "1", "X-Heel-Runner-Signature": "sig" };
+    const fetcher = vi.fn().mockResolvedValue(new Response("{}", { headers: { "Content-Type": "application/json" } }));
+    const listed = await worker.fetch(request(`/api/control-plane/v1/workspaces/${workspace}/runners/${runner}/contexts/list`, headers), env(fetcher), { waitUntil() {}, passThroughOnException() {} });
+    expect(listed.status).toBe(200);
+    const upstream = fetcher.mock.calls[0][0] as Request;
+    expect([...upstream.headers.keys()].sort()).toEqual(["content-encoding", "content-length", "content-type", "x-heel-edge-auth", "x-heel-runner-id", "x-heel-runner-key-id", "x-heel-runner-nonce", "x-heel-runner-sequence", "x-heel-runner-signature", "x-heel-runner-timestamp-ms"]);
+    const oversized = request(`/api/control-plane/v1/workspaces/${workspace}/runners/${runner}/contexts/${binding}/claim`, headers, "x".repeat(257));
+    expect((await worker.fetch(oversized, env(fetcher), { waitUntil() {}, passThroughOnException() {} })).status).toBe(400);
+  });
   it("forwards only the resync proof header subset and raw body", async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response("{}", { headers: { "Content-Type": "application/json" } }));
     const response = await worker.fetch(request(

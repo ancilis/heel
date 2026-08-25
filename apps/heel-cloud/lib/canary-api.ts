@@ -86,6 +86,13 @@ export interface RunnerContextBindingRecord {
   runnerId: string; runnerKeyId: string; status: "active" | "revoked" | "expired";
   issuedAtMs: number; expiresAtMs: number; firstClaimedAtMs: number | null;
 }
+export interface RunnerContextRunner {
+  runnerId: string; runnerKeyId: string; displayName: string; fingerprint: string;
+  runnerVersion: string; adapterVersions: readonly string[]; status: "active";
+}
+export interface RunnerContextBindingDashboard {
+  runners: readonly RunnerContextRunner[]; bindings: readonly RunnerContextBindingRecord[];
+}
 
 export interface VerifiedEnvironmentRecord {
   schemaVersion: "VerifiedEnvironment.v1";
@@ -556,12 +563,12 @@ export class CanaryApi {
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
-  async listRunnerContextBindings(workspaceRef: string, projectRef: string): Promise<readonly RunnerContextBindingRecord[]> {
+  async listRunnerContextBindings(workspaceRef: string, projectRef: string): Promise<RunnerContextBindingDashboard> {
     const value = await this.#json(projectPath(workspaceRef, projectRef, "/runner-context-bindings"), "GET", undefined, 200);
     if (!exact(value, ["schema_version", "server_time_ms", "runners", "bindings"])
       || value.schema_version !== "heel.runner-context-binding-dashboard.v1" || !integer(value.server_time_ms)
       || !Array.isArray(value.runners) || !Array.isArray(value.bindings)) invalidResponse();
-    return deepFreeze(value.bindings.map((item): RunnerContextBindingRecord => {
+    const bindings = value.bindings.map((item): RunnerContextBindingRecord => {
       if (!exact(item, ["binding_id", "binding_digest", "environment_id", "origin", "environment_class", "verification_record_digest", "runner_id", "runner_key_id", "status", "issued_at_ms", "expires_at_ms", "first_claimed_at_ms"])
         || typeof item.binding_id !== "string" || !/^rcb_[0-9a-f]{32}$/.test(item.binding_id)
         || !digest(item.binding_digest) || !ENVIRONMENT_REF.test(String(item.environment_id))
@@ -574,7 +581,16 @@ export class CanaryApi {
         verificationRecordDigest: item.verification_record_digest, runnerId: item.runner_id,
         runnerKeyId: item.runner_key_id, status: item.status as "active" | "revoked" | "expired",
         issuedAtMs: item.issued_at_ms, expiresAtMs: item.expires_at_ms, firstClaimedAtMs: item.first_claimed_at_ms };
-    }));
+    });
+    const runners = value.runners.map((item): RunnerContextRunner => {
+      if (!exact(item, ["runner_id", "runner_key_id", "display_name", "fingerprint", "runner_version", "adapter_versions", "status"])
+        || !identifier(item.runner_id) || !identifier(item.runner_key_id) || !closedString(item.display_name, 128)
+        || !digest(item.fingerprint) || !identifier(item.runner_version) || !sortedUniqueStrings(item.adapter_versions)
+        || item.status !== "active") invalidResponse();
+      return { runnerId: item.runner_id, runnerKeyId: item.runner_key_id, displayName: item.display_name,
+        fingerprint: item.fingerprint, runnerVersion: item.runner_version, adapterVersions: item.adapter_versions, status: "active" };
+    });
+    return deepFreeze({ runners, bindings });
   }
 
   async createRunnerContextBinding(workspaceRef: string, projectRef: string, input: { environmentId: string; verificationRecordDigest: string; runnerId: string; runnerKeyId: string }): Promise<void> {
