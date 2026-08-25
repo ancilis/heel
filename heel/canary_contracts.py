@@ -115,17 +115,17 @@ def parse_json(raw: bytes, *, max_bytes: int) -> Any:
                            parse_float=lambda _: _fail("floating point is forbidden"))
     except ContractError:
         raise
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
         _fail("invalid JSON")
     return _normalize(value)
 
 
 def canonical_bytes(value: Any) -> bytes:
-    normalized = _normalize(value)
     try:
+        normalized = _normalize(value)
         return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
                           allow_nan=False).encode("utf-8")
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         _fail("not canonical JSON")
 
 
@@ -300,7 +300,7 @@ def _budgets(value: Any) -> dict[str, Any]:
         _fail("concurrency must be one")
     _integer(obj["action_timeout_ms"], lower=1, upper=5000)
     _integer(obj["wall_timeout_ms"], lower=1, upper=60000)
-    _integer(obj["maximum_response_bytes"], lower=1)
+    _integer(obj["maximum_response_bytes"], lower=1, upper=256 * 1024)
     return obj
 
 
@@ -367,8 +367,9 @@ def validate_test_manifest(value: Any) -> dict[str, Any]:
     for ordinal, action in enumerate(actions):
         action = _object(action, {"ordinal", "scenario_id", "adapter_version", "method", "route_template", "fixture_bindings", "semantic_auth_role", "auth_profile", "assertion_class", "allowed_status_codes", "allowed_body_shapes", "side_effect_class"})
         if _integer(action["ordinal"]) != ordinal: _fail("non-contiguous ordinal")
+        _id_fields(action, ("scenario_id", "adapter_version", "semantic_auth_role"))
         if (action["scenario_id"], action["adapter_version"]) not in scenario_ids: _fail("unknown action scenario")
-        _id_fields(action, ("scenario_id", "adapter_version", "semantic_auth_role")); _method(action["method"]); _route(action["route_template"])
+        _method(action["method"]); _route(action["route_template"])
         bindings = _list(action["fixture_bindings"], maximum=20)
         for binding in bindings:
             binding = _object(binding, {"parameter_name", "fixture_id"}); _id_fields(binding, ("parameter_name", "fixture_id"))
@@ -397,9 +398,13 @@ def validate_approval_projection(value: Any) -> dict[str, Any]:
     actions = _list(obj["actions"], maximum=20)
     for ordinal, action in enumerate(actions):
         action = _object(action, {"ordinal", "scenario_id", "adapter_version", "method", "route_template", "semantic_auth_role", "assertion_class", "allowed_status_codes", "allowed_body_shapes", "side_effect_class"})
-        if _integer(action["ordinal"]) != ordinal or (action["scenario_id"], action["adapter_version"]) not in scenario_ids: _fail("invalid action ordering")
-        _id_fields(action, ("scenario_id", "adapter_version", "semantic_auth_role")); _method(action["method"]); _route(action["route_template"]); _enum(action["assertion_class"], {"anonymous_authenticated", "object_ownership", "role_boundary", "plan_entitlement"}); _statuses(action["allowed_status_codes"]); _body_shapes(action["allowed_body_shapes"]); _enum(action["side_effect_class"], {"read_only"})
-    _budgets(obj["budgets"]); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["compiled_at_ms"], lower=0); _hash(obj["manifest_digest"]); _signature(obj, "projection_digest")
+        if _integer(action["ordinal"]) != ordinal: _fail("invalid action ordering")
+        _id_fields(action, ("scenario_id", "adapter_version", "semantic_auth_role"))
+        if (action["scenario_id"], action["adapter_version"]) not in scenario_ids: _fail("invalid action ordering")
+        _method(action["method"]); _route(action["route_template"]); _enum(action["assertion_class"], {"anonymous_authenticated", "object_ownership", "role_boundary", "plan_entitlement"}); _statuses(action["allowed_status_codes"]); _body_shapes(action["allowed_body_shapes"]); _enum(action["side_effect_class"], {"read_only"})
+    _budgets(obj["budgets"]); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["compiled_at_ms"], lower=0); _hash(obj["manifest_digest"])
+    if obj["signing_key_id"] != runner["runner_key_id"]: _fail("approval signing key mismatch")
+    _signature(obj, "projection_digest")
     return copy.deepcopy(obj)
 
 
@@ -463,7 +468,7 @@ def validate_operational_run(value: Any) -> dict[str, Any]:
     if terminal != (timestamps["terminal_at_ms"] is not None): _fail("terminal timestamp consistency")
     claimed = timestamps["claimed_at_ms"]; started = timestamps["started_at_ms"]
     stop_requested = timestamps["stop_requested_at_ms"]; stop_acknowledged = timestamps["stop_acknowledged_at_ms"]
-    updated = timestamps["updated_at_ms"]; terminal_at = timestamps["terminal_at_ms"]
+    updated = _integer(timestamps["updated_at_ms"], lower=0); terminal_at = timestamps["terminal_at_ms"]
     if started is not None and (claimed is None or claimed > started): _fail("invalid claim/start ordering")
     if stop_acknowledged is not None and (stop_requested is None or stop_requested > stop_acknowledged): _fail("invalid stop ordering")
     if terminal_at is not None:
@@ -497,8 +502,9 @@ def validate_canary_findings(value: Any) -> dict[str, Any]:
     for ordinal, item in enumerate(entries):
         item = _object(item, {"ordinal", "scenario_id", "adapter_version", "assessment_outcome", "route", "observations", "finding", "containment_codes", "redaction_count", "local_evidence_refs"})
         if _integer(item["ordinal"]) != ordinal: _fail("non-contiguous ordinal")
+        _id_fields(item, ("scenario_id", "adapter_version"))
         if item["scenario_id"] in seen: _fail("duplicate scenario result")
-        seen.add(item["scenario_id"]); _id_fields(item, ("scenario_id", "adapter_version")); _enum(item["assessment_outcome"], {"blocked", "observed", "inconclusive"}); route = _object(item["route"], {"method", "route_template"}); _method(route["method"]); _route(route["route_template"])
+        seen.add(item["scenario_id"]); _enum(item["assessment_outcome"], {"blocked", "observed", "inconclusive"}); route = _object(item["route"], {"method", "route_template"}); _method(route["method"]); _route(route["route_template"])
         observations = _list(item["observations"], maximum=20)
         for observation in observations:
             observation = _object(observation, {"semantic_role", "status_code", "body_shape", "truncation_state"}); _id_fields(observation, ("semantic_role",)); _integer(observation["status_code"], lower=100, upper=599); _enum(observation["body_shape"], {"absent", "empty", "json_object", "json_array", "json_scalar", "text", "binary", "truncated", "invalid"}); _enum(observation["truncation_state"], {"complete", "truncated"})

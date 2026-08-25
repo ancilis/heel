@@ -36,7 +36,7 @@ KEY = base64.b64encode(bytes(range(32))).decode("ascii")
 SIG = base64.b64encode(bytes(range(64))).decode("ascii")
 FIXTURES = Path(__file__).resolve().parent / "fixtures/canary/contracts"
 FIXTURE_HASHES = {
-    "approval-projection.v1.json": "608ae3c173168bcd5830e50f85a9cd4860951c6c915d9f244c76a34a24085a7b",
+    "approval-projection.v1.json": "61a25796ebdb3976694ff4bfe502a7fa47294b5015add279689e1dc400564f89",
     "operational-run.v1.json": "9a81fb52d1bfd30cef67c6a6a01a856530a64da4793bc7c5cdaa2db4afc04056",
     "canary-findings.v1.json": "743be795e6212d90af54ea2864d19a0361ae8b3f4131bc86b7c9e0f79d4eecdd",
 }
@@ -92,7 +92,7 @@ def approval() -> dict:
         "compiler": {"compiler_version": "1", "engine_version": "1"}, "scenarios": [{"ordinal": 0, "scenario_id": "s", "adapter_version": "1"}],
         "actions": [{"ordinal": 0, "scenario_id": "s", "adapter_version": "1", "method": "GET", "route_template": "/safe", "semantic_auth_role": "anonymous", "assertion_class": "anonymous_authenticated", "allowed_status_codes": [200], "allowed_body_shapes": ["absent"], "side_effect_class": "read_only"}],
         "budgets": budgets(), "egress": egress(), "retry_policy": retry(), "compiled_at_ms": 1, "manifest_digest": HASH,
-        "projection_digest": HASH, "signing_key_id": "key", "signature_b64": SIG,
+        "projection_digest": HASH, "signing_key_id": "rk", "signature_b64": SIG,
     }
     return _digest(value, "projection_digest")
 
@@ -333,3 +333,43 @@ class CanaryContractTests(unittest.TestCase):
         for validator, record, digest in cases:
             with self.subTest(validator=validator.__name__):
                 with self.assertRaises(ContractError): validator(_digest(record, digest))
+
+    def test_public_contract_entrypoints_never_leak_recursion_or_type_errors(self):
+        raw = b"[" * 10_000 + b"0" + b"]" * 10_000
+        with self.assertRaises(ContractError): parse_json(raw, max_bytes=64 * 1024)
+        cases = []
+        record = manifest(); record["actions"][0]["scenario_id"] = []; cases.append((validate_test_manifest, record, "manifest_digest"))
+        record = approval(); record["actions"][0]["scenario_id"] = []; cases.append((validate_approval_projection, record, "projection_digest"))
+        record = findings(); record["scenario_results"][0]["scenario_id"] = []; cases.append((validate_canary_findings, record, "projection_digest"))
+        record = identity(); record["runner_id"] = []; cases.append((validate_runner_identity, record, "identity_digest"))
+        record = grant(); record["approval"]["projection_id"] = []; cases.append((validate_execution_grant, record, "grant_digest"))
+        record = operational(); record["run_id"] = []; cases.append((validate_operational_run, record, "projection_digest"))
+        record = permit(); record["runner_binding"]["runner_id"] = []; cases.append((validate_disclosure_permit, record, "permit_digest"))
+        for validator, record, digest in cases:
+            with self.subTest(validator=validator.__name__):
+                with self.assertRaises(ContractError): validator(_digest(record, digest))
+
+    def test_updated_timestamp_is_required_for_every_lifecycle_phase(self):
+        valid = {
+            "prepared": {}, "awaiting_execution_approval": {}, "approved": {},
+            "claimed": {"claimed_at_ms": 1}, "running": {"claimed_at_ms": 1, "started_at_ms": 2},
+            "stop_requested": {"claimed_at_ms": 1, "started_at_ms": 2, "stop_requested_at_ms": 3},
+            "finalizing": {"claimed_at_ms": 1, "started_at_ms": 2},
+            "terminal": {"claimed_at_ms": 1, "started_at_ms": 2, "terminal_at_ms": 3},
+            "cancelled": {}, "expired": {},
+        }
+        for phase, timestamps in valid.items():
+            record = operational(); record["lifecycle_phase"] = phase; record["execution_disposition"] = "completed" if phase == "terminal" else None
+            record["timestamps"].update(timestamps); record["timestamps"]["updated_at_ms"] = None
+            with self.subTest(phase=phase):
+                with self.assertRaises(ContractError): validate_operational_run(_digest(record, "projection_digest"))
+
+    def test_response_budget_and_approval_signing_key_binding_are_frozen(self):
+        for builder, validator, digest in ((manifest, validate_test_manifest, "manifest_digest"), (approval, validate_approval_projection, "projection_digest"), (grant, validate_execution_grant, "grant_digest")):
+            record = builder(); record["budgets"]["maximum_response_bytes"] = 262144
+            with self.subTest(builder=builder.__name__, boundary=True): validator(_digest(record, digest))
+            record["budgets"]["maximum_response_bytes"] = 262145
+            with self.subTest(builder=builder.__name__, boundary=False):
+                with self.assertRaises(ContractError): validator(_digest(record, digest))
+        record = approval(); record["signing_key_id"] = "other"
+        with self.assertRaises(ContractError): validate_approval_projection(_digest(record, "projection_digest"))
