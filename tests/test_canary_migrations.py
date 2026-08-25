@@ -30,7 +30,7 @@ class CanaryMigrationTests(unittest.TestCase):
         )
 
     def test_migration_six_creates_tenant_bound_unique_tables(self):
-        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 13)
+        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 14)
         tables = (
             "canary_environments", "canary_runners", "canary_runner_keys",
             "canary_consumed_nonces", "canary_approval_projections",
@@ -114,7 +114,7 @@ class CanaryMigrationTests(unittest.TestCase):
         ledger("runner_heartbeat:run", 2, "runner_heartbeat", "/v1/workspaces/ws/runners/runner/runs/run/stop-ack")
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14])
         self.assertEqual([tuple(row) for row in conn.execute(
             "SELECT chain_name,next_sequence,generation FROM canary_runner_chain_cursors ORDER BY chain_name"
         )], [("heartbeat:run", 2, 0), ("progress:run", 3, 0), ("stop-ack:run", 3, 0)])
@@ -137,6 +137,39 @@ class CanaryMigrationTests(unittest.TestCase):
         self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 12)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM canary_runner_nonce_chains").fetchone()[0], 2)
 
+    def test_migration_thirteen_upgrades_populated_v12_resync_challenges_with_foreign_keys_on(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        self.addCleanup(conn.close)
+        Migrator(conn, CONTROL_PLANE_MIGRATIONS[:12]).apply_all()
+        conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+        conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+        conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", 1))
+        for index, status in enumerate(("pending", "completed", "invalidated"), 1):
+            chain = f"progress:run-{index}"
+            conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", ("ws", "runner", chain, index, 0, 1))
+            conn.execute(
+                "INSERT INTO canary_runner_resync_challenges VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (f"rrs_{index:032x}", "ws", "runner", chain, "a" * 64, "b" * 64,
+                 "c" * 64, "client-cipher", "server-cipher", status, 1, 2,
+                 "completed-cipher" if status == "completed" else None,
+                 "d" * 64 if status == "completed" else None,
+                 1.5 if status == "completed" else None),
+            )
+        conn.commit()
+
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 14)
+        self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(
+            [tuple(row) for row in conn.execute(
+                "SELECT challenge_id,status,challenge_generation,result_generation "
+                "FROM canary_runner_resync_challenges ORDER BY challenge_id"
+            )],
+            [(f"rrs_{index:032x}", "invalidated", 0, None) for index in range(1, 4)],
+        )
+
     def test_migration_thirteen_runner_constraints_reject_hostile_rows(self):
         self.seed_root("ws", "prj")
         self.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", 1))
@@ -145,6 +178,75 @@ class CanaryMigrationTests(unittest.TestCase):
         self.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", ("ws", "runner", "claim", 1, 0, 1))
         with self.assertRaises(sqlite3.IntegrityError):
             self.conn.execute("INSERT INTO canary_runner_request_ledger(workspace_id,runner_id,chain_name,sequence,generation,request_digest,response_json,next_nonce,created_at,nonce_hash,key_id,capability,method,path,timestamp_ms,signed_request_digest,body_digest,response_ciphertext,next_nonce_ciphertext) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ws", "runner", "claim", 1, 0, "a" * 64, "sealed", "b" * 64, 1, "c" * 64, "key", "runner_claim", "POST", "/claim", 1, "d" * 64, "e" * 64, None, "cipher"))
+
+    def test_migration_fourteen_quarantines_archive_derived_active_rows_without_touching_exact_rows(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        self.addCleanup(conn.close)
+        Migrator(conn, CONTROL_PLANE_MIGRATIONS[:12]).apply_all()
+        conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+        conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+        conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", 1))
+        values = ("a" * 64, "sealed", "opaque", 1, "b" * 64, "key",
+                  "runner_progress", "POST", 1, "c" * 64, "d" * 64, "cipher", "nonce-cipher")
+        for chain, run_id in (("evil:run", "run"), ("progress:real", "real")):
+            path = f"/v1/workspaces/ws/runners/runner/runs/{run_id}/progress"
+            conn.execute(
+                "INSERT INTO canary_runner_request_ledger VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("ws", "runner", chain, 1, values[0], values[1], values[2], values[3],
+                 values[4], values[5], values[6], values[7], path, values[8], values[9],
+                 values[10], values[11], values[12]),
+            )
+        conn.commit()
+
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14])
+        self.assertEqual(
+            [tuple(row) for row in conn.execute("SELECT chain_name,sequence FROM canary_runner_request_ledger")],
+            [("progress:real", 1)],
+        )
+        self.assertEqual(
+            [tuple(row) for row in conn.execute("SELECT chain_name FROM canary_runner_chain_cursors")],
+            [("progress:real",)],
+        )
+        self.assertEqual(
+            [tuple(row) for row in conn.execute("SELECT legacy_chain_name,archive_reason FROM canary_runner_request_ledger_archive")],
+            [("evil:run", "path_chain_mismatch")],
+        )
+
+    def test_migration_fourteen_runner_constraints_reject_hostile_chain_display_and_challenge_rows(self):
+        self.seed_root("ws", "prj")
+        self.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", 1))
+        pairing = "INSERT INTO canary_runner_pairings(pairing_id,workspace_id,runner_id,invitation_hash,status,created_at,expires_at,display_name) VALUES(?,?,?,?,?,?,?,?)"
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(pairing, ("pair-tab", "ws", "", "a" * 64, "invited", 1, 2, "\tbad"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(pairing, ("pair-null", "ws", "", "b" * 64, "invited", 1, 2, None))
+        for index, chain in enumerate(("progress:a/b", "result:" + "a" * 129), 1):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", ("ws", "runner", chain, 1, 0, index))
+        self.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", ("ws", "runner", "progress:run", 1, 0, 1))
+        challenge = "INSERT INTO canary_runner_resync_challenges(challenge_id,workspace_id,runner_id,chain_name,client_nonce_hash,server_challenge_hash,signed_digest,client_nonce_ciphertext,server_challenge_ciphertext,challenge_generation,result_generation,status,created_at,expires_at,completed_response_ciphertext,complete_signed_digest,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(challenge, ("rrs_" + "1" * 32, "ws", "runner", "progress:run", "a" * 64, "b" * 64, "c" * 64, "client", "server", 0, None, "pending", 1, 62, None, None, None))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(challenge, ("rrs_" + "2" * 32, "ws", "runner", "progress:run", "a" * 64, "b" * 64, "c" * 64, "client", "server", 0, 1, "invalidated", 1, 2, "completed", "d" * 64, 1.5))
+
+    def test_runner_startup_rejects_non_nfc_or_category_c_persisted_display_names(self):
+        from heel.saas.runner_auth import validate_runner_auth_schema
+
+        self.seed_root("ws", "prj")
+        self.conn.execute(
+            "INSERT INTO canary_runner_pairings(pairing_id,workspace_id,runner_id,invitation_hash,status,created_at,expires_at,display_name) VALUES(?,?,?,?,?,?,?,?)",
+            ("pair", "ws", "runner", "a" * 64, "activated", 1, 2, "Cafe\u0301"),
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(RuntimeError, "display name"):
+            validate_runner_auth_schema(self.conn)
+        self.conn.execute("UPDATE canary_runner_pairings SET display_name=? WHERE pairing_id='pair'", ("A\u200dB",))
+        self.conn.commit()
+        with self.assertRaisesRegex(RuntimeError, "display name"):
+            validate_runner_auth_schema(self.conn)
 
     def test_direct_control_plane_runtime_uses_final_runner_foreign_keys(self):
         from heel.saas.http_api import ControlPlane
@@ -266,8 +368,8 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
         conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
         conn.commit()
-        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13])
-        self.assertEqual(migration.current_version(), 13)
+        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14])
+        self.assertEqual(migration.current_version(), 14)
         self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):

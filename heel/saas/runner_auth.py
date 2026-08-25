@@ -278,9 +278,9 @@ SELECT r.challenge_id,r.workspace_id,r.runner_id,r.chain_name,r.client_nonce_has
 FROM canary_runner_resync_challenges_v12 r JOIN canary_runner_chain_cursors c ON c.workspace_id=r.workspace_id AND c.runner_id=r.runner_id AND c.chain_name=r.chain_name;
 
 DROP TABLE canary_runner_nonce_chains_v12;
+DROP TABLE canary_runner_resync_challenges_v12;
 DROP TABLE canary_runner_chain_cursors_v12;
 DROP TABLE canary_runner_request_ledger_v12;
-DROP TABLE canary_runner_resync_challenges_v12;
 DROP INDEX IF EXISTS idx_canary_runner_resync_expiry;
 DROP INDEX IF EXISTS idx_canary_runner_resync_rate;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runner_key_triple ON canary_runner_keys(workspace_id,runner_id,key_id);
@@ -290,6 +290,215 @@ CREATE INDEX idx_canary_runner_nonce_expiry ON canary_runner_nonce_chains(expire
 CREATE INDEX idx_canary_runner_resync_status_expiry ON canary_runner_resync_challenges(status,expires_at);
 CREATE INDEX idx_canary_runner_resync_rate ON canary_runner_resync_challenges(workspace_id,runner_id,created_at);
 CREATE UNIQUE INDEX idx_canary_runner_resync_pending ON canary_runner_resync_challenges(workspace_id,runner_id,chain_name) WHERE status='pending';
+"""
+
+# Migration fourteen removes the narrow class of v13 rows whose legacy evidence was both
+# archived and accidentally promoted, then rebuilds the externally writable state tables with
+# their final closed shapes.  Quarantine tables exist only inside the migration transaction.
+RUNNER_AUTH_FINALIZATION_MIGRATION = """
+CREATE TABLE canary_runner_quarantine_rows_v14(
+ workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
+ sequence INTEGER NOT NULL, generation INTEGER NOT NULL, created_at REAL NOT NULL,
+ PRIMARY KEY(workspace_id,runner_id,chain_name,sequence,generation));
+INSERT INTO canary_runner_quarantine_rows_v14
+SELECT l.workspace_id,l.runner_id,l.chain_name,l.sequence,l.generation,l.created_at
+FROM canary_runner_request_ledger l
+WHERE NOT (
+ l.chain_name='claim' AND l.capability='runner_claim'
+  AND l.path='/v1/workspaces/'||l.workspace_id||'/runners/'||l.runner_id||'/claim'
+ OR substr(l.chain_name,1,10)='heartbeat:' AND l.capability='runner_heartbeat'
+  AND l.path='/v1/workspaces/'||l.workspace_id||'/runners/'||l.runner_id||'/runs/'||substr(l.chain_name,11)||'/heartbeat'
+ OR substr(l.chain_name,1,9)='progress:' AND l.capability='runner_progress'
+  AND l.path='/v1/workspaces/'||l.workspace_id||'/runners/'||l.runner_id||'/runs/'||substr(l.chain_name,10)||'/progress'
+ OR substr(l.chain_name,1,7)='result:' AND l.capability='runner_result'
+  AND l.path='/v1/workspaces/'||l.workspace_id||'/runners/'||l.runner_id||'/runs/'||substr(l.chain_name,8)||'/result'
+ OR substr(l.chain_name,1,9)='stop-ack:' AND l.capability='runner_heartbeat'
+  AND l.path='/v1/workspaces/'||l.workspace_id||'/runners/'||l.runner_id||'/runs/'||substr(l.chain_name,10)||'/stop-ack'
+)
+OR EXISTS (
+ SELECT 1 FROM canary_runner_request_ledger_archive a
+ WHERE a.workspace_id=l.workspace_id AND a.runner_id=l.runner_id
+  AND a.sequence=l.sequence AND a.path=l.path AND a.capability=l.capability
+  AND (
+   substr(l.chain_name,1,10)='heartbeat:' AND substr(a.legacy_chain_name,instr(a.legacy_chain_name,':')+1)=substr(l.chain_name,11)
+    AND a.legacy_chain_name NOT IN ('heartbeat:'||substr(l.chain_name,11),'runner_heartbeat:'||substr(l.chain_name,11))
+   OR substr(l.chain_name,1,9)='progress:' AND substr(a.legacy_chain_name,instr(a.legacy_chain_name,':')+1)=substr(l.chain_name,10)
+    AND a.legacy_chain_name NOT IN ('progress:'||substr(l.chain_name,10),'runner_progress:'||substr(l.chain_name,10))
+   OR substr(l.chain_name,1,7)='result:' AND substr(a.legacy_chain_name,instr(a.legacy_chain_name,':')+1)=substr(l.chain_name,8)
+    AND a.legacy_chain_name NOT IN ('result:'||substr(l.chain_name,8),'runner_result:'||substr(l.chain_name,8))
+   OR substr(l.chain_name,1,9)='stop-ack:' AND substr(a.legacy_chain_name,instr(a.legacy_chain_name,':')+1)=substr(l.chain_name,10)
+    AND a.legacy_chain_name NOT IN ('stop-ack:'||substr(l.chain_name,10),'runner_heartbeat:'||substr(l.chain_name,10))
+  )
+);
+INSERT INTO canary_runner_request_ledger_archive(
+ workspace_id,runner_id,legacy_chain_name,sequence,request_digest,response_json,next_nonce,created_at,
+ nonce_hash,key_id,capability,method,path,timestamp_ms,signed_request_digest,body_digest,
+ response_ciphertext,next_nonce_ciphertext,archive_reason)
+SELECT l.workspace_id,l.runner_id,l.chain_name,l.sequence,l.request_digest,l.response_json,l.next_nonce,l.created_at,
+ l.nonce_hash,l.key_id,l.capability,l.method,l.path,l.timestamp_ms,l.signed_request_digest,l.body_digest,
+ l.response_ciphertext,l.next_nonce_ciphertext,'path_chain_mismatch'
+FROM canary_runner_request_ledger l
+JOIN canary_runner_quarantine_rows_v14 q
+ ON q.workspace_id=l.workspace_id AND q.runner_id=l.runner_id AND q.chain_name=l.chain_name
+ AND q.sequence=l.sequence AND q.generation=l.generation
+WHERE NOT (
+ l.chain_name='claim' AND l.capability='runner_claim'
+  AND l.path='/v1/workspaces/'||l.workspace_id||'/runners/'||l.runner_id||'/claim'
+ OR substr(l.chain_name,1,10)='heartbeat:' AND l.capability='runner_heartbeat'
+  AND l.path='/v1/workspaces/'||l.workspace_id||'/runners/'||l.runner_id||'/runs/'||substr(l.chain_name,11)||'/heartbeat'
+ OR substr(l.chain_name,1,9)='progress:' AND l.capability='runner_progress'
+  AND l.path='/v1/workspaces/'||l.workspace_id||'/runners/'||l.runner_id||'/runs/'||substr(l.chain_name,10)||'/progress'
+ OR substr(l.chain_name,1,7)='result:' AND l.capability='runner_result'
+  AND l.path='/v1/workspaces/'||l.workspace_id||'/runners/'||l.runner_id||'/runs/'||substr(l.chain_name,8)||'/result'
+ OR substr(l.chain_name,1,9)='stop-ack:' AND l.capability='runner_heartbeat'
+  AND l.path='/v1/workspaces/'||l.workspace_id||'/runners/'||l.runner_id||'/runs/'||substr(l.chain_name,10)||'/stop-ack'
+);
+DELETE FROM canary_runner_request_ledger
+WHERE EXISTS (
+ SELECT 1 FROM canary_runner_quarantine_rows_v14 q
+ WHERE q.workspace_id=canary_runner_request_ledger.workspace_id
+  AND q.runner_id=canary_runner_request_ledger.runner_id
+  AND q.chain_name=canary_runner_request_ledger.chain_name
+  AND q.sequence=canary_runner_request_ledger.sequence
+  AND q.generation=canary_runner_request_ledger.generation);
+
+ALTER TABLE canary_runner_pairings RENAME TO canary_runner_pairings_v13;
+CREATE TABLE canary_runner_pairings(
+  pairing_id TEXT PRIMARY KEY CHECK(length(pairing_id) BETWEEN 1 AND 128),
+  workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+  invitation_hash TEXT NOT NULL UNIQUE CHECK(length(invitation_hash)=64 AND invitation_hash NOT GLOB '*[^0-9a-f]*'),
+  phrase TEXT, public_key TEXT, fingerprint TEXT, key_id TEXT, runner_version TEXT,
+  adapters_json TEXT, activation_challenge TEXT,
+  status TEXT NOT NULL CHECK(status IN ('invited','pending','approved','activated','expired')),
+  created_at REAL NOT NULL, expires_at REAL NOT NULL, approved_at REAL, activated_at REAL, approved_by TEXT,
+  display_name TEXT CHECK(
+   display_name IS NULL AND status='expired' OR
+   display_name IS NOT NULL AND length(display_name) BETWEEN 1 AND 64
+    AND length(CAST(display_name AS BLOB))<=128 AND instr(display_name,char(0))=0
+    AND unicode(substr(display_name,1,1)) NOT IN (9,10,11,12,13,32)
+    AND unicode(substr(display_name,length(display_name),1)) NOT IN (9,10,11,12,13,32)),
+  UNIQUE(workspace_id, runner_id), FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id));
+INSERT INTO canary_runner_pairings
+SELECT pairing_id,workspace_id,runner_id,invitation_hash,phrase,public_key,fingerprint,key_id,
+ runner_version,adapters_json,activation_challenge,status,created_at,expires_at,approved_at,
+ activated_at,approved_by,CASE WHEN display_name IS NULL AND status!='expired' THEN 'Pending runner' ELSE display_name END
+FROM canary_runner_pairings_v13;
+DROP TABLE canary_runner_pairings_v13;
+
+ALTER TABLE canary_runner_resync_challenges RENAME TO canary_runner_resync_challenges_v13;
+ALTER TABLE canary_runner_request_ledger RENAME TO canary_runner_request_ledger_v13;
+ALTER TABLE canary_runner_chain_cursors RENAME TO canary_runner_chain_cursors_v13;
+CREATE TABLE canary_runner_chain_cursors(
+ workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+ chain_name TEXT NOT NULL CHECK(
+  chain_name='claim' OR (
+   substr(chain_name,1,instr(chain_name,':')) IN ('heartbeat:','progress:','result:','stop-ack:')
+   AND length(CAST(substr(chain_name,instr(chain_name,':')+1) AS BLOB)) BETWEEN 1 AND 128
+   AND substr(chain_name,instr(chain_name,':')+1) NOT GLOB '*[^A-Za-z0-9_-]*')),
+ next_sequence INTEGER NOT NULL CHECK(next_sequence>=1),
+ generation INTEGER NOT NULL CHECK(generation>=0), updated_at REAL NOT NULL,
+ PRIMARY KEY(workspace_id,runner_id,chain_name),
+ FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+INSERT INTO canary_runner_chain_cursors
+SELECT c.* FROM canary_runner_chain_cursors_v13 c
+WHERE NOT (
+ EXISTS (SELECT 1 FROM canary_runner_quarantine_rows_v14 q
+  WHERE q.workspace_id=c.workspace_id AND q.runner_id=c.runner_id AND q.chain_name=c.chain_name)
+ AND NOT EXISTS (SELECT 1 FROM canary_runner_request_ledger_v13 l
+  WHERE l.workspace_id=c.workspace_id AND l.runner_id=c.runner_id AND l.chain_name=c.chain_name)
+ AND NOT EXISTS (SELECT 1 FROM canary_runner_nonce_chains n
+  WHERE n.workspace_id=c.workspace_id AND n.runner_id=c.runner_id AND n.chain_name=c.chain_name)
+ AND NOT EXISTS (SELECT 1 FROM canary_runner_resync_challenges_v13 r
+  WHERE r.workspace_id=c.workspace_id AND r.runner_id=c.runner_id AND r.chain_name=c.chain_name
+   AND r.status IN ('pending','completed'))
+ AND c.next_sequence=(SELECT max(q.sequence)+1 FROM canary_runner_quarantine_rows_v14 q
+  WHERE q.workspace_id=c.workspace_id AND q.runner_id=c.runner_id AND q.chain_name=c.chain_name)
+ AND c.updated_at=(SELECT max(q.created_at) FROM canary_runner_quarantine_rows_v14 q
+  WHERE q.workspace_id=c.workspace_id AND q.runner_id=c.runner_id AND q.chain_name=c.chain_name)
+);
+
+CREATE TABLE canary_runner_request_ledger(
+  workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+  chain_name TEXT NOT NULL CHECK(
+   chain_name='claim' OR (
+    substr(chain_name,1,instr(chain_name,':')) IN ('heartbeat:','progress:','result:','stop-ack:')
+    AND length(CAST(substr(chain_name,instr(chain_name,':')+1) AS BLOB)) BETWEEN 1 AND 128
+    AND substr(chain_name,instr(chain_name,':')+1) NOT GLOB '*[^A-Za-z0-9_-]*')),
+  sequence INTEGER NOT NULL CHECK(sequence>=1), generation INTEGER NOT NULL CHECK(generation>=0),
+  request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+  response_json TEXT NOT NULL, next_nonce TEXT NOT NULL, created_at REAL NOT NULL,
+  nonce_hash TEXT NOT NULL CHECK(length(nonce_hash)=64 AND nonce_hash NOT GLOB '*[^0-9a-f]*'), key_id TEXT NOT NULL,
+  capability TEXT NOT NULL CHECK(capability IN ('runner_claim','runner_heartbeat','runner_progress','runner_result')),
+  method TEXT NOT NULL CHECK(method='POST'), path TEXT NOT NULL, timestamp_ms INTEGER NOT NULL CHECK(timestamp_ms>=0),
+  signed_request_digest TEXT NOT NULL CHECK(length(signed_request_digest)=64 AND signed_request_digest NOT GLOB '*[^0-9a-f]*'),
+  body_digest TEXT NOT NULL CHECK(length(body_digest)=64 AND body_digest NOT GLOB '*[^0-9a-f]*'),
+  response_ciphertext TEXT NOT NULL, next_nonce_ciphertext TEXT NOT NULL,
+  PRIMARY KEY(workspace_id,runner_id,chain_name,sequence,generation),
+  FOREIGN KEY(workspace_id,runner_id,chain_name)
+   REFERENCES canary_runner_chain_cursors(workspace_id,runner_id,chain_name));
+INSERT INTO canary_runner_request_ledger
+SELECT l.* FROM canary_runner_request_ledger_v13 l
+JOIN canary_runner_chain_cursors c
+ ON c.workspace_id=l.workspace_id AND c.runner_id=l.runner_id AND c.chain_name=l.chain_name;
+
+CREATE TABLE canary_runner_resync_challenges(
+ challenge_id TEXT PRIMARY KEY CHECK(
+  length(challenge_id)=36 AND substr(challenge_id,1,4)='rrs_'
+  AND substr(challenge_id,5) NOT GLOB '*[^0-9a-f]*'),
+ workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+ chain_name TEXT NOT NULL CHECK(
+  chain_name='claim' OR (
+   substr(chain_name,1,instr(chain_name,':')) IN ('heartbeat:','progress:','result:','stop-ack:')
+   AND length(CAST(substr(chain_name,instr(chain_name,':')+1) AS BLOB)) BETWEEN 1 AND 128
+   AND substr(chain_name,instr(chain_name,':')+1) NOT GLOB '*[^A-Za-z0-9_-]*')),
+ client_nonce_hash TEXT NOT NULL CHECK(length(client_nonce_hash)=64 AND client_nonce_hash NOT GLOB '*[^0-9a-f]*'),
+ server_challenge_hash TEXT NOT NULL CHECK(length(server_challenge_hash)=64 AND server_challenge_hash NOT GLOB '*[^0-9a-f]*'),
+ signed_digest TEXT NOT NULL CHECK(length(signed_digest)=64 AND signed_digest NOT GLOB '*[^0-9a-f]*'),
+ client_nonce_ciphertext TEXT NOT NULL CHECK(length(CAST(client_nonce_ciphertext AS BLOB)) BETWEEN 1 AND 4096),
+ server_challenge_ciphertext TEXT NOT NULL CHECK(length(CAST(server_challenge_ciphertext AS BLOB)) BETWEEN 1 AND 4096),
+ challenge_generation INTEGER NOT NULL CHECK(challenge_generation>=0),
+ result_generation INTEGER CHECK(result_generation>=1),
+ status TEXT NOT NULL CHECK(status IN ('pending','completed','invalidated')),
+ created_at REAL NOT NULL,
+ expires_at REAL NOT NULL CHECK(created_at<expires_at AND expires_at<=created_at+60),
+ completed_response_ciphertext TEXT CHECK(
+  completed_response_ciphertext IS NULL OR length(CAST(completed_response_ciphertext AS BLOB)) BETWEEN 1 AND 4096),
+ complete_signed_digest TEXT CHECK(
+  complete_signed_digest IS NULL OR (
+   length(complete_signed_digest)=64 AND complete_signed_digest NOT GLOB '*[^0-9a-f]*')),
+ completed_at REAL,
+ CHECK(
+  status IN ('pending','invalidated') AND result_generation IS NULL
+   AND completed_response_ciphertext IS NULL AND complete_signed_digest IS NULL AND completed_at IS NULL
+  OR status='completed' AND result_generation=challenge_generation+1
+   AND completed_response_ciphertext IS NOT NULL AND complete_signed_digest IS NOT NULL AND completed_at IS NOT NULL),
+ FOREIGN KEY(workspace_id,runner_id,chain_name)
+  REFERENCES canary_runner_chain_cursors(workspace_id,runner_id,chain_name));
+INSERT INTO canary_runner_resync_challenges
+SELECT r.challenge_id,r.workspace_id,r.runner_id,r.chain_name,r.client_nonce_hash,
+ r.server_challenge_hash,r.signed_digest,r.client_nonce_ciphertext,r.server_challenge_ciphertext,
+ r.challenge_generation,CASE WHEN r.status='completed' THEN r.result_generation END,r.status,
+ r.created_at,CASE WHEN r.expires_at<=r.created_at THEN r.created_at+1
+  WHEN r.expires_at>r.created_at+60 THEN r.created_at+60 ELSE r.expires_at END,
+ CASE WHEN r.status='completed' THEN r.completed_response_ciphertext END,
+ CASE WHEN r.status='completed' THEN r.complete_signed_digest END,
+ CASE WHEN r.status='completed' THEN r.completed_at END
+FROM canary_runner_resync_challenges_v13 r
+JOIN canary_runner_chain_cursors c
+ ON c.workspace_id=r.workspace_id AND c.runner_id=r.runner_id AND c.chain_name=r.chain_name;
+
+DROP TABLE canary_runner_resync_challenges_v13;
+DROP TABLE canary_runner_request_ledger_v13;
+DROP TABLE canary_runner_chain_cursors_v13;
+DROP TABLE canary_runner_quarantine_rows_v14;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runner_key_triple
+ ON canary_runner_keys(workspace_id,runner_id,key_id);
+CREATE INDEX idx_canary_runner_pairings_expiry ON canary_runner_pairings(expires_at);
+CREATE INDEX idx_canary_runner_ledger_cleanup ON canary_runner_request_ledger(created_at);
+CREATE INDEX idx_canary_runner_resync_status_expiry ON canary_runner_resync_challenges(status,expires_at);
+CREATE INDEX idx_canary_runner_resync_rate ON canary_runner_resync_challenges(workspace_id,runner_id,created_at);
+CREATE UNIQUE INDEX idx_canary_runner_resync_pending
+ ON canary_runner_resync_challenges(workspace_id,runner_id,chain_name) WHERE status='pending';
 """
 
 # A new in-process ControlPlane has no runner-auth rows to preserve.  Build its tables directly
@@ -360,6 +569,7 @@ CREATE INDEX IF NOT EXISTS idx_canary_runner_resync_rate ON canary_runner_resync
 # Fresh local control planes replay the same final rebuild used by durable databases.  This keeps
 # runtime table SQL, foreign keys, and index metadata byte-for-byte aligned with migrations.
 RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_GENERATION_MIGRATION
+RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_FINALIZATION_MIGRATION
 
 
 class RunnerAuthError(PermissionError):
@@ -402,6 +612,18 @@ def _token() -> str:
 WORDS = runner_phrase_words()
 
 
+def _valid_persisted_display_name(value: object) -> bool:
+    return bool(
+        type(value) is str
+        and value
+        and value == unicodedata.normalize("NFC", value)
+        and value == value.strip()
+        and len(value) <= 64
+        and len(value.encode("utf-8")) <= 128
+        and not any(unicodedata.category(char).startswith("C") for char in value)
+    )
+
+
 def _ensure_hardened_ledger_schema(conn: sqlite3.Connection) -> None:
     present = {row[1] for row in conn.execute("PRAGMA table_info(canary_runner_request_ledger)")}
     for statement in RUNNER_AUTH_HARDENING_MIGRATION.strip().split(";"):
@@ -437,7 +659,7 @@ _RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "
 
 
 def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
-    """Read-only exact v12 schema validation; startup must migrate rather than repair."""
+    """Read-only exact final schema/data validation; startup must migrate rather than repair."""
     if not isinstance(conn, sqlite3.Connection):
         raise TypeError("runner authentication requires a SQLite connection")
     expected = sqlite3.connect(":memory:")
@@ -454,6 +676,12 @@ def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
                     raise RuntimeError("runner authentication schema is not current")
         if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise RuntimeError("runner authentication schema has foreign-key violations")
+        for display_name, status in conn.execute("SELECT display_name,status FROM canary_runner_pairings"):
+            if display_name is None:
+                if status != "expired":
+                    raise RuntimeError("runner pairing has an invalid persisted display name")
+            elif not _valid_persisted_display_name(display_name):
+                raise RuntimeError("runner pairing has an invalid persisted display name")
     finally:
         expected.close()
 
@@ -581,8 +809,8 @@ class RunnerAuthStore:
         try:
             self.conn.execute("DELETE FROM canary_runner_pairings WHERE expires_at<?", (instant,))
             self.conn.execute(
-                "INSERT INTO canary_runner_pairings(pairing_id,workspace_id,runner_id,invitation_hash,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?)",
-                ("pending_" + secrets.token_hex(16), workspace_id, "", self._hash("invitation", token), "invited", instant, instant + PAIRING_TTL),
+                "INSERT INTO canary_runner_pairings(pairing_id,workspace_id,runner_id,invitation_hash,status,created_at,expires_at,display_name) VALUES(?,?,?,?,?,?,?,?)",
+                ("pending_" + secrets.token_hex(16), workspace_id, "", self._hash("invitation", token), "invited", instant, instant + PAIRING_TTL, "Pending runner"),
             )
             self.conn.commit()
         except Exception:
@@ -781,7 +1009,7 @@ class RunnerAuthStore:
             raise RunnerAuthError("invalid rotation")
         return row["activation_challenge"]
 
-    def activate_rotation(self, pairing_id: str, signature_b64: str, *, overlap_seconds: int = 300) -> tuple[str, str, str]:
+    def activate_rotation(self, pairing_id: str, signature_b64: str, *, overlap_seconds: int = 300) -> tuple[str, str, str, int, int]:
         if not isinstance(overlap_seconds, int) or not 1 <= overlap_seconds <= 3600:
             raise ValueError("invalid key overlap")
         instant = self._now()
@@ -793,7 +1021,7 @@ class RunnerAuthStore:
             try:
                 signature = base64.b64decode(signature_b64, validate=True)
                 if len(signature) != 64 or _b64(signature) != signature_b64: raise ValueError
-                load_public_key_base64(row["public_key"]).verify(signature, b"heel.runner-rotation-activate.v1\0" + canonical_bytes({"pairing_id": pairing_id, "challenge": row["activation_challenge"]}))
+                load_public_key_base64(row["public_key"]).verify(signature, b"heel.runner-rotation-activate.v2\0" + canonical_bytes({"pairing_id": pairing_id, "challenge": row["activation_challenge"]}))
             except (ValueError, InvalidSignature):
                 raise RunnerAuthError("invalid rotation") from None
             self.conn.execute("UPDATE canary_runner_keys SET status='verification_only',revoked_at=? WHERE workspace_id=? AND runner_id=? AND status='active'", (instant + overlap_seconds, row["workspace_id"], row["runner_id"]))
@@ -802,7 +1030,7 @@ class RunnerAuthStore:
             self.conn.execute("UPDATE canary_runner_chain_cursors SET generation=generation+1,updated_at=? WHERE workspace_id=? AND runner_id=?", (instant, row["workspace_id"], row["runner_id"]))
             self.conn.execute("UPDATE canary_runner_resync_challenges SET status='invalidated' WHERE workspace_id=? AND runner_id=? AND status='pending'", (row["workspace_id"], row["runner_id"]))
             nonce = _token()
-            claim_cursor = self.conn.execute("SELECT next_sequence FROM canary_runner_chain_cursors WHERE workspace_id=? AND runner_id=? AND chain_name='claim'", (row["workspace_id"], row["runner_id"])).fetchone()
+            claim_cursor = self.conn.execute("SELECT next_sequence,generation FROM canary_runner_chain_cursors WHERE workspace_id=? AND runner_id=? AND chain_name='claim'", (row["workspace_id"], row["runner_id"])).fetchone()
             if claim_cursor is None:
                 raise RunnerAuthError("invalid rotation")
             self.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (row["workspace_id"], row["runner_id"], "claim", self._hash("nonce", nonce), claim_cursor["next_sequence"], instant + NONCE_TTL))
@@ -820,7 +1048,7 @@ class RunnerAuthStore:
             self.conn.commit()
         except Exception:
             self.conn.rollback(); raise
-        return row["workspace_id"], row["runner_id"], nonce
+        return row["workspace_id"], row["runner_id"], nonce, claim_cursor["next_sequence"], claim_cursor["generation"]
 
     @staticmethod
     def _resync_chain(value: object) -> tuple[str, str | None, str]:

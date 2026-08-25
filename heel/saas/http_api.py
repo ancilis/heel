@@ -978,12 +978,19 @@ class _Handler(BaseHTTPRequestHandler):
     def _runner_rotation_activate(self, pairing_id: str) -> None:
         try:
             body = self._body()
-            if set(body) != {"schema_version", "signature_b64"} or body["schema_version"] != "heel.runner-rotation-activate.v1":
+            if set(body) != {"schema_version", "signature_b64"} or body["schema_version"] != "heel.runner-rotation-activate.v2":
                 raise ValueError
-            wid, runner_id, nonce = self._runner_store().activate_rotation(pairing_id, body["signature_b64"])
+            wid, runner_id, nonce, sequence, generation = self._runner_store().activate_rotation(pairing_id, body["signature_b64"])
         except (KeyError, ValueError, RunnerAuthError):
             raise ApiError(400, "invalid runner rotation", code="invalid_runner_rotation") from None
-        self._json(200, {"schema_version": "heel.runner-rotation-activated.v1", "workspace_id": wid, "runner_id": runner_id, "initial_claim_nonce": nonce})
+        self._json(200, {
+            "schema_version": "heel.runner-rotation-activated.v2",
+            "workspace_id": wid,
+            "runner_id": runner_id,
+            "initial_claim_nonce": nonce,
+            "initial_claim_sequence": sequence,
+            "initial_claim_generation": generation,
+        })
 
     def _runner_rotation_start(self, wid: str, runner_id: str) -> None:
         self._recent_owner_admin(wid)

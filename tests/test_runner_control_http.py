@@ -85,7 +85,7 @@ def test_has_no_public_generic_request_api():
     control, _, _ = client()
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
-    assert public <= {"claim", "heartbeat", "progress", "result", "stop_ack", "retry_last", "start_resync", "complete_resync"}
+    assert public <= {"claim", "heartbeat", "progress", "result", "stop_ack", "retry_last", "start_resync", "complete_resync", "install_rotation_claim"}
 
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
@@ -269,6 +269,20 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
         conn.request(method, path, raw, ({"Content-Type":"application/json", **(headers or {})} if method == "POST" else (headers or {})))
         response = conn.getresponse(); payload = json.loads(response.read()); cookie = response.getheader("Set-Cookie"); conn.close()
         return response.status, payload, cookie
+    class HttpTransport:
+        def post(self, path, *, headers=None, body=b""):
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+            conn.request("POST", path, body, headers or {})
+            response = conn.getresponse(); payload = json.loads(response.read())
+            response_headers = dict(response.getheaders()); status = response.status; conn.close()
+            return status, response_headers, payload
+    class LocalSigner:
+        def __init__(self, private):
+            self.private = private
+            self.public_key = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            self.key_id = ed25519_key_id(self.public_key)
+        def sign(self, payload):
+            return self.private.sign(payload)
     try:
         _, signup, cookie = request("POST", "/v1/signup", {"email":"rotate@example.test", "password":"correct-horse-battery"})
         browser = {"Cookie":cookie.split(";", 1)[0], "Origin":"https://heel.test", "X-Heel-Internal-Origin":"same-origin"}
@@ -279,7 +293,14 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
         _, pending, _ = request("POST", "/v1/runner-pairings/exchange", {"schema_version":"heel.runner-pairing-exchange.v2", "invitation_token":invite["invitation_token"], "public_key_b64":old_public, "pairing_phrase":phrase, "display_name":"Rotating runner", "runner_version":"v1", "adapters":{}}, {})
         request("POST", f"/v1/workspaces/{signup['workspace_id']}/runner-pairings/{pending['pairing_id']}/approve", {"schema_version":"heel.runner-pairing-approve.v1", "pairing_phrase":phrase, "fingerprint":pending["fingerprint"]}, browser)
         proof = b"heel.runner-pairing-activate.v1\0" + canonical_bytes({"pairing_id":pending["pairing_id"], "challenge":pending["activation_challenge"]})
-        request("POST", f"/v1/runner-pairings/{pending['pairing_id']}/activate", {"schema_version":"heel.runner-pairing-activate.v1", "signature_b64":base64.b64encode(old.sign(proof)).decode()})
+        status, first_activation, _ = request("POST", f"/v1/runner-pairings/{pending['pairing_id']}/activate", {"schema_version":"heel.runner-pairing-activate.v1", "signature_b64":base64.b64encode(old.sign(proof)).decode()})
+        assert status == 200
+        old_client = RunnerControlClient(
+            origin="http://127.0.0.1", workspace_id=signup["workspace_id"], runner_id=pending["runner_id"],
+            signer=LocalSigner(old), clock=lambda: int(time.time() * 1000), transport=HttpTransport(),
+            nonce_source=lambda chain: first_activation["initial_claim_nonce"],
+        )
+        assert old_client.claim()[0] == 200
         new = Ed25519PrivateKey.generate(); new_public = base64.b64encode(new.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
         old_fingerprint = hashlib.sha256(base64.b64decode(old_public)).hexdigest()
         status, rotation, _ = request("POST", f"/v1/workspaces/{signup['workspace_id']}/runners/{pending['runner_id']}/rotate", {"schema_version":"heel.runner-rotation-start.v1", "previous_fingerprint":old_fingerprint, "public_key_b64":new_public, "pairing_phrase":phrase, "runner_version":"v2", "adapters":{}}, browser)
@@ -288,8 +309,22 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
         assert request("POST", f"/v1/workspaces/{signup['workspace_id']}/runners/{pending['runner_id']}/rotations/{rotation['pairing_id']}/approve", {"schema_version":"heel.runner-rotation-approve.v1", "pairing_phrase":phrase, "fingerprint":rotation["fingerprint"]}, browser)[0] == 200
         status, poll, _ = request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/poll", {})
         assert status == 200 and poll["activation_challenge"]
-        proof = b"heel.runner-rotation-activate.v1\0" + canonical_bytes({"pairing_id":rotation["pairing_id"], "challenge":poll["activation_challenge"]})
-        assert request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/activate", {"schema_version":"heel.runner-rotation-activate.v1", "signature_b64":base64.b64encode(new.sign(proof)).decode()})[0] == 200
+        v1_proof = b"heel.runner-rotation-activate.v1\0" + canonical_bytes({"pairing_id":rotation["pairing_id"], "challenge":poll["activation_challenge"]})
+        assert request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/activate", {"schema_version":"heel.runner-rotation-activate.v1", "signature_b64":base64.b64encode(new.sign(v1_proof)).decode()})[0] == 400
+        proof = b"heel.runner-rotation-activate.v2\0" + canonical_bytes({"pairing_id":rotation["pairing_id"], "challenge":poll["activation_challenge"]})
+        status, activated, _ = request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/activate", {"schema_version":"heel.runner-rotation-activate.v2", "signature_b64":base64.b64encode(new.sign(proof)).decode()})
+        assert status == 200
+        assert set(activated) == {"schema_version", "workspace_id", "runner_id", "initial_claim_nonce", "initial_claim_sequence", "initial_claim_generation"}
+        assert activated["schema_version"] == "heel.runner-rotation-activated.v2"
+        assert activated["initial_claim_sequence"] == 2 and activated["initial_claim_generation"] == 1
+        new_client = RunnerControlClient(
+            origin="http://127.0.0.1", workspace_id=signup["workspace_id"], runner_id=pending["runner_id"],
+            signer=LocalSigner(new), clock=lambda: int(time.time() * 1000), transport=HttpTransport(),
+            nonce_source=lambda chain: (_ for _ in ()).throw(AssertionError("rotation install did not seed claim")),
+        )
+        installed = new_client.install_rotation_claim(activated)
+        assert installed.initial_claim_sequence == 2 and installed.initial_claim_generation == 1
+        assert new_client.claim()[0] == 200
         identity = cp.runner_auth.identity(signup["workspace_id"], pending["runner_id"])
         assert identity["state"] == "active" and identity["public_key"]["public_key_b64"] == new_public
         assert identity["rotation"]["previous_key_ids"]
