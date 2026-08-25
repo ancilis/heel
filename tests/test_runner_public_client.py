@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from heel.canary_contracts import OPERATIONAL_RUN_SCHEMA, canonical_bytes, canonical_digest
 from heel.crypto import ed25519_key_id
-from heel.runner.control_client import PendingRunnerResync, RunnerControlClient
+from heel.runner.control_client import PendingRunnerResync, RunnerControlClient, RunnerRotationActivated
 from heel.runner.identity import (
     SecureSigner,
     bind_runner_identity,
@@ -20,10 +20,12 @@ from heel.runner.identity import (
 def test_open_core_runner_package_exports_pairing_and_recovery_types():
     from heel.runner import (  # noqa: PLC0415 - checks the installed public facade.
         PendingRunnerResync, RecoveredRunnerChain, RunnerPairingMaterial,
+        RunnerRotationActivated,
         bind_runner_identity, create_runner_pairing_material,
     )
     assert all(item is not None for item in (PendingRunnerResync, RecoveredRunnerChain,
-                                               RunnerPairingMaterial, bind_runner_identity,
+                                               RunnerPairingMaterial, RunnerRotationActivated,
+                                               bind_runner_identity,
                                                create_runner_pairing_material))
 
 
@@ -141,7 +143,8 @@ def test_named_control_methods_emit_closed_bodies_and_separate_stop_ack_chain():
                            ("result", "run"), ("stop-ack", "run")]
     assert transport.requests[1][1]["X-Heel-Runner-Nonce"] != transport.requests[4][1]["X-Heel-Runner-Nonce"]
     public = {name for name, method in vars(RunnerControlClient).items() if callable(method) and not name.startswith("_")}
-    assert public == {"claim", "heartbeat", "progress", "result", "stop_ack", "retry_last", "start_resync", "complete_resync"}
+    assert public == {"claim", "heartbeat", "progress", "result", "stop_ack", "retry_last",
+                      "start_resync", "complete_resync", "install_rotation_claim"}
     assert all(parameter.kind is not inspect.Parameter.VAR_KEYWORD for method in (
         RunnerControlClient.claim, RunnerControlClient.heartbeat, RunnerControlClient.progress,
         RunnerControlClient.result, RunnerControlClient.stop_ack,
@@ -236,3 +239,61 @@ def test_resync_generation_install_is_monotonic_and_idempotent():
     client.heartbeat(run_id="run", operational_projection=operational_projection("claimed"))
     assert transport.requests[-1][1]["X-Heel-Runner-Nonce"] == nonce
     assert transport.requests[-1][1]["X-Heel-Runner-Sequence"] == "8"
+
+
+def test_rotation_v2_installs_consumed_claim_state_without_resetting_sequence_or_generation():
+    transport, signer, nonces = Transport(), Signer(), NonceSource()
+    client = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner",
+                                 signer=signer, clock=lambda: 1000, transport=transport,
+                                 nonce_source=nonces)
+    client.claim()
+    client.claim()
+    rotated_nonce = base64.b64encode(b"r" * 32).decode()
+    response = {
+        "schema_version": "heel.runner-rotation-activated.v2", "workspace_id": "ws",
+        "runner_id": "runner", "initial_claim_nonce": rotated_nonce,
+        "initial_claim_sequence": 7, "initial_claim_generation": 3,
+    }
+    activated = client.install_rotation_claim(response)
+    assert activated == RunnerRotationActivated(
+        "heel.runner-rotation-activated.v2", "ws", "runner", rotated_nonce, 7, 3,
+    )
+    client.claim()
+    assert transport.requests[-1][1]["X-Heel-Runner-Nonce"] == rotated_nonce
+    assert transport.requests[-1][1]["X-Heel-Runner-Sequence"] == "7"
+
+
+def test_rotation_claim_install_rejects_v1_invalid_and_nonmonotonic_responses_without_mutation():
+    transport, signer = Transport(), Signer()
+    client = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner",
+                                 signer=signer, clock=lambda: 1000, transport=transport,
+                                 nonce_source=NonceSource())
+    first_nonce = base64.b64encode(b"a" * 32).decode()
+    response = {
+        "schema_version": "heel.runner-rotation-activated.v2", "workspace_id": "ws",
+        "runner_id": "runner", "initial_claim_nonce": first_nonce,
+        "initial_claim_sequence": 9, "initial_claim_generation": 4,
+    }
+    assert client.install_rotation_claim(response).initial_claim_generation == 4
+    assert client.install_rotation_claim(dict(response)) == RunnerRotationActivated(
+        "heel.runner-rotation-activated.v2", "ws", "runner", first_nonce, 9, 4,
+    )
+    invalid = [
+        {**response, "schema_version": "heel.runner-rotation-activated.v1"},
+        {**response, "extra": "closed"},
+        {**response, "workspace_id": "other"},
+        {**response, "initial_claim_nonce": "not-base64"},
+        {**response, "initial_claim_sequence": True},
+        {**response, "initial_claim_generation": 3},
+        {**response, "initial_claim_nonce": base64.b64encode(b"b" * 32).decode()},
+        {**response, "initial_claim_sequence": 10},
+    ]
+    for candidate in invalid:
+        with pytest.raises(ValueError):
+            client.install_rotation_claim(candidate)
+    newer = {**response, "initial_claim_nonce": base64.b64encode(b"n" * 32).decode(),
+             "initial_claim_sequence": 12, "initial_claim_generation": 5}
+    assert client.install_rotation_claim(newer).initial_claim_generation == 5
+    client.claim()
+    assert transport.requests[-1][1]["X-Heel-Runner-Nonce"] == newer["initial_claim_nonce"]
+    assert transport.requests[-1][1]["X-Heel-Runner-Sequence"] == "12"

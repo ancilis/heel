@@ -855,7 +855,10 @@ class OpenCoreReleaseTests(unittest.TestCase):
             b"def create_runner_pairing_material", b"def bind_runner_identity",
         ):
             self.assertIn(required, sources["heel/runner/identity.py"])
-        for required in (b"class PendingRunnerResync", b"class RecoveredRunnerChain"):
+        for required in (
+            b"class PendingRunnerResync", b"class RecoveredRunnerChain",
+            b"class RunnerRotationActivated", b"def install_rotation_claim",
+        ):
             self.assertIn(required, sources["heel/runner/control_client.py"])
         with zipfile.ZipFile(downloads / WHEEL) as wheel:
             for name, source in sources.items():

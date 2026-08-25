@@ -47,6 +47,16 @@ class RecoveredRunnerChain:
     next_sequence: int; expires_at_ms: int; generation: int
 
 
+@dataclass(frozen=True)
+class RunnerRotationActivated:
+    schema_version: str
+    workspace_id: str
+    runner_id: str
+    initial_claim_nonce: str
+    initial_claim_sequence: int
+    initial_claim_generation: int
+
+
 class RunnerControlClient:
     """Emit only named closed control/recovery envelopes; no generic request API exists."""
 
@@ -180,6 +190,31 @@ class RunnerControlClient:
     def retry_last(self):
         return self._post_control("claim", {}, None, retry=True)
 
+    def install_rotation_claim(self, response: object) -> RunnerRotationActivated:
+        fields = {
+            "schema_version", "workspace_id", "runner_id", "initial_claim_nonce",
+            "initial_claim_sequence", "initial_claim_generation",
+        }
+        if not isinstance(response, dict) or set(response) != fields:
+            raise ValueError("invalid runner rotation activation response")
+        if (response["schema_version"] != "heel.runner-rotation-activated.v2"
+                or response["workspace_id"] != self.workspace_id
+                or response["runner_id"] != self.runner_id
+                or not self._b64_32(response["initial_claim_nonce"])
+                or not self._positive_int(response["initial_claim_sequence"])
+                or not self._generation(response["initial_claim_generation"])):
+            raise ValueError("invalid runner rotation activation response")
+        state = (
+            response["initial_claim_nonce"], response["initial_claim_sequence"],
+            response["initial_claim_generation"],
+        )
+        self._install_chain_state("claim", state)
+        return RunnerRotationActivated(
+            response["schema_version"], response["workspace_id"], response["runner_id"],
+            response["initial_claim_nonce"], response["initial_claim_sequence"],
+            response["initial_claim_generation"],
+        )
+
     def start_resync(self, *, operation: str, run_id: str | None = None) -> PendingRunnerResync:
         self._validate_chain(operation, run_id)
         client_nonce, chain = self._random_b64(), {"operation": operation, "run_id": run_id}
@@ -229,18 +264,19 @@ class RunnerControlClient:
             raise ValueError("invalid runner resync completion")
         chain_name = self._chain(pending.operation, pending.run_id)
         recovered = (next_nonce, next_sequence, generation)
-        current = self._chains.get(chain_name)
-        if current is not None:
-            if generation < current[2] or (generation == current[2] and recovered != current):
-                raise ValueError("runner resync generation did not advance")
-            if generation == current[2]:
-                return RecoveredRunnerChain(
-                    pending.operation, pending.run_id, next_nonce, next_sequence, expires, generation,
-                )
-        self._chains[chain_name] = recovered
+        self._install_chain_state(chain_name, recovered)
         return RecoveredRunnerChain(
             pending.operation, pending.run_id, next_nonce, next_sequence, expires, generation,
         )
+
+    def _install_chain_state(self, chain_name: str, state: tuple[str, int, int]) -> None:
+        current = self._chains.get(chain_name)
+        if current is not None:
+            if state[2] < current[2] or (state[2] == current[2] and state != current):
+                raise ValueError("runner chain generation did not advance")
+            if state[2] == current[2]:
+                return
+        self._chains[chain_name] = state
 
     def _random_b64(self) -> str:
         raw = self.resync_random_source(32)

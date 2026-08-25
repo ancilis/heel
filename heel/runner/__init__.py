@@ -6,7 +6,10 @@ from .identity import (
     SystemSecureSigner, bind_runner_identity, create_runner_identity,
     create_runner_pairing_material, runner_phrase_words, validate_pairing_phrase,
 )
-from .control_client import PendingRunnerResync, RecoveredRunnerChain, RunnerControlClient
+from .control_client import (
+    PendingRunnerResync, RecoveredRunnerChain, RunnerControlClient,
+    RunnerRotationActivated,
+)
 
 __all__ = [
     "RUNNER_CAPABILITIES", "RunnerIdentity", "RunnerPairingMaterial", "SecureSigner", "SystemSecureSigner",
@@ -14,4 +17,5 @@ __all__ = [
     "create_runner_identity", "create_runner_pairing_material", "bind_runner_identity",
     "runner_phrase_words", "validate_pairing_phrase", "RunnerControlClient",
     "PendingRunnerResync", "RecoveredRunnerChain",
+    "RunnerRotationActivated",
 ]
