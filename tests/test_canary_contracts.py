@@ -16,6 +16,7 @@ from heel.canary_contracts import (
     EXECUTION_GRANT_SCHEMA,
     OPERATIONAL_RUN_SCHEMA,
     RUNNER_IDENTITY_SCHEMA,
+    RUNNER_CONTEXT_BINDING_SCHEMA,
     TEST_MANIFEST_SCHEMA,
     ContractError,
     canonical_bytes,
@@ -32,6 +33,7 @@ from heel.canary_contracts import (
     validate_runner_result_request,
     validate_runner_stop_ack_request,
     validate_runner_identity,
+    validate_runner_context_binding,
     validate_test_manifest,
 )
 
@@ -148,6 +150,23 @@ def permit() -> dict:
     return _digest(value, "permit_digest")
 
 
+def context_binding() -> dict:
+    unsigned = {
+        "binding_id": "rcb_" + "a" * 32,
+        "workspace_id": "ws", "project_id": "prj",
+        "environment": environment(),
+        "runner_binding": {"runner_id": "r", "runner_key_id": "rk", "public_key_digest": HASH},
+        "authorization": {"user_id": "u", "role": "owner"},
+        "issued_at_ms": 1, "expires_at_ms": 60_001,
+    }
+    value = {
+        "schema_version": RUNNER_CONTEXT_BINDING_SCHEMA, **unsigned,
+        "binding_digest": canonical_digest(unsigned), "signing_key_id": "cloud",
+        "signature_b64": SIG,
+    }
+    return value
+
+
 class CanaryContractTests(unittest.TestCase):
     def test_runner_request_wrappers_are_closed_and_validate_operational_projection(self):
         claim = {"schema_version": "heel.runner-claim-request.v1"}
@@ -204,13 +223,22 @@ class CanaryContractTests(unittest.TestCase):
         self.assertEqual(canonical_digest(source), hashlib.sha256(canonical_bytes(source)).hexdigest())
 
     def test_all_validators_accept_detached_canonical_records(self):
-        records = [(validate_test_manifest, manifest()), (validate_approval_projection, approval()), (validate_runner_identity, identity()), (validate_execution_grant, grant()), (validate_operational_run, operational()), (validate_canary_findings, findings()), (validate_disclosure_permit, permit())]
+        records = [(validate_test_manifest, manifest()), (validate_approval_projection, approval()), (validate_runner_identity, identity()), (validate_execution_grant, grant()), (validate_operational_run, operational()), (validate_canary_findings, findings()), (validate_disclosure_permit, permit()), (validate_runner_context_binding, context_binding())]
         for validator, record in records:
             with self.subTest(validator=validator.__name__):
                 result = validator(record)
                 self.assertEqual(result, record)
                 self.assertIsNot(result, record)
                 self.assertEqual(canonical_bytes(result), canonical_bytes(record))
+
+    def test_context_binding_is_closed_and_digest_is_over_exact_unsigned_artifact(self):
+        binding = context_binding()
+        self.assertEqual(validate_runner_context_binding(binding), binding)
+        for key, value in (("binding_digest", HASH), ("expires_at_ms", 60_000), ("unknown", 1)):
+            tampered = copy.deepcopy(binding)
+            tampered[key] = value
+            with self.subTest(key=key), self.assertRaises(ContractError):
+                validate_runner_context_binding(tampered)
 
     def test_validators_fail_closed_for_fields_privacy_digest_and_lifecycle(self):
         cases = [(validate_test_manifest, manifest(), "actions", [{"headers": {}}]), (validate_approval_projection, approval(), "credential_handle", "secret"), (validate_operational_run, operational(), "assessment", "private"), (validate_canary_findings, findings(), "raw_traffic", "private")]

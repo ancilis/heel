@@ -329,14 +329,16 @@ class CanaryRunService:
             raise CanaryRunError("invalid_projection_signature") from None
         return row
 
-    def submit_projection(self, projection: object, *, uploaded_by: str) -> dict[str, object]:
+    def submit_projection(self, projection: object, *, uploaded_by: str, _transaction_owned: bool = False) -> dict[str, object]:
+        """Store a human submission, or participate in a caller-owned runner PoP transaction."""
         uploaded_by = _identifier(uploaded_by, "invalid_projection_actor")
         try:
             validated = validate_approval_projection(projection)
         except (TypeError, ValueError):
             raise CanaryRunError("invalid_projection") from None
         now = self._now_ms()
-        self.conn.execute("BEGIN IMMEDIATE")
+        if not _transaction_owned:
+            self.conn.execute("BEGIN IMMEDIATE")
         try:
             authority = self._projection_authority(validated, now)
             control_generation = self._control_generation()
@@ -359,7 +361,8 @@ class CanaryRunService:
                     "approval_id": prior["approval_id"], "run_id": prior["run_id"],
                     "status": prior["status"], "projection_digest": prior["projection_digest"],
                 }
-                self.conn.commit()
+                if not _transaction_owned:
+                    self.conn.commit()
                 return result
             run_id = "crun_" + secrets.token_hex(16)
             expires = min(now + APPROVAL_TTL_MS, int(authority["proof_expires_at"] * 1000))
@@ -420,7 +423,8 @@ class CanaryRunService:
                 actor_class="human", actor_id=uploaded_by,
                 payload={"projection_digest": validated["projection_digest"]},
             )
-            self.conn.commit()
+            if not _transaction_owned:
+                self.conn.commit()
             return {
                 "schema_version": "heel.canary-projection-submitted.v1",
                 "approval_id": validated["projection_id"], "run_id": run_id,
@@ -428,9 +432,51 @@ class CanaryRunService:
                 "projection_digest": validated["projection_digest"],
             }
         except Exception:
-            if self.conn.in_transaction:
+            if self.conn.in_transaction and not _transaction_owned:
                 self.conn.rollback()
             raise
+
+    def submit_projection_from_runner_in_transaction(
+        self, projection: object, binding_row: sqlite3.Row, *, uploaded_by_runner_id: str,
+    ) -> dict[str, object]:
+        """Create only the Task-7 awaiting-approval records inside runner PoP's transaction."""
+        if not self.conn.in_transaction:
+            raise RuntimeError("runner projection submission requires caller transaction")
+        if binding_row["status"] != "active" or int(binding_row["expires_at_ms"]) <= self._now_ms():
+            raise CanaryRunError("canary_authority_unavailable")
+        try:
+            validated = validate_approval_projection(projection)
+        except (TypeError, ValueError):
+            raise CanaryRunError("invalid_projection") from None
+        environment = validated["environment"]
+        runner = validated["runner"]
+        if (
+            validated["workspace_id"] != binding_row["workspace_id"]
+            or validated["project_id"] != binding_row["project_ref"]
+            or environment["environment_id"] != binding_row["environment_id"]
+            or environment["origin"] != binding_row["environment_origin"]
+            or environment["environment_class"] != binding_row["environment_class"]
+            or environment["verification_record_digest"] != binding_row["verification_record_digest"]
+            or runner["runner_id"] != binding_row["runner_id"]
+            or runner["runner_key_id"] != binding_row["runner_key_id"]
+            or uploaded_by_runner_id != binding_row["runner_id"]
+        ):
+            raise CanaryRunError("canary_authority_unavailable")
+        result = self.submit_projection(
+            validated, uploaded_by=uploaded_by_runner_id, _transaction_owned=True,
+        )
+        self.conn.execute(
+            "INSERT OR IGNORE INTO canary_runner_context_projection_links("
+            "workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id,rcb_id,projection_digest,created_at_ms) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                binding_row["workspace_id"], binding_row["project_ref"], result["approval_id"],
+                result["run_id"], binding_row["environment_id"], binding_row["runner_id"],
+                binding_row["runner_key_id"], binding_row["rcb_id"], result["projection_digest"],
+                self._now_ms(),
+            ),
+        )
+        return result
 
     def _run(self, workspace_id: str, project_ref: str, run_id: str) -> sqlite3.Row:
         row = self.conn.execute(
@@ -586,6 +632,23 @@ class CanaryRunService:
             if exact_hostname != hostname:
                 raise CanaryRunError("hostname_confirmation_mismatch")
             authority = self._projection_authority(projection, now)
+            # Human-originated legacy projections intentionally have no link.  A linked
+            # runner context, however, remains an authority precondition until approval.
+            binding = self.conn.execute(
+                "SELECT b.* FROM canary_runner_context_projection_links l "
+                "JOIN canary_runner_context_bindings b ON b.workspace_id=l.workspace_id "
+                "AND b.project_ref=l.project_ref AND b.environment_id=l.environment_id "
+                "AND b.runner_id=l.runner_id AND b.runner_key_id=l.runner_key_id AND b.rcb_id=l.rcb_id "
+                "WHERE l.workspace_id=? AND l.project_ref=? AND l.approval_id=? AND l.run_id=?",
+                (workspace_id, project_ref, approval["approval_id"], run_id),
+            ).fetchone()
+            if binding is not None and (
+                binding["status"] != "active" or int(binding["expires_at_ms"]) <= now
+                or binding["environment_id"] != approval["environment_id"]
+                or binding["runner_id"] != approval["runner_id"]
+                or binding["runner_key_id"] != approval["runner_key_id"]
+            ):
+                raise CanaryRunError("canary_authority_unavailable")
             generation = self._control_generation()
             if generation != expected_kill_switch_generation:
                 raise CanaryRunError("kill_switch_changed")

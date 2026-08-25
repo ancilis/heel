@@ -30,8 +30,8 @@ class CanaryMigrationTests(unittest.TestCase):
         )
 
     def test_current_migrations_create_tenant_bound_unique_tables(self):
-        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 15)
-        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].name, "verified_canary_coordination")
+        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 16)
+        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].name, "runner_context_bindings")
         tables = (
             "canary_environments", "canary_runners", "canary_runner_keys",
             "canary_consumed_nonces", "canary_approval_projections",
@@ -135,7 +135,7 @@ class CanaryMigrationTests(unittest.TestCase):
         ledger("runner_heartbeat:run", 2, "runner_heartbeat", "/v1/workspaces/ws/runners/runner/runs/run/stop-ack")
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15, 16])
         self.assertEqual([tuple(row) for row in conn.execute(
             "SELECT chain_name,next_sequence,generation FROM canary_runner_chain_cursors ORDER BY chain_name"
         )], [("heartbeat:run", 2, 0), ("progress:run", 3, 0), ("stop-ack:run", 3, 0)])
@@ -180,8 +180,8 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15])
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 15)
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 16)
         self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.assertEqual(
             [tuple(row) for row in conn.execute(
@@ -190,6 +190,23 @@ class CanaryMigrationTests(unittest.TestCase):
             )],
             [(f"rrs_{index:032x}", "invalidated", 0, None) for index in range(1, 4)],
         )
+
+    def test_migration_sixteen_adds_closed_runner_context_binding_tables(self):
+        self.seed_root("ws", "prj")
+        tables = {row[0] for row in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        self.assertTrue({
+            "canary_runner_context_bindings",
+            "canary_runner_context_projection_links",
+            "canary_runner_context_events",
+        }.issubset(tables))
+        binding_sql = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='canary_runner_context_bindings'"
+        ).fetchone()[0]
+        self.assertIn("status IN ('active','revoked','expired')", binding_sql)
+        self.assertIn("environment_class IN ('staging','sandbox')", binding_sql)
 
     def test_migration_thirteen_runner_constraints_reject_hostile_rows(self):
         self.seed_root("ws", "prj")
@@ -221,7 +238,7 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16])
         self.assertEqual(
             [tuple(row) for row in conn.execute("SELECT chain_name,sequence FROM canary_runner_request_ledger")],
             [("progress:real", 1)],
@@ -325,6 +342,8 @@ class CanaryMigrationTests(unittest.TestCase):
             "canary_operational_receipts", "canary_audit_records",
             "canary_disclosure_requests", "canary_disclosure_permits",
             "canary_findings_projections", "canary_reaper_state", "canary_control_generation",
+            "canary_runner_context_bindings", "canary_runner_context_projection_links",
+            "canary_runner_context_events",
         )
         for table in tables:
             with self.subTest(table=table):
@@ -442,8 +461,8 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
         conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
         conn.commit()
-        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
-        self.assertEqual(migration.current_version(), 15)
+        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+        self.assertEqual(migration.current_version(), 16)
         self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):

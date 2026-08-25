@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from .canary_store import (
     CANARY_COORDINATION_MIGRATION, CANARY_ENVIRONMENT_ATTESTATION_ACK_MIGRATION,
     CANARY_ENVIRONMENT_VERIFICATION_MIGRATION, CANARY_STORE_SCHEMA,
+    RUNNER_CONTEXT_BINDINGS_MIGRATION,
 )
 from .runner_auth import (
     RUNNER_AUTH_FINALIZATION_MIGRATION, RUNNER_AUTH_GENERATION_MIGRATION, RUNNER_AUTH_HARDENING_MIGRATION,
@@ -373,6 +374,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_canary_fault_refund
     Migration(13, "verified_canary_runner_generations", RUNNER_AUTH_GENERATION_MIGRATION),
     Migration(14, "verified_canary_runner_finalization", RUNNER_AUTH_FINALIZATION_MIGRATION),
     Migration(15, "verified_canary_coordination", CANARY_COORDINATION_MIGRATION),
+    Migration(16, "runner_context_bindings", RUNNER_CONTEXT_BINDINGS_MIGRATION),
 ]
 
 

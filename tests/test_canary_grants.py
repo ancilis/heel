@@ -28,11 +28,11 @@ from canary_test_support import (
 )
 
 
-def test_migration_fifteen_installs_closed_coordination_schema_and_generation_triggers():
+def test_migration_sixteen_preserves_closed_coordination_schema_and_adds_context_bindings():
     from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS
 
-    assert CONTROL_PLANE_MIGRATIONS[-1].version == 15
-    assert CONTROL_PLANE_MIGRATIONS[-1].name == "verified_canary_coordination"
+    assert CONTROL_PLANE_MIGRATIONS[-1].version == 16
+    assert CONTROL_PLANE_MIGRATIONS[-1].name == "runner_context_bindings"
     conn = connect()
     assert "verification_record_digest" in {
         row[1] for row in conn.execute("PRAGMA table_info(canary_environments)")

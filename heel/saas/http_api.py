@@ -32,6 +32,8 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
 from heel.findings_sync import (
     MAX_FINDINGS_SYNC_BYTES,
     parse_findings_sync_request,
@@ -47,6 +49,8 @@ from heel.canary_contracts import (
     validate_runner_progress_request,
     validate_runner_result_request,
     validate_runner_stop_ack_request,
+    validate_runner_context_create,
+    validate_runner_context_revoke,
 )
 from heel.crypto import load_public_key_base64, verify_envelope
 
@@ -67,6 +71,7 @@ from .canary_disclosure import (
     CanaryDisclosureService,
 )
 from .canary_runs import CanaryRunError, CanaryRunService
+from .runner_contexts import RunnerContextBindingService, RunnerContextError
 from .runner_auth import RunnerAuthError, RunnerAuthRateLimited, RunnerAuthStore, initialize_runner_auth_schema
 from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
 from .device_auth import (
@@ -274,9 +279,11 @@ class ControlPlane:
         if grant_authority is None:
             self.canary_runs = None
             self.canary_disclosure = None
+            self.runner_contexts = None
         else:
             self.canary_runs = CanaryRunService(conn, signing=grant_authority)
             self.canary_disclosure = CanaryDisclosureService(conn, signing=grant_authority)
+            self.runner_contexts = RunnerContextBindingService(conn, signing=grant_authority)
         self.draining = False
         self.required_schema_version: int | None = None
         # Every store shares one SQLite connection. Serialize complete HTTP request units so
@@ -830,6 +837,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(401, {"schema_version": "heel.runner-error.v1", "code": "invalid_runner_auth"})
         except (CanaryRunError, CanaryDisclosureError) as error:
             self._canary_error(error.code)
+        except RunnerContextError as error:
+            status = {"same_origin_required": 403, "recent_auth_required": 403,
+                      "runner_context_binding_not_found": 404, "conflict": 409,
+                      "expired": 410, "canary_authority_unavailable": 503}.get(error.code, 400)
+            self._json(status, {"schema_version": "heel.runner-context-error.v1", "code": error.code})
         except PermissionError as e:
             self._json(403, {"error": str(e)})
         except ThrottledError as e:
@@ -954,6 +966,14 @@ class _Handler(BaseHTTPRequestHandler):
                     return lambda: self._ws_environment_revoke(wid, project_ref, tail[3])
             if len(tail) >= 3 and tail[0] == "projects":
                 project_ref = tail[1]
+                if len(tail) == 3 and tail[2] == "runner-context-bindings":
+                    if method == "GET":
+                        return lambda: self._ws_runner_context_list(wid, project_ref)
+                    if method == "POST":
+                        return lambda: self._ws_runner_context_create(wid, project_ref)
+                if (method == "POST" and len(tail) == 5 and tail[2] == "runner-context-bindings"
+                        and tail[4] == "revoke"):
+                    return lambda: self._ws_runner_context_revoke(wid, project_ref, tail[3])
                 if len(tail) == 3 and tail[2] == "canary-approval-projections" and method == "POST":
                     return lambda: self._ws_canary_projection_submit(wid, project_ref)
                 if len(tail) >= 4 and tail[2] == "canary-runs":
@@ -2102,6 +2122,57 @@ class _Handler(BaseHTTPRequestHandler):
         except LookupError:
             raise CanaryRunError("canary_authority_unavailable") from None
         self._json(201, result)
+
+    def _runner_context_service(self) -> RunnerContextBindingService:
+        if self.cp.runner_contexts is None:
+            raise RunnerContextError("canary_authority_unavailable")
+        return self.cp.runner_contexts
+
+    def _ws_runner_context_create(self, wid: str, project_ref: str) -> None:
+        actor, role, _ = self._recent_owner_admin_context(wid)
+        try:
+            body = parse_json(self._raw_body(), max_bytes=2048)
+            if canonical_bytes(body) != self._raw_body():
+                raise ValueError
+            binding = self._runner_context_service().create(wid, project_ref, body, actor=actor, role=role)
+        except (TypeError, ValueError, RunnerContextError):
+            raise
+        self._json(201, {"schema_version": "heel.runner-context-binding-created.v1", "context_binding": binding})
+
+    def _ws_runner_context_revoke(self, wid: str, project_ref: str, binding_id: str) -> None:
+        actor, role, _ = self._recent_owner_admin_context(wid)
+        try:
+            body = parse_json(self._raw_body(), max_bytes=256)
+            if canonical_bytes(body) != self._raw_body():
+                raise ValueError
+            result = self._runner_context_service().revoke(wid, project_ref, binding_id, actor=actor, role=role, request=body)
+        except (TypeError, ValueError, RunnerContextError):
+            raise
+        self._json(200, result)
+
+    def _ws_runner_context_list(self, wid: str, project_ref: str) -> None:
+        self._recent_owner_admin_context(wid)
+        now = int(time.time() * 1000)
+        rows = self.cp.store.conn.execute(
+            "SELECT r.runner_id,r.display_name,k.key_id,k.public_key,i.identity_json,b.rcb_id,b.binding_digest,"
+            "b.environment_id,b.environment_origin,b.environment_class,b.verification_record_digest,b.runner_id AS binding_runner_id,"
+            "b.runner_key_id,b.status,b.issued_at_ms,b.expires_at_ms,b.first_claimed_at_ms "
+            "FROM canary_runner_context_bindings b JOIN canary_runners r ON r.workspace_id=b.workspace_id AND r.runner_id=b.runner_id "
+            "JOIN canary_runner_keys k ON k.workspace_id=b.workspace_id AND k.runner_id=b.runner_id AND k.key_id=b.runner_key_id "
+            "LEFT JOIN canary_runner_identity_records i ON i.workspace_id=r.workspace_id AND i.runner_id=r.runner_id "
+            "WHERE b.workspace_id=? AND b.project_ref=? ORDER BY b.issued_at_ms,b.rcb_id",
+            (wid, project_ref),
+        ).fetchall()
+        runners: dict[tuple[str, str], dict] = {}
+        bindings: list[dict] = []
+        for row in rows:
+            identity = json.loads(row["identity_json"]) if row["identity_json"] else {}
+            key = (row["runner_id"], row["key_id"])
+            runners.setdefault(key, {"runner_id": row["runner_id"], "runner_key_id": row["key_id"],
+                "display_name": row["display_name"], "fingerprint": hashlib.sha256(load_public_key_base64(row["public_key"]).public_bytes(Encoding.Raw, PublicFormat.Raw)).hexdigest(),
+                "runner_version": identity.get("runner_version", ""), "adapter_versions": identity.get("adapter_versions", []), "status": "active"})
+            bindings.append({"binding_id": row["rcb_id"], "binding_digest": row["binding_digest"], "environment_id": row["environment_id"], "origin": row["environment_origin"], "environment_class": row["environment_class"], "verification_record_digest": row["verification_record_digest"], "runner_id": row["binding_runner_id"], "runner_key_id": row["runner_key_id"], "status": row["status"], "issued_at_ms": row["issued_at_ms"], "expires_at_ms": row["expires_at_ms"], "first_claimed_at_ms": row["first_claimed_at_ms"]})
+        self._json(200, {"schema_version": "heel.runner-context-binding-dashboard.v1", "server_time_ms": now, "runners": list(runners.values()), "bindings": bindings})
 
     def _ws_canary_approve(self, wid: str, project_ref: str, run_id: str) -> None:
         actor, role, recent_auth_at_ms = self._recent_owner_admin_context(wid)

@@ -26,6 +26,12 @@ RUNNER_RESULT_REQUEST_SCHEMA = "heel.runner-result-request.v1"
 RUNNER_STOP_ACK_REQUEST_SCHEMA = "heel.runner-stop-ack-request.v1"
 CANARY_FINDINGS_SCHEMA = "heel.canary-findings-projection.v1"
 DISCLOSURE_PERMIT_SCHEMA = "heel.disclosure-permit.v1"
+RUNNER_CONTEXT_BINDING_SCHEMA = "heel.runner-context-binding.v1"
+RUNNER_CONTEXT_BINDING_CREATE_SCHEMA = "heel.runner-context-binding-create.v1"
+RUNNER_CONTEXT_BINDING_REVOKE_SCHEMA = "heel.runner-context-binding-revoke.v1"
+RUNNER_CONTEXT_LIST_SCHEMA = "heel.runner-context-list.v1"
+RUNNER_CONTEXT_CLAIM_SCHEMA = "heel.runner-context-claim.v1"
+RUNNER_APPROVAL_PROJECTION_SUBMIT_SCHEMA = "heel.runner-approval-projection-submit.v1"
 
 _SAFE_INT = (1 << 53) - 1
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -410,6 +416,94 @@ def validate_approval_projection(value: Any) -> dict[str, Any]:
     _budgets(obj["budgets"]); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["compiled_at_ms"], lower=0); _hash(obj["manifest_digest"])
     if obj["signing_key_id"] != runner["runner_key_id"]: _fail("approval signing key mismatch")
     _signature(obj, "projection_digest")
+    return copy.deepcopy(obj)
+
+
+def validate_runner_context_binding(value: Any) -> dict[str, Any]:
+    """Validate the closed, cloud-signed authorization artifact.
+
+    Cryptographic verification belongs to the cloud/runner trust boundary; this pure
+    contract checker establishes the canonical unsigned bytes that both sides verify.
+    """
+    obj = _contract(value, 16 * 1024)
+    obj = _object(obj, {
+        "schema_version", "binding_id", "workspace_id", "project_id", "environment",
+        "runner_binding", "authorization", "issued_at_ms", "expires_at_ms",
+        "binding_digest", "signing_key_id", "signature_b64",
+    })
+    _enum(obj["schema_version"], {RUNNER_CONTEXT_BINDING_SCHEMA})
+    if not isinstance(obj["binding_id"], str) or not re.fullmatch(r"rcb_[0-9a-f]{32}", obj["binding_id"]):
+        _fail("invalid context binding id")
+    _id_fields(obj, ("workspace_id", "project_id", "signing_key_id"))
+    _environment(obj["environment"])
+    runner = _object(obj["runner_binding"], {"runner_id", "runner_key_id", "public_key_digest"})
+    _id_fields(runner, ("runner_id", "runner_key_id")); _hash(runner["public_key_digest"])
+    authorization = _object(obj["authorization"], {"user_id", "role"})
+    _id_fields(authorization, ("user_id",)); _enum(authorization["role"], {"owner", "admin"})
+    issued = _integer(obj["issued_at_ms"], lower=0)
+    expires = _integer(obj["expires_at_ms"], lower=0)
+    if not issued < expires <= issued + 86_400_000:
+        _fail("invalid context binding expiry")
+    unsigned = {
+        key: obj[key] for key in (
+            "binding_id", "workspace_id", "project_id", "environment", "runner_binding",
+            "authorization", "issued_at_ms", "expires_at_ms",
+        )
+    }
+    _hash(obj["binding_digest"])
+    if obj["binding_digest"] != canonical_digest(unsigned):
+        _fail("digest mismatch")
+    _base64(obj["signature_b64"], 64)
+    return copy.deepcopy(obj)
+
+
+def validate_runner_context_create(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 2 * 1024)
+    obj = _object(obj, {
+        "schema_version", "environment_id", "verification_record_digest", "runner_id",
+        "runner_key_id",
+    })
+    _enum(obj["schema_version"], {RUNNER_CONTEXT_BINDING_CREATE_SCHEMA})
+    _id_fields(obj, ("environment_id", "runner_id", "runner_key_id"))
+    _hash(obj["verification_record_digest"])
+    return copy.deepcopy(obj)
+
+
+def validate_runner_context_revoke(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 256)
+    obj = _object(obj, {"schema_version", "reason_code"})
+    _enum(obj["schema_version"], {RUNNER_CONTEXT_BINDING_REVOKE_SCHEMA})
+    _enum(obj["reason_code"], {"operator_requested"})
+    return copy.deepcopy(obj)
+
+
+def validate_runner_context_list(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 128)
+    obj = _object(obj, {"schema_version"})
+    _enum(obj["schema_version"], {RUNNER_CONTEXT_LIST_SCHEMA})
+    return copy.deepcopy(obj)
+
+
+def validate_runner_context_claim(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 256)
+    obj = _object(obj, {"schema_version", "binding_id", "binding_digest"})
+    _enum(obj["schema_version"], {RUNNER_CONTEXT_CLAIM_SCHEMA})
+    if not isinstance(obj["binding_id"], str) or not re.fullmatch(r"rcb_[0-9a-f]{32}", obj["binding_id"]):
+        _fail("invalid context binding id")
+    _hash(obj["binding_digest"])
+    return copy.deepcopy(obj)
+
+
+def validate_runner_approval_projection_submit(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 69632)
+    obj = _object(obj, {"schema_version", "context_binding_id", "context_binding_digest", "approval_projection"})
+    _enum(obj["schema_version"], {RUNNER_APPROVAL_PROJECTION_SUBMIT_SCHEMA})
+    if not isinstance(obj["context_binding_id"], str) or not re.fullmatch(r"rcb_[0-9a-f]{32}", obj["context_binding_id"]):
+        _fail("invalid context binding id")
+    _hash(obj["context_binding_digest"])
+    obj["approval_projection"] = validate_approval_projection(obj["approval_projection"])
+    if len(canonical_bytes(obj["approval_projection"])) > 65536:
+        _fail("approval projection exceeds size limit")
     return copy.deepcopy(obj)
 
 
