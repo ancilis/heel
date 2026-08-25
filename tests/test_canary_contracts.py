@@ -272,3 +272,64 @@ class CanaryContractTests(unittest.TestCase):
         detached["actions"][0]["allowed_status_codes"].append(201)
         self.assertEqual(record["environment"]["environment_id"], "env_staging")
         self.assertEqual(record["actions"][0]["allowed_status_codes"], [200])
+
+    def test_every_lifecycle_phase_has_a_closed_timestamp_contract(self):
+        expected = {
+            "prepared": ({}, None),
+            "awaiting_execution_approval": ({}, None),
+            "approved": ({}, None),
+            "claimed": ({"claimed_at_ms": 1, "updated_at_ms": 1}, None),
+            "running": ({"claimed_at_ms": 1, "started_at_ms": 2, "updated_at_ms": 2}, None),
+            "stop_requested": ({"claimed_at_ms": 1, "started_at_ms": 2, "stop_requested_at_ms": 3, "updated_at_ms": 3}, None),
+            "finalizing": ({"claimed_at_ms": 1, "started_at_ms": 2, "updated_at_ms": 2}, None),
+            "terminal": ({"claimed_at_ms": 1, "started_at_ms": 2, "terminal_at_ms": 3, "updated_at_ms": 3}, "completed"),
+            "cancelled": ({}, None),
+            "expired": ({}, None),
+        }
+        for phase, (timestamps, disposition) in expected.items():
+            record = operational()
+            record["lifecycle_phase"] = phase
+            record["execution_disposition"] = disposition
+            record["timestamps"].update(timestamps)
+            with self.subTest(phase=phase):
+                validate_operational_run(_digest(record, "projection_digest"))
+        for phase in ("cancelled", "expired"):
+            record = operational(); record["lifecycle_phase"] = phase; record["timestamps"]["claimed_at_ms"] = 1
+            with self.subTest(invalid=phase):
+                with self.assertRaises(ContractError): validate_operational_run(_digest(record, "projection_digest"))
+        record = operational(); record["lifecycle_phase"] = "finalizing"
+        with self.assertRaises(ContractError): validate_operational_run(_digest(record, "projection_digest"))
+
+    def test_response_bytes_are_portable_but_not_arbitrarily_aggregate_capped(self):
+        record = operational()
+        record["counters"]["response_bytes_read"] = 256 * 1024 + 1
+        validate_operational_run(_digest(record, "projection_digest"))
+
+    def test_manifest_methods_and_execution_ceilings_are_closed(self):
+        for method in ("GET", "HEAD"):
+            record = manifest(); record["actions"][0]["method"] = method
+            with self.subTest(method=method): validate_test_manifest(_digest(record, "manifest_digest"))
+        record = manifest(); record["actions"][0]["method"] = "POST"
+        with self.assertRaises(ContractError): validate_test_manifest(_digest(record, "manifest_digest"))
+        record = manifest()
+        for ordinal in range(1, 21):
+            action = copy.deepcopy(record["actions"][0]); action["ordinal"] = ordinal; record["actions"].append(action)
+        with self.assertRaises(ContractError): validate_test_manifest(_digest(record, "manifest_digest"))
+        record = manifest(); record["retry_policy"]["maximum_retries"] = 2
+        with self.assertRaises(ContractError): validate_test_manifest(_digest(record, "manifest_digest"))
+
+    def test_every_contract_rejects_closed_fields_and_enums(self):
+        cases = []
+        record = identity(); record["unexpected"] = True; cases.append((validate_runner_identity, record, "identity_digest"))
+        record = identity(); record["public_key"]["extra"] = "x"; cases.append((validate_runner_identity, record, "identity_digest"))
+        record = grant(); record["operational_receipt_policy"]["allowed_error_categories"] = ["not_a_category"]; cases.append((validate_execution_grant, record, "grant_digest"))
+        record = grant(); record["approval_actor"]["role"] = "viewer"; cases.append((validate_execution_grant, record, "grant_digest"))
+        record = operational(); record["error_category"] = "unbounded"; cases.append((validate_operational_run, record, "projection_digest"))
+        record = operational(); record["timestamps"]["extra"] = 1; cases.append((validate_operational_run, record, "projection_digest"))
+        record = findings(); record["scenario_results"][0]["observations"][0]["body_shape"] = "xml"; cases.append((validate_canary_findings, record, "projection_digest"))
+        record = findings(); record["scenario_results"][0]["finding"] = {"title": "x", "reachability_rationale": "x", "confidence": "certain", "recommended_control": "x", "regression_suggestion": "x"}; cases.append((validate_canary_findings, record, "projection_digest"))
+        record = permit(); record["projection"]["schema_version"] = "wrong"; cases.append((validate_disclosure_permit, record, "permit_digest"))
+        record = permit(); record["extra"] = "x"; cases.append((validate_disclosure_permit, record, "permit_digest"))
+        for validator, record, digest in cases:
+            with self.subTest(validator=validator.__name__):
+                with self.assertRaises(ContractError): validator(_digest(record, digest))

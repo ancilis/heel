@@ -477,9 +477,14 @@ def validate_operational_run(value: Any) -> dict[str, Any]:
     if phase == "claimed" and (claimed is None or started is not None or stop_requested is not None or stop_acknowledged is not None): _fail("invalid claimed timestamps")
     if phase == "running" and (claimed is None or started is None or stop_requested is not None or stop_acknowledged is not None): _fail("invalid running timestamps")
     if phase == "stop_requested" and (claimed is None or started is None or stop_requested is None): _fail("invalid stop-request timestamps")
+    if phase == "finalizing" and (claimed is None or started is None): _fail("invalid finalizing timestamps")
+    if phase == "terminal" and (claimed is None or started is None): _fail("invalid terminal timestamps")
+    if phase in {"cancelled", "expired"} and any(
+        moment is not None for moment in (claimed, started, stop_requested, stop_acknowledged, terminal_at)
+    ): _fail("invalid pre-claim terminal timestamps")
     counters = _object(obj["counters"], {"requests_started", "requests_completed", "response_bytes_read", "actions_contained", "retries_used", "remaining_requests", "remaining_wall_ms"})
     for number in counters.values(): _integer(number, lower=0)
-    if counters["requests_started"] > 20 or counters["requests_completed"] > counters["requests_started"] or counters["actions_contained"] > counters["requests_started"] or counters["actions_contained"] > 20 or counters["retries_used"] > 1 or counters["remaining_requests"] > 20 or counters["requests_started"] + counters["remaining_requests"] > 20 or counters["remaining_wall_ms"] > 60000 or counters["response_bytes_read"] > 256 * 1024:
+    if counters["requests_started"] > 20 or counters["requests_completed"] > counters["requests_started"] or counters["actions_contained"] > counters["requests_started"] or counters["actions_contained"] > 20 or counters["retries_used"] > 1 or counters["remaining_requests"] > 20 or counters["requests_started"] + counters["remaining_requests"] > 20 or counters["remaining_wall_ms"] > 60000:
         _fail("operational counter ceiling")
     versions = _object(obj["versions"], {"runner_version", "engine_version", "adapter_versions"}); _id_fields(versions, ("runner_version", "engine_version")); _version_list(versions["adapter_versions"]); _enum(obj["error_category"], _ERRORS); _enum(obj["stop_reason"], _STOPS); _enum_list(obj["containment_codes"], _CONTAINMENT); _integer(obj["redaction_count"], lower=0); _signature(obj, "projection_digest"); return copy.deepcopy(obj)
 
