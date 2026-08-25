@@ -16,11 +16,13 @@ export interface ActivationSnapshot {
 export interface ActivationCardProps {
   snapshot: ActivationSnapshot;
   completedSteps: number;
+  environmentOrigin?: string;
+  scenarioCount?: number;
   onReviewApproval?: () => void;
 }
 
 
-export function ActivationCard({ snapshot, completedSteps, onReviewApproval }: ActivationCardProps) {
+export function ActivationCard({ snapshot, completedSteps, environmentOrigin, scenarioCount = 0, onReviewApproval }: ActivationCardProps) {
   const firstIncomplete = snapshot.environment !== "verified"
     ? "verify staging"
     : snapshot.runner !== "online"
@@ -33,7 +35,7 @@ export function ActivationCard({ snapshot, completedSteps, onReviewApproval }: A
     <section aria-label="Launch activation" className="activation-card">
       <header className="activation-card-header">
         <div>
-          <p className="canary-kicker">Launch preview · first useful run · target 20 minutes</p>
+          <p className="canary-kicker">First useful run · target 20 minutes</p>
           <h2>Your staging rehearsal, end to end.</h2>
         </div>
         <div className="activation-meter" aria-label={`${completedSteps} of 4 setup steps complete`}>
@@ -48,10 +50,10 @@ export function ActivationCard({ snapshot, completedSteps, onReviewApproval }: A
       </div>
 
       <ol className="activation-steps">
-        <EnvironmentStep state={snapshot.environment} />
+        <EnvironmentStep origin={environmentOrigin} state={snapshot.environment} />
         <RunnerStep state={snapshot.runner} />
         <CanaryAccessStep state={snapshot.canaryAccess} />
-        <RehearsalStep onReviewApproval={onReviewApproval} scenarioCount={4} state={snapshot.rehearsal} />
+        <RehearsalStep onReviewApproval={onReviewApproval} scenarioCount={scenarioCount} state={snapshot.rehearsal} />
       </ol>
     </section>
   );

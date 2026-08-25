@@ -30,7 +30,9 @@ describe("canary activation dashboard", () => {
     ]);
     expect(within(activation).getByText(/next action: verify staging/i)).toBeTruthy();
     expect(within(activation).getByRole("link", { name: /verify staging now/i })).toBeTruthy();
-    expect(within(activation).getByText(/launch preview/i)).toBeTruthy();
+    expect(within(activation).getByText(/first useful run/i)).toBeTruthy();
+    expect(screen.queryByRole("navigation", { name: /preview activation states/i })).toBeNull();
+    expect(document.body.textContent).not.toMatch(/Northstar workspace|Sample state only/i);
   });
 
   test("keeps pre-disclosure cloud status operational and free of local-sensitive content", () => {
@@ -51,7 +53,8 @@ describe("canary activation dashboard", () => {
     cleanup();
     render(<Runner />);
     expect(screen.getByRole("heading", { name: /pair your runner/i })).toBeTruthy();
-    expect(screen.getByText(/waiting for this browser to approve/i)).toBeTruthy();
+    expect(screen.getByText(/connect your signed-in workspace/i)).toBeTruthy();
+    expect(screen.queryByText(/copper · field · seven|8C1F · 4E29 · A773/i)).toBeNull();
     expect(screen.getByRole("link", { name: /return to activation/i }).getAttribute("href"))
       .toBe("/dashboard");
   });

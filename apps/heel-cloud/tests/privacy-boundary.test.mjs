@@ -131,7 +131,9 @@ function analyzeSource(fileName, text) {
   const sinkAliases = new Set();
   const engineWorker = relativeName === "workers/heel-review.worker.ts";
   const serverWorker = relativeName === "worker/index.ts";
-  const controlPlaneClient = relativeName === "lib/heel-cloud-api.ts";
+  const findingsControlPlaneClient = relativeName === "lib/heel-cloud-api.ts";
+  const canaryControlPlaneClient = relativeName === "lib/canary-api.ts";
+  const controlPlaneClient = findingsControlPlaneClient || canaryControlPlaneClient;
   const constStringInitializers = new Map();
 
   function collectConstStringInitializers(node) {
@@ -220,7 +222,9 @@ function analyzeSource(fileName, text) {
       && !call.questionDotToken
       && ts.isIdentifier(call.expression)
       && call.expression.text === "fetch"
-      && enclosingFunctionName(call) === "sameOriginControlPlaneFetch"
+      && enclosingFunctionName(call) === (
+        canaryControlPlaneClient ? "sameOriginCanaryFetch" : "sameOriginControlPlaneFetch"
+      )
       && call.arguments.length === 2
       && call.arguments[0].getText(parsed) === "path"
       && call.arguments[1].getText(parsed) === "init"
@@ -258,9 +262,12 @@ function analyzeSource(fileName, text) {
   function validateControlPlaneClientContract() {
     if (!controlPlaneClient) return;
     const sourceText = parsed.getFullText();
+    const fetchContract = canaryControlPlaneClient
+      ? "async function sameOriginCanaryFetch(path: string, init: RequestInit): Promise<Response> {\n  return fetch(path, init);\n}"
+      : "async function sameOriginControlPlaneFetch(path: string, init: RequestInit): Promise<Response> {\n  return fetch(path, init);\n}";
     for (const fragment of [
       'const CONTROL_PLANE_PREFIX = "/api/control-plane";',
-      "async function sameOriginControlPlaneFetch(path: string, init: RequestInit): Promise<Response> {\n  return fetch(path, init);\n}",
+      fetchContract,
       'if (!path.startsWith(`${CONTROL_PLANE_PREFIX}/v1/`) || path.includes("?") || path.includes("#"))',
       'cache: "no-store",',
       'credentials: "same-origin",',
@@ -291,7 +298,8 @@ function analyzeSource(fileName, text) {
   if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
   if ((RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (RUNNER_REVOKE.test(upstreamPath) && method === "DELETE") return upstreamPath;
-  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath)) && method === "POST") return upstreamPath;
+  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath)) && method === "POST") return upstreamPath;
+  if (isHumanCanaryRoute(method, upstreamPath) || isHumanEnvironmentRoute(method, upstreamPath)) return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
   }
@@ -330,6 +338,7 @@ function analyzeSource(fileName, text) {
       'const SYNCED_REVIEW_REF = "synrev_[0-9a-f]{32}";',
       'const MAX_RUNNER_CLAIM_BODY_BYTES = 256;',
       'const MAX_RUNNER_CONTROL_BODY_BYTES = 36 * 1024;',
+      'const MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES = 272 * 1024;',
       'const MAX_RUNNER_RESYNC_BODY_BYTES = 2 * 1024;',
       'const MAX_RUNNER_PAIRING_BODY_BYTES = 16 * 1024;',
       "const upstreamUrl = new URL(upstreamPath, CONTROL_PLANE_ORIGIN);",
@@ -2314,6 +2323,30 @@ test("the privacy analyzer pins the private control-plane fetch and route allowl
       `${mutation.label}: ${violations.join("\n")}`,
     );
   }
+});
+
+
+test("the edge keeps canary human and runner-result authorities on exact route and header families", async () => {
+  const worker = await source("worker/index.ts");
+  for (const fragment of [
+    "const CANARY_APPROVAL_PROJECTION_ROUTE = new RegExp(",
+    "const CANARY_RUN_ROUTE = new RegExp(",
+    "const CANARY_RUN_EVENTS_ROUTE = new RegExp(",
+    "const CANARY_RUN_APPROVE_ROUTE = new RegExp(",
+    "const CANARY_RUN_STOP_ROUTE = new RegExp(",
+    "const CANARY_DISCLOSURE_PERMIT_ROUTE = new RegExp(",
+    "const CANARY_DISCLOSURE_LOCAL_ROUTE = new RegExp(",
+    "const CANARY_FINDINGS_ROUTE = new RegExp(",
+    "const RUNNER_RESULT_PROJECTION = new RegExp(",
+    "const MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES = 272 * 1024;",
+    "const RUNNER_NEXT_NONCE = /^[A-Za-z0-9+/]{43}=$/;",
+    "const humanCanary = isHumanCanaryRoute(method, upstreamPath);",
+    "const runnerResultProjection = RUNNER_RESULT_PROJECTION.test(upstreamPath);",
+    'headers.set("If-Heel-Control-Generation", controlGeneration);',
+    'if (!CANARY_IDEMPOTENCY_KEY.test(idempotencyKey)) throw new InvalidControlPlaneRequest();\n    headers.set("Idempotency-Key", idempotencyKey);',
+  ]) assert.equal(worker.split(fragment).length - 1, 1, `missing exact ${fragment}`);
+
+  assert.doesNotMatch(worker, /startsWith\("\/v1\/.*(?:runs|jobs|targets)/);
 });
 
 

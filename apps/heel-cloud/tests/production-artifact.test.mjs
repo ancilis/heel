@@ -1754,6 +1754,24 @@ test("production worker streams only the approved findings control-plane routes"
 });
 
 
+test("production source freezes exact canary route families before artifact generation", async () => {
+  const source = await readFile(join(appRoot, "worker/index.ts"), "utf8");
+  for (const name of [
+    "CANARY_APPROVAL_PROJECTION_ROUTE",
+    "CANARY_RUN_ROUTE",
+    "CANARY_RUN_EVENTS_ROUTE",
+    "CANARY_RUN_APPROVE_ROUTE",
+    "CANARY_RUN_STOP_ROUTE",
+    "CANARY_DISCLOSURE_PERMIT_ROUTE",
+    "CANARY_DISCLOSURE_LOCAL_ROUTE",
+    "CANARY_FINDINGS_ROUTE",
+    "RUNNER_RESULT_PROJECTION",
+  ]) assert.match(source, new RegExp(`const ${name} = new RegExp\\(`), name);
+  assert.match(source, /const MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES = 272 \* 1024;/);
+  assert.doesNotMatch(source, /startsWith\(["'`]\/v1\/.*(?:runs|jobs|targets)/);
+});
+
+
 test("production worker carries only Heel session cookies on the exact account routes", async () => {
   const artifact = await import(
     pathToFileURL(join(serverRoot, "index.js")).href + `?account-proxy=${Date.now()}`

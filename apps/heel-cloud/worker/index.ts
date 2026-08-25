@@ -83,16 +83,57 @@ const REVIEWS_ROUTE = new RegExp(
 const REVIEW_DETAIL_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/reviews/${SYNCED_REVIEW_REF}$`,
 );
+const ENVIRONMENT_REF = "env_[0-9a-f]{32}";
+const CANARY_RUN_REF = "crun_[0-9a-f]{32}";
+const CANARY_APPROVAL_PROJECTION_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-approval-projections$`,
+);
+const CANARY_RUN_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}$`,
+);
+const CANARY_RUN_EVENTS_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/events$`,
+);
+const CANARY_RUN_APPROVE_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/approve$`,
+);
+const CANARY_RUN_STOP_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/stop$`,
+);
+const CANARY_DISCLOSURE_PERMIT_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/disclosure-permits$`,
+);
+const CANARY_DISCLOSURE_LOCAL_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/disclosure-local-only$`,
+);
+const CANARY_FINDINGS_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/findings$`,
+);
+const ENVIRONMENTS_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/environments$`,
+);
+const ENVIRONMENT_CHECK_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/environments/${ENVIRONMENT_REF}/check$`,
+);
+const ENVIRONMENT_REVOKE_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/environments/${ENVIRONMENT_REF}/revoke$`,
+);
 const MAX_CONTROL_PLANE_BODY_BYTES = 256 * 1024;
 const MAX_DEVICE_BODY_BYTES = 8 * 1024;
+const MAX_CANARY_PROJECTION_BODY_BYTES = 64 * 1024;
+const MAX_CANARY_HUMAN_BODY_BYTES = 16 * 1024;
 const MAX_RUNNER_CLAIM_BODY_BYTES = 256;
 const MAX_RUNNER_CONTROL_BODY_BYTES = 36 * 1024;
+const MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES = 272 * 1024;
 const MAX_RUNNER_RESYNC_BODY_BYTES = 2 * 1024;
 const MAX_RUNNER_PAIRING_BODY_BYTES = 16 * 1024;
 const API_KEY_AUTHORIZATION = /^Bearer heel_sk_[A-Za-z0-9_-]+$/;
 const DEVICE_AUTHORIZATION = /^Bearer heel_at_[A-Za-z0-9_-]{43}$/;
 const SESSION_TOKEN = /^[A-Za-z0-9_-]+$/;
 const IDEMPOTENCY_KEY = /^fs1-[0-9a-f]{64}$/;
+const CANARY_IDEMPOTENCY_KEY = /^ca1-[0-9a-f]{64}$/;
+const CONTROL_GENERATION = /^(?:0|[1-9][0-9]{0,19})$/;
+const RUNNER_NEXT_NONCE = /^[A-Za-z0-9+/]{43}=$/;
 const RUNNER_PAIRING_EXCHANGE = "/v1/runner-pairings/exchange";
 const RUNNER_PAIRING_ACTIVATE = /^\/v1\/runner-pairings\/pending_[0-9a-f]{32}\/activate$/;
 const RUNNER_PAIRING_MANAGE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runner-pairings(?:/pending_[0-9a-f]{32}(?:/approve)?)?$`);
@@ -101,9 +142,27 @@ const RUNNER_ROTATION_APPROVE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/run
 const RUNNER_REVOKE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}$`);
 const RUNNER_ROTATION_PUBLIC = /^\/v1\/runner-rotations\/rotation_[0-9a-f]{32}\/(?:activate|poll)$/;
 const RUNNER_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}(?:/claim|/runs/[A-Za-z0-9_-]{1,128}/(?:heartbeat|progress|result|stop-ack))$`);
+const RUNNER_RESULT_PROJECTION = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/runs/${CANARY_RUN_REF}/result-projection$`);
 const RUNNER_RESYNC = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/resync/(?:start|complete)$`);
 const RUNNER_HEADERS = ["X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature"];
 const RUNNER_RESYNC_HEADERS = ["X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Signature"];
+
+function isHumanCanaryRoute(method: string, upstreamPath: string): boolean {
+  if (CANARY_APPROVAL_PROJECTION_ROUTE.test(upstreamPath)) return method === "POST";
+  if (CANARY_RUN_ROUTE.test(upstreamPath)) return method === "GET";
+  if (CANARY_RUN_EVENTS_ROUTE.test(upstreamPath)) return method === "GET";
+  if (CANARY_RUN_APPROVE_ROUTE.test(upstreamPath)) return method === "POST";
+  if (CANARY_RUN_STOP_ROUTE.test(upstreamPath)) return method === "POST";
+  if (CANARY_DISCLOSURE_PERMIT_ROUTE.test(upstreamPath)) return method === "POST";
+  if (CANARY_DISCLOSURE_LOCAL_ROUTE.test(upstreamPath)) return method === "POST";
+  return CANARY_FINDINGS_ROUTE.test(upstreamPath) && method === "GET";
+}
+
+function isHumanEnvironmentRoute(method: string, upstreamPath: string): boolean {
+  if (ENVIRONMENTS_ROUTE.test(upstreamPath)) return method === "GET" || method === "POST";
+  return method === "POST"
+    && (ENVIRONMENT_CHECK_ROUTE.test(upstreamPath) || ENVIRONMENT_REVOKE_ROUTE.test(upstreamPath));
+}
 
 function contentSecurityPolicy(nonce: string): string {
   return [
@@ -188,8 +247,11 @@ function controlPlaneRequestHeaders(
   edgeAuthSecret: string,
 ): { headers: Headers; contentLength: number } {
   let headers: Headers;
-  const runnerControl = RUNNER_CONTROL.test(upstreamPath);
+  const runnerResultProjection = RUNNER_RESULT_PROJECTION.test(upstreamPath);
+  const runnerControl = RUNNER_CONTROL.test(upstreamPath) || runnerResultProjection;
   const runnerResync = RUNNER_RESYNC.test(upstreamPath);
+  const humanCanary = isHumanCanaryRoute(method, upstreamPath);
+  const humanEnvironment = isHumanEnvironmentRoute(method, upstreamPath);
   const runnerPairingPublic = upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath) || RUNNER_ROTATION_PUBLIC.test(upstreamPath);
   const runnerPairingHuman = RUNNER_PAIRING_MANAGE.test(upstreamPath) || RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath) || RUNNER_REVOKE.test(upstreamPath);
   if (runnerControl) {
@@ -212,6 +274,18 @@ function controlPlaneRequestHeaders(
   } else if (runnerPairingPublic) {
     if (method !== "POST" || source.has("Authorization") || source.has("Cookie")) throw new InvalidControlPlaneRequest();
     headers = new Headers();
+  } else if (humanCanary || humanEnvironment) {
+    if (source.has("Authorization")) throw new InvalidControlPlaneRequest();
+    headers = controlPlaneCredentials(source);
+    if (!headers.has("Cookie") || headers.has("Authorization")) throw new InvalidControlPlaneRequest();
+    if (method === "POST") {
+      const origin = source.get("Origin") ?? "";
+      if (origin !== configuredPublicOrigin || source.get("Sec-Fetch-Site") !== "same-origin") {
+        throw new InvalidControlPlaneRequest();
+      }
+      headers.set("X-Heel-Internal-Origin", "same-origin");
+      headers.set("Origin", origin);
+    }
   } else if (runnerPairingHuman) {
     const origin = source.get("Origin") ?? "";
     if (origin !== configuredPublicOrigin || source.get("Sec-Fetch-Site") !== "same-origin") throw new InvalidControlPlaneRequest();
@@ -271,11 +345,17 @@ function controlPlaneRequestHeaders(
   }
   const contentLength = Number(declaredLength);
   const maximum = runnerControl
-    ? (upstreamPath.endsWith("/claim") ? MAX_RUNNER_CLAIM_BODY_BYTES : MAX_RUNNER_CONTROL_BODY_BYTES)
+    ? runnerResultProjection
+      ? MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES
+      : (upstreamPath.endsWith("/claim") ? MAX_RUNNER_CLAIM_BODY_BYTES : MAX_RUNNER_CONTROL_BODY_BYTES)
     : runnerResync
       ? MAX_RUNNER_RESYNC_BODY_BYTES
       : (runnerPairingPublic || runnerPairingHuman)
         ? MAX_RUNNER_PAIRING_BODY_BYTES
+        : CANARY_APPROVAL_PROJECTION_ROUTE.test(upstreamPath)
+          ? MAX_CANARY_PROJECTION_BODY_BYTES
+          : humanCanary || humanEnvironment
+            ? MAX_CANARY_HUMAN_BODY_BYTES
         : upstreamPath.startsWith("/v1/device/")
           ? MAX_DEVICE_BODY_BYTES
           : MAX_CONTROL_PLANE_BODY_BYTES;
@@ -297,6 +377,16 @@ function controlPlaneRequestHeaders(
     if (!IDEMPOTENCY_KEY.test(idempotencyKey)) throw new InvalidControlPlaneRequest();
     headers.set("Idempotency-Key", idempotencyKey);
   }
+  if (CANARY_RUN_APPROVE_ROUTE.test(upstreamPath)) {
+    const idempotencyKey = singletonHeader(source, "Idempotency-Key")?.trim() ?? "";
+    if (!CANARY_IDEMPOTENCY_KEY.test(idempotencyKey)) throw new InvalidControlPlaneRequest();
+    headers.set("Idempotency-Key", idempotencyKey);
+  }
+  if (CANARY_RUN_APPROVE_ROUTE.test(upstreamPath) || CANARY_RUN_STOP_ROUTE.test(upstreamPath)) {
+    const controlGeneration = singletonHeader(source, "If-Heel-Control-Generation")?.trim() ?? "";
+    if (!CONTROL_GENERATION.test(controlGeneration)) throw new InvalidControlPlaneRequest();
+    headers.set("If-Heel-Control-Generation", controlGeneration);
+  }
   return { headers, contentLength };
 }
 
@@ -306,9 +396,12 @@ function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""
     const value = response.headers.get(name);
     if (value !== null) headers.set(name, value);
   }
-  if (RUNNER_CONTROL.test(upstreamPath)) {
+  if (RUNNER_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath)) {
     const nextNonce = response.headers.get("X-Heel-Runner-Next-Nonce");
-    if (nextNonce !== null) headers.set("X-Heel-Runner-Next-Nonce", nextNonce);
+    if (nextNonce !== null) {
+      if (!RUNNER_NEXT_NONCE.test(nextNonce)) throw new Error("invalid runner nonce response");
+      headers.set("X-Heel-Runner-Next-Nonce", nextNonce);
+    }
   }
   if (response.status >= 200 && response.status <= 299) {
     const setCookie = response.headers.get("Set-Cookie");
@@ -361,7 +454,8 @@ function controlPlaneRoute(method: string, pathname: string): string | null {
   if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
   if ((RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (RUNNER_REVOKE.test(upstreamPath) && method === "DELETE") return upstreamPath;
-  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath)) && method === "POST") return upstreamPath;
+  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath)) && method === "POST") return upstreamPath;
+  if (isHumanCanaryRoute(method, upstreamPath) || isHumanEnvironmentRoute(method, upstreamPath)) return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
   }
