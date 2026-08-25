@@ -18,8 +18,8 @@ import time
 from dataclasses import dataclass
 
 from .canary_store import (
-    CANARY_ENVIRONMENT_ATTESTATION_ACK_MIGRATION, CANARY_ENVIRONMENT_VERIFICATION_MIGRATION,
-    CANARY_STORE_SCHEMA,
+    CANARY_COORDINATION_MIGRATION, CANARY_ENVIRONMENT_ATTESTATION_ACK_MIGRATION,
+    CANARY_ENVIRONMENT_VERIFICATION_MIGRATION, CANARY_STORE_SCHEMA,
 )
 from .runner_auth import (
     RUNNER_AUTH_FINALIZATION_MIGRATION, RUNNER_AUTH_GENERATION_MIGRATION, RUNNER_AUTH_HARDENING_MIGRATION,
@@ -83,7 +83,12 @@ class Migrator:
         for m in self.pending():
             try:
                 self.conn.execute("BEGIN IMMEDIATE" if self.dialect == "sqlite" else "BEGIN")
-                for stmt in translate(m.sql, self.dialect).split(";"):
+                translated = translate(m.sql, self.dialect)
+                statements = (
+                    _sqlite_statements(translated)
+                    if self.dialect == "sqlite" else translated.split(";")
+                )
+                for stmt in statements:
                     if stmt.strip():
                         self.conn.execute(stmt)
                 self.conn.execute(
@@ -95,6 +100,23 @@ class Migrator:
                 raise MigrationError(f"migration {m.version} ({m.name}) failed: {e}") from e
             applied.append(m.version)
         return applied
+
+
+def _sqlite_statements(sql: str) -> list[str]:
+    """Split SQLite scripts without breaking trigger bodies at their inner semicolon."""
+    statements: list[str] = []
+    buffer = ""
+    for line in sql.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statements.append(buffer.strip())
+            buffer = ""
+    if buffer.strip():
+        terminated = buffer.rstrip() + ";"
+        if not sqlite3.complete_statement(terminated):
+            raise MigrationError("incomplete SQLite migration statement")
+        statements.append(buffer.strip())
+    return statements
 
 
 def read_current_version(conn) -> int:
@@ -350,6 +372,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_canary_fault_refund
     Migration(12, "verified_canary_runner_resync", RUNNER_AUTH_RESYNC_MIGRATION),
     Migration(13, "verified_canary_runner_generations", RUNNER_AUTH_GENERATION_MIGRATION),
     Migration(14, "verified_canary_runner_finalization", RUNNER_AUTH_FINALIZATION_MIGRATION),
+    Migration(15, "verified_canary_coordination", CANARY_COORDINATION_MIGRATION),
 ]
 
 

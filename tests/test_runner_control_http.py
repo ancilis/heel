@@ -132,6 +132,27 @@ def test_run_chain_allocator_issues_four_distinct_operation_chains_atomically():
     }
 
 
+def test_run_chain_allocator_can_share_a_caller_owned_claim_transaction():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO workspaces VALUES('ws')")
+    CanaryStore(conn); initialize_runner_auth_schema(conn)
+    store = RunnerAuthStore(conn, pepper=b"p" * 32, now=lambda: 100.0)
+    conn.execute(
+        "INSERT INTO canary_runners VALUES(?,?,?,?,?)",
+        ("runner", "ws", "runner", "active", 1),
+    )
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    issued = store.provision_run_chains_in_transaction("ws", "runner", "run")
+    assert conn.in_transaction
+    assert set(issued) == {"heartbeat", "progress", "result", "stop-ack"}
+    conn.rollback()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_runner_nonce_chains WHERE chain_name!='claim'"
+    ).fetchone()[0] == 0
+
+
 def test_resync_recovers_an_existing_chain_and_replays_only_the_same_signed_completion():
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY)")
@@ -387,12 +408,37 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
             cp.store.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", workspace, "runner", "active", time.time()))
             cp.store.conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", public, "active", time.time()))
             cp.store.conn.commit(); issued = cp.runner_auth.provision_run_chains(workspace, "runner", "run"); nonce = issued["heartbeat"]["next_nonce_b64"]
-            stamp, digest = time.time(), "a" * 64
+            stamp, stamp_ms, digest = time.time(), int(time.time() * 1000), "a" * 64
             cp.store.conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", (workspace, "prj", "project", "owner", stamp))
             cp.store.conn.execute("INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at) VALUES(?,?,?,?,?,?,?)", ("env", workspace, "prj", "https://canary.example.com", "staging", "verified", stamp))
-            cp.store.conn.execute("INSERT INTO canary_approval_projections VALUES(?,?,?,?,?,?,?,?,?)", ("approval", workspace, "prj", "env", "runner", digest, json.dumps({"manifest_digest": digest}), stamp, stamp + 60))
-            cp.store.conn.execute("INSERT INTO canary_execution_grants VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("g", workspace, "prj", "approval", "env", "runner", "nonce", digest, "issued", stamp + 60, stamp))
-            cp.store.conn.execute("INSERT INTO canary_runs VALUES(?,?,?,?,?,?,?,?,?)", ("run", workspace, "prj", "g", "env", "runner", "claimed", stamp, stamp))
+            cp.store.conn.execute(
+                "INSERT INTO canary_approval_projections(approval_id,workspace_id,project_ref,run_id,"
+                "environment_id,runner_id,runner_key_id,manifest_digest,projection_digest,signing_key_id,"
+                "status,projection_json,scenario_ids_json,budgets_json,uploaded_by,approved_by,reason,"
+                "created_at,expires_at,approved_at,purge_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("approval", workspace, "prj", "run", "env", "runner", key_id, digest, digest,
+                 key_id, "approved", json.dumps({"manifest_digest": digest}), "[]", "{}", "owner",
+                 "owner", "test", stamp_ms, stamp_ms + 60_000, stamp_ms, stamp_ms + 120_000),
+            )
+            cp.store.conn.execute(
+                "INSERT INTO canary_execution_grants(grant_id,workspace_id,project_ref,approval_id,"
+                "run_id,environment_id,runner_id,runner_key_id,nonce_hash,grant_digest,grant_json,status,"
+                "reservation_id,meter,period,idempotency_key,issued_at,expires_at,claimed_at,purge_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("g", workspace, "prj", "approval", "run", "env", "runner", key_id, "b" * 64,
+                 digest, "{}", "claimed", "reservation", "canary_runs", "2026-08",
+                 "ca1-" + "c" * 64, stamp_ms, stamp_ms + 60_000, stamp_ms, stamp_ms + 120_000),
+            )
+            cp.store.conn.execute(
+                "INSERT INTO canary_runs(run_id,workspace_id,project_ref,approval_id,grant_id,"
+                "environment_id,runner_id,runner_key_id,status,error_category,stop_reason,"
+                "source_event_sequence,cloud_event_sequence,last_heartbeat_at_ms,claimed_at_ms,"
+                "stop_generation,stop_ack_late,reservation_id,quota_state,kill_switch_generation,"
+                "created_at,updated_at,purge_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("run", workspace, "prj", "approval", "g", "env", "runner", key_id, "claimed",
+                 "none", "none", -1, 0, stamp_ms, stamp_ms, 0, 0, "reservation", "reserved", 0,
+                 stamp_ms, stamp_ms, stamp_ms + 120_000),
+            )
             identity = cp.runner_auth._identity_record(workspace_id=workspace, runner_id="runner", public_key=public, fingerprint=hashlib.sha256(raw).hexdigest(), key_id=key_id, runner_version="v1", adapters_json="{}", paired_by="owner", paired_at=time.time(), heartbeat_at=time.time())
             cp.runner_auth._save_identity(identity, instant=time.time()); cp.store.conn.commit()
             from test_canary_contracts import _digest, operational

@@ -33,6 +33,10 @@ class OpsStore:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
         self.conn.executescript(_SCHEMA)
+        # Coordination owns the generation table and its triggers.  Delegating here keeps
+        # Ops-first and CanaryStore-first startup byte-identical.
+        from .canary_store import CanaryStore
+        CanaryStore(conn)
 
     def _audit(self, actor: str, action: str, subject: str, reason: str) -> None:
         self.conn.execute(
@@ -71,6 +75,15 @@ class OpsStore:
             scope = row["scope"] if isinstance(row, sqlite3.Row) else row[0]
             raise KillSwitchTripped(
                 "service paused" if scope == "global" else "workspace paused")
+
+    def control_generation(self) -> int:
+        """Return the monotonic authority generation bound into canary grants and gates."""
+        row = self.conn.execute(
+            "SELECT generation FROM canary_control_generation WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("canary control state is unavailable")
+        return int(row["generation"] if isinstance(row, sqlite3.Row) else row[0])
 
     def active(self) -> list:
         return self.conn.execute(

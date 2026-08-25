@@ -913,34 +913,229 @@ class RunnerAuthStore:
 
     def provision_run_chains(self, workspace_id: str, runner_id: str, run_id: str) -> dict[str, dict[str, object]]:
         """Atomically issue independent nonce state for every named run operation."""
-        self._identifier(run_id, "run")
-        instant = self._now()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            row = self.conn.execute("SELECT 1 FROM canary_runners WHERE workspace_id=? AND runner_id=? AND status='active'", (workspace_id, runner_id)).fetchone()
-            if row is None:
-                raise RunnerAuthError("invalid runner")
-            issued: dict[str, dict[str, object]] = {}
-            for operation in ("heartbeat", "progress", "result", "stop-ack"):
-                nonce, chain = _token(), f"{operation}:{run_id}"
-                self.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace_id, runner_id, chain, self._hash("nonce", nonce), 1, instant + NONCE_TTL))
-                self.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace_id, runner_id, chain, 1, 0, instant))
-                issued[operation] = {"next_nonce_b64": nonce, "next_sequence": 1, "generation": 0}
+            issued = self.provision_run_chains_in_transaction(workspace_id, runner_id, run_id)
             self.conn.commit()
         except Exception:
             self.conn.rollback(); raise
         return issued
 
+    def provision_run_chains_in_transaction(
+        self, workspace_id: str, runner_id: str, run_id: str,
+    ) -> dict[str, dict[str, object]]:
+        """Issue run chains inside the caller's claim transaction, without nesting BEGIN."""
+        if not self.conn.in_transaction:
+            raise RuntimeError("run-chain provisioning requires an active transaction")
+        self._identifier(run_id, "run")
+        instant = self._now()
+        row = self.conn.execute(
+            "SELECT 1 FROM canary_runners WHERE workspace_id=? AND runner_id=? AND status='active'",
+            (workspace_id, runner_id),
+        ).fetchone()
+        if row is None:
+            raise RunnerAuthError("invalid runner")
+        issued: dict[str, dict[str, object]] = {}
+        for operation in ("heartbeat", "progress", "result", "stop-ack"):
+            nonce, chain = _token(), f"{operation}:{run_id}"
+            self.conn.execute(
+                "INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)",
+                (workspace_id, runner_id, chain, self._hash("nonce", nonce), 1,
+                 instant + NONCE_TTL),
+            )
+            self.conn.execute(
+                "INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)",
+                (workspace_id, runner_id, chain, 1, 0, instant),
+            )
+            issued[operation] = {
+                "next_nonce_b64": nonce, "next_sequence": 1, "generation": 0,
+            }
+        return issued
+
+    def _revoke_unused_canary_grants_in_transaction(
+        self,
+        workspace_id: str,
+        runner_id: str,
+        *,
+        runner_key_id: str | None,
+        actor: str,
+        reason_code: str,
+        instant: float,
+        ledger: object,
+    ) -> None:
+        """Cancel and refund unclaimed grants bound to authority that is going away."""
+        if not self.conn.in_transaction:
+            raise RuntimeError("grant revocation requires an active transaction")
+        columns = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(canary_execution_grants)")
+        }
+        if "runner_key_id" not in columns:
+            self.conn.execute(
+                "UPDATE canary_execution_grants SET status='revoked' "
+                "WHERE workspace_id=? AND runner_id=? "
+                "AND status IN ('prepared','approved','issued')",
+                (workspace_id, runner_id),
+            )
+            return
+
+        parameters: list[object] = [workspace_id, runner_id]
+        key_clause = ""
+        if runner_key_id is not None:
+            key_clause = " AND g.runner_key_id=?"
+            parameters.append(runner_key_id)
+        grants = self.conn.execute(
+            "SELECT g.grant_id,g.run_id,g.reservation_id,g.project_ref,r.quota_state,"
+            "r.cloud_event_sequence,r.purge_at "
+            "FROM canary_execution_grants g JOIN canary_runs r "
+            "ON r.workspace_id=g.workspace_id AND r.project_ref=g.project_ref "
+            "AND r.run_id=g.run_id AND r.grant_id=g.grant_id "
+            "WHERE g.workspace_id=? AND g.runner_id=? "
+            "AND g.status IN ('prepared','approved','issued')" + key_clause,
+            tuple(parameters),
+        ).fetchall()
+        now_ms = self._milliseconds(instant)
+        for grant in grants:
+            quota_refunded = False
+            if grant["quota_state"] == "reserved":
+                quota_refunded = ledger._settle_in_transaction(
+                    grant["reservation_id"], "refund",
+                )
+            self.conn.execute(
+                "UPDATE canary_execution_grants SET status='revoked' WHERE grant_id=?",
+                (grant["grant_id"],),
+            )
+            self.conn.execute(
+                "UPDATE canary_runs SET status='cancelled',quota_state=?,updated_at=? "
+                "WHERE workspace_id=? AND project_ref=? AND run_id=?",
+                (
+                    "refunded" if quota_refunded or grant["quota_state"] == "refunded"
+                    else grant["quota_state"],
+                    now_ms, workspace_id, grant["project_ref"], grant["run_id"],
+                ),
+            )
+            event_types = ["grant_revoked"]
+            if quota_refunded:
+                event_types.append("quota_refunded")
+            event_types.append("cancelled")
+            sequence = int(grant["cloud_event_sequence"])
+            for event_type in event_types:
+                status = "cancelled" if event_type == "cancelled" else "approved"
+                payload = {
+                    "schema_version": "heel.canary-run-event.v1",
+                    "event_type": event_type,
+                    "status": status,
+                    "reason_code": reason_code,
+                }
+                self.conn.execute(
+                    "INSERT INTO canary_run_events("
+                    "event_id,workspace_id,project_ref,run_id,sequence,event_type,event_json,"
+                    "payload_digest,source_event_sequence,actor_class,actor_id,reason_code,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,NULL,?,?,?,?)",
+                    (
+                        "cre_" + secrets.token_hex(16), workspace_id, grant["project_ref"],
+                        grant["run_id"], sequence, event_type, canonical_bytes(payload).decode(),
+                        canonical_digest(payload), "human", actor, reason_code, now_ms,
+                    ),
+                )
+                action = event_type if event_type in {"cancelled", "quota_refunded"} else None
+                if action is not None:
+                    self.conn.execute(
+                        "INSERT INTO canary_audit_records("
+                        "audit_id,workspace_id,project_ref,run_id,subject_ref,action,actor_class,"
+                        "actor_id,reason_code,payload_digest,created_at,purge_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            "cra_" + secrets.token_hex(16), workspace_id, grant["project_ref"],
+                            grant["run_id"], grant["grant_id"], action, "human", actor,
+                            reason_code, canonical_digest(payload), now_ms, grant["purge_at"],
+                        ),
+                    )
+                sequence += 1
+            self.conn.execute(
+                "UPDATE canary_runs SET cloud_event_sequence=? WHERE workspace_id=? "
+                "AND project_ref=? AND run_id=?",
+                (sequence, workspace_id, grant["project_ref"], grant["run_id"]),
+            )
+
+    def _stop_inflight_canary_runs_in_transaction(
+        self, workspace_id: str, runner_id: str, *, actor: str, instant: float,
+    ) -> None:
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(canary_runs)")}
+        if "stop_deadline_ms" not in columns:
+            return
+        generation_row = self.conn.execute(
+            "SELECT generation FROM canary_control_generation WHERE singleton=1"
+        ).fetchone()
+        generation = int(generation_row[0]) if generation_row is not None else 0
+        now_ms = self._milliseconds(instant)
+        runs = self.conn.execute(
+            "SELECT * FROM canary_runs WHERE workspace_id=? AND runner_id=? "
+            "AND status IN ('claimed','running','finalizing') AND stop_reason='none'",
+            (workspace_id, runner_id),
+        ).fetchall()
+        for run in runs:
+            next_status = "finalizing" if run["status"] == "finalizing" else "stop_requested"
+            self.conn.execute(
+                "UPDATE canary_runs SET status=?,stop_reason='runner_revoked',stop_generation=?,"
+                "stop_requested_at_ms=?,stop_deadline_ms=?,updated_at=? "
+                "WHERE workspace_id=? AND project_ref=? AND run_id=?",
+                (
+                    next_status, generation, now_ms, now_ms + 5000, now_ms,
+                    workspace_id, run["project_ref"], run["run_id"],
+                ),
+            )
+            payload = {
+                "schema_version": "heel.canary-run-event.v1",
+                "event_type": "stop_requested", "status": next_status,
+                "reason_code": "runner_revoked",
+            }
+            self.conn.execute(
+                "INSERT INTO canary_run_events("
+                "event_id,workspace_id,project_ref,run_id,sequence,event_type,event_json,"
+                "payload_digest,source_event_sequence,actor_class,actor_id,reason_code,created_at) "
+                "VALUES(?,?,?,?,?,'stop_requested',?,?,NULL,'human',?,'runner_revoked',?)",
+                (
+                    "cre_" + secrets.token_hex(16), workspace_id, run["project_ref"],
+                    run["run_id"], run["cloud_event_sequence"], canonical_bytes(payload).decode(),
+                    canonical_digest(payload), actor, now_ms,
+                ),
+            )
+            self.conn.execute(
+                "UPDATE canary_runs SET cloud_event_sequence=cloud_event_sequence+1 "
+                "WHERE workspace_id=? AND project_ref=? AND run_id=?",
+                (workspace_id, run["project_ref"], run["run_id"]),
+            )
+            self.conn.execute(
+                "INSERT INTO canary_audit_records("
+                "audit_id,workspace_id,project_ref,run_id,subject_ref,action,actor_class,actor_id,"
+                "reason_code,payload_digest,created_at,purge_at) VALUES(?,?,?,?,?,'stop_requested',"
+                "'human',?,'runner_revoked',?,?,?)",
+                (
+                    "cra_" + secrets.token_hex(16), workspace_id, run["project_ref"],
+                    run["run_id"], run["run_id"], actor, canonical_digest(payload), now_ms,
+                    run["purge_at"],
+                ),
+            )
+
     def revoke(self, workspace_id: str, runner_id: str, *, actor: str, reason_code: str = "human_revocation") -> bool:
         """Human-authorized revocation preserves historical runs but ends every control chain."""
         self._identifier(actor, "actor")
         instant = self._now()
+        from .ledger import UsageLedger
+        ledger = UsageLedger(self.conn)
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self.conn.execute("SELECT 1 FROM canary_runners WHERE workspace_id=? AND runner_id=? AND status='active'", (workspace_id, runner_id)).fetchone()
             if row is None:
                 self.conn.rollback(); return False
             self._identifier(reason_code, "revocation reason")
+            self._revoke_unused_canary_grants_in_transaction(
+                workspace_id, runner_id, runner_key_id=None, actor=actor,
+                reason_code=reason_code, instant=instant, ledger=ledger,
+            )
+            self._stop_inflight_canary_runs_in_transaction(
+                workspace_id, runner_id, actor=actor, instant=instant,
+            )
             self.conn.execute("UPDATE canary_runners SET status='revoked' WHERE workspace_id=? AND runner_id=?", (workspace_id, runner_id))
             self.conn.execute("UPDATE canary_runner_keys SET status='revoked', revoked_at=? WHERE workspace_id=? AND runner_id=? AND revoked_at IS NULL", (instant, workspace_id, runner_id))
             self.conn.execute("DELETE FROM canary_runner_nonce_chains WHERE workspace_id=? AND runner_id=?", (workspace_id, runner_id))
@@ -948,7 +1143,6 @@ class RunnerAuthStore:
             self.conn.execute("UPDATE canary_runner_resync_challenges SET status='invalidated' WHERE workspace_id=? AND runner_id=? AND status='pending'", (workspace_id, runner_id))
             # A runner loss invalidates only work which has not been claimed; historical and
             # in-flight records remain evidence and are settled by Task 7's lifecycle service.
-            self.conn.execute("UPDATE canary_execution_grants SET status='revoked' WHERE workspace_id=? AND runner_id=? AND status IN ('prepared','approved','issued')", (workspace_id, runner_id))
             identity = self._load_identity(workspace_id, runner_id)
             identity["state"] = "revoked"
             identity["revocation"] = {"revoked_at_ms": self._milliseconds(instant), "revoked_by": actor, "reason_code": reason_code}
@@ -981,6 +1175,13 @@ class RunnerAuthStore:
             old_raw = load_public_key_base64(old["public_key"]).public_bytes(Encoding.Raw, PublicFormat.Raw)
             if not hmac.compare_digest(hashlib.sha256(old_raw).hexdigest(), previous_fingerprint):
                 raise RunnerAuthError("invalid rotation")
+            active = self.conn.execute(
+                "SELECT 1 FROM canary_runs WHERE workspace_id=? AND runner_id=? "
+                "AND status IN ('claimed','running','stop_requested','finalizing') LIMIT 1",
+                (workspace_id, runner_id),
+            ).fetchone()
+            if active is not None:
+                raise RunnerAuthError("active canary run blocks rotation")
             pairing_id, challenge = "rotation_" + secrets.token_hex(16), _token()
             self.conn.execute("INSERT INTO canary_runner_rotations(pairing_id,workspace_id,runner_id,phrase,public_key,fingerprint,key_id,runner_version,adapters_json,activation_challenge,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (pairing_id, workspace_id, runner_id, phrase, public_key_b64, fingerprint, key_id, runner_version, canonical_bytes(dict(adapters)).decode(), challenge, "rotation_pending", instant, instant + PAIRING_TTL))
             identity = self._load_identity(workspace_id, runner_id)
@@ -1013,6 +1214,8 @@ class RunnerAuthStore:
         if not isinstance(overlap_seconds, int) or not 1 <= overlap_seconds <= 3600:
             raise ValueError("invalid key overlap")
         instant = self._now()
+        from .ledger import UsageLedger
+        ledger = UsageLedger(self.conn)
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self.conn.execute("SELECT * FROM canary_runner_rotations WHERE pairing_id=?", (pairing_id,)).fetchone()
@@ -1024,6 +1227,18 @@ class RunnerAuthStore:
                 load_public_key_base64(row["public_key"]).verify(signature, b"heel.runner-rotation-activate.v2\0" + canonical_bytes({"pairing_id": pairing_id, "challenge": row["activation_challenge"]}))
             except (ValueError, InvalidSignature):
                 raise RunnerAuthError("invalid rotation") from None
+            old_key = self.conn.execute(
+                "SELECT key_id FROM canary_runner_keys WHERE workspace_id=? AND runner_id=? "
+                "AND status='active' AND revoked_at IS NULL",
+                (row["workspace_id"], row["runner_id"]),
+            ).fetchone()
+            if old_key is None:
+                raise RunnerAuthError("invalid rotation")
+            self._revoke_unused_canary_grants_in_transaction(
+                row["workspace_id"], row["runner_id"], runner_key_id=old_key["key_id"],
+                actor=row["approved_by"], reason_code="runner_key_rotated", instant=instant,
+                ledger=ledger,
+            )
             self.conn.execute("UPDATE canary_runner_keys SET status='verification_only',revoked_at=? WHERE workspace_id=? AND runner_id=? AND status='active'", (instant + overlap_seconds, row["workspace_id"], row["runner_id"]))
             self.conn.execute("INSERT INTO canary_runner_keys(key_id,workspace_id,runner_id,public_key,status,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL)", (row["key_id"], row["workspace_id"], row["runner_id"], row["public_key"], "active", instant))
             self.conn.execute("DELETE FROM canary_runner_nonce_chains WHERE workspace_id=? AND runner_id=?", (row["workspace_id"], row["runner_id"]))

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import pytest
 
+from heel.canary_contracts import canonical_digest
+
 from heel.saas.network_guard import (
     AddressSetValidationError,
     BoundedDNSResolver,
@@ -423,12 +425,54 @@ def test_environment_proof_is_project_bound_and_clears_pending_token():
     assert seen == ["https://staging.example.com"]
     assert row["challenge_token"] is None
     assert row["attestation_text"] == OWNERSHIP_ATTESTATION
+    expected_verification_record = {
+        "schema_version": "heel.environment-verification-record.v1",
+        "workspace_id": "ws",
+        "project_id": "prj",
+        "environment_id": challenge.environment_id,
+        "origin": "https://staging.example.com",
+        "environment_class": "staging",
+        "attestation_text": OWNERSHIP_ATTESTATION,
+        "attestation_version": "v1",
+        "attestation_acknowledgement": "accepted",
+        "proof_method": "https-file",
+        "proof_version": "https-file.v1",
+        "normalization_version": "exact-origin.v1",
+        "challenge_generation": 1,
+        "verified_at_ms": int(row["verified_at"] * 1000),
+        "proof_expires_at_ms": int(row["proof_expires_at"] * 1000),
+    }
+    assert row["verification_record_digest"] == canonical_digest(expected_verification_record)
+    assert service.public_record(row)["verification_record_digest"] == row["verification_record_digest"]
     assert service.is_executable("ws", "prj", challenge.environment_id)
     replacement = service.start("ws", "prj", "https://staging.example.com", "production", actor="owner",
                                 attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
                                 attestation_acknowledgement="accepted")
     assert replacement.environment_id == challenge.environment_id
     assert not service.is_executable("ws", "prj", challenge.environment_id)
+    conn.close()
+
+
+def test_pre_migration_verified_row_without_record_digest_is_never_executable():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    service = VerifiedEnvironmentService(conn, clock=lambda: 100.0)
+    conn.execute(
+        "INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at,"
+        "attestation_text,attestation_version,attestation_acknowledgement,proof_method,proof_version,normalization_version,"
+        "challenge_generation,verified_at,proof_expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("env_legacy", "ws", "prj", "https://legacy.example.com", "staging", "verified", 1,
+         OWNERSHIP_ATTESTATION, "v1", "accepted", "https-file", "https-file.v1", "exact-origin.v1", 1, 1, 200),
+    )
+    conn.commit()
+    assert not service.is_executable("ws", "prj", "env_legacy")
+    assert service.list("ws", "prj")[0]["verification_record_digest"] is None
     conn.close()
 
 

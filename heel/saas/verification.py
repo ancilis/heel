@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from heel.canary_contracts import canonical_digest
+
 CHALLENGE_TTL = 24 * 3600
 REVERIFY_AFTER = 30 * 24 * 3600   # verified targets should be re-proven monthly
 
@@ -214,6 +216,7 @@ class TargetVerifier:
 # Legacy /targets remains compatible and has its own meter; canary execution consumes only this
 # project-bound exact-origin record.
 VERIFIED_ENVIRONMENT_SCHEMA_VERSION = "VerifiedEnvironment.v1"
+VERIFICATION_RECORD_SCHEMA_VERSION = "heel.environment-verification-record.v1"
 NORMALIZATION_VERSION = "exact-origin.v1"
 HTTPS_PROOF_VERSION = "https-file.v1"
 DNS_PROOF_VERSION = "dns-txt.v1"
@@ -345,7 +348,8 @@ class VerifiedEnvironmentService:
                     "attestation_version=?,attestation_acknowledgement=?,attested_by=?,attested_at=?,proof_method=?,proof_version=?,normalization_version=?,"
                     "challenge_generation=?,challenge_digest=?,challenge_token=?,challenge_created_at=?,challenge_expires_at=?,"
                     "last_check_at=NULL,last_failure_code='challenge_replaced',verified_at=NULL,proof_expires_at=NULL,revoked_at=NULL,"
-                    "revoked_by=NULL,revoked_reason=NULL WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+                    "revoked_by=NULL,revoked_reason=NULL,verification_record_digest=NULL "
+                    "WHERE workspace_id=? AND project_ref=? AND environment_id=?",
                     (environment_class, attestation_text, attestation_version, attestation_acknowledgement, actor, now,
                      proof_method, HTTPS_PROOF_VERSION if proof_method == "https-file" else DNS_PROOF_VERSION,
                      NORMALIZATION_VERSION, generation, digest, token, now, expires_at,
@@ -501,11 +505,32 @@ class VerifiedEnvironmentService:
                     if other_count >= self.max_workspaces_per_hostname:
                         self.conn.execute("ROLLBACK")
                         raise HostnameReuseExceeded(f"{hostname} is already verified in other workspaces")
+                proof_expires_at = now + ENVIRONMENT_PROOF_TTL
+                verification_record = {
+                    "schema_version": VERIFICATION_RECORD_SCHEMA_VERSION,
+                    "workspace_id": workspace_id,
+                    "project_id": project_ref,
+                    "environment_id": environment_id,
+                    "origin": fresh["origin"],
+                    "environment_class": fresh["environment_class"],
+                    "attestation_text": fresh["attestation_text"],
+                    "attestation_version": fresh["attestation_version"],
+                    "attestation_acknowledgement": fresh["attestation_acknowledgement"],
+                    "proof_method": fresh["proof_method"],
+                    "proof_version": fresh["proof_version"],
+                    "normalization_version": fresh["normalization_version"],
+                    "challenge_generation": int(generation),
+                    "verified_at_ms": max(0, int(now * 1000)),
+                    "proof_expires_at_ms": max(0, int(proof_expires_at * 1000)),
+                }
+                verification_record_digest = canonical_digest(verification_record)
                 self.conn.execute(
                     "UPDATE canary_environments SET status='verified',verified_at=?,proof_expires_at=?,"
-                    "challenge_token=NULL,last_check_at=?,last_failure_code=NULL WHERE workspace_id=? AND project_ref=? "
+                    "challenge_token=NULL,last_check_at=?,last_failure_code=NULL,verification_record_digest=? "
+                    "WHERE workspace_id=? AND project_ref=? "
                     "AND environment_id=? AND challenge_generation=?",
-                    (now, now + ENVIRONMENT_PROOF_TTL, now, workspace_id, project_ref, environment_id, generation),
+                    (now, proof_expires_at, now, verification_record_digest,
+                     workspace_id, project_ref, environment_id, generation),
                 )
                 self.conn.execute("COMMIT")
                 return True
@@ -547,6 +572,7 @@ class VerifiedEnvironmentService:
                     and row["attestation_text"] == OWNERSHIP_ATTESTATION
                     and row["attestation_version"] == ATTESTATION_VERSION
                     and row["attestation_acknowledgement"] == ATTESTATION_ACKNOWLEDGEMENT
+                    and row["verification_record_digest"] is not None
                     and row["revoked_at"] is None
                     and row["verified_at"] is not None and row["proof_expires_at"] is not None
                     and row["proof_expires_at"] > self._now())
@@ -570,6 +596,7 @@ class VerifiedEnvironmentService:
             "normalization_version": row["normalization_version"], "challenge_generation": row["challenge_generation"],
             "challenge_expires_at": row["challenge_expires_at"], "last_failure_code": row["last_failure_code"],
             "verified_at": row["verified_at"], "proof_expires_at": row["proof_expires_at"],
+            "verification_record_digest": row["verification_record_digest"],
             "revoked_at": row["revoked_at"], "is_executable": False,
         }
 
