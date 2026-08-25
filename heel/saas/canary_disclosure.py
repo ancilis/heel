@@ -87,6 +87,7 @@ class CanaryDisclosureService:
         *,
         signing,
         clock: Callable[[], float] = time.time,
+        initialize_schema: bool = True,
     ):
         if not isinstance(conn, sqlite3.Connection):
             raise TypeError("canary disclosure requires SQLite")
@@ -97,11 +98,14 @@ class CanaryDisclosureService:
             or getattr(signing, "public_key", None) is None
         ):
             raise TypeError("production disclosure signing authority is required")
+        if type(initialize_schema) is not bool:
+            raise TypeError("initialize_schema must be a boolean")
         self.conn = conn
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA busy_timeout=5000")
-        CanaryStore(conn)
+        if initialize_schema:
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.execute("PRAGMA busy_timeout=5000")
+            CanaryStore(conn)
         self.signing = signing
         self.clock = clock
 

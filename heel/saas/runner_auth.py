@@ -31,7 +31,65 @@ PAIRING_TTL = 10 * 60
 NONCE_TTL = 60
 CLOCK_SKEW_MS = 30_000
 MAX_RUNNER_BODY = 64 * 1024
+MAX_RUNNER_UPLOAD_BODY = 272 * 1024
+MAX_SEALED_RESPONSE_BODY = 512 * 1024
+_SAFE_JSON_INT = (1 << 53) - 1
 RUNNER_CAPABILITIES = ("runner_claim", "runner_heartbeat", "runner_progress", "runner_result")
+
+
+def _normalize_sealed_response(value, depth: int = 0):
+    """Normalize trusted action output without widening signed contract JSON."""
+    if depth > 16:
+        raise ValueError("runner response nesting is too deep")
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if not -_SAFE_JSON_INT <= value <= _SAFE_JSON_INT:
+            raise ValueError("runner response integer is outside the portable range")
+        return value
+    if isinstance(value, float):
+        raise ValueError("runner response floats are forbidden")
+    if isinstance(value, str):
+        if (
+            unicodedata.normalize("NFC", value) != value
+            or len(value.encode("utf-8")) > 4096
+            or any(
+                unicodedata.category(character) == "Cc"
+                or 0xD800 <= ord(character) <= 0xDFFF
+                for character in value
+            )
+        ):
+            raise ValueError("runner response text is invalid")
+        return value
+    if isinstance(value, list):
+        return [_normalize_sealed_response(item, depth + 1) for item in value]
+    if isinstance(value, dict):
+        output = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("runner response keys must be strings")
+            normalized_key = _normalize_sealed_response(key, depth + 1)
+            if normalized_key in output:
+                raise ValueError("runner response keys are ambiguous")
+            output[normalized_key] = _normalize_sealed_response(item, depth + 1)
+        return output
+    raise ValueError("runner response value is unsupported")
+
+
+def _sealed_response_json(value: dict) -> str:
+    if not isinstance(value, dict):
+        raise ValueError("runner action must return a response object")
+    normalized = _normalize_sealed_response(value)
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) > MAX_SEALED_RESPONSE_BODY:
+        raise ValueError("runner response is too large")
+    return encoded.decode("utf-8")
 
 
 RUNNER_AUTH_SCHEMA = """
@@ -1413,8 +1471,15 @@ class RunnerAuthStore:
 
     def authenticate_and_consume(self, *, workspace_id: str, runner_id: str, capability: str, path: str,
                                  raw_body: bytes, headers: Mapping[str, list[str]], action: Callable[[], dict],
-                                 chain_name: str | None = None) -> tuple[dict, str]:
+                                 chain_name: str | None = None,
+                                 max_body_bytes: int = MAX_RUNNER_BODY) -> tuple[dict, str]:
         """Verify a fixed request then atomically record it, rotate its nonce, and act."""
+        if (
+            isinstance(max_body_bytes, bool)
+            or not isinstance(max_body_bytes, int)
+            or not 1 <= max_body_bytes <= MAX_RUNNER_UPLOAD_BODY
+        ):
+            raise ValueError("invalid runner request body limit")
         required = ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature")
         try:
             if capability not in RUNNER_CAPABILITIES or any(len(headers.get(name, ())) != 1 for name in required):
@@ -1430,7 +1495,7 @@ class RunnerAuthStore:
             timestamp, sequence = int(timestamp), int(sequence)
             if sequence < 1 or abs(int(self._now() * 1000) - timestamp) > CLOCK_SKEW_MS:
                 raise RunnerAuthError("invalid runner authentication")
-            parsed = parse_json(raw_body, max_bytes=MAX_RUNNER_BODY)
+            parsed = parse_json(raw_body, max_bytes=max_body_bytes)
             if canonical_bytes(parsed) != raw_body:
                 raise RunnerAuthError("invalid runner authentication")
             body_digest = hashlib.sha256(raw_body).hexdigest()
@@ -1485,7 +1550,7 @@ class RunnerAuthStore:
                 self._save_changed_identity(identity, instant=self._now())
             nonce = _token()
             aad = f"{workspace_id}\0{runner_id}\0{chain}\0{sequence}".encode()
-            response_json = canonical_bytes(response).decode("utf-8")
+            response_json = _sealed_response_json(response)
             response_ciphertext = self._seal(response_json, aad=aad)
             nonce_ciphertext = self._seal(nonce, aad=aad)
             self.conn.execute("UPDATE canary_runner_nonce_chains SET nonce_hash=?,next_sequence=?,expires_at=? WHERE workspace_id=? AND runner_id=? AND chain_name=?", (self._hash("nonce", nonce), sequence + 1, self._now() + NONCE_TTL, workspace_id, runner_id, chain))
@@ -1503,8 +1568,25 @@ class RunnerAuthStore:
 
 
 def json_load(value: str) -> dict:
-    import json
-    decoded = json.loads(value)
-    if not isinstance(decoded, dict):
+    if not isinstance(value, str):
+        raise RunnerAuthError("invalid runner authentication")
+
+    def pairs(items):
+        result = {}
+        for key, item in items:
+            if key in result:
+                raise ValueError("duplicate runner response key")
+            result[key] = item
+        return result
+
+    try:
+        decoded = json.loads(
+            value,
+            object_pairs_hook=pairs,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("constant")),
+        )
+        if _sealed_response_json(decoded) != value:
+            raise ValueError("noncanonical runner response")
+    except (TypeError, ValueError, json.JSONDecodeError):
         raise RunnerAuthError("invalid runner authentication")
     return decoded

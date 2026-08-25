@@ -180,6 +180,14 @@ class ProductionConfigurationTests(unittest.TestCase):
             try:
                 self.assertIsInstance(server.control_plane.billing, DisabledBilling)
                 self.assertIs(server.control_plane.grant_authority, config.grant_authority)
+                self.assertIs(
+                    server.control_plane.canary_runs.signing,
+                    config.grant_authority,
+                )
+                self.assertIs(
+                    server.control_plane.canary_disclosure.signing,
+                    config.grant_authority,
+                )
                 self.assertIs(server.control_plane.canary_store.conn, server.control_plane.store.conn)
                 mode = server.control_plane.store.conn.execute("PRAGMA journal_mode").fetchone()[0]
                 self.assertEqual(mode.lower(), "wal")

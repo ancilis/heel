@@ -37,9 +37,17 @@ from heel.findings_sync import (
     parse_findings_sync_request,
     stable_json,
 )
-from heel.canary_contracts import (canonical_bytes, parse_json, validate_runner_claim_request,
-    validate_runner_heartbeat_request, validate_runner_progress_request,
-    validate_runner_result_request, validate_runner_stop_ack_request)
+from heel.canary_contracts import (
+    canonical_bytes,
+    parse_json,
+    validate_approval_projection,
+    validate_operational_run,
+    validate_runner_claim_request,
+    validate_runner_heartbeat_request,
+    validate_runner_progress_request,
+    validate_runner_result_request,
+    validate_runner_stop_ack_request,
+)
 from heel.crypto import load_public_key_base64, verify_envelope
 
 from .auth import AuthStore, ThrottledError
@@ -52,6 +60,13 @@ from .billing import (
     SubscriptionManager,
 )
 from .canary_store import CanaryStore
+from .canary_disclosure import (
+    CANARY_FINDINGS_SCHEMA,
+    MAX_UPLOAD_BYTES,
+    CanaryDisclosureError,
+    CanaryDisclosureService,
+)
+from .canary_runs import CanaryRunError, CanaryRunService
 from .runner_auth import RunnerAuthError, RunnerAuthRateLimited, RunnerAuthStore, initialize_runner_auth_schema
 from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
 from .device_auth import (
@@ -95,6 +110,8 @@ REQUEST_DRAIN_TIMEOUT_SECONDS = 30
 
 _LOGGER = logging.getLogger("heel.saas.control_plane")
 _SYNC_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_CANARY_IDEMPOTENCY = re.compile(r"ca1-[0-9a-f]{64}\Z")
+_CONTROL_GENERATION = re.compile(r"0|[1-9][0-9]*\Z")
 
 
 class _NullLock:
@@ -254,6 +271,12 @@ class ControlPlane:
             ),
         )
         self.metrics = Metrics()
+        if grant_authority is None:
+            self.canary_runs = None
+            self.canary_disclosure = None
+        else:
+            self.canary_runs = CanaryRunService(conn, signing=grant_authority)
+            self.canary_disclosure = CanaryDisclosureService(conn, signing=grant_authority)
         self.draining = False
         self.required_schema_version: int | None = None
         # Every store shares one SQLite connection. Serialize complete HTTP request units so
@@ -365,6 +388,17 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _write_empty(self, status: int, headers: dict | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        request_id = getattr(self, "_request_id", None)
+        if request_id is not None:
+            self.send_header("X-Heel-Request-Id", request_id)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+
     def _body(self) -> dict:
         raw = getattr(self, "_buffered_body", b"")
         if not raw:
@@ -462,9 +496,17 @@ class _Handler(BaseHTTPRequestHandler):
             )
         length = int(lengths[0])
         device_path = len(parts) == 3 and parts[:2] == ["v1", "device"]
+        canary_findings_upload = bool(
+            len(parts) == 8
+            and parts[:2] == ["v1", "workspaces"]
+            and parts[3] == "runners"
+            and parts[5] == "runs"
+            and parts[7] == "result-projection"
+        )
         maximum = (
             MAX_FINDINGS_SYNC_BYTES
             if sync_path
+            else MAX_UPLOAD_BYTES if canary_findings_upload
             else MAX_DEVICE_BODY if device_path else MAX_BODY
         )
         if length > maximum:
@@ -752,7 +794,9 @@ class _Handler(BaseHTTPRequestHandler):
         return bool(len(p) >= 6 and p[1] == "workspaces" and p[3] == "runners" and (
             (len(p) == 6 and p[5] == "claim") or
             (len(p) == 7 and p[5] == "resync" and p[6] in {"start", "complete"}) or
-            (len(p) == 8 and p[5] == "runs" and p[7] in {"heartbeat", "progress", "result", "stop-ack"})
+            (len(p) == 8 and p[5] == "runs" and p[7] in {
+                "heartbeat", "progress", "result", "stop-ack", "result-projection",
+            })
         ))
 
     def _route_serial(self, method: str) -> None:
@@ -784,6 +828,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(429, {"schema_version": "heel.runner-error.v1", "code": "runner_resync_rate_limited", "retry_after_ms": 60_000}, {"Retry-After": "60"})
         except RunnerAuthError:
             self._json(401, {"schema_version": "heel.runner-error.v1", "code": "invalid_runner_auth"})
+        except (CanaryRunError, CanaryDisclosureError) as error:
+            self._canary_error(error.code)
         except PermissionError as e:
             self._json(403, {"error": str(e)})
         except ThrottledError as e:
@@ -866,6 +912,11 @@ class _Handler(BaseHTTPRequestHandler):
             if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "runs" and tail[4] in {"heartbeat", "progress", "result", "stop-ack"}:
                 capability = "runner_heartbeat" if tail[4] in {"heartbeat", "stop-ack"} else "runner_" + tail[4]
                 return lambda: self._runner_request(wid, tail[1], capability, tail[3], tail[4])
+            if (method == "POST" and len(tail) == 5 and tail[0] == "runners"
+                    and tail[2] == "runs" and tail[4] == "result-projection"):
+                return lambda: self._runner_request(
+                    wid, tail[1], "runner_result", tail[3], "result-projection",
+                )
             if method == "GET" and len(tail) == 2 and tail[0] == "jobs":
                 return lambda: self._ws_job_get(wid, tail[1])
             if tail == ("projects",):
@@ -901,6 +952,26 @@ class _Handler(BaseHTTPRequestHandler):
                     return lambda: self._ws_environment_check(wid, project_ref, tail[3])
                 if len(tail) == 5 and method == "POST" and tail[4] == "revoke":
                     return lambda: self._ws_environment_revoke(wid, project_ref, tail[3])
+            if len(tail) >= 3 and tail[0] == "projects":
+                project_ref = tail[1]
+                if len(tail) == 3 and tail[2] == "canary-approval-projections" and method == "POST":
+                    return lambda: self._ws_canary_projection_submit(wid, project_ref)
+                if len(tail) >= 4 and tail[2] == "canary-runs":
+                    run_id = tail[3]
+                    if len(tail) == 4 and method == "GET":
+                        return lambda: self._ws_canary_status(wid, project_ref, run_id)
+                    if len(tail) == 5 and tail[4] == "approve" and method == "POST":
+                        return lambda: self._ws_canary_approve(wid, project_ref, run_id)
+                    if len(tail) == 5 and tail[4] == "events" and method == "GET":
+                        return lambda: self._ws_canary_events(wid, project_ref, run_id)
+                    if len(tail) == 5 and tail[4] == "stop" and method == "POST":
+                        return lambda: self._ws_canary_stop(wid, project_ref, run_id)
+                    if len(tail) == 5 and tail[4] == "disclosure-permits" and method == "POST":
+                        return lambda: self._ws_canary_disclosure_permit(wid, project_ref, run_id)
+                    if len(tail) == 5 and tail[4] == "disclosure-local-only" and method == "POST":
+                        return lambda: self._ws_canary_disclosure_local_only(wid, project_ref, run_id)
+                    if len(tail) == 5 and tail[4] == "findings" and method == "GET":
+                        return lambda: self._ws_canary_findings(wid, project_ref, run_id)
         return None
 
     # --- isolated runner pairing and proof routes ---
@@ -1028,6 +1099,45 @@ class _Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "invalid runner revocation", code="invalid_runner_revocation")
         self._json(200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
 
+    def _canary_error(self, code: str) -> None:
+        status = {
+            "invalid_canary_projection": 400,
+            "invalid_canary_approval": 400,
+            "hostname_confirmation_mismatch": 400,
+            "environment_not_executable": 403,
+            "canary_quota_exceeded": 402,
+            "canary_state_conflict": 409,
+            "event_sequence_conflict": 409,
+            "disclosure_permit_required": 403,
+            "disclosure_permit_expired": 410,
+            "permit_consumed": 409,
+            "canary_run_not_found": 404,
+            "canary_authority_unavailable": 503,
+        }.get(code, 409)
+        self._json(
+            status,
+            {"schema_version": "heel.canary-error.v1", "code": code},
+        )
+
+    def _human_canary_services(
+        self,
+    ) -> tuple[CanaryRunService, CanaryDisclosureService]:
+        runs = self.cp.canary_runs
+        disclosure = self.cp.canary_disclosure
+        if runs is None or disclosure is None:
+            raise CanaryRunError("canary_authority_unavailable")
+        return runs, disclosure
+
+    def _expected_control_generation(self) -> int:
+        values = self._header_values("If-Heel-Control-Generation")
+        if (len(values) != 1 or _CONTROL_GENERATION.fullmatch(values[0]) is None
+                or len(values[0]) > 20):
+            raise ApiError(
+                400, "invalid canary control generation",
+                code="invalid_canary_approval",
+            )
+        return int(values[0])
+
     @staticmethod
     def _operational_context_matches(conn: sqlite3.Connection, *, workspace_id: str,
                                      runner_id: str, projection: dict) -> bool:
@@ -1075,27 +1185,111 @@ class _Handler(BaseHTTPRequestHandler):
         if "?" in self.path or "#" in self.path or "%" in self.path or self.command != "POST":
             raise RunnerAuthError("invalid runner authentication")
         try:
-            parsed = parse_json(self._raw_body(), max_bytes=256 if operation == "claim" else 36 * 1024)
+            maximum = (
+                256 if operation == "claim"
+                else MAX_UPLOAD_BYTES if operation == "result-projection"
+                else 36 * 1024
+            )
+            parsed = parse_json(self._raw_body(), max_bytes=maximum)
             validators = {"claim": validate_runner_claim_request, "heartbeat": validate_runner_heartbeat_request,
                           "progress": validate_runner_progress_request, "result": validate_runner_result_request,
                           "stop-ack": validate_runner_stop_ack_request}
-            parsed = validators[operation](parsed)
-            if canonical_bytes(parsed) != self._raw_body() or (run_id is not None and parsed["run_id"] != run_id):
+            if operation != "result-projection":
+                parsed = validators[operation](parsed)
+            if (canonical_bytes(parsed) != self._raw_body()
+                    or (run_id is not None and parsed.get("run_id") != run_id)):
                 raise RunnerAuthError("invalid runner authentication")
-            if operation != "claim" and not self._operational_context_matches(
+            if operation not in {"claim", "result-projection"} and not self._operational_context_matches(
                     self._runner_store().conn, workspace_id=wid, runner_id=runner_id,
                     projection=parsed["operational_projection"]):
                 raise RunnerAuthError("invalid runner authentication")
             all_headers = {name: self._header_values(name) for name in ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature", "Authorization", "Cookie")}
+            store = self._runner_store()
+            # Bind both services to this exact migration-validated request connection before
+            # PoP opens its write transaction. Request mode performs no DDL or PRAGMA changes;
+            # the lifecycle/disclosure action then commits atomically with proof consumption.
+            runs, disclosure = self._runner_canary_services(store)
+
+            def action() -> dict:
+                if operation == "claim":
+                    claimed = runs.claim(
+                        wid, runner_id, all_headers["X-Heel-Runner-Key-Id"][0],
+                    )
+                    return claimed or {
+                        "schema_version": "heel.runner-claim-idle.internal.v1",
+                    }
+                if operation == "result-projection":
+                    project_ref = self._runner_run_project(
+                        store.conn, wid, runner_id, run_id,
+                    )
+                    return disclosure.upload(
+                        wid, project_ref, run_id, runner_id, parsed,
+                    )
+                projection = parsed["operational_projection"]
+                project_ref = projection["project_id"]
+                if operation == "heartbeat":
+                    return runs.heartbeat(wid, project_ref, run_id, runner_id, projection)
+                if operation == "progress":
+                    return runs.progress(wid, project_ref, run_id, runner_id, projection)
+                if operation == "result":
+                    return runs.result(wid, project_ref, run_id, runner_id, projection)
+                acknowledged = runs.ack_stop(
+                    wid, project_ref, run_id, runner_id, projection,
+                )
+                return acknowledged
+
             response, nonce = self._runner_store().authenticate_and_consume(
                 workspace_id=wid, runner_id=runner_id, capability=capability, path=self.path,
                 raw_body=self._raw_body(), headers=all_headers,
-                action=lambda: {"schema_version": "heel.runner-control-response.v1", "operation": operation, "status": "accepted"},
-                chain_name="claim" if operation == "claim" else f"{operation}:{run_id}",
+                action=action,
+                chain_name=(
+                    "claim" if operation == "claim"
+                    else f"result:{run_id}" if operation == "result-projection"
+                    else f"{operation}:{run_id}"
+                ),
+                max_body_bytes=maximum,
             )
-        except (ValueError, RunnerAuthError):
+        except (CanaryRunError, CanaryDisclosureError):
+            raise
+        except (ValueError, RunnerAuthError, LookupError):
             raise RunnerAuthError("invalid runner authentication") from None
-        self._json(200, response, {"X-Heel-Runner-Next-Nonce": nonce})
+        response_headers = {"X-Heel-Runner-Next-Nonce": nonce}
+        if response.get("schema_version") == "heel.runner-claim-idle.internal.v1":
+            self._write_empty(204, response_headers)
+        else:
+            self._json(200, response, response_headers)
+
+    def _runner_canary_services(
+        self, store: RunnerAuthStore,
+    ) -> tuple[CanaryRunService, CanaryDisclosureService]:
+        authority = self.cp.grant_authority
+        if authority is None:
+            raise CanaryRunError("canary_authority_unavailable")
+        return (
+            CanaryRunService(
+                store.conn, signing=authority, runner_auth=store,
+                initialize_schema=False,
+            ),
+            CanaryDisclosureService(
+                store.conn, signing=authority, initialize_schema=False,
+            ),
+        )
+
+    @staticmethod
+    def _runner_run_project(
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        runner_id: str,
+        run_id: str | None,
+    ) -> str:
+        row = conn.execute(
+            "SELECT project_ref FROM canary_runs WHERE workspace_id=? AND runner_id=? "
+            "AND run_id=?",
+            (workspace_id, runner_id, run_id),
+        ).fetchone()
+        if row is None:
+            raise LookupError("canary run not found")
+        return row["project_ref"]
 
     def _runner_resync(self, wid: str, runner_id: str, phase: str) -> None:
         if "?" in self.path or "#" in self.path or "%" in self.path or self.command != "POST":
@@ -1869,8 +2063,8 @@ class _Handler(BaseHTTPRequestHandler):
                            upgrade_to=self.cp.entitlements.upgrade_target(sub))
         self._json(200, {"verified": ok})
 
-    def _recent_owner_admin(self, wid: str) -> str:
-        """Sensitive proof actions require a fresh browser session, never a key/device token."""
+    def _recent_owner_admin_context(self, wid: str) -> tuple[str, str, int]:
+        """Resolve one fresh same-origin browser owner/admin ceremony."""
         if (self.cp.public_origin is None
                 or self.headers.get("Origin") != self.cp.public_origin
                 or self.headers.get("X-Heel-Internal-Origin") != "same-origin"):
@@ -1888,7 +2082,341 @@ class _Handler(BaseHTTPRequestHandler):
         if (session is None or time.time() - session["created_at"] > 15 * 60
                 or role not in {Role.OWNER, Role.ADMIN}):
             raise ApiError(403, "a recent owner or admin browser session is required", code="recent_auth_required")
-        return user_id
+        return user_id, role.value, int(float(session["created_at"]) * 1000)
+
+    def _recent_owner_admin(self, wid: str) -> str:
+        """Sensitive proof actions require a fresh browser session, never a key/device token."""
+        return self._recent_owner_admin_context(wid)[0]
+
+    def _ws_canary_projection_submit(self, wid: str, project_ref: str) -> None:
+        actor, _, _ = self._recent_owner_admin_context(wid)
+        runs, _ = self._human_canary_services()
+        projection = self._body()
+        if (
+            projection.get("workspace_id") != wid
+            or projection.get("project_id") != project_ref
+        ):
+            raise CanaryRunError("invalid_canary_projection")
+        try:
+            result = runs.submit_projection(projection, uploaded_by=actor)
+        except LookupError:
+            raise CanaryRunError("canary_authority_unavailable") from None
+        self._json(201, result)
+
+    def _ws_canary_approve(self, wid: str, project_ref: str, run_id: str) -> None:
+        actor, role, recent_auth_at_ms = self._recent_owner_admin_context(wid)
+        runs, _ = self._human_canary_services()
+        body = self._body()
+        if (
+            set(body) != {
+                "schema_version", "projection_digest", "hostname_retype", "reason",
+            }
+            or body.get("schema_version") != "heel.canary-execution-approval.v1"
+            or not all(type(body.get(name)) is str for name in (
+                "projection_digest", "hostname_retype", "reason",
+            ))
+        ):
+            raise CanaryRunError("invalid_canary_approval")
+        idempotency = self._header_values("Idempotency-Key")
+        if len(idempotency) != 1 or _CANARY_IDEMPOTENCY.fullmatch(idempotency[0]) is None:
+            raise CanaryRunError("invalid_canary_approval")
+        result = runs.approve(
+            wid,
+            project_ref,
+            run_id,
+            projection_digest=body["projection_digest"],
+            actor=actor,
+            role=role,
+            reason=body["reason"],
+            exact_hostname=body["hostname_retype"],
+            recent_auth_at_ms=recent_auth_at_ms,
+            idempotency_key=idempotency[0],
+            expected_kill_switch_generation=self._expected_control_generation(),
+        )
+        self._json(201, result)
+
+    def _ws_canary_status(self, wid: str, project_ref: str, run_id: str) -> None:
+        self._authorize(wid, "view")
+        runs, _ = self._human_canary_services()
+        try:
+            result = runs.get_status(wid, project_ref, run_id)
+        except LookupError:
+            raise CanaryDisclosureError("canary_run_not_found") from None
+        self._json(200, {
+            "schema_version": "heel.canary-run-dashboard.v1",
+            "run": result,
+            "progress": self._canary_dashboard_progress(wid, project_ref, run_id),
+        })
+
+    @staticmethod
+    def _unavailable_canary_progress() -> dict[str, object]:
+        return {
+            "schema_version": "heel.canary-run-progress.v1",
+            "available": False,
+            "current_scenario_id": None,
+            "scenarios_completed": None,
+            "scenarios_total": None,
+            "requests_started": None,
+            "requests_completed": None,
+            "remaining_requests": None,
+            "remaining_wall_ms": None,
+            "retries_used": None,
+            "redaction_count": None,
+            "local_result_ready": False,
+        }
+
+    @staticmethod
+    def _verified_stored_canary_contract(serialized: object, validator) -> dict:
+        if type(serialized) is not str:
+            raise ValueError("invalid stored canary contract")
+        parsed = parse_json(serialized.encode("utf-8"), max_bytes=64 * 1024)
+        value = validator(parsed)
+        if canonical_bytes(value).decode("utf-8") != serialized:
+            raise ValueError("noncanonical stored canary contract")
+        return value
+
+    @staticmethod
+    def _verify_stored_runner_signature(value: dict, public_key: str) -> None:
+        payload = {
+            key: item for key, item in value.items()
+            if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+        }
+        verify_envelope(
+            {value["signing_key_id"]: load_public_key_base64(public_key)},
+            {
+                "signing_key_id": value["signing_key_id"],
+                "signature_b64": value["signature_b64"],
+            },
+            canonical_bytes(payload),
+        )
+
+    def _canary_dashboard_progress(
+        self, wid: str, project_ref: str, run_id: str,
+    ) -> dict[str, object]:
+        unavailable = self._unavailable_canary_progress()
+        row = self.cp.store.conn.execute(
+            "SELECT r.status,r.grant_id,r.runner_id,r.runner_key_id,"
+            "a.projection_json,a.projection_digest AS approval_digest,a.manifest_digest,"
+            "g.grant_digest,o.receipt_json,o.receipt_digest,k.public_key "
+            "FROM canary_runs r JOIN canary_approval_projections a ON "
+            "a.workspace_id=r.workspace_id AND a.project_ref=r.project_ref "
+            "AND a.approval_id=r.approval_id JOIN canary_execution_grants g ON "
+            "g.workspace_id=r.workspace_id AND g.project_ref=r.project_ref "
+            "AND g.grant_id=r.grant_id JOIN canary_runner_keys k ON "
+            "k.workspace_id=r.workspace_id AND k.runner_id=r.runner_id "
+            "AND k.key_id=r.runner_key_id LEFT JOIN canary_operational_receipts o ON "
+            "o.workspace_id=r.workspace_id AND o.project_ref=r.project_ref "
+            "AND o.run_id=r.run_id WHERE r.workspace_id=? AND r.project_ref=? AND r.run_id=?",
+            (wid, project_ref, run_id),
+        ).fetchone()
+        if row is None:
+            return unavailable
+        try:
+            approval = self._verified_stored_canary_contract(
+                row["projection_json"], validate_approval_projection,
+            )
+            self._verify_stored_runner_signature(approval, row["public_key"])
+            if (
+                approval["workspace_id"] != wid
+                or approval["project_id"] != project_ref
+                or approval["runner"]["runner_id"] != row["runner_id"]
+                or approval["runner"]["runner_key_id"] != row["runner_key_id"]
+                or approval["projection_digest"] != row["approval_digest"]
+                or approval["manifest_digest"] != row["manifest_digest"]
+            ):
+                raise ValueError("stored canary approval binding mismatch")
+            scenarios = approval["scenarios"]
+            maximum_requests = approval["budgets"]["maximum_requests"]
+            maximum_wall_ms = approval["budgets"]["wall_timeout_ms"]
+            progress = {
+                "schema_version": "heel.canary-run-progress.v1",
+                "available": True,
+                "current_scenario_id": None,
+                "scenarios_completed": 0,
+                "scenarios_total": len(scenarios),
+                "requests_started": 0,
+                "requests_completed": 0,
+                "remaining_requests": maximum_requests,
+                "remaining_wall_ms": maximum_wall_ms,
+                "retries_used": 0,
+                "redaction_count": 0,
+                "local_result_ready": False,
+            }
+            if row["receipt_json"] is None:
+                return progress
+            receipt = self._verified_stored_canary_contract(
+                row["receipt_json"], validate_operational_run,
+            )
+            self._verify_stored_runner_signature(receipt, row["public_key"])
+            if (
+                receipt["workspace_id"] != wid
+                or receipt["project_id"] != project_ref
+                or receipt["run_id"] != run_id
+                or receipt["grant_id"] != row["grant_id"]
+                or receipt["signing_key_id"] != row["runner_key_id"]
+                or receipt["approval_projection_digest"] != row["approval_digest"]
+                or receipt["manifest_digest"] != row["manifest_digest"]
+                or receipt["grant_digest"] != row["grant_digest"]
+                or receipt["projection_digest"] != row["receipt_digest"]
+            ):
+                raise ValueError("stored canary receipt binding mismatch")
+            counters = receipt["counters"]
+            completed = min(len(scenarios), counters["actions_contained"] // 2)
+            current = None
+            if receipt["lifecycle_phase"] != "terminal" and completed < len(scenarios):
+                current = scenarios[completed]["scenario_id"]
+            progress.update({
+                "current_scenario_id": current,
+                "scenarios_completed": completed,
+                "requests_started": counters["requests_started"],
+                "requests_completed": counters["requests_completed"],
+                "remaining_requests": counters["remaining_requests"],
+                "remaining_wall_ms": counters["remaining_wall_ms"],
+                "retries_used": counters["retries_used"],
+                "redaction_count": receipt["redaction_count"],
+                "local_result_ready": bool(
+                    row["status"] == "terminal"
+                    and receipt["lifecycle_phase"] == "terminal"
+                ),
+            })
+            return progress
+        except (KeyError, TypeError, ValueError):
+            return unavailable
+
+    def _ws_canary_events(self, wid: str, project_ref: str, run_id: str) -> None:
+        self._authorize(wid, "view")
+        runs, _ = self._human_canary_services()
+        try:
+            events = runs.list_events(wid, project_ref, run_id)
+        except LookupError:
+            raise CanaryDisclosureError("canary_run_not_found") from None
+        self._json(200, {
+            "schema_version": "heel.canary-run-events.v1",
+            "run_id": run_id,
+            "events": events,
+        })
+
+    def _ws_canary_stop(self, wid: str, project_ref: str, run_id: str) -> None:
+        actor, _, _ = self._recent_owner_admin_context(wid)
+        runs, _ = self._human_canary_services()
+        body = self._body()
+        if set(body) != {"schema_version", "reason_code"} or body != {
+            "schema_version": "heel.canary-stop-request.v1",
+            "reason_code": "operator_requested",
+        }:
+            raise CanaryRunError("canary_state_conflict")
+        try:
+            result = runs.request_stop(
+                wid,
+                project_ref,
+                run_id,
+                actor=actor,
+                reason="cloud_stop",
+                expected_kill_switch_generation=self._expected_control_generation(),
+            )
+        except LookupError:
+            raise CanaryDisclosureError("canary_run_not_found") from None
+        self._json(200, result)
+
+    @staticmethod
+    def _disclosure_metadata(body: dict, schema: str) -> tuple[str, int, int, int]:
+        if (
+            set(body) != {
+                "schema_version", "projection_digest", "projection_bytes",
+                "scenario_count", "finding_count",
+            }
+            or body.get("schema_version") != schema
+            or type(body.get("projection_digest")) is not str
+            or type(body.get("projection_bytes")) is not int
+            or isinstance(body.get("projection_bytes"), bool)
+            or type(body.get("scenario_count")) is not int
+            or isinstance(body.get("scenario_count"), bool)
+            or type(body.get("finding_count")) is not int
+            or isinstance(body.get("finding_count"), bool)
+        ):
+            raise CanaryDisclosureError("invalid_canary_projection")
+        return (
+            body["projection_digest"], body["projection_bytes"],
+            body["scenario_count"], body["finding_count"],
+        )
+
+    def _canary_run_binding(self, wid: str, project_ref: str, run_id: str) -> sqlite3.Row:
+        row = self.cp.store.conn.execute(
+            "SELECT runner_id,runner_key_id FROM canary_runs WHERE workspace_id=? "
+            "AND project_ref=? AND run_id=?",
+            (wid, project_ref, run_id),
+        ).fetchone()
+        if row is None:
+            raise CanaryDisclosureError("canary_run_not_found")
+        return row
+
+    def _ws_canary_disclosure_permit(
+        self, wid: str, project_ref: str, run_id: str,
+    ) -> None:
+        actor, role, recent_auth_at_ms = self._recent_owner_admin_context(wid)
+        _, disclosure = self._human_canary_services()
+        digest, byte_count, scenario_count, finding_count = self._disclosure_metadata(
+            self._body(), "heel.canary-disclosure-request.v1",
+        )
+        binding = self._canary_run_binding(wid, project_ref, run_id)
+        preview = disclosure.preview(
+            wid,
+            project_ref,
+            run_id,
+            runner_id=binding["runner_id"],
+            runner_key_id=binding["runner_key_id"],
+            projection_schema_version=CANARY_FINDINGS_SCHEMA,
+            projection_digest=digest,
+            byte_count=byte_count,
+            scenario_count=scenario_count,
+            finding_count=finding_count,
+        )
+        result = disclosure.permit(
+            wid,
+            project_ref,
+            run_id,
+            request_id=preview["request_id"],
+            projection_schema_version=CANARY_FINDINGS_SCHEMA,
+            projection_digest=digest,
+            byte_count=byte_count,
+            scenario_count=scenario_count,
+            finding_count=finding_count,
+            actor=actor,
+            role=role,
+            recent_auth_at_ms=recent_auth_at_ms,
+        )
+        self._json(201, result)
+
+    def _ws_canary_disclosure_local_only(
+        self, wid: str, project_ref: str, run_id: str,
+    ) -> None:
+        actor, _, _ = self._recent_owner_admin_context(wid)
+        _, disclosure = self._human_canary_services()
+        digest, byte_count, scenario_count, finding_count = self._disclosure_metadata(
+            self._body(), "heel.canary-disclosure-local-only.v1",
+        )
+        binding = self._canary_run_binding(wid, project_ref, run_id)
+        preview = disclosure.preview(
+            wid,
+            project_ref,
+            run_id,
+            runner_id=binding["runner_id"],
+            runner_key_id=binding["runner_key_id"],
+            projection_schema_version=CANARY_FINDINGS_SCHEMA,
+            projection_digest=digest,
+            byte_count=byte_count,
+            scenario_count=scenario_count,
+            finding_count=finding_count,
+        )
+        result = disclosure.local_only(
+            wid, project_ref, run_id, request_id=preview["request_id"], actor=actor,
+        )
+        self._json(200, result)
+
+    def _ws_canary_findings(self, wid: str, project_ref: str, run_id: str) -> None:
+        self._authorize(wid, "view")
+        _, disclosure = self._human_canary_services()
+        self._json(200, disclosure.get(wid, project_ref, run_id))
 
     def _ws_environments_list(self, wid: str, project_ref: str):
         self._authorize(wid, "view")

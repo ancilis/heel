@@ -232,6 +232,63 @@ def test_heartbeat_records_and_advances_when_progress_already_accepted_same_snap
     ).fetchone()[0] == 1
 
 
+def test_delayed_older_heartbeat_advances_only_liveness_after_newer_progress():
+    conn, _, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    older = operational_projection(
+        runner, grant, sequence=0, phase="running", requests_started=1,
+        updated_at_ms=NOW_MS + 200,
+    )
+    coordinator.progress(WORKSPACE, PROJECT, grant["run_id"], RUNNER, older)
+    newer = operational_projection(
+        runner, grant, sequence=1, phase="running", requests_started=1,
+        requests_completed=1, updated_at_ms=NOW_MS + 300,
+    )
+    coordinator.progress(WORKSPACE, PROJECT, grant["run_id"], RUNNER, newer)
+    before = conn.execute(
+        "SELECT status,source_event_sequence,source_projection_digest,last_heartbeat_at_ms "
+        "FROM canary_runs WHERE run_id=?",
+        (grant["run_id"],),
+    ).fetchone()
+    receipt_before = conn.execute(
+        "SELECT source_event_sequence,receipt_digest,receipt_json "
+        "FROM canary_operational_receipts WHERE run_id=?",
+        (grant["run_id"],),
+    ).fetchone()
+    heartbeat_events = conn.execute(
+        "SELECT COUNT(*) FROM canary_run_events WHERE run_id=? AND event_type='heartbeat_accepted'",
+        (grant["run_id"],),
+    ).fetchone()[0]
+
+    gate = coordinator.heartbeat(WORKSPACE, PROJECT, grant["run_id"], RUNNER, older)
+
+    after = conn.execute(
+        "SELECT status,source_event_sequence,source_projection_digest,last_heartbeat_at_ms "
+        "FROM canary_runs WHERE run_id=?",
+        (grant["run_id"],),
+    ).fetchone()
+    receipt_after = conn.execute(
+        "SELECT source_event_sequence,receipt_digest,receipt_json "
+        "FROM canary_operational_receipts WHERE run_id=?",
+        (grant["run_id"],),
+    ).fetchone()
+    assert gate["active"] is True
+    assert tuple(after)[:3] == tuple(before)[:3]
+    assert after["last_heartbeat_at_ms"] == NOW_MS
+    assert tuple(receipt_after) == tuple(receipt_before)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_run_events WHERE run_id=? AND event_type='heartbeat_accepted'",
+        (grant["run_id"],),
+    ).fetchone()[0] == heartbeat_events
+
+    tampered = copy.deepcopy(older)
+    tampered["counters"]["response_bytes_read"] += 1
+    with pytest.raises(ValueError):
+        coordinator.heartbeat(WORKSPACE, PROJECT, grant["run_id"], RUNNER, tampered)
+    with pytest.raises(LookupError):
+        coordinator.heartbeat(WORKSPACE, PROJECT, grant["run_id"], "runr_other", older)
+
+
 def test_terminal_stopped_disposition_requires_a_stop_reason():
     _, _, runner, coordinator, approved, _ = running_setup()
     grant = approved["grant"]
@@ -282,3 +339,34 @@ def test_cross_tenant_or_wrong_runner_never_reads_run_state():
         coordinator.heartbeat("ws_other", PROJECT, grant["run_id"], RUNNER, projection)
     with pytest.raises(LookupError):
         coordinator.heartbeat(WORKSPACE, PROJECT, grant["run_id"], "runr_other", projection)
+
+
+@pytest.mark.parametrize("operation", ["heartbeat", "progress", "result"])
+def test_runner_lifecycle_mutations_join_an_outer_pop_transaction(operation):
+    conn, _, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    phase = "terminal" if operation == "result" else "running"
+    projection = operational_projection(
+        runner,
+        grant,
+        sequence=0,
+        phase=phase,
+        requests_started=1,
+        requests_completed=1 if operation == "result" else 0,
+        disposition="completed" if operation == "result" else None,
+        updated_at_ms=NOW_MS + 200,
+    )
+
+    conn.execute("BEGIN IMMEDIATE")
+    response = getattr(coordinator, operation)(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, projection,
+    )
+
+    assert conn.in_transaction is True
+    assert isinstance(response, dict)
+    conn.rollback()
+    stored = conn.execute(
+        "SELECT status,source_event_sequence FROM canary_runs WHERE run_id=?",
+        (grant["run_id"],),
+    ).fetchone()
+    assert tuple(stored) == ("claimed", -1)

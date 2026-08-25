@@ -120,19 +120,31 @@ class CanaryRunService:
         clock: Callable[[], float] = time.time,
         plan_for_workspace: Callable[[str], object] | None = None,
         global_cap: int | None = None,
+        initialize_schema: bool = True,
     ):
         if not isinstance(conn, sqlite3.Connection):
             raise TypeError("canary coordination requires SQLite")
         if signing is None or not callable(getattr(signing, "sign", None)):
             raise TypeError("canary grant signing authority is required")
+        if type(initialize_schema) is not bool:
+            raise TypeError("initialize_schema must be a boolean")
         self.conn = conn
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA busy_timeout=5000")
-        CanaryStore(conn)
+        if initialize_schema:
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.execute("PRAGMA busy_timeout=5000")
+            CanaryStore(conn)
         self.signing = signing
         self.runner_auth = runner_auth
-        self.ledger = ledger or UsageLedger(conn)
+        if ledger is not None:
+            self.ledger = ledger
+        elif initialize_schema:
+            self.ledger = UsageLedger(conn)
+        else:
+            # Request-scoped connections are already migration-validated.  Bind the ledger
+            # methods to this exact transaction without re-running its startup DDL/pragmas.
+            self.ledger = object.__new__(UsageLedger)
+            self.ledger.conn = conn
         self.clock = clock
         self.plan_for_workspace = plan_for_workspace or self._workspace_plan
         self.global_cap = global_cap
@@ -973,7 +985,7 @@ class CanaryRunService:
         projection: object,
         *,
         operation: str,
-    ) -> tuple[sqlite3.Row, dict, bool]:
+    ) -> tuple[sqlite3.Row, dict, str]:
         row = self._context(workspace_id, project_ref, run_id, runner_id)
         value = self._validate_operational(row, projection)
         phase = value["lifecycle_phase"]
@@ -982,15 +994,20 @@ class CanaryRunService:
             raise CanaryRunError("illegal_run_transition")
         if stop_reason != "none" and phase not in {"stop_requested", "finalizing"}:
             raise CanaryRunError("illegal_run_transition")
-        if row["stop_reason"] != "none" and stop_reason != row["stop_reason"]:
-            raise CanaryRunError("stop_conflict")
         if operation != "result" and phase == "terminal":
             raise CanaryRunError("illegal_run_transition")
         if operation == "result" and phase != "terminal":
             raise CanaryRunError("illegal_run_transition")
+        # Heartbeat and progress use independent PoP chains while reporting one shared
+        # operational sequence.  A delayed, still-authentic heartbeat is liveness evidence,
+        # not authority to roll the durable lifecycle snapshot backwards.
+        if operation == "heartbeat" and value["event_sequence"] < row["source_event_sequence"]:
+            return row, value, "stale"
+        if row["stop_reason"] != "none" and stop_reason != row["stop_reason"]:
+            raise CanaryRunError("stop_conflict")
         source = self._source_state(row, value)
         if source == "replay":
-            return row, value, True
+            return row, value, source
         allowed = {
             "claimed": {"claimed", "running", "stop_requested", "finalizing"},
             "running": {"running", "stop_requested", "finalizing"},
@@ -1057,15 +1074,17 @@ class CanaryRunService:
                 source_event_sequence=value["event_sequence"],
             )
             row = self._context(workspace_id, project_ref, run_id, runner_id)
-        return row, value, False
+        return row, value, source
 
     def heartbeat(
         self, workspace_id: str, project_ref: str, run_id: str, runner_id: str,
         projection: object,
     ) -> CanaryGate:
-        self.conn.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.conn.in_transaction
+        if owns_transaction:
+            self.conn.execute("BEGIN IMMEDIATE")
         try:
-            row, value, replay = self._accept_operational(
+            row, value, source = self._accept_operational(
                 workspace_id, project_ref, run_id, runner_id, projection, operation="heartbeat",
             )
             now = self._now_ms()
@@ -1075,15 +1094,17 @@ class CanaryRunService:
                 (now, workspace_id, project_ref, run_id),
             )
             row = self._context(workspace_id, project_ref, run_id, runner_id)
-            self._append_event(
-                row, "heartbeat_accepted", actor_class="runner", actor_id=runner_id,
-                source_event_sequence=value["event_sequence"],
-            )
+            if source != "stale":
+                self._append_event(
+                    row, "heartbeat_accepted", actor_class="runner", actor_id=runner_id,
+                    source_event_sequence=value["event_sequence"],
+                )
             gate = self._gate(row, advance=True)
-            self.conn.commit()
+            if owns_transaction:
+                self.conn.commit()
             return gate
         except Exception:
-            if self.conn.in_transaction:
+            if owns_transaction and self.conn.in_transaction:
                 self.conn.rollback()
             raise
 
@@ -1091,21 +1112,24 @@ class CanaryRunService:
         self, workspace_id: str, project_ref: str, run_id: str, runner_id: str,
         projection: object,
     ) -> dict[str, object]:
-        self.conn.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.conn.in_transaction
+        if owns_transaction:
+            self.conn.execute("BEGIN IMMEDIATE")
         try:
-            row, value, replay = self._accept_operational(
+            row, value, source = self._accept_operational(
                 workspace_id, project_ref, run_id, runner_id, projection, operation="progress",
             )
-            if not replay:
+            if source != "replay":
                 self._append_event(
                     row, "progress_accepted", actor_class="runner", actor_id=runner_id,
                     source_event_sequence=value["event_sequence"],
                 )
             status = self.get_status(workspace_id, project_ref, run_id)
-            self.conn.commit()
+            if owns_transaction:
+                self.conn.commit()
             return status
         except Exception:
-            if self.conn.in_transaction:
+            if owns_transaction and self.conn.in_transaction:
                 self.conn.rollback()
             raise
 
@@ -1173,14 +1197,17 @@ class CanaryRunService:
         self, workspace_id: str, project_ref: str, run_id: str, runner_id: str,
         projection: object,
     ) -> dict[str, bool]:
-        self.conn.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.conn.in_transaction
+        if owns_transaction:
+            self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._context(workspace_id, project_ref, run_id, runner_id)
             value = self._validate_operational(row, projection)
             source = self._source_state(row, value)
             if source == "replay" and row["stop_acknowledged_at_ms"] is not None:
                 late = bool(row["stop_ack_late"])
-                self.conn.commit()
+                if owns_transaction:
+                    self.conn.commit()
                 return {"accepted": True, "deadline_met": not late, "late": late}
             if row["status"] not in {"stop_requested", "finalizing", "terminal"}:
                 raise CanaryRunError("stop_conflict")
@@ -1193,13 +1220,10 @@ class CanaryRunService:
                 raise CanaryRunError("invalid_stop_ack")
             if value["stop_reason"] != row["stop_reason"]:
                 raise CanaryRunError("invalid_stop_ack")
-            if (
-                row["stop_requested_at_ms"] is not None
-                and value["timestamps"]["stop_requested_at_ms"] != row["stop_requested_at_ms"]
-            ):
-                raise CanaryRunError("invalid_stop_ack")
             arrival = self._now_ms()
-            late = max(arrival, acknowledged) > row["stop_deadline_ms"]
+            # The Cloud receipt clock is deadline authority.  Runner-local stop/ack times stay
+            # signed evidence, but skew or backdating can neither win nor lose the five-second SLA.
+            late = arrival > row["stop_deadline_ms"]
             terminal_ack = row["status"] == "terminal"
             if (
                 terminal_ack and row["quota_state"] == "refunded"
@@ -1237,10 +1261,11 @@ class CanaryRunService:
                 actor_class="runner", actor_id=runner_id,
                 reason_code="late" if late else "deadline_met",
             )
-            self.conn.commit()
+            if owns_transaction:
+                self.conn.commit()
             return {"accepted": True, "deadline_met": not late, "late": late}
         except Exception:
-            if self.conn.in_transaction:
+            if owns_transaction and self.conn.in_transaction:
                 self.conn.rollback()
             raise
 
@@ -1281,14 +1306,17 @@ class CanaryRunService:
         self, workspace_id: str, project_ref: str, run_id: str, runner_id: str,
         projection: object,
     ) -> dict[str, object]:
-        self.conn.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.conn.in_transaction
+        if owns_transaction:
+            self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._context(workspace_id, project_ref, run_id, runner_id)
             value = self._validate_operational(row, projection)
             source = self._source_state(row, value)
             if source == "replay" and row["status"] == "terminal":
                 result = self.get_status(workspace_id, project_ref, run_id)
-                self.conn.commit()
+                if owns_transaction:
+                    self.conn.commit()
                 return result
             if value["lifecycle_phase"] != "terminal" or row["status"] not in {
                 "claimed", "running", "stop_requested", "finalizing",
@@ -1302,11 +1330,6 @@ class CanaryRunService:
             if row["stop_reason"] != "none" and (
                 value["stop_reason"] != row["stop_reason"]
                 or value["execution_disposition"] != "stopped"
-            ):
-                raise CanaryRunError("stop_conflict")
-            if (
-                row["stop_requested_at_ms"] is not None
-                and timestamps["stop_requested_at_ms"] != row["stop_requested_at_ms"]
             ):
                 raise CanaryRunError("stop_conflict")
             if (
@@ -1372,10 +1395,11 @@ class CanaryRunService:
                 reason_code=value["error_category"],
                 payload={"execution_disposition": value["execution_disposition"]},
             )
-            self.conn.commit()
+            if owns_transaction:
+                self.conn.commit()
             return self.get_status(workspace_id, project_ref, run_id)
         except Exception:
-            if self.conn.in_transaction:
+            if owns_transaction and self.conn.in_transaction:
                 self.conn.rollback()
             raise
 

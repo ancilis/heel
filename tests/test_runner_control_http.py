@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 import pytest
 
 from heel.canary_contracts import canonical_bytes, canonical_digest, validate_runner_identity
-from heel.crypto import ed25519_key_id
+from heel.crypto import SigningAuthority, ed25519_key_id
 from heel.runner.control_client import RunnerControlClient
 from heel.saas.canary_store import CanaryStore
 from heel.saas.runner_auth import RunnerAuthError, RunnerAuthStore, initialize_runner_auth_schema
@@ -85,7 +85,7 @@ def test_has_no_public_generic_request_api():
     control, _, _ = client()
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
-    assert public <= {"claim", "heartbeat", "progress", "result", "stop_ack", "retry_last", "start_resync", "complete_resync", "install_rotation_claim"}
+    assert public <= {"claim", "heartbeat", "progress", "result", "upload_findings", "stop_ack", "retry_last", "start_resync", "complete_resync", "install_rotation_claim"}
 
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
@@ -108,13 +108,80 @@ def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
         proof = {"schema_version":"heel.runner-request-proof.v1","workspace_id":"ws","runner_id":"r","key_id":key_id,"capability":"runner_claim","method":"POST","path":path,"body_sha256":hashlib.sha256(body).hexdigest(),"timestamp_ms":timestamp,"server_nonce":nonce,"sequence":1}
         signature = base64.b64encode(signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))).decode()
         return {"X-Heel-Runner-Id":["r"],"X-Heel-Runner-Key-Id":[key_id],"X-Heel-Runner-Timestamp-Ms":[str(timestamp)],"X-Heel-Runner-Nonce":[nonce],"X-Heel-Runner-Sequence":["1"],"X-Heel-Runner-Signature":[signature],"Authorization":[],"Cookie":[]}
-    accepted, next_nonce = store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"status": "ok"})
-    assert accepted == {"status": "ok"} and next_nonce
+    with pytest.raises(ValueError):
+        store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"bad": 1.5})
+    with pytest.raises(ValueError):
+        store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"bad": object()})
+    with pytest.raises(ValueError):
+        store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"bad": "x" * (513 * 1024)})
+    accepted, next_nonce = store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"status": "ok", "active": True})
+    assert accepted == {"status": "ok", "active": True} and next_nonce
     assert store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"status": "bad"}) == (accepted, next_nonce)
     with pytest.raises(RunnerAuthError):
         store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(now + 1), action=lambda: {"status": "leak"})
     receipt = conn.execute("SELECT response_json,next_nonce,response_ciphertext,next_nonce_ciphertext FROM canary_runner_request_ledger").fetchone()
     assert receipt[0] == "sealed" and receipt[1] != next_nonce and receipt[2] and receipt[3]
+
+
+def test_runner_auth_body_cap_requires_an_explicit_bounded_integer_override():
+    conn = sqlite3.connect(":memory:")
+    CanaryStore(conn)
+    initialize_runner_auth_schema(conn)
+    store = RunnerAuthStore(conn, pepper=b"p" * 32)
+    arguments = {
+        "workspace_id": "ws", "runner_id": "runner", "capability": "runner_result",
+        "path": "/v1/workspaces/ws/runners/runner/runs/run/result-projection",
+        "raw_body": b"{}", "headers": {}, "action": lambda: {},
+    }
+    for invalid in (True, 0, -1, 272 * 1024 + 1, "278528"):
+        with pytest.raises(ValueError):
+            store.authenticate_and_consume(**arguments, max_body_bytes=invalid)
+
+
+def test_runner_result_projection_is_the_only_explicit_above_default_body_cap():
+    conn = sqlite3.connect(":memory:")
+    CanaryStore(conn)
+    initialize_runner_auth_schema(conn)
+    store = RunnerAuthStore(conn, pepper=b"p" * 32)
+    private = Ed25519PrivateKey.generate()
+    raw_key = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    key_id = ed25519_key_id(raw_key)
+    now = time.time()
+    nonce = "u" * 44
+    conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", now))
+    conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, "ws", "runner", base64.b64encode(raw_key).decode(), "active", now))
+    conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", ("ws", "runner", "result:run", store._hash("nonce", nonce), 1, now + 60))
+    conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", ("ws", "runner", "result:run", 1, 0, now))
+    conn.commit()
+    body = canonical_bytes({"chunks": ["x" * 4096 for _ in range(18)]})
+    assert 64 * 1024 < len(body) < 272 * 1024
+    path = "/v1/workspaces/ws/runners/runner/runs/run/result-projection"
+    timestamp = int(now * 1000)
+    proof = {
+        "schema_version": "heel.runner-request-proof.v1", "workspace_id": "ws",
+        "runner_id": "runner", "key_id": key_id, "capability": "runner_result",
+        "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(),
+        "timestamp_ms": timestamp, "server_nonce": nonce, "sequence": 1,
+    }
+    headers = {
+        "X-Heel-Runner-Id": ["runner"], "X-Heel-Runner-Key-Id": [key_id],
+        "X-Heel-Runner-Timestamp-Ms": [str(timestamp)], "X-Heel-Runner-Nonce": [nonce],
+        "X-Heel-Runner-Sequence": ["1"],
+        "X-Heel-Runner-Signature": [base64.b64encode(private.sign(
+            b"heel.runner-pop.v1\0" + canonical_bytes(proof)
+        )).decode()], "Authorization": [], "Cookie": [],
+    }
+    arguments = {
+        "workspace_id": "ws", "runner_id": "runner", "capability": "runner_result",
+        "path": path, "raw_body": body, "headers": headers,
+        "chain_name": "result:run", "action": lambda: {"accepted": True},
+    }
+    with pytest.raises(ValueError):
+        store.authenticate_and_consume(**arguments)
+    response, _ = store.authenticate_and_consume(
+        **arguments, max_body_bytes=272 * 1024,
+    )
+    assert response == {"accepted": True}
 
 
 def test_run_chain_allocator_issues_four_distinct_operation_chains_atomically():
@@ -281,8 +348,10 @@ def test_http_pairing_exchange_returns_runner_only_challenge_for_activation():
 
 
 def test_rotation_has_its_own_public_poll_and_activation_path():
+    cloud = SigningAuthority.generate()
     cp = ControlPlane(device_token_pepper=b"d" * 32, runner_auth_pepper=b"r" * 32,
-                      enable_device_auth=True, public_origin="https://heel.test")
+                      enable_device_auth=True, public_origin="https://heel.test",
+                      grant_authority=cloud)
     server = serve(cp); thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     def request(method, path, body, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
@@ -294,7 +363,8 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
         def post(self, path, *, headers=None, body=b""):
             conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
             conn.request("POST", path, body, headers or {})
-            response = conn.getresponse(); payload = json.loads(response.read())
+            response = conn.getresponse(); raw_response = response.read()
+            payload = json.loads(raw_response) if raw_response else None
             response_headers = dict(response.getheaders()); status = response.status; conn.close()
             return status, response_headers, payload
     class LocalSigner:
@@ -321,7 +391,7 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
             signer=LocalSigner(old), clock=lambda: int(time.time() * 1000), transport=HttpTransport(),
             nonce_source=lambda chain: first_activation["initial_claim_nonce"],
         )
-        assert old_client.claim()[0] == 200
+        assert old_client.claim()[0] == 204
         new = Ed25519PrivateKey.generate(); new_public = base64.b64encode(new.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
         old_fingerprint = hashlib.sha256(base64.b64decode(old_public)).hexdigest()
         status, rotation, _ = request("POST", f"/v1/workspaces/{signup['workspace_id']}/runners/{pending['runner_id']}/rotate", {"schema_version":"heel.runner-rotation-start.v1", "previous_fingerprint":old_fingerprint, "public_key_b64":new_public, "pairing_phrase":phrase, "runner_version":"v2", "adapters":{}}, browser)
@@ -345,7 +415,7 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
         )
         installed = new_client.install_rotation_claim(activated)
         assert installed.initial_claim_sequence == 2 and installed.initial_claim_generation == 1
-        assert new_client.claim()[0] == 200
+        assert new_client.claim()[0] == 204
         identity = cp.runner_auth.identity(signup["workspace_id"], pending["runner_id"])
         assert identity["state"] == "active" and identity["public_key"]["public_key_b64"] == new_public
         assert identity["rotation"]["previous_key_ids"]
@@ -397,7 +467,10 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
     """Run-operation paths have eight components and must never wait on the Python human lock."""
     with tempfile.TemporaryDirectory() as directory:
         path = str(Path(directory) / "control.sqlite")
-        cp = ControlPlane(path, runner_auth_pepper=b"r" * 32)
+        cp = ControlPlane(
+            path, runner_auth_pepper=b"r" * 32,
+            grant_authority=SigningAuthority.generate(),
+        )
         server = serve(cp); served = threading.Thread(target=server.serve_forever, daemon=True); served.start()
         try:
             org = cp.store.create_org("org")
@@ -493,6 +566,6 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
             stop_proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace, "runner_id":"runner", "key_id":key_id, "capability":"runner_heartbeat", "method":"POST", "path":stop_route, "body_sha256":hashlib.sha256(stop_body).hexdigest(), "timestamp_ms":stop_timestamp, "server_nonce":stop_nonce, "sequence":1}
             stop_headers = {"Content-Type":"application/json", "X-Heel-Runner-Id":"runner", "X-Heel-Runner-Key-Id":key_id, "X-Heel-Runner-Timestamp-Ms":str(stop_timestamp), "X-Heel-Runner-Nonce":stop_nonce, "X-Heel-Runner-Sequence":"1", "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(stop_proof))).decode()}
             conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1]); conn.request("POST", stop_route, stop_body, stop_headers)
-            assert conn.getresponse().status == 200; conn.close()
+            assert conn.getresponse().status == 409; conn.close()
         finally:
             server.shutdown(); server.server_close(); cp.close()

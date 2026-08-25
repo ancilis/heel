@@ -49,7 +49,7 @@ def test_stop_is_idempotent_generation_bound_and_ack_deadline_is_durable():
 
 
 def test_late_stop_ack_succeeds_but_never_claims_deadline_met():
-    _, _, runner, coordinator, approved, _ = running_setup()
+    _, clock, runner, coordinator, approved, _ = running_setup()
     grant = approved["grant"]
     coordinator.progress(
         WORKSPACE, PROJECT, grant["run_id"], RUNNER,
@@ -67,6 +67,7 @@ def test_late_stop_ack_succeeds_but_never_claims_deadline_met():
         stop_reason="cloud_stop", stop_requested_at_ms=NOW_MS,
         stop_acknowledged_at_ms=NOW_MS + 5001, updated_at_ms=NOW_MS + 5001,
     )
+    clock.value += 6
     assert coordinator.ack_stop(
         WORKSPACE, PROJECT, grant["run_id"], RUNNER, late,
     ) == {"accepted": True, "deadline_met": False, "late": True}
@@ -88,6 +89,23 @@ def test_backdated_runner_ack_cannot_claim_a_missed_cloud_deadline():
     assert coordinator.ack_stop(
         WORKSPACE, PROJECT, grant["run_id"], RUNNER, backdated,
     ) == {"accepted": True, "deadline_met": False, "late": True}
+
+
+def test_stop_ack_treats_runner_stop_timestamp_as_evidence_not_server_authority():
+    _, _, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    coordinator.request_stop(
+        WORKSPACE, PROJECT, grant["run_id"], actor="user_owner",
+        reason="cloud_stop", expected_kill_switch_generation=0,
+    )
+    runner_local_stop = operational_projection(
+        runner, grant, sequence=0, phase="stop_requested", stop_reason="cloud_stop",
+        stop_requested_at_ms=NOW_MS + 250,
+        stop_acknowledged_at_ms=NOW_MS + 300, updated_at_ms=NOW_MS + 300,
+    )
+    assert coordinator.ack_stop(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, runner_local_stop,
+    ) == {"accepted": True, "deadline_met": True, "late": False}
 
 
 def test_stop_ack_persists_when_heartbeat_already_accepted_the_same_snapshot():
@@ -158,7 +176,7 @@ def test_identical_stop_replay_survives_later_control_generation_change():
 
 
 def test_new_late_ack_after_terminal_is_stored_without_rewriting_terminal_receipt():
-    conn, _, runner, coordinator, approved, _ = running_setup()
+    conn, clock, runner, coordinator, approved, _ = running_setup()
     grant = approved["grant"]
     coordinator.progress(
         WORKSPACE, PROJECT, grant["run_id"], RUNNER,
@@ -186,6 +204,7 @@ def test_new_late_ack_after_terminal_is_stored_without_rewriting_terminal_receip
         stop_reason="cloud_stop", stop_requested_at_ms=NOW_MS,
         stop_acknowledged_at_ms=NOW_MS + 7000, updated_at_ms=NOW_MS + 7000,
     )
+    clock.value += 7
     assert coordinator.ack_stop(
         WORKSPACE, PROJECT, grant["run_id"], RUNNER, late,
     ) == {"accepted": True, "deadline_met": False, "late": True}
@@ -373,3 +392,30 @@ def test_kill_switch_generation_advances_and_gate_stops_old_grant():
     assert ops.control_generation() == 1
     ops.clear(WORKSPACE, actor="admin", reason="incident resolved")
     assert ops.control_generation() == 2
+
+
+def test_stop_ack_joins_an_outer_pop_transaction_and_does_not_commit_it():
+    conn, _, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    coordinator.request_stop(
+        WORKSPACE, PROJECT, grant["run_id"], actor="user_owner",
+        reason="cloud_stop", expected_kill_switch_generation=0,
+    )
+    acknowledgement = operational_projection(
+        runner, grant, sequence=0, phase="stop_requested", requests_started=0,
+        stop_reason="cloud_stop", stop_requested_at_ms=NOW_MS,
+        stop_acknowledged_at_ms=NOW_MS + 300, updated_at_ms=NOW_MS + 300,
+    )
+
+    conn.execute("BEGIN IMMEDIATE")
+    response = coordinator.ack_stop(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, acknowledgement,
+    )
+
+    assert conn.in_transaction is True
+    assert response == {"accepted": True, "deadline_met": True, "late": False}
+    conn.rollback()
+    assert conn.execute(
+        "SELECT stop_acknowledged_at_ms FROM canary_runs WHERE run_id=?",
+        (grant["run_id"],),
+    ).fetchone()[0] is None
