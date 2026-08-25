@@ -444,9 +444,10 @@ class RunnerAuthStore:
             self.conn.rollback(); raise
         return PairingInvitation(token, instant + PAIRING_TTL)
 
-    def exchange(self, invitation: str, public_key_b64: str, phrase: str, *, runner_id: str,
+    def exchange(self, invitation: str, public_key_b64: str, phrase: str, *, display_name: str,
                  runner_version: str, adapters: Mapping[str, str]) -> PairingView:
-        runner_id = self._identifier(runner_id, "runner")
+        if type(display_name) is not str or not display_name or display_name != display_name.strip() or len(display_name.encode()) > 128 or len(display_name) > 64 or any(ord(c) < 32 for c in display_name):
+            raise ValueError("invalid runner display name")
         self._identifier(runner_version, "runner version")
         phrase = self._phrase(phrase)
         if not isinstance(adapters, Mapping) or not all(type(k) is str and type(v) is str for k, v in adapters.items()):
@@ -462,12 +463,15 @@ class RunnerAuthStore:
             row = self.conn.execute("SELECT * FROM canary_runner_pairings WHERE invitation_hash=?", (self._hash("invitation", invitation),)).fetchone()
             if row is None or row["status"] != "invited" or row["expires_at"] <= instant:
                 raise RunnerAuthError("invalid pairing")
-            duplicate = self.conn.execute("SELECT 1 FROM canary_runners WHERE workspace_id=? AND runner_id=?", (row["workspace_id"], runner_id)).fetchone()
-            if duplicate:
-                raise RunnerAuthError("invalid pairing")
+            runner_id = None
+            for _ in range(8):
+                candidate = "runr_" + secrets.token_hex(16)
+                if self.conn.execute("SELECT 1 FROM canary_runners WHERE runner_id=? UNION SELECT 1 FROM canary_runner_pairings WHERE runner_id=?", (candidate, candidate)).fetchone() is None:
+                    runner_id = candidate; break
+            if runner_id is None: raise RunnerAuthError("runner ID unavailable")
             challenge = _token()
-            self.conn.execute("UPDATE canary_runner_pairings SET runner_id=?, invitation_hash=?, phrase=?, public_key=?, fingerprint=?, key_id=?, runner_version=?, adapters_json=?, activation_challenge=?, status='pending' WHERE pairing_id=?",
-                              (runner_id, self._hash("consumed-invitation", row["pairing_id"]), phrase, public_key_b64, fingerprint, key_id, runner_version, canonical_bytes(dict(adapters)).decode(), challenge, row["pairing_id"]))
+            self.conn.execute("UPDATE canary_runner_pairings SET runner_id=?, invitation_hash=?, phrase=?, public_key=?, fingerprint=?, key_id=?, runner_version=?, adapters_json=?, activation_challenge=?, status='pending', display_name=? WHERE pairing_id=?",
+                              (runner_id, self._hash("consumed-invitation", row["pairing_id"]), phrase, public_key_b64, fingerprint, key_id, runner_version, canonical_bytes(dict(adapters)).decode(), challenge, display_name, row["pairing_id"]))
             self.conn.commit()
         except Exception:
             self.conn.rollback(); raise
@@ -513,7 +517,7 @@ class RunnerAuthStore:
             current = self.conn.execute("SELECT COUNT(*) FROM canary_runners WHERE workspace_id=? AND status='active'", (row["workspace_id"],)).fetchone()[0]
             if max_active is not None and current >= max_active:
                 raise RunnerAuthError("runner quota exceeded")
-            self.conn.execute("INSERT INTO canary_runners(runner_id,workspace_id,display_name,status,created_at) VALUES(?,?,?,?,?)", (row["runner_id"], row["workspace_id"], row["runner_id"], "active", instant))
+            self.conn.execute("INSERT INTO canary_runners(runner_id,workspace_id,display_name,status,created_at) VALUES(?,?,?,?,?)", (row["runner_id"], row["workspace_id"], row["display_name"] or row["runner_id"], "active", instant))
             self.conn.execute("INSERT INTO canary_runner_keys(key_id,workspace_id,runner_id,public_key,status,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL)", (row["key_id"], row["workspace_id"], row["runner_id"], row["public_key"], "active", instant))
             nonce = _token()
             self.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (row["workspace_id"], row["runner_id"], "claim", self._hash("nonce", nonce), 1, instant + NONCE_TTL))

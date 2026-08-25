@@ -922,11 +922,11 @@ class _Handler(BaseHTTPRequestHandler):
     def _runner_pairing_exchange(self) -> None:
         try:
             body = self._body()
-            if set(body) != {"schema_version", "invitation_token", "public_key_b64", "pairing_phrase", "runner_id", "runner_version", "adapters"} or body["schema_version"] != "heel.runner-pairing-exchange.v1":
+            if set(body) != {"schema_version", "invitation_token", "public_key_b64", "pairing_phrase", "display_name", "runner_version", "adapters"} or body["schema_version"] != "heel.runner-pairing-exchange.v2":
                 raise ValueError
             pairing = self._runner_store().exchange(
                 body["invitation_token"], body["public_key_b64"], body["pairing_phrase"],
-                runner_id=body["runner_id"], runner_version=body["runner_version"], adapters=body["adapters"],
+                display_name=body["display_name"], runner_version=body["runner_version"], adapters=body["adapters"],
             )
         except (KeyError, TypeError, ValueError, RunnerAuthError):
             # Exchange must not reveal whether a one-time invitation was known.
