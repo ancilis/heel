@@ -23,8 +23,10 @@ RUNNER_CAPABILITIES = (
     "runner_claim", "runner_heartbeat", "runner_progress", "runner_result",
 )
 _MACOS_SECURITY_PATH = "/usr/bin/security"
-_KEYCHAIN_TIMEOUT_SECONDS = 5
-_MAX_KEYCHAIN_OUTPUT_BYTES = 1024
+_LINUX_SECRET_TOOL_PATH = "/usr/bin/secret-tool"
+_LINUX_SECRET_TOOL_ALLOWLIST = frozenset({_LINUX_SECRET_TOOL_PATH})
+_SECRET_HELPER_TIMEOUT_SECONDS = 5
+_MAX_SECRET_HELPER_OUTPUT_BYTES = 1024
 
 
 def _phrase_words() -> tuple[str, ...]:
@@ -93,10 +95,7 @@ class InMemorySecretBackend:
 
 
 class _CommandSecretBackend:
-    """Narrow subprocess adapter shared by macOS Keychain and Linux Secret Service."""
-
-    def __init__(self, *, command: Callable[..., subprocess.CompletedProcess] = subprocess.run):
-        self._command = command
+    """Shared validation for OS secret-service record labels."""
 
     @staticmethod
     def _label(label: str) -> str:
@@ -105,9 +104,8 @@ class _CommandSecretBackend:
         return label
 
 
-def _verified_security_path() -> str:
-    """Return the one fixed macOS helper only when it is a regular executable."""
-    path = _MACOS_SECURITY_PATH
+def _verified_secret_helper_path(path: str) -> str:
+    """Return an allowlisted helper only when it is an absolute regular executable."""
     if not os.path.isabs(path) or os.path.normpath(path) != path:
         raise RuntimeError("runner OS secret service unavailable")
     try:
@@ -119,11 +117,24 @@ def _verified_security_path() -> str:
     return path
 
 
-def _run_bounded_security(
-    arguments: tuple[str, ...], *, payload: bytes | None, popen: Callable[..., object],
+def _verified_security_path() -> str:
+    """Return the one fixed macOS helper only when it is a regular executable."""
+    return _verified_secret_helper_path(_MACOS_SECURITY_PATH)
+
+
+def _verified_secret_tool_path() -> str:
+    """Return the one fixed Linux helper only when it is a regular executable."""
+    if _LINUX_SECRET_TOOL_PATH not in _LINUX_SECRET_TOOL_ALLOWLIST:
+        raise RuntimeError("runner OS secret service unavailable")
+    return _verified_secret_helper_path(_LINUX_SECRET_TOOL_PATH)
+
+
+def _run_bounded_secret_helper(
+    helper: str, arguments: tuple[str, ...], *, payload: bytes | None,
+    popen: Callable[..., object],
 ) -> subprocess.CompletedProcess:
-    """Run macOS Keychain with bounded capture and secret input isolated to stdin."""
-    argv = (_verified_security_path(), *arguments)
+    """Run a fixed OS secret helper with bounded capture and stdin-only secret input."""
+    argv = (helper, *arguments)
     try:
         process = popen(
             argv,
@@ -168,7 +179,7 @@ def _run_bounded_security(
                 chunk = process_stdout.read(4096)
                 if not chunk:
                     return
-                remaining = _MAX_KEYCHAIN_OUTPUT_BYTES + 1 - len(retained)
+                remaining = _MAX_SECRET_HELPER_OUTPUT_BYTES + 1 - len(retained)
                 if remaining > 0:
                     retained.extend(chunk[:remaining])
         except (OSError, TypeError, ValueError):
@@ -179,7 +190,7 @@ def _run_bounded_security(
     writer.start()
     reader.start()
     try:
-        returncode = process.wait(timeout=_KEYCHAIN_TIMEOUT_SECONDS)
+        returncode = process.wait(timeout=_SECRET_HELPER_TIMEOUT_SECONDS)
     except (OSError, TypeError, ValueError, subprocess.SubprocessError):
         try:
             process.kill()
@@ -202,6 +213,22 @@ def _run_bounded_security(
             pass
         raise RuntimeError("runner OS secret service unavailable")
     return subprocess.CompletedProcess(argv, returncode, bytes(retained), None)
+
+
+def _run_bounded_security(
+    arguments: tuple[str, ...], *, payload: bytes | None, popen: Callable[..., object],
+) -> subprocess.CompletedProcess:
+    return _run_bounded_secret_helper(
+        _verified_security_path(), arguments, payload=payload, popen=popen,
+    )
+
+
+def _run_bounded_secret_tool(
+    arguments: tuple[str, ...], *, payload: bytes | None, popen: Callable[..., object],
+) -> subprocess.CompletedProcess:
+    return _run_bounded_secret_helper(
+        _verified_secret_tool_path(), arguments, payload=payload, popen=popen,
+    )
 
 
 class MacOSKeychainSecretBackend:
@@ -247,13 +274,23 @@ class MacOSKeychainSecretBackend:
             raise RuntimeError("runner OS secret service unavailable")
 
 
-class LinuxSecretServiceBackend(_CommandSecretBackend):
+class LinuxSecretServiceBackend:
     """Freedesktop Secret Service adapter via ``secret-tool`` (no filesystem fallback)."""
+
+    def __init__(self, *, popen: Callable[..., object] = subprocess.Popen):
+        self._popen = popen
+
+    @staticmethod
+    def _label(label: str) -> str:
+        return _CommandSecretBackend._label(label)
 
     def load(self, label: str) -> bytes | None:
         label = self._label(label)
-        result = self._command(["secret-tool", "lookup", "heel", "runner", "label", label],
-                               capture_output=True, check=False)
+        result = _run_bounded_secret_tool(
+            ("lookup", "heel", "runner", "label", label),
+            payload=None,
+            popen=self._popen,
+        )
         if result.returncode == 1:
             return None
         if result.returncode != 0:
@@ -265,9 +302,13 @@ class LinuxSecretServiceBackend(_CommandSecretBackend):
 
     def store(self, label: str, seed: bytes) -> None:
         label = self._label(label)
-        result = self._command(["secret-tool", "store", "--label=Heel runner signing key",
-                                "heel", "runner", "label", label], input=base64.b64encode(seed),
-                               capture_output=True, check=False)
+        if not isinstance(seed, bytes) or len(seed) != 32:
+            raise RuntimeError("runner OS secret service returned invalid material")
+        result = _run_bounded_secret_tool(
+            ("store", "--label=Heel runner signing key", "heel", "runner", "label", label),
+            payload=base64.b64encode(seed),
+            popen=self._popen,
+        )
         if result.returncode != 0:
             raise RuntimeError("runner OS secret service unavailable")
 

@@ -8,6 +8,7 @@ import pytest
 from heel.crypto import ed25519_key_id
 from heel.runner.identity import (
     InMemorySecretBackend,
+    LinuxSecretServiceBackend,
     MacOSKeychainSecretBackend,
     SecureSigner,
     SystemSecureSigner,
@@ -179,3 +180,72 @@ def test_macos_load_is_bounded_and_never_exposes_helper_output(monkeypatch):
         "heel.runner.ed25519.v1", "-a", "runner-one", "-w",
     )
     assert secret_marker.decode() not in str(caught.value)
+
+
+def test_linux_first_create_uses_only_verified_helper_and_stdin_for_seed(monkeypatch):
+    expected_seed = b"l" * 32
+    encoded_seed = base64.b64encode(expected_seed)
+    calls = []
+
+    def popen(argv, **kwargs):
+        process = _FakeProcess(
+            argv, returncode=1 if argv[1] == "lookup" else 0, stdout=b"",
+        )
+        calls.append((tuple(argv), kwargs, process))
+        return process
+
+    monkeypatch.setattr("heel.runner.identity._verified_secret_tool_path",
+                        lambda: "/usr/bin/secret-tool")
+    monkeypatch.setattr("heel.runner.identity.secrets.token_bytes", lambda count: expected_seed)
+    signer = SystemSecureSigner(
+        "runner-linux", backend=LinuxSecretServiceBackend(popen=popen),
+    )
+
+    assert signer.public_key and encoded_seed not in repr(signer).encode()
+    assert [call[0] for call in calls] == [
+        ("/usr/bin/secret-tool", "lookup", "heel", "runner", "label", "runner-linux"),
+        ("/usr/bin/secret-tool", "store", "--label=Heel runner signing key",
+         "heel", "runner", "label", "runner-linux"),
+    ]
+    for argv, kwargs, process in calls:
+        assert encoded_seed.decode() not in argv
+        assert kwargs == {
+            "stdin": subprocess.PIPE, "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL, "shell": False, "bufsize": 0,
+            "env": {"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        }
+        assert process.wait_timeouts == [5]
+    assert bytes(calls[0][2].stdin.data) == b""
+    assert bytes(calls[1][2].stdin.data) == encoded_seed
+
+
+def test_linux_helper_output_is_bounded_and_never_exposed(monkeypatch):
+    secret_marker = b"linux-private-helper-output"
+
+    def popen(argv, **kwargs):
+        return _FakeProcess(argv, returncode=0, stdout=secret_marker * 100)
+
+    monkeypatch.setattr("heel.runner.identity._verified_secret_tool_path",
+                        lambda: "/usr/bin/secret-tool")
+    backend = LinuxSecretServiceBackend(popen=popen)
+    with pytest.raises(RuntimeError, match="invalid material") as caught:
+        backend.load("runner-linux")
+    assert secret_marker.decode() not in str(caught.value)
+
+
+@pytest.mark.parametrize("helper_path", ["secret-tool", "/tmp/not-allowlisted-secret-tool"])
+def test_linux_helper_rejects_path_resolution_before_process_launch(
+    monkeypatch, tmp_path, helper_path,
+):
+    calls = []
+    if helper_path.startswith("/"):
+        helper = tmp_path / "secret-tool"
+        helper.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        helper.chmod(0o700)
+        helper_path = str(helper)
+    monkeypatch.setattr("heel.runner.identity._LINUX_SECRET_TOOL_PATH", helper_path)
+    backend = LinuxSecretServiceBackend(popen=lambda *args, **kwargs: calls.append(args))
+
+    with pytest.raises(RuntimeError, match="secret service unavailable"):
+        backend.load("runner-linux")
+    assert calls == []
