@@ -17,7 +17,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-from .canary_store import CANARY_STORE_SCHEMA
+from .canary_store import CANARY_ENVIRONMENT_VERIFICATION_MIGRATION, CANARY_STORE_SCHEMA
 
 _TRACKING = """
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -335,6 +335,7 @@ ALTER TABLE usage_ledger ADD COLUMN reason TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_canary_fault_refund
   ON usage_ledger(reservation_id) WHERE kind='platform_fault_refund';
 """),
+    Migration(7, "verified_canary_environment_proofs", CANARY_ENVIRONMENT_VERIFICATION_MIGRATION),
 ]
 
 

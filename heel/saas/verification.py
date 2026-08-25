@@ -16,7 +16,9 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import hashlib
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -206,3 +208,323 @@ class TargetVerifier:
 
     def verified_count(self, workspace_id: str) -> int:
         return self._verified_count_locked(workspace_id)
+
+
+# VerifiedEnvironment.v1 is intentionally separate from the legacy hostname-only target flow.
+# Legacy /targets remains compatible and has its own meter; canary execution consumes only this
+# project-bound exact-origin record.
+VERIFIED_ENVIRONMENT_SCHEMA_VERSION = "VerifiedEnvironment.v1"
+NORMALIZATION_VERSION = "exact-origin.v1"
+HTTPS_PROOF_VERSION = "https-file.v1"
+DNS_PROOF_VERSION = "dns-txt.v1"
+OWNERSHIP_ATTESTATION = "ownership verified; environment classification supplied by you"
+ENVIRONMENT_CHALLENGE_TTL = 24 * 3600
+ENVIRONMENT_PROOF_TTL = 30 * 24 * 3600
+ENVIRONMENT_CHECK_COOLDOWN = 5
+_ENVIRONMENT_CLASSES = frozenset({"staging", "sandbox", "production"})
+_FAILURE_CODES = frozenset({
+    "challenge_expired", "challenge_missing", "challenge_replaced", "cooldown",
+    "dns_proof_mismatch", "https_proof_mismatch", "network_rejected", "network_timeout",
+    "proof_revoked", "quota_exceeded", "hostname_reuse_exceeded", "internal_error",
+})
+
+
+class EnvironmentNotFound(LookupError):
+    pass
+
+
+class EnvironmentCooldown(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class EnvironmentChallenge:
+    environment_id: str
+    workspace_id: str
+    project_ref: str
+    origin: str
+    environment_class: str
+    token: str
+    generation: int
+    expires_at: float
+    attestation: str = OWNERSHIP_ATTESTATION
+
+    @property
+    def http_url(self) -> str:
+        return self.origin + "/.well-known/heel-verify.txt"
+
+
+class VerifiedEnvironmentService:
+    """Project-scoped environment proof state with snapshot/network/finalize semantics."""
+    def __init__(self, conn: sqlite3.Connection, *, https_verifier=None, dns_txt=None,
+                 max_workspaces_per_hostname: int | None = None, clock: Callable[[], float] = _now):
+        from .canary_store import CanaryStore
+        self.conn = conn
+        CanaryStore(conn)  # install the exact runtime/migration schema without a second identity
+        self.https_verifier = https_verifier
+        self.dns_txt = dns_txt
+        self.clock = clock
+        self._db_lock = threading.RLock()
+        self.max_workspaces_per_hostname = (
+            MAX_WORKSPACES_PER_HOSTNAME if max_workspaces_per_hostname is None
+            else max_workspaces_per_hostname
+        )
+
+    @staticmethod
+    def _digest(token: str) -> str:
+        return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+    @staticmethod
+    def _origin_host(origin: str) -> str:
+        return origin[len("https://"):]
+
+    def _now(self) -> float:
+        return float(self.clock())
+
+    def _row(self, workspace_id: str, project_ref: str, environment_id: str):
+        with self._db_lock:
+            return self.conn.execute(
+                "SELECT * FROM canary_environments WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+                (workspace_id, project_ref, environment_id),
+            ).fetchone()
+
+    def start(self, workspace_id: str, project_ref: str, origin: str, environment_class: str,
+              *, actor: str, proof_method: str = "https-file") -> EnvironmentChallenge:
+        from .network_guard import OriginValidationError, normalize_verified_origin
+        if type(environment_class) is not str or environment_class not in _ENVIRONMENT_CLASSES:
+            raise ValueError("environment_class must be staging, sandbox, or production")
+        if proof_method not in {"https-file", "dns-txt"}:
+            raise ValueError("proof_method is invalid")
+        try:
+            normalized = normalize_verified_origin(origin)
+        except OriginValidationError as exc:
+            raise ValueError("origin must be an exact public https origin") from exc
+        if type(actor) is not str or not actor or len(actor) > 256:
+            raise ValueError("actor is invalid")
+        now = self._now()
+        token = secrets.token_urlsafe(32)
+        digest = self._digest(token)
+        expires_at = now + ENVIRONMENT_CHALLENGE_TTL
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            project = self.conn.execute(
+                "SELECT 1 FROM projects WHERE workspace_id=? AND project_ref=?", (workspace_id, project_ref)
+            ).fetchone()
+            if project is None:
+                raise EnvironmentNotFound("project not found")
+            existing = self.conn.execute(
+                "SELECT * FROM canary_environments WHERE workspace_id=? AND project_ref=? AND origin=?",
+                (workspace_id, project_ref, normalized),
+            ).fetchone()
+            if existing is None:
+                environment_id = f"env_{secrets.token_hex(16)}"
+                generation = 1
+                self.conn.execute(
+                    "INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at,"
+                    "attestation_text,attestation_version,attested_by,attested_at,proof_method,proof_version,normalization_version,"
+                    "challenge_generation,challenge_digest,challenge_token,challenge_created_at,challenge_expires_at,last_failure_code,"
+                    "verified_at,proof_expires_at,revoked_at,revoked_by,revoked_reason) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (environment_id, workspace_id, project_ref, normalized, environment_class, "pending", now,
+                     OWNERSHIP_ATTESTATION, VERIFIED_ENVIRONMENT_SCHEMA_VERSION, actor, now, proof_method,
+                     HTTPS_PROOF_VERSION if proof_method == "https-file" else DNS_PROOF_VERSION, NORMALIZATION_VERSION,
+                     generation, digest, token, now, expires_at, None, None, None, None, None, None),
+                )
+            else:
+                environment_id = existing["environment_id"]
+                generation = int(existing["challenge_generation"] or 0) + 1
+                self.conn.execute(
+                    "UPDATE canary_environments SET environment_class=?,status='pending',attestation_text=?,"
+                    "attestation_version=?,attested_by=?,attested_at=?,proof_method=?,proof_version=?,normalization_version=?,"
+                    "challenge_generation=?,challenge_digest=?,challenge_token=?,challenge_created_at=?,challenge_expires_at=?,"
+                    "last_check_at=NULL,last_failure_code=NULL,verified_at=NULL,proof_expires_at=NULL,revoked_at=NULL,"
+                    "revoked_by=NULL,revoked_reason=NULL WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+                    (environment_class, OWNERSHIP_ATTESTATION, VERIFIED_ENVIRONMENT_SCHEMA_VERSION, actor, now,
+                     proof_method, HTTPS_PROOF_VERSION if proof_method == "https-file" else DNS_PROOF_VERSION,
+                     NORMALIZATION_VERSION, generation, digest, token, now, expires_at,
+                     workspace_id, project_ref, environment_id),
+                )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.rollback()
+            raise
+        return EnvironmentChallenge(environment_id, workspace_id, project_ref, normalized, environment_class,
+                                    token, generation, expires_at)
+
+    def _record_failure(self, workspace_id: str, project_ref: str, environment_id: str,
+                        generation: int, code: str) -> None:
+        if code not in _FAILURE_CODES:
+            code = "internal_error"
+        with self._db_lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute(
+                    "UPDATE canary_environments SET last_failure_code=?,last_check_at=? "
+                    "WHERE workspace_id=? AND project_ref=? AND environment_id=? AND challenge_generation=? "
+                    "AND status='pending' AND revoked_at IS NULL",
+                    (code, self._now(), workspace_id, project_ref, environment_id, generation),
+                )
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def check(self, workspace_id: str, project_ref: str, environment_id: str, *,
+              max_verified: int | None = None) -> bool:
+        """Network proof is deliberately outside any SQLite transaction or HTTP request lock."""
+        row = self._row(workspace_id, project_ref, environment_id)
+        if row is None:
+            raise EnvironmentNotFound("environment not found")
+        now = self._now()
+        if row["revoked_at"] is not None:
+            self._record_failure(workspace_id, project_ref, environment_id, row["challenge_generation"], "proof_revoked")
+            return False
+        if row["status"] != "pending" or not row["challenge_token"]:
+            self._record_failure(workspace_id, project_ref, environment_id, row["challenge_generation"], "challenge_missing")
+            return False
+        if now >= row["challenge_expires_at"]:
+            self._record_failure(workspace_id, project_ref, environment_id, row["challenge_generation"], "challenge_expired")
+            return False
+        # Claim the cooldown before network I/O. This is intentionally a short transaction, then
+        # released: concurrent check callers cannot fan out identical proof requests.
+        with self._db_lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                fresh = self._row(workspace_id, project_ref, environment_id)
+                if (fresh is None or fresh["challenge_generation"] != row["challenge_generation"]
+                        or fresh["status"] != "pending" or fresh["revoked_at"] is not None
+                        or fresh["challenge_token"] != row["challenge_token"]
+                        or fresh["challenge_expires_at"] <= now):
+                    self.conn.execute("ROLLBACK")
+                    return False
+                if fresh["last_check_at"] is not None and now - fresh["last_check_at"] < ENVIRONMENT_CHECK_COOLDOWN:
+                    self.conn.execute("ROLLBACK")
+                    raise EnvironmentCooldown("environment check is cooling down")
+                self.conn.execute(
+                    "UPDATE canary_environments SET last_check_at=? WHERE workspace_id=? AND project_ref=? "
+                    "AND environment_id=? AND challenge_generation=?",
+                    (now, workspace_id, project_ref, environment_id, fresh["challenge_generation"]),
+                )
+                self.conn.execute("COMMIT")
+                row = fresh
+            except EnvironmentCooldown:
+                raise
+            except Exception:
+                self.conn.rollback()
+                raise
+        generation, expected_digest, token = row["challenge_generation"], row["challenge_digest"], row["challenge_token"]
+        try:
+            if row["proof_method"] == "dns-txt":
+                observed = self.dns_txt("_heel." + self._origin_host(row["origin"])) if self.dns_txt else []
+                valid = any(str(value) == "heel-verify=" + token for value in observed)
+                failure = "dns_proof_mismatch"
+            else:
+                observed = self.https_verifier.verify(row["origin"]) if self.https_verifier else None
+                valid = type(observed) is str and hashlib.sha256(observed.encode("ascii")).hexdigest() == expected_digest
+                failure = "https_proof_mismatch"
+        except TimeoutError:
+            valid, failure = False, "network_timeout"
+        except Exception:
+            valid, failure = False, "network_rejected"
+        if not valid:
+            self._record_failure(workspace_id, project_ref, environment_id, generation, failure)
+            return False
+        return self._finalize_success(workspace_id, project_ref, environment_id, generation,
+                                      expected_digest, token, max_verified)
+
+    def _finalize_success(self, workspace_id: str, project_ref: str, environment_id: str,
+                          generation: int, expected_digest: str, token: str,
+                          max_verified: int | None) -> bool:
+        """The second half of check: one short, serializable DB transaction after network I/O."""
+        with self._db_lock:
+            now = self._now()
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                fresh = self._row(workspace_id, project_ref, environment_id)
+                if (fresh is None or fresh["challenge_generation"] != generation or fresh["status"] != "pending"
+                        or fresh["revoked_at"] is not None or fresh["challenge_expires_at"] <= now
+                        or fresh["challenge_digest"] != expected_digest or fresh["challenge_token"] != token
+                        or fresh["attestation_text"] != OWNERSHIP_ATTESTATION):
+                    self.conn.execute("ROLLBACK")
+                    return False
+                if max_verified is not None and self._active_count_locked(workspace_id, project_ref, now) >= max_verified:
+                    self.conn.execute("ROLLBACK")
+                    raise TargetLimitExceeded("verified environment limit reached")
+                hostname = self._origin_host(fresh["origin"])
+                if self.max_workspaces_per_hostname >= 0:
+                    other_count = self.conn.execute(
+                        "SELECT COUNT(DISTINCT workspace_id) AS n FROM canary_environments WHERE origin=? "
+                        "AND workspace_id!=? AND status='verified' AND revoked_at IS NULL AND proof_expires_at>?",
+                        (fresh["origin"], workspace_id, now),
+                    ).fetchone()["n"]
+                    if other_count >= self.max_workspaces_per_hostname:
+                        self.conn.execute("ROLLBACK")
+                        raise HostnameReuseExceeded(f"{hostname} is already verified in other workspaces")
+                self.conn.execute(
+                    "UPDATE canary_environments SET status='verified',verified_at=?,proof_expires_at=?,"
+                    "challenge_token=NULL,last_check_at=?,last_failure_code=NULL WHERE workspace_id=? AND project_ref=? "
+                    "AND environment_id=? AND challenge_generation=?",
+                    (now, now + ENVIRONMENT_PROOF_TTL, now, workspace_id, project_ref, environment_id, generation),
+                )
+                self.conn.execute("COMMIT")
+                return True
+            except (TargetLimitExceeded, HostnameReuseExceeded):
+                raise
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def revoke(self, workspace_id: str, project_ref: str, environment_id: str, *, actor: str, reason: str) -> bool:
+        now = self._now()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self.conn.execute(
+                "UPDATE canary_environments SET status='revoked',revoked_at=?,revoked_by=?,revoked_reason=?,"
+                "challenge_token=NULL,last_failure_code='proof_revoked' WHERE workspace_id=? AND project_ref=? "
+                "AND environment_id=? AND revoked_at IS NULL",
+                (now, actor, reason[:512], workspace_id, project_ref, environment_id),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.rollback()
+            raise
+        return cursor.rowcount == 1
+
+    def is_executable(self, workspace_id: str, project_ref: str, environment_id: str) -> bool:
+        row = self._row(workspace_id, project_ref, environment_id)
+        return bool(row and row["environment_class"] in {"staging", "sandbox"} and row["status"] == "verified"
+                    and row["attestation_text"] == OWNERSHIP_ATTESTATION and row["revoked_at"] is None
+                    and row["verified_at"] is not None and row["proof_expires_at"] is not None
+                    and row["proof_expires_at"] > self._now())
+
+    def list(self, workspace_id: str, project_ref: str) -> list[dict[str, object]]:
+        rows = self.conn.execute(
+            "SELECT * FROM canary_environments WHERE workspace_id=? AND project_ref=? ORDER BY created_at,environment_id",
+            (workspace_id, project_ref),
+        ).fetchall()
+        return [self.public_record(row) for row in rows]
+
+    @staticmethod
+    def public_record(row) -> dict[str, object]:
+        return {
+            "schema_version": VERIFIED_ENVIRONMENT_SCHEMA_VERSION,
+            "environment_id": row["environment_id"], "origin": row["origin"],
+            "environment_class": row["environment_class"], "status": row["status"],
+            "attestation": row["attestation_text"], "attestation_version": row["attestation_version"],
+            "proof_method": row["proof_method"], "proof_version": row["proof_version"],
+            "normalization_version": row["normalization_version"], "challenge_generation": row["challenge_generation"],
+            "challenge_expires_at": row["challenge_expires_at"], "last_failure_code": row["last_failure_code"],
+            "verified_at": row["verified_at"], "proof_expires_at": row["proof_expires_at"],
+            "revoked_at": row["revoked_at"], "is_executable": False,
+        }
+
+    def _active_count_locked(self, workspace_id: str, project_ref: str, now: float) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM canary_environments WHERE workspace_id=? AND project_ref=? "
+            "AND status='verified' AND revoked_at IS NULL AND proof_expires_at>?",
+            (workspace_id, project_ref, now),
+        ).fetchone()[0]
+
+
+# A concise public name for consumers that should not learn implementation details.
+VerifiedEnvironment = VerifiedEnvironmentService

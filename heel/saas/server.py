@@ -233,6 +233,16 @@ class ProductionConfiguration:
 
 def build_server(config: ProductionConfiguration):
     """Construct the private listener after every production invariant has passed."""
+    # Resolve the explicitly pinned control-plane dependency before we acquire the durable
+    # database process lock or bind a listener. A deployment missing the safe resolver is not a
+    # partially usable live-verification deployment.
+    try:
+        from .network_guard import BoundedDNSResolver, PinnedHTTPSVerifier
+        environment_verifier = PinnedHTTPSVerifier(resolver=BoundedDNSResolver())
+    except Exception as exc:
+        raise ProductionConfigurationError(
+            "verified environments require the pinned dnspython==2.8.0 control-plane dependency"
+        ) from exc
     database_lock = _SingleProcessDatabaseLock.acquire(config.database_path)
     control_plane = None
     try:
@@ -257,6 +267,7 @@ def build_server(config: ProductionConfiguration):
             edge_auth_secret=config.edge_auth_secret,
             grant_authority=config.grant_authority,
             grant_trusted_keys=config.grant_trusted_keys,
+            environment_https_verifier=environment_verifier,
         )
         # One process owns this database. WAL keeps reads responsive; FULL preserves accepted
         # findings and auth state across an abrupt host restart on a durable volume.

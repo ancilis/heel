@@ -30,7 +30,7 @@ class CanaryMigrationTests(unittest.TestCase):
         )
 
     def test_migration_six_creates_tenant_bound_unique_tables(self):
-        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 6)
+        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 7)
         tables = (
             "canary_environments", "canary_runners", "canary_runner_keys",
             "canary_consumed_nonces", "canary_approval_projections",
@@ -81,12 +81,12 @@ class CanaryMigrationTests(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("missing-runner", "missing-ws", "runner", "active", 1))
         with self.assertRaises(sqlite3.IntegrityError):
-            execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("missing-env", "missing-ws", "missing-prj", "https://missing.example", "staging", "verified", 1))
+            execute("INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at) VALUES(?,?,?,?,?,?,?)", ("missing-env", "missing-ws", "missing-prj", "https://missing.example", "staging", "verified", 1))
         self.seed_root("ws-1", "prj-1")
         self.seed_root("ws-2", "prj-2")
-        execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("env-1", "ws-1", "prj-1", "https://one.example", "staging", "verified", 1))
-        execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("env-1-alt", "ws-1", "prj-1", "https://one-alt.example", "staging", "verified", 1))
-        execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("env-2", "ws-2", "prj-2", "https://two.example", "staging", "verified", 1))
+        execute("INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at) VALUES(?,?,?,?,?,?,?)", ("env-1", "ws-1", "prj-1", "https://one.example", "staging", "verified", 1))
+        execute("INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at) VALUES(?,?,?,?,?,?,?)", ("env-1-alt", "ws-1", "prj-1", "https://one-alt.example", "staging", "verified", 1))
+        execute("INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at) VALUES(?,?,?,?,?,?,?)", ("env-2", "ws-2", "prj-2", "https://two.example", "staging", "verified", 1))
         execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner-1", "ws-1", "runner", "active", 1))
         execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner-1-alt", "ws-1", "runner", "active", 1))
         execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner-2", "ws-2", "runner", "active", 1))
@@ -144,8 +144,8 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
         conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
         conn.commit()
-        self.assertEqual(migration.apply_all(), [6])
-        self.assertEqual(migration.current_version(), 6)
+        self.assertEqual(migration.apply_all(), [6, 7])
+        self.assertEqual(migration.current_version(), 7)
         self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):

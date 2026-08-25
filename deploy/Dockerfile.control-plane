@@ -12,7 +12,11 @@ RUN groupadd --system --gid 10001 heel \
 WORKDIR /app
 COPY --chown=root:root heel /app/heel
 COPY --chown=root:root LICENSE-COMMERCIAL.md /app/LICENSE-COMMERCIAL.md
-RUN pip install --no-cache-dir --only-binary=:all: cryptography==45.0.7
+RUN pip install --no-cache-dir --only-binary=:all: cryptography==45.0.7 \
+    && pip download --no-cache-dir --only-binary=:all: --no-deps -d /tmp/dns dnspython==2.8.0 \
+    && echo '01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af  /tmp/dns/dnspython-2.8.0-py3-none-any.whl' | sha256sum -c - \
+    && pip install --no-cache-dir --no-index --find-links=/tmp/dns dnspython==2.8.0 \
+    && rm -rf /tmp/dns
 
 USER heel
 EXPOSE 8080

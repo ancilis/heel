@@ -171,6 +171,61 @@ CREATE TABLE IF NOT EXISTS canary_audit_records(
     REFERENCES canary_runs(workspace_id, project_ref, run_id));
 """
 
+# Migration 7 deliberately extends the original Task-2 identity table rather than introducing a
+# second environment identity.  Keep ``CANARY_STORE_SCHEMA`` above byte-stable: it is migration 6.
+CANARY_ENVIRONMENT_VERIFICATION_MIGRATION = """
+ALTER TABLE canary_environments ADD COLUMN attestation_text TEXT;
+ALTER TABLE canary_environments ADD COLUMN attestation_version TEXT;
+ALTER TABLE canary_environments ADD COLUMN attested_by TEXT;
+ALTER TABLE canary_environments ADD COLUMN attested_at REAL;
+ALTER TABLE canary_environments ADD COLUMN proof_method TEXT;
+ALTER TABLE canary_environments ADD COLUMN proof_version TEXT;
+ALTER TABLE canary_environments ADD COLUMN normalization_version TEXT;
+ALTER TABLE canary_environments ADD COLUMN challenge_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE canary_environments ADD COLUMN challenge_digest TEXT;
+ALTER TABLE canary_environments ADD COLUMN challenge_token TEXT;
+ALTER TABLE canary_environments ADD COLUMN challenge_created_at REAL;
+ALTER TABLE canary_environments ADD COLUMN challenge_expires_at REAL;
+ALTER TABLE canary_environments ADD COLUMN last_check_at REAL;
+ALTER TABLE canary_environments ADD COLUMN last_failure_code TEXT;
+ALTER TABLE canary_environments ADD COLUMN verified_at REAL;
+ALTER TABLE canary_environments ADD COLUMN proof_expires_at REAL;
+ALTER TABLE canary_environments ADD COLUMN revoked_at REAL;
+ALTER TABLE canary_environments ADD COLUMN revoked_by TEXT;
+ALTER TABLE canary_environments ADD COLUMN revoked_reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_canary_environment_project
+  ON canary_environments(workspace_id, project_ref, origin);
+"""
+
+_ENVIRONMENT_COLUMNS = (
+    "attestation_text", "attestation_version", "attested_by", "attested_at", "proof_method",
+    "proof_version", "normalization_version", "challenge_generation", "challenge_digest",
+    "challenge_token", "challenge_created_at", "challenge_expires_at", "last_check_at",
+    "last_failure_code", "verified_at", "proof_expires_at", "revoked_at", "revoked_by",
+    "revoked_reason",
+)
+
+
+def ensure_canary_environment_schema(conn: sqlite3.Connection) -> None:
+    """Bring direct in-process construction to migration-7 schema parity.
+
+    Migrated production databases take the same statements through ``Migrator``.  Unit/control
+    plane construction intentionally owns a runtime schema too, so add only missing columns here.
+    """
+    present = {row[1] for row in conn.execute("PRAGMA table_info(canary_environments)")}
+    for statement in CANARY_ENVIRONMENT_VERIFICATION_MIGRATION.strip().split(";"):
+        statement = statement.strip()
+        if not statement:
+            continue
+        if statement.startswith("ALTER TABLE"):
+            column = statement.split()[5]
+            if column in present:
+                continue
+            conn.execute(statement)
+            present.add(column)
+        else:
+            conn.execute(statement)
+
 
 class CanaryStore:
     """Typed schema owner. Higher canary services are added in later packets."""
@@ -180,3 +235,4 @@ class CanaryStore:
             raise TypeError("CanaryStore requires the ControlPlane SQLite connection")
         self.conn = conn
         self.conn.executescript(CANARY_STORE_SCHEMA)
+        ensure_canary_environment_schema(conn)

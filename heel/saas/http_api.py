@@ -74,7 +74,10 @@ from .projects import ProjectNotFound, ProjectStore
 from .tenancy import (
     ControlPlaneStore, IntegrationLimitExceeded, Role, SeatLimitExceeded, hash_api_key, require,
 )
-from .verification import HostnameReuseExceeded, TargetLimitExceeded, TargetVerifier
+from .verification import (
+    EnvironmentCooldown, EnvironmentNotFound, HostnameReuseExceeded, TargetLimitExceeded,
+    TargetVerifier, VerifiedEnvironmentService,
+)
 
 MAX_BODY = 64 * 1024
 MAX_DEVICE_BODY = 8 * 1024
@@ -138,7 +141,9 @@ class ControlPlane:
                  trust_edge_client_key: bool = False,
                  edge_auth_secret: str | None = None,
                  grant_authority=None,
-                 grant_trusted_keys: dict[str, object] | None = None):
+                 grant_trusted_keys: dict[str, object] | None = None,
+                 environment_https_verifier=None,
+                 environment_dns_txt=None):
         configured_pepper = bool(os.environ.get("HEEL_DEVICE_TOKEN_PEPPER_B64"))
         device_enabled = (
             enable_device_auth
@@ -186,6 +191,9 @@ class ControlPlane:
         self.edge_auth_secret = edge_auth_secret
         self.entitlements = EntitlementService(self.ledger)
         self.verifier = TargetVerifier(conn, dns_txt=dns_txt, http_get=http_get)
+        self.environments = VerifiedEnvironmentService(
+            conn, https_verifier=environment_https_verifier, dns_txt=environment_dns_txt,
+        )
         self.jobs = JobPlane(conn, scope_validator=scope_validator,
                              concurrency_limit=lambda wid: self.entitlements.quota(
                                  self.subscription(wid), Meter.CONCURRENCY))
@@ -625,14 +633,24 @@ class _Handler(BaseHTTPRequestHandler):
         self._pending_json_response = None
         self._defer_json_response = bool(self._route_parts and self._route_parts[0] == "v1")
         try:
-            with self.cp.request_lock:
+            # The environment check owns only short DB snapshots/finalization; its DNS/TLS read
+            # must not monopolize the process-wide SQLite request lock.
+            if self._is_environment_check_route(method):
                 self._route_serial(method)
+            else:
+                with self.cp.request_lock:
+                    self._route_serial(method)
         finally:
             self._defer_json_response = False
         pending = self._pending_json_response
         self._pending_json_response = None
         if pending is not None:
             self._write_json(*pending)
+
+    def _is_environment_check_route(self, method: str) -> bool:
+        p = self._route_parts
+        return bool(method == "POST" and len(p) == 8 and p[0] == "v1" and p[1] == "workspaces"
+                    and p[3] == "projects" and p[5] == "environments" and p[7] == "check")
 
     def _route_serial(self, method: str) -> None:
         try:
@@ -739,6 +757,17 @@ class _Handler(BaseHTTPRequestHandler):
             if len(tail) == 4 and tail[0] == "projects" and tail[2] == "reviews":
                 if method == "GET":
                     return lambda: self._ws_findings_review(wid, tail[1], tail[3])
+            if len(tail) >= 3 and tail[0] == "projects" and tail[2] == "environments":
+                project_ref = tail[1]
+                if len(tail) == 3:
+                    if method == "GET":
+                        return lambda: self._ws_environments_list(wid, project_ref)
+                    if method == "POST":
+                        return lambda: self._ws_environment_start(wid, project_ref)
+                if len(tail) == 5 and method == "POST" and tail[4] == "check":
+                    return lambda: self._ws_environment_check(wid, project_ref, tail[3])
+                if len(tail) == 5 and method == "POST" and tail[4] == "revoke":
+                    return lambda: self._ws_environment_revoke(wid, project_ref, tail[3])
         return None
 
     # --- open endpoints ---
@@ -1493,6 +1522,99 @@ class _Handler(BaseHTTPRequestHandler):
             raise ApiError(402, "verified target limit reached",
                            upgrade_to=self.cp.entitlements.upgrade_target(sub))
         self._json(200, {"verified": ok})
+
+    def _recent_owner_admin(self, wid: str) -> str:
+        """Sensitive proof actions require a fresh browser session, never a key/device token."""
+        kind, user_id, _ = self._principal()
+        if kind != "session" or user_id is None:
+            raise ApiError(403, "a recent owner or admin browser session is required", code="recent_auth_required")
+        cookie = self._header_values("Cookie")[0] if self._header_values("Cookie") else ""
+        token = next((value for part in cookie.split(";") for key, _, value in [part.strip().partition("=")]
+                      if key == "heel_session"), "")
+        session = self.cp.store.conn.execute(
+            "SELECT created_at FROM sessions WHERE token_hash=? AND revoked_at IS NULL", (hash_api_key(token),)
+        ).fetchone()
+        role = self.cp.store.get_role(wid, user_id)
+        if (session is None or time.time() - session["created_at"] > 15 * 60
+                or role not in {Role.OWNER, Role.ADMIN}):
+            raise ApiError(403, "a recent owner or admin browser session is required", code="recent_auth_required")
+        return user_id
+
+    def _ws_environments_list(self, wid: str, project_ref: str):
+        self._authorize(wid, "view")
+        try:
+            self.cp.projects.get(wid, project_ref)
+        except ProjectNotFound:
+            raise ApiError(404, "project not found", code="project_not_found") from None
+        records = self.cp.environments.list(wid, project_ref)
+        for record in records:
+            record["is_executable"] = self.cp.environments.is_executable(wid, project_ref, record["environment_id"])
+        self._json(200, {"schema_version": "heel.verified-environment-list.v1", "environments": records})
+
+    def _ws_environment_start(self, wid: str, project_ref: str):
+        actor = self._recent_owner_admin(wid)
+        body = self._body()
+        if set(body) != {"schema_version", "origin", "environment_class", "proof_method"}:
+            raise ApiError(400, "invalid verified environment request", code="invalid_environment_request")
+        if body.get("schema_version") != "heel.verified-environment-start.v1":
+            raise ApiError(400, "invalid verified environment request", code="invalid_environment_request")
+        if not all(type(body.get(key)) is str for key in ("origin", "environment_class", "proof_method")):
+            raise ApiError(400, "invalid verified environment request", code="invalid_environment_request")
+        try:
+            challenge = self.cp.environments.start(
+                wid, project_ref, body["origin"], body["environment_class"], actor=actor,
+                proof_method=body["proof_method"],
+            )
+        except EnvironmentNotFound:
+            raise ApiError(404, "project not found", code="project_not_found") from None
+        except ValueError:
+            raise ApiError(400, "invalid verified environment request", code="invalid_environment_request") from None
+        self._json(201, {
+            "schema_version": "heel.verified-environment-challenge.v1",
+            "environment_id": challenge.environment_id, "origin": challenge.origin,
+            "environment_class": challenge.environment_class, "proof_method": body["proof_method"],
+            "token": challenge.token, "http_url": challenge.http_url,
+            "dns_record": "_heel." + challenge.origin[len("https://"):] + " TXT heel-verify=" + challenge.token,
+            "challenge_generation": challenge.generation, "expires_at": challenge.expires_at,
+            "attestation": challenge.attestation,
+        })
+
+    def _ws_environment_check(self, wid: str, project_ref: str, environment_id: str):
+        self._recent_owner_admin(wid)
+        body = self._body()
+        if set(body) != {"schema_version"} or body.get("schema_version") != "heel.verified-environment-check.v1":
+            raise ApiError(400, "invalid verified environment check", code="invalid_environment_check")
+        try:
+            self.cp.projects.get(wid, project_ref)
+            sub = self.cp.subscription(wid)
+            limit = self.cp.entitlements.quota(sub, Meter.VERIFIED_TARGETS)
+            verified = self.cp.environments.check(wid, project_ref, environment_id,
+                                                   max_verified=None if limit < 0 else limit)
+        except EnvironmentNotFound:
+            raise ApiError(404, "environment not found", code="environment_not_found") from None
+        except ProjectNotFound:
+            raise ApiError(404, "project not found", code="project_not_found") from None
+        except EnvironmentCooldown:
+            raise ApiError(429, "environment check is cooling down", code="environment_check_cooldown") from None
+        except TargetLimitExceeded:
+            raise ApiError(402, "verified environment limit reached", code="quota_exceeded",
+                           upgrade_to=self.cp.entitlements.upgrade_target(sub)) from None
+        self._json(200, {"schema_version": "heel.verified-environment-check-result.v1", "verified": verified})
+
+    def _ws_environment_revoke(self, wid: str, project_ref: str, environment_id: str):
+        actor = self._recent_owner_admin(wid)
+        body = self._body()
+        reason = body.get("reason")
+        if (set(body) != {"schema_version", "reason"} or body.get("schema_version") != "heel.verified-environment-revoke.v1"
+                or type(reason) is not str or not reason.strip() or len(reason) > 512):
+            raise ApiError(400, "invalid verified environment revocation", code="invalid_environment_revoke")
+        try:
+            revoked = self.cp.environments.revoke(wid, project_ref, environment_id, actor=actor, reason=reason.strip())
+        except EnvironmentNotFound:
+            raise ApiError(404, "environment not found", code="environment_not_found") from None
+        if not revoked:
+            raise ApiError(404, "environment not found", code="environment_not_found")
+        self._json(200, {"schema_version": "heel.verified-environment-revoke-result.v1", "revoked": True})
 
     def _ws_checkout(self, wid: str):
         self._authorize(wid, "manage_billing")
