@@ -174,6 +174,7 @@ EXPECTED_CONTRACT = {
         "heel/runner/compiler.py",
         "heel/runner/containment.py",
         "heel/runner/control_client.py",
+        "heel/runner/coordinator.py",
         "heel/runner/execution.py",
         "heel/runner/http_transport.py",
         "heel/runner/identity.py",
@@ -862,7 +863,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
             f"heel/runner/{name}": (ROOT / "heel" / "runner" / name).read_bytes()
             for name in (
                 "__init__.py", "adapters.py", "catalog.py", "companion.py", "compiler.py",
-                "containment.py", "control_client.py", "execution.py", "http_transport.py",
+                "containment.py", "control_client.py", "coordinator.py", "execution.py", "http_transport.py",
                 "identity.py", "openapi_routes.py", "redaction.py", "service.py", "store.py",
                 "vault.py",
             )
