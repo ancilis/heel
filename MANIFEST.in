@@ -1,5 +1,6 @@
 include DCO LICENSE NOTICE
 include heel/*.py
+include heel/runner/*.py
 include heel/heldout/targets.json
 include heel/scenarios_lib/community.json
 include release/open-core-v1.json

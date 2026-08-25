@@ -37,6 +37,7 @@ class DeploymentBundleTests(unittest.TestCase):
         for name in (
             "HEEL_PUBLIC_ORIGIN",
             "HEEL_DEVICE_TOKEN_PEPPER_B64",
+            "HEEL_RUNNER_AUTH_PEPPER_B64",
             "HEEL_API_KEY_PEPPER",
             "HEEL_EDGE_AUTH_SECRET_B64",
             "HEEL_GRANT_SIGNING_PRIVATE_KEY_B64",

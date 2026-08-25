@@ -107,6 +107,7 @@ class ProductionConfiguration:
     database_path: str
     public_origin: str
     device_token_pepper: bytes
+    runner_auth_pepper: bytes
     api_key_pepper: str
     edge_auth_secret: str
     host: str
@@ -154,6 +155,10 @@ class ProductionConfiguration:
         device_pepper = _canonical_pepper(
             env.get("HEEL_DEVICE_TOKEN_PEPPER_B64", "").strip(),
             "HEEL_DEVICE_TOKEN_PEPPER_B64",
+        )
+        runner_pepper = _canonical_pepper(
+            env.get("HEEL_RUNNER_AUTH_PEPPER_B64", "").strip(),
+            "HEEL_RUNNER_AUTH_PEPPER_B64",
         )
         api_pepper = env.get("HEEL_API_KEY_PEPPER", "")
         if (
@@ -226,7 +231,7 @@ class ProductionConfiguration:
                 "HEEL_GRANT_TRUSTED_PUBLIC_KEYS must contain the configured signing key"
             )
         return cls(
-            str(database), public_origin, device_pepper, api_pepper, edge_auth_value,
+            str(database), public_origin, device_pepper, runner_pepper, api_pepper, edge_auth_value,
             host, port, billing_mode, authority, trusted_keys,
         )
 
@@ -261,6 +266,7 @@ def build_server(config: ProductionConfiguration):
         control_plane = ControlPlane(
             config.database_path,
             device_token_pepper=config.device_token_pepper,
+            runner_auth_pepper=config.runner_auth_pepper,
             enable_device_auth=True,
             public_origin=config.public_origin,
             billing=DisabledBilling(),

@@ -43,6 +43,7 @@ _CAN = {
     "run_rehearsal":  {Role.OWNER, Role.ADMIN, Role.MEMBER},
     "view":           {Role.OWNER, Role.ADMIN, Role.MEMBER, Role.BILLING, Role.VIEWER},
     "manage_api_keys": {Role.OWNER, Role.ADMIN},
+    "manage_runners": {Role.OWNER, Role.ADMIN},
     "sync_findings": {Role.OWNER, Role.ADMIN, Role.MEMBER},
     "view_synced_reviews": {Role.OWNER, Role.ADMIN, Role.MEMBER, Role.VIEWER},
 }

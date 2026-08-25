@@ -167,6 +167,9 @@ EXPECTED_CONTRACT = {
         "heel/review_export.py",
         "heel/review_rules.py",
         "heel/review_service.py",
+        "heel/runner/__init__.py",
+        "heel/runner/control_client.py",
+        "heel/runner/identity.py",
         "heel/scenario_validate.py",
         "heel/scenarios.py",
         "heel/scope.py",
@@ -182,6 +185,7 @@ EXPECTED_CONTRACT = {
 }
 EXPECTED_MANIFEST = """include DCO LICENSE NOTICE
 include heel/*.py
+include heel/runner/*.py
 include heel/heldout/targets.json
 include heel/scenarios_lib/community.json
 include release/open-core-v1.json
@@ -795,7 +799,8 @@ class OpenCoreReleaseTests(unittest.TestCase):
 
         actual_python_modules = {
             path.relative_to(ROOT).as_posix()
-            for path in (ROOT / "heel").glob("*.py")
+            for path in (ROOT / "heel").rglob("*.py")
+            if "saas" not in path.relative_to(ROOT / "heel").parts
             if path.is_file()
         }
         self.assertEqual(actual_python_modules, set(contract["python_modules"]))
@@ -819,7 +824,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
             setuptools,
             {
                 "include-package-data": False,
-                "packages": ["heel"],
+                "packages": ["heel", "heel.runner"],
                 "package-data": {
                     "heel": [
                         "heldout/targets.json",

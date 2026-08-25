@@ -33,7 +33,7 @@ runner = ["cryptography==45.0.7"]
 
 [tool.setuptools]
 include-package-data = false
-packages = ["heel"]
+packages = ["heel", "heel.runner"]
 
 [tool.setuptools.package-data]
 heel = ["heldout/targets.json", "scenarios_lib/community.json"]

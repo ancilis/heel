@@ -308,6 +308,20 @@ class SourceTree:
                             f"top-level module is not a regular file: heel/{name}"
                         )
                     modules.add(f"heel/{name}")
+                runner_status = os.stat("runner", dir_fd=package_descriptor, follow_symlinks=False)
+                if stat.S_ISLNK(runner_status.st_mode) or not stat.S_ISDIR(runner_status.st_mode):
+                    raise OpenCoreBuildError("runner source package is unsafe")
+                runner_descriptor = os.open("runner", _directory_flags(), dir_fd=package_descriptor)
+                try:
+                    for name in os.listdir(runner_descriptor):
+                        if not name.endswith(".py"):
+                            continue
+                        module_status = os.stat(name, dir_fd=runner_descriptor, follow_symlinks=False)
+                        if stat.S_ISLNK(module_status.st_mode) or not stat.S_ISREG(module_status.st_mode):
+                            raise OpenCoreBuildError(f"runner module is unsafe: heel/runner/{name}")
+                        modules.add(f"heel/runner/{name}")
+                finally:
+                    os.close(runner_descriptor)
                 return modules
             finally:
                 os.close(package_descriptor)
@@ -406,8 +420,8 @@ def _validate_contract(contract: dict[str, object]) -> None:
         _validated_relative_path(path)
     for path in lists["python_modules"]:
         parsed = PurePosixPath(path)
-        if parsed.parent.as_posix() != "heel" or parsed.suffix != ".py":
-            raise OpenCoreBuildError(f"invalid top-level Python module path: {path}")
+        if parsed.parent.as_posix() not in {"heel", "heel/runner"} or parsed.suffix != ".py":
+            raise OpenCoreBuildError(f"invalid public Python module path: {path}")
 
 
 def _package_version(source: bytes) -> str:
@@ -502,7 +516,7 @@ def _validate_pyproject(payload: bytes, contract: dict[str, object]) -> None:
         for classifier in classifiers
     ):
         raise OpenCoreBuildError("pyproject legacy license classifiers are forbidden")
-    if setuptools.get("packages") != ["heel"]:
+    if setuptools.get("packages") != ["heel", "heel.runner"]:
         raise OpenCoreBuildError("pyproject package boundary mismatch")
     package_data = setuptools.get("package-data", {}).get("heel")
     expected_data = [path.removeprefix("heel/") for path in contract["package_data"]]

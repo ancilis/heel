@@ -36,6 +36,7 @@ from heel.findings_sync import (
     parse_findings_sync_request,
     stable_json,
 )
+from heel.canary_contracts import canonical_bytes, parse_json
 
 from .auth import AuthStore, ThrottledError
 from .billing import (
@@ -47,6 +48,7 @@ from .billing import (
     SubscriptionManager,
 )
 from .canary_store import CanaryStore
+from .runner_auth import RUNNER_AUTH_SCHEMA, RunnerAuthError, RunnerAuthStore
 from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
 from .device_auth import (
     DEVICE_CAPABILITIES,
@@ -144,7 +146,8 @@ class ControlPlane:
                  grant_authority=None,
                  grant_trusted_keys: dict[str, object] | None = None,
                  environment_https_verifier=None,
-                 environment_dns_txt=None):
+                 environment_dns_txt=None,
+                 runner_auth_pepper: bytes | None = None):
         configured_pepper = bool(os.environ.get("HEEL_DEVICE_TOKEN_PEPPER_B64"))
         device_enabled = (
             enable_device_auth
@@ -177,6 +180,15 @@ class ControlPlane:
         self.store = ControlPlaneStore(path)
         conn = self.store.conn
         self.canary_store = CanaryStore(conn)
+        # Runtime construction (including unit/demo instances) stays schema-parity with the
+        # migration, while authentication itself remains disabled absent a distinct pepper.
+        conn.executescript(RUNNER_AUTH_SCHEMA)
+        # Runner PoP is optional in local/demo construction but production supplies a distinct
+        # pepper before starting its listener. It never shares device or API-key hash domains.
+        self.runner_auth = (
+            RunnerAuthStore(conn, pepper=runner_auth_pepper)
+            if runner_auth_pepper is not None else None
+        )
         self.grant_authority = grant_authority
         self.grant_trusted_keys = dict(grant_trusted_keys or {})
         self.auth = AuthStore(conn)
@@ -641,9 +653,13 @@ class _Handler(BaseHTTPRequestHandler):
             # must not monopolize the process-wide SQLite request lock.
             if self._is_environment_check_route(method):
                 self._route_serial(method)
-            else:
+            elif not self._is_runner_route(method):
                 with self.cp.request_lock:
                     self._route_serial(method)
+            else:
+                # Runner messages are fast independent DB units. They must not wait behind a
+                # human password hash or future target I/O.
+                self._route_serial(method)
         finally:
             self._defer_json_response = False
         pending = self._pending_json_response
@@ -655,6 +671,12 @@ class _Handler(BaseHTTPRequestHandler):
         p = self._route_parts
         return bool(method == "POST" and len(p) == 8 and p[0] == "v1" and p[1] == "workspaces"
                     and p[3] == "projects" and p[5] == "environments" and p[7] == "check")
+
+    def _is_runner_route(self, method: str) -> bool:
+        p = self._route_parts
+        return bool(method == "POST" and len(p) >= 2 and p[0] == "v1" and (
+            p[1] == "runner-pairings" or (len(p) >= 4 and p[1] == "workspaces" and "runners" in p)
+        ))
 
     def _route_serial(self, method: str) -> None:
         try:
@@ -718,6 +740,10 @@ class _Handler(BaseHTTPRequestHandler):
         }
         if (method, tuple(rest)) in flat:
             return flat[(method, tuple(rest))]
+        if method == "POST" and tuple(rest) == ("runner-pairings", "exchange"):
+            return self._runner_pairing_exchange
+        if method == "POST" and len(rest) == 3 and rest[0] == "runner-pairings" and rest[2] == "activate":
+            return lambda: self._runner_pairing_activate(rest[1])
         if len(rest) >= 3 and rest[0] == "workspaces":
             wid, tail = rest[1], tuple(rest[2:])
             ws_routes = {
@@ -732,11 +758,27 @@ class _Handler(BaseHTTPRequestHandler):
                 ("POST", ("targets",)): lambda: self._ws_target_start(wid),
                 ("POST", ("targets", "check")): lambda: self._ws_target_check(wid),
                 ("POST", ("billing", "checkout")): lambda: self._ws_checkout(wid),
+                ("POST", ("runner-pairings",)): lambda: self._runner_pairing_invite(wid),
             }
             if (method, tail) in ws_routes:
                 return ws_routes[(method, tail)]
             if method == "DELETE" and len(tail) == 2 and tail[0] == "api-keys":
                 return lambda: self._ws_key_revoke(wid, tail[1])
+            if method == "GET" and len(tail) == 2 and tail[0] == "runner-pairings":
+                return lambda: self._runner_pairing_inspect(wid, tail[1])
+            if method == "POST" and len(tail) == 3 and tail[0] == "runner-pairings" and tail[2] == "approve":
+                return lambda: self._runner_pairing_approve(wid, tail[1])
+            if method == "POST" and len(tail) == 3 and tail[0] == "runners" and tail[2] == "rotate":
+                return lambda: self._runner_rotation_start(wid, tail[1])
+            if method == "POST" and len(tail) == 4 and tail[0] == "runners" and tail[2] == "rotations" and tail[3] == "approve":
+                return lambda: self._runner_rotation_approve(wid, tail[1])
+            if method == "DELETE" and len(tail) == 2 and tail[0] == "runners":
+                return lambda: self._runner_revoke(wid, tail[1])
+            if method == "POST" and len(tail) == 3 and tail[0] == "runners" and tail[2] == "claim":
+                return lambda: self._runner_request(wid, tail[1], "runner_claim", None, "claim")
+            if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "runs" and tail[4] in {"heartbeat", "progress", "result", "stop-ack"}:
+                capability = "runner_heartbeat" if tail[4] in {"heartbeat", "stop-ack"} else "runner_" + tail[4]
+                return lambda: self._runner_request(wid, tail[1], capability, tail[3], tail[4])
             if method == "GET" and len(tail) == 2 and tail[0] == "jobs":
                 return lambda: self._ws_job_get(wid, tail[1])
             if tail == ("projects",):
@@ -773,6 +815,130 @@ class _Handler(BaseHTTPRequestHandler):
                 if len(tail) == 5 and method == "POST" and tail[4] == "revoke":
                     return lambda: self._ws_environment_revoke(wid, project_ref, tail[3])
         return None
+
+    # --- isolated runner pairing and proof routes ---
+    def _runner_store(self) -> RunnerAuthStore:
+        if self.cp.runner_auth is None:
+            raise RunnerAuthError("invalid runner authentication")
+        return self.cp.runner_auth
+
+    def _runner_pairing_invite(self, wid: str) -> None:
+        actor = self._recent_owner_admin(wid)
+        try:
+            if set(self._body()) != {"schema_version"} or self._body()["schema_version"] != "heel.runner-pairing-invite.v1":
+                raise ValueError
+            invitation = self._runner_store().invite(wid)
+        except (ValueError, RunnerAuthError):
+            raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
+        self._json(201, {"schema_version": "heel.runner-pairing-invitation.v1", "invitation_token": invitation.token, "expires_at": invitation.expires_at})
+
+    def _runner_pairing_exchange(self) -> None:
+        try:
+            body = self._body()
+            if set(body) != {"schema_version", "invitation_token", "public_key_b64", "pairing_phrase", "runner_id", "runner_version", "adapters"} or body["schema_version"] != "heel.runner-pairing-exchange.v1":
+                raise ValueError
+            pairing = self._runner_store().exchange(
+                body["invitation_token"], body["public_key_b64"], body["pairing_phrase"],
+                runner_id=body["runner_id"], runner_version=body["runner_version"], adapters=body["adapters"],
+            )
+        except (KeyError, TypeError, ValueError, RunnerAuthError):
+            # Exchange must not reveal whether a one-time invitation was known.
+            raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
+        self._json(201, {"schema_version": "heel.runner-pairing-pending.v1", "pairing_id": pairing.pairing_id, "fingerprint": pairing.fingerprint, "status": pairing.status})
+
+    def _runner_pairing_inspect(self, wid: str, pairing_id: str) -> None:
+        self._recent_owner_admin(wid)
+        try:
+            pairing = self._runner_store().inspect(wid, pairing_id)
+        except RunnerAuthError:
+            raise ApiError(404, "runner pairing not found", code="runner_pairing_not_found") from None
+        self._json(200, {"schema_version": "heel.runner-pairing-view.v1", "pairing_id": pairing.pairing_id, "runner_id": pairing.runner_id, "pairing_phrase": pairing.phrase, "fingerprint": pairing.fingerprint, "status": pairing.status, "expires_at": pairing.expires_at})
+
+    def _runner_pairing_approve(self, wid: str, pairing_id: str) -> None:
+        actor = self._recent_owner_admin(wid)
+        try:
+            body = self._body()
+            if set(body) != {"schema_version", "pairing_phrase", "fingerprint"} or body["schema_version"] != "heel.runner-pairing-approve.v1":
+                raise ValueError
+            self._runner_store().approve(wid, pairing_id, phrase=body["pairing_phrase"], fingerprint=body["fingerprint"], actor=actor)
+        except (KeyError, ValueError, RunnerAuthError):
+            raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
+        self._json(200, {"schema_version": "heel.runner-pairing-approved.v1", "status": "approved"})
+
+    def _runner_pairing_activate(self, pairing_id: str) -> None:
+        try:
+            body = self._body()
+            if set(body) != {"schema_version", "signature_b64"} or body["schema_version"] != "heel.runner-pairing-activate.v1":
+                raise ValueError
+            # The quota is enforced inside the identity activation transaction.
+            row = self.cp.store.conn.execute("SELECT workspace_id FROM canary_runner_pairings WHERE pairing_id=?", (pairing_id,)).fetchone()
+            if row is None:
+                raise RunnerAuthError("invalid pairing")
+            sub = self.cp.subscription(row["workspace_id"])
+            limit = self.cp.entitlements.quota(sub, Meter.ACTIVE_RUNNERS)
+            pairing_row = self.cp.store.conn.execute("SELECT status,runner_id FROM canary_runner_rotations WHERE pairing_id=?", (pairing_id,)).fetchone()
+            if pairing_row is not None and pairing_row["status"] == "rotation_approved":
+                nonce = self._runner_store().activate_rotation(pairing_id, body["signature_b64"])
+                wid, runner_id = row["workspace_id"], pairing_row["runner_id"]
+            else:
+                wid, runner_id, nonce = self._runner_store().activate(pairing_id, body["signature_b64"], max_active=None if limit < 0 else limit)
+        except (KeyError, ValueError, RunnerAuthError):
+            raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
+        self._json(200, {"schema_version": "heel.runner-pairing-activated.v1", "workspace_id": wid, "runner_id": runner_id, "initial_claim_nonce": nonce, "capabilities": ["runner_claim", "runner_heartbeat", "runner_progress", "runner_result"]})
+
+    def _runner_rotation_start(self, wid: str, runner_id: str) -> None:
+        self._recent_owner_admin(wid)
+        try:
+            body = self._body()
+            required = {"schema_version", "previous_fingerprint", "public_key_b64", "pairing_phrase", "runner_version", "adapters"}
+            if set(body) != required or body["schema_version"] != "heel.runner-rotation-start.v1": raise ValueError
+            view = self._runner_store().start_rotation(wid, runner_id, previous_fingerprint=body["previous_fingerprint"], public_key_b64=body["public_key_b64"], phrase=body["pairing_phrase"], runner_version=body["runner_version"], adapters=body["adapters"])
+        except (KeyError, TypeError, ValueError, RunnerAuthError):
+            raise ApiError(400, "invalid runner rotation", code="invalid_runner_rotation") from None
+        self._json(201, {"schema_version": "heel.runner-rotation-pending.v1", "pairing_id": view.pairing_id, "fingerprint": view.fingerprint, "pairing_phrase": view.phrase})
+
+    def _runner_rotation_approve(self, wid: str, pairing_id: str) -> None:
+        actor = self._recent_owner_admin(wid)
+        try:
+            body = self._body()
+            if set(body) != {"schema_version", "pairing_phrase", "fingerprint"} or body["schema_version"] != "heel.runner-rotation-approve.v1": raise ValueError
+            self._runner_store().approve_rotation(wid, pairing_id, phrase=body["pairing_phrase"], fingerprint=body["fingerprint"], actor=actor)
+        except (KeyError, ValueError, RunnerAuthError):
+            raise ApiError(400, "invalid runner rotation", code="invalid_runner_rotation") from None
+        self._json(200, {"schema_version": "heel.runner-rotation-approved.v1", "status": "approved"})
+
+    def _runner_revoke(self, wid: str, runner_id: str) -> None:
+        actor = self._recent_owner_admin(wid)
+        if self._body() not in ({}, {"schema_version": "heel.runner-revoke.v1"}):
+            raise ApiError(400, "invalid runner revocation", code="invalid_runner_revocation")
+        if not self._runner_store().revoke(wid, runner_id, actor=actor):
+            raise ApiError(404, "runner not found", code="runner_not_found")
+        self._json(200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
+
+    def _runner_request(self, wid: str, runner_id: str, capability: str, run_id: str | None, operation: str) -> None:
+        # Runner paths are fixed and strict: no URI aliases, bearer headers, URL parameters,
+        # or payload/path disagreement can enter the PoP verifier.
+        if "?" in self.path or "#" in self.path or "%" in self.path or self.command != "POST":
+            raise RunnerAuthError("invalid runner authentication")
+        try:
+            parsed = parse_json(self._raw_body(), max_bytes=MAX_BODY)
+            if not isinstance(parsed, dict) or (run_id is not None and parsed.get("run_id") not in {None, run_id}):
+                raise RunnerAuthError("invalid runner authentication")
+            if run_id is not None:
+                parsed = {**parsed, "run_id": run_id}
+                # Only the canonical exact raw bytes are signed; a body that omits its route
+                # run ID is never silently rewritten for verification.
+                if canonical_bytes(parsed) != self._raw_body():
+                    raise RunnerAuthError("invalid runner authentication")
+            all_headers = {name: self._header_values(name) for name in ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature", "Authorization", "Cookie")}
+            response, nonce = self._runner_store().authenticate_and_consume(
+                workspace_id=wid, runner_id=runner_id, capability=capability, path=self.path,
+                raw_body=self._raw_body(), headers=all_headers,
+                action=lambda: {"schema_version": "heel.runner-control-response.v1", "operation": operation, "status": "accepted"},
+            )
+        except (ValueError, RunnerAuthError):
+            raise RunnerAuthError("invalid runner authentication") from None
+        self._json(200, response, {"X-Heel-Runner-Next-Nonce": nonce})
 
     # --- open endpoints ---
     def _health(self):
