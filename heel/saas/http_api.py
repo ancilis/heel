@@ -781,9 +781,9 @@ class _Handler(BaseHTTPRequestHandler):
         except HostnameReuseExceeded as e:
             self._json(403, {"error": str(e)})
         except RunnerAuthRateLimited as e:
-            self._json(429, {"error": str(e)})
+            self._json(429, {"schema_version": "heel.runner-error.v1", "code": "runner_resync_rate_limited", "retry_after_ms": 60_000}, {"Retry-After": "60"})
         except RunnerAuthError:
-            self._json(401, {"error": "invalid runner authentication"})
+            self._json(401, {"schema_version": "heel.runner-error.v1", "code": "invalid_runner_auth"})
         except PermissionError as e:
             self._json(403, {"error": str(e)})
         except ThrottledError as e:
@@ -1103,8 +1103,10 @@ class _Handler(BaseHTTPRequestHandler):
                 workspace_id=wid, runner_id=runner_id, path=self.path,
                 raw_body=self._raw_body(), headers=headers,
             )
-        except (ValueError, RunnerAuthError):
+        except RunnerAuthRateLimited:
             raise
+        except (ValueError, RunnerAuthError):
+            raise RunnerAuthError("invalid runner authentication") from None
         self._json(200, response)
 
     # --- open endpoints ---

@@ -20,7 +20,8 @@ from heel.saas.canary_store import CanaryStore
 from heel.saas.runner_auth import RunnerAuthError, RunnerAuthStore, initialize_runner_auth_schema
 from heel.saas.http_api import ControlPlane, serve
 
-PUBLIC_KEY = b"0123456789abcdef0123456789abcdef"
+SIGNING_PRIVATE = Ed25519PrivateKey.from_private_bytes(b"0123456789abcdef0123456789abcdef")
+PUBLIC_KEY = SIGNING_PRIVATE.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 KEY_ID = ed25519_key_id(PUBLIC_KEY)
 
 class Transport:
@@ -31,31 +32,44 @@ class Transport:
 
 class Signer:
     key_id = KEY_ID
+    public_key = PUBLIC_KEY
     def __init__(self): self.payloads = []
-    def sign(self, payload): self.payloads.append(payload); return b"s" * 64
+    def sign(self, payload): self.payloads.append(payload); return SIGNING_PRIVATE.sign(payload)
 
 def client():
     transport, signer = Transport(), Signer()
-    return RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer, clock=lambda: 1000, transport=transport, nonce_source=lambda capability: capability + "-first"), transport, signer
+    return RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer, clock=lambda: 1000, transport=transport, nonce_source=lambda key: key[0] + "-first"), transport, signer
+
+def client_projection(signer, phase="running"):
+    from test_canary_contracts import _digest, operational
+    value = operational(); value["lifecycle_phase"] = phase
+    if phase == "claimed": value["timestamps"]["claimed_at_ms"] = 1
+    elif phase == "running": value["timestamps"].update({"claimed_at_ms":1, "started_at_ms":1})
+    elif phase == "stop_requested":
+        value["timestamps"].update({"claimed_at_ms":1, "started_at_ms":1, "stop_requested_at_ms":1, "stop_acknowledged_at_ms":1}); value["stop_reason"] = "cloud_stop"
+    value = _digest(value, "projection_digest"); value["signing_key_id"] = signer.key_id
+    payload = {key:item for key,item in value.items() if key not in {"projection_digest", "signing_key_id", "signature_b64"}}
+    value["projection_digest"] = canonical_digest(payload); value["signature_b64"] = base64.b64encode(signer.sign(canonical_bytes(payload))).decode()
+    return value
 
 def test_named_methods_use_fixed_workspace_paths_and_exact_pop_headers():
     control, transport, signer = client()
     control.claim()
     path, headers, body = transport.requests[0]
     assert path == "/v1/workspaces/ws/runners/runner/claim"
-    assert headers == {"Content-Type": "application/json", "X-Heel-Runner-Id": "runner", "X-Heel-Runner-Key-Id": KEY_ID, "X-Heel-Runner-Timestamp-Ms": "1000", "X-Heel-Runner-Nonce": "runner_claim-first", "X-Heel-Runner-Sequence": "1", "X-Heel-Runner-Signature": base64.b64encode(b"s" * 64).decode()}
-    expected = {"schema_version": "heel.runner-request-proof.v1", "workspace_id": "ws", "runner_id": "runner", "key_id": KEY_ID, "capability": "runner_claim", "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": 1000, "server_nonce": "runner_claim-first", "sequence": 1}
+    assert {key:value for key,value in headers.items() if key != "X-Heel-Runner-Signature"} == {"Content-Type": "application/json", "X-Heel-Runner-Id": "runner", "X-Heel-Runner-Key-Id": KEY_ID, "X-Heel-Runner-Timestamp-Ms": "1000", "X-Heel-Runner-Nonce": "claim-first", "X-Heel-Runner-Sequence": "1"}
+    expected = {"schema_version": "heel.runner-request-proof.v1", "workspace_id": "ws", "runner_id": "runner", "key_id": KEY_ID, "capability": "runner_claim", "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": 1000, "server_nonce": "claim-first", "sequence": 1}
     assert signer.payloads == [b"heel.runner-pop.v1\0" + canonical_bytes(expected)]
 
 def test_sequences_are_independent_per_run_capability_and_stop_ack_is_heartbeat():
-    control, transport, _ = client()
-    control.heartbeat(run_id="one", operational_projection={})
-    control.heartbeat(run_id="one", operational_projection={})
-    control.progress(run_id="one", operational_projection={})
-    control.stop_ack(run_id="one", operational_projection={})
+    control, transport, signer = client()
+    control.heartbeat(run_id="run", operational_projection=client_projection(signer))
+    control.heartbeat(run_id="run", operational_projection=client_projection(signer))
+    control.progress(run_id="run", operational_projection=client_projection(signer))
+    control.stop_ack(run_id="run", operational_projection=client_projection(signer, "stop_requested"))
     assert [h["X-Heel-Runner-Sequence"] for _, h, _ in transport.requests] == ["1", "2", "1", "1"]
-    assert transport.requests[-1][0].endswith("/runs/one/stop-ack")
-    assert canonical_bytes({"schema_version": "heel.runner-progress-request.v1", "run_id": "one", "operational_projection": {}}) == transport.requests[2][2]
+    assert transport.requests[-1][0].endswith("/runs/run/stop-ack")
+    assert json.loads(transport.requests[2][2])["schema_version"] == "heel.runner-progress-request.v1"
 
 def test_refuses_noncanonical_origin_bad_nonce_and_changed_retry():
     with pytest.raises(ValueError, match="pathless origin"):
@@ -63,8 +77,8 @@ def test_refuses_noncanonical_origin_bad_nonce_and_changed_retry():
     bad = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="r", signer=Signer(), clock=lambda: 0, transport=Transport(), nonce_source=lambda _: "")
     with pytest.raises(ValueError, match="nonce"):
         bad.claim()
-    control, _, _ = client()
-    control.progress(run_id="one", operational_projection={})
+    control, _, signer = client()
+    control.progress(run_id="run", operational_projection=client_projection(signer))
     control.retry_last()
 
 def test_has_no_public_generic_request_api():
@@ -87,6 +101,7 @@ def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
     conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, "ws", "r", base64.b64encode(raw).decode(), "active", time.time()))
     nonce = "n" * 44
     conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", ("ws", "r", "claim", store._hash("nonce", nonce), 1, time.time() + 60))
+    conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", ("ws", "r", "claim", 1, 0, time.time()))
     conn.commit()
     body, path = b"{}", "/v1/workspaces/ws/runners/r/claim"
     def headers(timestamp=now, signer=private):
@@ -100,6 +115,21 @@ def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
         store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(now + 1), action=lambda: {"status": "leak"})
     receipt = conn.execute("SELECT response_json,next_nonce,response_ciphertext,next_nonce_ciphertext FROM canary_runner_request_ledger").fetchone()
     assert receipt[0] == "sealed" and receipt[1] != next_nonce and receipt[2] and receipt[3]
+
+
+def test_run_chain_allocator_issues_four_distinct_operation_chains_atomically():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY)"); conn.execute("INSERT INTO workspaces VALUES('ws')")
+    CanaryStore(conn); initialize_runner_auth_schema(conn)
+    store = RunnerAuthStore(conn, pepper=b"p" * 32, now=lambda: 100.0)
+    conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", 1)); conn.commit()
+    issued = store.provision_run_chains("ws", "runner", "run")
+    assert set(issued) == {"heartbeat", "progress", "result", "stop-ack"}
+    assert len({entry["next_nonce_b64"] for entry in issued.values()}) == 4
+    assert all(entry["next_sequence"] == 1 and entry["generation"] == 0 for entry in issued.values())
+    assert {row[0] for row in conn.execute("SELECT chain_name FROM canary_runner_nonce_chains")} == {
+        "heartbeat:run", "progress:run", "result:run", "stop-ack:run",
+    }
 
 
 def test_resync_recovers_an_existing_chain_and_replays_only_the_same_signed_completion():
@@ -119,18 +149,21 @@ def test_resync_recovers_an_existing_chain_and_replays_only_the_same_signed_comp
     conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace, "runner", "heartbeat:run", 8, 0, instant[0]))
     conn.commit()
 
-    def signed(domain, schema, path, body):
-        proof = {"schema_version": schema, "workspace_id": workspace, "runner_id": "runner", "key_id": key_id, "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": 1_000_000}
-        return {"X-Heel-Runner-Id":["runner"], "X-Heel-Runner-Key-Id":[key_id], "X-Heel-Runner-Timestamp-Ms":["1000000"], "X-Heel-Runner-Signature":[base64.b64encode(private.sign(domain + canonical_bytes(proof))).decode()], "X-Heel-Runner-Nonce":[], "X-Heel-Runner-Sequence":[], "Authorization":[], "Cookie":[]}
+    def signed(domain, schema, path, body, timestamp_ms=1_000_000):
+        proof = {"schema_version": schema, "workspace_id": workspace, "runner_id": "runner", "key_id": key_id, "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms}
+        return {"X-Heel-Runner-Id":["runner"], "X-Heel-Runner-Key-Id":[key_id], "X-Heel-Runner-Timestamp-Ms":[str(timestamp_ms)], "X-Heel-Runner-Signature":[base64.b64encode(private.sign(domain + canonical_bytes(proof))).decode()], "X-Heel-Runner-Nonce":[], "X-Heel-Runner-Sequence":[], "Authorization":[], "Cookie":[]}
 
     chain = {"operation":"heartbeat", "run_id":"run"}; client_nonce = base64.b64encode(b"c" * 32).decode()
     start_path = f"/v1/workspaces/{workspace}/runners/runner/resync/start"
-    start = canonical_bytes({"schema_version":"heel.runner-resync-start.v1", "chain":chain, "client_nonce_b64":client_nonce})
-    challenge = store.start_resync(workspace_id=workspace, runner_id="runner", path=start_path, raw_body=start, headers=signed(b"heel.runner-resync-start-pop.v1\0", "heel.runner-resync-start-proof.v1", start_path, start))
+    start = canonical_bytes({"schema_version":"heel.runner-resync-start.v2", "chain":chain, "client_nonce_b64":client_nonce})
+    start_headers = signed(b"heel.runner-resync-start-pop.v2\0", "heel.runner-resync-start-proof.v2", start_path, start)
+    challenge = store.start_resync(workspace_id=workspace, runner_id="runner", path=start_path, raw_body=start, headers=start_headers)
     assert challenge["next_sequence"] == 8
+    instant[0] += 31
+    assert store.start_resync(workspace_id=workspace, runner_id="runner", path=start_path, raw_body=start, headers=start_headers) == challenge
     complete_path = f"/v1/workspaces/{workspace}/runners/runner/resync/complete"
-    complete = canonical_bytes({"schema_version":"heel.runner-resync-complete.v1", "challenge_id":challenge["challenge_id"], "chain":chain, "client_nonce_b64":client_nonce, "server_challenge_b64":challenge["server_challenge_b64"]})
-    headers = signed(b"heel.runner-resync-complete-pop.v1\0", "heel.runner-resync-complete-proof.v1", complete_path, complete)
+    complete = canonical_bytes({"schema_version":"heel.runner-resync-complete.v2", "challenge_id":challenge["challenge_id"], "chain":chain, "client_nonce_b64":client_nonce, "server_challenge_b64":challenge["server_challenge_b64"], "generation":challenge["generation"]})
+    headers = signed(b"heel.runner-resync-complete-pop.v2\0", "heel.runner-resync-complete-proof.v2", complete_path, complete, 1_031_000)
     recovered = store.complete_resync(workspace_id=workspace, runner_id="runner", path=complete_path, raw_body=complete, headers=headers)
     assert recovered["next_sequence"] == 8 and base64.b64decode(recovered["next_nonce_b64"], validate=True)
     assert store.complete_resync(workspace_id=workspace, runner_id="runner", path=complete_path, raw_body=complete, headers=headers) == recovered
@@ -153,24 +186,34 @@ def test_http_resync_uses_current_key_and_replays_the_exact_completed_exchange()
             cp.store.conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", public, "active", now))
             cp.store.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace, "runner", "claim", cp.runner_auth._hash("nonce", "lost"), 4, now + 60))
             cp.store.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace, "runner", "claim", 4, 0, now)); cp.store.conn.commit()
+            for operation in ("heartbeat", "progress", "result"):
+                cp.store.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace, "runner", f"{operation}:run", 1, 0, now))
+            cp.store.conn.commit()
 
-            def post(path, body, schema, domain):
+            def post(path, body, schema, domain, include_headers=False):
                 proof = {"schema_version":schema, "workspace_id":workspace, "runner_id":"runner", "key_id":key_id, "method":"POST", "path":path, "body_sha256":hashlib.sha256(body).hexdigest(), "timestamp_ms":timestamp}
                 headers = {"Content-Type":"application/json", "X-Heel-Runner-Id":"runner", "X-Heel-Runner-Key-Id":key_id, "X-Heel-Runner-Timestamp-Ms":str(timestamp), "X-Heel-Runner-Signature":base64.b64encode(private.sign(domain + canonical_bytes(proof))).decode()}
                 conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1]); conn.request("POST", path, body, headers)
-                response = conn.getresponse(); payload = json.loads(response.read()); status = response.status; conn.close()
-                return status, payload
+                response = conn.getresponse(); payload = json.loads(response.read()); status = response.status; response_headers = dict(response.getheaders()); conn.close()
+                return (status, payload, response_headers) if include_headers else (status, payload)
 
             chain, client_nonce = {"operation":"claim", "run_id":None}, base64.b64encode(b"c" * 32).decode()
             start_path = f"/v1/workspaces/{workspace}/runners/runner/resync/start"
-            start = canonical_bytes({"schema_version":"heel.runner-resync-start.v1", "chain":chain, "client_nonce_b64":client_nonce})
-            status, challenge = post(start_path, start, "heel.runner-resync-start-proof.v1", b"heel.runner-resync-start-pop.v1\0")
+            assert post(start_path, b"{}", "heel.runner-resync-start-proof.v2", b"heel.runner-resync-start-pop.v2\0") == (401, {"schema_version":"heel.runner-error.v1", "code":"invalid_runner_auth"})
+            start = canonical_bytes({"schema_version":"heel.runner-resync-start.v2", "chain":chain, "client_nonce_b64":client_nonce})
+            status, challenge = post(start_path, start, "heel.runner-resync-start-proof.v2", b"heel.runner-resync-start-pop.v2\0")
             assert status == 200 and challenge["next_sequence"] == 4
+            for operation, byte in (("heartbeat", b"h"), ("progress", b"p")):
+                fresh = canonical_bytes({"schema_version":"heel.runner-resync-start.v2", "chain":{"operation":operation,"run_id":"run"}, "client_nonce_b64":base64.b64encode(byte * 32).decode()})
+                assert post(start_path, fresh, "heel.runner-resync-start-proof.v2", b"heel.runner-resync-start-pop.v2\0")[0] == 200
+            limited = canonical_bytes({"schema_version":"heel.runner-resync-start.v2", "chain":{"operation":"result","run_id":"run"}, "client_nonce_b64":base64.b64encode(b"r" * 32).decode()})
+            limited_status, limited_body, limited_headers = post(start_path, limited, "heel.runner-resync-start-proof.v2", b"heel.runner-resync-start-pop.v2\0", True)
+            assert limited_status == 429 and limited_body["retry_after_ms"] == 60_000 and limited_headers["Retry-After"] == "60"
             complete_path = f"/v1/workspaces/{workspace}/runners/runner/resync/complete"
-            complete = canonical_bytes({"schema_version":"heel.runner-resync-complete.v1", "challenge_id":challenge["challenge_id"], "chain":chain, "client_nonce_b64":client_nonce, "server_challenge_b64":challenge["server_challenge_b64"]})
-            status, recovered = post(complete_path, complete, "heel.runner-resync-complete-proof.v1", b"heel.runner-resync-complete-pop.v1\0")
+            complete = canonical_bytes({"schema_version":"heel.runner-resync-complete.v2", "challenge_id":challenge["challenge_id"], "chain":chain, "client_nonce_b64":client_nonce, "server_challenge_b64":challenge["server_challenge_b64"], "generation":challenge["generation"]})
+            status, recovered = post(complete_path, complete, "heel.runner-resync-complete-proof.v2", b"heel.runner-resync-complete-pop.v2\0")
             assert status == 200 and recovered["next_sequence"] == 4
-            assert post(complete_path, complete, "heel.runner-resync-complete-proof.v1", b"heel.runner-resync-complete-pop.v1\0") == (200, recovered)
+            assert post(complete_path, complete, "heel.runner-resync-complete-proof.v2", b"heel.runner-resync-complete-pop.v2\0") == (200, recovered)
         finally:
             server.shutdown(); server.server_close(); cp.close()
 
@@ -275,6 +318,7 @@ def test_runner_request_uses_a_fresh_connection_and_never_joins_human_write():
             cp.store.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", workspace, "runner", "active", time.time()))
             cp.store.conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", base64.b64encode(raw).decode(), "active", time.time()))
             cp.store.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace, "runner", "claim", cp.runner_auth._hash("nonce", nonce), 1, time.time() + 60)); cp.store.conn.commit()
+            cp.store.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace, "runner", "claim", 1, 0, time.time())); cp.store.conn.commit()
             body = b"{}"; route = f"/v1/workspaces/{workspace}/runners/runner/claim"; now = int(time.time() * 1000)
             proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace, "runner_id":"runner", "key_id":key_id, "capability":"runner_claim", "method":"POST", "path":route, "body_sha256":hashlib.sha256(body).hexdigest(), "timestamp_ms":now, "server_nonce":nonce, "sequence":1}
             headers = {"X-Heel-Runner-Id":["runner"], "X-Heel-Runner-Key-Id":[key_id], "X-Heel-Runner-Timestamp-Ms":[str(now)], "X-Heel-Runner-Nonce":[nonce], "X-Heel-Runner-Sequence":["1"], "X-Heel-Runner-Signature":[base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))).decode()], "Authorization":[], "Cookie":[]}

@@ -30,7 +30,7 @@ class CanaryMigrationTests(unittest.TestCase):
         )
 
     def test_migration_six_creates_tenant_bound_unique_tables(self):
-        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 12)
+        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 13)
         tables = (
             "canary_environments", "canary_runners", "canary_runner_keys",
             "canary_consumed_nonces", "canary_approval_projections",
@@ -84,6 +84,67 @@ class CanaryMigrationTests(unittest.TestCase):
         conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("skeleton", "ws", "skeleton", "active", 1)); conn.commit()
         Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
         self.assertEqual(conn.execute("SELECT status FROM canary_runners WHERE runner_id='skeleton'").fetchone()[0], "disabled")
+
+    def test_migration_thirteen_canonicalizes_populated_legacy_runner_chains(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        self.addCleanup(conn.close)
+        Migrator(conn, CONTROL_PLANE_MIGRATIONS[:12]).apply_all()
+        conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+        conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+        conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", 1))
+        conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", ("ws", "runner", "runner_progress:run", "a" * 64, 3, 100))
+        values = {
+            "workspace_id":"ws", "runner_id":"runner", "request_digest":"b" * 64,
+            "response_json":"sealed", "next_nonce":"c" * 64, "created_at":1,
+            "nonce_hash":"d" * 64, "key_id":"key", "method":"POST", "timestamp_ms":1,
+            "signed_request_digest":"e" * 64, "body_digest":"f" * 64,
+            "response_ciphertext":"cipher", "next_nonce_ciphertext":"nonce-cipher",
+        }
+        def ledger(chain, sequence, capability, path):
+            conn.execute("INSERT INTO canary_runner_request_ledger VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                values["workspace_id"], values["runner_id"], chain, sequence,
+                values["request_digest"], values["response_json"], values["next_nonce"], values["created_at"],
+                values["nonce_hash"], values["key_id"], capability, values["method"], path,
+                values["timestamp_ms"], values["signed_request_digest"], values["body_digest"],
+                values["response_ciphertext"], values["next_nonce_ciphertext"],
+            ))
+        ledger("runner_progress:run", 1, "runner_progress", "/v1/workspaces/ws/runners/runner/runs/run/progress")
+        ledger("runner_heartbeat:run", 1, "runner_heartbeat", "/v1/workspaces/ws/runners/runner/runs/run/heartbeat")
+        ledger("runner_heartbeat:run", 2, "runner_heartbeat", "/v1/workspaces/ws/runners/runner/runs/run/stop-ack")
+        conn.commit()
+
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13])
+        self.assertEqual([tuple(row) for row in conn.execute(
+            "SELECT chain_name,next_sequence,generation FROM canary_runner_chain_cursors ORDER BY chain_name"
+        )], [("heartbeat:run", 2, 0), ("progress:run", 3, 0), ("stop-ack:run", 3, 0)])
+        self.assertEqual(tuple(conn.execute("SELECT chain_name,next_sequence FROM canary_runner_nonce_chains").fetchone()), ("progress:run", 3))
+        self.assertEqual([tuple(row) for row in conn.execute(
+            "SELECT chain_name,sequence,generation FROM canary_runner_request_ledger ORDER BY chain_name"
+        )], [("heartbeat:run", 1, 0), ("progress:run", 1, 0), ("stop-ack:run", 2, 0)])
+
+    def test_migration_thirteen_aborts_atomically_on_canonical_chain_collision(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        Migrator(conn, CONTROL_PLANE_MIGRATIONS[:12]).apply_all()
+        conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+        conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+        conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", 1))
+        conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", ("ws", "runner", "runner_progress:run", "a" * 64, 1, 100))
+        conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", ("ws", "runner", "progress:run", "b" * 64, 1, 100)); conn.commit()
+        with self.assertRaises(MigrationError):
+            Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 12)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM canary_runner_nonce_chains").fetchone()[0], 2)
+
+    def test_migration_thirteen_runner_constraints_reject_hostile_rows(self):
+        self.seed_root("ws", "prj")
+        self.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", 1))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("INSERT INTO canary_runner_pairings(pairing_id,workspace_id,runner_id,invitation_hash,status,created_at,expires_at,display_name) VALUES(?,?,?,?,?,?,?,?)", ("pair", "ws", "", "a" * 64, "invited", 1, 2, " padded "))
+        self.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", ("ws", "runner", "claim", 1, 0, 1))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("INSERT INTO canary_runner_request_ledger(workspace_id,runner_id,chain_name,sequence,generation,request_digest,response_json,next_nonce,created_at,nonce_hash,key_id,capability,method,path,timestamp_ms,signed_request_digest,body_digest,response_ciphertext,next_nonce_ciphertext) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ws", "runner", "claim", 1, 0, "a" * 64, "sealed", "b" * 64, 1, "c" * 64, "key", "runner_claim", "POST", "/claim", 1, "d" * 64, "e" * 64, None, "cipher"))
 
     def test_direct_control_plane_runtime_uses_final_runner_foreign_keys(self):
         from heel.saas.http_api import ControlPlane
@@ -205,8 +266,8 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
         conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
         conn.commit()
-        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12])
-        self.assertEqual(migration.current_version(), 12)
+        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13])
+        self.assertEqual(migration.current_version(), 13)
         self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):

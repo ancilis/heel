@@ -22,7 +22,8 @@ from .canary_store import (
     CANARY_STORE_SCHEMA,
 )
 from .runner_auth import (
-    RUNNER_AUTH_HARDENING_MIGRATION, RUNNER_AUTH_LIFECYCLE_MIGRATION, RUNNER_AUTH_RESYNC_MIGRATION, RUNNER_AUTH_SCHEMA,
+    RUNNER_AUTH_GENERATION_MIGRATION, RUNNER_AUTH_HARDENING_MIGRATION,
+    RUNNER_AUTH_LIFECYCLE_MIGRATION, RUNNER_AUTH_RESYNC_MIGRATION, RUNNER_AUTH_SCHEMA,
 )
 
 _TRACKING = """
@@ -347,6 +348,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_canary_fault_refund
     Migration(10, "verified_canary_runner_replay_hardening", RUNNER_AUTH_HARDENING_MIGRATION),
     Migration(11, "verified_canary_runner_identity_lifecycle", RUNNER_AUTH_LIFECYCLE_MIGRATION),
     Migration(12, "verified_canary_runner_resync", RUNNER_AUTH_RESYNC_MIGRATION),
+    Migration(13, "verified_canary_runner_generations", RUNNER_AUTH_GENERATION_MIGRATION),
 ]
 
 
