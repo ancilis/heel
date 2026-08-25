@@ -17,14 +17,17 @@ CREATE TABLE IF NOT EXISTS canary_environments(
   environment_class TEXT NOT NULL,
   status TEXT NOT NULL,
   created_at REAL NOT NULL,
-  UNIQUE(workspace_id, project_ref, environment_id));
+  UNIQUE(workspace_id, project_ref, environment_id),
+  FOREIGN KEY(workspace_id, project_ref)
+    REFERENCES projects(workspace_id, project_ref));
 CREATE TABLE IF NOT EXISTS canary_runners(
   runner_id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
   display_name TEXT NOT NULL,
   status TEXT NOT NULL,
   created_at REAL NOT NULL,
-  UNIQUE(workspace_id, runner_id));
+  UNIQUE(workspace_id, runner_id),
+  FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id));
 CREATE TABLE IF NOT EXISTS canary_runner_keys(
   key_id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,

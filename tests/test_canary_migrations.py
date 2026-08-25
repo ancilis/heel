@@ -19,6 +19,16 @@ class CanaryMigrationTests(unittest.TestCase):
     def table_columns(self, table):
         return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
 
+    def seed_root(self, workspace_id: str, project_ref: str) -> None:
+        self.conn.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+            (workspace_id, "org", workspace_id, "free", CATALOG_VERSION, 1),
+        )
+        self.conn.execute(
+            "INSERT INTO projects VALUES(?,?,?,?,?)",
+            (workspace_id, project_ref, project_ref, "owner", 1),
+        )
+
     def test_migration_six_creates_tenant_bound_unique_tables(self):
         self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 6)
         tables = (
@@ -37,6 +47,7 @@ class CanaryMigrationTests(unittest.TestCase):
         ):
             self.assertIn("project_ref", self.table_columns(table))
 
+        self.seed_root("ws", "prj")
         self.conn.execute(
             "INSERT INTO canary_runners VALUES(?,?,?,?,?)",
             ("runner-1", "ws", "runner", "active", 1),
@@ -67,6 +78,12 @@ class CanaryMigrationTests(unittest.TestCase):
         def execute(sql, values):
             self.conn.execute(sql, values)
 
+        with self.assertRaises(sqlite3.IntegrityError):
+            execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("missing-runner", "missing-ws", "runner", "active", 1))
+        with self.assertRaises(sqlite3.IntegrityError):
+            execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("missing-env", "missing-ws", "missing-prj", "https://missing.example", "staging", "verified", 1))
+        self.seed_root("ws-1", "prj-1")
+        self.seed_root("ws-2", "prj-2")
         execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("env-1", "ws-1", "prj-1", "https://one.example", "staging", "verified", 1))
         execute("INSERT INTO canary_environments VALUES(?,?,?,?,?,?,?)", ("env-2", "ws-2", "prj-2", "https://two.example", "staging", "verified", 1))
         execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner-1", "ws-1", "runner", "active", 1))
