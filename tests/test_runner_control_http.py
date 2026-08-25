@@ -186,7 +186,7 @@ def test_http_resync_uses_current_key_and_replays_the_exact_completed_exchange()
             cp.store.conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", public, "active", now))
             cp.store.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace, "runner", "claim", cp.runner_auth._hash("nonce", "lost"), 4, now + 60))
             cp.store.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace, "runner", "claim", 4, 0, now)); cp.store.conn.commit()
-            for operation in ("heartbeat", "progress", "result"):
+            for operation in ("heartbeat", "stop-ack", "result"):
                 cp.store.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace, "runner", f"{operation}:run", 1, 0, now))
             cp.store.conn.commit()
 
@@ -203,7 +203,7 @@ def test_http_resync_uses_current_key_and_replays_the_exact_completed_exchange()
             start = canonical_bytes({"schema_version":"heel.runner-resync-start.v2", "chain":chain, "client_nonce_b64":client_nonce})
             status, challenge = post(start_path, start, "heel.runner-resync-start-proof.v2", b"heel.runner-resync-start-pop.v2\0")
             assert status == 200 and challenge["next_sequence"] == 4
-            for operation, byte in (("heartbeat", b"h"), ("progress", b"p")):
+            for operation, byte in (("heartbeat", b"h"), ("stop-ack", b"s")):
                 fresh = canonical_bytes({"schema_version":"heel.runner-resync-start.v2", "chain":{"operation":operation,"run_id":"run"}, "client_nonce_b64":base64.b64encode(byte * 32).decode()})
                 assert post(start_path, fresh, "heel.runner-resync-start-proof.v2", b"heel.runner-resync-start-pop.v2\0")[0] == 200
             limited = canonical_bytes({"schema_version":"heel.runner-resync-start.v2", "chain":{"operation":"result","run_id":"run"}, "client_nonce_b64":base64.b64encode(b"r" * 32).decode()})
@@ -348,11 +348,10 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
             workspace = cp.store.create_workspace(org, "ws", "free", "2026-08")
             private = Ed25519PrivateKey.generate()
             public = base64.b64encode(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
-            raw = base64.b64decode(public); key_id = ed25519_key_id(raw); nonce = "n" * 44
+            raw = base64.b64decode(public); key_id = ed25519_key_id(raw)
             cp.store.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", workspace, "runner", "active", time.time()))
             cp.store.conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", public, "active", time.time()))
-            cp.store.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace, "runner", "heartbeat:run", cp.runner_auth._hash("nonce", nonce), 1, time.time() + 60))
-            cp.store.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace, "runner", "heartbeat:run", 1, 0, time.time()))
+            cp.store.conn.commit(); issued = cp.runner_auth.provision_run_chains(workspace, "runner", "run"); nonce = issued["heartbeat"]["next_nonce_b64"]
             stamp, digest = time.time(), "a" * 64
             cp.store.conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", (workspace, "prj", "project", "owner", stamp))
             cp.store.conn.execute("INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at) VALUES(?,?,?,?,?,?,?)", ("env", workspace, "prj", "https://canary.example.com", "staging", "verified", stamp))
@@ -404,5 +403,15 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
             tampered_headers = {**headers, "X-Heel-Runner-Nonce":result[0][1], "X-Heel-Runner-Sequence":"2", "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(tampered_proof))).decode()}
             conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1]); conn.request("POST", route, tampered_body, tampered_headers)
             assert conn.getresponse().status == 401; conn.close()
+            stop_projection = operational(); stop_projection["workspace_id"] = workspace; stop_projection["lifecycle_phase"] = "stop_requested"; stop_projection["stop_reason"] = "cloud_stop"
+            stop_projection["timestamps"].update({"claimed_at_ms":1, "started_at_ms":1, "stop_requested_at_ms":1, "stop_acknowledged_at_ms":1})
+            stop_payload = {key:value for key,value in stop_projection.items() if key not in {"projection_digest", "signing_key_id", "signature_b64"}}
+            stop_projection["projection_digest"] = canonical_digest(stop_payload); stop_projection["signing_key_id"] = key_id; stop_projection["signature_b64"] = base64.b64encode(private.sign(canonical_bytes(stop_payload))).decode()
+            stop_body = canonical_bytes({"schema_version":"heel.runner-stop-ack-request.v1", "run_id":"run", "operational_projection":stop_projection})
+            stop_route = f"/v1/workspaces/{workspace}/runners/runner/runs/run/stop-ack"; stop_timestamp = int(time.time() * 1000); stop_nonce = issued["stop-ack"]["next_nonce_b64"]
+            stop_proof = {"schema_version":"heel.runner-request-proof.v1", "workspace_id":workspace, "runner_id":"runner", "key_id":key_id, "capability":"runner_heartbeat", "method":"POST", "path":stop_route, "body_sha256":hashlib.sha256(stop_body).hexdigest(), "timestamp_ms":stop_timestamp, "server_nonce":stop_nonce, "sequence":1}
+            stop_headers = {"Content-Type":"application/json", "X-Heel-Runner-Id":"runner", "X-Heel-Runner-Key-Id":key_id, "X-Heel-Runner-Timestamp-Ms":str(stop_timestamp), "X-Heel-Runner-Nonce":stop_nonce, "X-Heel-Runner-Sequence":"1", "X-Heel-Runner-Signature":base64.b64encode(private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(stop_proof))).decode()}
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1]); conn.request("POST", stop_route, stop_body, stop_headers)
+            assert conn.getresponse().status == 200; conn.close()
         finally:
             server.shutdown(); server.server_close(); cp.close()
