@@ -3,23 +3,32 @@ import ipaddress
 import os
 import socket
 import sqlite3
+import http.client
+import json
+import threading
 from dataclasses import dataclass
 
 import pytest
 
 from heel.saas.network_guard import (
     AddressSetValidationError,
+    BoundedDNSResolver,
     CHALLENGE_PATH,
     OriginValidationError,
     PeerMismatch,
     PinnedHTTPSVerifier,
     VerificationError,
     VerificationTimeout,
+    VerificationTimeout,
     normalize_verified_origin,
     select_safe_addresses,
 )
 from heel.saas.catalog import CATALOG_VERSION
-from heel.saas.verification import EnvironmentCooldown, OWNERSHIP_ATTESTATION, VerifiedEnvironmentService
+from heel.saas.verification import (
+    EnvironmentCooldown, OWNERSHIP_ATTESTATION, TargetLimitExceeded, VerifiedEnvironmentService,
+)
+from heel.saas.http_api import ControlPlane, serve
+from heel.saas.tenancy import Role
 
 
 PIN = hashlib.sha256(b"certificate").hexdigest()
@@ -89,6 +98,11 @@ def test_normalize_exact_https_origin(origin, expected):
         "https://localhost",
         "https://foo.localhost",
         "https://metadata.google.internal",
+        "https://printer",
+        "https://svc.corp",
+        "https://x.example",
+        "https://x.onion",
+        "https://x.home.arpa",
         "https://-.example.com",
         "https://example..com",
     ],
@@ -118,6 +132,26 @@ def test_select_addresses_sorts_and_deduplicates():
 def test_select_addresses_poisons_mixed_answer(text):
     with pytest.raises(AddressSetValidationError):
         select_safe_addresses(["93.184.216.34", text])
+
+
+def test_bounded_dns_txt_uses_absolute_names_and_rejects_private_answers():
+    class TXT:
+        strings = (b"heel-verify=token",)
+    class Resolver:
+        def __init__(self): self.calls = []
+        def resolve(self, name, kind, **kwargs):
+            self.calls.append((name, kind, kwargs))
+            return {"A": ["93.184.216.34"], "AAAA": [], "TXT": [TXT()]}[kind]
+    fake = Resolver()
+    resolver = BoundedDNSResolver(resolver=fake)
+    assert resolver.txt("staging.example.com") == ["heel-verify=token"]
+    assert [call[0] for call in fake.calls] == ["staging.example.com.", "staging.example.com.", "_heel.staging.example.com."]
+    assert all(call[2]["search"] is False for call in fake.calls)
+    class PrivateResolver(Resolver):
+        def resolve(self, name, kind, **kwargs):
+            return ["10.0.0.1"] if kind == "A" else []
+    with pytest.raises(AddressSetValidationError):
+        BoundedDNSResolver(resolver=PrivateResolver()).txt("staging.example.com")
 
 
 class FakeSocket:
@@ -286,7 +320,9 @@ def test_environment_proof_is_project_bound_and_clears_pending_token():
             return token[0]
     token = [""]
     service = VerifiedEnvironmentService(conn, https_verifier=Proof())
-    challenge = service.start("ws", "prj", "https://Staging.Example.COM", "staging", actor="owner")
+    challenge = service.start("ws", "prj", "https://Staging.Example.COM", "staging", actor="owner",
+                              attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                              attestation_acknowledgement="accepted")
     token[0] = challenge.token
     assert service.check("ws", "prj", challenge.environment_id, max_verified=1)
     row = conn.execute("SELECT * FROM canary_environments WHERE environment_id=?", (challenge.environment_id,)).fetchone()
@@ -294,7 +330,9 @@ def test_environment_proof_is_project_bound_and_clears_pending_token():
     assert row["challenge_token"] is None
     assert row["attestation_text"] == OWNERSHIP_ATTESTATION
     assert service.is_executable("ws", "prj", challenge.environment_id)
-    replacement = service.start("ws", "prj", "https://staging.example.com", "production", actor="owner")
+    replacement = service.start("ws", "prj", "https://staging.example.com", "production", actor="owner",
+                                attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                                attestation_acknowledgement="accepted")
     assert replacement.environment_id == challenge.environment_id
     assert not service.is_executable("ws", "prj", challenge.environment_id)
     conn.close()
@@ -313,8 +351,140 @@ def test_environment_check_claims_cooldown_before_a_failed_network_call():
         def verify(self, origin):
             raise TimeoutError
     service = VerifiedEnvironmentService(conn, https_verifier=FailingProof())
-    challenge = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner")
+    challenge = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                              attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                              attestation_acknowledgement="accepted")
     assert not service.check("ws", "prj", challenge.environment_id)
     with pytest.raises(EnvironmentCooldown):
         service.check("ws", "prj", challenge.environment_id)
     conn.close()
+
+
+def test_environment_records_typed_network_timeout_code():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    class TimedOut:
+        def verify(self, origin): raise VerificationTimeout("late")
+    service = VerifiedEnvironmentService(conn, https_verifier=TimedOut())
+    challenge = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                              attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                              attestation_acknowledgement="accepted")
+    assert not service.check("ws", "prj", challenge.environment_id)
+    assert conn.execute("SELECT last_failure_code FROM canary_environments WHERE environment_id=?", (challenge.environment_id,)).fetchone()[0] == "network_timeout"
+    conn.close()
+
+
+def test_environment_quota_counts_the_whole_workspace_not_one_project():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.executemany("INSERT INTO projects VALUES(?,?,?,?,?)", [("ws", "one", "one", "owner", 1), ("ws", "two", "two", "owner", 1)])
+    token = [""]
+    class Proof:
+        def verify(self, origin): return token[0]
+    service = VerifiedEnvironmentService(conn, https_verifier=Proof())
+    fields = {"attestation_text": OWNERSHIP_ATTESTATION, "attestation_version": "v1", "attestation_acknowledgement": "accepted"}
+    first = service.start("ws", "one", "https://one.example.com", "staging", actor="owner", **fields)
+    token[0] = first.token
+    assert service.check("ws", "one", first.environment_id, max_verified=1)
+    second = service.start("ws", "two", "https://two.example.com", "staging", actor="owner", **fields)
+    token[0] = second.token
+    with pytest.raises(TargetLimitExceeded):
+        service.check("ws", "two", second.environment_id, max_verified=1)
+    conn.close()
+
+
+def test_environment_start_requires_exact_user_attestation_fields():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    service = VerifiedEnvironmentService(conn)
+    with pytest.raises(ValueError):
+        service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                      attestation_text="forged", attestation_version="v1", attestation_acknowledgement="accepted")
+    challenge = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                              attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                              attestation_acknowledgement="accepted")
+    row = conn.execute("SELECT * FROM canary_environments WHERE environment_id=?", (challenge.environment_id,)).fetchone()
+    assert row["attestation_text"] == OWNERSHIP_ATTESTATION
+    assert row["attestation_version"] == "v1"
+    assert row["attestation_acknowledgement"] == "accepted"
+    conn.close()
+
+
+def test_environment_http_ceremony_is_closed_and_token_is_pending_only():
+    class Proof:
+        token = ""
+        def verify(self, origin):
+            return self.token
+    proof = Proof()
+    cp = ControlPlane(device_token_pepper=b"p" * 32, enable_device_auth=True,
+                      public_origin="https://heel.example", environment_https_verifier=proof)
+    oid = cp.store.create_org("org")
+    owner = cp.store.create_user("owner@example.com")
+    wid = cp.store.create_workspace(oid, "ws", "free", CATALOG_VERSION)
+    cp.store.add_member(wid, owner, Role.OWNER)
+    project = cp.projects.create(wid, "project", created_by=owner)
+    session = cp.auth.create_session(owner)
+    server = serve(cp)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        def request(method, path, body=None, headers=None):
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            wire = None if body is None else json.dumps(body)
+            connection.request(method, path, body=wire, headers=headers or {})
+            response = connection.getresponse()
+            result = json.loads(response.read())
+            connection.close()
+            return response.status, result
+        base = {"Cookie": f"heel_session={session.token}", "Origin": "https://heel.example",
+                "X-Heel-Internal-Origin": "same-origin", "Content-Type": "application/json"}
+        start_body = {"schema_version": "heel.verified-environment-start.v1", "origin": "https://staging.example.com",
+                      "environment_class": "staging", "proof_method": "https-file",
+                      "attestation_text": OWNERSHIP_ATTESTATION, "attestation_version": "v1",
+                      "attestation_acknowledgement": "accepted"}
+        path = f"/v1/workspaces/{wid}/projects/{project.project_ref}/environments"
+        status, failed = request("POST", path, start_body, {k: v for k, v in base.items() if k != "Origin"})
+        assert status == 403 and failed["code"] == "same_origin_required"
+        status, failed = request("POST", path, start_body, {**base, "Origin": "https://evil.example"})
+        assert status == 403 and failed["code"] == "same_origin_required"
+        member = cp.store.create_user("member@example.com")
+        cp.store.add_member(wid, member, Role.MEMBER)
+        member_session = cp.auth.create_session(member)
+        status, failed = request("POST", path, start_body, {**base, "Cookie": f"heel_session={member_session.token}"})
+        assert status == 403 and failed["code"] == "recent_auth_required"
+        bad = dict(start_body, attestation_text="forged")
+        status, failed = request("POST", path, bad, base)
+        assert status == 400 and failed["code"] == "invalid_environment_request"
+        status, challenge = request("POST", path, start_body, base)
+        assert status == 201 and challenge["token"]
+        proof.token = challenge["token"]
+        eid = challenge["environment_id"]
+        check_path = path + f"/{eid}/check"
+        status, checked = request("POST", check_path, {"schema_version": "heel.verified-environment-check.v1"}, base)
+        assert status == 200 and checked["verified"] is True
+        status, listed = request("GET", path, headers={"Cookie": f"heel_session={session.token}"})
+        assert status == 200 and listed["environments"][0]["is_executable"] is True
+        assert "token" not in listed["environments"][0]
+        revoke_path = path + f"/{eid}/revoke"
+        status, revoked = request("POST", revoke_path, {"schema_version": "heel.verified-environment-revoke.v1", "reason": "done"}, base)
+        assert status == 200 and revoked["revoked"] is True
+    finally:
+        server.shutdown()
+        server.server_close()

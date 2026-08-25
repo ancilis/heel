@@ -218,6 +218,8 @@ NORMALIZATION_VERSION = "exact-origin.v1"
 HTTPS_PROOF_VERSION = "https-file.v1"
 DNS_PROOF_VERSION = "dns-txt.v1"
 OWNERSHIP_ATTESTATION = "ownership verified; environment classification supplied by you"
+ATTESTATION_VERSION = "v1"
+ATTESTATION_ACKNOWLEDGEMENT = "accepted"
 ENVIRONMENT_CHALLENGE_TTL = 24 * 3600
 ENVIRONMENT_PROOF_TTL = 30 * 24 * 3600
 ENVIRONMENT_CHECK_COOLDOWN = 5
@@ -257,14 +259,15 @@ class EnvironmentChallenge:
 class VerifiedEnvironmentService:
     """Project-scoped environment proof state with snapshot/network/finalize semantics."""
     def __init__(self, conn: sqlite3.Connection, *, https_verifier=None, dns_txt=None,
-                 max_workspaces_per_hostname: int | None = None, clock: Callable[[], float] = _now):
+                 max_workspaces_per_hostname: int | None = None, clock: Callable[[], float] = _now,
+                 lock: threading.RLock | None = None):
         from .canary_store import CanaryStore
         self.conn = conn
         CanaryStore(conn)  # install the exact runtime/migration schema without a second identity
         self.https_verifier = https_verifier
         self.dns_txt = dns_txt
         self.clock = clock
-        self._db_lock = threading.RLock()
+        self._db_lock = lock if lock is not None else threading.RLock()
         self.max_workspaces_per_hostname = (
             MAX_WORKSPACES_PER_HOSTNAME if max_workspaces_per_hostname is None
             else max_workspaces_per_hostname
@@ -289,12 +292,16 @@ class VerifiedEnvironmentService:
             ).fetchone()
 
     def start(self, workspace_id: str, project_ref: str, origin: str, environment_class: str,
-              *, actor: str, proof_method: str = "https-file") -> EnvironmentChallenge:
+              *, actor: str, attestation_text: str, attestation_version: str,
+              attestation_acknowledgement: str, proof_method: str = "https-file") -> EnvironmentChallenge:
         from .network_guard import OriginValidationError, normalize_verified_origin
         if type(environment_class) is not str or environment_class not in _ENVIRONMENT_CLASSES:
             raise ValueError("environment_class must be staging, sandbox, or production")
         if proof_method not in {"https-file", "dns-txt"}:
             raise ValueError("proof_method is invalid")
+        if (attestation_text != OWNERSHIP_ATTESTATION or attestation_version != ATTESTATION_VERSION
+                or attestation_acknowledgement != ATTESTATION_ACKNOWLEDGEMENT):
+            raise ValueError("exact ownership attestation is required")
         try:
             normalized = normalize_verified_origin(origin)
         except OriginValidationError as exc:
@@ -321,12 +328,12 @@ class VerifiedEnvironmentService:
                 generation = 1
                 self.conn.execute(
                     "INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at,"
-                    "attestation_text,attestation_version,attested_by,attested_at,proof_method,proof_version,normalization_version,"
+                    "attestation_text,attestation_version,attestation_acknowledgement,attested_by,attested_at,proof_method,proof_version,normalization_version,"
                     "challenge_generation,challenge_digest,challenge_token,challenge_created_at,challenge_expires_at,last_failure_code,"
                     "verified_at,proof_expires_at,revoked_at,revoked_by,revoked_reason) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (environment_id, workspace_id, project_ref, normalized, environment_class, "pending", now,
-                     OWNERSHIP_ATTESTATION, VERIFIED_ENVIRONMENT_SCHEMA_VERSION, actor, now, proof_method,
+                     attestation_text, attestation_version, attestation_acknowledgement, actor, now, proof_method,
                      HTTPS_PROOF_VERSION if proof_method == "https-file" else DNS_PROOF_VERSION, NORMALIZATION_VERSION,
                      generation, digest, token, now, expires_at, None, None, None, None, None, None),
                 )
@@ -335,11 +342,11 @@ class VerifiedEnvironmentService:
                 generation = int(existing["challenge_generation"] or 0) + 1
                 self.conn.execute(
                     "UPDATE canary_environments SET environment_class=?,status='pending',attestation_text=?,"
-                    "attestation_version=?,attested_by=?,attested_at=?,proof_method=?,proof_version=?,normalization_version=?,"
+                    "attestation_version=?,attestation_acknowledgement=?,attested_by=?,attested_at=?,proof_method=?,proof_version=?,normalization_version=?,"
                     "challenge_generation=?,challenge_digest=?,challenge_token=?,challenge_created_at=?,challenge_expires_at=?,"
                     "last_check_at=NULL,last_failure_code=NULL,verified_at=NULL,proof_expires_at=NULL,revoked_at=NULL,"
                     "revoked_by=NULL,revoked_reason=NULL WHERE workspace_id=? AND project_ref=? AND environment_id=?",
-                    (environment_class, OWNERSHIP_ATTESTATION, VERIFIED_ENVIRONMENT_SCHEMA_VERSION, actor, now,
+                    (environment_class, attestation_text, attestation_version, attestation_acknowledgement, actor, now,
                      proof_method, HTTPS_PROOF_VERSION if proof_method == "https-file" else DNS_PROOF_VERSION,
                      NORMALIZATION_VERSION, generation, digest, token, now, expires_at,
                      workspace_id, project_ref, environment_id),
@@ -415,7 +422,12 @@ class VerifiedEnvironmentService:
         generation, expected_digest, token = row["challenge_generation"], row["challenge_digest"], row["challenge_token"]
         try:
             if row["proof_method"] == "dns-txt":
-                observed = self.dns_txt("_heel." + self._origin_host(row["origin"])) if self.dns_txt else []
+                if self.dns_txt is None:
+                    observed = []
+                elif hasattr(self.dns_txt, "txt"):
+                    observed = self.dns_txt.txt(self._origin_host(row["origin"]))
+                else:
+                    observed = self.dns_txt("_heel." + self._origin_host(row["origin"]))
                 valid = any(str(value) == "heel-verify=" + token for value in observed)
                 failure = "dns_proof_mismatch"
             else:
@@ -424,8 +436,11 @@ class VerifiedEnvironmentService:
                 failure = "https_proof_mismatch"
         except TimeoutError:
             valid, failure = False, "network_timeout"
-        except Exception:
-            valid, failure = False, "network_rejected"
+        except Exception as exc:
+            if type(exc).__name__ in {"VerificationTimeout", "DNSResolutionTimeout", "LifetimeTimeout", "Timeout"}:
+                valid, failure = False, "network_timeout"
+            else:
+                valid, failure = False, "network_rejected"
         if not valid:
             self._record_failure(workspace_id, project_ref, environment_id, generation, failure)
             return False
@@ -444,7 +459,9 @@ class VerifiedEnvironmentService:
                 if (fresh is None or fresh["challenge_generation"] != generation or fresh["status"] != "pending"
                         or fresh["revoked_at"] is not None or fresh["challenge_expires_at"] <= now
                         or fresh["challenge_digest"] != expected_digest or fresh["challenge_token"] != token
-                        or fresh["attestation_text"] != OWNERSHIP_ATTESTATION):
+                    or fresh["attestation_text"] != OWNERSHIP_ATTESTATION
+                    or fresh["attestation_version"] != ATTESTATION_VERSION
+                    or fresh["attestation_acknowledgement"] != ATTESTATION_ACKNOWLEDGEMENT):
                     self.conn.execute("ROLLBACK")
                     return False
                 if max_verified is not None and self._active_count_locked(workspace_id, project_ref, now) >= max_verified:
@@ -493,7 +510,10 @@ class VerifiedEnvironmentService:
     def is_executable(self, workspace_id: str, project_ref: str, environment_id: str) -> bool:
         row = self._row(workspace_id, project_ref, environment_id)
         return bool(row and row["environment_class"] in {"staging", "sandbox"} and row["status"] == "verified"
-                    and row["attestation_text"] == OWNERSHIP_ATTESTATION and row["revoked_at"] is None
+                    and row["attestation_text"] == OWNERSHIP_ATTESTATION
+                    and row["attestation_version"] == ATTESTATION_VERSION
+                    and row["attestation_acknowledgement"] == ATTESTATION_ACKNOWLEDGEMENT
+                    and row["revoked_at"] is None
                     and row["verified_at"] is not None and row["proof_expires_at"] is not None
                     and row["proof_expires_at"] > self._now())
 
@@ -511,6 +531,7 @@ class VerifiedEnvironmentService:
             "environment_id": row["environment_id"], "origin": row["origin"],
             "environment_class": row["environment_class"], "status": row["status"],
             "attestation": row["attestation_text"], "attestation_version": row["attestation_version"],
+            "attestation_acknowledgement": row["attestation_acknowledgement"],
             "proof_method": row["proof_method"], "proof_version": row["proof_version"],
             "normalization_version": row["normalization_version"], "challenge_generation": row["challenge_generation"],
             "challenge_expires_at": row["challenge_expires_at"], "last_failure_code": row["last_failure_code"],
@@ -520,9 +541,9 @@ class VerifiedEnvironmentService:
 
     def _active_count_locked(self, workspace_id: str, project_ref: str, now: float) -> int:
         return self.conn.execute(
-            "SELECT COUNT(*) FROM canary_environments WHERE workspace_id=? AND project_ref=? "
+            "SELECT COUNT(*) FROM canary_environments WHERE workspace_id=? "
             "AND status='verified' AND revoked_at IS NULL AND proof_expires_at>?",
-            (workspace_id, project_ref, now),
+            (workspace_id, now),
         ).fetchone()[0]
 
 

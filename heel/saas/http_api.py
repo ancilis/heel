@@ -75,8 +75,9 @@ from .tenancy import (
     ControlPlaneStore, IntegrationLimitExceeded, Role, SeatLimitExceeded, hash_api_key, require,
 )
 from .verification import (
-    EnvironmentCooldown, EnvironmentNotFound, HostnameReuseExceeded, TargetLimitExceeded,
-    TargetVerifier, VerifiedEnvironmentService,
+    ATTESTATION_ACKNOWLEDGEMENT, ATTESTATION_VERSION, EnvironmentCooldown, EnvironmentNotFound,
+    HostnameReuseExceeded, OWNERSHIP_ATTESTATION, TargetLimitExceeded, TargetVerifier,
+    VerifiedEnvironmentService,
 )
 
 MAX_BODY = 64 * 1024
@@ -170,6 +171,9 @@ class ControlPlane:
                 raise RuntimeError(
                     "device authorization requires a canonical HEEL_PUBLIC_ORIGIN"
                 )
+        # All callers touching this shared SQLite connection use this one re-entrant lock. The
+        # environment proof deliberately releases it only for DNS/TLS I/O.
+        self.request_lock = threading.RLock()
         self.store = ControlPlaneStore(path)
         conn = self.store.conn
         self.canary_store = CanaryStore(conn)
@@ -193,6 +197,7 @@ class ControlPlane:
         self.verifier = TargetVerifier(conn, dns_txt=dns_txt, http_get=http_get)
         self.environments = VerifiedEnvironmentService(
             conn, https_verifier=environment_https_verifier, dns_txt=environment_dns_txt,
+            lock=self.request_lock,
         )
         self.jobs = JobPlane(conn, scope_validator=scope_validator,
                              concurrency_limit=lambda wid: self.entitlements.quota(
@@ -219,7 +224,6 @@ class ControlPlane:
         # Every store shares one SQLite connection. Serialize complete HTTP request units so
         # transaction boundaries and authentication touches cannot interleave across handler
         # threads. A Postgres deployment replaces this with a per-request pooled connection.
-        self.request_lock = threading.RLock()
 
     def close(self) -> None:
         """Release the shared database connection. Safe to call more than once."""
@@ -1525,6 +1529,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _recent_owner_admin(self, wid: str) -> str:
         """Sensitive proof actions require a fresh browser session, never a key/device token."""
+        if (self.cp.public_origin is None
+                or self.headers.get("Origin") != self.cp.public_origin
+                or self.headers.get("X-Heel-Internal-Origin") != "same-origin"):
+            raise ApiError(403, "same-origin browser ceremony is required", code="same_origin_required")
         kind, user_id, _ = self._principal()
         if kind != "session" or user_id is None:
             raise ApiError(403, "a recent owner or admin browser session is required", code="recent_auth_required")
@@ -1554,16 +1562,18 @@ class _Handler(BaseHTTPRequestHandler):
     def _ws_environment_start(self, wid: str, project_ref: str):
         actor = self._recent_owner_admin(wid)
         body = self._body()
-        if set(body) != {"schema_version", "origin", "environment_class", "proof_method"}:
+        if set(body) != {"schema_version", "origin", "environment_class", "proof_method", "attestation_text", "attestation_version", "attestation_acknowledgement"}:
             raise ApiError(400, "invalid verified environment request", code="invalid_environment_request")
         if body.get("schema_version") != "heel.verified-environment-start.v1":
             raise ApiError(400, "invalid verified environment request", code="invalid_environment_request")
-        if not all(type(body.get(key)) is str for key in ("origin", "environment_class", "proof_method")):
+        if not all(type(body.get(key)) is str for key in ("origin", "environment_class", "proof_method", "attestation_text", "attestation_version", "attestation_acknowledgement")):
             raise ApiError(400, "invalid verified environment request", code="invalid_environment_request")
         try:
             challenge = self.cp.environments.start(
                 wid, project_ref, body["origin"], body["environment_class"], actor=actor,
-                proof_method=body["proof_method"],
+                proof_method=body["proof_method"], attestation_text=body["attestation_text"],
+                attestation_version=body["attestation_version"],
+                attestation_acknowledgement=body["attestation_acknowledgement"],
             )
         except EnvironmentNotFound:
             raise ApiError(404, "project not found", code="project_not_found") from None
@@ -1580,20 +1590,24 @@ class _Handler(BaseHTTPRequestHandler):
         })
 
     def _ws_environment_check(self, wid: str, project_ref: str, environment_id: str):
-        self._recent_owner_admin(wid)
-        body = self._body()
-        if set(body) != {"schema_version"} or body.get("schema_version") != "heel.verified-environment-check.v1":
-            raise ApiError(400, "invalid verified environment check", code="invalid_environment_check")
+        # Dispatch releases the global lock for this endpoint; retain it for all auth and
+        # SQLite reads, while the service releases it only during bounded proof I/O.
+        with self.cp.request_lock:
+            self._recent_owner_admin(wid)
+            body = self._body()
+            if set(body) != {"schema_version"} or body.get("schema_version") != "heel.verified-environment-check.v1":
+                raise ApiError(400, "invalid verified environment check", code="invalid_environment_check")
+            try:
+                self.cp.projects.get(wid, project_ref)
+                sub = self.cp.subscription(wid)
+                limit = self.cp.entitlements.quota(sub, Meter.VERIFIED_TARGETS)
+            except ProjectNotFound:
+                raise ApiError(404, "project not found", code="project_not_found") from None
         try:
-            self.cp.projects.get(wid, project_ref)
-            sub = self.cp.subscription(wid)
-            limit = self.cp.entitlements.quota(sub, Meter.VERIFIED_TARGETS)
             verified = self.cp.environments.check(wid, project_ref, environment_id,
                                                    max_verified=None if limit < 0 else limit)
         except EnvironmentNotFound:
             raise ApiError(404, "environment not found", code="environment_not_found") from None
-        except ProjectNotFound:
-            raise ApiError(404, "project not found", code="project_not_found") from None
         except EnvironmentCooldown:
             raise ApiError(429, "environment check is cooling down", code="environment_check_cooldown") from None
         except TargetLimitExceeded:

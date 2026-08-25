@@ -43,7 +43,7 @@ jobs:
       - name: Install pinned runner/control-plane wheels
         run: |
           env PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1 \
-            python -m pip --isolated install --only-binary=:all: cryptography==45.0.7
+            python -m pip --isolated install --only-binary=:all: cryptography==45.0.7 pytest==9.0.2
           env PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1 \
             python -m pip --isolated download --only-binary=:all: --no-deps -d /tmp/heel-dns dnspython==2.8.0
           echo '01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af  /tmp/heel-dns/dnspython-2.8.0-py3-none-any.whl' | sha256sum -c -
@@ -51,6 +51,8 @@ jobs:
             python -m pip --isolated install --no-index --find-links=/tmp/heel-dns dnspython==2.8.0
       - name: Acceptance + safety tests (runner crypto installed)
         run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Verified-environment pytest security contract
+        run: python -m pytest -q tests/test_verified_environments.py
       - name: One-command demo (auth gate + honest backtests)
         run: python run_demo.py
       - name: Hosted control-plane smoke (signup → run → verify → kill switch)

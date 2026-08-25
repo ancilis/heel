@@ -23,7 +23,10 @@ MAX_CHALLENGE_BODY_BYTES = 4096
 MAX_CHALLENGE_HEADER_BYTES = 16384
 MAX_DNS_ANSWERS = 16
 _HOSTNAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-.")
-_SPECIAL_SUFFIXES = (".localhost", ".local", ".internal", ".invalid", ".localdomain", ".test")
+_SPECIAL_SUFFIXES = (
+    ".localhost", ".local", ".internal", ".invalid", ".test", ".example", ".onion",
+    ".home.arpa", ".corp", ".lan", ".localdomain",
+)
 _SPECIAL_NAMES = frozenset({"localhost", "broadcasthost", "ip6-allnodes", "ip6-allrouters", "ip6-localhost", "ip6-loopback"})
 
 # Frozen special-use corpus. ``is_global`` remains defence in depth, never the only decision.
@@ -46,6 +49,10 @@ class OriginValidationError(NetworkGuardError):
 
 
 class AddressSetValidationError(NetworkGuardError):
+    pass
+
+
+class DNSResolutionTimeout(AddressSetValidationError):
     pass
 
 
@@ -91,7 +98,7 @@ def normalize_verified_origin(origin: str) -> str:
     host = hostname.lower()
     labels = host.split(".")
     if (host.endswith(".") or len(host) > 253 or any(not label or len(label) > 63 for label in labels)
-            or not set(host).issubset(_HOSTNAME_CHARS)):
+            or len(labels) < 2 or not set(host).issubset(_HOSTNAME_CHARS)):
         raise OriginValidationError("hostname is not an exact DNS name")
     if any(label[0] == "-" or label[-1] == "-" for label in labels):
         raise OriginValidationError("hostname has invalid label hyphenation")
@@ -143,18 +150,57 @@ class BoundedDNSResolver:
         self.lifetime = lifetime
 
     def __call__(self, hostname: str) -> list[str]:
+        absolute = hostname.rstrip(".") + "."
         answers: list[str] = []
         for record_type in ("A", "AAAA"):
             try:
-                response = self.resolver.resolve(hostname, record_type, lifetime=self.lifetime, raise_on_no_answer=False)
+                response = self.resolver.resolve(
+                    absolute, record_type, lifetime=self.lifetime, search=False, raise_on_no_answer=False,
+                )
             except Exception as exc:
                 if type(exc).__name__ in {"NXDOMAIN", "NoAnswer"}:
                     continue
+                if type(exc).__name__ in {"LifetimeTimeout", "Timeout"}:
+                    raise DNSResolutionTimeout("DNS resolution timed out") from exc
                 raise AddressSetValidationError("DNS resolution failed") from exc
             answers.extend(str(record) for record in response)
             if len(answers) > MAX_DNS_ANSWERS:
                 raise AddressSetValidationError("DNS answer exceeds configured bound")
+        # Poison the full A+AAAA answer before a TXT proof can authorize this origin.
+        select_safe_addresses(answers)
         return answers
+
+    def txt(self, hostname: str) -> list[str]:
+        """Resolve only exact ASCII TXT values at ``_heel.<host>.`` after public-IP validation."""
+        host = hostname.rstrip(".")
+        self(host)
+        name = "_heel." + host + "."
+        try:
+            response = self.resolver.resolve(
+                name, "TXT", lifetime=self.lifetime, search=False, raise_on_no_answer=False,
+            )
+        except Exception as exc:
+            if type(exc).__name__ in {"NXDOMAIN", "NoAnswer"}:
+                return []
+            if type(exc).__name__ in {"LifetimeTimeout", "Timeout"}:
+                raise DNSResolutionTimeout("DNS TXT resolution timed out") from exc
+            raise AddressSetValidationError("DNS TXT resolution failed") from exc
+        values: list[str] = []
+        for record in response:
+            fragments = getattr(record, "strings", None)
+            if fragments is None:
+                text = str(record).strip('"')
+            else:
+                try:
+                    text = b"".join(fragments).decode("ascii")
+                except (TypeError, UnicodeDecodeError) as exc:
+                    raise AddressSetValidationError("DNS TXT answer is not ASCII") from exc
+            if len(text) > 512:
+                raise AddressSetValidationError("DNS TXT answer exceeds bound")
+            values.append(text)
+            if len(values) > MAX_DNS_ANSWERS:
+                raise AddressSetValidationError("DNS TXT answer exceeds bound")
+        return values
 
 
 class SocketTransport:

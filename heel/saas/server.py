@@ -238,7 +238,8 @@ def build_server(config: ProductionConfiguration):
     # partially usable live-verification deployment.
     try:
         from .network_guard import BoundedDNSResolver, PinnedHTTPSVerifier
-        environment_verifier = PinnedHTTPSVerifier(resolver=BoundedDNSResolver())
+        environment_resolver = BoundedDNSResolver()
+        environment_verifier = PinnedHTTPSVerifier(resolver=environment_resolver)
     except Exception as exc:
         raise ProductionConfigurationError(
             "verified environments require the pinned dnspython==2.8.0 control-plane dependency"
@@ -268,6 +269,7 @@ def build_server(config: ProductionConfiguration):
             grant_authority=config.grant_authority,
             grant_trusted_keys=config.grant_trusted_keys,
             environment_https_verifier=environment_verifier,
+            environment_dns_txt=environment_resolver,
         )
         # One process owns this database. WAL keeps reads responsive; FULL preserves accepted
         # findings and auth state across an abrupt host restart on a durable volume.

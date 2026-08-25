@@ -197,6 +197,10 @@ CREATE INDEX IF NOT EXISTS idx_canary_environment_project
   ON canary_environments(workspace_id, project_ref, origin);
 """
 
+CANARY_ENVIRONMENT_ATTESTATION_ACK_MIGRATION = """
+ALTER TABLE canary_environments ADD COLUMN attestation_acknowledgement TEXT;
+"""
+
 _ENVIRONMENT_COLUMNS = (
     "attestation_text", "attestation_version", "attested_by", "attested_at", "proof_method",
     "proof_version", "normalization_version", "challenge_generation", "challenge_digest",
@@ -225,6 +229,9 @@ def ensure_canary_environment_schema(conn: sqlite3.Connection) -> None:
             present.add(column)
         else:
             conn.execute(statement)
+    present = {row[1] for row in conn.execute("PRAGMA table_info(canary_environments)")}
+    if "attestation_acknowledgement" not in present:
+        conn.execute(CANARY_ENVIRONMENT_ATTESTATION_ACK_MIGRATION.strip())
 
 
 class CanaryStore:
