@@ -512,6 +512,7 @@ class CanaryRunService:
         actor_id: str,
         reason_code: str,
         now_ms: int,
+        run_id: str | None = None,
     ) -> int:
         """Cancel only linked pre-grant work and append its durable run/audit spine."""
         if not self.conn.in_transaction:
@@ -529,12 +530,13 @@ class CanaryRunService:
             "JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref AND r.run_id=l.run_id "
             "WHERE l.workspace_id=? AND l.project_ref=? AND l.environment_id=? AND l.runner_id=? "
             "AND l.runner_key_id=? AND l.rcb_id=? AND l.binding_digest=? "
+            + ("AND l.run_id=? " if run_id is not None else "") +
             "ORDER BY l.run_id,l.approval_id",
             (
                 binding_row["workspace_id"], binding_row["project_ref"], binding_row["environment_id"],
                 binding_row["runner_id"], binding_row["runner_key_id"], binding_row["rcb_id"],
                 binding_row["binding_digest"],
-            ),
+            ) + ((run_id,) if run_id is not None else ()),
         ).fetchall()
         cancelled = 0
         for row in rows:
@@ -1918,8 +1920,15 @@ class CanaryRunService:
         try:
             approvals = self.conn.execute(
                 "SELECT * FROM canary_approval_projections WHERE status='awaiting_execution_approval' "
-                "AND expires_at<=?",
-                (now,),
+                "AND expires_at<=? AND NOT EXISTS(SELECT 1 FROM canary_runner_context_projection_links l "
+                "JOIN canary_runner_context_bindings b ON b.workspace_id=l.workspace_id "
+                "AND b.project_ref=l.project_ref AND b.rcb_id=l.rcb_id AND b.binding_digest=l.binding_digest "
+                "WHERE l.workspace_id=canary_approval_projections.workspace_id "
+                "AND l.project_ref=canary_approval_projections.project_ref "
+                "AND l.approval_id=canary_approval_projections.approval_id "
+                "AND l.run_id=canary_approval_projections.run_id "
+                "AND (b.status IN ('revoked','expired') OR b.expires_at_ms<=?))",
+                (now, now),
             ).fetchall()
             for approval in approvals:
                 run = self._run(approval["workspace_id"], approval["project_ref"], approval["run_id"])

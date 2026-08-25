@@ -24,6 +24,20 @@ describe("canary activation dashboard", () => {
     expect(source).not.toContain("loadProjection(");
     expect(source).not.toContain("Choose approval projection");
   });
+  test("uses the project-scoped server runner list as the add-access selector", () => {
+    const source = readFileSync(resolve(process.cwd(), "app/dashboard/page.tsx"), "utf8");
+    const selector = source.slice(source.indexOf("Paired runner<select"), source.indexOf("</select></label>", source.indexOf("Paired runner<select")));
+    expect(selector).toContain("context.contextBindings.runners.map");
+    expect(selector).not.toContain("context.contextBindings.bindings.map");
+  });
+  test("clears an occupied runner selection after refresh or a project switch", () => {
+    const source = readFileSync(resolve(process.cwd(), "app/dashboard/page.tsx"), "utf8");
+    expect(source).toContain("const selectedRunnerAvailable");
+    expect(source).toContain("setSelectedRunner((current) => contextBindings.runners.some");
+    expect(source).toContain("setSelectedRunner(\"\"); setSelectedBindingEnvironment(\"\");");
+    expect(source).toContain("!selectedRunnerAvailable");
+    expect(source).toContain("value={selectedRunnerAvailable ? selectedRunner : \"\"}");
+  });
   test("leads with four ordered steps and one unambiguous next action", () => {
     render(<Dashboard />);
 

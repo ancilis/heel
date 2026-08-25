@@ -48,6 +48,22 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
                 actor="user_owner", role="owner",
             )
 
+    def test_reaper_context_batches_refuse_unbounded_limits(self):
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for method in (
+                self.service.expire_due_batch_in_transaction,
+                self.service.cancel_due_batch_in_transaction,
+            ):
+                for limit in (0, 129, 10_000_000, True, 1.0, "128"):
+                    with self.assertRaisesRegex(ValueError, "invalid runner context batch limit"):
+                        method(self.service._now_ms(), limit=limit)
+                for now_ms in (-1, True, 1.0, "1", 9_007_199_254_740_992):
+                    with self.assertRaisesRegex(ValueError, "invalid runner context expiry time"):
+                        method(now_ms)
+        finally:
+            self.conn.rollback()
+
     def test_runner_cannot_receive_two_active_contexts_across_projects(self):
         self.service.create(
             WORKSPACE, PROJECT,
@@ -86,6 +102,52 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
             "SELECT COUNT(*) FROM canary_runner_context_bindings WHERE workspace_id=? AND runner_id=? AND status='active'",
             (WORKSPACE, RUNNER),
         ).fetchone()[0], 1)
+
+    def test_dashboard_hides_runner_occupied_by_another_project_until_revoke(self):
+        binding = self.service.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+             "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+        )
+        other_project = "prj_other"
+        other_environment = "env_other"
+        self.conn.execute(
+            "INSERT INTO projects VALUES(?,?,?,?,?)",
+            (WORKSPACE, other_project, "Other", "user_owner", NOW_MS / 1000),
+        )
+        source = self.conn.execute(
+            "SELECT * FROM canary_environments WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+            (WORKSPACE, PROJECT, ENVIRONMENT),
+        ).fetchone()
+        columns = tuple(source.keys())
+        values = [source[column] for column in columns]
+        values[columns.index("environment_id")] = other_environment
+        values[columns.index("project_ref")] = other_project
+        self.conn.execute(
+            f"INSERT INTO canary_environments({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+            values,
+        )
+        same_project_values = [source[column] for column in columns]
+        same_project_values[columns.index("environment_id")] = "env_same_project"
+        self.conn.execute(
+            f"INSERT INTO canary_environments({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+            same_project_values,
+        )
+        self.conn.commit()
+
+        current = self.service.list_for_human(WORKSPACE, PROJECT, actor="user_owner")
+        occupied_elsewhere = self.service.list_for_human(WORKSPACE, other_project, actor="user_owner")
+        # A second executable environment in this project cannot make a runner
+        # eligible for another binding while its current one is active.
+        self.assertEqual(current["runners"], [])
+        self.assertEqual([item["binding_id"] for item in current["bindings"]], [binding["binding_id"]])
+        self.assertEqual(occupied_elsewhere["runners"], [])
+        self.assertEqual(occupied_elsewhere["bindings"], [])
+
+        self.service.revoke(WORKSPACE, PROJECT, binding["binding_id"], actor="user_owner", role="owner")
+        after_revoke = self.service.list_for_human(WORKSPACE, other_project, actor="user_owner")
+        self.assertEqual([item["runner_id"] for item in after_revoke["runners"]], [RUNNER])
 
     def test_revoke_marks_state_and_is_visible_to_runner_transaction(self):
         binding = self.service.create(
@@ -216,9 +278,11 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         clock.value += 25 * 60 * 60
 
         conn.execute("BEGIN IMMEDIATE")
-        expired, cancelled = contexts._expire_in_transaction(contexts._now_ms())
+        expired = contexts.expire_due_batch_in_transaction(contexts._now_ms())
+        cancelled = contexts.cancel_due_batch_in_transaction(contexts._now_ms())
         conn.commit()
-        self.assertEqual((expired, cancelled), (1, 1))
+        self.assertEqual(expired["expired_runner_contexts"], 1)
+        self.assertEqual(cancelled["cancelled_context_runs"], 1)
         self.assertEqual(conn.execute(
             "SELECT status FROM canary_approval_projections WHERE approval_id=?", (submitted["approval_id"],),
         ).fetchone()[0], "cancelled")
@@ -244,7 +308,7 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         )
         clock.value += 31 * 24 * 60 * 60
         conn.execute("BEGIN IMMEDIATE")
-        contexts._expire_in_transaction(contexts._now_ms())
+        contexts.expire_due_batch_in_transaction(contexts._now_ms())
         conn.commit()
         clock.value += 31 * 24 * 60 * 60
         conn.execute("BEGIN IMMEDIATE")
@@ -256,6 +320,44 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         self.assertIsNone(conn.execute(
             "SELECT 1 FROM canary_runner_context_bindings WHERE rcb_id=?", (binding["binding_id"],),
         ).fetchone())
+
+    def test_late_context_expiry_defers_binding_purge_until_its_terminal_event_retention(self):
+        conn = connect()
+        self.addCleanup(conn.close)
+        clock = Clock()
+        runner = seed_authority(conn, proof_expires_at=clock.value + 48 * 60 * 60)
+        contexts = RunnerContextBindingService(conn, signing=SigningAuthority.generate(), clock=clock)
+        binding = contexts.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+             "runner_key_id": runner.key_id}, actor="user_owner", role="owner",
+        )
+        initial = conn.execute(
+            "SELECT expires_at_ms,purge_at_ms FROM canary_runner_context_bindings WHERE rcb_id=?",
+            (binding["binding_id"],),
+        ).fetchone()
+        clock.value += 25 * 60 * 60  # Process the 24-hour TTL one hour late.
+        conn.execute("BEGIN IMMEDIATE")
+        contexts.expire_due_batch_in_transaction(contexts._now_ms())
+        contexts.expire_and_purge_in_transaction(contexts._now_ms())
+        conn.commit()
+        delayed_deadline = contexts._now_ms() + 30 * 24 * 60 * 60 * 1000
+        self.assertEqual(conn.execute(
+            "SELECT purge_at_ms FROM canary_runner_context_bindings WHERE rcb_id=?", (binding["binding_id"],),
+        ).fetchone()[0], delayed_deadline)
+
+        clock.value = initial["purge_at_ms"] / 1000
+        conn.execute("BEGIN IMMEDIATE")
+        before_event_retention = contexts.expire_and_purge_in_transaction(contexts._now_ms())
+        conn.commit()
+        self.assertEqual(before_event_retention["purged_bindings"], 0)
+
+        clock.value = delayed_deadline / 1000
+        conn.execute("BEGIN IMMEDIATE")
+        due = contexts.expire_and_purge_in_transaction(contexts._now_ms())
+        conn.commit()
+        self.assertEqual(due["purged_bindings"], 1)
 
     def test_human_dashboard_is_bounded_to_64_historical_bindings(self):
         # One runner may only have one active binding, but its revocation history

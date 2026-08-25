@@ -10,7 +10,9 @@ from pathlib import Path
 
 import pytest
 
+from heel.crypto import SigningAuthority
 from heel.saas.canary_reaper import CanaryReaper
+from heel.saas.runner_contexts import RunnerContextBindingService
 
 from canary_test_support import (
     Clock,
@@ -51,6 +53,54 @@ def _durable_pending_setup(root: Path):
     durable.close()
     source.close()
     return database, clock, coordinator.signing, submitted
+
+
+def test_context_expiry_cancels_linked_pending_run_before_generic_approval_expiry():
+    with tempfile.TemporaryDirectory() as tmp:
+        source = connect()
+        clock = Clock()
+        runner = seed_authority(source, proof_expires_at=clock.value + 48 * 60 * 60)
+        signing = SigningAuthority.generate()
+        contexts = RunnerContextBindingService(source, signing=signing, clock=clock)
+        contexts.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": "env_canary",
+             "verification_record_digest": "a" * 64, "runner_id": RUNNER,
+             "runner_key_id": runner.key_id}, actor="user_owner", role="owner",
+        )
+        binding = source.execute("SELECT * FROM canary_runner_context_bindings").fetchone()
+        coordinator = service(source, clock, grant_signer=signing)
+        projection = approval_projection(runner)
+        source.execute("BEGIN IMMEDIATE")
+        submitted = coordinator.submit_projection_from_runner_in_transaction(
+            projection, binding, uploaded_by_runner_id=RUNNER,
+        )
+        source.commit()
+        database = Path(tmp) / "heel.sqlite3"
+        durable = sqlite3.connect(database)
+        source.backup(durable)
+        durable.close()
+        source.close()
+        clock.value += 25 * 60 * 60
+
+        CanaryReaper(str(database), signing=signing, clock=clock).run_once()
+        connection = sqlite3.connect(database)
+        try:
+            assert connection.execute(
+                "SELECT status FROM canary_approval_projections WHERE approval_id=?", (submitted["approval_id"],),
+            ).fetchone()[0] == "cancelled"
+            assert connection.execute(
+                "SELECT status FROM canary_runs WHERE run_id=?", (submitted["run_id"],),
+            ).fetchone()[0] == "cancelled"
+            assert connection.execute(
+                "SELECT actor_class,actor_id,reason_code FROM canary_run_events "
+                "WHERE run_id=? AND event_type='cancelled'", (submitted["run_id"],),
+            ).fetchone() == ("system", "control-plane", "runner_context_expired")
+            assert connection.execute(
+                "SELECT COUNT(*) FROM canary_run_events WHERE run_id=? AND event_type='expired'", (submitted["run_id"],),
+            ).fetchone()[0] == 0
+        finally:
+            connection.close()
 
 
 def test_reaper_runs_on_the_exact_durable_database_and_stops_its_non_daemon_thread():

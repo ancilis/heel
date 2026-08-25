@@ -112,6 +112,7 @@ export default function Dashboard() {
     const { context } = connection;
     const contextBindings = await canaryApi.listRunnerContextBindings(context.workspaceRef, context.project.projectRef);
     setConnection({ phase: "ready", context: { ...context, contextBindings } });
+    setSelectedRunner((current) => contextBindings.runners.some((runner) => runner.runnerId === current) ? current : "");
   }, [connection]);
 
   useEffect(() => {
@@ -164,6 +165,8 @@ export default function Dashboard() {
 
   const executable = connection.phase === "ready"
     ? connection.context.environments.find((item) => item.isExecutable) : undefined;
+  const selectedRunnerAvailable = connection.phase === "ready"
+    && connection.context.contextBindings.runners.some((runner) => runner.runnerId === selectedRunner);
   const hasPlan = approval !== null;
   const snapshot: ActivationSnapshot = {
     environment: executable ? "verified" : proofChallenge ? "checking" : "unverified",
@@ -192,6 +195,7 @@ export default function Dashboard() {
       const environments = await canaryApi.listEnvironments(connection.context.workspaceRef, project.projectRef);
       const contextBindings = await canaryApi.listRunnerContextBindings(connection.context.workspaceRef, project.projectRef);
       setConnection({ phase: "ready", context: { ...connection.context, project, environments, contextBindings } });
+      setSelectedRunner(""); setSelectedBindingEnvironment("");
       setApproval(null); setRun(null); setProofChallenge(null); setDisclosurePreview(null);
     } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
   }
@@ -332,8 +336,8 @@ export default function Dashboard() {
         </section> : null}
         {context && executable && !approval ? <section className="runner-recovery"><p className="canary-kicker">Paired runner authorization</p><h2>Add canary access</h2><p>Authorize one active paired runner for one verified staging or sandbox environment. The runner alone may submit its signed plan; this dashboard never accepts projection file uploads.</p>
           <label>Verified environment<select disabled={working} onChange={(event) => setSelectedBindingEnvironment(event.target.value)} value={selectedBindingEnvironment}><option value="">Select environment</option>{context.environments.filter((item) => item.isExecutable && item.verificationRecordDigest !== null).map((item) => <option key={item.environmentId} value={item.environmentId}>{item.origin}</option>)}</select></label>
-          <label>Paired runner<select disabled={working} onChange={(event) => setSelectedRunner(event.target.value)} value={selectedRunner}><option value="">Select runner</option>{context.contextBindings.runners.map((item) => <option key={`${item.runnerId}:${item.runnerKeyId}`} value={item.runnerId}>{item.displayName} · {item.fingerprint.slice(0, 12)}</option>)}</select></label>
-          <button className="button button-primary" disabled={working || !selectedBindingEnvironment || !selectedRunner} onClick={() => void createContextBinding()} type="button">Authorize paired runner</button>
+          <label>Paired runner<select disabled={working} onChange={(event) => setSelectedRunner(event.target.value)} value={selectedRunnerAvailable ? selectedRunner : ""}><option value="">Select runner</option>{context.contextBindings.runners.map((item) => <option key={`${item.runnerId}:${item.runnerKeyId}`} value={item.runnerId}>{item.displayName} · {item.fingerprint.slice(0, 12)}</option>)}</select></label>
+          <button className="button button-primary" disabled={working || !selectedBindingEnvironment || !selectedRunnerAvailable} onClick={() => void createContextBinding()} type="button">Authorize paired runner</button>
           {context.contextBindings.bindings.length > 0 ? <ul className="context-binding-list">{context.contextBindings.bindings.map((item) => <li key={item.bindingId}><span>{item.origin} · {item.runnerId} · {item.status}</span>{item.status === "active" ? <button disabled={working} onClick={() => void revokeContextBinding(item.bindingId)} type="button">Revoke</button> : null}</li>)}</ul> : null}
         </section> : null}
       </div>

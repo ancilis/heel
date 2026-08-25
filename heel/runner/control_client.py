@@ -99,6 +99,81 @@ _FINDINGS_RECEIPT_FIELDS = {
     "grant_id", "permit_id", "projection_id", "projection_digest", "byte_count",
     "scenario_count", "finding_count", "accepted_at_ms", "status",
 }
+_ROLLOVER_RECEIPT_CONSTRUCTOR = object()
+_ROLLOVER_RECEIPT_REGISTRY: dict[bytes, tuple["RunnerControlClient", "_RunnerContextRolloverReceipt", object]] = {}
+
+
+class _RunnerContextRolloverReceipt:
+    """Opaque, one-use evidence emitted only after this client's list/claim pair."""
+
+    __slots__ = (
+        "_client_instance", "_store", "_used", "_receipt_id", "_evidence",
+    )
+
+    def __init__(self, token: object, *, client_instance: object, evidence: Mapping[str, object]):
+        if token is not _ROLLOVER_RECEIPT_CONSTRUCTOR:
+            raise TypeError("runner context rollover receipts are internal")
+        self._client_instance = client_instance
+        self._store: object | None = None
+        self._used = False
+        self._receipt_id = secrets.token_bytes(32)
+        self._evidence = dict(evidence)
+
+    def _bind_store(self, store: object) -> None:
+        if self._used or self._store is not None:
+            raise ValueError("runner context rollover receipt is not reusable")
+        self._store = store
+
+    def _assert_bound_for(self, store: object) -> None:
+        if self._used or self._store is not store:
+            raise ValueError("runner context rollover receipt is not valid for this store")
+
+    def _consume_for(
+        self, store: object, *, old_binding_id: str, old_binding_digest: str,
+        new_binding_id: str, new_binding_digest: str,
+    ) -> dict[str, object]:
+        self._assert_bound_for(store)
+        evidence = self._evidence
+        if (
+            evidence.get("old_binding_id") != old_binding_id
+            or evidence.get("old_binding_digest") != old_binding_digest
+            or evidence.get("new_binding_id") != new_binding_id
+            or evidence.get("new_binding_digest") != new_binding_digest
+            or not isinstance(evidence.get("observed_server_time_ms"), int)
+            or not isinstance(evidence.get("list_request_digest"), str)
+            or not isinstance(evidence.get("claim_request_digest"), str)
+            or not isinstance(evidence.get("list_generation"), int)
+            or not isinstance(evidence.get("claim_generation"), int)
+        ):
+            raise ValueError("runner context rollover receipt is inconsistent")
+        self._used = True
+        return dict(evidence)
+
+
+def _registered_rollover_receipt(receipt: object, store: object) -> _RunnerContextRolloverReceipt:
+    if not isinstance(receipt, _RunnerContextRolloverReceipt):
+        raise ValueError("runner context rollover receipt is invalid")
+    registered = _ROLLOVER_RECEIPT_REGISTRY.get(receipt._receipt_id)
+    if registered is None or registered[1] is not receipt or registered[2] is not store:
+        raise ValueError("runner context rollover receipt is not registered")
+    return receipt
+
+
+def _consume_registered_rollover_receipt(
+    receipt: object, store: object, *, old_binding_id: str, old_binding_digest: str,
+    new_binding_id: str, new_binding_digest: str,
+) -> dict[str, object]:
+    checked = _registered_rollover_receipt(receipt, store)
+    try:
+        return checked._consume_for(
+            store, old_binding_id=old_binding_id, old_binding_digest=old_binding_digest,
+            new_binding_id=new_binding_id, new_binding_digest=new_binding_digest,
+        )
+    finally:
+        # A valid attempt is one-use even when a subsequent local write faults.
+        registered = _ROLLOVER_RECEIPT_REGISTRY.pop(checked._receipt_id, None)
+        if registered is not None:
+            registered[0]._rollover_receipts.pop(checked._receipt_id, None)
 
 
 class RunnerControlClient:
@@ -127,6 +202,8 @@ class RunnerControlClient:
         self._chain_locks: dict[str, threading.Lock] = {}
         self._terminal_runs: set[str] = set()
         self._terminal_bindings: dict[str, tuple[str, str, str, str]] = {}
+        self._context_receipt_client_instance = object()
+        self._rollover_receipts: dict[bytes, _RunnerContextRolloverReceipt] = {}
         self.calls: list[_Call] = []
 
     @staticmethod
@@ -493,7 +570,10 @@ class RunnerControlClient:
     def _claim_closed(self):
         return self._closed_control("claim", None)
 
-    def _context_control(self, path: str, request: dict, *, expected_status: int, schema: str) -> dict:
+    def _context_control(
+        self, path: str, request: dict, *, expected_status: int, schema: str,
+        include_call: bool = False,
+    ) -> dict | tuple[dict, _Call]:
         """Use the existing claim PoP chain for the three fixed pairing-only calls."""
         with self._operation_lock("claim", None):
             nonce, sequence, generation, chain = self._next_chain("claim", None)
@@ -554,13 +634,15 @@ class RunnerControlClient:
             next_nonce = response[1].get("X-Heel-Runner-Next-Nonce")
             if not self._b64_32(next_nonce):
                 raise ValueError("invalid runner context response")
+            call = _Call(path, headers, body, "runner_claim", chain, sequence, generation)
             with self._state_lock:
                 current = self._chains.get(chain)
                 if current is not None and current != (nonce, sequence, generation):
                     raise ValueError("runner control chain changed during request")
                 self._chains[chain] = (next_nonce, sequence + 1, generation)
-                self.calls.append(_Call(path, headers, body, "runner_claim", chain, sequence, generation))
-            return dict(response[2])
+                self.calls.append(call)
+            payload = dict(response[2])
+            return (payload, call) if include_call else payload
 
     def list_contexts(self) -> dict:
         request = validate_runner_context_list({"schema_version": "heel.runner-context-list.v1"})
@@ -575,6 +657,77 @@ class RunnerControlClient:
             f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/{binding_id}/claim",
             request, expected_status=200, schema="heel.runner-context-claim-result.v1",
         )
+
+    @staticmethod
+    def _context_call_digest(call: _Call) -> str:
+        return hashlib.sha256(canonical_bytes({
+            "path": call.path, "body_sha256": hashlib.sha256(call.body).hexdigest(),
+            "headers": call.headers, "chain": call.chain, "sequence": call.sequence,
+            "generation": call.generation,
+        })).hexdigest()
+
+    def _claim_single_context_for_rollover(
+        self, old_binding_id: str, old_binding_digest: str,
+    ) -> tuple[dict, _RunnerContextRolloverReceipt] | None | bool:
+        """Produce a private receipt only from this fresh authenticated list→claim pair."""
+        listed_request = validate_runner_context_list({"schema_version": "heel.runner-context-list.v1"})
+        listed, list_call = self._context_control(
+            f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/list",
+            listed_request, expected_status=200, schema="heel.runner-context-list-result.v1", include_call=True,
+        )
+        contexts = listed["contexts"]
+        if len(contexts) == 0:
+            return None
+        if len(contexts) != 1 or listed["has_more"]:
+            raise ValueError("ambiguous cloud runner contexts")
+        item = contexts[0]
+        if (item["binding_id"], item["binding_digest"]) == (old_binding_id, old_binding_digest):
+            return False
+        claim_request = validate_runner_context_claim({
+            "schema_version": "heel.runner-context-claim.v1", "binding_id": item["binding_id"],
+            "binding_digest": item["binding_digest"],
+        })
+        claimed, claim_call = self._context_control(
+            f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/{item['binding_id']}/claim",
+            claim_request, expected_status=200, schema="heel.runner-context-claim-result.v1", include_call=True,
+        )
+        binding = validate_runner_context_binding(claimed["context_binding"])
+        environment = binding["environment"]
+        if (
+            binding["binding_id"] != item["binding_id"]
+            or binding["binding_digest"] != item["binding_digest"]
+            or binding["project_id"] != item["project_id"]
+            or environment["environment_id"] != item["environment_id"]
+            or environment["origin"] != item["origin"]
+            or environment["environment_class"] != item["environment_class"]
+            or environment["verification_record_digest"] != item["verification_record_digest"]
+            or binding["expires_at_ms"] != item["expires_at_ms"]
+        ):
+            raise ValueError("invalid runner context rollover claim")
+        receipt = _RunnerContextRolloverReceipt(
+            _ROLLOVER_RECEIPT_CONSTRUCTOR,
+            client_instance=self._context_receipt_client_instance,
+            evidence={
+                "old_binding_id": old_binding_id, "old_binding_digest": old_binding_digest,
+                "new_binding_id": binding["binding_id"], "new_binding_digest": binding["binding_digest"],
+                "observed_server_time_ms": listed["server_time_ms"],
+                "list_request_digest": self._context_call_digest(list_call),
+                "claim_request_digest": self._context_call_digest(claim_call),
+                "list_generation": list_call.generation, "claim_generation": claim_call.generation,
+            },
+        )
+        self._rollover_receipts[receipt._receipt_id] = receipt
+        return claimed, receipt
+
+    def _bind_rollover_receipt_to_store(self, receipt: object, store: object) -> None:
+        if (
+            not isinstance(receipt, _RunnerContextRolloverReceipt)
+            or receipt._client_instance is not self._context_receipt_client_instance
+            or self._rollover_receipts.get(receipt._receipt_id) is not receipt
+        ):
+            raise ValueError("runner context rollover receipt belongs to another control client")
+        receipt._bind_store(store)
+        _ROLLOVER_RECEIPT_REGISTRY[receipt._receipt_id] = (self, receipt, store)
 
     def submit_context_approval_projection(self, binding_id: str, binding_digest: str, approval_projection: object) -> dict:
         request = validate_runner_approval_projection_submit({

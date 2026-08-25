@@ -524,13 +524,26 @@ class CanaryReaper:
     ) -> dict[str, int]:
         if disclosure is None:
             disclosure = self._disclosure_service(service.conn)
-        counts = service.expire_and_reconcile()
         now_ms = max(0, int(float(self.clock()) * 1000))
         service.conn.execute("BEGIN IMMEDIATE")
         try:
-            context_counts = RunnerContextBindingService(
+            contexts = RunnerContextBindingService(
                 service.conn, signing=self.signing, clock=self.clock,
-            ).expire_and_purge_in_transaction(now_ms)
+            )
+            context_counts = contexts.expire_due_batch_in_transaction(now_ms)
+            cancellation_counts = contexts.cancel_due_batch_in_transaction(now_ms)
+            purge_counts = contexts.expire_and_purge_in_transaction(now_ms)
+            service.conn.commit()
+        except Exception:
+            if service.conn.in_transaction:
+                service.conn.rollback()
+            raise
+        # Context expiry is a stronger pairing authority transition than the
+        # generic approval TTL.  It must cancel its linked awaiting work and
+        # append the context-specific spine before the generic reconciler sees it.
+        counts = service.expire_and_reconcile()
+        service.conn.execute("BEGIN IMMEDIATE")
+        try:
             additional = self._request_authority_stops(service, disclosure, now_ms)
             service.conn.commit()
         except Exception:
@@ -540,9 +553,12 @@ class CanaryReaper:
         for name, value in additional.items():
             counts[name] = counts.get(name, 0) + value
         for name, value in context_counts.items():
-            if name == "next_cursor":
-                continue
             counts[name] = counts.get(name, 0) + value
+        for name, value in cancellation_counts.items():
+            counts[name] = counts.get(name, 0) + value
+        for name, value in purge_counts.items():
+            if name != "next_cursor":
+                counts[name] = counts.get(name, 0) + value
         return counts
 
     def run_once(self) -> dict[str, int]:

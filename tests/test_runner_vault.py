@@ -65,6 +65,30 @@ def store_and_identity(tmp_path):
     return store, identity, signer
 
 
+def _cloud_context_artifact(
+    identity, authority, context, *, binding_id, verification_record_digest, issued_at_ms, expires_at_ms,
+):
+    unsigned = {
+        "schema_version": "heel.runner-context-binding.v1", "binding_id": binding_id,
+        "workspace_id": identity.workspace_id, "project_id": context.project_id,
+        "environment": {
+            "environment_id": context.environment_id, "origin": context.origin,
+            "environment_class": context.environment_class,
+            "verification_record_digest": verification_record_digest,
+        },
+        "runner_binding": {
+            "runner_id": identity.runner_id, "runner_key_id": identity.key_id,
+            "public_key_digest": identity.fingerprint,
+        },
+        "authorization": {"user_id": "owner", "role": "owner"},
+        "issued_at_ms": issued_at_ms, "expires_at_ms": expires_at_ms,
+    }
+    return {
+        **unsigned, "binding_digest": canonical_digest(unsigned),
+        **authority.sign(b"heel.runner-context-binding.v1\0" + canonical_bytes(unsigned)),
+    }
+
+
 def test_cloud_context_sidecar_requires_domain_signature_and_is_immutable(tmp_path):
     store, identity, signer = store_and_identity(tmp_path)
     authority = SigningAuthority.generate()
@@ -148,6 +172,172 @@ def test_expired_cloud_context_rolls_forward_only_with_closed_rollover_evidence(
     assert store.verify_cloud_context_binding(
         identity=identity, trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_002,
     )["binding_id"] == new["binding_id"]
+
+
+def test_proof_generation_rollover_rejects_current_old_authority_and_preserves_it(tmp_path):
+    store, identity, signer = store_and_identity(tmp_path)
+    authority = SigningAuthority.generate()
+    context = store.load_context()
+    old = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "d" * 32,
+        verification_record_digest=context.verification_record_digest,
+        issued_at_ms=1, expires_at_ms=60_001,
+    )
+    store.install_cloud_context_binding(
+        old, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    )
+    new = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "e" * 32,
+        verification_record_digest="e" * 64, issued_at_ms=2, expires_at_ms=120_002,
+    )
+    evidence = RunnerContextRolloverEvidence(
+        old["binding_id"], old["binding_digest"], new["binding_id"],
+        new["binding_digest"], 2,
+    )
+
+    with pytest.raises(RunnerStoreError, match="cannot be replaced"):
+        store.install_cloud_context_binding(
+            new, identity=identity, signer=signer, signer_label="test-signer",
+            trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=2,
+            rollover_evidence=evidence,
+        )
+
+    assert store.load_context().verification_record_digest == old["environment"]["verification_record_digest"]
+    assert store.load_cloud_context_binding()["binding_digest"] == old["binding_digest"]
+
+
+def test_constructed_private_receipt_cannot_authorize_current_cloud_rollover(tmp_path):
+    """Only a client-registered list/claim receipt may replace current authority."""
+    import heel.runner.control_client as control_client_module
+
+    store, identity, signer = store_and_identity(tmp_path)
+    authority = SigningAuthority.generate()
+    context = store.load_context()
+    old = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "c" * 32,
+        verification_record_digest=context.verification_record_digest,
+        issued_at_ms=1, expires_at_ms=60_001,
+    )
+    store.install_cloud_context_binding(
+        old, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    )
+    new = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "b" * 32,
+        verification_record_digest="b" * 64, issued_at_ms=2, expires_at_ms=120_002,
+    )
+    forged = control_client_module._RunnerContextRolloverReceipt(
+        control_client_module._ROLLOVER_RECEIPT_CONSTRUCTOR,
+        client_instance=object(),
+        evidence={
+            "old_binding_id": old["binding_id"],
+            "old_binding_digest": old["binding_digest"],
+            "new_binding_id": new["binding_id"],
+            "new_binding_digest": new["binding_digest"],
+            "observed_server_time_ms": 2,
+            "list_request_digest": "forged",
+            "claim_request_digest": "forged",
+            "list_generation": 0,
+            "claim_generation": 0,
+        },
+    )
+    forged._bind_store(store)
+
+    with pytest.raises(RunnerStoreError, match="rollover receipt"):
+        store._install_cloud_context_binding_from_control(
+            new, identity=identity, signer=signer, signer_label="test-signer",
+            trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=2,
+            rollover_receipt=forged,
+        )
+
+    assert store.load_context().verification_record_digest == old["environment"]["verification_record_digest"]
+    assert store.load_cloud_context_binding()["binding_digest"] == old["binding_digest"]
+
+
+def test_first_cloud_install_journal_blocks_static_adoption_and_exact_retry_recovers(tmp_path, monkeypatch):
+    _bound, identity, signer = store_and_identity(tmp_path / "fixture")
+    store = RunnerStore(tmp_path / "fresh")
+    authority = SigningAuthority.generate()
+    context = RunnerContext(
+        workspace_id=identity.workspace_id, project_id="prj_123456789", environment_id="env_123456789",
+        origin="https://staging.acme.dev", verification_record_digest="0" * 64,
+        environment_class="staging",
+    )
+    artifact = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "f" * 32,
+        verification_record_digest=context.verification_record_digest, issued_at_ms=1, expires_at_ms=60_001,
+    )
+    original_write = runner_store_module._write_json
+
+    def fail_sidecar(directory_fd, filename, value):
+        if filename == "cloud-context-binding.json":
+            raise OSError("injected initial sidecar failure")
+        return original_write(directory_fd, filename, value)
+
+    monkeypatch.setattr(runner_store_module, "_write_json", fail_sidecar)
+    with pytest.raises(OSError, match="initial sidecar"):
+        store.install_cloud_context_binding(
+            artifact, identity=identity, signer=signer, signer_label="test-signer",
+            trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+        )
+    monkeypatch.setattr(runner_store_module, "_write_json", original_write)
+
+    restarted = RunnerStore(tmp_path / "fresh")
+    assert not restarted.is_context_bound
+    with pytest.raises(RunnerStoreError, match="installation requires recovery"):
+        restarted.bind_context(context, identity=identity, signer=signer, signer_label="test-signer")
+    rejected = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "e" * 32,
+        verification_record_digest="e" * 64, issued_at_ms=2, expires_at_ms=120_002,
+    )
+    with pytest.raises(RunnerStoreError, match="cannot be installed over an active context"):
+        restarted.install_cloud_context_binding(
+            rejected, identity=identity, signer=signer, signer_label="test-signer",
+            trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=2,
+        )
+    assert not restarted.is_context_bound
+    assert restarted.install_cloud_context_binding(
+        artifact, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    ) == context
+    assert restarted.load_context() == context
+
+
+def test_first_cloud_install_retries_root_journal_cleanup_after_active_pointer_fault(tmp_path, monkeypatch):
+    _bound, identity, signer = store_and_identity(tmp_path / "fixture")
+    store = RunnerStore(tmp_path / "fresh")
+    authority = SigningAuthority.generate()
+    context = RunnerContext(
+        workspace_id=identity.workspace_id, project_id="prj_123456789", environment_id="env_123456789",
+        origin="https://staging.acme.dev", verification_record_digest="0" * 64,
+        environment_class="staging",
+    )
+    artifact = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "c" * 32,
+        verification_record_digest=context.verification_record_digest, issued_at_ms=1, expires_at_ms=60_001,
+    )
+    original_unlink = runner_store_module.os.unlink
+
+    def fail_root_journal(path, *args, **kwargs):
+        if path == "context-install.json":
+            raise OSError("injected root journal unlink failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(runner_store_module.os, "unlink", fail_root_journal)
+    with pytest.raises(OSError, match="root journal unlink"):
+        store.install_cloud_context_binding(
+            artifact, identity=identity, signer=signer, signer_label="test-signer",
+            trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+        )
+    monkeypatch.setattr(runner_store_module.os, "unlink", original_unlink)
+    restarted = RunnerStore(tmp_path / "fresh")
+    assert restarted.is_context_bound
+    assert restarted.install_cloud_context_binding(
+        artifact, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    ) == context
+    assert not restarted._has_pending_cloud_install()
 
 
 def test_proof_generation_rollover_refuses_a_nonterminal_reserved_local_run(tmp_path):
@@ -248,6 +438,134 @@ def test_rollover_journal_blocks_normal_load_then_recovers_exact_crash_state(tmp
         rollover_evidence=evidence,
     ).verification_record_digest == "4" * 64
     assert restarted.load_context().verification_record_digest == "4" * 64
+
+
+@pytest.mark.parametrize("failure", ["unlink", "directory_fsync"])
+def test_rollover_new_state_retries_exact_cleanup_after_journal_removal_fault(
+    tmp_path, monkeypatch, failure,
+):
+    store, identity, signer = store_and_identity(tmp_path)
+    authority = SigningAuthority.generate()
+    context = store.load_context()
+    old = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "9" * 32,
+        verification_record_digest="0" * 64, issued_at_ms=1, expires_at_ms=60_001,
+    )
+    new = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "a" * 32,
+        verification_record_digest="a" * 64, issued_at_ms=60_002, expires_at_ms=120_003,
+    )
+    evidence = RunnerContextRolloverEvidence(
+        old["binding_id"], old["binding_digest"], new["binding_id"], new["binding_digest"], 60_002,
+    )
+    store.install_cloud_context_binding(
+        old, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    )
+    original_unlink = runner_store_module.os.unlink
+    original_fsync = runner_store_module.os.fsync
+    journal_removed = [False]
+
+    def unlink_journal(path, *args, **kwargs):
+        if path == "context-rollover.json":
+            if failure == "unlink":
+                raise OSError("injected rollover unlink failure")
+            journal_removed[0] = True
+        return original_unlink(path, *args, **kwargs)
+
+    def fsync_after_journal_removal(descriptor):
+        if failure == "directory_fsync" and journal_removed[0]:
+            raise OSError("injected rollover directory fsync failure")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(runner_store_module.os, "unlink", unlink_journal)
+    monkeypatch.setattr(runner_store_module.os, "fsync", fsync_after_journal_removal)
+    with pytest.raises(OSError, match="injected rollover"):
+        store.install_cloud_context_binding(
+            new, identity=identity, signer=signer, signer_label="test-signer",
+            trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_002,
+            rollover_evidence=evidence,
+        )
+    monkeypatch.setattr(runner_store_module.os, "unlink", original_unlink)
+    monkeypatch.setattr(runner_store_module.os, "fsync", original_fsync)
+
+    restarted = RunnerStore(tmp_path / "home")
+    if failure == "unlink":
+        with pytest.raises(RunnerStoreError, match="rollover requires recovery"):
+            restarted.load_context()
+    assert restarted.install_cloud_context_binding(
+        new, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_002,
+        rollover_evidence=evidence,
+    ).verification_record_digest == "a" * 64
+    # Recovery completion is idempotent after the journal finalizer is durable.
+    assert restarted.install_cloud_context_binding(
+        new, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_002,
+        rollover_evidence=evidence,
+    ).verification_record_digest == "a" * 64
+
+
+@pytest.mark.parametrize("tamper", ["signature", "evidence", "artifact"])
+def test_rollover_new_state_rejects_a_tampered_pending_journal(tmp_path, monkeypatch, tamper):
+    store, identity, signer = store_and_identity(tmp_path)
+    authority = SigningAuthority.generate()
+    context = store.load_context()
+    old = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "b" * 32,
+        verification_record_digest="0" * 64, issued_at_ms=1, expires_at_ms=60_001,
+    )
+    new = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "c" * 32,
+        verification_record_digest="c" * 64, issued_at_ms=60_002, expires_at_ms=120_003,
+    )
+    evidence = RunnerContextRolloverEvidence(
+        old["binding_id"], old["binding_digest"], new["binding_id"], new["binding_digest"], 60_002,
+    )
+    store.install_cloud_context_binding(
+        old, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    )
+    original_unlink = runner_store_module.os.unlink
+
+    def fail_journal_unlink(path, *args, **kwargs):
+        if path == "context-rollover.json":
+            raise OSError("injected rollover unlink failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(runner_store_module.os, "unlink", fail_journal_unlink)
+    with pytest.raises(OSError, match="injected rollover unlink"):
+        store.install_cloud_context_binding(
+            new, identity=identity, signer=signer, signer_label="test-signer",
+            trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_002,
+            rollover_evidence=evidence,
+        )
+    monkeypatch.setattr(runner_store_module.os, "unlink", original_unlink)
+
+    restarted = RunnerStore(tmp_path / "home")
+    with restarted._transaction(exclusive=True, allow_rollover_journal=True) as context_fd:
+        journal = runner_store_module._read_json(context_fd, "context-rollover.json", None)
+        if tamper == "signature":
+            journal["signature_b64"] = "A" * 88
+        else:
+            if tamper == "evidence":
+                journal["evidence"]["new_binding_digest"] = "d" * 64
+            else:
+                journal["artifact"]["binding_digest"] = "d" * 64
+            unsigned = {
+                key: value for key, value in journal.items()
+                if key not in {"signing_key_id", "signature_b64"}
+            }
+            journal["signature_b64"] = base64.b64encode(
+                signer.sign(canonical_bytes(unsigned)),
+            ).decode("ascii")
+        runner_store_module._write_json(context_fd, "context-rollover.json", journal)
+    with pytest.raises(RunnerStoreError, match="(invalid cloud context rollover journal|does not match recovery)"):
+        restarted.install_cloud_context_binding(
+            new, identity=identity, signer=signer, signer_label="test-signer",
+            trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_002,
+            rollover_evidence=evidence,
+        )
 
 
 def test_first_cloud_context_sidecar_failure_never_publishes_static_authority(tmp_path, monkeypatch):

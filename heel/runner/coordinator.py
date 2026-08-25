@@ -26,9 +26,7 @@ from heel.runner.execution import (
 )
 from heel.runner.identity import RunnerIdentity, SecureSigner
 from heel.runner.service import ClaimLease
-from heel.runner.store import (
-    RunnerContext, RunnerContextRolloverEvidence, RunnerStore, RunnerStoreError,
-)
+from heel.runner.store import RunnerContext, RunnerStore, RunnerStoreError
 
 
 _MAX_AUTHENTICATED_GATE_AGE_SECONDS = 0.5
@@ -161,6 +159,27 @@ class RunnerCoordinator:
         """Acquire one Cloud authorization before work polling, without synthesizing context."""
         # First pairing has no local namespace: list before touching a namespaced sidecar.
         if not self.store.is_context_bound:
+            pending_install = self.store._pending_cloud_context_install_for_recovery(
+                identity=self.identity, signer=self.signer,
+            )
+            if pending_install is not None:
+                old, _context, _journal = pending_install
+                acquired = self.control._claim_single_context_for_rollover(
+                    old["binding_id"], old["binding_digest"],
+                )
+                if acquired is None:
+                    return False
+                if acquired is False:
+                    self.install_cloud_context_binding(old, signer_label=self.signer.key_id)
+                    return True
+                claimed, receipt = acquired
+                self.control._bind_rollover_receipt_to_store(receipt, self.store)
+                self.store._install_cloud_context_binding_from_control(
+                    claimed["context_binding"], identity=self.identity, signer=self.signer,
+                    signer_label=self.signer.key_id, trusted_cloud_keys=self.trusted_grant_keys,
+                    now_ms=self._now_ms(), rollover_receipt=receipt,
+                )
+                return True
             listed = self.control.list_contexts()
             contexts = listed["contexts"]
             if len(contexts) == 0:
@@ -177,55 +196,57 @@ class RunnerCoordinator:
             current = self.store.verify_cloud_context_binding(
                 identity=self.identity, trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
             )
-            listed = self.control.list_contexts()
-            contexts = listed["contexts"]
-            if len(contexts) == 1 and (contexts[0]["binding_id"], contexts[0]["binding_digest"]) == (
+            acquired = self.control._claim_single_context_for_rollover(
                 current["binding_id"], current["binding_digest"],
-            ):
-                return True
-            if len(contexts) == 0:
-                return False
-            if len(contexts) != 1:
-                raise ValueError("ambiguous cloud runner contexts")
-            item = contexts[0]
-            claimed = self.control.claim_context(item["binding_id"], item["binding_digest"])
-            artifact = claimed["context_binding"]
-            evidence = RunnerContextRolloverEvidence(
-                current["binding_id"], current["binding_digest"], item["binding_id"],
-                item["binding_digest"], listed["server_time_ms"],
             )
-            self.store.install_cloud_context_binding(
-                artifact, identity=self.identity, signer=self.signer,
+            if acquired is None:
+                return False
+            if acquired is False:
+                # A crash after active-context publication but before the root
+                # journal cleanup is an already-authorized exact install, not a
+                # static fallback.  Re-enter the closed idempotent path to finish it.
+                self.install_cloud_context_binding(current, signer_label=self.signer.key_id)
+                return True
+            claimed, receipt = acquired
+            self.control._bind_rollover_receipt_to_store(receipt, self.store)
+            self.store._install_cloud_context_binding_from_control(
+                claimed["context_binding"],
+                identity=self.identity, signer=self.signer,
                 signer_label=self.signer.key_id, trusted_cloud_keys=self.trusted_grant_keys,
-                now_ms=self._now_ms(), rollover_evidence=evidence,
+                now_ms=self._now_ms(), rollover_receipt=receipt,
             )
             return True
         except RunnerStoreError:
             if self.store.has_cloud_context_provenance():
                 try:
-                    old = self.store.load_cloud_context_binding_for_recovery()
+                    pending_rollover = self.store._pending_context_rollover_for_recovery(identity=self.identity)
+                    old = (
+                        {"binding_id": pending_rollover["old_binding_id"],
+                         "binding_digest": pending_rollover["old_binding_digest"]}
+                        if pending_rollover is not None
+                        else self.store.load_cloud_context_binding_for_recovery()
+                    )
                 except RunnerStoreError:
                     old = None
-                listed = self.control.list_contexts()
-                contexts = listed["contexts"]
-                if len(contexts) == 0:
+                if old is None:
+                    listed = self.control.list_contexts()
+                    if len(listed["contexts"]) == 0:
+                        return False
+                    raise ValueError("cloud context binding no longer verifies")
+                acquired = self.control._claim_single_context_for_rollover(
+                    old["binding_id"], old["binding_digest"],
+                )
+                if acquired is None:
                     return False
-                if len(contexts) != 1:
-                    raise ValueError("ambiguous cloud runner contexts")
-                item = contexts[0]
-                claimed = self.control.claim_context(item["binding_id"], item["binding_digest"])
+                if acquired is False:
+                    raise ValueError("cloud context binding no longer verifies")
+                claimed, receipt = acquired
                 try:
-                    artifact = claimed["context_binding"]
-                    evidence = (
-                        RunnerContextRolloverEvidence(
-                            old["binding_id"], old["binding_digest"], item["binding_id"],
-                            item["binding_digest"], listed["server_time_ms"],
-                        ) if old is not None else None
-                    )
-                    self.store.install_cloud_context_binding(
-                        artifact, identity=self.identity, signer=self.signer,
+                    self.control._bind_rollover_receipt_to_store(receipt, self.store)
+                    self.store._install_cloud_context_binding_from_control(
+                        claimed["context_binding"], identity=self.identity, signer=self.signer,
                         signer_label=self.signer.key_id, trusted_cloud_keys=self.trusted_grant_keys,
-                        now_ms=self._now_ms(), rollover_evidence=evidence,
+                        now_ms=self._now_ms(), rollover_receipt=receipt,
                     )
                 except RunnerStoreError:
                     raise ValueError("cloud context binding no longer verifies") from None

@@ -75,6 +75,7 @@ class RunnerContextBindingService:
 
     def _event(self, row: sqlite3.Row, action: str, actor_class: str, actor_id: str, *, reason: str | None = None) -> None:
         now = self._now_ms()
+        purge_at = now + CONTEXT_RETENTION_MS
         self.conn.execute(
             "INSERT INTO canary_runner_context_events("
             "rce_id,workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,"
@@ -83,28 +84,103 @@ class RunnerContextBindingService:
             (
                 "rce_" + secrets.token_hex(16), row["workspace_id"], row["project_ref"],
                 row["environment_id"], row["runner_id"], row["runner_key_id"], row["rcb_id"],
-                action, actor_class, actor_id, reason, row["binding_digest"], now,
-                now + CONTEXT_RETENTION_MS,
+                action, actor_class, actor_id, reason, row["binding_digest"], now, purge_at,
             ),
         )
+        # Terminal history cannot be collected before the latest child event.
+        # This matters when a TTL transition is reconciled late by the reaper.
+        self.conn.execute(
+            "UPDATE canary_runner_context_bindings SET purge_at_ms=MAX(purge_at_ms,?) WHERE rcb_id=?",
+            (purge_at, row["rcb_id"]),
+        )
 
-    def _expire_in_transaction(self, now: int) -> tuple[int, int]:
+    def _expire_rows_in_transaction(self, rows: list[sqlite3.Row], now: int) -> int:
+        """Transition already-bounded rows only; linked cancellation belongs to reaper."""
+        changed = 0
+        for row in rows:
+            result = self.conn.execute(
+                "UPDATE canary_runner_context_bindings SET status='expired' "
+                "WHERE rcb_id=? AND status='active' AND expires_at_ms<=?",
+                (row["rcb_id"], now),
+            )
+            if result.rowcount == 1:
+                self._event(row, "expired", "system", "control-plane", reason="ttl_elapsed")
+                changed += 1
+        return changed
+
+    def _expire_scoped_in_transaction(
+        self, now: int, *, workspace_id: str, runner_id: str, runner_key_id: str | None = None,
+        project_id: str | None = None, binding_id: str | None = None, binding_digest: str | None = None,
+    ) -> int:
+        clauses = ["workspace_id=?", "runner_id=?", "status='active'", "expires_at_ms<=?"]
+        values: list[object] = [workspace_id, runner_id, now]
+        for column, value in (("runner_key_id", runner_key_id), ("project_ref", project_id),
+                              ("rcb_id", binding_id), ("binding_digest", binding_digest)):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                values.append(value)
         rows = self.conn.execute(
-            "SELECT * FROM canary_runner_context_bindings WHERE status='active' AND expires_at_ms<=?",
-            (now,),
+            "SELECT * FROM canary_runner_context_bindings WHERE " + " AND ".join(clauses)
+            + " ORDER BY expires_at_ms,rcb_id LIMIT 2", values,
+        ).fetchall()
+        if len(rows) > 1:
+            raise RuntimeError("runner context expiry scope is inconsistent")
+        return self._expire_rows_in_transaction(rows, now)
+
+    def expire_due_batch_in_transaction(self, now_ms: int, *, limit: int = 128) -> dict[str, int]:
+        if not self.conn.in_transaction:
+            raise RuntimeError("runner context expiry requires caller transaction")
+        if type(now_ms) is not int or not 0 <= now_ms <= 9_007_199_254_740_991:
+            raise ValueError("invalid runner context expiry time")
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError("invalid runner context batch limit")
+        rows = self.conn.execute(
+            "SELECT * FROM canary_runner_context_bindings WHERE status='active' AND expires_at_ms<=? "
+            "ORDER BY expires_at_ms,rcb_id LIMIT ?", (now_ms, limit + 1),
+        ).fetchall()
+        return {"expired_runner_contexts": self._expire_rows_in_transaction(rows[:limit], now_ms),
+                "runner_context_expiry_has_more": int(len(rows) > limit)}
+
+    def cancel_due_batch_in_transaction(self, now_ms: int, *, limit: int = 128) -> dict[str, int]:
+        """Cancel at most one deterministic linked awaiting run per selected row."""
+        if not self.conn.in_transaction:
+            raise RuntimeError("runner context cancellation requires caller transaction")
+        if type(now_ms) is not int or not 0 <= now_ms <= 9_007_199_254_740_991:
+            raise ValueError("invalid runner context expiry time")
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError("invalid runner context batch limit")
+        rows = self.conn.execute(
+            "SELECT b.*,l.run_id FROM canary_runner_context_bindings b "
+            "JOIN canary_runner_context_projection_links l ON l.workspace_id=b.workspace_id "
+            "AND l.project_ref=b.project_ref AND l.rcb_id=b.rcb_id AND l.binding_digest=b.binding_digest "
+            "JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id AND a.project_ref=l.project_ref "
+            "AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
+            "JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref AND r.run_id=l.run_id "
+            "WHERE b.status IN ('revoked','expired') "
+            "AND a.status='awaiting_execution_approval' AND r.status IN ('prepared','awaiting_execution_approval') "
+            "ORDER BY b.expires_at_ms,b.rcb_id,l.run_id LIMIT ?", (limit + 1,),
         ).fetchall()
         cancelled = 0
-        for row in rows:
+        for row in rows[:limit]:
+            run_id = row["run_id"]
+            actor_class = "human" if row["status"] == "revoked" else "system"
+            actor_id = row["revoked_by"] if actor_class == "human" else "control-plane"
+            reason = "runner_context_revoked" if actor_class == "human" else "runner_context_expired"
             cancelled += self._cancel_linked_pending_in_transaction(
-                row, actor_class="system", actor_id="control-plane",
-                reason_code="runner_context_expired", now_ms=now,
+                row, actor_class=actor_class, actor_id=actor_id, reason_code=reason,
+                now_ms=now_ms, run_id=run_id,
             )
-            self.conn.execute("UPDATE canary_runner_context_bindings SET status='expired' WHERE rcb_id=?", (row["rcb_id"],))
-            self._event(row, "expired", "system", "control-plane", reason="ttl_elapsed")
-        return len(rows), cancelled
+        return {
+            "cancelled_context_projections": cancelled,
+            "cancelled_context_runs": cancelled,
+            "context_cancellation_events": cancelled,
+            "context_cancellation_audits": cancelled,
+            "runner_context_cancellation_has_more": int(len(rows) > limit),
+        }
 
     def _cancel_linked_pending_in_transaction(
         self, row: sqlite3.Row, *, actor_class: str, actor_id: str, reason_code: str, now_ms: int,
+        run_id: str | None = None,
     ) -> int:
         """Use the Task-7 append-only event/audit writer on this exact transaction."""
         if not self.conn.in_transaction:
@@ -118,7 +194,7 @@ class RunnerContextBindingService:
         )
         return runs.cancel_context_pending_in_transaction(
             row, actor_class=actor_class, actor_id=actor_id, reason_code=reason_code,
-            now_ms=now_ms,
+            now_ms=now_ms, run_id=run_id,
         )
 
     def expire_and_purge_in_transaction(self, now_ms: int, *, limit: int = 128) -> dict:
@@ -129,17 +205,32 @@ class RunnerContextBindingService:
             raise ValueError("invalid runner context expiry time")
         if type(limit) is not int or isinstance(limit, bool) or not 1 <= limit <= 128:
             raise ValueError("invalid runner context purge limit")
-        expired, cancelled = self._expire_in_transaction(now_ms)
         rows = self.conn.execute(
             "SELECT * FROM canary_runner_context_bindings "
             "WHERE status IN ('expired','revoked') AND purge_at_ms<=? "
+            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_events e "
+            "WHERE e.workspace_id=canary_runner_context_bindings.workspace_id "
+            "AND e.project_ref=canary_runner_context_bindings.project_ref "
+            "AND e.rcb_id=canary_runner_context_bindings.rcb_id "
+            "AND e.binding_digest=canary_runner_context_bindings.binding_digest AND e.purge_at_ms>?) "
+            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_projection_links l "
+            "JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id AND a.project_ref=l.project_ref "
+            "AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
+            "JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref AND r.run_id=l.run_id "
+            "WHERE l.workspace_id=canary_runner_context_bindings.workspace_id "
+            "AND l.project_ref=canary_runner_context_bindings.project_ref "
+            "AND l.rcb_id=canary_runner_context_bindings.rcb_id "
+            "AND l.binding_digest=canary_runner_context_bindings.binding_digest "
+            "AND a.status='awaiting_execution_approval' "
+            "AND r.status IN ('prepared','awaiting_execution_approval') "
+            "AND r.grant_id IS NULL AND r.reservation_id IS NULL AND r.quota_state='unreserved') "
             "ORDER BY purge_at_ms,rcb_id LIMIT ?",
-            (now_ms, limit + 1),
+            (now_ms, now_ms, limit + 1),
         ).fetchall()
         selected = rows[:limit]
         counts: dict[str, int | dict | None] = {
-            "expired_bindings": expired,
-            "cancelled_projections": cancelled,
+            "expired_bindings": 0,
+            "cancelled_projections": 0,
             "purged_links": 0,
             "purged_events": 0,
             "purged_bindings": 0,
@@ -149,13 +240,6 @@ class RunnerContextBindingService:
             ),
         }
         for row in selected:
-            live_event = self.conn.execute(
-                "SELECT 1 FROM canary_runner_context_events WHERE workspace_id=? AND project_ref=? "
-                "AND rcb_id=? AND binding_digest=? AND purge_at_ms>? LIMIT 1",
-                (row["workspace_id"], row["project_ref"], row["rcb_id"], row["binding_digest"], now_ms),
-            ).fetchone()
-            if live_event is not None:
-                raise RuntimeError("runner context purge has live event retention")
             pregrant = self.conn.execute(
                 "SELECT 1 FROM canary_runner_context_projection_links l "
                 "JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id AND a.project_ref=l.project_ref "
@@ -198,7 +282,7 @@ class RunnerContextBindingService:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             authorized_role = self._assert_membership(workspace_id, actor, role)
-            self._expire_in_transaction(now)
+            self._expire_scoped_in_transaction(now, workspace_id=workspace_id, runner_id=request["runner_id"])
             row = self.conn.execute(
                 "SELECT e.origin,e.environment_class,e.status AS environment_status,e.revoked_at,"
                 "e.proof_expires_at,e.verification_record_digest,k.public_key,k.status AS key_status,"
@@ -279,7 +363,15 @@ class RunnerContextBindingService:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             self._assert_membership(workspace_id, actor, role)
-            self._expire_in_transaction(now)
+            row = self.conn.execute(
+                "SELECT runner_id FROM canary_runner_context_bindings WHERE workspace_id=? AND project_ref=? AND rcb_id=?",
+                (workspace_id, project_id, binding_id),
+            ).fetchone()
+            if row is not None:
+                self._expire_scoped_in_transaction(
+                    now, workspace_id=workspace_id, project_id=project_id,
+                    runner_id=row["runner_id"], binding_id=binding_id,
+                )
             row = self.conn.execute(
                 "SELECT * FROM canary_runner_context_bindings WHERE workspace_id=? AND project_ref=? AND rcb_id=?",
                 (workspace_id, project_id, binding_id),
@@ -324,7 +416,10 @@ class RunnerContextBindingService:
             "FROM canary_runners r JOIN canary_runner_keys k ON k.workspace_id=r.workspace_id AND k.runner_id=r.runner_id "
             "JOIN canary_runner_identity_records i ON i.workspace_id=r.workspace_id AND i.runner_id=r.runner_id "
             "WHERE r.workspace_id=? AND r.status='active' AND k.status='active' AND k.revoked_at IS NULL "
-            "ORDER BY r.runner_id,k.key_id LIMIT 17", (workspace_id,),
+            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_bindings b "
+            "WHERE b.workspace_id=r.workspace_id AND b.runner_id=r.runner_id "
+            "AND b.status='active' AND b.expires_at_ms>?) "
+            "ORDER BY r.runner_id,k.key_id LIMIT 17", (workspace_id, now),
         ).fetchall()
         binding_rows = self.conn.execute(
             "SELECT * FROM canary_runner_context_bindings WHERE workspace_id=? AND project_ref=? "
@@ -360,7 +455,9 @@ class RunnerContextBindingService:
         if not self.conn.in_transaction:
             raise RuntimeError("runner context list requires caller transaction")
         now = self._now_ms()
-        self._expire_in_transaction(now)
+        self._expire_scoped_in_transaction(
+            now, workspace_id=workspace_id, runner_id=runner_id, runner_key_id=runner_key_id,
+        )
         rows = self.conn.execute(
             "SELECT b.*,k.public_key,i.identity_json FROM canary_runner_context_bindings b "
             "JOIN canary_environments e ON e.workspace_id=b.workspace_id AND e.project_ref=b.project_ref AND e.environment_id=b.environment_id "
@@ -456,7 +553,10 @@ class RunnerContextBindingService:
         if not self.conn.in_transaction:
             raise RuntimeError("runner context validation requires caller transaction")
         now = self._now_ms()
-        self._expire_in_transaction(now)
+        self._expire_scoped_in_transaction(
+            now, workspace_id=workspace_id, runner_id=runner_id, runner_key_id=runner_key_id,
+            binding_id=binding_id, binding_digest=binding_digest,
+        )
         row = self.conn.execute(
             "SELECT b.*,k.public_key,i.identity_json FROM canary_runner_context_bindings b "
             "JOIN canary_environments e ON e.workspace_id=b.workspace_id AND e.project_ref=b.project_ref AND e.environment_id=b.environment_id "

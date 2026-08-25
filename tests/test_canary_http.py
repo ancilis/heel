@@ -235,6 +235,41 @@ def test_runner_context_human_routes_reject_raw_path_aliases(canary_http):
     ).fetchone()[0] == before
 
 
+def test_context_dashboard_hides_runner_bound_in_another_project_until_revoke(canary_http):
+    fixture = canary_http
+    first_path = f"/v1/workspaces/{fixture.workspace}/projects/{fixture.project}/runner-context-bindings"
+    create = {
+        "schema_version": "heel.runner-context-binding-create.v1", "environment_id": "env_canary",
+        "verification_record_digest": "a" * 64, "runner_id": fixture.runner_id,
+        "runner_key_id": fixture.runner.key_id,
+    }
+    status, _, created = fixture.request("POST", first_path, headers=fixture.browser, raw=canonical_bytes(create))
+    assert status == 201
+    other = fixture.cp.projects.create(
+        fixture.workspace, "Other", created_by=fixture.user,
+    ).project_ref
+    other_path = f"/v1/workspaces/{fixture.workspace}/projects/{other}/runner-context-bindings"
+
+    status, _, current = fixture.request("GET", first_path, headers=fixture.browser)
+    assert status == 200
+    assert current["runners"] == []
+    assert [item["binding_id"] for item in current["bindings"]] == [created["context_binding"]["binding_id"]]
+    status, _, occupied = fixture.request("GET", other_path, headers=fixture.browser)
+    assert status == 200
+    assert occupied["runners"] == []
+    assert occupied["bindings"] == []
+
+    revoke = {"schema_version": "heel.runner-context-binding-revoke.v1", "reason_code": "operator_requested"}
+    status, _, _ = fixture.request(
+        "POST", f"{first_path}/{created['context_binding']['binding_id']}/revoke",
+        headers=fixture.browser, raw=canonical_bytes(revoke),
+    )
+    assert status == 200
+    status, _, available = fixture.request("GET", other_path, headers=fixture.browser)
+    assert status == 200
+    assert [item["runner_id"] for item in available["runners"]] == [fixture.runner_id]
+
+
 def test_execution_approval_claim_heartbeat_progress_status_events_are_real(canary_http):
     fixture = canary_http
     projection = approval_projection(

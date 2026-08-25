@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import shutil
 from types import SimpleNamespace
 import threading
 
@@ -17,7 +18,7 @@ from heel.runner.coordinator import RunnerCoordinator, RunnerExecutionAdapter
 from heel.runner.http_transport import CancellationToken
 from heel.runner.execution import ExecutionBundle, ExecutionGate
 from heel.runner.service import ClaimLease, RunnerService
-from heel.runner.store import RunnerStore
+from heel.runner.store import RunnerStore, RunnerStoreError
 import heel.runner.store as runner_store_module
 from tests.test_runner_stop import (
     BlockingExecutor, StopCoordinator, compiled_pair, signed_grant,
@@ -278,6 +279,140 @@ def test_first_cloud_context_acquisition_lists_before_binding_a_namespace(tmp_pa
     assert store.load_binding()["signer_label"] == identity.key_id
 
 
+def test_pending_first_install_rolls_forward_only_from_fresh_singleton_claim(tmp_path, monkeypatch):
+    bound, identity, signer, _manifest, _projection = compiled_pair(tmp_path / "fixture")
+    context = bound.load_context()
+    store = RunnerStore(tmp_path / "fresh")
+    authority = SigningAuthority.generate()
+
+    def artifact(binding_id, verification_digest, issued_at, expires_at):
+        unsigned = {
+            "schema_version": "heel.runner-context-binding.v1", "binding_id": binding_id,
+            "workspace_id": identity.workspace_id, "project_id": context.project_id,
+            "environment": {"environment_id": context.environment_id, "origin": context.origin,
+                            "environment_class": context.environment_class,
+                            "verification_record_digest": verification_digest},
+            "runner_binding": {"runner_id": identity.runner_id, "runner_key_id": identity.key_id,
+                               "public_key_digest": identity.fingerprint},
+            "authorization": {"user_id": "owner", "role": "owner"},
+            "issued_at_ms": issued_at, "expires_at_ms": expires_at,
+        }
+        return {**unsigned, "binding_digest": canonical_digest(unsigned),
+                **authority.sign(b"heel.runner-context-binding.v1\0" + canonical_bytes(unsigned))}
+
+    old = artifact("rcb_" + "1" * 32, context.verification_record_digest, 1, 60_001)
+    new = artifact("rcb_" + "2" * 32, "2" * 64, 2, 120_002)
+    original_write = runner_store_module._write_json
+
+    def fail_active(directory_fd, filename, value):
+        if filename == "active-context.json":
+            raise OSError("injected active selector failure")
+        return original_write(directory_fd, filename, value)
+
+    monkeypatch.setattr(runner_store_module, "_write_json", fail_active)
+    with pytest.raises(OSError, match="active selector"):
+        store.install_cloud_context_binding(
+            old, identity=identity, signer=signer, signer_label=identity.key_id,
+            trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+        )
+    monkeypatch.setattr(runner_store_module, "_write_json", original_write)
+    restarted = RunnerStore(tmp_path / "fresh")
+    assert not restarted.is_context_bound
+    calls: list[str] = []
+
+    class Transport:
+        def post(self, path, *, headers, body):
+            if path.endswith("/contexts/list"):
+                calls.append("list")
+                return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"a")}, {
+                    "schema_version": "heel.runner-context-list-result.v1", "server_time_ms": 2,
+                    "contexts": [{"binding_id": new["binding_id"], "binding_digest": new["binding_digest"],
+                                  "project_id": context.project_id, "environment_id": context.environment_id,
+                                  "origin": context.origin, "environment_class": context.environment_class,
+                                  "verification_record_digest": "2" * 64, "expires_at_ms": 120_002,
+                                  "claimed": False}], "has_more": False,
+                }
+            calls.append("claim")
+            assert path.endswith(f"/contexts/{new['binding_id']}/claim")
+            return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"b")}, {
+                "schema_version": "heel.runner-context-claim-result.v1", "context_binding": new,
+                "claimed_at_ms": 2,
+            }
+
+    control = RunnerControlClient(
+        origin="https://control.example", workspace_id=identity.workspace_id, runner_id=identity.runner_id,
+        signer=signer, clock=lambda: 2, transport=Transport(), nonce_source=lambda _chain: _nonce(b"c"),
+        trusted_disclosure_keys={authority.key_id: authority.public_key},
+    )
+    coordinator = RunnerCoordinator(
+        control=control, store=restarted, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key}, clock_ms=lambda: 2,
+    )
+    # The root first-install journal is still old here.  A subsequent Cloud
+    # proof-generation rollover can finish its namespaced records but fault
+    # before the root active selector is published.  Its signed rollover
+    # journal must remain durable until that final root commit.
+    def fail_successor_active(directory_fd, filename, value):
+        if filename == "active-context.json":
+            raise OSError("injected successor active selector failure")
+        return original_write(directory_fd, filename, value)
+
+    monkeypatch.setattr(runner_store_module, "_write_json", fail_successor_active)
+    with pytest.raises(OSError, match="successor active selector"):
+        coordinator.ensure_runner_context()
+    monkeypatch.setattr(runner_store_module, "_write_json", original_write)
+    assert not restarted.is_context_bound
+    restarted._namespace = context.namespace
+    with restarted._transaction(exclusive=False, allow_rollover_journal=True) as context_fd:
+        assert runner_store_module._read_json(context_fd, "context-rollover.json", None) is not None
+    restarted._namespace = None
+
+    def recovery_coordinator(directory, token):
+        recovery_store = RunnerStore(directory)
+        recovery_control = RunnerControlClient(
+            origin="https://control.example", workspace_id=identity.workspace_id, runner_id=identity.runner_id,
+            signer=signer, clock=lambda: 2, transport=Transport(), nonce_source=lambda _chain: _nonce(token),
+            trusted_disclosure_keys={authority.key_id: authority.public_key},
+        )
+        return recovery_store, RunnerCoordinator(
+            control=recovery_control, store=recovery_store, identity=identity, signer=signer,
+            trusted_grant_keys={authority.key_id: authority.public_key}, clock_ms=lambda: 2,
+        )
+
+    # Neither a tampered signed journal nor a durable local binding for a third
+    # context is recoverable.  Both retain the exact root old intent, proving
+    # that recovery cannot adopt arbitrary orphaned namespace state.
+    tampered = tmp_path / "tampered"
+    shutil.copytree(tmp_path / "fresh", tampered)
+    tampered_store = RunnerStore(tampered)
+    tampered_store._namespace = context.namespace
+    with tampered_store._transaction(exclusive=True, allow_rollover_journal=True) as context_fd:
+        journal = runner_store_module._read_json(context_fd, "context-rollover.json", None)
+        journal["signature_b64"] = "A" * 88
+        runner_store_module._write_json(context_fd, "context-rollover.json", journal)
+    _tampered_store, tampered_coordinator = recovery_coordinator(tampered, b"e")
+    with pytest.raises(RunnerStoreError, match="invalid cloud context rollover journal"):
+        tampered_coordinator.ensure_runner_context()
+
+    mixed = tmp_path / "mixed"
+    shutil.copytree(tmp_path / "fresh", mixed)
+    mixed_store = RunnerStore(mixed)
+    mixed_store._namespace = context.namespace
+    with mixed_store._transaction(exclusive=True, allow_rollover_journal=True) as context_fd:
+        local = mixed_store._binding_locked(context_fd)
+        local["context"] = {**local["context"], "verification_record_digest": "3" * 64}
+        runner_store_module._write_json(context_fd, "binding.json", local)
+    _mixed_store, mixed_coordinator = recovery_coordinator(mixed, b"f")
+    with pytest.raises(RunnerStoreError, match="installation recovery state is inconsistent"):
+        mixed_coordinator.ensure_runner_context()
+
+    recovered_store, recovered = recovery_coordinator(tmp_path / "fresh", b"d")
+    assert recovered.ensure_runner_context() is True
+    assert calls == ["list", "claim"] * 4
+    assert recovered_store.load_context().verification_record_digest == "2" * 64
+    assert recovered_store.load_cloud_context_binding()["binding_id"] == new["binding_id"]
+
+
 def test_failed_cloud_install_provenance_never_downgrades_to_static_context(tmp_path, monkeypatch):
     store, identity, signer, _manifest, _projection = compiled_pair(tmp_path)
     authority = SigningAuthority.generate()
@@ -363,7 +498,7 @@ def test_coordinator_rolls_forward_only_from_one_fresh_list_and_matching_claim(t
         }
 
     old = artifact("rcb_" + "7" * 32, context.verification_record_digest, 1, 60_001)
-    new = artifact("rcb_" + "8" * 32, "8" * 64, 60_002, 120_003)
+    new = artifact("rcb_" + "8" * 32, "8" * 64, 2, 120_003)
     store.install_cloud_context_binding(
         old, identity=identity, signer=signer, signer_label="test-signer",
         trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
@@ -375,7 +510,7 @@ def test_coordinator_rolls_forward_only_from_one_fresh_list_and_matching_claim(t
             if path.endswith("/contexts/list"):
                 calls.append("list")
                 return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"r")}, {
-                    "schema_version": "heel.runner-context-list-result.v1", "server_time_ms": 60_002,
+                    "schema_version": "heel.runner-context-list-result.v1", "server_time_ms": 2,
                     "contexts": [{
                         "binding_id": new["binding_id"], "binding_digest": new["binding_digest"],
                         "project_id": context.project_id, "environment_id": context.environment_id,
@@ -388,18 +523,18 @@ def test_coordinator_rolls_forward_only_from_one_fresh_list_and_matching_claim(t
             calls.append("claim")
             return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"s")}, {
                 "schema_version": "heel.runner-context-claim-result.v1",
-                "context_binding": new, "claimed_at_ms": 60_002,
+                "context_binding": new, "claimed_at_ms": 2,
             }
 
     control = RunnerControlClient(
         origin="https://control.example", workspace_id=identity.workspace_id,
-        runner_id=identity.runner_id, signer=signer, clock=lambda: 60_002,
+        runner_id=identity.runner_id, signer=signer, clock=lambda: 2,
         transport=Transport(), nonce_source=lambda _chain: _nonce(b"q"),
         trusted_disclosure_keys={authority.key_id: authority.public_key},
     )
     coordinator = RunnerCoordinator(
         control=control, store=store, identity=identity, signer=signer,
-        trusted_grant_keys={authority.key_id: authority.public_key}, clock_ms=lambda: 60_002,
+        trusted_grant_keys={authority.key_id: authority.public_key}, clock_ms=lambda: 2,
     )
 
     assert coordinator.ensure_runner_context() is True
