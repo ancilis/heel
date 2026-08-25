@@ -1,10 +1,14 @@
+import base64
 import hashlib
+import io
+import subprocess
 
 import pytest
 
 from heel.crypto import ed25519_key_id
 from heel.runner.identity import (
     InMemorySecretBackend,
+    MacOSKeychainSecretBackend,
     SecureSigner,
     SystemSecureSigner,
     create_runner_identity,
@@ -97,3 +101,81 @@ def test_system_secure_signer_persists_only_behind_explicit_secret_backend():
     assert first.public_key == second.public_key
     assert first.sign(b"control") == second.sign(b"control")
     assert "seed" not in repr(first).lower()
+
+
+class _InputRecorder:
+    def __init__(self): self.data = bytearray(); self.closed = False
+    def write(self, value): self.data.extend(value); return len(value)
+    def flush(self): return None
+    def close(self): self.closed = True
+
+
+class _FakeProcess:
+    def __init__(self, argv, *, returncode, stdout):
+        self.argv = tuple(argv)
+        self.returncode = returncode
+        self.stdin = _InputRecorder()
+        self.stdout = io.BytesIO(stdout)
+        self.wait_timeouts = []
+        self.killed = False
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        return self.returncode
+
+    def kill(self): self.killed = True
+
+
+def test_macos_first_create_never_places_ed25519_seed_in_process_argv(monkeypatch):
+    expected_seed = b"k" * 32
+    encoded_seed = base64.b64encode(expected_seed)
+    calls = []
+
+    def popen(argv, **kwargs):
+        process = _FakeProcess(
+            argv, returncode=44 if argv[1] == "find-generic-password" else 0,
+            stdout=b"",
+        )
+        calls.append((tuple(argv), kwargs, process))
+        return process
+
+    monkeypatch.setattr("heel.runner.identity._verified_security_path",
+                        lambda: "/usr/bin/security")
+    monkeypatch.setattr("heel.runner.identity.secrets.token_bytes", lambda count: expected_seed)
+    signer = SystemSecureSigner(
+        "runner-one", backend=MacOSKeychainSecretBackend(popen=popen),
+    )
+    assert signer.public_key and encoded_seed not in repr(signer).encode()
+    assert len(calls) == 2
+    for argv, kwargs, process in calls:
+        assert argv[0] == "/usr/bin/security" and argv[-1] == "-w"
+        assert encoded_seed.decode() not in argv
+        assert kwargs == {
+            "stdin": subprocess.PIPE, "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL, "shell": False, "bufsize": 0,
+            "env": {"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        }
+        assert process.wait_timeouts == [5]
+    assert bytes(calls[0][2].stdin.data) == b""
+    assert bytes(calls[1][2].stdin.data) == encoded_seed
+
+
+def test_macos_load_is_bounded_and_never_exposes_helper_output(monkeypatch):
+    secret_marker = b"private-helper-output"
+    calls = []
+
+    def popen(argv, **kwargs):
+        process = _FakeProcess(argv, returncode=0, stdout=secret_marker * 100)
+        calls.append((tuple(argv), kwargs, process))
+        return process
+
+    monkeypatch.setattr("heel.runner.identity._verified_security_path",
+                        lambda: "/usr/bin/security")
+    backend = MacOSKeychainSecretBackend(popen=popen)
+    with pytest.raises(RuntimeError, match="invalid material") as caught:
+        backend.load("runner-one")
+    assert calls[0][0] == (
+        "/usr/bin/security", "find-generic-password", "-s",
+        "heel.runner.ed25519.v1", "-a", "runner-one", "-w",
+    )
+    assert secret_marker.decode() not in str(caught.value)

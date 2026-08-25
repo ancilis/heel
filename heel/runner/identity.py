@@ -9,7 +9,9 @@ import base64
 import hashlib
 import os
 import secrets
+import stat
 import subprocess
+import threading
 import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
@@ -20,6 +22,9 @@ from heel.crypto import ed25519_key_id
 RUNNER_CAPABILITIES = (
     "runner_claim", "runner_heartbeat", "runner_progress", "runner_result",
 )
+_MACOS_SECURITY_PATH = "/usr/bin/security"
+_KEYCHAIN_TIMEOUT_SECONDS = 5
+_MAX_KEYCHAIN_OUTPUT_BYTES = 1024
 
 
 def _phrase_words() -> tuple[str, ...]:
@@ -100,15 +105,124 @@ class _CommandSecretBackend:
         return label
 
 
-class MacOSKeychainSecretBackend(_CommandSecretBackend):
+def _verified_security_path() -> str:
+    """Return the one fixed macOS helper only when it is a regular executable."""
+    path = _MACOS_SECURITY_PATH
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise RuntimeError("runner OS secret service unavailable")
+    try:
+        status = os.stat(path, follow_symlinks=False)
+    except OSError:
+        raise RuntimeError("runner OS secret service unavailable") from None
+    if not stat.S_ISREG(status.st_mode) or not os.access(path, os.X_OK):
+        raise RuntimeError("runner OS secret service unavailable")
+    return path
+
+
+def _run_bounded_security(
+    arguments: tuple[str, ...], *, payload: bytes | None, popen: Callable[..., object],
+) -> subprocess.CompletedProcess:
+    """Run macOS Keychain with bounded capture and secret input isolated to stdin."""
+    argv = (_verified_security_path(), *arguments)
+    try:
+        process = popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            bufsize=0,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        process_stdin = process.stdin
+        process_stdout = process.stdout
+    except (AttributeError, OSError, TypeError, ValueError):
+        raise RuntimeError("runner OS secret service unavailable") from None
+    if process_stdin is None or process_stdout is None:
+        try:
+            process.kill()
+            process.wait()
+        except (AttributeError, OSError, subprocess.SubprocessError):
+            pass
+        raise RuntimeError("runner OS secret service unavailable")
+
+    retained = bytearray()
+    worker_failed = threading.Event()
+
+    def write_input() -> None:
+        try:
+            if payload is not None:
+                process_stdin.write(payload)
+                process_stdin.flush()
+        except (BrokenPipeError, OSError, TypeError, ValueError):
+            worker_failed.set()
+        finally:
+            try:
+                process_stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    def read_output() -> None:
+        try:
+            while True:
+                chunk = process_stdout.read(4096)
+                if not chunk:
+                    return
+                remaining = _MAX_KEYCHAIN_OUTPUT_BYTES + 1 - len(retained)
+                if remaining > 0:
+                    retained.extend(chunk[:remaining])
+        except (OSError, TypeError, ValueError):
+            worker_failed.set()
+
+    writer = threading.Thread(target=write_input, daemon=True)
+    reader = threading.Thread(target=read_output, daemon=True)
+    writer.start()
+    reader.start()
+    try:
+        returncode = process.wait(timeout=_KEYCHAIN_TIMEOUT_SECONDS)
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        try:
+            process.kill()
+            process.wait()
+        except (AttributeError, OSError, subprocess.SubprocessError):
+            pass
+        raise RuntimeError("runner OS secret service unavailable") from None
+    finally:
+        writer.join(1)
+        reader.join(1)
+        try:
+            process_stdout.close()
+        except (OSError, ValueError):
+            pass
+    if writer.is_alive() or reader.is_alive() or worker_failed.is_set():
+        try:
+            process.kill()
+            process.wait()
+        except (AttributeError, OSError, subprocess.SubprocessError):
+            pass
+        raise RuntimeError("runner OS secret service unavailable")
+    return subprocess.CompletedProcess(argv, returncode, bytes(retained), None)
+
+
+class MacOSKeychainSecretBackend:
     """macOS Keychain adapter. Errors intentionally look like key-store failure, never data."""
 
     service = "heel.runner.ed25519.v1"
 
+    def __init__(self, *, popen: Callable[..., object] = subprocess.Popen):
+        self._popen = popen
+
+    @staticmethod
+    def _label(label: str) -> str:
+        return _CommandSecretBackend._label(label)
+
     def load(self, label: str) -> bytes | None:
         label = self._label(label)
-        result = self._command(["security", "find-generic-password", "-s", self.service,
-                                "-a", label, "-w"], capture_output=True, check=False)
+        result = _run_bounded_security(
+            ("find-generic-password", "-s", self.service, "-a", label, "-w"),
+            payload=None,
+            popen=self._popen,
+        )
         if result.returncode == 44:
             return None
         if result.returncode != 0:
@@ -121,9 +235,14 @@ class MacOSKeychainSecretBackend(_CommandSecretBackend):
 
     def store(self, label: str, seed: bytes) -> None:
         label = self._label(label)
-        encoded = base64.b64encode(seed).decode("ascii")
-        result = self._command(["security", "add-generic-password", "-U", "-s", self.service,
-                                "-a", label, "-w", encoded], capture_output=True, check=False)
+        if not isinstance(seed, bytes) or len(seed) != 32:
+            raise RuntimeError("runner OS secret service returned invalid material")
+        encoded = base64.b64encode(seed)
+        result = _run_bounded_security(
+            ("add-generic-password", "-U", "-s", self.service, "-a", label, "-w"),
+            payload=encoded,
+            popen=self._popen,
+        )
         if result.returncode != 0:
             raise RuntimeError("runner OS secret service unavailable")
 
