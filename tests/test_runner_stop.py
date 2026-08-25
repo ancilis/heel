@@ -1256,6 +1256,235 @@ def test_prepare_stop_ack_snapshots_budget_counters_under_the_execution_lock(tmp
     ) is True
 
 
+def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progress_race(tmp_path):
+    import base64
+
+    from canary_test_support import Clock, NOW, NOW_MS, connect
+    from heel.runner.coordinator import RunnerCoordinator, RunnerStopAcknowledgement
+    from heel.saas.canary_runs import CanaryRunService
+    from heel.saas.catalog import CATALOG_VERSION
+    from heel.saas.runner_auth import RunnerAuthStore
+
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    conn = connect()
+    conn.execute(
+        "INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+        (manifest["workspace_id"], "org_canary", "Executor", "free", CATALOG_VERSION, NOW),
+    )
+    conn.execute(
+        "INSERT INTO memberships VALUES(?,?,?,?)",
+        (manifest["workspace_id"], "user_owner", "owner", NOW),
+    )
+    conn.execute(
+        "INSERT INTO projects VALUES(?,?,?,?,?)",
+        (manifest["workspace_id"], manifest["project_id"], "Executor", "user_owner", NOW),
+    )
+    environment = manifest["environment"]
+    conn.execute(
+        "INSERT INTO canary_environments("
+        "environment_id,workspace_id,project_ref,origin,environment_class,status,created_at,"
+        "attestation_text,attestation_version,attestation_acknowledgement,attested_by,attested_at,"
+        "proof_method,proof_version,normalization_version,challenge_generation,last_check_at,"
+        "verified_at,proof_expires_at,verification_record_digest) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            environment["environment_id"], manifest["workspace_id"], manifest["project_id"],
+            environment["origin"], environment["environment_class"], "verified", NOW,
+            "ownership verified; environment classification supplied by you", "v1", "accepted",
+            "user_owner", NOW, "https-file", "https-file.v1", "exact-origin.v1", 1,
+            NOW, NOW, NOW + 3600, environment["verification_record_digest"],
+        ),
+    )
+    public_key = base64.b64encode(signer.public_key).decode("ascii")
+    conn.execute(
+        "INSERT INTO canary_runners VALUES(?,?,?,?,?)",
+        (identity.runner_id, manifest["workspace_id"], "Executor", "active", NOW),
+    )
+    conn.execute(
+        "INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)",
+        (identity.key_id, manifest["workspace_id"], identity.runner_id, public_key, "active", NOW),
+    )
+    clock = Clock()
+    auth = RunnerAuthStore(conn, pepper=b"s" * 32, now=clock)
+    identity_record = auth._identity_record(
+        workspace_id=manifest["workspace_id"], runner_id=identity.runner_id,
+        public_key=public_key, fingerprint=identity.fingerprint, key_id=identity.key_id,
+        runner_version=identity.runner_version,
+        adapters_json=json.dumps(identity.adapter_versions), paired_by="user_owner",
+        paired_at=NOW, heartbeat_at=NOW,
+    )
+    auth._save_identity(identity_record, instant=NOW)
+    conn.commit()
+
+    cloud = SigningAuthority.generate()
+    coordinator = CanaryRunService(
+        conn, signing=cloud, runner_auth=auth, clock=clock,
+    )
+    submitted = coordinator.submit_projection(projection, uploaded_by="user_owner")
+    approved = coordinator.approve(
+        manifest["workspace_id"], manifest["project_id"], submitted["run_id"],
+        projection_digest=projection["projection_digest"], actor="user_owner", role="owner",
+        reason="Exercise real sparse containment sequence coordination",
+        exact_hostname=manifest["egress"]["hostname"], recent_auth_at_ms=NOW_MS,
+        idempotency_key="ca1-" + "d" * 64, expected_kill_switch_generation=0,
+    )
+    grant = approved["grant"]
+    coordinator.claim(
+        manifest["workspace_id"], identity.runner_id, identity.key_id,
+    )
+
+    claim_builder = object.__new__(RunnerCoordinator)
+    claim_builder.identity = identity
+    claim_builder.signer = signer
+    claimed_projection = claim_builder._claimed_projection(
+        manifest, projection, grant, claimed_at_ms=NOW_MS + 100,
+    )
+
+    executor = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={cloud.key_id: cloud.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: NOW_MS + 100,
+        monotonic=time.monotonic,
+    )
+    progress_committed = threading.Event()
+    acknowledgement_committed = threading.Event()
+    observed_progress: list[dict] = []
+    observed_acknowledgements: list[dict] = []
+    observed_results: list[dict] = []
+    heartbeat_failures: list[BaseException] = []
+
+    class CloudBridge:
+        claimed_once = False
+        stop_started_at = None
+
+        def claim(self):
+            if self.claimed_once:
+                return None
+            self.claimed_once = True
+            return ClaimLease(
+                grant["run_id"], ExecutionBundle(manifest, projection, grant),
+                claimed_projection,
+            )
+
+        def progress(self, run_id, value):
+            assert run_id == grant["run_id"]
+            observed_progress.append(value)
+            # Freeze the Cloud stop after the runner produced progress but before that
+            # synchronous progress call commits, which is the real supervisor race.
+            self.stop_started_at = time.monotonic()
+            coordinator.request_stop(
+                manifest["workspace_id"], manifest["project_id"], run_id,
+                actor="user_owner", reason="cloud_stop",
+                expected_kill_switch_generation=0,
+            )
+            status = coordinator.progress(
+                manifest["workspace_id"], manifest["project_id"], run_id,
+                identity.runner_id, value,
+            )
+            progress_committed.set()
+            assert acknowledgement_committed.wait(1)
+            return status
+
+        def heartbeat(self, run_id, value):
+            assert progress_committed.wait(1)
+            try:
+                gate = coordinator.heartbeat(
+                    manifest["workspace_id"], manifest["project_id"], run_id,
+                    identity.runner_id, value,
+                )
+            except BaseException as exc:
+                heartbeat_failures.append(exc)
+                raise
+            return ExecutionGate(**gate)
+
+        def stop_ack(self, run_id, value, *, deadline):
+            assert time.monotonic() < deadline
+            unsigned = {
+                key: copy.deepcopy(item) for key, item in value.items()
+                if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+            }
+            acknowledged_at = max(
+                NOW_MS + 200,
+                unsigned["timestamps"]["updated_at_ms"],
+                unsigned["timestamps"]["stop_requested_at_ms"],
+            )
+            unsigned["timestamps"] = {
+                **unsigned["timestamps"],
+                "updated_at_ms": acknowledged_at,
+                "stop_acknowledged_at_ms": acknowledged_at,
+            }
+            acknowledgement = {
+                **unsigned,
+                "projection_digest": canonical_digest(unsigned),
+                "signing_key_id": signer.key_id,
+                "signature_b64": base64.b64encode(
+                    signer.sign(canonical_bytes(unsigned)),
+                ).decode("ascii"),
+            }
+            observed_acknowledgements.append(acknowledgement)
+            response = coordinator.ack_stop(
+                manifest["workspace_id"], manifest["project_id"], run_id,
+                identity.runner_id, acknowledgement,
+            )
+            acknowledgement_committed.set()
+            return RunnerStopAcknowledgement(
+                **response, acknowledged_at_ms=acknowledged_at,
+            )
+
+        def result(self, run_id, value):
+            observed_results.append(value)
+            return coordinator.result(
+                manifest["workspace_id"], manifest["project_id"], run_id,
+                identity.runner_id, value,
+            )
+
+    class ExecutorAdapter:
+        def execute(self, lease, *, cancellation, on_progress):
+            return executor.execute(
+                lease.bundle, transport=ScriptedTransport([401]),
+                gate_source=lambda: ExecutionGate(
+                    True, "active", "valid", NOW_MS + 60_000, 0, "none", NOW_MS,
+                ),
+                cancellation=cancellation, on_progress=on_progress,
+            )
+
+        def prepare_stop_ack(self, lease, value, stop_reason, proposed_at_ms):
+            del value
+            return executor.prepare_stop_ack(
+                lease.run_id, stop_reason=stop_reason, proposed_at_ms=proposed_at_ms,
+            )
+
+    def service_monotonic():
+        # Hold the first heartbeat before it snapshots so this probe deterministically
+        # reproduces the synchronous progress-commit race reported by the real supervisor.
+        if (
+            threading.current_thread().name == "heel-runner-heartbeat"
+            and not progress_committed.is_set()
+        ):
+            assert progress_committed.wait(1)
+        return time.monotonic()
+
+    bridge = CloudBridge()
+    assert RunnerService(
+        coordinator=bridge, executor=ExecutorAdapter(), heartbeat_interval=0.01,
+        idle_poll_interval=2.0, clock_ms=lambda: NOW_MS + 200,
+        monotonic=service_monotonic,
+    ).run_once() is True
+
+    assert (
+        observed_progress[0]["event_sequence"],
+        observed_acknowledgements[0]["event_sequence"],
+        observed_results[0]["event_sequence"],
+    ) == (4, 5, 6)
+    assert time.monotonic() - bridge.stop_started_at < 5
+    status = coordinator.get_status(
+        manifest["workspace_id"], manifest["project_id"], grant["run_id"],
+    )
+    assert status["status"] == "terminal"
+    assert status["execution_disposition"] == "stopped"
+    assert status["error_category"] == "none", heartbeat_failures
+
+
 def test_real_executor_local_emergency_stop_transitions_and_allocates_ack_sequence(tmp_path):
     store, identity, signer, manifest, projection = compiled_pair(tmp_path)
     authority = SigningAuthority.generate()

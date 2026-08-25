@@ -347,10 +347,11 @@ def test_execution_approval_claim_heartbeat_progress_status_events_are_real(cana
     )
     assert status == 200 and progress["status"] == "running"
 
-    # A service-layer failure is part of the same transaction as PoP consumption.  The
-    # sequence gap must leave both the lifecycle snapshot and the request chain untouched.
+    # A service-layer failure is part of the same transaction as PoP consumption.  An
+    # equal sequence with a changed digest must leave both lifecycle and PoP untouched.
     invalid_progress = fixture.operational(
-        approved["grant"], sequence=3, phase="running", requests_started=1,
+        approved["grant"], sequence=1, phase="running", requests_started=1,
+        actions_contained=1,
     )
     invalid_progress_body = canonical_bytes({
         "schema_version": "heel.runner-progress-request.v1",
@@ -380,7 +381,7 @@ def test_execution_approval_claim_heartbeat_progress_status_events_are_real(cana
     ).fetchone()[0] == 2
 
     corrected_progress = fixture.operational(
-        approved["grant"], sequence=2, phase="running", requests_started=1,
+        approved["grant"], sequence=3, phase="running", requests_started=1,
         actions_contained=1,
     )
     corrected_progress_body = canonical_bytes({
@@ -396,7 +397,7 @@ def test_execution_approval_claim_heartbeat_progress_status_events_are_real(cana
         "POST", progress_path,
         headers=corrected_progress_headers, raw=corrected_progress_body,
     )
-    assert status == 200 and corrected["source_event_sequence"] == 2
+    assert status == 200 and corrected["source_event_sequence"] == 3
     replay_status, replay_headers, replay_body = fixture.request(
         "POST", progress_path,
         headers=corrected_progress_headers, raw=corrected_progress_body,
@@ -444,7 +445,7 @@ def test_execution_approval_claim_heartbeat_progress_status_events_are_real(cana
     assert fixture.cp.store.conn.execute(
         "SELECT source_event_sequence FROM canary_runs WHERE run_id=?",
         (submitted["run_id"],),
-    ).fetchone()[0] == 2
+    ).fetchone()[0] == 3
     assert fixture.cp.store.conn.execute(
         "SELECT COUNT(*) FROM canary_run_events WHERE run_id=? "
         "AND event_type='heartbeat_accepted'",
@@ -465,7 +466,7 @@ def test_execution_approval_claim_heartbeat_progress_status_events_are_real(cana
     runner_local_stop_at = stop_requested_at + 25
     acknowledgement = fixture.operational(
         approved["grant"],
-        sequence=3,
+        sequence=4,
         phase="stop_requested",
         requests_started=1,
         stop_reason="cloud_stop",
@@ -514,7 +515,7 @@ def test_execution_approval_claim_heartbeat_progress_status_events_are_real(cana
 
     terminal = fixture.operational(
         approved["grant"],
-        sequence=4,
+        sequence=5,
         phase="terminal",
         requests_started=1,
         requests_completed=1,
@@ -527,7 +528,7 @@ def test_execution_approval_claim_heartbeat_progress_status_events_are_real(cana
     result_chain = claimed["chain_states"]["result"]
     tampered_terminal = fixture.operational(
         approved["grant"],
-        sequence=4,
+        sequence=5,
         phase="terminal",
         requests_started=1,
         requests_completed=1,

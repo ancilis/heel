@@ -185,8 +185,8 @@ def test_stop_ack_persists_when_heartbeat_already_accepted_the_same_snapshot():
     ).fetchone()[0] == 1
 
 
-def test_stop_requested_cannot_regress_to_running():
-    _, _, runner, coordinator, approved, _ = running_setup()
+def test_post_stop_running_progress_is_evidence_and_cannot_regress_durable_stop():
+    conn, _, runner, coordinator, approved, _ = running_setup()
     grant = approved["grant"]
     coordinator.progress(
         WORKSPACE, PROJECT, grant["run_id"], RUNNER,
@@ -199,15 +199,18 @@ def test_stop_requested_cannot_regress_to_running():
         WORKSPACE, PROJECT, grant["run_id"], actor="user_owner",
         reason="cloud_stop", expected_kill_switch_generation=0,
     )
-    with pytest.raises(ValueError):
-        coordinator.progress(
-            WORKSPACE, PROJECT, grant["run_id"], RUNNER,
-            operational_projection(
-                runner, grant, sequence=1, phase="running", requests_started=1,
-                updated_at_ms=NOW_MS + 300,
-            ),
-        )
-    assert coordinator.get_status(WORKSPACE, PROJECT, grant["run_id"])["status"] == "stop_requested"
+    in_flight = operational_projection(
+        runner, grant, sequence=4, phase="running", requests_started=1,
+        updated_at_ms=NOW_MS + 300,
+    )
+    status = coordinator.progress(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, in_flight,
+    )
+    assert status["status"] == "stop_requested"
+    assert status["stop_reason"] == "cloud_stop"
+    assert tuple(conn.execute(
+        "SELECT status,stop_reason,source_event_sequence FROM canary_runs"
+    ).fetchone()) == ("stop_requested", "cloud_stop", 4)
 
 
 def test_identical_stop_replay_survives_later_control_generation_change():

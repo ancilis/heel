@@ -979,7 +979,10 @@ class CanaryRunService:
             if digest == row["source_projection_digest"]:
                 return "replay"
             raise CanaryRunError("source_sequence_conflict")
-        if sequence != row["source_event_sequence"] + 1:
+        # Runner event_sequence is the signed containment-log position.  Cloud receives only
+        # operational projections, so valid local containment events create intentional gaps.
+        # Equality is replay/conflict above; only an older position is a regression.
+        if sequence < row["source_event_sequence"]:
             raise CanaryRunError("source_sequence_gap")
         receipt = self.conn.execute(
             "SELECT receipt_json FROM canary_operational_receipts WHERE workspace_id=? "
@@ -1124,10 +1127,21 @@ class CanaryRunService:
             raise CanaryRunError("illegal_run_transition")
         if operation == "result" and phase != "terminal":
             raise CanaryRunError("illegal_run_transition")
-        # A post-stop heartbeat can legitimately carry the last exact pre-stop snapshot.  It is
-        # Cloud liveness only: never overwrite the durable stop or runner receipt.  The shared
-        # source check still rejects equal-sequence/different-digest projections.
-        if operation == "heartbeat" and row["stop_reason"] != "none" and stop_reason == "none":
+        # Heartbeat and progress use independent PoP chains while reporting one shared
+        # operational sequence.  A delayed, still-authentic heartbeat is liveness evidence,
+        # not authority to roll the durable lifecycle snapshot backwards.  This must precede
+        # post-stop preservation because an ack may commit after the heartbeat took its snapshot.
+        if operation == "heartbeat" and value["event_sequence"] < row["source_event_sequence"]:
+            return row, value, "stale"
+        # A heartbeat or synchronous progress call can race just behind a durable Cloud stop
+        # and carry the runner's last valid pre-stop snapshot.  Treat it as liveness/execution
+        # evidence only: never overwrite the authoritative stop.  The shared source check still
+        # rejects equal-sequence/different-digest and lower-sequence projections.
+        if (
+            operation in {"heartbeat", "progress"}
+            and row["stop_reason"] != "none"
+            and stop_reason == "none"
+        ):
             source = self._source_state(row, value)
             if source == "replay":
                 return row, value, "liveness"
@@ -1160,11 +1174,6 @@ class CanaryRunService:
             raise CanaryRunError("stop_conflict")
         if verification_mismatch and stop_reason == "none":
             return row, value, "authority_stop"
-        # Heartbeat and progress use independent PoP chains while reporting one shared
-        # operational sequence.  A delayed, still-authentic heartbeat is liveness evidence,
-        # not authority to roll the durable lifecycle snapshot backwards.
-        if operation == "heartbeat" and value["event_sequence"] < row["source_event_sequence"]:
-            return row, value, "stale"
         if row["stop_reason"] != "none" and stop_reason != row["stop_reason"]:
             raise CanaryRunError("stop_conflict")
         source = self._source_state(row, value)

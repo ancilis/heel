@@ -74,7 +74,7 @@ def test_heartbeat_and_progress_validate_signature_binding_privacy_and_source_se
         coordinator.progress(WORKSPACE, PROJECT, grant["run_id"], RUNNER, private)
 
 
-def test_counter_regression_and_sequence_gap_rollback_without_receipt_change():
+def test_sparse_sequences_advance_while_regressions_rollback_without_receipt_change():
     conn, _, runner, coordinator, approved, _ = running_setup()
     grant = approved["grant"]
     accepted = operational_projection(
@@ -82,18 +82,26 @@ def test_counter_regression_and_sequence_gap_rollback_without_receipt_change():
         updated_at_ms=NOW_MS + 200,
     )
     coordinator.progress(WORKSPACE, PROJECT, grant["run_id"], RUNNER, accepted)
+    sparse = operational_projection(
+        runner, grant, sequence=4, phase="running", requests_started=1,
+        updated_at_ms=NOW_MS + 300,
+    )
+    coordinator.progress(WORKSPACE, PROJECT, grant["run_id"], RUNNER, sparse)
     before = conn.execute(
         "SELECT source_event_sequence,receipt_digest FROM canary_operational_receipts"
     ).fetchone()
-    gap = operational_projection(
-        runner, grant, sequence=2, phase="running", requests_started=1,
-        updated_at_ms=NOW_MS + 300,
+    assert tuple(before) == (4, sparse["projection_digest"])
+    lower_sequence = operational_projection(
+        runner, grant, sequence=3, phase="running", requests_started=1,
+        updated_at_ms=NOW_MS + 400,
     )
     with pytest.raises(ValueError):
-        coordinator.progress(WORKSPACE, PROJECT, grant["run_id"], RUNNER, gap)
+        coordinator.progress(
+            WORKSPACE, PROJECT, grant["run_id"], RUNNER, lower_sequence,
+        )
     regressed = operational_projection(
-        runner, grant, sequence=1, phase="running", requests_started=0,
-        updated_at_ms=NOW_MS + 300,
+        runner, grant, sequence=7, phase="running", requests_started=0,
+        updated_at_ms=NOW_MS + 500,
     )
     with pytest.raises(ValueError):
         coordinator.progress(WORKSPACE, PROJECT, grant["run_id"], RUNNER, regressed)
@@ -392,11 +400,12 @@ def test_stop_racing_uncommitted_progress_accepts_new_running_snapshot_as_livene
         updated_at_ms=NOW_MS + 200,
     )
 
-    gate = coordinator.heartbeat(
+    status = coordinator.progress(
         WORKSPACE, PROJECT, grant["run_id"], RUNNER, running,
     )
 
-    assert gate["active"] is False and gate["stop_reason"] == "cloud_stop"
+    assert status["status"] == "stop_requested"
+    assert status["stop_reason"] == "cloud_stop"
     assert tuple(conn.execute(
         "SELECT status,stop_reason,source_event_sequence,quota_state,started_at_ms "
         "FROM canary_runs"
