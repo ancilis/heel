@@ -424,13 +424,35 @@ def test_pending_first_install_rolls_forward_only_from_fresh_singleton_claim(tmp
     with pytest.raises(RunnerStoreError, match="installation recovery state is inconsistent"):
         mixed_coordinator.ensure_runner_context()
 
-    recovered_store, recovered = recovery_coordinator(tmp_path / "fresh", b"d")
+    # A recovery can itself fault at the root selector after it has made every
+    # B namespaced record durable.  The root A intent still needs the signed
+    # A→B journal until its final selector write commits; otherwise this second
+    # crash strands an unbound runner whose next B claim cannot be correlated.
+    recovery_store, recovery = recovery_coordinator(tmp_path / "fresh", b"d")
+    monkeypatch.setattr(runner_store_module, "_write_json", fail_successor_active)
+    with pytest.raises(OSError, match="successor active selector"):
+        recovery.ensure_runner_context()
+    monkeypatch.setattr(runner_store_module, "_write_json", original_write)
+    assert not recovery_store.is_context_bound
+    recovery_store._namespace = context.namespace
+    with recovery_store._transaction(exclusive=False, allow_rollover_journal=True) as context_fd:
+        assert runner_store_module._read_json(context_fd, "context-rollover.json", None) is not None
+    recovery_store._namespace = None
+
+    recovered_store, recovered = recovery_coordinator(tmp_path / "fresh", b"g")
     assert recovered.ensure_runner_context() is True
     # Recovery completes the locally signed A→B journal before asking Cloud.
     # The sole later poll observes B exactly; tampered/mixed copies never poll.
     assert calls == ["list", "claim", "list"]
     assert recovered_store.load_context().verification_record_digest == "2" * 64
     assert recovered_store.load_cloud_context_binding()["binding_id"] == new["binding_id"]
+    with recovered_store._open_runner(create=False) as runner_fd:
+        assert runner_fd is not None
+        assert runner_store_module._read_json(runner_fd, "context-install.json", None) is None
+    recovered_store._namespace = context.namespace
+    with recovered_store._transaction(exclusive=False, allow_rollover_journal=True) as context_fd:
+        assert runner_store_module._read_json(context_fd, "context-rollover.json", None) is None
+    recovered_store._namespace = None
 
 
 def test_failed_cloud_install_provenance_never_downgrades_to_static_context(tmp_path, monkeypatch):

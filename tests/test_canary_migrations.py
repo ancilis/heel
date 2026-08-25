@@ -315,6 +315,112 @@ class CanaryMigrationTests(unittest.TestCase):
             "prj_affinity", "env_affinity", signer.key_id, binding["binding_id"], binding["binding_digest"],
         ))
 
+    def test_direct_affinity_initialization_rolls_back_conflicting_claim_history_on_restart(self):
+        from heel.saas.runner_contexts import RunnerContextBindingService
+        from tests.canary_test_support import seed_authority
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        self.addCleanup(conn.close)
+        Migrator(conn, CONTROL_PLANE_MIGRATIONS[:18]).apply_all()
+        conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org_direct_affinity", "org", 1))
+        conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws_direct_affinity", "org_direct_affinity", "ws", "free", CATALOG_VERSION, 1))
+        conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws_direct_affinity", "prj_direct_a", "one", "user_owner", 1))
+        conn.execute("INSERT INTO users VALUES(?,?,?)", ("user_owner", "owner@example.test", 1))
+        conn.execute("INSERT INTO memberships VALUES(?,?,?,?)", ("ws_direct_affinity", "user_owner", "owner", 1))
+        signer = seed_authority(
+            conn, workspace_id="ws_direct_affinity", project_ref="prj_direct_a",
+            environment_id="env_direct_a", runner_id="runr_direct_affinity",
+        )
+        contexts = RunnerContextBindingService(conn, signing=signer, clock=lambda: 1_800_000_000)
+        first = contexts.create(
+            "ws_direct_affinity", "prj_direct_a",
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": "env_direct_a",
+             "verification_record_digest": "a" * 64, "runner_id": "runr_direct_affinity", "runner_key_id": signer.key_id},
+            actor="user_owner", role="owner",
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        contexts.claim_in_transaction(
+            "ws_direct_affinity", "runr_direct_affinity", signer.key_id, first["binding_id"],
+            {"schema_version": "heel.runner-context-claim.v1", "binding_id": first["binding_id"],
+             "binding_digest": first["binding_digest"]},
+        )
+        conn.commit()
+        contexts.revoke("ws_direct_affinity", "prj_direct_a", first["binding_id"], actor="user_owner", role="owner")
+        conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws_direct_affinity", "prj_direct_b", "two", "user_owner", 1))
+        source = conn.execute(
+            "SELECT * FROM canary_environments WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+            ("ws_direct_affinity", "prj_direct_a", "env_direct_a"),
+        ).fetchone()
+        columns = tuple(source.keys())
+        values = [source[column] for column in columns]
+        values[columns.index("project_ref")] = "prj_direct_b"
+        values[columns.index("environment_id")] = "env_direct_b"
+        conn.execute(f"INSERT INTO canary_environments({','.join(columns)}) VALUES({','.join('?' for _ in columns)})", values)
+        conn.commit()
+        second = contexts.create(
+            "ws_direct_affinity", "prj_direct_b",
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": "env_direct_b",
+             "verification_record_digest": "a" * 64, "runner_id": "runr_direct_affinity", "runner_key_id": signer.key_id},
+            actor="user_owner", role="owner",
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        contexts.claim_in_transaction(
+            "ws_direct_affinity", "runr_direct_affinity", signer.key_id, second["binding_id"],
+            {"schema_version": "heel.runner-context-claim.v1", "binding_id": second["binding_id"],
+             "binding_digest": second["binding_digest"]},
+        )
+        conn.commit()
+
+        affinity_objects = {
+            "canary_runner_context_affinities", "idx_runner_context_affinities_project_runner",
+            "canary_runner_context_affinity_backfill_guard",
+        }
+        for _attempt in range(2):
+            with self.assertRaisesRegex(RuntimeError, "affinity"):
+                ensure_runner_context_schema(conn)
+            self.assertEqual(
+                {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE name IN (?,?,?)", tuple(affinity_objects),
+                )},
+                set(),
+            )
+            self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_direct_runtime_rejects_claimed_history_without_its_affinity(self):
+        from heel.saas.runner_contexts import RunnerContextBindingService
+        from tests.canary_test_support import seed_authority
+
+        workspace, project, environment, runner = "ws_affinity_startup", "prj_affinity_startup", "env_affinity_startup", "runr_affinity_startup"
+        self.seed_root(workspace, project)
+        self.conn.execute("INSERT INTO users VALUES(?,?,?)", ("user_owner", "owner@example.test", 1))
+        self.conn.execute("INSERT INTO memberships VALUES(?,?,?,?)", (workspace, "user_owner", "owner", 1))
+        signer = seed_authority(
+            self.conn, workspace_id=workspace, project_ref=project,
+            environment_id=environment, runner_id=runner,
+        )
+        contexts = RunnerContextBindingService(self.conn, signing=signer, clock=lambda: 1_800_000_000)
+        binding = contexts.create(
+            workspace, project,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": environment,
+             "verification_record_digest": "a" * 64, "runner_id": runner, "runner_key_id": signer.key_id},
+            actor="user_owner", role="owner",
+        )
+        self.conn.execute("BEGIN IMMEDIATE")
+        contexts.claim_in_transaction(
+            workspace, runner, signer.key_id, binding["binding_id"],
+            {"schema_version": "heel.runner-context-claim.v1", "binding_id": binding["binding_id"],
+             "binding_digest": binding["binding_digest"]},
+        )
+        self.conn.commit()
+        self.conn.execute(
+            "DELETE FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
+            (workspace, runner),
+        )
+        with self.assertRaisesRegex(RuntimeError, "affinity history"):
+            ensure_runner_context_schema(self.conn)
+
     def test_direct_runner_context_schema_rejects_a_tampered_link_index(self):
         self.conn.execute("DROP INDEX idx_runner_context_links_binding")
         with self.assertRaisesRegex(RuntimeError, "indexes"):

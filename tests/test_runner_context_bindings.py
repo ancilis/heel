@@ -7,7 +7,7 @@ from copy import deepcopy
 from heel.canary_contracts import canonical_bytes, canonical_digest, validate_runner_context_binding
 from heel.crypto import SigningAuthority
 from heel.saas.canary_runs import CanaryRunError
-from heel.saas.runner_contexts import RunnerContextBindingService, RunnerContextError
+from heel.saas.runner_contexts import CONTEXT_DOMAIN, RunnerContextBindingService, RunnerContextError
 from tests.canary_test_support import (
     Clock, ENVIRONMENT, NOW_MS, PROJECT, RUNNER, VERIFICATION_DIGEST, WORKSPACE,
     approval_projection, connect, seed_authority, service,
@@ -220,6 +220,105 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         self.assertEqual(
             self.service.list_for_human(WORKSPACE, other_project, actor="user_owner")["runners"], [],
         )
+
+    def test_missing_affinity_with_claimed_history_fails_closed_for_dashboard_create_and_claim(self):
+        first = self.service.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+             "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+        )
+        self.conn.execute("BEGIN IMMEDIATE")
+        self.service.claim_in_transaction(
+            WORKSPACE, RUNNER, self.runner.key_id, first["binding_id"],
+            {"schema_version": "heel.runner-context-claim.v1", "binding_id": first["binding_id"],
+             "binding_digest": first["binding_digest"]},
+        )
+        self.conn.commit()
+        self.service.revoke(WORKSPACE, PROJECT, first["binding_id"], actor="user_owner", role="owner")
+
+        other_project, other_environment = "prj_history_other", "env_history_other"
+        self.conn.execute(
+            "INSERT INTO projects VALUES(?,?,?,?,?)", (WORKSPACE, other_project, "Other", "user_owner", NOW_MS / 1000),
+        )
+        source = self.conn.execute(
+            "SELECT * FROM canary_environments WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+            (WORKSPACE, PROJECT, ENVIRONMENT),
+        ).fetchone()
+        columns = tuple(source.keys())
+        values = [source[column] for column in columns]
+        values[columns.index("project_ref")] = other_project
+        values[columns.index("environment_id")] = other_environment
+        self.conn.execute(
+            f"INSERT INTO canary_environments({','.join(columns)}) VALUES({','.join('?' for _ in columns)})", values,
+        )
+        self.conn.execute(
+            "DELETE FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
+            (WORKSPACE, RUNNER),
+        )
+        self.conn.commit()
+
+        with self.assertRaisesRegex(RunnerContextError, "canary_authority_unavailable"):
+            self.service.list_for_human(WORKSPACE, other_project, actor="user_owner")
+        with self.assertRaisesRegex(RunnerContextError, "canary_authority_unavailable"):
+            self.service.create(
+                WORKSPACE, other_project,
+                {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": other_environment,
+                 "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+                 "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+            )
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM canary_runner_context_bindings WHERE workspace_id=? AND project_ref=?",
+            (WORKSPACE, other_project),
+        ).fetchone()[0], 0)
+
+        # Claim must not rebuild the deleted A affinity from an unclaimed B row.
+        unsigned = {
+            key: value for key, value in first.items()
+            if key not in {"binding_digest", "signing_key_id", "signature_b64"}
+        }
+        unsigned["binding_id"] = "rcb_" + "f" * 32
+        unsigned["project_id"] = other_project
+        unsigned["environment"] = {**unsigned["environment"], "environment_id": other_environment}
+        second = {**unsigned, "binding_digest": canonical_digest(unsigned)}
+        second.update(self.cloud.sign(CONTEXT_DOMAIN + canonical_bytes(unsigned)))
+        original = self.conn.execute(
+            "SELECT * FROM canary_runner_context_bindings WHERE rcb_id=?", (first["binding_id"],),
+        ).fetchone()
+        self.conn.execute(
+            "INSERT INTO canary_runner_context_bindings("
+            "rcb_id,workspace_id,project_ref,environment_id,runner_id,runner_key_id,environment_origin,environment_class,"
+            "binding_digest,public_key_digest,verification_record_digest,binding_json,status,created_by,created_role,"
+            "issued_at_ms,expires_at_ms,first_claimed_at_ms,revoked_by,revoked_at_ms,revoke_reason,purge_at_ms) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,?)",
+            (
+                second["binding_id"], WORKSPACE, other_project, other_environment, RUNNER, self.runner.key_id,
+                original["environment_origin"], original["environment_class"], second["binding_digest"],
+                original["public_key_digest"], VERIFICATION_DIGEST, canonical_bytes(second).decode(), "active",
+                "user_owner", "owner", second["issued_at_ms"], second["expires_at_ms"],
+                second["expires_at_ms"] + 30 * 24 * 60 * 60 * 1000,
+            ),
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(RunnerContextError, "canary_authority_unavailable"):
+            self.service.create(
+                WORKSPACE, other_project,
+                {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": other_environment,
+                 "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+                 "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+            )
+        self.conn.execute("BEGIN IMMEDIATE")
+        with self.assertRaisesRegex(RunnerContextError, "runner_context_binding_not_found"):
+            self.service.claim_in_transaction(
+                WORKSPACE, RUNNER, self.runner.key_id, second["binding_id"],
+                {"schema_version": "heel.runner-context-claim.v1", "binding_id": second["binding_id"],
+                 "binding_digest": second["binding_digest"]},
+            )
+        self.conn.rollback()
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
+            (WORKSPACE, RUNNER),
+        ).fetchone()[0], 0)
 
     def test_dashboard_hides_runner_occupied_by_another_project_until_revoke(self):
         binding = self.service.create(

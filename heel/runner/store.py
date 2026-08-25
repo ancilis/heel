@@ -1422,10 +1422,25 @@ class RunnerStore:
                     or self._binding_locked(context_fd)["context"] != new_context.as_dict()
                 ):
                     raise RunnerStoreError("cloud context installation recovery state is inconsistent")
-                os.unlink("context-rollover.json", dir_fd=context_fd)
-                os.fsync(context_fd)
+                # A root first-install intent has not committed until its
+                # active selector is durable.  Keep the signed A→B journal
+                # through that root commit so a second selector-write crash
+                # can still prove how the unselected namespace advanced.
+                if pending_install is None:
+                    os.unlink("context-rollover.json", dir_fd=context_fd)
+                    os.fsync(context_fd)
             if pending_install is not None:
                 self._finish_context_install_journal(context=new_context, journal=pending_install[2])
+                with self._transaction(exclusive=True, allow_rollover_journal=True) as context_fd:
+                    raw_journal = _read_json(context_fd, "context-rollover.json", None)
+                    if raw_journal is None:
+                        raise RunnerStoreError("cloud context rollover journal disappeared")
+                    self._validate_context_rollover_journal(
+                        raw_journal, identity=identity, expected_artifact=new,
+                        expected_evidence=None, expected_context=new_context,
+                    )
+                    os.unlink("context-rollover.json", dir_fd=context_fd)
+                    os.fsync(context_fd)
             return new
         except BaseException:
             self._namespace = previous_namespace

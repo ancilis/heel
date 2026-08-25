@@ -172,12 +172,43 @@ class RunnerContextBindingService:
             and affinity["public_key_digest"] == row["public_key_digest"]
         )
 
+    def _assert_affinity_history_integrity(
+        self, workspace_id: str, runner_id: str, affinity: sqlite3.Row | None, *, error_code: str,
+    ) -> None:
+        """A deleted or divergent affinity is corruption, never a fresh pairing authority."""
+        if affinity is None:
+            history = self.conn.execute(
+                "SELECT 1 FROM canary_runner_context_bindings INDEXED BY idx_runner_context_runner_status_expiry "
+                "WHERE workspace_id=? AND runner_id=? AND first_claimed_at_ms IS NOT NULL LIMIT 1",
+                (workspace_id, runner_id),
+            ).fetchone()
+            if history is not None:
+                raise RunnerContextError(error_code)
+            return
+        divergent = self.conn.execute(
+            "SELECT 1 FROM canary_runner_context_bindings INDEXED BY idx_runner_context_runner_status_expiry "
+            "WHERE workspace_id=? AND runner_id=? AND first_claimed_at_ms IS NOT NULL AND ("
+            "runner_key_id<>? OR project_ref<>? OR environment_id<>? OR environment_origin<>? "
+            "OR environment_class<>? OR public_key_digest<>?) LIMIT 1",
+            (
+                workspace_id, runner_id, affinity["runner_key_id"], affinity["project_ref"],
+                affinity["environment_id"], affinity["environment_origin"], affinity["environment_class"],
+                affinity["public_key_digest"],
+            ),
+        ).fetchone()
+        if divergent is not None:
+            raise RunnerContextError(error_code)
+
     def _assert_or_establish_affinity_in_transaction(self, row: sqlite3.Row, *, claimed_at_ms: int) -> None:
         """Create the one-way coordinate before recording a runner's first claim."""
         affinity = self.conn.execute(
             "SELECT * FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
             (row["workspace_id"], row["runner_id"]),
         ).fetchone()
+        self._assert_affinity_history_integrity(
+            row["workspace_id"], row["runner_id"], affinity,
+            error_code="runner_context_binding_not_found",
+        )
         if affinity is not None:
             if not self._affinity_matches_row(affinity, row):
                 raise RunnerContextError("runner_context_binding_not_found")
@@ -475,6 +506,16 @@ class RunnerContextBindingService:
                 or row["runner_status"] != "active" or row["key_status"] != "active" or row["key_revoked_at"] is not None
             ):
                 raise RunnerContextError("conflict")
+            affinity: sqlite3.Row | None = None
+            if self._has_affinity_schema():
+                affinity = self.conn.execute(
+                    "SELECT * FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
+                    (workspace_id, request["runner_id"]),
+                ).fetchone()
+                self._assert_affinity_history_integrity(
+                    workspace_id, request["runner_id"], affinity,
+                    error_code="canary_authority_unavailable",
+                )
             if self.conn.execute(
                 "SELECT 1 FROM canary_runner_context_bindings WHERE workspace_id=? "
                 "AND runner_id=? AND status='active'",
@@ -483,20 +524,15 @@ class RunnerContextBindingService:
                 raise RunnerContextError("conflict")
             public_key = load_public_key_base64(row["public_key"]).public_bytes(Encoding.Raw, PublicFormat.Raw)
             public_key_digest = hashlib.sha256(public_key).hexdigest()
-            if self._has_affinity_schema():
-                affinity = self.conn.execute(
-                    "SELECT * FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
-                    (workspace_id, request["runner_id"]),
-                ).fetchone()
-                if affinity is not None and (
-                    affinity["runner_key_id"] != request["runner_key_id"]
-                    or affinity["project_ref"] != project_id
-                    or affinity["environment_id"] != request["environment_id"]
-                    or affinity["environment_origin"] != row["origin"]
-                    or affinity["environment_class"] != row["environment_class"]
-                    or affinity["public_key_digest"] != public_key_digest
-                ):
-                    raise RunnerContextError("conflict")
+            if affinity is not None and (
+                affinity["runner_key_id"] != request["runner_key_id"]
+                or affinity["project_ref"] != project_id
+                or affinity["environment_id"] != request["environment_id"]
+                or affinity["environment_origin"] != row["origin"]
+                or affinity["environment_class"] != row["environment_class"]
+                or affinity["public_key_digest"] != public_key_digest
+            ):
+                raise RunnerContextError("conflict")
             expires = min(now + CONTEXT_TTL_MS, int(row["proof_expires_at"] * 1000))
             if expires - now < CONTEXT_MIN_TTL_MS:
                 raise RunnerContextError("expired")
@@ -623,6 +659,14 @@ class RunnerContextBindingService:
         runners: list[dict] = []
         for row in runner_rows:
             try:
+                affinity = self.conn.execute(
+                    "SELECT * FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
+                    (workspace_id, row["runner_id"]),
+                ).fetchone()
+                self._assert_affinity_history_integrity(
+                    workspace_id, row["runner_id"], affinity,
+                    error_code="canary_authority_unavailable",
+                )
                 identity = json.loads(row["identity_json"])
                 public = load_public_key_base64(row["public_key"]).public_bytes(Encoding.Raw, PublicFormat.Raw)
             except (TypeError, ValueError):

@@ -743,6 +743,35 @@ def ensure_canary_environment_schema(conn: sqlite3.Connection) -> None:
         conn.execute(CANARY_ENVIRONMENT_ATTESTATION_ACK_MIGRATION.strip())
 
 
+def _sqlite_schema_statements(script: str) -> list[str]:
+    """Split a frozen SQLite script without splitting trigger bodies."""
+    statements: list[str] = []
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statements.append(buffer.strip())
+            buffer = ""
+    if buffer.strip():
+        raise RuntimeError("runner context schema migration is incomplete")
+    return statements
+
+
+def _apply_runner_context_schema_script(conn: sqlite3.Connection, script: str, *, label: str) -> None:
+    """Run direct-runtime DDL atomically; ``executescript`` would commit partial state."""
+    savepoint = "runner_context_schema_apply"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for statement in _sqlite_schema_statements(script):
+            if statement:
+                conn.execute(statement)
+    except Exception as error:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise RuntimeError(f"runner context {label} schema initialization failed") from error
+    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+
 def ensure_runner_context_schema(conn: sqlite3.Connection) -> None:
     """Apply the v16 tables atomically for direct ControlPlane construction.
 
@@ -891,8 +920,21 @@ def ensure_runner_context_schema(conn: sqlite3.Connection) -> None:
             % ",".join("?" for _ in reaper_indexes), reaper_indexes,
         )
     }
+    reaper_aux = {
+        "canary_runner_context_cancellation_queue",
+        "trg_runner_context_cancellation_queue_insert_guard",
+        "trg_runner_context_cancellation_queue_update_guard",
+    }
+    found_reaper_aux = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN (%s)"
+            % ",".join("?" for _ in reaper_aux), tuple(reaper_aux),
+        )
+    }
     if not found_reaper:
-        conn.executescript(RUNNER_CONTEXT_REAPER_INDEXES_MIGRATION)
+        if found_reaper_aux:
+            raise RuntimeError("runner context reaper index schema is partially initialized")
+        _apply_runner_context_schema_script(conn, RUNNER_CONTEXT_REAPER_INDEXES_MIGRATION, label="reaper")
     elif found_reaper != set(reaper_indexes):
         raise RuntimeError("runner context reaper index schema is partially initialized")
     for index in reaper_indexes:
@@ -958,21 +1000,25 @@ def ensure_runner_context_schema(conn: sqlite3.Connection) -> None:
             raise RuntimeError("runner context cancellation queue triggers do not match migration 18")
     affinity_table = "canary_runner_context_affinities"
     affinity_index = "idx_runner_context_affinities_project_runner"
+    affinity_guard = "canary_runner_context_affinity_backfill_guard"
     affinity_table_row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (affinity_table,)
     ).fetchone()
     affinity_index_row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (affinity_index,)
     ).fetchone()
-    if affinity_table_row is None and affinity_index_row is None:
-        conn.executescript(RUNNER_CONTEXT_AFFINITIES_MIGRATION)
+    affinity_guard_row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (affinity_guard,)
+    ).fetchone()
+    if affinity_table_row is None and affinity_index_row is None and affinity_guard_row is None:
+        _apply_runner_context_schema_script(conn, RUNNER_CONTEXT_AFFINITIES_MIGRATION, label="affinity")
         affinity_table_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (affinity_table,)
         ).fetchone()
         affinity_index_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (affinity_index,)
         ).fetchone()
-    elif affinity_table_row is None or affinity_index_row is None:
+    elif affinity_table_row is None or affinity_index_row is None or affinity_guard_row is not None:
         raise RuntimeError("runner context affinity schema is partially initialized")
     affinity_table_expected = re.search(
         rf"CREATE TABLE {affinity_table}\((.*?)\);", RUNNER_CONTEXT_AFFINITIES_MIGRATION, flags=re.DOTALL,
@@ -1011,6 +1057,16 @@ def ensure_runner_context_schema(conn: sqlite3.Connection) -> None:
         })),
     }:
         raise RuntimeError("runner context affinity schema foreign keys do not match migration 19")
+    if conn.execute(
+        "SELECT 1 FROM canary_runner_context_bindings b "
+        "LEFT JOIN canary_runner_context_affinities a "
+        "ON a.workspace_id=b.workspace_id AND a.runner_id=b.runner_id "
+        "WHERE b.first_claimed_at_ms IS NOT NULL AND (a.workspace_id IS NULL "
+        "OR a.runner_key_id<>b.runner_key_id OR a.project_ref<>b.project_ref "
+        "OR a.environment_id<>b.environment_id OR a.environment_origin<>b.environment_origin "
+        "OR a.environment_class<>b.environment_class OR a.public_key_digest<>b.public_key_digest) LIMIT 1"
+    ).fetchone() is not None:
+        raise RuntimeError("runner context affinity history does not match migration 19")
     if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise RuntimeError("runner context binding schema foreign keys are invalid")
 
