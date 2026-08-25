@@ -4,12 +4,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import secrets
+import threading
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
 from heel.canary_contracts import (
     canonical_bytes,
+    validate_approval_projection,
+    validate_canary_findings,
+    validate_disclosure_permit,
+    validate_execution_grant,
     validate_runner_claim_request,
     validate_runner_heartbeat_request,
     validate_runner_progress_request,
@@ -57,6 +62,39 @@ class RunnerRotationActivated:
     initial_claim_generation: int
 
 
+_GATE_FIELDS = {
+    "active", "runner_state", "proof_state", "proof_expires_at_ms",
+    "kill_switch_generation", "stop_reason", "server_time_ms",
+}
+_STATUS_FIELDS = {
+    "schema_version", "run_id", "approval_id", "grant_id", "status",
+    "execution_disposition", "error_category", "stop_reason",
+    "source_event_sequence", "quota_state", "kill_switch_generation",
+    "stop_generation", "stop_deadline_ms", "stop_acknowledged_at_ms",
+    "stop_ack_late",
+}
+_RUN_STATUSES = {
+    "prepared", "awaiting_execution_approval", "approved", "claimed", "running",
+    "stop_requested", "finalizing", "terminal", "cancelled", "expired",
+}
+_DISPOSITIONS = {"completed", "incomplete", "failed", "stopped"}
+_ERRORS = {
+    "none", "platform_fault", "runner_fault", "target_unavailable", "proof_expired",
+    "dns_changed", "credential_unavailable", "version_mismatch", "budget_exhausted",
+    "containment_rejected", "cloud_disconnected",
+}
+_STOPS = {
+    "none", "local_emergency_stop", "cloud_stop", "runner_revoked",
+    "target_revoked", "kill_switch",
+}
+_MAX_FINDINGS_UPLOAD_BYTES = 272 * 1024
+_FINDINGS_RECEIPT_FIELDS = {
+    "schema_version", "receipt_id", "workspace_id", "project_id", "run_id",
+    "grant_id", "permit_id", "projection_id", "projection_digest", "byte_count",
+    "scenario_count", "finding_count", "accepted_at_ms", "status",
+}
+
+
 class RunnerControlClient:
     """Emit only named closed control/recovery envelopes; no generic request API exists."""
 
@@ -71,6 +109,9 @@ class RunnerControlClient:
         self.signer, self.clock, self.transport, self.nonce_source = signer, clock, transport, nonce_source
         self.resync_random_source = resync_random_source
         self._chains: dict[str, tuple[str, int, int]] = {}
+        self._state_lock = threading.Lock()
+        self._chain_locks: dict[str, threading.Lock] = {}
+        self._terminal_runs: set[str] = set()
         self._last: _Call | None = None
         self.calls: list[_Call] = []
 
@@ -93,7 +134,9 @@ class RunnerControlClient:
         if current is None:
             nonce = self.nonce_source((operation, run_id))
             if type(nonce) is not str or not nonce: raise ValueError("a non-empty next nonce is required")
-            current = (nonce, 1, 0); self._chains[chain] = current
+            # Do not persist speculative state. A malformed or rejected response must leave
+            # every local cursor exactly as it was before the request.
+            current = (nonce, 1, 0)
         return current[0], current[1], current[2], chain
 
     def _control_path(self, operation: str, run_id: str | None) -> str:
@@ -150,6 +193,395 @@ class RunnerControlClient:
         self._chains[call.chain] = (next_nonce, call.sequence + 1, call.generation)
         return status, headers
 
+    def _post_closed(
+        self, call: _Call, operation: str, run_id: str | None,
+        *, upload_binding: tuple[dict[str, Any], dict[str, Any], int, int] | None = None,
+    ):
+        """Decode one closed coordinator response before atomically advancing any cursor."""
+        response = self.transport.post(call.path, headers=call.headers, body=call.body)
+        if (
+            not isinstance(response, tuple) or len(response) != 3
+            or isinstance(response[0], bool) or not isinstance(response[0], int)
+            or not isinstance(response[1], dict)
+            or any(type(key) is not str or type(value) is not str
+                   for key, value in response[1].items())
+        ):
+            raise ValueError("invalid runner control response")
+        status, headers, body = response
+        next_nonce = headers.get("X-Heel-Runner-Next-Nonce")
+        if not self._b64_32(next_nonce):
+            raise ValueError("invalid runner control response")
+        run_states: dict[str, tuple[str, int, int]] = {}
+        if operation == "claim":
+            body, run_states = self._decode_claim(status, body)
+        elif operation == "heartbeat":
+            if status != 200:
+                raise ValueError("invalid runner heartbeat response")
+            body = self._decode_gate(body, "invalid runner heartbeat response")
+        elif operation in {"progress", "result"}:
+            if status != 200:
+                raise ValueError(f"invalid runner {operation} response")
+            body = self._decode_status(body, run_id, operation)
+        elif operation == "stop-ack":
+            if (
+                status != 200 or not isinstance(body, dict)
+                or set(body) != {"accepted", "deadline_met", "late"}
+                or any(type(body[field]) is not bool for field in body)
+                or body["accepted"] is not True
+                or body["deadline_met"] is body["late"]
+            ):
+                raise ValueError("invalid runner stop acknowledgement response")
+            body = dict(body)
+        elif operation == "upload-findings":
+            if status != 200:
+                raise ValueError("invalid runner findings receipt")
+            body = self._decode_findings_receipt(body, run_id)
+            if upload_binding is None:
+                raise ValueError("invalid runner findings receipt")
+            permit_value, findings, projection_bytes, finding_count = upload_binding
+            if (
+                body["project_id"] != permit_value["project_id"]
+                or body["grant_id"] != permit_value["grant_id"]
+                or body["permit_id"] != permit_value["permit_id"]
+                or body["projection_id"] != findings["projection_id"]
+                or body["projection_digest"] != findings["projection_digest"]
+                or body["byte_count"] != projection_bytes
+                or body["scenario_count"] != len(findings["scenario_results"])
+                or body["finding_count"] != finding_count
+            ):
+                raise ValueError("invalid runner findings receipt")
+        else:
+            raise ValueError("invalid runner control operation")
+
+        with self._state_lock:
+            staged = dict(self._chains)
+            current = staged.get(call.chain)
+            if current is not None and current != (
+                call.headers["X-Heel-Runner-Nonce"], call.sequence, call.generation,
+            ):
+                raise ValueError("runner control chain changed during request")
+            staged[call.chain] = (next_nonce, call.sequence + 1, call.generation)
+            for chain_name, state in run_states.items():
+                self._stage_chain(staged, chain_name, state)
+            self._chains = staged
+            if operation == "result" and body["status"] == "terminal":
+                self._terminal_runs.add(run_id)
+            self.calls.append(call)
+        return body
+
+    def _operation_lock(self, operation: str, run_id: str | None) -> threading.Lock:
+        chain = self._chain(operation, run_id)
+        with self._state_lock:
+            lock = self._chain_locks.get(chain)
+            if lock is None:
+                lock = threading.Lock()
+                self._chain_locks[chain] = lock
+            return lock
+
+    @staticmethod
+    def _stage_chain(
+        states: dict[str, tuple[str, int, int]],
+        chain_name: str,
+        state: tuple[str, int, int],
+    ) -> None:
+        current = states.get(chain_name)
+        if current is not None:
+            if state[2] < current[2] or (state[2] == current[2] and state != current):
+                raise ValueError("runner chain generation did not advance")
+            if state[2] == current[2]:
+                return
+        states[chain_name] = state
+
+    def _decode_claim(
+        self, status: int, body: object,
+    ) -> tuple[dict[str, Any] | None, dict[str, tuple[str, int, int]]]:
+        if status == 204 and body is None:
+            return None, {}
+        fields = {
+            "schema_version", "run_id", "approval_projection", "grant",
+            "chain_states", "gate",
+        }
+        if status != 200 or not isinstance(body, dict) or set(body) != fields:
+            raise ValueError("invalid runner claim response")
+        try:
+            projection = validate_approval_projection(body["approval_projection"])
+            grant = validate_execution_grant(body["grant"])
+        except (TypeError, ValueError):
+            raise ValueError("invalid runner claim response") from None
+        run_id = body["run_id"]
+        if (
+            body["schema_version"] != "heel.runner-claim-response.v1"
+            or type(run_id) is not str or not run_id
+            or run_id != grant["run_id"]
+            or projection["workspace_id"] != self.workspace_id
+            or grant["workspace_id"] != self.workspace_id
+            or projection["project_id"] != grant["project_id"]
+            or projection["runner"]["runner_id"] != self.runner_id
+            or projection["runner"]["runner_key_id"] != self.signer.key_id
+            or grant["runner_binding"]["runner_id"] != self.runner_id
+            or grant["runner_binding"]["runner_key_id"] != self.signer.key_id
+            or grant["approval"] != {
+                "projection_id": projection["projection_id"],
+                "projection_digest": projection["projection_digest"],
+                "manifest_digest": projection["manifest_digest"],
+            }
+        ):
+            raise ValueError("invalid runner claim response")
+        try:
+            self._verify_projection_signature(projection)
+        except (TypeError, ValueError):
+            raise ValueError("invalid runner claim response") from None
+        gate = self._decode_gate(body["gate"], "invalid runner claim response")
+        if (
+            gate["active"] is not True or gate["runner_state"] != "active"
+            or gate["proof_state"] != "valid" or gate["stop_reason"] != "none"
+            or gate["proof_expires_at_ms"] <= gate["server_time_ms"]
+            or gate["kill_switch_generation"] != grant["kill_switch_generation"]
+        ):
+            raise ValueError("invalid runner claim response")
+        chains = body["chain_states"]
+        if not isinstance(chains, dict) or set(chains) != _RUN_OPERATIONS:
+            raise ValueError("invalid runner claim response")
+        states: dict[str, tuple[str, int, int]] = {}
+        for operation, value in chains.items():
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"next_nonce_b64", "next_sequence", "generation"}
+                or not self._b64_32(value["next_nonce_b64"])
+                or not self._positive_int(value["next_sequence"])
+                or not self._generation(value["generation"])
+            ):
+                raise ValueError("invalid runner claim response")
+            states[self._chain(operation, run_id)] = (
+                value["next_nonce_b64"], value["next_sequence"], value["generation"],
+            )
+        return {
+            "schema_version": body["schema_version"], "run_id": run_id,
+            "approval_projection": projection, "grant": grant,
+            "chain_states": {
+                operation: dict(chains[operation]) for operation in sorted(chains)
+            },
+            "gate": gate,
+        }, states
+
+    @staticmethod
+    def _decode_gate(body: object, error: str) -> dict[str, Any]:
+        if not isinstance(body, dict) or set(body) != _GATE_FIELDS:
+            raise ValueError(error)
+        if (
+            type(body["active"]) is not bool
+            or body["runner_state"] not in {"active", "revoked", "replaced"}
+            or body["proof_state"] not in {"valid", "expired", "revoked"}
+            or body["stop_reason"] not in _STOPS
+            or any(isinstance(body[field], bool) or not isinstance(body[field], int)
+                   or body[field] < 0 for field in (
+                       "proof_expires_at_ms", "kill_switch_generation", "server_time_ms",
+                   ))
+        ):
+            raise ValueError(error)
+        return dict(body)
+
+    def _decode_findings_receipt(
+        self, body: object, run_id: str | None,
+    ) -> dict[str, Any]:
+        if not isinstance(body, dict) or set(body) != _FINDINGS_RECEIPT_FIELDS:
+            raise ValueError("invalid runner findings receipt")
+        if (
+            body["schema_version"] != "heel.canary-findings-receipt.v1"
+            or body["workspace_id"] != self.workspace_id
+            or body["run_id"] != run_id
+            or any(type(body[field]) is not str or not body[field] for field in (
+                "receipt_id", "workspace_id", "project_id", "run_id", "grant_id",
+                "permit_id", "projection_id",
+            ))
+            or not (
+                type(body["projection_digest"]) is str
+                and len(body["projection_digest"]) == 64
+                and all(char in "0123456789abcdef" for char in body["projection_digest"])
+            )
+            or any(isinstance(body[field], bool) or not isinstance(body[field], int)
+                   or body[field] < 0 for field in (
+                       "byte_count", "scenario_count", "finding_count", "accepted_at_ms",
+                   ))
+            or body["byte_count"] > 256 * 1024
+            or body["scenario_count"] > 4
+            or body["finding_count"] > body["scenario_count"]
+            or body["status"] != "synchronized"
+        ):
+            raise ValueError("invalid runner findings receipt")
+        return dict(body)
+
+    @staticmethod
+    def _decode_status(body: object, run_id: str | None, operation: str) -> dict[str, Any]:
+        error = f"invalid runner {operation} response"
+        if not isinstance(body, dict) or set(body) != _STATUS_FIELDS:
+            raise ValueError(error)
+        integers = ("source_event_sequence", "kill_switch_generation", "stop_generation")
+        optional_integers = ("stop_deadline_ms", "stop_acknowledged_at_ms")
+        if (
+            body["schema_version"] != "heel.canary-run-status.v1"
+            or body["run_id"] != run_id
+            or any(type(body[field]) is not str or not body[field]
+                   for field in ("run_id", "approval_id", "grant_id"))
+            or body["status"] not in _RUN_STATUSES
+            or (body["execution_disposition"] is not None
+                and body["execution_disposition"] not in _DISPOSITIONS)
+            or (body["status"] == "terminal") != (body["execution_disposition"] is not None)
+            or body["error_category"] not in _ERRORS
+            or body["stop_reason"] not in _STOPS
+            or body["quota_state"] not in {
+                "unreserved", "reserved", "consumed", "refunded", "compensated",
+            }
+            or any(isinstance(body[field], bool) or not isinstance(body[field], int)
+                   or body[field] < (-1 if field == "source_event_sequence" else 0)
+                   for field in integers)
+            or any(value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ) for value in (body[field] for field in optional_integers))
+            or type(body["stop_ack_late"]) is not bool
+        ):
+            raise ValueError(error)
+        return dict(body)
+
+    def _closed_control_locked(
+        self, operation: str, run_id: str | None,
+        operational_projection: object | None = None,
+    ):
+        if operation == "claim":
+            request = validate_runner_claim_request({
+                "schema_version": "heel.runner-claim-request.v1",
+            })
+        else:
+            self._validate_chain(operation, run_id)
+            request = _REQUEST_VALIDATORS[operation]({
+                "schema_version": f"heel.runner-{operation}-request.v1",
+                "run_id": run_id,
+                "operational_projection": operational_projection,
+            })
+            self._verify_projection_signature(request["operational_projection"])
+        nonce, sequence, generation, chain = self._next_chain(operation, run_id)
+        path, body, timestamp_ms = (
+            self._control_path(operation, run_id), canonical_bytes(request), self._timestamp()
+        )
+        proof = {
+            "schema_version": "heel.runner-request-proof.v1", "workspace_id": self.workspace_id,
+            "runner_id": self.runner_id, "key_id": self.signer.key_id,
+            "capability": _CAPS[operation], "method": "POST", "path": path,
+            "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms,
+            "server_nonce": nonce, "sequence": sequence,
+        }
+        call = _Call(
+            path,
+            self._headers(
+                self._signature(b"heel.runner-pop.v1\0" + canonical_bytes(proof)),
+                timestamp_ms, nonce=nonce, sequence=sequence,
+            ),
+            body, _CAPS[operation], chain, sequence, generation,
+        )
+        return self._post_closed(call, operation, run_id)
+
+    def _closed_control(
+        self, operation: str, run_id: str | None,
+        operational_projection: object | None = None,
+    ):
+        self._validate_chain(operation, run_id)
+        with self._operation_lock(operation, run_id):
+            return self._closed_control_locked(
+                operation, run_id, operational_projection,
+            )
+
+    def _claim_closed(self):
+        return self._closed_control("claim", None)
+
+    def _heartbeat_closed(self, run_id: str, operational_projection: object):
+        return self._closed_control("heartbeat", run_id, operational_projection)
+
+    def _progress_closed(self, run_id: str, operational_projection: object):
+        return self._closed_control("progress", run_id, operational_projection)
+
+    def _result_closed(self, run_id: str, operational_projection: object):
+        return self._closed_control("result", run_id, operational_projection)
+
+    def _stop_ack_closed(self, run_id: str, operational_projection: object):
+        return self._closed_control("stop-ack", run_id, operational_projection)
+
+    def _upload_findings_closed(
+        self, *, run_id: str, permit: object, findings_projection: object,
+    ):
+        self._validate_chain("result", run_id)
+        with self._state_lock:
+            if run_id not in self._terminal_runs:
+                raise ValueError("terminal runner result is required before disclosure")
+        try:
+            permit_value = validate_disclosure_permit(permit)
+            findings = validate_canary_findings(findings_projection)
+        except (TypeError, ValueError):
+            raise ValueError("invalid runner findings upload") from None
+        projection_bytes = canonical_bytes(findings)
+        finding_count = sum(
+            item["finding"] is not None for item in findings["scenario_results"]
+        )
+        if (
+            permit_value["workspace_id"] != self.workspace_id
+            or permit_value["run_id"] != run_id
+            or findings["workspace_id"] != self.workspace_id
+            or findings["run_id"] != run_id
+            or findings["project_id"] != permit_value["project_id"]
+            or findings["grant_id"] != permit_value["grant_id"]
+            or permit_value["runner_binding"] != {
+                "runner_id": self.runner_id, "runner_key_id": self.signer.key_id,
+            }
+            or permit_value["projection"] != {
+                "schema_version": findings["schema_version"],
+                "projection_digest": findings["projection_digest"],
+                "maximum_bytes": len(projection_bytes),
+                "scenario_count": len(findings["scenario_results"]),
+                "finding_count": finding_count,
+            }
+        ):
+            raise ValueError("invalid runner findings upload")
+        try:
+            self._verify_projection_signature(findings)
+        except (TypeError, ValueError):
+            raise ValueError("invalid runner findings upload") from None
+        request = {
+            "schema_version": "heel.runner-findings-upload.v1", "run_id": run_id,
+            "permit": permit_value, "findings_projection": findings,
+        }
+        body = canonical_bytes(request)
+        if len(body) > _MAX_FINDINGS_UPLOAD_BYTES:
+            raise ValueError("invalid runner findings upload")
+        with self._operation_lock("result", run_id):
+            nonce, sequence, generation, chain = self._next_chain("result", run_id)
+            path = (
+                f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/runs/"
+                f"{run_id}/result-projection"
+            )
+            timestamp_ms = self._timestamp()
+            proof = {
+                "schema_version": "heel.runner-request-proof.v1",
+                "workspace_id": self.workspace_id, "runner_id": self.runner_id,
+                "key_id": self.signer.key_id, "capability": "runner_result",
+                "method": "POST", "path": path,
+                "body_sha256": hashlib.sha256(body).hexdigest(),
+                "timestamp_ms": timestamp_ms, "server_nonce": nonce,
+                "sequence": sequence,
+            }
+            call = _Call(
+                path,
+                self._headers(
+                    self._signature(b"heel.runner-pop.v1\0" + canonical_bytes(proof)),
+                    timestamp_ms, nonce=nonce, sequence=sequence,
+                ),
+                body, "runner_result", chain, sequence, generation,
+            )
+            return self._post_closed(
+                call, "upload-findings", run_id,
+                upload_binding=(
+                    permit_value, findings, len(projection_bytes), finding_count,
+                ),
+            )
+
     def claim(self):
         request = validate_runner_claim_request({"schema_version": "heel.runner-claim-request.v1"})
         return self._post_control("claim", request, None)
@@ -158,6 +590,11 @@ class RunnerControlClient:
     def progress(self, *, run_id, operational_projection): return self._run("progress", run_id, operational_projection)
     def result(self, *, run_id, operational_projection): return self._run("result", run_id, operational_projection)
     def stop_ack(self, *, run_id, operational_projection): return self._run("stop-ack", run_id, operational_projection)
+
+    def upload_findings(self, *, run_id, permit, findings_projection):
+        return self._upload_findings_closed(
+            run_id=run_id, permit=permit, findings_projection=findings_projection,
+        )
 
     def _run(self, operation: str, run_id: str, operational_projection: Any):
         self._validate_chain(operation, run_id)

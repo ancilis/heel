@@ -10,6 +10,9 @@ from .control_client import (
     PendingRunnerResync, RecoveredRunnerChain, RunnerControlClient,
     RunnerRotationActivated,
 )
+from .coordinator import (
+    RunnerCoordinator, RunnerExecutionAdapter, RunnerStopAcknowledgement,
+)
 from .catalog import AUTH_PROFILES, CATALOG, CATALOG_IDS, SEMANTIC_ROLES
 from .compiler import CanaryCompiler, CompileResult
 from .companion import CompanionServer, validate_disclosure_preview, validate_local_result_view
@@ -44,6 +47,7 @@ __all__ = [
     "runner_phrase_words", "validate_pairing_phrase", "RunnerControlClient",
     "PendingRunnerResync", "RecoveredRunnerChain",
     "RunnerRotationActivated",
+    "RunnerCoordinator", "RunnerExecutionAdapter", "RunnerStopAcknowledgement",
     "AUTH_PROFILES", "CATALOG", "CATALOG_IDS", "SEMANTIC_ROLES",
     "CanaryCompiler", "CompileResult", "RouteInventory", "normalize_route_template",
     "CompanionServer", "validate_disclosure_preview", "validate_local_result_view",

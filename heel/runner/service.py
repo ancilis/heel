@@ -118,10 +118,19 @@ class _StopController:
 
             def call() -> None:
                 try:
-                    self.coordinator.stop_ack(
+                    response = self.coordinator.stop_ack(
                         self.lease.run_id, acknowledgement, deadline=deadline,
                     )
-                    acknowledged_at_ms.append(self.clock_ms())
+                    exact_timestamp = getattr(response, "acknowledged_at_ms", None)
+                    if exact_timestamp is None:
+                        exact_timestamp = self.clock_ms()
+                    if (
+                        isinstance(exact_timestamp, bool)
+                        or not isinstance(exact_timestamp, int)
+                        or exact_timestamp < 0
+                    ):
+                        raise ValueError("invalid stop acknowledgement timestamp")
+                    acknowledged_at_ms.append(exact_timestamp)
                 except BaseException as exc:
                     failure.append(exc)
                 finally:
