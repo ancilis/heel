@@ -260,6 +260,8 @@ def build_server(config: ProductionConfiguration):
             migrator.apply_all()
             if migrator.current_version() != CONTROL_PLANE_MIGRATIONS[-1].version:
                 raise ProductionConfigurationError("control-plane schema is not current")
+            from .runner_auth import validate_runner_auth_schema
+            validate_runner_auth_schema(migration_connection)
         finally:
             migration_connection.close()
 

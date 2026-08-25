@@ -253,21 +253,37 @@ def _ensure_lifecycle_tables(conn: sqlite3.Connection) -> None:
     """)
 
 
-def ensure_runner_auth_schema(conn: sqlite3.Connection) -> None:
-    """Runtime schema parity through migration eleven, with no dependence on a pepper."""
+_RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records")
+
+
+def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
+    """Read-only exact v11 schema validation; startup must migrate rather than repair."""
     if not isinstance(conn, sqlite3.Connection):
         raise TypeError("runner authentication requires a SQLite connection")
-    exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_runner_pairings'"
-    ).fetchone()
-    if exists is None:
+    expected = sqlite3.connect(":memory:")
+    try:
+        expected.executescript(RUNNER_AUTH_RUNTIME_SCHEMA)
+        for table in _RUNNER_AUTH_TABLES:
+            actual = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            wanted = expected.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            if actual is None or wanted is None or "".join(actual[0].split()) != "".join(wanted[0].split()):
+                raise RuntimeError("runner authentication schema is not current")
+            for pragma in ("foreign_key_list", "index_list"):
+                if [tuple(row) for row in conn.execute(f"PRAGMA {pragma}({table})")] != [tuple(row) for row in expected.execute(f"PRAGMA {pragma}({table})")]:
+                    raise RuntimeError("runner authentication schema is not current")
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("runner authentication schema has foreign-key violations")
+    finally:
+        expected.close()
+
+
+def initialize_runner_auth_schema(conn: sqlite3.Connection) -> None:
+    """Startup-only creation for a fresh local ControlPlane; never repairs old databases."""
+    if not isinstance(conn, sqlite3.Connection):
+        raise TypeError("runner authentication requires a SQLite connection")
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_runner_pairings'").fetchone() is None:
         conn.executescript(RUNNER_AUTH_RUNTIME_SCHEMA)
-        return
-    # A durable legacy database is never rebuilt by runtime construction. The migrator remains
-    # the only upgrade authority; these additive statements retain compatibility while it runs.
-    conn.executescript(RUNNER_AUTH_SCHEMA)
-    _ensure_hardened_ledger_schema(conn)
-    _ensure_lifecycle_tables(conn)
+    validate_runner_auth_schema(conn)
 
 
 class RunnerAuthStore:
@@ -276,7 +292,6 @@ class RunnerAuthStore:
             raise ValueError("runner authentication pepper must be 32 to 64 bytes")
         self.conn, self._pepper, self._now = conn, pepper, now
         self.conn.row_factory = sqlite3.Row
-        ensure_runner_auth_schema(self.conn)
 
     def _ensure_hardened_ledger(self) -> None:
         _ensure_hardened_ledger_schema(self.conn)

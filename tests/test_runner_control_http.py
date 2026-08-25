@@ -17,7 +17,7 @@ from heel.canary_contracts import canonical_bytes, validate_runner_identity
 from heel.crypto import ed25519_key_id
 from heel.runner.control_client import RunnerControlClient
 from heel.saas.canary_store import CanaryStore
-from heel.saas.runner_auth import RunnerAuthError, RunnerAuthStore
+from heel.saas.runner_auth import RunnerAuthError, RunnerAuthStore, initialize_runner_auth_schema
 from heel.saas.http_api import ControlPlane, serve
 
 PUBLIC_KEY = b"0123456789abcdef0123456789abcdef"
@@ -78,6 +78,7 @@ def test_has_no_public_generic_request_api():
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
     conn = sqlite3.connect(":memory:")
     CanaryStore(conn)
+    initialize_runner_auth_schema(conn)
     store = RunnerAuthStore(conn, pepper=b"p" * 32)
     private = Ed25519PrivateKey.generate()
     raw = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
