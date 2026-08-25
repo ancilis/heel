@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import secrets
 import sqlite3
 import time
@@ -18,8 +19,11 @@ from typing import Callable, Mapping
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from heel.canary_contracts import canonical_bytes, parse_json
+from heel.canary_contracts import (
+    canonical_bytes, canonical_digest, parse_json, validate_runner_identity,
+)
 from heel.crypto import ed25519_key_id, load_public_key_base64
+from heel.runner.identity import runner_phrase_words, validate_pairing_phrase
 
 
 PAIRING_TTL = 10 * 60
@@ -74,6 +78,66 @@ ALTER TABLE canary_runner_request_ledger ADD COLUMN response_ciphertext TEXT;
 ALTER TABLE canary_runner_request_ledger ADD COLUMN next_nonce_ciphertext TEXT;
 """
 
+# Migration eleven intentionally leaves migrations 9 and 10 byte-stable.  The runner tables
+# below are rebuilt where SQLite permits it, adding tenant FKs and vocabulary checks; the
+# identity/audit tables are new immutable lifecycle projections.
+RUNNER_AUTH_LIFECYCLE_MIGRATION = """
+ALTER TABLE canary_runner_pairings RENAME TO canary_runner_pairings_v10;
+CREATE TABLE canary_runner_pairings(
+  pairing_id TEXT PRIMARY KEY CHECK(length(pairing_id) BETWEEN 1 AND 128),
+  workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+  invitation_hash TEXT NOT NULL UNIQUE CHECK(length(invitation_hash)=64 AND invitation_hash NOT GLOB '*[^0-9a-f]*'),
+  phrase TEXT, public_key TEXT, fingerprint TEXT, key_id TEXT, runner_version TEXT,
+  adapters_json TEXT, activation_challenge TEXT,
+  status TEXT NOT NULL CHECK(status IN ('invited','pending','approved','activated','expired')),
+  created_at REAL NOT NULL, expires_at REAL NOT NULL, approved_at REAL, activated_at REAL, approved_by TEXT,
+  UNIQUE(workspace_id, runner_id), FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id));
+INSERT INTO canary_runner_pairings SELECT * FROM canary_runner_pairings_v10;
+DROP TABLE canary_runner_pairings_v10;
+ALTER TABLE canary_runner_nonce_chains RENAME TO canary_runner_nonce_chains_v10;
+CREATE TABLE canary_runner_nonce_chains(
+  workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
+  nonce_hash TEXT NOT NULL CHECK(length(nonce_hash)=64 AND nonce_hash NOT GLOB '*[^0-9a-f]*'),
+  next_sequence INTEGER NOT NULL CHECK(next_sequence >= 1), expires_at REAL NOT NULL,
+  PRIMARY KEY(workspace_id,runner_id,chain_name),
+  FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+INSERT INTO canary_runner_nonce_chains SELECT * FROM canary_runner_nonce_chains_v10;
+DROP TABLE canary_runner_nonce_chains_v10;
+ALTER TABLE canary_runner_request_ledger RENAME TO canary_runner_request_ledger_v10;
+CREATE TABLE canary_runner_request_ledger(
+  workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, chain_name TEXT NOT NULL,
+  sequence INTEGER NOT NULL CHECK(sequence >= 1), request_digest TEXT NOT NULL,
+  response_json TEXT NOT NULL, next_nonce TEXT NOT NULL, created_at REAL NOT NULL,
+  nonce_hash TEXT, key_id TEXT, capability TEXT CHECK(capability IN ('runner_claim','runner_heartbeat','runner_progress','runner_result')),
+  method TEXT CHECK(method='POST'), path TEXT, timestamp_ms INTEGER CHECK(timestamp_ms >= 0),
+  signed_request_digest TEXT, body_digest TEXT, response_ciphertext TEXT, next_nonce_ciphertext TEXT,
+  PRIMARY KEY(workspace_id,runner_id,chain_name,sequence),
+  FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+INSERT INTO canary_runner_request_ledger SELECT * FROM canary_runner_request_ledger_v10;
+DROP TABLE canary_runner_request_ledger_v10;
+ALTER TABLE canary_runner_rotations RENAME TO canary_runner_rotations_v10;
+CREATE TABLE canary_runner_rotations(
+  pairing_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+  phrase TEXT NOT NULL, public_key TEXT NOT NULL, fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64 AND fingerprint NOT GLOB '*[^0-9a-f]*'),
+  key_id TEXT NOT NULL, runner_version TEXT NOT NULL, adapters_json TEXT NOT NULL, activation_challenge TEXT,
+  status TEXT NOT NULL CHECK(status IN ('rotation_pending','rotation_approved','rotated','expired')),
+  created_at REAL NOT NULL, expires_at REAL NOT NULL, approved_at REAL, activated_at REAL, approved_by TEXT,
+  FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+INSERT INTO canary_runner_rotations SELECT * FROM canary_runner_rotations_v10;
+DROP TABLE canary_runner_rotations_v10;
+CREATE TABLE IF NOT EXISTS canary_runner_identity_records(
+  workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, identity_json TEXT NOT NULL,
+  identity_digest TEXT NOT NULL CHECK(length(identity_digest)=64 AND identity_digest NOT GLOB '*[^0-9a-f]*'),
+  updated_at REAL NOT NULL, PRIMARY KEY(workspace_id,runner_id), UNIQUE(identity_digest),
+  FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+CREATE TABLE IF NOT EXISTS canary_runner_audit_records(
+  audit_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+  action TEXT NOT NULL CHECK(action IN ('runner_revoked','runner_rotated','runner_activated')),
+  actor TEXT NOT NULL, reason_code TEXT, created_at REAL NOT NULL,
+  FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+UPDATE canary_runners SET status='disabled' WHERE status='active';
+"""
+
 
 class RunnerAuthError(PermissionError):
     """Uniform external runner-auth failure."""
@@ -108,16 +172,7 @@ def _token() -> str:
     return _b64(secrets.token_bytes(32))
 
 
-def _phrase_words() -> tuple[str, ...]:
-    # 32 * 16 * 4 deterministic pseudo-words: no external word-list licensing.
-    onset = ("b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "n", "p", "r", "s", "t", "v",
-             "w", "z", "br", "cl", "dr", "fr", "gr", "kr", "pl", "pr", "sk", "sl", "st", "tr", "vr", "zl")
-    vowel = ("a", "e", "i", "o", "u", "ae", "ai", "ao", "ea", "ei", "ia", "io", "oa", "oi", "ua", "ui")
-    tail = ("n", "r", "l", "m")
-    return tuple(a + b + c for a in onset for b in vowel for c in tail)
-
-
-WORDS = _phrase_words()
+WORDS = runner_phrase_words()
 
 
 class RunnerAuthStore:
@@ -128,6 +183,7 @@ class RunnerAuthStore:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(RUNNER_AUTH_SCHEMA)
         self._ensure_hardened_ledger()
+        self._ensure_lifecycle_schema()
 
     def _ensure_hardened_ledger(self) -> None:
         present = {row[1] for row in self.conn.execute("PRAGMA table_info(canary_runner_request_ledger)")}
@@ -139,6 +195,18 @@ class RunnerAuthStore:
             if column not in present:
                 self.conn.execute(statement)
                 present.add(column)
+
+    def _ensure_lifecycle_schema(self) -> None:
+        """Runtime parity for new databases; migrated production gets these through v11."""
+        self.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS canary_runner_identity_records(
+          workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, identity_json TEXT NOT NULL,
+          identity_digest TEXT NOT NULL, updated_at REAL NOT NULL,
+          PRIMARY KEY(workspace_id,runner_id), UNIQUE(identity_digest));
+        CREATE TABLE IF NOT EXISTS canary_runner_audit_records(
+          audit_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+          action TEXT NOT NULL, actor TEXT NOT NULL, reason_code TEXT, created_at REAL NOT NULL);
+        """)
 
     def _seal(self, value: str, *, aad: bytes) -> str:
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -158,6 +226,70 @@ class RunnerAuthStore:
         return hmac.new(self._pepper, domain.encode("ascii") + b"\0" + value.encode("utf-8"), hashlib.sha256).hexdigest()
 
     @staticmethod
+    def _milliseconds(instant: float) -> int:
+        return max(0, int(instant * 1000))
+
+    def _identity_record(self, *, workspace_id: str, runner_id: str, public_key: str,
+                         fingerprint: str, key_id: str, runner_version: str,
+                         adapters_json: str, paired_by: str, paired_at: float,
+                         heartbeat_at: float, state: str = "active",
+                         previous_key_ids: list[str] | None = None,
+                         rotated_at: float | None = None,
+                         overlap_ends_at: float | None = None,
+                         revoked_at: float | None = None, revoked_by: str | None = None,
+                         reason_code: str | None = None) -> dict:
+        try:
+            adapters = json.loads(adapters_json or "{}")
+            versions = sorted(set(adapters.values()))
+        except (TypeError, ValueError):
+            raise RunnerAuthError("invalid runner identity") from None
+        base = {
+            "schema_version": "heel.runner-identity.v1", "runner_id": runner_id,
+            "workspace_id": workspace_id,
+            "public_key": {"algorithm": "Ed25519", "key_id": key_id,
+                           "public_key_b64": public_key},
+            "fingerprint": fingerprint, "runner_version": runner_version,
+            "adapter_versions": versions,
+            "capabilities": list(RUNNER_CAPABILITIES),
+            "pairing": {"paired_by": paired_by, "paired_at_ms": self._milliseconds(paired_at),
+                        "fingerprint_confirmation": "confirmed", "phrase_confirmation": "confirmed"},
+            "last_heartbeat_at_ms": self._milliseconds(heartbeat_at), "state": state,
+            "rotation": {"previous_key_ids": sorted(previous_key_ids or []),
+                         "rotated_at_ms": None if rotated_at is None else self._milliseconds(rotated_at),
+                         "verification_overlap_ends_at_ms": None if overlap_ends_at is None else self._milliseconds(overlap_ends_at)},
+            "revocation": {"revoked_at_ms": None if revoked_at is None else self._milliseconds(revoked_at),
+                           "revoked_by": revoked_by, "reason_code": reason_code},
+        }
+        base["identity_digest"] = canonical_digest(base)
+        return validate_runner_identity(base)
+
+    def _save_identity(self, record: dict, *, instant: float) -> dict:
+        validated = validate_runner_identity(record)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO canary_runner_identity_records(workspace_id,runner_id,identity_json,identity_digest,updated_at) VALUES(?,?,?,?,?)",
+            (validated["workspace_id"], validated["runner_id"], canonical_bytes(validated).decode("utf-8"),
+             validated["identity_digest"], instant),
+        )
+        return validated
+
+    def _load_identity(self, workspace_id: str, runner_id: str) -> dict:
+        row = self.conn.execute("SELECT identity_json FROM canary_runner_identity_records WHERE workspace_id=? AND runner_id=?", (workspace_id, runner_id)).fetchone()
+        if row is None:
+            raise RunnerAuthError("invalid runner identity")
+        try:
+            return validate_runner_identity(json.loads(row["identity_json"]))
+        except (TypeError, ValueError):
+            raise RunnerAuthError("invalid runner identity") from None
+
+    def _save_changed_identity(self, identity: dict, *, instant: float) -> dict:
+        identity["identity_digest"] = canonical_digest({key: value for key, value in identity.items() if key != "identity_digest"})
+        return self._save_identity(identity, instant=instant)
+
+    def identity(self, workspace_id: str, runner_id: str) -> dict:
+        """Return a detached validated cloud identity projection, never local key material."""
+        return self._load_identity(workspace_id, runner_id)
+
+    @staticmethod
     def _identifier(value: object, field: str) -> str:
         if type(value) is not str or not value or len(value.encode("utf-8")) > 128 or value.strip() != value:
             raise ValueError(f"invalid {field}")
@@ -165,12 +297,7 @@ class RunnerAuthStore:
 
     @staticmethod
     def _phrase(value: object) -> str:
-        if type(value) is not str or value != value.lower() or value != " ".join(value.split()):
-            raise ValueError("invalid pairing phrase")
-        words = value.split(" ")
-        if len(words) != 6 or any(word not in WORDS for word in words):
-            raise ValueError("invalid pairing phrase")
-        return value
+        return validate_pairing_phrase(value)
 
     def invite(self, workspace_id: str) -> PairingInvitation:
         self._identifier(workspace_id, "workspace")
@@ -262,6 +389,12 @@ class RunnerAuthStore:
             self.conn.execute("INSERT INTO canary_runner_keys(key_id,workspace_id,runner_id,public_key,status,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL)", (row["key_id"], row["workspace_id"], row["runner_id"], row["public_key"], "active", instant))
             nonce = _token()
             self.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (row["workspace_id"], row["runner_id"], "claim", self._hash("nonce", nonce), 1, instant + NONCE_TTL))
+            self._save_identity(self._identity_record(
+                workspace_id=row["workspace_id"], runner_id=row["runner_id"], public_key=row["public_key"],
+                fingerprint=row["fingerprint"], key_id=row["key_id"], runner_version=row["runner_version"],
+                adapters_json=row["adapters_json"], paired_by=row["approved_by"],
+                paired_at=row["approved_at"], heartbeat_at=instant), instant=instant)
+            self.conn.execute("INSERT INTO canary_runner_audit_records(audit_id,workspace_id,runner_id,action,actor,reason_code,created_at) VALUES(?,?,?,?,?,?,?)", ("runner_audit_" + secrets.token_hex(16), row["workspace_id"], row["runner_id"], "runner_activated", row["approved_by"], None, instant))
             self.conn.execute("UPDATE canary_runner_pairings SET status='activated', phrase=NULL, activation_challenge=NULL, activated_at=? WHERE pairing_id=?", (instant, pairing_id))
             self.conn.commit()
         except Exception:
@@ -285,7 +418,7 @@ class RunnerAuthStore:
             self.conn.rollback(); raise
         return nonce
 
-    def revoke(self, workspace_id: str, runner_id: str, *, actor: str) -> bool:
+    def revoke(self, workspace_id: str, runner_id: str, *, actor: str, reason_code: str = "human_revocation") -> bool:
         """Human-authorized revocation preserves historical runs but ends every control chain."""
         self._identifier(actor, "actor")
         instant = self._now()
@@ -294,9 +427,18 @@ class RunnerAuthStore:
             row = self.conn.execute("SELECT 1 FROM canary_runners WHERE workspace_id=? AND runner_id=? AND status='active'", (workspace_id, runner_id)).fetchone()
             if row is None:
                 self.conn.rollback(); return False
+            self._identifier(reason_code, "revocation reason")
             self.conn.execute("UPDATE canary_runners SET status='revoked' WHERE workspace_id=? AND runner_id=?", (workspace_id, runner_id))
             self.conn.execute("UPDATE canary_runner_keys SET status='revoked', revoked_at=? WHERE workspace_id=? AND runner_id=? AND revoked_at IS NULL", (instant, workspace_id, runner_id))
             self.conn.execute("DELETE FROM canary_runner_nonce_chains WHERE workspace_id=? AND runner_id=?", (workspace_id, runner_id))
+            # A runner loss invalidates only work which has not been claimed; historical and
+            # in-flight records remain evidence and are settled by Task 7's lifecycle service.
+            self.conn.execute("UPDATE canary_execution_grants SET status='revoked' WHERE workspace_id=? AND runner_id=? AND status IN ('prepared','approved','issued')", (workspace_id, runner_id))
+            identity = self._load_identity(workspace_id, runner_id)
+            identity["state"] = "revoked"
+            identity["revocation"] = {"revoked_at_ms": self._milliseconds(instant), "revoked_by": actor, "reason_code": reason_code}
+            self._save_changed_identity(identity, instant=instant)
+            self.conn.execute("INSERT INTO canary_runner_audit_records(audit_id,workspace_id,runner_id,action,actor,reason_code,created_at) VALUES(?,?,?,?,?,?,?)", ("runner_audit_" + secrets.token_hex(16), workspace_id, runner_id, "runner_revoked", actor, reason_code, instant))
             self.conn.commit()
         except Exception:
             if self.conn.in_transaction: self.conn.rollback()
@@ -326,6 +468,9 @@ class RunnerAuthStore:
                 raise RunnerAuthError("invalid rotation")
             pairing_id, challenge = "rotation_" + secrets.token_hex(16), _token()
             self.conn.execute("INSERT INTO canary_runner_rotations(pairing_id,workspace_id,runner_id,phrase,public_key,fingerprint,key_id,runner_version,adapters_json,activation_challenge,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (pairing_id, workspace_id, runner_id, phrase, public_key_b64, fingerprint, key_id, runner_version, canonical_bytes(dict(adapters)).decode(), challenge, "rotation_pending", instant, instant + PAIRING_TTL))
+            identity = self._load_identity(workspace_id, runner_id)
+            identity["state"] = "rotating"
+            self._save_changed_identity(identity, instant=instant)
             self.conn.commit()
         except Exception:
             self.conn.rollback(); raise
@@ -343,7 +488,13 @@ class RunnerAuthStore:
         except Exception:
             self.conn.rollback(); raise
 
-    def activate_rotation(self, pairing_id: str, signature_b64: str, *, overlap_seconds: int = 300) -> str:
+    def rotation_activation_challenge(self, pairing_id: str) -> str:
+        row = self.conn.execute("SELECT activation_challenge,status,expires_at FROM canary_runner_rotations WHERE pairing_id=?", (pairing_id,)).fetchone()
+        if row is None or row["status"] != "rotation_approved" or row["expires_at"] <= self._now() or not row["activation_challenge"]:
+            raise RunnerAuthError("invalid rotation")
+        return row["activation_challenge"]
+
+    def activate_rotation(self, pairing_id: str, signature_b64: str, *, overlap_seconds: int = 300) -> tuple[str, str, str]:
         if not isinstance(overlap_seconds, int) or not 1 <= overlap_seconds <= 3600:
             raise ValueError("invalid key overlap")
         instant = self._now()
@@ -363,11 +514,21 @@ class RunnerAuthStore:
             self.conn.execute("DELETE FROM canary_runner_nonce_chains WHERE workspace_id=? AND runner_id=?", (row["workspace_id"], row["runner_id"]))
             nonce = _token()
             self.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (row["workspace_id"], row["runner_id"], "claim", self._hash("nonce", nonce), 1, instant + NONCE_TTL))
+            identity = self._load_identity(row["workspace_id"], row["runner_id"])
+            previous = sorted(set(identity["rotation"]["previous_key_ids"] + [identity["public_key"]["key_id"]]))
+            identity["public_key"] = {"algorithm": "Ed25519", "key_id": row["key_id"], "public_key_b64": row["public_key"]}
+            identity["fingerprint"] = row["fingerprint"]
+            identity["runner_version"] = row["runner_version"]
+            identity["adapter_versions"] = sorted(set(json.loads(row["adapters_json"]).values()))
+            identity["state"] = "active"
+            identity["rotation"] = {"previous_key_ids": previous, "rotated_at_ms": self._milliseconds(instant), "verification_overlap_ends_at_ms": self._milliseconds(instant + overlap_seconds)}
+            self._save_changed_identity(identity, instant=instant)
+            self.conn.execute("INSERT INTO canary_runner_audit_records(audit_id,workspace_id,runner_id,action,actor,reason_code,created_at) VALUES(?,?,?,?,?,?,?)", ("runner_audit_" + secrets.token_hex(16), row["workspace_id"], row["runner_id"], "runner_rotated", row["approved_by"], None, instant))
             self.conn.execute("UPDATE canary_runner_rotations SET status='rotated',activation_challenge=NULL,activated_at=? WHERE pairing_id=?", (instant, pairing_id))
             self.conn.commit()
         except Exception:
             self.conn.rollback(); raise
-        return nonce
+        return row["workspace_id"], row["runner_id"], nonce
 
     def authenticate_and_consume(self, *, workspace_id: str, runner_id: str, capability: str, path: str,
                                  raw_body: bytes, headers: Mapping[str, list[str]], action: Callable[[], dict]) -> tuple[dict, str]:
@@ -432,6 +593,10 @@ class RunnerAuthStore:
             response = action()
             if not isinstance(response, dict):
                 raise ValueError("runner action must return a response object")
+            if capability == "runner_heartbeat":
+                identity = self._load_identity(workspace_id, runner_id)
+                identity["last_heartbeat_at_ms"] = self._milliseconds(self._now())
+                self._save_changed_identity(identity, instant=self._now())
             nonce = _token()
             aad = f"{workspace_id}\0{runner_id}\0{chain}\0{sequence}".encode()
             response_json = canonical_bytes(response).decode("utf-8")

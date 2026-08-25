@@ -30,7 +30,7 @@ class CanaryMigrationTests(unittest.TestCase):
         )
 
     def test_migration_six_creates_tenant_bound_unique_tables(self):
-        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 10)
+        self.assertEqual(CONTROL_PLANE_MIGRATIONS[-1].version, 11)
         tables = (
             "canary_environments", "canary_runners", "canary_runner_keys",
             "canary_consumed_nonces", "canary_approval_projections",
@@ -61,6 +61,29 @@ class CanaryMigrationTests(unittest.TestCase):
                 "INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)",
                 ("key-2", "ws", "runner-1", "public-key", "active", 1, None),
             )
+
+    def test_migration_eleven_binds_runner_lifecycle_records_and_checks_vocabularies(self):
+        self.seed_root("ws", "prj")
+        self.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", 1))
+        for table in ("canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_rotations", "canary_runner_identity_records"):
+            foreign = self.conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+            self.assertTrue(foreign, table)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", ("ws", "runner", "claim", "a" * 64, 0, 1))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("INSERT INTO canary_runner_pairings(pairing_id,workspace_id,runner_id,invitation_hash,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?)", ("pair", "ws", "", "a" * 64, "surprise", 1, 2))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("INSERT INTO canary_runner_rotations(pairing_id,workspace_id,runner_id,phrase,public_key,fingerprint,key_id,runner_version,adapters_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("rotation", "other", "runner", "phrase", "A" * 44, "a" * 64, "k", "v", "{}", "rotation_pending", 1, 2))
+
+    def test_migration_eleven_never_promotes_pre_pairing_runner_skeletons(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        Migrator(conn, CONTROL_PLANE_MIGRATIONS[:10]).apply_all()
+        conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+        conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+        conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("skeleton", "ws", "skeleton", "active", 1)); conn.commit()
+        Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+        self.assertEqual(conn.execute("SELECT status FROM canary_runners WHERE runner_id='skeleton'").fetchone()[0], "disabled")
 
     def test_current_catalog_only_has_new_meters(self):
         current_free = get_plan("free", CATALOG_VERSION)
@@ -144,8 +167,8 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
         conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
         conn.commit()
-        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10])
-        self.assertEqual(migration.current_version(), 10)
+        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11])
+        self.assertEqual(migration.current_version(), 11)
         self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):

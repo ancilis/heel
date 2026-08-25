@@ -28,6 +28,7 @@ import socket
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -93,6 +94,11 @@ _LOGGER = logging.getLogger("heel.saas.control_plane")
 _SYNC_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
+class _NullLock:
+    def __enter__(self): return self
+    def __exit__(self, *_): return False
+
+
 class _DuplicateJsonKey(ValueError):
     pass
 
@@ -147,7 +153,9 @@ class ControlPlane:
                  grant_trusted_keys: dict[str, object] | None = None,
                  environment_https_verifier=None,
                  environment_dns_txt=None,
-                 runner_auth_pepper: bytes | None = None):
+                 runner_auth_pepper: bytes | None = None,
+                 runner_connection_factory=None,
+                 runner_connections_are_shared: bool | None = None):
         configured_pepper = bool(os.environ.get("HEEL_DEVICE_TOKEN_PEPPER_B64"))
         device_enabled = (
             enable_device_auth
@@ -178,6 +186,18 @@ class ControlPlane:
         # environment proof deliberately releases it only for DNS/TLS I/O.
         self.request_lock = threading.RLock()
         self.store = ControlPlaneStore(path)
+        self._runner_auth_pepper = runner_auth_pepper
+        if runner_connection_factory is None:
+            self._runner_connection_factory = (
+                (lambda: sqlite3.connect(path, check_same_thread=False)) if path != ":memory:"
+                else (lambda: self.store.conn)
+            )
+            self.runner_connections_are_shared = path == ":memory:"
+        else:
+            self._runner_connection_factory = runner_connection_factory
+            # An injected test factory is safe only when the test explicitly declares that it
+            # returns independent durable connections. Defaulting to shared protects fixtures.
+            self.runner_connections_are_shared = True if runner_connections_are_shared is None else bool(runner_connections_are_shared)
         conn = self.store.conn
         self.canary_store = CanaryStore(conn)
         # Runtime construction (including unit/demo instances) stays schema-parity with the
@@ -240,6 +260,49 @@ class ControlPlane:
     def close(self) -> None:
         """Release the shared database connection. Safe to call more than once."""
         self.store.conn.close()
+
+    @contextmanager
+    def runner_request_store(self):
+        """A short independent SQLite unit for a public runner request.
+
+        Browser ceremony calls remain on the human connection under ``request_lock``.  A normal
+        deployment gives control requests their own connection, with a deliberately short busy
+        wait; in-memory fixtures are marked shared and remain locked by the handler.
+        """
+        if self._runner_auth_pepper is None:
+            raise RunnerAuthError("invalid runner authentication")
+        conn = self._runner_connection_factory()
+        shared = conn is self.store.conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=250")
+            if not shared:
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                except sqlite3.DatabaseError:
+                    pass
+            yield RunnerAuthStore(conn, pepper=self._runner_auth_pepper)
+        finally:
+            if not shared:
+                conn.close()
+
+    @staticmethod
+    def runner_active_limit(store: RunnerAuthStore, pairing_id: str) -> int | None:
+        """Read the plan pin through the runner's own connection during activation."""
+        row = store.conn.execute(
+            "SELECT p.workspace_id,w.plan_id AS workspace_plan,w.catalog_version AS workspace_catalog,"
+            "s.plan_id AS subscription_plan,s.catalog_version AS subscription_catalog "
+            "FROM canary_runner_pairings p JOIN workspaces w ON w.workspace_id=p.workspace_id "
+            "LEFT JOIN subscriptions s ON s.workspace_id=p.workspace_id WHERE p.pairing_id=?",
+            (pairing_id,),
+        ).fetchone()
+        if row is None:
+            raise RunnerAuthError("invalid pairing")
+        plan_id = row["subscription_plan"] or row["workspace_plan"]
+        catalog_version = row["subscription_catalog"] or row["workspace_catalog"]
+        limit = get_plan(plan_id, catalog_version).quota(Meter.ACTIVE_RUNNERS)
+        return None if limit < 0 else limit
 
     def subscription(self, workspace_id: str) -> Subscription:
         ws = self.store.get_workspace(workspace_id)
@@ -653,13 +716,21 @@ class _Handler(BaseHTTPRequestHandler):
             # must not monopolize the process-wide SQLite request lock.
             if self._is_environment_check_route(method):
                 self._route_serial(method)
-            elif not self._is_runner_route(method):
+            elif not self._is_runner_control_route(method):
                 with self.cp.request_lock:
                     self._route_serial(method)
             else:
-                # Runner messages are fast independent DB units. They must not wait behind a
-                # human password hash or future target I/O.
-                self._route_serial(method)
+                # Only the exact public exchange/activation and fixed PoP routes bypass the
+                # global human lock. They own a fresh short SQLite connection per request.
+                # In-memory tests explicitly use a shared connection and therefore stay locked.
+                guard = self.cp.request_lock if self.cp.runner_connections_are_shared else _NullLock()
+                with guard:
+                    with self.cp.runner_request_store() as store:
+                        self._runner_request_store = store
+                        try:
+                            self._route_serial(method)
+                        finally:
+                            self._runner_request_store = None
         finally:
             self._defer_json_response = False
         pending = self._pending_json_response
@@ -672,10 +743,17 @@ class _Handler(BaseHTTPRequestHandler):
         return bool(method == "POST" and len(p) == 8 and p[0] == "v1" and p[1] == "workspaces"
                     and p[3] == "projects" and p[5] == "environments" and p[7] == "check")
 
-    def _is_runner_route(self, method: str) -> bool:
+    def _is_runner_control_route(self, method: str) -> bool:
         p = self._route_parts
-        return bool(method == "POST" and len(p) >= 2 and p[0] == "v1" and (
-            p[1] == "runner-pairings" or (len(p) >= 4 and p[1] == "workspaces" and "runners" in p)
+        if method != "POST" or not p or p[0] != "v1":
+            return False
+        if len(p) == 3 and p[1] in {"runner-pairings", "runner-rotations"} and p[2] == "exchange":
+            return True
+        if len(p) == 4 and p[1] in {"runner-pairings", "runner-rotations"} and p[3] in {"activate", "poll"}:
+            return True
+        return bool(len(p) >= 6 and p[1] == "workspaces" and p[3] == "runners" and (
+            (len(p) == 6 and p[5] == "claim") or
+            (len(p) == 9 and p[5] == "runs" and p[8] in {"heartbeat", "progress", "result", "stop-ack"})
         ))
 
     def _route_serial(self, method: str) -> None:
@@ -744,6 +822,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._runner_pairing_exchange
         if method == "POST" and len(rest) == 3 and rest[0] == "runner-pairings" and rest[2] == "activate":
             return lambda: self._runner_pairing_activate(rest[1])
+        if method == "POST" and len(rest) == 3 and rest[0] == "runner-rotations" and rest[2] == "activate":
+            return lambda: self._runner_rotation_activate(rest[1])
+        if method == "POST" and len(rest) == 3 and rest[0] == "runner-rotations" and rest[2] == "poll":
+            return lambda: self._runner_rotation_poll(rest[1])
         if len(rest) >= 3 and rest[0] == "workspaces":
             wid, tail = rest[1], tuple(rest[2:])
             ws_routes = {
@@ -770,8 +852,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return lambda: self._runner_pairing_approve(wid, tail[1])
             if method == "POST" and len(tail) == 3 and tail[0] == "runners" and tail[2] == "rotate":
                 return lambda: self._runner_rotation_start(wid, tail[1])
-            if method == "POST" and len(tail) == 4 and tail[0] == "runners" and tail[2] == "rotations" and tail[3] == "approve":
-                return lambda: self._runner_rotation_approve(wid, tail[1])
+            if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "rotations" and tail[4] == "approve":
+                return lambda: self._runner_rotation_approve(wid, tail[3])
             if method == "DELETE" and len(tail) == 2 and tail[0] == "runners":
                 return lambda: self._runner_revoke(wid, tail[1])
             if method == "POST" and len(tail) == 3 and tail[0] == "runners" and tail[2] == "claim":
@@ -818,6 +900,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     # --- isolated runner pairing and proof routes ---
     def _runner_store(self) -> RunnerAuthStore:
+        request_store = getattr(self, "_runner_request_store", None)
+        if request_store is not None:
+            return request_store
         if self.cp.runner_auth is None:
             raise RunnerAuthError("invalid runner authentication")
         return self.cp.runner_auth
@@ -870,21 +955,30 @@ class _Handler(BaseHTTPRequestHandler):
             body = self._body()
             if set(body) != {"schema_version", "signature_b64"} or body["schema_version"] != "heel.runner-pairing-activate.v1":
                 raise ValueError
-            # The quota is enforced inside the identity activation transaction.
-            row = self.cp.store.conn.execute("SELECT workspace_id FROM canary_runner_pairings WHERE pairing_id=?", (pairing_id,)).fetchone()
-            if row is None:
-                raise RunnerAuthError("invalid pairing")
-            sub = self.cp.subscription(row["workspace_id"])
-            limit = self.cp.entitlements.quota(sub, Meter.ACTIVE_RUNNERS)
-            pairing_row = self.cp.store.conn.execute("SELECT status,runner_id FROM canary_runner_rotations WHERE pairing_id=?", (pairing_id,)).fetchone()
-            if pairing_row is not None and pairing_row["status"] == "rotation_approved":
-                nonce = self._runner_store().activate_rotation(pairing_id, body["signature_b64"])
-                wid, runner_id = row["workspace_id"], pairing_row["runner_id"]
-            else:
-                wid, runner_id, nonce = self._runner_store().activate(pairing_id, body["signature_b64"], max_active=None if limit < 0 else limit)
+            store = self._runner_store()
+            # The plan read is intentionally on the same short runner connection, never on
+            # cp.store.conn; activation and its active-runner count then share one transaction.
+            wid, runner_id, nonce = store.activate(pairing_id, body["signature_b64"], max_active=self.cp.runner_active_limit(store, pairing_id))
         except (KeyError, ValueError, RunnerAuthError):
             raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
         self._json(200, {"schema_version": "heel.runner-pairing-activated.v1", "workspace_id": wid, "runner_id": runner_id, "initial_claim_nonce": nonce, "capabilities": ["runner_claim", "runner_heartbeat", "runner_progress", "runner_result"]})
+
+    def _runner_rotation_poll(self, pairing_id: str) -> None:
+        try:
+            challenge = self._runner_store().rotation_activation_challenge(pairing_id)
+        except RunnerAuthError:
+            raise ApiError(400, "invalid runner rotation", code="invalid_runner_rotation") from None
+        self._json(200, {"schema_version": "heel.runner-rotation-activation-challenge.v1", "pairing_id": pairing_id, "activation_challenge": challenge})
+
+    def _runner_rotation_activate(self, pairing_id: str) -> None:
+        try:
+            body = self._body()
+            if set(body) != {"schema_version", "signature_b64"} or body["schema_version"] != "heel.runner-rotation-activate.v1":
+                raise ValueError
+            wid, runner_id, nonce = self._runner_store().activate_rotation(pairing_id, body["signature_b64"])
+        except (KeyError, ValueError, RunnerAuthError):
+            raise ApiError(400, "invalid runner rotation", code="invalid_runner_rotation") from None
+        self._json(200, {"schema_version": "heel.runner-rotation-activated.v1", "workspace_id": wid, "runner_id": runner_id, "initial_claim_nonce": nonce})
 
     def _runner_rotation_start(self, wid: str, runner_id: str) -> None:
         self._recent_owner_admin(wid)
@@ -909,10 +1003,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _runner_revoke(self, wid: str, runner_id: str) -> None:
         actor = self._recent_owner_admin(wid)
-        if self._body() not in ({}, {"schema_version": "heel.runner-revoke.v1"}):
+        body = self._body()
+        if (set(body) != {"schema_version", "reason_code"}
+                or body.get("schema_version") != "heel.runner-revoke.v1"
+                or type(body.get("reason_code")) is not str):
             raise ApiError(400, "invalid runner revocation", code="invalid_runner_revocation")
-        if not self._runner_store().revoke(wid, runner_id, actor=actor):
-            raise ApiError(404, "runner not found", code="runner_not_found")
+        try:
+            revoked = self._runner_store().revoke(wid, runner_id, actor=actor, reason_code=body["reason_code"])
+        except (ValueError, RunnerAuthError):
+            revoked = False
+        if not revoked:
+            raise ApiError(400, "invalid runner revocation", code="invalid_runner_revocation")
         self._json(200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
 
     def _runner_request(self, wid: str, runner_id: str, capability: str, run_id: str | None, operation: str) -> None:

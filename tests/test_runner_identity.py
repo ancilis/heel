@@ -4,8 +4,12 @@ import pytest
 
 from heel.crypto import ed25519_key_id
 from heel.runner.identity import (
+    InMemorySecretBackend,
     SecureSigner,
+    SystemSecureSigner,
     create_runner_identity,
+    runner_phrase_words,
+    validate_pairing_phrase,
 )
 
 
@@ -74,3 +78,22 @@ def test_identity_phrase_is_cryptographically_indexed_and_validated():
     duplicate[1] = duplicate[0]
     with pytest.raises(ValueError, match="unique"):
         create_runner_identity("r", "w", "v", {}, signer, duplicate, lambda n: b"\0" * n)
+
+
+def test_public_phrase_vocabulary_is_exact_and_runner_auth_can_share_it():
+    words = runner_phrase_words()
+    assert len(words) == 2048 and len(set(words)) == 2048
+    phrase = " ".join(words[:6])
+    assert validate_pairing_phrase(phrase) == phrase
+    with pytest.raises(ValueError, match="pairing phrase"):
+        validate_pairing_phrase("not a valid pairing phrase")
+
+
+def test_system_secure_signer_persists_only_behind_explicit_secret_backend():
+    backend = InMemorySecretBackend()
+    first = SystemSecureSigner("heel-test-runner", backend=backend)
+    second = SystemSecureSigner("heel-test-runner", backend=backend)
+    assert first.key_id == second.key_id
+    assert first.public_key == second.public_key
+    assert first.sign(b"control") == second.sign(b"control")
+    assert "seed" not in repr(first).lower()
