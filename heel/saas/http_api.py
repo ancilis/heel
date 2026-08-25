@@ -51,6 +51,9 @@ from heel.canary_contracts import (
     validate_runner_stop_ack_request,
     validate_runner_context_create,
     validate_runner_context_revoke,
+    validate_runner_context_list,
+    validate_runner_context_claim,
+    validate_runner_approval_projection_submit,
 )
 from heel.crypto import load_public_key_base64, verify_envelope
 
@@ -800,6 +803,8 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         return bool(len(p) >= 6 and p[1] == "workspaces" and p[3] == "runners" and (
             (len(p) == 6 and p[5] == "claim") or
+            (len(p) == 7 and p[5] == "contexts" and p[6] == "list") or
+            (len(p) == 8 and p[5] == "contexts" and p[7] in {"claim", "approval-projections"}) or
             (len(p) == 7 and p[5] == "resync" and p[6] in {"start", "complete"}) or
             (len(p) == 8 and p[5] == "runs" and p[7] in {
                 "heartbeat", "progress", "result", "stop-ack", "result-projection",
@@ -919,6 +924,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return lambda: self._runner_revoke(wid, tail[1])
             if method == "POST" and len(tail) == 3 and tail[0] == "runners" and tail[2] == "claim":
                 return lambda: self._runner_request(wid, tail[1], "runner_claim", None, "claim")
+            if method == "POST" and len(tail) == 4 and tail[0] == "runners" and tail[2:] == ("contexts", "list"):
+                return lambda: self._runner_request(wid, tail[1], "runner_claim", None, "context-list")
+            if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "contexts" and tail[4] in {"claim", "approval-projections"}:
+                return lambda: self._runner_request(wid, tail[1], "runner_claim", tail[3], "context-" + tail[4])
             if method == "POST" and len(tail) == 4 and tail[0] == "runners" and tail[2] == "resync" and tail[3] in {"start", "complete"}:
                 return lambda: self._runner_resync(wid, tail[1], tail[3])
             if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "runs" and tail[4] in {"heartbeat", "progress", "result", "stop-ack"}:
@@ -1206,20 +1215,23 @@ class _Handler(BaseHTTPRequestHandler):
             raise RunnerAuthError("invalid runner authentication")
         try:
             maximum = (
-                256 if operation == "claim"
+                128 if operation == "context-list"
+                else 256 if operation in {"claim", "context-claim"}
+                else 69632 if operation == "context-approval-projections"
                 else MAX_UPLOAD_BYTES if operation == "result-projection"
                 else 36 * 1024
             )
             parsed = parse_json(self._raw_body(), max_bytes=maximum)
             validators = {"claim": validate_runner_claim_request, "heartbeat": validate_runner_heartbeat_request,
                           "progress": validate_runner_progress_request, "result": validate_runner_result_request,
-                          "stop-ack": validate_runner_stop_ack_request}
+                          "stop-ack": validate_runner_stop_ack_request, "context-list": validate_runner_context_list,
+                          "context-claim": validate_runner_context_claim, "context-approval-projections": validate_runner_approval_projection_submit}
             if operation != "result-projection":
                 parsed = validators[operation](parsed)
             if (canonical_bytes(parsed) != self._raw_body()
-                    or (run_id is not None and parsed.get("run_id") != run_id)):
+                    or (run_id is not None and (parsed.get("run_id", parsed.get("binding_id", parsed.get("context_binding_id"))) != run_id))):
                 raise RunnerAuthError("invalid runner authentication")
-            if operation not in {"claim", "result-projection"} and not self._operational_context_matches(
+            if operation not in {"claim", "result-projection", "context-list", "context-claim", "context-approval-projections"} and not self._operational_context_matches(
                     self._runner_store().conn, workspace_id=wid, runner_id=runner_id,
                     projection=parsed["operational_projection"]):
                 raise RunnerAuthError("invalid runner authentication")
@@ -1229,6 +1241,7 @@ class _Handler(BaseHTTPRequestHandler):
             # PoP opens its write transaction. Request mode performs no DDL or PRAGMA changes;
             # the lifecycle/disclosure action then commits atomically with proof consumption.
             runs, disclosure = self._runner_canary_services(store)
+            contexts = RunnerContextBindingService(store.conn, signing=self.cp.grant_authority)
 
             def action() -> dict:
                 if operation == "claim":
@@ -1238,6 +1251,20 @@ class _Handler(BaseHTTPRequestHandler):
                     return claimed or {
                         "schema_version": "heel.runner-claim-idle.internal.v1",
                     }
+                key_id = all_headers["X-Heel-Runner-Key-Id"][0]
+                if operation == "context-list":
+                    return contexts.list_for_runner_in_transaction(wid, runner_id, key_id)
+                if operation == "context-claim":
+                    return contexts.claim_in_transaction(wid, runner_id, key_id, run_id, parsed)
+                if operation == "context-approval-projections":
+                    binding = contexts.active_binding_for_projection_in_transaction(
+                        wid, runner_id, key_id, run_id, parsed["context_binding_digest"],
+                    )
+                    response = runs.submit_projection_from_runner_in_transaction(
+                        parsed["approval_projection"], binding, uploaded_by_runner_id=runner_id,
+                    )
+                    contexts._event(binding, "projection_submitted", "runner", runner_id)
+                    return response
                 if operation == "result-projection":
                     project_ref = self._runner_run_project(
                         store.conn, wid, runner_id, run_id,
@@ -1263,12 +1290,14 @@ class _Handler(BaseHTTPRequestHandler):
                 raw_body=self._raw_body(), headers=all_headers,
                 action=action,
                 chain_name=(
-                    "claim" if operation == "claim"
+                    "claim" if operation in {"claim", "context-list", "context-claim", "context-approval-projections"}
                     else f"result:{run_id}" if operation == "result-projection"
                     else f"{operation}:{run_id}"
                 ),
                 max_body_bytes=maximum,
             )
+        except RunnerContextError:
+            raise RunnerAuthError("invalid runner authentication") from None
         except (CanaryRunError, CanaryDisclosureError):
             raise
         except (ValueError, RunnerAuthError, LookupError):
@@ -1276,6 +1305,8 @@ class _Handler(BaseHTTPRequestHandler):
         response_headers = {"X-Heel-Runner-Next-Nonce": nonce}
         if response.get("schema_version") == "heel.runner-claim-idle.internal.v1":
             self._write_empty(204, response_headers)
+        elif operation == "context-approval-projections":
+            self._json(201, response, response_headers)
         else:
             self._json(200, response, response_headers)
 

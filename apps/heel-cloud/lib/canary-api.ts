@@ -80,6 +80,13 @@ export interface CanaryApprovalSummary {
   egress: string;
 }
 
+export interface RunnerContextBindingRecord {
+  bindingId: string; bindingDigest: string; environmentId: string; origin: string;
+  environmentClass: "staging" | "sandbox"; verificationRecordDigest: string;
+  runnerId: string; runnerKeyId: string; status: "active" | "revoked" | "expired";
+  issuedAtMs: number; expiresAtMs: number; firstClaimedAtMs: number | null;
+}
+
 export interface VerifiedEnvironmentRecord {
   schemaVersion: "VerifiedEnvironment.v1";
   environmentId: string;
@@ -547,6 +554,37 @@ export class CanaryApi {
     this.#transport = options.transport ?? sameOriginCanaryFetch;
     if (!integer(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 1, 60_000)) invalidRequest();
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  }
+
+  async listRunnerContextBindings(workspaceRef: string, projectRef: string): Promise<readonly RunnerContextBindingRecord[]> {
+    const value = await this.#json(projectPath(workspaceRef, projectRef, "/runner-context-bindings"), "GET", undefined, 200);
+    if (!exact(value, ["schema_version", "server_time_ms", "runners", "bindings"])
+      || value.schema_version !== "heel.runner-context-binding-dashboard.v1" || !integer(value.server_time_ms)
+      || !Array.isArray(value.runners) || !Array.isArray(value.bindings)) invalidResponse();
+    return deepFreeze(value.bindings.map((item): RunnerContextBindingRecord => {
+      if (!exact(item, ["binding_id", "binding_digest", "environment_id", "origin", "environment_class", "verification_record_digest", "runner_id", "runner_key_id", "status", "issued_at_ms", "expires_at_ms", "first_claimed_at_ms"])
+        || typeof item.binding_id !== "string" || !/^rcb_[0-9a-f]{32}$/.test(item.binding_id)
+        || !digest(item.binding_digest) || !ENVIRONMENT_REF.test(String(item.environment_id))
+        || typeof item.origin !== "string" || !["staging", "sandbox"].includes(String(item.environment_class))
+        || !digest(item.verification_record_digest) || !identifier(item.runner_id) || !identifier(item.runner_key_id)
+        || !["active", "revoked", "expired"].includes(String(item.status)) || !integer(item.issued_at_ms)
+        || !integer(item.expires_at_ms) || item.expires_at_ms <= item.issued_at_ms || !nullableInteger(item.first_claimed_at_ms)) invalidResponse();
+      return { bindingId: item.binding_id, bindingDigest: item.binding_digest, environmentId: item.environment_id,
+        origin: item.origin, environmentClass: item.environment_class as "staging" | "sandbox",
+        verificationRecordDigest: item.verification_record_digest, runnerId: item.runner_id,
+        runnerKeyId: item.runner_key_id, status: item.status as "active" | "revoked" | "expired",
+        issuedAtMs: item.issued_at_ms, expiresAtMs: item.expires_at_ms, firstClaimedAtMs: item.first_claimed_at_ms };
+    }));
+  }
+
+  async createRunnerContextBinding(workspaceRef: string, projectRef: string, input: { environmentId: string; verificationRecordDigest: string; runnerId: string; runnerKeyId: string }): Promise<void> {
+    if (!ENVIRONMENT_REF.test(input.environmentId) || !digest(input.verificationRecordDigest) || !identifier(input.runnerId) || !identifier(input.runnerKeyId)) invalidRequest();
+    await this.#json(projectPath(workspaceRef, projectRef, "/runner-context-bindings"), "POST", { schema_version: "heel.runner-context-binding-create.v1", environment_id: input.environmentId, verification_record_digest: input.verificationRecordDigest, runner_id: input.runnerId, runner_key_id: input.runnerKeyId }, 201);
+  }
+
+  async revokeRunnerContextBinding(workspaceRef: string, projectRef: string, bindingId: string): Promise<void> {
+    if (!/^rcb_[0-9a-f]{32}$/.test(bindingId)) invalidRequest();
+    await this.#json(projectPath(workspaceRef, projectRef, `/runner-context-bindings/${bindingId}/revoke`), "POST", { schema_version: "heel.runner-context-binding-revoke.v1", reason_code: "operator_requested" }, 200);
   }
 
   async submitApprovalProjection(workspaceRef: string, projectRef: string, projection: unknown): Promise<Readonly<CanaryApprovalSummary>> {

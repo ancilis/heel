@@ -28,6 +28,7 @@ from heel.canary_contracts import (
     validate_execution_grant,
     validate_operational_run,
     validate_test_manifest,
+    validate_runner_context_binding,
 )
 from heel.crypto import ed25519_key_id, load_public_key_base64, verify_envelope
 from heel.runner.identity import RunnerIdentity, SecureSigner
@@ -90,6 +91,7 @@ _MAX_EVIDENCE_HEADER_BYTES = 16 * 1024
 _MAX_EVIDENCE_BODY_BYTES = 256 * 1024
 _RESERVATION_SCHEMA = "heel.local-grant-consumption.v2"
 _FINALS_SCHEMA = "heel.local-final-projections.v1"
+_CONTEXT_DOMAIN = b"heel.runner-context-binding.v1\0"
 
 
 def _require_capabilities() -> None:
@@ -731,6 +733,64 @@ class RunnerStore:
         except BaseException:
             self._namespace = previous
             raise
+
+    def install_cloud_context_binding(
+        self, artifact: object, *, identity: RunnerIdentity, signer: SecureSigner,
+        signer_label: str, trusted_cloud_keys: Mapping[str, object], now_ms: int,
+    ) -> RunnerContext:
+        """Verify and atomically retain a Cloud authorization beside the immutable context."""
+        try:
+            binding = validate_runner_context_binding(artifact)
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid cloud context binding") from None
+        if not isinstance(trusted_cloud_keys, Mapping) or not trusted_cloud_keys:
+            raise RunnerStoreError("cloud context authority is unavailable")
+        if type(now_ms) is not int or isinstance(now_ms, bool):
+            raise RunnerStoreError("invalid cloud context time")
+        unsigned = {key: binding[key] for key in (
+            "binding_id", "workspace_id", "project_id", "environment", "runner_binding",
+            "authorization", "issued_at_ms", "expires_at_ms",
+        )}
+        try:
+            verify_envelope(dict(trusted_cloud_keys), {
+                "signing_key_id": binding["signing_key_id"], "signature_b64": binding["signature_b64"],
+            }, _CONTEXT_DOMAIN + canonical_bytes(unsigned))
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid cloud context signature") from None
+        runner = binding["runner_binding"]
+        try:
+            public = base64.b64decode(identity.public_key_b64, validate=True)
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid local runner identity") from None
+        if (
+            binding["workspace_id"] != identity.workspace_id or runner["runner_id"] != identity.runner_id
+            or runner["runner_key_id"] != identity.key_id or hashlib.sha256(public).hexdigest() != runner["public_key_digest"]
+            or binding["issued_at_ms"] > now_ms + 30_000 or now_ms >= binding["expires_at_ms"]
+        ):
+            raise RunnerStoreError("cloud context binding does not match local runner")
+        environment = binding["environment"]
+        context = RunnerContext(
+            workspace_id=binding["workspace_id"], project_id=binding["project_id"],
+            environment_id=environment["environment_id"], origin=environment["origin"],
+            verification_record_digest=environment["verification_record_digest"],
+            environment_class=environment["environment_class"],
+        )
+        self.bind_context(context, identity=identity, signer=signer, signer_label=signer_label)
+        with self._transaction(exclusive=True) as context_fd:
+            existing = _read_json(context_fd, "cloud-context-binding.json", None)
+            if existing is not None and existing != binding:
+                raise RunnerStoreError("cloud context binding cannot be replaced")
+            if existing is None:
+                _write_json(context_fd, "cloud-context-binding.json", binding)
+        return context
+
+    def load_cloud_context_binding(self) -> dict[str, Any]:
+        with self._transaction(exclusive=False) as context_fd:
+            value = _read_json(context_fd, "cloud-context-binding.json", None)
+            try:
+                return validate_runner_context_binding(value)
+            except (TypeError, ValueError):
+                raise RunnerStoreError("invalid cloud context binding") from None
 
     def _binding_locked(self, context_fd: int) -> dict[str, Any]:
         value = _read_json(context_fd, "binding.json", None)

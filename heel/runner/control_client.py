@@ -21,6 +21,9 @@ from heel.canary_contracts import (
     validate_runner_progress_request,
     validate_runner_result_request,
     validate_runner_stop_ack_request,
+    validate_runner_context_list,
+    validate_runner_context_claim,
+    validate_runner_approval_projection_submit,
 )
 from heel.crypto import ed25519_key_id, verify_envelope
 
@@ -487,6 +490,63 @@ class RunnerControlClient:
 
     def _claim_closed(self):
         return self._closed_control("claim", None)
+
+    def _context_control(self, path: str, request: dict, *, expected_status: int, schema: str) -> dict:
+        """Use the existing claim PoP chain for the three fixed pairing-only calls."""
+        with self._operation_lock("claim", None):
+            nonce, sequence, generation, chain = self._next_chain("claim", None)
+            body, timestamp_ms = canonical_bytes(request), self._timestamp()
+            proof = {
+                "schema_version": "heel.runner-request-proof.v1", "workspace_id": self.workspace_id,
+                "runner_id": self.runner_id, "key_id": self.signer.key_id,
+                "capability": "runner_claim", "method": "POST", "path": path,
+                "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms,
+                "server_nonce": nonce, "sequence": sequence,
+            }
+            headers = self._headers(
+                self._signature(b"heel.runner-pop.v1\0" + canonical_bytes(proof)), timestamp_ms,
+                nonce=nonce, sequence=sequence,
+            )
+            response = self.transport.post(path, headers=headers, body=body)
+            if (not isinstance(response, tuple) or len(response) != 3 or response[0] != expected_status
+                    or not isinstance(response[1], dict) or not isinstance(response[2], dict)
+                    or set(response[2]) == set() or response[2].get("schema_version") != schema):
+                raise ValueError("invalid runner context response")
+            next_nonce = response[1].get("X-Heel-Runner-Next-Nonce")
+            if not self._b64_32(next_nonce):
+                raise ValueError("invalid runner context response")
+            with self._state_lock:
+                current = self._chains.get(chain)
+                if current is not None and current != (nonce, sequence, generation):
+                    raise ValueError("runner control chain changed during request")
+                self._chains[chain] = (next_nonce, sequence + 1, generation)
+                self.calls.append(_Call(path, headers, body, "runner_claim", chain, sequence, generation))
+            return dict(response[2])
+
+    def list_contexts(self) -> dict:
+        request = validate_runner_context_list({"schema_version": "heel.runner-context-list.v1"})
+        return self._context_control(
+            f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/list",
+            request, expected_status=200, schema="heel.runner-context-list-result.v1",
+        )
+
+    def claim_context(self, binding_id: str, binding_digest: str) -> dict:
+        request = validate_runner_context_claim({"schema_version": "heel.runner-context-claim.v1", "binding_id": binding_id, "binding_digest": binding_digest})
+        return self._context_control(
+            f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/{binding_id}/claim",
+            request, expected_status=200, schema="heel.runner-context-claim-result.v1",
+        )
+
+    def submit_context_approval_projection(self, binding_id: str, binding_digest: str, approval_projection: object) -> dict:
+        request = validate_runner_approval_projection_submit({
+            "schema_version": "heel.runner-approval-projection-submit.v1",
+            "context_binding_id": binding_id, "context_binding_digest": binding_digest,
+            "approval_projection": approval_projection,
+        })
+        return self._context_control(
+            f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/{binding_id}/approval-projections",
+            request, expected_status=201, schema="heel.canary-projection-submitted.v1",
+        )
 
     def _heartbeat_closed(self, run_id: str, operational_projection: object):
         return self._closed_control("heartbeat", run_id, operational_projection)

@@ -103,6 +103,26 @@ def test_named_methods_use_fixed_workspace_paths_and_exact_pop_headers():
     expected = {"schema_version": "heel.runner-request-proof.v1", "workspace_id": "ws", "runner_id": "runner", "key_id": KEY_ID, "capability": "runner_claim", "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": 1000, "server_nonce": claim_nonce, "sequence": 1}
     assert signer.payloads == [b"heel.runner-pop.v1\0" + canonical_bytes(expected)]
 
+
+def test_context_methods_use_claim_chain_and_closed_context_routes():
+    class ContextTransport:
+        def __init__(self): self.requests = []
+        def post(self, path, *, headers=None, body=b""):
+            self.requests.append((path, headers, body))
+            nonce = base64.b64encode(bytes([len(self.requests)]) * 32).decode()
+            if path.endswith("/contexts/list"):
+                return 200, {"X-Heel-Runner-Next-Nonce": nonce}, {"schema_version": "heel.runner-context-list-result.v1", "server_time_ms": 1, "contexts": [], "has_more": False}
+            return 200, {"X-Heel-Runner-Next-Nonce": nonce}, {"schema_version": "heel.runner-context-claim-result.v1", "context_binding": {}, "claimed_at_ms": 1}
+    transport, signer = ContextTransport(), Signer()
+    control = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer, clock=lambda: 1000, transport=transport, nonce_source=lambda _: base64.b64encode(b"n" * 32).decode())
+    assert control.list_contexts()["contexts"] == []
+    control.claim_context("rcb_" + "a" * 32, "a" * 64)
+    assert [item[0] for item in transport.requests] == [
+        "/v1/workspaces/ws/runners/runner/contexts/list",
+        "/v1/workspaces/ws/runners/runner/contexts/rcb_" + "a" * 32 + "/claim",
+    ]
+    assert [item[1]["X-Heel-Runner-Sequence"] for item in transport.requests] == ["1", "2"]
+
 def test_sequences_are_independent_per_run_capability_and_stop_ack_is_heartbeat():
     control, transport, signer = client()
     control.heartbeat(run_id="run", operational_projection=client_projection(signer))
@@ -127,7 +147,7 @@ def test_has_no_public_generic_request_api():
     control, _, _ = client()
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
-    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim"}
+    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection"}
 
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():

@@ -175,19 +175,6 @@ export default function Dashboard() {
     } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
   }
 
-  async function loadProjection(file: File | undefined): Promise<void> {
-    if (connection.phase !== "ready" || file === undefined) return;
-    if (file.size > 64 * 1024) { setNotice("The signed approval projection exceeds its 64 KB limit."); return; }
-    setWorking(true); setNotice(null);
-    try {
-      const projection = JSON.parse(await file.text()) as unknown;
-      const prepared = await canaryApi.submitApprovalProjection(connection.context.workspaceRef, connection.context.project.projectRef, projection);
-      setApproval(prepared);
-      setRun(await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, prepared.runId));
-      setApprovalOpen(true);
-    } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
-  }
-
   async function approveRun(reason: string): Promise<void> {
     if (connection.phase !== "ready" || approval === null || run === null) return;
     setWorking(true); setNotice(null);
@@ -267,7 +254,7 @@ export default function Dashboard() {
           <label>Proof method<select onChange={(event) => setProofMethod(event.target.value as "https-file" | "dns-txt")} value={proofMethod}><option value="https-file">HTTPS file</option><option value="dns-txt">DNS TXT</option></select></label>
           {proofChallenge ? <><p><code>{proofChallenge.instruction}</code></p><button className="button button-primary" disabled={working} onClick={() => void checkProof()} type="button">Check exact proof</button></> : <button className="button button-primary" disabled={working || !/^https:\/\/[a-z0-9.-]+$/.test(origin.trim())} onClick={() => void startProof()} type="button">Create proof challenge</button>}
         </section> : null}
-        {context && executable && !approval ? <section className="runner-recovery"><p className="canary-kicker">From the local runner companion</p><h2>Load the signed rehearsal plan</h2><p>This projection contains only immutable routes, scenario names, roles, and ceilings. It contains no credentials or responses.</p><label className="button button-primary">Choose approval projection<input accept="application/json,.json" disabled={working} hidden onChange={(event) => void loadProjection(event.target.files?.[0])} type="file" /></label></section> : null}
+        {context && executable && !approval ? <section className="runner-recovery"><p className="canary-kicker">From the paired runner</p><h2>Await the signed rehearsal plan</h2><p>The paired runner submits the immutable plan through its signed context binding. This dashboard never accepts projection file uploads.</p></section> : null}
       </div>
 
       <aside className="dashboard-rail" aria-label="Rehearsal safety boundaries"><section className="boundary-ledger"><p className="canary-kicker">Always enforced</p><h2>The runner owns target traffic.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Methods</dt><dd>GET + HEAD</dd></div><div><dt>Egress</dt><dd>Staging :443 only</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></section>

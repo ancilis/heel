@@ -85,6 +85,9 @@ const REVIEW_DETAIL_ROUTE = new RegExp(
 );
 const ENVIRONMENT_REF = "env_[0-9a-f]{32}";
 const CANARY_RUN_REF = "crun_[0-9a-f]{32}";
+const RUNNER_CONTEXT_REF = "rcb_[0-9a-f]{32}";
+const RUNNER_CONTEXT_BINDINGS_ROUTE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/runner-context-bindings$`);
+const RUNNER_CONTEXT_REVOKE_ROUTE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/runner-context-bindings/${RUNNER_CONTEXT_REF}/revoke$`);
 const CANARY_APPROVAL_PROJECTION_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-approval-projections$`,
 );
@@ -124,6 +127,9 @@ const MAX_CANARY_PROJECTION_BODY_BYTES = 64 * 1024;
 const MAX_CANARY_HUMAN_BODY_BYTES = 16 * 1024;
 const MAX_RUNNER_CLAIM_BODY_BYTES = 256;
 const MAX_RUNNER_CONTROL_BODY_BYTES = 36 * 1024;
+const MAX_RUNNER_CONTEXT_LIST_BODY_BYTES = 128;
+const MAX_RUNNER_CONTEXT_CLAIM_BODY_BYTES = 256;
+const MAX_RUNNER_CONTEXT_SUBMIT_BODY_BYTES = 69632;
 const MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES = 272 * 1024;
 const MAX_RUNNER_RESYNC_BODY_BYTES = 2 * 1024;
 const MAX_RUNNER_PAIRING_BODY_BYTES = 16 * 1024;
@@ -142,12 +148,15 @@ const RUNNER_ROTATION_APPROVE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/run
 const RUNNER_REVOKE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}$`);
 const RUNNER_ROTATION_PUBLIC = /^\/v1\/runner-rotations\/rotation_[0-9a-f]{32}\/(?:activate|poll)$/;
 const RUNNER_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}(?:/claim|/runs/[A-Za-z0-9_-]{1,128}/(?:heartbeat|progress|result|stop-ack))$`);
+const RUNNER_CONTEXT_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/contexts(?:/list|/${RUNNER_CONTEXT_REF}/(?:claim|approval-projections))$`);
 const RUNNER_RESULT_PROJECTION = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/runs/${CANARY_RUN_REF}/result-projection$`);
 const RUNNER_RESYNC = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/resync/(?:start|complete)$`);
 const RUNNER_HEADERS = ["X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature"];
 const RUNNER_RESYNC_HEADERS = ["X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Signature"];
 
 function isHumanCanaryRoute(method: string, upstreamPath: string): boolean {
+  if (RUNNER_CONTEXT_BINDINGS_ROUTE.test(upstreamPath)) return method === "GET" || method === "POST";
+  if (RUNNER_CONTEXT_REVOKE_ROUTE.test(upstreamPath)) return method === "POST";
   if (CANARY_APPROVAL_PROJECTION_ROUTE.test(upstreamPath)) return method === "POST";
   if (CANARY_RUN_ROUTE.test(upstreamPath)) return method === "GET";
   if (CANARY_RUN_EVENTS_ROUTE.test(upstreamPath)) return method === "GET";
@@ -248,7 +257,8 @@ function controlPlaneRequestHeaders(
 ): { headers: Headers; contentLength: number } {
   let headers: Headers;
   const runnerResultProjection = RUNNER_RESULT_PROJECTION.test(upstreamPath);
-  const runnerControl = RUNNER_CONTROL.test(upstreamPath) || runnerResultProjection;
+  const runnerContextControl = RUNNER_CONTEXT_CONTROL.test(upstreamPath);
+  const runnerControl = RUNNER_CONTROL.test(upstreamPath) || runnerContextControl || runnerResultProjection;
   const runnerResync = RUNNER_RESYNC.test(upstreamPath);
   const humanCanary = isHumanCanaryRoute(method, upstreamPath);
   const humanEnvironment = isHumanEnvironmentRoute(method, upstreamPath);
@@ -347,7 +357,10 @@ function controlPlaneRequestHeaders(
   const maximum = runnerControl
     ? runnerResultProjection
       ? MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES
-      : (upstreamPath.endsWith("/claim") ? MAX_RUNNER_CLAIM_BODY_BYTES : MAX_RUNNER_CONTROL_BODY_BYTES)
+      : (upstreamPath.endsWith("/contexts/list") ? MAX_RUNNER_CONTEXT_LIST_BODY_BYTES
+        : (runnerContextControl && upstreamPath.endsWith("/claim") ? MAX_RUNNER_CONTEXT_CLAIM_BODY_BYTES
+          : (upstreamPath.endsWith("/approval-projections") ? MAX_RUNNER_CONTEXT_SUBMIT_BODY_BYTES
+            : (upstreamPath.endsWith("/claim") ? MAX_RUNNER_CLAIM_BODY_BYTES : MAX_RUNNER_CONTROL_BODY_BYTES))))
     : runnerResync
       ? MAX_RUNNER_RESYNC_BODY_BYTES
       : (runnerPairingPublic || runnerPairingHuman)
@@ -355,7 +368,8 @@ function controlPlaneRequestHeaders(
         : CANARY_APPROVAL_PROJECTION_ROUTE.test(upstreamPath)
           ? MAX_CANARY_PROJECTION_BODY_BYTES
           : humanCanary || humanEnvironment
-            ? MAX_CANARY_HUMAN_BODY_BYTES
+            ? (RUNNER_CONTEXT_BINDINGS_ROUTE.test(upstreamPath) ? 2 * 1024
+              : (RUNNER_CONTEXT_REVOKE_ROUTE.test(upstreamPath) ? 256 : MAX_CANARY_HUMAN_BODY_BYTES))
         : upstreamPath.startsWith("/v1/device/")
           ? MAX_DEVICE_BODY_BYTES
           : MAX_CONTROL_PLANE_BODY_BYTES;
@@ -396,7 +410,7 @@ function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""
     const value = response.headers.get(name);
     if (value !== null) headers.set(name, value);
   }
-  if (RUNNER_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath)) {
+  if (RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath)) {
     const nextNonce = response.headers.get("X-Heel-Runner-Next-Nonce");
     if (nextNonce !== null) {
       if (!RUNNER_NEXT_NONCE.test(nextNonce)) throw new Error("invalid runner nonce response");
