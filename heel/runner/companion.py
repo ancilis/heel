@@ -33,8 +33,13 @@ _DISCLOSURE_FIELDS = {
 }
 _MAX_BOOTSTRAP_BODY = 512
 _BOOTSTRAP_TTL_SECONDS = 60.0
-_COOKIE_NAME = "heel_local_session"
-_SHELL = b"""<!doctype html><html><head><meta charset=utf-8><title>Heel local result</title></head><body><main id=app>Opening your local Heel result...</main><script>'use strict';const b=location.hash.slice(1),h={'X-Heel-Local-Origin':location.origin};history.replaceState(null,'',location.pathname);fetch('/v1/session',{method:'POST',headers:{...h,'Content-Type':'application/json'},body:JSON.stringify({bootstrap:b})}).then(r=>{if(!r.ok)throw Error('session');return fetch('/v1/result',{headers:h})}).then(r=>r.json()).then(v=>{document.getElementById('app').textContent=JSON.stringify(v)});</script></body></html>"""
+_SCRIPT = b"'use strict';const b=location.hash.slice(1),o=location.origin,h={'X-Heel-Local-Origin':o};history.replaceState(null,'',location.pathname);fetch('/v1/session',{method:'POST',headers:{...h,'Content-Type':'application/json'},body:JSON.stringify({bootstrap:b})}).then(r=>{if(!r.ok)throw Error('session');return r.json()}).then(s=>fetch('/v1/result',{headers:{...h,'X-Heel-Local-Session':s.session}})).then(r=>{if(!r.ok)throw Error('result');return r.json()}).then(v=>{document.getElementById('app').textContent=JSON.stringify(v)});"
+_SCRIPT_HASH = base64.b64encode(hashlib.sha256(_SCRIPT).digest()).decode("ascii")
+_SHELL = (
+    b"<!doctype html><html><head><meta charset=utf-8><title>Heel local result</title>"
+    b"</head><body><main id=app>Opening your local Heel result...</main><script>"
+    + _SCRIPT + b"</script></body></html>"
+)
 
 
 def _hash_token(token: str) -> bytes:
@@ -164,20 +169,20 @@ class CompanionServer:
 
     def __init__(
         self,
-        local_result: Mapping[str, Any],
-        disclosure_preview: Mapping[str, Any],
+        store: object,
+        run_id: str,
         *,
-        trusted_runner_keys: Mapping[str, object],
         bootstrap_bytes: bytes | None = None,
         session_bytes: Callable[[int], bytes] = secrets.token_bytes,
         clock: Callable[[], float] = time.monotonic,
     ):
-        self._result = validate_local_result_view(
-            local_result, trusted_runner_keys=trusted_runner_keys,
-        )
-        self._disclosure = validate_disclosure_preview(
-            disclosure_preview, trusted_runner_keys=trusted_runner_keys,
-        )
+        from heel.runner.store import RunnerStore
+
+        if not isinstance(store, RunnerStore) or type(run_id) is not str or not run_id:
+            raise TypeError("companion requires one store-verified local run")
+        committed = store.load_final_projections(run_id)
+        self._result = committed["local_view"]
+        self._disclosure = committed["disclosure_preview"]
         if self._disclosure["projection"] != self._result["findings_projection"]:
             raise ValueError("disclosure preview is not the local findings projection")
         self._clock = clock
@@ -224,19 +229,8 @@ class CompanionServer:
             self._bootstrap_hash = b"\0" * 32
             return True
 
-    def _valid_session(self, cookie_header: str | None) -> bool:
-        if type(cookie_header) is not str or len(cookie_header) > 4096:
-            return False
-        values = {}
-        for part in cookie_header.split(";"):
-            if "=" not in part:
-                return False
-            name, value = (item.strip() for item in part.split("=", 1))
-            if name in values:
-                return False
-            values[name] = value
-        token = values.get(_COOKIE_NAME)
-        if token is None:
+    def _valid_session(self, token: str | None) -> bool:
+        if type(token) is not str or len(token) > 128:
             return False
         try:
             return hmac.compare_digest(_hash_token(token), self._session_hash)
@@ -256,12 +250,12 @@ class CompanionServer:
             def log_message(self, format: str, *args: object) -> None:
                 del format, args
 
-            def _headers(self, status: int, content_type: str, length: int, *, cookie: str | None = None) -> None:
+            def _headers(self, status: int, content_type: str, length: int) -> None:
                 self.send_response(status)
                 self.send_header("Cache-Control", "no-store")
                 self.send_header(
                     "Content-Security-Policy",
-                    "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; "
+                    f"default-src 'none'; script-src 'sha256-{_SCRIPT_HASH}'; connect-src 'self'; "
                     "style-src 'none'; img-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
                     "form-action 'none'",
                 )
@@ -270,8 +264,6 @@ class CompanionServer:
                 self.send_header("X-Frame-Options", "DENY")
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(length))
-                if cookie is not None:
-                    self.send_header("Set-Cookie", cookie)
                 self.end_headers()
 
             def _reject(self, status: int = 404) -> None:
@@ -287,6 +279,7 @@ class CompanionServer:
                 local_origins = self.headers.get_all("X-Heel-Local-Origin", [])
                 origins = self.headers.get_all("Origin", [])
                 cookies = self.headers.get_all("Cookie", [])
+                sessions = self.headers.get_all("X-Heel-Local-Session", [])
                 lengths = self.headers.get_all("Content-Length", [])
                 content_types = self.headers.get_all("Content-Type", [])
                 transfer_encodings = self.headers.get_all("Transfer-Encoding", [])
@@ -294,7 +287,8 @@ class CompanionServer:
                     peer != "127.0.0.1"
                     or hosts != [expected_host]
                     or len(origins) > 1
-                    or len(cookies) > 1
+                    or cookies
+                    or len(sessions) > 1
                     or len(lengths) > 1
                     or len(content_types) > 1
                     or transfer_encodings
@@ -327,13 +321,17 @@ class CompanionServer:
                     self._reject(400)
                     return
                 if self.path == "/":
+                    if self.headers.get_all("X-Heel-Local-Session", []):
+                        self._reject(403)
+                        return
                     self._headers(200, "text/html; charset=utf-8", len(_SHELL))
                     self.wfile.write(_SHELL)
                     return
                 if self.path not in {"/v1/result", "/v1/disclosure-preview"}:
                     self._reject(404)
                     return
-                if not owner._valid_session(self.headers.get("Cookie")):
+                sessions = self.headers.get_all("X-Heel-Local-Session", [])
+                if len(sessions) != 1 or not owner._valid_session(sessions[0]):
                     self._reject(403)
                     return
                 value = owner._result if self.path == "/v1/result" else owner._disclosure
@@ -346,6 +344,9 @@ class CompanionServer:
                     return
                 if self.path != "/v1/session":
                     self._reject(404)
+                    return
+                if self.headers.get_all("X-Heel-Local-Session", []):
+                    self._reject(403)
                     return
                 if self.headers.get_all("Content-Type", []) != ["application/json"]:
                     self._reject(400)
@@ -371,16 +372,14 @@ class CompanionServer:
                 if not isinstance(value, dict) or set(value) != {"bootstrap"} or not owner._consume_bootstrap(value["bootstrap"]):
                     self._reject(403)
                     return
-                session_token = None
-                # The token itself is never kept in the URL or response body.  Reconstructing it
-                # is impossible from the hash, so retain it only in this closure until issuance.
                 if not hasattr(owner, "_session_token"):
                     self._reject(500)
                     return
                 session_token = owner._session_token
                 del owner._session_token
-                cookie = f"{_COOKIE_NAME}={session_token}; Path=/; HttpOnly; SameSite=Strict"
-                self._headers(204, "application/json", 0, cookie=cookie)
+                payload = canonical_bytes({"session": session_token})
+                self._headers(200, "application/json", len(payload))
+                self.wfile.write(payload)
 
         # Keep the clear session token only until the one allowed bootstrap exchange.
         session_value = _token_from_bytes(self._session_source(32))

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import shutil
 import threading
 import time
 
@@ -158,7 +160,70 @@ def test_execution_bundle_is_exactly_bound_signed_fresh_and_reserved_once(tmp_pa
         validate_execution_bundle(
             bundle, store=store, identity=identity, trusted_grant_keys=trusted,
             now_ms=10_000, gate=active_gate(10_000),
-        )
+            )
+
+
+@pytest.mark.parametrize("checkpoint", ["write", "fsync", "rename"])
+def test_create_only_records_are_never_visible_before_atomic_publish(
+    tmp_path, monkeypatch, checkpoint,
+):
+    import heel.runner.store as store_module
+
+    directory_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        with monkeypatch.context() as fault:
+            if checkpoint == "write":
+                real_write = os.write
+                writes = [0]
+
+                def interrupted_write(descriptor, value):
+                    if writes[0]:
+                        raise OSError("simulated crash")
+                    writes[0] += 1
+                    return real_write(descriptor, value[:max(1, len(value) // 2)])
+
+                fault.setattr(store_module.os, "write", interrupted_write)
+            elif checkpoint == "fsync":
+                fault.setattr(
+                    store_module.os, "fsync",
+                    lambda descriptor: (_ for _ in ()).throw(OSError("simulated crash")),
+                )
+            else:
+                fault.setattr(
+                    store_module.os, "rename",
+                    lambda *args, **kwargs: (_ for _ in ()).throw(OSError("simulated crash")),
+                )
+            with pytest.raises(OSError, match="simulated crash"):
+                store_module._create_json(directory_fd, "finals.json", {"complete": "yes"})
+        assert not (tmp_path / "finals.json").exists()
+        assert list(tmp_path.iterdir()) == []
+        store_module._create_json(directory_fd, "finals.json", {"complete": "yes"})
+        assert json.loads((tmp_path / "finals.json").read_text()) == {"complete": "yes"}
+    finally:
+        os.close(directory_fd)
+
+
+def test_interrupted_consumption_marker_can_be_safely_retried(tmp_path, monkeypatch):
+    import heel.runner.store as store_module
+
+    store, identity, _, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    real_write = os.write
+    writes = [0]
+
+    def interrupted_write(descriptor, value):
+        if writes[0]:
+            raise OSError("simulated crash")
+        writes[0] += 1
+        return real_write(descriptor, value[:max(1, len(value) // 2)])
+
+    with monkeypatch.context() as fault:
+        fault.setattr(store_module.os, "write", interrupted_write)
+        with pytest.raises(OSError, match="simulated crash"):
+            store.reserve_run(grant, retention_expires_at_ms=86_400_000)
+    store.reserve_run(grant, retention_expires_at_ms=86_400_000)
+    assert store.load_run_grant(grant["run_id"]) == grant
 
 
 def test_containment_chain_is_zero_based_signed_closed_and_tamper_evident(tmp_path):
@@ -171,6 +236,11 @@ def test_containment_chain_is_zero_based_signed_closed_and_tamper_evident(tmp_pa
         manifest_digest=manifest["manifest_digest"], clock_ms=lambda: 2_000,
     )
     first = log.append("grant_verified", detail_code="grant_exact")
+    events_path = store.run_path(grant["run_id"]) / "events"
+    unfinished = events_path / ".00000000000000000001.json.0123456789abcdef01234567.tmp"
+    unfinished.write_bytes(b'{"partial":')
+    unfinished.chmod(0o600)
+    assert log.load() == [first]
     second = log.append(
         "action_started", action_ordinal=0, scenario_id="anonymous_authenticated_read",
         semantic_role="anonymous", attempt=1, detail_code="admitted",
@@ -179,6 +249,7 @@ def test_containment_chain_is_zero_based_signed_closed_and_tamper_evident(tmp_pa
     assert first["sequence"] == 0 and first["previous_event_digest"] == "0" * 64
     assert second["sequence"] == 1
     assert second["previous_event_digest"] == first["event_digest"]
+    assert not unfinished.exists()
     assert [item["event_code"] for item in log.load()] == ["grant_verified", "action_started"]
     with pytest.raises(ValueError, match="event code"):
         log.append("raw_response", detail_code="forbidden")
@@ -233,6 +304,36 @@ def test_local_evidence_is_opaque_owner_only_bounded_and_retention_pruned(tmp_pa
     assert not store.run_path(grant["run_id"]).exists()
 
 
+def test_evidence_references_are_random_and_integrity_digest_stays_local(tmp_path):
+    store, identity, _, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    store.reserve_run(grant, retention_expires_at_ms=50_000)
+    values = {
+        "action_ordinal": 0, "attempt": 1, "status_code": 200,
+        "raw_headers": b"Content-Length: 2", "raw_body": b"{}",
+        "expires_at_ms": 40_000,
+    }
+    first = store.store_response_evidence(grant["run_id"], **values)
+    second = store.store_response_evidence(grant["run_id"], **values)
+    guessed = "ev1_" + __import__("hashlib").sha256(b"\0".join((
+        grant["run_id"].encode(), b"0", b"1", b"200",
+        values["raw_headers"], values["raw_body"],
+    ))).hexdigest()
+    assert first != second
+    assert first != guessed and second != guessed
+    metadata = json.loads(
+        (store.run_path(grant["run_id"]) / "evidence" / f"{first}.meta").read_text()
+    )
+    assert metadata["content_sha256"] == __import__("hashlib").sha256(
+        len(values["raw_headers"]).to_bytes(4, "big")
+        + values["raw_headers"] + values["raw_body"],
+    ).hexdigest()
+    assert store.load_response_evidence(grant["run_id"], first, now_ms=2_000) == (
+        values["raw_headers"], values["raw_body"],
+    )
+
+
 def test_store_reverifies_bound_runner_signatures_on_save_and_load(tmp_path):
     store, identity, signer, manifest, projection = compiled_pair(tmp_path)
     authority = SigningAuthority.generate()
@@ -248,11 +349,22 @@ def test_store_reverifies_bound_runner_signatures_on_save_and_load(tmp_path):
     )
     assert store.load_final_projections(grant["run_id"])["local_view"] == result.local_view
     run_path = store.run_path(grant["run_id"])
-    for filename in ("operational.json", "findings.json"):
-        path = run_path / filename
+    path = run_path / "finals.json"
+    for projection_name in ("operational_projection", "findings_projection"):
         original = path.read_bytes()
         tampered = json.loads(original)
-        tampered["signature_b64"] = __import__("base64").b64encode(b"\0" * 64).decode("ascii")
+        tampered[projection_name]["signature_b64"] = __import__("base64").b64encode(
+            b"\0" * 64,
+        ).decode("ascii")
+        tampered["local_view"][projection_name]["signature_b64"] = tampered[
+            projection_name
+        ]["signature_b64"]
+        if projection_name == "findings_projection":
+            tampered["disclosure_preview"]["projection"]["signature_b64"] = tampered[
+                projection_name
+            ]["signature_b64"]
+        core = {key: value for key, value in tampered.items() if key != "finals_digest"}
+        tampered["finals_digest"] = canonical_digest(core)
         path.write_text(json.dumps(tampered, sort_keys=True, separators=(",", ":")))
         with pytest.raises(RunnerStoreError, match="signature"):
             store.load_final_projections(grant["run_id"])
@@ -270,6 +382,101 @@ def test_store_reverifies_bound_runner_signatures_on_save_and_load(tmp_path):
     state_path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
     with pytest.raises(RunnerStoreError, match="bound identity"):
         store.load_final_projections(grant["run_id"])
+
+
+def test_store_derives_containment_summary_and_rejects_event_or_view_tampering(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    run_path = store.run_path(grant["run_id"])
+    finals_path = run_path / "finals.json"
+    original_finals = finals_path.read_bytes()
+    finals = json.loads(original_finals)
+    finals["local_view"]["containment_summary"]["event_count"] = 0
+    finals["local_view"]["containment_summary"]["head_digest"] = "0" * 64
+    core = {key: value for key, value in finals.items() if key != "finals_digest"}
+    finals["finals_digest"] = canonical_digest(core)
+    finals_path.write_text(json.dumps(finals, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(RunnerStoreError, match="containment summary"):
+        store.load_final_projections(grant["run_id"])
+    finals_path.write_bytes(original_finals)
+
+    finals = json.loads(original_finals)
+    operational = finals["operational_projection"]
+    unsigned = {
+        key: copy.deepcopy(value) for key, value in operational.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    unsigned["counters"]["requests_started"] += 1
+    unsigned["counters"]["remaining_requests"] -= 1
+    altered_operational = {
+        **unsigned,
+        "projection_digest": canonical_digest(unsigned),
+        "signing_key_id": signer.key_id,
+        "signature_b64": __import__("base64").b64encode(
+            signer.sign(canonical_bytes(unsigned)),
+        ).decode("ascii"),
+    }
+    finals["operational_projection"] = altered_operational
+    finals["local_view"]["operational_projection"] = altered_operational
+    core = {key: value for key, value in finals.items() if key != "finals_digest"}
+    finals["finals_digest"] = canonical_digest(core)
+    finals_path.write_bytes(canonical_bytes(finals))
+    with pytest.raises(RunnerStoreError, match="projection mismatch"):
+        store.load_final_projections(grant["run_id"])
+    finals_path.write_bytes(original_finals)
+
+    event_path = run_path / "events" / "00000000000000000001.json"
+    event = json.loads(event_path.read_text())
+    event["signature_b64"] = __import__("base64").b64encode(b"x" * 64).decode()
+    event_path.write_text(json.dumps(event, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(RunnerStoreError, match="containment chain"):
+        store.load_final_projections(grant["run_id"])
+
+
+def test_final_projections_cannot_be_substituted_between_runs_on_one_runner(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant_a = signed_grant(manifest, projection, identity, authority)
+    grant_b = copy.deepcopy(grant_a)
+    grant_b.update({
+        "grant_id": "grant_987654321",
+        "run_id": "run_987654321",
+        "grant_nonce": "nonce_987654321",
+    })
+    grant_b = resign_grant(grant_b, authority)
+    executor = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    )
+    for grant in (grant_a, grant_b):
+        executor.execute(
+            ExecutionBundle(manifest, projection, grant),
+            transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+        )
+    path_a = store.run_path(grant_a["run_id"]) / "finals.json"
+    path_b = store.run_path(grant_b["run_id"]) / "finals.json"
+    original_a = json.loads(path_a.read_text())
+    substituted = json.loads(path_b.read_text())
+    substituted["local_view"]["containment_summary"] = original_a[
+        "local_view"
+    ]["containment_summary"]
+    core = {key: value for key, value in substituted.items() if key != "finals_digest"}
+    substituted["finals_digest"] = canonical_digest(core)
+    path_a.write_bytes(canonical_bytes(substituted))
+    with pytest.raises(RunnerStoreError, match="projection mismatch"):
+        store.load_final_projections(grant_a["run_id"])
 
 
 @pytest.mark.parametrize("checkpoint", ["reserved", "between_actions", "finalizing"])
@@ -336,6 +543,64 @@ def test_recovery_verifies_existing_finals_then_marks_finalizing_run_terminal(tm
     ).recover(grant["run_id"])
     assert recovered.local_view == result.local_view
     assert store.load_run(grant["run_id"])["state"] == "terminal"
+
+
+def test_recovery_reconstructs_run_after_consumption_marker_before_state(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    store.reserve_run(grant, retention_expires_at_ms=86_400_000)
+    run_path = store.run_path(grant["run_id"])
+    shutil.rmtree(run_path)
+    recovered = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 3_000,
+        monotonic=lambda: 1.0,
+    ).recover(grant["run_id"], transport=ScriptedTransport([200]))
+    assert recovered.execution_disposition == "incomplete"
+    assert store.load_run(grant["run_id"])["state"] == "terminal"
+    assert store.load_run_grant(grant["run_id"]) == grant
+
+
+@pytest.mark.parametrize("visible_legacy_files", [1, 2, 3])
+def test_recovery_never_observes_partial_legacy_final_writes(tmp_path, visible_legacy_files):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    run_path = store.run_path(grant["run_id"])
+    names = ("operational.json", "findings.json", "local-view.json", "disclosure-preview.json")
+    committed = json.loads((run_path / "finals.json").read_text())
+    values = dict(zip(names, (
+        committed["operational_projection"], committed["findings_projection"],
+        committed["local_view"], committed["disclosure_preview"],
+    ), strict=True))
+    (run_path / "finals.json").unlink()
+    for name in names[:visible_legacy_files]:
+        (run_path / name).write_bytes(canonical_bytes(values[name]))
+    state_path = run_path / "state.json"
+    state = json.loads(state_path.read_text())
+    state["state"] = "finalizing"
+    state_path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
+    transport = ScriptedTransport([200])
+    recovered = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 3_000,
+        monotonic=lambda: 1.0,
+    ).recover(grant["run_id"], transport=transport)
+    assert transport.calls == []
+    assert recovered.execution_disposition == "incomplete"
+    assert (run_path / "finals.json").is_file()
 
 
 class StaticVault:
@@ -537,6 +802,41 @@ def test_executor_passes_the_exact_signed_zero_retry_policy(tmp_path, monkeypatc
     assert result.operational_projection["counters"]["retries_used"] == 0
 
 
+def test_fixed_server_time_cannot_renew_live_authority_past_half_second(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+
+    class Clock:
+        value = 0.0
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+
+    gate_calls = [0]
+
+    def gate_that_stalls_before_returning():
+        gate_calls[0] += 1
+        if gate_calls[0] == 3:
+            clock.value = 0.501
+        return active_gate()
+
+    result = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=clock,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([200] * 4), gate_source=gate_that_stalls_before_returning,
+    )
+    assert result.execution_disposition == "incomplete"
+    assert result.operational_projection["error_category"] == "cloud_disconnected"
+    assert result.operational_projection["counters"]["requests_started"] == 0
+
+
 @pytest.mark.parametrize(
     "failure_code,expected_disposition,expected_error",
     [
@@ -646,6 +946,7 @@ class StopCoordinator:
         self.heartbeats = []
         self.acks = []
         self.ack_deadlines = []
+        self.ack_projections = []
 
     def claim(self):
         if self.claimed:
@@ -666,6 +967,7 @@ class StopCoordinator:
     def stop_ack(self, run_id, operational_projection, *, deadline):
         self.acks.append(time.monotonic())
         self.ack_deadlines.append(deadline)
+        self.ack_projections.append(operational_projection)
 
 
 def test_supervisor_heartbeat_cancels_blocked_target_and_acks_within_five_seconds():
@@ -755,6 +1057,71 @@ def test_failed_stop_ack_never_records_a_local_acknowledgement_timestamp():
     assert observed == [None]
 
 
+def test_stop_ack_is_not_started_when_projection_preparation_exhausts_deadline():
+    now = [0.0]
+
+    class DeadlineExecutor(BlockingExecutor):
+        def prepare_stop_ack(self, lease, projection, stop_reason, proposed_at_ms):
+            del lease, stop_reason, proposed_at_ms
+            now[0] = 5.0
+            return projection
+
+    lease = ClaimLease("run_123456789", object(), {
+        "run_id": "run_123456789", "lifecycle_phase": "running",
+    })
+    coordinator = StopCoordinator(lease)
+    executor = DeadlineExecutor()
+    service = RunnerService(
+        coordinator=coordinator, executor=executor, heartbeat_interval=0.05,
+        idle_poll_interval=2.0, monotonic=lambda: now[0],
+    )
+    worker = threading.Thread(target=service.run_once)
+    worker.start()
+    assert executor.started.wait(1)
+    assert service.request_local_stop() is True
+    worker.join(2)
+    assert not worker.is_alive()
+    assert coordinator.acks == []
+
+
+def test_local_and_cloud_stop_race_uses_one_async_ack_and_suppresses_result():
+    cloud_stop = threading.Event()
+
+    class RaceCoordinator(StopCoordinator):
+        def __init__(self, lease):
+            super().__init__(lease)
+            self.results = 0
+
+        def heartbeat(self, run_id, operational_projection):
+            self.heartbeats.append(time.monotonic())
+            reason = "cloud_stop" if cloud_stop.is_set() else "none"
+            return ExecutionGate(True, "active", "valid", 20_000, 7, reason, 2_000)
+
+        def result(self, run_id, operational_projection):
+            self.results += 1
+
+    lease = ClaimLease("run_123456789", object(), {
+        "run_id": "run_123456789", "lifecycle_phase": "running",
+    })
+    coordinator = RaceCoordinator(lease)
+    executor = BlockingExecutor()
+    service = RunnerService(
+        coordinator=coordinator, executor=executor, heartbeat_interval=0.01,
+        idle_poll_interval=2.0,
+    )
+    worker = threading.Thread(target=service.run_once)
+    worker.start()
+    assert executor.started.wait(1)
+    began = time.monotonic()
+    assert service.request_local_stop() is True
+    assert time.monotonic() - began < 0.1
+    cloud_stop.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert len(coordinator.acks) == 1
+    assert coordinator.results == 0
+
+
 def test_real_executor_stop_interrupts_blocked_transport_and_never_starts_next_action(tmp_path):
     store, identity, signer, manifest, projection = compiled_pair(tmp_path)
     authority = SigningAuthority.generate()
@@ -812,6 +1179,7 @@ def test_real_executor_stop_interrupts_blocked_transport_and_never_starts_next_a
     service.run_once()
     assert len(transport.calls) == 1
     assert coordinator.acks
+    assert coordinator.ack_projections[0]["timestamps"]["stop_acknowledged_at_ms"] is None
     final = store.load_final_projections(grant["run_id"])
     assert final["operational_projection"]["execution_disposition"] == "stopped"
     assert final["operational_projection"]["timestamps"]["stop_acknowledged_at_ms"] is not None

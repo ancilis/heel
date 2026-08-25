@@ -7,9 +7,15 @@ from pathlib import Path
 import socket
 from urllib.parse import urlsplit
 
+import pytest
+
 from heel.canary_contracts import canonical_bytes, canonical_digest
 from heel.crypto import SigningAuthority
 from heel.runner.companion import CompanionServer
+from heel.runner.execution import ExecutionBundle, LocalCanaryExecutor
+from tests.test_runner_stop import (
+    ScriptedTransport, StaticVault, active_gate, compiled_pair, signed_grant,
+)
 
 
 def views():
@@ -48,6 +54,28 @@ def views():
     return result, disclosure, {authority.key_id: authority.public_key}
 
 
+def test_companion_rejects_caller_supplied_unverified_views():
+    result, _, _ = views()
+    with pytest.raises((TypeError, ValueError), match="store"):
+        CompanionServer(result, "run_unverified")
+
+
+def committed_run(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    result = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    return store, grant["run_id"], result.local_view, result.disclosure_preview
+
+
 def request(server, method, path, *, body=b"", headers=None, host=None):
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=2)
     supplied = {"Host": host or f"127.0.0.1:{server.port}", **(headers or {})}
@@ -59,10 +87,10 @@ def request(server, method, path, *, body=b"", headers=None, host=None):
     return result
 
 
-def test_companion_is_loopback_fragment_bootstrapped_one_use_and_data_free_at_root():
-    result, disclosure, keys = views()
+def test_companion_is_loopback_fragment_bootstrapped_one_use_and_data_free_at_root(tmp_path):
+    store, run_id, result, disclosure = committed_run(tmp_path)
     server = CompanionServer(
-        result, disclosure, trusted_runner_keys=keys,
+        store, run_id,
         bootstrap_bytes=b"x" * 32, clock=lambda: 100.0,
     )
     server.start()
@@ -73,20 +101,22 @@ def test_companion_is_loopback_fragment_bootstrapped_one_use_and_data_free_at_ro
         assert status == 200 and b"operational-run" not in body and b"canary-findings" not in body
         assert headers["Cache-Control"] == "no-store"
         assert headers["Content-Security-Policy"]
+        assert "unsafe-inline" not in headers["Content-Security-Policy"]
+        assert b"document.cookie" not in body and b"localStorage" not in body
         assert headers["X-Content-Type-Options"] == "nosniff"
         assert headers["Referrer-Policy"] == "no-referrer"
         assert headers["X-Frame-Options"] == "DENY"
 
         bootstrap = json.dumps({"bootstrap": parsed.fragment}).encode()
-        status, headers, _ = request(
+        status, headers, session_body = request(
             server, "POST", "/v1/session", body=bootstrap,
             headers={"Content-Type": "application/json", "Origin": server.origin,
                      "X-Heel-Local-Origin": server.origin},
         )
-        assert status == 204
-        cookie = headers["Set-Cookie"].split(";", 1)[0]
-        assert "HttpOnly" in headers["Set-Cookie"] and "SameSite=Strict" in headers["Set-Cookie"]
-        assert "Domain=" not in headers["Set-Cookie"]
+        assert status == 200
+        session = json.loads(session_body)["session"]
+        assert len(session) == 43
+        assert "Set-Cookie" not in headers
         assert request(
             server, "POST", "/v1/session", body=bootstrap,
             headers={"Content-Type": "application/json", "Origin": server.origin,
@@ -94,23 +124,30 @@ def test_companion_is_loopback_fragment_bootstrapped_one_use_and_data_free_at_ro
         )[0] == 403
         status, headers, payload = request(
             server, "GET", "/v1/result",
-            headers={"Cookie": cookie, "X-Heel-Local-Origin": server.origin},
+            headers={"X-Heel-Local-Session": session,
+                     "X-Heel-Local-Origin": server.origin},
         )
         assert status == 200 and json.loads(payload) == result
         assert headers["Access-Control-Allow-Origin"] if "Access-Control-Allow-Origin" in headers else True
         assert "Access-Control-Allow-Origin" not in headers
         status, _, payload = request(
             server, "GET", "/v1/disclosure-preview",
-            headers={"Cookie": cookie, "X-Heel-Local-Origin": server.origin},
+            headers={"X-Heel-Local-Session": session,
+                     "X-Heel-Local-Origin": server.origin},
         )
         assert status == 200 and json.loads(payload) == disclosure
+        assert request(
+            server, "GET", "/v1/result",
+            headers={"Cookie": f"heel_local_session={session}",
+                     "X-Heel-Local-Origin": server.origin},
+        )[0] == 403
     finally:
         server.close()
 
 
-def test_companion_rejects_rebinding_cors_queries_encoded_paths_and_private_surfaces():
-    result, disclosure, keys = views()
-    server = CompanionServer(result, disclosure, trusted_runner_keys=keys)
+def test_companion_rejects_rebinding_cors_queries_encoded_paths_and_private_surfaces(tmp_path):
+    store, run_id, _, _ = committed_run(tmp_path)
+    server = CompanionServer(store, run_id)
     server.start()
     try:
         for method, path, headers, host in (
@@ -135,11 +172,11 @@ def test_companion_rejects_rebinding_cors_queries_encoded_paths_and_private_surf
         server.close()
 
 
-def test_companion_rejects_expired_or_oversized_bootstrap():
-    result, disclosure, keys = views()
+def test_companion_rejects_expired_or_oversized_bootstrap(tmp_path):
+    store, run_id, _, _ = committed_run(tmp_path)
     now = [100.0]
     server = CompanionServer(
-        result, disclosure, trusted_runner_keys=keys,
+        store, run_id,
         bootstrap_bytes=b"z" * 32, clock=lambda: now[0],
     )
     server.start()
@@ -175,9 +212,9 @@ def raw_request(server, payload):
         connection.close()
 
 
-def test_companion_rejects_duplicate_or_transfer_framed_security_headers():
-    result, disclosure, keys = views()
-    server = CompanionServer(result, disclosure, trusted_runner_keys=keys)
+def test_companion_rejects_duplicate_or_transfer_framed_security_headers(tmp_path):
+    store, run_id, _, _ = committed_run(tmp_path)
+    server = CompanionServer(store, run_id)
     server.start()
     try:
         origin = server.origin
@@ -187,6 +224,7 @@ def test_companion_rejects_duplicate_or_transfer_framed_security_headers():
             f"GET /v1/result HTTP/1.1\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\nX-Heel-Local-Origin: {origin}\r\n\r\n",
             f"GET /v1/result HTTP/1.1\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\nOrigin: {origin}\r\nOrigin: {origin}\r\n\r\n",
             f"GET /v1/result HTTP/1.1\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\nCookie: a=b\r\nCookie: c=d\r\n\r\n",
+            f"GET /v1/result HTTP/1.1\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\nX-Heel-Local-Session: a\r\nX-Heel-Local-Session: b\r\n\r\n",
             f"POST /v1/session HTTP/1.1\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{{}}",
             f"POST /v1/session HTTP/1.1\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         )
@@ -199,14 +237,16 @@ def test_companion_rejects_duplicate_or_transfer_framed_security_headers():
         server.close()
 
 
-def test_companion_rejects_invalid_projection_signature_before_binding():
-    result, disclosure, keys = views()
+def test_companion_rejects_invalid_projection_signature_before_binding(tmp_path):
+    store, run_id, _, _ = committed_run(tmp_path)
+    path = store.run_path(run_id) / "finals.json"
+    finals = json.loads(path.read_text())
     invalid_signature = base64.b64encode(b"\0" * 64).decode("ascii")
-    result["findings_projection"]["signature_b64"] = invalid_signature
-    disclosure["projection"]["signature_b64"] = invalid_signature
-    try:
-        CompanionServer(result, disclosure, trusted_runner_keys=keys)
-    except ValueError as error:
-        assert "signature" in str(error)
-    else:
-        raise AssertionError("tampered findings signature was displayed")
+    finals["findings_projection"]["signature_b64"] = invalid_signature
+    finals["local_view"]["findings_projection"]["signature_b64"] = invalid_signature
+    finals["disclosure_preview"]["projection"]["signature_b64"] = invalid_signature
+    core = {key: value for key, value in finals.items() if key != "finals_digest"}
+    finals["finals_digest"] = canonical_digest(core)
+    path.write_text(json.dumps(finals, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(ValueError, match="signature"):
+        CompanionServer(store, run_id)

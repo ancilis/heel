@@ -121,6 +121,60 @@ def _validate_event(value: Any, *, expected_sequence: int, previous_digest: str)
     return event
 
 
+def verify_containment_chain(
+    raw_events: list[Any],
+    *,
+    public_key: object,
+    runner_key_id: str,
+    run_id: str,
+    grant_id: str,
+    manifest_digest: str,
+) -> list[dict[str, Any]]:
+    """Verify the complete reserved-key chain without requiring the private signer."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    if not isinstance(public_key, Ed25519PublicKey):
+        raise ContainmentError("containment verification key is invalid")
+    previous = "0" * 64
+    result: list[dict[str, Any]] = []
+    previous_counters = {key: 0 for key in _COUNTER_FIELDS}
+    previous_time = 0
+    for sequence, raw in enumerate(raw_events):
+        event = _validate_event(raw, expected_sequence=sequence, previous_digest=previous)
+        if (
+            event["run_id"] != run_id
+            or event["grant_id"] != grant_id
+            or event["manifest_digest"] != manifest_digest
+            or event["signing_key_id"] != runner_key_id
+            or event["occurred_at_ms"] < previous_time
+            or any(
+                event["counters"][key] < previous_counters[key]
+                for key in _COUNTER_FIELDS
+            )
+        ):
+            raise ContainmentError("containment event binding mismatch")
+        signed = {
+            **{key: event[key] for key in _CORE_FIELDS},
+            "event_digest": event["event_digest"],
+            "signing_key_id": event["signing_key_id"],
+        }
+        try:
+            public_key.verify(
+                base64.b64decode(event["signature_b64"], validate=True),
+                LOCAL_EVENT_DOMAIN + canonical_bytes(signed),
+            )
+        except (InvalidSignature, TypeError, ValueError):
+            raise ContainmentError("containment signature verification failed") from None
+        if sequence == 0 and event["event_code"] != "grant_verified":
+            raise ContainmentError("containment chain must begin with grant verification")
+        result.append(event)
+        previous = event["event_digest"]
+        previous_counters = event["counters"]
+        previous_time = event["occurred_at_ms"]
+    return result
+
+
 class ContainmentLog:
     """Append and fully verify the signed chain stored under one local run."""
 
@@ -150,44 +204,17 @@ class ContainmentLog:
         self.clock_ms = clock_ms
 
     def load(self) -> list[dict[str, Any]]:
-        from cryptography.exceptions import InvalidSignature
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
         public = Ed25519PublicKey.from_public_bytes(self.signer.public_key)
-        previous = "0" * 64
-        result: list[dict[str, Any]] = []
-        previous_counters = {key: 0 for key in _COUNTER_FIELDS}
-        previous_time = 0
-        for sequence, raw in enumerate(self.store.load_run_events(self.run_id)):
-            event = _validate_event(raw, expected_sequence=sequence, previous_digest=previous)
-            if (
-                event["run_id"] != self.run_id
-                or event["grant_id"] != self.grant_id
-                or event["manifest_digest"] != self.manifest_digest
-                or event["signing_key_id"] != self.signer.key_id
-                or event["occurred_at_ms"] < previous_time
-                or any(event["counters"][key] < previous_counters[key] for key in _COUNTER_FIELDS)
-            ):
-                raise ContainmentError("containment event binding mismatch")
-            signed = {
-                **{key: event[key] for key in _CORE_FIELDS},
-                "event_digest": event["event_digest"],
-                "signing_key_id": event["signing_key_id"],
-            }
-            try:
-                public.verify(
-                    base64.b64decode(event["signature_b64"], validate=True),
-                    LOCAL_EVENT_DOMAIN + canonical_bytes(signed),
-                )
-            except (InvalidSignature, TypeError, ValueError):
-                raise ContainmentError("containment signature verification failed") from None
-            if sequence == 0 and event["event_code"] != "grant_verified":
-                raise ContainmentError("containment chain must begin with grant verification")
-            result.append(event)
-            previous = event["event_digest"]
-            previous_counters = event["counters"]
-            previous_time = event["occurred_at_ms"]
-        return result
+        return verify_containment_chain(
+            self.store.load_run_events(self.run_id),
+            public_key=public,
+            runner_key_id=self.signer.key_id,
+            run_id=self.run_id,
+            grant_id=self.grant_id,
+            manifest_digest=self.manifest_digest,
+        )
 
     def append(
         self,
@@ -247,5 +274,5 @@ class ContainmentLog:
 
 __all__ = [
     "ContainmentError", "ContainmentLog", "LOCAL_EVENT_CODES", "LOCAL_EVENT_SCHEMA",
-    "OPERATIONAL_EVENT_CODES", "operational_containment_codes",
+    "OPERATIONAL_EVENT_CODES", "operational_containment_codes", "verify_containment_chain",
 ]

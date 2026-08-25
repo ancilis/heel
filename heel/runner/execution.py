@@ -92,6 +92,77 @@ class ExecutionResult:
     disclosure_preview: dict[str, Any]
 
 
+_MAX_GATE_STALE_SECONDS = 0.5
+
+
+class _LiveAuthority:
+    """Monotonic, non-renewable authority derived from the first server clock sample."""
+
+    def __init__(
+        self,
+        *,
+        grant: Mapping[str, Any],
+        initial_gate: ExecutionGate,
+        now: float,
+    ):
+        self._grant = grant
+        self._lock = threading.Lock()
+        self._last_server_time_ms = initial_gate.server_time_ms
+        self._last_advance = now
+        self._grant_deadline = now + (
+            grant["expires_at_ms"] - initial_gate.server_time_ms
+        ) / 1000
+        self._proof_deadline = now + (
+            initial_gate.proof_expires_at_ms - initial_gate.server_time_ms
+        ) / 1000
+
+    @staticmethod
+    def _rejected(error: str, stop: str = "none") -> TransportFailure:
+        failure = TransportFailure("cancelled" if stop != "none" else "gate_rejected")
+        failure.gate_error = error
+        failure.stop_reason = stop
+        return failure
+
+    def check(
+        self,
+        source: Callable[[], ExecutionGate],
+        *,
+        generation: int,
+        monotonic: Callable[[], float],
+    ) -> float:
+        try:
+            gate = source()
+        except BaseException:
+            raise self._rejected("cloud_disconnected") from None
+        now = monotonic()
+        if not isinstance(gate, ExecutionGate):
+            raise self._rejected("cloud_disconnected")
+        failure = _gate_failure(gate, generation)
+        if failure is not None:
+            raise self._rejected(*failure)
+        with self._lock:
+            if gate.server_time_ms < self._last_server_time_ms:
+                raise self._rejected("cloud_disconnected")
+            if gate.server_time_ms == self._last_server_time_ms:
+                if now - self._last_advance > _MAX_GATE_STALE_SECONDS:
+                    raise self._rejected("cloud_disconnected")
+            else:
+                self._last_server_time_ms = gate.server_time_ms
+                self._last_advance = now
+            self._grant_deadline = min(
+                self._grant_deadline,
+                now + (self._grant["expires_at_ms"] - gate.server_time_ms) / 1000,
+            )
+            self._proof_deadline = min(
+                self._proof_deadline,
+                now + (gate.proof_expires_at_ms - gate.server_time_ms) / 1000,
+            )
+            deadline = min(self._grant_deadline, self._proof_deadline)
+            if now >= deadline:
+                raise self._rejected("proof_expired")
+            return deadline
+
+
 def _verify_runner_projection(projection: Mapping[str, Any], identity: RunnerIdentity) -> None:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -393,7 +464,7 @@ class LocalCanaryExecutor:
             "timestamps": {
                 "claimed_at_ms": started_at, "started_at_ms": started_at,
                 "updated_at_ms": requested_at, "stop_requested_at_ms": requested_at,
-                "stop_acknowledged_at_ms": requested_at, "terminal_at_ms": None,
+                "stop_acknowledged_at_ms": None, "terminal_at_ms": None,
             },
             "counters": {
                 **counters,
@@ -453,11 +524,15 @@ class LocalCanaryExecutor:
         on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> ExecutionResult:
         initial_gate = gate_source()
+        initial_gate_monotonic = self.monotonic()
         validated = validate_execution_bundle(
             bundle, store=self.store, identity=self.identity,
             trusted_grant_keys=self.trusted_grant_keys, now_ms=self.clock_ms(), gate=initial_gate,
         )
         manifest, projection, grant = validated.manifest, validated.projection, validated.grant
+        authority = _LiveAuthority(
+            grant=grant, initial_gate=initial_gate, now=initial_gate_monotonic,
+        )
         # Compile every closed action before consuming the grant or allowing a target socket.
         prepared = [prepare_action(action) for action in manifest["actions"]]
         retention_expires = (
@@ -514,7 +589,10 @@ class LocalCanaryExecutor:
             credentials, configured_secrets = self._resolve_credentials(manifest)
             redactor = Redactor(configured_secrets)
             retry_policy = RetryPolicy.from_mapping(manifest["retry_policy"])
-            self._gate(gate_source, grant["kill_switch_generation"])
+            authority.check(
+                gate_source, generation=grant["kill_switch_generation"],
+                monotonic=self.monotonic,
+            )
             self.store.transition_run(grant["run_id"], "running", now_ms=self.clock_ms())
             log.append("run_started", detail_code="all_preflight_valid", counters=counters)
             for source, action in zip(manifest["actions"], prepared, strict=True):
@@ -533,10 +611,17 @@ class LocalCanaryExecutor:
                     attempt: int, previous_failure_code: str | None,
                 ) -> AttemptPermit:
                     cancellation.raise_if_cancelled()
-                    gate = self._gate(gate_source, grant["kill_switch_generation"])
-                    now = self.monotonic()
+                    authority_deadline = authority.check(
+                        gate_source, generation=grant["kill_switch_generation"],
+                        monotonic=self.monotonic,
+                    )
                     with budget_lock:
                         cancellation.raise_if_cancelled()
+                        now = self.monotonic()
+                        if now >= authority_deadline:
+                            expired = TransportFailure("gate_rejected")
+                            expired.gate_error = "proof_expired"
+                            raise expired
                         if attempt != action_attempts[0] + 1 or attempt not in {1, 2}:
                             raise TransportFailure("gate_rejected")
                         if attempt == 1:
@@ -563,10 +648,6 @@ class LocalCanaryExecutor:
                             exhausted = TransportFailure("gate_rejected")
                             exhausted.gate_error = "budget_exhausted"
                             raise exhausted
-                        if not grant["issued_at_ms"] <= gate.server_time_ms < grant["expires_at_ms"]:
-                            expired = TransportFailure("gate_rejected")
-                            expired.gate_error = "proof_expired"
-                            raise expired
                         counters["requests_started"] += 1
                         if attempt == 1:
                             counters["actions_contained"] += 1
@@ -583,10 +664,8 @@ class LocalCanaryExecutor:
                         wall_deadline = (
                             started_monotonic + manifest["budgets"]["wall_timeout_ms"] / 1000
                         )
-                        grant_deadline = now + (grant["expires_at_ms"] - gate.server_time_ms) / 1000
-                        proof_deadline = now + (gate.proof_expires_at_ms - gate.server_time_ms) / 1000
                         return AttemptPermit(min(
-                            action_deadline, wall_deadline, grant_deadline, proof_deadline,
+                            action_deadline, wall_deadline, authority_deadline,
                         ))
 
                 def evidence_sink(evidence: BoundedResponseEvidence) -> str:
@@ -943,6 +1022,10 @@ class LocalCanaryExecutor:
     def recover(self, run_id: str, *, transport: Any = None) -> ExecutionResult:
         """Finalize an interrupted run without ever replaying a started target action."""
         del transport
+        try:
+            self.store.load_run(run_id)
+        except RunnerStoreError:
+            self.store.recover_run_reservation(run_id)
         try:
             stored = self.store.load_final_projections(run_id)
         except RunnerStoreError:

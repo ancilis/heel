@@ -45,6 +45,112 @@ class LeaseExecutor(Protocol):
     ) -> object: ...
 
 
+class _StopController:
+    """Choose one stop reason, cancel immediately, and acknowledge on a bounded worker."""
+
+    def __init__(
+        self,
+        *,
+        lease: ClaimLease,
+        coordinator: Coordinator,
+        executor: LeaseExecutor,
+        cancellation: CancellationToken,
+        snapshot: Callable[[], dict[str, Any]],
+        accept_projection: Callable[[dict[str, Any]], None],
+        monotonic: Callable[[], float],
+        clock_ms: Callable[[], int],
+    ):
+        self.lease = lease
+        self.coordinator = coordinator
+        self.executor = executor
+        self.cancellation = cancellation
+        self.snapshot = snapshot
+        self.accept_projection = accept_projection
+        self.monotonic = monotonic
+        self.clock_ms = clock_ms
+        self.initiated = threading.Event()
+        self.completed = threading.Event()
+        self._lock = threading.Lock()
+        self._worker: threading.Thread | None = None
+
+    def request(self, reason: str, *, deadline: float | None = None) -> bool:
+        if reason not in {
+            "local_emergency_stop", "cloud_stop", "runner_revoked",
+            "target_revoked", "kill_switch",
+        }:
+            raise ValueError("invalid runner stop reason")
+        with self._lock:
+            if self.initiated.is_set():
+                return False
+            absolute_deadline = self.monotonic() + 5.0 if deadline is None else deadline
+            proposed_at_ms = self.clock_ms()
+            self.cancellation.stop_reason = reason
+            self.cancellation.stop_requested_at_ms = proposed_at_ms
+            self.cancellation.stop_ack_deadline = absolute_deadline
+            self.cancellation.stop_ack_event = self.completed
+            self.initiated.set()
+            self.cancellation.cancel()
+            self._worker = threading.Thread(
+                target=self._acknowledge,
+                args=(reason, proposed_at_ms, absolute_deadline),
+                daemon=True,
+                name="heel-runner-stop-controller",
+            )
+            self._worker.start()
+            return True
+
+    def _acknowledge(self, reason: str, proposed_at_ms: int, deadline: float) -> None:
+        try:
+            prepare = getattr(self.executor, "prepare_stop_ack", None)
+            acknowledgement = (
+                self.snapshot()
+                if prepare is None
+                else prepare(self.lease, self.snapshot(), reason, proposed_at_ms)
+            )
+            if not isinstance(acknowledgement, dict):
+                return
+            if self.monotonic() >= deadline:
+                return
+            call_completed = threading.Event()
+            failure: list[BaseException] = []
+            completion_monotonic: list[float] = []
+            acknowledged_at_ms: list[int] = []
+
+            def call() -> None:
+                try:
+                    self.coordinator.stop_ack(
+                        self.lease.run_id, acknowledgement, deadline=deadline,
+                    )
+                    acknowledged_at_ms.append(self.clock_ms())
+                except BaseException as exc:
+                    failure.append(exc)
+                finally:
+                    completion_monotonic.append(self.monotonic())
+                    call_completed.set()
+
+            threading.Thread(
+                target=call, daemon=True, name="heel-runner-stop-ack",
+            ).start()
+            call_completed.wait(max(0.0, deadline - self.monotonic()))
+            if (
+                call_completed.is_set()
+                and not failure
+                and completion_monotonic
+                and completion_monotonic[0] <= deadline
+                and acknowledged_at_ms
+            ):
+                self.cancellation.stop_acknowledged_at_ms = acknowledged_at_ms[0]
+                self.accept_projection(acknowledgement)
+        finally:
+            self.completed.set()
+
+    def join(self, timeout: float = 5.1) -> None:
+        with self._lock:
+            worker = self._worker
+        if worker is not None:
+            worker.join(timeout)
+
+
 class RunnerService:
     """Keep Cloud coordination responsive while target execution occupies another call stack."""
 
@@ -76,15 +182,15 @@ class RunnerService:
         self.clock_ms = clock_ms
         self._active_lock = threading.Lock()
         self._active_cancellation: CancellationToken | None = None
+        self._active_stop_controller: _StopController | None = None
 
     def request_local_stop(self) -> bool:
         """Cancel any in-flight target socket immediately; no coordinator call is awaited."""
         with self._active_lock:
-            cancellation = self._active_cancellation
-        if cancellation is None:
+            controller = self._active_stop_controller
+        if controller is None:
             return False
-        cancellation.cancel()
-        return True
+        return controller.request("local_emergency_stop") or controller.initiated.is_set()
 
     def run_once(self) -> bool:
         lease = self.coordinator.claim()
@@ -93,16 +199,10 @@ class RunnerService:
         if not isinstance(lease, ClaimLease) or type(lease.run_id) is not str or not lease.run_id:
             raise ValueError("coordinator returned an invalid claim lease")
         cancellation = CancellationToken()
-        with self._active_lock:
-            if self._active_cancellation is not None:
-                raise RuntimeError("runner already has an active lease")
-            self._active_cancellation = cancellation
         finished = threading.Event()
-        stop_received = threading.Event()
         heartbeat_failure: list[BaseException] = []
         projection_lock = threading.Lock()
         current_projection = [lease.operational_projection]
-        stop_ack_failure: list[BaseException] = []
 
         def snapshot() -> dict[str, Any]:
             with projection_lock:
@@ -115,59 +215,25 @@ class RunnerService:
                 current_projection[0] = value
             self.coordinator.progress(lease.run_id, value)
 
-        def issue_stop_ack(stop_reason: str, *, deadline: float) -> None:
-            """Cancel first, then bound one coordinator acknowledgement independently."""
-            proposed_at_ms = self.clock_ms()
-            cancellation.stop_reason = stop_reason
-            cancellation.stop_requested_at_ms = proposed_at_ms
-            cancellation.stop_ack_deadline = deadline
-            cancellation.stop_ack_event = threading.Event()
-            cancellation.cancel()
-            stop_received.set()
-            prepare = getattr(self.executor, "prepare_stop_ack", None)
-            try:
-                if prepare is None:
-                    acknowledgement = snapshot()
-                else:
-                    acknowledgement = prepare(
-                        lease, snapshot(), stop_reason, proposed_at_ms,
-                    )
-                if not isinstance(acknowledgement, dict):
-                    raise ValueError("executor stop acknowledgement must be an object")
-            except BaseException as exc:
-                stop_ack_failure.append(exc)
-                cancellation.stop_ack_event.set()
-                return
+        def accept_projection(value: dict[str, Any]) -> None:
+            with projection_lock:
+                current_projection[0] = value
 
-            completed = threading.Event()
-            failed: list[BaseException] = []
-
-            def acknowledge() -> None:
-                try:
-                    self.coordinator.stop_ack(
-                        lease.run_id, acknowledgement, deadline=deadline,
-                    )
-                except BaseException as exc:
-                    failed.append(exc)
-                finally:
-                    completed.set()
-
-            worker = threading.Thread(
-                target=acknowledge, daemon=True, name="heel-runner-stop-ack",
-            )
-            worker.start()
-            completed.wait(max(0.0, deadline - self.monotonic()))
-            acknowledged_in_time = completed.is_set() and self.monotonic() <= deadline
-            if acknowledged_in_time and not failed:
-                cancellation.stop_acknowledged_at_ms = self.clock_ms()
-                with projection_lock:
-                    current_projection[0] = acknowledgement
-            else:
-                if failed:
-                    stop_ack_failure.extend(failed)
-                else:
-                    stop_ack_failure.append(TimeoutError("stop acknowledgement timed out"))
-            cancellation.stop_ack_event.set()
+        stop_controller = _StopController(
+            lease=lease,
+            coordinator=self.coordinator,
+            executor=self.executor,
+            cancellation=cancellation,
+            snapshot=snapshot,
+            accept_projection=accept_projection,
+            monotonic=self.monotonic,
+            clock_ms=self.clock_ms,
+        )
+        with self._active_lock:
+            if self._active_cancellation is not None:
+                raise RuntimeError("runner already has an active lease")
+            self._active_cancellation = cancellation
+            self._active_stop_controller = stop_controller
 
         def heartbeats() -> None:
             while not finished.is_set():
@@ -204,8 +270,10 @@ class RunnerService:
                             requested_stop_reason = "kill_switch"
                         else:
                             requested_stop_reason = "none"
-                        if actual_stop and not stop_received.is_set():
-                            issue_stop_ack(requested_stop_reason, deadline=cycle + 5.0)
+                        if actual_stop:
+                            stop_controller.request(
+                                requested_stop_reason, deadline=cycle + 5.0,
+                            )
                         else:
                             cancellation.cancel()
                 except BaseException as exc:
@@ -236,13 +304,15 @@ class RunnerService:
         finally:
             finished.set()
             heartbeat_thread.join(5.1)
+            stop_controller.join()
             with self._active_lock:
                 self._active_cancellation = None
+                self._active_stop_controller = None
         if heartbeat_thread.is_alive():
             raise RuntimeError("runner heartbeat worker did not stop")
-        if not stop_received.is_set() and heartbeat_failure:
+        if not stop_controller.initiated.is_set() and heartbeat_failure:
             raise RuntimeError("runner heartbeat failed closed") from heartbeat_failure[0]
-        elif not stop_received.is_set():
+        elif not stop_controller.initiated.is_set():
             self.coordinator.result(lease.run_id, snapshot())
         return True
 
