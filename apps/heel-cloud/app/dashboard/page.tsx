@@ -194,7 +194,7 @@ export default function Dashboard() {
     try {
       await canaryApi.approveRun(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId, {
         projectionDigest: approval.projectionDigest, hostnameRetype: approval.hostname, reason,
-        idempotencyKey: idempotencyKey(), controlGeneration: run.run.killSwitchGeneration,
+        idempotencyKey: idempotencyKey(), controlGeneration: run.approvalControlGeneration,
       });
       setApprovalOpen(false);
       setRun(await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId));

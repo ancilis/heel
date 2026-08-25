@@ -55,6 +55,7 @@ export interface CanaryRunProgress {
 }
 
 export interface CanaryRunDashboard {
+  approvalControlGeneration: number;
   run: CanaryRunStatus;
   progress: CanaryRunProgress;
 }
@@ -255,8 +256,9 @@ function parseRunStatus(value: unknown, expectedRun: string): CanaryRunStatus {
 }
 
 function parseRunDashboard(value: unknown, expectedRun: string): CanaryRunDashboard {
-  if (!exact(value, ["schema_version", "run", "progress"])
+  if (!exact(value, ["schema_version", "approval_control_generation", "run", "progress"])
     || value.schema_version !== "heel.canary-run-dashboard.v1"
+    || !integer(value.approval_control_generation)
     || !exact(value.progress, [
       "schema_version", "available", "current_scenario_id", "scenarios_completed",
       "scenarios_total", "requests_started", "requests_completed", "remaining_requests",
@@ -286,6 +288,7 @@ function parseRunDashboard(value: unknown, expectedRun: string): CanaryRunDashbo
     || (value.progress.requests_completed as number) > (value.progress.requests_started as number)
   )) invalidResponse();
   return deepFreeze({
+    approvalControlGeneration: value.approval_control_generation,
     run: parseRunStatus(value.run, expectedRun),
     progress: {
       available: value.progress.available,

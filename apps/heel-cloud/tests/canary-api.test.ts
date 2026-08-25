@@ -47,6 +47,7 @@ function statusValue(overrides: Record<string, unknown> = {}): Record<string, un
   };
   return {
     schema_version: "heel.canary-run-dashboard.v1",
+    approval_control_generation: 7,
     run: runStatus,
     progress: {
       schema_version: "heel.canary-run-progress.v1",
@@ -79,6 +80,7 @@ it("CanaryApi exposes named methods only and sends same-origin closed requests",
   assert.equal("request" in api, false);
   const value = await api.getRun(workspace, project, run);
   assert.equal(value.run.runId, run);
+  assert.equal(value.approvalControlGeneration, 7);
   assert.equal(Object.isFrozen(value), true);
   assert.equal(Object.isFrozen(value.progress), true);
   assert.deepEqual(calls.map(([path]) => path), [
