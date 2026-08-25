@@ -569,18 +569,19 @@ export class CanaryApi {
       || value.schema_version !== "heel.runner-context-binding-dashboard.v1" || !integer(value.server_time_ms)
       || !Array.isArray(value.runners) || !Array.isArray(value.bindings)) invalidResponse();
     const bindings = value.bindings.map((item): RunnerContextBindingRecord => {
-      if (!exact(item, ["binding_id", "binding_digest", "environment_id", "origin", "environment_class", "verification_record_digest", "runner_id", "runner_key_id", "status", "issued_at_ms", "expires_at_ms", "first_claimed_at_ms"])
-        || typeof item.binding_id !== "string" || !/^rcb_[0-9a-f]{32}$/.test(item.binding_id)
-        || !digest(item.binding_digest) || !ENVIRONMENT_REF.test(String(item.environment_id))
-        || typeof item.origin !== "string" || !["staging", "sandbox"].includes(String(item.environment_class))
-        || !digest(item.verification_record_digest) || !identifier(item.runner_id) || !identifier(item.runner_key_id)
-        || !["active", "revoked", "expired"].includes(String(item.status)) || !integer(item.issued_at_ms)
-        || !integer(item.expires_at_ms) || item.expires_at_ms <= item.issued_at_ms || !nullableInteger(item.first_claimed_at_ms)) invalidResponse();
-      return { bindingId: item.binding_id, bindingDigest: item.binding_digest, environmentId: item.environment_id,
-        origin: item.origin, environmentClass: item.environment_class as "staging" | "sandbox",
-        verificationRecordDigest: item.verification_record_digest, runnerId: item.runner_id,
-        runnerKeyId: item.runner_key_id, status: item.status as "active" | "revoked" | "expired",
-        issuedAtMs: item.issued_at_ms, expiresAtMs: item.expires_at_ms, firstClaimedAtMs: item.first_claimed_at_ms };
+      if (!exact(item, ["binding_id", "binding_digest", "environment_id", "origin", "environment_class", "verification_record_digest", "runner_id", "runner_key_id", "status", "issued_at_ms", "expires_at_ms", "first_claimed_at_ms"])) invalidResponse();
+      const { binding_id, binding_digest, environment_id, origin, environment_class, verification_record_digest, runner_id, runner_key_id, status, issued_at_ms, expires_at_ms, first_claimed_at_ms } = item;
+      if (typeof binding_id !== "string" || !/^rcb_[0-9a-f]{32}$/.test(binding_id)
+        || !digest(binding_digest) || typeof environment_id !== "string" || !ENVIRONMENT_REF.test(environment_id)
+        || typeof origin !== "string" || typeof environment_class !== "string" || !["staging", "sandbox"].includes(environment_class)
+        || !digest(verification_record_digest) || !identifier(runner_id) || !identifier(runner_key_id)
+        || typeof status !== "string" || !["active", "revoked", "expired"].includes(status) || !integer(issued_at_ms)
+        || !integer(expires_at_ms) || expires_at_ms <= issued_at_ms || !nullableInteger(first_claimed_at_ms)) invalidResponse();
+      return { bindingId: binding_id, bindingDigest: binding_digest, environmentId: environment_id,
+        origin, environmentClass: environment_class as "staging" | "sandbox",
+        verificationRecordDigest: verification_record_digest, runnerId: runner_id,
+        runnerKeyId: runner_key_id, status: status as "active" | "revoked" | "expired",
+        issuedAtMs: issued_at_ms, expiresAtMs: expires_at_ms, firstClaimedAtMs: first_claimed_at_ms };
     });
     const runners = value.runners.map((item): RunnerContextRunner => {
       if (!exact(item, ["runner_id", "runner_key_id", "display_name", "fingerprint", "runner_version", "adapter_versions", "status"])
