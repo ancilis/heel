@@ -21,7 +21,7 @@ const ignoredRootDirectories = new Set([
   "outputs",
   "work",
 ]);
-const ignoredRootPaths = new Set(["public/heel-runtime"]);
+const ignoredRootPaths = new Set(["next-env.d.ts", "public/heel-runtime"]);
 
 async function assertMissing(relativePath) {
   await assert.rejects(access(new URL(relativePath, appRoot)));
@@ -42,6 +42,8 @@ async function sourceFiles(directoryUrl, rootUrl = directoryUrl) {
     }
 
     const entryUrl = new URL(`${entry.name}${entry.isDirectory() ? "/" : ""}`, directoryUrl);
+    const relativeEntry = relative(fileURLToPath(rootUrl), fileURLToPath(entryUrl)).replaceAll("\\", "/");
+    if (ignoredRootPaths.has(relativeEntry)) continue;
     if (entry.isDirectory()) {
       files.push(...(await sourceFiles(entryUrl, rootUrl)));
     } else if (sourceExtensions.has(extname(entry.name))) {

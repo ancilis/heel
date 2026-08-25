@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { cp, lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
-import { extname, join, relative } from "node:path";
+import { basename, extname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { deflateRawSync, gunzipSync, inflateRawSync } from "node:zlib";
@@ -729,10 +729,10 @@ async function firstPartyBrowserSources() {
   const manifest = await json(join(clientRoot, ".vite/manifest.json"));
   const workspace = manifest["components/review/ReviewWorkspace.tsx"]?.file;
   assert.equal(typeof workspace, "string", "production client manifest omits ReviewWorkspace");
-  const workerFiles = (await readdir(join(clientRoot, "assets")))
-    .filter((name) => /^heel-review\.worker-[A-Za-z0-9_-]+\.js$/.test(name));
+  const workerFiles = (await filesUnder(clientRoot))
+    .filter((path) => /^heel-review\.worker-[A-Za-z0-9_-]+\.js$/.test(basename(path)));
   assert.equal(workerFiles.length, 1, "production build must contain one browser review worker");
-  const paths = [join(clientRoot, workspace), join(clientRoot, "assets", workerFiles[0])];
+  const paths = [join(clientRoot, workspace), workerFiles[0]];
   return {
     paths,
     source: (await Promise.all(paths.map((path) => readFile(path, "utf8")))).join("\n"),
@@ -1312,7 +1312,7 @@ test("recursively scans every deployed executable, text manifest, and wheel memb
     if (carriesReviewedHistoryPath) {
       assert.match(
         label,
-        /^(?:client|server\/ssr)\/assets\/(?:ReviewWorkspace|heel-cloud-api)-[A-Za-z0-9_-]+\.js$/,
+        /^(?:client|server\/ssr)\/(?:assets|_next\/static(?:\/chunks)?)\/(?:ReviewWorkspace|heel-cloud-api)-[A-Za-z0-9_-]+\.js$/,
       );
       assert.match(record.text, /["'`]\/api\/control-plane["'`]/);
       assert.match(record.text, /\/v1\/workspaces\//);
@@ -1557,10 +1557,10 @@ test("production worker exposes exact headers, request-URL metadata, and only th
   assert.match(response.headers.get("permissions-policy"), /payment=\(\)/);
 
   const html = await response.text();
-  assert.match(html, /<meta property="og:image" content="https:\/\/request-url\.heel\.invalid\/og\.png"\/>/);
-  assert.match(html, /<meta property="og:image:width" content="1200"\/>/);
-  assert.match(html, /<meta property="og:image:height" content="630"\/>/);
-  assert.match(html, /<meta name="twitter:image" content="https:\/\/request-url\.heel\.invalid\/og\.png"\/>/);
+  assert.match(html, /<meta property="og:image" content="https:\/\/request-url\.heel\.invalid\/og\.png"\/?>/);
+  assert.match(html, /<meta property="og:image:width" content="1200"\/?>/);
+  assert.match(html, /<meta property="og:image:height" content="630"\/?>/);
+  assert.match(html, /<meta name="twitter:image" content="https:\/\/request-url\.heel\.invalid\/og\.png"\/?>/);
   assert.doesNotMatch(html, /https:\/\/(?:host-|forwarded-|internal-)attacker\.invalid\/og\.png/);
 
   const localResponse = await artifact.default.fetch(
@@ -1577,7 +1577,7 @@ test("production worker exposes exact headers, request-URL metadata, and only th
   assert.equal(localResponse.status, 200);
   assert.match(
     await localResponse.text(),
-    /<meta property="og:image" content="http:\/\/127\.0\.0\.1:8787\/og\.png"\/>/,
+    /<meta property="og:image" content="http:\/\/127\.0\.0\.1:8787\/og\.png"\/?>/,
   );
 });
 
