@@ -16,6 +16,7 @@ from heel.canary_contracts import (
     validate_canary_findings,
     validate_disclosure_permit,
     validate_operational_run,
+    validate_runner_context_binding,
 )
 from heel.crypto import verify_envelope
 from heel.runner.control_client import RunnerControlClient
@@ -26,7 +27,7 @@ from heel.runner.execution import (
 )
 from heel.runner.identity import RunnerIdentity, SecureSigner
 from heel.runner.service import ClaimLease
-from heel.runner.store import RunnerStore
+from heel.runner.store import RunnerContext, RunnerStore
 
 
 _MAX_AUTHENTICATED_GATE_AGE_SECONDS = 0.5
@@ -147,6 +148,24 @@ class RunnerCoordinator:
                 projection["projection_digest"],
             )
         return ClaimLease(response["run_id"], bundle, claimed)
+
+    def install_cloud_context_binding(self, artifact: object, *, signer_label: str) -> RunnerContext:
+        """Install only a Cloud-signed pairing authorization; it grants no execution lease."""
+        return self.store.install_cloud_context_binding(
+            artifact, identity=self.identity, signer=self.signer, signer_label=signer_label,
+            trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
+        )
+
+    def submit_cloud_context_approval(self, approval_projection: object) -> dict[str, Any]:
+        """Use the serialized claim chain to submit a plan bound to the installed Cloud artifact."""
+        binding = self.store.load_cloud_context_binding()
+        binding = validate_runner_context_binding(binding)
+        now = self._now_ms()
+        if binding["issued_at_ms"] > now + 30_000 or now >= binding["expires_at_ms"]:
+            raise ValueError("cloud context binding is expired")
+        return self.control.submit_context_approval_projection(
+            binding["binding_id"], binding["binding_digest"], approval_projection,
+        )
 
     def _claimed_projection(
         self, manifest: dict[str, Any], projection: dict[str, Any], grant: dict[str, Any],
