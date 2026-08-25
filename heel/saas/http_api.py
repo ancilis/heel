@@ -1020,6 +1020,33 @@ class _Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "invalid runner revocation", code="invalid_runner_revocation")
         self._json(200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
 
+    @staticmethod
+    def _operational_context_matches(conn: sqlite3.Connection, *, workspace_id: str,
+                                     runner_id: str, projection: dict) -> bool:
+        """Bind a closed runner receipt to the immutable run/grant graph, not its labels."""
+        row = conn.execute(
+            "SELECT r.workspace_id,r.project_ref,r.grant_id,g.grant_digest,a.projection_digest,a.projection_json "
+            "FROM canary_runs r JOIN canary_execution_grants g ON "
+            "g.workspace_id=r.workspace_id AND g.project_ref=r.project_ref AND g.grant_id=r.grant_id "
+            "JOIN canary_approval_projections a ON a.workspace_id=g.workspace_id AND a.project_ref=g.project_ref AND a.approval_id=g.approval_id "
+            "WHERE r.workspace_id=? AND r.runner_id=? AND r.run_id=? AND g.runner_id=? AND a.runner_id=?",
+            (workspace_id, runner_id, projection["run_id"], runner_id, runner_id),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            approval = json.loads(row["projection_json"])
+        except (TypeError, ValueError):
+            return False
+        return all((
+            projection["workspace_id"] == row["workspace_id"],
+            projection["project_id"] == row["project_ref"],
+            projection["grant_id"] == row["grant_id"],
+            projection["grant_digest"] == row["grant_digest"],
+            projection["approval_projection_digest"] == row["projection_digest"],
+            projection["manifest_digest"] == approval.get("manifest_digest"),
+        ))
+
     def _runner_request(self, wid: str, runner_id: str, capability: str, run_id: str | None, operation: str) -> None:
         # Runner paths are fixed and strict: no URI aliases, bearer headers, URL parameters,
         # or payload/path disagreement can enter the PoP verifier.
@@ -1032,6 +1059,10 @@ class _Handler(BaseHTTPRequestHandler):
                           "stop-ack": validate_runner_stop_ack_request}
             parsed = validators[operation](parsed)
             if canonical_bytes(parsed) != self._raw_body() or (run_id is not None and parsed["run_id"] != run_id):
+                raise RunnerAuthError("invalid runner authentication")
+            if operation != "claim" and not self._operational_context_matches(
+                    self._runner_store().conn, workspace_id=wid, runner_id=runner_id,
+                    projection=parsed["operational_projection"]):
                 raise RunnerAuthError("invalid runner authentication")
             all_headers = {name: self._header_values(name) for name in ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature", "Authorization", "Cookie")}
             response, nonce = self._runner_store().authenticate_and_consume(

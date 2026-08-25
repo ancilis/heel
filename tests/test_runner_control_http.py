@@ -273,10 +273,17 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
             cp.store.conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", public, "active", time.time()))
             cp.store.conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)", (workspace, "runner", "heartbeat:run", cp.runner_auth._hash("nonce", nonce), 1, time.time() + 60))
             cp.store.conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (workspace, "runner", "heartbeat:run", 1, 0, time.time()))
+            stamp, digest = time.time(), "a" * 64
+            cp.store.conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", (workspace, "prj", "project", "owner", stamp))
+            cp.store.conn.execute("INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at) VALUES(?,?,?,?,?,?,?)", ("env", workspace, "prj", "https://canary.example.com", "staging", "verified", stamp))
+            cp.store.conn.execute("INSERT INTO canary_approval_projections VALUES(?,?,?,?,?,?,?,?,?)", ("approval", workspace, "prj", "env", "runner", digest, json.dumps({"manifest_digest": digest}), stamp, stamp + 60))
+            cp.store.conn.execute("INSERT INTO canary_execution_grants VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("g", workspace, "prj", "approval", "env", "runner", "nonce", digest, "issued", stamp + 60, stamp))
+            cp.store.conn.execute("INSERT INTO canary_runs VALUES(?,?,?,?,?,?,?,?,?)", ("run", workspace, "prj", "g", "env", "runner", "claimed", stamp, stamp))
             identity = cp.runner_auth._identity_record(workspace_id=workspace, runner_id="runner", public_key=public, fingerprint=hashlib.sha256(raw).hexdigest(), key_id=key_id, runner_version="v1", adapters_json="{}", paired_by="owner", paired_at=time.time(), heartbeat_at=time.time())
             cp.runner_auth._save_identity(identity, instant=time.time()); cp.store.conn.commit()
             from test_canary_contracts import _digest, operational
             projection = operational()
+            projection["workspace_id"] = workspace
             projection["lifecycle_phase"] = "claimed"
             projection["timestamps"]["claimed_at_ms"] = 1
             projection = _digest(projection, "projection_digest")
