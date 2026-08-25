@@ -155,6 +155,10 @@ class ApiError(Exception):
         self.body = {"error": message, **extra}
 
 
+class _RunnerContextUnavailable(Exception):
+    pass
+
+
 class DeviceApiError(ApiError):
     """Closed device-flow error: stable code only, never a reflected detail string."""
 
@@ -1215,9 +1219,6 @@ class _Handler(BaseHTTPRequestHandler):
         # or payload/path disagreement can enter the PoP verifier.
         if "?" in self.path or "#" in self.path or "%" in self.path or self.command != "POST":
             raise RunnerAuthError("invalid runner authentication")
-        if operation.startswith("context-") and self.cp.grant_authority is None:
-            self._json(503, {"schema_version": "heel.runner-context-error.v1", "code": "runner_context_unavailable"})
-            return
         try:
             maximum = (
                 128 if operation == "context-list"
@@ -1245,8 +1246,11 @@ class _Handler(BaseHTTPRequestHandler):
             # Bind both services to this exact migration-validated request connection before
             # PoP opens its write transaction. Request mode performs no DDL or PRAGMA changes;
             # the lifecycle/disclosure action then commits atomically with proof consumption.
-            runs, disclosure = self._runner_canary_services(store)
-            contexts = RunnerContextBindingService(store.conn, signing=self.cp.grant_authority)
+            if operation.startswith("context-"):
+                runs = disclosure = contexts = None
+            else:
+                runs, disclosure = self._runner_canary_services(store)
+                contexts = RunnerContextBindingService(store.conn, signing=self.cp.grant_authority)
 
             def action() -> dict:
                 if operation == "claim":
@@ -1257,18 +1261,23 @@ class _Handler(BaseHTTPRequestHandler):
                         "schema_version": "heel.runner-claim-idle.internal.v1",
                     }
                 key_id = all_headers["X-Heel-Runner-Key-Id"][0]
+                if operation.startswith("context-"):
+                    if self.cp.grant_authority is None:
+                        raise _RunnerContextUnavailable
+                    context_runs, _ = self._runner_canary_services(store)
+                    context_service = RunnerContextBindingService(store.conn, signing=self.cp.grant_authority)
                 if operation == "context-list":
-                    return contexts.list_for_runner_in_transaction(wid, runner_id, key_id)
+                    return context_service.list_for_runner_in_transaction(wid, runner_id, key_id)
                 if operation == "context-claim":
-                    return contexts.claim_in_transaction(wid, runner_id, key_id, run_id, parsed)
+                    return context_service.claim_in_transaction(wid, runner_id, key_id, run_id, parsed)
                 if operation == "context-approval-projections":
-                    binding = contexts.active_binding_for_projection_in_transaction(
+                    binding = context_service.active_binding_for_projection_in_transaction(
                         wid, runner_id, key_id, run_id, parsed["context_binding_digest"],
                     )
-                    response = runs.submit_projection_from_runner_in_transaction(
+                    response = context_runs.submit_projection_from_runner_in_transaction(
                         parsed["approval_projection"], binding, uploaded_by_runner_id=runner_id,
                     )
-                    contexts._event(binding, "projection_submitted", "runner", runner_id)
+                    context_service._event(binding, "projection_submitted", "runner", runner_id)
                     return response
                 if operation == "result-projection":
                     project_ref = self._runner_run_project(
@@ -1301,6 +1310,9 @@ class _Handler(BaseHTTPRequestHandler):
                 ),
                 max_body_bytes=maximum,
             )
+        except _RunnerContextUnavailable:
+            self._json(503, {"schema_version": "heel.runner-context-error.v1", "code": "runner_context_unavailable"})
+            return
         except RunnerContextError:
             raise RunnerAuthError("invalid runner authentication") from None
         except (CanaryRunError, CanaryDisclosureError):
@@ -2185,6 +2197,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _ws_runner_context_create(self, wid: str, project_ref: str) -> None:
         try:
+            self._runner_context_human_scope(wid, project_ref)
             actor, role, _ = self._recent_owner_admin_context(wid)
             body = parse_json(self._raw_body(), max_bytes=2048)
             if canonical_bytes(body) != self._raw_body():
@@ -2202,6 +2215,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _ws_runner_context_revoke(self, wid: str, project_ref: str, binding_id: str) -> None:
         try:
+            self._runner_context_human_scope(wid, project_ref)
             actor, role, _ = self._recent_owner_admin_context(wid)
             body = parse_json(self._raw_body(), max_bytes=256)
             if canonical_bytes(body) != self._raw_body():
@@ -2222,6 +2236,15 @@ class _Handler(BaseHTTPRequestHandler):
         if kind != "session" or user_id is None:
             raise RunnerContextError("runner_context_binding_not_found")
         self._json(200, self._runner_context_service().list_for_human(wid, project_ref, actor=user_id))
+
+    def _runner_context_human_scope(self, wid: str, project_ref: str) -> None:
+        """Hide foreign/missing project identifiers before sensitive session ceremonies."""
+        kind, user_id, _ = self._principal()
+        if kind == "session" and user_id is not None:
+            if (self.cp.store.get_role(wid, user_id) is None or self.cp.store.conn.execute(
+                "SELECT 1 FROM projects WHERE workspace_id=? AND project_ref=?", (wid, project_ref),
+            ).fetchone() is None):
+                raise RunnerContextError("runner_context_binding_not_found")
 
     def _ws_canary_approve(self, wid: str, project_ref: str, run_id: str) -> None:
         actor, role, recent_auth_at_ms = self._recent_owner_admin_context(wid)

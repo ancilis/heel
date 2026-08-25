@@ -477,7 +477,7 @@ class CanaryRunService:
             if link is None or link["rcb_id"] != binding_row["rcb_id"] or link["projection_digest"] != validated["projection_digest"]:
                 raise CanaryRunError("projection_conflict")
             return {"schema_version": "heel.canary-projection-submitted.v1", "approval_id": prior["approval_id"],
-                    "run_id": prior["run_id"], "status": "awaiting_execution_approval", "projection_digest": validated["projection_digest"]}
+                    "run_id": prior["run_id"], "status": prior["status"], "projection_digest": prior["projection_digest"]}
         result = self.submit_projection(validated, uploaded_by=uploaded_by_runner_id, _transaction_owned=True, _actor_class="runner")
         self.conn.execute(
             "INSERT INTO canary_runner_context_projection_links("

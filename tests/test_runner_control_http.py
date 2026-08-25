@@ -120,7 +120,11 @@ def test_context_methods_use_claim_chain_and_closed_context_routes():
     transport, signer = ContextTransport(), Signer()
     control = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer, clock=lambda: 1000, transport=transport, nonce_source=lambda _: base64.b64encode(b"n" * 32).decode())
     assert control.list_contexts()["contexts"] == []
-    control.claim_context("rcb_" + "a" * 32, "a" * 64)
+    claim_unsigned = {"schema_version": "heel.runner-context-binding.v1", "binding_id": "rcb_" + "a" * 32,
+                      "workspace_id": "ws", "project_id": "project", "environment": {"environment_id": "env_" + "a" * 32, "origin": "https://staging.example.com", "environment_class": "staging", "verification_record_digest": "a" * 64},
+                      "runner_binding": {"runner_id": "runner", "runner_key_id": KEY_ID, "public_key_digest": "a" * 64},
+                      "authorization": {"user_id": "owner", "role": "owner"}, "issued_at_ms": 0, "expires_at_ms": 60_000}
+    control.claim_context("rcb_" + "a" * 32, canonical_digest(claim_unsigned))
     assert [item[0] for item in transport.requests] == [
         "/v1/workspaces/ws/runners/runner/contexts/list",
         "/v1/workspaces/ws/runners/runner/contexts/rcb_" + "a" * 32 + "/claim",
@@ -138,6 +142,32 @@ def test_context_methods_reject_extra_or_unsigned_claim_artifacts():
     control = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=Signer(), clock=lambda: 1000, transport=BadContextTransport(), nonce_source=lambda _: base64.b64encode(b"n" * 32).decode())
     with pytest.raises(ValueError, match="invalid runner context response"):
         control.claim_context("rcb_" + "a" * 32, "a" * 64)
+
+
+def test_context_list_does_not_replace_server_issued_order_with_expiry_order():
+    class OrderedTransport:
+        def post(self, path, *, headers=None, body=b""):
+            del path, headers, body
+            contexts = []
+            for marker, expires_at_ms in (("b", 90_000), ("a", 2_000)):
+                contexts.append({
+                    "binding_id": "rcb_" + marker * 32, "binding_digest": marker * 64,
+                    "project_id": "project", "environment_id": "env", "origin": "https://staging.example.com",
+                    "environment_class": "staging", "verification_record_digest": marker * 64,
+                    "expires_at_ms": expires_at_ms, "claimed": False,
+                })
+            return 200, {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"n" * 32).decode()}, {
+                "schema_version": "heel.runner-context-list-result.v1", "server_time_ms": 1,
+                "contexts": contexts, "has_more": False,
+            }
+
+    control = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner", signer=Signer(),
+        clock=lambda: 1, transport=OrderedTransport(), nonce_source=lambda _: base64.b64encode(b"n" * 32).decode(),
+    )
+    assert [item["binding_id"] for item in control.list_contexts()["contexts"]] == [
+        "rcb_" + "b" * 32, "rcb_" + "a" * 32,
+    ]
 
 def test_sequences_are_independent_per_run_capability_and_stop_ack_is_heartbeat():
     control, transport, signer = client()

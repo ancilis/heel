@@ -15,7 +15,7 @@ const edge = "a".repeat(43);
 
 beforeAll(() => {
   class LengthStream extends TransformStream<Uint8Array, Uint8Array> {
-    constructor(_: number) { super(); }
+    constructor(length: number) { void length; super(); }
   }
   (globalThis as typeof globalThis & { FixedLengthStream: typeof LengthStream }).FixedLengthStream = LengthStream;
 });

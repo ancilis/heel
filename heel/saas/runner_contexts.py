@@ -185,6 +185,7 @@ class RunnerContextBindingService:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             self._assert_membership(workspace_id, actor, role)
+            self._expire_in_transaction(now)
             row = self.conn.execute(
                 "SELECT * FROM canary_runner_context_bindings WHERE workspace_id=? AND project_ref=? AND rcb_id=?",
                 (workspace_id, project_id, binding_id),
@@ -229,6 +230,10 @@ class RunnerContextBindingService:
         ).fetchone()
         if membership is None:
             raise RunnerContextError("runner_context_binding_not_found")
+        if self.conn.execute(
+            "SELECT 1 FROM projects WHERE workspace_id=? AND project_ref=?", (workspace_id, project_id),
+        ).fetchone() is None:
+            raise RunnerContextError("runner_context_binding_not_found")
         now = self._now_ms()
         runner_rows = self.conn.execute(
             "SELECT r.runner_id,r.display_name,k.key_id,k.public_key,i.identity_json "
@@ -257,7 +262,7 @@ class RunnerContextBindingService:
                 "runners": runners, "bindings": [{"binding_id": row["rcb_id"], "binding_digest": row["binding_digest"],
                     "environment_id": row["environment_id"], "origin": row["environment_origin"],
                     "environment_class": row["environment_class"], "verification_record_digest": row["verification_record_digest"],
-                    "runner_id": row["runner_id"], "runner_key_id": row["runner_key_id"], "status": row["status"],
+                    "runner_id": row["runner_id"], "runner_key_id": row["runner_key_id"], "status": ("expired" if row["status"] == "active" and row["expires_at_ms"] <= now else row["status"]),
                     "issued_at_ms": row["issued_at_ms"], "expires_at_ms": row["expires_at_ms"],
                     "first_claimed_at_ms": row["first_claimed_at_ms"]} for row in binding_rows]}
 
@@ -267,15 +272,32 @@ class RunnerContextBindingService:
         now = self._now_ms()
         self._expire_in_transaction(now)
         rows = self.conn.execute(
-            "SELECT * FROM canary_runner_context_bindings WHERE workspace_id=? AND runner_id=? AND runner_key_id=? "
-            "AND status='active' AND expires_at_ms>? ORDER BY issued_at_ms,rcb_id LIMIT 17",
-            (workspace_id, runner_id, runner_key_id, now),
+            "SELECT b.*,k.public_key,i.identity_json FROM canary_runner_context_bindings b "
+            "JOIN canary_environments e ON e.workspace_id=b.workspace_id AND e.project_ref=b.project_ref AND e.environment_id=b.environment_id "
+            "JOIN canary_runners r ON r.workspace_id=b.workspace_id AND r.runner_id=b.runner_id "
+            "JOIN canary_runner_keys k ON k.workspace_id=b.workspace_id AND k.runner_id=b.runner_id AND k.key_id=b.runner_key_id "
+            "JOIN canary_runner_identity_records i ON i.workspace_id=b.workspace_id AND i.runner_id=b.runner_id "
+            "WHERE b.workspace_id=? AND b.runner_id=? AND b.runner_key_id=? AND b.status='active' AND b.expires_at_ms>? "
+            "AND e.status='verified' AND e.revoked_at IS NULL AND e.proof_expires_at IS NOT NULL AND e.proof_expires_at*1000>? "
+            "AND e.origin=b.environment_origin AND e.environment_class=b.environment_class AND e.verification_record_digest=b.verification_record_digest "
+            "AND r.status='active' AND k.status='active' AND k.revoked_at IS NULL ORDER BY b.issued_at_ms,b.rcb_id LIMIT 17",
+            (workspace_id, runner_id, runner_key_id, now, now),
         ).fetchall()
         contexts = []
         for row in rows[:16]:
             # Listing is discovery metadata only. The signed artifact is released only by
             # the PoP-protected claim response, so a list cannot become an install channel.
-            validate_runner_context_binding(json.loads(row["binding_json"]))
+            artifact = validate_runner_context_binding(json.loads(row["binding_json"]))
+            try:
+                public = load_public_key_base64(row["public_key"]).public_bytes(Encoding.Raw, PublicFormat.Raw)
+                identity = json.loads(row["identity_json"])
+            except (TypeError, ValueError):
+                continue
+            if (hashlib.sha256(public).hexdigest() != row["public_key_digest"] or identity.get("state") != "active"
+                    or identity.get("runner_id") != runner_id or identity.get("workspace_id") != workspace_id
+                    or identity.get("public_key", {}).get("key_id") != runner_key_id
+                    or artifact["binding_id"] != row["rcb_id"] or artifact["binding_digest"] != row["binding_digest"]):
+                continue
             contexts.append({
                 "binding_id": row["rcb_id"], "binding_digest": row["binding_digest"],
                 "project_id": row["project_ref"], "environment_id": row["environment_id"],
@@ -296,14 +318,9 @@ class RunnerContextBindingService:
         if request["binding_id"] != binding_id:
             raise RunnerContextError("invalid_runner_context_binding")
         now = self._now_ms()
-        self._expire_in_transaction(now)
-        row = self.conn.execute(
-            "SELECT * FROM canary_runner_context_bindings WHERE workspace_id=? AND runner_id=? "
-            "AND runner_key_id=? AND rcb_id=?",
-            (workspace_id, runner_id, runner_key_id, binding_id),
-        ).fetchone()
-        if row is None or row["status"] != "active" or row["binding_digest"] != request["binding_digest"]:
-            raise RunnerContextError("runner_context_binding_not_found")
+        row = self.active_binding_for_projection_in_transaction(
+            workspace_id, runner_id, runner_key_id, binding_id, request["binding_digest"],
+        )
         artifact = validate_runner_context_binding(json.loads(row["binding_json"]))
         if row["first_claimed_at_ms"] is None:
             self.conn.execute(
@@ -311,7 +328,7 @@ class RunnerContextBindingService:
                 (now, binding_id),
             )
             self._event(row, "claimed", "runner", runner_id)
-        return {"schema_version": "heel.runner-context-claim-result.v1", "claimed_at_ms": now}
+        return {"schema_version": "heel.runner-context-claim-result.v1", "context_binding": artifact, "claimed_at_ms": now}
 
     def active_binding_for_projection_in_transaction(
         self, workspace_id: str, runner_id: str, runner_key_id: str, binding_id: str, binding_digest: str,

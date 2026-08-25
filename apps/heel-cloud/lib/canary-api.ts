@@ -233,6 +233,21 @@ function invalidResponse(): never {
   throw new CanaryApiError("invalid_response", 502);
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    if (typeof value === "string" && value.normalize("NFC") !== value) invalidRequest();
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) invalidRequest();
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (!record(value)) invalidRequest();
+  const fields = Object.keys(value).sort();
+  return `{${fields.map((field) => `${JSON.stringify(field)}:${canonicalJson(value[field])}`).join(",")}}`;
+}
+
 function projectPath(workspaceRef: string, projectRef: string, suffix: string): string {
   if (!WORKSPACE_REF.test(workspaceRef) || !PROJECT_REF.test(projectRef)) invalidRequest();
   return `${CONTROL_PLANE_PREFIX}/v1/workspaces/${workspaceRef}/projects/${projectRef}${suffix}`;
@@ -625,7 +640,12 @@ export class CanaryApi {
     if (!ENVIRONMENT_REF.test(input.environmentId) || !digest(input.verificationRecordDigest) || !identifier(input.runnerId) || !identifier(input.runnerKeyId)) invalidRequest();
     const value = await this.#json(projectPath(workspaceRef, projectRef, "/runner-context-bindings"), "POST", { schema_version: "heel.runner-context-binding-create.v1", environment_id: input.environmentId, verification_record_digest: input.verificationRecordDigest, runner_id: input.runnerId, runner_key_id: input.runnerKeyId }, 201);
     if (!exact(value, ["schema_version", "context_binding"]) || value.schema_version !== "heel.runner-context-binding-created.v1") invalidResponse();
-    return parseRunnerContextBinding(value.context_binding);
+    const binding = parseRunnerContextBinding(value.context_binding);
+    if (binding.environmentId !== input.environmentId || binding.verificationRecordDigest !== input.verificationRecordDigest
+      || binding.runnerId !== input.runnerId || binding.runnerKeyId !== input.runnerKeyId
+      || !exact(value.context_binding, ["schema_version", "binding_id", "workspace_id", "project_id", "environment", "runner_binding", "authorization", "issued_at_ms", "expires_at_ms", "binding_digest", "signing_key_id", "signature_b64"])
+      || value.context_binding.workspace_id !== workspaceRef || value.context_binding.project_id !== projectRef) invalidResponse();
+    return binding;
   }
 
   async revokeRunnerContextBinding(workspaceRef: string, projectRef: string, bindingId: string): Promise<void> {
@@ -851,7 +871,7 @@ export class CanaryApi {
     const headers = new Headers({ Accept: "application/json", ...extraHeaders });
     let payload: string | undefined;
     if (body !== undefined) {
-      payload = JSON.stringify(body);
+      payload = canonicalJson(body);
       if (new TextEncoder().encode(payload).byteLength > MAX_REQUEST_BYTES) invalidRequest();
       headers.set("Content-Type", "application/json");
     }

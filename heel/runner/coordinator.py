@@ -158,6 +158,18 @@ class RunnerCoordinator:
 
     def ensure_runner_context(self) -> bool:
         """Acquire one Cloud authorization before work polling, without synthesizing context."""
+        # First pairing has no local namespace: list before touching a namespaced sidecar.
+        if not self.store.is_context_bound:
+            listed = self.control.list_contexts()
+            contexts = listed["contexts"]
+            if len(contexts) == 0:
+                return False
+            if len(contexts) != 1:
+                raise ValueError("ambiguous cloud runner contexts")
+            item = contexts[0]
+            claimed = self.control.claim_context(item["binding_id"], item["binding_digest"])
+            self.install_cloud_context_binding(claimed["context_binding"], signer_label="cloud-context")
+            return True
         try:
             self.store.verify_cloud_context_binding(
                 identity=self.identity, trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),

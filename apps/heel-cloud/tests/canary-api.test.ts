@@ -20,8 +20,10 @@ it("uses closed create list revoke routes for browser context authorization", as
   const runner = "runr_0123456789abcdef0123456789abcdef";
   const binding = "rcb_0123456789abcdef0123456789abcdef";
   const calls: string[] = [];
+  const bodies: string[] = [];
   const api = new CanaryApi({ transport: async (path, init) => {
     calls.push(`${init.method}:${path}`);
+    if (typeof init.body === "string") bodies.push(init.body);
     if (init.method === "GET") return jsonResponse({ schema_version: "heel.runner-context-binding-dashboard.v1", server_time_ms: 1, runners: [{ runner_id: runner, runner_key_id: "key", display_name: "Runner", fingerprint: digest, runner_version: "1", adapter_versions: [], status: "active" }], bindings: [] });
     if (String(path).endsWith("/revoke")) return jsonResponse({ schema_version: "heel.runner-context-binding-revoked.v1", binding_id: binding, status: "revoked", revoked_at_ms: 1 });
     return jsonResponse({ schema_version: "heel.runner-context-binding-created.v1", context_binding: {
@@ -38,6 +40,10 @@ it("uses closed create list revoke routes for browser context authorization", as
     `GET:/api/control-plane/v1/workspaces/${workspace}/projects/${project}/runner-context-bindings`,
     `POST:/api/control-plane/v1/workspaces/${workspace}/projects/${project}/runner-context-bindings`,
     `POST:/api/control-plane/v1/workspaces/${workspace}/projects/${project}/runner-context-bindings/${binding}/revoke`,
+  ]);
+  assert.deepEqual(bodies, [
+    `{"environment_id":"env_0123456789abcdef0123456789abcdef","runner_id":"${runner}","runner_key_id":"key","schema_version":"heel.runner-context-binding-create.v1","verification_record_digest":"${digest}"}`,
+    '{"reason_code":"operator_requested","schema_version":"heel.runner-context-binding-revoke.v1"}',
   ]);
 });
 

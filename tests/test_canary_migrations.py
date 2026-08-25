@@ -6,6 +6,7 @@ from heel.saas.catalog import (
 )
 from heel.saas.ledger import IdempotencyConflict, UsageLedger
 from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, MigrationError, Migrator
+from heel.saas.canary_store import ensure_runner_context_schema
 
 
 class CanaryMigrationTests(unittest.TestCase):
@@ -207,6 +208,11 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertIn("status IN ('active','revoked','expired')", binding_sql)
         self.assertIn("environment_class IN ('staging','sandbox')", binding_sql)
+
+    def test_direct_runner_context_schema_rejects_a_tampered_link_index(self):
+        self.conn.execute("DROP INDEX idx_runner_context_links_binding")
+        with self.assertRaisesRegex(RuntimeError, "indexes"):
+            ensure_runner_context_schema(self.conn)
 
     def test_migration_thirteen_runner_constraints_reject_hostile_rows(self):
         self.seed_root("ws", "prj")

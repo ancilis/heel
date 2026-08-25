@@ -592,6 +592,11 @@ class RunnerStore:
             raise RunnerStoreError("runner has no bound context")
         return self._namespace
 
+    @property
+    def is_context_bound(self) -> bool:
+        """Whether a local context namespace was selected without opening it."""
+        return self._namespace is not None
+
     def _open_root(self, *, create: bool) -> int | None:
         current = os.open(self.root.anchor, _DIRECTORY_FLAGS)
         try:

@@ -177,7 +177,8 @@ def test_named_control_methods_emit_closed_bodies_and_separate_stop_ack_chain():
     public = {name for name, method in vars(RunnerControlClient).items() if callable(method) and not name.startswith("_")}
     assert public == {"claim", "heartbeat", "progress", "result", "stop_ack",
                       "start_resync", "complete_resync", "install_rotation_claim",
-                      "upload_findings"}
+                      "upload_findings", "list_contexts", "claim_context",
+                      "submit_context_approval_projection"}
     assert all(parameter.kind is not inspect.Parameter.VAR_KEYWORD for method in (
         RunnerControlClient.claim, RunnerControlClient.heartbeat, RunnerControlClient.progress,
         RunnerControlClient.result, RunnerControlClient.stop_ack,

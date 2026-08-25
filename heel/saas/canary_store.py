@@ -6,6 +6,7 @@ Keeping one schema literal prevents an un-migrated unit instance from drifting f
 from __future__ import annotations
 
 import sqlite3
+import re
 
 
 CANARY_STORE_SCHEMA = """
@@ -541,7 +542,7 @@ CREATE TABLE canary_runner_context_bindings(
  purge_at_ms INTEGER NOT NULL CHECK(purge_at_ms>issued_at_ms),
  CHECK((status='revoked' AND revoked_by IS NOT NULL AND revoked_at_ms IS NOT NULL AND revoke_reason='operator_requested')
     OR (status IN ('active','expired') AND revoked_by IS NULL AND revoked_at_ms IS NULL AND revoke_reason IS NULL)),
- UNIQUE(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id),
+ UNIQUE(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest),
  UNIQUE(workspace_id,project_ref,binding_digest),
  FOREIGN KEY(workspace_id,project_ref,environment_id)
   REFERENCES canary_environments(workspace_id,project_ref,environment_id),
@@ -553,6 +554,8 @@ CREATE UNIQUE INDEX idx_runner_context_one_active
 CREATE INDEX idx_runner_context_runner_status_expiry
  ON canary_runner_context_bindings(workspace_id,runner_id,runner_key_id,status,expires_at_ms);
 CREATE INDEX idx_runner_context_purge ON canary_runner_context_bindings(purge_at_ms);
+CREATE UNIQUE INDEX idx_canary_approval_projection_context_digest
+ ON canary_approval_projections(workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id,projection_digest);
 
 CREATE TABLE canary_runner_context_projection_links(
  workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, approval_id TEXT NOT NULL,
@@ -561,15 +564,11 @@ CREATE TABLE canary_runner_context_projection_links(
  binding_digest TEXT NOT NULL CHECK(length(binding_digest)=64 AND binding_digest NOT GLOB '*[^0-9a-f]*'),
  projection_digest TEXT NOT NULL CHECK(length(projection_digest)=64 AND projection_digest NOT GLOB '*[^0-9a-f]*'),
  created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
- UNIQUE(workspace_id,project_ref,approval_id,run_id,rcb_id,binding_digest,projection_digest),
- FOREIGN KEY(workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id)
-  REFERENCES canary_approval_projections(workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id),
- FOREIGN KEY(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id)
-  REFERENCES canary_runner_context_bindings(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id),
- FOREIGN KEY(workspace_id,project_ref,projection_digest)
-  REFERENCES canary_approval_projections(workspace_id,project_ref,projection_digest),
- FOREIGN KEY(workspace_id,project_ref,binding_digest)
-  REFERENCES canary_runner_context_bindings(workspace_id,project_ref,binding_digest));
+ PRIMARY KEY(workspace_id,project_ref,approval_id,run_id),
+ FOREIGN KEY(workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id,projection_digest)
+  REFERENCES canary_approval_projections(workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id,projection_digest),
+ FOREIGN KEY(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest)
+  REFERENCES canary_runner_context_bindings(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest));
 CREATE INDEX idx_runner_context_links_binding
  ON canary_runner_context_projection_links(workspace_id,project_ref,rcb_id);
 
@@ -585,10 +584,8 @@ CREATE TABLE canary_runner_context_events(
  created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
  purge_at_ms INTEGER NOT NULL CHECK(purge_at_ms>created_at_ms),
  CHECK((action='revoked' AND reason_code='operator_requested') OR (action='expired' AND reason_code='ttl_elapsed') OR (action NOT IN ('revoked','expired') AND reason_code IS NULL)),
- FOREIGN KEY(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id)
-  REFERENCES canary_runner_context_bindings(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id),
- FOREIGN KEY(workspace_id,project_ref,binding_digest)
-  REFERENCES canary_runner_context_bindings(workspace_id,project_ref,binding_digest));
+ FOREIGN KEY(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest)
+  REFERENCES canary_runner_context_bindings(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest));
 CREATE INDEX idx_runner_context_events_purge ON canary_runner_context_events(purge_at_ms);
 """
 
@@ -645,21 +642,112 @@ def ensure_runner_context_schema(conn: sqlite3.Connection) -> None:
         raise RuntimeError("runner context binding schema is partially initialized")
     if not found:
         conn.executescript(RUNNER_CONTEXT_BINDINGS_MIGRATION)
-    # A names-only check is unsafe: a hand-created table can omit the very FK/check
-    # that keeps a pairing authorization from becoming broader authority.
-    expected = {
-        "canary_runner_context_bindings": ("json_valid(binding_json)", "status IN ('active','revoked','expired')", "public_key_digest"),
-        "canary_runner_context_projection_links": ("binding_digest", "projection_digest", "REFERENCES canary_approval_projections"),
-        "canary_runner_context_events": ("binding_digest", "action IN ('created','claimed','revoked','expired','projection_submitted')"),
+    # A names-only or fragment check is unsafe: a hand-created table can omit the
+    # composite FK/check that keeps pairing authorization from becoming broader
+    # authority.  Compare the frozen v16 definitions, then independently inspect
+    # columns and FK shapes so SQLite parser normalization cannot hide a substitution.
+    def normalize(sql: object) -> str:
+        return re.sub(r"\s+", "", str(sql).lower())
+
+    tables = (
+        "canary_runner_context_bindings",
+        "canary_runner_context_projection_links",
+        "canary_runner_context_events",
+    )
+    expected_columns = {
+        "canary_runner_context_bindings": (
+            "rcb_id", "workspace_id", "project_ref", "environment_id", "runner_id", "runner_key_id",
+            "environment_origin", "environment_class", "binding_digest", "public_key_digest",
+            "verification_record_digest", "binding_json", "status", "created_by", "created_role",
+            "issued_at_ms", "expires_at_ms", "first_claimed_at_ms", "revoked_by", "revoked_at_ms",
+            "revoke_reason", "purge_at_ms",
+        ),
+        "canary_runner_context_projection_links": (
+            "workspace_id", "project_ref", "approval_id", "run_id", "environment_id", "runner_id",
+            "runner_key_id", "rcb_id", "binding_digest", "projection_digest", "created_at_ms",
+        ),
+        "canary_runner_context_events": (
+            "rce_id", "workspace_id", "project_ref", "environment_id", "runner_id", "runner_key_id",
+            "rcb_id", "action", "actor_class", "actor_id", "reason_code", "binding_digest",
+            "created_at_ms", "purge_at_ms",
+        ),
     }
-    for table, fragments in expected.items():
-        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
-        sql = "" if row is None or row[0] is None else "".join(str(row[0]).lower().split())
-        if not all("".join(fragment.lower().split()) in sql for fragment in fragments):
+    expected_fks = {
+        "canary_runner_context_bindings": {
+            ("canary_environments", frozenset({
+                ("workspace_id", "workspace_id"), ("project_ref", "project_ref"),
+                ("environment_id", "environment_id"),
+            })),
+            ("canary_runner_keys", frozenset({
+                ("workspace_id", "workspace_id"), ("runner_id", "runner_id"),
+                ("runner_key_id", "key_id"),
+            })),
+        },
+        "canary_runner_context_projection_links": {
+            ("canary_approval_projections", frozenset({
+                ("workspace_id", "workspace_id"), ("project_ref", "project_ref"),
+                ("approval_id", "approval_id"), ("run_id", "run_id"),
+                ("environment_id", "environment_id"), ("runner_id", "runner_id"),
+                ("runner_key_id", "runner_key_id"), ("projection_digest", "projection_digest"),
+            })),
+            ("canary_runner_context_bindings", frozenset({
+                ("workspace_id", "workspace_id"), ("project_ref", "project_ref"),
+                ("environment_id", "environment_id"), ("runner_id", "runner_id"),
+                ("runner_key_id", "runner_key_id"), ("rcb_id", "rcb_id"),
+                ("binding_digest", "binding_digest"),
+            })),
+        },
+        "canary_runner_context_events": {
+            ("canary_runner_context_bindings", frozenset({
+                ("workspace_id", "workspace_id"), ("project_ref", "project_ref"),
+                ("environment_id", "environment_id"), ("runner_id", "runner_id"),
+                ("runner_key_id", "runner_key_id"), ("rcb_id", "rcb_id"),
+                ("binding_digest", "binding_digest"),
+            })),
+        },
+    }
+    for table in tables:
+        match = re.search(
+            rf"CREATE TABLE {re.escape(table)}\((.*?)\);", RUNNER_CONTEXT_BINDINGS_MIGRATION,
+            flags=re.DOTALL,
+        )
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if match is None or row is None or row[0] is None or normalize(row[0]) != normalize(
+            f"CREATE TABLE {table}({match.group(1)})"
+        ):
             raise RuntimeError("runner context binding schema does not match migration 16")
-    indexes = {row[1] for row in conn.execute("PRAGMA index_list(canary_runner_context_bindings)")}
-    if not {"idx_runner_context_one_active", "idx_runner_context_runner_status_expiry", "idx_runner_context_purge"} <= indexes:
-        raise RuntimeError("runner context binding schema indexes are incomplete")
+        columns = tuple(row[1] for row in conn.execute(f"PRAGMA table_info({table})"))
+        if columns != expected_columns[table]:
+            raise RuntimeError("runner context binding schema columns do not match migration 16")
+        grouped: dict[int, list[sqlite3.Row | tuple]] = {}
+        for foreign in conn.execute(f"PRAGMA foreign_key_list({table})"):
+            grouped.setdefault(foreign[0], []).append(foreign)
+        actual_fks = {
+            (rows[0][2], frozenset((row[3], row[4]) for row in rows))
+            for rows in grouped.values()
+        }
+        if actual_fks != expected_fks[table]:
+            raise RuntimeError("runner context binding schema foreign keys do not match migration 16")
+
+    expected_indexes = (
+        "idx_runner_context_one_active", "idx_runner_context_runner_status_expiry",
+        "idx_runner_context_purge", "idx_canary_approval_projection_context_digest",
+        "idx_runner_context_links_binding", "idx_runner_context_events_purge",
+    )
+    for index in expected_indexes:
+        match = re.search(
+            rf"(CREATE (?:UNIQUE )?INDEX {re.escape(index)}\s+ON .*?);",
+            RUNNER_CONTEXT_BINDINGS_MIGRATION, flags=re.DOTALL,
+        )
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index,)
+        ).fetchone()
+        if match is None or row is None or row[0] is None or normalize(row[0]) != normalize(match.group(1)):
+            raise RuntimeError("runner context binding schema indexes are incomplete")
+    if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise RuntimeError("runner context binding schema foreign keys are invalid")
 
 
 class CanaryStore:

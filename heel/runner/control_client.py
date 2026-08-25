@@ -523,7 +523,6 @@ class RunnerControlClient:
                     contexts = payload["contexts"]
                     if not isinstance(contexts, list) or len(contexts) > 16:
                         raise ValueError
-                    previous = None
                     for item in contexts:
                         if not isinstance(item, dict) or set(item) != {"binding_id", "binding_digest", "project_id", "environment_id", "origin", "environment_class", "verification_record_digest", "expires_at_ms", "claimed"}:
                             raise ValueError
@@ -533,18 +532,16 @@ class RunnerControlClient:
                                 or type(item["verification_record_digest"]) is not str or len(item["verification_record_digest"]) != 64
                                 or type(item["expires_at_ms"]) is not int or item["expires_at_ms"] < 0 or type(item["claimed"]) is not bool):
                             raise ValueError
-                        order = (item["expires_at_ms"], item["binding_id"])
-                        if previous is not None and order < previous:
-                            raise ValueError
-                        previous = order
                 elif schema == "heel.runner-context-claim-result.v1":
                     if set(payload) != {"schema_version", "context_binding", "claimed_at_ms"} or type(payload["claimed_at_ms"]) is not int or payload["claimed_at_ms"] < 0:
                         raise ValueError
                     binding = validate_runner_context_binding(payload["context_binding"])
-                    if binding["workspace_id"] != self.workspace_id or binding["runner_binding"]["runner_id"] != self.runner_id:
+                    if (binding["workspace_id"] != self.workspace_id or binding["runner_binding"]["runner_id"] != self.runner_id
+                            or binding["runner_binding"]["runner_key_id"] != self.signer.key_id
+                            or binding["binding_id"] != request["binding_id"] or binding["binding_digest"] != request["binding_digest"]):
                         raise ValueError
                 elif schema == "heel.canary-projection-submitted.v1":
-                    if set(payload) != {"schema_version", "approval_id", "run_id", "status", "projection_digest"} or payload["status"] != "awaiting_execution_approval":
+                    if set(payload) != {"schema_version", "approval_id", "run_id", "status", "projection_digest"} or payload["status"] not in {"awaiting_execution_approval", "approved", "cancelled", "expired"}:
                         raise ValueError
                     if not all(type(payload[key]) is str and payload[key] for key in ("approval_id", "run_id", "projection_digest")):
                         raise ValueError
