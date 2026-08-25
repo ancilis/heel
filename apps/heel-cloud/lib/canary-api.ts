@@ -217,6 +217,17 @@ function closedString(value: unknown, maximum = 512): value is string {
     && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
+function validApprovalRouteSummary(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const matched = /^(GET|HEAD) (\/.*)$/u.exec(value);
+  if (matched === null) return false;
+  const route = matched[2];
+  return route.normalize("NFC") === route
+    && new TextEncoder().encode(route).byteLength <= 1024
+    && !/[\p{Cc}\uD800-\uDFFF]/u.test(route)
+    && !route.includes("?") && !route.includes("#") && !route.includes("//");
+}
+
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === "object") {
     for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
@@ -691,7 +702,7 @@ export class CanaryApi {
       || !digest(item.projection_digest) || item.status !== "awaiting_execution_approval" || !integer(item.submitted_at_ms)
       || !integer(item.expires_at_ms) || item.expires_at_ms <= item.submitted_at_ms || typeof item.origin !== "string"
       || typeof item.hostname !== "string" || !/^[a-z0-9.-]{1,253}$/.test(item.hostname)
-      || !Array.isArray(item.routes) || item.routes.length > 20 || !item.routes.every((route) => typeof route === "string" && /^(?:GET|HEAD) \/[A-Za-z0-9_~%/.{}:-]{1,512}$/.test(route))
+      || !Array.isArray(item.routes) || item.routes.length > 20 || !item.routes.every(validApprovalRouteSummary)
       || !Array.isArray(item.scenarios) || item.scenarios.length > 4 || !item.scenarios.every(identifier)
       || !integer(item.request_budget, 1, 20) || !integer(item.duration_seconds, 1, 60)
       || item.egress !== `${item.hostname}:443`) invalidResponse();

@@ -59,6 +59,33 @@ it("discovers only a closed pending approval summary", async () => {
   assert.equal(value.request?.projectionDigest, digest);
 });
 
+it("mirrors Task7 route-summary byte bounds and forbidden route grammar", async () => {
+  const pending = (routes: unknown, extra: Record<string, unknown> = {}) => jsonResponse({
+    schema_version: "heel.canary-approval-request-list.v1", server_time_ms: 1, has_more: false,
+    requests: [{ approval_id: "ap_canary", run_id: run, projection_digest: digest, status: "awaiting_execution_approval",
+      submitted_at_ms: 1, expires_at_ms: 2, origin: "https://staging.acme.dev", hostname: "staging.acme.dev",
+      routes, scenarios: ["scenario"], request_budget: 1, duration_seconds: 1, egress: "staging.acme.dev:443", ...extra }],
+  });
+  const valid = [
+    "GET /safe!$&'()*+,;=@",
+    `HEAD /${"a".repeat(512)}`,
+    `GET /${"é".repeat(511)}a`,
+  ];
+  const api = new CanaryApi({ transport: async () => pending(valid) });
+  assert.deepEqual((await api.listPendingApprovalRequests(workspace, project)).request?.routes, valid);
+
+  for (const invalid of [
+    `GET /${"a".repeat(1024)}`,
+    `GET /${"é".repeat(512)}`,
+    "GET /safe\u0001", "GET /safe?query", "GET /safe#fragment", "GET /safe//child", "POST /safe",
+  ]) {
+    const invalidApi = new CanaryApi({ transport: async () => pending([invalid]) });
+    await assert.rejects(() => invalidApi.listPendingApprovalRequests(workspace, project), CanaryApiError);
+  }
+  const extraApi = new CanaryApi({ transport: async () => pending(["GET /safe"], { extra: true }) });
+  await assert.rejects(() => extraApi.listPendingApprovalRequests(workspace, project), CanaryApiError);
+});
+
 
 function jsonResponse(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
   const body = JSON.stringify(value);
