@@ -970,6 +970,39 @@ class StopCoordinator:
         self.ack_projections.append(operational_projection)
 
 
+def test_supervisor_treats_a_closed_progress_stop_response_as_control():
+    progress_returned = threading.Event()
+    projection = {"run_id": "run_123456789", "lifecycle_phase": "running"}
+    lease = ClaimLease("run_123456789", object(), projection)
+
+    class ProgressStopCoordinator(StopCoordinator):
+        def heartbeat(self, run_id, operational_projection):
+            assert progress_returned.wait(1)
+            return ExecutionGate(True, "active", "valid", 20_000, 7, "none", 2_000)
+
+        def progress(self, run_id, operational_projection):
+            progress_returned.set()
+            return {"status": "stop_requested", "stop_reason": "cloud_stop"}
+
+    class ProgressStopExecutor:
+        def execute(self, lease, *, cancellation, on_progress):
+            on_progress(lease.operational_projection)
+            assert cancellation.cancelled
+            assert cancellation.stop_ack_event.wait(1)
+            return {"operational_projection": lease.operational_projection}
+
+        def prepare_stop_ack(self, lease, projection, stop_reason, proposed_at_ms):
+            assert stop_reason == "cloud_stop"
+            return projection
+
+    coordinator = ProgressStopCoordinator(lease)
+    assert RunnerService(
+        coordinator=coordinator, executor=ProgressStopExecutor(),
+        heartbeat_interval=0.05, idle_poll_interval=2.0,
+    ).run_once() is True
+    assert len(coordinator.acks) == 1
+
+
 def test_supervisor_heartbeat_cancels_blocked_target_and_acks_within_five_seconds():
     projection = {"run_id": "run_123456789", "lifecycle_phase": "running"}
     lease = ClaimLease("run_123456789", object(), projection)
@@ -1256,7 +1289,16 @@ def test_prepare_stop_ack_snapshots_budget_counters_under_the_execution_lock(tmp
     ) is True
 
 
-def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progress_race(tmp_path):
+@pytest.mark.parametrize(
+    "stop_after_completed,overtake_progress,expected_sequences",
+    [
+        (1, False, (4, 5, 6)),
+        (4, True, (13, 14, 15)),
+    ],
+)
+def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progress_race(
+    tmp_path, stop_after_completed, overtake_progress, expected_sequences,
+):
     import base64
 
     from canary_test_support import Clock, NOW, NOW_MS, connect
@@ -1346,12 +1388,14 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
         vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: NOW_MS + 100,
         monotonic=time.monotonic,
     )
-    progress_committed = threading.Event()
+    heartbeat_released = threading.Event()
     acknowledgement_committed = threading.Event()
     observed_progress: list[dict] = []
     observed_acknowledgements: list[dict] = []
     observed_results: list[dict] = []
-    heartbeat_failures: list[BaseException] = []
+    overtaken_receipts: list[tuple] = []
+    heartbeat_failures: list[object] = []
+    cloud_request_lock = threading.Lock()
 
     class CloudBridge:
         claimed_once = False
@@ -1369,31 +1413,70 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
         def progress(self, run_id, value):
             assert run_id == grant["run_id"]
             observed_progress.append(value)
+            if value["counters"]["requests_completed"] != stop_after_completed:
+                with cloud_request_lock:
+                    return coordinator.progress(
+                        manifest["workspace_id"], manifest["project_id"], run_id,
+                        identity.runner_id, value,
+                    )
             # Freeze the Cloud stop after the runner produced progress but before that
             # synchronous progress call commits, which is the real supervisor race.
             self.stop_started_at = time.monotonic()
-            coordinator.request_stop(
-                manifest["workspace_id"], manifest["project_id"], run_id,
-                actor="user_owner", reason="cloud_stop",
-                expected_kill_switch_generation=0,
-            )
-            status = coordinator.progress(
-                manifest["workspace_id"], manifest["project_id"], run_id,
-                identity.runner_id, value,
-            )
-            progress_committed.set()
-            assert acknowledgement_committed.wait(1)
+            with cloud_request_lock:
+                coordinator.request_stop(
+                    manifest["workspace_id"], manifest["project_id"], run_id,
+                    actor="user_owner", reason="cloud_stop",
+                    expected_kill_switch_generation=0,
+                )
+            if overtake_progress:
+                # The independent heartbeat/ack chain commits a newer containment position
+                # while this already-produced progress snapshot is still in flight.
+                heartbeat_released.set()
+                assert acknowledgement_committed.wait(1)
+                with cloud_request_lock:
+                    status = coordinator.progress(
+                        manifest["workspace_id"], manifest["project_id"], run_id,
+                        identity.runner_id, value,
+                    )
+                run_state = conn.execute(
+                    "SELECT source_event_sequence,source_projection_digest FROM canary_runs "
+                    "WHERE run_id=?", (run_id,),
+                ).fetchone()
+                receipt = conn.execute(
+                    "SELECT source_event_sequence,receipt_digest,receipt_json "
+                    "FROM canary_operational_receipts WHERE run_id=?", (run_id,),
+                ).fetchone()
+                overtaken_receipts.append((
+                    *tuple(run_state), receipt[0], receipt[1],
+                    json.loads(receipt[2])["counters"],
+                ))
+            else:
+                with cloud_request_lock:
+                    status = coordinator.progress(
+                        manifest["workspace_id"], manifest["project_id"], run_id,
+                        identity.runner_id, value,
+                    )
+                heartbeat_released.set()
+                assert acknowledgement_committed.wait(1)
             return status
 
         def heartbeat(self, run_id, value):
-            assert progress_committed.wait(1)
+            assert heartbeat_released.wait(1)
             try:
-                gate = coordinator.heartbeat(
-                    manifest["workspace_id"], manifest["project_id"], run_id,
-                    identity.runner_id, value,
-                )
+                with cloud_request_lock:
+                    gate = coordinator.heartbeat(
+                        manifest["workspace_id"], manifest["project_id"], run_id,
+                        identity.runner_id, value,
+                    )
             except BaseException as exc:
-                heartbeat_failures.append(exc)
+                stored = conn.execute(
+                    "SELECT source_event_sequence,source_projection_digest,status,stop_reason "
+                    "FROM canary_runs WHERE run_id=?", (run_id,),
+                ).fetchone()
+                heartbeat_failures.append((
+                    exc, value.get("event_sequence"), value.get("projection_digest"),
+                    value.get("lifecycle_phase"), value.get("stop_reason"), tuple(stored),
+                ))
                 raise
             return ExecutionGate(**gate)
 
@@ -1422,10 +1505,11 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
                 ).decode("ascii"),
             }
             observed_acknowledgements.append(acknowledgement)
-            response = coordinator.ack_stop(
-                manifest["workspace_id"], manifest["project_id"], run_id,
-                identity.runner_id, acknowledgement,
-            )
+            with cloud_request_lock:
+                response = coordinator.ack_stop(
+                    manifest["workspace_id"], manifest["project_id"], run_id,
+                    identity.runner_id, acknowledgement,
+                )
             acknowledgement_committed.set()
             return RunnerStopAcknowledgement(
                 **response, acknowledged_at_ms=acknowledged_at,
@@ -1433,15 +1517,16 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
 
         def result(self, run_id, value):
             observed_results.append(value)
-            return coordinator.result(
-                manifest["workspace_id"], manifest["project_id"], run_id,
-                identity.runner_id, value,
-            )
+            with cloud_request_lock:
+                return coordinator.result(
+                    manifest["workspace_id"], manifest["project_id"], run_id,
+                    identity.runner_id, value,
+                )
 
     class ExecutorAdapter:
         def execute(self, lease, *, cancellation, on_progress):
             return executor.execute(
-                lease.bundle, transport=ScriptedTransport([401]),
+                lease.bundle, transport=ScriptedTransport([401, 200, 200, 403]),
                 gate_source=lambda: ExecutionGate(
                     True, "active", "valid", NOW_MS + 60_000, 0, "none", NOW_MS,
                 ),
@@ -1459,9 +1544,9 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
         # reproduces the synchronous progress-commit race reported by the real supervisor.
         if (
             threading.current_thread().name == "heel-runner-heartbeat"
-            and not progress_committed.is_set()
+            and not heartbeat_released.is_set()
         ):
-            assert progress_committed.wait(1)
+            assert heartbeat_released.wait(1)
         return time.monotonic()
 
     bridge = CloudBridge()
@@ -1471,11 +1556,22 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
         monotonic=service_monotonic,
     ).run_once() is True
 
+    stopped_progress = next(
+        value for value in observed_progress
+        if value["counters"]["requests_completed"] == stop_after_completed
+    )
     assert (
-        observed_progress[0]["event_sequence"],
+        stopped_progress["event_sequence"],
         observed_acknowledgements[0]["event_sequence"],
         observed_results[0]["event_sequence"],
-    ) == (4, 5, 6)
+    ) == expected_sequences
+    if overtake_progress:
+        acknowledgement = observed_acknowledgements[0]
+        assert overtaken_receipts == [(
+            acknowledgement["event_sequence"], acknowledgement["projection_digest"],
+            acknowledgement["event_sequence"], acknowledgement["projection_digest"],
+            acknowledgement["counters"],
+        )]
     assert time.monotonic() - bridge.stop_started_at < 5
     status = coordinator.get_status(
         manifest["workspace_id"], manifest["project_id"], grant["run_id"],

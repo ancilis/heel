@@ -11,6 +11,12 @@ from heel.runner.execution import ExecutionGate
 from heel.runner.http_transport import CancellationToken
 
 
+_CONTROL_STOP_REASONS = frozenset({
+    "local_emergency_stop", "cloud_stop", "runner_revoked",
+    "target_revoked", "kill_switch",
+})
+
+
 @dataclass(frozen=True, slots=True)
 class ClaimLease:
     run_id: str
@@ -75,10 +81,7 @@ class _StopController:
         self._worker: threading.Thread | None = None
 
     def request(self, reason: str, *, deadline: float | None = None) -> bool:
-        if reason not in {
-            "local_emergency_stop", "cloud_stop", "runner_revoked",
-            "target_revoked", "kill_switch",
-        }:
+        if reason not in _CONTROL_STOP_REASONS:
             raise ValueError("invalid runner stop reason")
         with self._lock:
             if self.initiated.is_set():
@@ -223,7 +226,15 @@ class RunnerService:
                 raise ValueError("executor progress projection must be an object")
             with projection_lock:
                 current_projection[0] = value
-            self.coordinator.progress(lease.run_id, value)
+            response = self.coordinator.progress(lease.run_id, value)
+            if isinstance(response, dict) and response.get("status") == "stop_requested":
+                stop_reason = response.get("stop_reason")
+                if stop_reason not in _CONTROL_STOP_REASONS:
+                    raise ValueError("coordinator progress stop response is invalid")
+                # The closed progress response is authenticated control state.  Initiate the
+                # same bounded controller synchronously so a last-action stop cannot wait for
+                # the independent heartbeat loop.
+                stop_controller.request(stop_reason)
 
         def accept_projection(value: dict[str, Any]) -> None:
             with projection_lock:
@@ -246,7 +257,10 @@ class RunnerService:
             self._active_stop_controller = stop_controller
 
         def heartbeats() -> None:
-            while not finished.is_set():
+            # Once stop control owns the run, target cancellation and the bounded ack worker
+            # are authoritative.  Continuing heartbeats can race the ack's timestamp re-signing
+            # and replay a pre-ack digest at the same containment sequence.
+            while not finished.is_set() and not stop_controller.initiated.is_set():
                 cycle = self.monotonic()
                 try:
                     gate = self.coordinator.heartbeat(lease.run_id, snapshot())

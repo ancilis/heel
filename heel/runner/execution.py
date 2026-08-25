@@ -795,6 +795,15 @@ class LocalCanaryExecutor:
                         manifest, projection, grant, started_at, started_monotonic,
                         counters, log.load(), redaction_state["count"],
                     ))
+            # The final action callback may synchronously receive a Cloud stop.  Recheck both
+            # the cancellation channel and the latest authenticated authority before choosing
+            # successful finalization; there is no next action to perform these checks for us.
+            cancellation.raise_if_cancelled()
+            authority.check(
+                gate_source, generation=grant["kill_switch_generation"],
+                monotonic=self.monotonic,
+            )
+            cancellation.raise_if_cancelled()
         except BaseException as exc:
             if isinstance(exc, TransportFailure) and exc.code == "cancelled":
                 control_error = getattr(cancellation, "control_error", None)

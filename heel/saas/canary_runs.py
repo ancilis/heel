@@ -1133,6 +1133,19 @@ class CanaryRunService:
         # post-stop preservation because an ack may commit after the heartbeat took its snapshot.
         if operation == "heartbeat" and value["event_sequence"] < row["source_event_sequence"]:
             return row, value, "stale"
+        # Progress and stop acknowledgement use independent authenticated chains.  A newer ack
+        # may overtake a pre-stop claimed/running snapshot already in flight.  Once the durable
+        # stop has won, that older snapshot is liveness-only and cannot rewrite source, receipt,
+        # counters, quota, or lifecycle state.  Lower sequences remain conflicts everywhere else.
+        if (
+            operation == "progress"
+            and value["event_sequence"] < row["source_event_sequence"]
+            and row["status"] in {"stop_requested", "finalizing"}
+            and row["stop_reason"] != "none"
+            and phase in {"claimed", "running"}
+            and stop_reason == "none"
+        ):
+            return row, value, "stale_stop"
         # A heartbeat or synchronous progress call can race just behind a durable Cloud stop
         # and carry the runner's last valid pre-stop snapshot.  Treat it as liveness/execution
         # evidence only: never overwrite the authoritative stop.  The shared source check still
