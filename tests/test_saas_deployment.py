@@ -37,6 +37,9 @@ class DeploymentBundleTests(unittest.TestCase):
             "HEEL_DEVICE_TOKEN_PEPPER_B64",
             "HEEL_API_KEY_PEPPER",
             "HEEL_EDGE_AUTH_SECRET_B64",
+            "HEEL_GRANT_SIGNING_PRIVATE_KEY_B64",
+            "HEEL_GRANT_SIGNING_KEY_ID",
+            "HEEL_GRANT_TRUSTED_PUBLIC_KEYS",
             "HEEL_CLOUDFLARE_TUNNEL_TOKEN",
             "HEEL_CLOUDFLARED_IMAGE",
         ):

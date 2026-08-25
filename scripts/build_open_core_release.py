@@ -79,6 +79,7 @@ EXPECTED_CONSOLE_SCRIPTS = {
     "heel-mcp": "heel.mcp_server:main",
     "heel-rest": "heel.rest:serve",
 }
+EXPECTED_OPTIONAL_DEPENDENCIES = {"runner": ["cryptography==45.0.7"]}
 FORBIDDEN_PREFIXES = (
     "apps/",
     "deploy/",
@@ -103,6 +104,8 @@ METADATA = (
     "License-Expression: Apache-2.0\n"
     "License-File: LICENSE\n"
     "License-File: NOTICE\n"
+    "Provides-Extra: runner\n"
+    "Requires-Dist: cryptography==45.0.7; extra == \"runner\"\n"
     "\n"
 ).encode("utf-8")
 WHEEL_METADATA = (
@@ -480,8 +483,10 @@ def _validate_pyproject(payload: bytes, contract: dict[str, object]) -> None:
         raise OpenCoreBuildError("pyproject console scripts mismatch")
     if project.get("dependencies") != []:
         raise OpenCoreBuildError("open-core runtime dependencies must remain empty")
-    if project.get("optional-dependencies", {}) != {}:
-        raise OpenCoreBuildError("open-core optional dependencies must remain empty")
+    if project.get("optional-dependencies", {}) != EXPECTED_OPTIONAL_DEPENDENCIES:
+        raise OpenCoreBuildError(
+            "open-core optional dependencies must contain only the pinned runner extra"
+        )
     if "dynamic" in project:
         raise OpenCoreBuildError("open-core dynamic metadata is forbidden")
     if project.get("license") != "Apache-2.0":

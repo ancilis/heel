@@ -15,7 +15,8 @@ from enum import Enum
 from typing import Mapping
 
 
-CATALOG_VERSION = "2026-08-04"
+CATALOG_VERSION = "2026-08-24"
+PRE_CANARY_CATALOG_VERSION = "2026-08-04"
 LEGACY_CATALOG_VERSION = "2026-07-13"
 
 
@@ -29,6 +30,8 @@ class Meter(str, Enum):
     SEATS = "seats"
     INTEGRATIONS = "integrations"       # CI/API/MCP connectors
     SYNCED_REVIEWS = "synced_reviews"   # new substantive findings projections / month
+    ACTIVE_RUNNERS = "active_runners"
+    CANARY_RUNS = "canary_runs"
 
 
 class Feature(str, Enum):
@@ -131,28 +134,41 @@ FREE_VERIFIED_RUNS = 5
 CONFIG_GATED_FEATURES = frozenset({Feature.SSO, Feature.SCIM, Feature.DATA_REGION, Feature.PRIVATE_RUNNERS})
 
 
-# Versioned catalog history. The prior catalog predates hosted findings continuity, so its plans
-# deliberately resolve the new meter to Plan.quota's zero default. A subscription pins the version
-# it was created on; current quota changes never silently alter that grandfathered subscription.
+# Free Early Access launch catalog. Older subscriptions remain pinned to the previous snapshot and
+# deliberately resolve both canary meters to zero.
+_LAUNCH_PLANS = {
+    plan_id: replace(plan, quotas={**plan.quotas})
+    for plan_id, plan in _PLANS.items()
+}
+_LAUNCH_PLANS["free"].quotas[Meter.ACTIVE_RUNNERS] = 1
+_LAUNCH_PLANS["free"].quotas[Meter.CANARY_RUNS] = 10
+
+# Versioned catalog history. A subscription pins its catalog version, so current quota changes
+# never silently alter its grandfathered entitlements.
 _LEGACY_PLANS = {
     plan_id: replace(
         plan,
         quotas={
             meter: quota
             for meter, quota in plan.quotas.items()
-            if meter is not Meter.SYNCED_REVIEWS
+            if meter not in {Meter.SYNCED_REVIEWS, Meter.ACTIVE_RUNNERS, Meter.CANARY_RUNS}
         },
     )
     for plan_id, plan in _PLANS.items()
 }
+_PRE_CANARY_PLANS = {
+    plan_id: replace(plan, quotas={**plan.quotas})
+    for plan_id, plan in _PLANS.items()
+}
 _CATALOGS: dict[str, dict] = {
     LEGACY_CATALOG_VERSION: _LEGACY_PLANS,
-    CATALOG_VERSION: _PLANS,
+    PRE_CANARY_CATALOG_VERSION: _PRE_CANARY_PLANS,
+    CATALOG_VERSION: _LAUNCH_PLANS,
 }
 
 
 def get_plan(plan_id: str, catalog_version: str | None = None) -> Plan:
-    plans = _PLANS if catalog_version is None else _catalog(catalog_version)
+    plans = _LAUNCH_PLANS if catalog_version is None else _catalog(catalog_version)
     try:
         return plans[plan_id]
     except KeyError:
@@ -167,7 +183,7 @@ def _catalog(version: str) -> dict:
 
 
 def all_plans() -> list[Plan]:
-    return [_PLANS[k] for k in ("free", "pro", "team", "enterprise")]
+    return [_LAUNCH_PLANS[k] for k in ("free", "pro", "team", "enterprise")]
 
 
 def self_serve_plans() -> list[Plan]:

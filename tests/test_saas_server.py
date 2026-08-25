@@ -13,6 +13,7 @@ from contextlib import redirect_stdout
 import io
 from unittest import mock
 
+from heel.crypto import SigningAuthority
 from heel.saas.catalog import CATALOG_VERSION
 from heel.saas.tenancy import Role
 
@@ -23,6 +24,7 @@ def _pepper(byte: bytes) -> str:
 
 class ProductionConfigurationTests(unittest.TestCase):
     def valid_environment(self, root: Path) -> dict[str, str]:
+        signing = SigningAuthority.generate()
         return {
             "HEEL_DATABASE_PATH": str(root / "heel.sqlite3"),
             "HEEL_PUBLIC_ORIGIN": "https://heel.example",
@@ -32,6 +34,11 @@ class ProductionConfigurationTests(unittest.TestCase):
             "HEEL_CONTROL_PLANE_HOST": "127.0.0.1",
             "HEEL_CONTROL_PLANE_PORT": "8080",
             "HEEL_BILLING_MODE": "free_launch",
+            "HEEL_GRANT_SIGNING_PRIVATE_KEY_B64": signing.canonical_private_key,
+            "HEEL_GRANT_SIGNING_KEY_ID": signing.key_id,
+            "HEEL_GRANT_TRUSTED_PUBLIC_KEYS": json.dumps({
+                signing.key_id: signing.canonical_public_key,
+            }, separators=(",", ":")),
         }
 
     def test_loads_one_node_private_free_launch_configuration(self):
@@ -45,6 +52,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         self.assertEqual(config.port, 8080)
         self.assertEqual(config.public_origin, "https://heel.example")
         self.assertEqual(config.billing_mode, "free_launch")
+        self.assertIn(config.grant_authority.key_id, config.grant_trusted_keys)
 
     def test_migrations_describe_every_runtime_table_and_column(self):
         from heel.saas.http_api import ControlPlane
@@ -58,7 +66,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         )
         self.addCleanup(migrated.close)
         self.addCleanup(runtime.close)
-        self.assertEqual(Migrator(migrated, CONTROL_PLANE_MIGRATIONS).apply_all(), [1, 2, 3, 4, 5])
+        self.assertEqual(Migrator(migrated, CONTROL_PLANE_MIGRATIONS).apply_all(), [1, 2, 3, 4, 5, 6])
 
         def schema(connection: sqlite3.Connection) -> dict[str, tuple[tuple, ...]]:
             tables = {
@@ -75,6 +83,8 @@ class ProductionConfigurationTests(unittest.TestCase):
             }
 
         self.assertEqual(schema(migrated), schema(runtime.store.conn))
+        self.assertIs(runtime.canary_store.conn, runtime.store.conn)
+        self.assertIsNone(runtime.grant_authority)
 
     def test_migration_cli_reports_pending_then_applies_real_schema(self):
         from heel.saas import migrate
@@ -87,9 +97,9 @@ class ProductionConfigurationTests(unittest.TestCase):
                 self.assertEqual(migrate.main(["status", str(database)]), 1)
                 self.assertEqual(migrate.main(["up", str(database)]), 0)
                 self.assertEqual(migrate.main(["status", str(database)]), 0)
-            self.assertIn("current=0 target=5", output.getvalue())
-            self.assertIn("applied=1,2,3,4,5", output.getvalue())
-            self.assertIn("current=5 target=5", output.getvalue())
+            self.assertIn("current=0 target=6", output.getvalue())
+            self.assertIn("applied=1,2,3,4,5,6", output.getvalue())
+            self.assertIn("current=6 target=6", output.getvalue())
 
     def test_restore_verification_is_read_only_and_rejects_pending_schema(self):
         from heel.saas import migrate
@@ -127,11 +137,21 @@ class ProductionConfigurationTests(unittest.TestCase):
                 ({**valid, "HEEL_CONTROL_PLANE_PORT": "0"}, "HEEL_CONTROL_PLANE_PORT"),
                 ({**valid, "HEEL_BILLING_MODE": "stub"}, "HEEL_BILLING_MODE"),
                 ({**valid, "HEEL_CONTROL_PLANE_HOST": "0.0.0.0"}, "HEEL_PRIVATE_NETWORK_ACK"),
+                ({**valid, "HEEL_GRANT_SIGNING_PRIVATE_KEY_B64": ""}, "HEEL_GRANT_SIGNING_PRIVATE_KEY_B64"),
+                ({**valid, "HEEL_GRANT_SIGNING_KEY_ID": ""}, "HEEL_GRANT_SIGNING_KEY_ID"),
+                ({**valid, "HEEL_GRANT_TRUSTED_PUBLIC_KEYS": ""}, "HEEL_GRANT_TRUSTED_PUBLIC_KEYS"),
             )
             for environment, field in cases:
                 with self.subTest(field=field), self.assertRaises(ProductionConfigurationError) as caught:
                     ProductionConfiguration.from_environment(environment)
                 self.assertIn(field, str(caught.exception))
+
+            config = ProductionConfiguration.from_environment(valid)
+            self.assertEqual(config.grant_authority.key_id, valid["HEEL_GRANT_SIGNING_KEY_ID"])
+
+            mismatched = {**valid, "HEEL_GRANT_SIGNING_KEY_ID": "k_wrong"}
+            with self.assertRaises(ProductionConfigurationError):
+                ProductionConfiguration.from_environment(mismatched)
 
     def test_non_loopback_bind_requires_explicit_private_network_acknowledgement(self):
         from heel.saas.server import ProductionConfiguration
@@ -157,6 +177,8 @@ class ProductionConfigurationTests(unittest.TestCase):
             server = build_server(config)
             try:
                 self.assertIsInstance(server.control_plane.billing, DisabledBilling)
+                self.assertIs(server.control_plane.grant_authority, config.grant_authority)
+                self.assertIs(server.control_plane.canary_store.conn, server.control_plane.store.conn)
                 mode = server.control_plane.store.conn.execute("PRAGMA journal_mode").fetchone()[0]
                 self.assertEqual(mode.lower(), "wal")
                 self.assertTrue(Path(config.database_path).is_file())
@@ -187,7 +209,7 @@ class ProductionConfigurationTests(unittest.TestCase):
                 version = restarted.control_plane.store.conn.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0]
-                self.assertEqual(version, 5)
+                self.assertEqual(version, 6)
             finally:
                 restarted.server_close()
 

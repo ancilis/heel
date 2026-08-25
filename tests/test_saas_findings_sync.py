@@ -52,7 +52,7 @@ def _request(project_ref: str, key: bytes, *, title: str, operation_suffix: str 
 
 class CatalogCapabilityMigrationTests(unittest.TestCase):
     def test_synced_review_quotas_are_versioned_and_exact(self):
-        self.assertEqual(CATALOG_VERSION, "2026-08-04")
+        self.assertEqual(CATALOG_VERSION, "2026-08-24")
         self.assertEqual(
             [get_plan(name).quota(Meter.SYNCED_REVIEWS) for name in ("free", "pro", "team")],
             [3, 25, 100],
@@ -74,7 +74,7 @@ class CatalogCapabilityMigrationTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
         migrator = Migrator(conn, CONTROL_PLANE_MIGRATIONS)
-        self.assertEqual(migrator.apply_all(), [1, 2, 3, 4, 5])
+        self.assertEqual(migrator.apply_all(), [1, 2, 3, 4, 5, 6])
         self.assertEqual(migrator.apply_all(), [])
         tables = {
             row[0] for row in conn.execute(

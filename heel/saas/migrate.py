@@ -17,6 +17,8 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
+from .canary_store import CANARY_STORE_SCHEMA
+
 _TRACKING = """
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at REAL NOT NULL);
@@ -326,6 +328,11 @@ CREATE TABLE IF NOT EXISTS kill_switches(
 CREATE TABLE IF NOT EXISTS admin_audit(
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   actor TEXT NOT NULL, action TEXT NOT NULL, subject TEXT, reason TEXT, ts REAL NOT NULL)
+"""),
+    Migration(6, "verified_canary_persistence", CANARY_STORE_SCHEMA + """
+ALTER TABLE usage_ledger ADD COLUMN reason TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_canary_fault_refund
+  ON usage_ledger(reservation_id) WHERE kind='platform_fault_refund';
 """),
 ]
 

@@ -23,6 +23,7 @@ from typing import Mapping
 from urllib.parse import urlsplit
 
 from .billing import DisabledBilling
+from heel.crypto import SigningAuthority, load_private_key_base64, load_public_key_set
 from .http_api import ControlPlane, serve
 from .migrate import CONTROL_PLANE_MIGRATIONS, Migrator
 
@@ -111,6 +112,8 @@ class ProductionConfiguration:
     host: str
     port: int
     billing_mode: str
+    grant_authority: SigningAuthority
+    grant_trusted_keys: dict[str, object]
 
     @classmethod
     def from_environment(
@@ -189,9 +192,42 @@ class ProductionConfiguration:
             raise ProductionConfigurationError(
                 "HEEL_BILLING_MODE must be free_launch until a live adapter is installed"
             )
+        private_key_value = env.get("HEEL_GRANT_SIGNING_PRIVATE_KEY_B64", "").strip()
+        key_id = env.get("HEEL_GRANT_SIGNING_KEY_ID", "").strip()
+        trusted_value = env.get("HEEL_GRANT_TRUSTED_PUBLIC_KEYS", "").strip()
+        if not private_key_value:
+            raise ProductionConfigurationError("HEEL_GRANT_SIGNING_PRIVATE_KEY_B64 is required")
+        if not key_id:
+            raise ProductionConfigurationError("HEEL_GRANT_SIGNING_KEY_ID is required")
+        if not trusted_value:
+            raise ProductionConfigurationError("HEEL_GRANT_TRUSTED_PUBLIC_KEYS is required")
+        try:
+            authority = SigningAuthority.from_private_key(
+                load_private_key_base64(private_key_value), key_id,
+            )
+        except (TypeError, ValueError) as error:
+            raise ProductionConfigurationError(
+                "HEEL_GRANT_SIGNING_PRIVATE_KEY_B64 or HEEL_GRANT_SIGNING_KEY_ID is invalid"
+            ) from error
+        try:
+            trusted_keys = load_public_key_set(trusted_value)
+        except (TypeError, ValueError) as error:
+            raise ProductionConfigurationError(
+                "HEEL_GRANT_TRUSTED_PUBLIC_KEYS is invalid"
+            ) from error
+        trusted_public = trusted_keys.get(authority.key_id)
+        if trusted_public is None:
+            raise ProductionConfigurationError(
+                "HEEL_GRANT_TRUSTED_PUBLIC_KEYS must contain the configured signing key"
+            )
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        if trusted_public.public_bytes(Encoding.Raw, PublicFormat.Raw) != authority.public_key_bytes:
+            raise ProductionConfigurationError(
+                "HEEL_GRANT_TRUSTED_PUBLIC_KEYS must contain the configured signing key"
+            )
         return cls(
             str(database), public_origin, device_pepper, api_pepper, edge_auth_value,
-            host, port, billing_mode,
+            host, port, billing_mode, authority, trusted_keys,
         )
 
 
@@ -219,6 +255,8 @@ def build_server(config: ProductionConfiguration):
             billing=DisabledBilling(),
             trust_edge_client_key=True,
             edge_auth_secret=config.edge_auth_secret,
+            grant_authority=config.grant_authority,
+            grant_trusted_keys=config.grant_trusted_keys,
         )
         # One process owns this database. WAL keeps reads responsive; FULL preserves accepted
         # findings and auth state across an abrupt host restart on a durable volume.

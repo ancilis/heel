@@ -27,12 +27,13 @@ CREATE TABLE IF NOT EXISTS usage_ledger(
   workspace_id TEXT NOT NULL,
   meter TEXT NOT NULL,
   period TEXT NOT NULL,            -- billing period bucket, e.g. '2026-07'
-  kind TEXT NOT NULL,             -- reserve | consume | refund
+  kind TEXT NOT NULL,             -- reserve | consume | refund | platform_fault_refund
   amount INTEGER NOT NULL,
   reservation_id TEXT,            -- reserve rows: self; consume/refund: the reserve they settle
   idempotency_key TEXT,
   ref TEXT,                       -- opaque caller ref (e.g. run_id)
-  ts REAL NOT NULL);
+  ts REAL NOT NULL,
+  reason TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_idem
   ON usage_ledger(workspace_id, meter, idempotency_key)
   WHERE idempotency_key IS NOT NULL AND kind='reserve';
@@ -96,8 +97,10 @@ class UsageLedger:
         """Active usage = reserved − refunded (consumed reservations still count)."""
         row = self.conn.execute(
             """SELECT
-                 COALESCE(SUM(CASE WHEN kind='reserve' THEN amount END),0) -
-                 COALESCE(SUM(CASE WHEN kind='refund'  THEN amount END),0) AS used
+                 COALESCE(SUM(CASE
+                   WHEN kind IN ('reserve', 'platform_fault_refund') THEN amount
+                   WHEN kind='refund' THEN -amount
+                   ELSE 0 END),0) AS used
                FROM usage_ledger
                WHERE workspace_id=? AND meter=? AND period=?""",
             (workspace_id, meter.value, period)).fetchone()
@@ -114,8 +117,10 @@ class UsageLedger:
         """Platform-wide active usage for a meter (reserved − refunded across ALL workspaces)."""
         row = self.conn.execute(
             """SELECT
-                 COALESCE(SUM(CASE WHEN kind='reserve' THEN amount END),0) -
-                 COALESCE(SUM(CASE WHEN kind='refund'  THEN amount END),0) AS used
+                 COALESCE(SUM(CASE
+                   WHEN kind IN ('reserve', 'platform_fault_refund') THEN amount
+                   WHEN kind='refund' THEN -amount
+                   ELSE 0 END),0) AS used
                FROM usage_ledger WHERE meter=? AND period=?""",
             (meter.value, period)).fetchone()
         return int(row["used"] or 0)
@@ -178,7 +183,8 @@ class UsageLedger:
                 (workspace_id, meter.value, idempotency_key)).fetchone()
             if prior:
                 refunded = self.conn.execute(
-                    "SELECT 1 FROM usage_ledger WHERE reservation_id=? AND kind='refund'",
+                    "SELECT 1 FROM usage_ledger WHERE reservation_id=? "
+                    "AND kind IN ('refund','platform_fault_refund')",
                     (prior["reservation_id"],)).fetchone()
                 if refunded:
                     raise IdempotencyConflict(
@@ -197,9 +203,12 @@ class UsageLedger:
                 raise GlobalCapExceeded(meter, global_used, global_cap)
         reservation_id = f"resv_{secrets.token_hex(8)}"
         self.conn.execute(
-            "INSERT INTO usage_ledger VALUES(?,?,?,?,?,?,?,?,?,?)",
+            """INSERT INTO usage_ledger(
+                 entry_id,workspace_id,meter,period,kind,amount,reservation_id,
+                 idempotency_key,ref,ts,reason)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (f"led_{secrets.token_hex(8)}", workspace_id, meter.value, period, "reserve",
-             amount, reservation_id, idempotency_key, ref, _now()))
+             amount, reservation_id, idempotency_key, ref, _now(), None))
         return Reservation(reservation_id, workspace_id, meter, amount, period)
 
     def _settle(self, reservation_id: str, kind: str) -> bool:
@@ -236,9 +245,12 @@ class UsageLedger:
         if kind in settled_kinds:
             return False
         self.conn.execute(
-            "INSERT INTO usage_ledger VALUES(?,?,?,?,?,?,?,?,?,?)",
+            """INSERT INTO usage_ledger(
+                 entry_id,workspace_id,meter,period,kind,amount,reservation_id,
+                 idempotency_key,ref,ts,reason)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (f"led_{secrets.token_hex(8)}", resv["workspace_id"], resv["meter"], resv["period"],
-             kind, resv["amount"], reservation_id, None, resv["ref"], _now()))
+             kind, resv["amount"], reservation_id, None, resv["ref"], _now(), None))
         return True
 
     def consume_in_transaction(self, reservation_id: str) -> bool:
@@ -253,3 +265,39 @@ class UsageLedger:
         """Release a reservation (e.g. job failed/cancelled before doing costly work). Idempotent;
         refusing after consume keeps double-refund impossible."""
         return self._settle(reservation_id, "refund")
+
+    def refund_consumed_in_transaction(self, reservation_id: str, reason: str) -> bool:
+        """Refund one consumed canary-run unit exactly once inside a caller transaction."""
+        if reason not in {"platform_fault", "runner_fault"}:
+            raise ValueError("canary compensation reason must be platform or runner fault")
+        if not self.conn.in_transaction:
+            raise RuntimeError("refund_consumed_in_transaction requires an active transaction")
+        resv = self.conn.execute(
+            "SELECT * FROM usage_ledger WHERE reservation_id=? AND kind='reserve'",
+            (reservation_id,),
+        ).fetchone()
+        if not resv:
+            raise KeyError(f"unknown reservation {reservation_id}")
+        if resv["meter"] != Meter.CANARY_RUNS.value:
+            raise ValueError("only CANARY_RUNS reservations support consumed compensation")
+        settled_kinds = {
+            row["kind"] for row in self.conn.execute(
+                "SELECT kind FROM usage_ledger WHERE reservation_id=? "
+                "AND kind IN ('consume','refund','platform_fault_refund')",
+                (reservation_id,),
+            )
+        }
+        if "consume" not in settled_kinds or {"refund", "platform_fault_refund"} & settled_kinds:
+            return False
+        self.conn.execute(
+            """INSERT INTO usage_ledger(
+                 entry_id,workspace_id,meter,period,kind,amount,reservation_id,
+                 idempotency_key,ref,ts,reason)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                f"led_{secrets.token_hex(8)}", resv["workspace_id"], resv["meter"],
+                resv["period"], "platform_fault_refund", -resv["amount"], reservation_id,
+                None, resv["ref"], _now(), reason,
+            ),
+        )
+        return True

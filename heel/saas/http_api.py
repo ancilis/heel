@@ -46,6 +46,7 @@ from .billing import (
     StubBilling,
     SubscriptionManager,
 )
+from .canary_store import CanaryStore
 from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
 from .device_auth import (
     DEVICE_CAPABILITIES,
@@ -135,7 +136,9 @@ class ControlPlane:
                  public_origin: str | None = None,
                  billing: Billing | None = None,
                  trust_edge_client_key: bool = False,
-                 edge_auth_secret: str | None = None):
+                 edge_auth_secret: str | None = None,
+                 grant_authority=None,
+                 grant_trusted_keys: dict[str, object] | None = None):
         configured_pepper = bool(os.environ.get("HEEL_DEVICE_TOKEN_PEPPER_B64"))
         device_enabled = (
             enable_device_auth
@@ -164,6 +167,9 @@ class ControlPlane:
                 )
         self.store = ControlPlaneStore(path)
         conn = self.store.conn
+        self.canary_store = CanaryStore(conn)
+        self.grant_authority = grant_authority
+        self.grant_trusted_keys = dict(grant_trusted_keys or {})
         self.auth = AuthStore(conn)
         self.device_auth = (
             DeviceAuthStore(conn, pepper=device_token_pepper) if device_enabled else None

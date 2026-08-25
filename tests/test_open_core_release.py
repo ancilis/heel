@@ -44,6 +44,8 @@ EXPECTED_METADATA = (
     "License-Expression: Apache-2.0\n"
     "License-File: LICENSE\n"
     "License-File: NOTICE\n"
+    "Provides-Extra: runner\n"
+    "Requires-Dist: cryptography==45.0.7; extra == \"runner\"\n"
     "\n"
 ).encode("utf-8")
 EXPECTED_WHEEL_METADATA = (
@@ -141,6 +143,7 @@ EXPECTED_CONTRACT = {
         "heel/contracts.py",
         "heel/control.py",
         "heel/control_simulator.py",
+        "heel/crypto.py",
         "heel/economics.py",
         "heel/entitlements.py",
         "heel/findings_sync.py",
@@ -1192,7 +1195,11 @@ class OpenCoreReleaseTests(unittest.TestCase):
             path = source / "pyproject.toml"
             text = path.read_text(encoding="utf-8")
             path.write_text(
-                text + '\n[project.optional-dependencies]\nllm = ["requests"]\n',
+                text.replace(
+                    'runner = ["cryptography==45.0.7"]',
+                    'runner = ["cryptography==45.0.7"]\nllm = ["requests"]',
+                    1,
+                ),
                 encoding="utf-8",
             )
 
@@ -1831,8 +1838,11 @@ class OpenCoreReleaseTests(unittest.TestCase):
                 parsed_metadata = BytesParser(policy=policy.default).parsebytes(metadata)
                 self.assertEqual(parsed_metadata.get_all("License-Expression"), ["Apache-2.0"])
                 self.assertEqual(parsed_metadata.get_all("License", []), [])
-                self.assertEqual(parsed_metadata.get_all("Requires-Dist", []), [])
-                self.assertEqual(parsed_metadata.get_all("Provides-Extra", []), [])
+                self.assertEqual(
+                    parsed_metadata.get_all("Requires-Dist", []),
+                    ['cryptography==45.0.7; extra == "runner"'],
+                )
+                self.assertEqual(parsed_metadata.get_all("Provides-Extra", []), ["runner"])
                 for path in wheel_files:
                     contents = wheel.read(path)
                     for marker in FORBIDDEN_DISTRIBUTED_CONTENT_MARKERS:
@@ -1851,6 +1861,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
                 "heel_sim.egg-info/SOURCES.txt",
                 "heel_sim.egg-info/dependency_links.txt",
                 "heel_sim.egg-info/entry_points.txt",
+                "heel_sim.egg-info/requires.txt",
                 "heel_sim.egg-info/top_level.txt",
             }
             with tarfile.open(sdists[0], "r:gz") as sdist:
