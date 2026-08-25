@@ -74,7 +74,7 @@ class CatalogCapabilityMigrationTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
         migrator = Migrator(conn, CONTROL_PLANE_MIGRATIONS)
-        self.assertEqual(migrator.apply_all(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        self.assertEqual(migrator.apply_all(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
         self.assertEqual(migrator.apply_all(), [])
         tables = {
             row[0] for row in conn.execute(
