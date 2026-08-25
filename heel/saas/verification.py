@@ -464,15 +464,27 @@ class VerifiedEnvironmentService:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 fresh = self._row(workspace_id, project_ref, environment_id)
-                if (fresh is None or fresh["challenge_generation"] != generation or fresh["status"] != "pending"
-                        or fresh["revoked_at"] is not None or fresh["challenge_expires_at"] <= now
-                        or fresh["challenge_digest"] != expected_digest or fresh["challenge_token"] != token
-                    or fresh["attestation_text"] != OWNERSHIP_ATTESTATION
-                    or fresh["attestation_version"] != ATTESTATION_VERSION
-                    or fresh["attestation_acknowledgement"] != ATTESTATION_ACKNOWLEDGEMENT):
+                failure_code: str | None = None
+                if fresh is None:
+                    failure_code = "challenge_missing"
+                elif fresh["revoked_at"] is not None:
+                    failure_code = "proof_revoked"
+                elif fresh["status"] != "pending" or not fresh["challenge_token"]:
+                    failure_code = "challenge_missing"
+                elif (fresh["challenge_generation"] != generation
+                      or fresh["challenge_digest"] != expected_digest
+                      or fresh["challenge_token"] != token):
+                    failure_code = "challenge_replaced"
+                elif fresh["challenge_expires_at"] <= now:
+                    failure_code = "challenge_expired"
+                elif (fresh["attestation_text"] != OWNERSHIP_ATTESTATION
+                      or fresh["attestation_version"] != ATTESTATION_VERSION
+                      or fresh["attestation_acknowledgement"] != ATTESTATION_ACKNOWLEDGEMENT):
+                    failure_code = "internal_error"
+                if failure_code is not None:
                     self.conn.execute("ROLLBACK")
                     self._record_failure(
-                        workspace_id, project_ref, environment_id, generation, "challenge_replaced",
+                        workspace_id, project_ref, environment_id, generation, failure_code,
                         expected_digest=expected_digest, token=token,
                     )
                     return False

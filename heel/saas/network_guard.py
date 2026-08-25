@@ -7,11 +7,11 @@ and keeps the original hostname solely for SNI and certificate verification.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import ipaddress
 import re
 import socket
 import ssl
-import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -181,6 +181,8 @@ class BoundedDNSResolver:
         for record_type in ("A", "AAAA"):
             try:
                 response = self._resolve(absolute, record_type, deadline=deadline)
+            except DNSResolutionTimeout:
+                raise
             except Exception as exc:
                 if type(exc).__name__ in {"NXDOMAIN", "NoAnswer"}:
                     continue
@@ -206,6 +208,8 @@ class BoundedDNSResolver:
         name = "_heel." + host + "."
         try:
             response = self._resolve(name, "TXT", deadline=deadline)
+        except DNSResolutionTimeout:
+            raise
         except Exception as exc:
             if type(exc).__name__ in {"NXDOMAIN", "NoAnswer"}:
                 return []
@@ -257,7 +261,7 @@ class PinnedHTTPSVerifier:
     """One pinned-address GET of the ownership file, with an absolute monotonic deadline."""
     pin_sha256_hex: str | None = None
     timeout_seconds: float = 5.0
-    resolver: Callable[[str], Sequence[Any]] | None = None
+    resolver: Callable[..., Sequence[Any]] | None = None
     sockets: SocketTransport | None = None
     tls: TLSTransport | None = None
     clock: Callable[[], float] = time.monotonic
@@ -272,6 +276,17 @@ class PinnedHTTPSVerifier:
                 raise ValueError("certificate pin must be hexadecimal") from exc
             if len(digest) != 32:
                 raise ValueError("certificate pin must contain 32 SHA-256 bytes")
+        if self.resolver is not None and not self._accepts_deadline(self.resolver):
+            raise ValueError("resolver must implement the deadline-aware timeout_seconds contract")
+
+    @staticmethod
+    def _accepts_deadline(resolver: Callable[..., Sequence[Any]]) -> bool:
+        """Require an inspectable keyword-timeout resolver; production uses BoundedDNSResolver."""
+        try:
+            inspect.signature(resolver).bind("example.com", timeout_seconds=0.1)
+        except (TypeError, ValueError):
+            return False
+        return True
 
     def _remaining(self, deadline: float) -> float:
         remaining = deadline - self.clock()
@@ -279,37 +294,11 @@ class PinnedHTTPSVerifier:
             raise VerificationTimeout("verification deadline expired")
         return remaining
 
-    def _resolve_generic(self, resolver: Callable[[str], Sequence[Any]], hostname: str,
-                         deadline: float) -> Sequence[Any]:
-        """Bound test/custom resolvers without allowing one stalled DNS call to hold a request."""
-        outcome: list[Sequence[Any]] = []
-        failure: list[BaseException] = []
-
-        def run() -> None:
-            try:
-                outcome.append(resolver(hostname))
-            except BaseException as exc:  # propagated on the request thread after a bounded join
-                failure.append(exc)
-
-        worker = threading.Thread(target=run, name="heel-bounded-dns", daemon=True)
-        worker.start()
-        worker.join(self._remaining(deadline))
-        if worker.is_alive():
-            raise VerificationTimeout("DNS resolution deadline expired")
-        if failure:
-            raise failure[0]
-        if not outcome:
-            raise AddressSetValidationError("DNS resolver returned no result")
-        return outcome[0]
-
     def resolve(self, hostname: str, *, deadline: float | None = None) -> ipaddress._BaseAddress:
         deadline = self.clock() + self.timeout_seconds if deadline is None else deadline
         try:
             resolver = self.resolver or BoundedDNSResolver()
-            if isinstance(resolver, BoundedDNSResolver):
-                answer = resolver(hostname, timeout_seconds=self._remaining(deadline))
-            else:
-                answer = self._resolve_generic(resolver, hostname, deadline)
+            answer = resolver(hostname, timeout_seconds=self._remaining(deadline))
             return select_safe_addresses(answer)[0]
         except NetworkGuardError:
             raise
