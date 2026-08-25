@@ -17,6 +17,7 @@ from heel.canary_contracts import (
     validate_canary_findings,
     validate_operational_run,
 )
+from heel.crypto import verify_envelope
 from heel.runner.containment import LOCAL_EVENT_CODES
 
 
@@ -52,13 +53,40 @@ def _bounded_integer(value: Any, label: str) -> int:
     return value
 
 
-def validate_local_result_view(value: Any) -> dict[str, Any]:
+def _verify_projection_signature(
+    projection: Mapping[str, Any], trusted_runner_keys: Mapping[str, object],
+) -> None:
+    if not isinstance(trusted_runner_keys, Mapping) or len(trusted_runner_keys) != 1:
+        raise ValueError("one bound runner verification key is required")
+    unsigned = {
+        key: value for key, value in projection.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    try:
+        verify_envelope(
+            dict(trusted_runner_keys),
+            {
+                "signing_key_id": projection["signing_key_id"],
+                "signature_b64": projection["signature_b64"],
+            },
+            canonical_bytes(unsigned),
+        )
+    except (TypeError, ValueError):
+        raise ValueError("local projection signature is invalid") from None
+
+
+def validate_local_result_view(
+    value: Any, *, trusted_runner_keys: Mapping[str, object] | None = None,
+) -> dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) != _RESULT_FIELDS:
         raise ValueError("invalid local result view")
     if value["schema_version"] != _RESULT_SCHEMA:
         raise ValueError("invalid local result view")
     operational = validate_operational_run(value["operational_projection"])
     findings = validate_canary_findings(value["findings_projection"])
+    if trusted_runner_keys is not None:
+        _verify_projection_signature(operational, trusted_runner_keys)
+        _verify_projection_signature(findings, trusted_runner_keys)
     if (
         operational["run_id"] != findings["run_id"]
         or operational["grant_id"] != findings["grant_id"]
@@ -95,12 +123,16 @@ def validate_local_result_view(value: Any) -> dict[str, Any]:
     }
 
 
-def validate_disclosure_preview(value: Any) -> dict[str, Any]:
+def validate_disclosure_preview(
+    value: Any, *, trusted_runner_keys: Mapping[str, object] | None = None,
+) -> dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) != _DISCLOSURE_FIELDS:
         raise ValueError("invalid local disclosure preview")
     if value["schema_version"] != _DISCLOSURE_SCHEMA:
         raise ValueError("invalid local disclosure preview")
     projection = validate_canary_findings(value["projection"])
+    if trusted_runner_keys is not None:
+        _verify_projection_signature(projection, trusted_runner_keys)
     if value["projection_digest"] != projection["projection_digest"]:
         raise ValueError("local disclosure digest mismatch")
     if _bounded_integer(value["projection_bytes"], "projection byte count") != len(canonical_bytes(projection)):
@@ -135,12 +167,17 @@ class CompanionServer:
         local_result: Mapping[str, Any],
         disclosure_preview: Mapping[str, Any],
         *,
+        trusted_runner_keys: Mapping[str, object],
         bootstrap_bytes: bytes | None = None,
         session_bytes: Callable[[int], bytes] = secrets.token_bytes,
         clock: Callable[[], float] = time.monotonic,
     ):
-        self._result = validate_local_result_view(local_result)
-        self._disclosure = validate_disclosure_preview(disclosure_preview)
+        self._result = validate_local_result_view(
+            local_result, trusted_runner_keys=trusted_runner_keys,
+        )
+        self._disclosure = validate_disclosure_preview(
+            disclosure_preview, trusted_runner_keys=trusted_runner_keys,
+        )
         if self._disclosure["projection"] != self._result["findings_projection"]:
             raise ValueError("disclosure preview is not the local findings projection")
         self._clock = clock
@@ -246,16 +283,31 @@ class CompanionServer:
             def _request_ok(self, *, api: bool) -> bool:
                 expected_host = f"127.0.0.1:{owner.port}"
                 peer = self.client_address[0]
-                if peer != "127.0.0.1" or self.headers.get("Host") != expected_host:
+                hosts = self.headers.get_all("Host", [])
+                local_origins = self.headers.get_all("X-Heel-Local-Origin", [])
+                origins = self.headers.get_all("Origin", [])
+                cookies = self.headers.get_all("Cookie", [])
+                lengths = self.headers.get_all("Content-Length", [])
+                content_types = self.headers.get_all("Content-Type", [])
+                transfer_encodings = self.headers.get_all("Transfer-Encoding", [])
+                if (
+                    peer != "127.0.0.1"
+                    or hosts != [expected_host]
+                    or len(origins) > 1
+                    or len(cookies) > 1
+                    or len(lengths) > 1
+                    or len(content_types) > 1
+                    or transfer_encodings
+                ):
                     self._reject(403)
                     return False
                 if "?" in self.path or "%" in self.path or "#" in self.path or "\\" in self.path:
                     self._reject(400)
                     return False
                 if api:
-                    origin = self.headers.get("Origin")
+                    origin = origins[0] if origins else None
                     if (
-                        self.headers.get("X-Heel-Local-Origin") != owner.origin
+                        local_origins != [owner.origin]
                         or (origin is not None and origin != owner.origin)
                     ):
                         self._reject(403)
@@ -270,6 +322,9 @@ class CompanionServer:
 
             def do_GET(self) -> None:
                 if not self._request_ok(api=self.path != "/"):
+                    return
+                if self.headers.get_all("Content-Length", []):
+                    self._reject(400)
                     return
                 if self.path == "/":
                     self._headers(200, "text/html; charset=utf-8", len(_SHELL))
@@ -292,10 +347,14 @@ class CompanionServer:
                 if self.path != "/v1/session":
                     self._reject(404)
                     return
-                if self.headers.get("Content-Type") != "application/json" or self.headers.get("Transfer-Encoding") is not None:
+                if self.headers.get_all("Content-Type", []) != ["application/json"]:
                     self._reject(400)
                     return
-                raw_length = self.headers.get("Content-Length")
+                lengths = self.headers.get_all("Content-Length", [])
+                if len(lengths) != 1:
+                    self._reject(400)
+                    return
+                raw_length = lengths[0]
                 if raw_length is None or not raw_length.isascii() or not raw_length.isdecimal():
                     self._reject(400)
                     return

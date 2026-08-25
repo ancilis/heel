@@ -25,7 +25,13 @@ class Coordinator(Protocol):
     def heartbeat(self, run_id: str, operational_projection: dict[str, Any]) -> ExecutionGate: ...
     def progress(self, run_id: str, operational_projection: dict[str, Any]) -> object: ...
     def result(self, run_id: str, operational_projection: dict[str, Any]) -> object: ...
-    def stop_ack(self, run_id: str, operational_projection: dict[str, Any]) -> object: ...
+    def stop_ack(
+        self,
+        run_id: str,
+        operational_projection: dict[str, Any],
+        *,
+        deadline: float,
+    ) -> object: ...
 
 
 @runtime_checkable
@@ -51,6 +57,7 @@ class RunnerService:
         idle_poll_interval: float = 2.0,
         sleeper: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        clock_ms: Callable[[], int] = lambda: int(time.time() * 1000),
     ):
         if not isinstance(heartbeat_interval, (int, float)) or isinstance(heartbeat_interval, bool):
             raise ValueError("heartbeat interval must be numeric")
@@ -66,6 +73,7 @@ class RunnerService:
         self.idle_poll_interval = float(idle_poll_interval)
         self.sleeper = sleeper
         self.monotonic = monotonic
+        self.clock_ms = clock_ms
         self._active_lock = threading.Lock()
         self._active_cancellation: CancellationToken | None = None
 
@@ -94,7 +102,7 @@ class RunnerService:
         heartbeat_failure: list[BaseException] = []
         projection_lock = threading.Lock()
         current_projection = [lease.operational_projection]
-        stop_received_at = [None]
+        stop_ack_failure: list[BaseException] = []
 
         def snapshot() -> dict[str, Any]:
             with projection_lock:
@@ -106,6 +114,60 @@ class RunnerService:
             with projection_lock:
                 current_projection[0] = value
             self.coordinator.progress(lease.run_id, value)
+
+        def issue_stop_ack(stop_reason: str, *, deadline: float) -> None:
+            """Cancel first, then bound one coordinator acknowledgement independently."""
+            proposed_at_ms = self.clock_ms()
+            cancellation.stop_reason = stop_reason
+            cancellation.stop_requested_at_ms = proposed_at_ms
+            cancellation.stop_ack_deadline = deadline
+            cancellation.stop_ack_event = threading.Event()
+            cancellation.cancel()
+            stop_received.set()
+            prepare = getattr(self.executor, "prepare_stop_ack", None)
+            try:
+                if prepare is None:
+                    acknowledgement = snapshot()
+                else:
+                    acknowledgement = prepare(
+                        lease, snapshot(), stop_reason, proposed_at_ms,
+                    )
+                if not isinstance(acknowledgement, dict):
+                    raise ValueError("executor stop acknowledgement must be an object")
+            except BaseException as exc:
+                stop_ack_failure.append(exc)
+                cancellation.stop_ack_event.set()
+                return
+
+            completed = threading.Event()
+            failed: list[BaseException] = []
+
+            def acknowledge() -> None:
+                try:
+                    self.coordinator.stop_ack(
+                        lease.run_id, acknowledgement, deadline=deadline,
+                    )
+                except BaseException as exc:
+                    failed.append(exc)
+                finally:
+                    completed.set()
+
+            worker = threading.Thread(
+                target=acknowledge, daemon=True, name="heel-runner-stop-ack",
+            )
+            worker.start()
+            completed.wait(max(0.0, deadline - self.monotonic()))
+            acknowledged_in_time = completed.is_set() and self.monotonic() <= deadline
+            if acknowledged_in_time and not failed:
+                cancellation.stop_acknowledged_at_ms = self.clock_ms()
+                with projection_lock:
+                    current_projection[0] = acknowledgement
+            else:
+                if failed:
+                    stop_ack_failure.extend(failed)
+                else:
+                    stop_ack_failure.append(TimeoutError("stop acknowledgement timed out"))
+            cancellation.stop_ack_event.set()
 
         def heartbeats() -> None:
             while not finished.is_set():
@@ -127,22 +189,25 @@ class RunnerService:
                             or gate.proof_state == "revoked"
                             or not gate.active
                         )
-                        if actual_stop and not stop_received.is_set():
-                            stop_received_at[0] = self.monotonic()
-                            stop_received.set()
                         if gate.stop_reason != "none":
-                            cancellation.stop_reason = gate.stop_reason
+                            requested_stop_reason = gate.stop_reason
                         elif gate.runner_state != "active":
-                            cancellation.stop_reason = "runner_revoked"
+                            requested_stop_reason = "runner_revoked"
                             cancellation.control_error = "runner_fault"
                         elif gate.proof_state == "revoked":
-                            cancellation.stop_reason = "target_revoked"
+                            requested_stop_reason = "target_revoked"
                             cancellation.control_error = "proof_expired"
                         elif gate.proof_state != "valid" or gate.proof_expires_at_ms <= gate.server_time_ms:
+                            requested_stop_reason = "none"
                             cancellation.control_error = "proof_expired"
                         elif not gate.active:
-                            cancellation.stop_reason = "kill_switch"
-                        cancellation.cancel()
+                            requested_stop_reason = "kill_switch"
+                        else:
+                            requested_stop_reason = "none"
+                        if actual_stop and not stop_received.is_set():
+                            issue_stop_ack(requested_stop_reason, deadline=cycle + 5.0)
+                        else:
+                            cancellation.cancel()
                 except BaseException as exc:
                     heartbeat_failure.append(exc)
                     cancellation.control_error = "cloud_disconnected"
@@ -170,20 +235,14 @@ class RunnerService:
                     current_projection[0] = final_projection
         finally:
             finished.set()
-            heartbeat_thread.join(2)
+            heartbeat_thread.join(5.1)
             with self._active_lock:
                 self._active_cancellation = None
         if heartbeat_thread.is_alive():
             raise RuntimeError("runner heartbeat worker did not stop")
-        if stop_received.is_set():
-            before = self.monotonic()
-            self.coordinator.stop_ack(lease.run_id, snapshot())
-            received = stop_received_at[0]
-            if received is None or before - received > 5.0:
-                raise RuntimeError("runner stop acknowledgement exceeded five seconds")
-        elif heartbeat_failure:
+        if not stop_received.is_set() and heartbeat_failure:
             raise RuntimeError("runner heartbeat failed closed") from heartbeat_failure[0]
-        else:
+        elif not stop_received.is_set():
             self.coordinator.result(lease.run_id, snapshot())
         return True
 

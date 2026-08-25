@@ -1227,7 +1227,7 @@ class RunnerStore:
         value = _read_json(run_fd, "state.json", None)
         fields = {
             "schema_version", "run_id", "grant_id", "grant_digest", "manifest_digest",
-            "state", "retention_expires_at_ms", "updated_at_ms",
+            "runner_authority", "state", "retention_expires_at_ms", "updated_at_ms",
         }
         if not isinstance(value, Mapping) or set(value) != fields:
             raise RunnerStoreError("invalid local run state")
@@ -1240,6 +1240,23 @@ class RunnerStore:
         _id(value["grant_id"], "grant ID")
         _digest(value["grant_digest"], "grant digest")
         _digest(value["manifest_digest"], "manifest digest")
+        authority = value["runner_authority"]
+        if not isinstance(authority, Mapping) or set(authority) != {
+            "runner_key_id", "public_key_b64", "public_key_digest",
+        }:
+            raise RunnerStoreError("invalid reserved runner authority")
+        try:
+            public_key = base64.b64decode(authority["public_key_b64"], validate=True)
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid reserved runner authority") from None
+        if (
+            len(public_key) != 32
+            or _id(authority["runner_key_id"], "runner key ID")
+            != ed25519_key_id(public_key)
+            or _digest(authority["public_key_digest"], "runner public key digest")
+            != hashlib.sha256(public_key).hexdigest()
+        ):
+            raise RunnerStoreError("invalid reserved runner authority")
         for field in ("retention_expires_at_ms", "updated_at_ms"):
             moment = value[field]
             if isinstance(moment, bool) or not isinstance(moment, int) or moment < 0:
@@ -1280,6 +1297,11 @@ class RunnerStore:
             "grant_id": grant["grant_id"],
             "grant_digest": grant["grant_digest"],
             "manifest_digest": manifest["manifest_digest"],
+            "runner_authority": {
+                "runner_key_id": binding["runner_key_id"],
+                "public_key_b64": binding["public_key_b64"],
+                "public_key_digest": binding["fingerprint"],
+            },
             "state": "verified",
             "retention_expires_at_ms": retention_expires_at_ms,
             "updated_at_ms": grant["issued_at_ms"],
@@ -1320,6 +1342,22 @@ class RunnerStore:
         with self._transaction(exclusive=False) as context_fd:
             with self._open_run(context_fd, run_id, create=False) as run_fd:
                 return self._run_state_locked(run_fd, run_id)
+
+    def load_run_trusted_keys(self, run_id: str) -> dict[str, object]:
+        state = self.load_run(run_id)
+        authority = state["runner_authority"]
+        binding = self.load_binding()["identity"]
+        if authority != {
+            "runner_key_id": binding["runner_key_id"],
+            "public_key_b64": binding["public_key_b64"],
+            "public_key_digest": binding["fingerprint"],
+        }:
+            raise RunnerStoreError("reserved runner authority differs from the bound identity")
+        try:
+            key = load_public_key_base64(authority["public_key_b64"])
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid reserved runner verification key") from None
+        return {authority["runner_key_id"]: key}
 
     def load_run_grant(self, run_id: str) -> dict[str, Any]:
         with self._transaction(exclusive=False) as context_fd:
@@ -1399,8 +1437,25 @@ class RunnerStore:
 
         operational = validate_operational_run(operational_projection)
         findings = validate_canary_findings(findings_projection)
-        safe_view = validate_local_result_view(local_view)
-        safe_disclosure = validate_disclosure_preview(disclosure_preview)
+        keys = self.load_run_trusted_keys(run_id)
+        try:
+            for record in (operational, findings):
+                unsigned = {
+                    key: value for key, value in record.items()
+                    if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+                }
+                verify_envelope(
+                    keys,
+                    {"signing_key_id": record["signing_key_id"],
+                     "signature_b64": record["signature_b64"]},
+                    canonical_bytes(unsigned),
+                )
+        except (TypeError, ValueError):
+            raise RunnerStoreError("local final projection signature is invalid") from None
+        safe_view = validate_local_result_view(local_view, trusted_runner_keys=keys)
+        safe_disclosure = validate_disclosure_preview(
+            disclosure_preview, trusted_runner_keys=keys,
+        )
         if (
             operational["run_id"] != run_id
             or findings["run_id"] != run_id
@@ -1446,8 +1501,27 @@ class RunnerStore:
         )
         result["findings_projection"] = validate_canary_findings(result["findings_projection"])
         from heel.runner.companion import validate_disclosure_preview, validate_local_result_view
-        result["local_view"] = validate_local_result_view(result["local_view"])
-        result["disclosure_preview"] = validate_disclosure_preview(result["disclosure_preview"])
+        keys = self.load_run_trusted_keys(run_id)
+        try:
+            for record in (result["operational_projection"], result["findings_projection"]):
+                unsigned = {
+                    key: value for key, value in record.items()
+                    if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+                }
+                verify_envelope(
+                    keys,
+                    {"signing_key_id": record["signing_key_id"],
+                     "signature_b64": record["signature_b64"]},
+                    canonical_bytes(unsigned),
+                )
+        except (TypeError, ValueError):
+            raise RunnerStoreError("local final projection signature is invalid") from None
+        result["local_view"] = validate_local_result_view(
+            result["local_view"], trusted_runner_keys=keys,
+        )
+        result["disclosure_preview"] = validate_disclosure_preview(
+            result["disclosure_preview"], trusted_runner_keys=keys,
+        )
         if (
             result["local_view"]["operational_projection"] != result["operational_projection"]
             or result["local_view"]["findings_projection"] != result["findings_projection"]
@@ -1468,7 +1542,13 @@ class RunnerStore:
         expires_at_ms: int,
     ) -> str:
         values = (action_ordinal, attempt, status_code, expires_at_ms)
-        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+        if (
+            any(isinstance(value, bool) or not isinstance(value, int) for value in values)
+            or not 0 <= action_ordinal < 20
+            or not 1 <= attempt <= 2
+            or not 100 <= status_code <= 599
+            or expires_at_ms < 0
+        ):
             raise ValueError("invalid local evidence metadata")
         if not isinstance(raw_headers, bytes) or not isinstance(raw_body, bytes):
             raise TypeError("local response evidence must be bytes")
@@ -1546,9 +1626,11 @@ class RunnerStore:
                         or any(
                             isinstance(metadata[field], bool)
                             or not isinstance(metadata[field], int)
-                            or metadata[field] < 0
                             for field in ("action_ordinal", "attempt", "status_code")
                         )
+                        or not 0 <= metadata["action_ordinal"] < 20
+                        or not 1 <= metadata["attempt"] <= 2
+                        or not 100 <= metadata["status_code"] <= 599
                         or isinstance(metadata["expires_at_ms"], bool)
                         or not isinstance(metadata["expires_at_ms"], int)
                         or now_ms >= metadata["expires_at_ms"]
@@ -1606,6 +1688,72 @@ class RunnerStore:
             else:
                 _secure_regular(status, "Heel retained run file")
                 os.unlink(name, dir_fd=directory_fd)
+
+    def prune_expired_evidence(self, *, now_ms: int) -> int:
+        """Prune evidence by its own TTL even when the containing run is nonterminal."""
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
+            raise ValueError("invalid local evidence retention time")
+        removed = 0
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                return 0
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                for run_name in sorted(os.listdir(runs_fd)):
+                    if _RUN_FILENAME.fullmatch(run_name) is None:
+                        continue
+                    run_fd = os.open(run_name, _DIRECTORY_FLAGS, dir_fd=runs_fd)
+                    try:
+                        _secure_directory(run_fd, "Heel retained local run directory")
+                        evidence_fd = _open_child(run_fd, "evidence", create=False)
+                        if evidence_fd is None:
+                            continue
+                        try:
+                            _secure_directory(evidence_fd, "Heel local evidence directory")
+                            names = set(os.listdir(evidence_fd))
+                            references: set[str] = set()
+                            for name in names:
+                                suffix = ".meta" if name.endswith(".meta") else ".bin" if name.endswith(".bin") else None
+                                reference = name[:-len(suffix)] if suffix is not None else ""
+                                if suffix is None or _EVIDENCE_REF.fullmatch(reference) is None:
+                                    raise RunnerStoreError("invalid local evidence retention entry")
+                                references.add(reference)
+                            for reference in sorted(references):
+                                metadata_name = reference + ".meta"
+                                binary_name = reference + ".bin"
+                                metadata = (
+                                    _read_json(evidence_fd, metadata_name, None)
+                                    if metadata_name in names else None
+                                )
+                                expires = metadata.get("expires_at_ms") if isinstance(metadata, Mapping) else None
+                                expired = (
+                                    metadata is None
+                                    or binary_name not in names
+                                    or isinstance(expires, bool)
+                                    or not isinstance(expires, int)
+                                    or expires <= now_ms
+                                )
+                                if not expired:
+                                    continue
+                                for filename in (binary_name, metadata_name):
+                                    if filename not in names:
+                                        continue
+                                    status = os.stat(
+                                        filename, dir_fd=evidence_fd, follow_symlinks=False,
+                                    )
+                                    _secure_regular(status, "Heel local evidence retention file")
+                                    os.unlink(filename, dir_fd=evidence_fd)
+                                removed += 1
+                            if removed:
+                                os.fsync(evidence_fd)
+                        finally:
+                            os.close(evidence_fd)
+                    finally:
+                        os.close(run_fd)
+            finally:
+                os.close(runs_fd)
+        return removed
 
     def prune_expired_runs(self, *, now_ms: int) -> int:
         if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:

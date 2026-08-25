@@ -7,6 +7,7 @@ import copy
 from dataclasses import dataclass
 import hashlib
 import json
+import threading
 import time
 from typing import Any
 
@@ -25,8 +26,16 @@ from heel.crypto import verify_envelope
 from heel.runner.adapters import evaluate_pair, prepare_action
 from heel.runner.companion import validate_disclosure_preview, validate_local_result_view
 from heel.runner.containment import ContainmentLog, operational_containment_codes
-from heel.runner.http_transport import CancellationToken, TransportFailure
+from heel.runner.http_transport import (
+    AttemptPermit,
+    BoundedResponseEvidence,
+    CancellationToken,
+    EvidenceContext,
+    RetryPolicy,
+    TransportFailure,
+)
 from heel.runner.identity import RunnerIdentity, SecureSigner
+from heel.runner.redaction import Redactor
 from heel.runner.store import RunnerStore, RunnerStoreError
 from heel.runner.vault import EphemeralVault, VaultUnavailable, validate_credential_secret
 
@@ -268,6 +277,9 @@ class LocalCanaryExecutor:
         self.vaults = dict(vaults or {})
         self.clock_ms = clock_ms
         self.monotonic = monotonic
+        self._active_lock = threading.Lock()
+        self._active_ready = threading.Event()
+        self._active_context: dict[str, Any] | None = None
 
     def _gate(self, source: Callable[[], ExecutionGate], generation: int) -> ExecutionGate:
         try:
@@ -286,9 +298,12 @@ class LocalCanaryExecutor:
             raise raised
         return gate
 
-    def _resolve_credentials(self, manifest: Mapping[str, Any]) -> dict[str, object]:
+    def _resolve_credentials(
+        self, manifest: Mapping[str, Any],
+    ) -> tuple[dict[str, object], tuple[str, ...]]:
         records = {item["credential_handle_id"]: item for item in self.store.list_credentials()}
         result: dict[str, object] = {}
+        redaction_secrets: set[str] = set()
         origin = manifest["environment"]["origin"]
         for binding in manifest["credential_bindings"]:
             handle = binding["credential_handle_id"]
@@ -312,9 +327,95 @@ class LocalCanaryExecutor:
             normalized = validate_credential_secret(
                 record["auth_profile"], vault.load(handle), origin,
             )
-            result[record["semantic_role"]] = _credential_value(record["auth_profile"], normalized)
+            credential = _credential_value(record["auth_profile"], normalized)
+            result[record["semantic_role"]] = credential
+            if isinstance(credential, str):
+                redaction_secrets.add(credential)
+            elif isinstance(credential, Mapping):
+                redaction_secrets.update(
+                    value for value in credential.values()
+                    if isinstance(value, str) and len(value.encode("utf-8")) >= 4
+                )
             normalized = b""
-        return result
+        return result, tuple(sorted(redaction_secrets))
+
+    def _set_active_context(self, value: dict[str, Any] | None) -> None:
+        with self._active_lock:
+            self._active_context = value
+            if value is None:
+                self._active_ready.clear()
+            else:
+                self._active_ready.set()
+
+    def prepare_stop_ack(
+        self, run_id: str, *, stop_reason: str, proposed_at_ms: int,
+    ) -> dict[str, Any]:
+        """Build the signed stop receipt while target execution unwinds separately."""
+        if type(run_id) is not str or not run_id:
+            raise ValueError("stop acknowledgement run ID is invalid")
+        if stop_reason not in {
+            "local_emergency_stop", "cloud_stop", "runner_revoked",
+            "target_revoked", "kill_switch",
+        }:
+            raise ValueError("stop acknowledgement reason is invalid")
+        if isinstance(proposed_at_ms, bool) or not isinstance(proposed_at_ms, int) or proposed_at_ms < 0:
+            raise ValueError("stop acknowledgement timestamp is invalid")
+        if not self._active_ready.wait(1.0):
+            raise RunnerStoreError("active run is unavailable for stop acknowledgement")
+        with self._active_lock:
+            context = self._active_context
+            if context is None or context["grant"]["run_id"] != run_id:
+                raise RunnerStoreError("active run does not match stop acknowledgement")
+            manifest = context["manifest"]
+            projection = context["projection"]
+            grant = context["grant"]
+            started_at = context["started_at"]
+            started_monotonic = context["started_monotonic"]
+            counters = dict(context["counters"])
+            redaction_count = context["redaction_state"]["count"]
+            log = context["log"]
+        events = log.load()
+        requested_at = max(started_at, proposed_at_ms)
+        remaining_wall = max(
+            0,
+            manifest["budgets"]["wall_timeout_ms"]
+            - int(max(0.0, self.monotonic() - started_monotonic) * 1000),
+        )
+        unsigned = {
+            "schema_version": OPERATIONAL_RUN_SCHEMA,
+            "run_id": grant["run_id"], "grant_id": grant["grant_id"],
+            "workspace_id": grant["workspace_id"], "project_id": grant["project_id"],
+            "manifest_digest": manifest["manifest_digest"],
+            "approval_projection_digest": projection["projection_digest"],
+            "grant_digest": grant["grant_digest"],
+            "event_sequence": events[-1]["sequence"] if events else 0,
+            "lifecycle_phase": "stop_requested", "execution_disposition": None,
+            "timestamps": {
+                "claimed_at_ms": started_at, "started_at_ms": started_at,
+                "updated_at_ms": requested_at, "stop_requested_at_ms": requested_at,
+                "stop_acknowledged_at_ms": requested_at, "terminal_at_ms": None,
+            },
+            "counters": {
+                **counters,
+                "remaining_requests": max(
+                    0, manifest["budgets"]["maximum_requests"] - counters["requests_started"],
+                ),
+                "remaining_wall_ms": remaining_wall,
+            },
+            "versions": {
+                "runner_version": self.identity.runner_version,
+                "engine_version": manifest["compiler"]["engine_version"],
+                "adapter_versions": sorted({
+                    item["adapter_version"] for item in manifest["scenarios"]
+                }),
+            },
+            "error_category": "none", "stop_reason": stop_reason,
+            "containment_codes": operational_containment_codes(events),
+            "redaction_count": redaction_count,
+        }
+        return validate_operational_run(
+            _sign_projection(unsigned, self.signer, "projection_digest")
+        )
 
     @staticmethod
     def _failure_class(exc: BaseException) -> tuple[str, str, str]:
@@ -385,31 +486,39 @@ class LocalCanaryExecutor:
         scenario_codes: dict[str, set[str]] = {
             item["scenario_id"]: set() for item in manifest["scenarios"]
         }
+        scenario_evidence: dict[str, list[str]] = {
+            item["scenario_id"]: [] for item in manifest["scenarios"]
+        }
+        scenario_redactions: dict[str, int] = {
+            item["scenario_id"]: 0 for item in manifest["scenarios"]
+        }
+        redaction_state = {"count": 0}
+        budget_lock = threading.Lock()
         disposition = "completed"
         error_category = "none"
         stop_reason = "none"
         systemic_failure = False
+        stop_requested_at_ms = None
+        stop_acknowledged_at_ms = None
+        self._set_active_context({
+            "manifest": manifest,
+            "projection": projection,
+            "grant": grant,
+            "started_at": started_at,
+            "started_monotonic": started_monotonic,
+            "counters": counters,
+            "redaction_state": redaction_state,
+            "log": log,
+        })
         try:
-            credentials = self._resolve_credentials(manifest)
+            credentials, configured_secrets = self._resolve_credentials(manifest)
+            redactor = Redactor(configured_secrets)
+            retry_policy = RetryPolicy.from_mapping(manifest["retry_policy"])
             self._gate(gate_source, grant["kill_switch_generation"])
             self.store.transition_run(grant["run_id"], "running", now_ms=self.clock_ms())
             log.append("run_started", detail_code="all_preflight_valid", counters=counters)
             for source, action in zip(manifest["actions"], prepared, strict=True):
                 cancellation.raise_if_cancelled()
-                self._gate(gate_source, grant["kill_switch_generation"])
-                elapsed_ms = int(max(0.0, self.monotonic() - started_monotonic) * 1000)
-                if (
-                    elapsed_ms >= manifest["budgets"]["wall_timeout_ms"]
-                    or counters["requests_started"] >= manifest["budgets"]["maximum_requests"]
-                ):
-                    log.append(
-                        "budget_exhausted", action_ordinal=source["ordinal"],
-                        scenario_id=source["scenario_id"], semantic_role=source["semantic_auth_role"],
-                        attempt=1, detail_code="budget_exhausted", counters=counters,
-                    )
-                    exhausted = TransportFailure("gate_rejected")
-                    exhausted.gate_error = "budget_exhausted"
-                    raise exhausted
                 action_binding = {
                     "action_ordinal": source["ordinal"],
                     "scenario_id": source["scenario_id"],
@@ -417,35 +526,141 @@ class LocalCanaryExecutor:
                     "attempt": 1,
                 }
                 log.append("admitted", detail_code="exact_action", counters=counters, **action_binding)
-                counters["actions_contained"] += 1
-                counters["requests_started"] += 1
-                log.append("action_started", detail_code="target_read", counters=counters, **action_binding)
                 credential = None if action.auth_profile == "anonymous" else credentials[action.semantic_auth_role]
+                action_attempts = [0]
+
+                def before_attempt(
+                    attempt: int, previous_failure_code: str | None,
+                ) -> AttemptPermit:
+                    cancellation.raise_if_cancelled()
+                    gate = self._gate(gate_source, grant["kill_switch_generation"])
+                    now = self.monotonic()
+                    with budget_lock:
+                        cancellation.raise_if_cancelled()
+                        if attempt != action_attempts[0] + 1 or attempt not in {1, 2}:
+                            raise TransportFailure("gate_rejected")
+                        if attempt == 1:
+                            if previous_failure_code is not None:
+                                raise TransportFailure("gate_rejected")
+                        elif previous_failure_code not in retry_policy.retryable_failure_codes:
+                            raise TransportFailure("gate_rejected")
+                        elapsed_ms = int(max(0.0, now - started_monotonic) * 1000)
+                        budget_failure = (
+                            elapsed_ms >= manifest["budgets"]["wall_timeout_ms"]
+                            or counters["requests_started"] >= manifest["budgets"]["maximum_requests"]
+                            or (
+                                attempt > 1
+                                and counters["retries_used"] >= retry_policy.maximum_retries
+                            )
+                        )
+                        if budget_failure:
+                            log.append(
+                                "budget_exhausted", action_ordinal=source["ordinal"],
+                                scenario_id=source["scenario_id"],
+                                semantic_role=source["semantic_auth_role"], attempt=attempt,
+                                detail_code="budget_exhausted", counters=counters,
+                            )
+                            exhausted = TransportFailure("gate_rejected")
+                            exhausted.gate_error = "budget_exhausted"
+                            raise exhausted
+                        if not grant["issued_at_ms"] <= gate.server_time_ms < grant["expires_at_ms"]:
+                            expired = TransportFailure("gate_rejected")
+                            expired.gate_error = "proof_expired"
+                            raise expired
+                        counters["requests_started"] += 1
+                        if attempt == 1:
+                            counters["actions_contained"] += 1
+                        else:
+                            counters["retries_used"] += 1
+                        action_attempts[0] = attempt
+                        log.append(
+                            "action_started", action_ordinal=source["ordinal"],
+                            scenario_id=source["scenario_id"],
+                            semantic_role=source["semantic_auth_role"], attempt=attempt,
+                            detail_code="target_read", counters=counters,
+                        )
+                        action_deadline = now + manifest["budgets"]["action_timeout_ms"] / 1000
+                        wall_deadline = (
+                            started_monotonic + manifest["budgets"]["wall_timeout_ms"] / 1000
+                        )
+                        grant_deadline = now + (grant["expires_at_ms"] - gate.server_time_ms) / 1000
+                        proof_deadline = now + (gate.proof_expires_at_ms - gate.server_time_ms) / 1000
+                        return AttemptPermit(min(
+                            action_deadline, wall_deadline, grant_deadline, proof_deadline,
+                        ))
+
+                def evidence_sink(evidence: BoundedResponseEvidence) -> str:
+                    if (
+                        not isinstance(evidence, BoundedResponseEvidence)
+                        or evidence.action_ordinal != source["ordinal"]
+                        or evidence.scenario_id != source["scenario_id"]
+                        or evidence.semantic_auth_role != source["semantic_auth_role"]
+                        or evidence.method != source["method"]
+                        or evidence.route_template != source["route_template"]
+                        or evidence.attempt != action_attempts[0]
+                    ):
+                        raise ValueError("response evidence differs from the frozen action")
+                    return self.store.store_response_evidence(
+                        grant["run_id"], action_ordinal=evidence.action_ordinal,
+                        attempt=evidence.attempt, status_code=evidence.status_code,
+                        raw_headers=evidence.raw_headers, raw_body=evidence.raw_body,
+                        expires_at_ms=retention_expires,
+                    )
+
                 try:
                     response = transport.request(
-                        action, credential=credential, cancellation=cancellation,
+                        action,
+                        credential=credential,
+                        cancellation=cancellation,
+                        retry_policy=retry_policy,
+                        remaining_requests=max(
+                            0,
+                            manifest["budgets"]["maximum_requests"]
+                            - counters["requests_started"],
+                        ),
+                        before_attempt=before_attempt,
+                        evidence_context=EvidenceContext(
+                            source["ordinal"], source["route_template"],
+                        ),
+                        evidence_sink=evidence_sink,
+                        redactor=redactor,
                     )
                 except TransportFailure as exc:
-                    additional = max(0, exc.requests_made - 1)
-                    counters["requests_started"] += additional
-                    counters["retries_used"] += additional
                     code = "dns_changed" if exc.code == "dns_changed" else "action_rejected"
                     scenario_codes[source["scenario_id"]].add(code)
-                    log.append(code, detail_code=exc.code, counters=counters, **action_binding)
+                    log.append(
+                        code, detail_code=exc.code, counters=counters,
+                        **{**action_binding, "attempt": max(1, action_attempts[0])},
+                    )
                     raise
                 attempts = getattr(response, "requests_made", 1)
-                if isinstance(attempts, bool) or not isinstance(attempts, int) or not 1 <= attempts <= 2:
+                if (
+                    isinstance(attempts, bool)
+                    or not isinstance(attempts, int)
+                    or attempts != action_attempts[0]
+                ):
                     raise TransportFailure("response_rejected")
-                counters["requests_started"] += attempts - 1
-                counters["retries_used"] += attempts - 1
                 counters["requests_completed"] += 1
                 counters["response_bytes_read"] += response.response_bytes
                 if (
                     counters["requests_started"] > manifest["budgets"]["maximum_requests"]
                     or counters["retries_used"] > manifest["retry_policy"]["maximum_retries"]
                     or response.response_bytes > manifest["budgets"]["maximum_response_bytes"]
+                    or type(response.evidence_ref) is not str
+                    or not response.evidence_ref.startswith("ev1_")
                 ):
                     raise TransportFailure("response_rejected")
+                scenario_evidence[source["scenario_id"]].append(response.evidence_ref)
+                scenario_redactions[source["scenario_id"]] += response.redaction_count
+                redaction_state["count"] += response.redaction_count
+                if response.redaction_count:
+                    scenario_codes[source["scenario_id"]].add("redacted")
+                    log.append(
+                        "redacted", action_ordinal=source["ordinal"],
+                        scenario_id=source["scenario_id"],
+                        semantic_role=source["semantic_auth_role"], attempt=attempts,
+                        detail_code="response_secret", counters=counters,
+                    )
                 observations[source["scenario_id"]].append({
                     "semantic_role": source["semantic_auth_role"],
                     "status_code": response.status_code,
@@ -453,10 +668,14 @@ class LocalCanaryExecutor:
                     "truncation_state": "complete",
                 })
                 scenario_codes[source["scenario_id"]].update({"admitted", "action_started", "action_completed"})
-                log.append("action_completed", detail_code="bounded_response", counters=counters, **action_binding)
+                log.append(
+                    "action_completed", detail_code="bounded_response", counters=counters,
+                    **{**action_binding, "attempt": attempts},
+                )
                 if on_progress is not None:
                     on_progress(self._running_projection(
-                        manifest, projection, grant, started_at, counters, log.load(),
+                        manifest, projection, grant, started_at, started_monotonic,
+                        counters, log.load(), redaction_state["count"],
                     ))
         except BaseException as exc:
             if isinstance(exc, TransportFailure) and exc.code == "cancelled":
@@ -469,6 +688,14 @@ class LocalCanaryExecutor:
             systemic_failure = True
             disposition, error_category, stop_reason = self._failure_class(exc)
             if disposition == "stopped":
+                acknowledgement = getattr(cancellation, "stop_ack_event", None)
+                if isinstance(acknowledgement, threading.Event):
+                    deadline = getattr(cancellation, "stop_ack_deadline", self.monotonic())
+                    acknowledgement.wait(max(0.0, deadline - self.monotonic()))
+                stop_requested_at_ms = getattr(cancellation, "stop_requested_at_ms", self.clock_ms())
+                stop_acknowledged_at_ms = getattr(
+                    cancellation, "stop_acknowledged_at_ms", None,
+                )
                 try:
                     state = self.store.load_run(grant["run_id"])["state"]
                     if state == "running":
@@ -482,14 +709,22 @@ class LocalCanaryExecutor:
                 pass
             elif error_category == "credential_unavailable" and not log.load():
                 log.append("grant_verified", detail_code="grant_exact", counters=counters)
-        return self._finalize(
-            manifest, projection, grant, log, observations, scenario_codes, counters,
-            started_at=started_at, disposition=disposition, error_category=error_category,
-            stop_reason=stop_reason, systemic_failure=systemic_failure,
-        )
+        try:
+            return self._finalize(
+                manifest, projection, grant, log, observations, scenario_codes,
+                scenario_evidence, scenario_redactions, counters,
+                redaction_count=redaction_state["count"], started_at=started_at,
+                disposition=disposition, error_category=error_category,
+                stop_reason=stop_reason, systemic_failure=systemic_failure,
+                stop_requested_at_ms=stop_requested_at_ms,
+                stop_acknowledged_at_ms=stop_acknowledged_at_ms,
+            )
+        finally:
+            self._set_active_context(None)
 
     def _running_projection(
-        self, manifest, projection, grant, started_at, counters, events,
+        self, manifest, projection, grant, started_at, started_monotonic, counters,
+        events, redaction_count,
     ) -> dict[str, Any]:
         now = self.clock_ms()
         unsigned = {
@@ -509,7 +744,11 @@ class LocalCanaryExecutor:
             "counters": {
                 **counters,
                 "remaining_requests": max(0, manifest["budgets"]["maximum_requests"] - counters["requests_started"]),
-                "remaining_wall_ms": manifest["budgets"]["wall_timeout_ms"],
+                "remaining_wall_ms": max(
+                    0,
+                    manifest["budgets"]["wall_timeout_ms"]
+                    - int(max(0.0, self.monotonic() - started_monotonic) * 1000),
+                ),
             },
             "versions": {
                 "runner_version": self.identity.runner_version,
@@ -517,7 +756,8 @@ class LocalCanaryExecutor:
                 "adapter_versions": sorted({item["adapter_version"] for item in manifest["scenarios"]}),
             },
             "error_category": "none", "stop_reason": "none",
-            "containment_codes": operational_containment_codes(events), "redaction_count": 0,
+            "containment_codes": operational_containment_codes(events),
+            "redaction_count": redaction_count,
         }
         return validate_operational_run(_sign_projection(unsigned, self.signer, "projection_digest"))
 
@@ -529,18 +769,25 @@ class LocalCanaryExecutor:
         log,
         observations,
         scenario_codes,
+        scenario_evidence,
+        scenario_redactions,
         counters,
         *,
+        redaction_count,
         started_at,
         disposition,
         error_category,
         stop_reason,
         systemic_failure,
+        stop_requested_at_ms,
+        stop_acknowledged_at_ms,
     ) -> ExecutionResult:
         state = self.store.load_run(grant["run_id"])["state"]
         if state in {"verified", "running", "stop_requested"}:
             self.store.transition_run(grant["run_id"], "finalizing", now_ms=self.clock_ms())
-        log.append("run_finalized", detail_code=disposition, counters=counters)
+        existing_events = log.load()
+        if not existing_events or existing_events[-1]["event_code"] != "run_finalized":
+            log.append("run_finalized", detail_code=disposition, counters=counters)
         scenario_results = []
         outcomes = []
         actions_by_scenario: dict[str, list[Mapping[str, Any]]] = {}
@@ -590,8 +837,8 @@ class LocalCanaryExecutor:
                 ),
                 "finding": finding,
                 "containment_codes": sorted(scenario_codes[scenario_id]),
-                "redaction_count": 0,
-                "local_evidence_refs": [],
+                "redaction_count": scenario_redactions[scenario_id],
+                "local_evidence_refs": sorted(scenario_evidence[scenario_id]),
             })
         aggregate = (
             "inconclusive" if systemic_failure
@@ -599,7 +846,10 @@ class LocalCanaryExecutor:
             else "blocked" if outcomes and all(item == "blocked" for item in outcomes)
             else "inconclusive"
         )
-        finished_at = self.clock_ms()
+        finished_at = max(
+            self.clock_ms(), started_at,
+            stop_requested_at_ms or 0, stop_acknowledged_at_ms or 0,
+        )
         findings_unsigned = {
             "schema_version": CANARY_FINDINGS_SCHEMA,
             "projection_id": "findings_" + hashlib.sha256(grant["run_id"].encode()).hexdigest()[:24],
@@ -614,12 +864,11 @@ class LocalCanaryExecutor:
             "started_at_ms": started_at, "finished_at_ms": finished_at,
             "assessment_outcome": aggregate, "scenario_results": scenario_results,
             "containment_codes": operational_containment_codes(log.load()),
-            "redaction_count": 0,
+            "redaction_count": redaction_count,
         }
         findings = validate_canary_findings(
             _sign_projection(findings_unsigned, self.signer, "projection_digest")
         )
-        stop_time = finished_at if stop_reason != "none" else None
         operational_unsigned = {
             "schema_version": OPERATIONAL_RUN_SCHEMA,
             "run_id": grant["run_id"], "grant_id": grant["grant_id"],
@@ -632,8 +881,8 @@ class LocalCanaryExecutor:
             "timestamps": {
                 "claimed_at_ms": started_at, "started_at_ms": started_at,
                 "updated_at_ms": finished_at,
-                "stop_requested_at_ms": stop_time,
-                "stop_acknowledged_at_ms": stop_time,
+                "stop_requested_at_ms": stop_requested_at_ms,
+                "stop_acknowledged_at_ms": stop_acknowledged_at_ms,
                 "terminal_at_ms": finished_at,
             },
             "counters": {
@@ -647,7 +896,8 @@ class LocalCanaryExecutor:
                 "adapter_versions": sorted({item["adapter_version"] for item in manifest["scenarios"]}),
             },
             "error_category": error_category, "stop_reason": stop_reason,
-            "containment_codes": operational_containment_codes(log.load()), "redaction_count": 0,
+            "containment_codes": operational_containment_codes(log.load()),
+            "redaction_count": redaction_count,
         }
         operational = validate_operational_run(
             _sign_projection(operational_unsigned, self.signer, "projection_digest")
@@ -666,7 +916,7 @@ class LocalCanaryExecutor:
             "event_count": len(events),
             "head_digest": events[-1]["event_digest"],
             "codes": sorted({item["event_code"] for item in events}),
-            "redaction_count": 0,
+            "redaction_count": redaction_count,
         }
         local_view = validate_local_result_view({
             "schema_version": "heel.local-result-view.v1",
@@ -698,6 +948,11 @@ class LocalCanaryExecutor:
         except RunnerStoreError:
             stored = None
         if stored is not None:
+            state = self.store.load_run(run_id)["state"]
+            if state != "terminal":
+                if state in {"verified", "running", "stop_requested"}:
+                    self.store.transition_run(run_id, "finalizing", now_ms=self.clock_ms())
+                self.store.transition_run(run_id, "terminal", now_ms=self.clock_ms())
             return ExecutionResult(
                 stored["findings_projection"]["assessment_outcome"],
                 stored["operational_projection"]["execution_disposition"],
@@ -707,26 +962,41 @@ class LocalCanaryExecutor:
         grant = self.store.load_run_grant(run_id)
         manifest = self.store.load_manifest(grant["approval"]["manifest_digest"])
         projection = self.store.load_projection(grant["approval"]["projection_id"])
+        validate_execution_bundle(
+            ExecutionBundle(manifest, projection, grant),
+            store=self.store,
+            identity=self.identity,
+            trusted_grant_keys=self.trusted_grant_keys,
+            now_ms=grant["issued_at_ms"],
+            gate=ExecutionGate(
+                active=True,
+                runner_state="active",
+                proof_state="valid",
+                proof_expires_at_ms=max(grant["expires_at_ms"], grant["issued_at_ms"] + 1),
+                kill_switch_generation=grant["kill_switch_generation"],
+                stop_reason="none",
+                server_time_ms=grant["issued_at_ms"],
+            ),
+        )
         log = ContainmentLog(
             store=self.store, signer=self.signer, run_id=run_id, grant_id=grant["grant_id"],
             manifest_digest=manifest["manifest_digest"], clock_ms=self.clock_ms,
         )
         events = log.load()
-        started = {
-            event["action_ordinal"] for event in events if event["event_code"] == "action_started"
-        }
-        completed = {
-            event["action_ordinal"] for event in events if event["event_code"] == "action_completed"
-        }
-        if not started - completed:
-            raise RunnerStoreError("local run has no interrupted target action")
+        if not events:
+            log.append("grant_verified", detail_code="recovery_verified")
+            events = log.load()
         counters = copy.deepcopy(events[-1]["counters"])
         observations = {item["scenario_id"]: [] for item in manifest["scenarios"]}
         codes = {item["scenario_id"]: set() for item in manifest["scenarios"]}
+        evidence = {item["scenario_id"]: [] for item in manifest["scenarios"]}
+        redactions = {item["scenario_id"]: 0 for item in manifest["scenarios"]}
         return self._finalize(
-            manifest, projection, grant, log, observations, codes, counters,
+            manifest, projection, grant, log, observations, codes, evidence, redactions, counters,
+            redaction_count=0,
             started_at=events[0]["occurred_at_ms"], disposition="incomplete",
             error_category="runner_fault", stop_reason="none", systemic_failure=True,
+            stop_requested_at_ms=None, stop_acknowledged_at_ms=None,
         )
 
 

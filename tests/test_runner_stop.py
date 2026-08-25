@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import threading
 import time
 
@@ -22,7 +23,7 @@ from heel.runner.execution import (
     LocalCanaryExecutor,
     validate_execution_bundle,
 )
-from heel.runner.http_transport import TargetResponse, TransportFailure
+from heel.runner.http_transport import BoundedResponseEvidence, TargetResponse, TransportFailure
 from heel.runner.service import ClaimLease, RunnerService
 from heel.runner.store import RunnerStoreError
 from tests.test_runner_compiler import CanaryCompiler, add_roles, bound_store, map_scenarios
@@ -194,7 +195,12 @@ def test_local_evidence_is_opaque_owner_only_bounded_and_retention_pruned(tmp_pa
     store, identity, _, manifest, projection = compiled_pair(tmp_path)
     authority = SigningAuthority.generate()
     grant = signed_grant(manifest, projection, identity, authority)
-    store.reserve_run(grant, retention_expires_at_ms=50_000)
+    state = store.reserve_run(grant, retention_expires_at_ms=50_000)
+    assert state["runner_authority"] == {
+        "runner_key_id": identity.key_id,
+        "public_key_b64": identity.public_key_b64,
+        "public_key_digest": identity.fingerprint,
+    }
     headers = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
     body = b"{}"
     reference = store.store_response_evidence(
@@ -216,6 +222,8 @@ def test_local_evidence_is_opaque_owner_only_bounded_and_retention_pruned(tmp_pa
         )
     with pytest.raises(RunnerStoreError, match="expired"):
         store.load_response_evidence(grant["run_id"], reference, now_ms=40_000)
+    assert store.prune_expired_evidence(now_ms=40_000) == 1
+    assert store.run_path(grant["run_id"]).is_dir()
     with pytest.raises(RunnerStoreError, match="transition"):
         store.transition_run(grant["run_id"], "terminal", now_ms=3_000)
     store.transition_run(grant["run_id"], "finalizing", now_ms=3_000)
@@ -223,6 +231,111 @@ def test_local_evidence_is_opaque_owner_only_bounded_and_retention_pruned(tmp_pa
     assert store.prune_expired_runs(now_ms=49_999) == 0
     assert store.prune_expired_runs(now_ms=50_000) == 1
     assert not store.run_path(grant["run_id"]).exists()
+
+
+def test_store_reverifies_bound_runner_signatures_on_save_and_load(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    result = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    assert store.load_final_projections(grant["run_id"])["local_view"] == result.local_view
+    run_path = store.run_path(grant["run_id"])
+    for filename in ("operational.json", "findings.json"):
+        path = run_path / filename
+        original = path.read_bytes()
+        tampered = json.loads(original)
+        tampered["signature_b64"] = __import__("base64").b64encode(b"\0" * 64).decode("ascii")
+        path.write_text(json.dumps(tampered, sort_keys=True, separators=(",", ":")))
+        with pytest.raises(RunnerStoreError, match="signature"):
+            store.load_final_projections(grant["run_id"])
+        path.write_bytes(original)
+    state_path = run_path / "state.json"
+    state = json.loads(state_path.read_text())
+    replacement = SigningAuthority.generate()
+    state["runner_authority"] = {
+        "runner_key_id": replacement.key_id,
+        "public_key_b64": replacement.canonical_public_key,
+        "public_key_digest": __import__("hashlib").sha256(
+            replacement.public_key_bytes,
+        ).hexdigest(),
+    }
+    state_path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(RunnerStoreError, match="bound identity"):
+        store.load_final_projections(grant["run_id"])
+
+
+@pytest.mark.parametrize("checkpoint", ["reserved", "between_actions", "finalizing"])
+def test_recovery_finalizes_every_consumed_nonterminal_without_target_replay(tmp_path, checkpoint):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    store.reserve_run(grant, retention_expires_at_ms=86_400_000)
+    log = ContainmentLog(
+        store=store, signer=signer, run_id=grant["run_id"], grant_id=grant["grant_id"],
+        manifest_digest=manifest["manifest_digest"], clock_ms=lambda: 2_000,
+    )
+    if checkpoint != "reserved":
+        log.append("grant_verified", detail_code="grant_exact")
+        store.transition_run(grant["run_id"], "running", now_ms=2_000)
+        log.append("run_started", detail_code="all_preflight_valid")
+    if checkpoint == "between_actions":
+        binding = {
+            "action_ordinal": 0, "scenario_id": "anonymous_authenticated_read",
+            "semantic_role": "anonymous", "attempt": 1,
+        }
+        log.append("admitted", detail_code="exact_action", **binding)
+        log.append("action_started", detail_code="target_read",
+                   counters={"requests_started": 1, "actions_contained": 1}, **binding)
+        log.append("action_completed", detail_code="bounded_response",
+                   counters={"requests_started": 1, "requests_completed": 1,
+                             "actions_contained": 1}, **binding)
+    if checkpoint == "finalizing":
+        store.transition_run(grant["run_id"], "finalizing", now_ms=2_000)
+    transport = ScriptedTransport([200])
+    recovered = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 3_000,
+        monotonic=lambda: 1.0,
+    ).recover(grant["run_id"], transport=transport)
+    assert transport.calls == []
+    assert recovered.execution_disposition == "incomplete"
+    assert recovered.assessment_outcome == "inconclusive"
+    assert store.load_run(grant["run_id"])["state"] == "terminal"
+
+
+def test_recovery_verifies_existing_finals_then_marks_finalizing_run_terminal(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    result = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    state_path = store.run_path(grant["run_id"]) / "state.json"
+    state = json.loads(state_path.read_text())
+    state["state"] = "finalizing"
+    state_path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
+    recovered = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 3_000,
+    ).recover(grant["run_id"])
+    assert recovered.local_view == result.local_view
+    assert store.load_run(grant["run_id"])["state"] == "terminal"
 
 
 class StaticVault:
@@ -238,10 +351,30 @@ class ScriptedTransport:
         self.statuses = list(statuses)
         self.calls = []
 
-    def request(self, action, *, credential=None, cancellation=None):
+    def request(
+        self, action, *, credential, cancellation, retry_policy, remaining_requests,
+        before_attempt, evidence_context, evidence_sink, redactor,
+    ):
+        del retry_policy, remaining_requests, redactor
+        before_attempt(1, None)
         self.calls.append((action, credential))
         status = self.statuses.pop(0)
-        return TargetResponse(status, "absent" if action.method == "HEAD" else "json_object", 2, 1)
+        raw_body = b"" if action.method == "HEAD" else b"{}"
+        reference = evidence_sink(BoundedResponseEvidence(
+            action_ordinal=evidence_context.action_ordinal,
+            scenario_id=action.scenario_id,
+            semantic_auth_role=action.semantic_auth_role,
+            method=action.method,
+            route_template=evidence_context.route_template,
+            attempt=1,
+            status_code=status,
+            raw_headers=b"Content-Type: application/json\r\nContent-Length: 2",
+            raw_body=raw_body,
+        ))
+        return TargetResponse(
+            status, "absent" if action.method == "HEAD" else "json_object",
+            len(raw_body), 1, reference, 0,
+        )
 
 
 def test_executor_builds_frozen_private_and_cloud_projections_without_raw_values(tmp_path):
@@ -273,6 +406,135 @@ def test_executor_builds_frozen_private_and_cloud_projections_without_raw_values
     assert [call[0].semantic_auth_role for call in transport.calls] == [
         "anonymous", "authenticated", "object_owner", "non_owner",
     ]
+    refs = [
+        ref
+        for scenario in result.findings_projection["scenario_results"]
+        for ref in scenario["local_evidence_refs"]
+    ]
+    assert len(refs) == 4 and all(ref.startswith("ev1_") for ref in refs)
+    assert store.load_response_evidence(grant["run_id"], refs[0], now_ms=2_000)[1] in {
+        b"", b"{}",
+    }
+
+
+def test_executor_persists_raw_attempt_evidence_but_projects_only_refs_and_counts(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+
+    class SecretEvidenceTransport(ScriptedTransport):
+        def request(
+            self, action, *, credential, cancellation, retry_policy, remaining_requests,
+            before_attempt, evidence_context, evidence_sink, redactor,
+        ):
+            del credential, cancellation, retry_policy, remaining_requests
+            before_attempt(1, None)
+            raw_headers = b"Authorization: Bearer canary-secret-token"
+            raw_body = b'{"token":"canary-secret-token"}'
+            assert redactor.count_bytes(raw_headers, raw_body) >= 2
+            reference = evidence_sink(BoundedResponseEvidence(
+                action_ordinal=evidence_context.action_ordinal,
+                scenario_id=action.scenario_id,
+                semantic_auth_role=action.semantic_auth_role,
+                method=action.method,
+                route_template=evidence_context.route_template,
+                attempt=1, status_code=200, raw_headers=raw_headers, raw_body=raw_body,
+            ))
+            self.calls.append((action, None))
+            return TargetResponse(200, "json_object", len(raw_body), 1, reference, 2)
+
+    executor = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    )
+    result = executor.execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=SecretEvidenceTransport([200] * 4), gate_source=active_gate,
+    )
+    assert result.operational_projection["redaction_count"] == 8
+    assert result.findings_projection["redaction_count"] == 8
+    assert result.local_view["containment_summary"]["redaction_count"] == 8
+    assert "redacted" in result.operational_projection["containment_codes"]
+    reference = result.findings_projection["scenario_results"][0]["local_evidence_refs"][0]
+    assert store.load_response_evidence(grant["run_id"], reference, now_ms=2_000) == (
+        b"Authorization: Bearer canary-secret-token",
+        b'{"token":"canary-secret-token"}',
+    )
+    safe = canonical_bytes(result.local_view)
+    assert b"canary-secret-token" not in safe
+    assert raw_headers_not_present(safe)
+
+
+def raw_headers_not_present(value):
+    return b"Authorization" not in value and b"raw_headers" not in value
+
+
+def test_every_actual_attempt_rechecks_live_gate_before_retry_and_reserves_once(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    current_gate = [active_gate()]
+    gate_calls = []
+
+    def live_gate():
+        gate_calls.append(current_gate[0])
+        return current_gate[0]
+
+    class RetryAfterRevocation:
+        def request(self, action, *, before_attempt, **kwargs):
+            del action, kwargs
+            before_attempt(1, None)
+            current_gate[0] = ExecutionGate(
+                True, "active", "revoked", 20_000, 7, "none", 2_001,
+            )
+            before_attempt(2, "connect_error")
+            raise AssertionError("revoked retry was admitted")
+
+    result = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=RetryAfterRevocation(), gate_source=live_gate,
+    )
+    assert len(gate_calls) >= 4
+    assert result.execution_disposition == "stopped"
+    assert result.operational_projection["stop_reason"] == "target_revoked"
+    assert result.operational_projection["counters"]["requests_started"] == 1
+    assert result.operational_projection["counters"]["retries_used"] == 0
+
+
+def test_executor_passes_the_exact_signed_zero_retry_policy(tmp_path, monkeypatch):
+    from heel.runner import compiler as compiler_module
+
+    monkeypatch.setitem(compiler_module.RETRY_POLICY, "maximum_retries", 0)
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+
+    class ZeroRetryTransport(ScriptedTransport):
+        def request(self, action, *, retry_policy, **kwargs):
+            assert retry_policy.maximum_retries == 0
+            assert retry_policy.retryable_failure_codes == ("connect_error", "timeout")
+            return super().request(
+                action, retry_policy=retry_policy, **kwargs,
+            )
+
+    result = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ZeroRetryTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    assert result.execution_disposition == "completed"
+    assert result.operational_projection["counters"]["retries_used"] == 0
 
 
 @pytest.mark.parametrize(
@@ -291,7 +553,9 @@ def test_systemic_transport_failures_force_inconclusive_and_closed_cloud_disposi
     grant = signed_grant(manifest, projection, identity, authority)
 
     class FailingTransport:
-        def request(self, action, *, credential=None, cancellation=None):
+        def request(self, action, *, before_attempt, **kwargs):
+            del action, kwargs
+            before_attempt(1, None)
             raise TransportFailure(failure_code, requests_made=1)
 
     executor = LocalCanaryExecutor(
@@ -381,6 +645,7 @@ class StopCoordinator:
         self.claimed = False
         self.heartbeats = []
         self.acks = []
+        self.ack_deadlines = []
 
     def claim(self):
         if self.claimed:
@@ -398,8 +663,9 @@ class StopCoordinator:
     def result(self, run_id, operational_projection):
         return None
 
-    def stop_ack(self, run_id, operational_projection):
+    def stop_ack(self, run_id, operational_projection, *, deadline):
         self.acks.append(time.monotonic())
+        self.ack_deadlines.append(deadline)
 
 
 def test_supervisor_heartbeat_cancels_blocked_target_and_acks_within_five_seconds():
@@ -416,7 +682,77 @@ def test_supervisor_heartbeat_cancels_blocked_target_and_acks_within_five_second
     elapsed = time.monotonic() - started
     assert executor.started.is_set() and executor.cancelled.is_set()
     assert coordinator.acks and coordinator.acks[0] - coordinator.heartbeats[0] < 5
+    assert coordinator.ack_deadlines[0] - coordinator.heartbeats[0] <= 5
     assert elapsed < 1
+
+
+def test_stop_ack_is_issued_once_before_executor_unwinds_and_uses_absolute_deadline():
+    ack_called = threading.Event()
+    executor_returned = threading.Event()
+
+    class SlowUnwindExecutor(BlockingExecutor):
+        def execute(self, lease, *, cancellation, on_progress):
+            self.started.set()
+            while not cancellation.cancelled:
+                time.sleep(0.005)
+            assert ack_called.wait(1)
+            executor_returned.set()
+            return {"operational_projection": lease.operational_projection}
+
+        def prepare_stop_ack(self, lease, projection, stop_reason, proposed_at_ms):
+            return {**projection, "stop_reason": stop_reason, "proposed_at_ms": proposed_at_ms}
+
+    class ImmediateStop(StopCoordinator):
+        def stop_ack(self, run_id, operational_projection, *, deadline):
+            assert not executor_returned.is_set()
+            assert deadline > time.monotonic()
+            super().stop_ack(run_id, operational_projection, deadline=deadline)
+            ack_called.set()
+
+    lease = ClaimLease("run_123456789", object(), {
+        "run_id": "run_123456789", "lifecycle_phase": "running",
+    })
+    coordinator = ImmediateStop(lease)
+    executor = SlowUnwindExecutor()
+    RunnerService(
+        coordinator=coordinator, executor=executor, heartbeat_interval=0.05,
+        idle_poll_interval=2.0,
+    ).run_once()
+    assert len(coordinator.acks) == 1
+    assert executor_returned.is_set()
+
+
+def test_failed_stop_ack_never_records_a_local_acknowledgement_timestamp():
+    observed = []
+
+    class WaitingExecutor(BlockingExecutor):
+        def execute(self, lease, *, cancellation, on_progress):
+            del on_progress
+            while not cancellation.cancelled:
+                time.sleep(0.005)
+            assert cancellation.stop_ack_event.wait(1)
+            observed.append(getattr(cancellation, "stop_acknowledged_at_ms", None))
+            return {"operational_projection": lease.operational_projection}
+
+        def prepare_stop_ack(self, lease, projection, stop_reason, proposed_at_ms):
+            del lease, stop_reason, proposed_at_ms
+            return projection
+
+    class FailedAck(StopCoordinator):
+        def stop_ack(self, run_id, operational_projection, *, deadline):
+            super().stop_ack(run_id, operational_projection, deadline=deadline)
+            raise TimeoutError("control plane unavailable")
+
+    lease = ClaimLease("run_123456789", object(), {
+        "run_id": "run_123456789", "lifecycle_phase": "running",
+    })
+    coordinator = FailedAck(lease)
+    RunnerService(
+        coordinator=coordinator, executor=WaitingExecutor(), heartbeat_interval=0.05,
+        idle_poll_interval=2.0,
+    ).run_once()
+    assert len(coordinator.acks) == 1
+    assert observed == [None]
 
 
 def test_real_executor_stop_interrupts_blocked_transport_and_never_starts_next_action(tmp_path):
@@ -429,7 +765,9 @@ def test_real_executor_stop_interrupts_blocked_transport_and_never_starts_next_a
             self.started = threading.Event()
             self.calls = []
 
-        def request(self, action, *, credential=None, cancellation=None):
+        def request(self, action, *, cancellation, before_attempt, **kwargs):
+            del kwargs
+            before_attempt(1, None)
             self.calls.append(action)
             self.started.set()
             assert cancellation is not None
@@ -452,6 +790,11 @@ def test_real_executor_stop_interrupts_blocked_transport_and_never_starts_next_a
                 cancellation=cancellation, on_progress=on_progress,
             )
 
+        def prepare_stop_ack(self, lease, projection, stop_reason, proposed_at_ms):
+            return local.prepare_stop_ack(
+                lease.run_id, stop_reason=stop_reason, proposed_at_ms=proposed_at_ms,
+            )
+
     class CoordinatorAfterStart(StopCoordinator):
         def heartbeat(self, run_id, operational_projection):
             self.heartbeats.append(time.monotonic())
@@ -471,4 +814,5 @@ def test_real_executor_stop_interrupts_blocked_transport_and_never_starts_next_a
     assert coordinator.acks
     final = store.load_final_projections(grant["run_id"])
     assert final["operational_projection"]["execution_disposition"] == "stopped"
+    assert final["operational_projection"]["timestamps"]["stop_acknowledged_at_ms"] is not None
     assert final["findings_projection"]["assessment_outcome"] == "inconclusive"

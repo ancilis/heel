@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 from pathlib import Path
+import socket
 from urllib.parse import urlsplit
 
+from heel.canary_contracts import canonical_bytes, canonical_digest
+from heel.crypto import SigningAuthority
 from heel.runner.companion import CompanionServer
 
 
@@ -12,6 +16,18 @@ def views():
     fixture_root = Path(__file__).parent / "fixtures/canary/contracts"
     operational = json.loads((fixture_root / "operational-run.v1.json").read_text())
     findings = json.loads((fixture_root / "canary-findings.v1.json").read_text())
+    authority = SigningAuthority.generate()
+    for record in (operational, findings):
+        unsigned = {
+            key: value for key, value in record.items()
+            if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+        }
+        record.clear()
+        record.update({
+            **unsigned,
+            "projection_digest": canonical_digest(unsigned),
+            **authority.sign(canonical_bytes(unsigned)),
+        })
     result = {
         "schema_version": "heel.local-result-view.v1",
         "operational_projection": operational,
@@ -29,13 +45,13 @@ def views():
         "scenario_count": 1,
         "finding_count": 0,
     }
-    return result, disclosure
+    return result, disclosure, {authority.key_id: authority.public_key}
 
 
 def request(server, method, path, *, body=b"", headers=None, host=None):
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=2)
     supplied = {"Host": host or f"127.0.0.1:{server.port}", **(headers or {})}
-    connection.request(method, path, body=body, headers=supplied)
+    connection.request(method, path, body=None if body == b"" else body, headers=supplied)
     response = connection.getresponse()
     payload = response.read()
     result = response.status, dict(response.getheaders()), payload
@@ -44,8 +60,11 @@ def request(server, method, path, *, body=b"", headers=None, host=None):
 
 
 def test_companion_is_loopback_fragment_bootstrapped_one_use_and_data_free_at_root():
-    result, disclosure = views()
-    server = CompanionServer(result, disclosure, bootstrap_bytes=b"x" * 32, clock=lambda: 100.0)
+    result, disclosure, keys = views()
+    server = CompanionServer(
+        result, disclosure, trusted_runner_keys=keys,
+        bootstrap_bytes=b"x" * 32, clock=lambda: 100.0,
+    )
     server.start()
     try:
         parsed = urlsplit(server.url)
@@ -90,8 +109,8 @@ def test_companion_is_loopback_fragment_bootstrapped_one_use_and_data_free_at_ro
 
 
 def test_companion_rejects_rebinding_cors_queries_encoded_paths_and_private_surfaces():
-    result, disclosure = views()
-    server = CompanionServer(result, disclosure)
+    result, disclosure, keys = views()
+    server = CompanionServer(result, disclosure, trusted_runner_keys=keys)
     server.start()
     try:
         for method, path, headers, host in (
@@ -117,9 +136,12 @@ def test_companion_rejects_rebinding_cors_queries_encoded_paths_and_private_surf
 
 
 def test_companion_rejects_expired_or_oversized_bootstrap():
-    result, disclosure = views()
+    result, disclosure, keys = views()
     now = [100.0]
-    server = CompanionServer(result, disclosure, bootstrap_bytes=b"z" * 32, clock=lambda: now[0])
+    server = CompanionServer(
+        result, disclosure, trusted_runner_keys=keys,
+        bootstrap_bytes=b"z" * 32, clock=lambda: now[0],
+    )
     server.start()
     try:
         now[0] = 161.0
@@ -136,3 +158,55 @@ def test_companion_rejects_expired_or_oversized_bootstrap():
         )[0] in {400, 413}
     finally:
         server.close()
+
+
+def raw_request(server, payload):
+    connection = socket.create_connection(("127.0.0.1", server.port), timeout=2)
+    try:
+        connection.sendall(payload)
+        response = bytearray()
+        while b"\r\n\r\n" not in response:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+        return bytes(response)
+    finally:
+        connection.close()
+
+
+def test_companion_rejects_duplicate_or_transfer_framed_security_headers():
+    result, disclosure, keys = views()
+    server = CompanionServer(result, disclosure, trusted_runner_keys=keys)
+    server.start()
+    try:
+        origin = server.origin
+        host = f"127.0.0.1:{server.port}"
+        cases = (
+            f"GET /v1/result HTTP/1.1\r\nHost: {host}\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\n\r\n",
+            f"GET /v1/result HTTP/1.1\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\nX-Heel-Local-Origin: {origin}\r\n\r\n",
+            f"GET /v1/result HTTP/1.1\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\nOrigin: {origin}\r\nOrigin: {origin}\r\n\r\n",
+            f"GET /v1/result HTTP/1.1\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\nCookie: a=b\r\nCookie: c=d\r\n\r\n",
+            f"POST /v1/session HTTP/1.1\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{{}}",
+            f"POST /v1/session HTTP/1.1\r\nHost: {host}\r\nX-Heel-Local-Origin: {origin}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        )
+        for source in cases:
+            response = raw_request(server, source.encode("ascii"))
+            status = int(response.split(b" ", 2)[1])
+            assert status in {400, 403}
+            assert b"Access-Control-Allow-Origin" not in response
+    finally:
+        server.close()
+
+
+def test_companion_rejects_invalid_projection_signature_before_binding():
+    result, disclosure, keys = views()
+    invalid_signature = base64.b64encode(b"\0" * 64).decode("ascii")
+    result["findings_projection"]["signature_b64"] = invalid_signature
+    disclosure["projection"]["signature_b64"] = invalid_signature
+    try:
+        CompanionServer(result, disclosure, trusted_runner_keys=keys)
+    except ValueError as error:
+        assert "signature" in str(error)
+    else:
+        raise AssertionError("tampered findings signature was displayed")
