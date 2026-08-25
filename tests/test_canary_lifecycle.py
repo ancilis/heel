@@ -344,6 +344,73 @@ def test_cloud_stop_accepts_exact_pre_stop_snapshot_only_as_liveness():
         coordinator.heartbeat(WORKSPACE, PROJECT, grant["run_id"], RUNNER, changed)
 
 
+def test_stop_before_first_heartbeat_accepts_new_claimed_snapshot_as_liveness():
+    conn, _, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    coordinator.request_stop(
+        WORKSPACE, PROJECT, grant["run_id"], actor="user_owner",
+        reason="cloud_stop", expected_kill_switch_generation=0,
+    )
+    claimed = operational_projection(
+        runner, grant, sequence=0, phase="claimed", updated_at_ms=NOW_MS + 100,
+    )
+
+    gate = coordinator.heartbeat(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, claimed,
+    )
+
+    assert gate["active"] is False and gate["stop_reason"] == "cloud_stop"
+    row = conn.execute(
+        "SELECT status,stop_reason,source_event_sequence,source_projection_digest,"
+        "quota_state FROM canary_runs"
+    ).fetchone()
+    assert tuple(row) == (
+        "stop_requested", "cloud_stop", 0, claimed["projection_digest"], "reserved",
+    )
+    receipt = json.loads(conn.execute(
+        "SELECT receipt_json FROM canary_operational_receipts"
+    ).fetchone()[0])
+    assert receipt["lifecycle_phase"] == "claimed"
+    assert receipt["stop_reason"] == "none"
+
+    changed = copy.deepcopy(claimed)
+    changed["timestamps"]["updated_at_ms"] += 1
+    changed = resign_operational(changed, runner)
+    with pytest.raises(ValueError):
+        coordinator.heartbeat(WORKSPACE, PROJECT, grant["run_id"], RUNNER, changed)
+
+
+def test_stop_racing_uncommitted_progress_accepts_new_running_snapshot_as_liveness():
+    conn, _, runner, coordinator, approved, _ = running_setup()
+    grant = approved["grant"]
+    coordinator.request_stop(
+        WORKSPACE, PROJECT, grant["run_id"], actor="user_owner",
+        reason="cloud_stop", expected_kill_switch_generation=0,
+    )
+    running = operational_projection(
+        runner, grant, sequence=0, phase="running", requests_started=1,
+        updated_at_ms=NOW_MS + 200,
+    )
+
+    gate = coordinator.heartbeat(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, running,
+    )
+
+    assert gate["active"] is False and gate["stop_reason"] == "cloud_stop"
+    assert tuple(conn.execute(
+        "SELECT status,stop_reason,source_event_sequence,quota_state,started_at_ms "
+        "FROM canary_runs"
+    ).fetchone()) == (
+        "stop_requested", "cloud_stop", 0, "consumed", NOW_MS,
+    )
+    receipt = json.loads(conn.execute(
+        "SELECT receipt_json FROM canary_operational_receipts"
+    ).fetchone()[0])
+    assert receipt["lifecycle_phase"] == "running"
+    assert receipt["counters"]["requests_started"] == 1
+    assert receipt["stop_reason"] == "none"
+
+
 def test_environment_reproof_digest_replacement_permanently_closes_gate():
     conn, _, runner, coordinator, approved, _ = running_setup()
     grant = approved["grant"]

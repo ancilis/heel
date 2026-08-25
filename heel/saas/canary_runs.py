@@ -1131,6 +1131,32 @@ class CanaryRunService:
             source = self._source_state(row, value)
             if source == "replay":
                 return row, value, "liveness"
+            if (
+                source == "new"
+                and row["status"] in {"stop_requested", "finalizing"}
+                and phase in {"claimed", "running"}
+            ):
+                # request_stop can commit just before the runner's first heartbeat or while a
+                # progress report is in flight.  Preserve that exact pre-stop snapshot as
+                # liveness/execution evidence without allowing it to regress Cloud's stop.
+                row = self._consume_if_started(row, value)
+                received_at = self._server_receipt_time(row)
+                self._store_receipt(row, value, received_at_ms=received_at)
+                started_at = received_at if value["timestamps"]["started_at_ms"] is not None else None
+                self.conn.execute(
+                    "UPDATE canary_runs SET source_event_sequence=?,source_projection_digest=?,"
+                    "started_at_ms=COALESCE(started_at_ms,?),updated_at=? "
+                    "WHERE workspace_id=? AND project_ref=? AND run_id=?",
+                    (
+                        value["event_sequence"], value["projection_digest"], started_at,
+                        received_at, workspace_id, project_ref, run_id,
+                    ),
+                )
+                return (
+                    self._context(workspace_id, project_ref, run_id, runner_id),
+                    value,
+                    "liveness_new",
+                )
             raise CanaryRunError("stop_conflict")
         if verification_mismatch and stop_reason == "none":
             return row, value, "authority_stop"

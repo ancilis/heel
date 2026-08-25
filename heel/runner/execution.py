@@ -459,9 +459,12 @@ class LocalCanaryExecutor:
             grant = context["grant"]
             started_at = context["started_at"]
             started_monotonic = context["started_monotonic"]
-            counters = dict(context["counters"])
+            counter_state = context["counters"]
+            budget_lock = context["budget_lock"]
             redaction_count = context["redaction_state"]["count"]
             log = context["log"]
+        with budget_lock:
+            counters = dict(counter_state)
         with self._stop_lock:
             state = self.store.load_run(run_id)
             if state["state"] == "running":
@@ -617,6 +620,7 @@ class LocalCanaryExecutor:
             "started_at": started_at,
             "started_monotonic": started_monotonic,
             "counters": counters,
+            "budget_lock": budget_lock,
             "redaction_state": redaction_state,
             "log": log,
         })

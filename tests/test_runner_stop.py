@@ -1197,6 +1197,65 @@ def test_real_executor_stop_interrupts_blocked_transport_and_never_starts_next_a
     assert final["findings_projection"]["assessment_outcome"] == "inconclusive"
 
 
+def test_prepare_stop_ack_snapshots_budget_counters_under_the_execution_lock(tmp_path):
+    from heel.saas.canary_runs import CanaryRunService
+
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    local = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    )
+    store.reserve_run(grant, retention_expires_at_ms=86_400_000)
+    store.transition_run(grant["run_id"], "running", now_ms=2_000)
+    log = ContainmentLog(
+        store=store, signer=signer, run_id=grant["run_id"],
+        grant_id=grant["grant_id"], manifest_digest=manifest["manifest_digest"],
+        clock_ms=lambda: 2_000,
+    )
+    log.append("grant_verified", detail_code="grant_exact")
+    log.append("run_started", detail_code="all_preflight_valid")
+    counters = {
+        "requests_started": 1, "requests_completed": 0,
+        "response_bytes_read": 0, "actions_contained": 1, "retries_used": 0,
+    }
+    budget_lock = threading.Lock()
+    local._set_active_context({
+        "manifest": manifest, "projection": projection, "grant": grant,
+        "started_at": 2_000, "started_monotonic": 1.0,
+        "counters": counters, "budget_lock": budget_lock,
+        "redaction_state": {"count": 0}, "log": log,
+    })
+    result: list[dict] = []
+    finished = threading.Event()
+
+    budget_lock.acquire()
+    counters["actions_contained"] = 0
+    worker = threading.Thread(target=lambda: (
+        result.append(local.prepare_stop_ack(
+            grant["run_id"], stop_reason="cloud_stop", proposed_at_ms=2_000,
+        )),
+        finished.set(),
+    ))
+    worker.start()
+    completed_mid_update = finished.wait(0.1)
+    counters["actions_contained"] = 1
+    budget_lock.release()
+    worker.join(1)
+
+    assert completed_mid_update is False
+    assert not worker.is_alive() and len(result) == 1
+    acknowledgement = result[0]
+    assert acknowledgement["counters"]["requests_started"] == 1
+    assert acknowledgement["counters"]["actions_contained"] == 1
+    assert CanaryRunService._operational_within_budget(
+        acknowledgement, projection, grant,
+    ) is True
+
+
 def test_real_executor_local_emergency_stop_transitions_and_allocates_ack_sequence(tmp_path):
     store, identity, signer, manifest, projection = compiled_pair(tmp_path)
     authority = SigningAuthority.generate()
