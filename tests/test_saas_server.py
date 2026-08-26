@@ -67,7 +67,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         )
         self.addCleanup(migrated.close)
         self.addCleanup(runtime.close)
-        self.assertEqual(Migrator(migrated, CONTROL_PLANE_MIGRATIONS).apply_all(), list(range(1, 25)))
+        self.assertEqual(Migrator(migrated, CONTROL_PLANE_MIGRATIONS).apply_all(), list(range(1, 27)))
 
         def schema(connection: sqlite3.Connection) -> dict[str, tuple[tuple, ...]]:
             tables = {
@@ -98,9 +98,9 @@ class ProductionConfigurationTests(unittest.TestCase):
                 self.assertEqual(migrate.main(["status", str(database)]), 1)
                 self.assertEqual(migrate.main(["up", str(database)]), 0)
                 self.assertEqual(migrate.main(["status", str(database)]), 0)
-            self.assertIn("current=0 target=24", output.getvalue())
+            self.assertIn("current=0 target=26", output.getvalue())
             self.assertIn("applied=1,2,3,4,5,6,7,8,9,10", output.getvalue())
-            self.assertIn("current=24 target=24", output.getvalue())
+            self.assertIn("current=26 target=26", output.getvalue())
 
     def test_restore_verification_is_read_only_and_rejects_pending_schema(self):
         from heel.saas import migrate
@@ -308,7 +308,7 @@ class ProductionConfigurationTests(unittest.TestCase):
                 version = restarted.control_plane.store.conn.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0]
-                self.assertEqual(version, 24)
+                self.assertEqual(version, 26)
             finally:
                 restarted.server_close()
 

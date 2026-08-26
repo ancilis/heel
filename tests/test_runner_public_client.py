@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from heel.canary_contracts import OPERATIONAL_RUN_SCHEMA, canonical_bytes, canonical_digest
-from heel.crypto import ed25519_key_id
+from heel.crypto import SigningAuthority, ed25519_key_id
 from heel.runner.control_client import _RunGuard, PendingRunnerResync, RunnerControlClient, RunnerRotationActivated
 from heel.runner.identity import (
     RunnerIdentity, SecureSigner,
@@ -22,6 +22,7 @@ from heel.runner.identity import (
 )
 from heel.runner.runtime import RunnerRuntimeState
 from heel.runner.store import RunnerStore
+from tests.test_runner_stop import compiled_pair, resign_grant, signed_grant
 
 
 RUN_ID = "crun_" + "a" * 32
@@ -67,6 +68,17 @@ def _rotation_identity(signer, *, version: str) -> RunnerIdentity:
         fingerprint=hashlib.sha256(signer.public_key).hexdigest(), key_id=signer.key_id,
         pairing_phrase=(),
     )
+
+
+def _rotation_runtime(root: Path, identity: RunnerIdentity, signer: SecureSigner) -> RunnerRuntimeState:
+    runtime = RunnerRuntimeState(root / "runner" / "runtime.sqlite3", identity, signer)
+    if runtime.load_chain("claim", None) is None:
+        runtime.install_chain(
+            operation="claim", run_id=None,
+            next_nonce_b64=base64.b64encode(b"r" * 32).decode(),
+            next_sequence=1, generation=0, now_ms=1,
+        )
+    return runtime
 
 
 class RotationSignerProvider:
@@ -122,7 +134,7 @@ def _complete_v3_pairing(root: Path, signer: SecureSigner, *, suffix: str):
 def _accepted_local_rotation(root: Path, *, suffix: str):
     old_signer = RotationSigner(b"o" * 32)
     new_signer = RotationSigner(b"n" * 32)
-    store, old_identity, _runtime, runtime_path = _complete_v3_pairing(root, old_signer, suffix=suffix)
+    store, old_identity, runtime, runtime_path = _complete_v3_pairing(root, old_signer, suffix=suffix)
     new_identity = RunnerIdentity(
         runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
         adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
@@ -137,7 +149,7 @@ def _accepted_local_rotation(root: Path, *, suffix: str):
     prepared = store.prepare_rotation_activation(
         pending, old_identity=old_identity, old_signer=old_signer,
         new_identity=new_identity, new_signer=new_signer,
-        new_signer_label="heel-rotation-key-2", now_ms=20,
+        new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=20,
     )
     store.accept_rotation_activation(
         prepared,
@@ -271,6 +283,105 @@ def activate_claimed_run(client, run_id: str, *, states=None, generation=0, sequ
             )
 
 
+def install_coherent_active_run(client, run_id, projection, grant):
+    """Test-only claim fixture: exact four cursors plus an authenticated active row."""
+    activate_claimed_run(client, run_id)
+    runtime = client.runtime
+    active = runtime._active_core(
+        run_id=run_id, approval_projection=projection, grant=grant,
+        gate={
+            "active": True, "runner_state": "active", "proof_state": "valid",
+            "proof_expires_at_ms": 10_000,
+            "kill_switch_generation": grant["kill_switch_generation"],
+            "stop_reason": "none", "server_time_ms": 1_000,
+        },
+        claim_response_digest=hashlib.sha256(b"claim").hexdigest(),
+        latest_gate_response_digest=hashlib.sha256(b"gate").hexdigest(),
+        claimed_at_ms=1_000, gate_received_at_ms=1_000, revision=1,
+        prior_state_digest=None,
+    )
+    blob = runtime._seal(
+        active, schema="heel.runner-active-run-state.v1", primary_fields=(active["run_hash"],),
+    )
+    with runtime._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "INSERT INTO active_runs(run_hash,sealed_blob,updated_at_ms) VALUES(?,?,?)",
+                (active["run_hash"], blob, 1_000),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    assert len(runtime.load_active_run_controls()) == 1
+
+
+def _compiled_active_client(tmp_path, transport):
+    _store, identity, signer, manifest, projection = compiled_pair(tmp_path / "compiled")
+    grant = signed_grant(manifest, projection, identity, SigningAuthority.generate())
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    runtime.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=base64.b64encode(b"p" * 32).decode(),
+        next_sequence=1, generation=0, now_ms=0,
+    )
+    client = RunnerControlClient(
+        origin="https://control.example", workspace_id=identity.workspace_id,
+        runner_id=identity.runner_id, signer=signer, clock=lambda: 1_000,
+        transport=transport, nonce_source=NonceSource(), runtime=runtime,
+    )
+    install_coherent_active_run(client, grant["run_id"], projection, grant)
+    return client, grant, signer
+
+
+def _compiled_operational_projection(phase, grant, signer):
+    value = operational_projection(phase)
+    unsigned = {
+        key: copy.deepcopy(item) for key, item in value.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    unsigned.update({
+        "run_id": grant["run_id"], "grant_id": grant["grant_id"],
+        "workspace_id": grant["workspace_id"], "project_id": grant["project_id"],
+        "manifest_digest": grant["approval"]["manifest_digest"],
+        "approval_projection_digest": grant["approval"]["projection_digest"],
+        "grant_digest": grant["grant_digest"],
+    })
+    return {
+        **unsigned, "projection_digest": canonical_digest(unsigned),
+        "signing_key_id": signer.key_id,
+        "signature_b64": base64.b64encode(signer.sign(canonical_bytes(unsigned))).decode(),
+    }
+
+
+def _replace_coherent_runtime_chain(runtime, operation, run_id, *, nonce, sequence, generation):
+    """Test-only authenticated cursor replacement for a resync fixture."""
+    chain = runtime._chain_key(operation, run_id)
+    core_without_digest = {
+        "schema_version": "heel.runner-control-chain-state.v1",
+        "workspace_id": runtime.identity.workspace_id, "runner_id": runtime.identity.runner_id,
+        "runner_key_id": runtime.identity.key_id, "operation": operation, "run_id": run_id,
+        "next_nonce_b64": nonce, "next_sequence": sequence, "generation": generation,
+        "updated_at_ms": 1,
+    }
+    core = {**core_without_digest, "state_digest": hashlib.sha256(
+        b"heel.runner-runtime-state-digest.v1\0" + canonical_bytes(core_without_digest)
+    ).hexdigest()}
+    blob = runtime._seal(core, schema=core["schema_version"], primary_fields=(chain,))
+    with runtime._connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            updated = conn.execute(
+                "UPDATE control_chains SET next_sequence=?,generation=?,sealed_blob=?,updated_at_ms=? WHERE chain=?",
+                (sequence, generation, blob, 1, chain),
+            )
+            assert updated.rowcount == 1
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+
 def test_pairing_material_has_no_client_runner_id_until_server_id_is_bound():
     signer = Signer()
     material = create_runner_pairing_material(
@@ -386,6 +497,132 @@ def test_v3_accepted_pairing_journal_recovers_the_cursor_without_reissuing_activ
     assert not (root / "runner" / "pairing-activation.json").exists()
 
 
+def test_pairing_activation_abort_writes_a_signed_tombstone_before_releasing_prepared_journal(tmp_path, monkeypatch):
+    signer = Signer()
+    material = create_runner_pairing_material(
+        display_name="Runner One", runner_version="1.0", adapters={"http": "1.0"},
+        signer=signer, random_source=lambda count: bytes(range(count)),
+    )
+    exchange = material.executable_exchange_request("invitation")
+    pending = {
+        "schema_version": "heel.runner-pairing-pending.v2", "pairing_id": "pending_" + "d" * 32,
+        "runner_id": "runr_" + "d" * 32, "fingerprint": material.fingerprint, "status": "pending",
+        "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+        "control_protocol": "heel.runner-control.v2",
+        "pairing_exchange_digest": hashlib.sha256(canonical_bytes(exchange)).hexdigest(),
+    }
+    root = tmp_path / "home"
+    store = RunnerStore(root)
+    activation = material.prepare_executable_activation(
+        pending, store=store, now_ms=10, random_source=lambda count: b"n" * count,
+    )
+    abort_request = {
+        "schema_version": "heel.runner-pairing-activation-abort.v1",
+        "pairing_id": pending["pairing_id"], "runner_id": pending["runner_id"],
+        "pairing_exchange_digest": pending["pairing_exchange_digest"],
+        "activation_request_digest": hashlib.sha256(canonical_bytes(activation.request)).hexdigest(),
+        "challenge_expires_at_ms": 600_000, "reason_code": "activation_challenge_expired",
+    }
+    abort_request["signature_b64"] = base64.b64encode(signer.sign(
+        b"heel.runner-pairing-activation-abort.v1\0" + canonical_bytes(abort_request),
+    )).decode()
+    abort_response = {
+        "schema_version": "heel.runner-pairing-activation-aborted.v1", "workspace_id": "ws",
+        "runner_id": pending["runner_id"], "pairing_id": pending["pairing_id"],
+        "activation_request_digest": abort_request["activation_request_digest"],
+        "status": "expired", "aborted_at_ms": 600_000,
+    }
+    original_unlink = __import__("os").unlink
+    def interrupted_unlink(name, *args, **kwargs):
+        if name == "pairing-activation.json":
+            raise OSError("injected journal unlink interruption")
+        return original_unlink(name, *args, **kwargs)
+    monkeypatch.setattr("heel.runner.store.os.unlink", interrupted_unlink)
+    with pytest.raises(OSError, match="injected journal unlink"):
+        store.complete_pairing_activation_abort(activation, abort_request, abort_response)
+    monkeypatch.setattr("heel.runner.store.os.unlink", original_unlink)
+    filename = "pairing-" + hashlib.sha256(pending["pairing_id"].encode()).hexdigest() + ".json"
+    assert (root / "runner" / "activation-tombstones" / filename).is_file()
+    assert (root / "runner" / "pairing-activation.json").is_file()
+    assert RunnerStore(root).recover_pairing_activation(
+        material, runtime_path=root / "runner" / "runtime.sqlite3",
+    ) is None
+    assert not (root / "runner" / "pairing-activation.json").exists()
+
+
+def test_rotation_activation_abort_clears_the_exact_runtime_fence_before_journal_release(tmp_path, monkeypatch):
+    root = tmp_path / "home"
+    old_signer = RotationSigner(b"o" * 32)
+    new_signer = RotationSigner(b"n" * 32)
+    store, old_identity, runtime, _runtime_path = _complete_v3_pairing(root, old_signer, suffix="r")
+    new_identity = RunnerIdentity(
+        runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
+        adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
+        fingerprint=hashlib.sha256(new_signer.public_key).hexdigest(), key_id=new_signer.key_id,
+        pairing_phrase=old_identity.pairing_phrase,
+    )
+    pending = store.prepare_rotation_activation(
+        {
+            "schema_version": "heel.runner-rotation-activation-challenge.v1",
+            "pairing_id": "rotate_" + "r" * 32,
+            "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+        },
+        old_identity=old_identity, old_signer=old_signer,
+        new_identity=new_identity, new_signer=new_signer,
+        new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=20,
+    )
+    request_core = {
+        "schema_version": "heel.runner-rotation-activation-abort.v1",
+        "workspace_id": old_identity.workspace_id, "runner_id": old_identity.runner_id,
+        "pairing_id": pending.pending["pairing_id"], "old_runner_key_id": old_identity.key_id,
+        "new_runner_key_id": new_identity.key_id,
+        "activation_request_digest": hashlib.sha256(canonical_bytes(pending.request)).hexdigest(),
+        "activation_challenge_digest": hashlib.sha256(b"c" * 32).hexdigest(),
+        "challenge_expires_at_ms": 600_000, "reason_code": "activation_challenge_expired",
+    }
+    abort_request = {
+        **request_core,
+        "old_signature_b64": base64.b64encode(old_signer.sign(
+            b"heel.runner-rotation-activation-abort.v1.old\0" + canonical_bytes(request_core),
+        )).decode(),
+        "new_signature_b64": base64.b64encode(new_signer.sign(
+            b"heel.runner-rotation-activation-abort.v1.new\0" + canonical_bytes(request_core),
+        )).decode(),
+    }
+    abort_response = {
+        "schema_version": "heel.runner-rotation-activation-aborted.v1",
+        "workspace_id": old_identity.workspace_id, "runner_id": old_identity.runner_id,
+        "pairing_id": pending.pending["pairing_id"], "old_runner_key_id": old_identity.key_id,
+        "new_runner_key_id": new_identity.key_id,
+        "activation_request_digest": abort_request["activation_request_digest"],
+        "status": "expired", "aborted_at_ms": 600_000,
+    }
+    original_unlink = __import__("os").unlink
+
+    def interrupted_unlink(name, *args, **kwargs):
+        if name == "rotation-activation.json":
+            raise OSError("injected rotation journal unlink interruption")
+        return original_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr("heel.runner.store.os.unlink", interrupted_unlink)
+    with pytest.raises(OSError, match="injected rotation journal unlink"):
+        store.complete_rotation_activation_abort(
+            pending, abort_request, abort_response, runtime_state=runtime,
+        )
+    monkeypatch.setattr("heel.runner.store.os.unlink", original_unlink)
+    assert runtime.rotation_fence_snapshot()[2] is None
+    filename = "rotation-" + hashlib.sha256(pending.pending["pairing_id"].encode()).hexdigest() + ".json"
+    assert (root / "runner" / "activation-tombstones" / filename).is_file()
+    assert (root / "runner" / "rotation-activation.json").is_file()
+    assert RunnerStore(root).recover_rotation_activation(
+        old_identity=old_identity, old_signer=old_signer,
+        signer_provider=RotationSignerProvider({"heel-rotation-key-2": new_signer}),
+        runtime_path=root / "runner" / "runtime.sqlite3",
+    ) is None
+    assert not (root / "runner" / "rotation-activation.json").exists()
+    assert RunnerRuntimeState(root / "runner" / "runtime.sqlite3", old_identity, old_signer).rotation_fence_snapshot()[2] is None
+
+
 def test_v3_prepared_pairing_recovery_binds_the_signed_runner_before_accepting_response(tmp_path):
     signer = Signer()
     material = create_runner_pairing_material(
@@ -471,6 +708,7 @@ def test_local_rotation_journal_is_dual_signed_and_never_serializes_the_new_sign
     old_identity = _rotation_identity(old_signer, version="1")
     new_identity = _rotation_identity(new_signer, version="2")
     store = RunnerStore(tmp_path / "home")
+    runtime = _rotation_runtime(tmp_path / "home", old_identity, old_signer)
     pending = {
         "schema_version": "heel.runner-rotation-activation-challenge.v1",
         "pairing_id": "rotate_" + "a" * 32,
@@ -480,7 +718,7 @@ def test_local_rotation_journal_is_dual_signed_and_never_serializes_the_new_sign
     prepared = store.prepare_rotation_activation(
         pending, old_identity=old_identity, old_signer=old_signer,
         new_identity=new_identity, new_signer=new_signer,
-        new_signer_label="heel-rotation-key-2", now_ms=10,
+        new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=10,
     )
 
     journal_path = tmp_path / "home" / "runner" / "rotation-activation.json"
@@ -488,7 +726,11 @@ def test_local_rotation_journal_is_dual_signed_and_never_serializes_the_new_sign
     assert set(journal) == {
         "schema_version", "state", "pairing_id", "old_identity", "new_identity",
         "new_signer_label", "activation_challenge", "activation_request", "activation_response",
-        "created_at_ms", "updated_at_ms", "journal_digest", "old_signing_key_id",
+        "created_at_ms", "updated_at_ms", "workspace_id", "runner_id",
+        "old_runner_key_id", "new_runner_key_id", "activation_request_digest",
+        "activation_challenge_digest", "runtime_authority_epoch",
+        "runtime_authority_identity_digest", "runtime_claim_state_digest",
+        "runtime_rotation_intent_digest", "prepared_at_ms", "journal_digest", "old_signing_key_id",
         "old_signature_b64", "new_signing_key_id", "new_signature_b64",
     }
     assert journal["state"] == "prepared"
@@ -514,12 +756,46 @@ def test_local_rotation_journal_is_dual_signed_and_never_serializes_the_new_sign
     assert final_journal["new_signing_key_id"] == new_identity.key_id
 
 
+def test_rotation_preparation_rejects_a_retained_terminal_before_journaling_or_signing(tmp_path):
+    """A rotation request must never leave this device while disclosures remain decryptable."""
+    root = tmp_path / "home"
+    old_signer = RotationSigner(b"o" * 32)
+    new_signer = RotationSigner(b"n" * 32)
+    store, old_identity, runtime, _runtime_path = _complete_v3_pairing(root, old_signer, suffix="q")
+    new_identity = RunnerIdentity(
+        runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
+        adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
+        fingerprint=hashlib.sha256(new_signer.public_key).hexdigest(), key_id=new_signer.key_id,
+        pairing_phrase=old_identity.pairing_phrase,
+    )
+    runtime.register_local_terminal(
+        run_id="crun_" + "d" * 32, project_id="prj_123456789", grant_id="grant_123456789",
+        approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+        terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
+    )
+
+    with pytest.raises(ValueError):
+        store.prepare_rotation_activation(
+            {
+                "schema_version": "heel.runner-rotation-activation-challenge.v1",
+                "pairing_id": "rotate_" + "q" * 32,
+                "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+            },
+            old_identity=old_identity, old_signer=old_signer,
+            new_identity=new_identity, new_signer=new_signer,
+            new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=20,
+        )
+
+    assert not (root / "runner" / "rotation-activation.json").exists()
+
+
 def test_local_rotation_journal_rejects_a_tampered_signer_label_without_accepting(tmp_path):
     old_signer = RotationSigner(b"o" * 32)
     new_signer = RotationSigner(b"n" * 32)
     old_identity = _rotation_identity(old_signer, version="1")
     new_identity = _rotation_identity(new_signer, version="2")
     store = RunnerStore(tmp_path / "home")
+    runtime = _rotation_runtime(tmp_path / "home", old_identity, old_signer)
     pending = {
         "schema_version": "heel.runner-rotation-activation-challenge.v1",
         "pairing_id": "rotate_" + "b" * 32,
@@ -528,7 +804,7 @@ def test_local_rotation_journal_rejects_a_tampered_signer_label_without_acceptin
     prepared = store.prepare_rotation_activation(
         pending, old_identity=old_identity, old_signer=old_signer,
         new_identity=new_identity, new_signer=new_signer,
-        new_signer_label="heel-rotation-key-2", now_ms=10,
+        new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=10,
     )
     journal_path = tmp_path / "home" / "runner" / "rotation-activation.json"
     journal = json.loads(journal_path.read_text())
@@ -552,7 +828,7 @@ def test_accepted_rotation_recovery_loads_the_named_signer_then_finishes_before_
     root = tmp_path / "home"
     old_signer = RotationSigner(b"o" * 32)
     new_signer = RotationSigner(b"n" * 32)
-    store, old_identity, _runtime, runtime_path = _complete_v3_pairing(root, old_signer, suffix="c")
+    store, old_identity, runtime, runtime_path = _complete_v3_pairing(root, old_signer, suffix="c")
     new_identity = RunnerIdentity(
         runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
         adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
@@ -567,7 +843,7 @@ def test_accepted_rotation_recovery_loads_the_named_signer_then_finishes_before_
     prepared = store.prepare_rotation_activation(
         pending, old_identity=old_identity, old_signer=old_signer,
         new_identity=new_identity, new_signer=new_signer,
-        new_signer_label="heel-rotation-key-2", now_ms=20,
+        new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=20,
     )
     store.accept_rotation_activation(
         prepared,
@@ -603,6 +879,7 @@ def test_prepared_rotation_recovery_never_creates_a_missing_named_signer(tmp_pat
     old_identity = _rotation_identity(old_signer, version="1")
     new_identity = _rotation_identity(new_signer, version="2")
     root = tmp_path / "home"
+    runtime = _rotation_runtime(root, old_identity, old_signer)
     RunnerStore(root).prepare_rotation_activation(
         {
             "schema_version": "heel.runner-rotation-activation-challenge.v1",
@@ -611,7 +888,7 @@ def test_prepared_rotation_recovery_never_creates_a_missing_named_signer(tmp_pat
         },
         old_identity=old_identity, old_signer=old_signer,
         new_identity=new_identity, new_signer=new_signer,
-        new_signer_label="heel-rotation-key-missing", now_ms=10,
+        new_signer_label="heel-rotation-key-missing", runtime_state=runtime, now_ms=10,
     )
     provider = RotationSignerProvider({})
 
@@ -628,7 +905,7 @@ def test_rotation_recovery_rejects_new_selector_with_old_runtime_without_mutatio
     root = tmp_path / "home"
     old_signer = RotationSigner(b"o" * 32)
     new_signer = RotationSigner(b"n" * 32)
-    store, old_identity, _runtime, runtime_path = _complete_v3_pairing(root, old_signer, suffix="e")
+    store, old_identity, runtime, runtime_path = _complete_v3_pairing(root, old_signer, suffix="e")
     new_identity = RunnerIdentity(
         runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
         adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
@@ -643,7 +920,7 @@ def test_rotation_recovery_rejects_new_selector_with_old_runtime_without_mutatio
     prepared = store.prepare_rotation_activation(
         pending, old_identity=old_identity, old_signer=old_signer,
         new_identity=new_identity, new_signer=new_signer,
-        new_signer_label="heel-rotation-key-2", now_ms=20,
+        new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=20,
     )
     store.accept_rotation_activation(
         prepared,
@@ -684,7 +961,9 @@ def test_rotation_recovery_rejects_new_selector_with_old_runtime_without_mutatio
             signer_provider=RotationSignerProvider({"heel-rotation-key-2": new_signer}),
             runtime_path=runtime_path,
         )
-    cursor = RunnerRuntimeState(runtime_path, old_identity, old_signer).load_chain("claim", None)
+    cursor = RunnerRuntimeState(
+        runtime_path, old_identity, old_signer, _allow_rotation_recovery=True,
+    ).load_chain("claim", None)
     assert cursor is not None and (cursor.next_sequence, cursor.generation) == (1, 0)
 
 
@@ -713,8 +992,10 @@ def test_rotation_recovery_completes_only_the_durable_suffix_after_each_local_cr
         monkeypatch.setattr(runner_store_module.os, "unlink", fail_unlink)
 
     with pytest.raises(OSError, match="injected"):
-        store.finish_rotation_activation(
-            prepared, RunnerRuntimeState(runtime_path, old_identity, old_signer),
+            store.finish_rotation_activation(
+            prepared, RunnerRuntimeState(
+                runtime_path, old_identity, old_signer, _allow_rotation_recovery=True,
+            ),
         )
 
     monkeypatch.setattr(runner_store_module, "_write_json", original_write)
@@ -764,7 +1045,8 @@ def test_named_run_control_requires_an_authenticated_active_claim_before_transpo
     assert public == {"claim", "heartbeat", "progress", "result", "stop_ack",
                       "start_resync", "complete_resync", "install_rotation_claim",
                       "upload_findings", "list_contexts", "claim_context",
-                      "submit_context_approval_projection"}
+                      "submit_context_approval_projection", "replay_pending_call",
+                      "replay_all_pending"}
     assert all(parameter.kind is not inspect.Parameter.VAR_KEYWORD for method in (
         RunnerControlClient.claim, RunnerControlClient.heartbeat, RunnerControlClient.progress,
         RunnerControlClient.result, RunnerControlClient.stop_ack,
@@ -796,6 +1078,41 @@ def test_control_claim_commits_its_authenticated_cursor_to_runtime_state():
     assert runtime.load_pending_calls() == ()
 
 
+def test_claim_replays_its_durable_pending_request_after_client_restart():
+    class LostResponseTransport(Transport):
+        def post(self, path, *, headers, body):
+            self.requests.append((path, dict(headers), body))
+            raise ConnectionError("response was lost after the request was accepted")
+
+    signer, lost = Signer(), LostResponseTransport()
+    runtime = _runtime(signer)
+    initial = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner",
+        signer=signer, clock=lambda: 1_000, transport=lost,
+        nonce_source=NonceSource(), runtime=runtime,
+    )
+
+    with pytest.raises(ConnectionError, match="response was lost"):
+        initial.claim()
+    pending = runtime.load_pending_calls()
+    assert len(pending) == 1 and pending[0].request_operation == "claim"
+    original_request = lost.requests[0]
+
+    replay_transport = Transport()
+    restarted = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner",
+        signer=signer, clock=lambda: 1_000, transport=replay_transport,
+        nonce_source=NonceSource(),
+        runtime=RunnerRuntimeState(runtime.path, runtime.identity, signer),
+    )
+
+    assert [(item.request_operation, item.status) for item in restarted.replay_all_pending(now_ms=1_000)] == [
+        ("claim", 204),
+    ]
+    assert replay_transport.requests == [original_request]
+    assert restarted.runtime.load_pending_calls() == ()
+
+
 def test_control_diagnostics_are_bounded_frozen_and_sensitive_field_free():
     signer, transport, nonces = Signer(), Transport(), NonceSource()
     client = RunnerControlClient(
@@ -818,8 +1135,9 @@ def test_control_diagnostics_are_bounded_frozen_and_sensitive_field_free():
     assert len(client.calls) == 128
 
 
-def test_terminal_disclosures_do_not_consume_active_run_capacity_without_findings():
-    signer, nonces = Signer(), NonceSource()
+def test_terminal_disclosures_do_not_consume_active_run_capacity_without_findings(tmp_path):
+    _store, identity, signer, manifest, projection = compiled_pair(tmp_path / "compiled")
+    authority, nonces = SigningAuthority.generate(), NonceSource()
 
     class CapacityTransport(Transport):
         def post(self, path, *, headers, body):
@@ -832,33 +1150,77 @@ def test_terminal_disclosures_do_not_consume_active_run_capacity_without_finding
             return status, response_headers, response
 
     transport = CapacityTransport()
-    runtime = _runtime(signer)
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    runtime.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=base64.b64encode(b"p" * 32).decode(),
+        next_sequence=1, generation=0, now_ms=0,
+    )
     client = RunnerControlClient(
-        origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer,
+        origin="https://control.example", workspace_id=identity.workspace_id,
+        runner_id=identity.runner_id, signer=signer,
         clock=lambda: 1_000, transport=transport, nonce_source=nonces, runtime=runtime,
     )
 
-    def terminal_for(run_id):
+    base_grant = signed_grant(manifest, projection, identity, authority)
+
+    def terminal_for(run_id, grant):
         value = operational_projection("terminal")
         unsigned = {
             key: copy.deepcopy(item) for key, item in value.items()
             if key not in {"projection_digest", "signing_key_id", "signature_b64"}
         }
-        unsigned["run_id"] = run_id
+        unsigned.update({
+            "run_id": run_id, "grant_id": grant["grant_id"],
+            "workspace_id": grant["workspace_id"], "project_id": grant["project_id"],
+            "manifest_digest": grant["approval"]["manifest_digest"],
+            "approval_projection_digest": grant["approval"]["projection_digest"],
+            "grant_digest": grant["grant_digest"],
+        })
         return {
             **unsigned, "projection_digest": canonical_digest(unsigned),
             "signing_key_id": signer.key_id,
             "signature_b64": base64.b64encode(signer.sign(canonical_bytes(unsigned))).decode(),
         }
 
+    def install_coherent_active(run_id, grant):
+        activate_claimed_run(client, run_id)
+        active = runtime._active_core(
+            run_id=run_id, approval_projection=projection, grant=grant,
+            gate={
+                "active": True, "runner_state": "active", "proof_state": "valid",
+                "proof_expires_at_ms": 10_000, "kill_switch_generation": 7,
+                "stop_reason": "none", "server_time_ms": 1_000,
+            },
+            claim_response_digest=hashlib.sha256(b"claim").hexdigest(),
+            latest_gate_response_digest=hashlib.sha256(b"gate").hexdigest(),
+            claimed_at_ms=1_000, gate_received_at_ms=1_000, revision=1,
+            prior_state_digest=None,
+        )
+        blob = runtime._seal(
+            active, schema="heel.runner-active-run-state.v1", primary_fields=(active["run_hash"],),
+        )
+        with runtime._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO active_runs(run_hash,sealed_blob,updated_at_ms) VALUES(?,?,?)",
+                    (active["run_hash"], blob, 1_000),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        assert len(runtime.load_active_run_controls()) == 1
+
     first_run = None
     for index in range(1_000):
         run_id = f"crun_{index:032x}"
-        terminal = terminal_for(run_id)
-        activate_claimed_run(client, run_id)
+        grant = resign_grant({**copy.deepcopy(base_grant), "run_id": run_id}, authority)
+        terminal = terminal_for(run_id, grant)
+        install_coherent_active(run_id, grant)
         registered = client._register_runtime_local_terminal({
-            "run_id": run_id, "project_id": "project", "grant_id": "grant",
-            "approval_projection_digest": "b" * 64,
+            "run_id": run_id, "project_id": grant["project_id"], "grant_id": grant["grant_id"],
+            "approval_projection_digest": grant["approval"]["projection_digest"],
             "terminal_projection_digest": terminal["projection_digest"],
             "terminal_record_digest": hashlib.sha256(run_id.encode()).hexdigest(),
             "terminal_at_ms": 1, "retention_expires_at_ms": 10_000,
@@ -874,8 +1236,8 @@ def test_terminal_disclosures_do_not_consume_active_run_capacity_without_finding
     assert first_run is not None
     assert client._tracked_runs == set() and not client._run_guards
     assert runtime.lease_terminal_disclosure(
-        first_run, expected_project_id="project", expected_grant_id="grant",
-        expected_approval_projection_digest="b" * 64, now_ms=1_000,
+        first_run, expected_project_id=base_grant["project_id"], expected_grant_id=base_grant["grant_id"],
+        expected_approval_projection_digest=base_grant["approval"]["projection_digest"], now_ms=1_000,
     ) is not None
 
 
@@ -892,31 +1254,46 @@ def test_terminal_result_cannot_recreate_an_inflight_heartbeat_chain(tmp_path):
                     "X-Heel-Runner-Next-Nonce": base64.b64encode(b"h" * 32).decode(),
                 }, {
                     "active": True, "runner_state": "active", "proof_state": "valid",
-                    "proof_expires_at_ms": 2_000, "kill_switch_generation": 0,
-                    "stop_reason": "none", "server_time_ms": 1_000,
+                    "proof_expires_at_ms": 2_000, "kill_switch_generation": 7,
+                    "stop_reason": "none", "server_time_ms": 1_001,
                 }
             return super().post(path, headers=headers, body=body)
 
-    transport, signer = BlockingHeartbeatTransport(), Signer()
-    client = RunnerControlClient(
-        origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer,
-        clock=lambda: 1_000, transport=transport, nonce_source=NonceSource(), runtime=_runtime(signer),
+    _store, identity, signer, manifest, projection = compiled_pair(tmp_path / "compiled")
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    transport = BlockingHeartbeatTransport()
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    runtime.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=base64.b64encode(b"p" * 32).decode(),
+        next_sequence=1, generation=0, now_ms=0,
     )
-    run_id = RUN_ID
-    activate_claimed_run(client, run_id)
+    client = RunnerControlClient(
+        origin="https://control.example", workspace_id=identity.workspace_id,
+        runner_id=identity.runner_id, signer=signer,
+        clock=lambda: 1_000, transport=transport, nonce_source=NonceSource(), runtime=runtime,
+    )
+    run_id = grant["run_id"]
+    install_coherent_active_run(client, run_id, projection, grant)
 
     def for_run(phase):
         value = operational_projection(phase)
-        value["run_id"] = run_id
         unsigned = {
             key: item for key, item in value.items()
             if key not in {"projection_digest", "signing_key_id", "signature_b64"}
         }
-        value["projection_digest"] = canonical_digest(unsigned)
-        value["signature_b64"] = base64.b64encode(
-            Signer._private_key.sign(canonical_bytes(unsigned))
-        ).decode()
-        return value
+        unsigned.update({
+            "run_id": run_id, "grant_id": grant["grant_id"],
+            "workspace_id": grant["workspace_id"], "project_id": grant["project_id"],
+            "manifest_digest": grant["approval"]["manifest_digest"],
+            "approval_projection_digest": grant["approval"]["projection_digest"],
+            "grant_digest": grant["grant_digest"],
+        })
+        return {
+            **unsigned, "projection_digest": canonical_digest(unsigned),
+            "signing_key_id": signer.key_id,
+            "signature_b64": base64.b64encode(signer.sign(canonical_bytes(unsigned))).decode(),
+        }
 
     failures = []
     def call_heartbeat():
@@ -957,7 +1334,7 @@ def test_terminal_result_cannot_recreate_an_inflight_heartbeat_chain(tmp_path):
     assert f"heartbeat:{run_id}" not in client._chains
 
 
-def test_duplicate_terminal_result_waiter_fails_before_second_transport():
+def test_duplicate_terminal_result_waiter_fails_before_second_transport(tmp_path):
     started, release = threading.Event(), threading.Event()
 
     class BlockingResultTransport(Transport):
@@ -969,34 +1346,21 @@ def test_duplicate_terminal_result_waiter_fails_before_second_transport():
                 return 200, {
                     "X-Heel-Runner-Next-Nonce": base64.b64encode(b"r" * 32).decode(),
                 }, {
-                    "schema_version": "heel.canary-run-status.v1", "run_id": RUN_ID,
-                    "approval_id": "approval", "grant_id": "grant", "status": "terminal",
+                    "schema_version": "heel.canary-run-status.v1", "run_id": grant["run_id"],
+                    "approval_id": grant["approval"]["projection_id"], "grant_id": grant["grant_id"], "status": "terminal",
                     "execution_disposition": "completed", "error_category": "none",
                     "stop_reason": "none", "source_event_sequence": 1,
-                    "quota_state": "reserved", "kill_switch_generation": 0,
+                    "quota_state": "reserved", "kill_switch_generation": 7,
                     "stop_generation": 0, "stop_deadline_ms": None,
                     "stop_acknowledged_at_ms": None, "stop_ack_late": False,
                 }
             return super().post(path, headers=headers, body=body)
 
-    transport, signer = BlockingResultTransport(), Signer()
-    client = RunnerControlClient(
-        origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer,
-        clock=lambda: 1_000, transport=transport, nonce_source=NonceSource(), runtime=_runtime(signer),
-    )
-    activate_claimed_run(client, RUN_ID)
-    terminal = operational_projection("terminal")
-    terminal["run_id"] = RUN_ID
-    unsigned = {
-        key: value for key, value in terminal.items()
-        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
-    }
-    terminal["projection_digest"] = canonical_digest(unsigned)
-    terminal["signature_b64"] = base64.b64encode(
-        Signer._private_key.sign(canonical_bytes(unsigned))
-    ).decode()
+    transport = BlockingResultTransport()
+    client, grant, signer = _compiled_active_client(tmp_path, transport)
+    terminal = _compiled_operational_projection("terminal", grant, signer)
     client.runtime.register_local_terminal(
-        run_id=RUN_ID, project_id=terminal["project_id"], grant_id=terminal["grant_id"],
+        run_id=grant["run_id"], project_id=terminal["project_id"], grant_id=terminal["grant_id"],
         approval_projection_digest=terminal["approval_projection_digest"],
         terminal_projection_digest=terminal["projection_digest"],
         terminal_record_digest="d" * 64, terminal_at_ms=1, retention_expires_at_ms=2_000,
@@ -1005,7 +1369,7 @@ def test_duplicate_terminal_result_waiter_fails_before_second_transport():
 
     def submit():
         try:
-            client.result(run_id=RUN_ID, operational_projection=terminal)
+            client.result(run_id=grant["run_id"], operational_projection=terminal)
         except BaseException as exc:
             failures.append(exc)
 
@@ -1036,30 +1400,24 @@ def test_run_control_tracks_at_most_one_lifecycle_guard_per_active_run():
     assert not hasattr(client, "_run_lock_stripes")
 
 
-def test_terminal_result_retires_live_chains_into_a_durable_disclosure_state():
-    signer, transport = Signer(), Transport()
-    client = RunnerControlClient(
-        origin="https://control.example", workspace_id="ws", runner_id="runner",
-        signer=signer, clock=lambda: 1000, transport=transport,
-        nonce_source=NonceSource(), runtime=_runtime(signer),
-    )
-    activate_claimed_run(client, RUN_ID)
-    terminal = operational_projection("terminal")
+def test_terminal_result_retires_live_chains_into_a_durable_disclosure_state(tmp_path):
+    client, grant, signer = _compiled_active_client(tmp_path, Transport())
+    terminal = _compiled_operational_projection("terminal", grant, signer)
     client.runtime.register_local_terminal(
-        run_id=RUN_ID, project_id=terminal["project_id"], grant_id=terminal["grant_id"],
+        run_id=grant["run_id"], project_id=terminal["project_id"], grant_id=terminal["grant_id"],
         approval_projection_digest=terminal["approval_projection_digest"],
         terminal_projection_digest=terminal["projection_digest"],
         terminal_record_digest="d" * 64, terminal_at_ms=1, retention_expires_at_ms=2_000,
     )
 
-    assert client.result(run_id=RUN_ID, operational_projection=terminal)[0] == 200
+    assert client.result(run_id=grant["run_id"], operational_projection=terminal)[0] == 200
     lease = client.runtime.lease_terminal_disclosure(
-        RUN_ID, expected_project_id="project", expected_grant_id="grant",
-        expected_approval_projection_digest="b" * 64, now_ms=1_000,
+        grant["run_id"], expected_project_id=grant["project_id"], expected_grant_id=grant["grant_id"],
+        expected_approval_projection_digest=grant["approval"]["projection_digest"], now_ms=1_000,
     )
     assert lease is not None
-    assert RUN_ID not in client._tracked_runs
-    assert not any(name.endswith(":" + RUN_ID) for name in client._chains)
+    assert grant["run_id"] not in client._tracked_runs
+    assert not any(name.endswith(":" + grant["run_id"]) for name in client._chains)
 
 
 @pytest.mark.parametrize(("method_name", "projection"), [
@@ -1124,7 +1482,7 @@ def test_every_public_control_operation_preserves_durable_pending_call_on_non_ex
     assert client.calls == []
 
 
-def test_resync_install_serializes_behind_inflight_control_and_wins_generation():
+def test_resync_install_serializes_behind_inflight_control_and_wins_generation(tmp_path):
     started, release = threading.Event(), threading.Event()
     recovered_nonce = base64.b64encode(b"r" * 32).decode()
 
@@ -1136,40 +1494,35 @@ def test_resync_install_serializes_behind_inflight_control_and_wins_generation()
                 assert release.wait(1)
                 return 200, {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"o" * 32).decode()}, {
                     "active": True, "runner_state": "active", "proof_state": "valid",
-                    "proof_expires_at_ms": 2_000, "kill_switch_generation": 0,
-                    "stop_reason": "none", "server_time_ms": 1_000,
+                    "proof_expires_at_ms": 2_000, "kill_switch_generation": 7,
+                    "stop_reason": "none", "server_time_ms": 1_001,
                 }
             assert path.endswith("/resync/complete")
             return 200, {}, {
                 "schema_version": "heel.runner-resync-completed.v2",
-                "chain": {"operation": "heartbeat", "run_id": RUN_ID},
+                "chain": {"operation": "heartbeat", "run_id": run_id},
                 "next_sequence": 9, "next_nonce_b64": recovered_nonce,
                 "expires_at_ms": 2_000, "generation": 2,
             }
 
-    transport, signer = BlockingTransport(), Signer()
-    client = RunnerControlClient(
-        origin="https://control.example", workspace_id="ws", runner_id="runner",
-        signer=signer, clock=lambda: 1000, transport=transport,
-        nonce_source=NonceSource(), runtime=_runtime(signer),
-    )
+    transport = BlockingTransport()
+    client, grant, signer = _compiled_active_client(tmp_path, transport)
+    run_id = grant["run_id"]
     heartbeat_nonce = base64.b64encode(b"h" * 32).decode()
     with client._state_lock:
-        client._tracked_runs.add(RUN_ID)
-        client._run_guards[RUN_ID] = _RunGuard(threading.Lock(), object())
-        client._chains[f"heartbeat:{RUN_ID}"] = (heartbeat_nonce, 8, 1)
-    client.runtime.install_chain(
-        operation="heartbeat", run_id=RUN_ID, next_nonce_b64=heartbeat_nonce,
-        next_sequence=8, generation=1, now_ms=1,
+        client._chains[f"heartbeat:{run_id}"] = (heartbeat_nonce, 8, 1)
+    _replace_coherent_runtime_chain(
+        client.runtime, "heartbeat", run_id,
+        nonce=heartbeat_nonce, sequence=8, generation=1,
     )
     pending = PendingRunnerResync(
-        "rrs_" + "a" * 32, "heartbeat", RUN_ID,
+        "rrs_" + "a" * 32, "heartbeat", run_id,
         base64.b64encode(b"c" * 32).decode(), base64.b64encode(b"s" * 32).decode(),
         8, 2_000, 1,
     )
     failures = []
     control = threading.Thread(target=lambda: client.heartbeat(
-        run_id=RUN_ID, operational_projection=operational_projection("claimed"),
+        run_id=run_id, operational_projection=_compiled_operational_projection("claimed", grant, signer),
     ))
     recovery = threading.Thread(target=lambda: _capture(failures, client.complete_resync, pending))
     control.start()
@@ -1179,8 +1532,8 @@ def test_resync_install_serializes_behind_inflight_control_and_wins_generation()
     release.set()
     control.join(1); recovery.join(1)
     assert failures == []
-    assert client._chains[f"heartbeat:{RUN_ID}"] == (recovered_nonce, 9, 2)
-    cursor = client.runtime.load_chain("heartbeat", RUN_ID)
+    assert client._chains[f"heartbeat:{run_id}"] == (recovered_nonce, 9, 2)
+    cursor = client.runtime.load_chain("heartbeat", run_id)
     assert cursor is not None
     assert (cursor.next_nonce_b64, cursor.next_sequence, cursor.generation) == (
         recovered_nonce, 9, 2,
@@ -1267,9 +1620,11 @@ def test_resync_signs_its_own_closed_envelopes_and_installs_recovered_sequence()
                             "client_nonce_b64": pending.client_nonce_b64,
                             "server_challenge_b64": pending.server_challenge_b64,
                             "generation": 4}) == complete_body
-    client.heartbeat(run_id=RUN_ID, operational_projection=operational_projection("claimed"))
-    assert transport.requests[-1][1]["X-Heel-Runner-Sequence"] == "8"
-    assert transport.requests[-1][1]["X-Heel-Runner-Nonce"] == base64.b64encode(b"n" * 32).decode()
+    cursor = client.runtime.load_chain("heartbeat", RUN_ID)
+    assert cursor is not None
+    assert (cursor.next_sequence, cursor.generation, cursor.next_nonce_b64) == (
+        8, 5, base64.b64encode(b"n" * 32).decode(),
+    )
 
 
 def test_resync_generation_install_is_monotonic_and_idempotent():
@@ -1301,9 +1656,9 @@ def test_resync_generation_install_is_monotonic_and_idempotent():
         client.complete_resync(lower)
     with pytest.raises(ValueError):
         client.complete_resync(pending)  # generation seven is not pending generation plus one.
-    client.heartbeat(run_id=RUN_ID, operational_projection=operational_projection("claimed"))
-    assert transport.requests[-1][1]["X-Heel-Runner-Nonce"] == nonce
-    assert transport.requests[-1][1]["X-Heel-Runner-Sequence"] == "8"
+    cursor = client.runtime.load_chain("heartbeat", RUN_ID)
+    assert cursor is not None
+    assert (cursor.next_nonce_b64, cursor.next_sequence, cursor.generation) == (nonce, 8, 5)
 
 
 def test_rotation_v2_installs_consumed_claim_state_without_resetting_sequence_or_generation():

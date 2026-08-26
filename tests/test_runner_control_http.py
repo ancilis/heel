@@ -16,11 +16,13 @@ import pytest
 from heel.canary_contracts import canonical_bytes, canonical_digest, validate_runner_identity
 from heel.crypto import SigningAuthority, ed25519_key_id
 from heel.runner.control_client import _RunGuard, RunnerControlClient
-from heel.runner.identity import RunnerIdentity, SecureSigner
-from heel.runner.runtime import RunnerRuntimeState
+from heel.runner.identity import RunnerIdentity, SecureSigner, runner_phrase_words
+from heel.runner.runtime import ActiveRunInstall, RunnerRuntimeState
 from heel.saas.canary_store import CanaryStore
 from heel.saas.catalog import CATALOG_VERSION
-from heel.saas.runner_auth import RunnerAuthError, RunnerAuthStore, initialize_runner_auth_schema
+from heel.saas.runner_auth import (
+    RunnerAuthError, RunnerAuthStore, RunnerHttpAction, initialize_runner_auth_schema,
+)
 from heel.saas.http_api import ControlPlane, serve
 
 SIGNING_PRIVATE = Ed25519PrivateKey.from_private_bytes(b"0123456789abcdef0123456789abcdef")
@@ -47,7 +49,7 @@ class Transport:
                 "proof_expires_at_ms": 2_000,
                 "kill_switch_generation": 0,
                 "stop_reason": "none",
-                "server_time_ms": 1_000,
+                "server_time_ms": 1_000 + len(self.requests),
             }
         if path.endswith("/stop-ack"):
             return 200, response_headers, {
@@ -127,16 +129,95 @@ def client_projection(signer, phase="running", *, run_id=RUN_ID):
 
 
 def activate_claimed_run(control, run_id=RUN_ID):
-    """Install the exact post-200 claim state without a generic client API."""
+    """Install a coherent post-claim active row through the durable claim transaction."""
+    from tests.test_canary_contracts import approval as fixture_approval, grant as fixture_grant
+
+    projection = fixture_approval()
+    projection.update({"workspace_id": control.workspace_id, "project_id": "prj"})
+    projection["runner"] = {
+        "runner_id": control.runner_id, "runner_key_id": control.signer.key_id,
+        "runner_version": "test", "adapter_versions": ["1"],
+    }
+    projection["signing_key_id"] = control.signer.key_id
+    projection["signature_b64"] = base64.b64encode(b"s" * 64).decode("ascii")
+    projection_unsigned = {
+        key: value for key, value in projection.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    projection["projection_digest"] = canonical_digest(projection_unsigned)
+
+    grant = fixture_grant()
+    grant.update({"workspace_id": control.workspace_id, "project_id": "prj", "run_id": run_id})
+    grant["approval"] = {
+        "projection_id": projection["projection_id"],
+        "projection_digest": projection["projection_digest"],
+        "manifest_digest": projection["manifest_digest"],
+    }
+    grant["runner_binding"] = {
+        "runner_id": control.runner_id, "runner_key_id": control.signer.key_id,
+        "public_key_digest": "a" * 64,
+    }
+    grant["kill_switch_generation"] = 0
+    grant["signing_key_id"] = control.signer.key_id
+    grant["signature_b64"] = base64.b64encode(b"s" * 64).decode("ascii")
+    grant_unsigned = {
+        key: value for key, value in grant.items()
+        if key not in {"grant_digest", "signing_key_id", "signature_b64"}
+    }
+    grant["grant_digest"] = canonical_digest(grant_unsigned)
+
+    claim = control.runtime.load_chain("claim", None)
+    assert claim is not None
+    path = f"/v1/workspaces/{control.workspace_id}/runners/{control.runner_id}/claim"
+    body = canonical_bytes({"schema_version": "heel.runner-claim-request.v1"})
+    proof = {
+        "schema_version": "heel.runner-request-proof.v1", "workspace_id": control.workspace_id,
+        "runner_id": control.runner_id, "key_id": control.signer.key_id,
+        "capability": "runner_claim", "method": "POST", "path": path,
+        "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": 1_000,
+        "server_nonce": claim.next_nonce_b64, "sequence": claim.next_sequence,
+    }
+    headers = {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": control.runner_id,
+        "X-Heel-Runner-Key-Id": control.signer.key_id, "X-Heel-Runner-Timestamp-Ms": "1000",
+        "X-Heel-Runner-Signature": base64.b64encode(
+            control.signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))
+        ).decode("ascii"),
+        "X-Heel-Runner-Nonce": claim.next_nonce_b64,
+        "X-Heel-Runner-Sequence": str(claim.next_sequence),
+    }
+    pending = control.runtime.stage_call(
+        request_operation="claim", chain_operation="claim", run_id=None, path=path,
+        capability="runner_claim", headers=headers, body=body,
+        expected_state_digest=claim.state_digest, now_ms=1_000,
+    )
     nonce = base64.b64encode(b"q" * 32).decode()
+    installed = tuple(
+        (operation, run_id, nonce, 1, 0)
+        for operation in ("heartbeat", "progress", "result", "stop-ack")
+    )
+    control.runtime.commit_call(
+        pending.call_id, next_nonce_b64=base64.b64encode(b"n" * 32).decode(), now_ms=1_000,
+        installed_chains=installed,
+        active_run=ActiveRunInstall(
+            run_id=run_id, approval_projection=projection, grant=grant,
+            gate={
+                "active": True, "runner_state": "active", "proof_state": "valid",
+                "proof_expires_at_ms": 2_000, "kill_switch_generation": 0,
+                "stop_reason": "none", "server_time_ms": 999,
+            },
+            claim_response_digest="a" * 64, gate_response_digest="b" * 64,
+            claimed_at_ms=1_000, gate_received_at_ms=999,
+        ),
+    )
     with control._state_lock:
         control._tracked_runs.add(run_id)
         control._run_guards[run_id] = _RunGuard(threading.Lock(), object())
         for operation in ("heartbeat", "progress", "result", "stop-ack"):
-            control._chains[f"{operation}:{run_id}"] = (nonce, 1, 0)
-            control.runtime.install_chain(
-                operation=operation, run_id=run_id, next_nonce_b64=nonce,
-                next_sequence=1, generation=0, now_ms=1,
+            cursor = control.runtime.load_chain(operation, run_id)
+            assert cursor is not None
+            control._chains[f"{operation}:{run_id}"] = (
+                cursor.next_nonce_b64, cursor.next_sequence, cursor.generation,
             )
 
 def test_named_methods_use_fixed_workspace_paths_and_exact_pop_headers():
@@ -189,6 +270,172 @@ def test_context_methods_reject_extra_or_unsigned_claim_artifacts():
     control = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer, clock=lambda: 1000, transport=BadContextTransport(), nonce_source=lambda _: base64.b64encode(b"n" * 32).decode(), runtime=_runtime(signer))
     with pytest.raises(ValueError, match="invalid runner context response"):
         control.claim_context("rcb_" + "a" * 32, "a" * 64)
+
+
+@pytest.mark.parametrize("operation", (
+    "list-contexts", "claim-context", "submit-context-approval-projection",
+))
+def test_context_call_lost_response_is_durably_staged_for_restart_replay(operation):
+    class LostResponseTransport:
+        def __init__(self):
+            self.requests = []
+
+        def post(self, path, *, headers=None, body=b""):
+            self.requests.append((path, dict(headers or {}), body))
+            raise ConnectionError("response was lost after the request was accepted")
+
+    from test_canary_contracts import approval
+
+    signer, transport = Signer(), LostResponseTransport()
+    runtime = _runtime(signer)
+    control = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner",
+        signer=signer, clock=lambda: 1_000, transport=transport,
+        nonce_source=lambda _: base64.b64encode(b"n" * 32).decode(), runtime=runtime,
+    )
+    binding_id, binding_digest = "rcb_" + "a" * 32, "a" * 64
+
+    with pytest.raises(ConnectionError, match="response was lost"):
+        if operation == "list-contexts":
+            control.list_contexts()
+        elif operation == "claim-context":
+            control.claim_context(binding_id, binding_digest)
+        else:
+            control.submit_context_approval_projection(binding_id, binding_digest, approval())
+
+    pending = runtime.load_pending_calls()
+    assert len(pending) == 1
+    assert pending[0].request_operation == operation
+    assert pending[0].body == transport.requests[0][2]
+    assert dict(pending[0].headers) == transport.requests[0][1]
+
+
+@pytest.mark.parametrize("operation", (
+    "list-contexts", "claim-context", "submit-context-approval-projection",
+))
+def test_context_pending_replay_uses_the_exact_sealed_request_before_reenabling_control(operation):
+    class LostResponseTransport:
+        def __init__(self): self.requests = []
+        def post(self, path, *, headers=None, body=b""):
+            self.requests.append((path, dict(headers or {}), body))
+            raise ConnectionError("response was lost after the request was accepted")
+
+    from test_canary_contracts import approval
+
+    signer = Signer()
+    runtime = _runtime(signer)
+    lost = LostResponseTransport()
+    control = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner",
+        signer=signer, clock=lambda: 1_000, transport=lost,
+        nonce_source=lambda _: base64.b64encode(b"n" * 32).decode(), runtime=runtime,
+    )
+    projection = approval()
+    binding_id = "rcb_" + "a" * 32
+    unsigned_binding = {
+        "schema_version": "heel.runner-context-binding.v1", "binding_id": binding_id,
+        "workspace_id": "ws", "project_id": "project",
+        "environment": {
+            "environment_id": "env_" + "a" * 32, "origin": "https://staging.example.com",
+            "environment_class": "staging", "verification_record_digest": "a" * 64,
+        },
+        "runner_binding": {
+            "runner_id": "runner", "runner_key_id": KEY_ID, "public_key_digest": "a" * 64,
+        },
+        "authorization": {"user_id": "owner", "role": "owner"},
+        "issued_at_ms": 0, "expires_at_ms": 60_000,
+    }
+    binding_digest = canonical_digest(unsigned_binding)
+    with pytest.raises(ConnectionError):
+        if operation == "list-contexts":
+            control.list_contexts()
+        elif operation == "claim-context":
+            control.claim_context(binding_id, binding_digest)
+        else:
+            control.submit_context_approval_projection(binding_id, binding_digest, projection)
+    staged = runtime.load_pending_calls()
+    assert len(staged) == 1
+
+    binding = {
+        **unsigned_binding, "binding_digest": canonical_digest(unsigned_binding),
+        "signing_key_id": "cloud", "signature_b64": base64.b64encode(b"s" * 64).decode(),
+    }
+
+    class ReplayTransport:
+        def __init__(self): self.requests = []
+        def post(self, path, *, headers=None, body=b""):
+            self.requests.append((path, dict(headers or {}), body))
+            assert path == staged[0].path and body == staged[0].body
+            assert dict(headers or {}) == dict(staged[0].headers)
+            response_headers = {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"q" * 32).decode()}
+            if operation == "list-contexts":
+                payload = {
+                    "schema_version": "heel.runner-context-list-result.v1", "server_time_ms": 1,
+                    "contexts": [], "has_more": False,
+                }
+                return 200, response_headers, payload
+            if operation == "claim-context":
+                return 200, response_headers, {
+                    "schema_version": "heel.runner-context-claim-result.v1",
+                    "context_binding": binding, "claimed_at_ms": 1,
+                }
+            return 201, response_headers, {
+                "schema_version": "heel.canary-projection-submitted.v1",
+                "approval_id": projection["projection_id"], "run_id": "crun_" + "b" * 32,
+                "status": "approved", "projection_digest": projection["projection_digest"],
+            }
+
+    replay = ReplayTransport()
+    fresh = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner",
+        signer=signer, clock=lambda: 9_999, transport=replay,
+        nonce_source=lambda _: base64.b64encode(b"x" * 32).decode(), runtime=runtime,
+    )
+    with pytest.raises(ValueError, match="pending replay is required"):
+        fresh.claim()
+    outcomes = fresh.replay_all_pending(now_ms=9_999)
+    assert [(item.call_id, item.request_operation, item.status) for item in outcomes] == [
+        (staged[0].call_id, operation, 201 if operation == "submit-context-approval-projection" else 200),
+    ]
+    assert len(replay.requests) == 1 and runtime.load_pending_calls() == ()
+    assert runtime.load_chain("claim", None).next_sequence == 2
+
+
+def test_claim_pending_replay_is_byte_identical_and_unblocks_the_fresh_client():
+    class LostThenReplay:
+        def __init__(self): self.requests = []; self.lost = True
+        def post(self, path, *, headers=None, body=b""):
+            self.requests.append((path, dict(headers or {}), body))
+            if self.lost:
+                self.lost = False
+                raise ConnectionError("claim response was lost")
+            return 204, {"X-Heel-Runner-Next-Nonce": base64.b64encode(b"q" * 32).decode()}, None
+
+    signer, transport = Signer(), LostThenReplay()
+    runtime = _runtime(signer)
+    control = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner",
+        signer=signer, clock=lambda: 1_000, transport=transport,
+        nonce_source=lambda _: base64.b64encode(b"n" * 32).decode(), runtime=runtime,
+    )
+    with pytest.raises(ConnectionError, match="response was lost"):
+        control.claim()
+    pending = runtime.load_pending_calls()
+    assert len(pending) == 1 and pending[0].request_operation == "claim"
+    fresh = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner",
+        signer=signer, clock=lambda: 9_000, transport=transport,
+        nonce_source=lambda _: base64.b64encode(b"x" * 32).decode(), runtime=runtime,
+    )
+    with pytest.raises(ValueError, match="pending replay is required"):
+        fresh.claim()
+    outcomes = fresh.replay_all_pending(now_ms=9_000)
+    assert [(outcome.request_operation, outcome.status, outcome.body) for outcome in outcomes] == [
+        ("claim", 204, None),
+    ]
+    assert transport.requests[1] == transport.requests[0]
+    assert runtime.load_pending_calls() == ()
+    assert runtime.load_chain("claim", None).next_sequence == 2
 
 
 def test_context_projection_submit_rejects_substitution_without_advancing_claim_cursor():
@@ -293,7 +540,7 @@ def test_has_no_public_generic_request_api():
     control, _, _ = client()
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
-    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection"}
+    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection", "replay_pending_call", "replay_all_pending"}
 
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
@@ -323,13 +570,61 @@ def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
         store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"bad": object()})
     with pytest.raises(ValueError):
         store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"bad": "x" * (513 * 1024)})
-    accepted, next_nonce = store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"status": "ok", "active": True})
-    assert accepted == {"status": "ok", "active": True} and next_nonce
-    assert store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(), action=lambda: {"status": "bad"}) == (accepted, next_nonce)
+    accepted_status, accepted, next_nonce = store.authenticate_and_consume(
+        workspace_id="ws", runner_id="r", capability="runner_claim", path=path,
+        raw_body=body, headers=headers(),
+        action=lambda: RunnerHttpAction(200, {"status": "ok", "active": "yes"}),
+    )
+    assert (accepted_status, accepted) == (200, {"status": "ok", "active": "yes"}) and next_nonce
+    assert store.authenticate_and_consume(
+        workspace_id="ws", runner_id="r", capability="runner_claim", path=path,
+        raw_body=body, headers=headers(),
+        action=lambda: RunnerHttpAction(200, {"status": "bad"}),
+    ) == (accepted_status, accepted, next_nonce)
     with pytest.raises(RunnerAuthError):
         store.authenticate_and_consume(workspace_id="ws", runner_id="r", capability="runner_claim", path=path, raw_body=body, headers=headers(now + 1), action=lambda: {"status": "leak"})
-    receipt = conn.execute("SELECT response_json,next_nonce,response_ciphertext,next_nonce_ciphertext FROM canary_runner_request_ledger").fetchone()
-    assert receipt[0] == "sealed" and receipt[1] != next_nonce and receipt[2] and receipt[3]
+    receipt = conn.execute("SELECT response_json,next_nonce,response_ciphertext,next_nonce_ciphertext,response_status,response_body_digest,retention_expires_at FROM canary_runner_request_ledger").fetchone()
+    assert receipt[0] == "sealed-v2" and receipt[1] != next_nonce and receipt[2] and receipt[3]
+    assert receipt[4] == 200 and receipt[5] == hashlib.sha256(canonical_bytes(accepted)).hexdigest()
+    assert receipt[6] >= time.time() + 2_591_999
+    assert store.purge_runner_request_receipts(receipt[6] + 1, limit=1) == (1, False)
+    assert conn.execute("SELECT 1 FROM canary_runner_request_ledger").fetchone() is None
+
+
+def test_expired_v3_pairing_activation_abort_is_signed_idempotent_and_retained():
+    conn = sqlite3.connect(":memory:")
+    CanaryStore(conn)
+    initialize_runner_auth_schema(conn)
+    instant = [1_000.0]
+    store = RunnerAuthStore(conn, pepper=b"p" * 32, now=lambda: instant[0])
+    private = Ed25519PrivateKey.generate()
+    public = base64.b64encode(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+    invitation = store.invite("ws")
+    phrase = " ".join(runner_phrase_words()[:6])
+    pending = store.exchange(
+        invitation.token, public, phrase, display_name="Runner", runner_version="v3",
+        adapters={}, control_protocol="heel.runner-control.v2", exchange_digest="a" * 64,
+    )
+    store.approve("ws", pending.pairing_id, phrase=phrase, fingerprint=pending.fingerprint, actor="owner")
+    instant[0] = pending.expires_at
+    request = {
+        "schema_version": "heel.runner-pairing-activation-abort.v1",
+        "pairing_id": pending.pairing_id, "runner_id": pending.runner_id,
+        "pairing_exchange_digest": "a" * 64, "activation_request_digest": "b" * 64,
+        "challenge_expires_at_ms": int(pending.expires_at * 1000),
+        "reason_code": "activation_challenge_expired",
+    }
+    request["signature_b64"] = base64.b64encode(private.sign(
+        b"heel.runner-pairing-activation-abort.v1\0" + canonical_bytes(request),
+    )).decode()
+    response = store.abort_executable_pairing_activation(pending.pairing_id, request)
+    assert response["status"] == "expired" and response["runner_id"] == pending.runner_id
+    assert store.abort_executable_pairing_activation(pending.pairing_id, request) == response
+    receipt = conn.execute(
+        "SELECT expires_at FROM canary_runner_pairing_activation_abort_receipts WHERE pairing_id=?",
+        (pending.pairing_id,),
+    ).fetchone()
+    assert receipt[0] == instant[0] + 2_592_000.0
 
 
 def test_runner_auth_body_cap_requires_an_explicit_bounded_integer_override():
@@ -384,14 +679,14 @@ def test_runner_result_projection_is_the_only_explicit_above_default_body_cap():
     arguments = {
         "workspace_id": "ws", "runner_id": "runner", "capability": "runner_result",
         "path": path, "raw_body": body, "headers": headers,
-        "chain_name": "result:run", "action": lambda: {"accepted": True},
+        "chain_name": "result:run", "action": lambda: RunnerHttpAction(200, {"accepted": True}),
     }
     with pytest.raises(ValueError):
         store.authenticate_and_consume(**arguments)
-    response, _ = store.authenticate_and_consume(
+    status, response, _ = store.authenticate_and_consume(
         **arguments, max_body_bytes=272 * 1024,
     )
-    assert response == {"accepted": True}
+    assert (status, response) == (200, {"accepted": True})
 
 
 def test_run_chain_allocator_issues_four_distinct_operation_chains_atomically():
@@ -655,6 +950,23 @@ def test_http_v3_pairing_activation_replays_one_sealed_executable_cursor():
         assert first["schema_version"] == "heel.runner-pairing-activated.v3"
         assert first["initial_claim_sequence"] == 1 and first["initial_claim_generation"] == 0
         assert request("POST", route, activation)[:2] == (200, first)
+        retention = cp.store.conn.execute(
+            "SELECT p.expires_at,r.expires_at FROM canary_runner_pairings p "
+            "JOIN canary_runner_pairing_activation_receipts r ON r.pairing_id=p.pairing_id "
+            "WHERE p.pairing_id=?", (pending["pairing_id"],),
+        ).fetchone()
+        assert retention[0] == retention[1] and retention[0] >= first["activated_at_ms"] / 1000 + 2_591_999
+        # A later invite must not resurrect the old global expiry sweep.
+        cp.store.conn.execute(
+            "UPDATE canary_runner_pairings SET expires_at=? WHERE pairing_id=?",
+            (time.time() - 1, pending["pairing_id"]),
+        )
+        cp.store.conn.commit()
+        cp.runner_auth.invite(signup["workspace_id"])
+        assert cp.store.conn.execute(
+            "SELECT 1 FROM canary_runner_pairing_activation_receipts WHERE pairing_id=?",
+            (pending["pairing_id"],),
+        ).fetchone() is not None
         changed = dict(activation); changed["client_activation_nonce_b64"] = base64.b64encode(b"w" * 32).decode()
         assert request("POST", route, changed)[0] == 400
         execution = cp.store.conn.execute(
@@ -674,7 +986,10 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
     server = serve(cp); thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     def request(method, path, body, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
-        raw = json.dumps(body, separators=(",", ":")).encode() if method == "POST" else None
+        raw = (
+            canonical_bytes(body) if path.endswith("/activation-abort")
+            else json.dumps(body, separators=(",", ":")).encode()
+        ) if method == "POST" else None
         conn.request(method, path, raw, ({"Content-Type":"application/json", **(headers or {})} if method == "POST" else (headers or {})))
         response = conn.getresponse(); payload = json.loads(response.read()); cookie = response.getheader("Set-Cookie"); conn.close()
         return response.status, payload, cookie
@@ -731,6 +1046,26 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
         assert request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/activate", {"schema_version":"heel.runner-rotation-activate.v1", "signature_b64":base64.b64encode(new.sign(v1_proof)).decode()})[0] == 400
         proof = b"heel.runner-rotation-activate.v2\0" + canonical_bytes({"pairing_id":rotation["pairing_id"], "challenge":poll["activation_challenge"]})
         activation_request = {"schema_version":"heel.runner-rotation-activate.v2", "signature_b64":base64.b64encode(new.sign(proof)).decode()}
+        abort_core = {
+            "schema_version": "heel.runner-rotation-activation-abort.v1",
+            "workspace_id": signup["workspace_id"], "runner_id": pending["runner_id"],
+            "pairing_id": rotation["pairing_id"], "old_runner_key_id": old_signer.key_id,
+            "new_runner_key_id": ed25519_key_id(base64.b64decode(new_public)),
+            "activation_request_digest": hashlib.sha256(canonical_bytes(activation_request)).hexdigest(),
+            "activation_challenge_digest": hashlib.sha256(base64.b64decode(poll["activation_challenge"])).hexdigest(),
+            "challenge_expires_at_ms": int(cp.store.conn.execute(
+                "SELECT expires_at FROM canary_runner_rotations WHERE pairing_id=?", (rotation["pairing_id"],),
+            ).fetchone()[0] * 1000),
+            "reason_code": "activation_challenge_expired",
+        }
+        abort = dict(abort_core)
+        abort["old_signature_b64"] = base64.b64encode(old.sign(
+            b"heel.runner-rotation-activation-abort.v1.old\0" + canonical_bytes(abort_core),
+        )).decode()
+        abort["new_signature_b64"] = base64.b64encode(new.sign(
+            b"heel.runner-rotation-activation-abort.v1.new\0" + canonical_bytes(abort_core),
+        )).decode()
+        assert request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/activation-abort", abort)[0] == 409
         status, activated, _ = request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/activate", activation_request)
         assert status == 200
         assert set(activated) == {"schema_version", "workspace_id", "runner_id", "initial_claim_nonce", "initial_claim_sequence", "initial_claim_generation"}
@@ -791,7 +1126,7 @@ def test_runner_request_uses_a_fresh_connection_and_never_joins_human_write():
             def heartbeat():
                 started.set()
                 with cp.runner_request_store() as isolated:
-                    result.append(isolated.authenticate_and_consume(workspace_id=workspace, runner_id="runner", capability="runner_claim", path=route, raw_body=body, headers=headers, action=lambda: {"ok":"yes"})[0])
+                    result.append(isolated.authenticate_and_consume(workspace_id=workspace, runner_id="runner", capability="runner_claim", path=route, raw_body=body, headers=headers, action=lambda: RunnerHttpAction(200, {"ok":"yes"}) )[1])
             cp.store.conn.execute("BEGIN IMMEDIATE"); cp.store.conn.execute("UPDATE workspaces SET name=name WHERE workspace_id=?", (workspace,))
             thread = threading.Thread(target=heartbeat); thread.start(); assert started.wait(1)
             time.sleep(.05); assert thread.is_alive()  # blocked on the database, not a second BEGIN on the human connection

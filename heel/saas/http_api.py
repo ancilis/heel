@@ -76,7 +76,9 @@ from .canary_disclosure import (
 from .canary_runs import CanaryRunError, CanaryRunService
 from .runner_contexts import RunnerContextBindingService, RunnerContextError
 from .runner_auth import (
+    RunnerActivationAbortConflict,
     RunnerAuthError,
+    RunnerHttpAction,
     RunnerAuthRateLimited,
     RunnerAuthStore,
     RunnerProtocolUpgradeRequired,
@@ -809,7 +811,9 @@ class _Handler(BaseHTTPRequestHandler):
             return False
         if len(p) == 3 and p[1] in {"runner-pairings", "runner-rotations"} and p[2] == "exchange":
             return True
-        if len(p) == 4 and p[1] in {"runner-pairings", "runner-rotations"} and p[3] in {"activate", "poll"}:
+        if len(p) == 4 and p[1] == "runner-pairings" and p[3] in {"activate", "activation-abort"}:
+            return True
+        if len(p) == 4 and p[1] == "runner-rotations" and p[3] in {"activate", "poll", "activation-abort"}:
             return True
         return bool(len(p) >= 6 and p[1] == "workspaces" and p[3] == "runners" and (
             (len(p) == 6 and p[5] == "claim") or
@@ -900,8 +904,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._runner_pairing_exchange
         if method == "POST" and len(rest) == 3 and rest[0] == "runner-pairings" and rest[2] == "activate":
             return lambda: self._runner_pairing_activate(rest[1])
+        if method == "POST" and len(rest) == 3 and rest[0] == "runner-pairings" and rest[2] == "activation-abort":
+            return lambda: self._runner_pairing_activation_abort(rest[1])
         if method == "POST" and len(rest) == 3 and rest[0] == "runner-rotations" and rest[2] == "activate":
             return lambda: self._runner_rotation_activate(rest[1])
+        if method == "POST" and len(rest) == 3 and rest[0] == "runner-rotations" and rest[2] == "activation-abort":
+            return lambda: self._runner_rotation_activation_abort(rest[1])
         if method == "POST" and len(rest) == 3 and rest[0] == "runner-rotations" and rest[2] == "poll":
             return lambda: self._runner_rotation_poll(rest[1])
         if len(rest) >= 3 and rest[0] == "workspaces":
@@ -1106,6 +1114,25 @@ class _Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
         self._json(200, {"schema_version": "heel.runner-pairing-activated.v1", "workspace_id": wid, "runner_id": runner_id, "initial_claim_nonce": nonce, "capabilities": ["runner_claim", "runner_heartbeat", "runner_progress", "runner_result"]})
 
+    def _runner_pairing_activation_abort(self, pairing_id: str) -> None:
+        """Runner-key-only recovery for a challenge that reached Cloud expiry."""
+        try:
+            if self._header_values("Authorization") or self._header_values("Cookie") or len(self._raw_body()) > 4096:
+                raise ValueError
+            body = self._body()
+            if canonical_bytes(body) != self._raw_body():
+                raise ValueError
+            response = self._runner_store().abort_executable_pairing_activation(pairing_id, body)
+        except RunnerActivationAbortConflict as error:
+            payload = {"schema_version": "heel.runner-error.v1", "code": error.code}
+            if error.retry_after_ms is not None:
+                payload["retry_after_ms"] = error.retry_after_ms
+            self._json(409, payload)
+            return
+        except (KeyError, TypeError, ValueError, RunnerAuthError):
+            raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
+        self._json(200, response)
+
     def _runner_rotation_poll(self, pairing_id: str) -> None:
         try:
             challenge = self._runner_store().rotation_activation_challenge(pairing_id)
@@ -1129,6 +1156,24 @@ class _Handler(BaseHTTPRequestHandler):
             "initial_claim_sequence": sequence,
             "initial_claim_generation": generation,
         })
+
+    def _runner_rotation_activation_abort(self, pairing_id: str) -> None:
+        try:
+            if self._header_values("Authorization") or self._header_values("Cookie") or len(self._raw_body()) > 4096:
+                raise ValueError
+            body = self._body()
+            if canonical_bytes(body) != self._raw_body():
+                raise ValueError
+            response = self._runner_store().abort_rotation_activation(pairing_id, body)
+        except RunnerActivationAbortConflict as error:
+            payload = {"schema_version": "heel.runner-error.v1", "code": error.code}
+            if error.retry_after_ms is not None:
+                payload["retry_after_ms"] = error.retry_after_ms
+            self._json(409, payload)
+            return
+        except (KeyError, TypeError, ValueError, RunnerAuthError):
+            raise ApiError(400, "invalid runner rotation", code="invalid_runner_rotation") from None
+        self._json(200, response)
 
     def _runner_rotation_start(self, wid: str, runner_id: str) -> None:
         self._recent_owner_admin(wid)
@@ -1275,7 +1320,7 @@ class _Handler(BaseHTTPRequestHandler):
                 raise RunnerAuthError("invalid runner authentication")
             all_headers = {name: self._header_values(name) for name in ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature", "Authorization", "Cookie")}
             store = self._runner_store()
-            def action() -> dict:
+            def action() -> RunnerHttpAction:
                 # This setup intentionally happens only after RunnerAuthStore's v3 protocol
                 # gate and PoP checks. A legacy pairing must not receive an authority error in
                 # place of the non-executable protocol response, and none of these services
@@ -1286,9 +1331,7 @@ class _Handler(BaseHTTPRequestHandler):
                     claimed = runs.claim(
                         wid, runner_id, all_headers["X-Heel-Runner-Key-Id"][0],
                     )
-                    return claimed or {
-                        "schema_version": "heel.runner-claim-idle.internal.v1",
-                    }
+                    return RunnerHttpAction(200, claimed) if claimed is not None else RunnerHttpAction(204, None)
                 key_id = all_headers["X-Heel-Runner-Key-Id"][0]
                 if operation.startswith("context-"):
                     if self.cp.grant_authority is None:
@@ -1296,9 +1339,9 @@ class _Handler(BaseHTTPRequestHandler):
                     context_runs, _ = self._runner_canary_services(store)
                     context_service = RunnerContextBindingService(store.conn, signing=self.cp.grant_authority)
                 if operation == "context-list":
-                    return context_service.list_for_runner_in_transaction(wid, runner_id, key_id)
+                    return RunnerHttpAction(200, context_service.list_for_runner_in_transaction(wid, runner_id, key_id))
                 if operation == "context-claim":
-                    return context_service.claim_in_transaction(wid, runner_id, key_id, run_id, parsed)
+                    return RunnerHttpAction(200, context_service.claim_in_transaction(wid, runner_id, key_id, run_id, parsed))
                 if operation == "context-approval-projections":
                     binding = context_service.active_binding_for_projection_in_transaction(
                         wid, runner_id, key_id, run_id, parsed["context_binding_digest"],
@@ -1308,28 +1351,28 @@ class _Handler(BaseHTTPRequestHandler):
                     )
                     if getattr(response, "created", False):
                         context_service._event(binding, "projection_submitted", "runner", runner_id)
-                    return response
+                    return RunnerHttpAction(201, response)
                 if operation == "result-projection":
                     project_ref = self._runner_run_project(
                         store.conn, wid, runner_id, run_id,
                     )
-                    return disclosure.upload(
+                    return RunnerHttpAction(200, disclosure.upload(
                         wid, project_ref, run_id, runner_id, parsed,
-                    )
+                    ))
                 projection = parsed["operational_projection"]
                 project_ref = projection["project_id"]
                 if operation == "heartbeat":
-                    return runs.heartbeat(wid, project_ref, run_id, runner_id, projection)
+                    return RunnerHttpAction(200, runs.heartbeat(wid, project_ref, run_id, runner_id, projection))
                 if operation == "progress":
-                    return runs.progress(wid, project_ref, run_id, runner_id, projection)
+                    return RunnerHttpAction(200, runs.progress(wid, project_ref, run_id, runner_id, projection))
                 if operation == "result":
-                    return runs.result(wid, project_ref, run_id, runner_id, projection)
+                    return RunnerHttpAction(200, runs.result(wid, project_ref, run_id, runner_id, projection))
                 acknowledged = runs.ack_stop(
                     wid, project_ref, run_id, runner_id, projection,
                 )
-                return acknowledged
+                return RunnerHttpAction(200, acknowledged)
 
-            response, nonce = self._runner_store().authenticate_and_consume(
+            response_status, response, nonce = self._runner_store().authenticate_and_consume(
                 workspace_id=wid, runner_id=runner_id, capability=capability, path=self.path,
                 raw_body=self._raw_body(), headers=all_headers,
                 action=action,
@@ -1354,12 +1397,16 @@ class _Handler(BaseHTTPRequestHandler):
         except (ValueError, RunnerAuthError, LookupError):
             raise RunnerAuthError("invalid runner authentication") from None
         response_headers = {"X-Heel-Runner-Next-Nonce": nonce}
-        if response.get("schema_version") == "heel.runner-claim-idle.internal.v1":
+        if response_status == 204:
             self._write_empty(204, response_headers)
-        elif operation == "context-approval-projections":
-            self._json(201, response, response_headers)
         else:
-            self._json(200, response, response_headers)
+            if response is None:
+                raise RunnerAuthError("invalid runner authentication")
+            body = RunnerAuthStore.response_wire_body(response)
+            if getattr(self, "_defer_json_response", False):
+                self._pending_json_response = (response_status, body, response_headers)
+            else:
+                self._write_json(response_status, body, response_headers)
 
     def _runner_canary_services(
         self, store: RunnerAuthStore,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import os
 import shutil
 from types import SimpleNamespace
@@ -20,7 +21,9 @@ from heel.runner.http_transport import CancellationToken
 from heel.runner.execution import ExecutionBundle, ExecutionGate
 from heel.runner.service import ClaimLease, RunnerService
 from heel.runner.store import RunnerStore, RunnerStoreError
-from heel.runner.runtime import RunnerRuntimeState
+from heel.runner.runtime import (
+    PendingResultReplayAuthority, RunnerRuntimeConflict, RunnerRuntimeState,
+)
 import heel.runner.store as runner_store_module
 from tests.test_runner_stop import (
     BlockingExecutor, LocalCanaryExecutor, ScriptedTransport, StaticVault,
@@ -681,7 +684,7 @@ def test_coordinator_rolls_forward_only_from_one_fresh_list_and_matching_claim(t
 
 
 def test_claim_decodes_closed_bundle_installs_all_run_chains_and_builds_safe_projection(tmp_path):
-    coordinator, _, transport, manifest, projection, grant, _ = _coordinator(
+    coordinator, client, transport, manifest, projection, grant, _ = _coordinator(
         tmp_path,
         lambda manifest, projection, grant: [
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
@@ -705,11 +708,323 @@ def test_claim_decodes_closed_bundle_installs_all_run_chains_and_builds_safe_pro
         "remaining_requests": manifest["budgets"]["maximum_requests"],
         "remaining_wall_ms": manifest["budgets"]["wall_timeout_ms"],
     }
+    active = client.runtime.load_active_run_controls()
+    assert len(active) == 1
+    assert active[0].run_id == grant["run_id"]
+    assert set(active[0].chains) == {"heartbeat", "progress", "result", "stop-ack"}
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=client.signer, clock=client.clock, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    assert restarted._tracked_runs == {grant["run_id"]}
+    assert grant["run_id"] in restarted._run_guards
 
     gate = coordinator.heartbeat(lease.run_id, lease.operational_projection)
     assert gate == ExecutionGate(**_gate(server_time_ms=2_001))
     assert transport.requests[-1][1]["X-Heel-Runner-Nonce"] == _nonce(b"h")
     assert transport.requests[-1][1]["X-Heel-Runner-Sequence"] == "4"
+    active = client.runtime.load_active_run_controls()
+    assert active[0].revision == 2 and active[0].gate["server_time_ms"] == 2_001
+
+
+def test_restart_coordinator_rehydrates_active_binding_but_requires_fresh_heartbeat(tmp_path):
+    coordinator, client, transport, _manifest, projection, grant, authority = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"z")},
+             _gate(server_time_ms=2_001)),
+        ],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+
+    restarted_control = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=client.signer, clock=client.clock, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    restarted = RunnerCoordinator(
+        control=restarted_control, store=coordinator.store,
+        identity=coordinator.identity, signer=coordinator.signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        clock_ms=lambda: 2_000, monotonic=lambda: 1.0,
+    )
+
+    assert restarted._bindings[grant["run_id"]] == (
+        grant["grant_id"], projection["projection_id"], projection["projection_digest"],
+    )
+    assert restarted._gates[grant["run_id"]] == ExecutionGate(**_gate())
+    with pytest.raises(ValueError, match="active runner claim is required"):
+        restarted.execution_gate(grant["run_id"])
+
+    gate = restarted.heartbeat(lease.run_id, lease.operational_projection)
+    assert gate == ExecutionGate(**_gate(server_time_ms=2_001))
+    assert restarted.execution_gate(grant["run_id"]) == gate
+
+
+def test_restart_replays_staged_heartbeat_with_the_original_signed_request(tmp_path, monkeypatch):
+    coordinator, client, transport, _manifest, _projection, grant, _authority = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"z")},
+             _gate(server_time_ms=2_001)),
+            # The control plane's immutable receipt returns this exact response
+            # when the runner replays after losing the first response locally.
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"z")},
+             _gate(server_time_ms=2_001)),
+        ],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+
+    real_commit = client.runtime.commit_call
+    monkeypatch.setattr(client.runtime, "commit_call", lambda *args, **kwargs: (
+        (_ for _ in ()).throw(RuntimeError("lost response before runtime commit"))
+    ))
+    with pytest.raises(RuntimeError, match="lost response"):
+        client._heartbeat_closed(lease.run_id, lease.operational_projection)
+    staged_path, staged_headers, staged_body = transport.requests[-1]
+    staged = client.runtime.load_pending_calls()
+    assert len(staged) == 1 and staged[0].request_operation == "heartbeat"
+    monkeypatch.setattr(client.runtime, "commit_call", real_commit)
+
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=client.signer, clock=client.clock, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    with pytest.raises(ValueError, match="pending replay"):
+        restarted._heartbeat_closed(lease.run_id, lease.operational_projection)
+
+    outcomes = restarted.replay_all_pending(now_ms=2_000)
+    assert [(item.request_operation, item.status) for item in outcomes] == [("heartbeat", 200)]
+    assert transport.requests[-1] == (staged_path, staged_headers, staged_body)
+    assert restarted.runtime.load_pending_calls() == ()
+    active = restarted.runtime.load_active_run_controls()
+    assert active[0].revision == 2
+    assert active[0].gate["server_time_ms"] == 2_001
+
+
+def test_restart_replays_staged_progress_with_the_original_signed_request(tmp_path, monkeypatch):
+    coordinator, client, transport, _manifest, projection, grant, _authority = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"z")},
+             _status(grant["run_id"], approval_id=projection["projection_id"], grant_id=grant["grant_id"])),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"z")},
+             _status(grant["run_id"], approval_id=projection["projection_id"], grant_id=grant["grant_id"])),
+        ],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+
+    real_commit = client.runtime.commit_call
+    monkeypatch.setattr(client.runtime, "commit_call", lambda *args, **kwargs: (
+        (_ for _ in ()).throw(RuntimeError("lost response before runtime commit"))
+    ))
+    with pytest.raises(RuntimeError, match="lost response"):
+        client._progress_closed(lease.run_id, lease.operational_projection)
+    staged_request = transport.requests[-1]
+    monkeypatch.setattr(client.runtime, "commit_call", real_commit)
+
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=client.signer, clock=client.clock, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    assert [(item.request_operation, item.status) for item in restarted.replay_all_pending(now_ms=2_000)] == [
+        ("progress", 200),
+    ]
+    assert transport.requests[-1] == staged_request
+    assert restarted.runtime.load_pending_calls() == ()
+
+
+def test_restart_replays_staged_stop_ack_with_the_original_signed_request(tmp_path, monkeypatch):
+    coordinator, client, transport, _manifest, _projection, _grant, _authority = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"z")},
+             {"accepted": True, "deadline_met": True, "late": False}),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"z")},
+             {"accepted": True, "deadline_met": True, "late": False}),
+        ],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    stopped = _phase(lease.operational_projection, coordinator.signer, "stop_requested")
+    stopped = _phase(stopped, coordinator.signer, "stop_requested")
+    stopped_unsigned = {
+        key: copy.deepcopy(value) for key, value in stopped.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    stopped_unsigned["timestamps"]["stop_acknowledged_at_ms"] = 2_000
+    stopped = validate_operational_run({
+        **stopped_unsigned,
+        "projection_digest": canonical_digest(stopped_unsigned),
+        "signing_key_id": coordinator.signer.key_id,
+        "signature_b64": base64.b64encode(
+            coordinator.signer.sign(canonical_bytes(stopped_unsigned))
+        ).decode("ascii"),
+    })
+
+    real_commit = client.runtime.commit_call
+    monkeypatch.setattr(client.runtime, "commit_call", lambda *args, **kwargs: (
+        (_ for _ in ()).throw(RuntimeError("lost response before runtime commit"))
+    ))
+    with pytest.raises(RuntimeError, match="lost response"):
+        client._stop_ack_closed(lease.run_id, stopped)
+    staged_request = transport.requests[-1]
+    monkeypatch.setattr(client.runtime, "commit_call", real_commit)
+
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=client.signer, clock=client.clock, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    assert [(item.request_operation, item.status) for item in restarted.replay_all_pending(now_ms=2_000)] == [
+        ("stop-ack", 200),
+    ]
+    assert transport.requests[-1] == staged_request
+    assert restarted.runtime.load_pending_calls() == ()
+
+
+def test_client_only_restart_never_replays_a_pending_terminal_result(tmp_path):
+    coordinator, client, transport, _manifest, _projection, grant, _authority = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, {"malformed": True}),
+        ],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    terminal = _phase(lease.operational_projection, coordinator.signer, "terminal")
+    _install_terminal_anchor(coordinator, grant, terminal)
+
+    with pytest.raises(ValueError, match="invalid runner result response"):
+        coordinator.result(grant["run_id"], terminal)
+    (pending,) = client.runtime.load_pending_calls()
+    assert pending.request_operation == "result"
+    before = len(transport.requests)
+
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=client.signer, clock=client.clock, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    with pytest.raises(RunnerRuntimeConflict, match="terminal result recovery is required"):
+        restarted.replay_pending_call(pending, now_ms=2_000)
+    assert len(transport.requests) == before
+
+
+def test_store_verifier_replays_only_the_detached_pending_terminal_request(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path / "store")
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    terminal = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    ).operational_projection
+    transport = ScriptedControlTransport([
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, _claim(manifest, projection, grant)),
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, {"malformed": True}),
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, _status(
+            grant["run_id"], approval_id=projection["projection_id"], status="terminal",
+        )),
+    ])
+    client = RunnerControlClient(
+        origin="https://control.example", workspace_id=identity.workspace_id,
+        runner_id=identity.runner_id, signer=signer, clock=lambda: 2_000,
+        transport=transport, nonce_source=lambda _key: _nonce(b"c"),
+        trusted_disclosure_keys={authority.key_id: authority.public_key},
+        runtime=_control_runtime(tmp_path / "runtime.sqlite3", identity, signer),
+    )
+    assert client._claim_closed()["run_id"] == grant["run_id"]
+
+    def prepare() -> None:
+        anchor = store._runtime_terminal_anchor(grant["run_id"])
+        state = client._register_runtime_local_terminal(anchor)
+        store.detach_terminal(
+            grant["run_id"], runtime=client.runtime,
+            expected_local_state_digest=state.state_digest, now_ms=2_000,
+        )
+
+    with pytest.raises(ValueError, match="invalid runner result response"):
+        client._result_closed(grant["run_id"], terminal, before_transport=prepare)
+    (pending,) = client.runtime.load_pending_calls()
+    staged_request = transport.requests[-1]
+    verifier = store.pending_result_replay_verifier(client.runtime)
+    issued = verifier.authorize_pending_result_replay(pending, now_ms=2_000)
+    (active,) = client.runtime.load_active_run_controls()
+    local = client.runtime.load_terminal_state(grant["run_id"])
+    assert local is not None
+    expected = {
+        "call_id": pending.call_id,
+        "pending_state_digest": pending.pending_state_digest,
+        "run_id": grant["run_id"],
+        "body_sha256": hashlib.sha256(pending.body).hexdigest(),
+        "active_state_digest": active.state_digest,
+        "runtime_terminal_state_digest": local.state_digest,
+        "terminal_record_digest": local.terminal_record_digest,
+        "terminal_projection_digest": local.terminal_projection_digest,
+        "retention_expires_at_ms": local.retention_expires_at_ms,
+    }
+    verifier.consume(issued, expected_fields=expected)
+    with pytest.raises(RunnerStoreError, match="pending terminal replay authority"):
+        verifier.consume(issued, expected_fields=expected)
+    forged = PendingResultReplayAuthority(
+        call_id=issued.call_id, pending_state_digest=issued.pending_state_digest,
+        run_id=issued.run_id, body_sha256=issued.body_sha256,
+        active_state_digest=issued.active_state_digest,
+        runtime_terminal_state_digest=issued.runtime_terminal_state_digest,
+        terminal_record_digest=issued.terminal_record_digest,
+        detached_record_digest=issued.detached_record_digest,
+        terminal_projection_digest=issued.terminal_projection_digest,
+        retention_expires_at_ms=issued.retention_expires_at_ms, _issuer=object(),
+    )
+    with pytest.raises(RunnerStoreError, match="pending terminal replay authority"):
+        verifier.consume(forged, expected_fields=expected)
+    assert transport.requests[-1] == staged_request
+
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=identity.workspace_id, runner_id=identity.runner_id,
+        signer=signer, clock=lambda: 2_000, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    recovered = RunnerCoordinator(
+        control=restarted, store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        clock_ms=lambda: 2_000, monotonic=lambda: 1.0,
+    )
+
+    assert transport.requests[-1] == staged_request
+    assert restarted.runtime.load_pending_calls() == ()
+    assert restarted.runtime.load_active_run_controls() == ()
+    assert recovered._gates == {}
+    assert recovered._gate_receipts == {}
+    assert recovered._bindings == {}
 
 
 def test_idle_claim_requires_exact_204_empty_body_and_advances_only_claim_chain(tmp_path):
@@ -741,22 +1056,37 @@ def test_malformed_claim_fails_before_any_local_nonce_state_is_installed(tmp_pat
 
 
 def test_live_gate_rejects_replayed_server_time_and_regressed_control_generation(tmp_path):
-    coordinator, _, _, _, _, _, _ = _coordinator(
+    coordinator, client, _, _, _, _, _ = _coordinator(
         tmp_path,
         lambda manifest, projection, grant: [
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
              _claim(manifest, projection, grant)),
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"a")}, _gate()),
-            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"b")},
-             _gate(server_time_ms=2_001, generation=6)),
         ],
     )
     lease = coordinator.claim()
     assert lease is not None
     with pytest.raises(ValueError, match="did not advance"):
         coordinator.heartbeat(lease.run_id, lease.operational_projection)
+    active = client.runtime.load_active_run_controls()
+    assert active[0].revision == 1 and active[0].gate["server_time_ms"] == 2_000
+    assert [call.request_operation for call in client.runtime.load_pending_calls()] == ["heartbeat"]
+
+    regressed, regressed_client, _, _, _, _, _ = _coordinator(
+        tmp_path / "regressed",
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"b")},
+             _gate(server_time_ms=2_001, generation=6)),
+        ],
+    )
+    regressed_lease = regressed.claim()
+    assert regressed_lease is not None
     with pytest.raises(ValueError, match="generation regressed"):
-        coordinator.heartbeat(lease.run_id, lease.operational_projection)
+        regressed.heartbeat(regressed_lease.run_id, regressed_lease.operational_projection)
+    active = regressed_client.runtime.load_active_run_controls()
+    assert active[0].revision == 1 and active[0].gate["kill_switch_generation"] == 7
 
 
 @pytest.mark.parametrize("response", [
@@ -990,7 +1320,7 @@ def test_supervisor_uses_the_exact_timestamp_signed_by_the_concrete_stop_ack():
 
 
 def test_control_for_distinct_runs_remains_concurrent(tmp_path):
-    coordinator, client, _, _, projection, grant, _ = _coordinator(
+    coordinator, client, transport, manifest, projection, grant, authority = _coordinator(
         tmp_path,
         lambda manifest, projection, grant: [
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
@@ -1000,18 +1330,25 @@ def test_control_for_distinct_runs_remains_concurrent(tmp_path):
     lease = coordinator.claim()
     assert lease is not None
     second_run_id = "crun_" + "b" * 32
-    with client._state_lock:
-        client._tracked_runs.add(second_run_id)
-        client._run_guards[second_run_id] = _RunGuard(threading.Lock(), object())
-        for operation, marker, sequence in (
-            ("heartbeat", b"h", 4), ("progress", b"p", 5),
-            ("result", b"r", 6), ("stop-ack", b"s", 7),
-        ):
-            client._chains[f"{operation}:{second_run_id}"] = (_nonce(marker), sequence, 3)
-            client.runtime.install_chain(
-                operation=operation, run_id=second_run_id, next_nonce_b64=_nonce(marker),
-                next_sequence=sequence, generation=3, now_ms=2_000,
-            )
+    second_unsigned = {
+        key: copy.deepcopy(value) for key, value in grant.items()
+        if key not in {"grant_digest", "signing_key_id", "signature_b64"}
+    }
+    second_unsigned.update({
+        "run_id": second_run_id,
+        "grant_id": "grant_987654321",
+        "grant_nonce": "nonce_987654321",
+    })
+    second_grant = {
+        **second_unsigned,
+        "grant_digest": canonical_digest(second_unsigned),
+        **authority.sign(canonical_bytes(second_unsigned)),
+    }
+    transport.responses.append((
+        200, {"X-Heel-Runner-Next-Nonce": _nonce(b"m")},
+        _claim(manifest, projection, second_grant),
+    ))
+    assert client._claim_closed()["run_id"] == second_run_id
     barrier = threading.Barrier(2)
 
     class ConcurrentTransport:
@@ -1024,6 +1361,7 @@ def test_control_for_distinct_runs_remains_concurrent(tmp_path):
                 )
             return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"b")}, _status(
                 second_run_id, approval_id=projection["projection_id"],
+                grant_id=second_grant["grant_id"],
             )
 
     client.transport = ConcurrentTransport()
@@ -1031,6 +1369,20 @@ def test_control_for_distinct_runs_remains_concurrent(tmp_path):
     second_running = _phase(
         lease.operational_projection, coordinator.signer, "running", run_id=second_run_id,
     )
+    second_running_unsigned = {
+        key: copy.deepcopy(value) for key, value in second_running.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    second_running_unsigned["grant_id"] = second_grant["grant_id"]
+    second_running_unsigned["grant_digest"] = second_grant["grant_digest"]
+    second_running = validate_operational_run({
+        **second_running_unsigned,
+        "projection_digest": canonical_digest(second_running_unsigned),
+        "signing_key_id": coordinator.signer.key_id,
+        "signature_b64": base64.b64encode(
+            coordinator.signer.sign(canonical_bytes(second_running_unsigned))
+        ).decode("ascii"),
+    })
     failures = []
 
     def call(method, run_id, current):
@@ -1168,6 +1520,73 @@ def test_terminal_disclosure_replays_the_sealed_pending_request_after_client_res
     assert receipt["status"] == "synchronized"
     assert client.runtime.load_pending_calls() == ()
     assert transport.requests[-1][2] == first_body
+
+
+def test_coordinator_startup_replays_real_detached_findings_pending_request(tmp_path):
+    receipt_holder = {}
+
+    def responses(manifest, projection, grant):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, _status(
+                grant["run_id"], approval_id=projection["projection_id"], status="terminal",
+            )),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, {"malformed": True}),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, receipt_holder),
+        ]
+
+    coordinator, client, transport, manifest, projection, grant, authority = _coordinator(
+        tmp_path, responses,
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    completed = LocalCanaryExecutor(
+        store=coordinator.store, identity=coordinator.identity, signer=coordinator.signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        lease.bundle, transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    coordinator.result(grant["run_id"], completed.operational_projection)
+    findings = _findings_projection(coordinator, manifest, projection, grant)
+    permit = _permit(authority, coordinator, grant, findings)
+    receipt_holder.update({
+        "schema_version": "heel.canary-findings-receipt.v1",
+        "receipt_id": "cfr_runner_recovered_upload",
+        "workspace_id": grant["workspace_id"], "project_id": grant["project_id"],
+        "run_id": grant["run_id"], "grant_id": grant["grant_id"],
+        "permit_id": permit["permit_id"], "projection_id": findings["projection_id"],
+        "projection_digest": findings["projection_digest"],
+        "byte_count": len(canonical_bytes(findings)), "scenario_count": 0,
+        "finding_count": 0, "accepted_at_ms": 2_001, "status": "synchronized",
+    })
+    with pytest.raises(ValueError, match="invalid runner findings receipt"):
+        coordinator.upload_findings(
+            grant["run_id"], permit=permit, findings_projection=findings,
+        )
+    (pending,) = client.runtime.load_pending_calls()
+    assert pending.request_operation == "upload-findings"
+    sealed_body = pending.body
+
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=client.signer, clock=client.clock, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    recovered = RunnerCoordinator(
+        control=restarted, store=coordinator.store, identity=coordinator.identity,
+        signer=coordinator.signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        clock_ms=lambda: 2_000, monotonic=lambda: 1.0,
+    )
+
+    assert transport.requests[-1][2] == sealed_body
+    assert restarted.runtime.load_pending_calls() == ()
+    assert restarted.runtime.load_terminal_state(grant["run_id"]).state == "consumed"
+    assert recovered._bindings == {}
 
 
 def test_real_detached_terminal_rehydrates_available_disclosure_and_rejects_missing_sides(tmp_path):

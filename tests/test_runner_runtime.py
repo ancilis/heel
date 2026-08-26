@@ -17,15 +17,20 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from heel.canary_contracts import canonical_bytes
-from heel.crypto import ed25519_key_id
+from heel.crypto import SigningAuthority, ed25519_key_id
 from heel.runner.catalog import CATALOG_IDS
 from heel.runner.identity import AcceptedRotationJournal, RunnerIdentity, SecureSigner, runner_phrase_words
 from heel.runner.runtime import (
+    ActiveRunInstall,
     RunnerRuntimeConflict,
+    RunnerRuntimeCorrupt,
     RunnerRuntimeState,
+    _active_json_bytes,
+    _active_state_digest,
     _SEAL_DOMAIN,
     _state_digest,
 )
+from tests.test_runner_stop import compiled_pair, signed_grant
 
 
 class Signer(SecureSigner):
@@ -90,6 +95,33 @@ assert not path.parent.exists()
     assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
+def test_runtime_refuses_an_ancestor_symlink_before_creating_a_database(tmp_path):
+    signer = Signer()
+    target = tmp_path / "real-parent"
+    target.mkdir(mode=0o700)
+    alias = tmp_path / "linked-parent"
+    alias.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(RunnerRuntimeCorrupt, match="runtime state parent is unsafe"):
+        RunnerRuntimeState(alias / "runtime.sqlite3", _identity(signer), signer)
+
+    assert not (target / "runtime.sqlite3").exists()
+
+
+def test_runtime_refuses_a_direct_database_symlink_before_sqlite_opens_it(tmp_path):
+    signer = Signer()
+    target = tmp_path / "target.sqlite3"
+    target.write_bytes(b"not a runtime database")
+    os.chmod(target, 0o600)
+    path = tmp_path / "runtime.sqlite3"
+    path.symlink_to(target)
+
+    with pytest.raises(RunnerRuntimeCorrupt, match="runtime state is unsafe"):
+        RunnerRuntimeState(path, _identity(signer), signer)
+
+    assert target.read_bytes() == b"not a runtime database"
+
+
 def _identity(signer: Signer) -> RunnerIdentity:
     import hashlib
     return RunnerIdentity(
@@ -100,6 +132,26 @@ def _identity(signer: Signer) -> RunnerIdentity:
         fingerprint=hashlib.sha256(signer.public_key).hexdigest(), key_id=signer.key_id,
         pairing_phrase=runner_phrase_words()[:6],
     )
+
+
+def test_active_runtime_canonicalizer_is_boolean_capable_but_still_closed():
+    value = {"z": None, "gate": {"active": True, "stopped": False}, "accent": "é"}
+    encoded = _active_json_bytes(value)
+
+    assert encoded == b'{"accent":"\xc3\xa9","gate":{"active":true,"stopped":false},"z":null}'
+    assert _active_state_digest(value) == hashlib.sha256(
+        b"heel.runner-active-run-state-digest.v1\0" + encoded
+    ).hexdigest()
+    for invalid in (
+        {"float": 1.5}, {"negative": -1}, {"large": 9_007_199_254_740_992},
+        {"non_nfc": "e\u0301"}, {"control": "bad\ntext"}, {"surrogate": "\ud800"},
+        {"nested": [[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]},
+    ):
+        with pytest.raises(ValueError):
+            _active_json_bytes(invalid)
+
+    with pytest.raises(ValueError):
+        canonical_bytes({"active": True})
 
 
 def _rotation_journal(old: RunnerIdentity, new: RunnerIdentity, *, nonce: str) -> AcceptedRotationJournal:
@@ -113,22 +165,76 @@ def _rotation_journal(old: RunnerIdentity, new: RunnerIdentity, *, nonce: str) -
             "initial_claim_sequence": 1, "initial_claim_generation": 1,
         },
         created_at_ms=1, updated_at_ms=2, new_signer_label="runner-rotation-key",
+        prepared_journal_digest="d" * 64, runtime_rotation_intent_digest="e" * 64,
     )
+
+
+def _runtime_with_active_run(tmp_path):
+    """Build the post-claim runtime state through the public durable transaction."""
+    _store, identity, signer, manifest, projection = compiled_pair(tmp_path / "authority")
+    grant_authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, grant_authority)
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    claim_nonce = base64.b64encode(b"c" * 32).decode("ascii")
+    claim = runtime.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=claim_nonce,
+        next_sequence=1, generation=0, now_ms=1,
+    )
+    path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/claim"
+    body = canonical_bytes({"schema_version": "heel.runner-claim-request.v1"})
+    proof = {
+        "schema_version": "heel.runner-request-proof.v1", "workspace_id": identity.workspace_id,
+        "runner_id": identity.runner_id, "key_id": identity.key_id, "capability": "runner_claim",
+        "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(),
+        "timestamp_ms": 2, "server_nonce": claim_nonce, "sequence": 1,
+    }
+    headers = {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
+        "X-Heel-Runner-Key-Id": identity.key_id, "X-Heel-Runner-Timestamp-Ms": "2",
+        "X-Heel-Runner-Signature": base64.b64encode(
+            signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))
+        ).decode("ascii"),
+        "X-Heel-Runner-Nonce": claim_nonce, "X-Heel-Runner-Sequence": "1",
+    }
+    pending = runtime.stage_call(
+        request_operation="claim", chain_operation="claim", run_id=None,
+        path=path, capability="runner_claim", headers=headers, body=body,
+        expected_state_digest=claim.state_digest, now_ms=2,
+    )
+    run_id = grant["run_id"]
+    installed = tuple(
+        (operation, run_id, base64.b64encode(marker * 32).decode("ascii"), 1, 0)
+        for operation, marker in (
+            ("heartbeat", b"h"), ("progress", b"p"),
+            ("result", b"r"), ("stop-ack", b"s"),
+        )
+    )
+    runtime.commit_call(
+        pending.call_id, next_nonce_b64=base64.b64encode(b"n" * 32).decode("ascii"),
+        now_ms=2, installed_chains=installed,
+        active_run=ActiveRunInstall(
+            run_id=run_id, approval_projection=projection, grant=grant,
+            gate={
+                "active": True, "runner_state": "active", "proof_state": "valid",
+                "proof_expires_at_ms": 20_000, "kill_switch_generation": 7,
+                "stop_reason": "none", "server_time_ms": 2_000,
+            },
+            claim_response_digest="a" * 64, gate_response_digest="b" * 64,
+            claimed_at_ms=2, gate_received_at_ms=2,
+        ),
+    )
+    return runtime, signer, identity, grant
 
 
 def _runtime_with_available_disclosure(tmp_path, *, suffix: str = "d"):
-    signer = Signer()
-    identity = _identity(signer)
-    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
-    run_id = "crun_" + suffix * 32
-    nonce = base64.b64encode(b"n" * 32).decode("ascii")
-    cursor = runtime.install_chain(
-        operation="result", run_id=run_id, next_nonce_b64=nonce,
-        next_sequence=1, generation=0, now_ms=1,
-    )
+    del suffix
+    runtime, signer, identity, grant = _runtime_with_active_run(tmp_path)
+    run_id = grant["run_id"]
+    cursor = runtime.load_chain("result", run_id)
+    assert cursor is not None
     runtime.register_local_terminal(
-        run_id=run_id, project_id="prj_123456789", grant_id="grant_123456789",
-        approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+        run_id=run_id, project_id=grant["project_id"], grant_id=grant["grant_id"],
+        approval_projection_digest=grant["approval"]["projection_digest"], terminal_projection_digest="b" * 64,
         terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
     )
     path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/runs/{run_id}/result"
@@ -137,7 +243,7 @@ def _runtime_with_available_disclosure(tmp_path, *, suffix: str = "d"):
         "schema_version": "heel.runner-request-proof.v1", "workspace_id": identity.workspace_id,
         "runner_id": identity.runner_id, "key_id": identity.key_id, "capability": "runner_result",
         "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(),
-        "timestamp_ms": 11, "server_nonce": nonce, "sequence": 1,
+        "timestamp_ms": 11, "server_nonce": cursor.next_nonce_b64, "sequence": 1,
     }
     headers = {
         "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
@@ -145,7 +251,7 @@ def _runtime_with_available_disclosure(tmp_path, *, suffix: str = "d"):
         "X-Heel-Runner-Signature": base64.b64encode(
             signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))
         ).decode("ascii"),
-        "X-Heel-Runner-Nonce": nonce, "X-Heel-Runner-Sequence": "1",
+        "X-Heel-Runner-Nonce": cursor.next_nonce_b64, "X-Heel-Runner-Sequence": "1",
     }
     staged = runtime.stage_call(
         request_operation="result", chain_operation="result", run_id=run_id, path=path,
@@ -156,6 +262,72 @@ def _runtime_with_available_disclosure(tmp_path, *, suffix: str = "d"):
         staged.call_id, next_nonce_b64=base64.b64encode(b"x" * 32).decode("ascii"), now_ms=12,
     )
     return runtime, signer, identity, run_id, available
+
+
+@pytest.mark.parametrize("tamper", ("remove-active", "insert-extra-cursor"))
+def test_active_hydration_rejects_orphaned_or_nonexact_cursor_groups(tmp_path, tamper):
+    runtime, _signer, _identity_value, grant = _runtime_with_active_run(tmp_path)
+    run_hash = hashlib.sha256(grant["run_id"].encode("utf-8")).hexdigest()
+
+    with sqlite3.connect(runtime.path) as conn:
+        if tamper == "remove-active":
+            conn.execute("DELETE FROM active_runs WHERE run_hash=?", (run_hash,))
+        else:
+            original = conn.execute(
+                "SELECT sealed_blob,updated_at_ms FROM control_chains "
+                "WHERE run_hash=? AND operation='heartbeat'",
+                (run_hash,),
+            ).fetchone()
+            assert original is not None
+            conn.execute(
+                "INSERT INTO control_chains(chain,run_hash,operation,next_sequence,generation,sealed_blob,updated_at_ms) "
+                "VALUES(?,?,?,?,?,?,?)",
+                ("a" * 64, run_hash, "heartbeat", 1, 0, original[0], original[1]),
+            )
+
+    with pytest.raises(RunnerRuntimeCorrupt, match="active run cursor group"):
+        runtime.load_active_run_controls()
+
+
+def test_active_hydration_rejects_an_available_terminal_that_coexists_with_live_cursors(tmp_path):
+    runtime, _signer, _identity_value, grant = _runtime_with_active_run(tmp_path)
+    run_id = grant["run_id"]
+    local = runtime.register_local_terminal(
+        run_id=run_id, project_id=grant["project_id"], grant_id=grant["grant_id"],
+        approval_projection_digest=grant["approval"]["projection_digest"],
+        terminal_projection_digest="b" * 64, terminal_record_digest="c" * 64,
+        terminal_at_ms=10, retention_expires_at_ms=20,
+    )
+    result = runtime.load_chain("result", run_id)
+    assert result is not None
+    core = runtime._terminal_core(
+        state="available", workspace_id=local.workspace_id, runner_id=local.runner_id,
+        runner_key_id=local.runner_key_id, run_id=run_id, run_hash=local.run_hash,
+        project_id=local.project_id, grant_id=local.grant_id,
+        approval_projection_digest=local.approval_projection_digest,
+        terminal_projection_digest=local.terminal_projection_digest,
+        terminal_record_digest=local.terminal_record_digest,
+        terminal_at_ms=local.terminal_at_ms,
+        retention_expires_at_ms=local.retention_expires_at_ms,
+        result_chain={
+            "operation": "result", "run_id": run_id,
+            "next_nonce_b64": base64.b64encode(b"x" * 32).decode("ascii"),
+            "next_sequence": result.next_sequence + 1, "generation": result.generation,
+        },
+        available_at_ms=11, permit_id=None, findings_projection_digest=None,
+        receipt_digest=None, disclosed_at_ms=None, revision=2,
+        prior_state_digest=local.state_digest,
+    )
+    available = runtime._validate_terminal_core(core)
+    blob = runtime._seal(core, schema=core["schema_version"], primary_fields=(local.run_hash,))
+    with sqlite3.connect(runtime.path) as conn:
+        conn.execute(
+            "UPDATE terminal_disclosures SET state=?,sealed_blob=?,updated_at_ms=? WHERE run_hash=?",
+            (available.state, blob, 11, local.run_hash),
+        )
+
+    with pytest.raises(RunnerRuntimeCorrupt, match="active run terminal state is invalid"):
+        runtime.load_active_run_controls()
 
 
 def test_runtime_load_terminal_state_is_exact_and_read_only(tmp_path):
@@ -243,7 +415,7 @@ def test_runtime_upgrades_v1_metadata_without_rewriting_existing_sealed_rows(tmp
     assert runtime.load_chain("claim", None).state_digest == core["state_digest"]
     assert RunnerRuntimeState(path, identity, signer).load_chain("claim", None).state_digest == core["state_digest"]
     with sqlite3.connect(path) as check:
-        assert check.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v2"
+        assert check.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v3"
         assert check.execute("SELECT sealed_blob FROM control_chains WHERE chain=?", (chain,)).fetchone()[0] == sealed
 
 
@@ -262,9 +434,14 @@ def test_runtime_finish_rotation_rewraps_the_stable_key_and_replaces_only_claim_
     rotation_nonce = base64.b64encode(b"n" * 32).decode("ascii")
 
     journal = _rotation_journal(old_identity, new_identity, nonce=rotation_nonce)
+    probe = runtime.probe_rotation_eligible(old_identity=old_identity)
+    eligibility = runtime.assert_rotation_eligible(
+        old_identity=old_identity, prepared_journal_digest="d" * 64,
+        runtime_rotation_intent_digest="e" * 64, probe=probe, now_ms=1,
+    )
     cursor = runtime.finish_rotation(
         journal,
-        new_identity=new_identity, new_signer=new_signer,
+        eligibility=eligibility, new_identity=new_identity, new_signer=new_signer,
     )
 
     assert runtime.identity == new_identity
@@ -274,7 +451,9 @@ def test_runtime_finish_rotation_rewraps_the_stable_key_and_replaces_only_claim_
     reopened = RunnerRuntimeState(path, new_identity, new_signer)
     assert reopened._key == stable_key
     assert reopened.load_chain("claim", None) == cursor
-    assert reopened.finish_rotation(journal, new_identity=new_identity, new_signer=new_signer) == cursor
+    assert reopened.finish_rotation(
+        journal, eligibility=eligibility, new_identity=new_identity, new_signer=new_signer,
+    ) == cursor
 
 
 def test_runtime_finish_rotation_rejects_live_authority_without_mutation(tmp_path):
@@ -294,13 +473,47 @@ def test_runtime_finish_rotation_rejects_live_authority_without_mutation(tmp_pat
     )
 
     with pytest.raises(Exception, match="active"):
-        runtime.finish_rotation(
-            _rotation_journal(old_identity, new_identity, nonce=base64.b64encode(b"n" * 32).decode("ascii")),
-            new_identity=new_identity, new_signer=new_signer,
+        probe = runtime.probe_rotation_eligible(old_identity=old_identity)
+        runtime.assert_rotation_eligible(
+            old_identity=old_identity, prepared_journal_digest="d" * 64,
+            runtime_rotation_intent_digest="e" * 64, probe=probe, now_ms=1,
         )
 
     assert runtime.identity == old_identity
     assert runtime.load_chain("claim", None) == old_cursor
+
+
+def test_stale_pre_rotation_runtime_cannot_write_after_another_instance_rotates(tmp_path):
+    old_signer = Signer(b"r" * 32)
+    new_signer = Signer(b"s" * 32)
+    old_identity = _identity(old_signer)
+    new_identity = _identity(new_signer)
+    path = tmp_path / "runtime.sqlite3"
+    rotating = RunnerRuntimeState(path, old_identity, old_signer)
+    rotating.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=base64.b64encode(b"o" * 32).decode("ascii"),
+        next_sequence=5, generation=0, now_ms=1,
+    )
+    stale = RunnerRuntimeState(path, old_identity, old_signer)
+    probe = rotating.probe_rotation_eligible(old_identity=old_identity)
+    eligibility = rotating.assert_rotation_eligible(
+        old_identity=old_identity, prepared_journal_digest="d" * 64,
+        runtime_rotation_intent_digest="e" * 64, probe=probe, now_ms=1,
+    )
+    rotating.finish_rotation(
+        _rotation_journal(old_identity, new_identity, nonce=base64.b64encode(b"n" * 32).decode("ascii")),
+        eligibility=eligibility, new_identity=new_identity, new_signer=new_signer,
+    )
+
+    with pytest.raises(RunnerRuntimeCorrupt):
+        stale.register_local_terminal(
+            run_id="crun_" + "d" * 32, project_id="prj_123456789", grant_id="grant_123456789",
+            approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+            terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
+        )
+
+    reopened = RunnerRuntimeState(path, new_identity, new_signer)
+    assert reopened.load_terminal_state("crun_" + "d" * 32) is None
 
 
 def test_runtime_stages_then_commits_an_exact_signed_claim_call(tmp_path):
@@ -436,18 +649,13 @@ def test_runtime_registers_an_exact_local_terminal_anchor(tmp_path):
 
 
 def test_runtime_commits_result_into_available_disclosure_and_retires_run_chains(tmp_path):
-    signer = Signer()
-    identity = _identity(signer)
-    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
-    run_id = "crun_" + "a" * 32
-    nonce = base64.b64encode(b"n" * 32).decode("ascii")
-    cursor = runtime.install_chain(
-        operation="result", run_id=run_id, next_nonce_b64=nonce,
-        next_sequence=1, generation=0, now_ms=1,
-    )
+    runtime, signer, identity, grant = _runtime_with_active_run(tmp_path)
+    run_id = grant["run_id"]
+    cursor = runtime.load_chain("result", run_id)
+    assert cursor is not None
     runtime.register_local_terminal(
-        run_id=run_id, project_id="prj_123456789", grant_id="grant_123456789",
-        approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+        run_id=run_id, project_id=grant["project_id"], grant_id=grant["grant_id"],
+        approval_projection_digest=grant["approval"]["projection_digest"], terminal_projection_digest="b" * 64,
         terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
     )
     path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/runs/{run_id}/result"
@@ -456,7 +664,7 @@ def test_runtime_commits_result_into_available_disclosure_and_retires_run_chains
         "schema_version": "heel.runner-request-proof.v1", "workspace_id": identity.workspace_id,
         "runner_id": identity.runner_id, "key_id": identity.key_id, "capability": "runner_result",
         "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(),
-        "timestamp_ms": 11, "server_nonce": nonce, "sequence": 1,
+        "timestamp_ms": 11, "server_nonce": cursor.next_nonce_b64, "sequence": cursor.next_sequence,
     }
     headers = {
         "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
@@ -464,7 +672,8 @@ def test_runtime_commits_result_into_available_disclosure_and_retires_run_chains
         "X-Heel-Runner-Signature": base64.b64encode(
             signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))
         ).decode("ascii"),
-        "X-Heel-Runner-Nonce": nonce, "X-Heel-Runner-Sequence": "1",
+        "X-Heel-Runner-Nonce": cursor.next_nonce_b64,
+        "X-Heel-Runner-Sequence": str(cursor.next_sequence),
     }
     staged = runtime.stage_call(
         request_operation="result", chain_operation="result", run_id=run_id, path=path,
@@ -484,18 +693,13 @@ def test_runtime_commits_result_into_available_disclosure_and_retires_run_chains
 
 
 def test_runtime_leases_an_available_terminal_disclosure_once(tmp_path):
-    signer = Signer()
-    identity = _identity(signer)
-    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
-    run_id = "crun_" + "b" * 32
-    nonce = base64.b64encode(b"n" * 32).decode("ascii")
-    cursor = runtime.install_chain(
-        operation="result", run_id=run_id, next_nonce_b64=nonce,
-        next_sequence=1, generation=0, now_ms=1,
-    )
+    runtime, signer, identity, grant = _runtime_with_active_run(tmp_path)
+    run_id = grant["run_id"]
+    cursor = runtime.load_chain("result", run_id)
+    assert cursor is not None
     runtime.register_local_terminal(
-        run_id=run_id, project_id="prj_123456789", grant_id="grant_123456789",
-        approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+        run_id=run_id, project_id=grant["project_id"], grant_id=grant["grant_id"],
+        approval_projection_digest=grant["approval"]["projection_digest"], terminal_projection_digest="b" * 64,
         terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
     )
     path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/runs/{run_id}/result"
@@ -504,7 +708,7 @@ def test_runtime_leases_an_available_terminal_disclosure_once(tmp_path):
         "schema_version": "heel.runner-request-proof.v1", "workspace_id": identity.workspace_id,
         "runner_id": identity.runner_id, "key_id": identity.key_id, "capability": "runner_result",
         "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(),
-        "timestamp_ms": 11, "server_nonce": nonce, "sequence": 1,
+        "timestamp_ms": 11, "server_nonce": cursor.next_nonce_b64, "sequence": cursor.next_sequence,
     }
     headers = {
         "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
@@ -512,7 +716,8 @@ def test_runtime_leases_an_available_terminal_disclosure_once(tmp_path):
         "X-Heel-Runner-Signature": base64.b64encode(
             signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))
         ).decode("ascii"),
-        "X-Heel-Runner-Nonce": nonce, "X-Heel-Runner-Sequence": "1",
+        "X-Heel-Runner-Nonce": cursor.next_nonce_b64,
+        "X-Heel-Runner-Sequence": str(cursor.next_sequence),
     }
     staged = runtime.stage_call(
         request_operation="result", chain_operation="result", run_id=run_id, path=path,
@@ -524,8 +729,8 @@ def test_runtime_leases_an_available_terminal_disclosure_once(tmp_path):
     )
 
     lease = runtime.lease_terminal_disclosure(
-        run_id, expected_project_id="prj_123456789", expected_grant_id="grant_123456789",
-        expected_approval_projection_digest="a" * 64, now_ms=12,
+        run_id, expected_project_id=grant["project_id"], expected_grant_id=grant["grant_id"],
+        expected_approval_projection_digest=grant["approval"]["projection_digest"], now_ms=12,
     )
 
     assert lease is not None
@@ -534,8 +739,8 @@ def test_runtime_leases_an_available_terminal_disclosure_once(tmp_path):
 def test_runtime_stages_and_commits_a_leased_findings_disclosure(tmp_path):
     runtime, signer, identity, run_id, available = _runtime_with_available_disclosure(tmp_path)
     lease = runtime.lease_terminal_disclosure(
-        run_id, expected_project_id="prj_123456789", expected_grant_id="grant_123456789",
-        expected_approval_projection_digest="a" * 64, now_ms=12,
+        run_id, expected_project_id=available.project_id, expected_grant_id=available.grant_id,
+        expected_approval_projection_digest=available.approval_projection_digest, now_ms=12,
     )
     assert available.result_chain is not None
     nonce = available.result_chain["next_nonce_b64"]
@@ -581,10 +786,153 @@ def test_runtime_claims_then_finishes_a_due_terminal_prune(tmp_path):
     )
 
     claimed = runtime.claim_due_prune(now_ms=20)
-    runtime.finish_prune(
-        run_id, expected_state_digest=claimed[0].state_digest,
-        pruned_record_digest="d" * 64, now_ms=20,
+    assert claimed.items[0].state == "prune_pending"
+    assert runtime.load_prune_pending().items == claimed.items
+
+
+def test_runtime_due_prune_retires_a_staged_terminal_result_and_all_run_cursors(tmp_path):
+    signer = Signer()
+    identity = _identity(signer)
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    run_id = "crun_" + "9" * 32
+    cursors = {
+        operation: runtime.install_chain(
+            operation=operation, run_id=run_id,
+            next_nonce_b64=base64.b64encode(operation.encode().ljust(32, b"_")).decode("ascii"),
+            next_sequence=1, generation=0, now_ms=1,
+        )
+        for operation in ("heartbeat", "progress", "result", "stop-ack")
+    }
+    runtime.register_local_terminal(
+        run_id=run_id, project_id="prj_123456789", grant_id="grant_123456789",
+        approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+        terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
+    )
+    result = cursors["result"]
+    body = canonical_bytes({"schema_version": "heel.runner-result-request.v1"})
+    path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/runs/{run_id}/result"
+    proof = {
+        "schema_version": "heel.runner-request-proof.v1", "workspace_id": identity.workspace_id,
+        "runner_id": identity.runner_id, "key_id": identity.key_id, "capability": "runner_result",
+        "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(),
+        "timestamp_ms": 11, "server_nonce": result.next_nonce_b64, "sequence": result.next_sequence,
+    }
+    headers = {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
+        "X-Heel-Runner-Key-Id": identity.key_id, "X-Heel-Runner-Timestamp-Ms": "11",
+        "X-Heel-Runner-Signature": base64.b64encode(
+            signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))
+        ).decode("ascii"),
+        "X-Heel-Runner-Nonce": result.next_nonce_b64,
+        "X-Heel-Runner-Sequence": str(result.next_sequence),
+    }
+    runtime.stage_call(
+        request_operation="result", chain_operation="result", run_id=run_id, path=path,
+        capability="runner_result", headers=headers, body=body,
+        expected_state_digest=result.state_digest, now_ms=11,
     )
 
-    assert claimed[0].state == "prune_pending"
-    assert runtime.claim_due_prune(now_ms=20) == ()
+    claimed = runtime.claim_due_prune(now_ms=20)
+
+    assert claimed.items[0].state == "prune_pending"
+    assert runtime.load_pending_calls() == ()
+    assert all(runtime.load_chain(operation, run_id) is None for operation in cursors)
+
+
+def test_runtime_due_prune_retires_a_staged_findings_disclosure(tmp_path):
+    runtime, signer, identity, run_id, available = _runtime_with_available_disclosure(tmp_path)
+    lease = runtime.lease_terminal_disclosure(
+        run_id, expected_project_id=available.project_id, expected_grant_id=available.grant_id,
+        expected_approval_projection_digest=available.approval_projection_digest, now_ms=12,
+    )
+    assert available.result_chain is not None
+    body = canonical_bytes({"schema_version": "heel.runner-findings-upload.v1"})
+    path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/runs/{run_id}/result-projection"
+    proof = {
+        "schema_version": "heel.runner-request-proof.v1", "workspace_id": identity.workspace_id,
+        "runner_id": identity.runner_id, "key_id": identity.key_id, "capability": "runner_result",
+        "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(),
+        "timestamp_ms": 13, "server_nonce": available.result_chain["next_nonce_b64"],
+        "sequence": available.result_chain["next_sequence"],
+    }
+    headers = {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
+        "X-Heel-Runner-Key-Id": identity.key_id, "X-Heel-Runner-Timestamp-Ms": "13",
+        "X-Heel-Runner-Signature": base64.b64encode(
+            signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))
+        ).decode("ascii"),
+        "X-Heel-Runner-Nonce": available.result_chain["next_nonce_b64"],
+        "X-Heel-Runner-Sequence": str(available.result_chain["next_sequence"]),
+    }
+    runtime.stage_disclosure_call(lease, path=path, headers=headers, body=body, now_ms=13)
+
+    claimed = runtime.claim_due_prune(now_ms=20)
+
+    assert claimed.items[0].state == "prune_pending"
+    assert claimed.items[0].result_chain is None
+    assert runtime.load_pending_calls() == ()
+
+
+def test_runtime_restart_reclaims_a_durable_due_prune_pending_terminal(tmp_path):
+    signer = Signer()
+    path = tmp_path / "runtime.sqlite3"
+    runtime = RunnerRuntimeState(path, _identity(signer), signer)
+    run_id = "crun_" + "f" * 32
+    runtime.register_local_terminal(
+        run_id=run_id, project_id="prj_123456789", grant_id="grant_123456789",
+        approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+        terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
+    )
+    pending = runtime.claim_due_prune(now_ms=20)
+    assert len(pending.items) == 1 and pending.items[0].state == "prune_pending"
+
+    restarted = RunnerRuntimeState(path, _identity(signer), signer)
+
+    recovered = restarted.load_prune_pending()
+    assert recovered.items == pending.items
+    assert recovered.has_more is False
+
+
+@pytest.mark.parametrize("object_name", (
+    "metadata",
+    "control_chains",
+    "pending_calls",
+    "terminal_disclosures",
+    "idx_terminal_disclosures_state_retention",
+))
+def test_runtime_rejects_each_precreated_noncanonical_schema_object(tmp_path, object_name):
+    signer = Signer()
+    identity = _identity(signer)
+    path = tmp_path / "runtime.sqlite3"
+    RunnerRuntimeState(path, identity, signer)
+
+    with sqlite3.connect(path) as conn:
+        if object_name == "metadata":
+            row = tuple(conn.execute("SELECT * FROM metadata WHERE singleton=1").fetchone())
+            conn.execute("DROP TABLE metadata")
+            conn.execute(
+                "CREATE TABLE metadata("
+                "singleton INTEGER PRIMARY KEY,schema_version TEXT NOT NULL,"
+                "workspace_id TEXT NOT NULL,runner_id TEXT NOT NULL,runner_key_id TEXT NOT NULL,"
+                "public_key_digest TEXT NOT NULL,state_key_ciphertext BLOB NOT NULL)"
+            )
+            conn.execute("INSERT INTO metadata VALUES(?,?,?,?,?,?,?)", (*row[:6], row[9]))
+        elif object_name == "control_chains":
+            conn.execute("DROP TABLE control_chains")
+            conn.execute("CREATE TABLE control_chains(chain TEXT)")
+        elif object_name == "pending_calls":
+            conn.execute("DROP TABLE pending_calls")
+            conn.execute("CREATE TABLE pending_calls(call_id TEXT)")
+        elif object_name == "terminal_disclosures":
+            conn.execute("DROP INDEX idx_terminal_disclosures_state_retention")
+            conn.execute("DROP TABLE terminal_disclosures")
+            conn.execute("CREATE TABLE terminal_disclosures(run_hash TEXT)")
+        else:
+            conn.execute("DROP INDEX idx_terminal_disclosures_state_retention")
+            conn.execute(
+                "CREATE INDEX idx_terminal_disclosures_state_retention "
+                "ON terminal_disclosures(run_hash)"
+            )
+
+    with pytest.raises(RunnerRuntimeCorrupt, match="runtime state schema is invalid"):
+        RunnerRuntimeState(path, identity, signer)

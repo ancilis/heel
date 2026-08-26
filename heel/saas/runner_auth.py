@@ -15,7 +15,7 @@ import sqlite3
 import time
 import unicodedata
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import Callable, Literal, Mapping
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -667,6 +667,109 @@ CREATE TABLE canary_runner_rotation_activation_receipts(
 RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_PROTOCOL_V3_MIGRATION
 
 
+# Migration twenty-five upgrades the one-row-per-chain replay ledger from a short-lived
+# implementation detail to the durable, exact HTTP receipt required for loss recovery.
+RUNNER_AUTH_RECEIPT_RETENTION_MIGRATION = """
+DROP INDEX IF EXISTS idx_canary_runner_ledger_cleanup;
+ALTER TABLE canary_runner_request_ledger RENAME TO canary_runner_request_ledger_v24;
+CREATE TABLE canary_runner_request_ledger(
+ workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL,
+ chain_name TEXT NOT NULL CHECK(
+  chain_name='claim' OR (
+   substr(chain_name,1,instr(chain_name,':')) IN ('heartbeat:','progress:','result:','stop-ack:')
+   AND length(CAST(substr(chain_name,instr(chain_name,':')+1) AS BLOB)) BETWEEN 1 AND 128
+   AND substr(chain_name,instr(chain_name,':')+1) NOT GLOB '*[^A-Za-z0-9_-]*')),
+ sequence INTEGER NOT NULL CHECK(sequence>=1),
+ generation INTEGER NOT NULL CHECK(generation>=0),
+ request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+ response_json TEXT NOT NULL, next_nonce TEXT NOT NULL, created_at REAL NOT NULL,
+ nonce_hash TEXT NOT NULL CHECK(length(nonce_hash)=64 AND nonce_hash NOT GLOB '*[^0-9a-f]*'),
+ key_id TEXT NOT NULL,
+ capability TEXT NOT NULL CHECK(capability IN ('runner_claim','runner_heartbeat','runner_progress','runner_result')),
+ method TEXT NOT NULL CHECK(method='POST'), path TEXT NOT NULL,
+ timestamp_ms INTEGER NOT NULL CHECK(timestamp_ms>=0),
+ signed_request_digest TEXT NOT NULL CHECK(length(signed_request_digest)=64 AND signed_request_digest NOT GLOB '*[^0-9a-f]*'),
+ body_digest TEXT NOT NULL CHECK(length(body_digest)=64 AND body_digest NOT GLOB '*[^0-9a-f]*'),
+ response_ciphertext TEXT NOT NULL, next_nonce_ciphertext TEXT NOT NULL,
+ response_status INTEGER NOT NULL CHECK(response_status IN (0,200,201,204)),
+ response_body_digest TEXT CHECK(response_body_digest IS NULL OR (length(response_body_digest)=64 AND response_body_digest NOT GLOB '*[^0-9a-f]*')),
+ retention_expires_at REAL NOT NULL CHECK(retention_expires_at>=created_at AND retention_expires_at<=created_at+2592000.0),
+ PRIMARY KEY(workspace_id,runner_id,chain_name,sequence,generation),
+ UNIQUE(workspace_id,runner_id,chain_name),
+ CHECK(response_status=0 AND response_body_digest IS NULL OR response_status IN (200,201,204) AND response_body_digest IS NOT NULL),
+ FOREIGN KEY(workspace_id,runner_id,chain_name)
+  REFERENCES canary_runner_chain_cursors(workspace_id,runner_id,chain_name));
+INSERT INTO canary_runner_request_ledger(
+ workspace_id,runner_id,chain_name,sequence,generation,request_digest,response_json,next_nonce,created_at,
+ nonce_hash,key_id,capability,method,path,timestamp_ms,signed_request_digest,body_digest,
+ response_ciphertext,next_nonce_ciphertext,response_status,response_body_digest,retention_expires_at)
+SELECT l.workspace_id,l.runner_id,l.chain_name,l.sequence,l.generation,l.request_digest,l.response_json,l.next_nonce,l.created_at,
+ l.nonce_hash,l.key_id,l.capability,l.method,l.path,l.timestamp_ms,l.signed_request_digest,l.body_digest,
+ l.response_ciphertext,l.next_nonce_ciphertext,0,NULL,l.created_at+3600.0
+FROM canary_runner_request_ledger_v24 l
+WHERE NOT EXISTS (
+ SELECT 1 FROM canary_runner_request_ledger_v24 n
+ WHERE n.workspace_id=l.workspace_id AND n.runner_id=l.runner_id AND n.chain_name=l.chain_name
+  AND (n.generation>l.generation OR n.generation=l.generation AND n.sequence>l.sequence));
+DROP TABLE canary_runner_request_ledger_v24;
+CREATE INDEX idx_canary_runner_ledger_retention
+ ON canary_runner_request_ledger(retention_expires_at,workspace_id,runner_id,chain_name,sequence,generation);
+
+UPDATE canary_runner_pairings
+ SET expires_at=activated_at+2592000.0
+ WHERE status='activated' AND activated_at IS NOT NULL AND expires_at<activated_at+2592000.0;
+UPDATE canary_runner_pairing_activation_receipts
+ SET expires_at=(SELECT p.expires_at FROM canary_runner_pairings p
+                 WHERE p.pairing_id=canary_runner_pairing_activation_receipts.pairing_id)
+ WHERE EXISTS (SELECT 1 FROM canary_runner_pairings p
+               WHERE p.pairing_id=canary_runner_pairing_activation_receipts.pairing_id
+                AND p.status='activated' AND p.activated_at IS NOT NULL);
+UPDATE canary_runner_rotations
+ SET expires_at=activated_at+2592000.0
+ WHERE status='rotated' AND activated_at IS NOT NULL AND expires_at<activated_at+2592000.0;
+UPDATE canary_runner_rotation_activation_receipts
+ SET expires_at=(SELECT r.expires_at FROM canary_runner_rotations r
+                 WHERE r.pairing_id=canary_runner_rotation_activation_receipts.pairing_id)
+ WHERE EXISTS (SELECT 1 FROM canary_runner_rotations r
+               WHERE r.pairing_id=canary_runner_rotation_activation_receipts.pairing_id
+                AND r.status='rotated' AND r.activated_at IS NOT NULL);
+CREATE INDEX idx_canary_runner_pairing_status_expiry
+ ON canary_runner_pairings(workspace_id,status,expires_at,pairing_id);
+CREATE INDEX idx_canary_runner_rotation_status_expiry
+ ON canary_runner_rotations(workspace_id,status,expires_at,pairing_id);
+CREATE INDEX idx_canary_runner_pairing_receipt_expiry
+ ON canary_runner_pairing_activation_receipts(expires_at,pairing_id);
+CREATE INDEX idx_canary_runner_rotation_receipt_expiry
+ ON canary_runner_rotation_activation_receipts(expires_at,pairing_id);
+"""
+RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_RECEIPT_RETENTION_MIGRATION
+
+
+RUNNER_AUTH_ACTIVATION_ABORT_MIGRATION = """
+CREATE TABLE canary_runner_pairing_activation_abort_receipts(
+ pairing_id TEXT PRIMARY KEY,
+ request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+ response_digest TEXT NOT NULL CHECK(length(response_digest)=64 AND response_digest NOT GLOB '*[^0-9a-f]*'),
+ response_ciphertext TEXT NOT NULL,
+ created_at REAL NOT NULL,
+ expires_at REAL NOT NULL CHECK(expires_at>created_at AND expires_at<=created_at+2592000.0),
+ FOREIGN KEY(pairing_id) REFERENCES canary_runner_pairings(pairing_id) ON DELETE CASCADE);
+CREATE TABLE canary_runner_rotation_activation_abort_receipts(
+ pairing_id TEXT PRIMARY KEY,
+ request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+ response_digest TEXT NOT NULL CHECK(length(response_digest)=64 AND response_digest NOT GLOB '*[^0-9a-f]*'),
+ response_ciphertext TEXT NOT NULL,
+ created_at REAL NOT NULL,
+ expires_at REAL NOT NULL CHECK(expires_at>created_at AND expires_at<=created_at+2592000.0),
+ FOREIGN KEY(pairing_id) REFERENCES canary_runner_rotations(pairing_id) ON DELETE CASCADE);
+CREATE INDEX idx_canary_runner_pairing_abort_receipt_expiry
+ ON canary_runner_pairing_activation_abort_receipts(expires_at,pairing_id);
+CREATE INDEX idx_canary_runner_rotation_abort_receipt_expiry
+ ON canary_runner_rotation_activation_abort_receipts(expires_at,pairing_id);
+"""
+RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_ACTIVATION_ABORT_MIGRATION
+
+
 class RunnerAuthError(PermissionError):
     """Uniform external runner-auth failure."""
 
@@ -677,6 +780,23 @@ class RunnerAuthRateLimited(RunnerAuthError):
 
 class RunnerProtocolUpgradeRequired(RunnerAuthError):
     """A legacy inventory pairing cannot consume executable runner authority."""
+
+
+class RunnerActivationAbortConflict(RunnerAuthError):
+    """A verified abort request reached a closed, non-mutating state."""
+
+    def __init__(self, code: str, *, retry_after_ms: int | None = None):
+        super().__init__(code)
+        self.code = code
+        self.retry_after_ms = retry_after_ms
+
+
+@dataclass(frozen=True)
+class RunnerHttpAction:
+    """The one closed HTTP result a verified runner action may persist."""
+
+    status: Literal[200, 201, 204]
+    body: dict | None
 
 
 @dataclass(frozen=True)
@@ -765,7 +885,7 @@ def _ensure_lifecycle_tables(conn: sqlite3.Connection) -> None:
     """)
 
 
-_RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_request_ledger_archive", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records", "canary_runner_chain_cursors", "canary_runner_resync_challenges", "canary_runner_pairing_protocols", "canary_runner_execution_protocols", "canary_runner_pairing_activation_receipts", "canary_runner_rotation_activation_receipts")
+_RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_request_ledger_archive", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records", "canary_runner_chain_cursors", "canary_runner_resync_challenges", "canary_runner_pairing_protocols", "canary_runner_execution_protocols", "canary_runner_pairing_activation_receipts", "canary_runner_rotation_activation_receipts", "canary_runner_pairing_activation_abort_receipts", "canary_runner_rotation_activation_abort_receipts")
 
 
 def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
@@ -927,7 +1047,15 @@ class RunnerAuthStore:
         # returned exactly once and the raw value never reaches persistent storage.
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            self.conn.execute("DELETE FROM canary_runner_pairings WHERE expires_at<?", (instant,))
+            # Activation receipts are authority-recovery evidence for thirty days.  An
+            # invitation in another tenant must never sweep an activated pairing (and
+            # cascade-delete its receipt) merely because its original ten-minute
+            # challenge deadline passed.
+            self.conn.execute(
+                "DELETE FROM canary_runner_pairings WHERE workspace_id=? "
+                "AND status IN ('invited','pending','approved','expired') AND expires_at<?",
+                (workspace_id, instant),
+            )
             self.conn.execute(
                 "INSERT INTO canary_runner_pairings(pairing_id,workspace_id,runner_id,invitation_hash,status,created_at,expires_at,display_name) VALUES(?,?,?,?,?,?,?,?)",
                 ("pending_" + secrets.token_hex(16), workspace_id, "", self._hash("invitation", token), "invited", instant, instant + PAIRING_TTL, "Pending runner"),
@@ -1187,14 +1315,274 @@ class RunnerAuthStore:
                 "activated_at_ms": self._milliseconds(instant),
             }
             self._validated_v3_activation_response(response, row, protocol)
+            receipt_expiry = instant + 2_592_000.0
             self.conn.execute(
                 "INSERT INTO canary_runner_pairing_activation_receipts(pairing_id,request_digest,response_ciphertext,created_at,expires_at) VALUES(?,?,?,?,?)",
-                (pairing_id, request_digest, self._seal(canonical_bytes(response).decode(), aad=f"pairing-v3-activation\0{pairing_id}".encode()), instant, row["expires_at"]),
+                (pairing_id, request_digest, self._seal(canonical_bytes(response).decode(), aad=f"pairing-v3-activation\0{pairing_id}".encode()), instant, receipt_expiry),
             )
             self.conn.execute(
-                "UPDATE canary_runner_pairings SET status='activated', phrase=NULL, activation_challenge=NULL, activated_at=? WHERE pairing_id=?",
-                (instant, pairing_id),
+                "UPDATE canary_runner_pairings SET status='activated', phrase=NULL, activation_challenge=NULL, activated_at=?,expires_at=? WHERE pairing_id=?",
+                (instant, receipt_expiry, pairing_id),
             )
+            self.conn.commit()
+            return response
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def abort_executable_pairing_activation(
+        self, pairing_id: str, request: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Atomically abandon an expired v3 activation, preserving a replay receipt."""
+        fields = {
+            "schema_version", "pairing_id", "runner_id", "pairing_exchange_digest",
+            "activation_request_digest", "challenge_expires_at_ms", "reason_code",
+            "signature_b64",
+        }
+        if (
+            not isinstance(request, Mapping) or set(request) != fields
+            or request.get("schema_version") != "heel.runner-pairing-activation-abort.v1"
+            or request.get("pairing_id") != pairing_id
+            or request.get("reason_code") != "activation_challenge_expired"
+            or not _lower_hex_digest(request.get("pairing_exchange_digest"))
+            or not _lower_hex_digest(request.get("activation_request_digest"))
+            or isinstance(request.get("challenge_expires_at_ms"), bool)
+            or not isinstance(request.get("challenge_expires_at_ms"), int)
+            or not 0 <= request["challenge_expires_at_ms"] <= _SAFE_JSON_INT
+            or type(request.get("signature_b64")) is not str
+        ):
+            raise ValueError("invalid pairing activation abort")
+        self._identifier(pairing_id, "pairing")
+        self._identifier(request["runner_id"], "runner")
+        digest = hashlib.sha256(canonical_bytes(dict(request))).hexdigest()
+        unsigned = {key: request[key] for key in fields - {"signature_b64"}}
+        try:
+            signature = base64.b64decode(request["signature_b64"], validate=True)
+            if len(signature) != 64 or _b64(signature) != request["signature_b64"]:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("invalid pairing activation abort") from None
+        instant = self._now()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM canary_runner_pairings WHERE pairing_id=?", (pairing_id,),
+            ).fetchone()
+            protocol = self.conn.execute(
+                "SELECT * FROM canary_runner_pairing_protocols WHERE pairing_id=?", (pairing_id,),
+            ).fetchone()
+            if (
+                row is None or protocol is None or row["runner_id"] != request["runner_id"]
+                or protocol["protocol_version"] != 3
+                or protocol["control_protocol"] != "heel.runner-control.v2"
+                or not hmac.compare_digest(protocol["exchange_digest"], request["pairing_exchange_digest"])
+            ):
+                raise RunnerAuthError("invalid pairing")
+            try:
+                load_public_key_base64(row["public_key"]).verify(
+                    signature,
+                    b"heel.runner-pairing-activation-abort.v1\0" + canonical_bytes(unsigned),
+                )
+            except (ValueError, InvalidSignature):
+                raise RunnerAuthError("invalid pairing") from None
+            existing = self.conn.execute(
+                "SELECT request_digest,response_digest,response_ciphertext FROM "
+                "canary_runner_pairing_activation_abort_receipts WHERE pairing_id=?",
+                (pairing_id,),
+            ).fetchone()
+            if existing is not None:
+                if not hmac.compare_digest(existing["request_digest"], digest):
+                    raise RunnerAuthError("invalid pairing")
+                response = json_load(self._open(
+                    existing["response_ciphertext"],
+                    aad=f"pairing-v3-activation-abort\0{pairing_id}".encode(),
+                ))
+                if hashlib.sha256(canonical_bytes(response)).hexdigest() != existing["response_digest"]:
+                    raise RunnerAuthError("invalid pairing")
+                self.conn.commit()
+                return response
+            activation = self.conn.execute(
+                "SELECT 1 FROM canary_runner_pairing_activation_receipts WHERE pairing_id=?",
+                (pairing_id,),
+            ).fetchone()
+            if row["status"] == "activated" and activation is not None:
+                raise RunnerActivationAbortConflict("runner_activation_already_accepted")
+            if int(row["expires_at"] * 1000) != request["challenge_expires_at_ms"]:
+                raise RunnerAuthError("invalid pairing")
+            if instant < row["expires_at"]:
+                retry = min(600_000, max(0, int((row["expires_at"] - instant) * 1000)))
+                raise RunnerActivationAbortConflict("runner_activation_not_expired", retry_after_ms=retry)
+            if row["status"] != "approved" or activation is not None:
+                raise RunnerAuthError("invalid pairing")
+            response = {
+                "schema_version": "heel.runner-pairing-activation-aborted.v1",
+                "workspace_id": row["workspace_id"], "runner_id": row["runner_id"],
+                "pairing_id": pairing_id,
+                "activation_request_digest": request["activation_request_digest"],
+                "status": "expired", "aborted_at_ms": self._milliseconds(instant),
+            }
+            response_digest = hashlib.sha256(canonical_bytes(response)).hexdigest()
+            expiry = instant + 2_592_000.0
+            self.conn.execute(
+                "INSERT INTO canary_runner_pairing_activation_abort_receipts("
+                "pairing_id,request_digest,response_digest,response_ciphertext,created_at,expires_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    pairing_id, digest, response_digest,
+                    self._seal(canonical_bytes(response).decode(), aad=f"pairing-v3-activation-abort\0{pairing_id}".encode()),
+                    instant, expiry,
+                ),
+            )
+            changed = self.conn.execute(
+                "UPDATE canary_runner_pairings SET status='expired',phrase=NULL,activation_challenge=NULL,expires_at=? "
+                "WHERE pairing_id=? AND status='approved'",
+                (expiry, pairing_id),
+            )
+            if changed.rowcount != 1:
+                raise RunnerAuthError("invalid pairing")
+            self.conn.commit()
+            return response
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def abort_rotation_activation(
+        self, pairing_id: str, request: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Atomically restore the old Cloud identity after an expired rotation challenge."""
+        fields = {
+            "schema_version", "workspace_id", "runner_id", "pairing_id",
+            "old_runner_key_id", "new_runner_key_id", "activation_request_digest",
+            "activation_challenge_digest", "challenge_expires_at_ms", "reason_code",
+            "old_signature_b64", "new_signature_b64",
+        }
+        if (
+            not isinstance(request, Mapping) or set(request) != fields
+            or request.get("schema_version") != "heel.runner-rotation-activation-abort.v1"
+            or request.get("pairing_id") != pairing_id
+            or request.get("reason_code") != "activation_challenge_expired"
+            or any(not _lower_hex_digest(request.get(key)) for key in (
+                "activation_request_digest", "activation_challenge_digest",
+            ))
+            or isinstance(request.get("challenge_expires_at_ms"), bool)
+            or not isinstance(request.get("challenge_expires_at_ms"), int)
+            or not 0 <= request["challenge_expires_at_ms"] <= _SAFE_JSON_INT
+            or type(request.get("old_signature_b64")) is not str
+            or type(request.get("new_signature_b64")) is not str
+        ):
+            raise ValueError("invalid rotation activation abort")
+        for field in ("workspace_id", "runner_id", "old_runner_key_id", "new_runner_key_id"):
+            self._identifier(request[field], field)
+        self._identifier(pairing_id, "pairing")
+        core = {key: request[key] for key in fields - {"old_signature_b64", "new_signature_b64"}}
+        digest = hashlib.sha256(canonical_bytes(dict(request))).hexdigest()
+        try:
+            old_signature = base64.b64decode(request["old_signature_b64"], validate=True)
+            new_signature = base64.b64decode(request["new_signature_b64"], validate=True)
+            if (
+                len(old_signature) != 64 or _b64(old_signature) != request["old_signature_b64"]
+                or len(new_signature) != 64 or _b64(new_signature) != request["new_signature_b64"]
+            ):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("invalid rotation activation abort") from None
+        instant = self._now()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM canary_runner_rotations WHERE pairing_id=?", (pairing_id,),
+            ).fetchone()
+            if (
+                row is None or row["workspace_id"] != request["workspace_id"]
+                or row["runner_id"] != request["runner_id"] or row["key_id"] != request["new_runner_key_id"]
+            ):
+                raise RunnerAuthError("invalid rotation")
+            old = self.conn.execute(
+                "SELECT public_key FROM canary_runner_keys WHERE workspace_id=? AND runner_id=? "
+                "AND key_id=? AND status='active' AND revoked_at IS NULL",
+                (row["workspace_id"], row["runner_id"], request["old_runner_key_id"]),
+            ).fetchone()
+            if old is None:
+                raise RunnerAuthError("invalid rotation")
+            try:
+                load_public_key_base64(old["public_key"]).verify(
+                    old_signature,
+                    b"heel.runner-rotation-activation-abort.v1.old\0" + canonical_bytes(core),
+                )
+                load_public_key_base64(row["public_key"]).verify(
+                    new_signature,
+                    b"heel.runner-rotation-activation-abort.v1.new\0" + canonical_bytes(core),
+                )
+            except (ValueError, InvalidSignature):
+                raise RunnerAuthError("invalid rotation") from None
+            existing = self.conn.execute(
+                "SELECT request_digest,response_digest,response_ciphertext FROM "
+                "canary_runner_rotation_activation_abort_receipts WHERE pairing_id=?",
+                (pairing_id,),
+            ).fetchone()
+            if existing is not None:
+                if not hmac.compare_digest(existing["request_digest"], digest):
+                    raise RunnerAuthError("invalid rotation")
+                response = json_load(self._open(
+                    existing["response_ciphertext"],
+                    aad=f"rotation-v2-activation-abort\0{pairing_id}".encode(),
+                ))
+                if hashlib.sha256(canonical_bytes(response)).hexdigest() != existing["response_digest"]:
+                    raise RunnerAuthError("invalid rotation")
+                self.conn.commit()
+                return response
+            accepted = self.conn.execute(
+                "SELECT 1 FROM canary_runner_rotation_activation_receipts WHERE pairing_id=?",
+                (pairing_id,),
+            ).fetchone()
+            if row["status"] == "rotated" and accepted is not None:
+                raise RunnerActivationAbortConflict("runner_activation_already_accepted")
+            try:
+                if hashlib.sha256(base64.b64decode(row["activation_challenge"], validate=True)).hexdigest() != request["activation_challenge_digest"]:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise RunnerAuthError("invalid rotation") from None
+            if int(row["expires_at"] * 1000) != request["challenge_expires_at_ms"]:
+                raise RunnerAuthError("invalid rotation")
+            if instant < row["expires_at"]:
+                retry = min(600_000, max(0, int((row["expires_at"] - instant) * 1000)))
+                raise RunnerActivationAbortConflict("runner_activation_not_expired", retry_after_ms=retry)
+            if row["status"] != "rotation_approved" or accepted is not None:
+                raise RunnerAuthError("invalid rotation")
+            response = {
+                "schema_version": "heel.runner-rotation-activation-aborted.v1",
+                "workspace_id": row["workspace_id"], "runner_id": row["runner_id"],
+                "pairing_id": pairing_id, "old_runner_key_id": request["old_runner_key_id"],
+                "new_runner_key_id": request["new_runner_key_id"],
+                "activation_request_digest": request["activation_request_digest"],
+                "status": "expired", "aborted_at_ms": self._milliseconds(instant),
+            }
+            response_digest = hashlib.sha256(canonical_bytes(response)).hexdigest()
+            expiry = instant + 2_592_000.0
+            self.conn.execute(
+                "INSERT INTO canary_runner_rotation_activation_abort_receipts("
+                "pairing_id,request_digest,response_digest,response_ciphertext,created_at,expires_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    pairing_id, digest, response_digest,
+                    self._seal(canonical_bytes(response).decode(), aad=f"rotation-v2-activation-abort\0{pairing_id}".encode()),
+                    instant, expiry,
+                ),
+            )
+            identity = self._load_identity(row["workspace_id"], row["runner_id"])
+            if identity.get("state") != "rotating":
+                raise RunnerAuthError("invalid rotation")
+            identity["state"] = "active"
+            self._save_changed_identity(identity, instant=instant)
+            changed = self.conn.execute(
+                "UPDATE canary_runner_rotations SET status='expired',phrase=NULL,activation_challenge=NULL,expires_at=? "
+                "WHERE pairing_id=? AND status='rotation_approved'",
+                (expiry, pairing_id),
+            )
+            if changed.rowcount != 1:
+                raise RunnerAuthError("invalid rotation")
             self.conn.commit()
             return response
         except Exception:
@@ -1615,15 +2003,19 @@ class RunnerAuthStore:
                 "initial_claim_generation": claim_cursor["generation"],
             }
             self._validated_rotation_activation_response(response, row)
+            receipt_expiry = instant + 2_592_000.0
             self.conn.execute(
                 "INSERT INTO canary_runner_rotation_activation_receipts(pairing_id,request_digest,response_ciphertext,created_at,expires_at) VALUES(?,?,?,?,?)",
                 (
                     pairing_id, request_digest,
                     self._seal(canonical_bytes(response).decode(), aad=f"rotation-v2-activation\0{pairing_id}".encode()),
-                    instant, row["expires_at"],
+                    instant, receipt_expiry,
                 ),
             )
-            self.conn.execute("UPDATE canary_runner_rotations SET status='rotated',activation_challenge=NULL,activated_at=? WHERE pairing_id=?", (instant, pairing_id))
+            self.conn.execute(
+                "UPDATE canary_runner_rotations SET status='rotated',activation_challenge=NULL,activated_at=?,expires_at=? WHERE pairing_id=?",
+                (instant, receipt_expiry, pairing_id),
+            )
             self.conn.commit()
         except Exception:
             self.conn.rollback(); raise
@@ -1777,11 +2169,70 @@ class RunnerAuthStore:
                 self.conn.rollback()
             raise
 
+    @staticmethod
+    def _receipt_aad(
+        workspace_id: str, runner_id: str, chain: str, sequence: int, generation: int,
+    ) -> bytes:
+        return (
+            b"heel.runner-http-receipt.v1\0" + workspace_id.encode("utf-8") + b"\0"
+            + runner_id.encode("utf-8") + b"\0" + chain.encode("utf-8") + b"\0"
+            + str(sequence).encode("ascii") + b"\0" + str(generation).encode("ascii")
+        )
+
+    def _open_exact_receipt(
+        self, row: sqlite3.Row, *, workspace_id: str, runner_id: str, chain: str,
+        sequence: int, generation: int,
+    ) -> tuple[int, dict | None, str]:
+        try:
+            status = int(row["response_status"])
+            if status == 0:
+                # Migration-25's only legacy form retains the previous encryption and derives
+                # its closed status from the frozen old routes without rewriting the row.
+                legacy_aad = f"{workspace_id}\0{runner_id}\0{chain}\0{sequence}".encode()
+                body = json_load(self._open(row["response_ciphertext"], aad=legacy_aad))
+                status = 204 if body.get("schema_version") == "heel.runner-claim-idle.internal.v1" else (
+                    201 if row["path"].endswith("/approval-projections") else 200
+                )
+                if status == 204:
+                    body = None
+                nonce = self._open(row["next_nonce_ciphertext"], aad=legacy_aad)
+                return status, body, nonce
+            if status not in {200, 201, 204}:
+                raise ValueError
+            aad = self._receipt_aad(workspace_id, runner_id, chain, sequence, generation)
+            envelope = json_load(self._open(row["response_ciphertext"], aad=aad))
+            if set(envelope) != {"schema_version", "status", "body"} or (
+                envelope["schema_version"] != "heel.runner-http-receipt.v1"
+                or envelope["status"] != status
+                or (status == 204) != (envelope["body"] is None)
+                or (status != 204 and not isinstance(envelope["body"], dict))
+            ):
+                raise ValueError
+            wire = b"" if status == 204 else self.response_wire_body(envelope["body"])
+            if row["response_body_digest"] != hashlib.sha256(wire).hexdigest():
+                raise ValueError
+            nonce = self._open(row["next_nonce_ciphertext"], aad=aad)
+            if not isinstance(nonce, str) or not nonce:
+                raise ValueError
+            return status, envelope["body"], nonce
+        except (KeyError, TypeError, ValueError, RunnerAuthError):
+            raise RunnerAuthError("invalid runner authentication") from None
+
+    @staticmethod
+    def response_wire_body(body: dict) -> bytes:
+        """Return the sole JSON serialization permitted for a runner receipt body.
+
+        Receipt replay is required to preserve the original HTTP bytes.  The normal
+        handler therefore writes this same compact, validated representation rather
+        than passing the mapping through its generic JSON response helper.
+        """
+        return _sealed_response_json(body).encode("utf-8")
+
     def authenticate_and_consume(self, *, workspace_id: str, runner_id: str, capability: str, path: str,
-                                 raw_body: bytes, headers: Mapping[str, list[str]], action: Callable[[], dict],
-                                 chain_name: str | None = None,
-                                 max_body_bytes: int = MAX_RUNNER_BODY) -> tuple[dict, str]:
-        """Verify a fixed request then atomically record it, rotate its nonce, and act."""
+                                 raw_body: bytes, headers: Mapping[str, list[str]],
+                                 action: Callable[[], RunnerHttpAction], chain_name: str | None = None,
+                                 max_body_bytes: int = MAX_RUNNER_BODY) -> tuple[int, dict | None, str]:
+        """Verify a fixed request then atomically record its exact HTTP receipt."""
         if (
             isinstance(max_body_bytes, bool)
             or not isinstance(max_body_bytes, int)
@@ -1801,7 +2252,7 @@ class RunnerAuthStore:
             if not timestamp.isascii() or not sequence.isascii() or not timestamp.isdecimal() or not sequence.isdecimal() or (len(timestamp) > 1 and timestamp.startswith("0")) or (len(sequence) > 1 and sequence.startswith("0")):
                 raise RunnerAuthError("invalid runner authentication")
             timestamp, sequence = int(timestamp), int(sequence)
-            if sequence < 1 or abs(int(self._now() * 1000) - timestamp) > CLOCK_SKEW_MS:
+            if sequence < 1:
                 raise RunnerAuthError("invalid runner authentication")
             parsed = parse_json(raw_body, max_bytes=max_body_bytes)
             if canonical_bytes(parsed) != raw_body:
@@ -1822,18 +2273,21 @@ class RunnerAuthStore:
                 load_public_key_base64(row["public_key"]).verify(signature, proof_bytes)
             except (ValueError, InvalidSignature):
                 raise RunnerAuthError("invalid runner authentication") from None
-            # Crucially, no receipt lookup occurs until all closed request material and PoP
-            # have authenticated. A sequence collision alone is never a replay credential.
             signed_digest = hashlib.sha256(proof_bytes + signature).hexdigest()
             nonce_hash = self._hash("nonce", values["X-Heel-Runner-Nonce"])
             cursor = self.conn.execute("SELECT * FROM canary_runner_chain_cursors WHERE workspace_id=? AND runner_id=? AND chain_name=?", (workspace_id, runner_id, chain)).fetchone()
             if cursor is None:
                 raise RunnerAuthError("invalid runner authentication")
             generation = cursor["generation"]
-            state = self.conn.execute("SELECT * FROM canary_runner_nonce_chains WHERE workspace_id=? AND runner_id=? AND chain_name=?", (workspace_id, runner_id, chain)).fetchone()
-            if state is None or state["expires_at"] <= self._now() or sequence != state["next_sequence"] or sequence != cursor["next_sequence"] or not hmac.compare_digest(state["nonce_hash"], nonce_hash):
-                prior = self.conn.execute("SELECT * FROM canary_runner_request_ledger WHERE workspace_id=? AND runner_id=? AND chain_name=? AND sequence=? AND generation=?", (workspace_id, runner_id, chain, sequence, generation)).fetchone()
-                if prior is not None and all((
+            # Exact receipt lookup intentionally precedes timestamp freshness and cursor state:
+            # a restart must replay its original signed bytes after ordinary clock skew expires.
+            prior = self.conn.execute(
+                "SELECT * FROM canary_runner_request_ledger WHERE workspace_id=? AND runner_id=? "
+                "AND chain_name=? AND sequence=? AND generation=?",
+                (workspace_id, runner_id, chain, sequence, generation),
+            ).fetchone()
+            if prior is not None:
+                if not all((
                     hmac.compare_digest(prior["signed_request_digest"] or "", signed_digest),
                     hmac.compare_digest(prior["nonce_hash"] or "", nonce_hash),
                     hmac.compare_digest(prior["key_id"] or "", values["X-Heel-Runner-Key-Id"]),
@@ -1842,34 +2296,77 @@ class RunnerAuthStore:
                     prior["timestamp_ms"] == timestamp,
                     hmac.compare_digest(prior["body_digest"] or "", body_digest),
                 )):
-                    try:
-                        aad = f"{workspace_id}\0{runner_id}\0{chain}\0{sequence}".encode()
-                        response = json_load(self._open(prior["response_ciphertext"], aad=aad))
-                        nonce = self._open(prior["next_nonce_ciphertext"], aad=aad)
-                    except (TypeError, ValueError):
-                        raise RunnerAuthError("invalid runner authentication") from None
-                    self.conn.rollback(); return response, nonce
+                    raise RunnerAuthError("invalid runner authentication")
+                result = self._open_exact_receipt(
+                    prior, workspace_id=workspace_id, runner_id=runner_id, chain=chain,
+                    sequence=sequence, generation=generation,
+                )
+                self.conn.rollback()
+                return result
+            if abs(int(self._now() * 1000) - timestamp) > CLOCK_SKEW_MS:
                 raise RunnerAuthError("invalid runner authentication")
-            response = action()
-            if not isinstance(response, dict):
-                raise ValueError("runner action must return a response object")
+            state = self.conn.execute("SELECT * FROM canary_runner_nonce_chains WHERE workspace_id=? AND runner_id=? AND chain_name=?", (workspace_id, runner_id, chain)).fetchone()
+            if state is None or state["expires_at"] <= self._now() or sequence != state["next_sequence"] or sequence != cursor["next_sequence"] or not hmac.compare_digest(state["nonce_hash"], nonce_hash):
+                raise RunnerAuthError("invalid runner authentication")
+            outcome = action()
+            if not isinstance(outcome, RunnerHttpAction) or outcome.status not in {200, 201, 204} or (
+                outcome.status == 204 and outcome.body is not None
+            ) or (outcome.status != 204 and not isinstance(outcome.body, dict)):
+                raise ValueError("runner action must return a closed HTTP response")
             if capability == "runner_heartbeat":
                 identity = self._load_identity(workspace_id, runner_id)
                 identity["last_heartbeat_at_ms"] = self._milliseconds(self._now())
                 self._save_changed_identity(identity, instant=self._now())
             nonce = _token()
-            aad = f"{workspace_id}\0{runner_id}\0{chain}\0{sequence}".encode()
-            response_json = _sealed_response_json(response)
-            response_ciphertext = self._seal(response_json, aad=aad)
+            aad = self._receipt_aad(workspace_id, runner_id, chain, sequence, generation)
+            wire_body = b"" if outcome.status == 204 else self.response_wire_body(outcome.body)
+            envelope = {
+                "schema_version": "heel.runner-http-receipt.v1",
+                "status": outcome.status, "body": outcome.body,
+            }
+            response_ciphertext = self._seal(_sealed_response_json(envelope), aad=aad)
             nonce_ciphertext = self._seal(nonce, aad=aad)
             self.conn.execute("UPDATE canary_runner_nonce_chains SET nonce_hash=?,next_sequence=?,expires_at=? WHERE workspace_id=? AND runner_id=? AND chain_name=?", (self._hash("nonce", nonce), sequence + 1, self._now() + NONCE_TTL, workspace_id, runner_id, chain))
             changed = self.conn.execute("UPDATE canary_runner_chain_cursors SET next_sequence=?,updated_at=? WHERE workspace_id=? AND runner_id=? AND chain_name=? AND generation=?", (sequence + 1, self._now(), workspace_id, runner_id, chain, generation))
             if changed.rowcount != 1:
                 raise RunnerAuthError("invalid runner authentication")
-            self.conn.execute("INSERT INTO canary_runner_request_ledger(workspace_id,runner_id,chain_name,sequence,generation,request_digest,response_json,next_nonce,created_at,nonce_hash,key_id,capability,method,path,timestamp_ms,signed_request_digest,body_digest,response_ciphertext,next_nonce_ciphertext) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (workspace_id, runner_id, chain, sequence, generation, signed_digest, "sealed", self._hash("next-nonce", nonce), self._now(), nonce_hash, values["X-Heel-Runner-Key-Id"], capability, "POST", path, timestamp, signed_digest, body_digest, response_ciphertext, nonce_ciphertext))
-            self.conn.execute("DELETE FROM canary_runner_request_ledger WHERE created_at<?", (self._now() - 3600,))
+            created_at = self._now()
+            self.conn.execute(
+                "DELETE FROM canary_runner_request_ledger WHERE workspace_id=? AND runner_id=? AND chain_name=?",
+                (workspace_id, runner_id, chain),
+            )
+            self.conn.execute("INSERT INTO canary_runner_request_ledger(workspace_id,runner_id,chain_name,sequence,generation,request_digest,response_json,next_nonce,created_at,nonce_hash,key_id,capability,method,path,timestamp_ms,signed_request_digest,body_digest,response_ciphertext,next_nonce_ciphertext,response_status,response_body_digest,retention_expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (workspace_id, runner_id, chain, sequence, generation, signed_digest, "sealed-v2", self._hash("next-nonce", nonce), created_at, nonce_hash, values["X-Heel-Runner-Key-Id"], capability, "POST", path, timestamp, signed_digest, body_digest, response_ciphertext, nonce_ciphertext, outcome.status, hashlib.sha256(wire_body).hexdigest(), created_at + 2_592_000.0))
             self.conn.commit()
-            return response, nonce
+            return outcome.status, outcome.body, nonce
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def purge_runner_request_receipts(self, now: float, limit: int = 128) -> tuple[int, bool]:
+        """Bound the thirty-day replay ledger without doing work on a request path."""
+        if isinstance(now, bool) or not isinstance(now, (int, float)) or not 1 <= limit <= 128:
+            raise ValueError("invalid runner receipt purge request")
+        instant = float(now)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.conn.execute(
+                "SELECT workspace_id,runner_id,chain_name,sequence,generation "
+                "FROM canary_runner_request_ledger INDEXED BY idx_canary_runner_ledger_retention "
+                "WHERE retention_expires_at<=? "
+                "ORDER BY retention_expires_at,workspace_id,runner_id,chain_name,sequence,generation LIMIT ?",
+                (instant, limit + 1),
+            ).fetchall()
+            for row in rows[:limit]:
+                deleted = self.conn.execute(
+                    "DELETE FROM canary_runner_request_ledger WHERE workspace_id=? AND runner_id=? "
+                    "AND chain_name=? AND sequence=? AND generation=?",
+                    tuple(row),
+                )
+                if deleted.rowcount != 1:
+                    raise RunnerAuthError("invalid runner authentication")
+            self.conn.commit()
+            return min(len(rows), limit), len(rows) > limit
         except Exception:
             if self.conn.in_transaction:
                 self.conn.rollback()

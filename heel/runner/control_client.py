@@ -31,7 +31,10 @@ from heel.canary_contracts import (
     validate_runner_context_binding,
 )
 from heel.crypto import ed25519_key_id, verify_envelope
-from heel.runner.runtime import RunnerRuntimeState
+from heel.runner.runtime import (
+    ActiveGateUpdate, ActiveRunInstall, PendingResultReplayVerifier, PendingSignedCall,
+    RunnerRuntimeConflict, RunnerRuntimeCorrupt, RunnerRuntimeState, _active_json_bytes,
+)
 
 
 _CAPS = {"claim": "runner_claim", "heartbeat": "runner_heartbeat", "progress": "runner_progress", "result": "runner_result", "stop-ack": "runner_heartbeat"}
@@ -58,6 +61,17 @@ class _CallDiagnostic:
     status: int
     sequence: int
     generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class PendingReplayOutcome:
+    """The closed response committed for one byte-identical durable request replay."""
+
+    call_id: str
+    request_operation: str
+    run_id: str | None
+    status: int
+    body: object | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +144,15 @@ _FINDINGS_RECEIPT_FIELDS = {
 _ROLLOVER_RECEIPT_CONSTRUCTOR = object()
 _ROLLOVER_RECEIPT_REGISTRY: dict[bytes, tuple["RunnerControlClient", "_RunnerContextRolloverReceipt", object]] = {}
 _ROLLOVER_RECEIPT_REGISTRY_LOCK = threading.Lock()
+
+
+def _response_digest(value: object) -> str:
+    """Hash a closed decoded HTTP JSON value, including Boolean gate fields."""
+    try:
+        encoded = _active_json_bytes(value)
+    except (TypeError, ValueError):
+        raise ValueError("invalid runner control response") from None
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class _RunnerContextRolloverReceipt:
@@ -253,6 +276,18 @@ class RunnerControlClient:
         self._rollover_receipts: dict[bytes, _RunnerContextRolloverReceipt] = {}
         self._calls: deque[_CallDiagnostic] = deque(maxlen=_MAX_CALL_DIAGNOSTICS)
         self._calls_dropped = 0
+        for active in runtime.load_active_run_controls(limit=64):
+            if active.run_id in self._tracked_runs:
+                raise RunnerRuntimeCorrupt("runtime active run recovery is invalid")
+            self._tracked_runs.add(active.run_id)
+            self._run_guards[active.run_id] = _RunGuard(threading.Lock(), object())
+            for operation, cursor in active.chains.items():
+                self._chains[self._chain(operation, active.run_id)] = (
+                    cursor.next_nonce_b64, cursor.next_sequence, cursor.generation,
+                )
+        # No normal control action may sign or transport over an accepted request whose
+        # response was lost.  The factory/coordinator drains this barrier first.
+        self._pending_replay_required = bool(runtime.load_pending_calls())
 
     @property
     def calls(self) -> list[_CallDiagnostic]:
@@ -264,6 +299,272 @@ class RunnerControlClient:
     def calls_dropped(self) -> int:
         with self._state_lock:
             return self._calls_dropped
+
+    @staticmethod
+    def _closed_transport_response(response: object, *, error: str) -> tuple[int, dict[str, str], object]:
+        if (
+            not isinstance(response, tuple) or len(response) != 3
+            or isinstance(response[0], bool) or not isinstance(response[0], int)
+            or not isinstance(response[1], dict)
+            or any(type(key) is not str or type(value) is not str for key, value in response[1].items())
+        ):
+            raise ValueError(error)
+        return response[0], dict(response[1]), response[2]
+
+    def _replay_context_pending(self, pending: PendingSignedCall, *, now_ms: int) -> PendingReplayOutcome:
+        """Validate and advance the claim cursor for a sealed context side effect."""
+        operation = pending.request_operation
+        shapes = {
+            "list-contexts": (200, "heel.runner-context-list-result.v1"),
+            "claim-context": (200, "heel.runner-context-claim-result.v1"),
+            "submit-context-approval-projection": (201, "heel.canary-projection-submitted.v1"),
+        }
+        if operation not in shapes or pending.chain_operation != "claim" or pending.run_id is not None:
+            raise RunnerRuntimeCorrupt("runtime pending context call is invalid")
+        try:
+            request = json.loads(pending.body)
+        except (TypeError, ValueError):
+            raise RunnerRuntimeCorrupt("runtime pending context call is invalid") from None
+        if not isinstance(request, dict) or canonical_bytes(request) != pending.body:
+            raise RunnerRuntimeCorrupt("runtime pending context call is invalid")
+        if operation == "list-contexts":
+            if validate_runner_context_list(request) != request:
+                raise RunnerRuntimeCorrupt("runtime pending context call is invalid")
+        elif operation == "claim-context":
+            if validate_runner_context_claim(request) != request:
+                raise RunnerRuntimeCorrupt("runtime pending context call is invalid")
+        elif validate_runner_approval_projection_submit(request) != request:
+            raise RunnerRuntimeCorrupt("runtime pending context call is invalid")
+        status, headers, payload = self._closed_transport_response(
+            self.transport.post(pending.path, headers=dict(pending.headers), body=pending.body),
+            error="invalid runner context response",
+        )
+        expected_status, schema = shapes[operation]
+        if status != expected_status or not isinstance(payload, dict) or payload.get("schema_version") != schema:
+            raise ValueError("invalid runner context response")
+        try:
+            if operation == "list-contexts":
+                if set(payload) != {"schema_version", "server_time_ms", "contexts", "has_more"}:
+                    raise ValueError
+                if type(payload["server_time_ms"]) is not int or payload["server_time_ms"] < 0 or type(payload["has_more"]) is not bool:
+                    raise ValueError
+                if not isinstance(payload["contexts"], list) or len(payload["contexts"]) > 16:
+                    raise ValueError
+                for item in payload["contexts"]:
+                    if not isinstance(item, dict) or set(item) != {
+                        "binding_id", "binding_digest", "project_id", "environment_id", "origin",
+                        "environment_class", "verification_record_digest", "expires_at_ms", "claimed",
+                    }:
+                        raise ValueError
+                    validate_runner_context_claim({
+                        "schema_version": "heel.runner-context-claim.v1",
+                        "binding_id": item["binding_id"], "binding_digest": item["binding_digest"],
+                    })
+                    if (
+                        type(item["project_id"]) is not str or not item["project_id"]
+                        or type(item["environment_id"]) is not str or not item["environment_id"]
+                        or type(item["origin"]) is not str or not item["origin"]
+                        or item["environment_class"] not in {"staging", "sandbox"}
+                        or type(item["verification_record_digest"]) is not str
+                        or len(item["verification_record_digest"]) != 64
+                        or type(item["expires_at_ms"]) is not int or item["expires_at_ms"] < 0
+                        or type(item["claimed"]) is not bool
+                    ):
+                        raise ValueError
+            elif operation == "claim-context":
+                if set(payload) != {"schema_version", "context_binding", "claimed_at_ms"} or (
+                    type(payload["claimed_at_ms"]) is not int or payload["claimed_at_ms"] < 0
+                ):
+                    raise ValueError
+                binding = validate_runner_context_binding(payload["context_binding"])
+                if (
+                    binding["workspace_id"] != self.workspace_id
+                    or binding["runner_binding"]["runner_id"] != self.runner_id
+                    or binding["runner_binding"]["runner_key_id"] != self.signer.key_id
+                    or binding["binding_id"] != request["binding_id"]
+                    or binding["binding_digest"] != request["binding_digest"]
+                ):
+                    raise ValueError
+            else:
+                if (
+                    set(payload) != {"schema_version", "approval_id", "run_id", "status", "projection_digest"}
+                    or payload["status"] not in {"awaiting_execution_approval", "approved", "cancelled", "expired"}
+                ):
+                    raise ValueError
+                submitted = request["approval_projection"]
+                if (
+                    type(payload["approval_id"]) is not str or payload["approval_id"] != submitted["projection_id"]
+                    or type(payload["projection_digest"]) is not str
+                    or payload["projection_digest"] != submitted["projection_digest"]
+                    or type(payload["run_id"]) is not str
+                    or re.fullmatch(r"crun_[0-9a-f]{32}", payload["run_id"]) is None
+                ):
+                    raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("invalid runner context response") from None
+        next_nonce = headers.get("X-Heel-Runner-Next-Nonce")
+        if not self._b64_32(next_nonce):
+            raise ValueError("invalid runner context response")
+        self.runtime.commit_call(pending.call_id, next_nonce_b64=next_nonce, now_ms=now_ms)
+        with self._state_lock:
+            current = self._chains.get("claim")
+            expected = (pending.headers["X-Heel-Runner-Nonce"], pending.sequence, pending.generation)
+            if current != expected:
+                raise RunnerRuntimeCorrupt("runner control claim chain changed during replay")
+            self._chains["claim"] = (next_nonce, pending.sequence + 1, pending.generation)
+            self._append_call_diagnostic_locked(operation, status, _Call(
+                pending.path, dict(pending.headers), pending.body, pending.capability,
+                "claim", pending.sequence, pending.generation,
+            ))
+        return PendingReplayOutcome(pending.call_id, operation, None, status, dict(payload))
+
+    def replay_pending_call(
+        self,
+        pending: PendingSignedCall,
+        *,
+        now_ms: int,
+        result_verifier: PendingResultReplayVerifier | None = None,
+    ) -> PendingReplayOutcome:
+        """Replay exactly one authenticated staged request; it never signs or rebuilds bytes."""
+        if not isinstance(pending, PendingSignedCall):
+            raise RunnerRuntimeCorrupt("runtime pending call is invalid")
+        current = self.runtime.get_pending_call(pending.call_id)
+        if current != pending:
+            raise RunnerRuntimeCorrupt("runtime pending call changed during replay")
+        if pending.request_operation in {
+            "list-contexts", "claim-context", "submit-context-approval-projection",
+        }:
+            return self._replay_context_pending(current, now_ms=now_ms)
+        if pending.request_operation in _RUN_OPERATIONS:
+            if pending.run_id is None or pending.chain_operation != pending.request_operation:
+                raise RunnerRuntimeCorrupt("runtime pending call is invalid")
+            if pending.request_operation == "result" and result_verifier is None:
+                # Replaying a terminal response additionally requires the signed
+                # detached Store anchor.  The coordinator owns that cross-store
+                # recovery step and must not be bypassed by a control client.
+                raise RunnerRuntimeConflict("runtime terminal result recovery is required")
+            try:
+                request = json.loads(pending.body)
+            except (TypeError, ValueError):
+                raise RunnerRuntimeCorrupt("runtime pending call is invalid") from None
+            if (
+                not isinstance(request, dict)
+                or canonical_bytes(request) != pending.body
+                or _REQUEST_VALIDATORS[pending.request_operation](request) != request
+            ):
+                raise RunnerRuntimeCorrupt("runtime pending call is invalid")
+            active = next(
+                (item for item in self.runtime.load_active_run_controls(limit=64)
+                 if item.run_id == pending.run_id),
+                None,
+            )
+            if active is None:
+                raise RunnerRuntimeCorrupt("runtime pending call has no active authority")
+            projection_binding = (
+                self.workspace_id, active.project_id, active.grant_id,
+                active.approval_projection_digest,
+            )
+            call = _Call(
+                pending.path, dict(pending.headers), pending.body, pending.capability,
+                self._chain(pending.chain_operation, pending.run_id),
+                pending.sequence, pending.generation,
+            )
+            if (
+                call.path != self._control_path(pending.request_operation, pending.run_id)
+                or call.capability != _CAPS[pending.request_operation]
+            ):
+                raise RunnerRuntimeCorrupt("runtime pending call is invalid")
+            with self._run_guard(pending.run_id) as guard_token:
+                # Reload once the exact guard is held: any replacement or prior
+                # same-run commit is authority loss, never a replay success.
+                current = self.runtime.get_pending_call(pending.call_id)
+                if current != pending:
+                    raise RunnerRuntimeCorrupt("runtime pending call changed during replay")
+                cursor = self.runtime.load_chain(pending.chain_operation, pending.run_id)
+                if (
+                    cursor is None or cursor.state_digest != pending.prior_chain_state_digest
+                    or (cursor.next_nonce_b64, cursor.next_sequence, cursor.generation)
+                    != (pending.headers["X-Heel-Runner-Nonce"], pending.sequence, pending.generation)
+                ):
+                    raise RunnerRuntimeCorrupt("runtime pending call no longer matches its chain")
+                if pending.request_operation == "result":
+                    assert result_verifier is not None
+                    with self._state_lock:
+                        if pending.run_id not in self._tracked_runs:
+                            raise RunnerRuntimeCorrupt("runtime pending call has no active authority")
+                    terminal = self.runtime.load_terminal_state(pending.run_id)
+                    if terminal is None or terminal.state != "local_terminal":
+                        raise RunnerRuntimeCorrupt("runtime pending terminal authority is invalid")
+                    authority = result_verifier.authorize_pending_result_replay(
+                        current, now_ms=now_ms,
+                    )
+                    # Store authorization is read-only.  Reload every mutable
+                    # runtime input before consuming its one attempt and sending
+                    # the sealed bytes.
+                    final_pending = self.runtime.get_pending_call(pending.call_id)
+                    final_terminal = self.runtime.load_terminal_state(pending.run_id)
+                    final_active = next(
+                        (item for item in self.runtime.load_active_run_controls(limit=64)
+                         if item.run_id == pending.run_id),
+                        None,
+                    )
+                    if (
+                        final_pending != current or final_terminal is None
+                        or final_terminal.state != "local_terminal"
+                        or final_active is None
+                        or now_ms >= final_terminal.retention_expires_at_ms
+                    ):
+                        raise RunnerRuntimeCorrupt("runtime pending terminal authority changed during replay")
+                    result_verifier.consume(authority, expected_fields={
+                        "call_id": final_pending.call_id,
+                        "pending_state_digest": final_pending.pending_state_digest,
+                        "run_id": pending.run_id,
+                        "body_sha256": hashlib.sha256(final_pending.body).hexdigest(),
+                        "active_state_digest": final_active.state_digest,
+                        "runtime_terminal_state_digest": final_terminal.state_digest,
+                        "terminal_record_digest": final_terminal.terminal_record_digest,
+                        "terminal_projection_digest": final_terminal.terminal_projection_digest,
+                        "retention_expires_at_ms": final_terminal.retention_expires_at_ms,
+                    })
+                body, status, _headers = self._post_closed(
+                    call, pending.request_operation, pending.run_id,
+                    projection_binding=projection_binding, guard_token=guard_token,
+                    include_response_metadata=True, runtime_pending=current,
+                )
+            return PendingReplayOutcome(
+                pending.call_id, pending.request_operation, pending.run_id, status, body,
+            )
+        if pending.request_operation != "claim":
+            raise RunnerRuntimeCorrupt("runtime pending call is invalid")
+        call = _Call(
+            pending.path, dict(pending.headers), pending.body, pending.capability,
+            "claim", pending.sequence, pending.generation,
+        )
+        body, status, _headers = self._post_closed(
+            call, "claim", None, include_response_metadata=True, runtime_pending=current,
+        )
+        return PendingReplayOutcome(pending.call_id, "claim", None, status, body)
+
+    def replay_all_pending(
+        self,
+        *,
+        now_ms: int,
+        limit: int = 74,
+        result_verifier: PendingResultReplayVerifier | None = None,
+    ) -> tuple[PendingReplayOutcome, ...]:
+        if type(limit) is not int or not 1 <= limit <= 74:
+            raise ValueError("invalid runner pending replay limit")
+        outcomes: list[PendingReplayOutcome] = []
+        while True:
+            pending = self.runtime.load_pending_calls(limit=limit)
+            if not pending:
+                with self._state_lock:
+                    self._pending_replay_required = False
+                return tuple(outcomes)
+            for item in pending:
+                outcomes.append(self.replay_pending_call(
+                    item, now_ms=now_ms, result_verifier=result_verifier,
+                ))
 
     def _append_call_diagnostic_locked(self, operation: str, status: int, call: _Call) -> None:
         if operation not in _CALL_DIAGNOSTIC_OPERATIONS:
@@ -288,6 +589,9 @@ class RunnerControlClient:
 
     def _next_chain(self, operation: str, run_id: str | None) -> tuple[str, int, int, str]:
         self._validate_chain(operation, run_id)
+        with self._state_lock:
+            if self._pending_replay_required:
+                raise ValueError("runner control pending replay is required")
         chain = self._chain(operation, run_id)
         if operation != "claim":
             with self._state_lock:
@@ -387,11 +691,39 @@ class RunnerControlClient:
             raise ValueError("invalid runner control operation")
 
         if runtime_pending is not None:
+            if operation == "heartbeat":
+                if run_id is None:
+                    raise ValueError("invalid runner heartbeat response")
+                active = next(
+                    (item for item in self.runtime.load_active_run_controls(limit=64)
+                     if item.run_id == run_id),
+                    None,
+                )
+                if active is None:
+                    raise ValueError("active runner claim is required")
+                if body["server_time_ms"] <= active.gate["server_time_ms"]:
+                    raise ValueError("runner gate server time did not advance")
+                if body["kill_switch_generation"] < active.gate["kill_switch_generation"]:
+                    raise ValueError("runner gate control generation regressed")
             installed = ()
+            active_run = None
+            gate_update = None
+            runtime_now = self._timestamp()
             if operation == "claim" and body is not None:
                 installed = tuple(
                     (name, body["run_id"], *run_states[self._chain(name, body["run_id"])])
                     for name in ("heartbeat", "progress", "result", "stop-ack")
+                )
+                active_run = ActiveRunInstall(
+                    run_id=body["run_id"], approval_projection=body["approval_projection"],
+                    grant=body["grant"], gate=body["gate"],
+                    claim_response_digest=_response_digest(body), gate_response_digest=_response_digest(body["gate"]),
+                    claimed_at_ms=runtime_now, gate_received_at_ms=runtime_now,
+                )
+            elif operation == "heartbeat":
+                gate_update = ActiveGateUpdate(
+                    gate=body, gate_response_digest=_response_digest(body),
+                    received_at_ms=runtime_now,
                 )
             try:
                 if operation == "result" and body["status"] == "terminal":
@@ -413,7 +745,8 @@ class RunnerControlClient:
                 else:
                     self.runtime.commit_call(
                         runtime_pending.call_id, next_nonce_b64=next_nonce,
-                        now_ms=self._timestamp(), installed_chains=installed,
+                        now_ms=runtime_now, installed_chains=installed,
+                        active_run=active_run, gate_update=gate_update,
                     )
             except (TypeError, ValueError) as exc:
                 raise ValueError("runner runtime state did not commit control response") from exc
@@ -777,6 +1110,20 @@ class RunnerControlClient:
                 self._signature(b"heel.runner-pop.v1\0" + canonical_bytes(proof)), timestamp_ms,
                 nonce=nonce, sequence=sequence,
             )
+            runtime_cursor = self.runtime.load_chain("claim", None)
+            if runtime_cursor is None or (
+                runtime_cursor.next_nonce_b64, runtime_cursor.next_sequence,
+                runtime_cursor.generation,
+            ) != (nonce, sequence, generation):
+                raise ValueError("runner runtime state chain differs from control client")
+            try:
+                runtime_pending = self.runtime.stage_call(
+                    request_operation=diagnostic_operation, chain_operation="claim", run_id=None,
+                    path=path, capability="runner_claim", headers=headers, body=body,
+                    expected_state_digest=runtime_cursor.state_digest, now_ms=timestamp_ms,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("runner runtime state did not stage context call") from exc
             response = self.transport.post(path, headers=headers, body=body)
             if (not isinstance(response, tuple) or len(response) != 3 or response[0] != expected_status
                     or not isinstance(response[1], dict) or not isinstance(response[2], dict)
@@ -823,6 +1170,13 @@ class RunnerControlClient:
             if not self._b64_32(next_nonce):
                 raise ValueError("invalid runner context response")
             call = _Call(path, headers, body, "runner_claim", chain, sequence, generation)
+            try:
+                self.runtime.commit_call(
+                    runtime_pending.call_id, next_nonce_b64=next_nonce,
+                    now_ms=self._timestamp(),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("runner runtime state did not commit context response") from exc
             with self._state_lock:
                 current = self._chains.get(chain)
                 if current is not None and current != (nonce, sequence, generation):

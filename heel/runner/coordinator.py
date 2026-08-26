@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+import json
 import math
 import threading
 import time
@@ -102,13 +103,128 @@ class RunnerCoordinator:
         self._bindings: dict[str, tuple[str, str, str]] = {}
         self._terminal_runs: set[str] = set()
         self._lock = threading.Lock()
+        self._pending_result_replay_verifier = store.pending_result_replay_verifier(control.runtime)
         try:
             self._recover_terminal_runtime_state()
+            self._recover_active_runtime_state()
+            self._replay_pending_calls()
         except RunnerStoreError as exc:
             # A signed Cloud rollover is completed by ensure_runner_context
             # before any terminal/run recovery can touch the namespace.
             if str(exc) != "cloud context rollover requires recovery":
                 raise
+
+    def _replay_pending_calls(self) -> None:
+        """Drain durable calls before exposing a coordinator to polling or execution."""
+        while True:
+            pending = self.control.runtime.load_pending_calls(limit=74)
+            if not pending:
+                # The client owns the startup-barrier bit; let its zero-pending
+                # path clear that bit without generating a transport request.
+                self.control.replay_all_pending(
+                    now_ms=self._now_ms(), result_verifier=self._pending_result_replay_verifier,
+                )
+                break
+            for item in pending:
+                if item.request_operation == "upload-findings":
+                    # Findings recovery remains lease/permit bound.  Re-enter
+                    # the coordinator rather than allowing the client to infer
+                    # disclosure authority from an available runtime row alone.
+                    try:
+                        request = json.loads(item.body.decode("utf-8"))
+                        if (
+                            canonical_bytes(request) != item.body
+                            or not isinstance(request, dict)
+                            or set(request) != {
+                                "schema_version", "run_id", "permit", "findings_projection",
+                            }
+                            or request["schema_version"] != "heel.runner-findings-upload.v1"
+                            or request["run_id"] != item.run_id
+                        ):
+                            raise ValueError
+                    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                        raise RunnerStoreError("local findings replay authority is invalid") from None
+                    self.upload_findings(
+                        item.run_id, permit=request["permit"],
+                        findings_projection=request["findings_projection"],
+                    )
+                    continue
+                self.control.replay_pending_call(
+                    item, now_ms=self._now_ms(),
+                    result_verifier=self._pending_result_replay_verifier,
+                )
+        active_ids = {
+            item.run_id for item in self.control.runtime.load_active_run_controls(limit=64)
+        }
+        with self._lock:
+            for run_id in set(self._gates) | set(self._gate_receipts) | set(self._bindings):
+                if run_id not in active_ids:
+                    self._gates.pop(run_id, None)
+                    self._gate_receipts.pop(run_id, None)
+                    self._bindings.pop(run_id, None)
+            self._terminal_runs.intersection_update(active_ids)
+
+    def _recover_active_runtime_state(self) -> None:
+        """Rebuild live coordinator authority from sealed runtime controls.
+
+        A runtime active row is the restart source for the Cloud grant, approval
+        projection and last gate.  The locally signed reservation is re-opened
+        (or deterministically completed) before those values are exposed to
+        the coordinator.  Its gate intentionally remains receipt-stale: only
+        a post-restart heartbeat may authorize execution.
+        """
+        for active in self.control.runtime.load_active_run_controls(limit=64):
+            projection = dict(active.approval_projection)
+            grant = dict(active.grant)
+            manifest, local_projection = self.store.load_approved_pair(active.approval_id)
+            if local_projection != projection:
+                raise RunnerStoreError("runtime active approval authority is unavailable")
+            gate = ExecutionGate(**dict(active.gate))
+            try:
+                validate_execution_bundle(
+                    ExecutionBundle(manifest, projection, grant), store=self.store,
+                    identity=self.identity, trusted_grant_keys=self.trusted_grant_keys,
+                    now_ms=self._now_ms(), gate=gate,
+                )
+            except (TypeError, ValueError) as exc:
+                raise RunnerStoreError("runtime active grant authority is unavailable") from exc
+            terminal = self.control.runtime.load_terminal_state(active.run_id)
+            if terminal is None:
+                retention_expires_at_ms = (
+                    active.claimed_at_ms
+                    + manifest["local_evidence_policy"]["retention_seconds"] * 1000
+                )
+                try:
+                    recovered = self.store.reserve_run(
+                        grant, retention_expires_at_ms=retention_expires_at_ms,
+                    )
+                    if recovered.get("run_id") != active.run_id:
+                        raise RunnerStoreError("runtime active reservation is unavailable")
+                    self.store.recover_run_reservation(active.run_id)
+                except (TypeError, ValueError, RunnerStoreError) as exc:
+                    if isinstance(exc, RunnerStoreError):
+                        raise
+                    raise RunnerStoreError("runtime active reservation is unavailable") from exc
+            elif terminal.state == "local_terminal":
+                pending = tuple(
+                    item for item in self.control.runtime.load_pending_calls(limit=74)
+                    if item.run_id == active.run_id
+                )
+                if len(pending) != 1 or pending[0].request_operation != "result":
+                    raise RunnerStoreError("runtime active terminal recovery is unavailable")
+            else:
+                raise RunnerStoreError("runtime active terminal recovery is unavailable")
+            binding = (
+                active.grant_id, active.approval_id,
+                active.approval_projection_digest,
+            )
+            with self._lock:
+                if active.run_id in self._gates or active.run_id in self._bindings:
+                    raise RunnerStoreError("runtime active run recovery is invalid")
+                self._gates[active.run_id] = gate
+                # A memory receipt is deliberately never reconstructed.  The
+                # persisted gate is only a heartbeat precondition after restart.
+                self._bindings[active.run_id] = binding
 
     def _now_ms(self) -> int:
         value = self.clock_ms()
@@ -133,15 +249,33 @@ class RunnerCoordinator:
         self.store.recover_terminal_detaches(
             runtime=self.control.runtime, now_ms=now_ms,
         )
-        for pending in self.control.runtime.claim_due_prune(now_ms=now_ms, limit=16):
-            pruned = self.store.prune_runtime_terminal(
-                pending.run_id, runtime=self.control.runtime,
-                expected_runtime_state_digest=pending.state_digest, now_ms=now_ms,
-            )
-            self.control.runtime.finish_prune(
-                pending.run_id, expected_state_digest=pending.state_digest,
-                pruned_record_digest=pruned, now_ms=now_ms,
-            )
+        def finish(batch) -> None:
+            for pending in batch.items:
+                try:
+                    receipt = self.store.load_pruned_run_receipt(
+                        pending.run_id, expected_runtime_state_digest=pending.state_digest,
+                    )
+                except RunnerStoreError as exc:
+                    if str(exc) != "local runtime prune receipt is unavailable":
+                        raise
+                    receipt = self.store.prune_runtime_terminal(
+                        pending.run_id, runtime=self.control.runtime,
+                        expected_runtime_state_digest=pending.state_digest, now_ms=now_ms,
+                    )
+                self.control.runtime.finish_prune(
+                    receipt=receipt, expected_prune_pending_state_digest=pending.state_digest,
+                )
+
+        while True:
+            pending = self.control.runtime.load_prune_pending(limit=16)
+            finish(pending)
+            if not pending.has_more:
+                break
+        while True:
+            claimed = self.control.runtime.claim_due_prune(now_ms=now_ms, limit=16)
+            finish(claimed)
+            if not claimed.has_more:
+                break
 
     def claim(self) -> ClaimLease | None:
         response = self.control._claim_closed()

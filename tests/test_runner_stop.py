@@ -749,15 +749,14 @@ def test_runtime_prune_removes_a_detached_terminal_only_after_signed_store_prune
         now_ms=store.load_run(grant["run_id"])["retention_expires_at_ms"],
     )[0]
 
-    pruned = store.prune_runtime_terminal(
+    receipt = store.prune_runtime_terminal(
         grant["run_id"], runtime=runtime,
         expected_runtime_state_digest=pending.state_digest,
         now_ms=pending.retention_expires_at_ms,
     )
 
     runtime.finish_prune(
-        grant["run_id"], expected_state_digest=pending.state_digest,
-        pruned_record_digest=pruned, now_ms=pending.retention_expires_at_ms,
+        receipt=receipt, expected_prune_pending_state_digest=pending.state_digest,
     )
     assert runtime.load_terminal_state(grant["run_id"]) is None
 

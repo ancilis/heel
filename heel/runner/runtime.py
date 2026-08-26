@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -16,21 +17,120 @@ import sqlite3
 import stat
 import threading
 from types import MappingProxyType
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Protocol
+import unicodedata
 
-from heel.canary_contracts import canonical_bytes
-from heel.runner.identity import AcceptedRotationJournal, RunnerIdentity, SecureSigner
+from heel.canary_contracts import (
+    canonical_bytes, validate_approval_projection, validate_execution_grant,
+)
+from heel.crypto import load_public_key_base64, verify_envelope
+from heel.runner.identity import (
+    AcceptedRotationAbortTombstone, AcceptedRotationJournal, RunnerIdentity, SecureSigner,
+)
 
 
 _SCHEMA_V1 = "heel.runner-runtime-state.v1"
-_SCHEMA = "heel.runner-runtime-state.v2"
+_SCHEMA_V2 = "heel.runner-runtime-state.v2"
+_SCHEMA = "heel.runner-runtime-state.v3"
 _SEAL_DOMAIN = b"heel.runner-runtime-state-seal.v1\0"
 _STATE_KEY_WRAP_DOMAIN = b"heel.runner-runtime-state-key-wrap.v1\0"
 _DIGEST_DOMAIN = b"heel.runner-runtime-state-digest.v1\0"
+_ACTIVE_STATE_DIGEST_DOMAIN = b"heel.runner-active-run-state-digest.v1\0"
+_AUTHORITY_IDENTITY_DOMAIN = b"heel.runner-runtime-authority-identity.v1\0"
+_RUNTIME_PRUNED_RECEIPT_DOMAIN = b"heel.local-run-pruned.v2\0"
 _MAX_SAFE_INT = 9_007_199_254_740_991
 _DIGEST = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _RUN_ID = re.compile(r"^crun_[0-9a-f]{32}$", re.ASCII)
 _B64_32 = re.compile(r"^[A-Za-z0-9+/]{43}=$", re.ASCII)
+
+
+_RUNTIME_TABLES = (
+    "metadata", "control_chains", "pending_calls", "terminal_disclosures", "active_runs",
+)
+_RUNTIME_INDEXES = (
+    "idx_pending_calls_created", "idx_terminal_disclosures_state_retention",
+    "idx_terminal_disclosures_due_retention",
+)
+_RUNTIME_OWNED_NAMES = frozenset((*_RUNTIME_TABLES, *_RUNTIME_INDEXES))
+
+# These literals are deliberately also used to build the in-memory parity reference.
+# Keep the SQL constraints closed: a permissive pre-created database is never a migration
+# candidate and therefore can never acquire runner authority by being opened.
+_V3_SCHEMA_SQL = (
+    "CREATE TABLE metadata("
+    "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
+    "schema_version TEXT NOT NULL CHECK(schema_version='heel.runner-runtime-state.v3'),"
+    "workspace_id TEXT NOT NULL CHECK(length(CAST(workspace_id AS BLOB)) BETWEEN 1 AND 128 AND instr(workspace_id,char(0))=0),"
+    "runner_id TEXT NOT NULL CHECK(length(CAST(runner_id AS BLOB)) BETWEEN 1 AND 128 AND instr(runner_id,char(0))=0),"
+    "runner_key_id TEXT NOT NULL CHECK(length(CAST(runner_key_id AS BLOB)) BETWEEN 1 AND 128 AND instr(runner_key_id,char(0))=0),"
+    "public_key_digest TEXT NOT NULL CHECK(length(public_key_digest)=64 AND public_key_digest NOT GLOB '*[^0-9a-f]*'),"
+    "authority_epoch INTEGER NOT NULL CHECK(authority_epoch BETWEEN 1 AND 9007199254740991),"
+    "authority_identity_digest TEXT NOT NULL CHECK(length(authority_identity_digest)=64 AND authority_identity_digest NOT GLOB '*[^0-9a-f]*'),"
+    "rotation_fence_digest TEXT CHECK(rotation_fence_digest IS NULL OR (length(rotation_fence_digest)=64 AND rotation_fence_digest NOT GLOB '*[^0-9a-f]*')),"
+    "state_key_ciphertext BLOB NOT NULL CHECK(typeof(state_key_ciphertext)='blob' AND length(state_key_ciphertext)=60))",
+    "CREATE TABLE control_chains("
+    "chain TEXT PRIMARY KEY CHECK(length(chain)=64 AND chain NOT GLOB '*[^0-9a-f]*'),"
+    "run_hash TEXT CHECK(run_hash IS NULL OR (length(run_hash)=64 AND run_hash NOT GLOB '*[^0-9a-f]*')),"
+    "operation TEXT NOT NULL CHECK(operation IN ('claim','heartbeat','progress','result','stop-ack')),"
+    "next_sequence INTEGER NOT NULL CHECK(next_sequence BETWEEN 1 AND 9007199254740991),"
+    "generation INTEGER NOT NULL CHECK(generation BETWEEN 0 AND 9007199254740991),"
+    "sealed_blob BLOB NOT NULL CHECK(typeof(sealed_blob)='blob' AND length(sealed_blob) BETWEEN 29 AND 4096),"
+    "updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms BETWEEN 0 AND 9007199254740991),"
+    "CHECK(operation='claim' AND run_hash IS NULL OR operation!='claim' AND run_hash IS NOT NULL))",
+    "CREATE TABLE pending_calls("
+    "call_id TEXT PRIMARY KEY CHECK(length(call_id)=64 AND call_id NOT GLOB '*[^0-9a-f]*'),"
+    "chain TEXT NOT NULL UNIQUE CHECK(length(chain)=64 AND chain NOT GLOB '*[^0-9a-f]*'),"
+    "run_hash TEXT CHECK(run_hash IS NULL OR (length(run_hash)=64 AND run_hash NOT GLOB '*[^0-9a-f]*')),"
+    "operation TEXT NOT NULL CHECK(operation IN ('claim','heartbeat','progress','result','stop-ack','upload-findings','list-contexts','claim-context','submit-context-approval-projection')),"
+    "sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 9007199254740991),"
+    "generation INTEGER NOT NULL CHECK(generation BETWEEN 0 AND 9007199254740991),"
+    "sealed_blob BLOB NOT NULL CHECK(typeof(sealed_blob)='blob' AND length(sealed_blob) BETWEEN 29 AND 393216),"
+    "created_at_ms INTEGER NOT NULL CHECK(created_at_ms BETWEEN 0 AND 9007199254740991),"
+    "CHECK(run_hash IS NULL AND operation IN ('claim','list-contexts','claim-context','submit-context-approval-projection') OR run_hash IS NOT NULL AND operation IN ('heartbeat','progress','result','stop-ack','upload-findings')))",
+    "CREATE TABLE terminal_disclosures("
+    "run_hash TEXT PRIMARY KEY CHECK(length(run_hash)=64 AND run_hash NOT GLOB '*[^0-9a-f]*'),"
+    "retention_expires_at_ms INTEGER NOT NULL CHECK(retention_expires_at_ms BETWEEN 0 AND 9007199254740991),"
+    "state TEXT NOT NULL CHECK(state IN ('local_terminal','available','consumed','prune_pending')),"
+    "sealed_blob BLOB NOT NULL CHECK(typeof(sealed_blob)='blob' AND length(sealed_blob) BETWEEN 29 AND 393216),"
+    "updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms BETWEEN 0 AND 9007199254740991))",
+    "CREATE TABLE active_runs("
+    "run_hash TEXT PRIMARY KEY CHECK(length(run_hash)=64 AND run_hash NOT GLOB '*[^0-9a-f]*'),"
+    "sealed_blob BLOB NOT NULL CHECK(typeof(sealed_blob)='blob' AND length(sealed_blob) BETWEEN 29 AND 393216),"
+    "updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms BETWEEN 0 AND 9007199254740991))",
+    "CREATE INDEX idx_pending_calls_created ON pending_calls(created_at_ms,call_id)",
+    "CREATE INDEX idx_terminal_disclosures_state_retention ON terminal_disclosures(state,retention_expires_at_ms,run_hash)",
+    "CREATE INDEX idx_terminal_disclosures_due_retention ON terminal_disclosures(retention_expires_at_ms,run_hash) WHERE state IN ('local_terminal','available','consumed')",
+)
+
+_V2_SCHEMA_SQL = (
+    "CREATE TABLE metadata("
+    "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
+    "schema_version TEXT NOT NULL CHECK(schema_version='heel.runner-runtime-state.v2'),"
+    "workspace_id TEXT NOT NULL,runner_id TEXT NOT NULL,runner_key_id TEXT NOT NULL,"
+    "public_key_digest TEXT NOT NULL,state_key_ciphertext BLOB NOT NULL)",
+    "CREATE TABLE control_chains("
+    "chain TEXT PRIMARY KEY,run_hash TEXT NULL,operation TEXT NOT NULL,"
+    "next_sequence INTEGER NOT NULL,generation INTEGER NOT NULL,sealed_blob BLOB NOT NULL,"
+    "updated_at_ms INTEGER NOT NULL)",
+    "CREATE TABLE pending_calls("
+    "call_id TEXT PRIMARY KEY,chain TEXT NOT NULL UNIQUE,run_hash TEXT NULL,operation TEXT NOT NULL,"
+    "sequence INTEGER NOT NULL,generation INTEGER NOT NULL,sealed_blob BLOB NOT NULL,"
+    "created_at_ms INTEGER NOT NULL)",
+    "CREATE TABLE terminal_disclosures("
+    "run_hash TEXT PRIMARY KEY,retention_expires_at_ms INTEGER NOT NULL,"
+    "state TEXT NOT NULL CHECK(state IN ('local_terminal','available','consumed','prune_pending')),"
+    "sealed_blob BLOB NOT NULL,updated_at_ms INTEGER NOT NULL)",
+    "CREATE INDEX idx_terminal_disclosures_state_retention ON terminal_disclosures(state,retention_expires_at_ms,run_hash)",
+)
+
+_V1_SCHEMA_SQL = (
+    "CREATE TABLE metadata("
+    "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
+    "schema_version TEXT NOT NULL CHECK(schema_version='heel.runner-runtime-state.v1'),"
+    "workspace_id TEXT NOT NULL,runner_id TEXT NOT NULL,runner_key_id TEXT NOT NULL,"
+    "public_key_digest TEXT NOT NULL)",
+    _V2_SCHEMA_SQL[1],
+)
 
 
 class RunnerRuntimeStateError(ValueError):
@@ -51,6 +151,22 @@ class RunnerRuntimeCorrupt(RunnerRuntimeStateError):
 
 class TerminalDisclosureUnavailable(RunnerRuntimeStateError):
     """A terminal disclosure has been consumed, pruned, expired, or is absent."""
+
+
+@dataclass(frozen=True, slots=True)
+class RotationEligibility:
+    authority_epoch: int
+    authority_identity_digest: str
+    claim_state_digest: str
+    runtime_rotation_intent_digest: str
+    prepared_journal_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class RotationEligibilityProbe:
+    authority_epoch: int
+    authority_identity_digest: str
+    claim_state_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +213,83 @@ class PendingSignedCall:
     generation: int
     prior_chain_state_digest: str | None
     created_at_ms: int
+    state_digest: str
+
+    @property
+    def pending_state_digest(self) -> str:
+        """The authenticated sealed pending-record digest used by recovery CAS."""
+        return self.state_digest
+
+
+@dataclass(frozen=True, slots=True)
+class PendingResultReplayAuthority:
+    """Nominal, single-attempt Store authority for one sealed terminal replay."""
+
+    call_id: str
+    pending_state_digest: str
+    run_id: str
+    body_sha256: str
+    active_state_digest: str
+    runtime_terminal_state_digest: str
+    terminal_record_digest: str
+    detached_record_digest: str
+    terminal_projection_digest: str
+    retention_expires_at_ms: int
+    _issuer: object = field(repr=False, compare=False)
+
+
+class PendingResultReplayVerifier(Protocol):
+    """Opaque coordinator/Store bridge; clients never receive a RunnerStore."""
+
+    def authorize_pending_result_replay(
+        self, pending: PendingSignedCall, *, now_ms: int,
+    ) -> PendingResultReplayAuthority: ...
+
+    def consume(
+        self, authority: PendingResultReplayAuthority, *, expected_fields: Mapping[str, object],
+    ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveRunInstall:
+    """Authenticated claim-200 authority to be committed with its four cursors."""
+
+    run_id: str
+    approval_projection: Mapping[str, Any]
+    grant: Mapping[str, Any]
+    gate: Mapping[str, Any]
+    claim_response_digest: str
+    gate_response_digest: str
+    claimed_at_ms: int
+    gate_received_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveGateUpdate:
+    gate: Mapping[str, Any]
+    gate_response_digest: str
+    received_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveRunControl:
+    run_id: str
+    project_id: str
+    approval_id: str
+    grant_id: str
+    grant_digest: str
+    approval_projection_digest: str
+    approval_projection: Mapping[str, Any]
+    grant: Mapping[str, Any]
+    gate: Mapping[str, Any]
+    claim_response_digest: str
+    latest_gate_response_digest: str
+    claimed_at_ms: int
+    gate_received_at_ms: int
+    revision: int
+    prior_state_digest: str | None
+    state_digest: str
+    chains: Mapping[str, RunnerChainCursor]
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +317,24 @@ class TerminalDisclosureState:
     revision: int
     prior_state_digest: str | None
     state_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class PrunePendingBatch:
+    items: tuple[TerminalDisclosureState, ...]
+    has_more: bool
+
+    # Existing local callers treated the old tuple result as a sequence.  The durable
+    # batch is still bounded and exposes that read-only convenience while callers move
+    # to the explicit ``items``/``has_more`` contract.
+    def __iter__(self):
+        return iter(self.items)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, index: int) -> TerminalDisclosureState:
+        return self.items[index]
 
 
 class _TerminalDisclosureLease:
@@ -190,27 +401,171 @@ def _state_digest(core: Mapping[str, Any]) -> str:
     return hashlib.sha256(_DIGEST_DOMAIN + canonical_bytes(dict(core))).hexdigest()
 
 
+def _active_state_digest(core: Mapping[str, Any]) -> str:
+    """Digest a sealed active record whose protocol gate deliberately contains Booleans."""
+    try:
+        payload = _active_json_bytes(core)
+    except (TypeError, ValueError):
+        raise RunnerRuntimeCorrupt("runtime active run state is invalid") from None
+    return hashlib.sha256(_ACTIVE_STATE_DIGEST_DOMAIN + payload).hexdigest()
+
+
+def _active_json_value(value: Any, *, depth: int = 0) -> Any:
+    """Validate the deliberately narrow Boolean-capable active-state JSON grammar."""
+    if depth > 16:
+        raise ValueError("runtime active value nesting is invalid")
+    if value is None or type(value) is bool:
+        return value
+    if type(value) is int:
+        if not 0 <= value <= _MAX_SAFE_INT:
+            raise ValueError("runtime active integer is invalid")
+        return value
+    if type(value) is str:
+        if (
+            unicodedata.normalize("NFC", value) != value
+            or any(
+                unicodedata.category(char) == "Cc" or 0xD800 <= ord(char) <= 0xDFFF
+                for char in value
+            )
+            or len(value.encode("utf-8")) > 4096
+        ):
+            raise ValueError("runtime active text is invalid")
+        return value
+    if type(value) is list:
+        return [_active_json_value(item, depth=depth + 1) for item in value]
+    if isinstance(value, Mapping):
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str or key in output:
+                raise ValueError("runtime active mapping is invalid")
+            output[_active_json_value(key, depth=depth + 1)] = _active_json_value(
+                item, depth=depth + 1,
+            )
+        return output
+    raise ValueError("runtime active value is invalid")
+
+
+def _active_json_bytes(core: Mapping[str, Any]) -> bytes:
+    """Encode active rows without widening the public runner canonicalizer."""
+    if not isinstance(core, Mapping):
+        raise ValueError("runtime active core is invalid")
+    encoded = json.dumps(
+        _active_json_value(core), ensure_ascii=False, allow_nan=False,
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    # The active table's sealed blob cap includes the 12-byte AEAD nonce and
+    # the 16-byte authentication tag.
+    if len(encoded) + 28 > 393_216:
+        raise ValueError("runtime active state is too large")
+    return encoded
+
+
+def _active_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("runtime active JSON has duplicate keys")
+        result[key] = value
+    return result
+
+
+def _active_json_parse(plaintext: bytes) -> dict[str, Any]:
+    try:
+        decoded = json.loads(
+            plaintext.decode("utf-8"), object_pairs_hook=_active_json_pairs,
+            parse_float=lambda _value: (_ for _ in ()).throw(ValueError("runtime active float is invalid")),
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("runtime active constant is invalid")),
+        )
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("runtime active JSON is invalid") from exc
+    if not isinstance(decoded, dict) or _active_json_bytes(decoded) != plaintext:
+        raise ValueError("runtime active JSON is not canonical")
+    return decoded
+
+
 class RunnerRuntimeState:
     """A sealed SQLite replay ledger tied to one exact runner identity."""
 
     def __init__(
         self, path: Path | str, identity: RunnerIdentity, signer: SecureSigner,
-        random_source=os.urandom,
+        random_source=os.urandom, *, _allow_rotation_recovery: bool = False,
     ) -> None:
         self._crypto = _load_runtime_crypto()
-        self.path = Path(path).expanduser().resolve(strict=False)
+        self.path = self._lexical_runtime_path(path)
         self.identity = identity
         self.signer = signer
         self._random_source = random_source
+        self._allow_rotation_recovery = _allow_rotation_recovery is True
         self._token = object()
         self._state_lock = threading.RLock()
         self._poisoned = False
+        self._initialized = False
+        self._authority_epoch = 0
+        self._authority_identity_digest = ""
+        self._parent_fd: int | None = None
+        self._leaf_fd: int | None = None
+        self._leaf_identity: tuple[int, int, int, int, int] | None = None
+        self._parent_identities: tuple[tuple[Path, tuple[int, int, int, int]], ...] = ()
+        self._created_leaf = False
         self._validate_identity()
         self._kek = self._derive_key()
         self._key = b""
-        self._prepare_path()
-        with self._connection() as conn:
-            self._initialize(conn)
+        try:
+            self._prepare_path()
+            with self._connection() as conn:
+                self._initialize(conn, allow_rotation_fence=self._allow_rotation_recovery)
+            self._assert_secure_path_unchanged()
+            self._initialized = True
+        except Exception:
+            self._cleanup_failed_path()
+            raise
+
+    @staticmethod
+    def _lexical_runtime_path(path: Path | str) -> Path:
+        try:
+            raw_path = os.fspath(path)
+        except TypeError as exc:
+            raise RunnerRuntimeCorrupt("runtime state path is invalid") from exc
+        if type(raw_path) is not str or "\0" in raw_path:
+            raise RunnerRuntimeCorrupt("runtime state path is invalid")
+        expanded = os.path.expanduser(raw_path)
+        if any(component in {".", ".."} for component in expanded.split(os.sep)):
+            raise RunnerRuntimeCorrupt("runtime state path is invalid")
+        absolute = os.path.abspath(expanded)
+        runtime_path = Path(absolute)
+        if not runtime_path.name:
+            raise RunnerRuntimeCorrupt("runtime state path is invalid")
+        return runtime_path
+
+    @staticmethod
+    def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            value.st_dev, value.st_ino, value.st_uid,
+            stat.S_IFMT(value.st_mode), value.st_nlink,
+        )
+
+    @staticmethod
+    def _directory_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+        return value.st_dev, value.st_ino, value.st_uid, stat.S_IFMT(value.st_mode)
+
+    @staticmethod
+    def _private_directory(value: os.stat_result) -> bool:
+        return (
+            stat.S_ISDIR(value.st_mode)
+            and not stat.S_ISLNK(value.st_mode)
+            and value.st_uid == os.geteuid()
+            and not (stat.S_IMODE(value.st_mode) & 0o077)
+        )
+
+    @staticmethod
+    def _private_runtime_leaf(value: os.stat_result) -> bool:
+        return (
+            stat.S_ISREG(value.st_mode)
+            and not stat.S_ISLNK(value.st_mode)
+            and value.st_uid == os.geteuid()
+            and value.st_nlink == 1
+            and not (stat.S_IMODE(value.st_mode) & 0o077)
+        )
 
     def _validate_identity(self) -> None:
         self._validate_identity_pair(self.identity, self.signer)
@@ -290,136 +645,396 @@ class RunnerRuntimeState:
         return state_key
 
     def _prepare_path(self) -> None:
-        parent = self.path.parent
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory_fd = os.open(self.path.anchor, flags)
         except OSError as exc:
             raise RunnerRuntimeCorrupt("runtime state parent is unavailable") from exc
+        identities: list[tuple[Path, tuple[int, int, int, int]]] = []
+        current = Path(self.path.anchor)
         try:
-            parent_stat = os.lstat(parent)
-        except OSError as exc:
-            raise RunnerRuntimeCorrupt("runtime state parent is unavailable") from exc
-        if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(parent_stat.st_mode):
-            raise RunnerRuntimeCorrupt("runtime state parent is unsafe")
-        if parent_stat.st_mode & 0o077:
-            raise RunnerRuntimeCorrupt("runtime state parent permissions are unsafe")
-        if self.path.exists() or self.path.is_symlink():
+            for component in self.path.parts[1:-1]:
+                current = current / component
+                try:
+                    component_stat = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                    component_stat = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISLNK(component_stat.st_mode) or not stat.S_ISDIR(component_stat.st_mode):
+                    raise RunnerRuntimeCorrupt("runtime state parent is unsafe")
+                next_fd = os.open(component, flags, dir_fd=directory_fd)
+                os.close(directory_fd)
+                directory_fd = next_fd
+                identities.append((current, self._directory_identity(component_stat)))
+            parent_stat = os.fstat(directory_fd)
+            if not self._private_directory(parent_stat):
+                raise RunnerRuntimeCorrupt("runtime state parent is unsafe")
             try:
-                file_stat = os.lstat(self.path)
-            except OSError as exc:
-                raise RunnerRuntimeCorrupt("runtime state is unavailable") from exc
-            if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+                leaf_stat = os.stat(self.path.name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                try:
+                    leaf_fd = os.open(
+                        self.path.name,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    raise RunnerRuntimeCorrupt("runtime state is unsafe") from exc
+                self._created_leaf = True
+                leaf_stat = os.fstat(leaf_fd)
+            else:
+                if not self._private_runtime_leaf(leaf_stat):
+                    raise RunnerRuntimeCorrupt("runtime state is unsafe")
+                try:
+                    leaf_fd = os.open(
+                        self.path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    raise RunnerRuntimeCorrupt("runtime state is unsafe") from exc
+            leaf_fd_stat = os.fstat(leaf_fd)
+            if not self._private_runtime_leaf(leaf_stat) or self._file_identity(leaf_stat) != self._file_identity(leaf_fd_stat):
+                os.close(leaf_fd)
                 raise RunnerRuntimeCorrupt("runtime state is unsafe")
-            if file_stat.st_mode & 0o077:
-                raise RunnerRuntimeCorrupt("runtime state permissions are unsafe")
+        except Exception:
+            os.close(directory_fd)
+            raise
+        self._parent_fd = directory_fd
+        self._leaf_fd = leaf_fd
+        self._leaf_identity = self._file_identity(leaf_fd_stat)
+        self._parent_identities = tuple(identities)
+
+    def _assert_secure_path_unchanged(self) -> None:
+        if self._parent_fd is None or self._leaf_fd is None or self._leaf_identity is None:
+            raise RunnerRuntimeCorrupt("runtime state is unsafe")
+        try:
+            for path, expected in self._parent_identities:
+                current = os.lstat(path)
+                if self._directory_identity(current) != expected or stat.S_ISLNK(current.st_mode):
+                    raise RunnerRuntimeCorrupt("runtime state parent is unsafe")
+            lexical = os.lstat(self.path)
+            from_parent = os.stat(self.path.name, dir_fd=self._parent_fd, follow_symlinks=False)
+            from_fd = os.fstat(self._leaf_fd)
+        except OSError as exc:
+            raise RunnerRuntimeCorrupt("runtime state is unavailable") from exc
+        if (
+            not self._private_runtime_leaf(lexical)
+            or self._file_identity(lexical) != self._leaf_identity
+            or self._file_identity(from_parent) != self._leaf_identity
+            or self._file_identity(from_fd) != self._leaf_identity
+        ):
+            raise RunnerRuntimeCorrupt("runtime state is unsafe")
+
+    def _cleanup_failed_path(self) -> None:
+        try:
+            if self._created_leaf and self._parent_fd is not None and self._leaf_fd is not None:
+                leaf_stat = os.fstat(self._leaf_fd)
+                if leaf_stat.st_size == 0 and self._file_identity(leaf_stat) == self._leaf_identity:
+                    os.unlink(self.path.name, dir_fd=self._parent_fd)
+        except OSError:
+            pass
+        finally:
+            for name in ("_leaf_fd", "_parent_fd"):
+                descriptor = getattr(self, name, None)
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                    setattr(self, name, None)
+
+    def __del__(self) -> None:
+        for name in ("_leaf_fd", "_parent_fd"):
+            descriptor = getattr(self, name, None)
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                setattr(self, name, None)
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
+    def _connection(self, *, allow_rotation_fence: bool = False) -> Iterator[sqlite3.Connection]:
         if self._poisoned:
             raise RunnerRuntimeCorrupt("runtime state requires reconstruction")
-        conn = sqlite3.connect(str(self.path), isolation_level=None)
-        try:
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA secure_delete=ON")
-            conn.execute("PRAGMA synchronous=FULL")
-            conn.execute("PRAGMA journal_mode=WAL")
-            yield conn
-        except sqlite3.DatabaseError as exc:
-            raise RunnerRuntimeCorrupt("runtime state database is invalid") from exc
-        finally:
-            conn.close()
-        try:
-            os.chmod(self.path, 0o600)
-        except OSError as exc:
-            raise RunnerRuntimeCorrupt("runtime state permissions are unsafe") from exc
+        with self._state_lock:
+            self._assert_secure_path_unchanged()
+            conn = sqlite3.connect(str(self.path), isolation_level=None)
+            try:
+                self._assert_secure_path_unchanged()
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.execute("PRAGMA secure_delete=ON")
+                conn.execute("PRAGMA synchronous=FULL")
+                conn.execute("PRAGMA journal_mode=WAL")
+                if self._initialized:
+                    self._validate_open_runtime(
+                        conn, allow_rotation_fence=allow_rotation_fence or self._allow_rotation_recovery,
+                    )
+                yield conn
+            except sqlite3.DatabaseError as exc:
+                raise RunnerRuntimeCorrupt("runtime state database is invalid") from exc
+            finally:
+                conn.close()
 
-    def _initialize(self, conn: sqlite3.Connection) -> None:
+    @staticmethod
+    def _normalized_sql(value: object) -> str:
+        if type(value) is not str:
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        return "".join(character for character in value if character not in " \t\n\r\f\v")
+
+    @staticmethod
+    def _reference_schema(statements: tuple[str, ...]) -> sqlite3.Connection:
+        reference = sqlite3.connect(":memory:")
+        try:
+            for statement in statements:
+                reference.execute(statement)
+        except sqlite3.DatabaseError as exc:  # Literal programming mistake, never recover a disk file.
+            reference.close()
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid") from exc
+        return reference
+
+    @classmethod
+    def _schema_matches(cls, conn: sqlite3.Connection, statements: tuple[str, ...]) -> bool:
+        try:
+            cls._assert_schema_parity(conn, statements)
+        except RunnerRuntimeCorrupt:
+            return False
+        return True
+
+    @classmethod
+    def _assert_schema_parity(cls, conn: sqlite3.Connection, statements: tuple[str, ...]) -> None:
+        reference = cls._reference_schema(statements)
+        try:
+            def rows(connection: sqlite3.Connection, statement: str) -> list[tuple[Any, ...]]:
+                return [tuple(item) for item in connection.execute(statement).fetchall()]
+
+            expected_rows = reference.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','index') ORDER BY type,name"
+            ).fetchall()
+            actual_rows = conn.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','index') ORDER BY type,name"
+            ).fetchall()
+            if [(row[0], row[1], row[2]) for row in actual_rows] != [
+                (row[0], row[1], row[2]) for row in expected_rows
+            ]:
+                raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+            for actual, expected in zip(actual_rows, expected_rows, strict=True):
+                if cls._normalized_sql(actual[3]) != cls._normalized_sql(expected[3]):
+                    raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+            for table in tuple(row[1] for row in expected_rows if row[0] == "table"):
+                for pragma in ("table_info", "table_xinfo", "index_list", "foreign_key_list"):
+                    if rows(conn, f"PRAGMA {pragma}({table})") != rows(reference, f"PRAGMA {pragma}({table})"):
+                        raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+                for index in conn.execute(f"PRAGMA index_list({table})").fetchall():
+                    name = index[1]
+                    if rows(conn, f"PRAGMA index_xinfo({name})") != rows(reference, f"PRAGMA index_xinfo({name})"):
+                        raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type IN ('trigger','view') LIMIT 1"
+            ).fetchone() is not None:
+                raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        finally:
+            reference.close()
+
+    def _classify_schema(self, conn: sqlite3.Connection) -> str:
+        objects = conn.execute(
+            "SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' "
+            "AND type IN ('table','index','trigger','view')"
+        ).fetchall()
+        if not objects:
+            return "none"
+        if self._schema_matches(conn, _V1_SCHEMA_SQL):
+            return "v1"
+        if self._schema_matches(conn, _V2_SCHEMA_SQL):
+            return "v2"
+        if self._schema_matches(conn, _V3_SCHEMA_SQL):
+            return "v3"
+        raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+
+    @staticmethod
+    def _execute_schema(conn: sqlite3.Connection, statements: tuple[str, ...]) -> None:
+        for statement in statements:
+            conn.execute(statement)
+
+    def _identity_values(self) -> tuple[str, str, str, str]:
+        return (
+            self.identity.workspace_id, self.identity.runner_id, self.identity.key_id,
+            self.identity.fingerprint,
+        )
+
+    @staticmethod
+    def _authority_digest_for(identity: RunnerIdentity) -> str:
+        return hashlib.sha256(_AUTHORITY_IDENTITY_DOMAIN + canonical_bytes({
+            "workspace_id": identity.workspace_id,
+            "runner_id": identity.runner_id,
+            "runner_key_id": identity.key_id,
+            "public_key_digest": identity.fingerprint,
+        })).hexdigest()
+
+    def _upgrade_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute("SELECT * FROM metadata WHERE singleton=1").fetchone()
+        if row is None or row["schema_version"] != _SCHEMA_V1 or tuple(
+            row[key] for key in ("workspace_id", "runner_id", "runner_key_id", "public_key_digest")
+        ) != self._identity_values():
+            raise RunnerRuntimeCorrupt("runtime state belongs to another runner identity")
+        self._key = self._kek
+        conn.execute("ALTER TABLE metadata RENAME TO metadata_v1")
+        self._execute_schema(conn, (_V2_SCHEMA_SQL[0], *_V2_SCHEMA_SQL[2:]))
+        conn.execute(
+            "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,state_key_ciphertext) "
+            "VALUES(1,?,?,?,?,?,?)",
+            (_SCHEMA_V2, *self._identity_values(), self._wrap_state_key(self._key)),
+        )
+        conn.execute("DROP TABLE metadata_v1")
+
+    def _upgrade_v2_to_v3(self, conn: sqlite3.Connection) -> None:
+        if not self._schema_matches(conn, _V2_SCHEMA_SQL):
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        self._validate_opaque_authority_rows(conn)
+        conn.execute("ALTER TABLE metadata RENAME TO metadata_v2")
+        conn.execute("ALTER TABLE control_chains RENAME TO control_chains_v2")
+        conn.execute("ALTER TABLE pending_calls RENAME TO pending_calls_v2")
+        conn.execute("DROP INDEX idx_terminal_disclosures_state_retention")
+        conn.execute("ALTER TABLE terminal_disclosures RENAME TO terminal_disclosures_v2")
+        self._execute_schema(conn, _V3_SCHEMA_SQL)
+        conn.execute(
+            "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext) "
+            "SELECT singleton,?,workspace_id,runner_id,runner_key_id,public_key_digest,1,?,NULL,state_key_ciphertext FROM metadata_v2",
+            (_SCHEMA, self._authority_digest_for(self.identity)),
+        )
+        conn.execute(
+            "INSERT INTO control_chains(chain,run_hash,operation,next_sequence,generation,sealed_blob,updated_at_ms) "
+            "SELECT chain,run_hash,operation,next_sequence,generation,sealed_blob,updated_at_ms FROM control_chains_v2"
+        )
+        conn.execute(
+            "INSERT INTO pending_calls(call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms) "
+            "SELECT call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms FROM pending_calls_v2"
+        )
+        conn.execute(
+            "INSERT INTO terminal_disclosures(run_hash,retention_expires_at_ms,state,sealed_blob,updated_at_ms) "
+            "SELECT run_hash,retention_expires_at_ms,state,sealed_blob,updated_at_ms FROM terminal_disclosures_v2"
+        )
+        for table in ("metadata_v2", "control_chains_v2", "pending_calls_v2", "terminal_disclosures_v2"):
+            conn.execute(f"DROP TABLE {table}")
+        self._assert_schema_parity(conn, _V3_SCHEMA_SQL)
+
+    def _validate_opaque_authority_rows(self, conn: sqlite3.Connection) -> None:
+        """Authenticate the legacy opaque index before a byte-for-byte v3 copy."""
+        for row in conn.execute(
+            "SELECT chain,run_hash,operation,sealed_blob FROM control_chains"
+        ).fetchall():
+            cursor = self._validate_chain_core(self._open(
+                row["sealed_blob"], schema="heel.runner-control-chain-state.v1",
+                primary_fields=(row["chain"],),
+            ))
+            if (
+                row["chain"] != self._chain_key(cursor.operation, cursor.run_id)
+                or row["operation"] != cursor.operation
+                or row["run_hash"] != (None if cursor.run_id is None else _run_hash(cursor.run_id))
+            ):
+                raise RunnerRuntimeCorrupt("runtime chain index is invalid")
+        for row in conn.execute(
+            "SELECT call_id,chain,run_hash,operation,sealed_blob FROM pending_calls"
+        ).fetchall():
+            pending, _core = self._validate_pending_core(self._open(
+                row["sealed_blob"], schema="heel.runner-pending-call.v1", primary_fields=(row["call_id"],),
+            ))
+            if (
+                row["call_id"] != pending.call_id
+                or row["chain"] != self._chain_key(pending.chain_operation, pending.run_id)
+                or row["run_hash"] != (None if pending.run_id is None else _run_hash(pending.run_id))
+                or row["operation"] != pending.request_operation
+            ):
+                raise RunnerRuntimeCorrupt("runtime pending call index is invalid")
+        for row in conn.execute(
+            "SELECT run_hash,retention_expires_at_ms,state,sealed_blob,updated_at_ms FROM terminal_disclosures"
+        ).fetchall():
+            state = self._validate_terminal_core(self._open(
+                row["sealed_blob"], schema="heel.runner-terminal-disclosure-state.v1",
+                primary_fields=(row["run_hash"],),
+            ))
+            if (
+                row["run_hash"] != state.run_hash
+                or row["retention_expires_at_ms"] != state.retention_expires_at_ms
+                or row["state"] != state.state
+                or (state.state == "local_terminal" and row["updated_at_ms"] != state.terminal_at_ms)
+            ):
+                raise RunnerRuntimeCorrupt("runtime terminal disclosure index is invalid")
+
+    def _validate_open_runtime(self, conn: sqlite3.Connection, *, allow_rotation_fence: bool = False) -> None:
+        self._assert_schema_parity(conn, _V3_SCHEMA_SQL)
+        if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal" or conn.execute(
+            "PRAGMA secure_delete"
+        ).fetchone()[0] != 1 or conn.execute("PRAGMA synchronous").fetchone()[0] != 2:
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        rows = conn.execute("SELECT * FROM metadata").fetchall()
+        if len(rows) != 1:
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        row = rows[0]
+        if row["singleton"] != 1 or row["schema_version"] != _SCHEMA or tuple(
+            row[key] for key in ("workspace_id", "runner_id", "runner_key_id", "public_key_digest")
+        ) != self._identity_values() or row["authority_identity_digest"] != self._authority_digest_for(self.identity):
+            raise RunnerRuntimeCorrupt("runtime state belongs to another runner identity")
+        authority_epoch = _safe_int(row["authority_epoch"], "runtime authority epoch", minimum=1)
+        if self._initialized and (
+            authority_epoch != self._authority_epoch
+            or row["authority_identity_digest"] != self._authority_identity_digest
+        ):
+            self._poisoned = True
+            raise RunnerRuntimeCorrupt("runtime state authority changed")
+        if self._unwrap_state_key(row["state_key_ciphertext"]) != self._key:
+            raise RunnerRuntimeCorrupt("runtime state key is invalid")
+        self._authority_epoch = authority_epoch
+        self._authority_identity_digest = row["authority_identity_digest"]
+        if row["rotation_fence_digest"] is not None and not allow_rotation_fence:
+            _digest(row["rotation_fence_digest"], "runtime rotation fence digest")
+            raise RunnerRuntimeConflict("runtime rotation is in progress")
+        limits = {"control_chains": 257, "pending_calls": 74, "active_runs": 64}
+        for table, limit in limits.items():
+            if conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] > limit:
+                raise RunnerRuntimeCorrupt("runtime state capacity is invalid")
+
+    def _initialize(self, conn: sqlite3.Connection, *, allow_rotation_fence: bool = False) -> None:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            metadata_exists = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'"
-            ).fetchone() is not None
-            if not metadata_exists:
-                conn.execute(
-                    "CREATE TABLE metadata("
-                    "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
-                    "schema_version TEXT NOT NULL CHECK(schema_version='heel.runner-runtime-state.v2'),"
-                    "workspace_id TEXT NOT NULL,runner_id TEXT NOT NULL,runner_key_id TEXT NOT NULL,"
-                    "public_key_digest TEXT NOT NULL,state_key_ciphertext BLOB NOT NULL)"
-                )
-            for statement in (
-                "CREATE TABLE IF NOT EXISTS control_chains("
-                "chain TEXT PRIMARY KEY,run_hash TEXT NULL,operation TEXT NOT NULL,"
-                "next_sequence INTEGER NOT NULL,generation INTEGER NOT NULL,sealed_blob BLOB NOT NULL,"
-                "updated_at_ms INTEGER NOT NULL)",
-                "CREATE TABLE IF NOT EXISTS pending_calls("
-                "call_id TEXT PRIMARY KEY,chain TEXT NOT NULL UNIQUE,run_hash TEXT NULL,operation TEXT NOT NULL,"
-                "sequence INTEGER NOT NULL,generation INTEGER NOT NULL,sealed_blob BLOB NOT NULL,"
-                "created_at_ms INTEGER NOT NULL)",
-                "CREATE TABLE IF NOT EXISTS terminal_disclosures("
-                "run_hash TEXT PRIMARY KEY,retention_expires_at_ms INTEGER NOT NULL,"
-                "state TEXT NOT NULL CHECK(state IN ('local_terminal','available','consumed','prune_pending')),"
-                "sealed_blob BLOB NOT NULL,updated_at_ms INTEGER NOT NULL)",
-                "CREATE INDEX IF NOT EXISTS idx_terminal_disclosures_state_retention "
-                "ON terminal_disclosures(state,retention_expires_at_ms,run_hash)",
-            ):
-                conn.execute(statement)
-            columns = tuple(row[1] for row in conn.execute("PRAGMA table_info(metadata)"))
-            v1_columns = (
-                "singleton", "schema_version", "workspace_id", "runner_id", "runner_key_id",
-                "public_key_digest",
-            )
-            v2_columns = v1_columns + ("state_key_ciphertext",)
-            if columns not in {v1_columns, v2_columns}:
-                raise RunnerRuntimeCorrupt("runtime state metadata is invalid")
-            row = conn.execute("SELECT * FROM metadata WHERE singleton=1").fetchone()
-            identity_values = (
-                self.identity.workspace_id, self.identity.runner_id, self.identity.key_id,
-                self.identity.fingerprint,
-            )
-            if row is None:
-                if columns != v2_columns:
-                    raise RunnerRuntimeCorrupt("runtime state metadata is invalid")
+            state = self._classify_schema(conn)
+            if state == "none":
+                self._execute_schema(conn, _V3_SCHEMA_SQL)
                 state_key = self._random_source(32)
                 if type(state_key) is not bytes or len(state_key) != 32:
                     raise RunnerRuntimeCorrupt("runtime state random source returned an invalid key")
                 self._key = state_key
                 conn.execute(
-                    "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,state_key_ciphertext) "
-                    "VALUES(1,?,?,?,?,?,?)",
-                    (_SCHEMA, *identity_values, self._wrap_state_key(state_key)),
+                    "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext) "
+                    "VALUES(1,?,?,?,?,?,?,?,?,?)",
+                    (
+                        _SCHEMA, *self._identity_values(), 1,
+                        self._authority_digest_for(self.identity), None, self._wrap_state_key(state_key),
+                    ),
                 )
-            elif columns == v1_columns:
-                if (
-                    row["schema_version"] != _SCHEMA_V1
-                    or tuple(row[key] for key in v1_columns[2:]) != identity_values
-                ):
+            elif state == "v1":
+                self._upgrade_v1_to_v2(conn)
+                state = "v2"
+            if state == "v2":
+                row = conn.execute("SELECT * FROM metadata WHERE singleton=1").fetchone()
+                if row is None or row["schema_version"] != _SCHEMA_V2 or tuple(
+                    row[key] for key in ("workspace_id", "runner_id", "runner_key_id", "public_key_digest")
+                ) != self._identity_values():
                     raise RunnerRuntimeCorrupt("runtime state belongs to another runner identity")
-                # v1 rows were sealed with the signer-derived key.  Preserve it as the
-                # stable v2 key and change only metadata; sealed authority records stay put.
-                self._key = self._kek
-                wrapped = self._wrap_state_key(self._key)
-                conn.execute(
-                    "CREATE TABLE metadata_v2("
-                    "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
-                    "schema_version TEXT NOT NULL CHECK(schema_version='heel.runner-runtime-state.v2'),"
-                    "workspace_id TEXT NOT NULL,runner_id TEXT NOT NULL,runner_key_id TEXT NOT NULL,"
-                    "public_key_digest TEXT NOT NULL,state_key_ciphertext BLOB NOT NULL)"
-                )
-                conn.execute(
-                    "INSERT INTO metadata_v2 VALUES(1,?,?,?,?,?,?)",
-                    (_SCHEMA, *identity_values, wrapped),
-                )
-                conn.execute("DROP TABLE metadata")
-                conn.execute("ALTER TABLE metadata_v2 RENAME TO metadata")
-            else:
-                if (
-                    row["schema_version"] != _SCHEMA
-                    or tuple(row[key] for key in v2_columns[2:6]) != identity_values
-                ):
+                if not self._key:
+                    self._key = self._unwrap_state_key(row["state_key_ciphertext"])
+                self._upgrade_v2_to_v3(conn)
+            elif state == "v3":
+                row = conn.execute("SELECT * FROM metadata WHERE singleton=1").fetchone()
+                if row is None or row["schema_version"] != _SCHEMA or tuple(
+                    row[key] for key in ("workspace_id", "runner_id", "runner_key_id", "public_key_digest")
+                ) != self._identity_values():
                     raise RunnerRuntimeCorrupt("runtime state belongs to another runner identity")
                 self._key = self._unwrap_state_key(row["state_key_ciphertext"])
+            self._validate_open_runtime(conn, allow_rotation_fence=allow_rotation_fence)
             conn.execute("COMMIT")
         except BaseException:
             conn.execute("ROLLBACK")
@@ -445,7 +1060,10 @@ class RunnerRuntimeState:
         nonce = self._random_source(12)
         if type(nonce) is not bytes or len(nonce) != 12:
             raise RunnerRuntimeCorrupt("runtime state random source returned an invalid nonce")
-        plaintext = canonical_bytes(dict(core))
+        plaintext = (
+            _active_json_bytes(core) if schema == "heel.runner-active-run-state.v1"
+            else canonical_bytes(dict(core))
+        )
         return nonce + self._crypto.aead(key).encrypt(
             nonce, plaintext, self._aad_for(identity, schema, *primary_fields),
         )
@@ -457,10 +1075,23 @@ class RunnerRuntimeState:
             plaintext = self._crypto.aead(self._key).decrypt(
                 value[:12], value[12:], self._aad(schema, *primary_fields),
             )
-            decoded = __import__("json").loads(plaintext)
+            decoded = (
+                _active_json_parse(plaintext)
+                if schema == "heel.runner-active-run-state.v1"
+                else json.loads(plaintext)
+            )
         except Exception as exc:
             raise RunnerRuntimeCorrupt("runtime state sealed record is invalid") from exc
-        if canonical_bytes(decoded) != plaintext or not isinstance(decoded, dict):
+        if not isinstance(decoded, dict):
+            raise RunnerRuntimeCorrupt("runtime state sealed record is invalid")
+        try:
+            expected_plaintext = (
+                _active_json_bytes(decoded) if schema == "heel.runner-active-run-state.v1"
+                else canonical_bytes(decoded)
+            )
+        except (TypeError, ValueError) as exc:
+            raise RunnerRuntimeCorrupt("runtime state sealed record is invalid") from exc
+        if expected_plaintext != plaintext:
             raise RunnerRuntimeCorrupt("runtime state sealed record is invalid")
         return decoded
 
@@ -679,16 +1310,144 @@ class RunnerRuntimeState:
             state_digest=_state_digest(core_without_digest),
         )
 
+    def _current_metadata_locked(self, conn: sqlite3.Connection) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM metadata WHERE singleton=1").fetchone()
+        if row is None or row["schema_version"] != _SCHEMA or tuple(
+            row[key] for key in ("workspace_id", "runner_id", "runner_key_id", "public_key_digest")
+        ) != self._identity_values() or row["authority_identity_digest"] != self._authority_identity_digest or (
+            row["authority_epoch"] != self._authority_epoch
+        ):
+            self._poisoned = True
+            raise RunnerRuntimeCorrupt("runtime state authority changed")
+        if self._unwrap_state_key(row["state_key_ciphertext"]) != self._key:
+            self._poisoned = True
+            raise RunnerRuntimeCorrupt("runtime state key is invalid")
+        return row
+
+    def rotation_authority_snapshot(self) -> tuple[int, str]:
+        """Return the authenticated pre-fence authority tuple for rotation preparation."""
+        with self._connection(allow_rotation_fence=True) as conn:
+            conn.execute("BEGIN")
+            try:
+                self._current_metadata_locked(conn)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return self._authority_epoch, self._authority_identity_digest
+
+    def rotation_fence_snapshot(self) -> tuple[int, str, str | None]:
+        """Read the authenticated fence after a failed rotation CAS without using authority rows."""
+        with self._connection(allow_rotation_fence=True) as conn:
+            conn.execute("BEGIN")
+            try:
+                metadata = self._current_metadata_locked(conn)
+                fence = metadata["rotation_fence_digest"]
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return self._authority_epoch, self._authority_identity_digest, fence
+
+    def probe_rotation_eligible(self, *, old_identity: RunnerIdentity) -> RotationEligibilityProbe:
+        if not isinstance(old_identity, RunnerIdentity) or not self._same_identity(self.identity, old_identity):
+            raise RunnerRuntimeCorrupt("runtime rotation identity is invalid")
+        with self._connection(allow_rotation_fence=True) as conn:
+            conn.execute("BEGIN")
+            try:
+                metadata = self._current_metadata_locked(conn)
+                if metadata["rotation_fence_digest"] is not None:
+                    raise RunnerRuntimeConflict("runtime rotation is in progress")
+                if conn.execute("SELECT 1 FROM pending_calls LIMIT 1").fetchone() is not None:
+                    raise RunnerRuntimeConflict("runtime rotation has pending calls")
+                if conn.execute("SELECT 1 FROM active_runs LIMIT 1").fetchone() is not None:
+                    raise RunnerRuntimeConflict("runtime rotation has active runs")
+                if conn.execute("SELECT 1 FROM terminal_disclosures LIMIT 1").fetchone() is not None:
+                    raise RunnerRuntimeConflict("runtime rotation has terminal disclosures")
+                chain = self._chain_key("claim", None)
+                rows = conn.execute("SELECT chain,run_hash,operation FROM control_chains").fetchall()
+                if len(rows) != 1 or tuple(rows[0]) != (chain, None, "claim"):
+                    raise RunnerRuntimeConflict("runtime rotation has active runs")
+                claim = self._load_chain_locked(conn, "claim", None)
+                if claim is None:
+                    raise RunnerRuntimeConflict("runtime rotation has active runs")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return RotationEligibilityProbe(
+            authority_epoch=self._authority_epoch,
+            authority_identity_digest=self._authority_identity_digest,
+            claim_state_digest=claim.state_digest,
+        )
+
+    def assert_rotation_eligible(
+        self, *, old_identity: RunnerIdentity, probe: RotationEligibilityProbe,
+        prepared_journal_digest: str, runtime_rotation_intent_digest: str, now_ms: int,
+    ) -> RotationEligibility:
+        if not isinstance(old_identity, RunnerIdentity) or not self._same_identity(self.identity, old_identity):
+            raise RunnerRuntimeCorrupt("runtime rotation identity is invalid")
+        if not isinstance(probe, RotationEligibilityProbe):
+            raise RunnerRuntimeCorrupt("runtime rotation eligibility is invalid")
+        prepared_journal_digest = _digest(prepared_journal_digest, "runtime rotation journal digest")
+        runtime_rotation_intent_digest = _digest(
+            runtime_rotation_intent_digest, "runtime rotation intent digest",
+        )
+        _safe_int(now_ms, "runtime rotation preparation time")
+        with self._connection(allow_rotation_fence=True) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                metadata = self._current_metadata_locked(conn)
+                if (
+                    probe.authority_epoch != self._authority_epoch
+                    or probe.authority_identity_digest != self._authority_identity_digest
+                ):
+                    raise RunnerRuntimeConflict("runtime rotation is unavailable")
+                if metadata["rotation_fence_digest"] not in {None, runtime_rotation_intent_digest}:
+                    raise RunnerRuntimeConflict("runtime rotation is in progress")
+                if conn.execute("SELECT 1 FROM pending_calls LIMIT 1").fetchone() is not None:
+                    raise RunnerRuntimeConflict("runtime rotation has pending calls")
+                if conn.execute("SELECT 1 FROM active_runs LIMIT 1").fetchone() is not None:
+                    raise RunnerRuntimeConflict("runtime rotation has active runs")
+                if conn.execute("SELECT 1 FROM terminal_disclosures LIMIT 1").fetchone() is not None:
+                    raise RunnerRuntimeConflict("runtime rotation has terminal disclosures")
+                chain = self._chain_key("claim", None)
+                rows = conn.execute("SELECT chain,run_hash,operation FROM control_chains").fetchall()
+                if len(rows) != 1 or tuple(rows[0]) != (chain, None, "claim"):
+                    raise RunnerRuntimeConflict("runtime rotation has active runs")
+                claim = self._load_chain_locked(conn, "claim", None)
+                if claim is None or claim.state_digest != probe.claim_state_digest:
+                    raise RunnerRuntimeConflict("runtime rotation is unavailable")
+                if metadata["rotation_fence_digest"] is None:
+                    updated = conn.execute(
+                        "UPDATE metadata SET rotation_fence_digest=? WHERE singleton=1 "
+                        "AND authority_epoch=? AND authority_identity_digest=? AND rotation_fence_digest IS NULL",
+                        (runtime_rotation_intent_digest, self._authority_epoch, self._authority_identity_digest),
+                    )
+                    if updated.rowcount != 1:
+                        raise RunnerRuntimeConflict("runtime rotation is unavailable")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return RotationEligibility(
+            authority_epoch=self._authority_epoch,
+            authority_identity_digest=self._authority_identity_digest,
+            claim_state_digest=probe.claim_state_digest,
+            runtime_rotation_intent_digest=runtime_rotation_intent_digest,
+            prepared_journal_digest=prepared_journal_digest,
+        )
+
     def finish_rotation(
         self, journal: AcceptedRotationJournal, *, new_identity: RunnerIdentity,
-        new_signer: SecureSigner,
+        new_signer: SecureSigner, eligibility: RotationEligibility,
     ) -> RunnerChainCursor:
         """Atomically rewrap the stable runtime key and install the accepted claim cursor.
 
         The caller supplies the live replacement signer explicitly.  Nothing serialized in
         the rotation journal can synthesize or replace that capability during recovery.
         """
-        if not isinstance(journal, AcceptedRotationJournal):
+        if not isinstance(journal, AcceptedRotationJournal) or not isinstance(eligibility, RotationEligibility):
             raise RunnerRuntimeCorrupt("runtime rotation journal is invalid")
         if not isinstance(new_identity, RunnerIdentity) or not isinstance(new_signer, SecureSigner):
             raise RunnerRuntimeCorrupt("runtime rotation signer is invalid")
@@ -703,6 +1462,15 @@ class RunnerRuntimeState:
             raise RunnerRuntimeCorrupt("runtime rotation identity is invalid")
         _text(journal.pairing_id, "runtime rotation pairing ID")
         _text(journal.new_signer_label, "runtime rotation signer label")
+        if (
+            eligibility.prepared_journal_digest != _digest(
+                journal.prepared_journal_digest, "runtime rotation journal digest",
+            )
+            or eligibility.runtime_rotation_intent_digest != _digest(
+                journal.runtime_rotation_intent_digest, "runtime rotation intent digest",
+            )
+        ):
+            raise RunnerRuntimeCorrupt("runtime rotation eligibility is invalid")
         accepted_at_ms = _safe_int(journal.updated_at_ms, "runtime rotation journal time")
         _safe_int(journal.created_at_ms, "runtime rotation journal time")
         nonce, sequence, generation = self._rotation_response(journal, identity=new_identity)
@@ -721,6 +1489,11 @@ class RunnerRuntimeState:
             if new_metadata:
                 # A factory may reconstruct with the replacement signer after the database
                 # committed but before its paired-identity selector/journal cleanup finished.
+                if (
+                    eligibility.authority_epoch + 1 != self._authority_epoch
+                    or eligibility.authority_identity_digest != self._authority_digest_for(journal.old_identity)
+                ):
+                    raise RunnerRuntimeCorrupt("runtime rotation identity is invalid")
                 current = self.load_chain("claim", None)
                 if current != expected:
                     raise RunnerRuntimeCorrupt("runtime rotation cursor is invalid")
@@ -745,19 +1518,16 @@ class RunnerRuntimeState:
                     schema="heel.runner-control-chain-state.v1", primary_fields=(chain,),
                 )
                 wrapped_key = self._wrap_state_key_for(new_kek, new_identity, self._key)
-                with self._connection() as conn:
+                with self._connection(allow_rotation_fence=True) as conn:
                     conn.execute("BEGIN IMMEDIATE")
                     try:
-                        metadata = conn.execute("SELECT * FROM metadata WHERE singleton=1").fetchone()
-                        if metadata is None or metadata["schema_version"] != _SCHEMA or tuple(
-                            metadata[key] for key in ("workspace_id", "runner_id", "runner_key_id", "public_key_digest")
-                        ) != (
-                            old_identity.workspace_id, old_identity.runner_id,
-                            old_identity.key_id, old_identity.fingerprint,
+                        metadata = self._current_metadata_locked(conn)
+                        if (
+                            eligibility.authority_epoch != self._authority_epoch
+                            or eligibility.authority_identity_digest != self._authority_identity_digest
+                            or metadata["rotation_fence_digest"] != eligibility.runtime_rotation_intent_digest
                         ):
-                            raise RunnerRuntimeCorrupt("runtime rotation identity is invalid")
-                        if self._unwrap_state_key(metadata["state_key_ciphertext"]) != self._key:
-                            raise RunnerRuntimeCorrupt("runtime state key is invalid")
+                            raise RunnerRuntimeCorrupt("runtime rotation eligibility is invalid")
                         if conn.execute("SELECT 1 FROM pending_calls LIMIT 1").fetchone() is not None:
                             raise RunnerRuntimeConflict("runtime rotation has pending calls")
                         rows = conn.execute(
@@ -770,18 +1540,24 @@ class RunnerRuntimeState:
                             raise RunnerRuntimeCorrupt("runtime rotation did not advance")
                         if conn.execute("SELECT 1 FROM terminal_disclosures LIMIT 1").fetchone() is not None:
                             raise RunnerRuntimeConflict("runtime rotation has terminal disclosures")
+                        if conn.execute("SELECT 1 FROM active_runs LIMIT 1").fetchone() is not None:
+                            raise RunnerRuntimeConflict("runtime rotation has active runs")
                         updated = conn.execute(
                             "UPDATE control_chains SET next_sequence=?,generation=?,sealed_blob=?,updated_at_ms=? WHERE chain=?",
                             (expected.next_sequence, expected.generation, next_blob, expected.updated_at_ms, chain),
                         )
                         if updated.rowcount != 1:
                             raise RunnerRuntimeConflict("runtime rotation cursor is unavailable")
+                        new_authority_digest = self._authority_digest_for(new_identity)
                         metadata_updated = conn.execute(
-                            "UPDATE metadata SET workspace_id=?,runner_id=?,runner_key_id=?,public_key_digest=?,state_key_ciphertext=? "
-                            "WHERE singleton=1",
+                            "UPDATE metadata SET workspace_id=?,runner_id=?,runner_key_id=?,public_key_digest=?,"
+                            "authority_epoch=?,authority_identity_digest=?,rotation_fence_digest=NULL,state_key_ciphertext=? "
+                            "WHERE singleton=1 AND authority_epoch=? AND authority_identity_digest=? AND rotation_fence_digest=?",
                             (
                                 new_identity.workspace_id, new_identity.runner_id, new_identity.key_id,
-                                new_identity.fingerprint, wrapped_key,
+                                new_identity.fingerprint, self._authority_epoch + 1, new_authority_digest,
+                                wrapped_key, self._authority_epoch, self._authority_identity_digest,
+                                eligibility.runtime_rotation_intent_digest,
                             ),
                         )
                         if metadata_updated.rowcount != 1:
@@ -793,6 +1569,8 @@ class RunnerRuntimeState:
                 self.identity = new_identity
                 self.signer = new_signer
                 self._kek = new_kek
+                self._authority_epoch += 1
+                self._authority_identity_digest = self._authority_digest_for(new_identity)
                 return expected
             except BaseException:
                 # If a future fault is injected after the durable metadata switch but before
@@ -801,6 +1579,84 @@ class RunnerRuntimeState:
                     raise
                 self._poisoned = True
                 raise
+
+    def abort_rotation(
+        self, *, eligibility: RotationEligibility,
+        abort_tombstone: AcceptedRotationAbortTombstone,
+    ) -> None:
+        """Clear only the exact durable prepare fence after a Cloud-signed abort."""
+        if not isinstance(eligibility, RotationEligibility) or not isinstance(
+            abort_tombstone, AcceptedRotationAbortTombstone,
+        ):
+            raise RunnerRuntimeCorrupt("runtime rotation abort is invalid")
+        if (
+            not self._same_identity(self.identity, abort_tombstone.old_identity)
+            or abort_tombstone.old_identity.workspace_id != abort_tombstone.new_identity.workspace_id
+            or abort_tombstone.old_identity.runner_id != abort_tombstone.new_identity.runner_id
+            or abort_tombstone.old_identity.key_id == abort_tombstone.new_identity.key_id
+            or eligibility.prepared_journal_digest != _digest(
+                abort_tombstone.prepared_journal_digest, "runtime rotation journal digest",
+            )
+            or eligibility.runtime_rotation_intent_digest != _digest(
+                abort_tombstone.runtime_rotation_intent_digest, "runtime rotation intent digest",
+            )
+        ):
+            raise RunnerRuntimeCorrupt("runtime rotation abort is invalid")
+        record = abort_tombstone.record
+        required = {
+            "schema_version", "workspace_id", "runner_id", "pairing_id", "old_runner_key_id",
+            "new_runner_key_id", "prepared_journal_digest", "runtime_rotation_intent_digest",
+            "runtime_authority_epoch", "runtime_authority_identity_digest",
+        }
+        if not isinstance(record, Mapping) or not required <= set(record) or (
+            record.get("schema_version") != "heel.runner-rotation-activation-abort-tombstone.v1"
+            or record.get("pairing_id") != abort_tombstone.pairing_id
+            or record.get("workspace_id") != self.identity.workspace_id
+            or record.get("runner_id") != self.identity.runner_id
+            or record.get("old_runner_key_id") != self.identity.key_id
+            or record.get("new_runner_key_id") != abort_tombstone.new_identity.key_id
+            or record.get("prepared_journal_digest") != eligibility.prepared_journal_digest
+            or record.get("runtime_rotation_intent_digest") != eligibility.runtime_rotation_intent_digest
+            or record.get("runtime_authority_epoch") != eligibility.authority_epoch
+            or record.get("runtime_authority_identity_digest") != eligibility.authority_identity_digest
+        ):
+            raise RunnerRuntimeCorrupt("runtime rotation abort is invalid")
+        with self._state_lock:
+            with self._connection(allow_rotation_fence=True) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    metadata = self._current_metadata_locked(conn)
+                    if (
+                        self._authority_epoch != eligibility.authority_epoch
+                        or self._authority_identity_digest != eligibility.authority_identity_digest
+                        or metadata["rotation_fence_digest"] != eligibility.runtime_rotation_intent_digest
+                        or conn.execute("SELECT 1 FROM pending_calls LIMIT 1").fetchone() is not None
+                        or conn.execute("SELECT 1 FROM active_runs LIMIT 1").fetchone() is not None
+                        or conn.execute("SELECT 1 FROM terminal_disclosures LIMIT 1").fetchone() is not None
+                    ):
+                        raise RunnerRuntimeConflict("runtime rotation abort is unavailable")
+                    chain = self._chain_key("claim", None)
+                    rows = conn.execute("SELECT chain,run_hash,operation FROM control_chains").fetchall()
+                    claim = self._load_chain_locked(conn, "claim", None)
+                    if (
+                        len(rows) != 1 or tuple(rows[0]) != (chain, None, "claim")
+                        or claim is None or claim.state_digest != eligibility.claim_state_digest
+                    ):
+                        raise RunnerRuntimeConflict("runtime rotation abort is unavailable")
+                    cleared = conn.execute(
+                        "UPDATE metadata SET rotation_fence_digest=NULL WHERE singleton=1 "
+                        "AND authority_epoch=? AND authority_identity_digest=? AND rotation_fence_digest=?",
+                        (
+                            eligibility.authority_epoch, eligibility.authority_identity_digest,
+                            eligibility.runtime_rotation_intent_digest,
+                        ),
+                    )
+                    if cleared.rowcount != 1:
+                        raise RunnerRuntimeConflict("runtime rotation abort is unavailable")
+                    conn.execute("COMMIT")
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
 
     def _commit_resync_chain(
         self, *, operation: str, run_id: str | None, next_nonce_b64: str,
@@ -945,6 +1801,7 @@ class RunnerRuntimeState:
             generation=_safe_int(value["generation"], "runtime pending generation"),
             prior_chain_state_digest=prior,
             created_at_ms=_safe_int(value["created_at_ms"], "runtime pending time"),
+            state_digest=_digest(value["state_digest"], "runtime pending state digest"),
         )
         _nonce(value["server_nonce_b64"])
         return pending, dict(value)
@@ -1097,22 +1954,45 @@ class RunnerRuntimeState:
                 conn.execute("ROLLBACK")
                 raise
 
+    def _pending_from_row_locked(self, row: sqlite3.Row) -> PendingSignedCall:
+        item, _core = self._validate_pending_core(self._open(
+            row["sealed_blob"], schema="heel.runner-pending-call.v1", primary_fields=(row["call_id"],),
+        ))
+        if (
+            row["call_id"] != item.call_id
+            or row["chain"] != self._chain_key(item.chain_operation, item.run_id)
+            or row["run_hash"] != (None if item.run_id is None else _run_hash(item.run_id))
+            or row["operation"] != item.request_operation
+            or row["sequence"] != item.sequence
+            or row["generation"] != item.generation
+            or row["created_at_ms"] != item.created_at_ms
+        ):
+            raise RunnerRuntimeCorrupt("runtime pending call index is invalid")
+        return item
+
+    def get_pending_call(self, call_id: str) -> PendingSignedCall:
+        """Load one fully authenticated immutable request, or fail rather than treating loss as success."""
+        call_id = _digest(call_id, "runtime pending call ID")
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT call_id,chain,run_hash,operation,sequence,generation,created_at_ms,sealed_blob "
+                "FROM pending_calls WHERE call_id=?", (call_id,),
+            ).fetchone()
+        if row is None:
+            raise RunnerRuntimeConflict("runtime pending call is unavailable")
+        return self._pending_from_row_locked(row)
+
     def load_pending_calls(self, *, limit: int = 74) -> tuple[PendingSignedCall, ...]:
         if type(limit) is not int or not 1 <= limit <= 74:
             raise RunnerRuntimeStateError("invalid runtime pending call limit")
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT call_id,chain,run_hash,operation,sealed_blob FROM pending_calls "
+                "SELECT call_id,chain,run_hash,operation,sequence,generation,created_at_ms,sealed_blob FROM pending_calls "
                 "ORDER BY created_at_ms,call_id LIMIT ?", (limit,),
             ).fetchall()
         pending: list[PendingSignedCall] = []
         for row in rows:
-            item, _core = self._validate_pending_core(self._open(
-                row["sealed_blob"], schema="heel.runner-pending-call.v1", primary_fields=(row["call_id"],),
-            ))
-            if row["call_id"] != item.call_id or row["chain"] != self._chain_key(item.chain_operation, item.run_id):
-                raise RunnerRuntimeCorrupt("runtime pending call index is invalid")
-            pending.append(item)
+            pending.append(self._pending_from_row_locked(row))
         return tuple(pending)
 
     def _cursor_core(self, cursor: RunnerChainCursor, *, next_nonce_b64: str, now_ms: int) -> dict[str, Any]:
@@ -1129,6 +2009,8 @@ class RunnerRuntimeState:
     def commit_call(
         self, call_id: str, *, next_nonce_b64: str, now_ms: int,
         installed_chains: tuple[tuple[str, str, str, int, int], ...] = (),
+        active_run: ActiveRunInstall | None = None,
+        gate_update: ActiveGateUpdate | None = None,
     ) -> RunnerChainCursor:
         call_id = _digest(call_id, "runtime pending call ID")
         _safe_int(now_ms, "runtime chain time")
@@ -1156,6 +2038,10 @@ class RunnerRuntimeState:
             if len({item[0] for item in values}) != 4 or len({item[1] for item in values}) != 1:
                 raise RunnerRuntimeStateError("invalid runtime installed claim chains")
             parsed_installed = tuple(values)
+        if active_run is not None and not isinstance(active_run, ActiveRunInstall):
+            raise RunnerRuntimeStateError("invalid runtime active run install")
+        if gate_update is not None and not isinstance(gate_update, ActiveGateUpdate):
+            raise RunnerRuntimeStateError("invalid runtime active gate update")
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1172,6 +2058,16 @@ class RunnerRuntimeState:
                     and pending.run_id is None
                 ):
                     raise RunnerRuntimeCorrupt("runtime installed claim chains do not match pending call")
+                if active_run is not None and not (
+                    pending.request_operation == "claim" and pending.chain_operation == "claim"
+                    and pending.run_id is None and parsed_installed
+                    and {item[1] for item in parsed_installed} == {active_run.run_id}
+                ):
+                    raise RunnerRuntimeCorrupt("runtime active run install does not match pending claim")
+                if gate_update is not None and not (
+                    pending.request_operation == "heartbeat" and pending.run_id is not None
+                ):
+                    raise RunnerRuntimeCorrupt("runtime active gate update does not match pending heartbeat")
                 chain = self._chain_key(pending.chain_operation, pending.run_id)
                 if row["chain"] != chain:
                     raise RunnerRuntimeCorrupt("runtime pending call index is invalid")
@@ -1249,12 +2145,258 @@ class RunnerRuntimeState:
                             (installed_key, _run_hash(run_id), operation, installed_cursor.next_sequence,
                              installed_cursor.generation, installed_blob, installed_cursor.updated_at_ms),
                         )
+                if active_run is not None:
+                    active_core = self._active_core(
+                        run_id=active_run.run_id, approval_projection=active_run.approval_projection,
+                        grant=active_run.grant, gate=active_run.gate,
+                        claim_response_digest=active_run.claim_response_digest,
+                        latest_gate_response_digest=active_run.gate_response_digest,
+                        claimed_at_ms=active_run.claimed_at_ms,
+                        gate_received_at_ms=active_run.gate_received_at_ms,
+                        revision=1, prior_state_digest=None,
+                    )
+                    active_hash = active_core["run_hash"]
+                    if conn.execute("SELECT 1 FROM active_runs WHERE run_hash=?", (active_hash,)).fetchone() is not None:
+                        raise RunnerRuntimeConflict("runtime active run already exists")
+                    if conn.execute("SELECT COUNT(*) FROM active_runs").fetchone()[0] >= 64:
+                        raise RunnerRuntimeConflict("runtime active run capacity is exhausted")
+                    active_blob = self._seal(
+                        active_core, schema="heel.runner-active-run-state.v1", primary_fields=(active_hash,),
+                    )
+                    conn.execute(
+                        "INSERT INTO active_runs(run_hash,sealed_blob,updated_at_ms) VALUES(?,?,?)",
+                        (active_hash, active_blob, active_core["gate_received_at_ms"]),
+                    )
+                if gate_update is not None:
+                    assert pending.run_id is not None
+                    prior_active = self._load_active_locked(conn, pending.run_id)
+                    if prior_active is None:
+                        raise RunnerRuntimeCorrupt("runtime active run is unavailable")
+                    if gate_update.gate["server_time_ms"] <= prior_active["gate"]["server_time_ms"]:
+                        raise RunnerRuntimeCorrupt("runtime active gate server time did not advance")
+                    if (
+                        gate_update.gate["kill_switch_generation"]
+                        < prior_active["gate"]["kill_switch_generation"]
+                    ):
+                        raise RunnerRuntimeCorrupt("runtime active gate control generation regressed")
+                    next_active = self._active_core(
+                        run_id=pending.run_id, approval_projection=prior_active["approval_projection"],
+                        grant=prior_active["grant"], gate=gate_update.gate,
+                        claim_response_digest=prior_active["claim_response_digest"],
+                        latest_gate_response_digest=gate_update.gate_response_digest,
+                        claimed_at_ms=prior_active["claimed_at_ms"],
+                        gate_received_at_ms=gate_update.received_at_ms,
+                        revision=prior_active["revision"] + 1,
+                        prior_state_digest=prior_active["state_digest"],
+                    )
+                    if next_active["gate"]["kill_switch_generation"] != prior_active["grant"]["kill_switch_generation"]:
+                        raise RunnerRuntimeCorrupt("runtime active gate is inconsistent")
+                    active_blob = self._seal(
+                        next_active, schema="heel.runner-active-run-state.v1",
+                        primary_fields=(next_active["run_hash"],),
+                    )
+                    updated_active = conn.execute(
+                        "UPDATE active_runs SET sealed_blob=?,updated_at_ms=? WHERE run_hash=?",
+                        (active_blob, next_active["gate_received_at_ms"], next_active["run_hash"]),
+                    )
+                    if updated_active.rowcount != 1:
+                        raise RunnerRuntimeConflict("runtime active run is unavailable")
                 conn.execute("DELETE FROM pending_calls WHERE call_id=?", (call_id,))
                 conn.execute("COMMIT")
                 return next_cursor
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
+
+    @staticmethod
+    def _validate_active_gate(value: object) -> dict[str, Any]:
+        fields = {
+            "active", "runner_state", "proof_state", "proof_expires_at_ms",
+            "kill_switch_generation", "stop_reason", "server_time_ms",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise RunnerRuntimeCorrupt("runtime active gate is invalid")
+        gate = dict(value)
+        if (
+            type(gate["active"]) is not bool
+            or gate["runner_state"] not in {"active", "revoked", "replaced"}
+            or gate["proof_state"] not in {"valid", "expired", "revoked"}
+            or gate["stop_reason"] not in {
+                "none", "local_emergency_stop", "cloud_stop", "runner_revoked", "target_revoked", "kill_switch",
+            }
+            or any(type(gate[name]) is not int or gate[name] < 0 for name in (
+                "proof_expires_at_ms", "kill_switch_generation", "server_time_ms",
+            ))
+        ):
+            raise RunnerRuntimeCorrupt("runtime active gate is invalid")
+        return gate
+
+    def _active_core(
+        self, *, run_id: str, approval_projection: Mapping[str, Any], grant: Mapping[str, Any],
+        gate: Mapping[str, Any], claim_response_digest: str, latest_gate_response_digest: str,
+        claimed_at_ms: int, gate_received_at_ms: int, revision: int,
+        prior_state_digest: str | None,
+    ) -> dict[str, Any]:
+        checked_projection = validate_approval_projection(approval_projection)
+        checked_grant = validate_execution_grant(grant)
+        checked_gate = self._validate_active_gate(gate)
+        run_id = _run_id(run_id)
+        assert run_id is not None
+        if (
+            checked_grant["run_id"] != run_id
+            or checked_projection["workspace_id"] != self.identity.workspace_id
+            or checked_grant["workspace_id"] != self.identity.workspace_id
+            or checked_projection["project_id"] != checked_grant["project_id"]
+            or checked_projection["runner"]["runner_id"] != self.identity.runner_id
+            or checked_projection["runner"]["runner_key_id"] != self.identity.key_id
+            or checked_grant["runner_binding"]["runner_id"] != self.identity.runner_id
+            or checked_grant["runner_binding"]["runner_key_id"] != self.identity.key_id
+            or checked_grant["approval"] != {
+                "projection_id": checked_projection["projection_id"],
+                "projection_digest": checked_projection["projection_digest"],
+                "manifest_digest": checked_projection["manifest_digest"],
+            }
+            or checked_gate["kill_switch_generation"] != checked_grant["kill_switch_generation"]
+        ):
+            raise RunnerRuntimeCorrupt("runtime active run authority is invalid")
+        claim_response_digest = _digest(claim_response_digest, "runtime claim response digest")
+        latest_gate_response_digest = _digest(latest_gate_response_digest, "runtime gate response digest")
+        claimed_at_ms = _safe_int(claimed_at_ms, "runtime claimed time")
+        gate_received_at_ms = _safe_int(gate_received_at_ms, "runtime gate time")
+        revision = _safe_int(revision, "runtime active revision", minimum=1)
+        if prior_state_digest is not None:
+            _digest(prior_state_digest, "runtime active prior state digest")
+        core_without_digest = {
+            "schema_version": "heel.runner-active-run-state.v1", "state": "active",
+            "workspace_id": self.identity.workspace_id, "runner_id": self.identity.runner_id,
+            "runner_key_id": self.identity.key_id, "run_id": run_id, "run_hash": _run_hash(run_id),
+            "project_id": checked_grant["project_id"], "approval_id": checked_projection["projection_id"],
+            "grant_id": checked_grant["grant_id"], "grant_digest": checked_grant["grant_digest"],
+            "approval_projection_digest": checked_projection["projection_digest"],
+            "approval_projection": checked_projection, "grant": checked_grant, "gate": checked_gate,
+            "claim_response_digest": claim_response_digest,
+            "latest_gate_response_digest": latest_gate_response_digest,
+            "claimed_at_ms": claimed_at_ms, "gate_received_at_ms": gate_received_at_ms,
+            "revision": revision, "prior_state_digest": prior_state_digest,
+        }
+        return {**core_without_digest, "state_digest": _active_state_digest(core_without_digest)}
+
+    def _validate_active_core(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        fields = {
+            "schema_version", "state", "workspace_id", "runner_id", "runner_key_id", "run_id", "run_hash",
+            "project_id", "approval_id", "grant_id", "grant_digest", "approval_projection_digest",
+            "approval_projection", "grant", "gate", "claim_response_digest", "latest_gate_response_digest",
+            "claimed_at_ms", "gate_received_at_ms", "revision", "prior_state_digest", "state_digest",
+        }
+        if (
+            set(value) != fields or value.get("schema_version") != "heel.runner-active-run-state.v1"
+            or value.get("state") != "active"
+            or value.get("workspace_id") != self.identity.workspace_id
+            or value.get("runner_id") != self.identity.runner_id
+            or value.get("runner_key_id") != self.identity.key_id
+        ):
+            raise RunnerRuntimeCorrupt("runtime active run state is invalid")
+        run_id = _run_id(value.get("run_id"))
+        assert run_id is not None
+        if value.get("run_hash") != _run_hash(run_id):
+            raise RunnerRuntimeCorrupt("runtime active run state is invalid")
+        core = self._active_core(
+            run_id=run_id, approval_projection=value["approval_projection"], grant=value["grant"],
+            gate=value["gate"], claim_response_digest=value["claim_response_digest"],
+            latest_gate_response_digest=value["latest_gate_response_digest"],
+            claimed_at_ms=value["claimed_at_ms"], gate_received_at_ms=value["gate_received_at_ms"],
+            revision=value["revision"], prior_state_digest=value["prior_state_digest"],
+        )
+        if value != core:
+            raise RunnerRuntimeCorrupt("runtime active run state is invalid")
+        return core
+
+    def _load_active_locked(self, conn: sqlite3.Connection, run_id: str) -> dict[str, Any] | None:
+        run_hash = _run_hash(run_id)
+        row = conn.execute(
+            "SELECT run_hash,sealed_blob,updated_at_ms FROM active_runs WHERE run_hash=?", (run_hash,),
+        ).fetchone()
+        if row is None:
+            return None
+        core = self._validate_active_core(self._open(
+            row["sealed_blob"], schema="heel.runner-active-run-state.v1", primary_fields=(run_hash,),
+        ))
+        if core["run_hash"] != row["run_hash"] or core["run_id"] != run_id or row["updated_at_ms"] != core["gate_received_at_ms"]:
+            raise RunnerRuntimeCorrupt("runtime active run index is invalid")
+        return core
+
+    def load_active_run_controls(self, *, limit: int = 64) -> tuple[ActiveRunControl, ...]:
+        if type(limit) is not int or not 1 <= limit <= 64:
+            raise RunnerRuntimeStateError("invalid runtime active run limit")
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT run_hash,sealed_blob,updated_at_ms FROM active_runs ORDER BY run_hash LIMIT 65",
+            ).fetchall()
+            if len(rows) > 64:
+                raise RunnerRuntimeCorrupt("runtime active run capacity is invalid")
+            active_by_hash: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                core = self._validate_active_core(self._open(
+                    row["sealed_blob"], schema="heel.runner-active-run-state.v1", primary_fields=(row["run_hash"],),
+                ))
+                if core["run_hash"] != row["run_hash"] or row["updated_at_ms"] != core["gate_received_at_ms"]:
+                    raise RunnerRuntimeCorrupt("runtime active run index is invalid")
+                if core["run_hash"] in active_by_hash:
+                    raise RunnerRuntimeCorrupt("runtime active run index is invalid")
+                active_by_hash[core["run_hash"]] = core
+
+            # Validate the whole run-scoped cursor relation, not only the cursors
+            # reached from active rows.  A surviving cursor-only group (or an
+            # extra opaque index key) is authority loss, never an empty restart.
+            chains_by_hash: dict[str, dict[str, RunnerChainCursor]] = {
+                run_hash: {} for run_hash in active_by_hash
+            }
+            cursor_rows = conn.execute(
+                "SELECT chain,run_hash,operation FROM control_chains WHERE run_hash IS NOT NULL",
+            ).fetchall()
+            for cursor_row in cursor_rows:
+                run_hash = cursor_row["run_hash"]
+                operation = cursor_row["operation"]
+                core = active_by_hash.get(run_hash)
+                if core is None or operation not in {"heartbeat", "progress", "result", "stop-ack"}:
+                    raise RunnerRuntimeCorrupt("runtime active run cursor group is invalid")
+                if cursor_row["chain"] != self._chain_key(operation, core["run_id"]):
+                    raise RunnerRuntimeCorrupt("runtime active run cursor group is invalid")
+                group = chains_by_hash[run_hash]
+                if operation in group:
+                    raise RunnerRuntimeCorrupt("runtime active run cursor group is invalid")
+                cursor = self._load_chain_locked(conn, operation, core["run_id"])
+                if cursor is None:
+                    raise RunnerRuntimeCorrupt("runtime active run cursor group is invalid")
+                group[operation] = cursor
+
+            values: list[ActiveRunControl] = []
+            for core in active_by_hash.values():
+                chains = chains_by_hash[core["run_hash"]]
+                if set(chains) != {"heartbeat", "progress", "result", "stop-ack"}:
+                    raise RunnerRuntimeCorrupt("runtime active run cursor group is invalid")
+                terminal = self._load_terminal_locked(conn, core["run_id"])
+                if terminal is not None and terminal.state != "local_terminal":
+                    # A result commit removes the whole active group in the
+                    # same transaction that makes disclosure available.  Any
+                    # later terminal state beside live cursors is rollback or
+                    # cross-row tampering, not restartable authority.
+                    raise RunnerRuntimeCorrupt("runtime active run terminal state is invalid")
+                values.append(ActiveRunControl(
+                    run_id=core["run_id"], project_id=core["project_id"], approval_id=core["approval_id"],
+                    grant_id=core["grant_id"], grant_digest=core["grant_digest"],
+                    approval_projection_digest=core["approval_projection_digest"],
+                    approval_projection=MappingProxyType(dict(core["approval_projection"])),
+                    grant=MappingProxyType(dict(core["grant"])), gate=MappingProxyType(dict(core["gate"])),
+                    claim_response_digest=core["claim_response_digest"],
+                    latest_gate_response_digest=core["latest_gate_response_digest"],
+                    claimed_at_ms=core["claimed_at_ms"], gate_received_at_ms=core["gate_received_at_ms"],
+                    revision=core["revision"], prior_state_digest=core["prior_state_digest"],
+                    state_digest=core["state_digest"], chains=MappingProxyType(chains),
+                ))
+            if len(values) > limit:
+                return tuple(sorted(values, key=lambda item: (item.run_id, _run_hash(item.run_id)))[:limit])
+            return tuple(sorted(values, key=lambda item: (item.run_id, _run_hash(item.run_id))))
 
     def _validate_terminal_core(self, value: Mapping[str, Any]) -> TerminalDisclosureState:
         fields = {
@@ -1370,6 +2512,22 @@ class RunnerRuntimeState:
         ))
         if (
             state.run_id != run_id or row["state"] != state.state
+            or row["retention_expires_at_ms"] != state.retention_expires_at_ms
+            or (state.state == "local_terminal" and row["updated_at_ms"] != state.terminal_at_ms)
+        ):
+            raise RunnerRuntimeCorrupt("runtime terminal disclosure index is invalid")
+        return state
+
+    def _load_terminal_row_locked(
+        self, row: sqlite3.Row,
+    ) -> TerminalDisclosureState:
+        run_hash = row["run_hash"]
+        state = self._validate_terminal_core(self._open(
+            row["sealed_blob"], schema="heel.runner-terminal-disclosure-state.v1",
+            primary_fields=(run_hash,),
+        ))
+        if (
+            state.run_hash != run_hash or row["state"] != state.state
             or row["retention_expires_at_ms"] != state.retention_expires_at_ms
             or (state.state == "local_terminal" and row["updated_at_ms"] != state.terminal_at_ms)
         ):
@@ -1496,6 +2654,11 @@ class RunnerRuntimeState:
                     "UPDATE terminal_disclosures SET state=?,sealed_blob=?,updated_at_ms=? WHERE run_hash=?",
                     (available.state, blob, now_ms, run_hash),
                 )
+                removed_active = conn.execute(
+                    "DELETE FROM active_runs WHERE run_hash=?", (run_hash,),
+                )
+                if removed_active.rowcount != 1:
+                    raise RunnerRuntimeCorrupt("runtime terminal result has no active run authority")
                 conn.execute("DELETE FROM control_chains WHERE run_hash=?", (run_hash,))
                 conn.execute("DELETE FROM pending_calls WHERE run_hash=?", (run_hash,))
                 conn.execute("COMMIT")
@@ -1726,29 +2889,130 @@ class RunnerRuntimeState:
             revision=state.revision + 1, prior_state_digest=state.state_digest,
         )
 
-    def claim_due_prune(
-        self, *, now_ms: int, limit: int = 16,
-    ) -> tuple[TerminalDisclosureState, ...]:
-        now_ms = _safe_int(now_ms, "runtime prune time")
+    @staticmethod
+    def _prune_limit(limit: object) -> int:
         if type(limit) is not int or not 1 <= limit <= 16:
             raise RunnerRuntimeStateError("invalid runtime prune limit")
+        return limit
+
+    def load_prune_pending(self, *, limit: int = 16) -> PrunePendingBatch:
+        """Read the bounded, authenticated set of durable prune work without changing it."""
+        limit = self._prune_limit(limit)
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            try:
+                rows = conn.execute(
+                    "SELECT run_hash,retention_expires_at_ms,state,sealed_blob,updated_at_ms "
+                    "FROM terminal_disclosures WHERE state='prune_pending' "
+                    "ORDER BY retention_expires_at_ms,run_hash LIMIT ?",
+                    (limit + 1,),
+                ).fetchall()
+                states = tuple(self._load_terminal_row_locked(row) for row in rows[:limit])
+                if any(state.state != "prune_pending" for state in states):
+                    raise RunnerRuntimeCorrupt("runtime terminal disclosure index is invalid")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return PrunePendingBatch(items=states, has_more=len(rows) > limit)
+
+    def claim_due_prune(
+        self, *, now_ms: int, limit: int = 16,
+    ) -> PrunePendingBatch:
+        now_ms = _safe_int(now_ms, "runtime prune time")
+        limit = self._prune_limit(limit)
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 rows = conn.execute(
-                    "SELECT run_hash,sealed_blob FROM terminal_disclosures "
+                    "SELECT run_hash,retention_expires_at_ms,state,sealed_blob,updated_at_ms FROM terminal_disclosures "
+                    "INDEXED BY idx_terminal_disclosures_due_retention "
                     "WHERE state IN ('local_terminal','available','consumed') "
                     "AND retention_expires_at_ms<=? ORDER BY retention_expires_at_ms,run_hash LIMIT ?",
-                    (now_ms, limit),
+                    (now_ms, limit + 1),
                 ).fetchall()
                 claimed: list[TerminalDisclosureState] = []
-                for row in rows:
-                    state = self._validate_terminal_core(self._open(
-                        row["sealed_blob"], schema="heel.runner-terminal-disclosure-state.v1",
-                        primary_fields=(row["run_hash"],),
-                    ))
+                for row in rows[:limit]:
+                    state = self._load_terminal_row_locked(row)
                     if state.run_hash != row["run_hash"] or state.state == "prune_pending":
                         raise RunnerRuntimeCorrupt("runtime terminal disclosure index is invalid")
+                    chain_rows = conn.execute(
+                        "SELECT chain,run_hash,operation,next_sequence,generation,sealed_blob "
+                        "FROM control_chains WHERE run_hash=?", (state.run_hash,),
+                    ).fetchall()
+                    chains: dict[str, RunnerChainCursor] = {}
+                    for chain_row in chain_rows:
+                        cursor = self._validate_chain_core(self._open(
+                            chain_row["sealed_blob"],
+                            schema="heel.runner-control-chain-state.v1",
+                            primary_fields=(chain_row["chain"],),
+                        ))
+                        if (
+                            chain_row["chain"] != self._chain_key(cursor.operation, cursor.run_id)
+                            or chain_row["run_hash"] != state.run_hash
+                            or chain_row["operation"] != cursor.operation
+                            or cursor.run_id != state.run_id
+                            or chain_row["next_sequence"] != cursor.next_sequence
+                            or chain_row["generation"] != cursor.generation
+                            or cursor.operation in chains
+                        ):
+                            raise RunnerRuntimeCorrupt("runtime run control state is invalid")
+                        chains[cursor.operation] = cursor
+                    pending_rows = conn.execute(
+                        "SELECT call_id,chain,run_hash,operation,sealed_blob FROM pending_calls WHERE run_hash=?",
+                        (state.run_hash,),
+                    ).fetchall()
+                    pending_calls: list[PendingSignedCall] = []
+                    for pending_row in pending_rows:
+                        call, _pending_core = self._validate_pending_core(self._open(
+                            pending_row["sealed_blob"], schema="heel.runner-pending-call.v1",
+                            primary_fields=(pending_row["call_id"],),
+                        ))
+                        if (
+                            pending_row["call_id"] != call.call_id
+                            or pending_row["chain"] != self._chain_key(
+                                call.chain_operation, call.run_id,
+                            )
+                            or pending_row["run_hash"] != state.run_hash
+                            or pending_row["operation"] != call.request_operation
+                            or call.run_id != state.run_id
+                        ):
+                            raise RunnerRuntimeCorrupt("runtime pending call index is invalid")
+                        pending_calls.append(call)
+                    if state.state == "local_terminal":
+                        if len(chains) not in {0, 4} or (
+                            chains and set(chains) != {"heartbeat", "progress", "result", "stop-ack"}
+                        ) or len(pending_calls) > 1:
+                            raise RunnerRuntimeCorrupt("runtime terminal prune does not own an exact run")
+                        if pending_calls:
+                            call = pending_calls[0]
+                            result = chains.get("result")
+                            if (
+                                result is None or call.request_operation != "result"
+                                or call.chain_operation != "result"
+                                or call.prior_chain_state_digest != result.state_digest
+                                or call.sequence != result.next_sequence
+                                or call.generation != result.generation
+                                or call.headers["X-Heel-Runner-Nonce"] != result.next_nonce_b64
+                            ):
+                                raise RunnerRuntimeCorrupt("runtime terminal prune does not own the result")
+                    elif state.state == "available":
+                        if chains or len(pending_calls) > 1:
+                            raise RunnerRuntimeCorrupt("runtime terminal prune does not own an exact disclosure")
+                        if pending_calls:
+                            call = pending_calls[0]
+                            result = state.result_chain
+                            if (
+                                result is None or call.request_operation != "upload-findings"
+                                or call.chain_operation != "result"
+                                or call.prior_chain_state_digest != state.state_digest
+                                or call.sequence != result["next_sequence"]
+                                or call.generation != result["generation"]
+                                or call.headers["X-Heel-Runner-Nonce"] != result["next_nonce_b64"]
+                            ):
+                                raise RunnerRuntimeCorrupt("runtime terminal prune does not own the disclosure")
+                    elif state.state == "consumed" and (chains or pending_calls):
+                        raise RunnerRuntimeCorrupt("runtime terminal prune does not own an exact disclosure")
                     core = self._prune_pending_core(state)
                     pending = self._validate_terminal_core(core)
                     blob = self._seal(core, schema=core["schema_version"], primary_fields=(state.run_hash,))
@@ -1757,30 +3021,101 @@ class RunnerRuntimeState:
                         "WHERE run_hash=? AND state=?",
                         (pending.state, blob, now_ms, state.run_hash, state.state),
                     )
+                    if state.state == "local_terminal":
+                        conn.execute("DELETE FROM control_chains WHERE run_hash=?", (state.run_hash,))
+                    if pending_calls:
+                        conn.execute("DELETE FROM pending_calls WHERE run_hash=?", (state.run_hash,))
                     claimed.append(pending)
                 conn.execute("COMMIT")
-                return tuple(claimed)
+                return PrunePendingBatch(items=tuple(claimed), has_more=len(rows) > limit)
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
 
+    def _validated_pruned_receipt(self, receipt: object) -> dict[str, object]:
+        from heel.runner.store import VerifiedPrunedRunReceipt
+
+        if type(receipt) is not VerifiedPrunedRunReceipt or not isinstance(receipt.record, Mapping):
+            raise RunnerRuntimeCorrupt("runtime prune receipt is invalid")
+        record = receipt.record
+        fields = {
+            "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
+            "run_id", "run_hash", "grant_id", "grant_digest", "retention_expires_at_ms",
+            "prior_head_digest", "terminal_record_digest", "terminal_projection_digest",
+            "terminal_at_ms", "detached_record_digest", "runtime_state_schema",
+            "runtime_prune_pending_state_digest", "pruned_at_ms", "record_digest",
+            "signing_key_id", "signature_b64",
+        }
+        if (
+            set(record) != fields
+            or record.get("schema_version") != "heel.local-run-pruned.v2"
+            or record.get("workspace_id") != self.identity.workspace_id
+            or record.get("runner_id") != self.identity.runner_id
+            or record.get("runner_key_id") != self.identity.key_id
+            or record.get("signing_key_id") != self.identity.key_id
+            or record.get("runtime_state_schema") != "heel.runner-terminal-disclosure-state.v1"
+        ):
+            raise RunnerRuntimeCorrupt("runtime prune receipt is invalid")
+        try:
+            run_id = _run_id(record["run_id"])
+            assert run_id is not None
+            if _run_hash(run_id) != record["run_hash"]:
+                raise ValueError
+            for field in (
+                "run_hash", "grant_digest", "prior_head_digest", "terminal_record_digest",
+                "terminal_projection_digest", "detached_record_digest",
+                "runtime_prune_pending_state_digest", "record_digest",
+            ):
+                _digest(record[field], "runtime prune receipt digest")
+            terminal_at = _safe_int(record["terminal_at_ms"], "runtime prune terminal time")
+            retention = _safe_int(record["retention_expires_at_ms"], "runtime prune retention time")
+            pruned_at = _safe_int(record["pruned_at_ms"], "runtime prune receipt time")
+            if not terminal_at <= retention <= pruned_at:
+                raise ValueError
+            core = {key: record[key] for key in fields - {"record_digest", "signing_key_id", "signature_b64"}}
+            if record["record_digest"] != hashlib.sha256(
+                _RUNTIME_PRUNED_RECEIPT_DOMAIN + canonical_bytes(core)
+            ).hexdigest():
+                raise ValueError
+            signature = record["signature_b64"]
+            if type(signature) is not str or base64.b64encode(
+                base64.b64decode(signature, validate=True)
+            ).decode("ascii") != signature:
+                raise ValueError
+            verify_envelope(
+                {self.identity.key_id: load_public_key_base64(self.identity.public_key_b64)},
+                {"signing_key_id": record["signing_key_id"], "signature_b64": signature},
+                _RUNTIME_PRUNED_RECEIPT_DOMAIN + canonical_bytes({**core, "record_digest": record["record_digest"]}),
+            )
+        except (AssertionError, TypeError, ValueError):
+            raise RunnerRuntimeCorrupt("runtime prune receipt is invalid") from None
+        return dict(record)
+
     def finish_prune(
-        self, run_id: str, *, expected_state_digest: str, pruned_record_digest: str,
-        now_ms: int,
+        self, *, receipt: object, expected_prune_pending_state_digest: str,
     ) -> None:
-        run_id = _run_id(run_id)
+        record = self._validated_pruned_receipt(receipt)
+        run_id = _run_id(record["run_id"])
         assert run_id is not None
-        expected_state_digest = _digest(expected_state_digest, "runtime prune state digest")
-        _digest(pruned_record_digest, "runtime pruned record digest")
-        now_ms = _safe_int(now_ms, "runtime prune time")
+        expected_state_digest = _digest(
+            expected_prune_pending_state_digest, "runtime prune state digest",
+        )
+        if record["runtime_prune_pending_state_digest"] != expected_state_digest:
+            raise RunnerRuntimeCorrupt("runtime terminal prune does not match local authority")
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 state = self._load_terminal_locked(conn, run_id)
+                if state is None:
+                    conn.execute("COMMIT")
+                    return
                 if (
-                    state is None or state.state != "prune_pending"
-                    or state.state_digest != expected_state_digest
-                    or now_ms < state.retention_expires_at_ms
+                    state.state != "prune_pending" or state.state_digest != expected_state_digest
+                    or state.run_hash != record["run_hash"]
+                    or state.terminal_record_digest != record["terminal_record_digest"]
+                    or state.terminal_projection_digest != record["terminal_projection_digest"]
+                    or state.terminal_at_ms != record["terminal_at_ms"]
+                    or state.retention_expires_at_ms != record["retention_expires_at_ms"]
                 ):
                     raise RunnerRuntimeCorrupt("runtime terminal prune does not match local authority")
                 conn.execute("DELETE FROM terminal_disclosures WHERE run_hash=?", (state.run_hash,))

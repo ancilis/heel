@@ -427,6 +427,7 @@ class PendingRotationActivation:
     new_signer_label: str
     _new_signer: SecureSigner = field(repr=False, compare=False)
     _store_token: object = field(repr=False, compare=False)
+    _eligibility: object = field(repr=False, compare=False)
 
     def __reduce_ex__(self, protocol: int) -> object:
         del protocol
@@ -446,6 +447,20 @@ class AcceptedRotationJournal:
     created_at_ms: int
     updated_at_ms: int
     new_signer_label: str
+    prepared_journal_digest: str
+    runtime_rotation_intent_digest: str
+
+
+@dataclass(frozen=True, repr=False)
+class AcceptedRotationAbortTombstone:
+    """Validated local proof that the Cloud atomically aborted a prepared rotation."""
+
+    pairing_id: str
+    old_identity: RunnerIdentity
+    new_identity: RunnerIdentity
+    prepared_journal_digest: str
+    runtime_rotation_intent_digest: str
+    record: Mapping[str, object]
 
 
 @dataclass(frozen=True, repr=False)
