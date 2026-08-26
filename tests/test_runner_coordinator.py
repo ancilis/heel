@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import os
 import shutil
 from types import SimpleNamespace
 import threading
@@ -13,20 +14,32 @@ from heel.canary_contracts import (
     CANARY_FINDINGS_SCHEMA, DISCLOSURE_PERMIT_SCHEMA, canonical_bytes,
     canonical_digest, validate_operational_run,
 )
-from heel.runner.control_client import RunnerControlClient
+from heel.runner.control_client import _RunGuard, RunnerControlClient
 from heel.runner.coordinator import RunnerCoordinator, RunnerExecutionAdapter
 from heel.runner.http_transport import CancellationToken
 from heel.runner.execution import ExecutionBundle, ExecutionGate
 from heel.runner.service import ClaimLease, RunnerService
 from heel.runner.store import RunnerStore, RunnerStoreError
+from heel.runner.runtime import RunnerRuntimeState
 import heel.runner.store as runner_store_module
 from tests.test_runner_stop import (
-    BlockingExecutor, StopCoordinator, compiled_pair, signed_grant,
+    BlockingExecutor, LocalCanaryExecutor, ScriptedTransport, StaticVault,
+    StopCoordinator, active_gate, compiled_pair, signed_grant,
 )
 
 
 def _nonce(byte: bytes) -> str:
     return base64.b64encode(byte * 32).decode("ascii")
+
+
+def _control_runtime(path, identity, signer):
+    """Every executable client fixture starts from its durable pairing-v3 cursor."""
+    runtime = RunnerRuntimeState(path, identity, signer)
+    runtime.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=_nonce(b"c"),
+        next_sequence=1, generation=0, now_ms=0,
+    )
+    return runtime
 
 
 class ScriptedControlTransport:
@@ -95,12 +108,14 @@ def _status(
     }
 
 
-def _phase(projection, signer, phase):
+def _phase(projection, signer, phase, *, run_id=None):
     unsigned = {
         key: copy.deepcopy(value) for key, value in projection.items()
         if key not in {"projection_digest", "signing_key_id", "signature_b64"}
     }
     unsigned["event_sequence"] += 1
+    if run_id is not None:
+        unsigned["run_id"] = run_id
     unsigned["lifecycle_phase"] = phase
     unsigned["timestamps"]["updated_at_ms"] = 2_000
     if phase in {"running", "stop_requested", "terminal"}:
@@ -202,6 +217,39 @@ def _permit(
     }
 
 
+def _install_terminal_anchor(coordinator, grant, terminal):
+    """Install the closed store authority fixture for coordinator-only tests."""
+    anchor = {
+        "run_id": grant["run_id"],
+        "project_id": grant["project_id"],
+        "grant_id": grant["grant_id"],
+        "approval_projection_digest": grant["approval"]["projection_digest"],
+        "terminal_projection_digest": terminal["projection_digest"],
+        "terminal_record_digest": "e" * 64,
+        "terminal_at_ms": terminal["timestamps"]["terminal_at_ms"],
+        "retention_expires_at_ms": grant["expires_at_ms"],
+    }
+    coordinator.store._runtime_terminal_anchor = lambda run_id: (
+        anchor if run_id == grant["run_id"] else (_ for _ in ()).throw(
+            RunnerStoreError("local terminal authority is unavailable")
+        )
+    )
+    # Coordinator-only control tests do not construct an executor-owned terminal
+    # queue.  Keep their fixture authority closed while integration tests cover
+    # the real signed detach ledger.
+    coordinator.store.detach_terminal = lambda run_id, **_kwargs: (
+        "a" * 64 if run_id == grant["run_id"] else (_ for _ in ()).throw(
+            RunnerStoreError("local terminal authority is unavailable")
+        )
+    )
+    coordinator.store.load_terminal_disclosure_anchor = lambda run_id, **_kwargs: (
+        anchor if run_id == grant["run_id"] else (_ for _ in ()).throw(
+            RunnerStoreError("local terminal authority is unavailable")
+        )
+    )
+    return anchor
+
+
 def _coordinator(tmp_path, responses, *, monotonic=lambda: 1.0):
     store, identity, signer, manifest, projection = compiled_pair(tmp_path)
     authority = SigningAuthority.generate()
@@ -216,6 +264,7 @@ def _coordinator(tmp_path, responses, *, monotonic=lambda: 1.0):
         transport=transport,
         nonce_source=lambda key: _nonce(b"c"),
         trusted_disclosure_keys={authority.key_id: authority.public_key},
+        runtime=_control_runtime(tmp_path / "runtime.sqlite3", identity, signer),
     )
     coordinator = RunnerCoordinator(
         control=client,
@@ -283,6 +332,7 @@ def test_first_cloud_context_acquisition_lists_before_binding_a_namespace(tmp_pa
         runner_id=identity.runner_id, signer=signer, clock=lambda: 2_000,
         transport=Transport(), nonce_source=lambda _chain: _nonce(b"c"),
         trusted_disclosure_keys={authority.key_id: authority.public_key},
+        runtime=_control_runtime(tmp_path / "context-runtime.sqlite3", identity, signer),
     )
     coordinator = RunnerCoordinator(
         control=control, store=store, identity=identity, signer=signer,
@@ -295,6 +345,47 @@ def test_first_cloud_context_acquisition_lists_before_binding_a_namespace(tmp_pa
     # The coordinator records the actual local signer identity, not a generic
     # Cloud label that would make a resumed binding ambiguous.
     assert store.load_binding()["signer_label"] == identity.key_id
+
+
+def test_incomplete_cloud_tuple_never_falls_back_to_context_discovery(tmp_path):
+    coordinator, _client, transport, _manifest, _projection, _grant, authority = _coordinator(
+        tmp_path, lambda _manifest, _projection, _grant: [],
+    )
+    context = coordinator.store.load_context()
+    unsigned = {
+        "schema_version": "heel.runner-context-binding.v1",
+        "binding_id": "rcb_" + "f" * 32,
+        "workspace_id": coordinator.identity.workspace_id,
+        "project_id": context.project_id,
+        "environment": {
+            "environment_id": context.environment_id, "origin": context.origin,
+            "environment_class": context.environment_class,
+            "verification_record_digest": context.verification_record_digest,
+        },
+        "runner_binding": {
+            "runner_id": coordinator.identity.runner_id,
+            "runner_key_id": coordinator.identity.key_id,
+            "public_key_digest": coordinator.identity.fingerprint,
+        },
+        "authorization": {"user_id": "owner", "role": "owner"},
+        "issued_at_ms": 1, "expires_at_ms": 60_001,
+    }
+    artifact = {
+        **unsigned, "binding_digest": canonical_digest(unsigned),
+        **authority.sign(b"heel.runner-context-binding.v1\0" + canonical_bytes(unsigned)),
+    }
+    coordinator.store.install_cloud_context_binding(
+        artifact, identity=coordinator.identity, signer=coordinator.signer,
+        signer_label=coordinator.identity.key_id,
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=2_000,
+    )
+    with coordinator.store._transaction(exclusive=True) as context_fd:
+        os.unlink("cloud-context-provenance.json", dir_fd=context_fd)
+        os.fsync(context_fd)
+
+    with pytest.raises(RunnerStoreError, match="cloud context authority is incomplete"):
+        coordinator.ensure_runner_context()
+    assert transport.requests == []
 
 
 def test_pending_first_install_rolls_forward_only_from_fresh_singleton_claim(tmp_path, monkeypatch):
@@ -361,6 +452,7 @@ def test_pending_first_install_rolls_forward_only_from_fresh_singleton_claim(tmp
         origin="https://control.example", workspace_id=identity.workspace_id, runner_id=identity.runner_id,
         signer=signer, clock=lambda: 2, transport=Transport(), nonce_source=lambda _chain: _nonce(b"c"),
         trusted_disclosure_keys={authority.key_id: authority.public_key},
+        runtime=_control_runtime(tmp_path / "recovery-runtime.sqlite3", identity, signer),
     )
     coordinator = RunnerCoordinator(
         control=control, store=restarted, identity=identity, signer=signer,
@@ -391,6 +483,7 @@ def test_pending_first_install_rolls_forward_only_from_fresh_singleton_claim(tmp
             origin="https://control.example", workspace_id=identity.workspace_id, runner_id=identity.runner_id,
             signer=signer, clock=lambda: 2, transport=Transport(), nonce_source=lambda _chain: _nonce(token),
             trusted_disclosure_keys={authority.key_id: authority.public_key},
+            runtime=_control_runtime(directory / "runtime.sqlite3", identity, signer),
         )
         return recovery_store, RunnerCoordinator(
             control=recovery_control, store=recovery_store, identity=identity, signer=signer,
@@ -503,6 +596,7 @@ def test_failed_cloud_install_provenance_never_downgrades_to_static_context(tmp_
         runner_id=identity.runner_id, signer=signer, clock=lambda: 2_000,
         transport=Transport(), nonce_source=lambda _chain: _nonce(b"c"),
         trusted_disclosure_keys={authority.key_id: authority.public_key},
+        runtime=_control_runtime(tmp_path / "pending-runtime.sqlite3", identity, signer),
     )
     coordinator = RunnerCoordinator(
         control=control, store=store, identity=identity, signer=signer,
@@ -573,6 +667,7 @@ def test_coordinator_rolls_forward_only_from_one_fresh_list_and_matching_claim(t
         runner_id=identity.runner_id, signer=signer, clock=lambda: 2,
         transport=Transport(), nonce_source=lambda _chain: _nonce(b"q"),
         trusted_disclosure_keys={authority.key_id: authority.public_key},
+        runtime=_control_runtime(tmp_path / "rollover-runtime.sqlite3", identity, signer),
     )
     coordinator = RunnerCoordinator(
         control=control, store=store, identity=identity, signer=signer,
@@ -639,9 +734,10 @@ def test_malformed_claim_fails_before_any_local_nonce_state_is_installed(tmp_pat
         return [(200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, response)]
 
     coordinator, client, _, _, _, _, _ = _coordinator(tmp_path, responses)
+    initial = dict(client._chains)
     with pytest.raises(ValueError, match="invalid runner claim response"):
         coordinator.claim()
-    assert client._chains == {}
+    assert client._chains == initial
 
 
 def test_live_gate_rejects_replayed_server_time_and_regressed_control_generation(tmp_path):
@@ -715,6 +811,7 @@ def test_progress_result_and_stop_ack_decode_only_exact_service_responses(tmp_pa
     running = _phase(lease.operational_projection, coordinator.signer, "running")
     stopping = _phase(lease.operational_projection, coordinator.signer, "stop_requested")
     terminal = _phase(lease.operational_projection, coordinator.signer, "terminal")
+    _install_terminal_anchor(coordinator, grant, terminal)
     assert coordinator.progress(grant["run_id"], running)["status"] == "running"
     acknowledgement = coordinator.stop_ack(
         grant["run_id"], stopping, deadline=2.0,
@@ -730,6 +827,100 @@ def test_progress_result_and_stop_ack_decode_only_exact_service_responses(tmp_pa
     now[0] = 2.0
     with pytest.raises(ValueError, match="active runner claim is required"):
         coordinator.stop_ack(grant["run_id"], stopping, deadline=2.0)
+
+
+def test_terminal_result_requires_a_verified_local_terminal_anchor_before_transport(tmp_path):
+    coordinator, client, transport, _, _, grant, _ = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+        ],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    terminal = _phase(lease.operational_projection, coordinator.signer, "terminal")
+
+    with pytest.raises(RunnerStoreError, match="local terminal authority"):
+        coordinator.result(grant["run_id"], terminal)
+
+    assert len(transport.requests) == 1
+
+
+def test_terminal_detach_failure_stages_no_result_transport_or_pending_call(tmp_path):
+    coordinator, client, transport, _, projection, grant, _ = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+        ],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    terminal = _phase(lease.operational_projection, coordinator.signer, "terminal")
+    _install_terminal_anchor(coordinator, grant, terminal)
+    coordinator.store.detach_terminal = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RunnerStoreError("injected local detach failure")
+    )
+
+    with pytest.raises(RunnerStoreError, match="injected local detach failure"):
+        coordinator.result(grant["run_id"], terminal)
+
+    assert len(transport.requests) == 1
+    assert client.runtime.load_pending_calls() == ()
+
+
+def test_second_coordinator_terminal_result_waiter_never_reaches_transport(tmp_path):
+    coordinator, client, _transport, _, projection, grant, _ = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+        ],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    terminal = _phase(lease.operational_projection, coordinator.signer, "terminal")
+    _install_terminal_anchor(coordinator, grant, terminal)
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingResultTransport:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, path, *, headers, body):
+            del path, headers, body
+            self.calls += 1
+            started.set()
+            assert release.wait(1)
+            return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, _status(
+                grant["run_id"], approval_id=projection["projection_id"], status="terminal",
+            )
+
+    transport = BlockingResultTransport()
+    client.transport = transport
+    failures = []
+
+    def send_result():
+        try:
+            coordinator.result(grant["run_id"], terminal)
+        except BaseException as exc:
+            failures.append(exc)
+
+    first = threading.Thread(target=send_result)
+    second = threading.Thread(target=send_result)
+    first.start()
+    assert started.wait(1)
+    second.start()
+    assert transport.calls == 1
+    release.set()
+    first.join(1)
+    second.join(1)
+
+    assert transport.calls == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], ValueError)
+    assert "active runner claim is required" in str(failures[0])
 
 
 def test_execution_adapter_supplies_only_the_live_claim_gate_and_fixed_local_transport(tmp_path):
@@ -798,7 +989,7 @@ def test_supervisor_uses_the_exact_timestamp_signed_by_the_concrete_stop_ack():
     assert observed == [1_777]
 
 
-def test_heartbeat_and_progress_use_independent_concurrent_nonce_chains(tmp_path):
+def test_control_for_distinct_runs_remains_concurrent(tmp_path):
     coordinator, client, _, _, projection, grant, _ = _coordinator(
         tmp_path,
         lambda manifest, projection, grant: [
@@ -808,6 +999,19 @@ def test_heartbeat_and_progress_use_independent_concurrent_nonce_chains(tmp_path
     )
     lease = coordinator.claim()
     assert lease is not None
+    second_run_id = "crun_" + "b" * 32
+    with client._state_lock:
+        client._tracked_runs.add(second_run_id)
+        client._run_guards[second_run_id] = _RunGuard(threading.Lock(), object())
+        for operation, marker, sequence in (
+            ("heartbeat", b"h", 4), ("progress", b"p", 5),
+            ("result", b"r", 6), ("stop-ack", b"s", 7),
+        ):
+            client._chains[f"{operation}:{second_run_id}"] = (_nonce(marker), sequence, 3)
+            client.runtime.install_chain(
+                operation=operation, run_id=second_run_id, next_nonce_b64=_nonce(marker),
+                next_sequence=sequence, generation=3, now_ms=2_000,
+            )
     barrier = threading.Barrier(2)
 
     class ConcurrentTransport:
@@ -819,22 +1023,25 @@ def test_heartbeat_and_progress_use_independent_concurrent_nonce_chains(tmp_path
                     server_time_ms=2_001,
                 )
             return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"b")}, _status(
-                grant["run_id"], approval_id=projection["projection_id"],
+                second_run_id, approval_id=projection["projection_id"],
             )
 
     client.transport = ConcurrentTransport()
     running = _phase(lease.operational_projection, coordinator.signer, "running")
+    second_running = _phase(
+        lease.operational_projection, coordinator.signer, "running", run_id=second_run_id,
+    )
     failures = []
 
-    def call(method):
+    def call(method, run_id, current):
         try:
-            method(grant["run_id"], running)
+            method(run_id, current)
         except BaseException as exc:
             failures.append(exc)
 
     threads = [
-        threading.Thread(target=call, args=(coordinator.heartbeat,)),
-        threading.Thread(target=call, args=(coordinator.progress,)),
+        threading.Thread(target=call, args=(client._heartbeat_closed, grant["run_id"], running)),
+        threading.Thread(target=call, args=(client._progress_closed, second_run_id, second_running)),
     ]
     for thread in threads:
         thread.start()
@@ -843,7 +1050,7 @@ def test_heartbeat_and_progress_use_independent_concurrent_nonce_chains(tmp_path
     assert all(not thread.is_alive() for thread in threads)
     assert failures == []
     assert client._chains[f"heartbeat:{grant['run_id']}"][1] == 5
-    assert client._chains[f"progress:{grant['run_id']}"][1] == 6
+    assert client._chains[f"progress:{second_run_id}"][1] == 6
 
 
 def test_findings_upload_is_closed_bounded_and_continues_the_terminal_result_chain(tmp_path):
@@ -865,13 +1072,14 @@ def test_findings_upload_is_closed_bounded_and_continues_the_terminal_result_cha
     lease = coordinator.claim()
     assert lease is not None
     terminal = _phase(lease.operational_projection, coordinator.signer, "terminal")
+    _install_terminal_anchor(coordinator, grant, terminal)
     coordinator.result(grant["run_id"], terminal)
     assert grant["run_id"] not in coordinator._gates
     assert grant["run_id"] not in coordinator._gate_receipts
-    assert client._tracked_runs == {grant["run_id"]}
-    assert {chain for chain in client._chains if chain.endswith(":" + grant["run_id"])} == {
-        "result:" + grant["run_id"],
-    }
+    assert grant["run_id"] not in coordinator._bindings
+    assert grant["run_id"] not in coordinator._terminal_runs
+    assert client._tracked_runs == set()
+    assert not {chain for chain in client._chains if chain.endswith(":" + grant["run_id"])}
     findings = _findings_projection(coordinator, manifest, projection, grant)
     permit = _permit(authority, coordinator, grant, findings)
     receipt_holder.update({
@@ -903,6 +1111,129 @@ def test_findings_upload_is_closed_bounded_and_continues_the_terminal_result_cha
         "run_id": grant["run_id"], "permit": permit,
         "findings_projection": findings,
     })
+
+
+def test_terminal_disclosure_replays_the_sealed_pending_request_after_client_restart(tmp_path):
+    receipt_holder = {}
+
+    def responses(manifest, projection, grant):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, _status(
+                grant["run_id"], approval_id=projection["projection_id"], status="terminal",
+            )),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, {"malformed": True}),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, receipt_holder),
+        ]
+
+    coordinator, client, transport, manifest, projection, grant, authority = _coordinator(
+        tmp_path, responses,
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    terminal = _phase(lease.operational_projection, coordinator.signer, "terminal")
+    _install_terminal_anchor(coordinator, grant, terminal)
+    coordinator.result(grant["run_id"], terminal)
+    findings = _findings_projection(coordinator, manifest, projection, grant)
+    permit = _permit(authority, coordinator, grant, findings)
+    receipt_holder.update({
+        "schema_version": "heel.canary-findings-receipt.v1",
+        "receipt_id": "cfr_runner_upload", "workspace_id": grant["workspace_id"],
+        "project_id": grant["project_id"], "run_id": grant["run_id"],
+        "grant_id": grant["grant_id"], "permit_id": permit["permit_id"],
+        "projection_id": findings["projection_id"],
+        "projection_digest": findings["projection_digest"],
+        "byte_count": len(canonical_bytes(findings)), "scenario_count": 0,
+        "finding_count": 0, "accepted_at_ms": 2_001, "status": "synchronized",
+    })
+
+    with pytest.raises(ValueError, match="invalid runner findings receipt"):
+        coordinator.upload_findings(
+            grant["run_id"], permit=permit, findings_projection=findings,
+        )
+    pending = client.runtime.load_pending_calls()
+    assert len(pending) == 1 and pending[0].request_operation == "upload-findings"
+    first_body = pending[0].body
+
+    restarted = RunnerControlClient(
+        origin="https://control.example", workspace_id=coordinator.identity.workspace_id,
+        runner_id=coordinator.identity.runner_id, signer=coordinator.signer,
+        clock=lambda: 2_000, transport=transport, nonce_source=lambda _chain: _nonce(b"z"),
+        trusted_disclosure_keys=dict(coordinator.trusted_grant_keys), runtime=client.runtime,
+    )
+    receipt = restarted.upload_findings(
+        run_id=grant["run_id"], permit=permit, findings_projection=findings,
+    )
+    assert receipt["status"] == "synchronized"
+    assert client.runtime.load_pending_calls() == ()
+    assert transport.requests[-1][2] == first_body
+
+
+def test_real_detached_terminal_rehydrates_available_disclosure_and_rejects_missing_sides(tmp_path):
+    receipt_holder = {}
+
+    def responses(manifest, projection, grant):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, _status(
+                grant["run_id"], approval_id=projection["projection_id"], status="terminal",
+            )),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, receipt_holder),
+        ]
+
+    coordinator, client, _transport, manifest, projection, grant, authority = _coordinator(
+        tmp_path, responses,
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    completed = LocalCanaryExecutor(
+        store=coordinator.store, identity=coordinator.identity, signer=coordinator.signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        lease.bundle, transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+
+    coordinator.result(grant["run_id"], completed.operational_projection)
+    available = client.runtime.load_terminal_state(grant["run_id"])
+    assert available is not None and available.state == "available"
+    anchor = coordinator.store.load_terminal_disclosure_anchor(
+        grant["run_id"], runtime=client.runtime,
+        expected_runtime_state_digest=available.state_digest,
+    )
+    assert anchor["grant_id"] == grant["grant_id"]
+    assert anchor["terminal_projection_digest"] == completed.operational_projection["projection_digest"]
+
+    detached_path = coordinator.store.run_path(grant["run_id"]).parent / (
+        "detached-" + coordinator.store._run_hash(grant["run_id"]) + ".json"
+    )
+    detached_bytes = detached_path.read_bytes()
+    detached_path.unlink()
+    with pytest.raises(RunnerStoreError, match="local terminal disclosure authority"):
+        coordinator.store.load_terminal_disclosure_anchor(
+            grant["run_id"], runtime=client.runtime,
+            expected_runtime_state_digest=available.state_digest,
+        )
+    detached_path.write_bytes(detached_bytes)
+    detached_path.write_bytes(b"{}")
+    with pytest.raises(RunnerStoreError, match="invalid local run authority record"):
+        coordinator.store.load_terminal_disclosure_anchor(
+            grant["run_id"], runtime=client.runtime,
+            expected_runtime_state_digest=available.state_digest,
+        )
+    detached_path.write_bytes(detached_bytes)
+
+    missing_runtime = RunnerRuntimeState(
+        tmp_path / "missing-runtime.sqlite3", coordinator.identity, coordinator.signer,
+    )
+    with pytest.raises(RunnerStoreError, match="local terminal disclosure authority"):
+        coordinator.store.load_terminal_disclosure_anchor(
+            grant["run_id"], runtime=missing_runtime,
+            expected_runtime_state_digest=available.state_digest,
+        )
 
 
 def test_delayed_execution_rejects_stale_authenticated_claim_gate_before_executor_use(tmp_path):
@@ -973,6 +1304,7 @@ def test_public_findings_upload_reverifies_permit_before_any_transport(
     )
     lease = coordinator.claim()
     terminal = _phase(lease.operational_projection, coordinator.signer, "terminal")
+    _install_terminal_anchor(coordinator, grant, terminal)
     coordinator.result(grant["run_id"], terminal)
     findings = _findings_projection(coordinator, manifest, projection, grant)
     if kind == "forged":

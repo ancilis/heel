@@ -76,6 +76,15 @@ class CanaryHttpFixture:
             "INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)",
             (self.workspace, self.runner_id, "claim", 1, 0, stamp),
         )
+        # This fixture models an already activated executable runner.  Legacy
+        # pairings intentionally lack this v3 protocol row and are exercised by
+        # the dedicated upgrade-required tests.
+        self.cp.store.conn.execute(
+            "INSERT INTO canary_runner_execution_protocols("
+            "workspace_id,runner_id,protocol_version,control_protocol,exchange_digest,activated_at"
+            ") VALUES(?,?,?,?,?,?)",
+            (self.workspace, self.runner_id, 3, "heel.runner-control.v2", "a" * 64, stamp),
+        )
         self.cp.store.conn.commit()
         self.runner_sql: list[str] = []
         database_path = str(root / "heel.sqlite3")

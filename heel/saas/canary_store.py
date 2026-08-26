@@ -804,6 +804,235 @@ CREATE INDEX idx_canary_approval_pending_live_seek
  WHERE status='awaiting_execution_approval';
 """
 
+# Migration 23 is intentionally a materialized readiness projection: the bounded purge worker
+# must select only a ready binding and never scan past a retention-blocked head row.
+RUNNER_CONTEXT_PURGE_READINESS_MIGRATION = r"""
+CREATE TABLE canary_runner_context_purge_readiness(
+ workspace_id TEXT NOT NULL CHECK(length(CAST(workspace_id AS BLOB)) BETWEEN 1 AND 128),
+ project_ref TEXT NOT NULL CHECK(length(CAST(project_ref AS BLOB)) BETWEEN 1 AND 128),
+ environment_id TEXT NOT NULL CHECK(length(CAST(environment_id AS BLOB)) BETWEEN 1 AND 128),
+ runner_id TEXT NOT NULL CHECK(length(CAST(runner_id AS BLOB)) BETWEEN 1 AND 128),
+ runner_key_id TEXT NOT NULL CHECK(length(CAST(runner_key_id AS BLOB)) BETWEEN 1 AND 128),
+ rcb_id TEXT NOT NULL COLLATE BINARY CHECK(length(rcb_id)=36 AND substr(rcb_id,1,4)='rcb_' AND substr(rcb_id,5) NOT GLOB '*[^0-9a-f]*'),
+ binding_digest TEXT NOT NULL CHECK(length(binding_digest)=64 AND binding_digest NOT GLOB '*[^0-9a-f]*'),
+ binding_purge_at_ms INTEGER NOT NULL CHECK(binding_purge_at_ms>0 AND binding_purge_at_ms<=9007199254740991),
+ eligible_at_ms INTEGER NOT NULL CHECK(eligible_at_ms>=binding_purge_at_ms AND eligible_at_ms<=9007199254740991),
+ cancellation_pending INTEGER NOT NULL CHECK(cancellation_pending IN (0,1)),
+ PRIMARY KEY(workspace_id,project_ref,rcb_id,binding_digest),
+ FOREIGN KEY(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest)
+  REFERENCES canary_runner_context_bindings(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest)
+  ON DELETE CASCADE);
+CREATE INDEX idx_runner_context_purge_readiness_ready
+ ON canary_runner_context_purge_readiness(eligible_at_ms,rcb_id,workspace_id,project_ref,binding_digest)
+ WHERE cancellation_pending=0;
+
+CREATE TABLE canary_runner_context_purge_readiness_backfill_guard(ok INTEGER NOT NULL CHECK(ok=1));
+INSERT INTO canary_runner_context_purge_readiness_backfill_guard(ok)
+SELECT CASE WHEN EXISTS(
+ SELECT 1 FROM canary_runner_context_purge_queue q
+ JOIN canary_runner_context_events e INDEXED BY idx_runner_context_events_binding_purge
+  ON e.workspace_id=q.workspace_id AND e.project_ref=q.project_ref
+  AND e.environment_id=q.environment_id AND e.runner_id=q.runner_id
+  AND e.runner_key_id=q.runner_key_id AND e.rcb_id=q.rcb_id
+  AND e.binding_digest=q.binding_digest
+ WHERE e.purge_at_ms>q.enqueued_at_ms
+) OR EXISTS(
+ SELECT 1 FROM canary_runner_context_purge_queue q
+ JOIN canary_runner_context_cancellation_queue c
+  ON c.workspace_id=q.workspace_id AND c.project_ref=q.project_ref
+  AND c.environment_id=q.environment_id AND c.runner_id=q.runner_id
+  AND c.runner_key_id=q.runner_key_id AND c.rcb_id=q.rcb_id
+  AND c.binding_digest=q.binding_digest
+) THEN 0 ELSE 1 END;
+DROP TABLE canary_runner_context_purge_readiness_backfill_guard;
+
+INSERT INTO canary_runner_context_purge_readiness(
+ workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,
+ binding_purge_at_ms,eligible_at_ms,cancellation_pending)
+SELECT b.workspace_id,b.project_ref,b.environment_id,b.runner_id,b.runner_key_id,b.rcb_id,b.binding_digest,
+ b.purge_at_ms,
+ MAX(b.purge_at_ms,COALESCE((
+  SELECT e.purge_at_ms FROM canary_runner_context_events e INDEXED BY idx_runner_context_events_binding_purge
+  WHERE e.workspace_id=b.workspace_id AND e.project_ref=b.project_ref
+   AND e.environment_id=b.environment_id AND e.runner_id=b.runner_id
+   AND e.runner_key_id=b.runner_key_id AND e.rcb_id=b.rcb_id
+   AND e.binding_digest=b.binding_digest
+  ORDER BY e.purge_at_ms DESC LIMIT 1),b.purge_at_ms)),
+ CASE WHEN EXISTS(
+  SELECT 1 FROM canary_runner_context_cancellation_queue c
+  WHERE c.workspace_id=b.workspace_id AND c.project_ref=b.project_ref
+   AND c.environment_id=b.environment_id AND c.runner_id=b.runner_id
+   AND c.runner_key_id=b.runner_key_id AND c.rcb_id=b.rcb_id
+   AND c.binding_digest=b.binding_digest) THEN 1 ELSE 0 END
+FROM canary_runner_context_bindings b INDEXED BY idx_runner_context_terminal_purge_order
+WHERE b.status IN ('revoked','expired') AND NOT EXISTS(
+ SELECT 1 FROM canary_runner_context_purge_queue q
+ WHERE q.workspace_id=b.workspace_id AND q.project_ref=b.project_ref
+  AND q.rcb_id=b.rcb_id AND q.binding_digest=b.binding_digest);
+
+CREATE TRIGGER trg_runner_context_purge_readiness_insert_guard
+BEFORE INSERT ON canary_runner_context_purge_readiness
+WHEN NOT EXISTS(
+ SELECT 1 FROM canary_runner_context_bindings b
+ WHERE b.workspace_id=NEW.workspace_id AND b.project_ref=NEW.project_ref
+  AND b.environment_id=NEW.environment_id AND b.runner_id=NEW.runner_id
+  AND b.runner_key_id=NEW.runner_key_id AND b.rcb_id=NEW.rcb_id
+  AND b.binding_digest=NEW.binding_digest AND b.status IN ('revoked','expired')
+  AND b.purge_at_ms=NEW.binding_purge_at_ms
+  AND NEW.eligible_at_ms=MAX(b.purge_at_ms,COALESCE((
+   SELECT e.purge_at_ms FROM canary_runner_context_events e INDEXED BY idx_runner_context_events_binding_purge
+   WHERE e.workspace_id=b.workspace_id AND e.project_ref=b.project_ref
+    AND e.environment_id=b.environment_id AND e.runner_id=b.runner_id
+    AND e.runner_key_id=b.runner_key_id AND e.rcb_id=b.rcb_id
+    AND e.binding_digest=b.binding_digest
+   ORDER BY e.purge_at_ms DESC LIMIT 1),b.purge_at_ms))
+  AND NEW.cancellation_pending=CASE WHEN EXISTS(
+   SELECT 1 FROM canary_runner_context_cancellation_queue c
+   WHERE c.workspace_id=b.workspace_id AND c.project_ref=b.project_ref
+    AND c.environment_id=b.environment_id AND c.runner_id=b.runner_id
+    AND c.runner_key_id=b.runner_key_id AND c.rcb_id=b.rcb_id
+    AND c.binding_digest=b.binding_digest) THEN 1 ELSE 0 END)
+ OR EXISTS(
+  SELECT 1 FROM canary_runner_context_purge_queue q
+  WHERE q.workspace_id=NEW.workspace_id AND q.project_ref=NEW.project_ref
+   AND q.rcb_id=NEW.rcb_id AND q.binding_digest=NEW.binding_digest)
+BEGIN SELECT RAISE(ABORT,'invalid runner context purge readiness insert'); END;
+
+CREATE TRIGGER trg_runner_context_purge_readiness_update_guard
+BEFORE UPDATE ON canary_runner_context_purge_readiness
+WHEN NEW.workspace_id<>OLD.workspace_id OR NEW.project_ref<>OLD.project_ref
+ OR NEW.environment_id<>OLD.environment_id OR NEW.runner_id<>OLD.runner_id
+ OR NEW.runner_key_id<>OLD.runner_key_id OR NEW.rcb_id<>OLD.rcb_id
+ OR NEW.binding_digest<>OLD.binding_digest OR NEW.eligible_at_ms<OLD.eligible_at_ms
+ OR NOT EXISTS(
+  SELECT 1 FROM canary_runner_context_bindings b
+  WHERE b.workspace_id=NEW.workspace_id AND b.project_ref=NEW.project_ref
+   AND b.environment_id=NEW.environment_id AND b.runner_id=NEW.runner_id
+   AND b.runner_key_id=NEW.runner_key_id AND b.rcb_id=NEW.rcb_id
+   AND b.binding_digest=NEW.binding_digest AND b.status IN ('revoked','expired')
+   AND b.purge_at_ms=NEW.binding_purge_at_ms
+   AND NEW.eligible_at_ms=MAX(b.purge_at_ms,COALESCE((
+    SELECT e.purge_at_ms FROM canary_runner_context_events e INDEXED BY idx_runner_context_events_binding_purge
+    WHERE e.workspace_id=b.workspace_id AND e.project_ref=b.project_ref
+     AND e.environment_id=b.environment_id AND e.runner_id=b.runner_id
+     AND e.runner_key_id=b.runner_key_id AND e.rcb_id=b.rcb_id
+     AND e.binding_digest=b.binding_digest
+    ORDER BY e.purge_at_ms DESC LIMIT 1),b.purge_at_ms))
+   AND NEW.cancellation_pending=CASE WHEN EXISTS(
+    SELECT 1 FROM canary_runner_context_cancellation_queue c
+    WHERE c.workspace_id=b.workspace_id AND c.project_ref=b.project_ref
+     AND c.environment_id=b.environment_id AND c.runner_id=b.runner_id
+     AND c.runner_key_id=b.runner_key_id AND c.rcb_id=b.rcb_id
+     AND c.binding_digest=b.binding_digest) THEN 1 ELSE 0 END)
+ OR EXISTS(
+  SELECT 1 FROM canary_runner_context_purge_queue q
+  WHERE q.workspace_id=NEW.workspace_id AND q.project_ref=NEW.project_ref
+   AND q.rcb_id=NEW.rcb_id AND q.binding_digest=NEW.binding_digest)
+BEGIN SELECT RAISE(ABORT,'invalid runner context purge readiness update'); END;
+
+CREATE TRIGGER trg_runner_context_purge_readiness_delete_guard
+BEFORE DELETE ON canary_runner_context_purge_readiness
+WHEN EXISTS(
+ SELECT 1 FROM canary_runner_context_bindings b
+ WHERE b.workspace_id=OLD.workspace_id AND b.project_ref=OLD.project_ref
+  AND b.rcb_id=OLD.rcb_id AND b.binding_digest=OLD.binding_digest)
+ AND NOT EXISTS(
+ SELECT 1 FROM canary_runner_context_purge_queue q
+ WHERE q.workspace_id=OLD.workspace_id AND q.project_ref=OLD.project_ref
+  AND q.rcb_id=OLD.rcb_id AND q.binding_digest=OLD.binding_digest)
+BEGIN SELECT RAISE(ABORT,'invalid runner context purge readiness delete'); END;
+
+CREATE TRIGGER trg_runner_context_binding_purge_readiness_insert
+AFTER INSERT ON canary_runner_context_bindings
+WHEN NEW.status IN ('revoked','expired')
+BEGIN
+ INSERT INTO canary_runner_context_purge_readiness(
+  workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,
+  binding_purge_at_ms,eligible_at_ms,cancellation_pending)
+ VALUES(NEW.workspace_id,NEW.project_ref,NEW.environment_id,NEW.runner_id,NEW.runner_key_id,
+  NEW.rcb_id,NEW.binding_digest,NEW.purge_at_ms,NEW.purge_at_ms,0);
+END;
+
+CREATE TRIGGER trg_runner_context_binding_purge_readiness_update
+AFTER UPDATE OF status,purge_at_ms ON canary_runner_context_bindings
+WHEN NEW.status IN ('revoked','expired') AND NOT EXISTS(
+ SELECT 1 FROM canary_runner_context_purge_queue q
+ WHERE q.workspace_id=NEW.workspace_id AND q.project_ref=NEW.project_ref
+  AND q.rcb_id=NEW.rcb_id AND q.binding_digest=NEW.binding_digest)
+BEGIN
+ INSERT INTO canary_runner_context_purge_readiness(
+  workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,
+  binding_purge_at_ms,eligible_at_ms,cancellation_pending)
+ VALUES(NEW.workspace_id,NEW.project_ref,NEW.environment_id,NEW.runner_id,NEW.runner_key_id,
+  NEW.rcb_id,NEW.binding_digest,NEW.purge_at_ms,
+  MAX(NEW.purge_at_ms,COALESCE((SELECT e.purge_at_ms FROM canary_runner_context_events e INDEXED BY idx_runner_context_events_binding_purge
+   WHERE e.workspace_id=NEW.workspace_id AND e.project_ref=NEW.project_ref
+    AND e.environment_id=NEW.environment_id AND e.runner_id=NEW.runner_id
+    AND e.runner_key_id=NEW.runner_key_id AND e.rcb_id=NEW.rcb_id
+    AND e.binding_digest=NEW.binding_digest ORDER BY e.purge_at_ms DESC LIMIT 1),NEW.purge_at_ms)),
+  CASE WHEN EXISTS(SELECT 1 FROM canary_runner_context_cancellation_queue c
+   WHERE c.workspace_id=NEW.workspace_id AND c.project_ref=NEW.project_ref
+    AND c.environment_id=NEW.environment_id AND c.runner_id=NEW.runner_id
+    AND c.runner_key_id=NEW.runner_key_id AND c.rcb_id=NEW.rcb_id
+    AND c.binding_digest=NEW.binding_digest) THEN 1 ELSE 0 END)
+ ON CONFLICT(workspace_id,project_ref,rcb_id,binding_digest) DO UPDATE SET
+  binding_purge_at_ms=excluded.binding_purge_at_ms,
+  eligible_at_ms=MAX(canary_runner_context_purge_readiness.eligible_at_ms,excluded.eligible_at_ms),
+  cancellation_pending=excluded.cancellation_pending;
+END;
+
+CREATE TRIGGER trg_runner_context_event_purge_readiness_insert
+AFTER INSERT ON canary_runner_context_events
+WHEN NOT EXISTS(
+ SELECT 1 FROM canary_runner_context_purge_queue q
+ WHERE q.workspace_id=NEW.workspace_id AND q.project_ref=NEW.project_ref
+  AND q.rcb_id=NEW.rcb_id AND q.binding_digest=NEW.binding_digest)
+BEGIN
+ UPDATE canary_runner_context_purge_readiness
+ SET eligible_at_ms=MAX(eligible_at_ms,NEW.purge_at_ms)
+ WHERE workspace_id=NEW.workspace_id AND project_ref=NEW.project_ref
+  AND environment_id=NEW.environment_id AND runner_id=NEW.runner_id
+  AND runner_key_id=NEW.runner_key_id AND rcb_id=NEW.rcb_id
+  AND binding_digest=NEW.binding_digest;
+END;
+
+CREATE TRIGGER trg_runner_context_cancellation_purge_readiness_insert
+AFTER INSERT ON canary_runner_context_cancellation_queue
+BEGIN
+ UPDATE canary_runner_context_purge_readiness SET cancellation_pending=1
+ WHERE workspace_id=NEW.workspace_id AND project_ref=NEW.project_ref
+  AND environment_id=NEW.environment_id AND runner_id=NEW.runner_id
+  AND runner_key_id=NEW.runner_key_id AND rcb_id=NEW.rcb_id
+  AND binding_digest=NEW.binding_digest;
+END;
+
+CREATE TRIGGER trg_runner_context_cancellation_purge_readiness_delete
+AFTER DELETE ON canary_runner_context_cancellation_queue
+BEGIN
+ UPDATE canary_runner_context_purge_readiness SET cancellation_pending=0
+ WHERE workspace_id=OLD.workspace_id AND project_ref=OLD.project_ref
+  AND environment_id=OLD.environment_id AND runner_id=OLD.runner_id
+  AND runner_key_id=OLD.runner_key_id AND rcb_id=OLD.rcb_id
+  AND binding_digest=OLD.binding_digest;
+END;
+
+CREATE TRIGGER trg_runner_context_cancellation_purge_guard
+BEFORE INSERT ON canary_runner_context_cancellation_queue
+WHEN EXISTS(
+ SELECT 1 FROM canary_runner_context_purge_queue q
+ WHERE q.workspace_id=NEW.workspace_id AND q.project_ref=NEW.project_ref
+  AND q.rcb_id=NEW.rcb_id AND q.binding_digest=NEW.binding_digest)
+BEGIN SELECT RAISE(ABORT,'runner context purge queue rejects new cancellation'); END;
+
+CREATE TRIGGER trg_runner_context_purge_queue_readiness_consume
+AFTER INSERT ON canary_runner_context_purge_queue
+BEGIN
+ DELETE FROM canary_runner_context_purge_readiness
+ WHERE workspace_id=NEW.workspace_id AND project_ref=NEW.project_ref
+  AND rcb_id=NEW.rcb_id AND binding_digest=NEW.binding_digest;
+END;
+"""
+
 _ENVIRONMENT_COLUMNS = (
     "attestation_text", "attestation_version", "attested_by", "attested_at", "proof_method",
     "proof_version", "normalization_version", "challenge_generation", "challenge_digest",
@@ -1260,6 +1489,41 @@ def ensure_runner_context_schema(conn: sqlite3.Connection) -> None:
         _apply_runner_context_schema_script(conn, PENDING_APPROVAL_LIVE_SEEK_MIGRATION, label="live approval seek")
     verify_named_statements(
         PENDING_APPROVAL_LIVE_SEEK_MIGRATION, label="live approval seek", indexes=(live_seek,),
+    )
+
+    readiness_tables = ("canary_runner_context_purge_readiness",)
+    readiness_indexes = ("idx_runner_context_purge_readiness_ready",)
+    readiness_triggers = (
+        "trg_runner_context_purge_readiness_insert_guard",
+        "trg_runner_context_purge_readiness_update_guard",
+        "trg_runner_context_purge_readiness_delete_guard",
+        "trg_runner_context_binding_purge_readiness_insert",
+        "trg_runner_context_binding_purge_readiness_update",
+        "trg_runner_context_event_purge_readiness_insert",
+        "trg_runner_context_cancellation_purge_readiness_insert",
+        "trg_runner_context_cancellation_purge_readiness_delete",
+        "trg_runner_context_cancellation_purge_guard",
+        "trg_runner_context_purge_queue_readiness_consume",
+    )
+    readiness_objects = set(readiness_tables + readiness_indexes + readiness_triggers)
+    present_readiness = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN (%s)" % ",".join("?" for _ in readiness_objects),
+            tuple(readiness_objects),
+        )
+    }
+    readiness_guard = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='canary_runner_context_purge_readiness_backfill_guard'"
+    ).fetchone()
+    if not present_readiness and readiness_guard is None:
+        _apply_runner_context_schema_script(
+            conn, RUNNER_CONTEXT_PURGE_READINESS_MIGRATION, label="purge readiness",
+        )
+    elif present_readiness != readiness_objects or readiness_guard is not None:
+        raise RuntimeError("runner context purge readiness schema is partially initialized")
+    verify_named_statements(
+        RUNNER_CONTEXT_PURGE_READINESS_MIGRATION, label="purge readiness",
+        tables=readiness_tables, indexes=readiness_indexes, triggers=readiness_triggers,
     )
     if conn.execute(
         "SELECT 1 FROM canary_runner_context_bindings b "

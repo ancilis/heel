@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
 import secrets
 import threading
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
 from heel.canary_contracts import (
@@ -29,6 +31,7 @@ from heel.canary_contracts import (
     validate_runner_context_binding,
 )
 from heel.crypto import ed25519_key_id, verify_envelope
+from heel.runner.runtime import RunnerRuntimeState
 
 
 _CAPS = {"claim": "runner_claim", "heartbeat": "runner_heartbeat", "progress": "runner_progress", "result": "runner_result", "stop-ack": "runner_heartbeat"}
@@ -55,6 +58,14 @@ class _CallDiagnostic:
     status: int
     sequence: int
     generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RunGuard:
+    """One lifecycle lock and nominal token for an authenticated active run."""
+
+    lock: threading.Lock
+    token: object
 
 
 @dataclass(frozen=True)
@@ -199,14 +210,25 @@ class RunnerControlClient:
 
     def __init__(self, *, origin, workspace_id, runner_id, signer, clock, transport, nonce_source,
                  resync_random_source=secrets.token_bytes,
-                 trusted_disclosure_keys: Mapping[str, object] | None = None):
+                 trusted_disclosure_keys: Mapping[str, object] | None = None,
+                 runtime: RunnerRuntimeState | None = None):
         parsed = urlsplit(origin)
         if origin != f"{parsed.scheme}://{parsed.netloc}" or parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("origin must be one exact pathless origin")
         if not all(type(value) is str and value for value in (workspace_id, runner_id)):
             raise ValueError("workspace and runner IDs are required")
+        if not isinstance(runtime, RunnerRuntimeState):
+            raise TypeError("authenticated runner runtime state is required")
+        if (
+            runtime.identity.workspace_id != workspace_id
+            or runtime.identity.runner_id != runner_id
+            or runtime.identity.key_id != signer.key_id
+            or runtime.signer is not signer
+        ):
+            raise ValueError("runner runtime state identity binding is invalid")
         self.origin, self.workspace_id, self.runner_id = origin, workspace_id, runner_id
         self.signer, self.clock, self.transport, self.nonce_source = signer, clock, transport, nonce_source
+        self.runtime = runtime
         self.resync_random_source = resync_random_source
         if trusted_disclosure_keys is not None and not isinstance(
             trusted_disclosure_keys, Mapping,
@@ -216,8 +238,14 @@ class RunnerControlClient:
             dict(trusted_disclosure_keys or {})
         )
         self._chains: dict[str, tuple[str, int, int]] = {}
+        claim_cursor = runtime.load_chain("claim", None)
+        if claim_cursor is not None:
+            self._chains["claim"] = (
+                claim_cursor.next_nonce_b64, claim_cursor.next_sequence, claim_cursor.generation,
+            )
         self._state_lock = threading.Lock()
-        self._run_lock_stripes = tuple(threading.Lock() for _ in range(_MAX_TRACKED_RUNS))
+        self._claim_lock = threading.Lock()
+        self._run_guards: dict[str, _RunGuard] = {}
         self._tracked_runs: set[str] = set()
         self._terminal_runs: set[str] = set()
         self._terminal_bindings: dict[str, tuple[str, str, str, str]] = {}
@@ -267,13 +295,7 @@ class RunnerControlClient:
                     raise ValueError("active runner claim is required")
         current = self._chains.get(chain)
         if current is None:
-            if operation != "claim":
-                raise ValueError("active runner claim is required")
-            nonce = self.nonce_source((operation, run_id))
-            if type(nonce) is not str or not nonce: raise ValueError("a non-empty next nonce is required")
-            # Do not persist speculative state. A malformed or rejected response must leave
-            # every local cursor exactly as it was before the request.
-            current = (nonce, 1, 0)
+            raise ValueError("active runner claim is required")
         return current[0], current[1], current[2], chain
 
     def _control_path(self, operation: str, run_id: str | None) -> str:
@@ -301,7 +323,10 @@ class RunnerControlClient:
         self, call: _Call, operation: str, run_id: str | None,
         *, upload_binding: tuple[dict[str, Any], dict[str, Any], int, int] | None = None,
         projection_binding: tuple[str, str, str, str] | None = None,
+        guard_token: object | None = None,
         include_response_metadata: bool = False,
+        runtime_pending: object | None = None,
+        runtime_disclosure_lease: object | None = None,
     ):
         """Decode one closed coordinator response before atomically advancing any cursor."""
         response = self.transport.post(call.path, headers=call.headers, body=call.body)
@@ -361,11 +386,58 @@ class RunnerControlClient:
         else:
             raise ValueError("invalid runner control operation")
 
+        if runtime_pending is not None:
+            installed = ()
+            if operation == "claim" and body is not None:
+                installed = tuple(
+                    (name, body["run_id"], *run_states[self._chain(name, body["run_id"])])
+                    for name in ("heartbeat", "progress", "result", "stop-ack")
+                )
+            try:
+                if operation == "result" and body["status"] == "terminal":
+                    self.runtime.commit_terminal_response(
+                        runtime_pending.call_id, next_nonce_b64=next_nonce,
+                        now_ms=self._timestamp(),
+                    )
+                elif operation == "upload-findings":
+                    if runtime_disclosure_lease is None or upload_binding is None:
+                        raise ValueError("runtime disclosure lease is required")
+                    permit_value, findings, _projection_bytes, _finding_count = upload_binding
+                    self.runtime.commit_disclosure(
+                        runtime_pending.call_id, runtime_disclosure_lease,
+                        next_nonce_b64=next_nonce, permit_id=permit_value["permit_id"],
+                        findings_projection_digest=findings["projection_digest"],
+                        receipt_digest=hashlib.sha256(canonical_bytes(body)).hexdigest(),
+                        disclosed_at_ms=body["accepted_at_ms"],
+                    )
+                else:
+                    self.runtime.commit_call(
+                        runtime_pending.call_id, next_nonce_b64=next_nonce,
+                        now_ms=self._timestamp(), installed_chains=installed,
+                    )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("runner runtime state did not commit control response") from exc
+
         with self._state_lock:
+            if operation not in {"claim", "upload-findings"}:
+                guard = self._run_guards.get(run_id)
+                if (
+                    guard is None or guard.token is not guard_token
+                    or run_id not in self._tracked_runs
+                ):
+                    raise ValueError("active runner claim is required")
             staged = dict(self._chains)
+            if operation == "upload-findings":
+                self._append_call_diagnostic_locked(operation, status, call)
+                if include_response_metadata:
+                    return body, status, dict(headers)
+                return body
             current = staged.get(call.chain)
-            if current is not None and current != (
+            expected = (
                 call.headers["X-Heel-Runner-Nonce"], call.sequence, call.generation,
+            )
+            if (operation != "claim" and current != expected) or (
+                operation == "claim" and current is not None and current != expected
             ):
                 raise ValueError("runner control chain changed during request")
             staged[call.chain] = (next_nonce, call.sequence + 1, call.generation)
@@ -383,33 +455,38 @@ class RunnerControlClient:
                 for chain_name, state in run_states.items():
                     self._stage_chain(staged, chain_name, state)
                 self._tracked_runs.add(claimed_run_id)
+                self._run_guards[claimed_run_id] = _RunGuard(threading.Lock(), object())
             else:
                 for chain_name, state in run_states.items():
                     self._stage_chain(staged, chain_name, state)
             if operation == "result" and body["status"] == "terminal":
                 if run_id not in self._tracked_runs or projection_binding is None:
                     raise ValueError("active runner claim is required")
-                self._terminal_runs.add(run_id)
-                self._terminal_bindings[run_id] = projection_binding
-                for retired_operation in ("heartbeat", "progress", "stop-ack"):
+                for retired_operation in ("heartbeat", "progress", "result", "stop-ack"):
                     staged.pop(self._chain(retired_operation, run_id), None)
-            if operation == "upload-findings":
-                if run_id not in self._terminal_runs:
-                    raise ValueError("terminal runner result is required before disclosure")
-                staged.pop(self._chain("result", run_id), None)
                 self._tracked_runs.discard(run_id)
                 self._terminal_runs.discard(run_id)
                 self._terminal_bindings.pop(run_id, None)
+                if self._run_guards.get(run_id) is not None and self._run_guards[run_id].token is guard_token:
+                    self._run_guards.pop(run_id, None)
             self._chains = staged
             self._append_call_diagnostic_locked(operation, status, call)
         if include_response_metadata:
             return body, status, dict(headers)
         return body
 
-    def _operation_lock(self, operation: str, run_id: str | None) -> threading.Lock:
-        chain = self._chain(operation, run_id)
-        bucket = int.from_bytes(hashlib.sha256(chain.encode("utf-8")).digest()[:8], "big") % _MAX_TRACKED_RUNS
-        return self._run_lock_stripes[bucket]
+    @contextmanager
+    def _run_guard(self, run_id: str):
+        """Serialize every control/resync/findings action for one live run."""
+        with self._state_lock:
+            guard = self._run_guards.get(run_id)
+            if guard is None or run_id not in self._tracked_runs:
+                raise ValueError("active runner claim is required")
+        with guard.lock:
+            with self._state_lock:
+                if self._run_guards.get(run_id) is not guard or run_id not in self._tracked_runs:
+                    raise ValueError("active runner claim is required")
+            yield guard.token
 
     @staticmethod
     def _stage_chain(
@@ -579,7 +656,7 @@ class RunnerControlClient:
     def _closed_control_locked(
         self, operation: str, run_id: str | None,
         operational_projection: object | None = None,
-        *, include_response_metadata: bool = False,
+        *, guard_token: object | None = None, include_response_metadata: bool = False,
     ):
         projection_binding = None
         if operation == "claim":
@@ -621,24 +698,59 @@ class RunnerControlClient:
             ),
             body, _CAPS[operation], chain, sequence, generation,
         )
+        runtime_cursor = self.runtime.load_chain(operation, run_id)
+        if runtime_cursor is None:
+            raise ValueError("active runner claim is required")
+        if runtime_cursor is not None and (
+            runtime_cursor.next_nonce_b64, runtime_cursor.next_sequence, runtime_cursor.generation,
+        ) != (nonce, sequence, generation):
+            raise ValueError("runner runtime state chain differs from control client")
+        try:
+            runtime_pending = self.runtime.stage_call(
+                request_operation=operation, chain_operation=operation, run_id=run_id,
+                path=path, capability=_CAPS[operation], headers=call.headers, body=body,
+                expected_state_digest=runtime_cursor.state_digest,
+                now_ms=timestamp_ms,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("runner runtime state did not stage control call") from exc
         return self._post_closed(
             call, operation, run_id, projection_binding=projection_binding,
+            guard_token=guard_token,
             include_response_metadata=include_response_metadata,
+            runtime_pending=runtime_pending,
         )
 
     def _closed_control(
         self, operation: str, run_id: str | None,
         operational_projection: object | None = None,
         *, include_response_metadata: bool = False,
+        before_transport: Callable[[], None] | None = None,
     ):
         self._validate_chain(operation, run_id)
-        if operation == "result":
+        if operation == "claim":
+            with self._claim_lock:
+                return self._closed_control_locked(
+                    operation, run_id, operational_projection,
+                    include_response_metadata=include_response_metadata,
+                )
+        with self._run_guard(run_id) as guard_token:
+            if operation == "result":
+                with self._state_lock:
+                    if run_id in self._terminal_runs:
+                        raise ValueError("terminal runner result is already recorded")
+            if before_transport is not None:
+                before_transport()
             with self._state_lock:
-                if run_id in self._terminal_runs:
-                    raise ValueError("terminal runner result is already recorded")
-        with self._operation_lock(operation, run_id):
+                guard = self._run_guards.get(run_id)
+                if (
+                    guard is None or guard.token is not guard_token
+                    or run_id not in self._tracked_runs
+                ):
+                    raise ValueError("active runner claim is required")
             return self._closed_control_locked(
                 operation, run_id, operational_projection,
+                guard_token=guard_token,
                 include_response_metadata=include_response_metadata,
             )
 
@@ -651,7 +763,7 @@ class RunnerControlClient:
         include_call: bool = False,
     ) -> dict | tuple[dict, _Call]:
         """Use the existing claim PoP chain for the three fixed pairing-only calls."""
-        with self._operation_lock("claim", None):
+        with self._claim_lock:
             nonce, sequence, generation, chain = self._next_chain("claim", None)
             body, timestamp_ms = canonical_bytes(request), self._timestamp()
             proof = {
@@ -833,8 +945,32 @@ class RunnerControlClient:
     def _progress_closed(self, run_id: str, operational_projection: object):
         return self._closed_control("progress", run_id, operational_projection)
 
-    def _result_closed(self, run_id: str, operational_projection: object):
-        return self._closed_control("result", run_id, operational_projection)
+    def _result_closed(
+        self, run_id: str, operational_projection: object,
+        *, before_transport: Callable[[], None] | None = None,
+    ):
+        return self._closed_control(
+            "result", run_id, operational_projection, before_transport=before_transport,
+        )
+
+    def _register_runtime_local_terminal(self, anchor: object):
+        """Persist the store-verified terminal anchor before its result request.
+
+        This is intentionally a coordinator-only bridge: a terminal result may
+        retire its live chains only after the signed local run authority has
+        supplied every immutable disclosure field.
+        """
+        fields = {
+            "run_id", "project_id", "grant_id", "approval_projection_digest",
+            "terminal_projection_digest", "terminal_record_digest", "terminal_at_ms",
+            "retention_expires_at_ms",
+        }
+        if not isinstance(anchor, dict) or set(anchor) != fields:
+            raise ValueError("local terminal runtime authority is invalid")
+        try:
+            return self.runtime.register_local_terminal(**anchor)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("local terminal runtime authority is invalid") from exc
 
     def _stop_ack_closed(self, run_id: str, operational_projection: object):
         return self._closed_control("stop-ack", run_id, operational_projection)
@@ -842,13 +978,6 @@ class RunnerControlClient:
     def _upload_findings_closed(
         self, *, run_id: str, permit: object, findings_projection: object,
     ):
-        self._validate_chain("result", run_id)
-        with self._state_lock:
-            if run_id not in self._terminal_runs:
-                raise ValueError("terminal runner result is required before disclosure")
-            terminal_binding = self._terminal_bindings.get(run_id)
-        if terminal_binding is None:
-            raise ValueError("terminal runner result is required before disclosure")
         try:
             permit_value = validate_disclosure_permit(permit)
             findings = validate_canary_findings(findings_projection)
@@ -861,10 +990,6 @@ class RunnerControlClient:
         if (
             permit_value["workspace_id"] != self.workspace_id
             or permit_value["run_id"] != run_id
-            or (
-                permit_value["workspace_id"], permit_value["project_id"],
-                permit_value["grant_id"], findings["approval_projection_digest"],
-            ) != terminal_binding
             or findings["workspace_id"] != self.workspace_id
             or findings["run_id"] != run_id
             or findings["project_id"] != permit_value["project_id"]
@@ -892,56 +1017,119 @@ class RunnerControlClient:
         body = canonical_bytes(request)
         if len(body) > _MAX_FINDINGS_UPLOAD_BYTES:
             raise ValueError("invalid runner findings upload")
-        with self._operation_lock("result", run_id):
-            timestamp_ms = self._timestamp()
-            unsigned_permit = {
-                key: value for key, value in permit_value.items()
-                if key not in {"permit_digest", "signing_key_id", "signature_b64"}
-            }
-            if not (
-                permit_value["issued_at_ms"] <= timestamp_ms
-                < permit_value["expires_at_ms"]
-            ):
-                raise ValueError("disclosure permit is expired or not yet valid")
-            try:
-                verify_envelope(
-                    dict(self._trusted_disclosure_keys),
-                    {
-                        "signing_key_id": permit_value["signing_key_id"],
-                        "signature_b64": permit_value["signature_b64"],
-                    },
-                    canonical_bytes(unsigned_permit),
-                )
-            except (TypeError, ValueError):
-                raise ValueError("invalid disclosure permit authority") from None
-            nonce, sequence, generation, chain = self._next_chain("result", run_id)
-            path = (
-                f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/runs/"
-                f"{run_id}/result-projection"
+        pending = tuple(
+            item for item in self.runtime.load_pending_calls()
+            if item.chain_operation == "result" and item.run_id == run_id
+        )
+        if pending:
+            if len(pending) != 1 or pending[0].request_operation != "upload-findings":
+                raise ValueError("terminal runner result is required before disclosure")
+            return self._replay_pending_disclosure(
+                pending[0], permit_value=permit_value, findings=findings,
+                projection_bytes=len(projection_bytes), finding_count=finding_count,
+                expected_body=body,
             )
-            proof = {
-                "schema_version": "heel.runner-request-proof.v1",
-                "workspace_id": self.workspace_id, "runner_id": self.runner_id,
-                "key_id": self.signer.key_id, "capability": "runner_result",
-                "method": "POST", "path": path,
-                "body_sha256": hashlib.sha256(body).hexdigest(),
-                "timestamp_ms": timestamp_ms, "server_nonce": nonce,
-                "sequence": sequence,
-            }
-            call = _Call(
-                path,
-                self._headers(
-                    self._signature(b"heel.runner-pop.v1\0" + canonical_bytes(proof)),
-                    timestamp_ms, nonce=nonce, sequence=sequence,
-                ),
-                body, "runner_result", chain, sequence, generation,
+        timestamp_ms = self._timestamp()
+        unsigned_permit = {
+            key: value for key, value in permit_value.items()
+            if key not in {"permit_digest", "signing_key_id", "signature_b64"}
+        }
+        if not permit_value["issued_at_ms"] <= timestamp_ms < permit_value["expires_at_ms"]:
+            raise ValueError("disclosure permit is expired or not yet valid")
+        try:
+            verify_envelope(
+                dict(self._trusted_disclosure_keys),
+                {
+                    "signing_key_id": permit_value["signing_key_id"],
+                    "signature_b64": permit_value["signature_b64"],
+                },
+                canonical_bytes(unsigned_permit),
             )
-            return self._post_closed(
-                call, "upload-findings", run_id,
-                upload_binding=(
-                    permit_value, findings, len(projection_bytes), finding_count,
-                ),
+        except (TypeError, ValueError):
+            raise ValueError("invalid disclosure permit authority") from None
+        try:
+            disclosure_lease = self.runtime.lease_terminal_disclosure(
+                run_id, expected_project_id=permit_value["project_id"],
+                expected_grant_id=permit_value["grant_id"],
+                expected_approval_projection_digest=findings["approval_projection_digest"],
+                now_ms=timestamp_ms,
             )
+            cursor = self.runtime._disclosure_result_cursor(disclosure_lease)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("terminal runner result is required before disclosure") from exc
+        nonce, sequence, generation = (
+            cursor["next_nonce_b64"], cursor["next_sequence"], cursor["generation"],
+        )
+        path = (
+            f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/runs/"
+            f"{run_id}/result-projection"
+        )
+        proof = {
+            "schema_version": "heel.runner-request-proof.v1",
+            "workspace_id": self.workspace_id, "runner_id": self.runner_id,
+            "key_id": self.signer.key_id, "capability": "runner_result",
+            "method": "POST", "path": path,
+            "body_sha256": hashlib.sha256(body).hexdigest(),
+            "timestamp_ms": timestamp_ms, "server_nonce": nonce,
+            "sequence": sequence,
+        }
+        call = _Call(
+            path,
+            self._headers(
+                self._signature(b"heel.runner-pop.v1\0" + canonical_bytes(proof)),
+                timestamp_ms, nonce=nonce, sequence=sequence,
+            ),
+            body, "runner_result", self._chain("result", run_id), sequence, generation,
+        )
+        try:
+            runtime_pending = self.runtime.stage_disclosure_call(
+                disclosure_lease, path=path, headers=call.headers, body=body,
+                now_ms=timestamp_ms,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("terminal runner result is required before disclosure") from exc
+        return self._post_closed(
+            call, "upload-findings", run_id,
+            upload_binding=(permit_value, findings, len(projection_bytes), finding_count),
+            runtime_pending=runtime_pending, runtime_disclosure_lease=disclosure_lease,
+        )
+
+    def _replay_pending_disclosure(
+        self, pending: object, *, permit_value: dict[str, Any], findings: dict[str, Any],
+        projection_bytes: int, finding_count: int, expected_body: bytes,
+    ) -> dict[str, Any]:
+        """Replay only the sealed, byte-identical disclosure request after restart."""
+        if (
+            not hasattr(pending, "run_id") or pending.run_id is None
+            or pending.body != expected_body or pending.request_operation != "upload-findings"
+            or pending.chain_operation != "result"
+        ):
+            raise ValueError("terminal runner result is required before disclosure")
+        try:
+            decoded = json.loads(pending.body)
+        except (TypeError, ValueError):
+            raise ValueError("terminal runner result is required before disclosure") from None
+        if canonical_bytes(decoded) != pending.body:
+            raise ValueError("terminal runner result is required before disclosure")
+        now_ms = self._timestamp()
+        try:
+            disclosure_lease = self.runtime.lease_terminal_disclosure(
+                pending.run_id, expected_project_id=permit_value["project_id"],
+                expected_grant_id=permit_value["grant_id"],
+                expected_approval_projection_digest=findings["approval_projection_digest"],
+                now_ms=now_ms,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("terminal runner result is required before disclosure") from exc
+        call = _Call(
+            pending.path, dict(pending.headers), pending.body, pending.capability,
+            self._chain("result", pending.run_id), pending.sequence, pending.generation,
+        )
+        return self._post_closed(
+            call, "upload-findings", pending.run_id,
+            upload_binding=(permit_value, findings, projection_bytes, finding_count),
+            runtime_pending=pending, runtime_disclosure_lease=disclosure_lease,
+        )
 
     def claim(self):
         _, status, headers = self._closed_control(
@@ -1018,7 +1206,14 @@ class RunnerControlClient:
             response["initial_claim_nonce"], response["initial_claim_sequence"],
             response["initial_claim_generation"],
         )
-        with self._operation_lock("claim", None):
+        with self._claim_lock:
+            try:
+                self.runtime._install_rotation_claim(
+                    next_nonce_b64=state[0], next_sequence=state[1], generation=state[2],
+                    now_ms=self._timestamp(),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("runner runtime state did not install rotation claim") from exc
             self._install_chain_state("claim", state)
         return RunnerRotationActivated(
             response["schema_version"], response["workspace_id"], response["runner_id"],
@@ -1028,10 +1223,13 @@ class RunnerControlClient:
 
     def start_resync(self, *, operation: str, run_id: str | None = None) -> PendingRunnerResync:
         self._validate_chain(operation, run_id)
-        if operation != "claim":
-            with self._state_lock:
-                if run_id not in self._tracked_runs:
-                    raise ValueError("active runner claim is required")
+        if operation == "claim":
+            with self._claim_lock:
+                return self._start_resync_locked(operation, run_id)
+        with self._run_guard(run_id):
+            return self._start_resync_locked(operation, run_id)
+
+    def _start_resync_locked(self, operation: str, run_id: str | None) -> PendingRunnerResync:
         client_nonce, chain = self._random_b64(), {"operation": operation, "run_id": run_id}
         path = f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/resync/start"
         body = canonical_bytes({"schema_version": "heel.runner-resync-start.v2", "chain": chain, "client_nonce_b64": client_nonce})
@@ -1059,15 +1257,14 @@ class RunnerControlClient:
     def complete_resync(self, pending: PendingRunnerResync) -> RecoveredRunnerChain:
         if not isinstance(pending, PendingRunnerResync): raise ValueError("pending runner resync is required")
         self._validate_chain(pending.operation, pending.run_id)
-        if pending.operation != "claim":
-            with self._state_lock:
-                if pending.run_id not in self._tracked_runs:
-                    raise ValueError("active runner claim is required")
-        with self._operation_lock(pending.operation, pending.run_id):
-            return self._complete_resync_locked(pending)
+        if pending.operation == "claim":
+            with self._claim_lock:
+                return self._complete_resync_locked(pending)
+        with self._run_guard(pending.run_id) as guard_token:
+            return self._complete_resync_locked(pending, guard_token=guard_token)
 
     def _complete_resync_locked(
-        self, pending: PendingRunnerResync,
+        self, pending: PendingRunnerResync, *, guard_token: object | None = None,
     ) -> RecoveredRunnerChain:
         chain = {"operation": pending.operation, "run_id": pending.run_id}
         path = f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/resync/complete"
@@ -1089,14 +1286,36 @@ class RunnerControlClient:
             raise ValueError("invalid runner resync completion")
         chain_name = self._chain(pending.operation, pending.run_id)
         recovered = (next_nonce, next_sequence, generation)
-        self._install_chain_state(chain_name, recovered)
+        try:
+            self.runtime._commit_resync_chain(
+                operation=pending.operation, run_id=pending.run_id,
+                next_nonce_b64=next_nonce, next_sequence=next_sequence,
+                generation=generation, now_ms=self._timestamp(),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("runner runtime state did not install resync") from exc
+        self._install_chain_state(
+            chain_name, recovered, run_id=pending.run_id, guard_token=guard_token,
+        )
         return RecoveredRunnerChain(
             pending.operation, pending.run_id, next_nonce, next_sequence, expires, generation,
         )
 
-    def _install_chain_state(self, chain_name: str, state: tuple[str, int, int]) -> None:
+    def _install_chain_state(
+        self, chain_name: str, state: tuple[str, int, int], *,
+        run_id: str | None = None, guard_token: object | None = None,
+    ) -> None:
         with self._state_lock:
+            if run_id is not None:
+                guard = self._run_guards.get(run_id)
+                if (
+                    guard is None or guard.token is not guard_token
+                    or run_id not in self._tracked_runs
+                ):
+                    raise ValueError("active runner claim is required")
             staged = dict(self._chains)
+            if run_id is not None and staged.get(chain_name) is None:
+                raise ValueError("active runner claim is required")
             self._stage_chain(staged, chain_name, state)
             self._chains = staged
 

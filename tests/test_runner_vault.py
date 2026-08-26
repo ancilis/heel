@@ -89,6 +89,26 @@ def _cloud_context_artifact(
     }
 
 
+def _install_cloud_authority(root, identity, signer, *, binding_marker: str, authority=None):
+    """Create one complete selected Cloud tuple for Cloud-mode hostile tests."""
+    store = RunnerStore(root)
+    context = RunnerContext(
+        workspace_id=identity.workspace_id, project_id="prj_123456789",
+        environment_id="env_123456789", origin="https://staging.acme.dev",
+        verification_record_digest="0" * 64, environment_class="staging",
+    )
+    authority = authority or SigningAuthority.generate()
+    artifact = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + binding_marker * 32,
+        verification_record_digest="0" * 64, issued_at_ms=1, expires_at_ms=60_001,
+    )
+    store.install_cloud_context_binding(
+        artifact, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    )
+    return store, context, authority, artifact
+
+
 def test_cloud_context_sidecar_requires_domain_signature_and_is_immutable(tmp_path):
     store, identity, signer = store_and_identity(tmp_path)
     authority = SigningAuthority.generate()
@@ -128,10 +148,258 @@ def test_cloud_context_sidecar_requires_domain_signature_and_is_immutable(tmp_pa
             "binding_id": "rcb_" + "b" * 32,
             "binding_digest": "f" * 64,
         })
-    with pytest.raises(RunnerStoreError, match="provenance"):
+    with pytest.raises(RunnerStoreError, match="cloud context authority is incomplete"):
         store.verify_cloud_context_binding(
             identity=identity, trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
         )
+
+
+def test_cloud_authority_commit_prevents_static_downgrade_after_sidecars_are_deleted(tmp_path):
+    """A selected Cloud context remains Cloud even if mutable sidecars disappear."""
+    _bound, identity, signer = store_and_identity(tmp_path)
+    store = RunnerStore(tmp_path / "cloud-home")
+    context = RunnerContext(
+        workspace_id=identity.workspace_id, project_id="prj_123456789",
+        environment_id="env_123456789", origin="https://staging.acme.dev",
+        verification_record_digest="0" * 64, environment_class="staging",
+    )
+    authority = SigningAuthority.generate()
+    artifact = _cloud_context_artifact(
+        identity, authority, context,
+        binding_id="rcb_" + "d" * 32,
+        verification_record_digest="0" * 64,
+        issued_at_ms=1, expires_at_ms=60_001,
+    )
+    store.install_cloud_context_binding(
+        artifact, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    )
+    assert store.load_binding()["schema_version"] == "heel.bound-runner-context.v2"
+    with store._transaction(exclusive=True) as context_fd:
+        os.unlink("cloud-context-binding.json", dir_fd=context_fd)
+        os.unlink("cloud-context-provenance.json", dir_fd=context_fd)
+        os.fsync(context_fd)
+
+    with pytest.raises(RunnerStoreError, match="cloud context authority is incomplete"):
+        RunnerStore(tmp_path / "cloud-home")
+
+
+@pytest.mark.parametrize(
+    "removed",
+    (
+        "cloud-context-binding.json", "cloud-context-provenance.json", "authority-commit",
+        "active-context.json", "all-cloud-authority-files",
+    ),
+)
+def test_cloud_authority_tuple_component_loss_fails_closed(tmp_path, removed):
+    _bound, identity, signer = store_and_identity(tmp_path / "fixture")
+    root = tmp_path / "cloud-home"
+    store = RunnerStore(root)
+    context = RunnerContext(
+        workspace_id=identity.workspace_id, project_id="prj_123456789",
+        environment_id="env_123456789", origin="https://staging.acme.dev",
+        verification_record_digest="0" * 64, environment_class="staging",
+    )
+    authority = SigningAuthority.generate()
+    artifact = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "e" * 32,
+        verification_record_digest="0" * 64, issued_at_ms=1, expires_at_ms=60_001,
+    )
+    store.install_cloud_context_binding(
+        artifact, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    )
+    commit_filename = store._cloud_authority_commit_filename(
+        store.load_binding()["authority_commit_digest"],
+    )
+    if removed == "active-context.json":
+        with store._open_runner(create=False) as runner_fd:
+            assert runner_fd is not None
+            os.unlink("active-context.json", dir_fd=runner_fd)
+            os.fsync(runner_fd)
+    else:
+        with store._transaction(exclusive=True) as context_fd:
+            filenames = (
+                ("cloud-context-binding.json", "cloud-context-provenance.json", commit_filename)
+                if removed == "all-cloud-authority-files"
+                else (commit_filename if removed == "authority-commit" else removed,)
+            )
+            for filename in filenames:
+                os.unlink(filename, dir_fd=context_fd)
+            os.fsync(context_fd)
+
+    with pytest.raises(RunnerStoreError, match="cloud context authority is incomplete"):
+        RunnerStore(root)
+
+
+def test_cloud_authority_rejects_restored_v1_binding_and_selector(tmp_path):
+    """Cloud mode is irrevocable even if both mutable current files are rolled back."""
+    _bound, identity, signer = store_and_identity(tmp_path / "fixture")
+    root = tmp_path / "cloud-home"
+    store = RunnerStore(root)
+    context = RunnerContext(
+        workspace_id=identity.workspace_id, project_id="prj_123456789",
+        environment_id="env_123456789", origin="https://staging.acme.dev",
+        verification_record_digest="0" * 64, environment_class="staging",
+    )
+    authority = SigningAuthority.generate()
+    artifact = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "f" * 32,
+        verification_record_digest="0" * 64, issued_at_ms=1, expires_at_ms=60_001,
+    )
+    store.install_cloud_context_binding(
+        artifact, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    )
+    cloud_binding = store.load_binding()
+    legacy_binding = {
+        key: cloud_binding[key]
+        for key in ("schema_version", "namespace", "context", "identity", "signer_label")
+    }
+    legacy_binding["schema_version"] = "heel.bound-runner-context.v1"
+    with store._transaction(exclusive=True) as context_fd:
+        runner_store_module._write_json(context_fd, "binding.json", legacy_binding)
+        os.fsync(context_fd)
+    with store._open_runner(create=False) as runner_fd:
+        assert runner_fd is not None
+        runner_store_module._write_json(runner_fd, "active-context.json", {
+            "schema_version": "heel.active-runner-context.v1",
+            "namespace": context.namespace,
+        })
+        os.fsync(runner_fd)
+
+    with pytest.raises(RunnerStoreError, match="cloud context authority is incomplete"):
+        RunnerStore(root)
+
+
+@pytest.mark.parametrize("tamper", ("signature", "binding_digest", "context"))
+def test_cloud_authority_commit_tampering_fails_closed(tmp_path, tamper):
+    _bound, identity, signer = store_and_identity(tmp_path / "fixture")
+    root = tmp_path / "cloud-home"
+    store, _context, _authority, _artifact = _install_cloud_authority(
+        root, identity, signer, binding_marker="a",
+    )
+    filename = store._cloud_authority_commit_filename(
+        store.load_binding()["authority_commit_digest"],
+    )
+    with store._transaction(exclusive=True) as context_fd:
+        commit = runner_store_module._read_json(context_fd, filename, None)
+        assert isinstance(commit, dict)
+        if tamper == "signature":
+            commit["signature_b64"] = base64.b64encode(b"\\x00" * 64).decode("ascii")
+        elif tamper == "binding_digest":
+            commit["binding_digest"] = "f" * 64
+        else:
+            commit["context"] = {
+                **commit["context"], "origin": "https://other.invalid",
+            }
+        runner_store_module._write_json(context_fd, filename, commit)
+        os.fsync(context_fd)
+
+    with pytest.raises(RunnerStoreError, match="cloud context authority is incomplete"):
+        RunnerStore(root)
+
+
+def test_cloud_authority_rejects_cross_paired_commit_record(tmp_path):
+    _bound, identity, signer = store_and_identity(tmp_path / "fixture")
+    authority = SigningAuthority.generate()
+    left, _context, _authority, _artifact = _install_cloud_authority(
+        tmp_path / "left", identity, signer, binding_marker="a", authority=authority,
+    )
+    right, _context, _authority, _artifact = _install_cloud_authority(
+        tmp_path / "right", identity, signer, binding_marker="b", authority=authority,
+    )
+    left_filename = left._cloud_authority_commit_filename(
+        left.load_binding()["authority_commit_digest"],
+    )
+    right_filename = right._cloud_authority_commit_filename(
+        right.load_binding()["authority_commit_digest"],
+    )
+    with right._transaction(exclusive=False) as context_fd:
+        cross_paired = runner_store_module._read_json(context_fd, right_filename, None)
+    with left._transaction(exclusive=True) as context_fd:
+        runner_store_module._write_json(context_fd, left_filename, cross_paired)
+        os.fsync(context_fd)
+
+    with pytest.raises(RunnerStoreError, match="cloud context authority is incomplete"):
+        RunnerStore(tmp_path / "left")
+
+
+def test_cloud_authority_rejects_old_v2_selector_without_rollover_journal(tmp_path):
+    _bound, identity, signer = store_and_identity(tmp_path / "fixture")
+    root = tmp_path / "cloud-home"
+    store, context, authority, old = _install_cloud_authority(
+        root, identity, signer, binding_marker="a",
+    )
+    with store._open_runner(create=False) as runner_fd:
+        assert runner_fd is not None
+        old_selector = runner_store_module._read_json(runner_fd, "active-context.json", None)
+    new = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "b" * 32,
+        verification_record_digest="0" * 64, issued_at_ms=60_002, expires_at_ms=120_003,
+    )
+    store.install_cloud_context_binding(
+        new, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_002,
+        rollover_evidence=RunnerContextRolloverEvidence(
+            old["binding_id"], old["binding_digest"], new["binding_id"],
+            new["binding_digest"], 60_002,
+        ),
+    )
+    with store._open_runner(create=False) as runner_fd:
+        assert runner_fd is not None
+        runner_store_module._write_json(runner_fd, "active-context.json", old_selector)
+        os.fsync(runner_fd)
+
+    with pytest.raises(RunnerStoreError, match="cloud context authority is incomplete"):
+        RunnerStore(root)
+
+
+def test_cloud_renewal_recovers_forward_from_signed_v2_rollover_selector_prefix(tmp_path, monkeypatch):
+    _bound, identity, signer = store_and_identity(tmp_path / "fixture")
+    root = tmp_path / "cloud-home"
+    store = RunnerStore(root)
+    context = RunnerContext(
+        workspace_id=identity.workspace_id, project_id="prj_123456789",
+        environment_id="env_123456789", origin="https://staging.acme.dev",
+        verification_record_digest="0" * 64, environment_class="staging",
+    )
+    authority = SigningAuthority.generate()
+    old = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "1" * 32,
+        verification_record_digest="0" * 64, issued_at_ms=1, expires_at_ms=60_001,
+    )
+    new = _cloud_context_artifact(
+        identity, authority, context, binding_id="rcb_" + "2" * 32,
+        verification_record_digest="0" * 64, issued_at_ms=60_002, expires_at_ms=120_003,
+    )
+    store.install_cloud_context_binding(
+        old, identity=identity, signer=signer, signer_label="test-signer",
+        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=1,
+    )
+    original_write = runner_store_module._write_json
+
+    def fail_new_selector(directory_fd, filename, value):
+        if filename == "active-context.json":
+            raise OSError("injected v2 selector failure")
+        return original_write(directory_fd, filename, value)
+
+    monkeypatch.setattr(runner_store_module, "_write_json", fail_new_selector)
+    with pytest.raises(OSError, match="v2 selector"):
+        store.install_cloud_context_binding(
+            new, identity=identity, signer=signer, signer_label="test-signer",
+            trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_002,
+            rollover_evidence=RunnerContextRolloverEvidence(
+                old["binding_id"], old["binding_digest"], new["binding_id"], new["binding_digest"], 60_002,
+            ),
+        )
+    monkeypatch.setattr(runner_store_module, "_write_json", original_write)
+
+    restarted = RunnerStore.for_runtime(root, identity=identity, signer=signer)
+    assert restarted.finish_pending_context_rollover(
+        identity=identity, trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_002,
+    )["binding_id"] == new["binding_id"]
+    assert restarted.load_cloud_context_binding()["binding_id"] == new["binding_id"]
 
 
 def test_expired_cloud_context_rolls_forward_only_with_closed_rollover_evidence(tmp_path):

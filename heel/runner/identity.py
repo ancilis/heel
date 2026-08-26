@@ -13,8 +13,8 @@ import stat
 import subprocess
 import threading
 import unicodedata
-from dataclasses import dataclass
-from typing import Callable, Protocol, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from heel.crypto import ed25519_key_id
 
@@ -317,6 +317,16 @@ class SystemSecureSigner(SecureSigner):
     """Ed25519 signer whose seed is generated and kept in an injected OS secret backend."""
 
     def __init__(self, label: str, *, backend: OSSecretBackend | None = None):
+        backend = self._backend(backend)
+        label = self._label(label)
+        seed = backend.load(label)
+        if seed is None:
+            seed = secrets.token_bytes(32)
+            backend.store(label, seed)
+        self._initialize_seed(seed)
+
+    @staticmethod
+    def _backend(backend: OSSecretBackend | None) -> OSSecretBackend:
         if backend is None:
             if os.name == "posix" and __import__("platform").system() == "Darwin":
                 backend = MacOSKeychainSecretBackend()
@@ -326,12 +336,15 @@ class SystemSecureSigner(SecureSigner):
                 raise RuntimeError("no supported runner OS secret service")
         if isinstance(backend, InMemorySecretBackend) and os.environ.get("PYTEST_CURRENT_TEST") is None:
             raise RuntimeError("in-memory runner secret backend is test-only")
+        return backend
+
+    @staticmethod
+    def _label(label: str) -> str:
         if type(label) is not str or not label or len(label) > 128 or "\x00" in label:
             raise ValueError("invalid runner signing label")
-        seed = backend.load(label)
-        if seed is None:
-            seed = secrets.token_bytes(32)
-            backend.store(label, seed)
+        return label
+
+    def _initialize_seed(self, seed: bytes) -> None:
         if not isinstance(seed, bytes) or len(seed) != 32:
             raise RuntimeError("runner OS secret service returned invalid material")
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -339,6 +352,32 @@ class SystemSecureSigner(SecureSigner):
         self._private = Ed25519PrivateKey.from_private_bytes(seed)
         self.public_key = self._private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         self.key_id = ed25519_key_id(self.public_key)
+
+    @classmethod
+    def create_new(cls, label: str, *, backend: OSSecretBackend | None = None) -> "SystemSecureSigner":
+        """Create a replacement signer once; recovery must use :meth:`load_existing`."""
+        backend = cls._backend(backend)
+        label = cls._label(label)
+        if backend.load(label) is not None:
+            raise ValueError("runner signing identity already exists")
+        seed = secrets.token_bytes(32)
+        if type(seed) is not bytes or len(seed) != 32:
+            raise RuntimeError("runner OS secret service returned invalid material")
+        backend.store(label, seed)
+        instance = cls.__new__(cls)
+        instance._initialize_seed(seed)
+        return instance
+
+    @classmethod
+    def load_existing(cls, label: str, *, backend: OSSecretBackend | None = None) -> "SystemSecureSigner":
+        """Load a named signer without ever generating one during recovery."""
+        backend = cls._backend(backend)
+        seed = backend.load(cls._label(label))
+        if seed is None:
+            raise RuntimeError("runner signing identity is unavailable")
+        instance = cls.__new__(cls)
+        instance._initialize_seed(seed)
+        return instance
 
     def sign(self, payload: bytes) -> bytes:
         if not isinstance(payload, bytes):
@@ -366,6 +405,47 @@ class RunnerIdentity:
             "RunnerIdentity(runner_id={!r}, workspace_id={!r}, key_id={!r}, "
             "fingerprint={!r})"
         ).format(self.runner_id, self.workspace_id, self.key_id, self.fingerprint)
+
+
+@dataclass(frozen=True, repr=False)
+class PendingPairingActivation:
+    """One exact v3 activation request backed by a signed local prepared journal."""
+
+    pending: Mapping[str, object]
+    request: Mapping[str, object]
+    _material: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, repr=False)
+class PendingRotationActivation:
+    """Live-only rotation request capability; the replacement signer is never serialized."""
+
+    pending: Mapping[str, object]
+    request: Mapping[str, object]
+    old_identity: RunnerIdentity
+    new_identity: RunnerIdentity
+    new_signer_label: str
+    _new_signer: SecureSigner = field(repr=False, compare=False)
+    _store_token: object = field(repr=False, compare=False)
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("pending runner rotation activation cannot be serialized")
+
+
+@dataclass(frozen=True, repr=False)
+class AcceptedRotationJournal:
+    """Validated public rotation journal data consumed by the sealed runtime transition."""
+
+    pairing_id: str
+    old_identity: RunnerIdentity
+    new_identity: RunnerIdentity
+    activation_challenge: str
+    activation_request: Mapping[str, object]
+    activation_response: Mapping[str, object]
+    created_at_ms: int
+    updated_at_ms: int
+    new_signer_label: str
 
 
 @dataclass(frozen=True, repr=False)
@@ -397,6 +477,23 @@ class RunnerPairingMaterial:
             "runner_version": self.runner_version,
             "adapters": dict(self.adapters),
         }
+
+    def executable_exchange_request(self, invitation_token: str) -> dict[str, object]:
+        """Build the v3 exchange that opts this material into the executable protocol."""
+        request = self.exchange_request(invitation_token)
+        request["schema_version"] = "heel.runner-pairing-exchange.v3"
+        request["control_protocol"] = "heel.runner-control.v2"
+        return request
+
+    def prepare_executable_activation(
+        self, pending_v2: Mapping[str, object], *, store: Any, now_ms: int,
+        random_source: Callable[[int], bytes] = secrets.token_bytes,
+    ) -> PendingPairingActivation:
+        """Durably prepare the one signed v3 activation request before transport."""
+        prepare = getattr(store, "_prepare_pairing_activation", None)
+        if not callable(prepare):
+            raise ValueError("runner pairing activation store is required")
+        return prepare(self, pending_v2, now_ms=now_ms, random_source=random_source)
 
 
 def _display_name(value: object) -> str:

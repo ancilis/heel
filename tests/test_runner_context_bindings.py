@@ -777,10 +777,8 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
              "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
         )
         self.service.revoke(WORKSPACE, PROJECT, binding["binding_id"], actor="user_owner", role="owner")
-        now = self.service._now_ms() + 1
-        self.conn.execute("UPDATE canary_runner_context_bindings SET purge_at_ms=?", (now,))
-        self.conn.execute("UPDATE canary_runner_context_events SET purge_at_ms=?", (now,))
-        self.conn.commit()
+        self.clock.value += 31 * 24 * 60 * 60
+        now = self.service._now_ms()
 
         self.conn.execute("BEGIN IMMEDIATE")
         counts = self.service.expire_and_purge_in_transaction(now, limit=1)
@@ -829,6 +827,77 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         conn.commit()
         self.assertEqual(due["purged_bindings"], 1)
 
+    def test_retention_purge_skips_a_future_event_head_and_uses_later_ready_binding(self):
+        """A retained future child must not head-of-line block an independently ready binding."""
+        first = self.service.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+             "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+        )
+        self.service.revoke(WORKSPACE, PROJECT, first["binding_id"], actor="user_owner", role="owner")
+        second = self.service.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+             "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+        )
+        self.service.revoke(WORKSPACE, PROJECT, second["binding_id"], actor="user_owner", role="owner")
+
+        self.clock.value += 31 * 24 * 60 * 60
+        now = self.service._now_ms()
+        first_row = self.conn.execute(
+            "SELECT * FROM canary_runner_context_bindings WHERE rcb_id=?", (first["binding_id"],),
+        ).fetchone()
+        self.conn.execute(
+            "UPDATE canary_runner_context_bindings SET purge_at_ms=? WHERE rcb_id=?",
+            (now - 2, first["binding_id"]),
+        )
+        self.conn.execute(
+            "UPDATE canary_runner_context_bindings SET purge_at_ms=? WHERE rcb_id=?",
+            (now - 1, second["binding_id"]),
+        )
+        # This is a valid retained history event but deliberately later than the binding's
+        # old deadline.  The v23 trigger raises just this row's readiness deadline.
+        self.conn.execute(
+            "INSERT INTO canary_runner_context_events("
+            "rce_id,workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,"
+            "action,actor_class,actor_id,reason_code,binding_digest,created_at_ms,purge_at_ms) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "rce_" + "f" * 32, first_row["workspace_id"], first_row["project_ref"],
+                first_row["environment_id"], first_row["runner_id"], first_row["runner_key_id"],
+                first_row["rcb_id"], "projection_submitted", "runner", RUNNER, None,
+                first_row["binding_digest"], now, now + 1,
+            ),
+        )
+        self.conn.commit()
+
+        statements: list[str] = []
+        self.conn.execute("BEGIN IMMEDIATE")
+        self.conn.set_trace_callback(statements.append)
+        try:
+            counts = self.service.expire_and_purge_in_transaction(now, limit=1)
+            self.conn.commit()
+        finally:
+            self.conn.set_trace_callback(None)
+
+        self.assertEqual(counts["purged_events"], 1)
+        queued = self.conn.execute(
+            "SELECT rcb_id FROM canary_runner_context_purge_queue"
+        ).fetchall()
+        self.assertEqual([row["rcb_id"] for row in queued], [second["binding_id"]])
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM canary_runner_context_purge_queue WHERE rcb_id=?", (first["binding_id"],),
+        ).fetchone()[0], 0)
+        readiness_seek = next(
+            statement for statement in statements
+            if "FROM canary_runner_context_purge_readiness INDEXED BY idx_runner_context_purge_readiness_ready" in statement
+        )
+        details = [row[3] for row in self.conn.execute("EXPLAIN QUERY PLAN " + readiness_seek)]
+        self.assertTrue(any("idx_runner_context_purge_readiness_ready" in detail for detail in details))
+        self.assertFalse(any("SCAN" in detail or "TEMP B-TREE" in detail or "AUTOMATIC" in detail for detail in details))
+
     def test_human_dashboard_is_bounded_to_64_historical_bindings(self):
         # One runner may only have one active binding, but its revocation history
         # must not make the session-only dashboard unbounded.
@@ -871,10 +940,8 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
                  "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
             )
             self.service.revoke(WORKSPACE, PROJECT, binding["binding_id"], actor="user_owner", role="owner")
-        now = self.service._now_ms() + 1
-        self.conn.execute("UPDATE canary_runner_context_bindings SET purge_at_ms=?", (now,))
-        self.conn.execute("UPDATE canary_runner_context_events SET purge_at_ms=?", (now,))
-        self.conn.commit()
+        self.clock.value += 31 * 24 * 60 * 60
+        now = self.service._now_ms()
 
         self.conn.execute("BEGIN IMMEDIATE")
         first = self.service.expire_and_purge_in_transaction(now, limit=128)

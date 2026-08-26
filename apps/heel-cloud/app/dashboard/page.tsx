@@ -41,6 +41,13 @@ type DisclosurePreview = CanaryDisclosureMetadata & {
   outcomeCounts: { blocked: number; observed: number; inconclusive: number };
 };
 type ApprovalDialogState = { requestKey: string; open: boolean } | null;
+type PendingApproval = {
+  requestKey: string;
+  workspaceRef: string;
+  projectRef: string;
+  summary: CanaryPendingApprovalRequest;
+  run: CanaryRunDashboard;
+};
 
 
 function messageOf(error: unknown): string {
@@ -86,23 +93,27 @@ export default function Dashboard() {
   const [origin, setOrigin] = useState("");
   const [proofMethod, setProofMethod] = useState<"https-file" | "dns-txt">("https-file");
   const [proofChallenge, setProofChallenge] = useState<ProofChallenge | null>(null);
-  const [approval, setApproval] = useState<CanaryApprovalSummary | null>(null);
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [approvalDialog, setApprovalDialog] = useState<ApprovalDialogState>(null);
-  const [run, setRun] = useState<CanaryRunDashboard | null>(null);
+  const [observedRun, setObservedRun] = useState<CanaryRunDashboard | null>(null);
   const [disclosurePreview, setDisclosurePreview] = useState<DisclosurePreview | null>(null);
   const [disclosureOpen, setDisclosureOpen] = useState(false);
   const [selectedRunner, setSelectedRunner] = useState("");
   const [selectedBindingEnvironment, setSelectedBindingEnvironment] = useState("");
   const [pendingHasMore, setPendingHasMore] = useState(false);
 
-  const clearApprovalIdentity = useCallback((): void => {
-    setApproval(null);
-    setRun(null);
+  const clearPendingApproval = useCallback((): void => {
+    setPendingApproval(null);
     setApprovalDialog(null);
     setPendingHasMore(false);
+  }, []);
+
+  const clearApprovalIdentity = useCallback((): void => {
+    clearPendingApproval();
+    setObservedRun(null);
     setDisclosurePreview(null);
     setDisclosureOpen(false);
-  }, []);
+  }, [clearPendingApproval]);
 
   useEffect(() => {
     let cancelled = false;
@@ -135,7 +146,7 @@ export default function Dashboard() {
   }, [connection]);
 
   useEffect(() => {
-    if (connection.phase !== "ready" || approval !== null || working) return;
+    if (connection.phase !== "ready" || pendingApproval !== null || working) return;
     let cancelled = false;
     let inFlight = false;
     let controller: AbortController | null = null;
@@ -150,9 +161,21 @@ export default function Dashboard() {
         const request = pending.request;
         if (request === null) return;
         const status = await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, request.runId, controller.signal);
-        if (cancelled || status.run.runId !== request.runId || status.run.approvalId !== request.approvalId || status.run.status !== "awaiting_execution_approval") return;
-        setApproval(request as CanaryPendingApprovalRequest);
-        setRun(status);
+        if (cancelled) return;
+        if (status.run.runId !== request.runId || status.run.approvalId !== request.approvalId || status.run.status !== "awaiting_execution_approval") {
+          setObservedRun(status);
+          clearPendingApproval();
+          return;
+        }
+        const summary = request as CanaryPendingApprovalRequest;
+        setPendingApproval({
+          requestKey: approvalRequestKey(connection.context.workspaceRef, connection.context.project.projectRef, summary),
+          workspaceRef: connection.context.workspaceRef,
+          projectRef: connection.context.project.projectRef,
+          summary,
+          run: status,
+        });
+        setObservedRun(status);
       } catch (error) {
         if (!cancelled && !(error instanceof CanaryApiError && error.code === "unavailable")) setNotice(messageOf(error));
       } finally { inFlight = false; controller = null; }
@@ -162,50 +185,60 @@ export default function Dashboard() {
     const timer = setInterval(() => void discover(), 2_000);
     document.addEventListener("visibilitychange", visibility);
     return () => { cancelled = true; controller?.abort(); clearInterval(timer); document.removeEventListener("visibilitychange", visibility); };
-  }, [approval, connection, working]);
+  }, [clearPendingApproval, connection, pendingApproval, working]);
 
   useEffect(() => {
-    if (connection.phase !== "ready" || approval === null || run === null
-      || ["terminal", "cancelled", "expired"].includes(run.run.status)) return;
+    if (connection.phase !== "ready" || pendingApproval === null) return;
     let cancelled = false;
     const timer = setInterval(() => {
-      void canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId)
+      void canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, pendingApproval.summary.runId)
         .then((next) => { if (!cancelled) {
-          setRun(next);
-          if (["cancelled", "expired"].includes(next.run.status)) clearApprovalIdentity();
+          if (next.run.runId !== pendingApproval.summary.runId || next.run.approvalId !== pendingApproval.summary.approvalId
+            || next.run.status !== "awaiting_execution_approval") {
+            setObservedRun(next);
+            clearPendingApproval();
+            return;
+          }
+          setPendingApproval((current) => current?.requestKey === pendingApproval.requestKey
+            ? { ...current, run: next } : current);
+          setObservedRun(next);
         } })
         .catch((error: unknown) => { if (!cancelled) {
-          if (error instanceof CanaryApiError && error.status === 404) clearApprovalIdentity();
+          if (error instanceof CanaryApiError && (error.status === 401 || error.status === 403)) {
+            clearApprovalIdentity();
+            setConnection({ phase: "checking" });
+            void loadConnection().then((next) => { if (!cancelled) setConnection(next); });
+          } else if (error instanceof CanaryApiError && error.status === 404) clearPendingApproval();
           else setNotice(messageOf(error));
         } });
     }, 1_000);
     return () => { cancelled = true; clearInterval(timer); };
-  }, [approval, clearApprovalIdentity, connection, run]);
+  }, [clearApprovalIdentity, clearPendingApproval, connection, pendingApproval]);
 
   const executable = connection.phase === "ready"
     ? connection.context.environments.find((item) => item.isExecutable) : undefined;
   const selectedRunnerAvailable = connection.phase === "ready"
     && connection.context.contextBindings.runners.some((runner) => runner.runnerId === selectedRunner);
-  const approvalKey = connection.phase === "ready" && approval !== null
-    ? approvalRequestKey(connection.context.workspaceRef, connection.context.project.projectRef, approval) : null;
+  const approvalKey = connection.phase === "ready" && pendingApproval !== null
+    ? pendingApproval.requestKey : null;
   const approvalDialogOpen = approvalKey !== null && approvalDialog?.requestKey === approvalKey && approvalDialog.open;
-  const hasPlan = approval !== null;
+  const hasPlan = pendingApproval !== null && pendingApproval.run.run.status === "awaiting_execution_approval";
   const snapshot: ActivationSnapshot = {
     environment: executable ? "verified" : proofChallenge ? "checking" : "unverified",
     runner: executable ? (hasPlan ? "online" : "unpaired") : "locked",
     canaryAccess: hasPlan ? "ready" : executable ? "missing" : "locked",
-    rehearsal: hasPlan ? (run === null ? "awaiting_approval" : run.run.status === "terminal" ? "complete" : run.run.status === "running" || run.run.status === "claimed" || run.run.status === "approved" ? "running" : run.run.status === "stop_requested" || run.run.status === "finalizing" ? "running" : "error") : "locked",
+    rehearsal: hasPlan ? "awaiting_approval" : "locked",
   };
   const completedSteps = [snapshot.environment === "verified", snapshot.runner === "online", snapshot.canaryAccess === "ready", hasPlan]
     .filter(Boolean).length;
 
   const runPhase: RunPhase | null = useMemo(() => {
-    if (run === null) return null;
-    if (run.run.status === "terminal") return run.run.executionDisposition === "stopped" ? "stopped" : "complete";
-    if (run.run.status === "stop_requested" || run.run.status === "finalizing") return "stopping";
-    if (["cancelled", "expired"].includes(run.run.status)) return "error";
+    if (observedRun === null) return null;
+    if (observedRun.run.status === "terminal") return observedRun.run.executionDisposition === "stopped" ? "stopped" : "complete";
+    if (observedRun.run.status === "stop_requested" || observedRun.run.status === "finalizing") return "stopping";
+    if (["cancelled", "expired"].includes(observedRun.run.status)) return "error";
     return "running";
-  }, [run]);
+  }, [observedRun]);
 
   async function selectProject(projectRef: string): Promise<void> {
     if (connection.phase !== "ready") return;
@@ -277,25 +310,36 @@ export default function Dashboard() {
     } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
   }
 
-  async function approveRun(reason: string): Promise<void> {
-    if (connection.phase !== "ready" || approval === null || run === null) return;
+  async function approveRun(requestKey: string, reason: string): Promise<void> {
+    const pending = pendingApproval;
+    if (connection.phase !== "ready" || pending === null
+      || pending.requestKey !== requestKey
+      || pending.workspaceRef !== connection.context.workspaceRef
+      || pending.projectRef !== connection.context.project.projectRef
+      || pending.run.run.status !== "awaiting_execution_approval") return;
+    clearPendingApproval();
     setWorking(true); setNotice(null);
     try {
-      await canaryApi.approveRun(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId, {
-        projectionDigest: approval.projectionDigest, hostnameRetype: approval.hostname, reason,
-        idempotencyKey: idempotencyKey(), controlGeneration: run.approvalControlGeneration,
+      await canaryApi.approveRun(pending.workspaceRef, pending.projectRef, pending.summary.runId, {
+        projectionDigest: pending.summary.projectionDigest, hostnameRetype: pending.summary.hostname, reason,
+        idempotencyKey: idempotencyKey(), controlGeneration: pending.run.approvalControlGeneration,
       });
-      setApprovalDialog(null);
-      setRun(await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId));
-    } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
+      setObservedRun(await canaryApi.getRun(pending.workspaceRef, pending.projectRef, pending.summary.runId));
+    } catch (error) {
+      if (error instanceof CanaryApiError && (error.status === 401 || error.status === 403)) {
+        clearApprovalIdentity();
+        setConnection({ phase: "checking" });
+        void loadConnection().then(setConnection);
+      } else setNotice(messageOf(error));
+    } finally { setWorking(false); }
   }
 
   async function stopRun(): Promise<void> {
-    if (connection.phase !== "ready" || approval === null || run === null) return;
+    if (connection.phase !== "ready" || observedRun === null) return;
     setWorking(true); setNotice(null);
     try {
-      await canaryApi.stopRun(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId, run.run.killSwitchGeneration);
-      setRun(await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId));
+      await canaryApi.stopRun(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId, observedRun.run.killSwitchGeneration);
+      setObservedRun(await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId));
     } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
   }
 
@@ -321,18 +365,18 @@ export default function Dashboard() {
   }
 
   async function decideDisclosure(share: boolean): Promise<void> {
-    if (connection.phase !== "ready" || approval === null || disclosurePreview === null) return;
+    if (connection.phase !== "ready" || observedRun === null || disclosurePreview === null) return;
     setWorking(true); setNotice(null);
     try {
-      if (share) await canaryApi.createDisclosurePermit(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId, disclosurePreview);
-      else await canaryApi.markDisclosureLocalOnly(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId, disclosurePreview);
+      if (share) await canaryApi.createDisclosurePermit(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId, disclosurePreview);
+      else await canaryApi.markDisclosureLocalOnly(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId, disclosurePreview);
       setDisclosureOpen(false);
       setNotice(share ? "One-use disclosure permit created. Return to the local runner to upload this exact summary." : "Result kept local. No summary bytes were uploaded.");
     } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
   }
 
   const context = connection.phase === "ready" ? connection.context : null;
-  const progress = run?.progress;
+  const progress = observedRun?.progress;
 
   return (
     <main className="canary-dashboard">
@@ -350,14 +394,14 @@ export default function Dashboard() {
 
       <div className="dashboard-grid"><div>
         <ActivationCard completedSteps={completedSteps} environmentOrigin={executable?.origin}
-          onReviewApproval={approval && approvalKey ? () => setApprovalDialog({ requestKey: approvalKey, open: true }) : undefined}
-          scenarioCount={approval?.scenarios.length ?? 0} snapshot={snapshot} />
+          onReviewApproval={hasPlan && approvalKey ? () => setApprovalDialog({ requestKey: approvalKey, open: true }) : undefined}
+          scenarioCount={pendingApproval?.summary.scenarios.length ?? 0} snapshot={snapshot} />
         {context && !executable ? <section className="runner-recovery" id="verify-origin" aria-labelledby="verify-origin-title"><p className="canary-kicker">Exact public HTTPS origin</p><h2 id="verify-origin-title">Verify staging now</h2>
           <label>Staging origin<input autoComplete="url" onChange={(event) => setOrigin(event.target.value)} placeholder="https://staging.yourcompany.com" value={origin} /></label>
           <label>Proof method<select onChange={(event) => setProofMethod(event.target.value as "https-file" | "dns-txt")} value={proofMethod}><option value="https-file">HTTPS file</option><option value="dns-txt">DNS TXT</option></select></label>
           {proofChallenge ? <><p><code>{proofChallenge.instruction}</code></p><button className="button button-primary" disabled={working} onClick={() => void checkProof()} type="button">Check exact proof</button></> : <button className="button button-primary" disabled={working || !/^https:\/\/[a-z0-9.-]+$/.test(origin.trim())} onClick={() => void startProof()} type="button">Create proof challenge</button>}
         </section> : null}
-        {context && executable && !approval ? <section className="runner-recovery"><p className="canary-kicker">Paired runner authorization</p><h2>Add canary access</h2><p>Authorize one active paired runner for one verified staging or sandbox environment. The runner alone may submit its signed plan; this dashboard never accepts projection file uploads.</p><p>This runner is fixed to its first claimed environment. To move it, stop and re-pair a fresh runner, then authorize access here.</p>
+        {context && executable && !pendingApproval ? <section className="runner-recovery"><p className="canary-kicker">Paired runner authorization</p><h2>Add canary access</h2><p>Authorize one active paired runner for one verified staging or sandbox environment. The runner alone may submit its signed plan; this dashboard never accepts projection file uploads.</p><p>This runner is fixed to its first claimed environment. To move it, stop and re-pair a fresh runner, then authorize access here.</p>
           <label>Verified environment<select disabled={working} onChange={(event) => setSelectedBindingEnvironment(event.target.value)} value={selectedBindingEnvironment}><option value="">Select environment</option>{context.environments.filter((item) => item.isExecutable && item.verificationRecordDigest !== null).map((item) => <option key={item.environmentId} value={item.environmentId}>{item.origin}</option>)}</select></label>
           <label>Paired runner<select disabled={working} onChange={(event) => setSelectedRunner(event.target.value)} value={selectedRunnerAvailable ? selectedRunner : ""}><option value="">Select runner</option>{context.contextBindings.runners.map((item) => <option key={`${item.runnerId}:${item.runnerKeyId}`} value={item.runnerId}>{item.displayName} · {item.fingerprint.slice(0, 12)}</option>)}</select></label>
           <button className="button button-primary" disabled={working || !selectedBindingEnvironment || !selectedRunnerAvailable} onClick={() => void createContextBinding()} type="button">Authorize paired runner</button>
@@ -366,12 +410,12 @@ export default function Dashboard() {
       </div>
 
       <aside className="dashboard-rail" aria-label="Rehearsal safety boundaries"><section className="boundary-ledger"><p className="canary-kicker">Always enforced</p><h2>The runner owns target traffic.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Methods</dt><dd>GET + HEAD</dd></div><div><dt>Egress</dt><dd>Staging :443 only</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></section>
-        {runPhase && progress?.available ? <RunProgress phase={runPhase} completedScenarios={progress.scenariosCompleted ?? 0} totalScenarios={progress.scenariosTotal ?? 0} requestsUsed={progress.requestsStarted ?? 0} requestBudget={(progress.requestsStarted ?? 0) + (progress.remainingRequests ?? 0)} secondsRemaining={Math.ceil((progress.remainingWallMs ?? 0) / 1000)} onStop={runPhase === "running" ? () => void stopRun() : undefined} localResultUrl={progress.localResultReady && approval ? `http://127.0.0.1:7331/runs/${approval.runId}` : undefined} /> : null}
-        {run && !run.progress.available ? <p className="run-recovery" role="alert">Signed progress is unavailable. The cloud will not invent metrics; inspect the local runner and retry status.</p> : null}
+         {runPhase && progress?.available ? <RunProgress phase={runPhase} completedScenarios={progress.scenariosCompleted ?? 0} totalScenarios={progress.scenariosTotal ?? 0} requestsUsed={progress.requestsStarted ?? 0} requestBudget={(progress.requestsStarted ?? 0) + (progress.remainingRequests ?? 0)} secondsRemaining={Math.ceil((progress.remainingWallMs ?? 0) / 1000)} onStop={runPhase === "running" ? () => void stopRun() : undefined} localResultUrl={progress.localResultReady && observedRun ? `http://127.0.0.1:7331/runs/${observedRun.run.runId}` : undefined} /> : null}
+         {observedRun && !observedRun.progress.available ? <p className="run-recovery" role="alert">Signed progress is unavailable. The cloud will not invent metrics; inspect the local runner and retry status.</p> : null}
         {progress?.localResultReady ? <label className="disclosure-entry"><span>Optional history</span><strong>Load local summary to review separate sharing →</strong><input accept="application/json,.json" hidden onChange={(event) => void loadDisclosurePreview(event.target.files?.[0])} type="file" /></label> : null}
       </aside></div>
 
-      {approval && approvalKey ? <ApprovalDialog key={approvalKey} durationSeconds={approval.durationSeconds} egress={approval.egress} onApprove={(reason) => void approveRun(reason)} onClose={() => setApprovalDialog(null)} open={approvalDialogOpen} origin={approval.origin} requestBudget={approval.requestBudget} routes={approval.routes} scenarios={approval.scenarios} /> : null}
+      {pendingApproval && hasPlan && approvalKey ? <ApprovalDialog key={approvalKey} durationSeconds={pendingApproval.summary.durationSeconds} egress={pendingApproval.summary.egress} onApprove={(reason) => void approveRun(approvalKey, reason)} onClose={() => setApprovalDialog(null)} open={approvalDialogOpen} origin={pendingApproval.summary.origin} requestBudget={pendingApproval.summary.requestBudget} routes={pendingApproval.summary.routes} scenarios={pendingApproval.summary.scenarios} /> : null}
       {disclosurePreview ? <DisclosureDialog byteCount={disclosurePreview.projectionBytes} completedScenarios={disclosurePreview.completedScenarios} onClose={() => setDisclosureOpen(false)} onKeepLocal={() => void decideDisclosure(false)} onPermit={() => void decideDisclosure(true)} open={disclosureOpen} outcomeCounts={disclosurePreview.outcomeCounts} /> : null}
     </main>
   );

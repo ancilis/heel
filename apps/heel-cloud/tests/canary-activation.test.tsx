@@ -48,6 +48,14 @@ describe("canary activation dashboard", () => {
     expect(source).toContain("<ApprovalDialog key={approvalKey}");
     expect(source).not.toContain("const [approvalOpen");
   });
+  test("keeps approval review available only while the server still reports awaiting approval", () => {
+    const source = readFileSync(resolve(process.cwd(), "app/dashboard/page.tsx"), "utf8");
+    expect(source).toContain("const [pendingApproval, setPendingApproval]");
+    expect(source).toContain("const [observedRun, setObservedRun]");
+    expect(source).toContain('next.run.status !== "awaiting_execution_approval"');
+    expect(source).toContain("error.status === 401 || error.status === 403");
+    expect(source).toContain("const hasPlan = pendingApproval !== null && pendingApproval.run.run.status === \"awaiting_execution_approval\"");
+  });
   test("leads with four ordered steps and one unambiguous next action", () => {
     render(<Dashboard />);
 

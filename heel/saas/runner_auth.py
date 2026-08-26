@@ -629,6 +629,43 @@ CREATE INDEX IF NOT EXISTS idx_canary_runner_resync_rate ON canary_runner_resync
 RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_GENERATION_MIGRATION
 RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_FINALIZATION_MIGRATION
 
+# Pairing v3 is the executable control protocol.  The three protocol rows bind the
+# activation exchange to the control cursor; sealed receipts make an accepted activation
+# replayable without allocating a second nonce or runner identity.
+RUNNER_AUTH_PROTOCOL_V3_MIGRATION = """
+CREATE TABLE canary_runner_pairing_protocols(
+ pairing_id TEXT PRIMARY KEY,
+ protocol_version INTEGER NOT NULL CHECK(protocol_version=3),
+ control_protocol TEXT NOT NULL CHECK(control_protocol='heel.runner-control.v2'),
+ exchange_digest TEXT NOT NULL CHECK(length(exchange_digest)=64 AND exchange_digest NOT GLOB '*[^0-9a-f]*'),
+ created_at REAL NOT NULL,
+ FOREIGN KEY(pairing_id) REFERENCES canary_runner_pairings(pairing_id) ON DELETE CASCADE);
+CREATE TABLE canary_runner_execution_protocols(
+ workspace_id TEXT NOT NULL,
+ runner_id TEXT NOT NULL,
+ protocol_version INTEGER NOT NULL CHECK(protocol_version=3),
+ control_protocol TEXT NOT NULL CHECK(control_protocol='heel.runner-control.v2'),
+ exchange_digest TEXT NOT NULL CHECK(length(exchange_digest)=64 AND exchange_digest NOT GLOB '*[^0-9a-f]*'),
+ activated_at REAL NOT NULL,
+ PRIMARY KEY(workspace_id,runner_id),
+ FOREIGN KEY(workspace_id,runner_id) REFERENCES canary_runners(workspace_id,runner_id));
+CREATE TABLE canary_runner_pairing_activation_receipts(
+ pairing_id TEXT PRIMARY KEY,
+ request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+ response_ciphertext TEXT NOT NULL,
+ created_at REAL NOT NULL,
+ expires_at REAL NOT NULL,
+ FOREIGN KEY(pairing_id) REFERENCES canary_runner_pairings(pairing_id) ON DELETE CASCADE);
+CREATE TABLE canary_runner_rotation_activation_receipts(
+ pairing_id TEXT PRIMARY KEY,
+ request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+ response_ciphertext TEXT NOT NULL,
+ created_at REAL NOT NULL,
+ expires_at REAL NOT NULL,
+ FOREIGN KEY(pairing_id) REFERENCES canary_runner_rotations(pairing_id) ON DELETE CASCADE);
+"""
+RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_PROTOCOL_V3_MIGRATION
+
 
 class RunnerAuthError(PermissionError):
     """Uniform external runner-auth failure."""
@@ -636,6 +673,10 @@ class RunnerAuthError(PermissionError):
 
 class RunnerAuthRateLimited(RunnerAuthError):
     """A verified runner exhausted its small recovery-start budget."""
+
+
+class RunnerProtocolUpgradeRequired(RunnerAuthError):
+    """A legacy inventory pairing cannot consume executable runner authority."""
 
 
 @dataclass(frozen=True)
@@ -653,6 +694,8 @@ class PairingView:
     status: str
     expires_at: float
     activation_challenge: str | None = None
+    control_protocol: str | None = None
+    pairing_exchange_digest: str | None = None
 
 
 def _now() -> float:
@@ -665,6 +708,15 @@ def _b64(raw: bytes) -> str:
 
 def _token() -> str:
     return _b64(secrets.token_bytes(32))
+
+
+def _lower_hex_digest(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 WORDS = runner_phrase_words()
@@ -713,7 +765,7 @@ def _ensure_lifecycle_tables(conn: sqlite3.Connection) -> None:
     """)
 
 
-_RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_request_ledger_archive", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records", "canary_runner_chain_cursors", "canary_runner_resync_challenges")
+_RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_request_ledger_archive", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records", "canary_runner_chain_cursors", "canary_runner_resync_challenges", "canary_runner_pairing_protocols", "canary_runner_execution_protocols", "canary_runner_pairing_activation_receipts", "canary_runner_rotation_activation_receipts")
 
 
 def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
@@ -840,6 +892,16 @@ class RunnerAuthStore:
         except (TypeError, ValueError):
             raise RunnerAuthError("invalid runner identity") from None
 
+    def _require_executable_protocol_in_transaction(self, workspace_id: str, runner_id: str) -> None:
+        """Gate every PoP/control cursor before it can consume a nonce or resync it."""
+        row = self.conn.execute(
+            "SELECT protocol_version,control_protocol FROM canary_runner_execution_protocols "
+            "WHERE workspace_id=? AND runner_id=?",
+            (workspace_id, runner_id),
+        ).fetchone()
+        if row is None or tuple(row) != (3, "heel.runner-control.v2"):
+            raise RunnerProtocolUpgradeRequired("runner protocol upgrade required")
+
     def _save_changed_identity(self, identity: dict, *, instant: float) -> dict:
         identity["identity_digest"] = canonical_digest({key: value for key, value in identity.items() if key != "identity_digest"})
         return self._save_identity(identity, instant=instant)
@@ -876,7 +938,8 @@ class RunnerAuthStore:
         return PairingInvitation(token, instant + PAIRING_TTL)
 
     def exchange(self, invitation: str, public_key_b64: str, phrase: str, *, display_name: str,
-                 runner_version: str, adapters: Mapping[str, str]) -> PairingView:
+                 runner_version: str, adapters: Mapping[str, str],
+                 control_protocol: str | None = None, exchange_digest: str | None = None) -> PairingView:
         if type(display_name) is not str:
             raise ValueError("invalid runner display name")
         display_name = unicodedata.normalize("NFC", display_name)
@@ -887,6 +950,11 @@ class RunnerAuthStore:
         phrase = self._phrase(phrase)
         if not isinstance(adapters, Mapping) or not all(type(k) is str and type(v) is str for k, v in adapters.items()):
             raise ValueError("invalid runner adapters")
+        if (control_protocol is None) != (exchange_digest is None):
+            raise ValueError("invalid runner protocol exchange")
+        if control_protocol is not None:
+            if control_protocol != "heel.runner-control.v2" or not _lower_hex_digest(exchange_digest):
+                raise ValueError("invalid runner protocol exchange")
         try:
             key = load_public_key_base64(public_key_b64)
         except ValueError as error:
@@ -907,10 +975,18 @@ class RunnerAuthStore:
             challenge = _token()
             self.conn.execute("UPDATE canary_runner_pairings SET runner_id=?, invitation_hash=?, phrase=?, public_key=?, fingerprint=?, key_id=?, runner_version=?, adapters_json=?, activation_challenge=?, status='pending', display_name=? WHERE pairing_id=?",
                               (runner_id, self._hash("consumed-invitation", row["pairing_id"]), phrase, public_key_b64, fingerprint, key_id, runner_version, canonical_bytes(dict(adapters)).decode(), challenge, display_name, row["pairing_id"]))
+            if control_protocol is not None:
+                self.conn.execute(
+                    "INSERT INTO canary_runner_pairing_protocols(pairing_id,protocol_version,control_protocol,exchange_digest,created_at) VALUES(?,?,?,?,?)",
+                    (row["pairing_id"], 3, control_protocol, exchange_digest, instant),
+                )
             self.conn.commit()
         except Exception:
             self.conn.rollback(); raise
-        return PairingView(row["pairing_id"], runner_id, phrase, fingerprint, "pending", row["expires_at"], challenge)
+        return PairingView(
+            row["pairing_id"], runner_id, phrase, fingerprint, "pending", row["expires_at"],
+            challenge, control_protocol, exchange_digest,
+        )
 
     def inspect(self, workspace_id: str, pairing_id: str) -> PairingView:
         row = self.conn.execute("SELECT * FROM canary_runner_pairings WHERE workspace_id=? AND pairing_id=?", (workspace_id, pairing_id)).fetchone()
@@ -968,6 +1044,163 @@ class RunnerAuthStore:
         except Exception:
             self.conn.rollback(); raise
         return row["workspace_id"], row["runner_id"], nonce
+
+    @staticmethod
+    def _activation_request_digest(pairing_id: str, request: Mapping[str, object]) -> str:
+        if type(pairing_id) is not str or not pairing_id:
+            raise ValueError("invalid pairing")
+        path = f"/v1/runner-pairings/{pairing_id}/activate".encode("utf-8")
+        return hashlib.sha256(b"POST\0" + path + b"\0" + canonical_bytes(dict(request))).hexdigest()
+
+    @staticmethod
+    def _activation_nonce(value: object) -> str:
+        if type(value) is not str:
+            raise ValueError("invalid pairing")
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except (ValueError, TypeError):
+            raise ValueError("invalid pairing") from None
+        if len(raw) != 32 or _b64(raw) != value:
+            raise ValueError("invalid pairing")
+        return value
+
+    def _validated_v3_activation_response(self, value: object, row: sqlite3.Row,
+                                          protocol: sqlite3.Row) -> dict:
+        if not isinstance(value, dict) or set(value) != {
+            "schema_version", "workspace_id", "runner_id", "runner_key_id",
+            "pairing_exchange_digest", "initial_claim_nonce", "initial_claim_sequence",
+            "initial_claim_generation", "capabilities", "control_protocol", "activated_at_ms",
+        }:
+            raise RunnerAuthError("invalid pairing")
+        if (
+            value["schema_version"] != "heel.runner-pairing-activated.v3"
+            or value["workspace_id"] != row["workspace_id"]
+            or value["runner_id"] != row["runner_id"]
+            or value["runner_key_id"] != row["key_id"]
+            or value["pairing_exchange_digest"] != protocol["exchange_digest"]
+            or value["control_protocol"] != "heel.runner-control.v2"
+            or value["capabilities"] != sorted(RUNNER_CAPABILITIES)
+            or value["initial_claim_sequence"] != 1
+            or value["initial_claim_generation"] != 0
+            or type(value["activated_at_ms"]) is not int
+            or not 0 <= value["activated_at_ms"] <= _SAFE_JSON_INT
+        ):
+            raise RunnerAuthError("invalid pairing")
+        self._activation_nonce(value["initial_claim_nonce"])
+        return value
+
+    def activate_executable(self, pairing_id: str, request: Mapping[str, object], *,
+                            max_active: int | None = None) -> dict:
+        """Activate one v3 pairing and persist the exact response before answering it."""
+        if not isinstance(request, Mapping) or set(request) != {
+            "schema_version", "client_activation_nonce_b64", "signature_b64",
+        } or request.get("schema_version") != "heel.runner-pairing-activate.v3":
+            raise ValueError("invalid pairing")
+        client_nonce = self._activation_nonce(request["client_activation_nonce_b64"])
+        if type(request["signature_b64"]) is not str:
+            raise ValueError("invalid pairing")
+        request_digest = self._activation_request_digest(pairing_id, request)
+        instant = self._now()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute("SELECT * FROM canary_runner_pairings WHERE pairing_id=?", (pairing_id,)).fetchone()
+            protocol = self.conn.execute(
+                "SELECT * FROM canary_runner_pairing_protocols WHERE pairing_id=?", (pairing_id,),
+            ).fetchone()
+            if row is None or protocol is None or protocol["protocol_version"] != 3 or protocol["control_protocol"] != "heel.runner-control.v2":
+                raise RunnerAuthError("invalid pairing")
+            if row["status"] == "activated":
+                receipt = self.conn.execute(
+                    "SELECT request_digest,response_ciphertext FROM canary_runner_pairing_activation_receipts WHERE pairing_id=?",
+                    (pairing_id,),
+                ).fetchone()
+                if receipt is None or not hmac.compare_digest(receipt["request_digest"], request_digest):
+                    raise RunnerAuthError("invalid pairing")
+                try:
+                    response = json_load(self._open(
+                        receipt["response_ciphertext"], aad=f"pairing-v3-activation\0{pairing_id}".encode(),
+                    ))
+                except (TypeError, ValueError, RunnerAuthError):
+                    raise RunnerAuthError("invalid pairing") from None
+                response = self._validated_v3_activation_response(response, row, protocol)
+                self.conn.commit()
+                return response
+            if row["status"] != "approved" or row["expires_at"] <= instant:
+                raise RunnerAuthError("invalid pairing")
+            try:
+                signature = base64.b64decode(request["signature_b64"], validate=True)
+                if len(signature) != 64 or _b64(signature) != request["signature_b64"]:
+                    raise ValueError
+                key = load_public_key_base64(row["public_key"])
+                proof = {
+                    "pairing_id": pairing_id, "activation_challenge": row["activation_challenge"],
+                    "pairing_exchange_digest": protocol["exchange_digest"],
+                    "client_activation_nonce_b64": client_nonce,
+                    "control_protocol": "heel.runner-control.v2",
+                }
+                key.verify(signature, b"heel.runner-pairing-activate.v3\0" + canonical_bytes(proof))
+            except (ValueError, InvalidSignature):
+                raise RunnerAuthError("invalid pairing") from None
+            current = self.conn.execute(
+                "SELECT COUNT(*) FROM canary_runners WHERE workspace_id=? AND status='active'",
+                (row["workspace_id"],),
+            ).fetchone()[0]
+            if max_active is not None and current >= max_active:
+                raise RunnerAuthError("runner quota exceeded")
+            self.conn.execute(
+                "INSERT INTO canary_runners(runner_id,workspace_id,display_name,status,created_at) VALUES(?,?,?,?,?)",
+                (row["runner_id"], row["workspace_id"], row["display_name"] or row["runner_id"], "active", instant),
+            )
+            self.conn.execute(
+                "INSERT INTO canary_runner_keys(key_id,workspace_id,runner_id,public_key,status,created_at,revoked_at) VALUES(?,?,?,?,?,?,NULL)",
+                (row["key_id"], row["workspace_id"], row["runner_id"], row["public_key"], "active", instant),
+            )
+            nonce = _token()
+            self.conn.execute(
+                "INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)",
+                (row["workspace_id"], row["runner_id"], "claim", self._hash("nonce", nonce), 1, instant + NONCE_TTL),
+            )
+            self.conn.execute(
+                "INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)",
+                (row["workspace_id"], row["runner_id"], "claim", 1, 0, instant),
+            )
+            self._save_identity(self._identity_record(
+                workspace_id=row["workspace_id"], runner_id=row["runner_id"], public_key=row["public_key"],
+                fingerprint=row["fingerprint"], key_id=row["key_id"], runner_version=row["runner_version"],
+                adapters_json=row["adapters_json"], paired_by=row["approved_by"], paired_at=row["approved_at"],
+                heartbeat_at=instant,
+            ), instant=instant)
+            self.conn.execute(
+                "INSERT INTO canary_runner_execution_protocols(workspace_id,runner_id,protocol_version,control_protocol,exchange_digest,activated_at) VALUES(?,?,?,?,?,?)",
+                (row["workspace_id"], row["runner_id"], 3, "heel.runner-control.v2", protocol["exchange_digest"], instant),
+            )
+            self.conn.execute(
+                "INSERT INTO canary_runner_audit_records(audit_id,workspace_id,runner_id,action,actor,reason_code,created_at) VALUES(?,?,?,?,?,?,?)",
+                ("runner_audit_" + secrets.token_hex(16), row["workspace_id"], row["runner_id"], "runner_activated", row["approved_by"], None, instant),
+            )
+            response = {
+                "schema_version": "heel.runner-pairing-activated.v3", "workspace_id": row["workspace_id"],
+                "runner_id": row["runner_id"], "runner_key_id": row["key_id"],
+                "pairing_exchange_digest": protocol["exchange_digest"], "initial_claim_nonce": nonce,
+                "initial_claim_sequence": 1, "initial_claim_generation": 0,
+                "capabilities": sorted(RUNNER_CAPABILITIES), "control_protocol": "heel.runner-control.v2",
+                "activated_at_ms": self._milliseconds(instant),
+            }
+            self._validated_v3_activation_response(response, row, protocol)
+            self.conn.execute(
+                "INSERT INTO canary_runner_pairing_activation_receipts(pairing_id,request_digest,response_ciphertext,created_at,expires_at) VALUES(?,?,?,?,?)",
+                (pairing_id, request_digest, self._seal(canonical_bytes(response).decode(), aad=f"pairing-v3-activation\0{pairing_id}".encode()), instant, row["expires_at"]),
+            )
+            self.conn.execute(
+                "UPDATE canary_runner_pairings SET status='activated', phrase=NULL, activation_challenge=NULL, activated_at=? WHERE pairing_id=?",
+                (instant, pairing_id),
+            )
+            self.conn.commit()
+            return response
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
 
     def provision_run_chains(self, workspace_id: str, runner_id: str, run_id: str) -> dict[str, dict[str, object]]:
         """Atomically issue independent nonce state for every named run operation."""
@@ -1268,16 +1501,74 @@ class RunnerAuthStore:
             raise RunnerAuthError("invalid rotation")
         return row["activation_challenge"]
 
+    @staticmethod
+    def _rotation_activation_request_digest(pairing_id: str, signature_b64: str) -> str:
+        if type(pairing_id) is not str or not pairing_id or type(signature_b64) is not str:
+            raise ValueError("invalid rotation")
+        request = {
+            "schema_version": "heel.runner-rotation-activate.v2",
+            "signature_b64": signature_b64,
+        }
+        path = f"/v1/runner-rotations/{pairing_id}/activate".encode("utf-8")
+        return hashlib.sha256(b"POST\0" + path + b"\0" + canonical_bytes(request)).hexdigest()
+
+    @staticmethod
+    def _validated_rotation_activation_response(value: object, row: sqlite3.Row) -> dict:
+        fields = {
+            "schema_version", "workspace_id", "runner_id", "initial_claim_nonce",
+            "initial_claim_sequence", "initial_claim_generation",
+        }
+        if not isinstance(value, dict) or set(value) != fields:
+            raise RunnerAuthError("invalid rotation")
+        if (
+            value["schema_version"] != "heel.runner-rotation-activated.v2"
+            or value["workspace_id"] != row["workspace_id"]
+            or value["runner_id"] != row["runner_id"]
+            or type(value["initial_claim_sequence"]) is not int
+            or value["initial_claim_sequence"] < 1
+            or type(value["initial_claim_generation"]) is not int
+            or not 0 <= value["initial_claim_generation"] <= _SAFE_JSON_INT
+        ):
+            raise RunnerAuthError("invalid rotation")
+        RunnerAuthStore._activation_nonce(value["initial_claim_nonce"])
+        return value
+
     def activate_rotation(self, pairing_id: str, signature_b64: str, *, overlap_seconds: int = 300) -> tuple[str, str, str, int, int]:
         if not isinstance(overlap_seconds, int) or not 1 <= overlap_seconds <= 3600:
             raise ValueError("invalid key overlap")
+        request_digest = self._rotation_activation_request_digest(pairing_id, signature_b64)
         instant = self._now()
         from .ledger import UsageLedger
         ledger = UsageLedger(self.conn)
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self.conn.execute("SELECT * FROM canary_runner_rotations WHERE pairing_id=?", (pairing_id,)).fetchone()
-            if row is None or row["status"] != "rotation_approved" or row["expires_at"] <= instant:
+            if row is None:
+                raise RunnerAuthError("invalid rotation")
+            if row["status"] == "rotated":
+                receipt = self.conn.execute(
+                    "SELECT request_digest,response_ciphertext FROM canary_runner_rotation_activation_receipts "
+                    "WHERE pairing_id=?",
+                    (pairing_id,),
+                ).fetchone()
+                if receipt is None or not hmac.compare_digest(receipt["request_digest"], request_digest):
+                    raise RunnerAuthError("invalid rotation")
+                try:
+                    response = self._validated_rotation_activation_response(
+                        json_load(self._open(
+                            receipt["response_ciphertext"],
+                            aad=f"rotation-v2-activation\0{pairing_id}".encode(),
+                        )),
+                        row,
+                    )
+                except (TypeError, ValueError, RunnerAuthError):
+                    raise RunnerAuthError("invalid rotation") from None
+                self.conn.commit()
+                return (
+                    response["workspace_id"], response["runner_id"], response["initial_claim_nonce"],
+                    response["initial_claim_sequence"], response["initial_claim_generation"],
+                )
+            if row["status"] != "rotation_approved" or row["expires_at"] <= instant:
                 raise RunnerAuthError("invalid rotation")
             try:
                 signature = base64.b64decode(signature_b64, validate=True)
@@ -1317,6 +1608,21 @@ class RunnerAuthStore:
             identity["rotation"] = {"previous_key_ids": previous, "rotated_at_ms": self._milliseconds(instant), "verification_overlap_ends_at_ms": self._milliseconds(instant + overlap_seconds)}
             self._save_changed_identity(identity, instant=instant)
             self.conn.execute("INSERT INTO canary_runner_audit_records(audit_id,workspace_id,runner_id,action,actor,reason_code,created_at) VALUES(?,?,?,?,?,?,?)", ("runner_audit_" + secrets.token_hex(16), row["workspace_id"], row["runner_id"], "runner_rotated", row["approved_by"], None, instant))
+            response = {
+                "schema_version": "heel.runner-rotation-activated.v2",
+                "workspace_id": row["workspace_id"], "runner_id": row["runner_id"],
+                "initial_claim_nonce": nonce, "initial_claim_sequence": claim_cursor["next_sequence"],
+                "initial_claim_generation": claim_cursor["generation"],
+            }
+            self._validated_rotation_activation_response(response, row)
+            self.conn.execute(
+                "INSERT INTO canary_runner_rotation_activation_receipts(pairing_id,request_digest,response_ciphertext,created_at,expires_at) VALUES(?,?,?,?,?)",
+                (
+                    pairing_id, request_digest,
+                    self._seal(canonical_bytes(response).decode(), aad=f"rotation-v2-activation\0{pairing_id}".encode()),
+                    instant, row["expires_at"],
+                ),
+            )
             self.conn.execute("UPDATE canary_runner_rotations SET status='rotated',activation_challenge=NULL,activated_at=? WHERE pairing_id=?", (instant, pairing_id))
             self.conn.commit()
         except Exception:
@@ -1388,6 +1694,7 @@ class RunnerAuthStore:
             operation, run_id, chain = self._resync_chain(body["chain"])
             client_nonce = self._b64_32(body["client_nonce_b64"])
             self.conn.execute("BEGIN IMMEDIATE")
+            self._require_executable_protocol_in_transaction(workspace_id, runner_id)
             _, signed_digest, timestamp_ms = self._resync_proof(workspace_id=workspace_id, runner_id=runner_id, path=path, raw_body=raw_body, headers=headers, proof_schema="heel.runner-resync-start-proof.v2", domain=b"heel.runner-resync-start-pop.v2\0", allow_stale=True)
             instant = self._now()
             cursor = self.conn.execute("SELECT * FROM canary_runner_chain_cursors WHERE workspace_id=? AND runner_id=? AND chain_name=?", (workspace_id, runner_id, chain)).fetchone()
@@ -1432,6 +1739,7 @@ class RunnerAuthStore:
             operation, run_id, chain = self._resync_chain(body["chain"])
             client_nonce, server_challenge = self._b64_32(body["client_nonce_b64"]), self._b64_32(body["server_challenge_b64"])
             self.conn.execute("BEGIN IMMEDIATE")
+            self._require_executable_protocol_in_transaction(workspace_id, runner_id)
             challenge = self.conn.execute("SELECT * FROM canary_runner_resync_challenges WHERE challenge_id=? AND workspace_id=? AND runner_id=?", (challenge_id, workspace_id, runner_id)).fetchone()
             if challenge is None or challenge["chain_name"] != chain or challenge["challenge_generation"] != body["generation"] or not hmac.compare_digest(challenge["client_nonce_hash"], self._hash("resync-client", client_nonce)) or not hmac.compare_digest(challenge["server_challenge_hash"], self._hash("resync-server", server_challenge)):
                 raise RunnerAuthError("invalid runner authentication")
@@ -1500,6 +1808,7 @@ class RunnerAuthStore:
                 raise RunnerAuthError("invalid runner authentication")
             body_digest = hashlib.sha256(raw_body).hexdigest()
             self.conn.execute("BEGIN IMMEDIATE")
+            self._require_executable_protocol_in_transaction(workspace_id, runner_id)
             row = self.conn.execute("SELECT * FROM canary_runner_keys WHERE workspace_id=? AND runner_id=? AND key_id=? AND status='active' AND revoked_at IS NULL", (workspace_id, runner_id, values["X-Heel-Runner-Key-Id"])).fetchone()
             if row is None:
                 raise RunnerAuthError("invalid runner authentication")

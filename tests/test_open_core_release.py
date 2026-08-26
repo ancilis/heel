@@ -23,6 +23,7 @@ import tarfile
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 import zipfile
 
 
@@ -180,6 +181,7 @@ EXPECTED_CONTRACT = {
         "heel/runner/identity.py",
         "heel/runner/openapi_routes.py",
         "heel/runner/redaction.py",
+        "heel/runner/runtime.py",
         "heel/runner/service.py",
         "heel/runner/store.py",
         "heel/runner/vault.py",
@@ -769,6 +771,91 @@ class OpenCoreReleaseTests(unittest.TestCase):
                 timeout=120,
             )
 
+    def test_release_smoke_inspects_the_open_core_runner_boundary(self):
+        """The smoke harness must not require hosted modules from this wheel."""
+        from scripts.release_smoke import _inspect_wheel
+
+        with tempfile.TemporaryDirectory(prefix="heel-release-smoke-boundary-") as temporary:
+            wheel = Path(temporary) / "open-core.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                for name in (
+                    "heel/__init__.py", "heel/cli.py", "heel/mcp_server.py",
+                    "heel/runner/__init__.py", "heel/runner/runtime.py",
+                ):
+                    archive.writestr(name, b"")
+            _inspect_wheel(wheel)
+
+    def test_release_smoke_bootstraps_an_isolated_uv_environment(self):
+        """The smoke must neither seed a venv nor install from the source tree."""
+        from scripts import release_smoke
+
+        class StopAfterInstall(RuntimeError):
+            pass
+
+        def create_environment(root: Path) -> None:
+            scripts = root / ("Scripts" if os.name == "nt" else "bin")
+            scripts.mkdir(parents=True)
+            (scripts / ("python.exe" if os.name == "nt" else "python")).symlink_to(
+                Path(sys.executable).resolve()
+            )
+
+        class FakeVenvBuilder:
+            def __init__(self, **_: object) -> None:
+                pass
+
+            def create(self, root: Path) -> None:
+                create_environment(root)
+
+        with tempfile.TemporaryDirectory(prefix="heel-release-smoke-uv-") as temporary:
+            scratch = Path(temporary)
+            environment_root = scratch / "environment"
+            wheel = scratch / "heel_sim-1.2.0-py3-none-any.whl"
+            wheel.write_bytes(b"wheel")
+            commands: list[list[str]] = []
+            base_python = Path(sys.executable).resolve()
+
+            def record(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                commands.append(command)
+                if command[:3] == ["uv", "python", "find"]:
+                    return subprocess.CompletedProcess(command, 0, f"{base_python}\n", "")
+                if command[:2] == ["uv", "venv"]:
+                    create_environment(Path(command[-1]))
+                if command[:2] == ["uv", "pip"] or command[1:3] == ["-m", "pip"]:
+                    raise StopAfterInstall
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                mock.patch.object(release_smoke, "_run", side_effect=record),
+                mock.patch.object(release_smoke.shutil, "which", return_value="uv"),
+                mock.patch("venv.EnvBuilder", FakeVenvBuilder),
+                self.assertRaises(StopAfterInstall),
+            ):
+                release_smoke._exercise_installed_wheel(
+                    wheel,
+                    scratch,
+                    environment_root,
+                    scratch,
+                )
+
+            python = environment_root / ("Scripts" if os.name == "nt" else "bin") / (
+                "python.exe" if os.name == "nt" else "python"
+            )
+            self.assertEqual(
+                commands,
+                [
+                    ["uv", "python", "find", "--system", "--resolve-links", "--no-project",
+                     "--no-config", "--no-python-downloads", "--offline", ">=3.11"],
+                    ["uv", "venv", "--no-project", "--no-config", "--no-python-downloads",
+                     "--offline", "--no-cache", "--python", str(base_python),
+                     str(environment_root.resolve())],
+                    [
+                        "uv", "pip", "install", "--no-config", "--no-python-downloads",
+                        "--offline", "--no-cache", "--no-index", "--python", str(python.absolute()),
+                        "--no-deps", str(wheel.resolve()),
+                    ],
+                ],
+            )
+
     def test_release_contract_is_an_exact_public_allowlist(self):
         self.assertTrue(CONTRACT.is_file(), "release/open-core-v1.json is missing")
         contract_text = CONTRACT.read_text(encoding="utf-8")
@@ -864,7 +951,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
             for name in (
                 "__init__.py", "adapters.py", "catalog.py", "companion.py", "compiler.py",
                 "containment.py", "control_client.py", "coordinator.py", "execution.py", "http_transport.py",
-                "identity.py", "openapi_routes.py", "redaction.py", "service.py", "store.py",
+                "identity.py", "openapi_routes.py", "redaction.py", "runtime.py", "service.py", "store.py",
                 "vault.py",
             )
         }

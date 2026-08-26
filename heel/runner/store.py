@@ -31,7 +31,10 @@ from heel.canary_contracts import (
     validate_runner_context_binding,
 )
 from heel.crypto import ed25519_key_id, load_public_key_base64, verify_envelope
-from heel.runner.identity import RunnerIdentity, SecureSigner
+from heel.runner.identity import (
+    AcceptedRotationJournal, PendingPairingActivation, PendingRotationActivation,
+    RunnerIdentity, RunnerPairingMaterial, SecureSigner,
+)
 from heel.scope import heel_home
 
 from .catalog import CATALOG_BY_ID, NONANONYMOUS_AUTH_PROFILES, SEMANTIC_ROLES
@@ -94,11 +97,25 @@ _RESERVATION_SCHEMA = "heel.local-grant-consumption.v2"
 _FINALS_SCHEMA = "heel.local-final-projections.v1"
 _CONTEXT_DOMAIN = b"heel.runner-context-binding.v1\0"
 _CLOUD_CONTEXT_PROVENANCE_SCHEMA = "heel.cloud-context-provenance.v1"
-_CONTEXT_ROLLOVER_SCHEMA = "heel.runner-context-rollover.v1"
-_CONTEXT_INSTALL_SCHEMA = "heel.runner-context-install.v1"
+_CLOUD_CONTEXT_AUTHORITY_COMMIT_SCHEMA = "heel.cloud-context-authority-commit.v1"
+_CLOUD_CONTEXT_AUTHORITY_COMMIT_DOMAIN = b"heel.cloud-context-authority-commit.v1\0"
+_ACTIVE_CONTEXT_CLOUD_SCHEMA = "heel.active-runner-context.v2"
+_ACTIVE_CONTEXT_CLOUD_DOMAIN = b"heel.active-runner-context.v2\0"
+_CONTEXT_ROLLOVER_SCHEMA = "heel.runner-context-rollover.v2"
+_CONTEXT_INSTALL_SCHEMA = "heel.runner-context-install.v2"
+_PAIRING_ACTIVATION_JOURNAL_SCHEMA = "heel.runner-pairing-activation-journal.v1"
+_PAIRED_RUNNER_IDENTITY_SCHEMA = "heel.local-paired-runner.v1"
+_ROTATION_ACTIVATION_JOURNAL_SCHEMA = "heel.runner-rotation-activation-journal.v1"
+_PAIRING_ACTIVATION_JOURNAL_DOMAIN = b"heel.runner-pairing-activation-journal.v1\0"
+_PAIRED_RUNNER_IDENTITY_DOMAIN = b"heel.local-paired-runner.v1\0"
+_ROTATION_ACTIVATION_JOURNAL_DOMAIN = b"heel.runner-rotation-activation-journal.v1\0"
+_PAIRING_ACTIVATION_JOURNAL_FILENAME = "pairing-activation.json"
+_PAIRED_RUNNER_IDENTITY_FILENAME = "paired-identity.json"
+_ROTATION_ACTIVATION_JOURNAL_FILENAME = "rotation-activation.json"
 _RUN_AUTHORITY_INDEX_SCHEMA = "heel.local-run-authority-index.v1"
 _RUN_RESERVATION_RECORD_SCHEMA = "heel.local-run-reservation.v1"
 _RUN_TERMINAL_RECORD_SCHEMA = "heel.local-run-terminal.v1"
+_RUN_TERMINAL_DETACHED_RECORD_SCHEMA = "heel.local-run-terminal-detached.v1"
 _RUN_PRUNED_RECORD_SCHEMA = "heel.local-run-pruned.v1"
 _RUN_AUTHORITY_MUTATION_SCHEMA = "heel.local-run-authority-mutation.v1"
 _RUN_AUTHORITY_INDEX_FILENAME = "run-authority-index.json"
@@ -113,6 +130,7 @@ _RUN_AUTHORITY_DOMAINS = {
     _RUN_AUTHORITY_INDEX_SCHEMA: b"heel.local-run-authority-index.v1\0",
     _RUN_RESERVATION_RECORD_SCHEMA: b"heel.local-run-reservation.v1\0",
     _RUN_TERMINAL_RECORD_SCHEMA: b"heel.local-run-terminal.v1\0",
+    _RUN_TERMINAL_DETACHED_RECORD_SCHEMA: b"heel.local-run-terminal-detached.v1\0",
     _RUN_PRUNED_RECORD_SCHEMA: b"heel.local-run-pruned.v1\0",
     _RUN_AUTHORITY_MUTATION_SCHEMA: b"heel.local-run-authority-mutation.v1\0",
 }
@@ -640,6 +658,7 @@ class RunnerStore:
         self.root = _absolute(Path(heel_home()) if root is None else Path(root))
         self._namespace: str | None = None
         self._runtime_authority: tuple[RunnerIdentity, SecureSigner] | None = None
+        self._rotation_token = object()
         with self._open_runner(create=True):
             pass
         self._select_active_if_present()
@@ -661,8 +680,10 @@ class RunnerStore:
                 raise RunnerStoreError("authenticated runner store identity changed")
             return
         if self._namespace is not None:
-            with self._transaction(exclusive=False, allow_rollover_journal=True) as context_fd:
-                if self._binding_locked(context_fd)["identity"] != record:
+            with self._transaction(
+                exclusive=False, allow_rollover_journal=True, allow_cloud_install_journal=True,
+            ) as context_fd:
+                if self._binding_locked(context_fd, validate_cloud=False)["identity"] != record:
                     raise RunnerStoreError("authenticated runner store identity differs from bound context")
         self._runtime_authority = (identity, signer)
 
@@ -678,6 +699,828 @@ class RunnerStore:
         actual = self._require_runtime_authority()
         if _identity_record(*actual) != expected:
             raise RunnerStoreError("authenticated runner store identity changed")
+
+    @staticmethod
+    def _pairing_time(value: object, label: str) -> int:
+        if type(value) is not int or not 0 <= value <= 9_007_199_254_740_991:
+            raise RunnerStoreError(f"invalid {label}")
+        return value
+
+    @staticmethod
+    def _pairing_nonce(value: object, label: str) -> str:
+        if type(value) is not str:
+            raise RunnerStoreError(f"invalid {label}")
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except (TypeError, ValueError):
+            raise RunnerStoreError(f"invalid {label}") from None
+        if len(raw) != 32 or base64.b64encode(raw).decode("ascii") != value:
+            raise RunnerStoreError(f"invalid {label}")
+        return value
+
+    @staticmethod
+    def _pairing_signed_value(
+        core: Mapping[str, Any], *, signer: SecureSigner, domain: bytes, digest_field: str,
+    ) -> dict[str, Any]:
+        unsigned = dict(core)
+        unsigned[digest_field] = hashlib.sha256(domain + canonical_bytes(unsigned)).hexdigest()
+        signature = signer.sign(domain + canonical_bytes(unsigned))
+        if type(signature) is not bytes or len(signature) != 64:
+            raise RunnerStoreError("runner signer returned an invalid pairing signature")
+        return {
+            **unsigned, "signing_key_id": signer.key_id,
+            "signature_b64": base64.b64encode(signature).decode("ascii"),
+        }
+
+    @staticmethod
+    def _verify_pairing_signed_value(
+        value: object, *, identity: RunnerIdentity, domain: bytes, digest_field: str,
+        fields: set[str], label: str,
+    ) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value) != fields | {digest_field, "signing_key_id", "signature_b64"}:
+            raise RunnerStoreError(f"invalid {label}")
+        if value.get("signing_key_id") != identity.key_id:
+            raise RunnerStoreError(f"invalid {label}")
+        unsigned = {key: value[key] for key in fields | {digest_field}}
+        core = {key: value[key] for key in fields}
+        if value[digest_field] != hashlib.sha256(domain + canonical_bytes(core)).hexdigest():
+            raise RunnerStoreError(f"invalid {label}")
+        try:
+            public = load_public_key_base64(identity.public_key_b64)
+            verify_envelope(
+                {identity.key_id: public},
+                {"signing_key_id": value["signing_key_id"], "signature_b64": value["signature_b64"]},
+                domain + canonical_bytes(unsigned),
+            )
+        except (TypeError, ValueError):
+            raise RunnerStoreError(f"invalid {label}") from None
+        return dict(value)
+
+    @classmethod
+    def _pairing_pending(cls, value: Mapping[str, object]) -> dict[str, object]:
+        fields = {
+            "schema_version", "pairing_id", "runner_id", "fingerprint", "status",
+            "activation_challenge", "control_protocol", "pairing_exchange_digest",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise RunnerStoreError("invalid executable pairing pending response")
+        if (
+            value["schema_version"] != "heel.runner-pairing-pending.v2"
+            or value["status"] != "pending"
+            or value["control_protocol"] != "heel.runner-control.v2"
+        ):
+            raise RunnerStoreError("invalid executable pairing pending response")
+        return {
+            "schema_version": value["schema_version"],
+            "pairing_id": _id(value["pairing_id"], "pairing ID"),
+            "runner_id": _id(value["runner_id"], "runner ID"),
+            "fingerprint": _digest(value["fingerprint"], "runner fingerprint"),
+            "status": value["status"],
+            "activation_challenge": cls._pairing_nonce(value["activation_challenge"], "pairing activation challenge"),
+            "control_protocol": value["control_protocol"],
+            "pairing_exchange_digest": _digest(value["pairing_exchange_digest"], "pairing exchange digest"),
+        }
+
+    @classmethod
+    def _activation_response(
+        cls, value: Mapping[str, object], *, material: RunnerPairingMaterial,
+        pending: Mapping[str, object],
+    ) -> tuple[dict[str, object], RunnerIdentity]:
+        fields = {
+            "schema_version", "workspace_id", "runner_id", "runner_key_id",
+            "pairing_exchange_digest", "initial_claim_nonce", "initial_claim_sequence",
+            "initial_claim_generation", "capabilities", "control_protocol", "activated_at_ms",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise RunnerStoreError("invalid executable pairing activation response")
+        if (
+            value["schema_version"] != "heel.runner-pairing-activated.v3"
+            or value["runner_id"] != pending["runner_id"]
+            or value["runner_key_id"] != material.key_id
+            or value["pairing_exchange_digest"] != pending["pairing_exchange_digest"]
+            or value["control_protocol"] != "heel.runner-control.v2"
+            or value["capabilities"] != ["runner_claim", "runner_heartbeat", "runner_progress", "runner_result"]
+            or value["initial_claim_sequence"] != 1
+            or value["initial_claim_generation"] != 0
+        ):
+            raise RunnerStoreError("invalid executable pairing activation response")
+        identity = RunnerIdentity(
+            runner_id=_id(value["runner_id"], "runner ID"),
+            workspace_id=_id(value["workspace_id"], "runner workspace ID"),
+            runner_version=material.runner_version, adapter_versions=dict(material.adapters),
+            public_key_b64=material.public_key_b64, fingerprint=material.fingerprint,
+            key_id=material.key_id, pairing_phrase=material.pairing_phrase,
+        )
+        return ({
+            "schema_version": value["schema_version"], "workspace_id": identity.workspace_id,
+            "runner_id": identity.runner_id, "runner_key_id": identity.key_id,
+            "pairing_exchange_digest": pending["pairing_exchange_digest"],
+            "initial_claim_nonce": cls._pairing_nonce(value["initial_claim_nonce"], "initial claim nonce"),
+            "initial_claim_sequence": 1, "initial_claim_generation": 0,
+            "capabilities": list(value["capabilities"]), "control_protocol": value["control_protocol"],
+            "activated_at_ms": cls._pairing_time(value["activated_at_ms"], "pairing activation time"),
+        }, identity)
+
+    def _prepare_pairing_activation(
+        self, material: RunnerPairingMaterial, pending_v2: Mapping[str, object], *, now_ms: int,
+        random_source: Any,
+    ) -> PendingPairingActivation:
+        if not isinstance(material, RunnerPairingMaterial):
+            raise RunnerStoreError("runner pairing material is required")
+        pending = self._pairing_pending(pending_v2)
+        if pending["fingerprint"] != material.fingerprint:
+            raise RunnerStoreError("executable pairing identity mismatch")
+        now_ms = self._pairing_time(now_ms, "pairing preparation time")
+        nonce = random_source(32)
+        if type(nonce) is not bytes or len(nonce) != 32:
+            raise RunnerStoreError("runner activation random source returned an invalid nonce")
+        nonce_b64 = base64.b64encode(nonce).decode("ascii")
+        proof = {
+            "pairing_id": pending["pairing_id"], "activation_challenge": pending["activation_challenge"],
+            "pairing_exchange_digest": pending["pairing_exchange_digest"],
+            "client_activation_nonce_b64": nonce_b64, "control_protocol": "heel.runner-control.v2",
+        }
+        signature = material._signer.sign(b"heel.runner-pairing-activate.v3\0" + canonical_bytes(proof))
+        if type(signature) is not bytes or len(signature) != 64:
+            raise RunnerStoreError("runner signer returned an invalid pairing activation signature")
+        request = {
+            "schema_version": "heel.runner-pairing-activate.v3", "client_activation_nonce_b64": nonce_b64,
+            "signature_b64": base64.b64encode(signature).decode("ascii"),
+        }
+        core = {
+            "schema_version": _PAIRING_ACTIVATION_JOURNAL_SCHEMA, "state": "prepared",
+            "pairing_id": pending["pairing_id"], "runner_id": pending["runner_id"],
+            "pairing_exchange_digest": pending["pairing_exchange_digest"],
+            "activation_challenge": pending["activation_challenge"], "client_activation_nonce_b64": nonce_b64,
+            "activation_request": request, "activation_response": None, "identity": None,
+            "created_at_ms": now_ms, "updated_at_ms": now_ms,
+        }
+        journal = self._pairing_signed_value(
+            core, signer=material._signer, domain=_PAIRING_ACTIVATION_JOURNAL_DOMAIN,
+            digest_field="journal_digest",
+        )
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                existing = _read_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, None)
+                if existing is None:
+                    if _read_json(runner_fd, _PAIRED_RUNNER_IDENTITY_FILENAME, None) is not None:
+                        raise RunnerStoreError("runner pairing activation is already complete")
+                    _write_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, journal)
+                elif existing != journal:
+                    raise RunnerStoreError("runner pairing activation requires recovery")
+        return PendingPairingActivation(dict(pending), dict(request), material)
+
+    def accept_pairing_activation(
+        self, pending: PendingPairingActivation, response_v3: Mapping[str, object], *, now_ms: int,
+    ) -> RunnerIdentity:
+        if not isinstance(pending, PendingPairingActivation):
+            raise RunnerStoreError("prepared runner pairing activation is required")
+        if (
+            not isinstance(pending.pending, Mapping) or not isinstance(pending.request, Mapping)
+            or not isinstance(pending._material, RunnerPairingMaterial)
+        ):
+            raise RunnerStoreError("prepared runner pairing activation is invalid")
+        pending_record = self._pairing_pending(pending.pending)
+        material = pending._material
+        now_ms = self._pairing_time(now_ms, "pairing activation acceptance time")
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                journal = _read_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, None)
+                if not isinstance(journal, Mapping) or journal.get("state") != "prepared":
+                    raise RunnerStoreError("runner pairing activation requires recovery")
+                journal_identity = RunnerIdentity(
+                    runner_id=_id(journal.get("runner_id"), "runner ID"), workspace_id="pending",
+                    runner_version=material.runner_version, adapter_versions=dict(material.adapters),
+                    public_key_b64=material.public_key_b64, fingerprint=material.fingerprint,
+                    key_id=material.key_id, pairing_phrase=material.pairing_phrase,
+                )
+                journal_fields = {
+                    "schema_version", "state", "pairing_id", "runner_id", "pairing_exchange_digest",
+                    "activation_challenge", "client_activation_nonce_b64", "activation_request",
+                    "activation_response", "identity", "created_at_ms", "updated_at_ms",
+                }
+                self._verify_pairing_signed_value(
+                    journal, identity=journal_identity, domain=_PAIRING_ACTIVATION_JOURNAL_DOMAIN,
+                    digest_field="journal_digest", fields=journal_fields,
+                    label="runner pairing activation journal",
+                )
+                request = journal.get("activation_request")
+                if (
+                    journal.get("schema_version") != _PAIRING_ACTIVATION_JOURNAL_SCHEMA
+                    or journal.get("pairing_id") != pending_record["pairing_id"]
+                    or journal.get("runner_id") != pending_record["runner_id"]
+                    or journal.get("pairing_exchange_digest") != pending_record["pairing_exchange_digest"]
+                    or journal.get("activation_challenge") != pending_record["activation_challenge"]
+                    or request != dict(pending.request)
+                    or journal.get("created_at_ms") != journal.get("updated_at_ms")
+                ):
+                    raise RunnerStoreError("runner pairing activation request changed")
+                identity_value = journal.get("identity")
+                if identity_value is not None or journal.get("activation_response") is not None:
+                    raise RunnerStoreError("runner pairing activation requires recovery")
+                response, identity = self._activation_response(
+                    response_v3, material=material, pending=pending_record,
+                )
+                accepted_core = {
+                    "schema_version": _PAIRING_ACTIVATION_JOURNAL_SCHEMA, "state": "accepted",
+                    "pairing_id": pending_record["pairing_id"], "runner_id": pending_record["runner_id"],
+                    "pairing_exchange_digest": pending_record["pairing_exchange_digest"],
+                    "activation_challenge": pending_record["activation_challenge"],
+                    "client_activation_nonce_b64": journal["client_activation_nonce_b64"],
+                    "activation_request": dict(pending.request), "activation_response": response,
+                    "identity": _identity_record(identity, material._signer),
+                    "created_at_ms": journal["created_at_ms"], "updated_at_ms": now_ms,
+                }
+                accepted = self._pairing_signed_value(
+                    accepted_core, signer=material._signer, domain=_PAIRING_ACTIVATION_JOURNAL_DOMAIN,
+                    digest_field="journal_digest",
+                )
+                _write_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, accepted)
+        self._pin_runtime_authority(identity, material._signer)
+        return identity
+
+    def finish_pairing_activation(self, runtime_state: object) -> RunnerIdentity:
+        """Publish paired v3 identity and its server cursor, then clear the accepted journal."""
+        identity, signer = self._require_runtime_authority()
+        if not self._runtime_matches_identity(runtime_state, identity=identity, signer=signer):
+            raise RunnerStoreError("runner runtime identity does not match pairing activation")
+        journal_fields = {
+            "schema_version", "state", "pairing_id", "runner_id", "pairing_exchange_digest",
+            "activation_challenge", "client_activation_nonce_b64", "activation_request",
+            "activation_response", "identity", "created_at_ms", "updated_at_ms",
+        }
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                journal = _read_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, None)
+                if not isinstance(journal, Mapping) or journal.get("state") != "accepted":
+                    raise RunnerStoreError("runner pairing activation requires recovery")
+                self._verify_pairing_signed_value(
+                    journal, identity=identity, domain=_PAIRING_ACTIVATION_JOURNAL_DOMAIN,
+                    digest_field="journal_digest", fields=journal_fields,
+                    label="runner pairing activation journal",
+                )
+                if journal.get("identity") != _identity_record(identity, signer):
+                    raise RunnerStoreError("runner pairing activation identity changed")
+                response = journal.get("activation_response")
+                if (
+                    journal.get("runner_id") != identity.runner_id
+                    or not isinstance(response, Mapping)
+                    or response.get("runner_id") != identity.runner_id
+                ):
+                    raise RunnerStoreError("invalid runner pairing activation journal")
+                nonce = self._pairing_nonce(response.get("initial_claim_nonce"), "initial claim nonce")
+                if response.get("initial_claim_sequence") != 1 or response.get("initial_claim_generation") != 0:
+                    raise RunnerStoreError("invalid runner pairing activation journal")
+                paired_core = {
+                    "schema_version": _PAIRED_RUNNER_IDENTITY_SCHEMA,
+                    "identity": _identity_record(identity, signer), "pairing_protocol_version": 3,
+                    "control_protocol": "heel.runner-control.v2", "pairing_id": journal["pairing_id"],
+                    "pairing_exchange_digest": journal["pairing_exchange_digest"],
+                    "activated_at_ms": response.get("activated_at_ms"),
+                    "activation_response_digest": hashlib.sha256(canonical_bytes(response)).hexdigest(),
+                }
+                paired = self._pairing_signed_value(
+                    paired_core, signer=signer, domain=_PAIRED_RUNNER_IDENTITY_DOMAIN,
+                    digest_field="record_digest",
+                )
+                existing_paired = _read_json(runner_fd, _PAIRED_RUNNER_IDENTITY_FILENAME, None)
+                if existing_paired is None:
+                    _write_json(runner_fd, _PAIRED_RUNNER_IDENTITY_FILENAME, paired)
+                elif existing_paired != paired:
+                    raise RunnerStoreError("paired runner identity changed")
+                install = getattr(runtime_state, "install_chain", None)
+                load = getattr(runtime_state, "load_chain", None)
+                if not callable(install) or not callable(load):
+                    raise RunnerStoreError("runner runtime state is invalid")
+                cursor = install(
+                    operation="claim", run_id=None, next_nonce_b64=nonce,
+                    next_sequence=1, generation=0, now_ms=response["activated_at_ms"],
+                )
+                if cursor.next_nonce_b64 != nonce or cursor.next_sequence != 1 or cursor.generation != 0:
+                    raise RunnerStoreError("runner runtime pairing cursor changed")
+                verified = load("claim", None)
+                if verified != cursor:
+                    raise RunnerStoreError("runner runtime pairing cursor is unavailable")
+                os.unlink(_PAIRING_ACTIVATION_JOURNAL_FILENAME, dir_fd=runner_fd)
+                os.fsync(runner_fd)
+        return identity
+
+    def recover_pairing_activation(
+        self, material: RunnerPairingMaterial, runtime_path: Path | str,
+    ) -> PendingPairingActivation | RunnerIdentity | None:
+        """Complete exactly one signed local pairing prefix without discovering state."""
+        if not isinstance(material, RunnerPairingMaterial):
+            raise RunnerStoreError("runner pairing material is required")
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=False):
+                journal = _read_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, None)
+        if journal is None:
+            return None
+        if not isinstance(journal, Mapping):
+            raise RunnerStoreError("invalid runner pairing activation journal")
+        state = journal.get("state")
+        if state not in {"prepared", "accepted"}:
+            raise RunnerStoreError("invalid runner pairing activation journal")
+        basic_fields = {
+            "schema_version", "state", "pairing_id", "runner_id", "pairing_exchange_digest",
+            "activation_challenge", "client_activation_nonce_b64", "activation_request",
+            "activation_response", "identity", "created_at_ms", "updated_at_ms",
+        }
+        pending = self._pairing_pending({
+            "schema_version": "heel.runner-pairing-pending.v2", "pairing_id": journal.get("pairing_id"),
+            "runner_id": journal.get("runner_id"),
+            "fingerprint": material.fingerprint, "status": "pending",
+            "activation_challenge": journal.get("activation_challenge"),
+            "control_protocol": "heel.runner-control.v2",
+            "pairing_exchange_digest": journal.get("pairing_exchange_digest"),
+        })
+        if state == "prepared":
+            pseudo_identity = RunnerIdentity(
+                runner_id=pending["runner_id"], workspace_id="pending", runner_version=material.runner_version,
+                adapter_versions=dict(material.adapters), public_key_b64=material.public_key_b64,
+                fingerprint=material.fingerprint, key_id=material.key_id,
+                pairing_phrase=material.pairing_phrase,
+            )
+            self._verify_pairing_signed_value(
+                journal, identity=pseudo_identity, domain=_PAIRING_ACTIVATION_JOURNAL_DOMAIN,
+                digest_field="journal_digest", fields=basic_fields,
+                label="runner pairing activation journal",
+            )
+            request = journal.get("activation_request")
+            if journal.get("activation_response") is not None or journal.get("identity") is not None or not isinstance(request, Mapping):
+                raise RunnerStoreError("invalid runner pairing activation journal")
+            return PendingPairingActivation(dict(pending), dict(request), material)
+        if not isinstance(journal.get("identity"), Mapping) or not isinstance(journal.get("activation_response"), Mapping):
+            raise RunnerStoreError("invalid runner pairing activation journal")
+        identity_record = _stored_identity_record(journal["identity"])
+        if (
+            identity_record["public_key_b64"] != material.public_key_b64
+            or identity_record["fingerprint"] != material.fingerprint
+            or identity_record["runner_key_id"] != material.key_id
+        ):
+            raise RunnerStoreError("runner pairing activation identity changed")
+        identity = RunnerIdentity(
+            runner_id=identity_record["runner_id"], workspace_id=identity_record["workspace_id"],
+            runner_version=identity_record["runner_version"], adapter_versions=identity_record["adapter_versions"],
+            public_key_b64=identity_record["public_key_b64"], fingerprint=identity_record["fingerprint"],
+            key_id=identity_record["runner_key_id"], pairing_phrase=material.pairing_phrase,
+        )
+        self._verify_pairing_signed_value(
+            journal, identity=identity, domain=_PAIRING_ACTIVATION_JOURNAL_DOMAIN,
+            digest_field="journal_digest", fields=basic_fields,
+            label="runner pairing activation journal",
+        )
+        response = journal["activation_response"]
+        if (
+            journal.get("runner_id") != identity.runner_id
+            or response.get("runner_id") != identity.runner_id
+            or response.get("workspace_id") != identity.workspace_id
+        ):
+            raise RunnerStoreError("invalid runner pairing activation journal")
+        self._pin_runtime_authority(identity, material._signer)
+        from heel.runner.runtime import RunnerRuntimeState
+        runtime = RunnerRuntimeState(runtime_path, identity, material._signer)
+        return self.finish_pairing_activation(runtime)
+
+    @classmethod
+    def _rotation_pending(cls, value: Mapping[str, object]) -> dict[str, object]:
+        fields = {"schema_version", "pairing_id", "activation_challenge"}
+        if not isinstance(value, Mapping) or set(value) != fields or value.get("schema_version") != "heel.runner-rotation-activation-challenge.v1":
+            raise RunnerStoreError("invalid runner rotation activation challenge")
+        return {
+            "schema_version": value["schema_version"],
+            "pairing_id": _id(value["pairing_id"], "rotation pairing ID"),
+            "activation_challenge": cls._pairing_nonce(value["activation_challenge"], "rotation activation challenge"),
+        }
+
+    @classmethod
+    def _rotation_response(
+        cls, value: Mapping[str, object], *, identity: RunnerIdentity,
+    ) -> dict[str, object]:
+        fields = {
+            "schema_version", "workspace_id", "runner_id", "initial_claim_nonce",
+            "initial_claim_sequence", "initial_claim_generation",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields or (
+            value.get("schema_version") != "heel.runner-rotation-activated.v2"
+            or value.get("workspace_id") != identity.workspace_id
+            or value.get("runner_id") != identity.runner_id
+        ):
+            raise RunnerStoreError("invalid runner rotation activation response")
+        sequence = value["initial_claim_sequence"]
+        generation = value["initial_claim_generation"]
+        if (
+            type(sequence) is not int or not 1 <= sequence <= 9_007_199_254_740_991
+            or type(generation) is not int or not 0 <= generation <= 9_007_199_254_740_991
+        ):
+            raise RunnerStoreError("invalid runner rotation activation response")
+        return {
+            "schema_version": value["schema_version"], "workspace_id": identity.workspace_id,
+            "runner_id": identity.runner_id,
+            "initial_claim_nonce": cls._pairing_nonce(value["initial_claim_nonce"], "rotation claim nonce"),
+            "initial_claim_sequence": sequence, "initial_claim_generation": generation,
+        }
+
+    @classmethod
+    def _signed_rotation_journal(
+        cls, core: Mapping[str, object], *, old_signer: SecureSigner, new_signer: SecureSigner,
+    ) -> dict[str, object]:
+        digest = hashlib.sha256(_ROTATION_ACTIVATION_JOURNAL_DOMAIN + canonical_bytes(dict(core))).hexdigest()
+        unsigned = {**core, "journal_digest": digest}
+        old_signature = old_signer.sign(_ROTATION_ACTIVATION_JOURNAL_DOMAIN + canonical_bytes(unsigned))
+        new_signature = new_signer.sign(_ROTATION_ACTIVATION_JOURNAL_DOMAIN + canonical_bytes(unsigned))
+        if (
+            type(old_signature) is not bytes or len(old_signature) != 64
+            or type(new_signature) is not bytes or len(new_signature) != 64
+        ):
+            raise RunnerStoreError("runner signer returned an invalid rotation signature")
+        return {
+            **unsigned,
+            "old_signing_key_id": old_signer.key_id,
+            "old_signature_b64": base64.b64encode(old_signature).decode("ascii"),
+            "new_signing_key_id": new_signer.key_id,
+            "new_signature_b64": base64.b64encode(new_signature).decode("ascii"),
+        }
+
+    @classmethod
+    def _verify_rotation_journal(
+        cls, value: object, *, old_identity: RunnerIdentity, new_identity: RunnerIdentity,
+    ) -> dict[str, object]:
+        fields = {
+            "schema_version", "state", "pairing_id", "old_identity", "new_identity",
+            "new_signer_label", "activation_challenge", "activation_request", "activation_response",
+            "created_at_ms", "updated_at_ms",
+        }
+        signature_fields = {
+            "journal_digest", "old_signing_key_id", "old_signature_b64",
+            "new_signing_key_id", "new_signature_b64",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields | signature_fields:
+            raise RunnerStoreError("invalid runner rotation activation journal")
+        if value.get("schema_version") != _ROTATION_ACTIVATION_JOURNAL_SCHEMA or value.get("state") not in {"prepared", "accepted"}:
+            raise RunnerStoreError("invalid runner rotation activation journal")
+        core = {key: value[key] for key in fields}
+        if value["journal_digest"] != hashlib.sha256(
+            _ROTATION_ACTIVATION_JOURNAL_DOMAIN + canonical_bytes(core)
+        ).hexdigest():
+            raise RunnerStoreError("invalid runner rotation activation journal")
+        if (
+            value["old_identity"] != _identity_record(old_identity, _IdentityPublicSigner(old_identity))
+            or value["new_identity"] != _identity_record(new_identity, _IdentityPublicSigner(new_identity))
+            or value["old_signing_key_id"] != old_identity.key_id
+            or value["new_signing_key_id"] != new_identity.key_id
+        ):
+            raise RunnerStoreError("invalid runner rotation activation journal")
+        try:
+            unsigned = {**core, "journal_digest": value["journal_digest"]}
+            verify_envelope(
+                {old_identity.key_id: load_public_key_base64(old_identity.public_key_b64)},
+                {"signing_key_id": value["old_signing_key_id"], "signature_b64": value["old_signature_b64"]},
+                _ROTATION_ACTIVATION_JOURNAL_DOMAIN + canonical_bytes(unsigned),
+            )
+            verify_envelope(
+                {new_identity.key_id: load_public_key_base64(new_identity.public_key_b64)},
+                {"signing_key_id": value["new_signing_key_id"], "signature_b64": value["new_signature_b64"]},
+                _ROTATION_ACTIVATION_JOURNAL_DOMAIN + canonical_bytes(unsigned),
+            )
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid runner rotation activation journal") from None
+        if (
+            type(value["pairing_id"]) is not str or _id(value["pairing_id"], "rotation pairing ID") != value["pairing_id"]
+            or type(value["new_signer_label"]) is not str or _id(value["new_signer_label"], "rotation signer label") != value["new_signer_label"]
+            or cls._pairing_nonce(value["activation_challenge"], "rotation activation challenge") != value["activation_challenge"]
+            or cls._pairing_time(value["created_at_ms"], "rotation creation time") > cls._pairing_time(value["updated_at_ms"], "rotation update time")
+        ):
+            raise RunnerStoreError("invalid runner rotation activation journal")
+        request = value["activation_request"]
+        if not isinstance(request, Mapping) or set(request) != {"schema_version", "signature_b64"} or request.get("schema_version") != "heel.runner-rotation-activate.v2":
+            raise RunnerStoreError("invalid runner rotation activation journal")
+        if value["state"] == "prepared":
+            if value["activation_response"] is not None or value["created_at_ms"] != value["updated_at_ms"]:
+                raise RunnerStoreError("invalid runner rotation activation journal")
+        elif cls._rotation_response(value["activation_response"], identity=new_identity) != value["activation_response"]:
+            raise RunnerStoreError("invalid runner rotation activation journal")
+        return dict(value)
+
+    @classmethod
+    def _accepted_rotation_journal(
+        cls, value: Mapping[str, object], *, old_identity: RunnerIdentity, new_identity: RunnerIdentity,
+    ) -> AcceptedRotationJournal:
+        verified = cls._verify_rotation_journal(value, old_identity=old_identity, new_identity=new_identity)
+        if verified["state"] != "accepted":
+            raise RunnerStoreError("runner rotation activation requires recovery")
+        return AcceptedRotationJournal(
+            pairing_id=verified["pairing_id"], old_identity=old_identity, new_identity=new_identity,
+            activation_challenge=verified["activation_challenge"],
+            activation_request=dict(verified["activation_request"]),
+            activation_response=dict(verified["activation_response"]),
+            created_at_ms=verified["created_at_ms"], updated_at_ms=verified["updated_at_ms"],
+            new_signer_label=verified["new_signer_label"],
+        )
+
+    @staticmethod
+    def _rotation_identity_from_record(value: object, *, pairing_phrase: tuple[str, ...]) -> RunnerIdentity:
+        record = _stored_identity_record(value)
+        return RunnerIdentity(
+            runner_id=record["runner_id"], workspace_id=record["workspace_id"],
+            runner_version=record["runner_version"], adapter_versions=record["adapter_versions"],
+            public_key_b64=record["public_key_b64"], fingerprint=record["fingerprint"],
+            key_id=record["runner_key_id"], pairing_phrase=pairing_phrase,
+        )
+
+    @classmethod
+    def _verify_paired_rotation_identity(
+        cls, value: object, *, identity: RunnerIdentity, signer: SecureSigner,
+        required_signer_label: str | None = None,
+    ) -> dict[str, object]:
+        fields = {
+            "schema_version", "identity", "pairing_protocol_version", "control_protocol",
+            "pairing_id", "pairing_exchange_digest", "activated_at_ms", "activation_response_digest",
+        }
+        if not isinstance(value, Mapping):
+            raise RunnerStoreError("paired runner identity requires recovery")
+        if "signer_label" in value:
+            fields.add("signer_label")
+        verified = cls._verify_pairing_signed_value(
+            value, identity=identity, domain=_PAIRED_RUNNER_IDENTITY_DOMAIN,
+            digest_field="record_digest", fields=fields, label="paired runner identity",
+        )
+        if (
+            verified["schema_version"] != _PAIRED_RUNNER_IDENTITY_SCHEMA
+            or verified["identity"] != _identity_record(identity, signer)
+            or verified["pairing_protocol_version"] != 3
+            or verified["control_protocol"] != "heel.runner-control.v2"
+        ):
+            raise RunnerStoreError("paired runner identity requires recovery")
+        _id(verified["pairing_id"], "paired runner pairing ID")
+        _digest(verified["pairing_exchange_digest"], "paired runner exchange digest")
+        _digest(verified["activation_response_digest"], "paired runner activation digest")
+        cls._pairing_time(verified["activated_at_ms"], "paired runner activation time")
+        actual_label = verified.get("signer_label")
+        if actual_label is not None:
+            actual_label = _id(actual_label, "paired runner signer label")
+        if required_signer_label is not None and actual_label != required_signer_label:
+            raise RunnerStoreError("paired runner identity requires recovery")
+        return verified
+
+    def prepare_rotation_activation(
+        self, pending: Mapping[str, object], *, old_identity: RunnerIdentity, old_signer: SecureSigner,
+        new_identity: RunnerIdentity, new_signer: SecureSigner, new_signer_label: str, now_ms: int,
+    ) -> PendingRotationActivation:
+        """Persist the dual-signed rotation request before it can reach the control plane."""
+        pending_value = self._rotation_pending(pending)
+        now_ms = self._pairing_time(now_ms, "rotation preparation time")
+        if (
+            not isinstance(old_identity, RunnerIdentity) or not isinstance(new_identity, RunnerIdentity)
+            or not isinstance(old_signer, SecureSigner) or not isinstance(new_signer, SecureSigner)
+            or old_identity.workspace_id != new_identity.workspace_id
+            or old_identity.runner_id != new_identity.runner_id
+            or old_identity.key_id == new_identity.key_id
+        ):
+            raise RunnerStoreError("invalid runner rotation identity")
+        old_record = _identity_record(old_identity, old_signer)
+        new_record = _identity_record(new_identity, new_signer)
+        new_signer_label = _id(new_signer_label, "rotation signer label")
+        if self._namespace is not None:
+            raise RunnerStoreError("runner rotation requires re-pairing")
+        authority = self._runtime_authority
+        if authority is None:
+            self._runtime_authority = (old_identity, old_signer)
+        elif _identity_record(*authority) != old_record:
+            raise RunnerStoreError("authenticated runner store identity changed")
+        proof = {"pairing_id": pending_value["pairing_id"], "challenge": pending_value["activation_challenge"]}
+        signature = new_signer.sign(b"heel.runner-rotation-activate.v2\0" + canonical_bytes(proof))
+        if type(signature) is not bytes or len(signature) != 64:
+            raise RunnerStoreError("runner signer returned an invalid rotation signature")
+        request = {
+            "schema_version": "heel.runner-rotation-activate.v2",
+            "signature_b64": base64.b64encode(signature).decode("ascii"),
+        }
+        core = {
+            "schema_version": _ROTATION_ACTIVATION_JOURNAL_SCHEMA, "state": "prepared",
+            "pairing_id": pending_value["pairing_id"], "old_identity": old_record, "new_identity": new_record,
+            "new_signer_label": new_signer_label, "activation_challenge": pending_value["activation_challenge"],
+            "activation_request": request, "activation_response": None,
+            "created_at_ms": now_ms, "updated_at_ms": now_ms,
+        }
+        journal = self._signed_rotation_journal(core, old_signer=old_signer, new_signer=new_signer)
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                existing = _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None)
+                if existing is None:
+                    _write_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, journal)
+                elif existing != journal:
+                    raise RunnerStoreError("runner rotation activation requires recovery")
+        return PendingRotationActivation(
+            dict(pending_value), dict(request), old_identity, new_identity, new_signer_label,
+            new_signer, self._rotation_token,
+        )
+
+    def accept_rotation_activation(
+        self, pending: PendingRotationActivation, response: Mapping[str, object], *, now_ms: int,
+    ) -> AcceptedRotationJournal:
+        if not isinstance(pending, PendingRotationActivation) or pending._store_token is not self._rotation_token:
+            raise RunnerStoreError("prepared runner rotation activation is required")
+        pending_value = self._rotation_pending(pending.pending)
+        now_ms = self._pairing_time(now_ms, "rotation activation acceptance time")
+        old_identity, old_signer = self._require_runtime_authority()
+        if _identity_record(old_identity, old_signer) != _identity_record(
+            pending.old_identity, _IdentityPublicSigner(pending.old_identity),
+        ):
+            raise RunnerStoreError("runner rotation activation identity changed")
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                journal = _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None)
+                if not isinstance(journal, Mapping):
+                    raise RunnerStoreError("runner rotation activation requires recovery")
+                verified = self._verify_rotation_journal(
+                    journal, old_identity=pending.old_identity, new_identity=pending.new_identity,
+                )
+                if verified["state"] != "prepared" or (
+                    verified["pairing_id"] != pending_value["pairing_id"]
+                    or verified["activation_challenge"] != pending_value["activation_challenge"]
+                    or verified["activation_request"] != dict(pending.request)
+                    or verified["new_signer_label"] != pending.new_signer_label
+                ):
+                    raise RunnerStoreError("runner rotation activation requires recovery")
+                activated = self._rotation_response(response, identity=pending.new_identity)
+                core = {
+                    "schema_version": _ROTATION_ACTIVATION_JOURNAL_SCHEMA, "state": "accepted",
+                    "pairing_id": verified["pairing_id"], "old_identity": verified["old_identity"],
+                    "new_identity": verified["new_identity"], "new_signer_label": verified["new_signer_label"],
+                    "activation_challenge": verified["activation_challenge"],
+                    "activation_request": verified["activation_request"], "activation_response": activated,
+                    "created_at_ms": verified["created_at_ms"], "updated_at_ms": now_ms,
+                }
+                accepted = self._signed_rotation_journal(
+                    core, old_signer=old_signer,
+                    new_signer=pending._new_signer,
+                )
+                _write_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, accepted)
+        return self._accepted_rotation_journal(
+            accepted, old_identity=pending.old_identity, new_identity=pending.new_identity,
+        )
+
+    def finish_rotation_activation(self, pending: PendingRotationActivation, runtime_state: object) -> RunnerIdentity:
+        """Commit the accepted runtime rewrap, publish the new selector, then unlink the journal."""
+        if not isinstance(pending, PendingRotationActivation) or pending._store_token is not self._rotation_token:
+            raise RunnerStoreError("prepared runner rotation activation is required")
+        old_identity, old_signer = self._require_runtime_authority()
+        if _identity_record(old_identity, old_signer) != _identity_record(
+            pending.old_identity, _IdentityPublicSigner(pending.old_identity),
+        ):
+            raise RunnerStoreError("runner rotation activation identity changed")
+        from heel.runner.runtime import RunnerRuntimeState
+        if not isinstance(runtime_state, RunnerRuntimeState):
+            raise RunnerStoreError("runner runtime state is invalid")
+        runtime_record = _identity_record(runtime_state.identity, runtime_state.signer)
+        old_record = _identity_record(pending.old_identity, _IdentityPublicSigner(pending.old_identity))
+        new_record = _identity_record(pending.new_identity, pending._new_signer)
+        runtime_is_old = runtime_record == old_record
+        runtime_is_new = runtime_record == new_record
+        if runtime_is_old == runtime_is_new:
+            raise RunnerStoreError("runner runtime rotation identity requires recovery")
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                journal = _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None)
+                accepted = self._accepted_rotation_journal(
+                    journal, old_identity=pending.old_identity, new_identity=pending.new_identity,
+                )
+                existing = _read_json(runner_fd, _PAIRED_RUNNER_IDENTITY_FILENAME, None)
+                if not isinstance(existing, Mapping):
+                    raise RunnerStoreError("paired runner identity requires recovery")
+                if existing.get("identity") == old_record:
+                    existing = self._verify_paired_rotation_identity(
+                        existing, identity=pending.old_identity, signer=old_signer,
+                    )
+                elif existing.get("identity") == new_record:
+                    if runtime_is_old:
+                        raise RunnerStoreError("paired runner identity requires recovery")
+                    existing = self._verify_paired_rotation_identity(
+                        existing, identity=pending.new_identity, signer=pending._new_signer,
+                        required_signer_label=accepted.new_signer_label,
+                    )
+                else:
+                    raise RunnerStoreError("paired runner identity requires recovery")
+                cursor = runtime_state.finish_rotation(
+                    accepted, new_identity=pending.new_identity, new_signer=pending._new_signer,
+                )
+                if (
+                    cursor.next_nonce_b64 != accepted.activation_response["initial_claim_nonce"]
+                    or cursor.next_sequence != accepted.activation_response["initial_claim_sequence"]
+                    or cursor.generation != accepted.activation_response["initial_claim_generation"]
+                ):
+                    raise RunnerStoreError("runner rotation activation cursor changed")
+                paired_core = {
+                    "schema_version": _PAIRED_RUNNER_IDENTITY_SCHEMA,
+                    "identity": _identity_record(pending.new_identity, pending._new_signer),
+                    "pairing_protocol_version": 3, "control_protocol": "heel.runner-control.v2",
+                    "pairing_id": existing["pairing_id"],
+                    "pairing_exchange_digest": existing["pairing_exchange_digest"],
+                    "activated_at_ms": existing["activated_at_ms"],
+                    "activation_response_digest": existing["activation_response_digest"],
+                    "signer_label": accepted.new_signer_label,
+                }
+                paired = self._pairing_signed_value(
+                    paired_core, signer=pending._new_signer, domain=_PAIRED_RUNNER_IDENTITY_DOMAIN,
+                    digest_field="record_digest",
+                )
+                if existing != paired:
+                    _write_json(runner_fd, _PAIRED_RUNNER_IDENTITY_FILENAME, paired)
+                os.unlink(_ROTATION_ACTIVATION_JOURNAL_FILENAME, dir_fd=runner_fd)
+                os.fsync(runner_fd)
+        self._runtime_authority = (pending.new_identity, pending._new_signer)
+        return pending.new_identity
+
+    def recover_rotation_activation(
+        self, *, old_identity: RunnerIdentity, old_signer: SecureSigner, signer_provider: object,
+        runtime_path: Path | str,
+    ) -> PendingRotationActivation | RunnerIdentity | None:
+        """Recover only an exact local rotation prefix before any control client exists.
+
+        A prepared journal yields the already-signed request capability.  An accepted journal
+        is completed entirely locally with a provider that may *only* load the named signer.
+        """
+        if not isinstance(old_identity, RunnerIdentity) or not isinstance(old_signer, SecureSigner):
+            raise RunnerStoreError("runner rotation recovery identity is invalid")
+        self._pin_runtime_authority(old_identity, old_signer)
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=False):
+                journal = _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None)
+        if journal is None:
+            return None
+        if not isinstance(journal, Mapping):
+            raise RunnerStoreError("invalid runner rotation activation journal")
+        new_identity = self._rotation_identity_from_record(
+            journal.get("new_identity"), pairing_phrase=old_identity.pairing_phrase,
+        )
+        if (
+            new_identity.workspace_id != old_identity.workspace_id
+            or new_identity.runner_id != old_identity.runner_id
+            or new_identity.key_id == old_identity.key_id
+        ):
+            raise RunnerStoreError("invalid runner rotation activation journal")
+        verified = self._verify_rotation_journal(
+            journal, old_identity=old_identity, new_identity=new_identity,
+        )
+        load_existing = getattr(signer_provider, "load_existing", None)
+        if not callable(load_existing):
+            raise RunnerStoreError("runner rotation signer provider is invalid")
+        try:
+            new_signer = load_existing(verified["new_signer_label"])
+        except Exception as exc:
+            raise RunnerStoreError("runner rotation signing identity is unavailable") from exc
+        if not isinstance(new_signer, SecureSigner):
+            raise RunnerStoreError("runner rotation signing identity is unavailable")
+        try:
+            if _identity_record(new_identity, new_signer) != verified["new_identity"]:
+                raise RunnerStoreError("runner rotation signing identity is unavailable")
+        except (TypeError, ValueError):
+            raise RunnerStoreError("runner rotation signing identity is unavailable") from None
+        pending = PendingRotationActivation(
+            self._rotation_pending({
+                "schema_version": "heel.runner-rotation-activation-challenge.v1",
+                "pairing_id": verified["pairing_id"],
+                "activation_challenge": verified["activation_challenge"],
+            }),
+            dict(verified["activation_request"]), old_identity, new_identity,
+            verified["new_signer_label"], new_signer, self._rotation_token,
+        )
+        if verified["state"] == "prepared":
+            return pending
+        accepted = self._accepted_rotation_journal(
+            verified, old_identity=old_identity, new_identity=new_identity,
+        )
+        path = Path(runtime_path)
+        try:
+            runtime_status = os.lstat(path)
+        except OSError as exc:
+            raise RunnerStoreError("runner rotation runtime requires recovery") from exc
+        if stat.S_ISLNK(runtime_status.st_mode) or not stat.S_ISREG(runtime_status.st_mode):
+            raise RunnerStoreError("runner rotation runtime requires recovery")
+        from heel.runner.runtime import RunnerRuntimeCorrupt, RunnerRuntimeState
+        try:
+            runtime = RunnerRuntimeState(path, old_identity, old_signer)
+        except RunnerRuntimeCorrupt as old_error:
+            if str(old_error) != "runtime state belongs to another runner identity":
+                raise RunnerStoreError("runner rotation runtime requires recovery") from old_error
+            try:
+                runtime = RunnerRuntimeState(path, new_identity, new_signer)
+            except RunnerRuntimeCorrupt as new_error:
+                raise RunnerStoreError("runner rotation runtime requires recovery") from new_error
+        # Re-read the accepted object through the closed parser before mutating durable runtime
+        # state, so a future change cannot accidentally let an unvalidated mapping through.
+        if accepted.new_signer_label != pending.new_signer_label:
+            raise RunnerStoreError("invalid runner rotation activation journal")
+        return self.finish_rotation_activation(pending, runtime)
 
     @staticmethod
     def _signed_run_authority_value(
@@ -723,6 +1566,13 @@ class RunnerStore:
                 "run_hash", "grant_id", "grant_digest", "reservation_record_digest",
                 "terminal_state_digest", "terminal_projection_digest", "retention_expires_at_ms",
                 "terminal_at_ms", "prior_head_digest", "record_digest", "signing_key_id", "signature_b64",
+            },
+            _RUN_TERMINAL_DETACHED_RECORD_SCHEMA: {
+                "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
+                "run_hash", "grant_id", "grant_digest", "terminal_record_digest",
+                "terminal_projection_digest", "terminal_at_ms", "retention_expires_at_ms",
+                "runtime_state_schema", "runtime_state", "runtime_state_digest", "detached_at_ms",
+                "prior_head_digest", "record_digest", "signing_key_id", "signature_b64",
             },
             _RUN_PRUNED_RECORD_SCHEMA: {
                 "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
@@ -770,6 +1620,7 @@ class RunnerStore:
             "runner_key_id": identity.key_id,
             "generation": 0,
             "nonterminal_count": 0,
+            "nonterminal_runs": [],
             "terminal_queue": [],
             "head_digest": _RUN_AUTHORITY_ZERO_HEAD,
         }, signer=signer, record_digest=False)
@@ -806,6 +1657,7 @@ class RunnerStore:
                     or type(checked["generation"]) is not int or checked["generation"] < 0
                     or type(checked["nonterminal_count"]) is not int
                     or not 0 <= checked["nonterminal_count"] <= _RUN_AUTHORITY_MAX_NONTERMINAL
+                    or checked["nonterminal_runs"] != []
                     or not isinstance(checked["terminal_queue"], list)
                     or len(checked["terminal_queue"]) > _RUN_AUTHORITY_MAX_TRACKED
                     or _DIGEST.fullmatch(checked["head_digest"]) is None
@@ -829,7 +1681,7 @@ class RunnerStore:
         if (
             set(checked) != {
                 "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
-                "generation", "nonterminal_count", "terminal_queue", "head_digest", "signing_key_id", "signature_b64",
+                "generation", "nonterminal_count", "nonterminal_runs", "terminal_queue", "head_digest", "signing_key_id", "signature_b64",
             }
             or checked["namespace"] != self.namespace
             or checked["workspace_id"] != identity.workspace_id
@@ -838,12 +1690,28 @@ class RunnerStore:
             or type(checked["generation"]) is not int or checked["generation"] < 0
             or type(checked["nonterminal_count"]) is not int
             or not 0 <= checked["nonterminal_count"] <= _RUN_AUTHORITY_MAX_NONTERMINAL
+            or not isinstance(checked["nonterminal_runs"], list)
+            or len(checked["nonterminal_runs"]) != checked["nonterminal_count"]
+            or len(checked["nonterminal_runs"]) > _RUN_AUTHORITY_MAX_TRACKED
             or not isinstance(checked["terminal_queue"], list)
             or len(checked["terminal_queue"]) > _RUN_AUTHORITY_MAX_TRACKED
-            or checked["nonterminal_count"] + len(checked["terminal_queue"]) > _RUN_AUTHORITY_MAX_TRACKED
             or _DIGEST.fullmatch(checked["head_digest"]) is None
         ):
             raise RunnerStoreError("local run authority index is invalid")
+        previous_run: str | None = None
+        nonterminal_hashes: set[str] = set()
+        for item in checked["nonterminal_runs"]:
+            if (
+                not isinstance(item, Mapping)
+                or set(item) != {"run_hash", "reservation_record_digest"}
+                or _RUN_FILENAME.fullmatch(item["run_hash"]) is None
+                or _DIGEST.fullmatch(item["reservation_record_digest"]) is None
+                or item["run_hash"] in nonterminal_hashes
+                or (previous_run is not None and item["run_hash"] <= previous_run)
+            ):
+                raise RunnerStoreError("local run authority index is invalid")
+            nonterminal_hashes.add(item["run_hash"])
+            previous_run = item["run_hash"]
         previous: tuple[int, str] | None = None
         seen_hashes: set[str] = set()
         for item in checked["terminal_queue"]:
@@ -855,6 +1723,7 @@ class RunnerStore:
                 or _RUN_FILENAME.fullmatch(item["run_hash"]) is None
                 or _DIGEST.fullmatch(item["terminal_record_digest"]) is None
                 or item["run_hash"] in seen_hashes
+                or item["run_hash"] in nonterminal_hashes
                 or (previous is not None and (item["retention_expires_at_ms"], item["run_hash"]) <= previous)
             ):
                 raise RunnerStoreError("local run authority index is invalid")
@@ -872,17 +1741,23 @@ class RunnerStore:
 
     def _next_run_authority_index(
         self, index: Mapping[str, Any], *, signer: SecureSigner, delta: int, head_digest: str,
+        nonterminal_runs: list[dict[str, Any]] | None = None,
         terminal_queue: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         next_count = index["nonterminal_count"] + delta
+        nonterminal = list(index["nonterminal_runs"] if nonterminal_runs is None else nonterminal_runs)
         queue = list(index["terminal_queue"] if terminal_queue is None else terminal_queue)
-        if not 0 <= next_count or next_count + len(queue) > _RUN_AUTHORITY_MAX_TRACKED:
+        if (
+            next_count != len(nonterminal) or not 0 <= next_count <= _RUN_AUTHORITY_MAX_NONTERMINAL
+            or len(queue) > _RUN_AUTHORITY_MAX_TRACKED
+        ):
             raise RunnerStoreError("local run authority capacity is exhausted")
         return self._signed_run_authority_value({
             "schema_version": _RUN_AUTHORITY_INDEX_SCHEMA,
             "namespace": index["namespace"], "workspace_id": index["workspace_id"],
             "runner_id": index["runner_id"], "runner_key_id": index["runner_key_id"],
             "generation": index["generation"] + 1, "nonterminal_count": next_count,
+            "nonterminal_runs": nonterminal,
             "terminal_queue": queue,
             "head_digest": _digest(head_digest, "local run authority head"),
         }, signer=signer, record_digest=False)
@@ -892,7 +1767,8 @@ class RunnerStore:
         if _RUN_FILENAME.fullmatch(run_hash) is None:
             raise RunnerStoreError("invalid local run authority hash")
         prefix = {
-            "reserve": "reservation-", "terminal": "terminal-", "prune": "pruned-",
+            "reserve": "reservation-", "terminal": "terminal-", "detach_terminal": "detached-",
+            "prune": "pruned-",
         }.get(kind)
         if prefix is None:
             raise RunnerStoreError("invalid local run authority operation")
@@ -902,7 +1778,7 @@ class RunnerStore:
         self, *, operation: str, context: RunnerContext, identity: RunnerIdentity,
         signer: SecureSigner, run_hash: str, grant: Mapping[str, Any], state: Mapping[str, Any],
         index: Mapping[str, Any], terminal: Mapping[str, Any] | None = None,
-        pruned_at_ms: int | None = None,
+        pruned_at_ms: int | None = None, detached_at_ms: int | None = None,
     ) -> dict[str, Any]:
         header = {
             "namespace": context.namespace, "workspace_id": context.workspace_id,
@@ -931,6 +1807,33 @@ class RunnerStore:
                 ),
                 "terminal_at_ms": state["updated_at_ms"],
             }
+        elif operation == "detach_terminal":
+            if terminal is None or detached_at_ms is None:
+                raise RunnerStoreError("local terminal detach requires terminal authority")
+            terminal_at_ms = terminal.get("terminal_at_ms")
+            runtime_state_digest = terminal.get("runtime_state_digest")
+            if (
+                type(terminal_at_ms) is not int or terminal_at_ms < 0
+                or type(detached_at_ms) is not int or detached_at_ms < terminal_at_ms
+                or not isinstance(runtime_state_digest, str)
+            ):
+                raise RunnerStoreError("local terminal detach requires terminal authority")
+            core = {
+                "schema_version": _RUN_TERMINAL_DETACHED_RECORD_SCHEMA, **header,
+                "terminal_record_digest": _digest(
+                    terminal["terminal_record_digest"], "local terminal record digest",
+                ),
+                "terminal_projection_digest": _digest(
+                    terminal["terminal_projection_digest"], "local terminal projection digest",
+                ),
+                "terminal_at_ms": terminal_at_ms,
+                "runtime_state_schema": "heel.runner-terminal-disclosure-state.v1",
+                "runtime_state": "local_terminal",
+                "runtime_state_digest": _digest(
+                    runtime_state_digest, "local terminal runtime state digest",
+                ),
+                "detached_at_ms": detached_at_ms,
+            }
         elif operation == "prune":
             if terminal is None or pruned_at_ms is None:
                 raise RunnerStoreError("local prune authority requires terminal record")
@@ -953,7 +1856,7 @@ class RunnerStore:
         operation: str, run_hash: str, index: Mapping[str, Any], next_index: Mapping[str, Any],
         record: Mapping[str, Any], recovery: Mapping[str, Any], created_at_ms: int,
     ) -> dict[str, Any]:
-        if operation not in {"reserve", "terminal", "prune"}:
+        if operation not in {"reserve", "terminal", "detach_terminal", "prune"}:
             raise RunnerStoreError("invalid local run authority operation")
         core = {
             "schema_version": _RUN_AUTHORITY_MUTATION_SCHEMA, "namespace": context.namespace,
@@ -983,7 +1886,7 @@ class RunnerStore:
         if (
             set(checked) != fields or checked["namespace"] != self.namespace
             or checked["workspace_id"] != identity.workspace_id or checked["runner_id"] != identity.runner_id
-            or checked["runner_key_id"] != identity.key_id or checked["operation"] not in {"reserve", "terminal", "prune"}
+            or checked["runner_key_id"] != identity.key_id or checked["operation"] not in {"reserve", "terminal", "detach_terminal", "prune"}
             or _RUN_FILENAME.fullmatch(checked["run_hash"]) is None
             or _DIGEST.fullmatch(checked["old_index_digest"]) is None
             or type(checked["created_at_ms"]) is not int or checked["created_at_ms"] < 0
@@ -1003,6 +1906,7 @@ class RunnerStore:
 
     def _complete_run_authority_journal_locked(
         self, context_fd: int, runs_fd: int, *, identity: RunnerIdentity,
+        runtime: object | None = None,
     ) -> bool:
         """Roll one signed run-authority mutation forward; never scan or roll back."""
         journal_value = _read_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, None)
@@ -1022,6 +1926,7 @@ class RunnerStore:
         record_schema = {
             "reserve": _RUN_RESERVATION_RECORD_SCHEMA,
             "terminal": _RUN_TERMINAL_RECORD_SCHEMA,
+            "detach_terminal": _RUN_TERMINAL_DETACHED_RECORD_SCHEMA,
             "prune": _RUN_PRUNED_RECORD_SCHEMA,
         }[operation]
         record = self._verify_signed_run_authority_value(
@@ -1030,6 +1935,46 @@ class RunnerStore:
         )
         if record.get("run_hash") != run_hash:
             raise RunnerStoreError("local run authority journal record changed")
+        next_nonterminal = next(
+            (item for item in next_index["nonterminal_runs"] if item["run_hash"] == run_hash),
+            None,
+        )
+        next_terminal = next(
+            (item for item in next_index["terminal_queue"] if item["run_hash"] == run_hash),
+            None,
+        )
+        if operation == "reserve":
+            if (
+                next_nonterminal is None
+                or next_nonterminal["reservation_record_digest"] != record["record_digest"]
+                or next_terminal is not None
+            ):
+                raise RunnerStoreError("local run authority journal index changed")
+        elif operation == "terminal":
+            if (
+                next_nonterminal is not None
+                or next_terminal is None
+                or next_terminal["terminal_record_digest"] != record["record_digest"]
+            ):
+                raise RunnerStoreError("local run authority journal index changed")
+        elif operation == "detach_terminal":
+            if next_nonterminal is not None or next_terminal is not None:
+                raise RunnerStoreError("local run authority journal index changed")
+            if self._run_authority_index_digest(current) == journal["old_index_digest"]:
+                matches = [
+                    item for item in current["terminal_queue"]
+                    if item["run_hash"] == run_hash
+                ]
+                if (
+                    len(matches) != 1
+                    or matches[0]["terminal_record_digest"] != record.get("terminal_record_digest")
+                    or matches[0]["retention_expires_at_ms"] != record.get("retention_expires_at_ms")
+                ):
+                    raise RunnerStoreError("local run authority journal index changed")
+            elif any(item["run_hash"] == run_hash for item in current["terminal_queue"]):
+                raise RunnerStoreError("local run authority journal index changed")
+        elif next_nonterminal is not None or next_terminal is not None:
+            raise RunnerStoreError("local run authority journal index changed")
         recovery = journal["recovery"]
         if operation == "reserve":
             try:
@@ -1075,8 +2020,88 @@ class RunnerStore:
             self._ensure_json_exact(
                 runs_fd, self._run_authority_record_filename("terminal", run_hash), record,
             )
+        elif operation == "detach_terminal":
+            if runtime is None:
+                raise RunnerStoreError("local terminal detach recovery is required")
+            expected_recovery = {
+                "runtime_state_schema", "runtime_state", "runtime_state_digest",
+                "terminal_record_digest", "retention_expires_at_ms",
+            }
+            if (
+                set(recovery) != expected_recovery
+                or recovery["runtime_state_schema"] != "heel.runner-terminal-disclosure-state.v1"
+                or recovery["runtime_state"] != "local_terminal"
+                or recovery["runtime_state_digest"] != record.get("runtime_state_digest")
+                or recovery["terminal_record_digest"] != record.get("terminal_record_digest")
+                or recovery["retention_expires_at_ms"] != record.get("retention_expires_at_ms")
+                or recovery["runtime_state_digest"] is None
+            ):
+                raise RunnerStoreError("local terminal detach recovery is invalid")
+            _identity, _signer = self._require_runtime_authority()
+            if not self._runtime_matches_identity(runtime, identity=_identity, signer=_signer):
+                raise RunnerStoreError("local terminal detach recovery is required")
+            try:
+                state = runtime.load_terminal_state(
+                    self._run_id_from_hash_locked(runs_fd, run_hash),
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise RunnerStoreError("local terminal detach recovery is required") from exc
+            if (
+                state is None
+                or state.run_hash != run_hash
+                or state.terminal_record_digest != record.get("terminal_record_digest")
+                or state.retention_expires_at_ms != record.get("retention_expires_at_ms")
+                or state.terminal_projection_digest != record.get("terminal_projection_digest")
+                or not (
+                    state.state == "local_terminal"
+                    and state.state_digest == record.get("runtime_state_digest")
+                    or state.state == "available"
+                    and state.prior_state_digest == record.get("runtime_state_digest")
+                    and state.revision == 2
+                )
+            ):
+                raise RunnerStoreError("local terminal detach recovery is invalid")
+            self._ensure_json_exact(
+                runs_fd, self._run_authority_record_filename("detach_terminal", run_hash), record,
+            )
         else:
-            if set(recovery) != {"retention_expires_at_ms"} or recovery["retention_expires_at_ms"] != record.get("retention_expires_at_ms"):
+            legacy_recovery = {"retention_expires_at_ms"}
+            runtime_recovery = {
+                "retention_expires_at_ms", "runtime_prune_state_digest", "detached_record_digest",
+            }
+            if set(recovery) == legacy_recovery:
+                if recovery["retention_expires_at_ms"] != record.get("retention_expires_at_ms"):
+                    raise RunnerStoreError("local run authority prune recovery is invalid")
+            elif set(recovery) == runtime_recovery:
+                if runtime is None:
+                    raise RunnerStoreError("local terminal prune recovery is required")
+                _identity, _signer = self._require_runtime_authority()
+                if not self._runtime_matches_identity(runtime, identity=_identity, signer=_signer):
+                    raise RunnerStoreError("local terminal prune recovery is required")
+                try:
+                    run_id = self._run_id_from_hash_locked(runs_fd, run_hash)
+                    state = runtime.load_terminal_state(run_id)
+                except (AttributeError, TypeError, ValueError) as exc:
+                    raise RunnerStoreError("local terminal prune recovery is required") from exc
+                detached_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("detach_terminal", run_hash), None,
+                )
+                if detached_value is None:
+                    raise RunnerStoreError("local terminal prune recovery is invalid")
+                detached = self._verify_signed_run_authority_value(
+                    detached_value, identity=identity,
+                    schema=_RUN_TERMINAL_DETACHED_RECORD_SCHEMA,
+                    record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                )
+                if (
+                    state is None or state.state != "prune_pending"
+                    or state.state_digest != recovery["runtime_prune_state_digest"]
+                    or state.retention_expires_at_ms != record.get("retention_expires_at_ms")
+                    or detached["record_digest"] != recovery["detached_record_digest"]
+                    or detached["terminal_record_digest"] != record.get("terminal_record_digest")
+                ):
+                    raise RunnerStoreError("local terminal prune recovery is invalid")
+            else:
                 raise RunnerStoreError("local run authority prune recovery is invalid")
             self._ensure_json_exact(
                 runs_fd, self._run_authority_record_filename("prune", run_hash), record,
@@ -1094,6 +2119,35 @@ class RunnerStore:
         os.unlink(_RUN_AUTHORITY_JOURNAL_FILENAME, dir_fd=runs_fd)
         os.fsync(runs_fd)
         return True
+
+    @staticmethod
+    def _runtime_matches_identity(
+        runtime: object, *, identity: RunnerIdentity, signer: SecureSigner,
+    ) -> bool:
+        try:
+            return _identity_record(
+                getattr(runtime, "identity"), getattr(runtime, "signer"),
+            ) == _identity_record(identity, signer)
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _run_id_from_hash_locked(runs_fd: int, run_hash: str) -> str:
+        """Resolve one indexed run hash through its retained, signed grant only."""
+        run_fd = _open_child(runs_fd, run_hash, create=False)
+        if run_fd is None:
+            raise RunnerStoreError("local terminal authority run is unavailable")
+        try:
+            _secure_directory(run_fd, "Heel retained local run directory")
+            try:
+                grant = validate_execution_grant(_read_json(run_fd, "grant.json", None))
+            except (TypeError, ValueError):
+                raise RunnerStoreError("invalid stored execution grant") from None
+            if RunnerStore._run_hash(grant["run_id"]) != run_hash:
+                raise RunnerStoreError("local terminal authority run is unavailable")
+            return grant["run_id"]
+        finally:
+            os.close(run_fd)
 
     @property
     def namespace(self) -> str:
@@ -1169,7 +2223,10 @@ class RunnerStore:
                 os.close(contexts_fd)
 
     @contextmanager
-    def _transaction(self, *, exclusive: bool, allow_rollover_journal: bool = False) -> Iterator[int]:
+    def _transaction(
+        self, *, exclusive: bool, allow_rollover_journal: bool = False,
+        allow_cloud_install_journal: bool = False,
+    ) -> Iterator[int]:
         with self._open_context(create=False) as context_fd:
             with _flock(context_fd, ".metadata.lock", exclusive=exclusive):
                 if (
@@ -1177,7 +2234,7 @@ class RunnerStore:
                     and _read_json(context_fd, "context-rollover.json", None) is not None
                 ):
                     raise RunnerStoreError("cloud context rollover requires recovery")
-                self._validate_binding_locked(context_fd)
+                self._binding_locked(context_fd, validate_cloud=not allow_cloud_install_journal)
                 yield context_fd
 
     def _select_active_if_present(self) -> None:
@@ -1186,14 +2243,120 @@ class RunnerStore:
             with _flock(runner_fd, ".runner.lock", exclusive=False):
                 active = _read_json(runner_fd, "active-context.json", None)
         if active is None:
+            if self._unselected_cloud_context_exists():
+                raise RunnerStoreError("cloud context authority is incomplete")
             return
-        if not isinstance(active, Mapping) or set(active) != {"schema_version", "namespace"}:
+        if not isinstance(active, Mapping):
             raise RunnerStoreError("invalid active runner context")
-        if active["schema_version"] != "heel.active-runner-context.v1":
+        if active.get("schema_version") == "heel.active-runner-context.v1":
+            if set(active) != {"schema_version", "namespace"}:
+                raise RunnerStoreError("invalid active runner context")
+            self._namespace = _digest(active["namespace"], "runner namespace")
+            with self._transaction(
+                exclusive=False, allow_rollover_journal=True, allow_cloud_install_journal=True,
+            ) as context_fd:
+                binding = self._binding_locked(context_fd, validate_cloud=False)
+                if binding["schema_version"] == "heel.bound-runner-context.v2" and self._selected_rollover_prefix_locked(
+                    context_fd, active=active, binding=binding,
+                ):
+                    return
+                if binding["schema_version"] != "heel.bound-runner-context.v1":
+                    raise RunnerStoreError("cloud context authority is incomplete")
+                # A static v1 pair is legal only while this namespace has never
+                # committed Cloud authority.  This is evidence detection, not
+                # artifact discovery: no commit found here is opened or adopted.
+                if self._cloud_context_evidence_locked(context_fd):
+                    raise RunnerStoreError("cloud context authority is incomplete")
+            return
+        if active.get("schema_version") != _ACTIVE_CONTEXT_CLOUD_SCHEMA:
             raise RunnerStoreError("invalid active runner context")
-        self._namespace = _digest(active["namespace"], "runner namespace")
-        with self._transaction(exclusive=False, allow_rollover_journal=True):
-            pass
+        self._namespace = _digest(active.get("namespace"), "runner namespace")
+        with self._transaction(
+            exclusive=False, allow_rollover_journal=True, allow_cloud_install_journal=True,
+        ) as context_fd:
+            binding = self._binding_locked(context_fd, validate_cloud=False)
+            if binding["schema_version"] != "heel.bound-runner-context.v2":
+                raise RunnerStoreError("cloud context authority is incomplete")
+            self._validate_cloud_active_context_record(active, binding=binding, allow_prior_commit=True)
+            try:
+                self._validate_cloud_context_authority_locked(context_fd, binding)
+                tuple_complete = True
+            except RunnerStoreError:
+                tuple_complete = False
+            if not tuple_complete and not self._selected_rollover_prefix_locked(
+                context_fd, active=active, binding=binding,
+            ):
+                raise RunnerStoreError("cloud context authority is incomplete")
+            if active["authority_commit_digest"] != binding["authority_commit_digest"] and not self._selected_rollover_prefix_locked(
+                context_fd, active=active, binding=binding,
+            ):
+                raise RunnerStoreError("cloud context authority is incomplete")
+
+    def _unselected_cloud_context_exists(self) -> bool:
+        """Detect Cloud-mode loss without adopting any namespace by directory scan."""
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=False):
+                if _read_json(runner_fd, "context-install.json", None) is not None:
+                    # A signed root intent owns the only legal unselected
+                    # first-install prefixes and is recovered explicitly.
+                    return False
+                contexts_fd = _open_child(runner_fd, "contexts", create=False)
+                if contexts_fd is None:
+                    return False
+                try:
+                    _secure_directory(contexts_fd, "Heel runner contexts directory")
+                    for entry in os.scandir(contexts_fd):
+                        if _DIGEST.fullmatch(entry.name) is None:
+                            continue
+                        context_fd = _open_child(contexts_fd, entry.name, create=False)
+                        if context_fd is None:
+                            continue
+                        try:
+                            _secure_directory(context_fd, "Heel runner context directory")
+                            binding = _read_json(context_fd, "binding.json", None)
+                            if isinstance(binding, Mapping) and binding.get("schema_version") == "heel.bound-runner-context.v2":
+                                return True
+                            if (
+                                _read_json(context_fd, "cloud-context-binding.json", None) is not None
+                                or _read_json(context_fd, "cloud-context-provenance.json", None) is not None
+                                or _read_json(context_fd, "context-rollover.json", None) is not None
+                            ):
+                                return True
+                        finally:
+                            os.close(context_fd)
+                finally:
+                    os.close(contexts_fd)
+        return False
+
+    @staticmethod
+    def _cloud_context_evidence_locked(context_fd: int) -> bool:
+        """Return whether a namespace contains a Cloud-mode marker.
+
+        This deliberately detects only immutable commit filenames and the exact
+        mutable Cloud artifacts.  It never parses or selects a discovered
+        commitment, so a tampered namespace cannot be adopted by a static
+        selector rollback.
+        """
+        if any(
+            _read_json(context_fd, filename, None) is not None
+            for filename in (
+                "cloud-context-binding.json", "cloud-context-provenance.json",
+                "context-rollover.json",
+            )
+        ):
+            return True
+        prefix = "cloud-authority-commit-"
+        suffix = ".json"
+        with os.scandir(context_fd) as entries:
+            for entry in entries:
+                name = entry.name
+                if (
+                    name.startswith(prefix) and name.endswith(suffix)
+                    and _DIGEST.fullmatch(name[len(prefix):-len(suffix)]) is not None
+                ):
+                    return True
+        return False
 
     def _has_pending_cloud_install(self) -> bool:
         with self._open_runner(create=True) as runner_fd:
@@ -1203,12 +2366,13 @@ class RunnerStore:
 
     def _context_install_journal(
         self, *, binding: Mapping[str, Any], context: RunnerContext,
-        identity: RunnerIdentity, signer: SecureSigner,
+        identity: RunnerIdentity, signer: SecureSigner, authority_commit: Mapping[str, Any],
     ) -> dict[str, Any]:
         identity_record = _identity_record(identity, signer)
         unsigned = {
             "schema_version": _CONTEXT_INSTALL_SCHEMA, "namespace": context.namespace,
             "context": context.as_dict(), "artifact": dict(binding), "identity": identity_record,
+            "authority_commit": dict(authority_commit),
         }
         return {
             **unsigned, "signing_key_id": signer.key_id,
@@ -1217,10 +2381,11 @@ class RunnerStore:
 
     def _stage_context_install_journal(
         self, *, binding: Mapping[str, Any], context: RunnerContext,
-        identity: RunnerIdentity, signer: SecureSigner,
+        identity: RunnerIdentity, signer: SecureSigner, authority_commit: Mapping[str, Any],
     ) -> dict[str, Any]:
         journal = self._context_install_journal(
             binding=binding, context=context, identity=identity, signer=signer,
+            authority_commit=authority_commit,
         )
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
@@ -1235,15 +2400,22 @@ class RunnerStore:
                     raise RunnerStoreError("cloud context installation requires recovery")
         return journal
 
-    def _finish_context_install_journal(self, *, context: RunnerContext, journal: Mapping[str, Any]) -> None:
+    def _finish_context_install_journal(
+        self, *, context: RunnerContext, journal: Mapping[str, Any],
+        identity: RunnerIdentity, signer: SecureSigner,
+    ) -> None:
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
             with _flock(runner_fd, ".runner.lock", exclusive=True):
                 if _read_json(runner_fd, "context-install.json", None) != dict(journal):
                     raise RunnerStoreError("cloud context installation journal changed")
-                expected_active = {
-                    "schema_version": "heel.active-runner-context.v1", "namespace": context.namespace,
-                }
+                authority_commit = journal.get("authority_commit")
+                if not isinstance(authority_commit, Mapping):
+                    raise RunnerStoreError("invalid cloud context installation journal")
+                expected_active = self._cloud_active_context_record(
+                    context=context, identity=identity, signer=signer,
+                    authority_commit_digest=authority_commit.get("record_digest"),
+                )
                 active = _read_json(runner_fd, "active-context.json", None)
                 if active is not None and active != expected_active:
                     raise RunnerStoreError("cloud context binding cannot replace active context")
@@ -1251,6 +2423,31 @@ class RunnerStore:
                     _write_json(runner_fd, "active-context.json", expected_active)
                 os.unlink("context-install.json", dir_fd=runner_fd)
                 os.fsync(runner_fd)
+
+    def _publish_cloud_active_context(
+        self, *, context: RunnerContext, identity: RunnerIdentity, signer: SecureSigner,
+        authority_commit_digest: str,
+    ) -> None:
+        """Publish the signed Cloud selector only after the namespace tuple is complete."""
+        expected = self._cloud_active_context_record(
+            context=context, identity=identity, signer=signer,
+            authority_commit_digest=authority_commit_digest,
+        )
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                active = _read_json(runner_fd, "active-context.json", None)
+                static = {
+                    "schema_version": "heel.active-runner-context.v1",
+                    "namespace": context.namespace,
+                }
+                if active is not None and active not in (static, expected):
+                    if not isinstance(active, Mapping) or active.get("schema_version") != _ACTIVE_CONTEXT_CLOUD_SCHEMA:
+                        raise RunnerStoreError("cloud context binding cannot replace active context")
+                    if active.get("namespace") != context.namespace:
+                        raise RunnerStoreError("cloud context binding cannot replace active context")
+                if active != expected:
+                    _write_json(runner_fd, "active-context.json", expected)
 
     def _pending_cloud_context_install_for_recovery(
         self, *, identity: RunnerIdentity, signer: SecureSigner,
@@ -1264,7 +2461,7 @@ class RunnerStore:
             return None
         fields = {
             "schema_version", "namespace", "context", "artifact", "identity",
-            "signing_key_id", "signature_b64",
+            "authority_commit", "signing_key_id", "signature_b64",
         }
         if not isinstance(value, Mapping) or set(value) != fields or value["schema_version"] != _CONTEXT_INSTALL_SCHEMA:
             raise RunnerStoreError("invalid cloud context installation journal")
@@ -1280,6 +2477,15 @@ class RunnerStore:
                 canonical_bytes(unsigned),
             )
             artifact = validate_runner_context_binding(value["artifact"])
+            commit = self._validate_cloud_authority_commit(
+                value["authority_commit"], expected_digest=value["authority_commit"]["record_digest"],
+                namespace=context.namespace, context=context, identity=_identity_record(identity, signer),
+            )
+            if (
+                commit["binding_id"] != artifact["binding_id"]
+                or commit["binding_digest"] != artifact["binding_digest"]
+            ):
+                raise ValueError
         except (TypeError, ValueError):
             raise RunnerStoreError("invalid cloud context installation journal") from None
         return artifact, context, dict(value)
@@ -1303,6 +2509,9 @@ class RunnerStore:
         signer: SecureSigner,
         signer_label: str,
         publish_active: bool,
+        install_journal: Mapping[str, Any] | None = None,
+        authority_commit: Mapping[str, Any] | None = None,
+        cloud_binding: Mapping[str, Any] | None = None,
     ) -> None:
         if not isinstance(context, RunnerContext):
             raise ValueError("RunnerContext is required")
@@ -1311,21 +2520,33 @@ class RunnerStore:
             raise ValueError("runner identity workspace does not match target context")
         signer_label = _id(signer_label, "runner signer label")
         namespace = context.namespace
-        binding = {
-            "schema_version": "heel.bound-runner-context.v1",
-            "namespace": namespace,
-            "context": context.as_dict(),
-            "identity": identity_record,
-            "signer_label": signer_label,
-        }
+        if (authority_commit is None) != (cloud_binding is None):
+            raise RunnerStoreError("cloud context authority is incomplete")
+        if authority_commit is None:
+            binding = {
+                "schema_version": "heel.bound-runner-context.v1",
+                "namespace": namespace,
+                "context": context.as_dict(),
+                "identity": identity_record,
+                "signer_label": signer_label,
+            }
+        else:
+            binding = self._cloud_bound_context_record(
+                context=context, identity=identity, signer=signer, signer_label=signer_label,
+                authority_commit=authority_commit,
+            )
         previous = self._namespace
         self._namespace = namespace
         try:
             with self._open_runner(create=True) as runner_fd:
                 assert runner_fd is not None
                 with _flock(runner_fd, ".runner.lock", exclusive=True):
-                    if publish_active and _read_json(runner_fd, "context-install.json", None) is not None:
-                        raise RunnerStoreError("cloud context installation requires recovery")
+                    root_install = _read_json(runner_fd, "context-install.json", None)
+                    if install_journal is None:
+                        if root_install is not None:
+                            raise RunnerStoreError("cloud context installation requires recovery")
+                    elif root_install != dict(install_journal):
+                        raise RunnerStoreError("local run authority index is unavailable")
                     contexts_fd = _open_child(runner_fd, "contexts", create=True)
                     assert contexts_fd is not None
                     context_fd = -1
@@ -1342,18 +2563,133 @@ class RunnerStore:
                                 raise ValueError(
                                     "bound context cannot be rebound to another runner or target"
                                 )
-                            initial_bind = existing is None
-                            if existing is None:
-                                _write_json(context_fd, "binding.json", binding)
-                            self._initialize_run_authority_index_locked(
-                                context_fd, context=context, identity=identity, signer=signer,
-                                initial_bind=initial_bind,
-                            )
+                            runs_fd = _open_child(context_fd, "runs", create=True)
+                            assert runs_fd is not None
+                            try:
+                                _secure_directory(runs_fd, "Heel runner runs directory")
+                                index = _read_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, None)
+                                metadata_names = {entry.name for entry in os.scandir(context_fd)}
+                                expected_metadata = {".metadata.lock", "binding.json", "runs"}
+                                run_names = {entry.name for entry in os.scandir(runs_fd)}
+                                zero = self._zero_run_authority_index(
+                                    context=context, identity=identity, signer=signer,
+                                )
+
+                                def exact_zero(value: object) -> bool:
+                                    if value is None:
+                                        return False
+                                    try:
+                                        checked = self._verify_signed_run_authority_value(
+                                            value, identity=identity,
+                                            schema=_RUN_AUTHORITY_INDEX_SCHEMA,
+                                            record_digest=False,
+                                            max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                                        )
+                                    except RunnerStoreError:
+                                        return False
+                                    return (
+                                        set(checked) == set(zero)
+                                        and checked["namespace"] == zero["namespace"]
+                                        and checked["workspace_id"] == zero["workspace_id"]
+                                        and checked["runner_id"] == zero["runner_id"]
+                                        and checked["runner_key_id"] == zero["runner_key_id"]
+                                        and checked["generation"] == 0
+                                        and checked["nonterminal_count"] == 0
+                                        and checked["nonterminal_runs"] == []
+                                        and checked["terminal_queue"] == []
+                                        and checked["head_digest"] == _RUN_AUTHORITY_ZERO_HEAD
+                                    )
+
+                                clean_metadata = metadata_names <= expected_metadata
+                                empty_runs = run_names == set()
+                                zero_only_runs = run_names == {_RUN_AUTHORITY_INDEX_FILENAME}
+                                if existing is None and index is None:
+                                    # Fresh authority publishes the signed zero index first.  A
+                                    # retry after an interrupted index write sees this same empty
+                                    # footprint and is safe to repeat.
+                                    if not clean_metadata or not empty_runs:
+                                        raise RunnerStoreError("local run authority index is unavailable")
+                                    self._initialize_run_authority_index_locked(
+                                        context_fd, context=context, identity=identity, signer=signer,
+                                        initial_bind=True,
+                                    )
+                                    if authority_commit is not None:
+                                        self._ensure_json_exact(
+                                            context_fd,
+                                            self._cloud_authority_commit_filename(authority_commit["record_digest"]),
+                                            authority_commit,
+                                        )
+                                    _write_json(context_fd, "binding.json", binding)
+                                elif existing is None and exact_zero(index):
+                                    # The only accepted index-first crash prefix is the exact
+                                    # signed zero for this caller, with no sidecars or history.
+                                    if not clean_metadata or not zero_only_runs:
+                                        raise RunnerStoreError("local run authority index is unavailable")
+                                    self._initialize_run_authority_index_locked(
+                                        context_fd, context=context, identity=identity, signer=signer,
+                                        initial_bind=False,
+                                    )
+                                    if authority_commit is not None:
+                                        self._ensure_json_exact(
+                                            context_fd,
+                                            self._cloud_authority_commit_filename(authority_commit["record_digest"]),
+                                            authority_commit,
+                                        )
+                                    _write_json(context_fd, "binding.json", binding)
+                                elif existing == binding and index is None:
+                                    # Compatibility repair for the historic binding-first
+                                    # prefix.  It is deliberately narrower than legacy upgrade:
+                                    # no active selection of this namespace, Cloud artifacts, or
+                                    # retained run state may be present.
+                                    active = _read_json(runner_fd, "active-context.json", None)
+                                    expected_active = {
+                                        "schema_version": "heel.active-runner-context.v1",
+                                        "namespace": namespace,
+                                    }
+                                    if (
+                                        not clean_metadata or not empty_runs
+                                        or active == expected_active
+                                    ):
+                                        raise RunnerStoreError("local run authority index is unavailable")
+                                    self._initialize_run_authority_index_locked(
+                                        context_fd, context=context, identity=identity, signer=signer,
+                                        initial_bind=True,
+                                    )
+                                elif existing == binding and index is not None:
+                                    self._initialize_run_authority_index_locked(
+                                        context_fd, context=context, identity=identity, signer=signer,
+                                        initial_bind=False,
+                                    )
+                                else:
+                                    raise RunnerStoreError("local run authority index is unavailable")
+                                if authority_commit is not None:
+                                    self._ensure_json_exact(
+                                        context_fd,
+                                        self._cloud_authority_commit_filename(authority_commit["record_digest"]),
+                                        authority_commit,
+                                    )
+                                    provenance = {
+                                        "schema_version": _CLOUD_CONTEXT_PROVENANCE_SCHEMA,
+                                        "binding_id": cloud_binding["binding_id"],
+                                        "binding_digest": cloud_binding["binding_digest"],
+                                    }
+                                    _write_json(context_fd, "cloud-context-provenance.json", provenance)
+                                    _write_json(context_fd, "cloud-context-binding.json", dict(cloud_binding))
+                                os.fsync(runs_fd)
+                                os.fsync(context_fd)
+                            finally:
+                                os.close(runs_fd)
                         if publish_active:
-                            _write_json(runner_fd, "active-context.json", {
-                                "schema_version": "heel.active-runner-context.v1",
-                                "namespace": namespace,
-                            })
+                            if authority_commit is None:
+                                _write_json(runner_fd, "active-context.json", {
+                                    "schema_version": "heel.active-runner-context.v1",
+                                    "namespace": namespace,
+                                })
+                            else:
+                                _write_json(runner_fd, "active-context.json", self._cloud_active_context_record(
+                                    context=context, identity=identity, signer=signer,
+                                    authority_commit_digest=authority_commit["record_digest"],
+                                ))
                     finally:
                         if context_fd >= 0:
                             os.close(context_fd)
@@ -1418,7 +2754,9 @@ class RunnerStore:
             try:
                 active_context = self.load_context()
             except RunnerStoreError:
-                with self._transaction(exclusive=False, allow_rollover_journal=True) as context_fd:
+                with self._transaction(
+                    exclusive=False, allow_rollover_journal=True, allow_cloud_install_journal=True,
+                ) as context_fd:
                     raw_journal = _read_json(context_fd, "context-rollover.json", None)
                     if raw_journal is None:
                         raise
@@ -1426,7 +2764,9 @@ class RunnerStore:
                         raw_journal, identity=identity, expected_artifact=binding,
                         expected_evidence=rollover_evidence, expected_context=context,
                     )
-                    active_context = _context_from_dict(self._binding_locked(context_fd)["context"])
+                    active_context = _context_from_dict(
+                        self._binding_locked(context_fd, validate_cloud=False)["context"],
+                    )
             pending_install = self._pending_cloud_context_install_for_recovery(
                 identity=identity, signer=signer,
             )
@@ -1450,14 +2790,17 @@ class RunnerStore:
                 # binding over it.  Nothing without both locally signed
                 # journals is adopted.
                 try:
-                    with self._transaction(exclusive=False, allow_rollover_journal=True) as context_fd:
+                    with self._transaction(
+                        exclusive=False, allow_rollover_journal=True,
+                        allow_cloud_install_journal=True,
+                    ) as context_fd:
                         raw_journal = _read_json(context_fd, "context-rollover.json", None)
                         if raw_journal is not None:
                             pending_journal = self._validate_context_rollover_journal(
                                 raw_journal, identity=identity, expected_artifact=binding,
                                 expected_evidence=None, expected_context=context,
                             )
-                            local = self._binding_locked(context_fd)
+                            local = self._binding_locked(context_fd, validate_cloud=False)
                             if (
                                 pending_journal["old_binding_id"] != pending_artifact["binding_id"]
                                 or pending_journal["old_binding_digest"] != pending_artifact["binding_digest"]
@@ -1481,7 +2824,27 @@ class RunnerStore:
             "binding_id": binding["binding_id"],
             "binding_digest": binding["binding_digest"],
         }
+        # The immutable signed commit is written before the local Cloud binding
+        # and is the durable mode marker.  A caller never chooses it from disk.
+        # A recovery must reuse the signed root intent verbatim rather than
+        # manufacture a second first-commit at a later local clock value.
+        new_authority_commit: dict[str, Any] | None = (
+            None if was_bound else (
+                dict(pending_install[2]["authority_commit"])
+                if pending_install is not None and binding == pending_install[0]
+                else self._cloud_authority_commit(
+                    binding=binding, context=context, identity=identity, signer=signer,
+                    committed_at_ms=now_ms,
+                    prior_commit_digest=(
+                        pending_install[2]["authority_commit"]["record_digest"]
+                        if pending_install is not None else None
+                    ),
+                )
+            )
+        )
         install_journal: dict[str, Any] | None = pending_install[2] if pending_install is not None else None
+        static_to_cloud = False
+        transitioned_cloud = False
         try:
             # A first Cloud installation never publishes the active selector
             # until the signed sidecar is durably present and revalidated.
@@ -1489,10 +2852,12 @@ class RunnerStore:
                 if pending_install is None:
                     install_journal = self._stage_context_install_journal(
                         binding=binding, context=context, identity=identity, signer=signer,
+                        authority_commit=new_authority_commit,
                     )
                     self._bind_context(
                         context, identity=identity, signer=signer, signer_label=signer_label,
-                        publish_active=False,
+                        publish_active=False, install_journal=install_journal,
+                        authority_commit=new_authority_commit, cloud_binding=binding,
                     )
                 else:
                     install_journal = pending_install[2]
@@ -1505,10 +2870,52 @@ class RunnerStore:
                         self._bind_context(
                             pending_install[1], identity=identity, signer=signer,
                             signer_label=signer_label, publish_active=False,
+                            install_journal=pending_install[2],
+                            authority_commit=pending_install[2]["authority_commit"],
+                            cloud_binding=pending_install[0],
                         )
             receipt_consumed = False
-            with self._transaction(exclusive=True, allow_rollover_journal=rollover) as context_fd:
+            with self._transaction(
+                exclusive=True, allow_rollover_journal=rollover,
+                allow_cloud_install_journal=rollover,
+            ) as context_fd:
                 existing = _read_json(context_fd, "cloud-context-binding.json", None)
+                local_before = self._binding_locked(context_fd, validate_cloud=not rollover)
+                if new_authority_commit is None:
+                    if pending_journal is not None:
+                        new_authority_commit = dict(pending_journal["new_authority_commit"])
+                    else:
+                        prior_commit = (
+                            local_before["authority_commit_digest"]
+                            if local_before["schema_version"] == "heel.bound-runner-context.v2"
+                            else None
+                        )
+                        new_authority_commit = self._cloud_authority_commit(
+                            binding=binding, context=context, identity=identity, signer=signer,
+                            committed_at_ms=now_ms, prior_commit_digest=prior_commit,
+                        )
+                if existing is None and local_before["schema_version"] == "heel.bound-runner-context.v1":
+                    static_to_cloud = True
+                    transitioned_cloud = True
+                    if pending_journal is None:
+                        _write_json(
+                            context_fd, "context-rollover.json",
+                            self._context_rollover_journal(
+                                old=None, new=binding, context=context, evidence=None,
+                                identity=identity, signer=signer,
+                                old_authority_commit_digest=None,
+                                new_authority_commit=new_authority_commit,
+                            ),
+                        )
+                    self._ensure_json_exact(
+                        context_fd,
+                        self._cloud_authority_commit_filename(new_authority_commit["record_digest"]),
+                        new_authority_commit,
+                    )
+                    _write_json(context_fd, "binding.json", self._cloud_bound_context_record(
+                        context=context, identity=identity, signer=signer, signer_label=signer_label,
+                        authority_commit=new_authority_commit,
+                    ))
                 if existing != binding and (
                     existing is not None or (pending_install is not None and binding != pending_install[0])
                 ):
@@ -1540,24 +2947,33 @@ class RunnerStore:
                         or (binding["expires_at_ms"] == old["expires_at_ms"] and not receipt_consumed)
                     ):
                         raise RunnerStoreError("cloud context binding cannot be replaced")
-                    if rollover:
-                        local = self._binding_locked(context_fd)
+                    if rollover or local_before["schema_version"] == "heel.bound-runner-context.v2":
+                        local = self._binding_locked(context_fd, validate_cloud=not rollover)
                         if self._has_nonterminal_local_run(context_fd):
                             raise RunnerStoreError("cloud context rollover requires terminal local runs")
-                        replacement = {
-                            "schema_version": local["schema_version"], "namespace": local["namespace"],
-                            "context": context.as_dict(), "identity": local["identity"],
-                            "signer_label": local["signer_label"],
-                        }
+                        if local["schema_version"] != "heel.bound-runner-context.v2":
+                            raise RunnerStoreError("cloud context rollover requires prior cloud authority")
+                        replacement = self._cloud_bound_context_record(
+                            context=context, identity=identity, signer=signer,
+                            signer_label=local["signer_label"], authority_commit=new_authority_commit,
+                        )
                         if pending_journal is None:
                             _write_json(
                                 context_fd, "context-rollover.json",
                                 self._context_rollover_journal(
                                     old=old, new=binding, context=context,
                                     evidence=rollover_evidence, identity=identity, signer=signer,
+                                    old_authority_commit_digest=local["authority_commit_digest"],
+                                    new_authority_commit=new_authority_commit,
                                 ),
                             )
+                        self._ensure_json_exact(
+                            context_fd,
+                            self._cloud_authority_commit_filename(new_authority_commit["record_digest"]),
+                            new_authority_commit,
+                        )
                         _write_json(context_fd, "binding.json", replacement)
+                        transitioned_cloud = True
                 elif rollover:
                     # A fault can occur after every new record is durable but before
                     # the journal unlink.  Complete that exact signed new/new state
@@ -1603,21 +3019,28 @@ class RunnerStore:
                 self._validated_cloud_context_binding(
                     stored, identity=identity, trusted_cloud_keys=trusted_cloud_keys, now_ms=now_ms,
                 )
-                # A first-install root journal must remain paired with this
-                # signed rollover journal until the root active selector is
-                # durable.  Otherwise a selector-write crash leaves a coherent
-                # new namespace that cannot prove how it advanced from the
-                # root journal's old artifact on restart.
-                if rollover and install_journal is None:
-                    try:
-                        os.unlink("context-rollover.json", dir_fd=context_fd)
-                    except FileNotFoundError:
-                        raise RunnerStoreError("cloud context rollover journal disappeared") from None
-                    os.fsync(context_fd)
+                # R remains until its matching v2 root selector is durable.
             if rollover_receipt is not None and not receipt_consumed:
                 raise RunnerStoreError("cloud context rollover receipt was not consumed")
+            if transitioned_cloud and install_journal is None:
+                self._publish_cloud_active_context(
+                    context=context, identity=identity, signer=signer,
+                    authority_commit_digest=new_authority_commit["record_digest"],
+                )
+                with self._transaction(exclusive=True, allow_rollover_journal=True) as context_fd:
+                    raw_journal = _read_json(context_fd, "context-rollover.json", None)
+                    if raw_journal is None:
+                        raise RunnerStoreError("cloud context rollover journal disappeared")
+                    self._validate_context_rollover_journal(
+                        raw_journal, identity=identity, expected_artifact=binding,
+                        expected_evidence=None, expected_context=context,
+                    )
+                    os.unlink("context-rollover.json", dir_fd=context_fd)
+                    os.fsync(context_fd)
             if install_journal is not None:
-                self._finish_context_install_journal(context=context, journal=install_journal)
+                self._finish_context_install_journal(
+                    context=context, journal=install_journal, identity=identity, signer=signer,
+                )
                 if rollover:
                     with self._transaction(exclusive=True, allow_rollover_journal=True) as context_fd:
                         raw_journal = _read_json(context_fd, "context-rollover.json", None)
@@ -1695,18 +3118,43 @@ class RunnerStore:
         }
 
     def _context_rollover_journal(
-        self, *, old: Mapping[str, Any], new: Mapping[str, Any], context: RunnerContext,
+        self, *, old: Mapping[str, Any] | None, new: Mapping[str, Any], context: RunnerContext,
         evidence: RunnerContextRolloverEvidence | None, identity: RunnerIdentity, signer: SecureSigner,
+        old_authority_commit_digest: str | None, new_authority_commit: Mapping[str, Any],
     ) -> dict[str, Any]:
-        if not isinstance(evidence, RunnerContextRolloverEvidence):
+        if old is None:
+            if evidence is not None or old_authority_commit_digest is not None:
+                raise RunnerStoreError("cloud context rollover requires evidence")
+            old_binding_id: str | None = None
+            old_binding_digest: str | None = None
+        else:
+            if not isinstance(evidence, RunnerContextRolloverEvidence) or old_authority_commit_digest is None:
+                raise RunnerStoreError("cloud context rollover requires evidence")
+            old_binding_id = old["binding_id"]
+            old_binding_digest = old["binding_digest"]
+            old_authority_commit_digest = _digest(
+                old_authority_commit_digest, "prior cloud authority commit digest",
+            )
+        commit = self._validate_cloud_authority_commit(
+            new_authority_commit, expected_digest=new_authority_commit.get("record_digest"),
+            namespace=context.namespace, context=context,
+            identity=_identity_record(identity, signer),
+        )
+        if (
+            commit["binding_id"] != new["binding_id"]
+            or commit["binding_digest"] != new["binding_digest"]
+            or commit["prior_commit_digest"] != old_authority_commit_digest
+        ):
             raise RunnerStoreError("cloud context rollover requires evidence")
         _identity_record(identity, signer)
         unsigned = {
             "schema_version": _CONTEXT_ROLLOVER_SCHEMA,
-            "old_binding_id": old["binding_id"], "old_binding_digest": old["binding_digest"],
+            "old_binding_id": old_binding_id, "old_binding_digest": old_binding_digest,
             "new_binding_id": new["binding_id"], "new_binding_digest": new["binding_digest"],
             "context": context.as_dict(), "artifact": dict(new),
-            "evidence": self._rollover_evidence_dict(evidence),
+            "evidence": self._rollover_evidence_dict(evidence) if evidence is not None else None,
+            "old_authority_commit_digest": old_authority_commit_digest,
+            "new_authority_commit": commit,
         }
         return {
             **unsigned, "signing_key_id": signer.key_id,
@@ -1735,12 +3183,22 @@ class RunnerStore:
     ) -> dict[str, Any]:
         fields = {
             "schema_version", "old_binding_id", "old_binding_digest", "new_binding_id",
-            "new_binding_digest", "context", "artifact", "evidence", "signing_key_id", "signature_b64",
+            "new_binding_digest", "context", "artifact", "evidence", "old_authority_commit_digest",
+            "new_authority_commit", "signing_key_id", "signature_b64",
         }
         if not isinstance(value, Mapping) or set(value) != fields or value["schema_version"] != _CONTEXT_ROLLOVER_SCHEMA:
             raise RunnerStoreError("invalid cloud context rollover journal")
         try:
-            evidence = RunnerContextRolloverEvidence(**dict(value["evidence"]))
+            is_static_transition = value["old_binding_id"] is None and value["old_binding_digest"] is None
+            if is_static_transition:
+                if value["evidence"] is not None or value["old_authority_commit_digest"] is not None:
+                    raise ValueError
+                evidence = None
+            else:
+                if value["old_binding_id"] is None or value["old_binding_digest"] is None:
+                    raise ValueError
+                evidence = RunnerContextRolloverEvidence(**dict(value["evidence"]))
+                _digest(value["old_authority_commit_digest"], "prior cloud authority commit digest")
             public = load_public_key_base64(identity.public_key_b64)
             unsigned = {key: value[key] for key in fields - {"signing_key_id", "signature_b64"}}
             verify_envelope(
@@ -1748,6 +3206,18 @@ class RunnerStore:
                 {"signing_key_id": value["signing_key_id"], "signature_b64": value["signature_b64"]},
                 canonical_bytes(unsigned),
             )
+            commit = self._validate_cloud_authority_commit(
+                value["new_authority_commit"],
+                expected_digest=value["new_authority_commit"]["record_digest"],
+                namespace=expected_context.namespace, context=expected_context,
+                identity=_identity_record(identity, _IdentityPublicSigner(identity)),
+            )
+            if (
+                commit["binding_id"] != expected_artifact["binding_id"]
+                or commit["binding_digest"] != expected_artifact["binding_digest"]
+                or commit["prior_commit_digest"] != value["old_authority_commit_digest"]
+            ):
+                raise ValueError
         except (TypeError, ValueError):
             raise RunnerStoreError("invalid cloud context rollover journal") from None
         if (
@@ -1788,7 +3258,9 @@ class RunnerStore:
         Cloud C is therefore always a new B→C control receipt, never an A→C jump.
         """
         previous_namespace = self._namespace
-        recovery_signer = _IdentityPublicSigner(identity)
+        runtime_identity, recovery_signer = self._require_runtime_authority()
+        if _identity_record(runtime_identity, recovery_signer) != _identity_record(identity, recovery_signer):
+            raise RunnerStoreError("authenticated runner store identity changed")
         pending_install = self._pending_cloud_context_install_for_recovery(
             identity=identity, signer=recovery_signer,
         ) if not self.is_context_bound else None
@@ -1797,7 +3269,9 @@ class RunnerStore:
         if self._namespace is None:
             return None
         try:
-            with self._transaction(exclusive=True, allow_rollover_journal=True) as context_fd:
+            with self._transaction(
+                exclusive=True, allow_rollover_journal=True, allow_cloud_install_journal=True,
+            ) as context_fd:
                 raw_journal = _read_json(context_fd, "context-rollover.json", None)
                 if raw_journal is None:
                     self._namespace = previous_namespace
@@ -1812,11 +3286,17 @@ class RunnerStore:
                         raw_journal, identity=identity, expected_artifact=new,
                         expected_evidence=None, expected_context=new_context,
                     )
-                    evidence = RunnerContextRolloverEvidence(**dict(journal["evidence"]))
-                    local = self._binding_locked(context_fd)
+                    evidence = (
+                        RunnerContextRolloverEvidence(**dict(journal["evidence"]))
+                        if journal["evidence"] is not None else None
+                    )
+                    local = self._binding_locked(context_fd, validate_cloud=False)
                     provenance_value = _read_json(context_fd, "cloud-context-provenance.json", None)
                     sidecar_value = _read_json(context_fd, "cloud-context-binding.json", None)
-                    sidecar = validate_runner_context_binding(sidecar_value)
+                    sidecar = (
+                        validate_runner_context_binding(sidecar_value)
+                        if sidecar_value is not None else None
+                    )
                     new_provenance = {
                         "schema_version": _CLOUD_CONTEXT_PROVENANCE_SCHEMA,
                         "binding_id": new["binding_id"], "binding_digest": new["binding_digest"],
@@ -1831,7 +3311,7 @@ class RunnerStore:
                         raise ValueError
                     if self._has_nonterminal_local_run(context_fd):
                         raise RunnerStoreError("cloud context rollover requires terminal local runs")
-                    if not sidecar_is_new:
+                    if not sidecar_is_new and journal["old_binding_id"] is not None:
                         old, old_context = self._validated_cloud_context_binding(
                             sidecar, identity=identity, trusted_cloud_keys=trusted_cloud_keys,
                             now_ms=now_ms, require_current=False,
@@ -1842,6 +3322,9 @@ class RunnerStore:
                             or not self._rollover_evidence_matches(evidence, old=old, new=new)
                             or (old_context != new_context and not self._is_proof_generation_rollover(old_context, new_context))
                         ):
+                            raise ValueError
+                    elif not sidecar_is_new:
+                        if evidence is not None or journal["old_binding_digest"] is not None:
                             raise ValueError
                     elif (
                         journal["new_binding_id"] != new["binding_id"]
@@ -1859,11 +3342,10 @@ class RunnerStore:
                     raise RunnerStoreError("cloud context installation recovery state is inconsistent") from None
 
                 if not local_is_new:
-                    _write_json(context_fd, "binding.json", {
-                        "schema_version": local["schema_version"], "namespace": local["namespace"],
-                        "context": new_context.as_dict(), "identity": local["identity"],
-                        "signer_label": local["signer_label"],
-                    })
+                    _write_json(context_fd, "binding.json", self._cloud_bound_context_record(
+                        context=new_context, identity=identity, signer=recovery_signer,
+                        signer_label=local["signer_label"], authority_commit=journal["new_authority_commit"],
+                    ))
                 if not provenance_is_new:
                     _write_json(context_fd, "cloud-context-provenance.json", new_provenance)
                 if not sidecar_is_new:
@@ -1874,15 +3356,27 @@ class RunnerStore:
                     or self._binding_locked(context_fd)["context"] != new_context.as_dict()
                 ):
                     raise RunnerStoreError("cloud context installation recovery state is inconsistent")
-                # A root first-install intent has not committed until its
-                # active selector is durable.  Keep the signed A→B journal
-                # through that root commit so a second selector-write crash
-                # can still prove how the unselected namespace advanced.
-                if pending_install is None:
+                # Keep R through publication of the v2 root selector.
+            if pending_install is None:
+                self._publish_cloud_active_context(
+                    context=new_context, identity=identity, signer=recovery_signer,
+                    authority_commit_digest=journal["new_authority_commit"]["record_digest"],
+                )
+                with self._transaction(exclusive=True, allow_rollover_journal=True) as context_fd:
+                    raw_journal = _read_json(context_fd, "context-rollover.json", None)
+                    if raw_journal is None:
+                        raise RunnerStoreError("cloud context rollover journal disappeared")
+                    self._validate_context_rollover_journal(
+                        raw_journal, identity=identity, expected_artifact=new,
+                        expected_evidence=None, expected_context=new_context,
+                    )
                     os.unlink("context-rollover.json", dir_fd=context_fd)
                     os.fsync(context_fd)
             if pending_install is not None:
-                self._finish_context_install_journal(context=new_context, journal=pending_install[2])
+                self._finish_context_install_journal(
+                    context=new_context, journal=pending_install[2],
+                    identity=identity, signer=recovery_signer,
+                )
                 with self._transaction(exclusive=True, allow_rollover_journal=True) as context_fd:
                     raw_journal = _read_json(context_fd, "context-rollover.json", None)
                     if raw_journal is None:
@@ -1910,6 +3404,231 @@ class RunnerStore:
             "binding_id": _id(value["binding_id"], "cloud context binding ID"),
             "binding_digest": _digest(value["binding_digest"], "cloud context binding digest"),
         }
+
+    @staticmethod
+    def _cloud_authority_commit_filename(record_digest: str) -> str:
+        return f"cloud-authority-commit-{_digest(record_digest, 'cloud authority commit digest')}.json"
+
+    def _cloud_authority_commit(
+        self, *, binding: Mapping[str, Any], context: RunnerContext,
+        identity: RunnerIdentity, signer: SecureSigner, committed_at_ms: int,
+        prior_commit_digest: str | None,
+    ) -> dict[str, Any]:
+        """Build the immutable local commitment that makes Cloud mode non-downgradeable."""
+        if type(committed_at_ms) is not int or not 0 <= committed_at_ms <= 9_007_199_254_740_991:
+            raise RunnerStoreError("invalid cloud context time")
+        if prior_commit_digest is not None:
+            prior_commit_digest = _digest(prior_commit_digest, "prior cloud authority commit digest")
+        if not (
+            binding["issued_at_ms"] <= committed_at_ms < binding["expires_at_ms"]
+        ):
+            raise RunnerStoreError("cloud context binding does not match local runner")
+        core = {
+            "schema_version": _CLOUD_CONTEXT_AUTHORITY_COMMIT_SCHEMA,
+            "namespace": context.namespace,
+            "context": context.as_dict(),
+            "identity": _identity_record(identity, signer),
+            "binding_id": binding["binding_id"],
+            "binding_digest": binding["binding_digest"],
+            "committed_at_ms": committed_at_ms,
+            "prior_commit_digest": prior_commit_digest,
+        }
+        record_digest = hashlib.sha256(
+            _CLOUD_CONTEXT_AUTHORITY_COMMIT_DOMAIN + canonical_bytes(core)
+        ).hexdigest()
+        signed = {**core, "record_digest": record_digest}
+        return {
+            **signed,
+            "signing_key_id": signer.key_id,
+            "signature_b64": base64.b64encode(
+                signer.sign(_CLOUD_CONTEXT_AUTHORITY_COMMIT_DOMAIN + canonical_bytes(signed))
+            ).decode("ascii"),
+        }
+
+    @staticmethod
+    def _validate_cloud_authority_commit(
+        value: object, *, expected_digest: str, namespace: str,
+        context: RunnerContext, identity: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        fields = {
+            "schema_version", "namespace", "context", "identity", "binding_id", "binding_digest",
+            "committed_at_ms", "prior_commit_digest", "record_digest", "signing_key_id", "signature_b64",
+        }
+        try:
+            if (
+                not isinstance(value, Mapping) or set(value) != fields
+                or value["schema_version"] != _CLOUD_CONTEXT_AUTHORITY_COMMIT_SCHEMA
+                or value["namespace"] != namespace
+                or value["record_digest"] != _digest(expected_digest, "cloud authority commit digest")
+                or _context_from_dict(value["context"]) != context
+                or _stored_identity_record(value["identity"]) != dict(identity)
+                or type(value["committed_at_ms"]) is not int
+                or not 0 <= value["committed_at_ms"] <= 9_007_199_254_740_991
+            ):
+                raise ValueError
+            prior = value["prior_commit_digest"]
+            if prior is not None:
+                _digest(prior, "prior cloud authority commit digest")
+            _id(value["binding_id"], "cloud context binding ID")
+            _digest(value["binding_digest"], "cloud context binding digest")
+            core = {key: value[key] for key in fields - {"record_digest", "signing_key_id", "signature_b64"}}
+            digest = hashlib.sha256(
+                _CLOUD_CONTEXT_AUTHORITY_COMMIT_DOMAIN + canonical_bytes(core)
+            ).hexdigest()
+            if digest != value["record_digest"]:
+                raise ValueError
+            public = load_public_key_base64(identity["public_key_b64"])
+            verify_envelope(
+                {identity["runner_key_id"]: public},
+                {"signing_key_id": value["signing_key_id"], "signature_b64": value["signature_b64"]},
+                _CLOUD_CONTEXT_AUTHORITY_COMMIT_DOMAIN + canonical_bytes({**core, "record_digest": digest}),
+            )
+        except (KeyError, TypeError, ValueError):
+            raise RunnerStoreError("cloud context authority is incomplete") from None
+        return dict(value)
+
+    @staticmethod
+    def _cloud_bound_context_record(
+        *, context: RunnerContext, identity: RunnerIdentity, signer: SecureSigner,
+        signer_label: str, authority_commit: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "heel.bound-runner-context.v2",
+            "namespace": context.namespace,
+            "context": context.as_dict(),
+            "identity": _identity_record(identity, signer),
+            "signer_label": _id(signer_label, "runner signer label"),
+            "authority_mode": "cloud",
+            "authority_commit_digest": _digest(
+                authority_commit["record_digest"], "cloud authority commit digest",
+            ),
+        }
+
+    @staticmethod
+    def _cloud_active_context_record(
+        *, context: RunnerContext, identity: RunnerIdentity, signer: SecureSigner,
+        authority_commit_digest: str,
+    ) -> dict[str, Any]:
+        core = {
+            "schema_version": _ACTIVE_CONTEXT_CLOUD_SCHEMA,
+            "namespace": context.namespace,
+            "workspace_id": identity.workspace_id,
+            "runner_id": identity.runner_id,
+            "runner_key_id": identity.key_id,
+            "authority_mode": "cloud",
+            "authority_commit_digest": _digest(
+                authority_commit_digest, "cloud authority commit digest",
+            ),
+        }
+        return {
+            **core, "signing_key_id": signer.key_id,
+            "signature_b64": base64.b64encode(
+                signer.sign(_ACTIVE_CONTEXT_CLOUD_DOMAIN + canonical_bytes(core))
+            ).decode("ascii"),
+        }
+
+    @staticmethod
+    def _validate_cloud_active_context_record(
+        value: object, *, binding: Mapping[str, Any], allow_prior_commit: bool = False,
+    ) -> None:
+        fields = {
+            "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
+            "authority_mode", "authority_commit_digest", "signing_key_id", "signature_b64",
+        }
+        try:
+            if (
+                not isinstance(value, Mapping) or set(value) != fields
+                or value["schema_version"] != _ACTIVE_CONTEXT_CLOUD_SCHEMA
+                or value["authority_mode"] != "cloud"
+                or value["namespace"] != binding["namespace"]
+                or (not allow_prior_commit and value["authority_commit_digest"] != binding["authority_commit_digest"])
+            ):
+                raise ValueError
+            identity = binding["identity"]
+            if (
+                value["workspace_id"] != identity["workspace_id"]
+                or value["runner_id"] != identity["runner_id"]
+                or value["runner_key_id"] != identity["runner_key_id"]
+            ):
+                raise ValueError
+            core = {key: value[key] for key in fields - {"signing_key_id", "signature_b64"}}
+            verify_envelope(
+                {identity["runner_key_id"]: load_public_key_base64(identity["public_key_b64"])},
+                {"signing_key_id": value["signing_key_id"], "signature_b64": value["signature_b64"]},
+                _ACTIVE_CONTEXT_CLOUD_DOMAIN + canonical_bytes(core),
+            )
+        except (KeyError, TypeError, ValueError):
+            raise RunnerStoreError("cloud context authority is incomplete") from None
+
+    def _selected_rollover_prefix_locked(
+        self, context_fd: int, *, active: Mapping[str, Any], binding: Mapping[str, Any],
+    ) -> bool:
+        """Allow only the signed selector-old/binding-new recovery prefix."""
+        try:
+            if binding["schema_version"] != "heel.bound-runner-context.v2":
+                return False
+            identity = self._rotation_identity_from_record(
+                binding["identity"], pairing_phrase=(),
+            )
+            context = _context_from_dict(binding["context"])
+            raw_journal = _read_json(context_fd, "context-rollover.json", None)
+            if not isinstance(raw_journal, Mapping):
+                return False
+            artifact = validate_runner_context_binding(raw_journal["artifact"])
+            journal = self._validate_context_rollover_journal(
+                raw_journal,
+                identity=identity, expected_artifact=artifact,
+                expected_evidence=None, expected_context=context,
+            )
+            if journal["new_authority_commit"]["record_digest"] != binding["authority_commit_digest"]:
+                return False
+            if active.get("schema_version") == "heel.active-runner-context.v1":
+                return (
+                    active == {"schema_version": "heel.active-runner-context.v1", "namespace": binding["namespace"]}
+                    and journal["old_authority_commit_digest"] is None
+                    and journal["old_binding_id"] is None
+                    and journal["old_binding_digest"] is None
+                )
+            return (
+                active.get("schema_version") == _ACTIVE_CONTEXT_CLOUD_SCHEMA
+                and active.get("authority_commit_digest") == journal["old_authority_commit_digest"]
+                and active.get("namespace") == binding["namespace"]
+            )
+        except (KeyError, TypeError, ValueError, RunnerStoreError):
+            return False
+
+    def _validate_cloud_context_authority_locked(
+        self, context_fd: int, binding: Mapping[str, Any],
+    ) -> None:
+        """Validate the independent durable Cloud tuple, never a file-existence hint."""
+        try:
+            context = _context_from_dict(binding["context"])
+            identity = _stored_identity_record(binding["identity"])
+            commit_digest = _digest(binding["authority_commit_digest"], "cloud authority commit digest")
+            if binding.get("authority_mode") != "cloud":
+                raise ValueError
+            commit = self._validate_cloud_authority_commit(
+                _read_json(context_fd, self._cloud_authority_commit_filename(commit_digest), None),
+                expected_digest=commit_digest, namespace=self.namespace,
+                context=context, identity=identity,
+            )
+            sidecar = validate_runner_context_binding(
+                _read_json(context_fd, "cloud-context-binding.json", None),
+            )
+            provenance = self._validate_cloud_context_provenance(
+                _read_json(context_fd, "cloud-context-provenance.json", None),
+            )
+            if (
+                commit["binding_id"] != sidecar["binding_id"]
+                or commit["binding_digest"] != sidecar["binding_digest"]
+                or provenance["binding_id"] != commit["binding_id"]
+                or provenance["binding_digest"] != commit["binding_digest"]
+                or commit["context"] != binding["context"]
+                or commit["identity"] != binding["identity"]
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, RunnerStoreError):
+            raise RunnerStoreError("cloud context authority is incomplete") from None
 
     def _validated_cloud_context_binding(
         self, artifact: object, *, identity: RunnerIdentity, trusted_cloud_keys: Mapping[str, object],
@@ -1960,12 +3679,19 @@ class RunnerStore:
             return _read_json(context_fd, "cloud-context-binding.json", None) is not None
 
     def has_cloud_context_provenance(self) -> bool:
-        """Whether an active local context was ever selected for Cloud authority."""
+        """Return Cloud mode only after validating its complete durable tuple."""
         with self._transaction(exclusive=False, allow_rollover_journal=True) as context_fd:
-            provenance = _read_json(context_fd, "cloud-context-provenance.json", None)
-            if provenance is not None:
+            binding = self._binding_locked(context_fd)
+            if binding["schema_version"] == "heel.bound-runner-context.v2":
+                # `_binding_locked` has already validated commit, sidecar and provenance.
                 return True
-            return _read_json(context_fd, "cloud-context-binding.json", None) is not None
+            if (
+                _read_json(context_fd, "cloud-context-provenance.json", None) is not None
+                or _read_json(context_fd, "cloud-context-binding.json", None) is not None
+                or _read_json(context_fd, "context-rollover.json", None) is not None
+            ):
+                raise RunnerStoreError("cloud context authority is incomplete")
+            return False
 
     def verify_cloud_context_binding(
         self, *, identity: RunnerIdentity, trusted_cloud_keys: Mapping[str, object], now_ms: int,
@@ -2012,12 +3738,20 @@ class RunnerStore:
             raise RunnerStoreError("cloud context binding does not match local runner")
         return binding
 
-    def _binding_locked(self, context_fd: int) -> dict[str, Any]:
+    def _binding_locked(self, context_fd: int, *, validate_cloud: bool = True) -> dict[str, Any]:
         value = _read_json(context_fd, "binding.json", None)
-        fields = {"schema_version", "namespace", "context", "identity", "signer_label"}
-        if not isinstance(value, Mapping) or set(value) != fields:
+        static_fields = {"schema_version", "namespace", "context", "identity", "signer_label"}
+        cloud_fields = static_fields | {"authority_mode", "authority_commit_digest"}
+        if not isinstance(value, Mapping):
             raise RunnerStoreError("invalid bound runner context")
-        if value["schema_version"] != "heel.bound-runner-context.v1":
+        schema = value.get("schema_version")
+        if schema == "heel.bound-runner-context.v1":
+            if set(value) != static_fields:
+                raise RunnerStoreError("invalid bound runner context")
+        elif schema == "heel.bound-runner-context.v2":
+            if set(value) != cloud_fields or value.get("authority_mode") != "cloud":
+                raise RunnerStoreError("invalid bound runner context")
+        else:
             raise RunnerStoreError("invalid bound runner context")
         if value["namespace"] != self.namespace:
             raise RunnerStoreError("runner namespace mismatch")
@@ -2028,7 +3762,10 @@ class RunnerStore:
         if identity["workspace_id"] != context.workspace_id:
             raise RunnerStoreError("runner identity context mismatch")
         signer_label = _id(value["signer_label"], "runner signer label")
-        return {**dict(value), "identity": identity, "signer_label": signer_label}
+        result = {**dict(value), "identity": identity, "signer_label": signer_label}
+        if schema == "heel.bound-runner-context.v2" and validate_cloud:
+            self._validate_cloud_context_authority_locked(context_fd, result)
+        return result
 
     def _validate_binding_locked(self, context_fd: int) -> None:
         self._binding_locked(context_fd)
@@ -2646,13 +4383,30 @@ class RunnerStore:
                     record = _read_json(runs_fd, reservation_name, None)
                     if record is None:
                         raise RunnerStoreError("local run authority reservation is unavailable")
-                    self._verify_signed_run_authority_value(
+                    record = self._verify_signed_run_authority_value(
                         record, identity=identity, schema=_RUN_RESERVATION_RECORD_SCHEMA,
                         record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
                     )
+                    tracked = next(
+                        (item for item in index["nonterminal_runs"] if item["run_hash"] == run_hash),
+                        None,
+                    )
+                    terminal = next(
+                        (item for item in index["terminal_queue"] if item["run_hash"] == run_hash),
+                        None,
+                    )
+                    if (
+                        tracked is None
+                        or tracked["reservation_record_digest"] != record["record_digest"]
+                        or terminal is not None
+                    ):
+                        raise RunnerStoreError("local run authority reservation is unavailable")
                     with self._open_run(context_fd, run_id, create=False) as run_fd:
-                        return self._run_state_locked(run_fd, run_id)
-                if index["nonterminal_count"] + len(index["terminal_queue"]) >= _RUN_AUTHORITY_MAX_TRACKED:
+                        current = self._run_state_locked(run_fd, run_id)
+                        if current["state"] not in {"verified", "running", "stop_requested", "finalizing"}:
+                            raise RunnerStoreError("local run authority reservation is unavailable")
+                        return current
+                if len(index["nonterminal_runs"]) >= _RUN_AUTHORITY_MAX_NONTERMINAL:
                     raise RunnerStoreError("local run authority capacity is exhausted")
                 record = self._run_authority_record(
                     operation="reserve", context=context, identity=identity, signer=signer,
@@ -2660,6 +4414,13 @@ class RunnerStore:
                 )
                 next_index = self._next_run_authority_index(
                     index, signer=signer, delta=1, head_digest=record["record_digest"],
+                    nonterminal_runs=sorted([
+                        *index["nonterminal_runs"],
+                        {
+                            "run_hash": run_hash,
+                            "reservation_record_digest": record["record_digest"],
+                        },
+                    ], key=lambda item: item["run_hash"]),
                 )
                 journal = self._run_authority_journal(
                     context=context, identity=identity, signer=signer, operation="reserve",
@@ -2686,7 +4447,7 @@ class RunnerStore:
         return state
 
     def recover_run_reservation(self, run_id: str) -> dict[str, Any]:
-        """Reconstruct the run namespace from its immutable consumption journal."""
+        """Read committed run authority; only a still-present reserve journal may repair files."""
         run_id = _id(run_id, "run ID")
         identity, _signer = self._require_runtime_authority()
         with self._transaction(exclusive=True) as context_fd:
@@ -2698,20 +4459,18 @@ class RunnerStore:
                 self._complete_run_authority_journal_locked(
                     context_fd, runs_fd, identity=identity,
                 )
-                self._run_authority_index_locked(runs_fd, identity=identity)
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
                 run_hash = self._run_hash(run_id)
-                if _read_json(runs_fd, self._run_authority_record_filename("prune", run_hash), None) is not None:
-                    raise RunnerStoreError("local run reservation is unavailable")
-                record = _read_json(
+                reservation_value = _read_json(
                     runs_fd, self._run_authority_record_filename("reserve", run_hash), None,
                 )
-                if record is None:
+                if reservation_value is None:
                     raise RunnerStoreError("local run reservation is unavailable")
-                checked = self._verify_signed_run_authority_value(
-                    record, identity=identity, schema=_RUN_RESERVATION_RECORD_SCHEMA,
+                reservation = self._verify_signed_run_authority_value(
+                    reservation_value, identity=identity, schema=_RUN_RESERVATION_RECORD_SCHEMA,
                     record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
                 )
-                marker = _read_json(runs_fd, f"grant-{checked.get('grant_digest')}.json", None)
+                marker = _read_json(runs_fd, f"grant-{reservation.get('grant_digest')}.json", None)
                 if (
                     not isinstance(marker, Mapping) or set(marker) != {
                         "schema_version", "grant", "initial_state",
@@ -2722,33 +4481,118 @@ class RunnerStore:
                     grant = validate_execution_grant(marker["grant"])
                 except (TypeError, ValueError):
                     raise RunnerStoreError("invalid local run reservation journal") from None
-                state = marker["initial_state"]
+                initial_state = marker["initial_state"]
                 if (
-                    grant["run_id"] != run_id or checked.get("run_hash") != run_hash
-                    or checked.get("grant_id") != grant["grant_id"]
-                    or checked.get("grant_digest") != grant["grant_digest"]
-                    or not isinstance(state, Mapping) or state.get("run_id") != run_id
-                    or state.get("state") != "verified" or checked.get("initial_state_digest") != canonical_digest(dict(state))
+                    grant["run_id"] != run_id or reservation.get("run_hash") != run_hash
+                    or reservation.get("grant_id") != grant["grant_id"]
+                    or reservation.get("grant_digest") != grant["grant_digest"]
+                    or not isinstance(initial_state, Mapping) or initial_state.get("run_id") != run_id
+                    or initial_state.get("state") != "verified"
+                    or reservation.get("initial_state_digest") != canonical_digest(dict(initial_state))
                 ):
                     raise RunnerStoreError("invalid local run reservation journal")
-                run_fd = _open_child(runs_fd, self._run_hash(run_id), create=True)
-                assert run_fd is not None
+
+                terminal_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("terminal", run_hash), None,
+                )
+                pruned_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("prune", run_hash), None,
+                )
+                nonterminal = next(
+                    (item for item in index["nonterminal_runs"] if item["run_hash"] == run_hash),
+                    None,
+                )
+                terminal_item = next(
+                    (item for item in index["terminal_queue"] if item["run_hash"] == run_hash),
+                    None,
+                )
+                if pruned_value is not None:
+                    pruned = self._verify_signed_run_authority_value(
+                        pruned_value, identity=identity, schema=_RUN_PRUNED_RECORD_SCHEMA,
+                        record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                    )
+                    pruned_run_fd = _open_child(runs_fd, run_hash, create=False)
+                    if pruned_run_fd is not None:
+                        os.close(pruned_run_fd)
+                        raise RunnerStoreError("local run authority recovery is invalid")
+                    if terminal_value is None or nonterminal is not None or terminal_item is not None:
+                        raise RunnerStoreError("local run authority recovery is invalid")
+                    terminal = self._verify_signed_run_authority_value(
+                        terminal_value, identity=identity, schema=_RUN_TERMINAL_RECORD_SCHEMA,
+                        record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                    )
+                    if (
+                        terminal.get("reservation_record_digest") != reservation["record_digest"]
+                        or pruned.get("terminal_record_digest") != terminal["record_digest"]
+                        or pruned.get("terminal_projection_digest") != terminal.get("terminal_projection_digest")
+                        or pruned.get("run_hash") != run_hash
+                    ):
+                        raise RunnerStoreError("local run authority recovery is invalid")
+                    raise RunnerStoreError("local run reservation is unavailable")
+
+                if terminal_value is not None:
+                    terminal = self._verify_signed_run_authority_value(
+                        terminal_value, identity=identity, schema=_RUN_TERMINAL_RECORD_SCHEMA,
+                        record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                    )
+                    if (
+                        nonterminal is not None or terminal_item is None
+                        or terminal_item["terminal_record_digest"] != terminal["record_digest"]
+                        or terminal.get("reservation_record_digest") != reservation["record_digest"]
+                    ):
+                        raise RunnerStoreError("local run authority recovery is invalid")
+                    run_fd = _open_child(runs_fd, run_hash, create=False)
+                    if run_fd is None:
+                        raise RunnerStoreError("terminal local run is unavailable")
+                    try:
+                        _secure_directory(run_fd, "Heel terminal local run directory")
+                        if _read_json(run_fd, "grant.json", None) != grant:
+                            raise RunnerStoreError("terminal local run is unavailable")
+                        recovered = self._run_state_locked(run_fd, run_id)
+                        finals = _read_json(run_fd, "finals.json", None)
+                        final_fields = {
+                            "schema_version", "operational_projection", "findings_projection",
+                            "local_view", "disclosure_preview", "finals_digest",
+                        }
+                        if (
+                            recovered["state"] != "terminal"
+                            or not isinstance(finals, Mapping) or set(finals) != final_fields
+                            or finals.get("schema_version") != _FINALS_SCHEMA
+                            or finals.get("finals_digest") != canonical_digest({
+                                key: finals[key] for key in finals if key != "finals_digest"
+                            })
+                            or terminal.get("terminal_state_digest") != canonical_digest(recovered)
+                        ):
+                            raise RunnerStoreError("terminal local run is unavailable")
+                        try:
+                            operational = validate_operational_run(finals["operational_projection"])
+                        except (TypeError, ValueError):
+                            raise RunnerStoreError("terminal local run is unavailable") from None
+                        if terminal.get("terminal_projection_digest") != operational["projection_digest"]:
+                            raise RunnerStoreError("terminal local run is unavailable")
+                        return recovered
+                    finally:
+                        os.close(run_fd)
+
+                if (
+                    nonterminal is None
+                    or nonterminal["reservation_record_digest"] != reservation["record_digest"]
+                    or terminal_item is not None
+                ):
+                    raise RunnerStoreError("local run authority recovery is invalid")
+                run_fd = _open_child(runs_fd, run_hash, create=False)
+                if run_fd is None:
+                    raise RunnerStoreError("local run reservation is unavailable")
                 try:
                     _secure_directory(run_fd, "Heel local run directory")
-                    stored_grant = _read_json(run_fd, "grant.json", None)
-                    if stored_grant is None:
-                        _create_json(run_fd, "grant.json", grant)
-                    elif stored_grant != grant:
-                        raise RunnerStoreError("immutable local run grant collision")
-                    stored_state = _read_json(run_fd, "state.json", None)
-                    if stored_state is None:
-                        _create_json(run_fd, "state.json", dict(state))
+                    if _read_json(run_fd, "grant.json", None) != grant:
+                        raise RunnerStoreError("local run reservation is unavailable")
                     recovered = self._run_state_locked(run_fd, run_id)
-                    os.fsync(run_fd)
+                    if recovered["state"] not in {"verified", "running", "stop_requested", "finalizing"}:
+                        raise RunnerStoreError("local run reservation is unavailable")
+                    return recovered
                 finally:
                     os.close(run_fd)
-                os.fsync(runs_fd)
-                return recovered
             finally:
                 os.close(runs_fd)
 
@@ -2852,6 +4696,13 @@ class RunnerStore:
                         )
                         index = self._next_run_authority_index(
                             index, signer=signer, delta=1, head_digest=reservation["record_digest"],
+                            nonterminal_runs=sorted([
+                                *index["nonterminal_runs"],
+                                {
+                                    "run_hash": run_hash,
+                                    "reservation_record_digest": reservation["record_digest"],
+                                },
+                            ], key=lambda item: item["run_hash"]),
                         )
                         if current_state["state"] == "terminal":
                             finals = _read_json(run_fd, "finals.json", None)
@@ -2888,6 +4739,9 @@ class RunnerStore:
                             })
                             index = self._next_run_authority_index(
                                 index, signer=signer, delta=-1, head_digest=terminal["record_digest"],
+                                nonterminal_runs=[
+                                    item for item in index["nonterminal_runs"] if item["run_hash"] != run_hash
+                                ],
                                 terminal_queue=sorted(
                                     terminal_items,
                                     key=lambda item: (item["retention_expires_at_ms"], item["run_hash"]),
@@ -2987,13 +4841,15 @@ class RunnerStore:
                         if (
                             existing_record["record_digest"] != existing_terminal["terminal_record_digest"]
                             or existing_record.get("terminal_projection_digest") != terminal_projection_digest
+                            or existing_record.get("terminal_state_digest") != canonical_digest(current)
+                            or existing_record.get("grant_id") != current["grant_id"]
+                            or existing_record.get("grant_digest") != current["grant_digest"]
+                            or existing_record.get("retention_expires_at_ms")
+                            != current["retention_expires_at_ms"]
+                            or existing_record.get("terminal_at_ms") != current["updated_at_ms"]
                         ):
                             raise RunnerStoreError("local run authority terminal queue is invalid")
-                        # A crash can leave the durable authority terminal record/index ahead of
-                        # the mutable run state.  The immutable record is the commitment; restore
-                        # only the state marker instead of minting a second terminal record.
-                        _write_json(run_fd, "state.json", updated)
-                        return updated
+                        return current
                     reservation = _read_json(
                         runs_fd, self._run_authority_record_filename("reserve", run_hash), None,
                     )
@@ -3003,6 +4859,15 @@ class RunnerStore:
                         reservation, identity=identity, schema=_RUN_RESERVATION_RECORD_SCHEMA,
                         record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
                     )
+                    tracked_reservation = next(
+                        (item for item in index["nonterminal_runs"] if item["run_hash"] == run_hash),
+                        None,
+                    )
+                    if (
+                        tracked_reservation is None
+                        or tracked_reservation["reservation_record_digest"] != reservation["record_digest"]
+                    ):
+                        raise RunnerStoreError("local run authority reservation is unavailable")
                     grant = _read_json(run_fd, "grant.json", None)
                     try:
                         grant = validate_execution_grant(grant)
@@ -3026,6 +4891,9 @@ class RunnerStore:
                     )
                     next_index = self._next_run_authority_index(
                         index, signer=signer, delta=-1, head_digest=record["record_digest"],
+                        nonterminal_runs=[
+                            item for item in index["nonterminal_runs"] if item["run_hash"] != run_hash
+                        ],
                         terminal_queue=terminal_queue,
                     )
                     journal = self._run_authority_journal(
@@ -3044,6 +4912,613 @@ class RunnerStore:
                     return updated
                 finally:
                     os.close(run_fd)
+            finally:
+                os.close(runs_fd)
+
+    def _runtime_terminal_anchor(self, run_id: str, *, runtime: object | None = None) -> dict[str, Any]:
+        """Return one runtime-disclosure anchor from committed local terminal authority."""
+        identity, _signer = self._require_runtime_authority()
+        run_id = _id(run_id, "run ID")
+        try:
+            finals = self.load_final_projections(run_id)
+        except RunnerStoreError as exc:
+            raise RunnerStoreError("local terminal authority is unavailable") from exc
+        operational = finals["operational_projection"]
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local terminal authority is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity, runtime=runtime,
+                )
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                run_hash = self._run_hash(run_id)
+                queued = next(
+                    (item for item in index["terminal_queue"] if item["run_hash"] == run_hash),
+                    None,
+                )
+                if queued is None:
+                    raise RunnerStoreError("local terminal authority is unavailable")
+                record = _read_json(
+                    runs_fd, self._run_authority_record_filename("terminal", run_hash), None,
+                )
+                if record is None:
+                    raise RunnerStoreError("local terminal authority is unavailable")
+                record = self._verify_signed_run_authority_value(
+                    record, identity=identity, schema=_RUN_TERMINAL_RECORD_SCHEMA,
+                    record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                )
+                with self._open_run(context_fd, run_id, create=False) as run_fd:
+                    state = self._run_state_locked(run_fd, run_id)
+                    grant = _read_json(run_fd, "grant.json", None)
+                try:
+                    grant = validate_execution_grant(grant)
+                except (TypeError, ValueError):
+                    raise RunnerStoreError("invalid stored execution grant") from None
+                if (
+                    state["state"] != "terminal"
+                    or queued["terminal_record_digest"] != record["record_digest"]
+                    or queued["retention_expires_at_ms"] != state["retention_expires_at_ms"]
+                    or record["run_hash"] != run_hash
+                    or record["grant_id"] != grant["grant_id"]
+                    or record["grant_digest"] != grant["grant_digest"]
+                    or record["terminal_state_digest"] != canonical_digest(state)
+                    or record["terminal_projection_digest"] != operational["projection_digest"]
+                    or record["terminal_at_ms"] != state["updated_at_ms"]
+                    or record["retention_expires_at_ms"] != state["retention_expires_at_ms"]
+                    or operational["run_id"] != run_id
+                    or operational["grant_id"] != grant["grant_id"]
+                    or operational["workspace_id"] != grant["workspace_id"]
+                    or operational["project_id"] != grant["project_id"]
+                    or operational["approval_projection_digest"]
+                    != grant["approval"]["projection_digest"]
+                ):
+                    raise RunnerStoreError("local terminal authority is invalid")
+                return {
+                    "run_id": run_id, "project_id": grant["project_id"],
+                    "grant_id": grant["grant_id"],
+                    "approval_projection_digest": grant["approval"]["projection_digest"],
+                    "terminal_projection_digest": record["terminal_projection_digest"],
+                    "terminal_record_digest": record["record_digest"],
+                    "terminal_at_ms": record["terminal_at_ms"],
+                    "retention_expires_at_ms": record["retention_expires_at_ms"],
+                }
+            finally:
+                os.close(runs_fd)
+
+    def detach_terminal(
+        self,
+        run_id: str,
+        *,
+        runtime: object,
+        expected_local_state_digest: str,
+        now_ms: int,
+    ) -> str:
+        """Durably detach a local terminal from the live-run claim ledger."""
+        run_id = _id(run_id, "run ID")
+        expected_local_state_digest = _digest(
+            expected_local_state_digest, "local terminal runtime state digest",
+        )
+        if type(now_ms) is not int or now_ms < 0:
+            raise ValueError("invalid local run timestamp")
+        identity, signer = self._require_runtime_authority()
+        if not self._runtime_matches_identity(runtime, identity=identity, signer=signer):
+            raise RunnerStoreError("local terminal detach recovery is required")
+
+        # A completed detach has intentionally removed q, so discover the named
+        # immutable record before asking the q-backed pre-detach anchor again.
+        run_hash = self._run_hash(run_id)
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local terminal authority is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity, runtime=runtime,
+                )
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                existing = _read_json(
+                    runs_fd, self._run_authority_record_filename("detach_terminal", run_hash), None,
+                )
+                if existing is not None:
+                    if any(item["run_hash"] == run_hash for item in index["terminal_queue"]):
+                        raise RunnerStoreError("local terminal authority is invalid")
+                    detached = self._verify_signed_run_authority_value(
+                        existing, identity=identity,
+                        schema=_RUN_TERMINAL_DETACHED_RECORD_SCHEMA,
+                        record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                    )
+                    try:
+                        state = runtime.load_terminal_state(run_id)
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        raise RunnerStoreError("local terminal detach recovery is required") from exc
+                    if (
+                        state is None or state.run_hash != run_hash
+                        or state.terminal_record_digest != detached["terminal_record_digest"]
+                        or state.terminal_projection_digest != detached["terminal_projection_digest"]
+                        or state.retention_expires_at_ms != detached["retention_expires_at_ms"]
+                        or not (
+                            state.state == "local_terminal"
+                            and state.state_digest == detached["runtime_state_digest"]
+                            or state.state == "available"
+                            and state.revision == 2
+                            and state.prior_state_digest == detached["runtime_state_digest"]
+                        )
+                    ):
+                        raise RunnerStoreError("local terminal authority is invalid")
+                    return detached["record_digest"]
+            finally:
+                os.close(runs_fd)
+        return self._detach_terminal_after_precheck(
+            run_id, runtime=runtime,
+            expected_local_state_digest=expected_local_state_digest, now_ms=now_ms,
+            identity=identity, signer=signer,
+        )
+
+    def load_terminal_disclosure_anchor(
+        self,
+        run_id: str,
+        *,
+        runtime: object,
+        expected_runtime_state_digest: str,
+    ) -> dict[str, Any]:
+        """Rehydrate disclosure authority from sealed runtime and detached records."""
+        run_id = _id(run_id, "run ID")
+        expected_runtime_state_digest = _digest(
+            expected_runtime_state_digest, "runtime terminal state digest",
+        )
+        identity, signer = self._require_runtime_authority()
+        if not self._runtime_matches_identity(runtime, identity=identity, signer=signer):
+            raise RunnerStoreError("local terminal disclosure authority is unavailable")
+        try:
+            runtime_state = runtime.load_terminal_state(run_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RunnerStoreError("local terminal disclosure authority is unavailable") from exc
+        if (
+            runtime_state is None or runtime_state.state != "available"
+            or runtime_state.revision != 2
+            or runtime_state.state_digest != expected_runtime_state_digest
+        ):
+            raise RunnerStoreError("local terminal disclosure authority is unavailable")
+        run_hash = self._run_hash(run_id)
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local terminal disclosure authority is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity, runtime=runtime,
+                )
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                if any(item["run_hash"] == run_hash for item in index["terminal_queue"]):
+                    raise RunnerStoreError("local terminal disclosure authority is unavailable")
+                detached_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("detach_terminal", run_hash), None,
+                )
+                terminal_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("terminal", run_hash), None,
+                )
+                if detached_value is None or terminal_value is None:
+                    raise RunnerStoreError("local terminal disclosure authority is unavailable")
+                detached = self._verify_signed_run_authority_value(
+                    detached_value, identity=identity,
+                    schema=_RUN_TERMINAL_DETACHED_RECORD_SCHEMA,
+                    record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                )
+                terminal = self._verify_signed_run_authority_value(
+                    terminal_value, identity=identity,
+                    schema=_RUN_TERMINAL_RECORD_SCHEMA,
+                    record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                )
+                run_fd = _open_child(runs_fd, run_hash, create=False)
+                if run_fd is None:
+                    raise RunnerStoreError("local terminal disclosure authority is unavailable")
+                try:
+                    _secure_directory(run_fd, "Heel terminal local run directory")
+                    state = self._run_state_locked(run_fd, run_id)
+                    try:
+                        grant = validate_execution_grant(_read_json(run_fd, "grant.json", None))
+                    except (TypeError, ValueError):
+                        raise RunnerStoreError("invalid stored execution grant") from None
+                    finals = _read_json(run_fd, "finals.json", None)
+                finally:
+                    os.close(run_fd)
+                try:
+                    operational = validate_operational_run(finals["operational_projection"])
+                except (KeyError, TypeError, ValueError):
+                    raise RunnerStoreError("local terminal disclosure authority is unavailable") from None
+                if (
+                    state["state"] != "terminal"
+                    or grant["run_id"] != run_id
+                    or terminal["run_hash"] != run_hash
+                    or terminal["grant_id"] != grant["grant_id"]
+                    or terminal["grant_digest"] != grant["grant_digest"]
+                    or terminal["terminal_state_digest"] != canonical_digest(state)
+                    or terminal["terminal_projection_digest"] != operational["projection_digest"]
+                    or detached["run_hash"] != run_hash
+                    or detached["grant_id"] != grant["grant_id"]
+                    or detached["grant_digest"] != grant["grant_digest"]
+                    or detached["terminal_record_digest"] != terminal["record_digest"]
+                    or detached["terminal_projection_digest"] != terminal["terminal_projection_digest"]
+                    or detached["terminal_at_ms"] != terminal["terminal_at_ms"]
+                    or detached["retention_expires_at_ms"] != terminal["retention_expires_at_ms"]
+                    or runtime_state.run_hash != run_hash
+                    or runtime_state.project_id != grant["project_id"]
+                    or runtime_state.grant_id != grant["grant_id"]
+                    or runtime_state.approval_projection_digest != grant["approval"]["projection_digest"]
+                    or runtime_state.terminal_projection_digest != detached["terminal_projection_digest"]
+                    or runtime_state.terminal_record_digest != detached["terminal_record_digest"]
+                    or runtime_state.terminal_at_ms != detached["terminal_at_ms"]
+                    or runtime_state.retention_expires_at_ms != detached["retention_expires_at_ms"]
+                    or runtime_state.prior_state_digest != detached["runtime_state_digest"]
+                ):
+                    raise RunnerStoreError("local terminal disclosure authority is invalid")
+                return {
+                    "run_id": run_id, "project_id": grant["project_id"],
+                    "grant_id": grant["grant_id"],
+                    "approval_projection_digest": grant["approval"]["projection_digest"],
+                    "terminal_projection_digest": terminal["terminal_projection_digest"],
+                    "terminal_record_digest": terminal["record_digest"],
+                    "terminal_at_ms": terminal["terminal_at_ms"],
+                    "retention_expires_at_ms": terminal["retention_expires_at_ms"],
+                }
+            finally:
+                os.close(runs_fd)
+
+    def recover_terminal_detaches(
+        self,
+        *,
+        runtime: object,
+        now_ms: int,
+        limit: int = 64,
+    ) -> int:
+        """Drain only the signed terminal queue; never enumerate retained runs."""
+        if type(now_ms) is not int or now_ms < 0:
+            raise ValueError("invalid local run timestamp")
+        if type(limit) is not int or not 1 <= limit <= _RUN_AUTHORITY_MAX_TRACKED:
+            raise ValueError("invalid local terminal detach limit")
+        identity, signer = self._require_runtime_authority()
+        if not self._runtime_matches_identity(runtime, identity=identity, signer=signer):
+            raise RunnerStoreError("local terminal detach recovery is required")
+        recovered = 0
+        for _ in range(limit):
+            with self._transaction(exclusive=True) as context_fd:
+                runs_fd = _open_child(context_fd, "runs", create=False)
+                if runs_fd is None:
+                    return recovered
+                try:
+                    _secure_directory(runs_fd, "Heel runner runs directory")
+                    self._complete_run_authority_journal_locked(
+                        context_fd, runs_fd, identity=identity, runtime=runtime,
+                    )
+                    index = self._run_authority_index_locked(runs_fd, identity=identity)
+                    if not index["terminal_queue"]:
+                        return recovered
+                    run_id = self._run_id_from_hash_locked(
+                        runs_fd, index["terminal_queue"][0]["run_hash"],
+                    )
+                finally:
+                    os.close(runs_fd)
+            anchor = self._runtime_terminal_anchor(run_id, runtime=runtime)
+            try:
+                state = runtime.load_terminal_state(run_id)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise RunnerStoreError("local terminal detach recovery is required") from exc
+            if state is None:
+                try:
+                    state = runtime.register_local_terminal(**anchor)
+                except (AttributeError, TypeError, ValueError) as exc:
+                    raise RunnerStoreError("local terminal detach recovery is required") from exc
+            elif (
+                state.state != "local_terminal"
+                or state.run_hash != self._run_hash(run_id)
+                or state.project_id != anchor["project_id"]
+                or state.grant_id != anchor["grant_id"]
+                or state.approval_projection_digest != anchor["approval_projection_digest"]
+                or state.terminal_projection_digest != anchor["terminal_projection_digest"]
+                or state.terminal_record_digest != anchor["terminal_record_digest"]
+                or state.terminal_at_ms != anchor["terminal_at_ms"]
+                or state.retention_expires_at_ms != anchor["retention_expires_at_ms"]
+            ):
+                raise RunnerStoreError("local terminal detach recovery is required")
+            self.detach_terminal(
+                run_id, runtime=runtime, expected_local_state_digest=state.state_digest,
+                now_ms=now_ms,
+            )
+            recovered += 1
+        return recovered
+
+    def prune_runtime_terminal(
+        self,
+        run_id: str,
+        *,
+        runtime: object,
+        expected_runtime_state_digest: str,
+        now_ms: int,
+    ) -> str:
+        """Write the signed prune tombstone before the runtime row is removed."""
+        run_id = _id(run_id, "run ID")
+        expected_runtime_state_digest = _digest(
+            expected_runtime_state_digest, "runtime prune state digest",
+        )
+        if type(now_ms) is not int or now_ms < 0:
+            raise ValueError("invalid local run timestamp")
+        identity, signer = self._require_runtime_authority()
+        if not self._runtime_matches_identity(runtime, identity=identity, signer=signer):
+            raise RunnerStoreError("local terminal prune recovery is required")
+        try:
+            runtime_state = runtime.load_terminal_state(run_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RunnerStoreError("local terminal prune recovery is required") from exc
+        if (
+            runtime_state is None or runtime_state.state != "prune_pending"
+            or runtime_state.state_digest != expected_runtime_state_digest
+            or now_ms < runtime_state.retention_expires_at_ms
+        ):
+            raise RunnerStoreError("local terminal prune authority is unavailable")
+        run_hash = self._run_hash(run_id)
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local terminal prune authority is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity, runtime=runtime,
+                )
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                if any(item["run_hash"] == run_hash for item in index["terminal_queue"]):
+                    raise RunnerStoreError("local terminal prune authority is unavailable")
+                detached_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("detach_terminal", run_hash), None,
+                )
+                terminal_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("terminal", run_hash), None,
+                )
+                if detached_value is None or terminal_value is None:
+                    raise RunnerStoreError("local terminal prune authority is unavailable")
+                detached = self._verify_signed_run_authority_value(
+                    detached_value, identity=identity,
+                    schema=_RUN_TERMINAL_DETACHED_RECORD_SCHEMA,
+                    record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                )
+                terminal = self._verify_signed_run_authority_value(
+                    terminal_value, identity=identity,
+                    schema=_RUN_TERMINAL_RECORD_SCHEMA,
+                    record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                )
+                existing_pruned = _read_json(
+                    runs_fd, self._run_authority_record_filename("prune", run_hash), None,
+                )
+                if existing_pruned is not None:
+                    pruned = self._verify_signed_run_authority_value(
+                        existing_pruned, identity=identity, schema=_RUN_PRUNED_RECORD_SCHEMA,
+                        record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                    )
+                    if (
+                        pruned["terminal_record_digest"] != terminal["record_digest"]
+                        or pruned["terminal_projection_digest"] != terminal["terminal_projection_digest"]
+                        or pruned["retention_expires_at_ms"] != runtime_state.retention_expires_at_ms
+                    ):
+                        raise RunnerStoreError("local terminal prune authority is invalid")
+                    return pruned["record_digest"]
+                run_fd = _open_child(runs_fd, run_hash, create=False)
+                if run_fd is None:
+                    raise RunnerStoreError("local terminal prune authority is unavailable")
+                try:
+                    _secure_directory(run_fd, "Heel retained local run directory")
+                    state = self._run_state_locked(run_fd, run_id)
+                    try:
+                        grant = validate_execution_grant(_read_json(run_fd, "grant.json", None))
+                    except (TypeError, ValueError):
+                        raise RunnerStoreError("invalid stored execution grant") from None
+                    finals = _read_json(run_fd, "finals.json", None)
+                    try:
+                        operational = validate_operational_run(finals["operational_projection"])
+                    except (KeyError, TypeError, ValueError):
+                        raise RunnerStoreError("local terminal prune authority is unavailable") from None
+                    if (
+                        state["state"] != "terminal"
+                        or state["retention_expires_at_ms"] != runtime_state.retention_expires_at_ms
+                        or terminal["run_hash"] != run_hash
+                        or terminal["grant_id"] != grant["grant_id"]
+                        or terminal["grant_digest"] != grant["grant_digest"]
+                        or terminal["terminal_state_digest"] != canonical_digest(state)
+                        or terminal["terminal_projection_digest"] != operational["projection_digest"]
+                        or detached["terminal_record_digest"] != terminal["record_digest"]
+                        or detached["terminal_projection_digest"] != terminal["terminal_projection_digest"]
+                        or detached["runtime_state_digest"] != runtime_state.prior_state_digest
+                        or runtime_state.terminal_record_digest != terminal["record_digest"]
+                        or runtime_state.terminal_projection_digest != terminal["terminal_projection_digest"]
+                        or runtime_state.grant_id != grant["grant_id"]
+                    ):
+                        raise RunnerStoreError("local terminal prune authority is invalid")
+                    context = _context_from_dict(self._binding_locked(context_fd)["context"])
+                    record = self._run_authority_record(
+                        operation="prune", context=context, identity=identity, signer=signer,
+                        run_hash=run_hash, grant=grant, state=state, index=index,
+                        terminal={
+                            "terminal_record_digest": terminal["record_digest"],
+                            "terminal_projection_digest": terminal["terminal_projection_digest"],
+                            "terminal_at_ms": terminal["terminal_at_ms"],
+                        },
+                        pruned_at_ms=now_ms,
+                    )
+                    next_index = self._next_run_authority_index(
+                        index, signer=signer, delta=0, head_digest=record["record_digest"],
+                    )
+                    journal = self._run_authority_journal(
+                        context=context, identity=identity, signer=signer, operation="prune",
+                        run_hash=run_hash, index=index, next_index=next_index, record=record,
+                        recovery={
+                            "retention_expires_at_ms": runtime_state.retention_expires_at_ms,
+                            "runtime_prune_state_digest": expected_runtime_state_digest,
+                            "detached_record_digest": detached["record_digest"],
+                        },
+                        created_at_ms=now_ms,
+                    )
+                    _write_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, journal)
+                    self._ensure_json_exact(
+                        runs_fd, self._run_authority_record_filename("prune", run_hash), record,
+                    )
+                    self._delete_directory_contents(run_fd)
+                finally:
+                    os.close(run_fd)
+                os.rmdir(run_hash, dir_fd=runs_fd)
+                _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
+                os.unlink(_RUN_AUTHORITY_JOURNAL_FILENAME, dir_fd=runs_fd)
+                os.fsync(runs_fd)
+                return record["record_digest"]
+            finally:
+                os.close(runs_fd)
+
+    def _detach_terminal_after_precheck(
+        self, run_id: str, *, runtime: object, expected_local_state_digest: str,
+        now_ms: int, identity: RunnerIdentity, signer: SecureSigner,
+    ) -> str:
+        # This opens the retained terminal files, validates q, grant, state and finals,
+        # and also finishes a preceding detach journal with the concrete runtime.
+        anchor = self._runtime_terminal_anchor(run_id, runtime=runtime)
+        try:
+            runtime_state = runtime.load_terminal_state(run_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RunnerStoreError("local terminal detach recovery is required") from exc
+        if (
+            runtime_state is None
+            or runtime_state.state != "local_terminal"
+            or runtime_state.state_digest != expected_local_state_digest
+            or runtime_state.run_hash != self._run_hash(run_id)
+            or any(runtime_state_value != anchor[key] for runtime_state_value, key in (
+                (runtime_state.project_id, "project_id"),
+                (runtime_state.grant_id, "grant_id"),
+                (runtime_state.approval_projection_digest, "approval_projection_digest"),
+                (runtime_state.terminal_projection_digest, "terminal_projection_digest"),
+                (runtime_state.terminal_record_digest, "terminal_record_digest"),
+                (runtime_state.terminal_at_ms, "terminal_at_ms"),
+                (runtime_state.retention_expires_at_ms, "retention_expires_at_ms"),
+            ))
+        ):
+            raise RunnerStoreError("local terminal authority is invalid")
+
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local terminal authority is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity, runtime=runtime,
+                )
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                run_hash = self._run_hash(run_id)
+                queued = [item for item in index["terminal_queue"] if item["run_hash"] == run_hash]
+                detached_name = self._run_authority_record_filename("detach_terminal", run_hash)
+                existing = _read_json(runs_fd, detached_name, None)
+                if not queued:
+                    if existing is None:
+                        raise RunnerStoreError("local terminal authority is unavailable")
+                    detached = self._verify_signed_run_authority_value(
+                        existing, identity=identity,
+                        schema=_RUN_TERMINAL_DETACHED_RECORD_SCHEMA,
+                        record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                    )
+                    try:
+                        state = runtime.load_terminal_state(run_id)
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        raise RunnerStoreError("local terminal detach recovery is required") from exc
+                    if (
+                        state is None
+                        or state.run_hash != run_hash
+                        or state.terminal_record_digest != detached["terminal_record_digest"]
+                        or state.terminal_projection_digest != detached["terminal_projection_digest"]
+                        or state.retention_expires_at_ms != detached["retention_expires_at_ms"]
+                        or not (
+                            state.state == "local_terminal"
+                            and state.state_digest == detached["runtime_state_digest"]
+                            or state.state == "available"
+                            and state.revision == 2
+                            and state.prior_state_digest == detached["runtime_state_digest"]
+                        )
+                    ):
+                        raise RunnerStoreError("local terminal authority is invalid")
+                    return detached["record_digest"]
+                if len(queued) != 1 or existing is not None:
+                    raise RunnerStoreError("local terminal authority is invalid")
+                terminal_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("terminal", run_hash), None,
+                )
+                if terminal_value is None:
+                    raise RunnerStoreError("local terminal authority is unavailable")
+                terminal = self._verify_signed_run_authority_value(
+                    terminal_value, identity=identity, schema=_RUN_TERMINAL_RECORD_SCHEMA,
+                    record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                )
+                run_fd = _open_child(runs_fd, run_hash, create=False)
+                if run_fd is None:
+                    raise RunnerStoreError("local terminal authority run is unavailable")
+                try:
+                    _secure_directory(run_fd, "Heel terminal local run directory")
+                    try:
+                        grant = validate_execution_grant(_read_json(run_fd, "grant.json", None))
+                    except (TypeError, ValueError):
+                        raise RunnerStoreError("invalid stored execution grant") from None
+                finally:
+                    os.close(run_fd)
+                if (
+                    queued[0]["terminal_record_digest"] != terminal["record_digest"]
+                    or queued[0]["retention_expires_at_ms"] != anchor["retention_expires_at_ms"]
+                    or terminal["grant_id"] != grant["grant_id"]
+                    or terminal["grant_digest"] != grant["grant_digest"]
+                    or terminal["terminal_projection_digest"] != anchor["terminal_projection_digest"]
+                    or terminal["terminal_at_ms"] != anchor["terminal_at_ms"]
+                    or terminal["retention_expires_at_ms"] != anchor["retention_expires_at_ms"]
+                ):
+                    raise RunnerStoreError("local terminal authority is invalid")
+                context = _context_from_dict(self._binding_locked(context_fd)["context"])
+                detached = self._run_authority_record(
+                    operation="detach_terminal", context=context, identity=identity, signer=signer,
+                    run_hash=run_hash, grant=grant,
+                    state={
+                        "retention_expires_at_ms": anchor["retention_expires_at_ms"],
+                        "updated_at_ms": anchor["terminal_at_ms"],
+                    },
+                    index=index,
+                    terminal={
+                        "terminal_record_digest": terminal["record_digest"],
+                        "terminal_projection_digest": terminal["terminal_projection_digest"],
+                        "terminal_at_ms": terminal["terminal_at_ms"],
+                        "runtime_state_digest": expected_local_state_digest,
+                    },
+                    detached_at_ms=now_ms,
+                )
+                next_index = self._next_run_authority_index(
+                    index, signer=signer, delta=0, head_digest=detached["record_digest"],
+                    terminal_queue=[
+                        item for item in index["terminal_queue"] if item["run_hash"] != run_hash
+                    ],
+                )
+                journal = self._run_authority_journal(
+                    context=context, identity=identity, signer=signer, operation="detach_terminal",
+                    run_hash=run_hash, index=index, next_index=next_index, record=detached,
+                    recovery={
+                        "runtime_state_schema": "heel.runner-terminal-disclosure-state.v1",
+                        "runtime_state": "local_terminal",
+                        "runtime_state_digest": expected_local_state_digest,
+                        "terminal_record_digest": terminal["record_digest"],
+                        "retention_expires_at_ms": anchor["retention_expires_at_ms"],
+                    },
+                    created_at_ms=now_ms,
+                )
+                _write_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, journal)
+                self._ensure_json_exact(runs_fd, detached_name, detached)
+                _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
+                os.unlink(_RUN_AUTHORITY_JOURNAL_FILENAME, dir_fd=runs_fd)
+                os.fsync(runs_fd)
+                return detached["record_digest"]
             finally:
                 os.close(runs_fd)
 
@@ -3601,6 +6076,9 @@ class RunnerStore:
         return removed
 
     def prune_expired_runs(self, *, now_ms: int) -> int:
+        # Terminal retention is now anchored in the authenticated runtime ledger.
+        # A queue-only caller cannot prove the corresponding durable runtime CAS.
+        raise RunnerStoreError("runtime terminal prune is required")
         identity, signer = self._require_runtime_authority()
         if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
             raise ValueError("invalid local retention time")

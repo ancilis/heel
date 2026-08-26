@@ -75,7 +75,13 @@ from .canary_disclosure import (
 )
 from .canary_runs import CanaryRunError, CanaryRunService
 from .runner_contexts import RunnerContextBindingService, RunnerContextError
-from .runner_auth import RunnerAuthError, RunnerAuthRateLimited, RunnerAuthStore, initialize_runner_auth_schema
+from .runner_auth import (
+    RunnerAuthError,
+    RunnerAuthRateLimited,
+    RunnerAuthStore,
+    RunnerProtocolUpgradeRequired,
+    initialize_runner_auth_schema,
+)
 from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
 from .device_auth import (
     DEVICE_CAPABILITIES,
@@ -842,6 +848,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(403, {"error": str(e)})
         except RunnerAuthRateLimited as e:
             self._json(429, {"schema_version": "heel.runner-error.v1", "code": "runner_resync_rate_limited", "retry_after_ms": 60_000}, {"Retry-After": "60"})
+        except RunnerProtocolUpgradeRequired:
+            self._json(403, {"schema_version": "heel.runner-error.v1", "code": "runner_protocol_upgrade_required"})
         except RunnerAuthError:
             self._json(401, {"schema_version": "heel.runner-error.v1", "code": "invalid_runner_auth"})
         except (CanaryRunError, CanaryDisclosureError) as error:
@@ -1031,15 +1039,33 @@ class _Handler(BaseHTTPRequestHandler):
     def _runner_pairing_exchange(self) -> None:
         try:
             body = self._body()
-            if set(body) != {"schema_version", "invitation_token", "public_key_b64", "pairing_phrase", "display_name", "runner_version", "adapters"} or body["schema_version"] != "heel.runner-pairing-exchange.v2":
+            v2_fields = {"schema_version", "invitation_token", "public_key_b64", "pairing_phrase", "display_name", "runner_version", "adapters"}
+            v3_fields = v2_fields | {"control_protocol"}
+            if (set(body) != v2_fields and set(body) != v3_fields) or body["schema_version"] not in {"heel.runner-pairing-exchange.v2", "heel.runner-pairing-exchange.v3"}:
+                raise ValueError
+            executable = body["schema_version"] == "heel.runner-pairing-exchange.v3"
+            if executable and (set(body) != v3_fields or body["control_protocol"] != "heel.runner-control.v2"):
+                raise ValueError
+            if not executable and set(body) != v2_fields:
                 raise ValueError
             pairing = self._runner_store().exchange(
                 body["invitation_token"], body["public_key_b64"], body["pairing_phrase"],
                 display_name=body["display_name"], runner_version=body["runner_version"], adapters=body["adapters"],
+                control_protocol="heel.runner-control.v2" if executable else None,
+                exchange_digest=hashlib.sha256(canonical_bytes(body)).hexdigest() if executable else None,
             )
         except (KeyError, TypeError, ValueError, RunnerAuthError):
             # Exchange must not reveal whether a one-time invitation was known.
             raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
+        if pairing.control_protocol is not None:
+            self._json(201, {
+                "schema_version": "heel.runner-pairing-pending.v2", "pairing_id": pairing.pairing_id,
+                "runner_id": pairing.runner_id, "fingerprint": pairing.fingerprint, "status": pairing.status,
+                "activation_challenge": pairing.activation_challenge,
+                "control_protocol": pairing.control_protocol,
+                "pairing_exchange_digest": pairing.pairing_exchange_digest,
+            })
+            return
         self._json(201, {"schema_version": "heel.runner-pairing-pending.v1", "pairing_id": pairing.pairing_id, "runner_id": pairing.runner_id, "fingerprint": pairing.fingerprint, "status": pairing.status, "activation_challenge": pairing.activation_challenge})
 
     def _runner_pairing_inspect(self, wid: str, pairing_id: str) -> None:
@@ -1064,9 +1090,15 @@ class _Handler(BaseHTTPRequestHandler):
     def _runner_pairing_activate(self, pairing_id: str) -> None:
         try:
             body = self._body()
+            store = self._runner_store()
+            if set(body) == {"schema_version", "client_activation_nonce_b64", "signature_b64"} and body["schema_version"] == "heel.runner-pairing-activate.v3":
+                response = store.activate_executable(
+                    pairing_id, body, max_active=self.cp.runner_active_limit(store, pairing_id),
+                )
+                self._json(200, response)
+                return
             if set(body) != {"schema_version", "signature_b64"} or body["schema_version"] != "heel.runner-pairing-activate.v1":
                 raise ValueError
-            store = self._runner_store()
             # The plan read is intentionally on the same short runner connection, never on
             # cp.store.conn; activation and its active-runner count then share one transaction.
             wid, runner_id, nonce = store.activate(pairing_id, body["signature_b64"], max_active=self.cp.runner_active_limit(store, pairing_id))
@@ -1243,16 +1275,13 @@ class _Handler(BaseHTTPRequestHandler):
                 raise RunnerAuthError("invalid runner authentication")
             all_headers = {name: self._header_values(name) for name in ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature", "Authorization", "Cookie")}
             store = self._runner_store()
-            # Bind both services to this exact migration-validated request connection before
-            # PoP opens its write transaction. Request mode performs no DDL or PRAGMA changes;
-            # the lifecycle/disclosure action then commits atomically with proof consumption.
-            if operation.startswith("context-"):
-                runs = disclosure = contexts = None
-            else:
-                runs, disclosure = self._runner_canary_services(store)
-                contexts = RunnerContextBindingService(store.conn, signing=self.cp.grant_authority)
-
             def action() -> dict:
+                # This setup intentionally happens only after RunnerAuthStore's v3 protocol
+                # gate and PoP checks. A legacy pairing must not receive an authority error in
+                # place of the non-executable protocol response, and none of these services
+                # may be reached before its nonce is protected by the same transaction.
+                if not operation.startswith("context-"):
+                    runs, disclosure = self._runner_canary_services(store)
                 if operation == "claim":
                     claimed = runs.claim(
                         wid, runner_id, all_headers["X-Heel-Runner-Key-Id"][0],
@@ -1320,6 +1349,8 @@ class _Handler(BaseHTTPRequestHandler):
             if operation.startswith("context-"):
                 raise RunnerAuthError("invalid runner authentication") from None
             raise
+        except RunnerProtocolUpgradeRequired:
+            raise
         except (ValueError, RunnerAuthError, LookupError):
             raise RunnerAuthError("invalid runner authentication") from None
         response_headers = {"X-Heel-Runner-Next-Nonce": nonce}
@@ -1375,7 +1406,7 @@ class _Handler(BaseHTTPRequestHandler):
                 workspace_id=wid, runner_id=runner_id, path=self.path,
                 raw_body=self._raw_body(), headers=headers,
             )
-        except RunnerAuthRateLimited:
+        except (RunnerAuthRateLimited, RunnerProtocolUpgradeRequired):
             raise
         except (ValueError, RunnerAuthError):
             raise RunnerAuthError("invalid runner authentication") from None

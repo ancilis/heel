@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import venv
 import zipfile
 
 
@@ -93,7 +92,8 @@ def _inspect_wheel(wheel: Path) -> None:
         "heel/__init__.py",
         "heel/cli.py",
         "heel/mcp_server.py",
-        "heel/saas/__init__.py",
+        "heel/runner/__init__.py",
+        "heel/runner/runtime.py",
     }
     missing = sorted(required - names)
     if missing:
@@ -119,17 +119,59 @@ def _exercise_installed_wheel(
     environment_root: Path,
     scratch: Path,
 ) -> None:
-    venv.EnvBuilder(with_pip=True).create(environment_root)
+    uv = shutil.which("uv")
+    if uv is None:
+        raise SmokeFailure("uv is required for isolated release smoke")
+    found_python = _run(
+        [
+            uv,
+            "python",
+            "find",
+            "--system",
+            "--resolve-links",
+            "--no-project",
+            "--no-config",
+            "--no-python-downloads",
+            "--offline",
+            ">=3.11",
+        ],
+        cwd=scratch,
+    ).stdout.splitlines()
+    if len(found_python) != 1 or not found_python[0]:
+        raise SmokeFailure("an installed system Python >=3.11 is required for release smoke")
+    base_python = Path(found_python[0])
+    if not base_python.is_absolute() or not base_python.is_file() or not os.access(base_python, os.X_OK):
+        raise SmokeFailure("an installed system Python >=3.11 is required for release smoke")
+    _run(
+        [
+            uv,
+            "venv",
+            "--no-project",
+            "--no-config",
+            "--no-python-downloads",
+            "--offline",
+            "--no-cache",
+            "--python",
+            str(base_python),
+            str(environment_root.resolve()),
+        ],
+        cwd=scratch,
+    )
     python, heel, heel_mcp = _installed_scripts(environment_root)
     _run(
         [
-            str(python),
-            "-m",
+            uv,
             "pip",
             "install",
-            "--disable-pip-version-check",
+            "--no-config",
+            "--no-python-downloads",
+            "--offline",
+            "--no-cache",
+            "--no-index",
+            "--python",
+            str(python.absolute()),
             "--no-deps",
-            str(wheel),
+            str(wheel.resolve()),
         ],
         cwd=scratch,
     )
@@ -137,6 +179,20 @@ def _exercise_installed_wheel(
     base_environment = os.environ.copy()
     base_environment.pop("PYTHONPATH", None)
     base_environment.pop("PYTHONHOME", None)
+
+    _run(
+        [
+            str(python), "-I", "-c",
+            (
+                "import importlib,importlib.util;"
+                "[importlib.import_module(name) for name in "
+                "('heel','heel.cli','heel.mcp_server','heel.runner','heel.runner.runtime')];"
+                "assert importlib.util.find_spec('heel.saas') is None"
+            ),
+        ],
+        cwd=scratch,
+        environment=base_environment,
+    )
 
     cli_home = (scratch / "cli-home").resolve()
     cli_environment = dict(base_environment, HEEL_HOME=str(cli_home))

@@ -104,6 +104,18 @@ def test_system_secure_signer_persists_only_behind_explicit_secret_backend():
     assert "seed" not in repr(first).lower()
 
 
+def test_system_secure_signer_rotation_provider_distinguishes_create_from_recovery_load():
+    backend = InMemorySecretBackend()
+    created = SystemSecureSigner.create_new("heel-rotation-new", backend=backend)
+    loaded = SystemSecureSigner.load_existing("heel-rotation-new", backend=backend)
+    assert loaded.public_key == created.public_key
+    with pytest.raises(RuntimeError, match="signing identity is unavailable"):
+        SystemSecureSigner.load_existing("heel-rotation-missing", backend=backend)
+    assert "heel-rotation-missing" not in backend._values
+    with pytest.raises(ValueError, match="already exists"):
+        SystemSecureSigner.create_new("heel-rotation-new", backend=backend)
+
+
 class _InputRecorder:
     def __init__(self): self.data = bytearray(); self.closed = False
     def write(self, value): self.data.extend(value); return len(value)

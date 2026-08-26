@@ -90,6 +90,7 @@ class RunnerCoordinator:
         self.store = store
         self.identity = identity
         self.signer = signer
+        self.store._pin_runtime_authority(identity, signer)
         trust = dict(trusted_grant_keys)
         if dict(control._trusted_disclosure_keys) != trust:
             raise ValueError("runner control disclosure authority binding is invalid")
@@ -101,6 +102,13 @@ class RunnerCoordinator:
         self._bindings: dict[str, tuple[str, str, str]] = {}
         self._terminal_runs: set[str] = set()
         self._lock = threading.Lock()
+        try:
+            self._recover_terminal_runtime_state()
+        except RunnerStoreError as exc:
+            # A signed Cloud rollover is completed by ensure_runner_context
+            # before any terminal/run recovery can touch the namespace.
+            if str(exc) != "cloud context rollover requires recovery":
+                raise
 
     def _now_ms(self) -> int:
         value = self.clock_ms()
@@ -116,6 +124,24 @@ class RunnerCoordinator:
         ):
             raise ValueError("runner monotonic clock returned an invalid timestamp")
         return float(value)
+
+    def _recover_terminal_runtime_state(self) -> None:
+        """Complete detached terminal authority before any control transport."""
+        if not self.store.is_context_bound:
+            return
+        now_ms = self._now_ms()
+        self.store.recover_terminal_detaches(
+            runtime=self.control.runtime, now_ms=now_ms,
+        )
+        for pending in self.control.runtime.claim_due_prune(now_ms=now_ms, limit=16):
+            pruned = self.store.prune_runtime_terminal(
+                pending.run_id, runtime=self.control.runtime,
+                expected_runtime_state_digest=pending.state_digest, now_ms=now_ms,
+            )
+            self.control.runtime.finish_prune(
+                pending.run_id, expected_state_digest=pending.state_digest,
+                pruned_record_digest=pruned, now_ms=now_ms,
+            )
 
     def claim(self) -> ClaimLease | None:
         response = self.control._claim_closed()
@@ -374,14 +400,54 @@ class RunnerCoordinator:
 
     def result(self, run_id: str, operational_projection: dict[str, Any]) -> object:
         self._known_run(run_id)
-        response = self.control._result_closed(run_id, operational_projection)
+        try:
+            projection = validate_operational_run(operational_projection)
+            self.control._verify_projection_signature(projection)
+        except (TypeError, ValueError):
+            raise ValueError("runner terminal projection is invalid") from None
+
+        def prepare_terminal_authority() -> None:
+            # This callback executes under the control client's exact per-run
+            # guard.  It is deliberately before call staging/transport: a
+            # failed local anchor or detach can never create a pending request.
+            anchor = self.store._runtime_terminal_anchor(run_id)
+            with self._lock:
+                binding = self._bindings.get(run_id)
+                gate = self._gates.get(run_id)
+            if (
+                gate is None
+                or binding is None
+                or projection["run_id"] != run_id
+                or projection["lifecycle_phase"] != "terminal"
+                or projection["workspace_id"] != self.identity.workspace_id
+                or projection["project_id"] != anchor["project_id"]
+                or projection["grant_id"] != anchor["grant_id"]
+                or projection["approval_projection_digest"]
+                != anchor["approval_projection_digest"]
+                or projection["projection_digest"] != anchor["terminal_projection_digest"]
+                or projection["timestamps"]["terminal_at_ms"] != anchor["terminal_at_ms"]
+                or binding != (
+                    anchor["grant_id"], binding[1], anchor["approval_projection_digest"],
+                )
+            ):
+                raise RunnerStoreError("local terminal authority is invalid")
+            state = self.control._register_runtime_local_terminal(anchor)
+            self.store.detach_terminal(
+                run_id, runtime=self.control.runtime,
+                expected_local_state_digest=state.state_digest, now_ms=self._now_ms(),
+            )
+
+        response = self.control._result_closed(
+            run_id, operational_projection, before_transport=prepare_terminal_authority,
+        )
         self._validate_status_binding(run_id, response)
         if response["status"] != "terminal":
             raise ValueError("runner result did not reach terminal state")
         with self._lock:
             self._gates.pop(run_id, None)
             self._gate_receipts.pop(run_id, None)
-            self._terminal_runs.add(run_id)
+            self._bindings.pop(run_id, None)
+            self._terminal_runs.discard(run_id)
         return response
 
     def _validate_status_binding(self, run_id: str, response: dict[str, Any]) -> None:
@@ -446,11 +512,6 @@ class RunnerCoordinator:
     ) -> dict[str, Any]:
         if type(run_id) is not str or not run_id:
             raise ValueError("active runner claim is required")
-        with self._lock:
-            terminal = run_id in self._terminal_runs
-            binding = self._bindings.get(run_id)
-        if not terminal or binding is None:
-            raise ValueError("terminal runner result is required before disclosure")
         try:
             permit_value = validate_disclosure_permit(permit)
             findings = validate_canary_findings(findings_projection)
@@ -461,10 +522,27 @@ class RunnerCoordinator:
             if key not in {"permit_digest", "signing_key_id", "signature_b64"}
         }
         now = self._now_ms()
+        try:
+            runtime_terminal = self.control.runtime.load_terminal_state(run_id)
+            if runtime_terminal is None:
+                raise RunnerStoreError("local terminal disclosure authority is unavailable")
+            anchor = self.store.load_terminal_disclosure_anchor(
+                run_id, runtime=self.control.runtime,
+                expected_runtime_state_digest=runtime_terminal.state_digest,
+            )
+        except (RunnerStoreError, ValueError) as exc:
+            raise ValueError("terminal runner result is required before disclosure") from exc
         if (
-            permit_value["grant_id"] != binding[0]
-            or findings["grant_id"] != binding[0]
-            or findings["approval_projection_digest"] != binding[2]
+            permit_value["workspace_id"] != self.identity.workspace_id
+            or permit_value["run_id"] != run_id
+            or permit_value["project_id"] != anchor["project_id"]
+            or permit_value["grant_id"] != anchor["grant_id"]
+            or findings["workspace_id"] != self.identity.workspace_id
+            or findings["run_id"] != run_id
+            or findings["project_id"] != anchor["project_id"]
+            or findings["grant_id"] != anchor["grant_id"]
+            or findings["approval_projection_digest"]
+            != anchor["approval_projection_digest"]
         ):
             raise ValueError("invalid runner findings upload")
         if not permit_value["issued_at_ms"] <= now < permit_value["expires_at_ms"]:
@@ -483,9 +561,6 @@ class RunnerCoordinator:
         receipt = self.control.upload_findings(
             run_id=run_id, permit=permit_value, findings_projection=findings,
         )
-        with self._lock:
-            self._bindings.pop(run_id, None)
-            self._terminal_runs.discard(run_id)
         return receipt
 
 
