@@ -1151,6 +1151,20 @@ def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
             "CREATE TABLE canary_approval_projections("
             "approval_id TEXT,workspace_id TEXT,project_ref TEXT,run_id TEXT,"
             "environment_id TEXT,runner_id TEXT,runner_key_id TEXT);"
+            "CREATE TABLE canary_runner_context_bindings("
+            "rcb_id TEXT,workspace_id TEXT,project_ref TEXT,environment_id TEXT,"
+            "runner_id TEXT,runner_key_id TEXT,environment_origin TEXT,environment_class TEXT,"
+            "binding_digest TEXT,public_key_digest TEXT,verification_record_digest TEXT,binding_json TEXT,"
+            "status TEXT,created_by TEXT,created_role TEXT,issued_at_ms INTEGER,expires_at_ms INTEGER);"
+            "CREATE TABLE canary_execution_grants("
+            "grant_id TEXT,workspace_id TEXT,project_ref TEXT,approval_id TEXT,run_id TEXT,"
+            "environment_id TEXT,runner_id TEXT,runner_key_id TEXT,nonce_hash TEXT,grant_digest TEXT,"
+            "grant_json TEXT,status TEXT,reservation_id TEXT,meter TEXT,period TEXT,idempotency_key TEXT,"
+            "issued_at REAL);"
+            "CREATE INDEX idx_runner_context_runner_status_expiry\n"
+            " ON canary_runner_context_bindings(workspace_id,runner_id,runner_key_id,status,expires_at_ms);"
+            "CREATE INDEX idx_canary_grants_runner_status\n"
+            " ON canary_execution_grants(workspace_id,runner_id,runner_key_id,status,issued_at);"
         )
         expected.executescript(RUNNER_AUTH_RUNTIME_SCHEMA)
         for table in _RUNNER_AUTH_TABLES:
@@ -1179,13 +1193,21 @@ def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
 
         for index_name in (
             "idx_canary_runner_key_history_expiry",
+            "idx_canary_runner_ledger_retention",
+            "idx_canary_runner_pairing_receipt_expiry",
+            "idx_canary_runner_rotation_receipt_expiry",
+            "idx_canary_runner_pairing_abort_receipt_expiry",
+            "idx_canary_runner_rotation_abort_receipt_expiry",
             "idx_canary_runner_pairing_parent_expiry_global",
             "idx_canary_runner_rotation_parent_expiry_global",
             "idx_canary_runner_ledger_key_ref",
+            "idx_runner_context_runner_status_expiry",
             "idx_runner_context_links_runner_key_ref",
             "idx_runner_context_events_runner_key_ref",
+            "idx_canary_grants_runner_status",
             "idx_canary_approval_runner_key_ref",
             "idx_canary_runner_rotation_new_key_ref",
+            "idx_canary_runner_rotation_old_key_history",
             "idx_canary_runner_key_retirement_due",
         ):
             if index_shape(conn, index_name) != index_shape(expected, index_name):
@@ -2994,11 +3016,15 @@ class RunnerAuthStore:
     def reap_expired_auth(
         self, *, now: float, limit: int = 128, phase_cursor: int = 0,
     ) -> RunnerAuthReapResult:
-        """Delete only receipt-retention work in one globally bounded transaction.
+        """Delete retention work in one globally bounded logical-work transaction.
 
         Runner request paths deliberately do no cleanup.  Each phase uses its
-        purpose-built expiry index and consumes from the same mutation budget,
-        so a large tenant cannot turn a reaper tick into an unbounded write.
+        purpose-built expiry index and consumes from the same ``limit`` of
+        logical retention work items (at most 128), so a large tenant cannot
+        turn a reaper tick into unbounded logical work.  Under the exact
+        schema, SQLite physical row changes are bounded by
+        ``limit + old_keys + pairing_parents <= 2 * limit``: each of those
+        two parent rows can cause one exact cascade.
         Old-key retirement is intentionally deferred until the frozen indexed
         migration exists; this method never falls back to a table scan.
         """
@@ -3036,6 +3062,9 @@ class RunnerAuthStore:
             "rotation_receipts": 0, "abort_receipts": 0,
             "pairing_parents": 0, "rotation_parents": 0, "old_keys": 0,
         }
+        # This is a logical work-item budget, not ``sqlite3_total_changes``:
+        # an old-key or pairing-parent retirement can each cause one exact
+        # additional FK cascade, preserving the ``<= 2 * limit`` row bound.
         remaining = limit
         # The constructor establishes the connection invariant, but callers
         # can still disable it.  Check directly before opening this reaper's

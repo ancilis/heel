@@ -823,6 +823,26 @@ def test_runner_auth_schema_rejects_a_same_name_m29_queue_index_with_wrong_colum
             " WHERE status='verification_only' AND revoked_at IS NOT NULL",
         ),
         (
+            "idx_canary_runner_ledger_retention", "canary_runner_request_ledger",
+            "workspace_id,retention_expires_at,runner_id,chain_name,sequence,generation", "",
+        ),
+        (
+            "idx_canary_runner_pairing_receipt_expiry", "canary_runner_pairing_activation_receipts",
+            "pairing_id,expires_at", "",
+        ),
+        (
+            "idx_canary_runner_rotation_receipt_expiry", "canary_runner_rotation_activation_receipts",
+            "pairing_id,expires_at", "",
+        ),
+        (
+            "idx_canary_runner_pairing_abort_receipt_expiry", "canary_runner_pairing_activation_abort_receipts",
+            "pairing_id,expires_at", "",
+        ),
+        (
+            "idx_canary_runner_rotation_abort_receipt_expiry", "canary_runner_rotation_activation_abort_receipts",
+            "pairing_id,expires_at", "",
+        ),
+        (
             "idx_canary_runner_pairing_parent_expiry_global", "canary_runner_pairings",
             "pairing_id,expires_at", " WHERE status IN ('activated','expired')",
         ),
@@ -833,6 +853,10 @@ def test_runner_auth_schema_rejects_a_same_name_m29_queue_index_with_wrong_colum
         (
             "idx_canary_runner_ledger_key_ref", "canary_runner_request_ledger",
             "key_id,workspace_id,runner_id", "",
+        ),
+        (
+            "idx_runner_context_runner_status_expiry", "canary_runner_context_bindings",
+            "runner_key_id,workspace_id,runner_id,status,expires_at_ms", "",
         ),
         (
             "idx_runner_context_links_runner_key_ref", "canary_runner_context_projection_links",
@@ -847,8 +871,16 @@ def test_runner_auth_schema_rejects_a_same_name_m29_queue_index_with_wrong_colum
             "runner_key_id,workspace_id,runner_id", "",
         ),
         (
+            "idx_canary_grants_runner_status", "canary_execution_grants",
+            "runner_key_id,workspace_id,runner_id,status,issued_at", "",
+        ),
+        (
             "idx_canary_runner_rotation_new_key_ref", "canary_runner_rotations",
             "key_id,workspace_id,runner_id", "",
+        ),
+        (
+            "idx_canary_runner_rotation_old_key_history", "canary_runner_rotations",
+            "old_key_id,workspace_id,runner_id,status,created_at,pairing_id", "",
         ),
         (
             "idx_canary_runner_key_retirement_due", "canary_runner_key_retirement_queue",
@@ -857,6 +889,38 @@ def test_runner_auth_schema_rejects_a_same_name_m29_queue_index_with_wrong_colum
     ),
 )
 def test_runner_auth_schema_requires_the_exact_sql_and_xinfo_for_each_reaper_index(
+    index_name, table_name, columns, predicate,
+):
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute(f"DROP INDEX {index_name}")
+    conn.execute(f"CREATE INDEX {index_name} ON {table_name}({columns}){predicate}")
+    with pytest.raises(RuntimeError, match="runner authentication schema is not current"):
+        validate_runner_auth_schema(conn)
+
+
+@pytest.mark.parametrize(
+    ("index_name", "table_name", "columns", "predicate"),
+    (
+        (
+            "idx_canary_runner_key_history_expiry", "canary_runner_keys",
+            "revoked_at,workspace_id,runner_id,key_id",
+            " WHERE status='verification_only'",
+        ),
+        (
+            "idx_canary_runner_pairing_parent_expiry_global", "canary_runner_pairings",
+            "expires_at,pairing_id", " WHERE status='activated'",
+        ),
+        (
+            "idx_canary_runner_rotation_parent_expiry_global", "canary_runner_rotations",
+            "expires_at,pairing_id", " WHERE status='rotated'",
+        ),
+    ),
+)
+def test_runner_auth_schema_rejects_altered_partial_reaper_index_predicates(
     index_name, table_name, columns, predicate,
 ):
     from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
@@ -987,6 +1051,83 @@ def test_runner_auth_reaper_ring_prioritizes_its_requested_lane_without_losing_d
     assert second.request_receipts == 1 and second.old_keys == 0 and second.has_more is False
 
 
+def test_runner_auth_reaper_limit_counts_logical_work_not_key_queue_cascade_rows():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+    conn.execute(
+        "INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+        ("ws", "org", "ws", "free", CATALOG_VERSION, 1),
+    )
+    conn.execute(
+        "INSERT INTO canary_runners VALUES(?,?,?,?,?)",
+        ("old-runner", "ws", "Old runner", "active", 1),
+    )
+    conn.execute(
+        "INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)",
+        ("old-key", "ws", "old-runner", "old-public-key", "verification_only", 1, 1),
+    )
+    pairings = [
+        (
+            f"pair-{number:03d}", "ws", f"runner-{number:03d}", f"{number:064x}",
+            "activated", 1, 1, f"Runner {number}",
+        )
+        for number in range(127)
+    ]
+    conn.executemany(
+        "INSERT INTO canary_runner_pairings("
+        "pairing_id,workspace_id,runner_id,invitation_hash,status,created_at,expires_at,display_name"
+        ") VALUES(?,?,?,?,?,?,?,?)",
+        pairings,
+    )
+    conn.executemany(
+        "INSERT INTO canary_runner_pairing_activation_receipts VALUES(?,?,?,?,?)",
+        [(pairing_id, "a" * 64, "sealed", 1, 1) for pairing_id, *_rest in pairings],
+    )
+    conn.commit()
+    store = RunnerAuthStore(conn, pepper=b"p" * 32)
+    before = conn.total_changes
+    reaped = store.reap_expired_auth(now=3_000_000.0, limit=128)
+    assert reaped.pairing_receipts == 127 and reaped.old_keys == 1
+    assert reaped.request_receipts == reaped.rotation_receipts == reaped.abort_receipts == 0
+    assert reaped.pairing_parents == reaped.rotation_parents == 0 and reaped.has_more is False
+    assert conn.total_changes - before == 129
+
+
+@pytest.mark.parametrize(("key_count", "limit", "expected_changes"), ((1, 1, 2), (128, 128, 256)))
+def test_runner_auth_reaper_key_retirement_bounds_physical_changes_per_logical_item(
+    key_count, limit, expected_changes,
+):
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+    conn.execute(
+        "INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+        ("ws", "org", "ws", "free", CATALOG_VERSION, 1),
+    )
+    runners = [(f"runner-{number:03d}", "ws", f"Runner {number}", "active", 1) for number in range(key_count)]
+    conn.executemany("INSERT INTO canary_runners VALUES(?,?,?,?,?)", runners)
+    conn.executemany(
+        "INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)",
+        [
+            (f"key-{number:03d}", "ws", f"runner-{number:03d}", f"public-{number}", "verification_only", 1, 1)
+            for number in range(key_count)
+        ],
+    )
+    conn.commit()
+    store = RunnerAuthStore(conn, pepper=b"p" * 32)
+    before = conn.total_changes
+    reaped = store.reap_expired_auth(now=3_000_000.0, limit=limit)
+    assert reaped.old_keys == key_count and reaped.has_more is False
+    assert conn.total_changes - before == expected_changes
+
+
 def test_m29_parent_reaper_selectors_stay_expiry_indexed_with_large_history():
     from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
 
@@ -1066,6 +1207,55 @@ def test_m29_parent_reaper_selectors_stay_expiry_indexed_with_large_history():
         assert any(f"SEARCH canary_runner_" in detail and index in detail for detail in details)
         assert not any("SCAN canary_runner_pair" in detail or "SCAN canary_runner_rotation" in detail for detail in details)
         assert not any("USE TEMP B-TREE" in detail for detail in details)
+
+
+@pytest.mark.parametrize(
+    ("table_name", "index_name", "query"),
+    (
+        (
+            "canary_runner_request_ledger", "idx_canary_runner_ledger_retention",
+            "SELECT workspace_id,runner_id,chain_name,sequence,generation "
+            "FROM canary_runner_request_ledger INDEXED BY idx_canary_runner_ledger_retention "
+            "WHERE retention_expires_at<=? "
+            "ORDER BY retention_expires_at,workspace_id,runner_id,chain_name,sequence,generation LIMIT ?",
+        ),
+        (
+            "canary_runner_pairing_activation_receipts", "idx_canary_runner_pairing_receipt_expiry",
+            "SELECT pairing_id FROM canary_runner_pairing_activation_receipts "
+            "INDEXED BY idx_canary_runner_pairing_receipt_expiry WHERE expires_at<=? "
+            "ORDER BY expires_at,pairing_id LIMIT ?",
+        ),
+        (
+            "canary_runner_rotation_activation_receipts", "idx_canary_runner_rotation_receipt_expiry",
+            "SELECT pairing_id FROM canary_runner_rotation_activation_receipts "
+            "INDEXED BY idx_canary_runner_rotation_receipt_expiry WHERE expires_at<=? "
+            "ORDER BY expires_at,pairing_id LIMIT ?",
+        ),
+        (
+            "canary_runner_pairing_activation_abort_receipts", "idx_canary_runner_pairing_abort_receipt_expiry",
+            "SELECT pairing_id FROM canary_runner_pairing_activation_abort_receipts "
+            "INDEXED BY idx_canary_runner_pairing_abort_receipt_expiry WHERE expires_at<=? "
+            "ORDER BY expires_at,pairing_id LIMIT ?",
+        ),
+        (
+            "canary_runner_rotation_activation_abort_receipts", "idx_canary_runner_rotation_abort_receipt_expiry",
+            "SELECT pairing_id FROM canary_runner_rotation_activation_abort_receipts "
+            "INDEXED BY idx_canary_runner_rotation_abort_receipt_expiry WHERE expires_at<=? "
+            "ORDER BY expires_at,pairing_id LIMIT ?",
+        ),
+    ),
+)
+def test_runner_auth_receipt_reaper_selectors_remain_indexed(table_name, index_name, query):
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    details = [row[-1] for row in conn.execute(
+        "EXPLAIN QUERY PLAN " + query, (3_000_000.0, 129),
+    )]
+    assert any("SEARCH" in detail and table_name in detail and index_name in detail for detail in details)
+    assert not any(f"SCAN {table_name}" in detail or "USE TEMP B-TREE" in detail for detail in details)
 
 
 def test_m29_old_key_reaper_reschedules_blocked_keys_without_starving_later_due_key():
