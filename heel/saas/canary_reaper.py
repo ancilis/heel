@@ -69,6 +69,7 @@ class CanaryReaper:
         self._state_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._failure: BaseException | None = None
+        self._runner_auth_phase_cursor = 0
 
     @property
     def thread(self) -> threading.Thread | None:
@@ -569,9 +570,13 @@ class CanaryReaper:
         # This connection is already the reaper's dedicated process-owned
         # connection; RunnerAuthStore opens no second connection and performs
         # one short BEGIN IMMEDIATE transaction of its own.
+        auth_phase_cursor = self._runner_auth_phase_cursor
         auth_counts = RunnerAuthStore(
             service.conn, pepper=self.runner_auth_pepper,
-        ).reap_expired_auth(now=now_ms / 1000.0, limit=128)
+        ).reap_expired_auth(
+            now=now_ms / 1000.0, limit=128, phase_cursor=auth_phase_cursor,
+        )
+        self._runner_auth_phase_cursor = (auth_phase_cursor + 1) % 8
         for name in (
             "request_receipts", "pairing_receipts", "rotation_receipts",
             "abort_receipts", "pairing_parents", "rotation_parents", "old_keys",

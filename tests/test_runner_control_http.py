@@ -22,7 +22,7 @@ from heel.saas.canary_store import CanaryStore
 from heel.saas.catalog import CATALOG_VERSION
 from heel.saas.runner_auth import (
     RunnerActivationAbortDeferred, RunnerActivationReceiptExpired, RunnerAuthError, RunnerAuthStore, RunnerHttpAction,
-    initialize_runner_auth_schema,
+    initialize_runner_auth_schema, validate_runner_auth_schema,
 )
 from heel.saas.http_api import ControlPlane, serve
 
@@ -546,6 +546,8 @@ def test_has_no_public_generic_request_api():
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
     conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO workspaces VALUES(?)", ("ws",))
     CanaryStore(conn)
     initialize_runner_auth_schema(conn)
     store = RunnerAuthStore(conn, pepper=b"p" * 32)
@@ -610,6 +612,8 @@ def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
 
 def test_expired_v3_pairing_activation_abort_is_signed_idempotent_and_retained():
     conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO workspaces VALUES(?)", ("ws",))
     CanaryStore(conn)
     initialize_runner_auth_schema(conn)
     instant = [1_000.0]
@@ -792,6 +796,195 @@ def test_old_runner_key_reaper_requires_m29_and_uses_its_exact_queue_index():
     second = store.reap_expired_auth(now=3_000_000.0, limit=1)
     assert second.old_keys == 1 and second.has_more is False
     assert conn.execute("SELECT 1 FROM canary_runner_keys").fetchone() is None
+
+
+def test_runner_auth_schema_rejects_a_same_name_m29_queue_index_with_wrong_columns():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    validate_runner_auth_schema(conn)
+    conn.execute("DROP INDEX idx_canary_runner_key_retirement_due")
+    conn.execute(
+        "CREATE INDEX idx_canary_runner_key_retirement_due "
+        "ON canary_runner_key_retirement_queue(eligible_at,next_attempt_at,workspace_id,runner_id,key_id)",
+    )
+    with pytest.raises(RuntimeError, match="runner authentication schema is not current"):
+        validate_runner_auth_schema(conn)
+
+
+@pytest.mark.parametrize(
+    ("index_name", "table_name", "columns", "predicate"),
+    (
+        (
+            "idx_canary_runner_key_history_expiry", "canary_runner_keys",
+            "workspace_id,runner_id,key_id,revoked_at",
+            " WHERE status='verification_only' AND revoked_at IS NOT NULL",
+        ),
+        (
+            "idx_canary_runner_pairing_parent_expiry_global", "canary_runner_pairings",
+            "pairing_id,expires_at", " WHERE status IN ('activated','expired')",
+        ),
+        (
+            "idx_canary_runner_rotation_parent_expiry_global", "canary_runner_rotations",
+            "pairing_id,expires_at", " WHERE status IN ('rotated','expired')",
+        ),
+        (
+            "idx_canary_runner_ledger_key_ref", "canary_runner_request_ledger",
+            "key_id,workspace_id,runner_id", "",
+        ),
+        (
+            "idx_runner_context_links_runner_key_ref", "canary_runner_context_projection_links",
+            "runner_key_id,workspace_id,runner_id", "",
+        ),
+        (
+            "idx_runner_context_events_runner_key_ref", "canary_runner_context_events",
+            "runner_key_id,workspace_id,runner_id", "",
+        ),
+        (
+            "idx_canary_approval_runner_key_ref", "canary_approval_projections",
+            "runner_key_id,workspace_id,runner_id", "",
+        ),
+        (
+            "idx_canary_runner_rotation_new_key_ref", "canary_runner_rotations",
+            "key_id,workspace_id,runner_id", "",
+        ),
+        (
+            "idx_canary_runner_key_retirement_due", "canary_runner_key_retirement_queue",
+            "eligible_at,next_attempt_at,workspace_id,runner_id,key_id", "",
+        ),
+    ),
+)
+def test_runner_auth_schema_requires_the_exact_sql_and_xinfo_for_each_reaper_index(
+    index_name, table_name, columns, predicate,
+):
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute(f"DROP INDEX {index_name}")
+    conn.execute(f"CREATE INDEX {index_name} ON {table_name}({columns}){predicate}")
+    with pytest.raises(RuntimeError, match="runner authentication schema is not current"):
+        validate_runner_auth_schema(conn)
+
+
+def test_runner_auth_store_enables_foreign_keys_before_accepting_a_connection():
+    conn = sqlite3.connect(":memory:")
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+    RunnerAuthStore(conn, pepper=b"p" * 32)
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_runner_auth_store_rejects_foreign_keys_disabled_inside_a_transaction():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("BEGIN")
+    with pytest.raises(RunnerAuthError, match="runner authentication requires foreign keys"):
+        RunnerAuthStore(conn, pepper=b"p" * 32)
+    assert conn.in_transaction
+    conn.rollback()
+
+
+def test_runner_auth_reaper_rejects_foreign_keys_disabled_after_construction_before_retirement():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+    conn.execute(
+        "INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+        ("ws", "org", "ws", "free", CATALOG_VERSION, 1),
+    )
+    conn.execute(
+        "INSERT INTO canary_runners VALUES(?,?,?,?,?)",
+        ("old-runner", "ws", "Old runner", "active", 1),
+    )
+    conn.execute(
+        "INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)",
+        ("old-key", "ws", "old-runner", "old-public-key", "verification_only", 1, 1),
+    )
+    conn.commit()
+    store = RunnerAuthStore(conn, pepper=b"p" * 32)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    with pytest.raises(RunnerAuthError, match="runner authentication requires foreign keys"):
+        store.reap_expired_auth(now=3_000_000.0, limit=1)
+    assert conn.execute("SELECT COUNT(*) FROM canary_runner_keys").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM canary_runner_key_retirement_queue").fetchone()[0] == 1
+
+
+def test_runner_auth_reaper_accepts_a_valid_phase_cursor_for_the_old_key_lane():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+    conn.execute(
+        "INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+        ("ws", "org", "ws", "free", CATALOG_VERSION, 1),
+    )
+    conn.execute(
+        "INSERT INTO canary_runners VALUES(?,?,?,?,?)",
+        ("old-runner", "ws", "Old runner", "active", 1),
+    )
+    conn.execute(
+        "INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)",
+        ("old-key", "ws", "old-runner", "old-public-key", "verification_only", 1, 1),
+    )
+    conn.commit()
+    reaped = RunnerAuthStore(conn, pepper=b"p" * 32).reap_expired_auth(
+        now=3_000_000.0, limit=1, phase_cursor=7,
+    )
+    assert reaped.old_keys == 1 and reaped.has_more is False
+
+
+def test_runner_auth_reaper_ring_prioritizes_its_requested_lane_without_losing_due_work():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+    conn.execute(
+        "INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+        ("ws", "org", "ws", "free", CATALOG_VERSION, 1),
+    )
+    conn.execute(
+        "INSERT INTO canary_runners VALUES(?,?,?,?,?)",
+        ("old-runner", "ws", "Old runner", "active", 1),
+    )
+    conn.execute(
+        "INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)",
+        ("old-key", "ws", "old-runner", "old-public-key", "verification_only", 1, 1),
+    )
+    conn.execute(
+        "INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)",
+        ("ws", "old-runner", "claim", 2, 0, 1),
+    )
+    digest = "a" * 64
+    conn.execute(
+        "INSERT INTO canary_runner_request_ledger("
+        "workspace_id,runner_id,chain_name,sequence,generation,request_digest,response_json,next_nonce,created_at,"
+        "nonce_hash,key_id,capability,method,path,timestamp_ms,signed_request_digest,body_digest,"
+        "response_ciphertext,next_nonce_ciphertext,response_status,response_body_digest,retention_expires_at"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "ws", "old-runner", "claim", 1, 0, digest, "sealed-v2", "next", 1,
+            digest, "receipt-only-key", "runner_claim", "POST", "/claim", 1,
+            digest, digest, "ciphertext", "nonce-ciphertext", 200, digest, 1,
+        ),
+    )
+    conn.commit()
+    store = RunnerAuthStore(conn, pepper=b"p" * 32)
+
+    first = store.reap_expired_auth(now=3_000_000.0, limit=1, phase_cursor=7)
+    assert first.old_keys == 1 and first.request_receipts == 0 and first.has_more is True
+    assert conn.execute("SELECT COUNT(*) FROM canary_runner_request_ledger").fetchone()[0] == 1
+
+    second = store.reap_expired_auth(now=3_000_000.0, limit=1, phase_cursor=0)
+    assert second.request_receipts == 1 and second.old_keys == 0 and second.has_more is False
 
 
 def test_m29_parent_reaper_selectors_stay_expiry_indexed_with_large_history():
@@ -1037,6 +1230,8 @@ def test_runner_auth_body_cap_requires_an_explicit_bounded_integer_override():
 
 def test_runner_result_projection_is_the_only_explicit_above_default_body_cap():
     conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO workspaces VALUES(?)", ("ws",))
     CanaryStore(conn)
     initialize_runner_auth_schema(conn)
     store = RunnerAuthStore(conn, pepper=b"p" * 32)

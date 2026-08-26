@@ -74,19 +74,46 @@ def test_reaper_runs_one_bounded_auth_retention_transaction_per_cycle(monkeypatc
         observed = []
         original = RunnerAuthStore.reap_expired_auth
 
-        def traced(self, *, now, limit):
-            observed.append((self._pepper, now, limit))
-            return original(self, now=now, limit=limit)
+        def traced(self, *, now, limit, phase_cursor=None):
+            observed.append((self._pepper, now, limit, phase_cursor))
+            if phase_cursor is None:
+                return original(self, now=now, limit=limit)
+            return original(self, now=now, limit=limit, phase_cursor=phase_cursor)
 
         monkeypatch.setattr(RunnerAuthStore, "reap_expired_auth", traced)
         counts = CanaryReaper(
             str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock,
         ).run_once()
 
-        assert observed == [(REAPER_PEPPER, NOW_MS / 1000.0, 128)]
+        assert observed == [(REAPER_PEPPER, NOW_MS / 1000.0, 128, 0)]
         assert counts["runner_auth_request_receipts"] == 0
         assert counts["runner_auth_old_keys"] == 0
         assert counts["runner_auth_has_more"] is False
+
+
+def test_reaper_advances_the_auth_phase_cursor_only_after_a_committed_cycle(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        database, clock, signing, _approved = _durable_running_setup(Path(tmp))
+        observed = []
+        original = RunnerAuthStore.reap_expired_auth
+
+        def traced(self, *, now, limit, phase_cursor):
+            observed.append(phase_cursor)
+            return original(self, now=now, limit=limit, phase_cursor=phase_cursor)
+
+        monkeypatch.setattr(RunnerAuthStore, "reap_expired_auth", traced)
+        reaper = CanaryReaper(
+            str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock,
+        )
+        connection = reaper._connect()
+        try:
+            service = reaper._service(connection)
+            disclosure = reaper._disclosure_service(connection)
+            reaper._cycle(service, disclosure)
+            reaper._cycle(service, disclosure)
+        finally:
+            connection.close()
+        assert observed == [0, 1]
 
 
 def test_reaper_fails_readiness_when_its_auth_retention_schema_is_corrupt():
@@ -114,13 +141,15 @@ def test_reaper_treats_one_auth_retention_busy_cycle_as_a_bounded_skip(monkeypat
         database, clock, signing, _approved = _durable_running_setup(Path(tmp))
         original = RunnerAuthStore.reap_expired_auth
         attempts = 0
+        phase_cursors = []
 
-        def busy_once(self, *, now, limit):
+        def busy_once(self, *, now, limit, phase_cursor):
             nonlocal attempts
             attempts += 1
+            phase_cursors.append(phase_cursor)
             if attempts == 1:
                 raise sqlite3.OperationalError("database is locked")
-            return original(self, now=now, limit=limit)
+            return original(self, now=now, limit=limit, phase_cursor=phase_cursor)
 
         monkeypatch.setattr(RunnerAuthStore, "reap_expired_auth", busy_once)
         reaper = CanaryReaper(
@@ -130,6 +159,7 @@ def test_reaper_treats_one_auth_retention_busy_cycle_as_a_bounded_skip(monkeypat
         reaper.start(timeout=2)
         try:
             assert attempts >= 2
+            assert phase_cursors[:2] == [0, 0]
             assert reaper.failure is None
         finally:
             assert reaper.stop(timeout=2) is True
