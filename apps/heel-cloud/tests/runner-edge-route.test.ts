@@ -29,6 +29,49 @@ function request(path: string, headers: Record<string, string>, body = "{}") {
 }
 
 describe("runner edge routes", () => {
+  it("forwards exact unauthenticated pairing and rotation activation-abort routes", async () => {
+    const pairing = `pending_${"a".repeat(32)}`;
+    const rotation = `rotation_${"b".repeat(32)}`;
+    const fetcher = vi.fn().mockResolvedValue(new Response("{}", { headers: { "Content-Type": "application/json" } }));
+    const context = { waitUntil() {}, passThroughOnException() {} };
+    const paths = [
+      `/api/control-plane/v1/runner-pairings/${pairing}/activation-abort`,
+      `/api/control-plane/v1/runner-rotations/${rotation}/activation-abort`,
+    ];
+
+    for (const path of paths) {
+      const response = await worker.fetch(request(path, {}), env(fetcher), context);
+      expect(response.status).toBe(200);
+    }
+
+    expect(fetcher).toHaveBeenCalledTimes(paths.length);
+    for (const [index, path] of paths.entries()) {
+      const upstream = fetcher.mock.calls[index][0] as Request;
+      expect(upstream.url).toBe(`https://heel-control-plane.internal${path.replace("/api/control-plane", "")}`);
+      expect([...upstream.headers.keys()].sort()).toEqual([
+        "content-encoding", "content-length", "content-type", "x-heel-edge-auth",
+      ]);
+    }
+  });
+
+  it("rejects activation-abort near matches and methods before the private binding", async () => {
+    const pairing = `pending_${"a".repeat(32)}`;
+    const rotation = `rotation_${"b".repeat(32)}`;
+    const fetcher = vi.fn();
+    const context = { waitUntil() {}, passThroughOnException() {} };
+    const rejected = [
+      new Request(`https://heel.example/api/control-plane/v1/runner-pairings/${pairing}/activation-abort`, { method: "GET" }),
+      new Request(`https://heel.example/api/control-plane/v1/runner-rotations/${rotation}/activation-abort`, { method: "GET" }),
+      request(`/api/control-plane/v1/runner-pairings/${pairing}/activation-abort-extra`, {}),
+      request(`/api/control-plane/v1/runner-rotations/${rotation}/activation-abort/extra`, {}),
+    ];
+
+    for (const candidate of rejected) {
+      expect((await worker.fetch(candidate, env(fetcher), context)).status).toBe(404);
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("isolates exact context routes on the existing claim proof headers and caps", async () => {
     const binding = "rcb_0123456789abcdef0123456789abcdef";
     const headers = { "X-Heel-Runner-Id": runner, "X-Heel-Runner-Key-Id": "key", "X-Heel-Runner-Timestamp-Ms": "1", "X-Heel-Runner-Nonce": "nonce", "X-Heel-Runner-Sequence": "1", "X-Heel-Runner-Signature": "sig" };
