@@ -1,9 +1,11 @@
 import base64
 import hashlib
+import inspect
 import sqlite3
 import time
 import http.client
 import json
+import re
 import threading
 import tempfile
 from pathlib import Path
@@ -24,6 +26,7 @@ from heel.saas.runner_auth import (
     RunnerActivationAbortDeferred, RunnerActivationReceiptExpired, RunnerAuthError, RunnerAuthStore, RunnerHttpAction,
     initialize_runner_auth_schema, validate_runner_auth_schema,
 )
+import heel.saas.runner_auth as runner_auth
 from heel.saas.http_api import ControlPlane, serve
 
 SIGNING_PRIVATE = Ed25519PrivateKey.from_private_bytes(b"0123456789abcdef0123456789abcdef")
@@ -814,6 +817,136 @@ def test_runner_auth_schema_rejects_a_same_name_m29_queue_index_with_wrong_colum
         validate_runner_auth_schema(conn)
 
 
+def test_runner_auth_schema_rejects_a_one_open_rotation_index_shape_with_preserved_index_list():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS[:26]).apply_all()
+    original = (
+        "CREATE UNIQUE INDEX idx_canary_runner_one_open_rotation\n"
+        " ON canary_runner_rotations(workspace_id,runner_id)\n"
+        " WHERE status IN ('rotation_pending','rotation_approved');"
+    )
+    replacement = (
+        "CREATE UNIQUE INDEX idx_canary_runner_one_open_rotation\n"
+        " ON canary_runner_rotations(pairing_id)\n"
+        " WHERE status IN ('rotation_pending','rotation_approved');"
+    )
+    altered_m27 = runner_auth.RUNNER_AUTH_SINGLE_OPEN_ROTATION_MIGRATION.replace(original, replacement)
+    assert altered_m27 != runner_auth.RUNNER_AUTH_SINGLE_OPEN_ROTATION_MIGRATION
+    conn.executescript(altered_m27)
+    conn.executescript(runner_auth.RUNNER_AUTH_KEY_HISTORY_EXPIRY_MIGRATION)
+    conn.executescript(runner_auth.RUNNER_AUTH_BOUNDED_RETENTION_MIGRATION)
+    correct = sqlite3.connect(":memory:")
+    correct.execute("PRAGMA foreign_keys=ON")
+    Migrator(correct, CONTROL_PLANE_MIGRATIONS).apply_all()
+    assert [tuple(row) for row in conn.execute("PRAGMA index_list(canary_runner_rotations)")] == [
+        tuple(row) for row in correct.execute("PRAGMA index_list(canary_runner_rotations)")
+    ]
+    with pytest.raises(RuntimeError, match="runner authentication schema is not current"):
+        validate_runner_auth_schema(conn)
+
+
+def test_runner_auth_forced_index_inventory_matches_every_indexed_by_clause():
+    forced_names = set(re.findall(
+        r"INDEXED BY ([A-Za-z0-9_]+)", inspect.getsource(runner_auth),
+    ))
+    exact_names = runner_auth._RUNNER_AUTH_EXACT_INDEX_NAMES
+    assert len(exact_names) == len(set(exact_names))
+    assert forced_names | {"idx_canary_runner_key_history_expiry"} == set(exact_names)
+
+
+def test_runner_auth_schema_rejects_an_altered_one_open_rotation_predicate_with_preserved_index_list():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS[:26]).apply_all()
+    original = (
+        "CREATE UNIQUE INDEX idx_canary_runner_one_open_rotation\n"
+        " ON canary_runner_rotations(workspace_id,runner_id)\n"
+        " WHERE status IN ('rotation_pending','rotation_approved');"
+    )
+    replacement = (
+        "CREATE UNIQUE INDEX idx_canary_runner_one_open_rotation\n"
+        " ON canary_runner_rotations(workspace_id,runner_id)\n"
+        " WHERE status='rotation_pending';"
+    )
+    conn.executescript(runner_auth.RUNNER_AUTH_SINGLE_OPEN_ROTATION_MIGRATION.replace(original, replacement))
+    conn.executescript(runner_auth.RUNNER_AUTH_KEY_HISTORY_EXPIRY_MIGRATION)
+    conn.executescript(runner_auth.RUNNER_AUTH_BOUNDED_RETENTION_MIGRATION)
+    with pytest.raises(RuntimeError, match="runner authentication schema is not current"):
+        validate_runner_auth_schema(conn)
+
+
+def test_runner_auth_schema_rejects_a_nonunique_one_open_rotation_index():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute("DROP INDEX idx_canary_runner_one_open_rotation")
+    conn.execute(
+        "CREATE INDEX idx_canary_runner_one_open_rotation "
+        "ON canary_runner_rotations(workspace_id,runner_id) "
+        "WHERE status IN ('rotation_pending','rotation_approved')",
+    )
+    with pytest.raises(RuntimeError, match="runner authentication schema is not current"):
+        validate_runner_auth_schema(conn)
+
+
+def test_one_open_rotation_index_rejects_a_second_open_ceremony_and_keeps_closed_history():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute("PRAGMA foreign_keys=OFF")
+
+    def insert(pairing_id, status):
+        conn.execute(
+            "INSERT INTO canary_runner_rotations("
+            "pairing_id,workspace_id,runner_id,phrase,public_key,fingerprint,key_id,runner_version,"
+            "adapters_json,status,created_at,expires_at,old_key_id,old_fingerprint"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                pairing_id, "ws", "runner", "phrase", "A" * 44, "a" * 64, pairing_id,
+                "v1", "{}", status, 1, 2,
+                "old-key" if status in {"rotation_pending", "rotation_approved"} else None,
+                "b" * 64 if status in {"rotation_pending", "rotation_approved"} else None,
+            ),
+        )
+
+    insert("closed-before", "rotated")
+    insert("open", "rotation_pending")
+    with pytest.raises(sqlite3.IntegrityError):
+        insert("second-open", "rotation_approved")
+    insert("closed-after", "expired")
+
+
+def test_one_open_rotation_lookup_uses_its_exact_partial_index_without_a_scan():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    details = [row[-1] for row in conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT 1 FROM canary_runner_rotations INDEXED BY idx_canary_runner_one_open_rotation "
+        "WHERE workspace_id=? AND runner_id=? "
+        "AND status IN ('rotation_pending','rotation_approved') LIMIT 1",
+        ("ws", "runner"),
+    )]
+    assert any(
+        "SEARCH canary_runner_rotations" in detail
+        and "idx_canary_runner_one_open_rotation" in detail
+        and "workspace_id=? AND runner_id=?" in detail
+        for detail in details
+    )
+    assert not any("SCAN canary_runner_rotations" in detail or "USE TEMP B-TREE" in detail for detail in details)
+
+
 @pytest.mark.parametrize(
     ("index_name", "table_name", "columns", "predicate"),
     (
@@ -885,6 +1018,10 @@ def test_runner_auth_schema_rejects_a_same_name_m29_queue_index_with_wrong_colum
         (
             "idx_canary_runner_key_retirement_due", "canary_runner_key_retirement_queue",
             "eligible_at,next_attempt_at,workspace_id,runner_id,key_id", "",
+        ),
+        (
+            "idx_canary_runner_one_open_rotation", "canary_runner_rotations",
+            "pairing_id", " WHERE status IN ('rotation_pending','rotation_approved')",
         ),
     ),
 )

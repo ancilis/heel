@@ -1123,6 +1123,26 @@ def _ensure_lifecycle_tables(conn: sqlite3.Connection) -> None:
 
 
 _RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_request_ledger_archive", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records", "canary_runner_chain_cursors", "canary_runner_resync_challenges", "canary_runner_pairing_protocols", "canary_runner_execution_protocols", "canary_runner_pairing_activation_receipts", "canary_runner_rotation_activation_receipts", "canary_runner_pairing_activation_abort_receipts", "canary_runner_rotation_activation_abort_receipts", "canary_runner_key_retirement_queue")
+_RUNNER_AUTH_EXACT_INDEX_NAMES = (
+    "idx_canary_runner_key_history_expiry",
+    "idx_canary_runner_ledger_retention",
+    "idx_canary_runner_pairing_receipt_expiry",
+    "idx_canary_runner_rotation_receipt_expiry",
+    "idx_canary_runner_pairing_abort_receipt_expiry",
+    "idx_canary_runner_rotation_abort_receipt_expiry",
+    "idx_canary_runner_pairing_parent_expiry_global",
+    "idx_canary_runner_rotation_parent_expiry_global",
+    "idx_canary_runner_ledger_key_ref",
+    "idx_runner_context_runner_status_expiry",
+    "idx_runner_context_links_runner_key_ref",
+    "idx_runner_context_events_runner_key_ref",
+    "idx_canary_grants_runner_status",
+    "idx_canary_approval_runner_key_ref",
+    "idx_canary_runner_rotation_new_key_ref",
+    "idx_canary_runner_rotation_old_key_history",
+    "idx_canary_runner_key_retirement_due",
+    "idx_canary_runner_one_open_rotation",
+)
 
 
 def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
@@ -1178,9 +1198,9 @@ def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
             if [tuple(row) for row in conn.execute(f"PRAGMA table_info({table})")] != [tuple(row) for row in expected.execute(f"PRAGMA table_info({table})")]:
                 raise RuntimeError("runner authentication schema is not current")
 
-        # Schema 28 owns exactly one key-history access path.  The runner key
-        # table itself belongs to the canary store, so compare only this frozen
-        # object instead of admitting a wider auth-schema ownership claim.
+        # This closes every explicit ``INDEXED BY`` path used by runner auth,
+        # plus schema 28's retained old-key-history defense.  Tables outside
+        # runner auth are represented only by the narrow expected stubs above.
         def index_shape(database: sqlite3.Connection, name: str) -> tuple[str, list[tuple[object, ...]]]:
             row = database.execute(
                 "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,),
@@ -1191,25 +1211,7 @@ def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
                 tuple(value) for value in database.execute(f"PRAGMA index_xinfo({name})")
             ]
 
-        for index_name in (
-            "idx_canary_runner_key_history_expiry",
-            "idx_canary_runner_ledger_retention",
-            "idx_canary_runner_pairing_receipt_expiry",
-            "idx_canary_runner_rotation_receipt_expiry",
-            "idx_canary_runner_pairing_abort_receipt_expiry",
-            "idx_canary_runner_rotation_abort_receipt_expiry",
-            "idx_canary_runner_pairing_parent_expiry_global",
-            "idx_canary_runner_rotation_parent_expiry_global",
-            "idx_canary_runner_ledger_key_ref",
-            "idx_runner_context_runner_status_expiry",
-            "idx_runner_context_links_runner_key_ref",
-            "idx_runner_context_events_runner_key_ref",
-            "idx_canary_grants_runner_status",
-            "idx_canary_approval_runner_key_ref",
-            "idx_canary_runner_rotation_new_key_ref",
-            "idx_canary_runner_rotation_old_key_history",
-            "idx_canary_runner_key_retirement_due",
-        ):
+        for index_name in _RUNNER_AUTH_EXACT_INDEX_NAMES:
             if index_shape(conn, index_name) != index_shape(expected, index_name):
                 raise RuntimeError("runner authentication schema is not current")
 
