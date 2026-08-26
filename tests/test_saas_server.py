@@ -588,6 +588,17 @@ class ProductionConfigurationTests(unittest.TestCase):
         self.assertIn('echo "TMPDIR=${RUNNER_TEMP}/heel-pytest" >> "$GITHUB_ENV"', workflow)
         self.assertIn("- name: Full Python acceptance + security suite\n        run: python -m pytest -q tests", workflow)
         self.assertNotIn("python -m unittest discover -s tests -p 'test_*.py' -v", workflow)
+        production_build = (
+            "- name: Build Cloudflare-compatible production artifact\n"
+            "        working-directory: apps/heel-cloud\n"
+            "        env:\n"
+            "          # Syntax-valid non-secret fixture. Production supplies the VPC service\n"
+            "          # UUID created for the private Heel control-plane tunnel.\n"
+            "          HEEL_CONTROL_PLANE_VPC_SERVICE_ID: 00000000-0000-4000-8000-000000000001\n"
+            "          HEEL_PUBLIC_ORIGIN: https://heel.example\n"
+            "        run: npm run build"
+        )
+        self.assertIn(production_build, workflow)
 
 
 if __name__ == "__main__":
