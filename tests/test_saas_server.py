@@ -67,7 +67,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         )
         self.addCleanup(migrated.close)
         self.addCleanup(runtime.close)
-        self.assertEqual(Migrator(migrated, CONTROL_PLANE_MIGRATIONS).apply_all(), list(range(1, 29)))
+        self.assertEqual(Migrator(migrated, CONTROL_PLANE_MIGRATIONS).apply_all(), list(range(1, 30)))
 
         def schema(connection: sqlite3.Connection) -> dict[str, tuple[tuple, ...]]:
             tables = {
@@ -98,9 +98,9 @@ class ProductionConfigurationTests(unittest.TestCase):
                 self.assertEqual(migrate.main(["status", str(database)]), 1)
                 self.assertEqual(migrate.main(["up", str(database)]), 0)
                 self.assertEqual(migrate.main(["status", str(database)]), 0)
-            self.assertIn("current=0 target=28", output.getvalue())
+            self.assertIn("current=0 target=29", output.getvalue())
             self.assertIn("applied=1,2,3,4,5,6,7,8,9,10", output.getvalue())
-            self.assertIn("current=28 target=28", output.getvalue())
+            self.assertIn("current=29 target=29", output.getvalue())
 
     def test_restore_verification_is_read_only_and_rejects_pending_schema(self):
         from heel.saas import migrate
@@ -195,6 +195,7 @@ class ProductionConfigurationTests(unittest.TestCase):
                 self.assertTrue(server.reaper_ready)
                 self.assertTrue(server.canary_reaper.alive)
                 self.assertFalse(server.canary_reaper.thread.daemon)
+                self.assertEqual(server.canary_reaper.runner_auth_pepper, config.runner_auth_pepper)
             finally:
                 server.server_close()
 
@@ -308,7 +309,7 @@ class ProductionConfigurationTests(unittest.TestCase):
                 version = restarted.control_plane.store.conn.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0]
-                self.assertEqual(version, 28)
+                self.assertEqual(version, 29)
             finally:
                 restarted.server_close()
 
@@ -580,6 +581,13 @@ class ProductionConfigurationTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_ci_uses_private_scratch_and_one_full_pytest_acceptance_gate(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn('install -d -m 700 "${RUNNER_TEMP}/heel-pytest"', workflow)
+        self.assertIn('echo "TMPDIR=${RUNNER_TEMP}/heel-pytest" >> "$GITHUB_ENV"', workflow)
+        self.assertIn("- name: Full Python acceptance + security suite\n        run: python -m pytest -q tests", workflow)
+        self.assertNotIn("python -m unittest discover -s tests -p 'test_*.py' -v", workflow)
 
 
 if __name__ == "__main__":

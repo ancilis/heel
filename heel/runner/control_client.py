@@ -516,17 +516,9 @@ class RunnerControlClient:
                         or now_ms >= final_terminal.retention_expires_at_ms
                     ):
                         raise RunnerRuntimeCorrupt("runtime pending terminal authority changed during replay")
-                    result_verifier.consume(authority, expected_fields={
-                        "call_id": final_pending.call_id,
-                        "pending_state_digest": final_pending.pending_state_digest,
-                        "run_id": pending.run_id,
-                        "body_sha256": hashlib.sha256(final_pending.body).hexdigest(),
-                        "active_state_digest": final_active.state_digest,
-                        "runtime_terminal_state_digest": final_terminal.state_digest,
-                        "terminal_record_digest": final_terminal.terminal_record_digest,
-                        "terminal_projection_digest": final_terminal.terminal_projection_digest,
-                        "retention_expires_at_ms": final_terminal.retention_expires_at_ms,
-                    })
+                    result_verifier.consume(
+                        authority, pending=final_pending, now_ms=now_ms,
+                    )
                 body, status, _headers = self._post_closed(
                     call, pending.request_operation, pending.run_id,
                     projection_binding=projection_binding, guard_token=guard_token,

@@ -735,11 +735,11 @@ def test_http_pairing_abort_v2_returns_the_authenticated_deferred_body_before_ex
         server.shutdown(); server.server_close(); thread.join(timeout=2)
 
 
-def test_old_runner_key_reaper_requires_m28_and_uses_its_exact_index():
+def test_old_runner_key_reaper_requires_m29_and_uses_its_exact_queue_index():
     from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
 
     legacy = sqlite3.connect(":memory:")
-    Migrator(legacy, CONTROL_PLANE_MIGRATIONS[:27]).apply_all()
+    Migrator(legacy, CONTROL_PLANE_MIGRATIONS[:28]).apply_all()
     legacy_store = RunnerAuthStore(legacy, pepper=b"p" * 32)
     with pytest.raises(RunnerAuthError, match="runner authentication schema upgrade required"):
         legacy_store.reap_expired_auth(now=3_000_000.0, limit=1)
@@ -747,8 +747,13 @@ def test_old_runner_key_reaper_requires_m28_and_uses_its_exact_index():
 
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    CanaryStore(conn)
-    initialize_runner_auth_schema(conn)
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+    conn.execute(
+        "INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+        ("ws", "org", "ws", "free", CATALOG_VERSION, 1),
+    )
     conn.execute(
         "INSERT INTO canary_runners VALUES(?,?,?,?,?)",
         ("old-runner", "ws", "Old runner", "active", 1),
@@ -764,21 +769,255 @@ def test_old_runner_key_reaper_requires_m28_and_uses_its_exact_index():
     store = RunnerAuthStore(conn, pepper=b"p" * 32)
     plan = conn.execute(
         "EXPLAIN QUERY PLAN "
-        "SELECT revoked_at,workspace_id,runner_id,key_id "
-        "FROM canary_runner_keys INDEXED BY idx_canary_runner_key_history_expiry "
-        "WHERE status='verification_only' AND revoked_at IS NOT NULL AND revoked_at<=? "
-        "ORDER BY revoked_at,workspace_id,runner_id,key_id LIMIT ?",
-        (400_000.0, 2),
+        "SELECT revoked_at,workspace_id,runner_id,key_id,attempt_count "
+        "FROM canary_runner_key_retirement_queue "
+        "INDEXED BY idx_canary_runner_key_retirement_due "
+        "WHERE next_attempt_at<=? "
+        "ORDER BY next_attempt_at,eligible_at,workspace_id,runner_id,key_id LIMIT ?",
+        (3_000_000.0, 2),
     ).fetchall()
-    assert any("idx_canary_runner_key_history_expiry" in row[-1] for row in plan)
-    assert not any("USE TEMP B-TREE" in row[-1] or "SCAN canary_runner_keys" in row[-1] for row in plan)
+    assert any("idx_canary_runner_key_retirement_due" in row[-1] for row in plan)
+    assert not any("USE TEMP B-TREE" in row[-1] or "SCAN canary_runner_key_retirement_queue" in row[-1] for row in plan)
 
+    traced = []
+    conn.set_trace_callback(traced.append)
     first = store.reap_expired_auth(now=3_000_000.0, limit=1)
+    conn.set_trace_callback(None)
+    assert any(
+        "FROM canary_runner_key_retirement_queue INDEXED BY idx_canary_runner_key_retirement_due" in statement
+        for statement in traced
+    )
     assert first.old_keys == 1 and first.has_more is True
     assert conn.execute("SELECT key_id FROM canary_runner_keys").fetchone()[0] == "old-key-b"
     second = store.reap_expired_auth(now=3_000_000.0, limit=1)
     assert second.old_keys == 1 and second.has_more is False
     assert conn.execute("SELECT 1 FROM canary_runner_keys").fetchone() is None
+
+
+def test_m29_parent_reaper_selectors_stay_expiry_indexed_with_large_history():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+    conn.execute(
+        "INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+        ("ws", "org", "ws", "free", CATALOG_VERSION, 1),
+    )
+    # These are planner-only irrelevant history rows; all production inserts
+    # remain FK-checked by the control-plane connection.
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executemany(
+        "INSERT INTO canary_runner_pairings("
+        "pairing_id,workspace_id,runner_id,invitation_hash,status,created_at,expires_at,display_name"
+        ") VALUES(?,?,?,?,?,?,?,?)",
+        (
+            (f"pair-{number:06d}", "ws", f"runner-{number:06d}", f"{number:064x}",
+             "expired", 1.0, 4_000_000.0, None)
+            for number in range(100_000)
+        ),
+    )
+    conn.executemany(
+        "INSERT INTO canary_runner_rotations("
+        "pairing_id,workspace_id,runner_id,phrase,public_key,fingerprint,key_id,"
+        "runner_version,adapters_json,status,created_at,expires_at"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            (f"rotation-{number:06d}", "ws", f"rotation-runner-{number:06d}",
+             "phrase", "key", "a" * 64, f"key-{number:06d}", "v1", "{}",
+             "expired", 1.0, 4_000_000.0)
+            for number in range(100_000)
+        ),
+    )
+    conn.commit()
+
+    pairing_plan = conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT pairing_id FROM canary_runner_pairings "
+        "INDEXED BY idx_canary_runner_pairing_parent_expiry_global "
+        "WHERE expires_at<=? AND status IN ('activated','expired') AND ("
+        "(status='activated' "
+        " AND EXISTS(SELECT 1 FROM canary_runner_execution_protocols ep "
+        "  WHERE ep.workspace_id=canary_runner_pairings.workspace_id "
+        "   AND ep.runner_id=canary_runner_pairings.runner_id) "
+        " AND NOT EXISTS(SELECT 1 FROM canary_runner_pairing_activation_receipts ar "
+        "  WHERE ar.pairing_id=canary_runner_pairings.pairing_id)) "
+        "OR (status='expired' "
+        " AND NOT EXISTS(SELECT 1 FROM canary_runner_pairing_activation_receipts ar "
+        "  WHERE ar.pairing_id=canary_runner_pairings.pairing_id) "
+        " AND NOT EXISTS(SELECT 1 FROM canary_runner_pairing_activation_abort_receipts ab "
+        "  WHERE ab.pairing_id=canary_runner_pairings.pairing_id))) "
+        "ORDER BY expires_at,pairing_id LIMIT ?",
+        (3_000_000.0, 129),
+    ).fetchall()
+    rotation_plan = conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT pairing_id FROM canary_runner_rotations "
+        "INDEXED BY idx_canary_runner_rotation_parent_expiry_global "
+        "WHERE expires_at<=? AND status IN ('rotated','expired') "
+        "AND NOT EXISTS(SELECT 1 FROM canary_runner_rotation_activation_receipts ar "
+        " WHERE ar.pairing_id=canary_runner_rotations.pairing_id) "
+        "AND NOT EXISTS(SELECT 1 FROM canary_runner_rotation_activation_abort_receipts ab "
+        " WHERE ab.pairing_id=canary_runner_rotations.pairing_id) "
+        "ORDER BY expires_at,pairing_id LIMIT ?",
+        (3_000_000.0, 129),
+    ).fetchall()
+
+    for plan, index in (
+        (pairing_plan, "idx_canary_runner_pairing_parent_expiry_global"),
+        (rotation_plan, "idx_canary_runner_rotation_parent_expiry_global"),
+    ):
+        details = [row[-1] for row in plan]
+        assert any(f"SEARCH canary_runner_" in detail and index in detail for detail in details)
+        assert not any("SCAN canary_runner_pair" in detail or "SCAN canary_runner_rotation" in detail for detail in details)
+        assert not any("USE TEMP B-TREE" in detail for detail in details)
+
+
+def test_m29_old_key_reaper_reschedules_blocked_keys_without_starving_later_due_key():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org", "org", 1))
+    conn.execute(
+        "INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+        ("ws", "org", "ws", "free", CATALOG_VERSION, 1),
+    )
+    blocked = [(f"runner-{number:03d}", f"key-{number:03d}") for number in range(128)]
+    survivor = ("runner-survivor", "key-survivor")
+    conn.executemany(
+        "INSERT INTO canary_runners VALUES(?,?,?,?,?)",
+        [
+            (runner_id, "ws", runner_id, "active", 1.0)
+            for runner_id, _key_id in [*blocked, survivor]
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)",
+        [
+            (key_id, "ws", runner_id, f"public-{key_id}", "verification_only", 1.0, 1.0)
+            for runner_id, key_id in [*blocked, survivor]
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO canary_runner_identity_records VALUES(?,?,?,?,?)",
+        [
+            (
+                "ws", runner_id,
+                json.dumps({"public_key": {"key_id": key_id}}, sort_keys=True),
+                f"{number:064x}", 1.0,
+            )
+            for number, (runner_id, key_id) in enumerate(blocked)
+        ],
+    )
+    conn.commit()
+    store = RunnerAuthStore(conn, pepper=b"p" * 32)
+
+    first = store.reap_expired_auth(now=3_000_000.0, limit=128)
+    assert first.old_keys == 0
+    assert first.has_more is True
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_runner_key_retirement_queue "
+        "WHERE next_attempt_at>3000000.0 AND attempt_count=1"
+    ).fetchone()[0] == 128
+
+    second = store.reap_expired_auth(now=3_000_000.0, limit=128)
+    assert second.old_keys == 1
+    assert second.has_more is False
+    assert conn.execute(
+        "SELECT 1 FROM canary_runner_keys WHERE workspace_id=? AND runner_id=? AND key_id=?",
+        ("ws", survivor[0], survivor[1]),
+    ).fetchone() is None
+    assert conn.execute("SELECT COUNT(*) FROM canary_runner_keys").fetchone()[0] == 128
+
+
+def test_m29_old_key_reference_probes_remain_exact_point_accesses():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    plans = (
+        (
+            "canary_runner_identity_records", None,
+            "SELECT 1 FROM canary_runner_identity_records "
+            "WHERE workspace_id=? AND runner_id=? "
+            "AND json_extract(identity_json,'$.public_key.key_id')=? LIMIT 1",
+        ),
+        (
+            "canary_runner_request_ledger", "idx_canary_runner_ledger_key_ref",
+            "SELECT 1 FROM canary_runner_request_ledger "
+            "INDEXED BY idx_canary_runner_ledger_key_ref "
+            "WHERE workspace_id=? AND runner_id=? AND key_id=? LIMIT 1",
+        ),
+        (
+            "canary_runner_context_bindings", "idx_runner_context_runner_status_expiry",
+            "SELECT 1 FROM canary_runner_context_bindings "
+            "INDEXED BY idx_runner_context_runner_status_expiry "
+            "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+        ),
+        (
+            "canary_runner_context_projection_links", "idx_runner_context_links_runner_key_ref",
+            "SELECT 1 FROM canary_runner_context_projection_links "
+            "INDEXED BY idx_runner_context_links_runner_key_ref "
+            "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+        ),
+        (
+            "canary_runner_context_events", "idx_runner_context_events_runner_key_ref",
+            "SELECT 1 FROM canary_runner_context_events "
+            "INDEXED BY idx_runner_context_events_runner_key_ref "
+            "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+        ),
+        (
+            "canary_runner_context_affinities", None,
+            "SELECT 1 FROM canary_runner_context_affinities "
+            "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+        ),
+        (
+            "canary_execution_grants", "idx_canary_grants_runner_status",
+            "SELECT 1 FROM canary_execution_grants "
+            "INDEXED BY idx_canary_grants_runner_status "
+            "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+        ),
+        (
+            "canary_approval_projections", "idx_canary_approval_runner_key_ref",
+            "SELECT 1 FROM canary_approval_projections "
+            "INDEXED BY idx_canary_approval_runner_key_ref "
+            "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+        ),
+        (
+            "canary_runner_pairings", None,
+            "SELECT 1 FROM canary_runner_pairings "
+            "WHERE workspace_id=? AND runner_id=? AND key_id=? LIMIT 1",
+        ),
+        (
+            "canary_runner_rotations", "idx_canary_runner_rotation_new_key_ref",
+            "SELECT 1 FROM canary_runner_rotations "
+            "INDEXED BY idx_canary_runner_rotation_new_key_ref "
+            "WHERE workspace_id=? AND runner_id=? AND key_id=? LIMIT 1",
+        ),
+        (
+            "canary_runner_rotations", "idx_canary_runner_rotation_old_key_history",
+            "SELECT 1 FROM canary_runner_rotations "
+            "INDEXED BY idx_canary_runner_rotation_old_key_history "
+            "WHERE workspace_id=? AND runner_id=? AND old_key_id=? LIMIT 1",
+        ),
+    )
+    try:
+        for table, index, query in plans:
+            details = [row[-1] for row in conn.execute(
+                "EXPLAIN QUERY PLAN " + query, ("ws", "runner", "old-key"),
+            )]
+            assert any("SEARCH" in detail and table in detail for detail in details)
+            if index is not None:
+                assert any(index in detail for detail in details)
+            assert not any(f"SCAN {table}" in detail or "USE TEMP B-TREE" in detail for detail in details)
+    finally:
+        conn.close()
 
 
 def test_runner_auth_body_cap_requires_an_explicit_bounded_integer_override():

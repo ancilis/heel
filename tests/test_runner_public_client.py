@@ -655,6 +655,62 @@ def test_pairing_activation_abort_writes_a_signed_tombstone_before_releasing_pre
     assert not (root / "runner" / "pairing-activation.json").exists()
 
 
+def test_tombstone_inventory_promotes_only_a_retention_bound_tombstone_temp(tmp_path):
+    """A SIGKILL after retention fsync may leave only the tombstone temp name."""
+    signer = Signer()
+    material = create_runner_pairing_material(
+        display_name="Runner One", runner_version="1.0", adapters={"http": "1.0"},
+        signer=signer, random_source=lambda count: bytes(range(count)),
+    )
+    exchange = material.executable_exchange_request("invitation")
+    pending = {
+        "schema_version": "heel.runner-pairing-pending.v2", "pairing_id": "pending_" + "e" * 32,
+        "runner_id": "runr_" + "e" * 32, "fingerprint": material.fingerprint, "status": "pending",
+        "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+        "control_protocol": "heel.runner-control.v2",
+        "pairing_exchange_digest": hashlib.sha256(canonical_bytes(exchange)).hexdigest(),
+    }
+    root = tmp_path / "home"
+    store = RunnerStore(root)
+    activation = material.prepare_executable_activation(
+        pending, store=store, now_ms=10, random_source=lambda count: b"n" * count,
+    )
+    prepared_abort = store.prepare_pairing_activation_abort(activation, now_ms=600_000)
+    response = {
+        "schema_version": "heel.runner-pairing-activation-aborted.v2", "workspace_id": "ws",
+        "runner_id": pending["runner_id"], "pairing_id": pending["pairing_id"],
+        "activation_request_digest": prepared_abort.request["activation_request_digest"],
+        "activation_challenge_digest": prepared_abort.request["activation_challenge_digest"],
+        "challenge_expires_at_ms": 600_000, "status": "expired", "aborted_at_ms": 600_000,
+    }
+    store.complete_pairing_activation_abort(prepared_abort, response)
+
+    tombstones = root / "runner" / "activation-tombstones"
+    name = "pairing-" + hashlib.sha256(pending["pairing_id"].encode()).hexdigest() + ".json"
+    temporary = tombstones / f".{name}.{'a' * 24}.tmp"
+    os.replace(tombstones / name, temporary)
+    tombstones_fd = os.open(tombstones, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        inventory = RunnerStore._activation_tombstone_inventory_locked(tombstones_fd)
+    finally:
+        os.close(tombstones_fd)
+
+    assert len(inventory) == 1
+    assert (tombstones / name).is_file()
+    assert not temporary.exists()
+
+    retention = "retention-pairing-" + hashlib.sha256(pending["pairing_id"].encode()).hexdigest() + ".json"
+    retention_temp = tombstones / f".{retention}.{'b' * 24}.tmp"
+    os.replace(tombstones / retention, retention_temp)
+    tombstones_fd = os.open(tombstones, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(RunnerStoreError, match="retention pair is incomplete"):
+            RunnerStore._activation_tombstone_inventory_locked(tombstones_fd)
+    finally:
+        os.close(tombstones_fd)
+    assert not retention_temp.exists()
+
+
 def test_legacy_pairing_abort_persists_a_cloud_deferred_deadline_without_changing_request(tmp_path):
     signer = Signer()
     material = create_runner_pairing_material(

@@ -1080,20 +1080,17 @@ def test_store_verifier_replays_only_the_detached_pending_terminal_request(tmp_p
     (active,) = client.runtime.load_active_run_controls()
     local = client.runtime.load_terminal_state(grant["run_id"])
     assert local is not None
-    expected = {
-        "call_id": pending.call_id,
-        "pending_state_digest": pending.pending_state_digest,
-        "run_id": grant["run_id"],
-        "body_sha256": hashlib.sha256(pending.body).hexdigest(),
-        "active_state_digest": active.state_digest,
-        "runtime_terminal_state_digest": local.state_digest,
-        "terminal_record_digest": local.terminal_record_digest,
-        "terminal_projection_digest": local.terminal_projection_digest,
-        "retention_expires_at_ms": local.retention_expires_at_ms,
-    }
-    verifier.consume(issued, expected_fields=expected)
+    detached_path = store.run_path(grant["run_id"]).parent / (
+        "detached-" + store._run_hash(grant["run_id"]) + ".json"
+    )
+    detached_bytes = detached_path.read_bytes()
+    detached_path.write_bytes(b"{}")
+    with pytest.raises(RunnerStoreError, match="invalid local run authority record"):
+        verifier.consume(issued, pending=pending, now_ms=2_000)
+    detached_path.write_bytes(detached_bytes)
+    verifier.consume(issued, pending=pending, now_ms=2_000)
     with pytest.raises(RunnerStoreError, match="pending terminal replay authority"):
-        verifier.consume(issued, expected_fields=expected)
+        verifier.consume(issued, pending=pending, now_ms=2_000)
     forged = PendingResultReplayAuthority(
         call_id=issued.call_id, pending_state_digest=issued.pending_state_digest,
         run_id=issued.run_id, body_sha256=issued.body_sha256,
@@ -1105,7 +1102,7 @@ def test_store_verifier_replays_only_the_detached_pending_terminal_request(tmp_p
         retention_expires_at_ms=issued.retention_expires_at_ms, _issuer=object(),
     )
     with pytest.raises(RunnerStoreError, match="pending terminal replay authority"):
-        verifier.consume(forged, expected_fields=expected)
+        verifier.consume(forged, pending=pending, now_ms=2_000)
     assert transport.requests[-1] == staged_request
 
     restarted = RunnerControlClient(

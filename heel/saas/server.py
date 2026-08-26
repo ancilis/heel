@@ -302,6 +302,7 @@ def build_server(config: ProductionConfiguration):
         reaper = CanaryReaper(
             config.database_path,
             signing=config.grant_authority,
+            runner_auth_pepper=config.runner_auth_pepper,
             on_unexpected_death=reaper_failed,
         )
         server.canary_reaper = reaper

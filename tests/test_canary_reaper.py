@@ -12,7 +12,8 @@ import pytest
 
 from heel.canary_contracts import canonical_bytes, canonical_digest
 from heel.crypto import SigningAuthority
-from heel.saas.canary_reaper import CanaryReaper
+from heel.saas.canary_reaper import CanaryReaper, CanaryReaperError
+from heel.saas.runner_auth import RunnerAuthStore
 from heel.saas.runner_contexts import RunnerContextBindingService
 
 from canary_test_support import (
@@ -28,6 +29,9 @@ from canary_test_support import (
     service,
 )
 from test_canary_lifecycle import resign_operational, running_setup
+
+
+REAPER_PEPPER = b"r" * 32
 
 
 def _durable_running_setup(root: Path):
@@ -54,6 +58,81 @@ def _durable_pending_setup(root: Path):
     durable.close()
     source.close()
     return database, clock, coordinator.signing, submitted
+
+
+def test_reaper_requires_the_distinct_runner_auth_pepper():
+    with pytest.raises(TypeError, match="runner_auth_pepper"):
+        CanaryReaper(
+            "/tmp/heel-reaper-requires-runner-auth-pepper.sqlite3",
+            signing=SigningAuthority.generate(),
+        )
+
+
+def test_reaper_runs_one_bounded_auth_retention_transaction_per_cycle(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        database, clock, signing, _approved = _durable_running_setup(Path(tmp))
+        observed = []
+        original = RunnerAuthStore.reap_expired_auth
+
+        def traced(self, *, now, limit):
+            observed.append((self._pepper, now, limit))
+            return original(self, now=now, limit=limit)
+
+        monkeypatch.setattr(RunnerAuthStore, "reap_expired_auth", traced)
+        counts = CanaryReaper(
+            str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock,
+        ).run_once()
+
+        assert observed == [(REAPER_PEPPER, NOW_MS / 1000.0, 128)]
+        assert counts["runner_auth_request_receipts"] == 0
+        assert counts["runner_auth_old_keys"] == 0
+        assert counts["runner_auth_has_more"] is False
+
+
+def test_reaper_fails_readiness_when_its_auth_retention_schema_is_corrupt():
+    with tempfile.TemporaryDirectory() as tmp:
+        database, clock, signing, _approved = _durable_running_setup(Path(tmp))
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("DROP TABLE canary_runner_key_retirement_queue")
+            connection.commit()
+        finally:
+            connection.close()
+        failures: list[BaseException] = []
+        reaper = CanaryReaper(
+            str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER,
+            clock=clock, on_unexpected_death=failures.append,
+        )
+        with pytest.raises(CanaryReaperError, match="startup failed"):
+            reaper.start(timeout=2)
+        assert len(failures) == 1
+        assert reaper.failure is failures[0]
+
+
+def test_reaper_treats_one_auth_retention_busy_cycle_as_a_bounded_skip(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        database, clock, signing, _approved = _durable_running_setup(Path(tmp))
+        original = RunnerAuthStore.reap_expired_auth
+        attempts = 0
+
+        def busy_once(self, *, now, limit):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return original(self, now=now, limit=limit)
+
+        monkeypatch.setattr(RunnerAuthStore, "reap_expired_auth", busy_once)
+        reaper = CanaryReaper(
+            str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER,
+            clock=clock, interval_seconds=0.01,
+        )
+        reaper.start(timeout=2)
+        try:
+            assert attempts >= 2
+            assert reaper.failure is None
+        finally:
+            assert reaper.stop(timeout=2) is True
 
 
 def test_context_expiry_cancels_linked_pending_run_before_generic_approval_expiry():
@@ -84,7 +163,7 @@ def test_context_expiry_cancels_linked_pending_run_before_generic_approval_expir
         source.close()
         clock.value += 25 * 60 * 60
 
-        CanaryReaper(str(database), signing=signing, clock=clock).run_once()
+        CanaryReaper(str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock).run_once()
         connection = sqlite3.connect(database)
         try:
             assert connection.execute(
@@ -224,7 +303,7 @@ def test_context_cancellation_queue_defers_the_one_hundred_twenty_ninth_link_wit
         source.close()
         clock.value += 25 * 60 * 60
 
-        reaper = CanaryReaper(str(database), signing=signing, clock=clock)
+        reaper = CanaryReaper(str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock)
         reaper.run_once()
         connection = sqlite3.connect(database)
         try:
@@ -277,7 +356,7 @@ def test_reaper_runs_on_the_exact_durable_database_and_stops_its_non_daemon_thre
         database, clock, signing, _approved = _durable_running_setup(Path(tmp))
         callback = threading.Event()
         reaper = CanaryReaper(
-            str(database), signing=signing, clock=clock,
+            str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock,
             interval_seconds=0.01, on_unexpected_death=lambda _error: callback.set(),
         )
 
@@ -309,7 +388,7 @@ def test_reaper_cycle_performs_no_network_io(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", forbidden)
     with tempfile.TemporaryDirectory() as tmp:
         database, clock, signing, _approved = _durable_running_setup(Path(tmp))
-        CanaryReaper(str(database), signing=signing, clock=clock).run_once()
+        CanaryReaper(str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock).run_once()
 
 
 def test_reaper_yields_quickly_when_an_http_writer_holds_the_database_lock():
@@ -320,7 +399,7 @@ def test_reaper_yields_quickly_when_an_http_writer_holds_the_database_lock():
         started = time.monotonic()
         try:
             with pytest.raises(sqlite3.OperationalError, match="locked"):
-                CanaryReaper(str(database), signing=signing, clock=clock).run_once()
+                CanaryReaper(str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock).run_once()
         finally:
             writer.rollback()
             writer.close()
@@ -332,7 +411,7 @@ def test_background_reaper_skips_one_routine_writer_lock_without_firing_death_ca
         database, clock, signing, _approved = _durable_running_setup(Path(tmp))
         callback_errors: list[BaseException] = []
         reaper = CanaryReaper(
-            str(database), signing=signing, clock=clock,
+            str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock,
             interval_seconds=0.01, on_unexpected_death=callback_errors.append,
         )
         reaper.start()
@@ -369,7 +448,7 @@ def test_background_reaper_reports_only_after_bounded_consecutive_lock_failures(
         monkeypatch.setattr(CanaryReaper, "_cycle", always_locked)
         callback = threading.Event()
         reaper = CanaryReaper(
-            str(database), signing=signing, clock=clock,
+            str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock,
             interval_seconds=0.01, on_unexpected_death=lambda _error: callback.set(),
         )
         with pytest.raises(Exception, match="startup failed"):
@@ -398,7 +477,7 @@ def test_repeated_cycles_never_run_schema_ddl_or_widen_connection_pragmas(monkey
             return connection
 
         monkeypatch.setattr("heel.saas.canary_reaper.sqlite3.connect", traced_connect)
-        reaper = CanaryReaper(str(database), signing=signing, clock=clock)
+        reaper = CanaryReaper(str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock)
         reaper.run_once()
         reaper.run_once()
 
@@ -444,7 +523,7 @@ def test_repeated_cycles_never_run_schema_ddl_or_widen_connection_pragmas(monkey
 def test_stale_heartbeat_is_stopped_then_minimally_finalized_without_a_runner_receipt():
     with tempfile.TemporaryDirectory() as tmp:
         database, clock, signing, _approved = _durable_running_setup(Path(tmp))
-        reaper = CanaryReaper(str(database), signing=signing, clock=clock)
+        reaper = CanaryReaper(str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock)
 
         clock.value += 6
         first = reaper.run_once()
@@ -515,7 +594,7 @@ def test_acknowledged_finalizing_run_is_minimally_closed_only_after_heartbeat_di
         clock.value += 6
 
         counts = CanaryReaper(
-            str(database), signing=coordinator.signing, clock=clock,
+            str(database), signing=coordinator.signing, runner_auth_pepper=REAPER_PEPPER, clock=clock,
         ).run_once()
 
         connection = sqlite3.connect(database)
@@ -552,7 +631,7 @@ def test_live_authority_changes_request_a_bounded_stop_without_fabricating_outco
             connection.close()
 
             counts = CanaryReaper(
-                str(database), signing=signing, clock=clock,
+                str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock,
             ).run_once()
             connection = sqlite3.connect(database)
             try:
@@ -578,7 +657,7 @@ def test_reproof_digest_replacement_is_a_permanent_authority_stop():
         connection.commit()
         connection.close()
 
-        counts = CanaryReaper(str(database), signing=signing, clock=clock).run_once()
+        counts = CanaryReaper(str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock).run_once()
         connection = sqlite3.connect(database)
         try:
             assert tuple(connection.execute(
@@ -593,7 +672,7 @@ def test_reproof_digest_replacement_is_a_permanent_authority_stop():
         finally:
             connection.close()
 
-        CanaryReaper(str(database), signing=signing, clock=clock).run_once()
+        CanaryReaper(str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock).run_once()
         connection = sqlite3.connect(database)
         try:
             assert tuple(connection.execute(
@@ -627,7 +706,7 @@ def test_future_runner_receipt_time_cannot_hide_a_stale_active_claim():
         source.close()
         clock.value += 6
 
-        counts = CanaryReaper(str(database), signing=coordinator.signing, clock=clock).run_once()
+        counts = CanaryReaper(str(database), signing=coordinator.signing, runner_auth_pepper=REAPER_PEPPER, clock=clock).run_once()
         connection = sqlite3.connect(database)
         try:
             assert tuple(connection.execute(
@@ -662,7 +741,7 @@ def test_future_runner_ack_time_cannot_evade_disconnected_finalization():
         source.close()
         clock.value += 60
 
-        counts = CanaryReaper(str(database), signing=coordinator.signing, clock=clock).run_once()
+        counts = CanaryReaper(str(database), signing=coordinator.signing, runner_auth_pepper=REAPER_PEPPER, clock=clock).run_once()
         connection = sqlite3.connect(database)
         try:
             assert connection.execute(
@@ -699,7 +778,7 @@ def test_pending_projection_after_historical_trip_clear_uses_current_generation(
         source.close()
 
         counts = CanaryReaper(
-            str(database), signing=coordinator.signing, clock=clock,
+            str(database), signing=coordinator.signing, runner_auth_pepper=REAPER_PEPPER, clock=clock,
         ).run_once()
         connection = sqlite3.connect(database)
         try:
@@ -729,7 +808,7 @@ def test_authority_loss_revokes_and_refunds_an_unclaimed_grant_in_the_same_cycle
         connection.close()
 
         counts = CanaryReaper(
-            str(database), signing=signing, clock=clock,
+            str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock,
         ).run_once()
 
         connection = sqlite3.connect(database)
@@ -762,7 +841,7 @@ def test_unclaimed_proof_expiry_is_audited_as_proof_expiry_not_runner_revocation
         connection.commit()
         connection.close()
 
-        CanaryReaper(str(database), signing=signing, clock=clock).run_once()
+        CanaryReaper(str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock).run_once()
 
         connection = sqlite3.connect(database)
         try:
@@ -786,7 +865,7 @@ def test_authority_loss_cancels_a_pending_projection_without_reserving_quota():
         connection.close()
 
         counts = CanaryReaper(
-            str(database), signing=signing, clock=clock,
+            str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock,
         ).run_once()
 
         connection = sqlite3.connect(database)
@@ -829,7 +908,7 @@ def test_reaper_purges_only_payloads_at_the_24_hour_and_7_day_boundaries():
         connection.commit()
         connection.close()
 
-        CanaryReaper(str(database), signing=signing, clock=clock).run_once()
+        CanaryReaper(str(database), signing=signing, runner_auth_pepper=REAPER_PEPPER, clock=clock).run_once()
         connection = sqlite3.connect(database)
         try:
             assert connection.execute(

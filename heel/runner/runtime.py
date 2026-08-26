@@ -374,7 +374,7 @@ class PendingResultReplayVerifier(Protocol):
     ) -> PendingResultReplayAuthority: ...
 
     def consume(
-        self, authority: PendingResultReplayAuthority, *, expected_fields: Mapping[str, object],
+        self, authority: PendingResultReplayAuthority, *, pending: PendingSignedCall, now_ms: int,
     ) -> None: ...
 
     def authorize_unstaged_terminal_result(
@@ -859,11 +859,40 @@ class RunnerRuntimeState:
         if type(executable) is not str or "\0" in executable or not os.path.isabs(executable):
             raise RunnerRuntimeCorrupt("runtime state helper is unavailable")
         try:
-            executable_stat = os.stat(executable)
+            candidate = os.path.realpath(executable, strict=True)
+            if not os.path.isabs(candidate) or "\0" in candidate:
+                raise ValueError
+            executable_stat = os.stat(candidate)
         except OSError as exc:
             raise RunnerRuntimeCorrupt("runtime state helper is unavailable") from exc
-        if not stat.S_ISREG(executable_stat.st_mode) or executable_stat.st_uid != os.geteuid():
+        except ValueError:
+            raise RunnerRuntimeCorrupt("runtime state helper is unavailable") from None
+        owner_ids = {0, os.geteuid()}
+        executable_mode = stat.S_IMODE(executable_stat.st_mode)
+        if (
+            not stat.S_ISREG(executable_stat.st_mode)
+            or executable_stat.st_uid not in owner_ids
+            or executable_mode & 0o022
+            or not executable_mode & 0o111
+            or not os.access(candidate, os.X_OK)
+        ):
             raise RunnerRuntimeCorrupt("runtime state helper is unavailable")
+        parent = os.path.dirname(candidate)
+        while True:
+            try:
+                parent_stat = os.stat(parent)
+            except OSError as exc:
+                raise RunnerRuntimeCorrupt("runtime state helper is unavailable") from exc
+            if (
+                not stat.S_ISDIR(parent_stat.st_mode)
+                or parent_stat.st_uid not in owner_ids
+                or stat.S_IMODE(parent_stat.st_mode) & 0o022
+            ):
+                raise RunnerRuntimeCorrupt("runtime state helper is unavailable")
+            next_parent = os.path.dirname(parent)
+            if next_parent == parent:
+                break
+            parent = next_parent
         try:
             parent_control, child_control = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         except OSError as exc:
@@ -875,7 +904,7 @@ class RunnerRuntimeState:
             child_control.close()
             raise RunnerRuntimeCorrupt("runtime state helper is unavailable")
         argv = [
-            executable,
+            candidate,
             "-I", "-S", "-B", "-c", _RUNTIME_INODE_GUARD_BOOTSTRAP,
             str(self._leaf_fd), str(child_fd),
         ]
@@ -977,6 +1006,47 @@ class RunnerRuntimeState:
         ):
             raise RunnerRuntimeCorrupt("runtime state is unsafe")
 
+    def _assert_runtime_sqlite_sidecars_secure(self) -> None:
+        """Admit only private SQLite sidecars beside the pinned runtime leaf.
+
+        SQLite may legitimately remove and recreate these names at checkpoint,
+        so they are checked at each admission boundary rather than pinned.  A
+        present sidecar is never repaired, removed, or followed by this path.
+        """
+        if self._parent_fd is None:
+            raise RunnerRuntimeCorrupt("runtime SQLite sidecar is unsafe")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        for suffix in ("-wal", "-shm", "-journal"):
+            name = self.path.name + suffix
+            try:
+                lexical = os.stat(name, dir_fd=self._parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                self._poison_inode_guard("runtime SQLite sidecar is unsafe")
+            if not self._private_runtime_leaf(lexical):
+                self._poison_inode_guard("runtime SQLite sidecar is unsafe")
+            try:
+                descriptor = os.open(name, flags, dir_fd=self._parent_fd)
+            except OSError:
+                self._poison_inode_guard("runtime SQLite sidecar is unsafe")
+            try:
+                opened = os.fstat(descriptor)
+            except OSError:
+                os.close(descriptor)
+                self._poison_inode_guard("runtime SQLite sidecar is unsafe")
+            try:
+                if (
+                    not self._private_runtime_leaf(opened)
+                    or self._file_identity(lexical) != self._file_identity(opened)
+                ):
+                    self._poison_inode_guard("runtime SQLite sidecar is unsafe")
+            finally:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
     def _cleanup_failed_path(self) -> None:
         try:
             if self._created_leaf and self._parent_fd is not None and self._leaf_fd is not None:
@@ -1023,6 +1093,7 @@ class RunnerRuntimeState:
             raise RunnerRuntimeCorrupt("runtime state requires reconstruction")
         with self._state_lock:
             self._assert_secure_path_unchanged()
+            self._assert_runtime_sqlite_sidecars_secure()
             conn: sqlite3.Connection | None = None
             try:
                 conn = sqlite3.connect(
@@ -1037,6 +1108,7 @@ class RunnerRuntimeState:
                 try:
                     self._probe_inode_guard()
                     self._assert_secure_path_unchanged()
+                    self._assert_runtime_sqlite_sidecars_secure()
                     conn.execute("COMMIT")
                 except BaseException:
                     try:
@@ -1065,6 +1137,7 @@ class RunnerRuntimeState:
             finally:
                 if conn is not None:
                     conn.close()
+                    self._assert_runtime_sqlite_sidecars_secure()
 
     @staticmethod
     def _normalized_sql(value: object) -> str:

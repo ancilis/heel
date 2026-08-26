@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import threading
 from types import MappingProxyType
 import unicodedata
 from typing import Any, Iterator, Mapping
@@ -164,6 +165,10 @@ _ACTIVATION_TOMBSTONE_FILENAME = re.compile(
 _ACTIVATION_TOMBSTONE_RETENTION_FILENAME = re.compile(
     r"^retention-(pairing|rotation)-([0-9a-f]{64})\.json$", flags=re.ASCII,
 )
+_ACTIVATION_TOMBSTONE_TEMP_FILENAME = re.compile(
+    r"^\.(retention-(?:pairing|rotation)-[0-9a-f]{64}\.json|(?:pairing|rotation)-[0-9a-f]{64}\.json)\.([0-9a-f]{24})\.tmp$",
+    flags=re.ASCII,
+)
 _RUN_AUTHORITY_INDEX_SCHEMA = "heel.local-run-authority-index.v1"
 _RUN_RESERVATION_RECORD_SCHEMA = "heel.local-run-reservation.v1"
 _RUN_TERMINAL_RECORD_SCHEMA = "heel.local-run-terminal.v1"
@@ -219,7 +224,9 @@ class ActivationTombstonePruneResult:
 class _PendingResultReplayVerifier:
     """Store-owned nominal issuer for one exact terminal request replay."""
 
-    __slots__ = ("_store", "_runtime", "_identity", "_token", "_consumed", "_retired")
+    __slots__ = (
+        "_store", "_runtime", "_identity", "_token", "_consumed", "_retired", "_consume_lock",
+    )
 
     def __init__(self, store: "RunnerStore", runtime: RunnerRuntimeState, identity: RunnerIdentity) -> None:
         self._store = store
@@ -228,10 +235,12 @@ class _PendingResultReplayVerifier:
         self._token = object()
         self._consumed: list[object] = []
         self._retired = False
+        self._consume_lock = threading.Lock()
 
     def _retire(self) -> None:
         """Permanently revoke an issuer bound to a pre-rotation identity."""
-        self._retired = True
+        with self._consume_lock:
+            self._retired = True
 
     def authorize_pending_result_replay(
         self, pending: PendingSignedCall, *, now_ms: int,
@@ -252,25 +261,28 @@ class _PendingResultReplayVerifier:
         )
 
     def consume(
-        self, authority: PendingResultReplayAuthority, *, expected_fields: Mapping[str, object],
+        self, authority: PendingResultReplayAuthority, *, pending: PendingSignedCall, now_ms: int,
     ) -> None:
-        fields = {
-            "call_id", "pending_state_digest", "run_id", "body_sha256",
-            "active_state_digest", "runtime_terminal_state_digest",
-            "terminal_record_digest", "terminal_projection_digest",
-            "retention_expires_at_ms",
-        }
-        if (
-            self._retired
-            or
-            not isinstance(authority, PendingResultReplayAuthority)
-            or authority._issuer is not self._token
-            or set(expected_fields) != fields
-            or any(getattr(authority, name) != expected_fields[name] for name in fields)
-            or any(item is authority for item in self._consumed)
-        ):
-            raise RunnerStoreError("local pending terminal replay authority is invalid")
-        self._consumed.append(authority)
+        with self._consume_lock:
+            if (
+                self._retired
+                or not isinstance(authority, PendingResultReplayAuthority)
+                or authority._issuer is not self._token
+                or any(item is authority for item in self._consumed)
+            ):
+                raise RunnerStoreError("local pending terminal replay authority is invalid")
+            fresh = self._store._authorize_pending_result_replay(
+                pending, runtime=self._runtime, now_ms=now_ms, issuer=self._token,
+            )
+            fields = (
+                "call_id", "pending_state_digest", "run_id", "body_sha256",
+                "active_state_digest", "runtime_terminal_state_digest",
+                "terminal_record_digest", "detached_record_digest",
+                "terminal_projection_digest", "retention_expires_at_ms",
+            )
+            if any(getattr(authority, name) != getattr(fresh, name) for name in fields):
+                raise RunnerStoreError("local pending terminal replay authority is invalid")
+            self._consumed.append(authority)
 
     def consume_stage(
         self, evidence: TerminalResultStageEvidence, *, expected_fields: Mapping[str, object],
@@ -1411,12 +1423,18 @@ class RunnerStore:
     @classmethod
     def _verify_activation_tombstone_pair(
         cls, tombstones_fd: int, *, kind: str, hashed_pairing_id: str,
+        retention_value: Mapping[str, object] | None = None,
+        tombstone_value: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Authenticate a bounded sidecar/tombstone pair without journal state."""
         filename = f"{kind}-{hashed_pairing_id}.json"
         retention_filename = f"retention-{kind}-{hashed_pairing_id}.json"
-        retention = _read_json(tombstones_fd, retention_filename, None)
-        tombstone = _read_json(tombstones_fd, filename, None)
+        retention = retention_value if retention_value is not None else _read_json(
+            tombstones_fd, retention_filename, None,
+        )
+        tombstone = tombstone_value if tombstone_value is not None else _read_json(
+            tombstones_fd, filename, None,
+        )
         if not isinstance(retention, Mapping) or not isinstance(tombstone, Mapping):
             raise RunnerStoreError("activation tombstone retention pair is incomplete")
         pairing_fields = {
@@ -1551,8 +1569,134 @@ class RunnerStore:
         }
 
     @classmethod
+    def _activation_tombstone_artifact_locked(
+        cls, tombstones_fd: int, name: str,
+    ) -> tuple[bytes, Mapping[str, object]]:
+        """Read one inventory artifact without repairing a crash residue."""
+        try:
+            before = os.stat(name, dir_fd=tombstones_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or not 1 <= before.st_size <= _MAX_METADATA_BYTES
+            ):
+                raise ValueError
+            descriptor = os.open(name, _READ_FLAGS, dir_fd=tombstones_fd)
+        except (OSError, ValueError):
+            raise RunnerStoreError("invalid activation tombstone inventory entry") from None
+        try:
+            after = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(after.st_mode)
+                or after.st_uid != os.geteuid()
+                or after.st_nlink != 1
+                or stat.S_IMODE(after.st_mode) != 0o600
+                or not 1 <= after.st_size <= _MAX_METADATA_BYTES
+                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            ):
+                raise ValueError
+            chunks: list[bytes] = []
+            remaining = _MAX_METADATA_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            if not 1 <= len(payload) <= _MAX_METADATA_BYTES:
+                raise ValueError
+        except (OSError, ValueError):
+            raise RunnerStoreError("invalid activation tombstone inventory entry") from None
+        finally:
+            os.close(descriptor)
+        try:
+            value = json.loads(payload.decode("utf-8"), object_pairs_hook=_pairs)
+            if not isinstance(value, Mapping) or canonical_bytes(value) != payload:
+                raise ValueError
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            raise RunnerStoreError("invalid activation tombstone inventory entry") from None
+        return payload, value
+
+    @classmethod
+    def _recover_activation_tombstone_temps_locked(cls, tombstones_fd: int) -> None:
+        """Finish only the one signed tombstone suffix that can survive replace()."""
+        names: list[str] = []
+        with os.scandir(tombstones_fd) as entries:
+            for entry in entries:
+                names.append(entry.name)
+                if len(names) > 33:
+                    raise RunnerStoreError("activation tombstone inventory exceeds capacity")
+        temporary: tuple[str, str] | None = None
+        final_names: set[str] = set()
+        for name in names:
+            if (
+                _ACTIVATION_TOMBSTONE_FILENAME.fullmatch(name) is not None
+                or _ACTIVATION_TOMBSTONE_RETENTION_FILENAME.fullmatch(name) is not None
+            ):
+                final_names.add(name)
+                cls._activation_tombstone_artifact_locked(tombstones_fd, name)
+                continue
+            match = _ACTIVATION_TOMBSTONE_TEMP_FILENAME.fullmatch(name)
+            if match is None or temporary is not None:
+                raise RunnerStoreError("invalid activation tombstone inventory entry")
+            cls._activation_tombstone_artifact_locked(tombstones_fd, name)
+            temporary = (name, match.group(1))
+        if len(final_names) > 32:
+            raise RunnerStoreError("activation tombstone inventory exceeds capacity")
+        if temporary is None:
+            return
+        temporary_name, target = temporary
+        temporary_bytes, temporary_value = cls._activation_tombstone_artifact_locked(
+            tombstones_fd, temporary_name,
+        )
+        if target in final_names:
+            final_bytes, _final_value = cls._activation_tombstone_artifact_locked(tombstones_fd, target)
+            if final_bytes != temporary_bytes:
+                raise RunnerStoreError("activation tombstone inventory entry changed")
+            target_match = _ACTIVATION_TOMBSTONE_FILENAME.fullmatch(target)
+            retention_match = _ACTIVATION_TOMBSTONE_RETENTION_FILENAME.fullmatch(target)
+            if target_match is not None:
+                kind, hashed = target_match.groups()
+            elif retention_match is not None:
+                kind, hashed = retention_match.groups()
+            else:  # The strict filename grammar above makes this unreachable.
+                raise RunnerStoreError("invalid activation tombstone inventory entry")
+            cls._verify_activation_tombstone_pair(
+                tombstones_fd, kind=kind, hashed_pairing_id=hashed,
+            )
+            os.unlink(temporary_name, dir_fd=tombstones_fd)
+            os.fsync(tombstones_fd)
+            return
+        retention_match = _ACTIVATION_TOMBSTONE_RETENTION_FILENAME.fullmatch(target)
+        if retention_match is not None:
+            # This is scratch before os.replace; the signed journal owns retry.
+            os.unlink(temporary_name, dir_fd=tombstones_fd)
+            os.fsync(tombstones_fd)
+            return
+        tombstone_match = _ACTIVATION_TOMBSTONE_FILENAME.fullmatch(target)
+        if tombstone_match is None:
+            raise RunnerStoreError("invalid activation tombstone inventory entry")
+        kind, hashed = tombstone_match.groups()
+        retention_name = f"retention-{kind}-{hashed}.json"
+        if retention_name not in final_names:
+            raise RunnerStoreError("activation tombstone retention pair is incomplete")
+        _retention_bytes, retention_value = cls._activation_tombstone_artifact_locked(
+            tombstones_fd, retention_name,
+        )
+        cls._verify_activation_tombstone_pair(
+            tombstones_fd, kind=kind, hashed_pairing_id=hashed,
+            retention_value=retention_value, tombstone_value=temporary_value,
+        )
+        os.replace(temporary_name, target, src_dir_fd=tombstones_fd, dst_dir_fd=tombstones_fd)
+        os.fsync(tombstones_fd)
+
+    @classmethod
     def _activation_tombstone_inventory_locked(cls, tombstones_fd: int) -> list[dict[str, object]]:
         """Return no more than sixteen fully authenticated retained ceremonies."""
+        cls._recover_activation_tombstone_temps_locked(tombstones_fd)
         names: list[str] = []
         with os.scandir(tombstones_fd) as entries:
             for entry in entries:
@@ -1564,9 +1708,11 @@ class RunnerStore:
             match = _ACTIVATION_TOMBSTONE_FILENAME.fullmatch(name)
             retention = _ACTIVATION_TOMBSTONE_RETENTION_FILENAME.fullmatch(name)
             if match is not None:
+                cls._activation_tombstone_artifact_locked(tombstones_fd, name)
                 kind, hashed = match.groups()
                 grouped.setdefault((kind, hashed), set()).add("tombstone")
             elif retention is not None:
+                cls._activation_tombstone_artifact_locked(tombstones_fd, name)
                 kind, hashed = retention.groups()
                 grouped.setdefault((kind, hashed), set()).add("retention")
             else:

@@ -32,7 +32,7 @@ class CanaryMigrationTests(unittest.TestCase):
 
     def test_current_migrations_create_tenant_bound_unique_tables(self):
         self.assertEqual(
-            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-9:]],
+            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-10:]],
             [
                 (20, "runner_context_bounded_purge"),
                 (21, "runner_context_affinity_guards"),
@@ -43,6 +43,7 @@ class CanaryMigrationTests(unittest.TestCase):
                 (26, "runner_activation_abort_receipts"),
                 (27, "runner_single_open_rotation"),
                 (28, "runner_key_history_expiry"),
+                (29, "runner_auth_bounded_retention"),
             ],
         )
         tables = (
@@ -64,7 +65,7 @@ class CanaryMigrationTests(unittest.TestCase):
     def test_migrations_twenty_three_to_twenty_five_add_purge_and_runner_receipts(self):
         """The direct/runtime schema target includes the append-only v23-v25 additions."""
         self.assertEqual(
-            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-9:]],
+            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-10:]],
             [
                 (20, "runner_context_bounded_purge"),
                 (21, "runner_context_affinity_guards"),
@@ -75,6 +76,7 @@ class CanaryMigrationTests(unittest.TestCase):
                 (26, "runner_activation_abort_receipts"),
                 (27, "runner_single_open_rotation"),
                 (28, "runner_key_history_expiry"),
+                (29, "runner_auth_bounded_retention"),
             ],
         )
         self.assertIsNotNone(self.conn.execute(
@@ -116,9 +118,9 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
 
     def test_migration_twenty_eight_adds_single_rotation_and_key_history_guards(self):
-        self.assertEqual(
-            (CONTROL_PLANE_MIGRATIONS[-1].version, CONTROL_PLANE_MIGRATIONS[-1].name),
+        self.assertIn(
             (28, "runner_key_history_expiry"),
+            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS],
         )
         self.assertEqual(
             {row[1] for row in self.conn.execute("PRAGMA table_info(canary_runner_rotations)")},
@@ -152,6 +154,70 @@ class CanaryMigrationTests(unittest.TestCase):
                 "canary_runner_rotation_activation_abort_receipts",
             },
         )
+
+    def test_migration_twenty_nine_adds_bounded_runner_key_retirement_queue(self):
+        self.assertEqual(
+            (CONTROL_PLANE_MIGRATIONS[-1].version, CONTROL_PLANE_MIGRATIONS[-1].name),
+            (29, "runner_auth_bounded_retention"),
+        )
+        self.assertEqual(
+            {
+                row[1] for row in self.conn.execute(
+                    "PRAGMA table_info(canary_runner_key_retirement_queue)"
+                )
+            },
+            {
+                "workspace_id", "runner_id", "key_id", "revoked_at", "eligible_at",
+                "next_attempt_at", "attempt_count",
+            },
+        )
+        self.assertEqual(
+            {
+                row[0] for row in self.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN (?,?,?,?)",
+                    (
+                        "trg_canary_runner_key_retirement_insert",
+                        "trg_canary_runner_key_retirement_update",
+                        "trg_canary_runner_key_retirement_insert_guard",
+                        "trg_canary_runner_key_retirement_update_guard",
+                    ),
+                )
+            },
+            {
+                "trg_canary_runner_key_retirement_insert",
+                "trg_canary_runner_key_retirement_update",
+                "trg_canary_runner_key_retirement_insert_guard",
+                "trg_canary_runner_key_retirement_update_guard",
+            },
+        )
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_canary_runner_key_retirement_due'"
+        ).fetchone())
+
+    def test_runner_auth_schema_rejects_a_missing_or_mismatched_key_retirement_queue_row(self):
+        from heel.saas.runner_auth import validate_runner_auth_schema
+
+        self.seed_root("ws", "prj")
+        self.conn.execute(
+            "INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", "ws", "runner", "active", 1),
+        )
+        self.conn.execute(
+            "INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)",
+            ("old-key", "ws", "runner", "public", "verification_only", 1.0, 1.0),
+        )
+        validate_runner_auth_schema(self.conn)
+        self.conn.execute(
+            "DELETE FROM canary_runner_key_retirement_queue "
+            "WHERE workspace_id='ws' AND runner_id='runner' AND key_id='old-key'",
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(RuntimeError, "runner authentication schema is not current"):
+            validate_runner_auth_schema(self.conn)
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM canary_runner_key_retirement_queue "
+            "WHERE workspace_id='ws' AND runner_id='runner' AND key_id='old-key'"
+        ).fetchone())
 
     def test_migrations_twenty_to_twenty_two_add_closed_context_lifecycle_objects(self):
         self.assertIsNotNone(self.conn.execute(
@@ -331,7 +397,7 @@ class CanaryMigrationTests(unittest.TestCase):
         ledger("runner_heartbeat:run", 2, "runner_heartbeat", "/v1/workspaces/ws/runners/runner/runs/run/stop-ack")
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
         self.assertEqual([tuple(row) for row in conn.execute(
             "SELECT chain_name,next_sequence,generation FROM canary_runner_chain_cursors ORDER BY chain_name"
         )], [("heartbeat:run", 2, 0), ("progress:run", 3, 0), ("stop-ack:run", 3, 0)])
@@ -376,8 +442,8 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 28)
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 29)
         self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.assertEqual(
             [tuple(row) for row in conn.execute(
@@ -483,8 +549,8 @@ class CanaryMigrationTests(unittest.TestCase):
         conn.commit()
 
         migration = Migrator(conn, CONTROL_PLANE_MIGRATIONS)
-        self.assertEqual(migration.apply_all(), [19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
-        self.assertEqual(migration.current_version(), 28)
+        self.assertEqual(migration.apply_all(), [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
+        self.assertEqual(migration.current_version(), 29)
         affinity = conn.execute(
             "SELECT project_ref,environment_id,runner_key_id,established_rcb_id,established_binding_digest "
             "FROM canary_runner_context_affinities WHERE workspace_id='ws_affinity' AND runner_id='runr_affinity'",
@@ -758,7 +824,7 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
         self.assertEqual(
             [tuple(row) for row in conn.execute("SELECT chain_name,sequence FROM canary_runner_request_ledger")],
             [("progress:real", 1)],
@@ -805,6 +871,43 @@ class CanaryMigrationTests(unittest.TestCase):
         self.conn.commit()
         with self.assertRaisesRegex(RuntimeError, "display name"):
             validate_runner_auth_schema(self.conn)
+
+    def test_runner_auth_schema_rejects_an_external_trigger_that_mutates_an_owned_table(self):
+        from heel.saas.runner_auth import validate_runner_auth_schema
+
+        spellings = (
+            "CaNaRy_RuNnEr_ReQuEsT_LeDgEr",
+            '"CaNaRy_RuNnEr_ReQuEsT_LeDgEr"',
+            "`CaNaRy_RuNnEr_ReQuEsT_LeDgEr`",
+            "[CaNaRy_RuNnEr_ReQuEsT_LeDgEr]",
+        )
+        for number, spelling in enumerate(spellings):
+            for temporary in ("", "TEMP "):
+                name = f"hostile_runner_auth_side_effect_{number}_{bool(temporary):d}"
+                self.conn.executescript(
+                    f"CREATE {temporary}TRIGGER {name} AFTER INSERT ON workspaces "
+                    f"BEGIN DELETE FROM {spelling}; END;"
+                )
+                with self.assertRaisesRegex(RuntimeError, "runner authentication schema is not current"):
+                    validate_runner_auth_schema(self.conn)
+                self.conn.execute(f"DROP TRIGGER {name}")
+
+        self.conn.execute(
+            'CREATE VIEW hostile_runner_auth_view AS '
+            'SELECT pairing_id FROM "CaNaRy_RuNnEr_PaIrInGs"'
+        )
+        with self.assertRaisesRegex(RuntimeError, "runner authentication schema is not current"):
+            validate_runner_auth_schema(self.conn)
+        self.conn.execute("DROP VIEW hostile_runner_auth_view")
+
+        self.conn.executescript("""
+        CREATE TRIGGER harmless_runner_auth_words
+        AFTER INSERT ON workspaces
+        BEGIN
+          SELECT 'canary_runner_request_ledger /* not an identifier */';
+        END;
+        """)
+        validate_runner_auth_schema(self.conn)
 
     def test_direct_control_plane_runtime_uses_final_runner_foreign_keys(self):
         from heel.saas.http_api import ControlPlane
@@ -981,8 +1084,8 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
         conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
         conn.commit()
-        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
-        self.assertEqual(migration.current_version(), 28)
+        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
+        self.assertEqual(migration.current_version(), 29)
         self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):

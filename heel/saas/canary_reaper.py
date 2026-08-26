@@ -16,6 +16,7 @@ from typing import Callable
 
 from .canary_disclosure import CanaryDisclosureService
 from .canary_runs import AUDIT_RETENTION_MS, PROJECTION_RETENTION_MS, CanaryRunService
+from .runner_auth import RunnerAuthStore
 from .runner_contexts import RunnerContextBindingService
 
 
@@ -42,6 +43,7 @@ class CanaryReaper:
         database_path: str,
         *,
         signing,
+        runner_auth_pepper: bytes,
         interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.time,
         on_unexpected_death: Callable[[BaseException], None] | None = None,
@@ -52,10 +54,13 @@ class CanaryReaper:
             raise ValueError("canary reaper requires an absolute SQLite path")
         if signing is None or not callable(getattr(signing, "sign", None)):
             raise TypeError("canary reaper requires the configured grant signing authority")
+        if not isinstance(runner_auth_pepper, bytes) or not 32 <= len(runner_auth_pepper) <= 64:
+            raise TypeError("canary reaper requires the configured runner authentication pepper")
         if not isinstance(interval_seconds, (int, float)) or interval_seconds <= 0:
             raise ValueError("canary reaper interval must be positive")
         self.database_path = database_path
         self.signing = signing
+        self.runner_auth_pepper = runner_auth_pepper
         self.interval_seconds = float(interval_seconds)
         self.clock = clock
         self.on_unexpected_death = on_unexpected_death
@@ -559,6 +564,20 @@ class CanaryReaper:
         for name, value in purge_counts.items():
             if name != "next_cursor":
                 counts[name] = counts.get(name, 0) + value
+        # Auth receipt/key retention has its own bounded transaction and
+        # intentionally runs outside every human or runner request path.
+        # This connection is already the reaper's dedicated process-owned
+        # connection; RunnerAuthStore opens no second connection and performs
+        # one short BEGIN IMMEDIATE transaction of its own.
+        auth_counts = RunnerAuthStore(
+            service.conn, pepper=self.runner_auth_pepper,
+        ).reap_expired_auth(now=now_ms / 1000.0, limit=128)
+        for name in (
+            "request_receipts", "pairing_receipts", "rotation_receipts",
+            "abort_receipts", "pairing_parents", "rotation_parents", "old_keys",
+        ):
+            counts[f"runner_auth_{name}"] = getattr(auth_counts, name)
+        counts["runner_auth_has_more"] = auth_counts.has_more
         return counts
 
     def run_once(self) -> dict[str, int]:

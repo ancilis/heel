@@ -871,6 +871,108 @@ CREATE INDEX idx_canary_runner_key_history_expiry
 RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_KEY_HISTORY_EXPIRY_MIGRATION
 
 
+RUNNER_AUTH_BOUNDED_RETENTION_MIGRATION = r"""
+CREATE INDEX idx_canary_runner_pairing_parent_expiry_global
+ ON canary_runner_pairings(expires_at,pairing_id)
+ WHERE status IN ('activated','expired');
+CREATE INDEX idx_canary_runner_rotation_parent_expiry_global
+ ON canary_runner_rotations(expires_at,pairing_id)
+ WHERE status IN ('rotated','expired');
+
+CREATE INDEX idx_canary_runner_ledger_key_ref
+ ON canary_runner_request_ledger(workspace_id,runner_id,key_id);
+CREATE INDEX idx_runner_context_links_runner_key_ref
+ ON canary_runner_context_projection_links(workspace_id,runner_id,runner_key_id);
+CREATE INDEX idx_runner_context_events_runner_key_ref
+ ON canary_runner_context_events(workspace_id,runner_id,runner_key_id);
+CREATE INDEX idx_canary_approval_runner_key_ref
+ ON canary_approval_projections(workspace_id,runner_id,runner_key_id);
+CREATE INDEX idx_canary_runner_rotation_new_key_ref
+ ON canary_runner_rotations(workspace_id,runner_id,key_id);
+
+CREATE TABLE canary_runner_key_retirement_queue(
+ workspace_id TEXT NOT NULL,
+ runner_id TEXT NOT NULL,
+ key_id TEXT NOT NULL,
+ revoked_at REAL NOT NULL,
+ eligible_at REAL NOT NULL CHECK(eligible_at=revoked_at+2592000.0),
+ next_attempt_at REAL NOT NULL CHECK(next_attempt_at>=eligible_at),
+ attempt_count INTEGER NOT NULL CHECK(attempt_count>=0),
+ PRIMARY KEY(workspace_id,runner_id,key_id),
+ FOREIGN KEY(workspace_id,runner_id,key_id)
+  REFERENCES canary_runner_keys(workspace_id,runner_id,key_id) ON DELETE CASCADE);
+CREATE INDEX idx_canary_runner_key_retirement_due
+ ON canary_runner_key_retirement_queue(next_attempt_at,eligible_at,workspace_id,runner_id,key_id);
+
+CREATE TABLE canary_runner_key_retirement_m29_guard(
+ ok INTEGER NOT NULL CHECK(ok=1));
+INSERT INTO canary_runner_key_retirement_m29_guard(ok)
+SELECT CASE WHEN EXISTS(
+ SELECT 1 FROM canary_runner_keys
+ WHERE status='verification_only' AND revoked_at IS NULL
+) THEN 0 ELSE 1 END;
+DROP TABLE canary_runner_key_retirement_m29_guard;
+
+INSERT INTO canary_runner_key_retirement_queue(
+ workspace_id,runner_id,key_id,revoked_at,eligible_at,next_attempt_at,attempt_count)
+SELECT workspace_id,runner_id,key_id,revoked_at,
+ revoked_at+2592000.0,revoked_at+2592000.0,0
+FROM canary_runner_keys
+WHERE status='verification_only' AND revoked_at IS NOT NULL;
+
+CREATE TRIGGER trg_canary_runner_key_retirement_insert
+AFTER INSERT ON canary_runner_keys
+WHEN NEW.status='verification_only' AND NEW.revoked_at IS NOT NULL
+BEGIN
+ INSERT INTO canary_runner_key_retirement_queue(
+  workspace_id,runner_id,key_id,revoked_at,eligible_at,next_attempt_at,attempt_count)
+ VALUES(NEW.workspace_id,NEW.runner_id,NEW.key_id,NEW.revoked_at,
+  NEW.revoked_at+2592000.0,NEW.revoked_at+2592000.0,0);
+END;
+
+CREATE TRIGGER trg_canary_runner_key_retirement_update
+AFTER UPDATE OF status,revoked_at ON canary_runner_keys
+BEGIN
+ DELETE FROM canary_runner_key_retirement_queue
+ WHERE workspace_id=OLD.workspace_id AND runner_id=OLD.runner_id AND key_id=OLD.key_id;
+ INSERT INTO canary_runner_key_retirement_queue(
+  workspace_id,runner_id,key_id,revoked_at,eligible_at,next_attempt_at,attempt_count)
+ SELECT NEW.workspace_id,NEW.runner_id,NEW.key_id,NEW.revoked_at,
+  NEW.revoked_at+2592000.0,NEW.revoked_at+2592000.0,0
+ WHERE NEW.status='verification_only' AND NEW.revoked_at IS NOT NULL;
+END;
+
+CREATE TRIGGER trg_canary_runner_key_retirement_insert_guard
+BEFORE INSERT ON canary_runner_key_retirement_queue
+WHEN NOT EXISTS(
+ SELECT 1 FROM canary_runner_keys k
+ WHERE k.workspace_id=NEW.workspace_id AND k.runner_id=NEW.runner_id
+  AND k.key_id=NEW.key_id AND k.status='verification_only'
+  AND k.revoked_at=NEW.revoked_at
+) OR NEW.eligible_at<>NEW.revoked_at+2592000.0
+ OR NEW.next_attempt_at<NEW.eligible_at OR NEW.attempt_count<>0
+BEGIN
+ SELECT RAISE(ABORT,'invalid runner key retirement queue insert');
+END;
+
+CREATE TRIGGER trg_canary_runner_key_retirement_update_guard
+BEFORE UPDATE ON canary_runner_key_retirement_queue
+WHEN NEW.workspace_id<>OLD.workspace_id OR NEW.runner_id<>OLD.runner_id
+ OR NEW.key_id<>OLD.key_id OR NEW.revoked_at<>OLD.revoked_at
+ OR NEW.eligible_at<>OLD.eligible_at OR NEW.next_attempt_at<=OLD.next_attempt_at
+ OR NEW.attempt_count<>OLD.attempt_count+1
+ OR NOT EXISTS(
+  SELECT 1 FROM canary_runner_keys k
+  WHERE k.workspace_id=NEW.workspace_id AND k.runner_id=NEW.runner_id
+   AND k.key_id=NEW.key_id AND k.status='verification_only'
+   AND k.revoked_at=NEW.revoked_at)
+BEGIN
+ SELECT RAISE(ABORT,'invalid runner key retirement queue update');
+END;
+"""
+RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_BOUNDED_RETENTION_MIGRATION
+
+
 class RunnerAuthError(PermissionError):
     """Uniform external runner-auth failure."""
 
@@ -1020,7 +1122,7 @@ def _ensure_lifecycle_tables(conn: sqlite3.Connection) -> None:
     """)
 
 
-_RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_request_ledger_archive", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records", "canary_runner_chain_cursors", "canary_runner_resync_challenges", "canary_runner_pairing_protocols", "canary_runner_execution_protocols", "canary_runner_pairing_activation_receipts", "canary_runner_rotation_activation_receipts", "canary_runner_pairing_activation_abort_receipts", "canary_runner_rotation_activation_abort_receipts")
+_RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_request_ledger_archive", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records", "canary_runner_chain_cursors", "canary_runner_resync_challenges", "canary_runner_pairing_protocols", "canary_runner_execution_protocols", "canary_runner_pairing_activation_receipts", "canary_runner_rotation_activation_receipts", "canary_runner_pairing_activation_abort_receipts", "canary_runner_rotation_activation_abort_receipts", "canary_runner_key_retirement_queue")
 
 
 def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
@@ -1034,7 +1136,21 @@ def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
             "CREATE TABLE canary_runners(workspace_id TEXT,runner_id TEXT,UNIQUE(workspace_id,runner_id));"
             "CREATE TABLE canary_runner_keys("
             "key_id TEXT PRIMARY KEY,workspace_id TEXT,runner_id TEXT,public_key TEXT,"
-            "status TEXT,created_at REAL,revoked_at REAL);"
+            "status TEXT,created_at REAL,revoked_at REAL,"
+            "UNIQUE(workspace_id,runner_id,key_id));"
+            # The m29 external indexes are parity-checked through
+            # ``index_xinfo`` as well as their SQL.  Keep the preceding
+            # columns so the ephemeral schema has the same column ordinals as
+            # the control-plane owners, without taking ownership of them.
+            "CREATE TABLE canary_runner_context_projection_links("
+            "workspace_id TEXT,project_ref TEXT,approval_id TEXT,run_id TEXT,"
+            "environment_id TEXT,runner_id TEXT,runner_key_id TEXT);"
+            "CREATE TABLE canary_runner_context_events("
+            "rce_id TEXT,workspace_id TEXT,project_ref TEXT,environment_id TEXT,"
+            "runner_id TEXT,runner_key_id TEXT);"
+            "CREATE TABLE canary_approval_projections("
+            "approval_id TEXT,workspace_id TEXT,project_ref TEXT,run_id TEXT,"
+            "environment_id TEXT,runner_id TEXT,runner_key_id TEXT);"
         )
         expected.executescript(RUNNER_AUTH_RUNTIME_SCHEMA)
         for table in _RUNNER_AUTH_TABLES:
@@ -1061,51 +1177,130 @@ def validate_runner_auth_schema(conn: sqlite3.Connection) -> None:
                 tuple(value) for value in database.execute(f"PRAGMA index_xinfo({name})")
             ]
 
-        if index_shape(conn, "idx_canary_runner_key_history_expiry") != index_shape(
-            expected, "idx_canary_runner_key_history_expiry",
+        for index_name in (
+            "idx_canary_runner_key_history_expiry",
+            "idx_runner_context_links_runner_key_ref",
+            "idx_runner_context_events_runner_key_ref",
+            "idx_canary_approval_runner_key_ref",
         ):
-            raise RuntimeError("runner authentication schema is not current")
-        owned = set(_RUNNER_AUTH_TABLES)
+            if index_shape(conn, index_name) != index_shape(expected, index_name):
+                raise RuntimeError("runner authentication schema is not current")
 
-        def normalized(value: object) -> str:
+        owned = frozenset(table.casefold() for table in _RUNNER_AUTH_TABLES)
+
+        def identifiers(value: object) -> frozenset[str]:
+            """Parse SQL identifiers without treating comments or literal text as authority."""
             if type(value) is not str:
                 raise RuntimeError("runner authentication schema is not current")
-            return "".join(value.split())
+            output: set[str] = set()
+            index = 0
+            length = len(value)
+            while index < length:
+                character = value[index]
+                if character in " \t\r\n\f":
+                    index += 1
+                    continue
+                if character == "-" and index + 1 < length and value[index + 1] == "-":
+                    newline = value.find("\n", index + 2)
+                    index = length if newline < 0 else newline + 1
+                    continue
+                if character == "/" and index + 1 < length and value[index + 1] == "*":
+                    end = value.find("*/", index + 2)
+                    if end < 0:
+                        raise RuntimeError("runner authentication schema is not current")
+                    index = end + 2
+                    continue
+                if character == "'":
+                    index += 1
+                    while index < length:
+                        if value[index] == "'":
+                            if index + 1 < length and value[index + 1] == "'":
+                                index += 2
+                                continue
+                            index += 1
+                            break
+                        index += 1
+                    else:
+                        raise RuntimeError("runner authentication schema is not current")
+                    continue
+                if character in ('"', "`", "["):
+                    delimiter = character
+                    closer = "]" if delimiter == "[" else delimiter
+                    index += 1
+                    decoded: list[str] = []
+                    while index < length:
+                        if value[index] == closer:
+                            if index + 1 < length and value[index + 1] == closer:
+                                decoded.append(closer)
+                                index += 2
+                                continue
+                            index += 1
+                            output.add("".join(decoded).casefold())
+                            break
+                        decoded.append(value[index])
+                        index += 1
+                    else:
+                        raise RuntimeError("runner authentication schema is not current")
+                    continue
+                if character.isascii() and (character.isalpha() or character == "_"):
+                    end = index + 1
+                    while end < length and value[end].isascii() and (
+                        value[end].isalnum() or value[end] in "_$"
+                    ):
+                        end += 1
+                    output.add(value[index:end].casefold())
+                    index = end
+                    continue
+                if not character.isascii() and (character.isalpha() or character == "_"):
+                    raise RuntimeError("runner authentication schema is not current")
+                index += 1
+            return frozenset(output)
 
-        def attached_triggers(database: sqlite3.Connection) -> list[tuple[str, str, str]]:
-            return sorted(
-                (str(row[0]), str(row[1]), normalized(row[2]))
-                for row in database.execute(
-                    "SELECT name,tbl_name,sql FROM sqlite_master "
-                    "WHERE type='trigger' ORDER BY name",
-                )
-                if row[1] in owned
+        def scoped_objects(
+            database: sqlite3.Connection, *, schema: str, object_type: str,
+        ) -> list[tuple[str, str, str, str]]:
+            rows = database.execute(
+                f"SELECT name,tbl_name,sql FROM {schema}.sqlite_schema "
+                "WHERE type=? ORDER BY name",
+                (object_type,),
             )
+            result: list[tuple[str, str, str, str]] = []
+            for row in rows:
+                name, table_name, sql = tuple(row)
+                if type(name) is not str or type(table_name) is not str or type(sql) is not str:
+                    raise RuntimeError("runner authentication schema is not current")
+                if table_name.casefold() in owned or identifiers(sql) & owned:
+                    result.append((schema, name, table_name, sql.strip()))
+            return result
 
-        # PRAGMA index_list above rejects extra indexes.  Triggers do not
-        # appear there, so compare their exact owned-schema set separately.
-        # This is intentionally dynamic from the literal schema: later owned
-        # migrations can add a frozen trigger without opening a permissive
-        # side-channel for unlisted triggers.
-        if attached_triggers(conn) != attached_triggers(expected):
+        for object_type in ("trigger", "view"):
+            if scoped_objects(conn, schema="main", object_type=object_type) != scoped_objects(
+                expected, schema="main", object_type=object_type,
+            ):
+                raise RuntimeError("runner authentication schema is not current")
+            if scoped_objects(conn, schema="temp", object_type=object_type):
+                raise RuntimeError("runner authentication schema is not current")
+
+        key_rows = [tuple(row) for row in conn.execute(
+            "SELECT workspace_id,runner_id,key_id,revoked_at FROM canary_runner_keys "
+            "WHERE status='verification_only' ORDER BY workspace_id,runner_id,key_id"
+        )]
+        queue_rows = [tuple(row) for row in conn.execute(
+            "SELECT workspace_id,runner_id,key_id,revoked_at,eligible_at "
+            "FROM canary_runner_key_retirement_queue "
+            "ORDER BY workspace_id,runner_id,key_id"
+        )]
+        if len(key_rows) != len(queue_rows):
             raise RuntimeError("runner authentication schema is not current")
-
-        table_pattern = re.compile(
-            r"(?<![A-Za-z0-9_])(?:" + "|".join(
-                re.escape(table) for table in sorted(owned, key=len, reverse=True)
-            ) + r")(?![A-Za-z0-9_])",
-        )
-        actual_views = sorted(
-            (str(row[0]), normalized(row[1]))
-            for row in conn.execute("SELECT name,sql FROM sqlite_master WHERE type='view' ORDER BY name")
-            if type(row[1]) is str and table_pattern.search(row[1]) is not None
-        )
-        expected_views = sorted(
-            (str(row[0]), normalized(row[1]))
-            for row in expected.execute("SELECT name,sql FROM sqlite_master WHERE type='view' ORDER BY name")
-            if type(row[1]) is str and table_pattern.search(row[1]) is not None
-        )
-        if actual_views != expected_views:
+        expected_queue = []
+        for workspace_id, runner_id, key_id, revoked_at in key_rows:
+            if revoked_at is None:
+                raise RuntimeError("runner authentication schema is not current")
+            expected_queue.append((
+                workspace_id, runner_id, key_id, revoked_at,
+                float(revoked_at) + 2_592_000.0,
+            ))
+        if expected_queue != queue_rows:
             raise RuntimeError("runner authentication schema is not current")
         if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise RuntimeError("runner authentication schema has foreign-key violations")
@@ -2786,19 +2981,24 @@ class RunnerAuthStore:
             or not isinstance(limit, int) or not 1 <= limit <= 128
         ):
             raise ValueError("invalid runner auth reap request")
-        # The old-key phase is legal only once the append-only schema-28
-        # index exists.  Check before BEGIN: a legacy database cannot turn a
-        # retention tick into an accidental full scan or partial mutation.
-        expected_key_history_index = "".join(
-            RUNNER_AUTH_KEY_HISTORY_EXPIRY_MIGRATION.strip().rstrip(";").split()
+        # The old-key phase is legal only once the append-only schema-29
+        # queue exists.  Check before BEGIN: an older database cannot turn a
+        # retention tick into an accidental scan or partial mutation.
+        expected_queue_index = (
+            "CREATEINDEXidx_canary_runner_key_retirement_due"
+            "ONcanary_runner_key_retirement_queue(next_attempt_at,eligible_at,workspace_id,runner_id,key_id)"
         )
-        key_history_index = self.conn.execute(
+        queue_index = self.conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' "
-            "AND name='idx_canary_runner_key_history_expiry'",
+            "AND name='idx_canary_runner_key_retirement_due'",
         ).fetchone()
         if (
-            key_history_index is None or type(key_history_index[0]) is not str
-            or "".join(key_history_index[0].split()) != expected_key_history_index
+            self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='canary_runner_key_retirement_queue'",
+            ).fetchone() is None
+            or queue_index is None or type(queue_index[0]) is not str
+            or "".join(queue_index[0].split()) != expected_queue_index
         ):
             raise RunnerAuthError("runner authentication schema upgrade required")
         instant = float(now)
@@ -2868,30 +3068,32 @@ class RunnerAuthStore:
                 ),
                 (
                     "SELECT pairing_id FROM canary_runner_pairings "
-                    "INDEXED BY idx_canary_runner_pairing_status_expiry "
-                    "WHERE expires_at<=? AND ("
-                    "(status='activated' AND EXISTS(SELECT 1 FROM canary_runner_execution_protocols ep "
-                    " WHERE ep.workspace_id=canary_runner_pairings.workspace_id "
-                    " AND ep.runner_id=canary_runner_pairings.runner_id) "
+                    "INDEXED BY idx_canary_runner_pairing_parent_expiry_global "
+                    "WHERE expires_at<=? AND status IN ('activated','expired') AND ("
+                    "(status='activated' "
+                    " AND EXISTS(SELECT 1 FROM canary_runner_execution_protocols ep "
+                    "  WHERE ep.workspace_id=canary_runner_pairings.workspace_id "
+                    "   AND ep.runner_id=canary_runner_pairings.runner_id) "
                     " AND NOT EXISTS(SELECT 1 FROM canary_runner_pairing_activation_receipts ar "
-                    " WHERE ar.pairing_id=canary_runner_pairings.pairing_id)) "
-                    "OR (status='expired' AND NOT EXISTS(SELECT 1 FROM canary_runner_pairing_activation_receipts ar "
-                    " WHERE ar.pairing_id=canary_runner_pairings.pairing_id) "
+                    "  WHERE ar.pairing_id=canary_runner_pairings.pairing_id)) "
+                    "OR (status='expired' "
+                    " AND NOT EXISTS(SELECT 1 FROM canary_runner_pairing_activation_receipts ar "
+                    "  WHERE ar.pairing_id=canary_runner_pairings.pairing_id) "
                     " AND NOT EXISTS(SELECT 1 FROM canary_runner_pairing_activation_abort_receipts ab "
-                    " WHERE ab.pairing_id=canary_runner_pairings.pairing_id))) "
-                    "ORDER BY workspace_id,status,expires_at,pairing_id LIMIT ?",
+                    "  WHERE ab.pairing_id=canary_runner_pairings.pairing_id))) "
+                    "ORDER BY expires_at,pairing_id LIMIT ?",
                     (instant,), "DELETE FROM canary_runner_pairings WHERE pairing_id=?",
                     "pairing_parents",
                 ),
                 (
                     "SELECT pairing_id FROM canary_runner_rotations "
-                    "INDEXED BY idx_canary_runner_rotation_status_expiry "
+                    "INDEXED BY idx_canary_runner_rotation_parent_expiry_global "
                     "WHERE expires_at<=? AND status IN ('rotated','expired') "
                     "AND NOT EXISTS(SELECT 1 FROM canary_runner_rotation_activation_receipts ar "
                     " WHERE ar.pairing_id=canary_runner_rotations.pairing_id) "
                     "AND NOT EXISTS(SELECT 1 FROM canary_runner_rotation_activation_abort_receipts ab "
                     " WHERE ab.pairing_id=canary_runner_rotations.pairing_id) "
-                    "ORDER BY workspace_id,status,expires_at,pairing_id LIMIT ?",
+                    "ORDER BY expires_at,pairing_id LIMIT ?",
                     (instant,), "DELETE FROM canary_runner_rotations WHERE pairing_id=?",
                     "rotation_parents",
                 ),
@@ -2902,79 +3104,123 @@ class RunnerAuthStore:
                     has_more = True
                     break
             if not has_more:
-                old_key_cutoff = instant - 2_592_000.0
                 query = (
-                    "SELECT revoked_at,workspace_id,runner_id,key_id "
-                    "FROM canary_runner_keys INDEXED BY idx_canary_runner_key_history_expiry "
-                    "WHERE status='verification_only' "
-                    "AND revoked_at IS NOT NULL "
-                    "AND revoked_at<=? "
-                    "ORDER BY revoked_at,workspace_id,runner_id,key_id "
+                    "SELECT revoked_at,workspace_id,runner_id,key_id,attempt_count "
+                    "FROM canary_runner_key_retirement_queue "
+                    "INDEXED BY idx_canary_runner_key_retirement_due "
+                    "WHERE next_attempt_at<=? "
+                    "ORDER BY next_attempt_at,eligible_at,workspace_id,runner_id,key_id "
                     "LIMIT ?"
                 )
                 if remaining == 0:
-                    has_more = bool(self.conn.execute(query, (old_key_cutoff, 1)).fetchone())
+                    has_more = bool(self.conn.execute(query, (instant, 1)).fetchone())
                 else:
                     candidate_budget = remaining
                     candidates = self.conn.execute(
-                        query, (old_key_cutoff, candidate_budget + 1),
+                        query, (instant, candidate_budget + 1),
                     ).fetchall()
-                    # Every negative reference check is an exact point lookup
-                    # rooted by this candidate; it never broadens the index
-                    # range into a tenant-wide history scan.
-                    for candidate in candidates[:candidate_budget]:
-                        revoked_at, workspace_id, runner_id, key_id = tuple(candidate)
-                        referenced = self.conn.execute(
-                            "SELECT 1 WHERE "
-                            "EXISTS(SELECT 1 FROM canary_runner_identity_records i "
-                            " WHERE i.workspace_id=? AND i.runner_id=? "
-                            " AND json_extract(i.identity_json,'$.public_key.key_id')=?) "
-                            "OR EXISTS(SELECT 1 FROM canary_runner_request_ledger l "
-                            " WHERE l.workspace_id=? AND l.runner_id=? AND l.key_id=?) "
-                            "OR EXISTS(SELECT 1 FROM canary_runner_context_bindings b "
-                            " WHERE b.workspace_id=? AND b.runner_id=? AND b.runner_key_id=?) "
-                            "OR EXISTS(SELECT 1 FROM canary_runner_context_projection_links l "
-                            " WHERE l.workspace_id=? AND l.runner_id=? AND l.runner_key_id=?) "
-                            "OR EXISTS(SELECT 1 FROM canary_runner_context_events e "
-                            " WHERE e.workspace_id=? AND e.runner_id=? AND e.runner_key_id=?) "
-                            "OR EXISTS(SELECT 1 FROM canary_runner_context_affinities a "
-                            " WHERE a.workspace_id=? AND a.runner_id=? AND a.runner_key_id=?) "
-                            "OR EXISTS(SELECT 1 FROM canary_execution_grants g "
-                            " WHERE g.workspace_id=? AND g.runner_id=? AND g.runner_key_id=?) "
-                            "OR EXISTS(SELECT 1 FROM canary_approval_projections p "
-                            " WHERE p.workspace_id=? AND p.runner_id=? AND p.runner_key_id=?) "
-                            "OR EXISTS(SELECT 1 FROM canary_runner_pairings p "
-                            " WHERE p.workspace_id=? AND p.runner_id=? AND p.key_id=?) "
-                            "OR EXISTS(SELECT 1 FROM canary_runner_rotations r "
-                            " WHERE r.workspace_id=? AND r.runner_id=? "
-                            " AND (r.key_id=? OR r.old_key_id=?))",
+
+                    def key_is_referenced(
+                        workspace_id: str, runner_id: str, key_id: str,
+                    ) -> bool:
+                        probes = (
                             (
-                                workspace_id, runner_id, key_id,
-                                workspace_id, runner_id, key_id,
-                                workspace_id, runner_id, key_id,
-                                workspace_id, runner_id, key_id,
-                                workspace_id, runner_id, key_id,
-                                workspace_id, runner_id, key_id,
-                                workspace_id, runner_id, key_id,
-                                workspace_id, runner_id, key_id,
-                                workspace_id, runner_id, key_id,
-                                workspace_id, runner_id, key_id, key_id,
+                                "SELECT 1 FROM canary_runner_identity_records "
+                                "WHERE workspace_id=? AND runner_id=? "
+                                "AND json_extract(identity_json,'$.public_key.key_id')=? LIMIT 1",
+                                (workspace_id, runner_id, key_id),
                             ),
-                        ).fetchone()
-                        if referenced is not None:
-                            continue
-                        deleted = self.conn.execute(
-                            "DELETE FROM canary_runner_keys WHERE revoked_at=? AND workspace_id=? "
-                            "AND runner_id=? AND key_id=? AND status='verification_only' "
-                            "AND revoked_at<=?",
-                            (revoked_at, workspace_id, runner_id, key_id, old_key_cutoff),
+                            (
+                                "SELECT 1 FROM canary_runner_request_ledger "
+                                "INDEXED BY idx_canary_runner_ledger_key_ref "
+                                "WHERE workspace_id=? AND runner_id=? AND key_id=? LIMIT 1",
+                                (workspace_id, runner_id, key_id),
+                            ),
+                            (
+                                "SELECT 1 FROM canary_runner_context_bindings "
+                                "INDEXED BY idx_runner_context_runner_status_expiry "
+                                "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+                                (workspace_id, runner_id, key_id),
+                            ),
+                            (
+                                "SELECT 1 FROM canary_runner_context_projection_links "
+                                "INDEXED BY idx_runner_context_links_runner_key_ref "
+                                "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+                                (workspace_id, runner_id, key_id),
+                            ),
+                            (
+                                "SELECT 1 FROM canary_runner_context_events "
+                                "INDEXED BY idx_runner_context_events_runner_key_ref "
+                                "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+                                (workspace_id, runner_id, key_id),
+                            ),
+                            (
+                                "SELECT 1 FROM canary_runner_context_affinities "
+                                "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+                                (workspace_id, runner_id, key_id),
+                            ),
+                            (
+                                "SELECT 1 FROM canary_execution_grants "
+                                "INDEXED BY idx_canary_grants_runner_status "
+                                "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+                                (workspace_id, runner_id, key_id),
+                            ),
+                            (
+                                "SELECT 1 FROM canary_approval_projections "
+                                "INDEXED BY idx_canary_approval_runner_key_ref "
+                                "WHERE workspace_id=? AND runner_id=? AND runner_key_id=? LIMIT 1",
+                                (workspace_id, runner_id, key_id),
+                            ),
+                            (
+                                "SELECT 1 FROM canary_runner_pairings "
+                                "WHERE workspace_id=? AND runner_id=? AND key_id=? LIMIT 1",
+                                (workspace_id, runner_id, key_id),
+                            ),
+                            (
+                                "SELECT 1 FROM canary_runner_rotations "
+                                "INDEXED BY idx_canary_runner_rotation_new_key_ref "
+                                "WHERE workspace_id=? AND runner_id=? AND key_id=? LIMIT 1",
+                                (workspace_id, runner_id, key_id),
+                            ),
+                            (
+                                "SELECT 1 FROM canary_runner_rotations "
+                                "INDEXED BY idx_canary_runner_rotation_old_key_history "
+                                "WHERE workspace_id=? AND runner_id=? AND old_key_id=? LIMIT 1",
+                                (workspace_id, runner_id, key_id),
+                            ),
                         )
-                        if deleted.rowcount != 1:
-                            raise RunnerAuthError("runner auth retention state is invalid")
-                        counts["old_keys"] += 1
-                        remaining -= 1
-                        if remaining == 0:
-                            break
+                        return any(
+                            self.conn.execute(statement, parameters).fetchone() is not None
+                            for statement, parameters in probes
+                        )
+
+                    for candidate in candidates[:candidate_budget]:
+                        revoked_at, workspace_id, runner_id, key_id, attempt_count = tuple(candidate)
+                        if key_is_referenced(workspace_id, runner_id, key_id):
+                            delay = min(86_400.0, 60.0 * (1 << min(int(attempt_count), 11)))
+                            rescheduled = self.conn.execute(
+                                "UPDATE canary_runner_key_retirement_queue "
+                                "SET next_attempt_at=?,attempt_count=? "
+                                "WHERE workspace_id=? AND runner_id=? AND key_id=? "
+                                "AND revoked_at=? AND next_attempt_at<=? AND attempt_count=?",
+                                (
+                                    instant + delay, int(attempt_count) + 1,
+                                    workspace_id, runner_id, key_id, revoked_at, instant,
+                                    attempt_count,
+                                ),
+                            )
+                            if rescheduled.rowcount != 1:
+                                raise RunnerAuthError("runner auth retention state is invalid")
+                        else:
+                            deleted = self.conn.execute(
+                                "DELETE FROM canary_runner_keys WHERE revoked_at=? AND workspace_id=? "
+                                "AND runner_id=? AND key_id=? AND status='verification_only'",
+                                (revoked_at, workspace_id, runner_id, key_id),
+                            )
+                            if deleted.rowcount != 1:
+                                raise RunnerAuthError("runner auth retention state is invalid")
+                            counts["old_keys"] += 1
+                    remaining -= min(len(candidates), candidate_budget)
                     has_more = len(candidates) > candidate_budget
             self.conn.commit()
             return RunnerAuthReapResult(**counts, has_more=has_more)

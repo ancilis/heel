@@ -185,7 +185,7 @@ def test_runtime_inode_guard_uses_the_fixed_isolated_stdio_only_bootstrap(tmp_pa
         argv = captured["argv"]
         kwargs = captured["kwargs"]
         assert isinstance(argv, list)
-        assert argv[:6] == [sys.executable, "-I", "-S", "-B", "-c", runtime_module._RUNTIME_INODE_GUARD_BOOTSTRAP]
+        assert argv[:6] == [os.path.realpath(sys.executable, strict=True), "-I", "-S", "-B", "-c", runtime_module._RUNTIME_INODE_GUARD_BOOTSTRAP]
         assert os.path.isabs(argv[0])
         assert "heel" not in runtime_module._RUNTIME_INODE_GUARD_BOOTSTRAP
         assert isinstance(kwargs, dict)
@@ -206,6 +206,72 @@ def test_runtime_inode_guard_uses_the_fixed_isolated_stdio_only_bootstrap(tmp_pa
         if "runtime" in locals():
             runtime.close()
         os.close(sentinel)
+
+
+def test_runtime_inode_guard_rejects_a_group_writable_resolved_interpreter_before_spawn(tmp_path, monkeypatch):
+    signer = Signer()
+    unsafe = tmp_path / "python"
+    unsafe.write_bytes(b"#!not-an-interpreter\n")
+    unsafe.chmod(0o775)
+    spawned = []
+
+    def forbidden(*_args, **_kwargs):
+        spawned.append(True)
+        raise AssertionError("unsafe interpreter reached Popen")
+
+    monkeypatch.setattr(runtime_module.sys, "executable", str(unsafe))
+    monkeypatch.setattr(runtime_module.subprocess, "Popen", forbidden)
+    with pytest.raises(RunnerRuntimeCorrupt, match="runtime state helper is unavailable"):
+        RunnerRuntimeState(tmp_path / "runtime.sqlite3", _identity(signer), signer)
+    assert spawned == []
+
+
+@pytest.mark.parametrize("suffix,fixture", [
+    ("-wal", "symlink"), ("-shm", "hardlink"), ("-journal", "mode"),
+])
+def test_runtime_rejects_an_unsafe_sqlite_sidecar_before_connect(tmp_path, suffix, fixture):
+    signer = Signer()
+    path = tmp_path / "runtime.sqlite3"
+    target = tmp_path / "sidecar-target"
+    target.write_bytes(b"not a wal")
+    target.chmod(0o600)
+    sidecar = tmp_path / f"runtime.sqlite3{suffix}"
+    if fixture == "symlink":
+        sidecar.symlink_to(target)
+    elif fixture == "hardlink":
+        sidecar.hardlink_to(target)
+    else:
+        sidecar.write_bytes(b"not a journal")
+        sidecar.chmod(0o644)
+
+    with pytest.raises(RunnerRuntimeCorrupt, match="runtime SQLite sidecar is unsafe"):
+        RunnerRuntimeState(path, _identity(signer), signer)
+
+
+def test_runtime_rechecks_sqlite_sidecars_after_its_inode_probe(tmp_path, monkeypatch):
+    signer = Signer()
+    path = tmp_path / "runtime.sqlite3"
+    runtime = RunnerRuntimeState(path, _identity(signer), signer)
+    original_probe = runtime._probe_inode_guard
+    target = tmp_path / "sidecar-target"
+    target.write_bytes(b"not a wal")
+    target.chmod(0o600)
+
+    def inject_after_probe():
+        original_probe()
+        wal = tmp_path / "runtime.sqlite3-wal"
+        wal.unlink()
+        wal.symlink_to(target)
+
+    monkeypatch.setattr(runtime, "_probe_inode_guard", inject_after_probe)
+    try:
+        with pytest.raises(RunnerRuntimeCorrupt, match="runtime SQLite sidecar is unsafe"):
+            runtime.load_chain("claim", None)
+    finally:
+        wal = tmp_path / "runtime.sqlite3-wal"
+        if wal.is_symlink():
+            wal.unlink()
+        runtime.close()
 
 
 def test_runtime_poisoned_when_its_inode_guard_exits(tmp_path):
