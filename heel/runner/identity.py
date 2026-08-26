@@ -14,6 +14,7 @@ import subprocess
 import threading
 import unicodedata
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from heel.crypto import ed25519_key_id
@@ -413,7 +414,30 @@ class PendingPairingActivation:
 
     pending: Mapping[str, object]
     request: Mapping[str, object]
+    challenge_expires_at_ms: int | None
     _material: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, repr=False)
+class PendingPairingActivationAbort:
+    """One Store-minted, byte-exact pairing abort request capability."""
+
+    pairing_id: str
+    runner_id: str
+    request: Mapping[str, object]
+    challenge_expires_at_ms: int | None
+    _pending: PendingPairingActivation = field(repr=False, compare=False)
+    _journal_digest: str = field(repr=False, compare=False)
+    _store_token: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # The Store passes a fresh closed dictionary.  Detach it again at this
+        # boundary so neither a transport nor caller can mutate signed bytes.
+        object.__setattr__(self, "request", MappingProxyType(dict(self.request)))
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("pending pairing activation abort cannot be serialized")
 
 
 @dataclass(frozen=True, repr=False)

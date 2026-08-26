@@ -3,6 +3,7 @@ import copy
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 import pickle
 import tempfile
@@ -21,7 +22,7 @@ from heel.runner.identity import (
     create_runner_pairing_material,
 )
 from heel.runner.runtime import RunnerRuntimeState
-from heel.runner.store import RunnerStore
+from heel.runner.store import RunnerStore, RunnerStoreError
 from tests.test_runner_stop import compiled_pair, resign_grant, signed_grant
 
 
@@ -162,6 +163,35 @@ def _accepted_local_rotation(root: Path, *, suffix: str):
         now_ms=21,
     )
     return store, old_identity, old_signer, new_identity, new_signer, prepared, runtime_path
+
+
+def _rotation_abort_messages(pending, *, old_identity, old_signer, new_identity, new_signer):
+    request_core = {
+        "schema_version": "heel.runner-rotation-activation-abort.v1",
+        "workspace_id": old_identity.workspace_id, "runner_id": old_identity.runner_id,
+        "pairing_id": pending.pending["pairing_id"], "old_runner_key_id": old_identity.key_id,
+        "new_runner_key_id": new_identity.key_id,
+        "activation_request_digest": hashlib.sha256(canonical_bytes(pending.request)).hexdigest(),
+        "activation_challenge_digest": hashlib.sha256(b"c" * 32).hexdigest(),
+        "challenge_expires_at_ms": 600_000, "reason_code": "activation_challenge_expired",
+    }
+    request = {
+        **request_core,
+        "old_signature_b64": base64.b64encode(old_signer.sign(
+            b"heel.runner-rotation-activation-abort.v1.old\0" + canonical_bytes(request_core),
+        )).decode(),
+        "new_signature_b64": base64.b64encode(new_signer.sign(
+            b"heel.runner-rotation-activation-abort.v1.new\0" + canonical_bytes(request_core),
+        )).decode(),
+    }
+    return request, {
+        "schema_version": "heel.runner-rotation-activation-aborted.v1",
+        "workspace_id": old_identity.workspace_id, "runner_id": old_identity.runner_id,
+        "pairing_id": pending.pending["pairing_id"], "old_runner_key_id": old_identity.key_id,
+        "new_runner_key_id": new_identity.key_id,
+        "activation_request_digest": request["activation_request_digest"],
+        "status": "expired", "aborted_at_ms": 600_000,
+    }
 
 
 class Transport:
@@ -458,6 +488,79 @@ def test_v3_pairing_journal_installs_the_server_claim_cursor_before_it_is_execut
     assert (tmp_path / "home" / "runner" / "paired-identity.json").is_file()
 
 
+def test_pending_v3_preserves_cloud_challenge_expiry_in_the_signed_prepared_journal(tmp_path):
+    signer = Signer()
+    material = create_runner_pairing_material(
+        display_name="Runner One", runner_version="1.0", adapters={"http": "1.0"},
+        signer=signer, random_source=lambda count: bytes(range(count)),
+    )
+    exchange = material.executable_exchange_request("invitation")
+    pending = {
+        "schema_version": "heel.runner-pairing-pending.v3", "pairing_id": "pending_" + "e" * 32,
+        "runner_id": "runr_" + "e" * 32, "fingerprint": material.fingerprint, "status": "pending",
+        "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+        "control_protocol": "heel.runner-control.v2",
+        "pairing_exchange_digest": hashlib.sha256(canonical_bytes(exchange)).hexdigest(),
+        "challenge_expires_at_ms": 600_000,
+    }
+    root = tmp_path / "home"
+    activation = material.prepare_executable_activation(
+        pending, store=RunnerStore(root), now_ms=10, random_source=lambda count: b"n" * count,
+    )
+    assert activation.challenge_expires_at_ms == 600_000
+    journal = json.loads((root / "runner" / "pairing-activation.json").read_text())
+    assert journal["schema_version"] == "heel.runner-pairing-activation-journal.v2"
+    assert journal["challenge_expires_at_ms"] == 600_000
+    assert journal["challenge_expiry_source"] == "exchange"
+    recovered = RunnerStore(root).recover_pairing_activation(
+        material, runtime_path=root / "runner" / "runtime.sqlite3",
+    )
+    assert recovered is not None and recovered.challenge_expires_at_ms == 600_000
+
+
+def test_recovery_upgrades_a_signed_v1_pairing_journal_without_changing_its_activation(tmp_path):
+    signer = Signer()
+    material = create_runner_pairing_material(
+        display_name="Runner One", runner_version="1.0", adapters={"http": "1.0"},
+        signer=signer, random_source=lambda count: bytes(range(count)),
+    )
+    exchange = material.executable_exchange_request("invitation")
+    pending = {
+        "schema_version": "heel.runner-pairing-pending.v2", "pairing_id": "pending_" + "f" * 32,
+        "runner_id": "runr_" + "f" * 32, "fingerprint": material.fingerprint, "status": "pending",
+        "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+        "control_protocol": "heel.runner-control.v2",
+        "pairing_exchange_digest": hashlib.sha256(canonical_bytes(exchange)).hexdigest(),
+    }
+    root = tmp_path / "home"
+    store = RunnerStore(root)
+    activation = material.prepare_executable_activation(
+        pending, store=store, now_ms=10, random_source=lambda count: b"n" * count,
+    )
+    path = root / "runner" / "pairing-activation.json"
+    v2 = json.loads(path.read_text())
+    v1_core = {
+        key: value for key, value in v2.items()
+        if key not in {"journal_digest", "signing_key_id", "signature_b64", "challenge_expires_at_ms", "challenge_expiry_source"}
+    }
+    v1_core["schema_version"] = "heel.runner-pairing-activation-journal.v1"
+    v1 = RunnerStore._pairing_signed_value(
+        v1_core, signer=signer, domain=b"heel.runner-pairing-activation-journal.v1\0",
+        digest_field="journal_digest",
+    )
+    path.write_bytes(canonical_bytes(v1))
+    recovered = RunnerStore(root).recover_pairing_activation(
+        material, runtime_path=root / "runner" / "runtime.sqlite3",
+    )
+    assert recovered is not None
+    assert recovered.request == activation.request
+    upgraded = json.loads(path.read_text())
+    assert upgraded["schema_version"] == "heel.runner-pairing-activation-journal.v2"
+    assert upgraded["challenge_expires_at_ms"] is None
+    assert upgraded["challenge_expiry_source"] == "unknown_legacy"
+    assert upgraded["created_at_ms"] == v1["created_at_ms"] == upgraded["updated_at_ms"]
+
+
 def test_v3_accepted_pairing_journal_recovers_the_cursor_without_reissuing_activation(tmp_path):
     signer = Signer()
     material = create_runner_pairing_material(
@@ -516,22 +619,22 @@ def test_pairing_activation_abort_writes_a_signed_tombstone_before_releasing_pre
     activation = material.prepare_executable_activation(
         pending, store=store, now_ms=10, random_source=lambda count: b"n" * count,
     )
-    abort_request = {
-        "schema_version": "heel.runner-pairing-activation-abort.v1",
-        "pairing_id": pending["pairing_id"], "runner_id": pending["runner_id"],
-        "pairing_exchange_digest": pending["pairing_exchange_digest"],
-        "activation_request_digest": hashlib.sha256(canonical_bytes(activation.request)).hexdigest(),
-        "challenge_expires_at_ms": 600_000, "reason_code": "activation_challenge_expired",
-    }
-    abort_request["signature_b64"] = base64.b64encode(signer.sign(
-        b"heel.runner-pairing-activation-abort.v1\0" + canonical_bytes(abort_request),
-    )).decode()
+    prepared_abort = store.prepare_pairing_activation_abort(activation, now_ms=600_000)
+    abort_request = prepared_abort.request
+    assert abort_request["schema_version"] == "heel.runner-pairing-activation-abort.v2"
+    assert "challenge_expires_at_ms" not in abort_request
     abort_response = {
-        "schema_version": "heel.runner-pairing-activation-aborted.v1", "workspace_id": "ws",
+        "schema_version": "heel.runner-pairing-activation-aborted.v2", "workspace_id": "ws",
         "runner_id": pending["runner_id"], "pairing_id": pending["pairing_id"],
         "activation_request_digest": abort_request["activation_request_digest"],
+        "activation_challenge_digest": abort_request["activation_challenge_digest"],
+        "challenge_expires_at_ms": 600_000,
         "status": "expired", "aborted_at_ms": 600_000,
     }
+    with pytest.raises(TypeError, match="cannot be serialized"):
+        pickle.dumps(prepared_abort)
+    with pytest.raises(RunnerStoreError):
+        store.complete_pairing_activation_abort(activation, abort_response)
     original_unlink = __import__("os").unlink
     def interrupted_unlink(name, *args, **kwargs):
         if name == "pairing-activation.json":
@@ -539,15 +642,54 @@ def test_pairing_activation_abort_writes_a_signed_tombstone_before_releasing_pre
         return original_unlink(name, *args, **kwargs)
     monkeypatch.setattr("heel.runner.store.os.unlink", interrupted_unlink)
     with pytest.raises(OSError, match="injected journal unlink"):
-        store.complete_pairing_activation_abort(activation, abort_request, abort_response)
+        store.complete_pairing_activation_abort(prepared_abort, abort_response)
     monkeypatch.setattr("heel.runner.store.os.unlink", original_unlink)
     filename = "pairing-" + hashlib.sha256(pending["pairing_id"].encode()).hexdigest() + ".json"
     assert (root / "runner" / "activation-tombstones" / filename).is_file()
+    retention = "retention-pairing-" + hashlib.sha256(pending["pairing_id"].encode()).hexdigest() + ".json"
+    assert (root / "runner" / "activation-tombstones" / retention).is_file()
     assert (root / "runner" / "pairing-activation.json").is_file()
     assert RunnerStore(root).recover_pairing_activation(
         material, runtime_path=root / "runner" / "runtime.sqlite3",
     ) is None
     assert not (root / "runner" / "pairing-activation.json").exists()
+
+
+def test_legacy_pairing_abort_persists_a_cloud_deferred_deadline_without_changing_request(tmp_path):
+    signer = Signer()
+    material = create_runner_pairing_material(
+        display_name="Runner One", runner_version="1.0", adapters={"http": "1.0"},
+        signer=signer, random_source=lambda count: bytes(range(count)),
+    )
+    exchange = material.executable_exchange_request("invitation")
+    pending = {
+        "schema_version": "heel.runner-pairing-pending.v2", "pairing_id": "pending_" + "g" * 32,
+        "runner_id": "runr_" + "g" * 32, "fingerprint": material.fingerprint, "status": "pending",
+        "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+        "control_protocol": "heel.runner-control.v2",
+        "pairing_exchange_digest": hashlib.sha256(canonical_bytes(exchange)).hexdigest(),
+    }
+    store = RunnerStore(tmp_path / "home")
+    activation = material.prepare_executable_activation(
+        pending, store=store, now_ms=10, random_source=lambda count: b"n" * count,
+    )
+    prepared = store.prepare_pairing_activation_abort(activation, now_ms=10)
+    deferred = {
+        "schema_version": "heel.runner-pairing-activation-abort-deferred.v1",
+        "code": "runner_activation_challenge_live", "pairing_id": pending["pairing_id"],
+        "runner_id": pending["runner_id"],
+        "pairing_exchange_digest": pending["pairing_exchange_digest"],
+        "activation_challenge_digest": prepared.request["activation_challenge_digest"],
+        "challenge_expires_at_ms": 600_000, "server_time_ms": 10,
+        "retry_after_ms": 599_990,
+    }
+    rescheduled = store.record_pairing_activation_abort_deferred(prepared, deferred, now_ms=11)
+    assert rescheduled.challenge_expires_at_ms == 600_000
+    assert rescheduled.request == prepared.request
+    recovered = RunnerStore(tmp_path / "home").recover_pairing_activation_abort(material)
+    assert recovered is not None
+    assert recovered.request == prepared.request
+    assert recovered.challenge_expires_at_ms == 600_000
 
 
 def test_rotation_activation_abort_clears_the_exact_runtime_fence_before_journal_release(tmp_path, monkeypatch):
@@ -613,6 +755,8 @@ def test_rotation_activation_abort_clears_the_exact_runtime_fence_before_journal
     assert runtime.rotation_fence_snapshot()[2] is None
     filename = "rotation-" + hashlib.sha256(pending.pending["pairing_id"].encode()).hexdigest() + ".json"
     assert (root / "runner" / "activation-tombstones" / filename).is_file()
+    retention = "retention-rotation-" + hashlib.sha256(pending.pending["pairing_id"].encode()).hexdigest() + ".json"
+    assert (root / "runner" / "activation-tombstones" / retention).is_file()
     assert (root / "runner" / "rotation-activation.json").is_file()
     assert RunnerStore(root).recover_rotation_activation(
         old_identity=old_identity, old_signer=old_signer,
@@ -621,6 +765,13 @@ def test_rotation_activation_abort_clears_the_exact_runtime_fence_before_journal
     ) is None
     assert not (root / "runner" / "rotation-activation.json").exists()
     assert RunnerRuntimeState(root / "runner" / "runtime.sqlite3", old_identity, old_signer).rotation_fence_snapshot()[2] is None
+    assert store.prune_activation_tombstones(
+        now_ms=600_000 + 2_592_000_000 - 1,
+    ).pruned == 0
+    pruned = store.prune_activation_tombstones(now_ms=600_000 + 2_592_000_000)
+    assert pruned.pruned == 1 and pruned.has_more is False
+    assert not (root / "runner" / "activation-tombstones" / filename).exists()
+    assert not (root / "runner" / "activation-tombstones" / retention).exists()
 
 
 def test_v3_prepared_pairing_recovery_binds_the_signed_runner_before_accepting_response(tmp_path):
@@ -703,12 +854,16 @@ def test_v3_prepared_pairing_recovery_rejects_a_tampered_signed_runner_id(tmp_pa
 
 
 def test_local_rotation_journal_is_dual_signed_and_never_serializes_the_new_signer(tmp_path):
+    root = tmp_path / "home"
     old_signer = RotationSigner(b"o" * 32)
     new_signer = RotationSigner(b"n" * 32)
-    old_identity = _rotation_identity(old_signer, version="1")
-    new_identity = _rotation_identity(new_signer, version="2")
-    store = RunnerStore(tmp_path / "home")
-    runtime = _rotation_runtime(tmp_path / "home", old_identity, old_signer)
+    store, old_identity, runtime, _runtime_path = _complete_v3_pairing(root, old_signer, suffix="a")
+    new_identity = RunnerIdentity(
+        runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
+        adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
+        fingerprint=hashlib.sha256(new_signer.public_key).hexdigest(), key_id=new_signer.key_id,
+        pairing_phrase=old_identity.pairing_phrase,
+    )
     pending = {
         "schema_version": "heel.runner-rotation-activation-challenge.v1",
         "pairing_id": "rotate_" + "a" * 32,
@@ -721,7 +876,7 @@ def test_local_rotation_journal_is_dual_signed_and_never_serializes_the_new_sign
         new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=10,
     )
 
-    journal_path = tmp_path / "home" / "runner" / "rotation-activation.json"
+    journal_path = root / "runner" / "rotation-activation.json"
     journal = json.loads(journal_path.read_text())
     assert set(journal) == {
         "schema_version", "state", "pairing_id", "old_identity", "new_identity",
@@ -743,7 +898,8 @@ def test_local_rotation_journal_is_dual_signed_and_never_serializes_the_new_sign
         prepared,
         {
             "schema_version": "heel.runner-rotation-activated.v2", "workspace_id": "ws",
-            "runner_id": "runner", "initial_claim_nonce": base64.b64encode(b"r" * 32).decode(),
+            "runner_id": old_identity.runner_id,
+            "initial_claim_nonce": base64.b64encode(b"r" * 32).decode(),
             "initial_claim_sequence": 2, "initial_claim_generation": 1,
         },
         now_ms=11,
@@ -789,13 +945,211 @@ def test_rotation_preparation_rejects_a_retained_terminal_before_journaling_or_s
     assert not (root / "runner" / "rotation-activation.json").exists()
 
 
-def test_local_rotation_journal_rejects_a_tampered_signer_label_without_accepting(tmp_path):
+def test_rotation_rejects_any_context_history_before_request_signing_or_journaling(tmp_path, monkeypatch):
+    """Rotation cannot invalidate a local context that has no rekey protocol."""
+    root = tmp_path / "home"
     old_signer = RotationSigner(b"o" * 32)
     new_signer = RotationSigner(b"n" * 32)
-    old_identity = _rotation_identity(old_signer, version="1")
-    new_identity = _rotation_identity(new_signer, version="2")
-    store = RunnerStore(tmp_path / "home")
-    runtime = _rotation_runtime(tmp_path / "home", old_identity, old_signer)
+    store, old_identity, runtime, _runtime_path = _complete_v3_pairing(root, old_signer, suffix="z")
+    new_identity = RunnerIdentity(
+        runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
+        adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
+        fingerprint=hashlib.sha256(new_signer.public_key).hexdigest(), key_id=new_signer.key_id,
+        pairing_phrase=old_identity.pairing_phrase,
+    )
+    contexts = root / "runner" / "contexts"
+    contexts.mkdir(mode=0o700)
+    os.mkdir(contexts / "orphan", 0o700)
+
+    signed: list[bytes] = []
+    original_sign = new_signer.sign
+
+    def record_sign(payload: bytes) -> bytes:
+        signed.append(payload)
+        return original_sign(payload)
+
+    import heel.runner.store as store_module
+    real_read_json = store_module._read_json
+
+    def forbid_context_checkpoint(directory_fd, filename, default):
+        if filename == "run-authority-checkpoint.json":
+            raise AssertionError("rotation must not inspect context authority history")
+        return real_read_json(directory_fd, filename, default)
+
+    new_signer.sign = record_sign  # type: ignore[method-assign]
+    monkeypatch.setattr(store_module, "_read_json", forbid_context_checkpoint)
+    with pytest.raises(RunnerStoreError, match="runner rotation requires re-pairing"):
+        store.prepare_rotation_activation(
+            {
+                "schema_version": "heel.runner-rotation-activation-challenge.v1",
+                "pairing_id": "rotate_" + "z" * 32,
+                "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+            },
+            old_identity=old_identity, old_signer=old_signer,
+            new_identity=new_identity, new_signer=new_signer,
+            new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=20,
+        )
+
+    assert signed == []
+    assert not (root / "runner" / "rotation-activation.json").exists()
+
+
+def test_rotation_recovery_rejects_context_injected_after_prepare_without_mutation(tmp_path):
+    root = tmp_path / "home"
+    old_signer = RotationSigner(b"o" * 32)
+    new_signer = RotationSigner(b"n" * 32)
+    store, old_identity, runtime, runtime_path = _complete_v3_pairing(root, old_signer, suffix="j")
+    new_identity = RunnerIdentity(
+        runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
+        adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
+        fingerprint=hashlib.sha256(new_signer.public_key).hexdigest(), key_id=new_signer.key_id,
+        pairing_phrase=old_identity.pairing_phrase,
+    )
+    prepared = store.prepare_rotation_activation(
+        {
+            "schema_version": "heel.runner-rotation-activation-challenge.v1",
+            "pairing_id": "rotate_" + "j" * 32,
+            "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+        },
+        old_identity=old_identity, old_signer=old_signer,
+        new_identity=new_identity, new_signer=new_signer,
+        new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=20,
+    )
+    journal_path = root / "runner" / "rotation-activation.json"
+    journal_before = journal_path.read_bytes()
+    contexts = root / "runner" / "contexts"
+    contexts.mkdir(mode=0o700)
+    os.mkdir(contexts / "injected", 0o700)
+    provider = RotationSignerProvider({"heel-rotation-key-2": new_signer})
+
+    with pytest.raises(RunnerStoreError, match="runner rotation requires re-pairing"):
+        RunnerStore(root).recover_rotation_activation(
+            old_identity=old_identity, old_signer=old_signer, signer_provider=provider,
+            runtime_path=runtime_path,
+        )
+
+    assert provider.loaded == []
+    assert journal_path.read_bytes() == journal_before
+    assert runtime.rotation_fence_snapshot()[2] == prepared._eligibility.runtime_rotation_intent_digest
+
+
+def test_rotation_finish_rejects_context_injected_after_accept_without_rekeying(tmp_path):
+    root = tmp_path / "home"
+    store, old_identity, old_signer, new_identity, _new_signer, prepared, runtime_path = (
+        _accepted_local_rotation(root, suffix="k")
+    )
+    runtime = RunnerRuntimeState(runtime_path, old_identity, old_signer, _allow_rotation_recovery=True)
+    paired_path = root / "runner" / "paired-identity.json"
+    paired_before = paired_path.read_bytes()
+    journal_path = root / "runner" / "rotation-activation.json"
+    journal_before = journal_path.read_bytes()
+    contexts = root / "runner" / "contexts"
+    contexts.mkdir(mode=0o700)
+    os.mkdir(contexts / "injected", 0o700)
+
+    with pytest.raises(RunnerStoreError, match="runner rotation requires re-pairing"):
+        store.finish_rotation_activation(prepared, runtime)
+
+    assert runtime.identity == old_identity and runtime.identity != new_identity
+    assert paired_path.read_bytes() == paired_before
+    assert journal_path.read_bytes() == journal_before
+
+
+def test_rotation_accept_rejects_context_injected_after_prepare_without_mutation(tmp_path):
+    root = tmp_path / "home"
+    old_signer = RotationSigner(b"o" * 32)
+    new_signer = RotationSigner(b"n" * 32)
+    store, old_identity, runtime, _runtime_path = _complete_v3_pairing(root, old_signer, suffix="l")
+    new_identity = RunnerIdentity(
+        runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
+        adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
+        fingerprint=hashlib.sha256(new_signer.public_key).hexdigest(), key_id=new_signer.key_id,
+        pairing_phrase=old_identity.pairing_phrase,
+    )
+    prepared = store.prepare_rotation_activation(
+        {
+            "schema_version": "heel.runner-rotation-activation-challenge.v1",
+            "pairing_id": "rotate_" + "l" * 32,
+            "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+        },
+        old_identity=old_identity, old_signer=old_signer,
+        new_identity=new_identity, new_signer=new_signer,
+        new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=20,
+    )
+    journal_path = root / "runner" / "rotation-activation.json"
+    journal_before = journal_path.read_bytes()
+    contexts = root / "runner" / "contexts"
+    contexts.mkdir(mode=0o700)
+    os.mkdir(contexts / "injected", 0o700)
+
+    with pytest.raises(RunnerStoreError, match="runner rotation requires re-pairing"):
+        store.accept_rotation_activation(
+            prepared,
+            {
+                "schema_version": "heel.runner-rotation-activated.v2", "workspace_id": "ws",
+                "runner_id": old_identity.runner_id,
+                "initial_claim_nonce": base64.b64encode(b"r" * 32).decode(),
+                "initial_claim_sequence": 2, "initial_claim_generation": 1,
+            },
+            now_ms=21,
+        )
+
+    assert journal_path.read_bytes() == journal_before
+    assert runtime.rotation_fence_snapshot()[2] == prepared._eligibility.runtime_rotation_intent_digest
+
+
+def test_rotation_abort_rejects_context_injected_after_prepare_without_fence_clear(tmp_path):
+    root = tmp_path / "home"
+    old_signer = RotationSigner(b"o" * 32)
+    new_signer = RotationSigner(b"n" * 32)
+    store, old_identity, runtime, _runtime_path = _complete_v3_pairing(root, old_signer, suffix="m")
+    new_identity = RunnerIdentity(
+        runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
+        adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
+        fingerprint=hashlib.sha256(new_signer.public_key).hexdigest(), key_id=new_signer.key_id,
+        pairing_phrase=old_identity.pairing_phrase,
+    )
+    prepared = store.prepare_rotation_activation(
+        {
+            "schema_version": "heel.runner-rotation-activation-challenge.v1",
+            "pairing_id": "rotate_" + "m" * 32,
+            "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+        },
+        old_identity=old_identity, old_signer=old_signer,
+        new_identity=new_identity, new_signer=new_signer,
+        new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=20,
+    )
+    abort_request, abort_response = _rotation_abort_messages(
+        prepared, old_identity=old_identity, old_signer=old_signer,
+        new_identity=new_identity, new_signer=new_signer,
+    )
+    journal_path = root / "runner" / "rotation-activation.json"
+    journal_before = journal_path.read_bytes()
+    contexts = root / "runner" / "contexts"
+    contexts.mkdir(mode=0o700)
+    os.mkdir(contexts / "injected", 0o700)
+
+    with pytest.raises(RunnerStoreError, match="runner rotation requires re-pairing"):
+        store.complete_rotation_activation_abort(
+            prepared, abort_request, abort_response, runtime_state=runtime,
+        )
+
+    assert journal_path.read_bytes() == journal_before
+    assert runtime.rotation_fence_snapshot()[2] == prepared._eligibility.runtime_rotation_intent_digest
+    assert not (root / "runner" / "activation-tombstones").exists()
+
+
+def test_local_rotation_journal_rejects_a_tampered_signer_label_without_accepting(tmp_path):
+    root = tmp_path / "home"
+    old_signer = RotationSigner(b"o" * 32)
+    new_signer = RotationSigner(b"n" * 32)
+    store, old_identity, runtime, _runtime_path = _complete_v3_pairing(root, old_signer, suffix="b")
+    new_identity = RunnerIdentity(
+        runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
+        adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
+        fingerprint=hashlib.sha256(new_signer.public_key).hexdigest(), key_id=new_signer.key_id,
+        pairing_phrase=old_identity.pairing_phrase,
+    )
     pending = {
         "schema_version": "heel.runner-rotation-activation-challenge.v1",
         "pairing_id": "rotate_" + "b" * 32,
@@ -806,7 +1160,7 @@ def test_local_rotation_journal_rejects_a_tampered_signer_label_without_acceptin
         new_identity=new_identity, new_signer=new_signer,
         new_signer_label="heel-rotation-key-2", runtime_state=runtime, now_ms=10,
     )
-    journal_path = tmp_path / "home" / "runner" / "rotation-activation.json"
+    journal_path = root / "runner" / "rotation-activation.json"
     journal = json.loads(journal_path.read_text())
     journal["new_signer_label"] = "heel-rotation-key-tampered"
     journal_path.write_text(json.dumps(journal, separators=(",", ":")))
@@ -815,8 +1169,9 @@ def test_local_rotation_journal_rejects_a_tampered_signer_label_without_acceptin
         store.accept_rotation_activation(
             prepared,
             {
-                "schema_version": "heel.runner-rotation-activated.v2", "workspace_id": "ws",
-                "runner_id": "runner", "initial_claim_nonce": base64.b64encode(b"r" * 32).decode(),
+            "schema_version": "heel.runner-rotation-activated.v2", "workspace_id": "ws",
+            "runner_id": old_identity.runner_id,
+            "initial_claim_nonce": base64.b64encode(b"r" * 32).decode(),
                 "initial_claim_sequence": 2, "initial_claim_generation": 1,
             },
             now_ms=11,
@@ -873,14 +1228,39 @@ def test_accepted_rotation_recovery_loads_the_named_signer_then_finishes_before_
     assert cursor is not None and (cursor.next_sequence, cursor.generation) == (2, 1)
 
 
+def test_rotation_retires_the_old_pending_result_verifier_and_rebinds_the_new_runtime(tmp_path):
+    store, old_identity, old_signer, new_identity, new_signer, prepared, runtime_path = (
+        _accepted_local_rotation(tmp_path / "home", suffix="h")
+    )
+    runtime = RunnerRuntimeState(
+        runtime_path, old_identity, old_signer,
+        _allow_rotation_recovery=True,
+    )
+    old_verifier = store.pending_result_replay_verifier(runtime)
+
+    assert store.finish_rotation_activation(prepared, runtime) == new_identity
+    assert old_verifier._retired is True
+    with pytest.raises(RunnerStoreError, match="pending terminal replay authority is unavailable"):
+        old_verifier.authorize_pending_result_replay(object(), now_ms=22)
+
+    rebound = store.pending_result_replay_verifier(runtime)
+    assert rebound is not old_verifier
+    assert rebound._identity == new_identity
+    assert rebound._runtime is runtime and runtime.identity == new_identity
+
+
 def test_prepared_rotation_recovery_never_creates_a_missing_named_signer(tmp_path):
     old_signer = RotationSigner(b"o" * 32)
     new_signer = RotationSigner(b"n" * 32)
-    old_identity = _rotation_identity(old_signer, version="1")
-    new_identity = _rotation_identity(new_signer, version="2")
     root = tmp_path / "home"
-    runtime = _rotation_runtime(root, old_identity, old_signer)
-    RunnerStore(root).prepare_rotation_activation(
+    store, old_identity, runtime, _runtime_path = _complete_v3_pairing(root, old_signer, suffix="d")
+    new_identity = RunnerIdentity(
+        runner_id=old_identity.runner_id, workspace_id=old_identity.workspace_id, runner_version="2",
+        adapter_versions={"http": "1"}, public_key_b64=base64.b64encode(new_signer.public_key).decode(),
+        fingerprint=hashlib.sha256(new_signer.public_key).hexdigest(), key_id=new_signer.key_id,
+        pairing_phrase=old_identity.pairing_phrase,
+    )
+    store.prepare_rotation_activation(
         {
             "schema_version": "heel.runner-rotation-activation-challenge.v1",
             "pairing_id": "rotate_" + "d" * 32,
@@ -1044,9 +1424,9 @@ def test_named_run_control_requires_an_authenticated_active_claim_before_transpo
     public = {name for name, method in vars(RunnerControlClient).items() if callable(method) and not name.startswith("_")}
     assert public == {"claim", "heartbeat", "progress", "result", "stop_ack",
                       "start_resync", "complete_resync", "install_rotation_claim",
-                      "upload_findings", "list_contexts", "claim_context",
-                      "submit_context_approval_projection", "replay_pending_call",
-                      "replay_all_pending"}
+                          "upload_findings", "list_contexts", "claim_context",
+                          "submit_context_approval_projection", "replay_pending_call",
+                          "replay_all_pending", "stage_recovered_result"}
     assert all(parameter.kind is not inspect.Parameter.VAR_KEYWORD for method in (
         RunnerControlClient.claim, RunnerControlClient.heartbeat, RunnerControlClient.progress,
         RunnerControlClient.result, RunnerControlClient.stop_ack,

@@ -361,10 +361,72 @@ class RunnerService:
     def serve(self, stop_event: threading.Event) -> None:
         if not isinstance(stop_event, threading.Event):
             raise ValueError("runner service stop event is required")
-        while not stop_event.is_set():
-            claimed = self.run_once()
-            if not claimed:
-                stop_event.wait(self.idle_poll_interval)
+        maintenance_once = getattr(self.coordinator, "maintenance_once", None)
+        maintenance_failure: list[BaseException] = []
+        maintenance_failure_lock = threading.Lock()
+        maintenance_worker: threading.Thread | None = None
+
+        if callable(maintenance_once):
+            def maintain() -> None:
+                # The constructor's bounded recovery has already completed.
+                # One maintenance call is one capped batch; this worker only
+                # decides the next Event-based wakeup interval.
+                delay = 60.0
+                while not stop_event.wait(delay):
+                    try:
+                        result = maintenance_once(limit=16)
+                        processed = getattr(result, "processed", None)
+                        has_more = getattr(result, "has_more", None)
+                        if (
+                            type(processed) is not int
+                            or not 0 <= processed <= 16
+                            or type(has_more) is not bool
+                        ):
+                            raise ValueError("runner maintenance result is invalid")
+                        delay = 1.0 if has_more else 60.0
+                    except BaseException as exc:
+                        with maintenance_failure_lock:
+                            if not maintenance_failure:
+                                maintenance_failure.append(exc)
+                        # A bounded local stop is the only safe way to wake a
+                        # currently executing target.  Setting the service
+                        # event also prevents the main loop from beginning a
+                        # subsequent claim before it observes this failure.
+                        self.request_local_stop()
+                        stop_event.set()
+                        return
+
+            maintenance_worker = threading.Thread(
+                target=maintain, daemon=True, name="heel-runner-maintenance",
+            )
+            maintenance_worker.start()
+
+        try:
+            while not stop_event.is_set():
+                with maintenance_failure_lock:
+                    failed = bool(maintenance_failure)
+                if failed:
+                    break
+                claimed = self.run_once()
+                with maintenance_failure_lock:
+                    failed = bool(maintenance_failure)
+                if failed:
+                    break
+                if not claimed:
+                    stop_event.wait(self.idle_poll_interval)
+        finally:
+            # A normal caller stop has already set the event.  An exceptional
+            # exit from run_once must also release the worker promptly; all
+            # worker waits are Event waits, never uninterruptible sleeps.
+            stop_event.set()
+            if maintenance_worker is not None:
+                maintenance_worker.join(5.1)
+        if maintenance_worker is not None and maintenance_worker.is_alive():
+            raise RuntimeError("runner maintenance worker did not stop")
+        with maintenance_failure_lock:
+            failure = maintenance_failure[0] if maintenance_failure else None
+        if failure is not None:
+            raise RuntimeError("runner maintenance failed closed") from failure
 
 
 __all__ = ["ClaimLease", "Coordinator", "LeaseExecutor", "RunnerService"]

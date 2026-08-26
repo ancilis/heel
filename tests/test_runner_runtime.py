@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+import gc
 import hashlib
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -20,6 +23,7 @@ from heel.canary_contracts import canonical_bytes
 from heel.crypto import SigningAuthority, ed25519_key_id
 from heel.runner.catalog import CATALOG_IDS
 from heel.runner.identity import AcceptedRotationJournal, RunnerIdentity, SecureSigner, runner_phrase_words
+import heel.runner.runtime as runtime_module
 from heel.runner.runtime import (
     ActiveRunInstall,
     RunnerRuntimeConflict,
@@ -120,6 +124,117 @@ def test_runtime_refuses_a_direct_database_symlink_before_sqlite_opens_it(tmp_pa
         RunnerRuntimeState(path, _identity(signer), signer)
 
     assert target.read_bytes() == b"not a runtime database"
+
+
+def test_runtime_rejects_a_database_swapped_only_while_sqlite_connects(tmp_path, monkeypatch):
+    """Path checks alone cannot prove which inode SQLite opened."""
+    signer = Signer()
+    identity = _identity(signer)
+    path = tmp_path / "runtime.sqlite3"
+    alternate = tmp_path / "alternate.sqlite3"
+    original_path = tmp_path / "original.sqlite3"
+    original_runtime = RunnerRuntimeState(path, identity, signer)
+    alternate_runtime = RunnerRuntimeState(alternate, identity, signer)
+    del original_runtime, alternate_runtime
+    gc.collect()
+
+    original_connect = runtime_module.sqlite3.connect
+    swapped = False
+
+    def connect_with_transient_swap(database, *args, **kwargs):
+        nonlocal swapped
+        if database == str(path) and not swapped:
+            swapped = True
+            os.replace(path, original_path)
+            os.replace(alternate, path)
+            try:
+                return original_connect(database, *args, **kwargs)
+            finally:
+                os.replace(path, alternate)
+                os.replace(original_path, path)
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_module.sqlite3, "connect", connect_with_transient_swap)
+
+    with pytest.raises(RunnerRuntimeCorrupt, match="runtime state is unsafe"):
+        RunnerRuntimeState(path, identity, signer)
+
+    assert swapped
+
+
+def test_runtime_inode_guard_uses_the_fixed_isolated_stdio_only_bootstrap(tmp_path, monkeypatch):
+    signer = Signer()
+    identity = _identity(signer)
+    sentinel = os.open(tmp_path / "unpassed-sentinel", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    captured: dict[str, object] = {}
+    original_popen = runtime_module.subprocess.Popen
+
+    def checked_popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return original_popen(argv, **kwargs)
+
+    monkeypatch.setattr(runtime_module.subprocess, "Popen", checked_popen)
+    monkeypatch.setenv("PYTHONPATH", "/hostile/pythonpath")
+    monkeypatch.setenv("PYTHONHOME", "/hostile/pythonhome")
+    monkeypatch.setenv("PYTHONSTARTUP", "/hostile/startup")
+    monkeypatch.setenv("VIRTUAL_ENV", "/hostile/venv")
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", "/hostile/dylib")
+    try:
+        runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+        argv = captured["argv"]
+        kwargs = captured["kwargs"]
+        assert isinstance(argv, list)
+        assert argv[:6] == [sys.executable, "-I", "-S", "-B", "-c", runtime_module._RUNTIME_INODE_GUARD_BOOTSTRAP]
+        assert os.path.isabs(argv[0])
+        assert "heel" not in runtime_module._RUNTIME_INODE_GUARD_BOOTSTRAP
+        assert isinstance(kwargs, dict)
+        assert kwargs["cwd"] == "/"
+        assert kwargs["env"] == {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"}
+        assert kwargs["stdin"] is runtime_module.subprocess.DEVNULL
+        assert kwargs["stdout"] is runtime_module.subprocess.DEVNULL
+        assert kwargs["stderr"] is runtime_module.subprocess.DEVNULL
+        assert kwargs["close_fds"] is True
+        assert kwargs["start_new_session"] is True
+        assert kwargs["restore_signals"] is True
+        assert "shell" not in kwargs and "executable" not in kwargs
+        assert isinstance(kwargs["pass_fds"], tuple)
+        assert len(kwargs["pass_fds"]) == 2
+        assert runtime._leaf_fd in kwargs["pass_fds"]
+        assert sentinel not in kwargs["pass_fds"]
+    finally:
+        if "runtime" in locals():
+            runtime.close()
+        os.close(sentinel)
+
+
+def test_runtime_poisoned_when_its_inode_guard_exits(tmp_path):
+    signer = Signer()
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", _identity(signer), signer)
+    process = runtime._inode_guard_process
+    assert process is not None
+    process.terminate()
+    process.wait(timeout=1)
+
+    with pytest.raises(RunnerRuntimeCorrupt, match="runtime state helper is unavailable"):
+        runtime.load_chain("claim", None)
+    with pytest.raises(RunnerRuntimeCorrupt, match="requires reconstruction"):
+        runtime.load_chain("claim", None)
+
+
+def test_runtime_close_shuts_down_its_inode_guard(tmp_path):
+    signer = Signer()
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", _identity(signer), signer)
+    process = runtime._inode_guard_process
+    assert process is not None
+
+    runtime.close()
+
+    assert process.poll() is not None
+    assert runtime._inode_guard_process is None
+    assert runtime._inode_guard_control is None
+    with pytest.raises(RunnerRuntimeCorrupt, match="requires reconstruction"):
+        runtime.load_chain("claim", None)
 
 
 def _identity(signer: Signer) -> RunnerIdentity:
@@ -284,6 +399,7 @@ def test_active_hydration_rejects_orphaned_or_nonexact_cursor_groups(tmp_path, t
                 "VALUES(?,?,?,?,?,?,?)",
                 ("a" * 64, run_hash, "heartbeat", 1, 0, original[0], original[1]),
             )
+    conn.close()
 
     with pytest.raises(RunnerRuntimeCorrupt, match="active run cursor group"):
         runtime.load_active_run_controls()
@@ -325,6 +441,7 @@ def test_active_hydration_rejects_an_available_terminal_that_coexists_with_live_
             "UPDATE terminal_disclosures SET state=?,sealed_blob=?,updated_at_ms=? WHERE run_hash=?",
             (available.state, blob, 11, local.run_hash),
         )
+    conn.close()
 
     with pytest.raises(RunnerRuntimeCorrupt, match="active run terminal state is invalid"):
         runtime.load_active_run_controls()
@@ -417,6 +534,7 @@ def test_runtime_upgrades_v1_metadata_without_rewriting_existing_sealed_rows(tmp
     with sqlite3.connect(path) as check:
         assert check.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v3"
         assert check.execute("SELECT sealed_blob FROM control_chains WHERE chain=?", (chain,)).fetchone()[0] == sealed
+    check.close()
 
 
 def test_runtime_finish_rotation_rewraps_the_stable_key_and_replaces_only_claim_cursor(tmp_path):
@@ -514,6 +632,72 @@ def test_stale_pre_rotation_runtime_cannot_write_after_another_instance_rotates(
 
     reopened = RunnerRuntimeState(path, new_identity, new_signer)
     assert reopened.load_terminal_state("crun_" + "d" * 32) is None
+
+
+def test_stale_runtime_cannot_write_while_rotation_holds_the_inode_lock(tmp_path):
+    old_signer = Signer(b"r" * 32)
+    new_signer = Signer(b"s" * 32)
+    old_identity = _identity(old_signer)
+    new_identity = _identity(new_signer)
+    path = tmp_path / "runtime.sqlite3"
+    rotating = RunnerRuntimeState(path, old_identity, old_signer)
+    rotating.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=base64.b64encode(b"o" * 32).decode("ascii"),
+        next_sequence=5, generation=0, now_ms=1,
+    )
+    stale = RunnerRuntimeState(path, old_identity, old_signer)
+    probe = rotating.probe_rotation_eligible(old_identity=old_identity)
+    eligibility = rotating.assert_rotation_eligible(
+        old_identity=old_identity, prepared_journal_digest="d" * 64,
+        runtime_rotation_intent_digest="e" * 64, probe=probe, now_ms=1,
+    )
+    entered, release = threading.Event(), threading.Event()
+    original_connection = rotating._connection
+
+    @contextmanager
+    def pause_after_inode_probe(*args, **kwargs):
+        with original_connection(*args, **kwargs) as conn:
+            entered.set()
+            assert release.wait(1)
+            yield conn
+
+    rotating._connection = pause_after_inode_probe
+    failures: list[BaseException] = []
+
+    def rotate() -> None:
+        try:
+            rotating.finish_rotation(
+                _rotation_journal(old_identity, new_identity, nonce=base64.b64encode(b"n" * 32).decode("ascii")),
+                eligibility=eligibility, new_identity=new_identity, new_signer=new_signer,
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=rotate)
+    worker.start()
+    assert entered.wait(1)
+
+    with pytest.raises(RunnerRuntimeCorrupt, match="runtime state database is invalid"):
+        stale.register_local_terminal(
+            run_id="crun_" + "e" * 32, project_id="prj_123456789", grant_id="grant_123456789",
+            approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+            terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
+        )
+
+    release.set()
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert failures == []
+    with pytest.raises(RunnerRuntimeCorrupt):
+        stale.register_local_terminal(
+            run_id="crun_" + "e" * 32, project_id="prj_123456789", grant_id="grant_123456789",
+            approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+            terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
+        )
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM terminal_disclosures").fetchone()[0] == 0
+    conn.close()
 
 
 def test_runtime_stages_then_commits_an_exact_signed_claim_call(tmp_path):
@@ -776,12 +960,10 @@ def test_runtime_stages_and_commits_a_leased_findings_disclosure(tmp_path):
 
 
 def test_runtime_claims_then_finishes_a_due_terminal_prune(tmp_path):
-    signer = Signer()
-    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", _identity(signer), signer)
-    run_id = "crun_" + "e" * 32
+    runtime, _signer, _identity_value, grant = _runtime_with_active_run(tmp_path)
     state = runtime.register_local_terminal(
-        run_id=run_id, project_id="prj_123456789", grant_id="grant_123456789",
-        approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+        run_id=grant["run_id"], project_id=grant["project_id"], grant_id=grant["grant_id"],
+        approval_projection_digest=grant["approval"]["projection_digest"], terminal_projection_digest="b" * 64,
         terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
     )
 
@@ -790,25 +972,39 @@ def test_runtime_claims_then_finishes_a_due_terminal_prune(tmp_path):
     assert runtime.load_prune_pending().items == claimed.items
 
 
-def test_runtime_due_prune_retires_a_staged_terminal_result_and_all_run_cursors(tmp_path):
-    signer = Signer()
-    identity = _identity(signer)
-    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
-    run_id = "crun_" + "9" * 32
-    cursors = {
-        operation: runtime.install_chain(
-            operation=operation, run_id=run_id,
-            next_nonce_b64=base64.b64encode(operation.encode().ljust(32, b"_")).decode("ascii"),
-            next_sequence=1, generation=0, now_ms=1,
+def test_runtime_claims_one_specific_due_terminal_by_exact_digest(tmp_path):
+    runtime, _signer, _identity_value, grant = _runtime_with_active_run(tmp_path)
+    state = runtime.register_local_terminal(
+        run_id=grant["run_id"], project_id=grant["project_id"], grant_id=grant["grant_id"],
+        approval_projection_digest=grant["approval"]["projection_digest"], terminal_projection_digest="b" * 64,
+        terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
+    )
+
+    claimed = runtime.claim_specific_due_prune(
+        grant["run_id"], expected_state_digest=state.state_digest, now_ms=20,
+    )
+    assert claimed.state == "prune_pending"
+    with pytest.raises(RunnerRuntimeConflict):
+        runtime.claim_specific_due_prune(
+            grant["run_id"], expected_state_digest=state.state_digest, now_ms=20,
         )
+
+
+def test_runtime_due_prune_retires_a_staged_terminal_result_and_all_run_cursors(tmp_path):
+    runtime, signer, identity, grant = _runtime_with_active_run(tmp_path)
+    run_id = grant["run_id"]
+    cursors = {
+        operation: runtime.load_chain(operation, run_id)
         for operation in ("heartbeat", "progress", "result", "stop-ack")
     }
+    assert all(cursor is not None for cursor in cursors.values())
     runtime.register_local_terminal(
-        run_id=run_id, project_id="prj_123456789", grant_id="grant_123456789",
-        approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+        run_id=run_id, project_id=grant["project_id"], grant_id=grant["grant_id"],
+        approval_projection_digest=grant["approval"]["projection_digest"], terminal_projection_digest="b" * 64,
         terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
     )
     result = cursors["result"]
+    assert result is not None
     body = canonical_bytes({"schema_version": "heel.runner-result-request.v1"})
     path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/runs/{run_id}/result"
     proof = {
@@ -837,6 +1033,21 @@ def test_runtime_due_prune_retires_a_staged_terminal_result_and_all_run_cursors(
     assert claimed.items[0].state == "prune_pending"
     assert runtime.load_pending_calls() == ()
     assert all(runtime.load_chain(operation, run_id) is None for operation in cursors)
+
+
+def test_runtime_due_prune_retires_the_active_group_with_an_expired_local_terminal(tmp_path):
+    runtime, _signer, _identity_value, grant = _runtime_with_active_run(tmp_path)
+    runtime.register_local_terminal(
+        run_id=grant["run_id"], project_id=grant["project_id"], grant_id=grant["grant_id"],
+        approval_projection_digest=grant["approval"]["projection_digest"],
+        terminal_projection_digest="b" * 64, terminal_record_digest="c" * 64,
+        terminal_at_ms=10, retention_expires_at_ms=20,
+    )
+
+    claimed = runtime.claim_due_prune(now_ms=20)
+
+    assert claimed.items[0].state == "prune_pending"
+    assert runtime.load_active_run_controls() == ()
 
 
 def test_runtime_due_prune_retires_a_staged_findings_disclosure(tmp_path):
@@ -874,19 +1085,17 @@ def test_runtime_due_prune_retires_a_staged_findings_disclosure(tmp_path):
 
 
 def test_runtime_restart_reclaims_a_durable_due_prune_pending_terminal(tmp_path):
-    signer = Signer()
-    path = tmp_path / "runtime.sqlite3"
-    runtime = RunnerRuntimeState(path, _identity(signer), signer)
-    run_id = "crun_" + "f" * 32
+    runtime, signer, identity, grant = _runtime_with_active_run(tmp_path)
+    path = runtime.path
     runtime.register_local_terminal(
-        run_id=run_id, project_id="prj_123456789", grant_id="grant_123456789",
-        approval_projection_digest="a" * 64, terminal_projection_digest="b" * 64,
+        run_id=grant["run_id"], project_id=grant["project_id"], grant_id=grant["grant_id"],
+        approval_projection_digest=grant["approval"]["projection_digest"], terminal_projection_digest="b" * 64,
         terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
     )
     pending = runtime.claim_due_prune(now_ms=20)
     assert len(pending.items) == 1 and pending.items[0].state == "prune_pending"
 
-    restarted = RunnerRuntimeState(path, _identity(signer), signer)
+    restarted = RunnerRuntimeState(path, identity, signer)
 
     recovered = restarted.load_prune_pending()
     assert recovered.items == pending.items
@@ -933,6 +1142,7 @@ def test_runtime_rejects_each_precreated_noncanonical_schema_object(tmp_path, ob
                 "CREATE INDEX idx_terminal_disclosures_state_retention "
                 "ON terminal_disclosures(run_hash)"
             )
+    conn.close()
 
     with pytest.raises(RunnerRuntimeCorrupt, match="runtime state schema is invalid"):
         RunnerRuntimeState(path, identity, signer)

@@ -281,6 +281,31 @@ def _coordinator(tmp_path, responses, *, monotonic=lambda: 1.0):
     return coordinator, client, transport, manifest, projection, grant, authority
 
 
+def test_startup_finalizes_pruned_compaction_before_other_runtime_recovery(tmp_path, monkeypatch):
+    coordinator, client, transport, _manifest, _projection, _grant, authority = _coordinator(
+        tmp_path, lambda *_: [],
+    )
+    calls = []
+
+    def recover(*, runtime):
+        calls.append(runtime)
+        return 0
+
+    monkeypatch.setattr(coordinator.store, "recover_pruned_compaction_finalizers", recover)
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=client.signer, clock=client.clock, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys={authority.key_id: authority.public_key},
+        runtime=client.runtime,
+    )
+    RunnerCoordinator(
+        control=restarted, store=coordinator.store, identity=coordinator.identity,
+        signer=coordinator.signer, trusted_grant_keys=coordinator.trusted_grant_keys,
+        clock_ms=lambda: 2_000, monotonic=lambda: 1.0,
+    )
+    assert calls == [restarted.runtime]
+
+
 def test_first_cloud_context_acquisition_lists_before_binding_a_namespace(tmp_path):
     _bound, identity, signer, _manifest, _projection = compiled_pair(tmp_path / "fixture")
     store = RunnerStore(tmp_path / "unbound")
@@ -767,6 +792,82 @@ def test_restart_coordinator_rehydrates_active_binding_but_requires_fresh_heartb
     assert restarted.execution_gate(grant["run_id"]) == gate
 
 
+def test_concurrent_heartbeats_publish_the_latest_durable_stop_gate(tmp_path):
+    coordinator, client, _transport, _manifest, _projection, grant, _authority = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+        ],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    first_published = threading.Event()
+    call_lock = threading.Lock()
+    call_count = [0]
+
+    class GateMap(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            if value.server_time_ms == 2_001:
+                first_published.set()
+
+    class Transport:
+        def post(self, path, *, headers, body):
+            del path, headers, body
+            with call_lock:
+                call_count[0] += 1
+                ordinal = call_count[0]
+            if ordinal == 1:
+                first_entered.set()
+                assert release_first.wait(1)
+                return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"a")}, _gate(
+                    server_time_ms=2_001,
+                )
+            assert first_published.wait(1)
+            return 200, {"X-Heel-Runner-Next-Nonce": _nonce(b"b")}, _gate(
+                server_time_ms=2_002, generation=8, active=False,
+                stop_reason="cloud_stop",
+            )
+
+    client.transport = Transport()
+    coordinator._gates = GateMap(coordinator._gates)
+    results = []
+    failures = []
+
+    def heartbeat() -> None:
+        try:
+            results.append(coordinator.heartbeat(lease.run_id, lease.operational_projection))
+        except BaseException as exc:  # test records both racing outcomes
+            failures.append(exc)
+
+    first = threading.Thread(target=heartbeat)
+    second = threading.Thread(target=heartbeat)
+    first.start()
+    assert first_entered.wait(1)
+    second.start()
+    release_first.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert failures == []
+    assert [gate.server_time_ms for gate in results] == [2_001, 2_002]
+    assert coordinator._gates[lease.run_id] == ExecutionGate(**_gate(
+        server_time_ms=2_002, generation=8, active=False, stop_reason="cloud_stop",
+    ))
+    active = client.runtime.load_active_run_controls()
+    assert active[0].revision == 3
+    assert active[0].gate == _gate(
+        server_time_ms=2_002, generation=8, active=False, stop_reason="cloud_stop",
+    )
+    with pytest.raises(ValueError, match="denies execution"):
+        coordinator.execution_gate(lease.run_id)
+
+
 def test_restart_replays_staged_heartbeat_with_the_original_signed_request(tmp_path, monkeypatch):
     coordinator, client, transport, _manifest, _projection, grant, _authority = _coordinator(
         tmp_path,
@@ -1025,6 +1126,96 @@ def test_store_verifier_replays_only_the_detached_pending_terminal_request(tmp_p
     assert recovered._gates == {}
     assert recovered._gate_receipts == {}
     assert recovered._bindings == {}
+
+
+def test_restart_stages_a_detached_local_terminal_before_replaying_control(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path / "store")
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    terminal = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    ).operational_projection
+    transport = ScriptedControlTransport([
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, _claim(manifest, projection, grant)),
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, _status(
+            grant["run_id"], approval_id=projection["projection_id"], status="terminal",
+        )),
+    ])
+    client = RunnerControlClient(
+        origin="https://control.example", workspace_id=identity.workspace_id,
+        runner_id=identity.runner_id, signer=signer, clock=lambda: 2_000,
+        transport=transport, nonce_source=lambda _key: _nonce(b"c"),
+        trusted_disclosure_keys={authority.key_id: authority.public_key},
+        runtime=_control_runtime(tmp_path / "runtime.sqlite3", identity, signer),
+    )
+    assert client._claim_closed()["run_id"] == grant["run_id"]
+    anchor = store._runtime_terminal_anchor(grant["run_id"])
+    local = client._register_runtime_local_terminal(anchor)
+    store.detach_terminal(
+        grant["run_id"], runtime=client.runtime,
+        expected_local_state_digest=local.state_digest, now_ms=2_000,
+    )
+    assert client.runtime.load_pending_calls() == ()
+
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=signer, clock=lambda: 2_000, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    recovered = RunnerCoordinator(
+        control=restarted, store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        clock_ms=lambda: 2_000, monotonic=lambda: 1.0,
+    )
+
+    assert len(transport.requests) == 2
+    assert restarted.runtime.load_pending_calls() == ()
+    state = restarted.runtime.load_terminal_state(grant["run_id"])
+    assert state is not None and state.state == "available"
+    assert recovered._bindings == {}
+
+
+def test_restart_rehydrates_authority_after_replaying_a_lost_claim_response(tmp_path):
+    coordinator, client, transport, manifest, projection, grant, _authority = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, {"malformed": True}),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"z")}, _gate(server_time_ms=2_001)),
+        ],
+    )
+    with pytest.raises(ValueError, match="invalid runner claim response"):
+        client._claim_closed()
+    assert [item.request_operation for item in client.runtime.load_pending_calls()] == ["claim"]
+
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=client.signer, clock=client.clock, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    recovered = RunnerCoordinator(
+        control=restarted, store=coordinator.store, identity=coordinator.identity,
+        signer=coordinator.signer, trusted_grant_keys=coordinator.trusted_grant_keys,
+        clock_ms=lambda: 2_000, monotonic=lambda: 1.0,
+    )
+
+    assert restarted.runtime.load_pending_calls() == ()
+    assert [active.run_id for active in restarted.runtime.load_active_run_controls()] == [grant["run_id"]]
+    assert grant["run_id"] in restarted._tracked_runs
+    assert grant["run_id"] in recovered._gates
+    assert grant["run_id"] in recovered._bindings
+    operational = recovered._claimed_projection(
+        manifest, projection, grant, claimed_at_ms=2_000,
+    )
+    assert recovered.heartbeat(grant["run_id"], operational) == ExecutionGate(**_gate(server_time_ms=2_001))
 
 
 def test_idle_claim_requires_exact_204_empty_body_and_advances_only_claim_chain(tmp_path):

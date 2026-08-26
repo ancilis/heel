@@ -32,7 +32,7 @@ class CanaryMigrationTests(unittest.TestCase):
 
     def test_current_migrations_create_tenant_bound_unique_tables(self):
         self.assertEqual(
-            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-7:]],
+            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-9:]],
             [
                 (20, "runner_context_bounded_purge"),
                 (21, "runner_context_affinity_guards"),
@@ -41,6 +41,8 @@ class CanaryMigrationTests(unittest.TestCase):
                 (24, "runner_pairing_control_protocol_v3"),
                 (25, "runner_request_receipt_retention"),
                 (26, "runner_activation_abort_receipts"),
+                (27, "runner_single_open_rotation"),
+                (28, "runner_key_history_expiry"),
             ],
         )
         tables = (
@@ -62,7 +64,7 @@ class CanaryMigrationTests(unittest.TestCase):
     def test_migrations_twenty_three_to_twenty_five_add_purge_and_runner_receipts(self):
         """The direct/runtime schema target includes the append-only v23-v25 additions."""
         self.assertEqual(
-            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-7:]],
+            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-9:]],
             [
                 (20, "runner_context_bounded_purge"),
                 (21, "runner_context_affinity_guards"),
@@ -71,6 +73,8 @@ class CanaryMigrationTests(unittest.TestCase):
                 (24, "runner_pairing_control_protocol_v3"),
                 (25, "runner_request_receipt_retention"),
                 (26, "runner_activation_abort_receipts"),
+                (27, "runner_single_open_rotation"),
+                (28, "runner_key_history_expiry"),
             ],
         )
         self.assertIsNotNone(self.conn.execute(
@@ -111,11 +115,28 @@ class CanaryMigrationTests(unittest.TestCase):
             "AND name='idx_canary_runner_ledger_retention'"
         ).fetchone())
 
-    def test_migration_twenty_six_adds_activation_abort_receipts(self):
+    def test_migration_twenty_eight_adds_single_rotation_and_key_history_guards(self):
         self.assertEqual(
             (CONTROL_PLANE_MIGRATIONS[-1].version, CONTROL_PLANE_MIGRATIONS[-1].name),
-            (26, "runner_activation_abort_receipts"),
+            (28, "runner_key_history_expiry"),
         )
+        self.assertEqual(
+            {row[1] for row in self.conn.execute("PRAGMA table_info(canary_runner_rotations)")},
+            {
+                "pairing_id", "workspace_id", "runner_id", "phrase", "public_key", "fingerprint",
+                "key_id", "runner_version", "adapters_json", "activation_challenge", "status",
+                "created_at", "expires_at", "approved_at", "activated_at", "approved_by",
+                "old_key_id", "old_fingerprint",
+            },
+        )
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_canary_runner_one_open_rotation'"
+        ).fetchone())
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_canary_runner_key_history_expiry'"
+        ).fetchone())
         self.assertEqual(
             {
                 row[0] for row in self.conn.execute(
@@ -310,7 +331,7 @@ class CanaryMigrationTests(unittest.TestCase):
         ledger("runner_heartbeat:run", 2, "runner_heartbeat", "/v1/workspaces/ws/runners/runner/runs/run/stop-ack")
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
         self.assertEqual([tuple(row) for row in conn.execute(
             "SELECT chain_name,next_sequence,generation FROM canary_runner_chain_cursors ORDER BY chain_name"
         )], [("heartbeat:run", 2, 0), ("progress:run", 3, 0), ("stop-ack:run", 3, 0)])
@@ -355,8 +376,8 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26])
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 26)
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 28)
         self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.assertEqual(
             [tuple(row) for row in conn.execute(
@@ -462,8 +483,8 @@ class CanaryMigrationTests(unittest.TestCase):
         conn.commit()
 
         migration = Migrator(conn, CONTROL_PLANE_MIGRATIONS)
-        self.assertEqual(migration.apply_all(), [19, 20, 21, 22, 23, 24, 25, 26])
-        self.assertEqual(migration.current_version(), 26)
+        self.assertEqual(migration.apply_all(), [19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
+        self.assertEqual(migration.current_version(), 28)
         affinity = conn.execute(
             "SELECT project_ref,environment_id,runner_key_id,established_rcb_id,established_binding_digest "
             "FROM canary_runner_context_affinities WHERE workspace_id='ws_affinity' AND runner_id='runr_affinity'",
@@ -737,7 +758,7 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
         self.assertEqual(
             [tuple(row) for row in conn.execute("SELECT chain_name,sequence FROM canary_runner_request_ledger")],
             [("progress:real", 1)],
@@ -960,8 +981,8 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
         conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
         conn.commit()
-        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26])
-        self.assertEqual(migration.current_version(), 26)
+        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
+        self.assertEqual(migration.current_version(), 28)
         self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):

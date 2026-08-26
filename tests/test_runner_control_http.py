@@ -21,7 +21,8 @@ from heel.runner.runtime import ActiveRunInstall, RunnerRuntimeState
 from heel.saas.canary_store import CanaryStore
 from heel.saas.catalog import CATALOG_VERSION
 from heel.saas.runner_auth import (
-    RunnerAuthError, RunnerAuthStore, RunnerHttpAction, initialize_runner_auth_schema,
+    RunnerActivationAbortDeferred, RunnerActivationReceiptExpired, RunnerAuthError, RunnerAuthStore, RunnerHttpAction,
+    initialize_runner_auth_schema,
 )
 from heel.saas.http_api import ControlPlane, serve
 
@@ -540,7 +541,7 @@ def test_has_no_public_generic_request_api():
     control, _, _ = client()
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
-    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection", "replay_pending_call", "replay_all_pending"}
+    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection", "replay_pending_call", "replay_all_pending", "stage_recovered_result"}
 
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
@@ -587,7 +588,23 @@ def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
     assert receipt[0] == "sealed-v2" and receipt[1] != next_nonce and receipt[2] and receipt[3]
     assert receipt[4] == 200 and receipt[5] == hashlib.sha256(canonical_bytes(accepted)).hexdigest()
     assert receipt[6] >= time.time() + 2_591_999
-    assert store.purge_runner_request_receipts(receipt[6] + 1, limit=1) == (1, False)
+    # Exact receipt lookup remains ahead of freshness only for the immutable
+    # thirty-day horizon.  At the boundary, it must never return a replayed
+    # nonce/body that an authenticated reaper may already have retired.
+    conn.execute(
+        "UPDATE canary_runner_request_ledger SET created_at=0,retention_expires_at=0"
+    )
+    conn.commit()
+    with pytest.raises(RunnerAuthError):
+        store.authenticate_and_consume(
+            workspace_id="ws", runner_id="r", capability="runner_claim", path=path,
+            raw_body=body, headers=headers(), action=lambda: RunnerHttpAction(200, {"status": "leak"}),
+        )
+    reaped = store.reap_expired_auth(now=time.time(), limit=1)
+    assert reaped.request_receipts == 1
+    assert reaped.pairing_receipts == reaped.rotation_receipts == 0
+    assert reaped.abort_receipts == reaped.pairing_parents == reaped.rotation_parents == 0
+    assert reaped.old_keys == 0 and reaped.has_more is False
     assert conn.execute("SELECT 1 FROM canary_runner_request_ledger").fetchone() is None
 
 
@@ -606,25 +623,162 @@ def test_expired_v3_pairing_activation_abort_is_signed_idempotent_and_retained()
         adapters={}, control_protocol="heel.runner-control.v2", exchange_digest="a" * 64,
     )
     store.approve("ws", pending.pairing_id, phrase=phrase, fingerprint=pending.fingerprint, actor="owner")
-    instant[0] = pending.expires_at
     request = {
-        "schema_version": "heel.runner-pairing-activation-abort.v1",
+        "schema_version": "heel.runner-pairing-activation-abort.v2",
         "pairing_id": pending.pairing_id, "runner_id": pending.runner_id,
         "pairing_exchange_digest": "a" * 64, "activation_request_digest": "b" * 64,
-        "challenge_expires_at_ms": int(pending.expires_at * 1000),
+        "activation_challenge_digest": hashlib.sha256(
+            base64.b64decode(pending.activation_challenge, validate=True),
+        ).hexdigest(),
         "reason_code": "activation_challenge_expired",
     }
     request["signature_b64"] = base64.b64encode(private.sign(
-        b"heel.runner-pairing-activation-abort.v1\0" + canonical_bytes(request),
+        b"heel.runner-pairing-activation-abort.v2\0" + canonical_bytes(request),
     )).decode()
+    with pytest.raises(RunnerActivationAbortDeferred) as deferred:
+        store.abort_executable_pairing_activation(pending.pairing_id, request)
+    assert deferred.value.response == {
+        "schema_version": "heel.runner-pairing-activation-abort-deferred.v1",
+        "code": "runner_activation_challenge_live", "pairing_id": pending.pairing_id,
+        "runner_id": pending.runner_id, "pairing_exchange_digest": "a" * 64,
+        "activation_challenge_digest": request["activation_challenge_digest"],
+        "challenge_expires_at_ms": int(pending.expires_at * 1000),
+        "server_time_ms": 1_000_000, "retry_after_ms": int(pending.expires_at * 1000) - 1_000_000,
+    }
+    assert conn.execute(
+        "SELECT 1 FROM canary_runner_pairing_activation_abort_receipts WHERE pairing_id=?",
+        (pending.pairing_id,),
+    ).fetchone() is None
+    instant[0] = pending.expires_at
     response = store.abort_executable_pairing_activation(pending.pairing_id, request)
     assert response["status"] == "expired" and response["runner_id"] == pending.runner_id
+    assert response["schema_version"] == "heel.runner-pairing-activation-aborted.v2"
+    assert response["activation_challenge_digest"] == request["activation_challenge_digest"]
+    assert response["challenge_expires_at_ms"] == int(pending.expires_at * 1000)
     assert store.abort_executable_pairing_activation(pending.pairing_id, request) == response
     receipt = conn.execute(
         "SELECT expires_at FROM canary_runner_pairing_activation_abort_receipts WHERE pairing_id=?",
         (pending.pairing_id,),
     ).fetchone()
     assert receipt[0] == instant[0] + 2_592_000.0
+    instant[0] = receipt[0]
+    with pytest.raises(RunnerActivationReceiptExpired):
+        store.abort_executable_pairing_activation(pending.pairing_id, request)
+    first_reap = store.reap_expired_auth(now=instant[0], limit=1)
+    assert first_reap.abort_receipts == 1
+    assert first_reap.pairing_parents == 0 and first_reap.has_more is True
+    second_reap = store.reap_expired_auth(now=instant[0], limit=1)
+    assert second_reap.pairing_parents == 1 and second_reap.has_more is False
+
+
+def test_http_pairing_abort_v2_returns_the_authenticated_deferred_body_before_expiry():
+    instant = [time.time()]
+    cp = ControlPlane(
+        device_token_pepper=b"d" * 32, runner_auth_pepper=b"r" * 32,
+        enable_device_auth=True, public_origin="http://127.0.0.1",
+    )
+    assert cp.runner_auth is not None
+    cp.runner_auth._now = lambda: instant[0]
+    server = serve(cp)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        private = Ed25519PrivateKey.generate()
+        public = base64.b64encode(
+            private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
+        ).decode()
+        org = cp.store.create_org("org")
+        workspace = cp.store.create_workspace(org, "ws", "free", "2026-08")
+        invitation = cp.runner_auth.invite(workspace)
+        phrase = " ".join(runner_phrase_words()[:6])
+        pending = cp.runner_auth.exchange(
+            invitation.token, public, phrase, display_name="Runner", runner_version="v3",
+            adapters={}, control_protocol="heel.runner-control.v2", exchange_digest="a" * 64,
+        )
+        cp.runner_auth.approve(
+            workspace, pending.pairing_id, phrase=phrase, fingerprint=pending.fingerprint, actor="owner",
+        )
+        request = {
+            "schema_version": "heel.runner-pairing-activation-abort.v2",
+            "pairing_id": pending.pairing_id, "runner_id": pending.runner_id,
+            "pairing_exchange_digest": "a" * 64, "activation_request_digest": "b" * 64,
+            "activation_challenge_digest": hashlib.sha256(
+                base64.b64decode(pending.activation_challenge, validate=True),
+            ).hexdigest(),
+            "reason_code": "activation_challenge_expired",
+        }
+        request["signature_b64"] = base64.b64encode(private.sign(
+            b"heel.runner-pairing-activation-abort.v2\0" + canonical_bytes(request),
+        )).decode()
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+        connection.request(
+            "POST", f"/v1/runner-pairings/{pending.pairing_id}/activation-abort",
+            canonical_bytes(request), {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        raw = response.read()
+        connection.close()
+        assert response.status == 409
+        body = json.loads(raw)
+        assert raw == canonical_bytes(body)
+        assert body == {
+            "schema_version": "heel.runner-pairing-activation-abort-deferred.v1",
+            "code": "runner_activation_challenge_live", "pairing_id": pending.pairing_id,
+            "runner_id": pending.runner_id, "pairing_exchange_digest": "a" * 64,
+            "activation_challenge_digest": request["activation_challenge_digest"],
+            "challenge_expires_at_ms": int(pending.expires_at * 1000),
+            "server_time_ms": body["server_time_ms"], "retry_after_ms": body["retry_after_ms"],
+        }
+        assert body["server_time_ms"] < body["challenge_expires_at_ms"]
+        assert body["retry_after_ms"] == body["challenge_expires_at_ms"] - body["server_time_ms"]
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_old_runner_key_reaper_requires_m28_and_uses_its_exact_index():
+    from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS, Migrator
+
+    legacy = sqlite3.connect(":memory:")
+    Migrator(legacy, CONTROL_PLANE_MIGRATIONS[:27]).apply_all()
+    legacy_store = RunnerAuthStore(legacy, pepper=b"p" * 32)
+    with pytest.raises(RunnerAuthError, match="runner authentication schema upgrade required"):
+        legacy_store.reap_expired_auth(now=3_000_000.0, limit=1)
+    assert not legacy.in_transaction
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    CanaryStore(conn)
+    initialize_runner_auth_schema(conn)
+    conn.execute(
+        "INSERT INTO canary_runners VALUES(?,?,?,?,?)",
+        ("old-runner", "ws", "Old runner", "active", 1),
+    )
+    conn.executemany(
+        "INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,?)",
+        (
+            ("old-key-a", "ws", "old-runner", "old-public-key-a", "verification_only", 1, 1),
+            ("old-key-b", "ws", "old-runner", "old-public-key-b", "verification_only", 1, 1),
+        ),
+    )
+    conn.commit()
+    store = RunnerAuthStore(conn, pepper=b"p" * 32)
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT revoked_at,workspace_id,runner_id,key_id "
+        "FROM canary_runner_keys INDEXED BY idx_canary_runner_key_history_expiry "
+        "WHERE status='verification_only' AND revoked_at IS NOT NULL AND revoked_at<=? "
+        "ORDER BY revoked_at,workspace_id,runner_id,key_id LIMIT ?",
+        (400_000.0, 2),
+    ).fetchall()
+    assert any("idx_canary_runner_key_history_expiry" in row[-1] for row in plan)
+    assert not any("USE TEMP B-TREE" in row[-1] or "SCAN canary_runner_keys" in row[-1] for row in plan)
+
+    first = store.reap_expired_auth(now=3_000_000.0, limit=1)
+    assert first.old_keys == 1 and first.has_more is True
+    assert conn.execute("SELECT key_id FROM canary_runner_keys").fetchone()[0] == "old-key-b"
+    second = store.reap_expired_auth(now=3_000_000.0, limit=1)
+    assert second.old_keys == 1 and second.has_more is False
+    assert conn.execute("SELECT 1 FROM canary_runner_keys").fetchone() is None
 
 
 def test_runner_auth_body_cap_requires_an_explicit_bounded_integer_override():
@@ -885,14 +1039,14 @@ def test_http_v3_pairing_activation_replays_one_sealed_executable_cursor():
     server = serve(cp)
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
 
-    def request(method, path, body, headers=None):
+    def request(method, path, body, headers=None, *, raw_response=False):
         conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
         payload = json.dumps(body, separators=(",", ":")).encode() if method == "POST" else None
         request_headers = ({"Content-Type": "application/json", **(headers or {})}
                            if method == "POST" else (headers or {}))
         conn.request(method, path, payload, request_headers)
         response = conn.getresponse(); raw = response.read(); cookie = response.getheader("Set-Cookie"); conn.close()
-        return response.status, json.loads(raw), cookie
+        return response.status, (raw if raw_response else json.loads(raw)), cookie
 
     try:
         _, signup, cookie = request(
@@ -918,10 +1072,16 @@ def test_http_v3_pairing_activation_replays_one_sealed_executable_cursor():
         assert set(pending) == {
             "schema_version", "pairing_id", "runner_id", "fingerprint", "status",
             "activation_challenge", "control_protocol", "pairing_exchange_digest",
+            "challenge_expires_at_ms",
         }
-        assert pending["schema_version"] == "heel.runner-pairing-pending.v2"
+        assert pending["schema_version"] == "heel.runner-pairing-pending.v3"
         assert pending["control_protocol"] == "heel.runner-control.v2"
         assert pending["pairing_exchange_digest"] == hashlib.sha256(canonical_bytes(exchange_request)).hexdigest()
+        assert type(pending["challenge_expires_at_ms"]) is int
+        row_expiry = cp.store.conn.execute(
+            "SELECT expires_at FROM canary_runner_pairings WHERE pairing_id=?", (pending["pairing_id"],),
+        ).fetchone()[0]
+        assert pending["challenge_expires_at_ms"] == int(row_expiry * 1000)
         fingerprint = hashlib.sha256(base64.b64decode(public)).hexdigest()
         assert request(
             "POST", f"/v1/workspaces/{signup['workspace_id']}/runner-pairings/{pending['pairing_id']}/approve",
@@ -940,7 +1100,8 @@ def test_http_v3_pairing_activation_replays_one_sealed_executable_cursor():
             )).decode(),
         }
         route = f"/v1/runner-pairings/{pending['pairing_id']}/activate"
-        status, first, _ = request("POST", route, activation)
+        status, first_raw, _ = request("POST", route, activation, raw_response=True)
+        first = json.loads(first_raw)
         assert status == 200
         assert set(first) == {
             "schema_version", "workspace_id", "runner_id", "runner_key_id", "pairing_exchange_digest",
@@ -949,7 +1110,8 @@ def test_http_v3_pairing_activation_replays_one_sealed_executable_cursor():
         }
         assert first["schema_version"] == "heel.runner-pairing-activated.v3"
         assert first["initial_claim_sequence"] == 1 and first["initial_claim_generation"] == 0
-        assert request("POST", route, activation)[:2] == (200, first)
+        replay_status, replay_raw, _ = request("POST", route, activation, raw_response=True)
+        assert replay_status == 200 and replay_raw == first_raw
         retention = cp.store.conn.execute(
             "SELECT p.expires_at,r.expires_at FROM canary_runner_pairings p "
             "JOIN canary_runner_pairing_activation_receipts r ON r.pairing_id=p.pairing_id "
@@ -974,6 +1136,26 @@ def test_http_v3_pairing_activation_replays_one_sealed_executable_cursor():
             "WHERE workspace_id=? AND runner_id=?", (signup["workspace_id"], pending["runner_id"]),
         ).fetchone()
         assert tuple(execution) == (3, "heel.runner-control.v2", pending["pairing_exchange_digest"])
+        # An activation receipt is byte-replay authority only through the
+        # receipt horizon; executable authority remains pinned separately.
+        cp.store.conn.execute(
+            "UPDATE canary_runner_pairing_activation_receipts SET expires_at=0 WHERE pairing_id=?",
+            (pending["pairing_id"],),
+        )
+        cp.store.conn.commit()
+        status, expired, _ = request("POST", route, activation)
+        assert status == 410
+        assert expired == {
+            "schema_version": "heel.runner-error.v1",
+            "code": "runner_activation_receipt_expired",
+        }
+        reaped = cp.runner_auth.reap_expired_auth(now=time.time(), limit=2)
+        assert reaped.pairing_receipts == 1 and reaped.pairing_parents == 1
+        assert reaped.rotation_receipts == reaped.abort_receipts == reaped.old_keys == 0
+        assert reaped.has_more is False
+        assert cp.store.conn.execute(
+            "SELECT 1 FROM canary_runner_pairings WHERE pairing_id=?", (pending["pairing_id"],),
+        ).fetchone() is None
     finally:
         server.shutdown(); server.server_close(); cp.close()
 
@@ -984,14 +1166,14 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
                       enable_device_auth=True, public_origin="https://heel.test",
                       grant_authority=cloud)
     server = serve(cp); thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
-    def request(method, path, body, headers=None):
+    def request(method, path, body, headers=None, *, raw_response=False):
         conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
         raw = (
             canonical_bytes(body) if path.endswith("/activation-abort")
             else json.dumps(body, separators=(",", ":")).encode()
         ) if method == "POST" else None
         conn.request(method, path, raw, ({"Content-Type":"application/json", **(headers or {})} if method == "POST" else (headers or {})))
-        response = conn.getresponse(); payload = json.loads(response.read()); cookie = response.getheader("Set-Cookie"); conn.close()
+        response = conn.getresponse(); raw_response_body = response.read(); payload = raw_response_body if raw_response else json.loads(raw_response_body); cookie = response.getheader("Set-Cookie"); conn.close()
         return response.status, payload, cookie
     class HttpTransport:
         def post(self, path, *, headers=None, body=b""):
@@ -1066,12 +1248,15 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
             b"heel.runner-rotation-activation-abort.v1.new\0" + canonical_bytes(abort_core),
         )).decode()
         assert request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/activation-abort", abort)[0] == 409
-        status, activated, _ = request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/activate", activation_request)
+        route = f"/v1/runner-rotations/{rotation['pairing_id']}/activate"
+        status, activated_raw, _ = request("POST", route, activation_request, raw_response=True)
+        activated = json.loads(activated_raw)
         assert status == 200
         assert set(activated) == {"schema_version", "workspace_id", "runner_id", "initial_claim_nonce", "initial_claim_sequence", "initial_claim_generation"}
         assert activated["schema_version"] == "heel.runner-rotation-activated.v2"
         assert activated["initial_claim_sequence"] == 2 and activated["initial_claim_generation"] == 1
-        assert request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/activate", activation_request)[:2] == (200, activated)
+        replay_status, replay_raw, _ = request("POST", route, activation_request, raw_response=True)
+        assert replay_status == 200 and replay_raw == activated_raw
         changed = dict(activation_request)
         changed["signature_b64"] = base64.b64encode(b"z" * 64).decode()
         assert request("POST", f"/v1/runner-rotations/{rotation['pairing_id']}/activate", changed)[0] == 400
@@ -1092,6 +1277,67 @@ def test_rotation_has_its_own_public_poll_and_activation_path():
         identity = cp.runner_auth.identity(signup["workspace_id"], pending["runner_id"])
         assert identity["state"] == "active" and identity["public_key"]["public_key_b64"] == new_public
         assert identity["rotation"]["previous_key_ids"]
+        # The signed identity is a bounded current summary.  Durable key rows
+        # retain the full overlap/audit history, so the 21st rotation must not
+        # turn a valid ceremony into a 500 after authority mutation.
+        current_private = new
+        for rotation_index in range(20):
+            current_raw = current_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            next_private = Ed25519PrivateKey.generate()
+            next_raw = next_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            status, next_rotation, _ = request(
+                "POST", f"/v1/workspaces/{signup['workspace_id']}/runners/{pending['runner_id']}/rotate",
+                {
+                    "schema_version": "heel.runner-rotation-start.v1",
+                    "previous_fingerprint": hashlib.sha256(current_raw).hexdigest(),
+                    "public_key_b64": base64.b64encode(next_raw).decode(),
+                    "pairing_phrase": phrase, "runner_version": "v-next", "adapters": {},
+                }, browser,
+            )
+            assert status == 201
+            assert request(
+                "POST",
+                f"/v1/workspaces/{signup['workspace_id']}/runners/{pending['runner_id']}/rotations/{next_rotation['pairing_id']}/approve",
+                {
+                    "schema_version": "heel.runner-rotation-approve.v1",
+                    "pairing_phrase": phrase, "fingerprint": next_rotation["fingerprint"],
+                }, browser,
+            )[0] == 200
+            status, challenge, _ = request(
+                "POST", f"/v1/runner-rotations/{next_rotation['pairing_id']}/poll", {},
+            )
+            assert status == 200
+            proof = b"heel.runner-rotation-activate.v2\0" + canonical_bytes({
+                "pairing_id": next_rotation["pairing_id"],
+                "challenge": challenge["activation_challenge"],
+            })
+            status, rotation_response, _ = request(
+                "POST", f"/v1/runner-rotations/{next_rotation['pairing_id']}/activate",
+                {
+                    "schema_version": "heel.runner-rotation-activate.v2",
+                    "signature_b64": base64.b64encode(next_private.sign(proof)).decode(),
+                },
+            )
+            assert status == 200, (rotation_index, rotation_response)
+            current_private = next_private
+        identity = cp.runner_auth.identity(signup["workspace_id"], pending["runner_id"])
+        assert len(identity["rotation"]["previous_key_ids"]) == 20
+        expected_previous = sorted(row[0] for row in cp.store.conn.execute(
+            "SELECT key_id FROM canary_runner_keys WHERE workspace_id=? AND runner_id=? "
+            "AND key_id<>? ORDER BY created_at DESC,key_id ASC LIMIT 20",
+            (
+                signup["workspace_id"], pending["runner_id"],
+                ed25519_key_id(current_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)),
+            ),
+        ))
+        assert identity["rotation"]["previous_key_ids"] == expected_previous
+        audits = cp.store.conn.execute(
+            "SELECT reason_code FROM canary_runner_audit_records WHERE workspace_id=? AND runner_id=? "
+            "AND action='runner_rotated' ORDER BY created_at,audit_id",
+            (signup["workspace_id"], pending["runner_id"]),
+        ).fetchall()
+        assert len(audits) == 21
+        assert audits[-1][0] == "previous_key_history_window_advanced"
     finally:
         server.shutdown(); server.server_close()
 

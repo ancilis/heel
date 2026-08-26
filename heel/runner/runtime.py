@@ -13,8 +13,11 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import sqlite3
 import stat
+import subprocess
+import sys
 import threading
 from types import MappingProxyType
 from typing import Any, Iterator, Mapping, Protocol
@@ -43,13 +46,62 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _RUN_ID = re.compile(r"^crun_[0-9a-f]{32}$", re.ASCII)
 _B64_32 = re.compile(r"^[A-Za-z0-9+/]{43}=$", re.ASCII)
 
+# This child deliberately has no package imports or ambient-process inputs.  It
+# receives only the pinned database leaf and a private AF_UNIX socket, then
+# tests whether SQLite locked that exact leaf's PENDING/RESERVED/SHARED range.
+_RUNTIME_INODE_GUARD_BOOTSTRAP = (
+    "import errno,fcntl,os,socket,stat,sys\n"
+    "leaf_fd=-1\n"
+    "control_fd=-1\n"
+    "control=None\n"
+    "try:\n"
+    " if len(sys.argv)!=3: raise ValueError()\n"
+    " def parse_fd(value):\n"
+    "  if not value.isascii() or not value.isdecimal(): raise ValueError()\n"
+    "  descriptor=int(value)\n"
+    "  if descriptor<=2 or str(descriptor)!=value: raise ValueError()\n"
+    "  return descriptor\n"
+    " leaf_fd=parse_fd(sys.argv[1])\n"
+    " control_fd=parse_fd(sys.argv[2])\n"
+    " if leaf_fd==control_fd: raise ValueError()\n"
+    " leaf_stat=os.fstat(leaf_fd)\n"
+    " if (not stat.S_ISREG(leaf_stat.st_mode) or leaf_stat.st_uid!=os.geteuid() "
+    "or leaf_stat.st_nlink!=1 or (stat.S_IMODE(leaf_stat.st_mode)&0o077)): raise ValueError()\n"
+    " control=socket.socket(fileno=control_fd)\n"
+    " if control.family!=socket.AF_UNIX or (control.type&0xf)!=socket.SOCK_STREAM: raise ValueError()\n"
+    " os.set_inheritable(leaf_fd,False)\n"
+    " os.set_inheritable(control_fd,False)\n"
+    " while True:\n"
+    "  request=control.recv(2)\n"
+    "  if len(request)!=1: raise ValueError()\n"
+    "  if request==b'Q': break\n"
+    "  if request!=b'P': raise ValueError()\n"
+    "  try:\n"
+    "   fcntl.lockf(leaf_fd,fcntl.LOCK_EX|fcntl.LOCK_NB,512,0x40000000,os.SEEK_SET)\n"
+    "  except OSError as error:\n"
+    "   if error.errno not in (errno.EACCES,errno.EAGAIN): raise\n"
+    "   control.sendall(b'L')\n"
+    "  else:\n"
+    "   fcntl.lockf(leaf_fd,fcntl.LOCK_UN,512,0x40000000,os.SEEK_SET)\n"
+    "   control.sendall(b'U')\n"
+    "except BaseException:\n"
+    " raise SystemExit(2)\n"
+    "finally:\n"
+    " if control is not None:\n"
+    "  control.close()\n"
+    " elif control_fd>2:\n"
+    "  os.close(control_fd)\n"
+    " if leaf_fd>2:\n"
+    "  os.close(leaf_fd)\n"
+)
+
 
 _RUNTIME_TABLES = (
     "metadata", "control_chains", "pending_calls", "terminal_disclosures", "active_runs",
 )
 _RUNTIME_INDEXES = (
     "idx_pending_calls_created", "idx_terminal_disclosures_state_retention",
-    "idx_terminal_disclosures_due_retention",
+    "idx_terminal_disclosures_due_retention", "idx_pending_calls_run_operation",
 )
 _RUNTIME_OWNED_NAMES = frozenset((*_RUNTIME_TABLES, *_RUNTIME_INDEXES))
 
@@ -98,6 +150,7 @@ _V3_SCHEMA_SQL = (
     "sealed_blob BLOB NOT NULL CHECK(typeof(sealed_blob)='blob' AND length(sealed_blob) BETWEEN 29 AND 393216),"
     "updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms BETWEEN 0 AND 9007199254740991))",
     "CREATE INDEX idx_pending_calls_created ON pending_calls(created_at_ms,call_id)",
+    "CREATE INDEX idx_pending_calls_run_operation ON pending_calls(run_hash,operation,call_id) WHERE run_hash IS NOT NULL",
     "CREATE INDEX idx_terminal_disclosures_state_retention ON terminal_disclosures(state,retention_expires_at_ms,run_hash)",
     "CREATE INDEX idx_terminal_disclosures_due_retention ON terminal_disclosures(retention_expires_at_ms,run_hash) WHERE state IN ('local_terminal','available','consumed')",
 )
@@ -153,6 +206,51 @@ class TerminalDisclosureUnavailable(RunnerRuntimeStateError):
     """A terminal disclosure has been consumed, pruned, expired, or is absent."""
 
 
+class _RuntimeSqliteConnection(sqlite3.Connection):
+    """Connection that authenticates authority after each transaction begins."""
+
+    _runtime: Any | None = None
+    _allow_rotation_fence = False
+    _authority_guard_enabled = False
+
+    def configure_runtime_guard(
+        self, runtime: "RunnerRuntimeState", *, allow_rotation_fence: bool,
+    ) -> None:
+        self._runtime = runtime
+        self._allow_rotation_fence = allow_rotation_fence
+        self._authority_guard_enabled = True
+
+    @staticmethod
+    def _is_transaction_begin(statement: object) -> bool:
+        return type(statement) is str and statement.lstrip().upper().startswith("BEGIN")
+
+    @staticmethod
+    def _is_transaction_end(statement: object) -> bool:
+        return type(statement) is str and statement.lstrip().upper().startswith(("COMMIT", "ROLLBACK"))
+
+    def _validate_after_begin(self) -> None:
+        runtime = self._runtime
+        if runtime is None:
+            raise RunnerRuntimeCorrupt("runtime state database is invalid")
+        runtime._validate_transaction_authority_locked(
+            self, allow_rotation_fence=self._allow_rotation_fence,
+        )
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        if not self._authority_guard_enabled:
+            return super().execute(sql, parameters)
+        if self._is_transaction_begin(sql):
+            cursor = super().execute(sql, parameters)
+            self._validate_after_begin()
+            return cursor
+        # Callers that only read do not otherwise issue BEGIN.  Start a snapshot
+        # and authenticate its metadata before their first child-row access.
+        if not self.in_transaction and not self._is_transaction_end(sql):
+            super().execute("BEGIN")
+            self._validate_after_begin()
+        return super().execute(sql, parameters)
+
+
 @dataclass(frozen=True, slots=True)
 class RotationEligibility:
     authority_epoch: int
@@ -167,6 +265,20 @@ class RotationEligibilityProbe:
     authority_epoch: int
     authority_identity_digest: str
     claim_state_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimePruneCompletion:
+    """Nominal proof that one exact runtime prune CAS committed."""
+
+    run_hash: str
+    pruned_record_digest: str
+    runtime_prune_pending_state_digest: str
+    authority_epoch: int
+    _issuer: object = field(repr=False, compare=False)
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        raise TypeError("runtime prune completion cannot be serialized")
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +350,22 @@ class PendingResultReplayAuthority:
     _issuer: object = field(repr=False, compare=False)
 
 
+@dataclass(frozen=True, slots=True)
+class TerminalResultStageEvidence:
+    """Nominal Store authority to stage exactly one recovered terminal result."""
+
+    run_id: str
+    operational_projection: Mapping[str, object]
+    body_sha256: str
+    active_state_digest: str
+    runtime_terminal_state_digest: str
+    terminal_record_digest: str
+    detached_record_digest: str
+    terminal_projection_digest: str
+    retention_expires_at_ms: int
+    _issuer: object = field(repr=False, compare=False)
+
+
 class PendingResultReplayVerifier(Protocol):
     """Opaque coordinator/Store bridge; clients never receive a RunnerStore."""
 
@@ -247,6 +375,14 @@ class PendingResultReplayVerifier(Protocol):
 
     def consume(
         self, authority: PendingResultReplayAuthority, *, expected_fields: Mapping[str, object],
+    ) -> None: ...
+
+    def authorize_unstaged_terminal_result(
+        self, run_id: str, *, now_ms: int,
+    ) -> TerminalResultStageEvidence: ...
+
+    def consume_stage(
+        self, evidence: TerminalResultStageEvidence, *, expected_fields: Mapping[str, object],
     ) -> None: ...
 
 
@@ -335,6 +471,14 @@ class PrunePendingBatch:
 
     def __getitem__(self, index: int) -> TerminalDisclosureState:
         return self.items[index]
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalDisclosureBatch:
+    """Bounded read-only local-terminal recovery work."""
+
+    items: tuple[TerminalDisclosureState, ...]
+    has_more: bool
 
 
 class _TerminalDisclosureLease:
@@ -507,6 +651,9 @@ class RunnerRuntimeState:
         self._leaf_identity: tuple[int, int, int, int, int] | None = None
         self._parent_identities: tuple[tuple[Path, tuple[int, int, int, int]], ...] = ()
         self._created_leaf = False
+        self._inode_guard_process: subprocess.Popen[bytes] | None = None
+        self._inode_guard_control: socket.socket | None = None
+        self._closed = False
         self._validate_identity()
         self._kek = self._derive_key()
         self._key = b""
@@ -688,7 +835,7 @@ class RunnerRuntimeState:
                     raise RunnerRuntimeCorrupt("runtime state is unsafe")
                 try:
                     leaf_fd = os.open(
-                        self.path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd,
+                        self.path.name, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd,
                     )
                 except OSError as exc:
                     raise RunnerRuntimeCorrupt("runtime state is unsafe") from exc
@@ -703,6 +850,111 @@ class RunnerRuntimeState:
         self._leaf_fd = leaf_fd
         self._leaf_identity = self._file_identity(leaf_fd_stat)
         self._parent_identities = tuple(identities)
+        self._start_inode_guard()
+
+    def _start_inode_guard(self) -> None:
+        if self._leaf_fd is None or self._inode_guard_process is not None or self._inode_guard_control is not None:
+            raise RunnerRuntimeCorrupt("runtime state helper is invalid")
+        executable = sys.executable
+        if type(executable) is not str or "\0" in executable or not os.path.isabs(executable):
+            raise RunnerRuntimeCorrupt("runtime state helper is unavailable")
+        try:
+            executable_stat = os.stat(executable)
+        except OSError as exc:
+            raise RunnerRuntimeCorrupt("runtime state helper is unavailable") from exc
+        if not stat.S_ISREG(executable_stat.st_mode) or executable_stat.st_uid != os.geteuid():
+            raise RunnerRuntimeCorrupt("runtime state helper is unavailable")
+        try:
+            parent_control, child_control = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        except OSError as exc:
+            raise RunnerRuntimeCorrupt("runtime state helper is unavailable") from exc
+        child_fd = child_control.fileno()
+        pass_fds = tuple(sorted((self._leaf_fd, child_fd)))
+        if len(pass_fds) != 2 or pass_fds[0] <= 2 or pass_fds[1] <= 2:
+            parent_control.close()
+            child_control.close()
+            raise RunnerRuntimeCorrupt("runtime state helper is unavailable")
+        argv = [
+            executable,
+            "-I", "-S", "-B", "-c", _RUNTIME_INODE_GUARD_BOOTSTRAP,
+            str(self._leaf_fd), str(child_fd),
+        ]
+        try:
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                pass_fds=pass_fds,
+                cwd="/",
+                env={"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
+                start_new_session=True,
+                restore_signals=True,
+            )
+        except OSError as exc:
+            parent_control.close()
+            child_control.close()
+            raise RunnerRuntimeCorrupt("runtime state helper is unavailable") from exc
+        child_control.close()
+        self._inode_guard_process = process
+        self._inode_guard_control = parent_control
+
+    def _stop_inode_guard(self) -> None:
+        control = self._inode_guard_control
+        process = self._inode_guard_process
+        self._inode_guard_control = None
+        self._inode_guard_process = None
+        if control is not None:
+            try:
+                control.settimeout(1.0)
+                control.sendall(b"Q")
+            except OSError:
+                pass
+            finally:
+                control.close()
+        if process is not None:
+            try:
+                process.wait(timeout=1.0)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    process.terminate()
+                    process.wait(timeout=1.0)
+                except (subprocess.TimeoutExpired, OSError):
+                    try:
+                        process.kill()
+                        process.wait(timeout=1.0)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+
+    def _poison_inode_guard(self, message: str) -> None:
+        self._poisoned = True
+        self._stop_inode_guard()
+        raise RunnerRuntimeCorrupt(message)
+
+    def _probe_inode_guard(self) -> None:
+        process = self._inode_guard_process
+        control = self._inode_guard_control
+        if process is None or control is None or process.poll() is not None:
+            self._poison_inode_guard("runtime state helper is unavailable")
+        try:
+            control.settimeout(1.0)
+            control.sendall(b"P")
+            response = control.recv(2)
+            control.setblocking(False)
+            try:
+                extra = control.recv(1)
+            except BlockingIOError:
+                extra = None
+            finally:
+                control.settimeout(None)
+        except (OSError, socket.timeout) as exc:
+            self._poison_inode_guard("runtime state helper is unavailable")
+            raise AssertionError("unreachable") from exc
+        if len(response) != 1 or extra is not None or process.poll() is not None:
+            self._poison_inode_guard("runtime state helper is unavailable")
+        if response != b"L":
+            self._poison_inode_guard("runtime state is unsafe")
 
     def _assert_secure_path_unchanged(self) -> None:
         if self._parent_fd is None or self._leaf_fd is None or self._leaf_identity is None:
@@ -734,6 +986,22 @@ class RunnerRuntimeState:
         except OSError:
             pass
         finally:
+            self._stop_inode_guard()
+            for name in ("_leaf_fd", "_parent_fd"):
+                descriptor = getattr(self, name, None)
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                    setattr(self, name, None)
+
+    def close(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._stop_inode_guard()
             for name in ("_leaf_fd", "_parent_fd"):
                 descriptor = getattr(self, name, None)
                 if descriptor is not None:
@@ -744,38 +1012,59 @@ class RunnerRuntimeState:
                     setattr(self, name, None)
 
     def __del__(self) -> None:
-        for name in ("_leaf_fd", "_parent_fd"):
-            descriptor = getattr(self, name, None)
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-                setattr(self, name, None)
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @contextmanager
     def _connection(self, *, allow_rotation_fence: bool = False) -> Iterator[sqlite3.Connection]:
-        if self._poisoned:
+        if self._poisoned or self._closed:
             raise RunnerRuntimeCorrupt("runtime state requires reconstruction")
         with self._state_lock:
             self._assert_secure_path_unchanged()
-            conn = sqlite3.connect(str(self.path), isolation_level=None)
+            conn: sqlite3.Connection | None = None
             try:
-                self._assert_secure_path_unchanged()
+                conn = sqlite3.connect(
+                    str(self.path), isolation_level=None, factory=_RuntimeSqliteConnection,
+                )
                 conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout=0")
+                locking_mode = conn.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()
+                if locking_mode is None or type(locking_mode[0]) is not str or locking_mode[0].lower() != "exclusive":
+                    self._poison_inode_guard("runtime state helper is unavailable")
+                conn.execute("BEGIN EXCLUSIVE")
+                try:
+                    self._probe_inode_guard()
+                    self._assert_secure_path_unchanged()
+                    conn.execute("COMMIT")
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.DatabaseError:
+                        pass
+                    raise
+                self._assert_secure_path_unchanged()
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA journal_mode=WAL")
+                journal_mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                if journal_mode is None or type(journal_mode[0]) is not str or journal_mode[0].lower() != "wal":
+                    self._poison_inode_guard("runtime state helper is unavailable")
                 if self._initialized:
                     self._validate_open_runtime(
                         conn, allow_rotation_fence=allow_rotation_fence or self._allow_rotation_recovery,
+                    )
+                    conn.configure_runtime_guard(
+                        self,
+                        allow_rotation_fence=allow_rotation_fence or self._allow_rotation_recovery,
                     )
                 yield conn
             except sqlite3.DatabaseError as exc:
                 raise RunnerRuntimeCorrupt("runtime state database is invalid") from exc
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
 
     @staticmethod
     def _normalized_sql(value: object) -> str:
@@ -1323,6 +1612,21 @@ class RunnerRuntimeState:
             self._poisoned = True
             raise RunnerRuntimeCorrupt("runtime state key is invalid")
         return row
+
+    def _validate_transaction_authority_locked(
+        self, conn: sqlite3.Connection, *, allow_rotation_fence: bool,
+    ) -> None:
+        """Validate the cached authority tuple inside the caller's transaction.
+
+        This deliberately runs after SQLite has acquired the transaction snapshot
+        or writer lock.  A second runtime object can otherwise rotate the
+        metadata after `_connection` validates it but before a child row is read
+        or written.
+        """
+        metadata = self._current_metadata_locked(conn)
+        if metadata["rotation_fence_digest"] is not None and not allow_rotation_fence:
+            _digest(metadata["rotation_fence_digest"], "runtime rotation fence digest")
+            raise RunnerRuntimeConflict("runtime rotation is in progress")
 
     def rotation_authority_snapshot(self) -> tuple[int, str]:
         """Return the authenticated pre-fence authority tuple for rotation preparation."""
@@ -2189,8 +2493,6 @@ class RunnerRuntimeState:
                         revision=prior_active["revision"] + 1,
                         prior_state_digest=prior_active["state_digest"],
                     )
-                    if next_active["gate"]["kill_switch_generation"] != prior_active["grant"]["kill_switch_generation"]:
-                        raise RunnerRuntimeCorrupt("runtime active gate is inconsistent")
                     active_blob = self._seal(
                         next_active, schema="heel.runner-active-run-state.v1",
                         primary_fields=(next_active["run_hash"],),
@@ -2256,9 +2558,21 @@ class RunnerRuntimeState:
                 "projection_digest": checked_projection["projection_digest"],
                 "manifest_digest": checked_projection["manifest_digest"],
             }
-            or checked_gate["kill_switch_generation"] != checked_grant["kill_switch_generation"]
         ):
             raise RunnerRuntimeCorrupt("runtime active run authority is invalid")
+        grant_generation = checked_grant["kill_switch_generation"]
+        gate_generation = checked_gate["kill_switch_generation"]
+        if (
+            gate_generation < grant_generation
+            or (
+                gate_generation > grant_generation
+                and (
+                    checked_gate["active"] is not False
+                    or checked_gate["stop_reason"] == "none"
+                )
+            )
+        ):
+            raise RunnerRuntimeCorrupt("runtime active gate is inconsistent")
         claim_response_digest = _digest(claim_response_digest, "runtime claim response digest")
         latest_gate_response_digest = _digest(latest_gate_response_digest, "runtime gate response digest")
         claimed_at_ms = _safe_int(claimed_at_ms, "runtime claimed time")
@@ -2540,6 +2854,33 @@ class RunnerRuntimeState:
         assert run_id is not None
         with self._connection() as conn:
             return self._load_terminal_locked(conn, run_id)
+
+    def load_unstaged_local_terminals(
+        self, *, limit: int = 16,
+    ) -> TerminalDisclosureBatch:
+        """Return bounded, zero-pending terminal result work without mutating it."""
+        if type(limit) is not int or not 1 <= limit <= 16:
+            raise RunnerRuntimeStateError("invalid runtime terminal recovery limit")
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            try:
+                rows = conn.execute(
+                    "SELECT run_hash,retention_expires_at_ms,state,sealed_blob,updated_at_ms "
+                    "FROM terminal_disclosures INDEXED BY idx_terminal_disclosures_state_retention "
+                    "WHERE state='local_terminal' AND NOT EXISTS ("
+                    "SELECT 1 FROM pending_calls INDEXED BY idx_pending_calls_run_operation "
+                    "WHERE pending_calls.run_hash=terminal_disclosures.run_hash"
+                    ") ORDER BY retention_expires_at_ms,run_hash LIMIT ?",
+                    (limit + 1,),
+                ).fetchall()
+                states = tuple(self._load_terminal_row_locked(row) for row in rows[:limit])
+                if any(state.state != "local_terminal" for state in states):
+                    raise RunnerRuntimeCorrupt("runtime terminal disclosure index is invalid")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return TerminalDisclosureBatch(items=states, has_more=len(rows) > limit)
 
     def _terminal_core(self, **values: Any) -> dict[str, Any]:
         core_without_digest = {
@@ -2919,23 +3260,62 @@ class RunnerRuntimeState:
     def claim_due_prune(
         self, *, now_ms: int, limit: int = 16,
     ) -> PrunePendingBatch:
+        return self._claim_due_prune(now_ms=now_ms, limit=limit)
+
+    def claim_specific_due_prune(
+        self, run_id: str, *, expected_state_digest: str, now_ms: int,
+    ) -> TerminalDisclosureState:
+        """Atomically claim one known expired disclosure without scanning history."""
+        run_id = _run_id(run_id) or ""
+        expected_state_digest = _digest(
+            expected_state_digest, "runtime prune state digest",
+        )
+        claimed = self._claim_due_prune(
+            now_ms=now_ms, limit=1, only_run_hash=_run_hash(run_id),
+            expected_state_digest=expected_state_digest,
+        )
+        if not claimed.items:
+            raise RunnerRuntimeConflict("runtime terminal prune state changed")
+        return claimed.items[0]
+
+    def _claim_due_prune(
+        self, *, now_ms: int, limit: int,
+        only_run_hash: str | None = None,
+        expected_state_digest: str | None = None,
+    ) -> PrunePendingBatch:
         now_ms = _safe_int(now_ms, "runtime prune time")
         limit = self._prune_limit(limit)
+        if only_run_hash is not None:
+            only_run_hash = _digest(only_run_hash, "runtime run hash")
+        if expected_state_digest is not None:
+            expected_state_digest = _digest(
+                expected_state_digest, "runtime prune state digest",
+            )
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                rows = conn.execute(
-                    "SELECT run_hash,retention_expires_at_ms,state,sealed_blob,updated_at_ms FROM terminal_disclosures "
-                    "INDEXED BY idx_terminal_disclosures_due_retention "
-                    "WHERE state IN ('local_terminal','available','consumed') "
-                    "AND retention_expires_at_ms<=? ORDER BY retention_expires_at_ms,run_hash LIMIT ?",
-                    (now_ms, limit + 1),
-                ).fetchall()
+                if only_run_hash is None:
+                    rows = conn.execute(
+                        "SELECT run_hash,retention_expires_at_ms,state,sealed_blob,updated_at_ms FROM terminal_disclosures "
+                        "INDEXED BY idx_terminal_disclosures_due_retention "
+                        "WHERE state IN ('local_terminal','available','consumed') "
+                        "AND retention_expires_at_ms<=? ORDER BY retention_expires_at_ms,run_hash LIMIT ?",
+                        (now_ms, limit + 1),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT run_hash,retention_expires_at_ms,state,sealed_blob,updated_at_ms FROM terminal_disclosures "
+                        "WHERE run_hash=? AND state IN ('local_terminal','available','consumed') "
+                        "AND retention_expires_at_ms<=? LIMIT ?",
+                        (only_run_hash, now_ms, limit + 1),
+                    ).fetchall()
                 claimed: list[TerminalDisclosureState] = []
                 for row in rows[:limit]:
                     state = self._load_terminal_row_locked(row)
                     if state.run_hash != row["run_hash"] or state.state == "prune_pending":
                         raise RunnerRuntimeCorrupt("runtime terminal disclosure index is invalid")
+                    if expected_state_digest is not None and state.state_digest != expected_state_digest:
+                        raise RunnerRuntimeConflict("runtime terminal prune state changed")
                     chain_rows = conn.execute(
                         "SELECT chain,run_hash,operation,next_sequence,generation,sealed_blob "
                         "FROM control_chains WHERE run_hash=?", (state.run_hash,),
@@ -2984,6 +3364,13 @@ class RunnerRuntimeState:
                             chains and set(chains) != {"heartbeat", "progress", "result", "stop-ack"}
                         ) or len(pending_calls) > 1:
                             raise RunnerRuntimeCorrupt("runtime terminal prune does not own an exact run")
+                        active = self._load_active_locked(conn, state.run_id)
+                        if active is None or not chains or any((
+                            active["project_id"] != state.project_id,
+                            active["grant_id"] != state.grant_id,
+                            active["approval_projection_digest"] != state.approval_projection_digest,
+                        )):
+                            raise RunnerRuntimeCorrupt("runtime terminal prune does not own an exact run")
                         if pending_calls:
                             call = pending_calls[0]
                             result = chains.get("result")
@@ -3022,9 +3409,22 @@ class RunnerRuntimeState:
                         (pending.state, blob, now_ms, state.run_hash, state.state),
                     )
                     if state.state == "local_terminal":
-                        conn.execute("DELETE FROM control_chains WHERE run_hash=?", (state.run_hash,))
+                        removed_active = conn.execute(
+                            "DELETE FROM active_runs WHERE run_hash=?", (state.run_hash,),
+                        )
+                        if removed_active.rowcount != 1:
+                            raise RunnerRuntimeCorrupt("runtime terminal prune does not own an exact run")
+                        removed_chains = conn.execute(
+                            "DELETE FROM control_chains WHERE run_hash=?", (state.run_hash,),
+                        )
+                        if removed_chains.rowcount != 4:
+                            raise RunnerRuntimeCorrupt("runtime terminal prune does not own an exact run")
                     if pending_calls:
-                        conn.execute("DELETE FROM pending_calls WHERE run_hash=?", (state.run_hash,))
+                        removed_pending = conn.execute(
+                            "DELETE FROM pending_calls WHERE run_hash=?", (state.run_hash,),
+                        )
+                        if removed_pending.rowcount != len(pending_calls):
+                            raise RunnerRuntimeCorrupt("runtime terminal prune does not own an exact run")
                     claimed.append(pending)
                 conn.execute("COMMIT")
                 return PrunePendingBatch(items=tuple(claimed), has_more=len(rows) > limit)
@@ -3093,7 +3493,7 @@ class RunnerRuntimeState:
 
     def finish_prune(
         self, *, receipt: object, expected_prune_pending_state_digest: str,
-    ) -> None:
+    ) -> RuntimePruneCompletion:
         record = self._validated_pruned_receipt(receipt)
         run_id = _run_id(record["run_id"])
         assert run_id is not None
@@ -3107,8 +3507,18 @@ class RunnerRuntimeState:
             try:
                 state = self._load_terminal_locked(conn, run_id)
                 if state is None:
+                    if (
+                        conn.execute("SELECT 1 FROM pending_calls WHERE run_hash=? LIMIT 1", (record["run_hash"],)).fetchone() is not None
+                        or conn.execute("SELECT 1 FROM active_runs WHERE run_hash=? LIMIT 1", (record["run_hash"],)).fetchone() is not None
+                        or conn.execute("SELECT 1 FROM control_chains WHERE run_hash=? LIMIT 1", (record["run_hash"],)).fetchone() is not None
+                    ):
+                        raise RunnerRuntimeCorrupt("runtime terminal prune does not match local authority")
                     conn.execute("COMMIT")
-                    return
+                    return RuntimePruneCompletion(
+                        run_hash=record["run_hash"], pruned_record_digest=record["record_digest"],
+                        runtime_prune_pending_state_digest=expected_state_digest,
+                        authority_epoch=self._authority_epoch, _issuer=self._token,
+                    )
                 if (
                     state.state != "prune_pending" or state.state_digest != expected_state_digest
                     or state.run_hash != record["run_hash"]
@@ -3120,6 +3530,11 @@ class RunnerRuntimeState:
                     raise RunnerRuntimeCorrupt("runtime terminal prune does not match local authority")
                 conn.execute("DELETE FROM terminal_disclosures WHERE run_hash=?", (state.run_hash,))
                 conn.execute("COMMIT")
+                return RuntimePruneCompletion(
+                    run_hash=record["run_hash"], pruned_record_digest=record["record_digest"],
+                    runtime_prune_pending_state_digest=expected_state_digest,
+                    authority_epoch=self._authority_epoch, _issuer=self._token,
+                )
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -27,7 +29,7 @@ from heel.runner.execution import (
 )
 from heel.runner.http_transport import BoundedResponseEvidence, TargetResponse, TransportFailure
 from heel.runner.service import ClaimLease, RunnerService
-from heel.runner.runtime import RunnerRuntimeState
+from heel.runner.runtime import ActiveRunInstall, RunnerRuntimeState, RuntimePruneCompletion
 from heel.runner.store import RunnerStoreError
 from tests.test_runner_compiler import CanaryCompiler, add_roles, bound_store, map_scenarios
 
@@ -101,6 +103,59 @@ def signed_grant(manifest, projection, identity, authority, *, issued=1_000, exp
     return grant
 
 
+def _install_runtime_active_claim(runtime, identity, signer, projection, grant):
+    """Install the same coherent claim-200 authority production persists."""
+    nonce = base64.b64encode(b"c" * 32).decode("ascii")
+    cursor = runtime.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=nonce,
+        next_sequence=1, generation=0, now_ms=1,
+    )
+    path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/claim"
+    body = canonical_bytes({"schema_version": "heel.runner-claim-request.v1"})
+    proof = {
+        "schema_version": "heel.runner-request-proof.v1",
+        "workspace_id": identity.workspace_id, "runner_id": identity.runner_id,
+        "key_id": identity.key_id, "capability": "runner_claim", "method": "POST",
+        "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": 2,
+        "server_nonce": nonce, "sequence": cursor.next_sequence,
+    }
+    headers = {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
+        "X-Heel-Runner-Key-Id": identity.key_id, "X-Heel-Runner-Timestamp-Ms": "2",
+        "X-Heel-Runner-Signature": base64.b64encode(
+            signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))
+        ).decode("ascii"),
+        "X-Heel-Runner-Nonce": nonce, "X-Heel-Runner-Sequence": "1",
+    }
+    pending = runtime.stage_call(
+        request_operation="claim", chain_operation="claim", run_id=None, path=path,
+        capability="runner_claim", headers=headers, body=body,
+        expected_state_digest=cursor.state_digest, now_ms=2,
+    )
+    run_id = grant["run_id"]
+    installed = tuple(
+        (operation, run_id, base64.b64encode(marker * 32).decode("ascii"), 1, 0)
+        for operation, marker in (
+            ("heartbeat", b"h"), ("progress", b"p"),
+            ("result", b"r"), ("stop-ack", b"s"),
+        )
+    )
+    runtime.commit_call(
+        pending.call_id, next_nonce_b64=base64.b64encode(b"n" * 32).decode("ascii"), now_ms=2,
+        installed_chains=installed,
+        active_run=ActiveRunInstall(
+            run_id=run_id, approval_projection=projection, grant=grant,
+            gate={
+                "active": True, "runner_state": "active", "proof_state": "valid",
+                "proof_expires_at_ms": 20_000, "kill_switch_generation": 7,
+                "stop_reason": "none", "server_time_ms": 2_000,
+            },
+            claim_response_digest="a" * 64, gate_response_digest="b" * 64,
+            claimed_at_ms=2, gate_received_at_ms=2,
+        ),
+    )
+
+
 def resign_grant(grant, authority):
     unsigned = {
         key: copy.deepcopy(value) for key, value in grant.items()
@@ -123,6 +178,33 @@ def active_gate(now=2_000):
         stop_reason="none",
         server_time_ms=now,
     )
+
+
+def _ready_runtime_prune_candidate(tmp_path):
+    """Create one exact detached terminal and its bounded runtime prune claim."""
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    _install_runtime_active_claim(runtime, identity, signer, projection, grant)
+    local = runtime.register_local_terminal(**store._runtime_terminal_anchor(grant["run_id"]))
+    store.detach_terminal(
+        grant["run_id"], runtime=runtime,
+        expected_local_state_digest=local.state_digest, now_ms=2_000,
+    )
+    pending = runtime.claim_due_prune(
+        now_ms=store.load_run(grant["run_id"])["retention_expires_at_ms"],
+    )[0]
+    return store, identity, signer, runtime, grant, pending
 
 
 def test_execution_bundle_is_exactly_bound_signed_fresh_and_reserved_once(tmp_path):
@@ -703,6 +785,7 @@ def test_terminal_detach_journal_recovers_after_record_write_crash(tmp_path, mon
         transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
     )
     runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    _install_runtime_active_claim(runtime, identity, signer, projection, grant)
     local = runtime.register_local_terminal(**store._runtime_terminal_anchor(grant["run_id"]))
     ensure = store._ensure_json_exact
 
@@ -726,7 +809,11 @@ def test_terminal_detach_journal_recovers_after_record_write_crash(tmp_path, mon
     )
 
 
-def test_runtime_prune_removes_a_detached_terminal_only_after_signed_store_prune(tmp_path):
+def test_runtime_prune_removes_a_detached_terminal_only_after_signed_store_prune(
+    tmp_path, monkeypatch,
+):
+    import heel.runner.store as store_module
+
     store, identity, signer, manifest, projection = compiled_pair(tmp_path)
     authority = SigningAuthority.generate()
     grant = signed_grant(manifest, projection, identity, authority)
@@ -740,6 +827,7 @@ def test_runtime_prune_removes_a_detached_terminal_only_after_signed_store_prune
         transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
     )
     runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    _install_runtime_active_claim(runtime, identity, signer, projection, grant)
     local = runtime.register_local_terminal(**store._runtime_terminal_anchor(grant["run_id"]))
     store.detach_terminal(
         grant["run_id"], runtime=runtime,
@@ -748,6 +836,38 @@ def test_runtime_prune_removes_a_detached_terminal_only_after_signed_store_prune
     pending = runtime.claim_due_prune(
         now_ms=store.load_run(grant["run_id"])["retention_expires_at_ms"],
     )[0]
+    run_hash = store._run_hash(grant["run_id"])
+    runs_path = store.run_path(grant["run_id"]).parent
+    compacted_roots = (
+        f"grant-{grant['grant_digest']}.json",
+        store._run_authority_record_filename("reserve", run_hash),
+        store._run_authority_record_filename("terminal", run_hash),
+        store._run_authority_record_filename("detach_terminal", run_hash),
+    )
+    assert all((runs_path / name).is_file() for name in compacted_roots)
+
+    runs_stat = runs_path.stat()
+    real_scandir = store_module.os.scandir
+    real_read_json = store_module._read_json
+    history_reads = 0
+
+    def unexpected_scan(directory, *args, **kwargs):
+        if type(directory) is int:
+            status = os.fstat(directory)
+            if (status.st_dev, status.st_ino) == (runs_stat.st_dev, runs_stat.st_ino):
+                raise AssertionError("runtime prune must not enumerate historical run authority")
+        return real_scandir(directory, *args, **kwargs)
+
+    def bounded_history_read(directory_fd, filename, default):
+        nonlocal history_reads
+        if type(directory_fd) is int:
+            status = os.fstat(directory_fd)
+            if (status.st_dev, status.st_ino) == (runs_stat.st_dev, runs_stat.st_ino):
+                history_reads += 1
+        return real_read_json(directory_fd, filename, default)
+
+    monkeypatch.setattr(store_module.os, "scandir", unexpected_scan)
+    monkeypatch.setattr(store_module, "_read_json", bounded_history_read)
 
     receipt = store.prune_runtime_terminal(
         grant["run_id"], runtime=runtime,
@@ -755,10 +875,241 @@ def test_runtime_prune_removes_a_detached_terminal_only_after_signed_store_prune
         now_ms=pending.retention_expires_at_ms,
     )
 
-    runtime.finish_prune(
+    assert all(not (runs_path / name).exists() for name in compacted_roots)
+    assert (runs_path / store._run_authority_record_filename("prune", run_hash)).is_file()
+    assert history_reads <= 32
+
+    forged = RuntimePruneCompletion(
+        run_hash=run_hash, pruned_record_digest=receipt.record["record_digest"],
+        runtime_prune_pending_state_digest=pending.state_digest,
+        authority_epoch=runtime._authority_epoch, _issuer=object(),
+    )
+    with pytest.raises(RunnerStoreError, match="compaction completion is invalid"):
+        store.finish_pruned_compaction(forged, runtime=runtime)
+    assert (runs_path / store._run_authority_record_filename("prune", run_hash)).is_file()
+
+    completion = runtime.finish_prune(
         receipt=receipt, expected_prune_pending_state_digest=pending.state_digest,
     )
+    store.finish_pruned_compaction(completion, runtime=runtime)
+    assert not (runs_path / store._run_authority_record_filename("prune", run_hash)).exists()
+    with pytest.raises(RunnerStoreError, match="compaction completion is unavailable"):
+        store.finish_pruned_compaction(completion, runtime=runtime)
     assert runtime.load_terminal_state(grant["run_id"]) is None
+    with pytest.raises(RunnerStoreError, match="execution grant has expired"):
+        store.reserve_run(grant, retention_expires_at_ms=pending.retention_expires_at_ms)
+
+
+def test_runtime_prune_rejects_a_full_compaction_finalize_queue_before_deleting_roots(tmp_path, monkeypatch):
+    store, _identity, _signer, runtime, grant, pending = _ready_runtime_prune_candidate(tmp_path)
+    run_hash = store._run_hash(grant["run_id"])
+    runs_path = store.run_path(grant["run_id"]).parent
+    run_path = store.run_path(grant["run_id"])
+    original_checkpoint = store._run_authority_checkpoint_locked
+
+    def saturated_checkpoint(runs_fd, *, identity):
+        value = original_checkpoint(runs_fd, identity=identity)
+        return {**value, "pending_finalize": [{"placeholder": index} for index in range(16)]}
+
+    monkeypatch.setattr(store, "_run_authority_checkpoint_locked", saturated_checkpoint)
+    with pytest.raises(RunnerStoreError, match="compaction queue is full"):
+        store.prune_runtime_terminal(
+            grant["run_id"], runtime=runtime,
+            expected_runtime_state_digest=pending.state_digest,
+            now_ms=pending.retention_expires_at_ms,
+        )
+
+    assert run_path.is_dir()
+    assert (runs_path / f"grant-{grant['grant_digest']}.json").is_file()
+    assert (runs_path / store._run_authority_record_filename("reserve", run_hash)).is_file()
+    assert (runs_path / store._run_authority_record_filename("terminal", run_hash)).is_file()
+    assert (runs_path / store._run_authority_record_filename("detach_terminal", run_hash)).is_file()
+    assert not (runs_path / store._run_authority_record_filename("prune", run_hash)).exists()
+
+
+def test_compaction_checkpoint_scale_keeps_a_singleton_root_and_monotonic_time_floor(tmp_path):
+    """A long compacted history advances only the signed checkpoint/index pair."""
+    import heel.runner.store as store_module
+
+    store, identity, signer, _manifest, _projection = compiled_pair(tmp_path)
+    with store._transaction(exclusive=True) as context_fd:
+        runs_fd = store_module._open_child(context_fd, "runs", create=False)
+        assert runs_fd is not None
+        try:
+            index = store._run_authority_index_locked(runs_fd, identity=identity)
+            checkpoint = store._run_authority_checkpoint_locked(runs_fd, identity=identity)
+            previous_floor = checkpoint["time_floor_ms"]
+            for sequence in range(1_000):
+                run_id = f"crun_{sequence:032x}"
+
+                def digest(label: str) -> str:
+                    return hashlib.sha256(f"{label}:{sequence}".encode("ascii")).hexdigest()
+
+                entry = {
+                    "run_id": run_id, "run_hash": store._run_hash(run_id),
+                    "grant_id": f"grant_{sequence:032x}", "grant_digest": digest("grant"),
+                    "grant_expires_at_ms": sequence + 1,
+                    "reservation_record_digest": digest("reservation"),
+                    "terminal_record_digest": digest("terminal"),
+                    "detached_record_digest": digest("detached"),
+                    "pruned_record_digest": digest("pruned"),
+                    "runtime_prune_pending_state_digest": digest("runtime"),
+                    "retention_expires_at_ms": sequence + 2,
+                    "pruned_at_ms": sequence + 3,
+                }
+                prepared = store._next_run_authority_checkpoint(
+                    checkpoint, index, entries=[entry], signer=signer, now_ms=sequence + 4,
+                )
+                prepared_index = store._next_run_authority_index(
+                    index, signer=signer, delta=0, head_digest=prepared["record_digest"],
+                )
+                checkpoint = store._next_finalized_run_authority_checkpoint(
+                    prepared, prepared_index, pending=prepared["pending_finalize"][0], signer=signer,
+                )
+                index = store._next_run_authority_index(
+                    prepared_index, signer=signer, delta=0, head_digest=checkpoint["record_digest"],
+                )
+                store_module._write_json(runs_fd, store_module._RUN_AUTHORITY_CHECKPOINT_FILENAME, checkpoint)
+                store_module._write_json(runs_fd, store_module._RUN_AUTHORITY_INDEX_FILENAME, index)
+                assert checkpoint["pending_finalize"] == []
+                assert checkpoint["time_floor_ms"] >= previous_floor
+                previous_floor = checkpoint["time_floor_ms"]
+        finally:
+            os.close(runs_fd)
+
+    runs_path = store.root / "runner" / "contexts" / store.namespace / "runs"
+    checkpoint = json.loads((runs_path / "run-authority-checkpoint.json").read_text())
+    assert checkpoint["compacted_run_count"] == 1_000
+    assert checkpoint["time_floor_ms"] == 1_003
+    assert sorted(entry.name for entry in runs_path.iterdir()) == [
+        "run-authority-checkpoint.json", "run-authority-index.json",
+    ]
+
+
+def test_pruned_compaction_journal_rolls_forward_after_checkpoint_publish_crash(
+    tmp_path, monkeypatch,
+):
+    import heel.runner.store as store_module
+
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    _install_runtime_active_claim(runtime, identity, signer, projection, grant)
+    local = runtime.register_local_terminal(**store._runtime_terminal_anchor(grant["run_id"]))
+    store.detach_terminal(
+        grant["run_id"], runtime=runtime,
+        expected_local_state_digest=local.state_digest, now_ms=2_000,
+    )
+    pending = runtime.claim_due_prune(
+        now_ms=store.load_run(grant["run_id"])["retention_expires_at_ms"],
+    )[0]
+    run_hash = store._run_hash(grant["run_id"])
+    runs_path = store.run_path(grant["run_id"]).parent
+    roots = (
+        f"grant-{grant['grant_digest']}.json",
+        store._run_authority_record_filename("reserve", run_hash),
+        store._run_authority_record_filename("terminal", run_hash),
+        store._run_authority_record_filename("detach_terminal", run_hash),
+    )
+    real_write_json = store_module._write_json
+
+    def fail_after_prepare_journal(directory_fd, filename, value):
+        if (
+            filename == store_module._RUN_AUTHORITY_CHECKPOINT_FILENAME
+            and (runs_path / store_module._RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME).exists()
+        ):
+            raise OSError("compaction checkpoint publish interrupted")
+        return real_write_json(directory_fd, filename, value)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(store_module, "_write_json", fail_after_prepare_journal)
+        with pytest.raises(OSError, match="compaction checkpoint publish interrupted"):
+            store.prune_runtime_terminal(
+                grant["run_id"], runtime=runtime,
+                expected_runtime_state_digest=pending.state_digest,
+                now_ms=pending.retention_expires_at_ms,
+            )
+
+    assert (runs_path / store_module._RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME).is_file()
+    assert all((runs_path / name).is_file() for name in roots)
+
+    receipt = store.load_pruned_run_receipt(
+        grant["run_id"], expected_runtime_state_digest=pending.state_digest,
+    )
+    assert receipt.record["run_hash"] == run_hash
+    assert not (runs_path / store_module._RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME).exists()
+    assert all(not (runs_path / name).exists() for name in roots)
+
+
+def test_finalizing_compaction_journal_rolls_forward_after_receipt_delete_crash(
+    tmp_path, monkeypatch,
+):
+    import heel.runner.store as store_module
+
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    _install_runtime_active_claim(runtime, identity, signer, projection, grant)
+    local = runtime.register_local_terminal(**store._runtime_terminal_anchor(grant["run_id"]))
+    store.detach_terminal(
+        grant["run_id"], runtime=runtime,
+        expected_local_state_digest=local.state_digest, now_ms=2_000,
+    )
+    pending = runtime.claim_due_prune(
+        now_ms=store.load_run(grant["run_id"])["retention_expires_at_ms"],
+    )[0]
+    receipt = store.prune_runtime_terminal(
+        grant["run_id"], runtime=runtime,
+        expected_runtime_state_digest=pending.state_digest,
+        now_ms=pending.retention_expires_at_ms,
+    )
+    completion = runtime.finish_prune(
+        receipt=receipt, expected_prune_pending_state_digest=pending.state_digest,
+    )
+    runs_path = store.run_path(grant["run_id"]).parent
+    real_write_json = store_module._write_json
+
+    def fail_after_finalizing_journal(directory_fd, filename, value):
+        if (
+            filename == store_module._RUN_AUTHORITY_CHECKPOINT_FILENAME
+            and (runs_path / store_module._RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME).exists()
+        ):
+            raise OSError("compaction final checkpoint publish interrupted")
+        return real_write_json(directory_fd, filename, value)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(store_module, "_write_json", fail_after_finalizing_journal)
+        with pytest.raises(OSError, match="compaction final checkpoint publish interrupted"):
+            store.finish_pruned_compaction(completion, runtime=runtime)
+
+    assert (runs_path / store_module._RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME).is_file()
+    assert not (runs_path / store._run_authority_record_filename(
+        "prune", store._run_hash(grant["run_id"]),
+    )).exists()
+
+    restarted = type(store).for_runtime(store.root, identity=identity, signer=signer)
+    assert restarted.recover_pruned_compaction_finalizers(runtime=runtime) == 1
+    assert not (runs_path / store_module._RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME).exists()
 
 
 def test_store_derives_containment_summary_and_rejects_event_or_view_tampering(tmp_path):
@@ -2019,3 +2370,94 @@ def test_real_executor_local_emergency_stop_transitions_and_allocates_ack_sequen
     assert acknowledgement["event_sequence"] > lease.operational_projection["event_sequence"]
     assert "stop_observed" in acknowledgement["containment_codes"]
     assert store.load_run(grant["run_id"])["state"] == "terminal"
+
+
+def test_service_runs_bounded_maintenance_before_returning_from_serve():
+    """A long-lived service owns its retention tick instead of restart-only cleanup."""
+    maintenance_called = threading.Event()
+
+    class FastStopEvent(threading.Event):
+        def wait(self, timeout=None):
+            # Exercise the worker's 60-second wait without making the test wait
+            # a minute.  The production implementation must still pass 60.0.
+            if timeout == 60.0 and not self.is_set():
+                return False
+            return super().wait(timeout)
+
+    stop_event = FastStopEvent()
+
+    class MaintenanceCoordinator:
+        def claim(self):
+            return None
+
+        def maintenance_once(self, *, limit):
+            assert limit == 16
+            maintenance_called.set()
+            stop_event.set()
+            return type("Maintenance", (), {"processed": 1, "has_more": False})()
+
+    service = RunnerService(
+        coordinator=MaintenanceCoordinator(), executor=object(), idle_poll_interval=2.0,
+    )
+    worker = threading.Thread(target=service.serve, args=(stop_event,))
+    worker.start()
+    try:
+        assert maintenance_called.wait(0.5)
+    finally:
+        stop_event.set()
+        worker.join(2)
+    assert not worker.is_alive()
+
+
+def test_service_maintenance_failure_stops_claiming_and_raises_closed():
+    """A periodic cleanup failure is terminal for this service lifetime."""
+    maintenance_entered = threading.Event()
+    returned = threading.Event()
+    seen: list[BaseException] = []
+
+    class FastStopEvent(threading.Event):
+        def wait(self, timeout=None):
+            if timeout == 60.0 and not self.is_set():
+                return False
+            return super().wait(timeout)
+
+    stop_event = FastStopEvent()
+
+    class BrokenMaintenanceCoordinator:
+        def __init__(self):
+            self.claims = 0
+
+        def claim(self):
+            self.claims += 1
+            return None
+
+        def maintenance_once(self, *, limit):
+            assert limit == 16
+            maintenance_entered.set()
+            raise OSError("prune disk failure")
+
+    coordinator = BrokenMaintenanceCoordinator()
+    service = RunnerService(
+        coordinator=coordinator, executor=object(), idle_poll_interval=2.0,
+    )
+
+    def serve() -> None:
+        try:
+            service.serve(stop_event)
+        except BaseException as exc:
+            seen.append(exc)
+        finally:
+            returned.set()
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    try:
+        assert maintenance_entered.wait(0.5)
+        assert returned.wait(1)
+    finally:
+        stop_event.set()
+        worker.join(2)
+    assert coordinator.claims <= 1
+    assert len(seen) == 1
+    assert isinstance(seen[0], RuntimeError)
+    assert str(seen[0]) == "runner maintenance failed closed"

@@ -33,7 +33,8 @@ from heel.canary_contracts import (
 from heel.crypto import ed25519_key_id, verify_envelope
 from heel.runner.runtime import (
     ActiveGateUpdate, ActiveRunInstall, PendingResultReplayVerifier, PendingSignedCall,
-    RunnerRuntimeConflict, RunnerRuntimeCorrupt, RunnerRuntimeState, _active_json_bytes,
+    RunnerRuntimeConflict, RunnerRuntimeCorrupt, RunnerRuntimeState,
+    TerminalResultStageEvidence, _active_json_bytes,
 )
 
 
@@ -705,6 +706,14 @@ class RunnerControlClient:
                     raise ValueError("runner gate server time did not advance")
                 if body["kill_switch_generation"] < active.gate["kill_switch_generation"]:
                     raise ValueError("runner gate control generation regressed")
+                if (
+                    body["kill_switch_generation"] > active.grant["kill_switch_generation"]
+                    and (
+                        body["active"] is not False
+                        or body["stop_reason"] == "none"
+                    )
+                ):
+                    raise ValueError("runner gate control generation is invalid")
             installed = ()
             active_run = None
             gate_update = None
@@ -1086,6 +1095,148 @@ class RunnerControlClient:
                 guard_token=guard_token,
                 include_response_metadata=include_response_metadata,
             )
+
+    def stage_recovered_result(
+        self,
+        evidence: TerminalResultStageEvidence,
+        *,
+        verifier: PendingResultReplayVerifier,
+        now_ms: int,
+    ) -> PendingSignedCall:
+        """Stage one Store-authorized terminal result without sending it.
+
+        This deliberately bypasses only the *global* pending replay barrier: it
+        is the startup phase which creates the missing durable result request
+        before that barrier is drained.  It still holds the ordinary exact-run
+        guard and never advances an in-memory cursor.
+        """
+        if (
+            not isinstance(evidence, TerminalResultStageEvidence)
+            or type(now_ms) is not int
+            or now_ms < 0
+            or not callable(getattr(verifier, "consume_stage", None))
+        ):
+            raise RunnerRuntimeCorrupt("runtime terminal result stage authority is invalid")
+        run_id = evidence.run_id
+        try:
+            request = validate_runner_result_request({
+                "schema_version": "heel.runner-result-request.v1",
+                "run_id": run_id,
+                "operational_projection": dict(evidence.operational_projection),
+            })
+            self._verify_projection_signature(request["operational_projection"])
+            body = canonical_bytes(request)
+        except (TypeError, ValueError):
+            raise RunnerRuntimeCorrupt("runtime terminal result stage authority is invalid") from None
+        if hashlib.sha256(body).hexdigest() != evidence.body_sha256:
+            raise RunnerRuntimeCorrupt("runtime terminal result stage authority is invalid")
+        projection = request["operational_projection"]
+        with self._run_guard(run_id) as guard_token:
+            active = next(
+                (item for item in self.runtime.load_active_run_controls(limit=64)
+                 if item.run_id == run_id),
+                None,
+            )
+            terminal = self.runtime.load_terminal_state(run_id)
+            pending = tuple(
+                item for item in self.runtime.load_pending_calls(limit=74)
+                if item.run_id == run_id
+            )
+            result_cursor = active.chains.get("result") if active is not None else None
+            if (
+                active is None
+                or result_cursor is None
+                or terminal is None
+                or terminal.state != "local_terminal"
+                or now_ms >= terminal.retention_expires_at_ms
+                or pending
+                or active.state_digest != evidence.active_state_digest
+                or terminal.state_digest != evidence.runtime_terminal_state_digest
+                or terminal.terminal_record_digest != evidence.terminal_record_digest
+                or terminal.terminal_projection_digest != evidence.terminal_projection_digest
+                or terminal.retention_expires_at_ms != evidence.retention_expires_at_ms
+                or projection["run_id"] != run_id
+                or projection["workspace_id"] != self.workspace_id
+                or projection["project_id"] != active.project_id
+                or projection["grant_id"] != active.grant_id
+                or projection["approval_projection_digest"] != active.approval_projection_digest
+            ):
+                raise RunnerRuntimeCorrupt("runtime terminal result stage authority is invalid")
+            verifier.consume_stage(evidence, expected_fields={
+                "run_id": run_id,
+                "operational_projection": evidence.operational_projection,
+                "body_sha256": hashlib.sha256(body).hexdigest(),
+                "active_state_digest": active.state_digest,
+                "runtime_terminal_state_digest": terminal.state_digest,
+                "terminal_record_digest": terminal.terminal_record_digest,
+                "detached_record_digest": evidence.detached_record_digest,
+                "terminal_projection_digest": terminal.terminal_projection_digest,
+                "retention_expires_at_ms": terminal.retention_expires_at_ms,
+            })
+            # The nominal evidence is one-use.  Verify the mutable authority
+            # again before its consumption can cause a durable side effect.
+            final_active = next(
+                (item for item in self.runtime.load_active_run_controls(limit=64)
+                 if item.run_id == run_id),
+                None,
+            )
+            final_terminal = self.runtime.load_terminal_state(run_id)
+            final_pending = tuple(
+                item for item in self.runtime.load_pending_calls(limit=74)
+                if item.run_id == run_id
+            )
+            if (
+                final_active is None
+                or final_terminal is None
+                or final_terminal.state != "local_terminal"
+                or final_pending
+                or final_active.state_digest != active.state_digest
+                or final_terminal.state_digest != terminal.state_digest
+                or now_ms >= final_terminal.retention_expires_at_ms
+            ):
+                raise RunnerRuntimeCorrupt("runtime terminal result changed during staging")
+            with self._state_lock:
+                current = self._chains.get(self._chain("result", run_id))
+            expected = (
+                final_active.chains["result"].next_nonce_b64,
+                final_active.chains["result"].next_sequence,
+                final_active.chains["result"].generation,
+            )
+            if current != expected:
+                raise RunnerRuntimeCorrupt("runtime result chain differs from control client")
+            proof = {
+                "schema_version": "heel.runner-request-proof.v1",
+                "workspace_id": self.workspace_id,
+                "runner_id": self.runner_id,
+                "key_id": self.signer.key_id,
+                "capability": _CAPS["result"],
+                "method": "POST",
+                "path": self._control_path("result", run_id),
+                "body_sha256": hashlib.sha256(body).hexdigest(),
+                "timestamp_ms": now_ms,
+                "server_nonce": expected[0],
+                "sequence": expected[1],
+            }
+            call = _Call(
+                self._control_path("result", run_id),
+                self._headers(
+                    self._signature(b"heel.runner-pop.v1\0" + canonical_bytes(proof)),
+                    now_ms, nonce=expected[0], sequence=expected[1],
+                ),
+                body, _CAPS["result"], self._chain("result", run_id), expected[1], expected[2],
+            )
+            try:
+                staged = self.runtime.stage_call(
+                    request_operation="result", chain_operation="result", run_id=run_id,
+                    path=call.path, capability=call.capability, headers=call.headers,
+                    body=call.body, expected_state_digest=final_active.chains["result"].state_digest,
+                    now_ms=now_ms,
+                )
+            except (TypeError, ValueError) as exc:
+                raise RunnerRuntimeCorrupt("runtime terminal result stage failed") from exc
+            with self._state_lock:
+                self._pending_replay_required = True
+            return staged
 
     def _claim_closed(self):
         return self._closed_control("claim", None)

@@ -31,7 +31,7 @@ from canary_test_support import (
 def test_context_migrations_preserve_binding_reaper_affinity_and_protocol_schema():
     from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS
 
-    assert [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-11:]] == [
+    assert [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-13:]] == [
         (16, "runner_context_bindings"),
         (17, "runner_context_one_active_per_runner"),
         (18, "runner_context_reaper_indexes"),
@@ -43,6 +43,8 @@ def test_context_migrations_preserve_binding_reaper_affinity_and_protocol_schema
         (24, "runner_pairing_control_protocol_v3"),
         (25, "runner_request_receipt_retention"),
         (26, "runner_activation_abort_receipts"),
+        (27, "runner_single_open_rotation"),
+        (28, "runner_key_history_expiry"),
     ]
     conn = connect()
     assert "verification_record_digest" in {
@@ -80,6 +82,34 @@ def test_context_migrations_preserve_binding_reaper_affinity_and_protocol_schema
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='canary_disclosure_permits'"
     ).fetchone()[0]
     assert "'permitted','consumed','expired','revoked'" in "".join(permit_sql.split())
+
+
+@pytest.mark.parametrize(
+    ("statement", "label"),
+    [
+        (
+            "CREATE TRIGGER canary_runner_receipt_destroy AFTER INSERT "
+            "ON canary_runner_request_ledger BEGIN "
+            "DELETE FROM canary_runner_request_ledger WHERE rowid=NEW.rowid; END",
+            "trigger",
+        ),
+        (
+            "CREATE VIEW canary_runner_receipt_view AS "
+            "SELECT request_digest FROM canary_runner_request_ledger",
+            "view",
+        ),
+    ],
+)
+def test_runner_auth_schema_rejects_extra_owned_trigger_or_view(statement, label):
+    from heel.saas.runner_auth import validate_runner_auth_schema
+
+    conn = connect()
+    conn.execute(statement)
+    with pytest.raises(RuntimeError, match="runner authentication schema is not current"):
+        validate_runner_auth_schema(conn)
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type=?", (label,),
+    ).fetchone() is not None
 
 
 def test_submit_verifies_current_runner_signature_exact_proof_and_adapters():
@@ -441,6 +471,45 @@ def test_rotation_is_blocked_while_a_claimed_run_is_active():
         )
 
 
+def test_rotation_start_has_one_immutable_old_key_bound_ceremony():
+    from heel.crypto import SigningAuthority
+    from heel.runner.identity import runner_phrase_words
+    from heel.saas.runner_auth import RunnerAuthStore, RunnerRotationInProgress
+
+    conn = connect()
+    runner = seed_authority(conn)
+    runner_auth = RunnerAuthStore(conn, pepper=b"r" * 32, now=Clock())
+    first = SigningAuthority.generate()
+    second = SigningAuthority.generate()
+    phrase = " ".join(runner_phrase_words()[:6])
+    rotation = runner_auth.start_rotation(
+        WORKSPACE, RUNNER,
+        previous_fingerprint=hashlib.sha256(runner.public_key_bytes).hexdigest(),
+        public_key_b64=first.canonical_public_key, phrase=phrase,
+        runner_version="2.0.0", adapters={"http": "1.0.0"},
+    )
+
+    row = conn.execute(
+        "SELECT old_key_id,old_fingerprint,status FROM canary_runner_rotations WHERE pairing_id=?",
+        (rotation.pairing_id,),
+    ).fetchone()
+    assert tuple(row) == (
+        runner.key_id, hashlib.sha256(runner.public_key_bytes).hexdigest(), "rotation_pending",
+    )
+    with pytest.raises(RunnerRotationInProgress, match="rotation in progress"):
+        runner_auth.start_rotation(
+            WORKSPACE, RUNNER,
+            previous_fingerprint=hashlib.sha256(runner.public_key_bytes).hexdigest(),
+            public_key_b64=second.canonical_public_key,
+            phrase=phrase, runner_version="2.0.0", adapters={"http": "1.0.0"},
+        )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_runner_rotations WHERE workspace_id=? AND runner_id=? "
+        "AND status IN ('rotation_pending','rotation_approved')",
+        (WORKSPACE, RUNNER),
+    ).fetchone()[0] == 1
+
+
 def test_rotation_revokes_and_refunds_unused_old_key_grants_atomically():
     from heel.crypto import SigningAuthority
     from heel.runner.identity import runner_phrase_words
@@ -487,3 +556,73 @@ def test_rotation_revokes_and_refunds_unused_old_key_grants_atomically():
         (approved["reservation_id"],),
     ).fetchone()[0] == 1
     assert coordinator.claim(WORKSPACE, RUNNER, replacement.key_id) is None
+
+
+def test_rotation_activation_rechecks_for_a_run_claimed_during_the_ceremony():
+    from heel.crypto import SigningAuthority
+    from heel.runner.identity import runner_phrase_words
+    from heel.saas.runner_auth import RunnerAuthError, RunnerAuthStore
+
+    conn = connect()
+    runner = seed_authority(conn)
+    coordinator, _, _approved = submit_and_approve(conn, Clock(), runner, idem_char="4")
+    runner_auth = RunnerAuthStore(conn, pepper=b"r" * 32, now=Clock())
+    conn.execute(
+        "INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)",
+        (WORKSPACE, RUNNER, "claim", 1, 0, NOW),
+    )
+    conn.commit()
+    replacement = SigningAuthority.generate()
+    phrase = " ".join(runner_phrase_words()[:6])
+    rotation = runner_auth.start_rotation(
+        WORKSPACE, RUNNER,
+        previous_fingerprint=hashlib.sha256(runner.public_key_bytes).hexdigest(),
+        public_key_b64=replacement.canonical_public_key,
+        phrase=phrase, runner_version="2.0.0", adapters={"http": "1.0.0"},
+    )
+    runner_auth.approve_rotation(
+        WORKSPACE, rotation.pairing_id, phrase=phrase,
+        fingerprint=rotation.fingerprint, actor="user_owner",
+    )
+    challenge = runner_auth.rotation_activation_challenge(rotation.pairing_id)
+    proof = b"heel.runner-rotation-activate.v2\0" + canonical_bytes({
+        "pairing_id": rotation.pairing_id, "challenge": challenge,
+    })
+    signature = base64.b64encode(replacement.private_key.sign(proof)).decode()
+
+    # Simulate the competing old-key claim transaction committing after the
+    # rotation start check and before activation acquires its own writer lock.
+    conn.execute(
+        "UPDATE canary_execution_grants SET status='claimed',claimed_at=? WHERE run_id=?",
+        (NOW, _approved["run_id"]),
+    )
+    conn.execute(
+        "UPDATE canary_runs SET status='claimed',claimed_at_ms=?,quota_state='consumed' WHERE run_id=?",
+        (NOW_MS, _approved["run_id"]),
+    )
+    conn.commit()
+    prior_keys = tuple(conn.execute(
+        "SELECT key_id,status FROM canary_runner_keys WHERE workspace_id=? AND runner_id=? ORDER BY key_id",
+        (WORKSPACE, RUNNER),
+    ))
+    prior_cursor = tuple(conn.execute(
+        "SELECT next_sequence,generation FROM canary_runner_chain_cursors "
+        "WHERE workspace_id=? AND runner_id=? AND chain_name='claim'",
+        (WORKSPACE, RUNNER),
+    ).fetchone())
+
+    with pytest.raises(RunnerAuthError, match="runner rotation busy"):
+        runner_auth.activate_rotation(rotation.pairing_id, signature)
+
+    assert tuple(conn.execute(
+        "SELECT key_id,status FROM canary_runner_keys WHERE workspace_id=? AND runner_id=? ORDER BY key_id",
+        (WORKSPACE, RUNNER),
+    )) == prior_keys
+    assert tuple(conn.execute(
+        "SELECT next_sequence,generation FROM canary_runner_chain_cursors "
+        "WHERE workspace_id=? AND runner_id=? AND chain_name='claim'",
+        (WORKSPACE, RUNNER),
+    ).fetchone()) == prior_cursor
+    assert conn.execute(
+        "SELECT status FROM canary_runner_rotations WHERE pairing_id=?", (rotation.pairing_id,),
+    ).fetchone()[0] == "rotation_approved"

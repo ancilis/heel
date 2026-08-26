@@ -53,6 +53,14 @@ class RunnerStopAcknowledgement:
     acknowledged_at_ms: int
 
 
+@dataclass(frozen=True, slots=True)
+class RunnerMaintenanceResult:
+    """The bounded work completed by one terminal-maintenance tick."""
+
+    processed: int
+    has_more: bool
+
+
 class RunnerCoordinator:
     """Decode only launch control contracts and expose the Task 6 coordinator protocol."""
 
@@ -103,11 +111,23 @@ class RunnerCoordinator:
         self._bindings: dict[str, tuple[str, str, str]] = {}
         self._terminal_runs: set[str] = set()
         self._lock = threading.Lock()
+        # The client serializes its signed chain, but the coordinator also owns
+        # the in-memory gate snapshot.  Keep the read -> signed heartbeat ->
+        # publish transition serialized per run so a newer durable stop gate
+        # can never lose a race to an older coordinator snapshot.
+        self._heartbeat_guards: dict[str, threading.Lock] = {}
+        self._maintenance_lock = threading.Lock()
         self._pending_result_replay_verifier = store.pending_result_replay_verifier(control.runtime)
         try:
             self._recover_terminal_runtime_state()
             self._recover_active_runtime_state()
+            self._stage_unstaged_terminal_results()
             self._replay_pending_calls()
+            # A replayed claim may atomically install its active row and four
+            # cursors after the first hydration pass.  Re-open that sealed
+            # authority before exposing the coordinator; otherwise the client
+            # tracks the run while the coordinator has no grant/binding/gate.
+            self._recover_active_runtime_state()
         except RunnerStoreError as exc:
             # A signed Cloud rollover is completed by ensure_runner_context
             # before any terminal/run recovery can touch the namespace.
@@ -162,6 +182,7 @@ class RunnerCoordinator:
                     self._gates.pop(run_id, None)
                     self._gate_receipts.pop(run_id, None)
                     self._bindings.pop(run_id, None)
+                    self._heartbeat_guards.pop(run_id, None)
             self._terminal_runs.intersection_update(active_ids)
 
     def _recover_active_runtime_state(self) -> None:
@@ -210,7 +231,9 @@ class RunnerCoordinator:
                     item for item in self.control.runtime.load_pending_calls(limit=74)
                     if item.run_id == active.run_id
                 )
-                if len(pending) != 1 or pending[0].request_operation != "result":
+                if len(pending) > 1 or (
+                    pending and pending[0].request_operation != "result"
+                ):
                     raise RunnerStoreError("runtime active terminal recovery is unavailable")
             else:
                 raise RunnerStoreError("runtime active terminal recovery is unavailable")
@@ -219,12 +242,32 @@ class RunnerCoordinator:
                 active.approval_projection_digest,
             )
             with self._lock:
-                if active.run_id in self._gates or active.run_id in self._bindings:
-                    raise RunnerStoreError("runtime active run recovery is invalid")
                 self._gates[active.run_id] = gate
                 # A memory receipt is deliberately never reconstructed.  The
                 # persisted gate is only a heartbeat precondition after restart.
+                self._gate_receipts.pop(active.run_id, None)
                 self._bindings[active.run_id] = binding
+
+    def _stage_unstaged_terminal_results(self) -> None:
+        """Durably reconstruct only Store-proven terminal requests before replay.
+
+        The only admissible zero-pending terminal prefix is a signed detach
+        followed by a crash before result call staging.  The Store verifier
+        reconstructs that one request; the control client merely signs and
+        persists it while holding its usual run guard.
+        """
+        while True:
+            batch = self.control.runtime.load_unstaged_local_terminals(limit=16)
+            for terminal in batch.items:
+                now_ms = self._now_ms()
+                evidence = self._pending_result_replay_verifier.authorize_unstaged_terminal_result(
+                    terminal.run_id, now_ms=now_ms,
+                )
+                self.control.stage_recovered_result(
+                    evidence, verifier=self._pending_result_replay_verifier, now_ms=now_ms,
+                )
+            if not batch.has_more:
+                return
 
     def _now_ms(self) -> int:
         value = self.clock_ms()
@@ -241,41 +284,128 @@ class RunnerCoordinator:
             raise ValueError("runner monotonic clock returned an invalid timestamp")
         return float(value)
 
+    def _finish_prune_states(self, states: tuple[object, ...], *, now_ms: int) -> int:
+        """Finish only already-authenticated bounded runtime prune ownership."""
+        processed = 0
+        for pending in states:
+            run_id = getattr(pending, "run_id", None)
+            state_digest = getattr(pending, "state_digest", None)
+            if type(run_id) is not str or type(state_digest) is not str:
+                raise RunnerStoreError("local runtime prune authority is invalid")
+            try:
+                receipt = self.store.load_pruned_run_receipt(
+                    run_id, expected_runtime_state_digest=state_digest,
+                )
+            except RunnerStoreError as exc:
+                if str(exc) != "local runtime prune receipt is unavailable":
+                    raise
+                receipt = self.store.prune_runtime_terminal(
+                    run_id, runtime=self.control.runtime,
+                    expected_runtime_state_digest=state_digest, now_ms=now_ms,
+                )
+            completion = self.control.runtime.finish_prune(
+                receipt=receipt, expected_prune_pending_state_digest=state_digest,
+            )
+            self.store.finish_pruned_compaction(completion, runtime=self.control.runtime)
+            processed += 1
+        return processed
+
+    def maintenance_once(
+        self, *, now_ms: int | None = None, limit: int = 16,
+    ) -> RunnerMaintenanceResult:
+        """Perform one capped passive terminal-retention pass.
+
+        A tick resumes durable ownership before it claims fresh work and never
+        spends more than one shared 1..16 item budget.  It deliberately does
+        not loop: availability is independent of passive retained history.
+        """
+        if type(limit) is not int or not 1 <= limit <= 16:
+            raise ValueError("runner maintenance limit must be between 1 and 16")
+        if now_ms is None:
+            now_ms = self._now_ms()
+        elif type(now_ms) is not int or now_ms < 0:
+            raise ValueError("runner maintenance time is invalid")
+        with self._maintenance_lock:
+            remaining = limit
+            # A previous signed local activation-tombstone journal is a hard
+            # suffix.  It is finished before runtime retention work, but it
+            # consumes from this tick's one shared budget.
+            activation_resumed = self.store._resume_activation_tombstone_prune(
+                limit=remaining,
+            )
+            processed = activation_resumed.pruned
+            remaining -= processed
+            if remaining:
+                resumed = self.control.runtime.load_prune_pending(limit=remaining)
+                resumed_count = self._finish_prune_states(resumed.items, now_ms=now_ms)
+                processed += resumed_count
+                remaining -= resumed_count
+                has_more = activation_resumed.has_more or resumed.has_more
+            else:
+                # The shared budget is exhausted before we can probe the next
+                # retention lane; schedule the 1-second catch-up tick rather
+                # than claiming there is no remaining work.
+                has_more = True
+            if remaining and not has_more:
+                claimed = self.control.runtime.claim_due_prune(
+                    now_ms=now_ms, limit=remaining,
+                )
+                claimed_count = self._finish_prune_states(claimed.items, now_ms=now_ms)
+                processed += claimed_count
+                remaining -= claimed_count
+                has_more = claimed.has_more
+            if remaining and not has_more:
+                tombstones = self.store.prune_activation_tombstones(
+                    now_ms=now_ms, limit=remaining,
+                )
+                processed += tombstones.pruned
+                has_more = tombstones.has_more
+            return RunnerMaintenanceResult(processed=processed, has_more=has_more)
+
     def _recover_terminal_runtime_state(self) -> None:
         """Complete detached terminal authority before any control transport."""
         if not self.store.is_context_bound:
             return
         now_ms = self._now_ms()
+        # The signed compaction queue is the first run-authority suffix: it
+        # retires only already-CASed runtime prune rows, before detach recovery
+        # or any pending/active authority can be hydrated.
+        self.store.recover_pruned_compaction_finalizers(runtime=self.control.runtime)
         self.store.recover_terminal_detaches(
             runtime=self.control.runtime, now_ms=now_ms,
         )
-        def finish(batch) -> None:
-            for pending in batch.items:
-                try:
-                    receipt = self.store.load_pruned_run_receipt(
-                        pending.run_id, expected_runtime_state_digest=pending.state_digest,
-                    )
-                except RunnerStoreError as exc:
-                    if str(exc) != "local runtime prune receipt is unavailable":
-                        raise
-                    receipt = self.store.prune_runtime_terminal(
-                        pending.run_id, runtime=self.control.runtime,
-                        expected_runtime_state_digest=pending.state_digest, now_ms=now_ms,
-                    )
-                self.control.runtime.finish_prune(
-                    receipt=receipt, expected_prune_pending_state_digest=pending.state_digest,
-                )
+        # Pre-existing claimed work is a hard startup suffix.  The runtime
+        # invariant admits at most one 16-item batch; a seventeenth row is not
+        # backlog but durable corruption.
+        pending = self.control.runtime.load_prune_pending(limit=16)
+        if pending.has_more:
+            raise RunnerStoreError("runtime prune pending capacity is corrupt")
+        self._finish_prune_states(pending.items, now_ms=now_ms)
 
-        while True:
-            pending = self.control.runtime.load_prune_pending(limit=16)
-            finish(pending)
-            if not pending.has_more:
-                break
-        while True:
-            claimed = self.control.runtime.claim_due_prune(now_ms=now_ms, limit=16)
-            finish(claimed)
-            if not claimed.has_more:
-                break
+        # An expired run reachable through the bounded active/pending control
+        # sets must never enter hydration or replay.  Point-claim its exact
+        # state before the one passive due batch below.
+        run_ids = {
+            active.run_id
+            for active in self.control.runtime.load_active_run_controls(limit=64)
+        }
+        run_ids.update(
+            item.run_id for item in self.control.runtime.load_pending_calls(limit=74)
+            if item.run_id is not None
+        )
+        blockers: list[object] = []
+        for run_id in sorted(run_ids):
+            terminal = self.control.runtime.load_terminal_state(run_id)
+            if terminal is not None and terminal.retention_expires_at_ms <= now_ms:
+                blockers.append(self.control.runtime.claim_specific_due_prune(
+                    run_id, expected_state_digest=terminal.state_digest, now_ms=now_ms,
+                ))
+        self._finish_prune_states(tuple(blockers), now_ms=now_ms)
+
+        # Passive history is intentionally one bounded batch only.  Periodic
+        # maintenance provides liveness after authority becomes available.
+        claimed = self.control.runtime.claim_due_prune(now_ms=now_ms, limit=16)
+        self._finish_prune_states(claimed.items, now_ms=now_ms)
 
     def claim(self) -> ClaimLease | None:
         response = self.control._claim_closed()
@@ -491,6 +621,15 @@ class RunnerCoordinator:
             raise ValueError("active runner claim is required")
         return gate
 
+    def _heartbeat_guard(self, run_id: str) -> threading.Lock:
+        """Return the coordinator-side serialization guard for one live run."""
+        with self._lock:
+            guard = self._heartbeat_guards.get(run_id)
+            if guard is None:
+                guard = threading.Lock()
+                self._heartbeat_guards[run_id] = guard
+            return guard
+
     def execution_gate(self, run_id: str) -> ExecutionGate:
         """Return the latest authenticated gate snapshot for local attempt authorization."""
         if type(run_id) is not str or not run_id:
@@ -500,6 +639,8 @@ class RunnerCoordinator:
             received_at = self._gate_receipts.get(run_id)
         if gate is None or received_at is None:
             raise ValueError("active runner claim is required")
+        if gate.active is not True or gate.stop_reason != "none":
+            raise ValueError("authenticated runner gate denies execution")
         elapsed = self._now_monotonic() - received_at
         if elapsed < 0 or elapsed > _MAX_AUTHENTICATED_GATE_AGE_SECONDS:
             raise ValueError("authenticated runner gate is stale")
@@ -510,21 +651,24 @@ class RunnerCoordinator:
     def heartbeat(
         self, run_id: str, operational_projection: dict[str, Any],
     ) -> ExecutionGate:
-        previous = self._known_run(run_id)
-        response = self.control._heartbeat_closed(run_id, operational_projection)
-        received_at = self._now_monotonic()
-        gate = ExecutionGate(**response)
-        if gate.server_time_ms <= previous.server_time_ms:
-            raise ValueError("runner gate server time did not advance")
-        if gate.kill_switch_generation < previous.kill_switch_generation:
-            raise ValueError("runner gate control generation regressed")
-        with self._lock:
-            current = self._gates.get(run_id)
-            if current != previous:
-                raise RuntimeError("runner gate update raced")
-            self._gates[run_id] = gate
-            self._gate_receipts[run_id] = received_at
-        return gate
+        with self._heartbeat_guard(run_id):
+            previous = self._known_run(run_id)
+            response = self.control._heartbeat_closed(run_id, operational_projection)
+            received_at = self._now_monotonic()
+            gate = ExecutionGate(**response)
+            if gate.server_time_ms <= previous.server_time_ms:
+                raise ValueError("runner gate server time did not advance")
+            if gate.kill_switch_generation < previous.kill_switch_generation:
+                raise ValueError("runner gate control generation regressed")
+            with self._lock:
+                # This equality is retained as a fail-closed check against a
+                # result/retirement race; other heartbeat calls are held by
+                # this guard from their initial gate read through publication.
+                if self._gates.get(run_id) != previous:
+                    raise ValueError("active runner claim is required")
+                self._gates[run_id] = gate
+                self._gate_receipts[run_id] = received_at
+            return gate
 
     def progress(self, run_id: str, operational_projection: dict[str, Any]) -> object:
         self._known_run(run_id)
@@ -582,6 +726,7 @@ class RunnerCoordinator:
             self._gate_receipts.pop(run_id, None)
             self._bindings.pop(run_id, None)
             self._terminal_runs.discard(run_id)
+            self._heartbeat_guards.pop(run_id, None)
         return response
 
     def _validate_status_binding(self, run_id: str, response: dict[str, Any]) -> None:

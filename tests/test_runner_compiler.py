@@ -267,9 +267,10 @@ def test_selected_subset_compiles_true_two_action_differentials_and_persists_pai
         if key not in {"projection_digest", "signing_key_id", "signature_b64"}
     }
     assert signer.payloads[-1] == canonical_bytes(unsigned)
-    # Binding the fresh runner context now persists the signed zero run-authority
-    # index before the compiler signs its manifest and approval projection.
-    assert len(signer.payloads) == 3
+    # Binding the fresh runner context persists both signed zero authority
+    # roots (index and checkpoint) before the compiler signs manifest and
+    # approval projection.
+    assert len(signer.payloads) == 4
     assert signer.payloads[0].startswith(b"heel.local-run-authority-index.v1\0")
     loaded_manifest, loaded_projection = store.load_approved_pair("projection_123456789")
     assert loaded_manifest == manifest

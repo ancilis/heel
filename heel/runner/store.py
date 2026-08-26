@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 try:
     import fcntl
@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+from types import MappingProxyType
 import unicodedata
 from typing import Any, Iterator, Mapping
 from urllib.parse import urlsplit
@@ -33,11 +34,13 @@ from heel.canary_contracts import (
 )
 from heel.crypto import ed25519_key_id, load_public_key_base64, verify_envelope
 from heel.runner.identity import (
-    AcceptedRotationAbortTombstone, AcceptedRotationJournal, PendingPairingActivation, PendingRotationActivation,
+    AcceptedRotationAbortTombstone, AcceptedRotationJournal, PendingPairingActivation,
+    PendingPairingActivationAbort, PendingRotationActivation,
     RunnerIdentity, RunnerPairingMaterial, SecureSigner,
 )
 from heel.runner.runtime import (
     PendingResultReplayAuthority, PendingSignedCall, RunnerRuntimeState,
+    RuntimePruneCompletion, TerminalResultStageEvidence,
 )
 from heel.scope import heel_home
 
@@ -107,16 +110,27 @@ _ACTIVE_CONTEXT_CLOUD_SCHEMA = "heel.active-runner-context.v2"
 _ACTIVE_CONTEXT_CLOUD_DOMAIN = b"heel.active-runner-context.v2\0"
 _CONTEXT_ROLLOVER_SCHEMA = "heel.runner-context-rollover.v2"
 _CONTEXT_INSTALL_SCHEMA = "heel.runner-context-install.v2"
-_PAIRING_ACTIVATION_JOURNAL_SCHEMA = "heel.runner-pairing-activation-journal.v1"
+_PAIRING_ACTIVATION_JOURNAL_V1_SCHEMA = "heel.runner-pairing-activation-journal.v1"
+_PAIRING_ACTIVATION_JOURNAL_SCHEMA = "heel.runner-pairing-activation-journal.v2"
 _PAIRED_RUNNER_IDENTITY_SCHEMA = "heel.local-paired-runner.v1"
 _ROTATION_ACTIVATION_JOURNAL_SCHEMA = "heel.runner-rotation-activation-journal.v1"
 _ROTATION_RUNTIME_INTENT_SCHEMA = "heel.runner-rotation-runtime-intent.v1"
-_PAIRING_ACTIVATION_JOURNAL_DOMAIN = b"heel.runner-pairing-activation-journal.v1\0"
+_PAIRING_ACTIVATION_JOURNAL_V1_DOMAIN = b"heel.runner-pairing-activation-journal.v1\0"
+_PAIRING_ACTIVATION_JOURNAL_DOMAIN = b"heel.runner-pairing-activation-journal.v2\0"
 _PAIRED_RUNNER_IDENTITY_DOMAIN = b"heel.local-paired-runner.v1\0"
 _ROTATION_ACTIVATION_JOURNAL_DOMAIN = b"heel.runner-rotation-activation-journal.v1\0"
 _ROTATION_RUNTIME_INTENT_DOMAIN = b"heel.runner-rotation-runtime-intent.v1\0"
 _ROTATION_ACTIVATION_JOURNAL_DIGEST_DOMAIN = b"heel.runner-rotation-activation-journal-digest.v1\0"
 _PAIRING_ACTIVATION_JOURNAL_FILENAME = "pairing-activation.json"
+_PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_SCHEMA = (
+    "heel.runner-pairing-activation-abort-request-journal.v1"
+)
+_PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_DOMAIN = (
+    b"heel.runner-pairing-activation-abort-request-journal.v1\0"
+)
+_PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_FILENAME = (
+    "pairing-activation-abort-request.json"
+)
 _PAIRED_RUNNER_IDENTITY_FILENAME = "paired-identity.json"
 _ROTATION_ACTIVATION_JOURNAL_FILENAME = "rotation-activation.json"
 _ACTIVATION_TOMBSTONES_DIRECTORY = "activation-tombstones"
@@ -125,6 +139,31 @@ _PAIRING_ABORT_TOMBSTONE_DOMAIN = b"heel.runner-pairing-activation-abort-tombsto
 _ROTATION_ABORT_TOMBSTONE_SCHEMA = "heel.runner-rotation-activation-abort-tombstone.v1"
 _ROTATION_ABORT_TOMBSTONE_OLD_DOMAIN = b"heel.runner-rotation-activation-abort-tombstone.v1.old\0"
 _ROTATION_ABORT_TOMBSTONE_NEW_DOMAIN = b"heel.runner-rotation-activation-abort-tombstone.v1.new\0"
+_ACTIVATION_TOMBSTONE_RETENTION_MS = 2_592_000_000
+_ACTIVATION_TOMBSTONE_MAX_CEREMONIES = 16
+_ACTIVATION_TOMBSTONE_PRUNE_BATCH = 16
+_ACTIVATION_TOMBSTONE_RETENTION_SCHEMA = "heel.runner-activation-tombstone-retention.v1"
+_ACTIVATION_TOMBSTONE_PRUNE_SCHEMA = "heel.runner-activation-tombstone-prune.v1"
+_ACTIVATION_TOMBSTONE_PREPAIR_PRUNE_SCHEMA = "heel.runner-activation-tombstone-prune-prepair.v1"
+_ACTIVATION_TOMBSTONE_PRUNE_FILENAME = "activation-tombstone-prune.json"
+_ACTIVATION_TOMBSTONE_RETENTION_PAIRING_DOMAIN = (
+    b"heel.runner-activation-tombstone-retention.v1.pairing\0"
+)
+_ACTIVATION_TOMBSTONE_RETENTION_OLD_DOMAIN = (
+    b"heel.runner-activation-tombstone-retention.v1.old\0"
+)
+_ACTIVATION_TOMBSTONE_RETENTION_NEW_DOMAIN = (
+    b"heel.runner-activation-tombstone-retention.v1.new\0"
+)
+_ACTIVATION_TOMBSTONE_PRUNE_DOMAIN = b"heel.runner-activation-tombstone-prune.v1\0"
+_ACTIVATION_TOMBSTONE_PREPAIR_PRUNE_DOMAIN = b"heel.runner-activation-tombstone-prune-prepair.v1\0"
+_ACTIVATION_TOMBSTONE_INVENTORY_DOMAIN = b"heel.runner-activation-tombstone-inventory.v1\0"
+_ACTIVATION_TOMBSTONE_FILENAME = re.compile(
+    r"^(pairing|rotation)-([0-9a-f]{64})\.json$", flags=re.ASCII,
+)
+_ACTIVATION_TOMBSTONE_RETENTION_FILENAME = re.compile(
+    r"^retention-(pairing|rotation)-([0-9a-f]{64})\.json$", flags=re.ASCII,
+)
 _RUN_AUTHORITY_INDEX_SCHEMA = "heel.local-run-authority-index.v1"
 _RUN_RESERVATION_RECORD_SCHEMA = "heel.local-run-reservation.v1"
 _RUN_TERMINAL_RECORD_SCHEMA = "heel.local-run-terminal.v1"
@@ -133,14 +172,22 @@ _RUN_PRUNED_RECORD_SCHEMA = "heel.local-run-pruned.v1"
 _RUN_RUNTIME_PRUNED_RECORD_SCHEMA = "heel.local-run-pruned.v2"
 _RUN_RUNTIME_PRUNED_RECORD_DOMAIN = b"heel.local-run-pruned.v2\0"
 _RUN_AUTHORITY_MUTATION_SCHEMA = "heel.local-run-authority-mutation.v1"
+_RUN_AUTHORITY_CHECKPOINT_SCHEMA = "heel.local-run-authority-checkpoint.v1"
+_RUN_AUTHORITY_COMPACTION_JOURNAL_SCHEMA = "heel.local-run-authority-compaction-journal.v1"
 _RUN_AUTHORITY_INDEX_FILENAME = "run-authority-index.json"
 _RUN_AUTHORITY_JOURNAL_FILENAME = "run-authority-journal.json"
+_RUN_AUTHORITY_CHECKPOINT_FILENAME = "run-authority-checkpoint.json"
+_RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME = "run-authority-compaction-journal.json"
 _RUN_AUTHORITY_MAX_RECORD_BYTES = 16 * 1024
 _RUN_AUTHORITY_MAX_JOURNAL_BYTES = 128 * 1024
+_RUN_AUTHORITY_MAX_CHECKPOINT_BYTES = 64 * 1024
+_RUN_AUTHORITY_MAX_COMPACTION_JOURNAL_BYTES = 128 * 1024
 _RUN_AUTHORITY_MAX_TRACKED = 64
 _RUN_AUTHORITY_MAX_NONTERMINAL = _RUN_AUTHORITY_MAX_TRACKED
 _RUN_PRUNE_BATCH = 16
 _RUN_AUTHORITY_ZERO_HEAD = "0" * 64
+_RUN_AUTHORITY_COMPACTION_MAX_FINALIZE = 16
+_RUN_AUTHORITY_COMPACTION_MAX_PREPARE = 4
 _RUN_AUTHORITY_DOMAINS = {
     _RUN_AUTHORITY_INDEX_SCHEMA: b"heel.local-run-authority-index.v1\0",
     _RUN_RESERVATION_RECORD_SCHEMA: b"heel.local-run-reservation.v1\0",
@@ -149,6 +196,8 @@ _RUN_AUTHORITY_DOMAINS = {
     _RUN_PRUNED_RECORD_SCHEMA: b"heel.local-run-pruned.v1\0",
     _RUN_RUNTIME_PRUNED_RECORD_SCHEMA: _RUN_RUNTIME_PRUNED_RECORD_DOMAIN,
     _RUN_AUTHORITY_MUTATION_SCHEMA: b"heel.local-run-authority-mutation.v1\0",
+    _RUN_AUTHORITY_CHECKPOINT_SCHEMA: b"heel.local-run-authority-checkpoint.v1\0",
+    _RUN_AUTHORITY_COMPACTION_JOURNAL_SCHEMA: b"heel.local-run-authority-compaction-journal.v1\0",
 }
 
 
@@ -159,23 +208,47 @@ class VerifiedPrunedRunReceipt:
     record: Mapping[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class ActivationTombstonePruneResult:
+    """The bounded local retention work completed for activation tombstones."""
+
+    pruned: int
+    has_more: bool
+
+
 class _PendingResultReplayVerifier:
     """Store-owned nominal issuer for one exact terminal request replay."""
 
-    __slots__ = ("_store", "_runtime", "_identity", "_token", "_consumed")
+    __slots__ = ("_store", "_runtime", "_identity", "_token", "_consumed", "_retired")
 
     def __init__(self, store: "RunnerStore", runtime: RunnerRuntimeState, identity: RunnerIdentity) -> None:
         self._store = store
         self._runtime = runtime
         self._identity = identity
         self._token = object()
-        self._consumed: list[PendingResultReplayAuthority] = []
+        self._consumed: list[object] = []
+        self._retired = False
+
+    def _retire(self) -> None:
+        """Permanently revoke an issuer bound to a pre-rotation identity."""
+        self._retired = True
 
     def authorize_pending_result_replay(
         self, pending: PendingSignedCall, *, now_ms: int,
     ) -> PendingResultReplayAuthority:
+        if self._retired:
+            raise RunnerStoreError("local pending terminal replay authority is unavailable")
         return self._store._authorize_pending_result_replay(
             pending, runtime=self._runtime, now_ms=now_ms, issuer=self._token,
+        )
+
+    def authorize_unstaged_terminal_result(
+        self, run_id: str, *, now_ms: int,
+    ) -> TerminalResultStageEvidence:
+        if self._retired:
+            raise RunnerStoreError("local terminal result stage authority is unavailable")
+        return self._store._authorize_unstaged_terminal_result(
+            run_id, runtime=self._runtime, now_ms=now_ms, issuer=self._token,
         )
 
     def consume(
@@ -188,6 +261,8 @@ class _PendingResultReplayVerifier:
             "retention_expires_at_ms",
         }
         if (
+            self._retired
+            or
             not isinstance(authority, PendingResultReplayAuthority)
             or authority._issuer is not self._token
             or set(expected_fields) != fields
@@ -196,6 +271,25 @@ class _PendingResultReplayVerifier:
         ):
             raise RunnerStoreError("local pending terminal replay authority is invalid")
         self._consumed.append(authority)
+
+    def consume_stage(
+        self, evidence: TerminalResultStageEvidence, *, expected_fields: Mapping[str, object],
+    ) -> None:
+        fields = {
+            "run_id", "operational_projection", "body_sha256", "active_state_digest",
+            "runtime_terminal_state_digest", "terminal_record_digest", "detached_record_digest",
+            "terminal_projection_digest", "retention_expires_at_ms",
+        }
+        if (
+            self._retired
+            or not isinstance(evidence, TerminalResultStageEvidence)
+            or evidence._issuer is not self._token
+            or set(expected_fields) != fields
+            or any(getattr(evidence, name) != expected_fields[name] for name in fields)
+            or any(item is evidence for item in self._consumed)
+        ):
+            raise RunnerStoreError("local terminal result stage authority is invalid")
+        self._consumed.append(evidence)
 
 
 def _require_capabilities() -> None:
@@ -518,6 +612,58 @@ def _create_json(directory_fd: int, filename: str, value: Any) -> None:
         raise
 
 
+def _create_json_without_scan(directory_fd: int, filename: str, value: Any) -> None:
+    """Create a known root record without turning bounded prune into a directory scan.
+
+    The caller has already read the exact destination under the exclusive
+    runner flock.  A random O_EXCL temporary name is sufficient here: stale
+    temporary files are inert and are deliberately not enumerated on the
+    terminal-retention path.
+    """
+    payload = canonical_bytes(value)
+    if len(payload) > _MAX_METADATA_BYTES:
+        raise RunnerStoreError("runner state exceeds size limit")
+    temporary = f".{filename}.{secrets.token_hex(12)}.tmp"
+    descriptor = -1
+    try:
+        descriptor = os.open(temporary, _WRITE_FLAGS, 0o600, dir_fd=directory_fd)
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written < 1:
+                raise OSError("short runner state write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            status = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            _secure_regular(status, "runner state target")
+            raise FileExistsError(filename)
+        os.rename(temporary, filename, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _ensure_json_exact_without_scan(directory_fd: int, filename: str, value: Mapping[str, Any]) -> None:
+    existing = _read_json(directory_fd, filename, None)
+    if existing is None:
+        _create_json_without_scan(directory_fd, filename, dict(value))
+    elif existing != dict(value):
+        raise RunnerStoreError("local run authority record collision")
+
+
 @contextmanager
 def _flock(directory_fd: int, filename: str, *, exclusive: bool) -> Iterator[None]:
     assert fcntl is not None
@@ -721,7 +867,9 @@ class RunnerStore:
         self._namespace: str | None = None
         self._runtime_authority: tuple[RunnerIdentity, SecureSigner] | None = None
         self._rotation_token = object()
+        self._pairing_abort_token = object()
         self._pending_result_replay_verifier: _PendingResultReplayVerifier | None = None
+        self._consumed_prune_completions: set[tuple[str, str, str, int]] = set()
         with self._open_runner(create=True):
             pass
         self._select_active_if_present()
@@ -836,18 +984,31 @@ class RunnerStore:
 
     @classmethod
     def _pairing_pending(cls, value: Mapping[str, object]) -> dict[str, object]:
-        fields = {
+        v2_fields = {
             "schema_version", "pairing_id", "runner_id", "fingerprint", "status",
             "activation_challenge", "control_protocol", "pairing_exchange_digest",
         }
-        if not isinstance(value, Mapping) or set(value) != fields:
+        v3_fields = v2_fields | {"challenge_expires_at_ms"}
+        if not isinstance(value, Mapping) or (set(value) != v2_fields and set(value) != v3_fields):
             raise RunnerStoreError("invalid executable pairing pending response")
         if (
-            value["schema_version"] != "heel.runner-pairing-pending.v2"
+            value["schema_version"] not in {"heel.runner-pairing-pending.v2", "heel.runner-pairing-pending.v3"}
             or value["status"] != "pending"
             or value["control_protocol"] != "heel.runner-control.v2"
+            or (
+                value["schema_version"] == "heel.runner-pairing-pending.v2"
+                and set(value) != v2_fields
+            )
+            or (
+                value["schema_version"] == "heel.runner-pairing-pending.v3"
+                and set(value) != v3_fields
+            )
         ):
             raise RunnerStoreError("invalid executable pairing pending response")
+        deadline = (
+            None if value["schema_version"] == "heel.runner-pairing-pending.v2"
+            else cls._pairing_time(value["challenge_expires_at_ms"], "pairing challenge expiry")
+        )
         return {
             "schema_version": value["schema_version"],
             "pairing_id": _id(value["pairing_id"], "pairing ID"),
@@ -857,7 +1018,92 @@ class RunnerStore:
             "activation_challenge": cls._pairing_nonce(value["activation_challenge"], "pairing activation challenge"),
             "control_protocol": value["control_protocol"],
             "pairing_exchange_digest": _digest(value["pairing_exchange_digest"], "pairing exchange digest"),
+            "challenge_expires_at_ms": deadline,
+            "challenge_expiry_source": "unknown_legacy" if deadline is None else "exchange",
         }
+
+    @classmethod
+    def _pairing_challenge_expiry(cls, value: Mapping[str, object]) -> tuple[int | None, str]:
+        """Validate the closed local scheduling metadata without manufacturing time."""
+        deadline = value.get("challenge_expires_at_ms")
+        source = value.get("challenge_expiry_source")
+        if source not in {"exchange", "server_deferred", "unknown_legacy"}:
+            raise RunnerStoreError("invalid pairing activation challenge expiry")
+        if deadline is None:
+            if source != "unknown_legacy":
+                raise RunnerStoreError("invalid pairing activation challenge expiry")
+            return None, source
+        deadline = cls._pairing_time(deadline, "pairing challenge expiry")
+        if source == "unknown_legacy":
+            raise RunnerStoreError("invalid pairing activation challenge expiry")
+        return deadline, source
+
+    @staticmethod
+    def _pairing_pending_wire(value: Mapping[str, object]) -> dict[str, object]:
+        fields = {
+            "schema_version", "pairing_id", "runner_id", "fingerprint", "status",
+            "activation_challenge", "control_protocol", "pairing_exchange_digest",
+        }
+        result = {key: value[key] for key in fields}
+        if value["challenge_expires_at_ms"] is not None:
+            result["schema_version"] = "heel.runner-pairing-pending.v3"
+            result["challenge_expires_at_ms"] = value["challenge_expires_at_ms"]
+        else:
+            result["schema_version"] = "heel.runner-pairing-pending.v2"
+        return result
+
+    @classmethod
+    def _load_pairing_activation_journal_locked(
+        cls, runner_fd: int, *, material: RunnerPairingMaterial,
+    ) -> dict[str, object] | None:
+        """Open the local pairing ceremony and make its v1->v2 upgrade atomic."""
+        journal = _read_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, None)
+        if journal is None:
+            return None
+        if not isinstance(journal, Mapping):
+            raise RunnerStoreError("invalid runner pairing activation journal")
+        base_fields = {
+            "schema_version", "state", "pairing_id", "runner_id", "pairing_exchange_digest",
+            "activation_challenge", "client_activation_nonce_b64", "activation_request",
+            "activation_response", "identity", "created_at_ms", "updated_at_ms",
+        }
+        v2_fields = base_fields | {"challenge_expires_at_ms", "challenge_expiry_source"}
+        try:
+            identity = RunnerIdentity(
+                runner_id=_id(journal.get("runner_id"), "runner ID"), workspace_id="pending",
+                runner_version=material.runner_version, adapter_versions=dict(material.adapters),
+                public_key_b64=material.public_key_b64, fingerprint=material.fingerprint,
+                key_id=material.key_id, pairing_phrase=material.pairing_phrase,
+            )
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid runner pairing activation journal") from None
+        if journal.get("schema_version") == _PAIRING_ACTIVATION_JOURNAL_V1_SCHEMA:
+            verified = cls._verify_pairing_signed_value(
+                journal, identity=identity, domain=_PAIRING_ACTIVATION_JOURNAL_V1_DOMAIN,
+                digest_field="journal_digest", fields=base_fields,
+                label="runner pairing activation journal",
+            )
+            core = {key: verified[key] for key in base_fields}
+            core.update({
+                "schema_version": _PAIRING_ACTIVATION_JOURNAL_SCHEMA,
+                "challenge_expires_at_ms": None,
+                "challenge_expiry_source": "unknown_legacy",
+            })
+            upgraded = cls._pairing_signed_value(
+                core, signer=material._signer, domain=_PAIRING_ACTIVATION_JOURNAL_DOMAIN,
+                digest_field="journal_digest",
+            )
+            _write_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, upgraded)
+            return upgraded
+        if journal.get("schema_version") != _PAIRING_ACTIVATION_JOURNAL_SCHEMA:
+            raise RunnerStoreError("invalid runner pairing activation journal")
+        verified = cls._verify_pairing_signed_value(
+            journal, identity=identity, domain=_PAIRING_ACTIVATION_JOURNAL_DOMAIN,
+            digest_field="journal_digest", fields=v2_fields,
+            label="runner pairing activation journal",
+        )
+        cls._pairing_challenge_expiry(verified)
+        return verified
 
     @classmethod
     def _activation_response(
@@ -931,6 +1177,8 @@ class RunnerStore:
             "pairing_exchange_digest": pending["pairing_exchange_digest"],
             "activation_challenge": pending["activation_challenge"], "client_activation_nonce_b64": nonce_b64,
             "activation_request": request, "activation_response": None, "identity": None,
+            "challenge_expires_at_ms": pending["challenge_expires_at_ms"],
+            "challenge_expiry_source": pending["challenge_expiry_source"],
             "created_at_ms": now_ms, "updated_at_ms": now_ms,
         }
         journal = self._pairing_signed_value(
@@ -940,6 +1188,8 @@ class RunnerStore:
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
             with _flock(runner_fd, ".runner.lock", exclusive=True):
+                if _read_json(runner_fd, _ACTIVATION_TOMBSTONE_PRUNE_FILENAME, None) is not None:
+                    raise RunnerStoreError("activation tombstone prune requires recovery")
                 existing = _read_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, None)
                 if existing is None:
                     if _read_json(runner_fd, _PAIRED_RUNNER_IDENTITY_FILENAME, None) is not None:
@@ -947,7 +1197,9 @@ class RunnerStore:
                     _write_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, journal)
                 elif existing != journal:
                     raise RunnerStoreError("runner pairing activation requires recovery")
-        return PendingPairingActivation(dict(pending), dict(request), material)
+        return PendingPairingActivation(
+            dict(pending_v2), dict(request), pending["challenge_expires_at_ms"], material,
+        )
 
     def accept_pairing_activation(
         self, pending: PendingPairingActivation, response_v3: Mapping[str, object], *, now_ms: int,
@@ -977,13 +1229,15 @@ class RunnerStore:
                 journal_fields = {
                     "schema_version", "state", "pairing_id", "runner_id", "pairing_exchange_digest",
                     "activation_challenge", "client_activation_nonce_b64", "activation_request",
-                    "activation_response", "identity", "created_at_ms", "updated_at_ms",
+                    "activation_response", "identity", "challenge_expires_at_ms",
+                    "challenge_expiry_source", "created_at_ms", "updated_at_ms",
                 }
                 self._verify_pairing_signed_value(
                     journal, identity=journal_identity, domain=_PAIRING_ACTIVATION_JOURNAL_DOMAIN,
                     digest_field="journal_digest", fields=journal_fields,
                     label="runner pairing activation journal",
                 )
+                journal_expiry, journal_expiry_source = self._pairing_challenge_expiry(journal)
                 request = journal.get("activation_request")
                 if (
                     journal.get("schema_version") != _PAIRING_ACTIVATION_JOURNAL_SCHEMA
@@ -992,6 +1246,8 @@ class RunnerStore:
                     or journal.get("pairing_exchange_digest") != pending_record["pairing_exchange_digest"]
                     or journal.get("activation_challenge") != pending_record["activation_challenge"]
                     or request != dict(pending.request)
+                    or journal_expiry != pending.challenge_expires_at_ms
+                    or journal_expiry_source != pending_record["challenge_expiry_source"]
                     or journal.get("created_at_ms") != journal.get("updated_at_ms")
                 ):
                     raise RunnerStoreError("runner pairing activation request changed")
@@ -1009,6 +1265,8 @@ class RunnerStore:
                     "client_activation_nonce_b64": journal["client_activation_nonce_b64"],
                     "activation_request": dict(pending.request), "activation_response": response,
                     "identity": _identity_record(identity, material._signer),
+                    "challenge_expires_at_ms": journal["challenge_expires_at_ms"],
+                    "challenge_expiry_source": journal["challenge_expiry_source"],
                     "created_at_ms": journal["created_at_ms"], "updated_at_ms": now_ms,
                 }
                 accepted = self._pairing_signed_value(
@@ -1022,6 +1280,752 @@ class RunnerStore:
     @staticmethod
     def _pairing_abort_tombstone_filename(pairing_id: str) -> str:
         return f"pairing-{hashlib.sha256(pairing_id.encode('utf-8')).hexdigest()}.json"
+
+    @staticmethod
+    def _activation_tombstone_retention_filename(kind: str, pairing_id: str) -> str:
+        if kind not in {"pairing", "rotation"}:
+            raise RunnerStoreError("invalid activation tombstone kind")
+        return f"retention-{kind}-{hashlib.sha256(pairing_id.encode('utf-8')).hexdigest()}.json"
+
+    @classmethod
+    def _pairing_tombstone_retention(
+        cls, tombstone: Mapping[str, object], *, material: RunnerPairingMaterial,
+    ) -> dict[str, object]:
+        """Seal the independent 30-day retention proof before the tombstone."""
+        try:
+            pairing_id = _id(tombstone["pairing_id"], "pairing abort pairing ID")
+            aborted_at_ms = cls._pairing_time(tombstone["aborted_at_ms"], "pairing abort time")
+            purge_at_ms = cls._pairing_time(
+                aborted_at_ms + _ACTIVATION_TOMBSTONE_RETENTION_MS,
+                "pairing tombstone purge time",
+            )
+            public_key = base64.b64decode(material.public_key_b64, validate=True)
+            if (
+                len(public_key) != 32
+                or base64.b64encode(public_key).decode("ascii") != material.public_key_b64
+                or hashlib.sha256(public_key).hexdigest() != material.fingerprint
+                or ed25519_key_id(public_key) != material.key_id
+            ):
+                raise ValueError
+            filename = cls._pairing_abort_tombstone_filename(pairing_id)
+            core = {
+                "schema_version": _ACTIVATION_TOMBSTONE_RETENTION_SCHEMA,
+                "kind": "pairing", "workspace_id": _id(tombstone["workspace_id"], "pairing abort workspace"),
+                "runner_id": _id(tombstone["runner_id"], "pairing abort runner"),
+                "pairing_id": pairing_id, "tombstone_filename": filename,
+                "tombstone_digest": hashlib.sha256(canonical_bytes(dict(tombstone))).hexdigest(),
+                "aborted_at_ms": aborted_at_ms, "purge_at_ms": purge_at_ms,
+                "signer_public_key_b64": material.public_key_b64,
+                "signer_public_key_digest": material.fingerprint,
+            }
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise RunnerStoreError("invalid runner pairing activation tombstone retention") from None
+        signature = material._signer.sign(
+            _ACTIVATION_TOMBSTONE_RETENTION_PAIRING_DOMAIN + canonical_bytes(core),
+        )
+        if type(signature) is not bytes or len(signature) != 64:
+            raise RunnerStoreError("runner signer returned an invalid pairing retention signature")
+        return {
+            **core, "signing_key_id": material.key_id,
+            "signature_b64": base64.b64encode(signature).decode("ascii"),
+        }
+
+    @classmethod
+    def _rotation_tombstone_retention(
+        cls, tombstone: Mapping[str, object], *, old_identity: RunnerIdentity,
+        new_identity: RunnerIdentity, old_signer: SecureSigner, new_signer: SecureSigner,
+    ) -> dict[str, object]:
+        try:
+            pairing_id = _id(tombstone["pairing_id"], "rotation abort pairing ID")
+            aborted_at_ms = cls._pairing_time(tombstone["aborted_at_ms"], "rotation abort time")
+            purge_at_ms = cls._pairing_time(
+                aborted_at_ms + _ACTIVATION_TOMBSTONE_RETENTION_MS,
+                "rotation tombstone purge time",
+            )
+            old_public = base64.b64decode(old_identity.public_key_b64, validate=True)
+            new_public = base64.b64decode(new_identity.public_key_b64, validate=True)
+            if (
+                len(old_public) != 32 or len(new_public) != 32
+                or old_signer.public_key != old_public or new_signer.public_key != new_public
+                or old_signer.key_id != old_identity.key_id or new_signer.key_id != new_identity.key_id
+                or hashlib.sha256(old_public).hexdigest() != old_identity.fingerprint
+                or hashlib.sha256(new_public).hexdigest() != new_identity.fingerprint
+                or tombstone["old_runner_key_id"] != old_identity.key_id
+                or tombstone["new_runner_key_id"] != new_identity.key_id
+            ):
+                raise ValueError
+            core = {
+                "schema_version": _ACTIVATION_TOMBSTONE_RETENTION_SCHEMA,
+                "kind": "rotation", "workspace_id": _id(tombstone["workspace_id"], "rotation abort workspace"),
+                "runner_id": _id(tombstone["runner_id"], "rotation abort runner"),
+                "pairing_id": pairing_id,
+                "tombstone_filename": cls._rotation_abort_tombstone_filename(pairing_id),
+                "tombstone_digest": hashlib.sha256(canonical_bytes(dict(tombstone))).hexdigest(),
+                "aborted_at_ms": aborted_at_ms, "purge_at_ms": purge_at_ms,
+                "old_runner_key_id": old_identity.key_id,
+                "old_public_key_b64": old_identity.public_key_b64,
+                "old_public_key_digest": old_identity.fingerprint,
+                "new_runner_key_id": new_identity.key_id,
+                "new_public_key_b64": new_identity.public_key_b64,
+                "new_public_key_digest": new_identity.fingerprint,
+            }
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise RunnerStoreError("invalid runner rotation activation tombstone retention") from None
+        old_signature = old_signer.sign(
+            _ACTIVATION_TOMBSTONE_RETENTION_OLD_DOMAIN + canonical_bytes(core),
+        )
+        new_signature = new_signer.sign(
+            _ACTIVATION_TOMBSTONE_RETENTION_NEW_DOMAIN + canonical_bytes(core),
+        )
+        if type(old_signature) is not bytes or len(old_signature) != 64 or type(new_signature) is not bytes or len(new_signature) != 64:
+            raise RunnerStoreError("runner signer returned an invalid rotation retention signature")
+        return {
+            **core, "old_signing_key_id": old_identity.key_id,
+            "old_signature_b64": base64.b64encode(old_signature).decode("ascii"),
+            "new_signing_key_id": new_identity.key_id,
+            "new_signature_b64": base64.b64encode(new_signature).decode("ascii"),
+        }
+
+    @staticmethod
+    def _retention_public_key(
+        *, key_id: object, public_key_b64: object, public_key_digest: object,
+        label: str,
+    ) -> bytes:
+        try:
+            checked_key_id = _id(key_id, f"{label} key ID")
+            checked_digest = _digest(public_key_digest, f"{label} public key digest")
+            if not isinstance(public_key_b64, str):
+                raise ValueError
+            raw = base64.b64decode(public_key_b64, validate=True)
+            if (
+                len(raw) != 32
+                or base64.b64encode(raw).decode("ascii") != public_key_b64
+                or ed25519_key_id(raw) != checked_key_id
+                or hashlib.sha256(raw).hexdigest() != checked_digest
+            ):
+                raise ValueError
+            return raw
+        except (TypeError, ValueError):
+            raise RunnerStoreError(f"invalid {label}") from None
+
+    @classmethod
+    def _verify_activation_tombstone_pair(
+        cls, tombstones_fd: int, *, kind: str, hashed_pairing_id: str,
+    ) -> dict[str, object]:
+        """Authenticate a bounded sidecar/tombstone pair without journal state."""
+        filename = f"{kind}-{hashed_pairing_id}.json"
+        retention_filename = f"retention-{kind}-{hashed_pairing_id}.json"
+        retention = _read_json(tombstones_fd, retention_filename, None)
+        tombstone = _read_json(tombstones_fd, filename, None)
+        if not isinstance(retention, Mapping) or not isinstance(tombstone, Mapping):
+            raise RunnerStoreError("activation tombstone retention pair is incomplete")
+        pairing_fields = {
+            "schema_version", "kind", "workspace_id", "runner_id", "pairing_id",
+            "tombstone_filename", "tombstone_digest", "aborted_at_ms", "purge_at_ms",
+            "signer_public_key_b64", "signer_public_key_digest",
+        }
+        rotation_fields = {
+            "schema_version", "kind", "workspace_id", "runner_id", "pairing_id",
+            "tombstone_filename", "tombstone_digest", "aborted_at_ms", "purge_at_ms",
+            "old_runner_key_id", "old_public_key_b64", "old_public_key_digest",
+            "new_runner_key_id", "new_public_key_b64", "new_public_key_digest",
+        }
+        if kind == "pairing":
+            if set(retention) != pairing_fields | {"signing_key_id", "signature_b64"}:
+                raise RunnerStoreError("invalid runner pairing activation tombstone retention")
+            core = {key: retention[key] for key in pairing_fields}
+            public = cls._retention_public_key(
+                key_id=retention["signing_key_id"], public_key_b64=retention["signer_public_key_b64"],
+                public_key_digest=retention["signer_public_key_digest"],
+                label="runner pairing activation tombstone retention",
+            )
+            try:
+                verify_envelope(
+                    {retention["signing_key_id"]: load_public_key_base64(retention["signer_public_key_b64"])},
+                    {"signing_key_id": retention["signing_key_id"], "signature_b64": retention["signature_b64"]},
+                    _ACTIVATION_TOMBSTONE_RETENTION_PAIRING_DOMAIN + canonical_bytes(core),
+                )
+                tombstone_fields = {
+                    "schema_version", "workspace_id", "runner_id", "pairing_id",
+                    "prepared_journal_digest", "activation_request_digest", "abort_request_digest",
+                    "abort_response_digest", "challenge_expires_at_ms", "aborted_at_ms",
+                }
+                if set(tombstone) != tombstone_fields | {"signing_key_id", "signature_b64"}:
+                    raise ValueError
+                tombstone_core = {key: tombstone[key] for key in tombstone_fields}
+                if (
+                    tombstone["schema_version"] != _PAIRING_ABORT_TOMBSTONE_SCHEMA
+                    or tombstone["signing_key_id"] != retention["signing_key_id"]
+                ):
+                    raise ValueError
+                verify_envelope(
+                    {retention["signing_key_id"]: load_public_key_base64(retention["signer_public_key_b64"])},
+                    {"signing_key_id": tombstone["signing_key_id"], "signature_b64": tombstone["signature_b64"]},
+                    _PAIRING_ABORT_TOMBSTONE_DOMAIN + canonical_bytes(tombstone_core),
+                )
+            except (TypeError, ValueError):
+                raise RunnerStoreError("invalid runner pairing activation tombstone retention") from None
+        elif kind == "rotation":
+            signature_fields = {
+                "old_signing_key_id", "old_signature_b64", "new_signing_key_id", "new_signature_b64",
+            }
+            if set(retention) != rotation_fields | signature_fields:
+                raise RunnerStoreError("invalid runner rotation activation tombstone retention")
+            core = {key: retention[key] for key in rotation_fields}
+            old_public = cls._retention_public_key(
+                key_id=retention["old_signing_key_id"], public_key_b64=retention["old_public_key_b64"],
+                public_key_digest=retention["old_public_key_digest"],
+                label="runner rotation old retention key",
+            )
+            new_public = cls._retention_public_key(
+                key_id=retention["new_signing_key_id"], public_key_b64=retention["new_public_key_b64"],
+                public_key_digest=retention["new_public_key_digest"],
+                label="runner rotation new retention key",
+            )
+            try:
+                verify_envelope(
+                    {retention["old_signing_key_id"]: load_public_key_base64(retention["old_public_key_b64"])},
+                    {"signing_key_id": retention["old_signing_key_id"], "signature_b64": retention["old_signature_b64"]},
+                    _ACTIVATION_TOMBSTONE_RETENTION_OLD_DOMAIN + canonical_bytes(core),
+                )
+                verify_envelope(
+                    {retention["new_signing_key_id"]: load_public_key_base64(retention["new_public_key_b64"])},
+                    {"signing_key_id": retention["new_signing_key_id"], "signature_b64": retention["new_signature_b64"]},
+                    _ACTIVATION_TOMBSTONE_RETENTION_NEW_DOMAIN + canonical_bytes(core),
+                )
+                tombstone_fields = {
+                    "schema_version", "workspace_id", "runner_id", "pairing_id", "old_runner_key_id",
+                    "new_runner_key_id", "prepared_journal_digest", "runtime_rotation_intent_digest",
+                    "runtime_authority_epoch", "runtime_authority_identity_digest",
+                    "activation_request_digest", "activation_challenge_digest", "abort_request_digest",
+                    "abort_response_digest", "challenge_expires_at_ms", "aborted_at_ms",
+                }
+                if set(tombstone) != tombstone_fields | signature_fields:
+                    raise ValueError
+                tombstone_core = {key: tombstone[key] for key in tombstone_fields}
+                if (
+                    tombstone["schema_version"] != _ROTATION_ABORT_TOMBSTONE_SCHEMA
+                    or tombstone["old_signing_key_id"] != retention["old_signing_key_id"]
+                    or tombstone["new_signing_key_id"] != retention["new_signing_key_id"]
+                ):
+                    raise ValueError
+                verify_envelope(
+                    {retention["old_signing_key_id"]: load_public_key_base64(retention["old_public_key_b64"])},
+                    {"signing_key_id": tombstone["old_signing_key_id"], "signature_b64": tombstone["old_signature_b64"]},
+                    _ROTATION_ABORT_TOMBSTONE_OLD_DOMAIN + canonical_bytes(tombstone_core),
+                )
+                verify_envelope(
+                    {retention["new_signing_key_id"]: load_public_key_base64(retention["new_public_key_b64"])},
+                    {"signing_key_id": tombstone["new_signing_key_id"], "signature_b64": tombstone["new_signature_b64"]},
+                    _ROTATION_ABORT_TOMBSTONE_NEW_DOMAIN + canonical_bytes(tombstone_core),
+                )
+            except (TypeError, ValueError):
+                raise RunnerStoreError("invalid runner rotation activation tombstone retention") from None
+        else:
+            raise RunnerStoreError("invalid activation tombstone kind")
+        try:
+            pairing_id = _id(retention["pairing_id"], "activation tombstone pairing ID")
+            aborted_at_ms = cls._pairing_time(retention["aborted_at_ms"], "activation tombstone abort time")
+            purge_at_ms = cls._pairing_time(retention["purge_at_ms"], "activation tombstone purge time")
+            if (
+                retention["schema_version"] != _ACTIVATION_TOMBSTONE_RETENTION_SCHEMA
+                or retention["kind"] != kind
+                or retention["tombstone_filename"] != filename
+                or hashlib.sha256(pairing_id.encode("utf-8")).hexdigest() != hashed_pairing_id
+                or retention["tombstone_digest"] != hashlib.sha256(canonical_bytes(dict(tombstone))).hexdigest()
+                or aborted_at_ms + _ACTIVATION_TOMBSTONE_RETENTION_MS != purge_at_ms
+                or tombstone["pairing_id"] != pairing_id
+                or tombstone["workspace_id"] != retention["workspace_id"]
+                or tombstone["runner_id"] != retention["runner_id"]
+                or tombstone["aborted_at_ms"] != aborted_at_ms
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise RunnerStoreError("invalid activation tombstone retention pair") from None
+        return {
+            "kind": kind, "pairing_id": pairing_id, "tombstone_filename": filename,
+            "tombstone_digest": retention["tombstone_digest"],
+            "retention_filename": retention_filename,
+            "retention_digest": hashlib.sha256(canonical_bytes(dict(retention))).hexdigest(),
+            "purge_at_ms": purge_at_ms,
+        }
+
+    @classmethod
+    def _activation_tombstone_inventory_locked(cls, tombstones_fd: int) -> list[dict[str, object]]:
+        """Return no more than sixteen fully authenticated retained ceremonies."""
+        names: list[str] = []
+        with os.scandir(tombstones_fd) as entries:
+            for entry in entries:
+                names.append(entry.name)
+                if len(names) > 32:
+                    raise RunnerStoreError("activation tombstone inventory exceeds capacity")
+        grouped: dict[tuple[str, str], set[str]] = {}
+        for name in names:
+            match = _ACTIVATION_TOMBSTONE_FILENAME.fullmatch(name)
+            retention = _ACTIVATION_TOMBSTONE_RETENTION_FILENAME.fullmatch(name)
+            if match is not None:
+                kind, hashed = match.groups()
+                grouped.setdefault((kind, hashed), set()).add("tombstone")
+            elif retention is not None:
+                kind, hashed = retention.groups()
+                grouped.setdefault((kind, hashed), set()).add("retention")
+            else:
+                raise RunnerStoreError("invalid activation tombstone inventory entry")
+        if len(grouped) > _ACTIVATION_TOMBSTONE_MAX_CEREMONIES:
+            raise RunnerStoreError("activation tombstone inventory exceeds capacity")
+        result: list[dict[str, object]] = []
+        for (kind, hashed), members in grouped.items():
+            if members != {"tombstone", "retention"}:
+                raise RunnerStoreError("activation tombstone retention pair is incomplete")
+            result.append(cls._verify_activation_tombstone_pair(
+                tombstones_fd, kind=kind, hashed_pairing_id=hashed,
+            ))
+        return result
+
+    @staticmethod
+    def _activation_tombstone_prune_limit(limit: object) -> int:
+        if type(limit) is not int or not 1 <= limit <= _ACTIVATION_TOMBSTONE_PRUNE_BATCH:
+            raise RunnerStoreError("invalid activation tombstone prune limit")
+        return limit
+
+    @classmethod
+    def _activation_tombstone_journal(
+        cls, value: object, *, identity: RunnerIdentity,
+    ) -> list[dict[str, object]]:
+        fields = {
+            "schema_version", "workspace_id", "runner_id", "runner_key_id", "entries", "created_at_ms",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields | {"signing_key_id", "signature_b64"}:
+            raise RunnerStoreError("invalid activation tombstone prune journal")
+        if (
+            value.get("schema_version") != _ACTIVATION_TOMBSTONE_PRUNE_SCHEMA
+            or value.get("workspace_id") != identity.workspace_id
+            or value.get("runner_id") != identity.runner_id
+            or value.get("runner_key_id") != identity.key_id
+            or value.get("signing_key_id") != identity.key_id
+        ):
+            raise RunnerStoreError("invalid activation tombstone prune journal")
+        core = {key: value[key] for key in fields}
+        try:
+            verify_envelope(
+                {identity.key_id: load_public_key_base64(identity.public_key_b64)},
+                {"signing_key_id": value["signing_key_id"], "signature_b64": value["signature_b64"]},
+                _ACTIVATION_TOMBSTONE_PRUNE_DOMAIN + canonical_bytes(core),
+            )
+            cls._pairing_time(value["created_at_ms"], "activation tombstone prune creation time")
+            entries = value["entries"]
+            if not isinstance(entries, list) or not 1 <= len(entries) <= _ACTIVATION_TOMBSTONE_PRUNE_BATCH:
+                raise ValueError
+            parsed: list[dict[str, object]] = []
+            exact = {
+                "kind", "pairing_id", "tombstone_filename", "tombstone_digest",
+                "retention_filename", "retention_digest", "purge_at_ms",
+            }
+            for item in entries:
+                if not isinstance(item, Mapping) or set(item) != exact or item.get("kind") not in {"pairing", "rotation"}:
+                    raise ValueError
+                pairing_id = _id(item["pairing_id"], "activation tombstone journal pairing ID")
+                kind = item["kind"]
+                expected_hash = hashlib.sha256(pairing_id.encode("utf-8")).hexdigest()
+                if (
+                    item["tombstone_filename"] != f"{kind}-{expected_hash}.json"
+                    or item["retention_filename"] != f"retention-{kind}-{expected_hash}.json"
+                ):
+                    raise ValueError
+                _digest(item["tombstone_digest"], "activation tombstone journal tombstone digest")
+                _digest(item["retention_digest"], "activation tombstone journal retention digest")
+                cls._pairing_time(item["purge_at_ms"], "activation tombstone journal purge time")
+                parsed.append(dict(item))
+            if parsed != sorted(parsed, key=lambda item: (item["purge_at_ms"], item["kind"], item["pairing_id"])):
+                raise ValueError
+            return parsed
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid activation tombstone prune journal") from None
+
+    @classmethod
+    def _write_activation_tombstone_journal(
+        cls, runner_fd: int, *, identity: RunnerIdentity, signer: SecureSigner,
+        entries: list[dict[str, object]], now_ms: int,
+    ) -> None:
+        core = {
+            "schema_version": _ACTIVATION_TOMBSTONE_PRUNE_SCHEMA,
+            "workspace_id": identity.workspace_id, "runner_id": identity.runner_id,
+            "runner_key_id": identity.key_id, "entries": entries,
+            "created_at_ms": cls._pairing_time(now_ms, "activation tombstone prune creation time"),
+        }
+        signature = signer.sign(_ACTIVATION_TOMBSTONE_PRUNE_DOMAIN + canonical_bytes(core))
+        if type(signature) is not bytes or len(signature) != 64:
+            raise RunnerStoreError("runner signer returned an invalid activation tombstone prune signature")
+        _write_json(runner_fd, _ACTIVATION_TOMBSTONE_PRUNE_FILENAME, {
+            **core, "signing_key_id": identity.key_id,
+            "signature_b64": base64.b64encode(signature).decode("ascii"),
+        })
+
+    @classmethod
+    def _finish_activation_tombstone_journal_locked(
+        cls, runner_fd: int, *, identity: RunnerIdentity,
+    ) -> int:
+        journal = _read_json(runner_fd, _ACTIVATION_TOMBSTONE_PRUNE_FILENAME, None)
+        if journal is None:
+            return 0
+        entries = cls._activation_tombstone_journal(journal, identity=identity)
+        tombstones_fd = _open_child(runner_fd, _ACTIVATION_TOMBSTONES_DIRECTORY, create=False)
+        if tombstones_fd is None:
+            raise RunnerStoreError("activation tombstone prune journal lost its directory")
+        try:
+            for entry in entries:
+                try:
+                    pair = cls._verify_activation_tombstone_pair(
+                        tombstones_fd, kind=entry["kind"],
+                        hashed_pairing_id=hashlib.sha256(entry["pairing_id"].encode("utf-8")).hexdigest(),
+                    )
+                except RunnerStoreError:
+                    # An exact authenticated journal is the only proof that a
+                    # prior crash may have removed one or both members.
+                    tombstone = _read_json(tombstones_fd, entry["tombstone_filename"], None)
+                    retention = _read_json(tombstones_fd, entry["retention_filename"], None)
+                    if (
+                        tombstone is not None
+                        and hashlib.sha256(canonical_bytes(tombstone)).hexdigest()
+                            != entry["tombstone_digest"]
+                    ) or (
+                        retention is not None
+                        and hashlib.sha256(canonical_bytes(retention)).hexdigest()
+                            != entry["retention_digest"]
+                    ):
+                        raise RunnerStoreError("activation tombstone prune journal changed") from None
+                else:
+                    if (
+                        pair["tombstone_digest"] != entry["tombstone_digest"]
+                        or pair["retention_digest"] != entry["retention_digest"]
+                        or pair["purge_at_ms"] != entry["purge_at_ms"]
+                    ):
+                        raise RunnerStoreError("activation tombstone prune journal changed")
+                for name in (entry["tombstone_filename"], entry["retention_filename"]):
+                    try:
+                        os.unlink(name, dir_fd=tombstones_fd)
+                    except FileNotFoundError:
+                        pass
+            os.fsync(tombstones_fd)
+        finally:
+            os.close(tombstones_fd)
+        os.unlink(_ACTIVATION_TOMBSTONE_PRUNE_FILENAME, dir_fd=runner_fd)
+        os.fsync(runner_fd)
+        return len(entries)
+
+    def prune_activation_tombstones(
+        self, *, now_ms: int, limit: int = 16,
+    ) -> ActivationTombstonePruneResult:
+        """Roll forward or start one bounded, signed local tombstone cleanup."""
+        now_ms = self._pairing_time(now_ms, "activation tombstone prune time")
+        limit = self._activation_tombstone_prune_limit(limit)
+        identity, signer = self._require_runtime_authority()
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                existing_journal = _read_json(
+                    runner_fd, _ACTIVATION_TOMBSTONE_PRUNE_FILENAME, None,
+                )
+                if existing_journal is not None and len(self._activation_tombstone_journal(
+                    existing_journal, identity=identity,
+                )) > limit:
+                    raise RunnerStoreError("activation tombstone prune journal exceeds maintenance budget")
+                recovered = self._finish_activation_tombstone_journal_locked(
+                    runner_fd, identity=identity,
+                )
+                if recovered:
+                    return ActivationTombstonePruneResult(pruned=recovered, has_more=False)
+                tombstones_fd = _open_child(runner_fd, _ACTIVATION_TOMBSTONES_DIRECTORY, create=False)
+                if tombstones_fd is None:
+                    return ActivationTombstonePruneResult(pruned=0, has_more=False)
+                try:
+                    inventory = self._activation_tombstone_inventory_locked(tombstones_fd)
+                    protected: set[tuple[str, str]] = set()
+                    for journal_name, kind in (
+                        (_PAIRING_ACTIVATION_JOURNAL_FILENAME, "pairing"),
+                        (_ROTATION_ACTIVATION_JOURNAL_FILENAME, "rotation"),
+                    ):
+                        journal = _read_json(runner_fd, journal_name, None)
+                        if isinstance(journal, Mapping) and isinstance(journal.get("pairing_id"), str):
+                            protected.add((kind, journal["pairing_id"]))
+                    due = [
+                        item for item in inventory
+                        if item["purge_at_ms"] <= now_ms
+                        and (item["kind"], item["pairing_id"]) not in protected
+                    ]
+                    due.sort(key=lambda item: (item["purge_at_ms"], item["kind"], item["pairing_id"]))
+                    selected = due[:limit]
+                    has_more = len(due) > limit
+                    if not selected:
+                        return ActivationTombstonePruneResult(pruned=0, has_more=has_more)
+                    self._write_activation_tombstone_journal(
+                        runner_fd, identity=identity, signer=signer,
+                        entries=selected, now_ms=now_ms,
+                    )
+                finally:
+                    os.close(tombstones_fd)
+                pruned = self._finish_activation_tombstone_journal_locked(
+                    runner_fd, identity=identity,
+                )
+                return ActivationTombstonePruneResult(pruned=pruned, has_more=has_more)
+
+    def _resume_activation_tombstone_prune(
+        self, *, limit: int = 16,
+    ) -> ActivationTombstonePruneResult:
+        """Finish only the authenticated local prune suffix, never fresh history."""
+        limit = self._activation_tombstone_prune_limit(limit)
+        identity, _signer = self._require_runtime_authority()
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                journal = _read_json(runner_fd, _ACTIVATION_TOMBSTONE_PRUNE_FILENAME, None)
+                if journal is None:
+                    return ActivationTombstonePruneResult(pruned=0, has_more=False)
+                entries = self._activation_tombstone_journal(journal, identity=identity)
+                if len(entries) > limit:
+                    raise RunnerStoreError("activation tombstone prune journal exceeds maintenance budget")
+                return ActivationTombstonePruneResult(
+                    pruned=self._finish_activation_tombstone_journal_locked(
+                        runner_fd, identity=identity,
+                    ),
+                    has_more=False,
+                )
+
+    def _assert_activation_tombstone_capacity(self, *, now_ms: int) -> None:
+        """Prune one bounded due batch, then reserve a local retained slot."""
+        self.prune_activation_tombstones(now_ms=now_ms, limit=16)
+        identity, _signer = self._require_runtime_authority()
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                if _read_json(runner_fd, _ACTIVATION_TOMBSTONE_PRUNE_FILENAME, None) is not None:
+                    raise RunnerStoreError("activation tombstone prune requires recovery")
+                tombstones_fd = _open_child(runner_fd, _ACTIVATION_TOMBSTONES_DIRECTORY, create=False)
+                if tombstones_fd is None:
+                    return
+                try:
+                    inventory = self._activation_tombstone_inventory_locked(tombstones_fd)
+                finally:
+                    os.close(tombstones_fd)
+                if len(inventory) >= _ACTIVATION_TOMBSTONE_MAX_CEREMONIES:
+                    raise RunnerStoreError("local activation tombstone capacity is exhausted")
+                # Keep identity in this method's proof boundary: an opener
+                # under the wrong authority cannot use retained sidecars to
+                # gain a capacity decision.
+                _identity_record(identity, _signer)
+
+    @classmethod
+    def _prepared_pairing_journal_for_tombstone_capacity(
+        cls, runner_fd: int, *, pending: PendingPairingActivation,
+    ) -> tuple[RunnerPairingMaterial, dict[str, object], dict[str, object]]:
+        if not isinstance(pending, PendingPairingActivation) or not isinstance(
+            pending._material, RunnerPairingMaterial,
+        ):
+            raise RunnerStoreError("prepared runner pairing activation is required")
+        material = pending._material
+        pending_record = cls._pairing_pending(pending.pending)
+        verified = cls._load_pairing_activation_journal_locked(
+            runner_fd, material=material,
+        )
+        if verified is None:
+            raise RunnerStoreError("runner pairing activation requires recovery")
+        deadline, source = cls._pairing_challenge_expiry(verified)
+        if (
+            verified["state"] != "prepared" or verified["pairing_id"] != pending_record["pairing_id"]
+            or verified["runner_id"] != pending_record["runner_id"]
+            or verified["pairing_exchange_digest"] != pending_record["pairing_exchange_digest"]
+            or verified["activation_request"] != dict(pending.request)
+            or deadline != pending.challenge_expires_at_ms
+            or source != pending_record["challenge_expiry_source"]
+            or verified["activation_response"] is not None or verified["identity"] is not None
+        ):
+            raise RunnerStoreError("runner pairing activation requires recovery")
+        return material, pending_record, verified
+
+    @classmethod
+    def _prepair_activation_prune_journal(
+        cls, value: object, *, material: RunnerPairingMaterial,
+        pending_record: Mapping[str, object], prepared_journal: Mapping[str, object],
+    ) -> list[dict[str, object]]:
+        fields = {
+            "schema_version", "scope", "cleanup_runner_id", "cleanup_runner_key_id",
+            "cleanup_public_key_b64", "cleanup_public_key_digest", "pending_pairing_id",
+            "prepared_journal_digest", "inventory_digest", "entries", "created_at_ms",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields | {"signing_key_id", "signature_b64"}:
+            raise RunnerStoreError("invalid pre-pairing activation tombstone prune journal")
+        if (
+            value.get("schema_version") != _ACTIVATION_TOMBSTONE_PREPAIR_PRUNE_SCHEMA
+            or value.get("scope") != "pre_pairing"
+            or value.get("cleanup_runner_id") != pending_record["runner_id"]
+            or value.get("cleanup_runner_key_id") != material.key_id
+            or value.get("cleanup_public_key_b64") != material.public_key_b64
+            or value.get("cleanup_public_key_digest") != material.fingerprint
+            or value.get("pending_pairing_id") != pending_record["pairing_id"]
+            or value.get("prepared_journal_digest") != prepared_journal["journal_digest"]
+            or value.get("signing_key_id") != material.key_id
+        ):
+            raise RunnerStoreError("invalid pre-pairing activation tombstone prune journal")
+        core = {key: value[key] for key in fields}
+        try:
+            raw = cls._retention_public_key(
+                key_id=material.key_id, public_key_b64=material.public_key_b64,
+                public_key_digest=material.fingerprint,
+                label="pre-pairing activation tombstone prune key",
+            )
+            verify_envelope(
+                {material.key_id: load_public_key_base64(material.public_key_b64)},
+                {"signing_key_id": value["signing_key_id"], "signature_b64": value["signature_b64"]},
+                _ACTIVATION_TOMBSTONE_PREPAIR_PRUNE_DOMAIN + canonical_bytes(core),
+            )
+            del raw
+            _digest(value["inventory_digest"], "pre-pairing activation tombstone inventory digest")
+            cls._pairing_time(value["created_at_ms"], "pre-pairing activation tombstone prune time")
+            entries = value["entries"]
+            if not isinstance(entries, list) or not 1 <= len(entries) <= _ACTIVATION_TOMBSTONE_PRUNE_BATCH:
+                raise ValueError
+            parsed: list[dict[str, object]] = []
+            exact = {
+                "kind", "pairing_id", "tombstone_filename", "tombstone_digest",
+                "retention_filename", "retention_digest", "purge_at_ms",
+            }
+            for item in entries:
+                if not isinstance(item, Mapping) or set(item) != exact:
+                    raise ValueError
+                kind = item["kind"]
+                pairing_id = _id(item["pairing_id"], "pre-pairing prune pairing ID")
+                hashed = hashlib.sha256(pairing_id.encode("utf-8")).hexdigest()
+                if (
+                    kind not in {"pairing", "rotation"}
+                    or item["tombstone_filename"] != f"{kind}-{hashed}.json"
+                    or item["retention_filename"] != f"retention-{kind}-{hashed}.json"
+                ):
+                    raise ValueError
+                _digest(item["tombstone_digest"], "pre-pairing prune tombstone digest")
+                _digest(item["retention_digest"], "pre-pairing prune retention digest")
+                cls._pairing_time(item["purge_at_ms"], "pre-pairing prune purge time")
+                parsed.append(dict(item))
+            if parsed != sorted(parsed, key=lambda item: (item["purge_at_ms"], item["kind"], item["pairing_id"])):
+                raise ValueError
+            return parsed
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid pre-pairing activation tombstone prune journal") from None
+
+    @classmethod
+    def _write_prepaired_activation_prune_journal(
+        cls, runner_fd: int, *, material: RunnerPairingMaterial,
+        pending_record: Mapping[str, object], prepared_journal: Mapping[str, object],
+        inventory: list[dict[str, object]], entries: list[dict[str, object]], now_ms: int,
+    ) -> None:
+        ordered_inventory = sorted(
+            inventory, key=lambda item: (item["purge_at_ms"], item["kind"], item["pairing_id"]),
+        )
+        core = {
+            "schema_version": _ACTIVATION_TOMBSTONE_PREPAIR_PRUNE_SCHEMA, "scope": "pre_pairing",
+            "cleanup_runner_id": pending_record["runner_id"], "cleanup_runner_key_id": material.key_id,
+            "cleanup_public_key_b64": material.public_key_b64,
+            "cleanup_public_key_digest": material.fingerprint,
+            "pending_pairing_id": pending_record["pairing_id"],
+            "prepared_journal_digest": prepared_journal["journal_digest"],
+            "inventory_digest": hashlib.sha256(
+                _ACTIVATION_TOMBSTONE_INVENTORY_DOMAIN + canonical_bytes(ordered_inventory),
+            ).hexdigest(),
+            "entries": entries, "created_at_ms": cls._pairing_time(now_ms, "pre-pairing prune time"),
+        }
+        signature = material._signer.sign(
+            _ACTIVATION_TOMBSTONE_PREPAIR_PRUNE_DOMAIN + canonical_bytes(core),
+        )
+        if type(signature) is not bytes or len(signature) != 64:
+            raise RunnerStoreError("runner signer returned an invalid pre-pairing prune signature")
+        _write_json(runner_fd, _ACTIVATION_TOMBSTONE_PRUNE_FILENAME, {
+            **core, "signing_key_id": material.key_id,
+            "signature_b64": base64.b64encode(signature).decode("ascii"),
+        })
+
+    def _assert_pre_pairing_tombstone_capacity(
+        self, *, pending: PendingPairingActivation, now_ms: int, limit: int = 16,
+        _runner_fd: int | None = None,
+    ) -> None:
+        """Bounded pre-Cloud capacity preflight for the unpaired abort ceremony."""
+        now_ms = self._pairing_time(now_ms, "pre-pairing tombstone capacity time")
+        limit = self._activation_tombstone_prune_limit(limit)
+        runner_context = (
+            nullcontext(_runner_fd)
+            if _runner_fd is not None else self._open_runner(create=True)
+        )
+        with runner_context as runner_fd:
+            assert runner_fd is not None
+            lock_context = (
+                nullcontext() if _runner_fd is not None
+                else _flock(runner_fd, ".runner.lock", exclusive=True)
+            )
+            with lock_context:
+                material, pending_record, prepared = self._prepared_pairing_journal_for_tombstone_capacity(
+                    runner_fd, pending=pending,
+                )
+                journal = _read_json(runner_fd, _ACTIVATION_TOMBSTONE_PRUNE_FILENAME, None)
+                if journal is not None:
+                    # A pre-pairing journal is deliberately the only unbound
+                    # recovery form.  A paired journal cannot be downgraded.
+                    selected = self._prepair_activation_prune_journal(
+                        journal, material=material, pending_record=pending_record,
+                        prepared_journal=prepared,
+                    )
+                    tombstones_fd = _open_child(runner_fd, _ACTIVATION_TOMBSTONES_DIRECTORY, create=False)
+                    if tombstones_fd is None:
+                        raise RunnerStoreError("pre-pairing tombstone prune lost its directory")
+                    try:
+                        for entry in selected:
+                            for name in (entry["tombstone_filename"], entry["retention_filename"]):
+                                try:
+                                    os.unlink(name, dir_fd=tombstones_fd)
+                                except FileNotFoundError:
+                                    pass
+                        os.fsync(tombstones_fd)
+                    finally:
+                        os.close(tombstones_fd)
+                    os.unlink(_ACTIVATION_TOMBSTONE_PRUNE_FILENAME, dir_fd=runner_fd)
+                    os.fsync(runner_fd)
+                tombstones_fd = _open_child(runner_fd, _ACTIVATION_TOMBSTONES_DIRECTORY, create=False)
+                if tombstones_fd is None:
+                    return
+                try:
+                    inventory = self._activation_tombstone_inventory_locked(tombstones_fd)
+                    protected = {
+                        pending_record["pairing_id"],
+                    }
+                    for name in (_PAIRING_ACTIVATION_JOURNAL_FILENAME, _ROTATION_ACTIVATION_JOURNAL_FILENAME):
+                        live = _read_json(runner_fd, name, None)
+                        if isinstance(live, Mapping) and isinstance(live.get("pairing_id"), str):
+                            protected.add(live["pairing_id"])
+                    due = [
+                        item for item in inventory
+                        if item["purge_at_ms"] <= now_ms and item["pairing_id"] not in protected
+                    ]
+                    due.sort(key=lambda item: (item["purge_at_ms"], item["kind"], item["pairing_id"]))
+                    if due:
+                        selected = due[:limit]
+                        self._write_prepaired_activation_prune_journal(
+                            runner_fd, material=material, pending_record=pending_record,
+                            prepared_journal=prepared, inventory=inventory,
+                            entries=selected, now_ms=now_ms,
+                        )
+                        for entry in selected:
+                            for name in (entry["tombstone_filename"], entry["retention_filename"]):
+                                os.unlink(name, dir_fd=tombstones_fd)
+                        os.fsync(tombstones_fd)
+                        os.unlink(_ACTIVATION_TOMBSTONE_PRUNE_FILENAME, dir_fd=runner_fd)
+                        os.fsync(runner_fd)
+                    # Re-read the complete bounded inventory after cleanup.
+                    inventory = self._activation_tombstone_inventory_locked(tombstones_fd)
+                    same = [item for item in inventory if item["pairing_id"] == pending_record["pairing_id"]]
+                    if same:
+                        if len(same) != 1:
+                            raise RunnerStoreError("invalid activation tombstone capacity state")
+                    elif len(inventory) >= _ACTIVATION_TOMBSTONE_MAX_CEREMONIES:
+                        raise RunnerStoreError("local activation tombstone capacity is exhausted")
+                finally:
+                    os.close(tombstones_fd)
 
     @classmethod
     def _pairing_abort_tombstone(
@@ -1056,47 +2060,323 @@ class RunnerStore:
             raise RunnerStoreError("invalid runner pairing activation abort tombstone") from None
         return dict(value)
 
-    def complete_pairing_activation_abort(
-        self, pending: PendingPairingActivation, abort_request: Mapping[str, object],
-        abort_response: Mapping[str, object],
-    ) -> None:
-        """Persist the Cloud-proven pairing abort before releasing its prepared journal."""
-        if not isinstance(pending, PendingPairingActivation) or not isinstance(pending._material, RunnerPairingMaterial):
+    @classmethod
+    def _pairing_abort_request_journal(
+        cls, value: object, *, material: RunnerPairingMaterial,
+        pending_record: Mapping[str, object], activation_journal: Mapping[str, object],
+    ) -> dict[str, object]:
+        fields = {
+            "schema_version", "state", "runner_id", "pairing_id", "pairing_exchange_digest",
+            "prepared_activation_journal_digest", "activation_request_digest",
+            "activation_challenge_digest", "challenge_expires_at_ms", "challenge_expiry_source",
+            "abort_request", "created_at_ms", "updated_at_ms",
+        }
+        identity = RunnerIdentity(
+            runner_id=pending_record["runner_id"], workspace_id="pending",
+            runner_version=material.runner_version, adapter_versions=dict(material.adapters),
+            public_key_b64=material.public_key_b64, fingerprint=material.fingerprint,
+            key_id=material.key_id, pairing_phrase=material.pairing_phrase,
+        )
+        verified = cls._verify_pairing_signed_value(
+            value, identity=identity, domain=_PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_DOMAIN,
+            digest_field="journal_digest", fields=fields,
+            label="runner pairing activation abort request journal",
+        )
+        if (
+            verified["schema_version"] != _PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_SCHEMA
+            or verified["state"] != "prepared"
+            or verified["runner_id"] != pending_record["runner_id"]
+            or verified["pairing_id"] != pending_record["pairing_id"]
+            or verified["pairing_exchange_digest"] != pending_record["pairing_exchange_digest"]
+            or verified["prepared_activation_journal_digest"] != activation_journal["journal_digest"]
+            or verified["activation_request_digest"] != hashlib.sha256(
+                canonical_bytes(dict(activation_journal["activation_request"])),
+            ).hexdigest()
+        ):
+            raise RunnerStoreError("invalid runner pairing activation abort request journal")
+        try:
+            challenge = cls._pairing_nonce(
+                activation_journal["activation_challenge"], "pairing activation challenge",
+            )
+            challenge_digest = hashlib.sha256(
+                base64.b64decode(challenge, validate=True),
+            ).hexdigest()
+            if verified["activation_challenge_digest"] != challenge_digest:
+                raise ValueError
+            deadline, source = cls._pairing_challenge_expiry(verified)
+            if cls._pairing_time(verified["created_at_ms"], "pairing abort creation time") > cls._pairing_time(
+                verified["updated_at_ms"], "pairing abort update time",
+            ):
+                raise ValueError
+            request = verified["abort_request"]
+            request_fields = {
+                "schema_version", "pairing_id", "runner_id", "pairing_exchange_digest",
+                "activation_request_digest", "activation_challenge_digest", "reason_code",
+                "signature_b64",
+            }
+            if (
+                not isinstance(request, Mapping) or set(request) != request_fields
+                or request["schema_version"] != "heel.runner-pairing-activation-abort.v2"
+                or request["pairing_id"] != pending_record["pairing_id"]
+                or request["runner_id"] != pending_record["runner_id"]
+                or request["pairing_exchange_digest"] != pending_record["pairing_exchange_digest"]
+                or request["activation_request_digest"] != verified["activation_request_digest"]
+                or request["activation_challenge_digest"] != challenge_digest
+                or request["reason_code"] != "activation_challenge_expired"
+                or type(request["signature_b64"]) is not str
+            ):
+                raise ValueError
+            verify_envelope(
+                {material.key_id: load_public_key_base64(material.public_key_b64)},
+                {"signing_key_id": material.key_id, "signature_b64": request["signature_b64"]},
+                b"heel.runner-pairing-activation-abort.v2\0" + canonical_bytes(
+                    {key: request[key] for key in request_fields - {"signature_b64"}},
+                ),
+            )
+            activation_deadline, activation_source = cls._pairing_challenge_expiry(activation_journal)
+            if deadline is not None and activation_deadline is not None and deadline != activation_deadline:
+                raise ValueError
+            if source == "exchange" and (deadline != activation_deadline or activation_source != "exchange"):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid runner pairing activation abort request journal") from None
+        return dict(verified)
+
+    def _mint_pairing_activation_abort(
+        self, *, pending: PendingPairingActivation, journal: Mapping[str, object],
+    ) -> PendingPairingActivationAbort:
+        deadline, _source = self._pairing_challenge_expiry(journal)
+        return PendingPairingActivationAbort(
+            pairing_id=journal["pairing_id"], runner_id=journal["runner_id"],
+            request=dict(journal["abort_request"]), challenge_expires_at_ms=deadline,
+            _pending=pending, _journal_digest=journal["journal_digest"],
+            _store_token=self._pairing_abort_token,
+        )
+
+    def prepare_pairing_activation_abort(
+        self, pending: PendingPairingActivation, *, now_ms: int,
+    ) -> PendingPairingActivationAbort:
+        """Durably reserve a local abort slot and mint its one exact v2 request."""
+        now_ms = self._pairing_time(now_ms, "pairing activation abort preparation time")
+        if not isinstance(pending, PendingPairingActivation):
             raise RunnerStoreError("prepared runner pairing activation is required")
-        material = pending._material
-        pending_record = self._pairing_pending(pending.pending)
-        journal_fields = {
-            "schema_version", "state", "pairing_id", "runner_id", "pairing_exchange_digest",
-            "activation_challenge", "client_activation_nonce_b64", "activation_request",
-            "activation_response", "identity", "created_at_ms", "updated_at_ms",
-        }
-        abort_fields = {
-            "schema_version", "pairing_id", "runner_id", "pairing_exchange_digest",
-            "activation_request_digest", "challenge_expires_at_ms", "reason_code", "signature_b64",
-        }
-        response_fields = {
-            "schema_version", "workspace_id", "runner_id", "pairing_id",
-            "activation_request_digest", "status", "aborted_at_ms",
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                material, pending_record, activation_journal = self._prepared_pairing_journal_for_tombstone_capacity(
+                    runner_fd, pending=pending,
+                )
+                deadline, _source = self._pairing_challenge_expiry(activation_journal)
+                if deadline is not None and now_ms < deadline:
+                    raise RunnerStoreError("runner pairing activation challenge is still live")
+                existing = _read_json(
+                    runner_fd, _PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_FILENAME, None,
+                )
+                if existing is not None:
+                    journal = self._pairing_abort_request_journal(
+                        existing, material=material, pending_record=pending_record,
+                        activation_journal=activation_journal,
+                    )
+                    return self._mint_pairing_activation_abort(pending=pending, journal=journal)
+                self._assert_pre_pairing_tombstone_capacity(
+                    pending=pending, now_ms=now_ms, _runner_fd=runner_fd,
+                )
+                request_core = {
+                    "schema_version": "heel.runner-pairing-activation-abort.v2",
+                    "pairing_id": pending_record["pairing_id"], "runner_id": pending_record["runner_id"],
+                    "pairing_exchange_digest": pending_record["pairing_exchange_digest"],
+                    "activation_request_digest": hashlib.sha256(
+                        canonical_bytes(dict(activation_journal["activation_request"])),
+                    ).hexdigest(),
+                    "activation_challenge_digest": hashlib.sha256(base64.b64decode(
+                        activation_journal["activation_challenge"], validate=True,
+                    )).hexdigest(),
+                    "reason_code": "activation_challenge_expired",
+                }
+                signature = material._signer.sign(
+                    b"heel.runner-pairing-activation-abort.v2\0" + canonical_bytes(request_core),
+                )
+                if type(signature) is not bytes or len(signature) != 64:
+                    raise RunnerStoreError("runner signer returned an invalid pairing activation signature")
+                request = {
+                    **request_core, "signature_b64": base64.b64encode(signature).decode("ascii"),
+                }
+                core = {
+                    "schema_version": _PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_SCHEMA,
+                    "state": "prepared", "runner_id": pending_record["runner_id"],
+                    "pairing_id": pending_record["pairing_id"],
+                    "pairing_exchange_digest": pending_record["pairing_exchange_digest"],
+                    "prepared_activation_journal_digest": activation_journal["journal_digest"],
+                    "activation_request_digest": request_core["activation_request_digest"],
+                    "activation_challenge_digest": request_core["activation_challenge_digest"],
+                    "challenge_expires_at_ms": deadline,
+                    "challenge_expiry_source": _source,
+                    "abort_request": request, "created_at_ms": now_ms, "updated_at_ms": now_ms,
+                }
+                journal = self._pairing_signed_value(
+                    core, signer=material._signer,
+                    domain=_PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_DOMAIN,
+                    digest_field="journal_digest",
+                )
+                _write_json(runner_fd, _PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_FILENAME, journal)
+                return self._mint_pairing_activation_abort(pending=pending, journal=journal)
+
+    def record_pairing_activation_abort_deferred(
+        self, prepared: PendingPairingActivationAbort, response: Mapping[str, object], *, now_ms: int,
+    ) -> PendingPairingActivationAbort:
+        """Durably record the Cloud's first authoritative legacy-expiry observation."""
+        now_ms = self._pairing_time(now_ms, "pairing activation abort deferred time")
+        if (
+            not isinstance(prepared, PendingPairingActivationAbort)
+            or prepared._store_token is not self._pairing_abort_token
+            or not isinstance(prepared._pending, PendingPairingActivation)
+        ):
+            raise RunnerStoreError("prepared runner pairing activation abort is required")
+        fields = {
+            "schema_version", "code", "pairing_id", "runner_id", "pairing_exchange_digest",
+            "activation_challenge_digest", "challenge_expires_at_ms", "server_time_ms",
+            "retry_after_ms",
         }
         if (
-            not isinstance(abort_request, Mapping) or set(abort_request) != abort_fields
-            or abort_request.get("schema_version") != "heel.runner-pairing-activation-abort.v1"
-            or abort_request.get("pairing_id") != pending_record["pairing_id"]
-            or abort_request.get("runner_id") != pending_record["runner_id"]
-            or abort_request.get("pairing_exchange_digest") != pending_record["pairing_exchange_digest"]
-            or abort_request.get("reason_code") != "activation_challenge_expired"
-            or not _digest(abort_request.get("activation_request_digest"), "pairing abort request digest")
-            or not isinstance(abort_response, Mapping) or set(abort_response) != response_fields
-            or abort_response.get("schema_version") != "heel.runner-pairing-activation-aborted.v1"
+            not isinstance(response, Mapping) or set(response) != fields
+            or response.get("schema_version") != "heel.runner-pairing-activation-abort-deferred.v1"
+            or response.get("code") != "runner_activation_challenge_live"
+        ):
+            raise RunnerStoreError("invalid runner pairing activation abort deferred response")
+        try:
+            expiry = self._pairing_time(response["challenge_expires_at_ms"], "pairing abort challenge expiry")
+            server_time = self._pairing_time(response["server_time_ms"], "pairing abort server time")
+            retry_after = self._pairing_time(response["retry_after_ms"], "pairing abort retry time")
+            if server_time >= expiry or retry_after != max(1, expiry - server_time):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise RunnerStoreError("invalid runner pairing activation abort deferred response") from None
+        pending = prepared._pending
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                material, pending_record, activation_journal = self._prepared_pairing_journal_for_tombstone_capacity(
+                    runner_fd, pending=pending,
+                )
+                value = _read_json(runner_fd, _PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_FILENAME, None)
+                journal = self._pairing_abort_request_journal(
+                    value, material=material, pending_record=pending_record,
+                    activation_journal=activation_journal,
+                )
+                deadline, source = self._pairing_challenge_expiry(journal)
+                request = journal["abort_request"]
+                if (
+                    prepared.pairing_id != journal["pairing_id"]
+                    or prepared.runner_id != journal["runner_id"]
+                    or dict(prepared.request) != request
+                    or prepared._journal_digest != journal["journal_digest"]
+                    or prepared.challenge_expires_at_ms != deadline
+                    or response["pairing_id"] != journal["pairing_id"]
+                    or response["runner_id"] != journal["runner_id"]
+                    or response["pairing_exchange_digest"] != journal["pairing_exchange_digest"]
+                    or response["activation_challenge_digest"] != journal["activation_challenge_digest"]
+                ):
+                    raise RunnerStoreError("invalid runner pairing activation abort deferred response")
+                if deadline is not None:
+                    if source != "server_deferred" or deadline != expiry:
+                        raise RunnerStoreError("invalid runner pairing activation abort deferred response")
+                    return self._mint_pairing_activation_abort(pending=pending, journal=journal)
+                if now_ms < journal["created_at_ms"]:
+                    raise RunnerStoreError("invalid runner pairing activation abort deferred time")
+                core = {
+                    key: journal[key] for key in (
+                        "schema_version", "state", "runner_id", "pairing_id",
+                        "pairing_exchange_digest", "prepared_activation_journal_digest",
+                        "activation_request_digest", "activation_challenge_digest", "abort_request",
+                        "created_at_ms",
+                    )
+                }
+                core.update({
+                    "challenge_expires_at_ms": expiry,
+                    "challenge_expiry_source": "server_deferred",
+                    "updated_at_ms": now_ms,
+                })
+                updated = self._pairing_signed_value(
+                    core, signer=material._signer,
+                    domain=_PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_DOMAIN,
+                    digest_field="journal_digest",
+                )
+                _write_json(runner_fd, _PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_FILENAME, updated)
+                return self._mint_pairing_activation_abort(pending=pending, journal=updated)
+
+    def recover_pairing_activation_abort(
+        self, material: RunnerPairingMaterial,
+    ) -> PendingPairingActivationAbort | None:
+        """Re-mint only an already durable abort request; never sign a replacement."""
+        if not isinstance(material, RunnerPairingMaterial):
+            raise RunnerStoreError("runner pairing material is required")
+        with self._open_runner(create=True) as runner_fd:
+            assert runner_fd is not None
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                activation = self._load_pairing_activation_journal_locked(
+                    runner_fd, material=material,
+                )
+                abort_value = _read_json(
+                    runner_fd, _PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_FILENAME, None,
+                )
+                if abort_value is None:
+                    return None
+                if activation is None:
+                    raise RunnerStoreError("runner pairing activation abort requires recovery")
+                deadline, _source = self._pairing_challenge_expiry(activation)
+                pending_record = self._pairing_pending({
+                    "schema_version": (
+                        "heel.runner-pairing-pending.v2" if deadline is None
+                        else "heel.runner-pairing-pending.v3"
+                    ),
+                    "pairing_id": activation["pairing_id"], "runner_id": activation["runner_id"],
+                    "fingerprint": material.fingerprint, "status": "pending",
+                    "activation_challenge": activation["activation_challenge"],
+                    "control_protocol": "heel.runner-control.v2",
+                    "pairing_exchange_digest": activation["pairing_exchange_digest"],
+                    **({} if deadline is None else {"challenge_expires_at_ms": deadline}),
+                })
+                pending = PendingPairingActivation(
+                    self._pairing_pending_wire(pending_record),
+                    dict(activation["activation_request"]), deadline, material,
+                )
+                _material, checked_pending, checked_activation = self._prepared_pairing_journal_for_tombstone_capacity(
+                    runner_fd, pending=pending,
+                )
+                journal = self._pairing_abort_request_journal(
+                    abort_value, material=material, pending_record=checked_pending,
+                    activation_journal=checked_activation,
+                )
+                return self._mint_pairing_activation_abort(pending=pending, journal=journal)
+
+    def complete_pairing_activation_abort(
+        self, prepared: PendingPairingActivationAbort, abort_response: Mapping[str, object],
+    ) -> None:
+        """Persist the Cloud-proven pairing abort before releasing its prepared journal."""
+        if (
+            not isinstance(prepared, PendingPairingActivationAbort)
+            or prepared._store_token is not self._pairing_abort_token
+            or not isinstance(prepared._pending, PendingPairingActivation)
+            or not isinstance(prepared._pending._material, RunnerPairingMaterial)
+        ):
+            raise RunnerStoreError("prepared runner pairing activation is required")
+        pending = prepared._pending
+        material = pending._material
+        pending_record = self._pairing_pending(pending.pending)
+        response_fields = {
+            "schema_version", "workspace_id", "runner_id", "pairing_id",
+            "activation_request_digest", "activation_challenge_digest",
+            "challenge_expires_at_ms", "status", "aborted_at_ms",
+        }
+        if (
+            not isinstance(abort_response, Mapping) or set(abort_response) != response_fields
+            or abort_response.get("schema_version") != "heel.runner-pairing-activation-aborted.v2"
             or abort_response.get("runner_id") != pending_record["runner_id"]
             or abort_response.get("pairing_id") != pending_record["pairing_id"]
-            or abort_response.get("activation_request_digest") != abort_request["activation_request_digest"]
             or abort_response.get("status") != "expired"
         ):
             raise RunnerStoreError("invalid runner pairing activation abort")
-        challenge_expiry = self._pairing_time(
-            abort_request.get("challenge_expires_at_ms"), "pairing abort challenge expiry",
-        )
+        challenge_expiry = self._pairing_time(abort_response.get("challenge_expires_at_ms"), "pairing abort challenge expiry")
         aborted_at = self._pairing_time(abort_response.get("aborted_at_ms"), "pairing abort time")
         if aborted_at < challenge_expiry:
             raise RunnerStoreError("invalid runner pairing activation abort")
@@ -1104,27 +2384,32 @@ class RunnerStore:
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
             with _flock(runner_fd, ".runner.lock", exclusive=True):
-                journal = _read_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, None)
-                pseudo_identity = RunnerIdentity(
-                    runner_id=pending_record["runner_id"], workspace_id="pending",
-                    runner_version=material.runner_version, adapter_versions=dict(material.adapters),
-                    public_key_b64=material.public_key_b64, fingerprint=material.fingerprint,
-                    key_id=material.key_id, pairing_phrase=material.pairing_phrase,
+                material, pending_record, verified = self._prepared_pairing_journal_for_tombstone_capacity(
+                    runner_fd, pending=pending,
                 )
-                verified = self._verify_pairing_signed_value(
-                    journal, identity=pseudo_identity, domain=_PAIRING_ACTIVATION_JOURNAL_DOMAIN,
-                    digest_field="journal_digest", fields=journal_fields,
-                    label="runner pairing activation journal",
+                journal_value = _read_json(
+                    runner_fd, _PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_FILENAME, None,
+                )
+                journal = self._pairing_abort_request_journal(
+                    journal_value, material=material, pending_record=pending_record,
+                    activation_journal=verified,
                 )
                 if (
-                    verified.get("state") != "prepared"
-                    or verified.get("activation_response") is not None or verified.get("identity") is not None
-                    or verified.get("activation_request") != dict(pending.request)
-                    or verified.get("pairing_id") != pending_record["pairing_id"]
-                    or verified.get("runner_id") != pending_record["runner_id"]
+                    prepared.pairing_id != journal["pairing_id"]
+                    or prepared.runner_id != journal["runner_id"]
+                    or dict(prepared.request) != journal["abort_request"]
+                    or prepared._journal_digest != journal["journal_digest"]
+                    or prepared.challenge_expires_at_ms != self._pairing_challenge_expiry(journal)[0]
                 ):
-                    raise RunnerStoreError("runner pairing activation requires recovery")
-                if abort_request["activation_request_digest"] != hashlib.sha256(canonical_bytes(dict(pending.request))).hexdigest():
+                    raise RunnerStoreError("prepared runner pairing activation abort changed")
+                abort_request = journal["abort_request"]
+                if (
+                    abort_response["activation_request_digest"] != abort_request["activation_request_digest"]
+                    or abort_response["activation_challenge_digest"] != abort_request["activation_challenge_digest"]
+                ):
+                    raise RunnerStoreError("invalid runner pairing activation abort")
+                known_deadline, _source = self._pairing_challenge_expiry(journal)
+                if known_deadline is not None and challenge_expiry != known_deadline:
                     raise RunnerStoreError("invalid runner pairing activation abort")
                 core = {
                     "schema_version": _PAIRING_ABORT_TOMBSTONE_SCHEMA,
@@ -1146,6 +2431,18 @@ class RunnerStore:
                 assert tombstones_fd is not None
                 try:
                     filename = self._pairing_abort_tombstone_filename(pending_record["pairing_id"])
+                    retention_filename = self._activation_tombstone_retention_filename(
+                        "pairing", pending_record["pairing_id"],
+                    )
+                    retention = self._pairing_tombstone_retention(tombstone, material=material)
+                    existing_retention = _read_json(tombstones_fd, retention_filename, None)
+                    if existing_retention is None:
+                        # Retention authority is the durable first suffix.  A
+                        # crash here leaves the prepared journal intact and
+                        # recovery will re-create this exact sidecar.
+                        _write_json(tombstones_fd, retention_filename, retention)
+                    elif existing_retention != retention:
+                        raise RunnerStoreError("runner pairing activation retention changed")
                     existing = _read_json(tombstones_fd, filename, None)
                     if existing is None:
                         _write_json(tombstones_fd, filename, tombstone)
@@ -1153,6 +2450,8 @@ class RunnerStore:
                         raise RunnerStoreError("runner pairing activation abort changed")
                 finally:
                     os.close(tombstones_fd)
+                os.unlink(_PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_FILENAME, dir_fd=runner_fd)
+                os.fsync(runner_fd)
                 os.unlink(_PAIRING_ACTIVATION_JOURNAL_FILENAME, dir_fd=runner_fd)
                 os.fsync(runner_fd)
 
@@ -1164,7 +2463,8 @@ class RunnerStore:
         journal_fields = {
             "schema_version", "state", "pairing_id", "runner_id", "pairing_exchange_digest",
             "activation_challenge", "client_activation_nonce_b64", "activation_request",
-            "activation_response", "identity", "created_at_ms", "updated_at_ms",
+            "activation_response", "identity", "challenge_expires_at_ms",
+            "challenge_expiry_source", "created_at_ms", "updated_at_ms",
         }
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
@@ -1225,14 +2525,19 @@ class RunnerStore:
 
     def recover_pairing_activation(
         self, material: RunnerPairingMaterial, runtime_path: Path | str,
-    ) -> PendingPairingActivation | RunnerIdentity | None:
+    ) -> PendingPairingActivation | PendingPairingActivationAbort | RunnerIdentity | None:
         """Complete exactly one signed local pairing prefix without discovering state."""
         if not isinstance(material, RunnerPairingMaterial):
             raise RunnerStoreError("runner pairing material is required")
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
-            with _flock(runner_fd, ".runner.lock", exclusive=False):
-                journal = _read_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, None)
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
+                journal = self._load_pairing_activation_journal_locked(
+                    runner_fd, material=material,
+                )
+                abort_journal_exists = _read_json(
+                    runner_fd, _PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_FILENAME, None,
+                ) is not None
         if journal is None:
             return None
         if not isinstance(journal, Mapping):
@@ -1243,17 +2548,28 @@ class RunnerStore:
         basic_fields = {
             "schema_version", "state", "pairing_id", "runner_id", "pairing_exchange_digest",
             "activation_challenge", "client_activation_nonce_b64", "activation_request",
-            "activation_response", "identity", "created_at_ms", "updated_at_ms",
+            "activation_response", "identity", "challenge_expires_at_ms",
+            "challenge_expiry_source", "created_at_ms", "updated_at_ms",
         }
+        journal_deadline, _journal_expiry_source = self._pairing_challenge_expiry(journal)
         pending = self._pairing_pending({
-            "schema_version": "heel.runner-pairing-pending.v2", "pairing_id": journal.get("pairing_id"),
+            "schema_version": (
+                "heel.runner-pairing-pending.v2" if journal_deadline is None
+                else "heel.runner-pairing-pending.v3"
+            ), "pairing_id": journal.get("pairing_id"),
             "runner_id": journal.get("runner_id"),
             "fingerprint": material.fingerprint, "status": "pending",
             "activation_challenge": journal.get("activation_challenge"),
             "control_protocol": "heel.runner-control.v2",
             "pairing_exchange_digest": journal.get("pairing_exchange_digest"),
+            **({} if journal_deadline is None else {"challenge_expires_at_ms": journal_deadline}),
         })
         if state == "prepared":
+            if abort_journal_exists:
+                recovered_abort = self.recover_pairing_activation_abort(material)
+                if recovered_abort is None:
+                    raise RunnerStoreError("runner pairing activation abort requires recovery")
+                return recovered_abort
             pseudo_identity = RunnerIdentity(
                 runner_id=pending["runner_id"], workspace_id="pending", runner_version=material.runner_version,
                 adapter_versions=dict(material.adapters), public_key_b64=material.public_key_b64,
@@ -1296,7 +2612,10 @@ class RunnerStore:
                         os.unlink(_PAIRING_ACTIVATION_JOURNAL_FILENAME, dir_fd=runner_fd)
                         os.fsync(runner_fd)
                         return None
-            return PendingPairingActivation(dict(pending), dict(request), material)
+            deadline, _source = self._pairing_challenge_expiry(verified_journal)
+            return PendingPairingActivation(
+                self._pairing_pending_wire(pending), dict(request), journal_deadline, material,
+            )
         if not isinstance(journal.get("identity"), Mapping) or not isinstance(journal.get("activation_response"), Mapping):
             raise RunnerStoreError("invalid runner pairing activation journal")
         identity_record = _stored_identity_record(journal["identity"])
@@ -1579,6 +2898,28 @@ class RunnerStore:
             raise RunnerStoreError("paired runner identity requires recovery")
         return verified
 
+    @staticmethod
+    def _assert_no_context_authority_locked(runner_fd: int) -> None:
+        """Prove that no local context history could require a root-key rekey.
+
+        The caller holds ``.runner.lock`` exclusively.  This deliberately does
+        not discover, parse, or classify namespace contents: a single entry is
+        sufficient evidence that the local Store must be reprovisioned.
+        """
+        for filename in ("active-context.json", "context-install.json"):
+            if _read_json(runner_fd, filename, None) is not None:
+                raise RunnerStoreError("runner rotation requires re-pairing")
+        contexts_fd = _open_child(runner_fd, "contexts", create=False)
+        if contexts_fd is None:
+            return
+        try:
+            _secure_directory(contexts_fd, "Heel runner contexts directory")
+            with os.scandir(contexts_fd) as entries:
+                if next(entries, None) is not None:
+                    raise RunnerStoreError("runner rotation requires re-pairing")
+        finally:
+            os.close(contexts_fd)
+
     def prepare_rotation_activation(
         self, pending: Mapping[str, object], *, old_identity: RunnerIdentity, old_signer: SecureSigner,
         new_identity: RunnerIdentity, new_signer: SecureSigner, new_signer_label: str,
@@ -1598,13 +2939,6 @@ class RunnerStore:
         old_record = _identity_record(old_identity, old_signer)
         new_record = _identity_record(new_identity, new_signer)
         new_signer_label = _id(new_signer_label, "rotation signer label")
-        if self._namespace is not None:
-            raise RunnerStoreError("runner rotation requires re-pairing")
-        authority = self._runtime_authority
-        if authority is None:
-            self._runtime_authority = (old_identity, old_signer)
-        elif _identity_record(*authority) != old_record:
-            raise RunnerStoreError("authenticated runner store identity changed")
         from heel.runner.runtime import RunnerRuntimeConflict, RunnerRuntimeState
         if not isinstance(runtime_state, RunnerRuntimeState) or not runtime_state._same_identity(
             runtime_state.identity, old_identity,
@@ -1616,39 +2950,57 @@ class RunnerStore:
             probe = runtime_state.probe_rotation_eligible(old_identity=old_identity)
         except RunnerRuntimeConflict as exc:
             raise RunnerStoreError("runner rotation is unavailable") from exc
-        proof = {"pairing_id": pending_value["pairing_id"], "challenge": pending_value["activation_challenge"]}
-        signature = new_signer.sign(b"heel.runner-rotation-activate.v2\0" + canonical_bytes(proof))
-        if type(signature) is not bytes or len(signature) != 64:
-            raise RunnerStoreError("runner signer returned an invalid rotation signature")
-        request = {
-            "schema_version": "heel.runner-rotation-activate.v2",
-            "signature_b64": base64.b64encode(signature).decode("ascii"),
-        }
-        intent = self._rotation_intent_core(
-            pairing_id=pending_value["pairing_id"], old_identity=old_identity, new_identity=new_identity,
-            activation_request=request, activation_challenge=pending_value["activation_challenge"],
-            new_signer_label=new_signer_label, authority_epoch=probe.authority_epoch,
-            authority_identity_digest=probe.authority_identity_digest,
-            claim_state_digest=probe.claim_state_digest, prepared_at_ms=now_ms,
-        )
-        core = {
-            "schema_version": _ROTATION_ACTIVATION_JOURNAL_SCHEMA, "state": "prepared",
-            "pairing_id": pending_value["pairing_id"], "old_identity": old_record, "new_identity": new_record,
-            "new_signer_label": new_signer_label, "activation_challenge": pending_value["activation_challenge"],
-            "activation_request": request, "activation_response": None,
-            "created_at_ms": now_ms, "updated_at_ms": now_ms,
-            **{key: value for key, value in intent.items() if key != "schema_version"},
-            "runtime_rotation_intent_digest": self._rotation_intent_digest(intent),
-        }
-        journal = self._signed_rotation_journal(core, old_signer=old_signer, new_signer=new_signer)
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
             with _flock(runner_fd, ".runner.lock", exclusive=True):
+                paired = _read_json(runner_fd, _PAIRED_RUNNER_IDENTITY_FILENAME, None)
+                self._verify_paired_rotation_identity(paired, identity=old_identity, signer=old_signer)
+                self._assert_no_context_authority_locked(runner_fd)
+                authority = self._runtime_authority
+                if authority is None:
+                    self._runtime_authority = (old_identity, old_signer)
+                elif _identity_record(*authority) != old_record:
+                    raise RunnerStoreError("authenticated runner store identity changed")
+                if (
+                    _read_json(runner_fd, _PAIRING_ACTIVATION_JOURNAL_FILENAME, None) is not None
+                    or _read_json(runner_fd, _PAIRING_ACTIVATION_ABORT_REQUEST_JOURNAL_FILENAME, None) is not None
+                ):
+                    raise RunnerStoreError("runner pairing activation requires recovery")
+                if _read_json(runner_fd, _ACTIVATION_TOMBSTONE_PRUNE_FILENAME, None) is not None:
+                    raise RunnerStoreError("activation tombstone prune requires recovery")
                 existing = _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None)
-                if existing is None:
-                    _write_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, journal)
-                elif existing != journal:
+                if existing is not None:
                     raise RunnerStoreError("runner rotation activation requires recovery")
+                proof = {
+                    "pairing_id": pending_value["pairing_id"],
+                    "challenge": pending_value["activation_challenge"],
+                }
+                signature = new_signer.sign(b"heel.runner-rotation-activate.v2\0" + canonical_bytes(proof))
+                if type(signature) is not bytes or len(signature) != 64:
+                    raise RunnerStoreError("runner signer returned an invalid rotation signature")
+                request = {
+                    "schema_version": "heel.runner-rotation-activate.v2",
+                    "signature_b64": base64.b64encode(signature).decode("ascii"),
+                }
+                intent = self._rotation_intent_core(
+                    pairing_id=pending_value["pairing_id"], old_identity=old_identity, new_identity=new_identity,
+                    activation_request=request, activation_challenge=pending_value["activation_challenge"],
+                    new_signer_label=new_signer_label, authority_epoch=probe.authority_epoch,
+                    authority_identity_digest=probe.authority_identity_digest,
+                    claim_state_digest=probe.claim_state_digest, prepared_at_ms=now_ms,
+                )
+                core = {
+                    "schema_version": _ROTATION_ACTIVATION_JOURNAL_SCHEMA, "state": "prepared",
+                    "pairing_id": pending_value["pairing_id"], "old_identity": old_record,
+                    "new_identity": new_record, "new_signer_label": new_signer_label,
+                    "activation_challenge": pending_value["activation_challenge"],
+                    "activation_request": request, "activation_response": None,
+                    "created_at_ms": now_ms, "updated_at_ms": now_ms,
+                    **{key: value for key, value in intent.items() if key != "schema_version"},
+                    "runtime_rotation_intent_digest": self._rotation_intent_digest(intent),
+                }
+                journal = self._signed_rotation_journal(core, old_signer=old_signer, new_signer=new_signer)
+                _write_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, journal)
         try:
             eligibility = runtime_state.assert_rotation_eligible(
                 old_identity=old_identity, probe=probe, prepared_journal_digest=journal["journal_digest"],
@@ -1663,6 +3015,7 @@ class RunnerStore:
                 with self._open_runner(create=True) as runner_fd:
                     assert runner_fd is not None
                     with _flock(runner_fd, ".runner.lock", exclusive=True):
+                        self._assert_no_context_authority_locked(runner_fd)
                         if _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None) == journal:
                             os.unlink(_ROTATION_ACTIVATION_JOURNAL_FILENAME, dir_fd=runner_fd)
                             os.fsync(runner_fd)
@@ -1688,6 +3041,7 @@ class RunnerStore:
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
             with _flock(runner_fd, ".runner.lock", exclusive=True):
+                self._assert_no_context_authority_locked(runner_fd)
                 journal = _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None)
                 if not isinstance(journal, Mapping):
                     raise RunnerStoreError("runner rotation activation requires recovery")
@@ -1864,6 +3218,7 @@ class RunnerStore:
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
             with _flock(runner_fd, ".runner.lock", exclusive=True):
+                self._assert_no_context_authority_locked(runner_fd)
                 journal = _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None)
                 verified = self._verify_rotation_journal(
                     journal, old_identity=pending.old_identity, new_identity=pending.new_identity,
@@ -1916,6 +3271,19 @@ class RunnerStore:
                 assert tombstones_fd is not None
                 try:
                     filename = self._rotation_abort_tombstone_filename(pending.pending["pairing_id"])
+                    retention_filename = self._activation_tombstone_retention_filename(
+                        "rotation", pending.pending["pairing_id"],
+                    )
+                    retention = self._rotation_tombstone_retention(
+                        tombstone, old_identity=pending.old_identity,
+                        new_identity=pending.new_identity, old_signer=old_signer,
+                        new_signer=pending._new_signer,
+                    )
+                    existing_retention = _read_json(tombstones_fd, retention_filename, None)
+                    if existing_retention is None:
+                        _write_json(tombstones_fd, retention_filename, retention)
+                    elif existing_retention != retention:
+                        raise RunnerStoreError("runner rotation activation retention changed")
                     existing = _read_json(tombstones_fd, filename, None)
                     if existing is None:
                         _write_json(tombstones_fd, filename, tombstone)
@@ -1953,6 +3321,7 @@ class RunnerStore:
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
             with _flock(runner_fd, ".runner.lock", exclusive=True):
+                self._assert_no_context_authority_locked(runner_fd)
                 journal = _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None)
                 accepted = self._accepted_rotation_journal(
                     journal, old_identity=pending.old_identity, new_identity=pending.new_identity,
@@ -2001,6 +3370,10 @@ class RunnerStore:
                     _write_json(runner_fd, _PAIRED_RUNNER_IDENTITY_FILENAME, paired)
                 os.unlink(_ROTATION_ACTIVATION_JOURNAL_FILENAME, dir_fd=runner_fd)
                 os.fsync(runner_fd)
+        old_verifier = self._pending_result_replay_verifier
+        if old_verifier is not None:
+            old_verifier._retire()
+        self._pending_result_replay_verifier = None
         self._runtime_authority = (pending.new_identity, pending._new_signer)
         return pending.new_identity
 
@@ -2015,15 +3388,17 @@ class RunnerStore:
         """
         if not isinstance(old_identity, RunnerIdentity) or not isinstance(old_signer, SecureSigner):
             raise RunnerStoreError("runner rotation recovery identity is invalid")
-        self._pin_runtime_authority(old_identity, old_signer)
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
-            with _flock(runner_fd, ".runner.lock", exclusive=False):
+            with _flock(runner_fd, ".runner.lock", exclusive=True):
                 journal = _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None)
+                if journal is not None:
+                    self._assert_no_context_authority_locked(runner_fd)
         if journal is None:
             return None
         if not isinstance(journal, Mapping):
             raise RunnerStoreError("invalid runner rotation activation journal")
+        self._pin_runtime_authority(old_identity, old_signer)
         new_identity = self._rotation_identity_from_record(
             journal.get("new_identity"), pairing_phrase=old_identity.pairing_phrase,
         )
@@ -2121,6 +3496,7 @@ class RunnerStore:
             with self._open_runner(create=True) as runner_fd:
                 assert runner_fd is not None
                 with _flock(runner_fd, ".runner.lock", exclusive=True):
+                    self._assert_no_context_authority_locked(runner_fd)
                     if _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None) != journal:
                         raise RunnerStoreError("runner rotation activation requires recovery")
                     tombstones_fd = _open_child(runner_fd, _ACTIVATION_TOMBSTONES_DIRECTORY, create=False)
@@ -2158,6 +3534,7 @@ class RunnerStore:
                     with self._open_runner(create=True) as runner_fd:
                         assert runner_fd is not None
                         with _flock(runner_fd, ".runner.lock", exclusive=True):
+                            self._assert_no_context_authority_locked(runner_fd)
                             if _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None) == journal:
                                 os.unlink(_ROTATION_ACTIVATION_JOURNAL_FILENAME, dir_fd=runner_fd)
                                 os.fsync(runner_fd)
@@ -2382,6 +3759,723 @@ class RunnerStore:
             raise RunnerStoreError("invalid local run authority record") from None
         return dict(value)
 
+    @staticmethod
+    def _checkpoint_record_digest(core: Mapping[str, Any]) -> str:
+        return hashlib.sha256(
+            _RUN_AUTHORITY_DOMAINS[_RUN_AUTHORITY_CHECKPOINT_SCHEMA] + canonical_bytes(dict(core))
+        ).hexdigest()
+
+    def _signed_run_authority_checkpoint(
+        self, core: Mapping[str, Any], *, signer: SecureSigner,
+    ) -> dict[str, Any]:
+        if core.get("schema_version") != _RUN_AUTHORITY_CHECKPOINT_SCHEMA:
+            raise RunnerStoreError("local run authority checkpoint is invalid")
+        record_digest = self._checkpoint_record_digest(core)
+        unsigned = {**dict(core), "record_digest": record_digest}
+        signature = signer.sign(
+            _RUN_AUTHORITY_DOMAINS[_RUN_AUTHORITY_CHECKPOINT_SCHEMA] + canonical_bytes(unsigned)
+        )
+        if type(signature) is not bytes or len(signature) != 64:
+            raise RunnerStoreError("runner signer returned an invalid local authority signature")
+        return {
+            **unsigned,
+            "signing_key_id": signer.key_id,
+            "signature_b64": base64.b64encode(signature).decode("ascii"),
+        }
+
+    def _zero_run_authority_checkpoint(
+        self, *, context: RunnerContext, identity: RunnerIdentity, signer: SecureSigner,
+    ) -> dict[str, Any]:
+        return self._signed_run_authority_checkpoint({
+            "schema_version": _RUN_AUTHORITY_CHECKPOINT_SCHEMA,
+            "namespace": context.namespace,
+            "workspace_id": context.workspace_id,
+            "runner_id": identity.runner_id,
+            "runner_key_id": identity.key_id,
+            "generation": 0,
+            "compacted_run_count": 0,
+            "accumulator_digest": _RUN_AUTHORITY_ZERO_HEAD,
+            "time_floor_ms": 0,
+            "pending_finalize": [],
+            "prior_head_digest": _RUN_AUTHORITY_ZERO_HEAD,
+        }, signer=signer)
+
+    def _validate_run_authority_checkpoint_value(
+        self, value: object, *, identity: RunnerIdentity,
+    ) -> dict[str, Any]:
+        fields = {
+            "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
+            "generation", "compacted_run_count", "accumulator_digest", "time_floor_ms",
+            "pending_finalize", "prior_head_digest", "record_digest", "signing_key_id", "signature_b64",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields or (
+            value.get("schema_version") != _RUN_AUTHORITY_CHECKPOINT_SCHEMA
+            or value.get("namespace") != self.namespace
+            or value.get("workspace_id") != identity.workspace_id
+            or value.get("runner_id") != identity.runner_id
+            or value.get("runner_key_id") != identity.key_id
+            or value.get("signing_key_id") != identity.key_id
+        ):
+            raise RunnerStoreError("local run authority checkpoint is invalid")
+        try:
+            for key in ("generation", "compacted_run_count", "time_floor_ms"):
+                if type(value[key]) is not int or not 0 <= value[key] <= 9_007_199_254_740_991:
+                    raise ValueError
+            for key in ("accumulator_digest", "prior_head_digest", "record_digest"):
+                _digest(value[key], "local run authority checkpoint digest")
+            pending = value["pending_finalize"]
+            if not isinstance(pending, list) or len(pending) > _RUN_AUTHORITY_COMPACTION_MAX_FINALIZE:
+                raise ValueError
+            previous: tuple[int, str] | None = None
+            seen: set[str] = set()
+            for item in pending:
+                if not isinstance(item, Mapping) or set(item) != {
+                    "run_id", "run_hash", "grant_digest", "pruned_record_digest",
+                    "runtime_prune_pending_state_digest", "retention_expires_at_ms", "pruned_at_ms",
+                }:
+                    raise ValueError
+                run_id = _id(item["run_id"], "run ID")
+                if self._run_hash(run_id) != item["run_hash"]:
+                    raise ValueError
+                for key in (
+                    "run_hash", "grant_digest", "pruned_record_digest", "runtime_prune_pending_state_digest",
+                ):
+                    _digest(item[key], "local run authority checkpoint digest")
+                if (
+                    type(item["retention_expires_at_ms"]) is not int
+                    or type(item["pruned_at_ms"]) is not int
+                    or not 0 <= item["retention_expires_at_ms"] <= item["pruned_at_ms"] <= 9_007_199_254_740_991
+                    or item["run_hash"] in seen
+                ):
+                    raise ValueError
+                order = (item["retention_expires_at_ms"], item["run_hash"])
+                if previous is not None and order <= previous:
+                    raise ValueError
+                seen.add(item["run_hash"])
+                previous = order
+            core = {key: value[key] for key in fields - {"record_digest", "signing_key_id", "signature_b64"}}
+            if value["record_digest"] != self._checkpoint_record_digest(core):
+                raise ValueError
+            signature = value["signature_b64"]
+            if type(signature) is not str or base64.b64encode(
+                base64.b64decode(signature, validate=True)
+            ).decode("ascii") != signature:
+                raise ValueError
+            verify_envelope(
+                {identity.key_id: load_public_key_base64(identity.public_key_b64)},
+                {"signing_key_id": identity.key_id, "signature_b64": signature},
+                _RUN_AUTHORITY_DOMAINS[_RUN_AUTHORITY_CHECKPOINT_SCHEMA]
+                + canonical_bytes({**core, "record_digest": value["record_digest"]}),
+            )
+        except (TypeError, ValueError):
+            raise RunnerStoreError("local run authority checkpoint is invalid") from None
+        return dict(value)
+
+    def _run_authority_checkpoint_locked(
+        self, runs_fd: int, *, identity: RunnerIdentity,
+    ) -> dict[str, Any]:
+        value = _read_json(runs_fd, _RUN_AUTHORITY_CHECKPOINT_FILENAME, None)
+        if value is None:
+            raise RunnerStoreError("local run authority checkpoint is unavailable")
+        return self._validate_run_authority_checkpoint_value(value, identity=identity)
+
+    @staticmethod
+    def _validate_run_authority_compaction_entry(value: object) -> dict[str, Any]:
+        fields = {
+            "run_id", "run_hash", "grant_id", "grant_digest", "grant_expires_at_ms",
+            "reservation_record_digest", "terminal_record_digest", "detached_record_digest",
+            "pruned_record_digest", "runtime_prune_pending_state_digest",
+            "retention_expires_at_ms", "pruned_at_ms",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise RunnerStoreError("local run authority compaction entry is invalid")
+        try:
+            run_id = _id(value["run_id"], "run ID")
+            if RunnerStore._run_hash(run_id) != value["run_hash"]:
+                raise ValueError
+            _id(value["grant_id"], "local grant ID")
+            for field in fields - {
+                "run_id", "grant_id", "grant_expires_at_ms", "retention_expires_at_ms", "pruned_at_ms",
+            }:
+                _digest(value[field], "local run authority compaction digest")
+            if (
+                type(value["grant_expires_at_ms"]) is not int
+                or type(value["retention_expires_at_ms"]) is not int
+                or type(value["pruned_at_ms"]) is not int
+                or not 0 <= value["grant_expires_at_ms"] <= value["retention_expires_at_ms"]
+                <= value["pruned_at_ms"] <= 9_007_199_254_740_991
+            ):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise RunnerStoreError("local run authority compaction entry is invalid") from None
+        return dict(value)
+
+    def _next_run_authority_checkpoint(
+        self, checkpoint: Mapping[str, Any], index: Mapping[str, Any], *,
+        entries: list[dict[str, Any]], signer: SecureSigner, now_ms: int,
+    ) -> dict[str, Any]:
+        if not entries or len(entries) > _RUN_AUTHORITY_COMPACTION_MAX_PREPARE or (
+            type(now_ms) is not int or now_ms < 0
+        ):
+            raise RunnerStoreError("local run authority compaction is invalid")
+        checked_entries = [self._validate_run_authority_compaction_entry(item) for item in entries]
+        if checked_entries != sorted(
+            checked_entries, key=lambda item: (item["retention_expires_at_ms"], item["run_hash"]),
+        ):
+            raise RunnerStoreError("local run authority compaction is invalid")
+        pending = list(checkpoint["pending_finalize"])
+        seen = {item["run_hash"] for item in pending}
+        for entry in checked_entries:
+            if entry["run_hash"] in seen:
+                raise RunnerStoreError("local run authority compaction is invalid")
+            pending.append({
+                "run_id": entry["run_id"], "run_hash": entry["run_hash"],
+                "grant_digest": entry["grant_digest"],
+                "pruned_record_digest": entry["pruned_record_digest"],
+                "runtime_prune_pending_state_digest": entry["runtime_prune_pending_state_digest"],
+                "retention_expires_at_ms": entry["retention_expires_at_ms"],
+                "pruned_at_ms": entry["pruned_at_ms"],
+            })
+            seen.add(entry["run_hash"])
+        pending.sort(key=lambda item: (item["retention_expires_at_ms"], item["run_hash"]))
+        if len(pending) > _RUN_AUTHORITY_COMPACTION_MAX_FINALIZE:
+            raise RunnerStoreError("local run authority compaction queue is full")
+        next_count = checkpoint["compacted_run_count"] + len(checked_entries)
+        if next_count > 9_007_199_254_740_991:
+            raise RunnerStoreError("local run authority compaction counter overflow")
+        batch_digest = hashlib.sha256(
+            b"heel.local-run-authority-compaction-batch.v1\0" + canonical_bytes(checked_entries)
+        ).hexdigest()
+        accumulator = hashlib.sha256(
+            b"heel.local-run-authority-accumulator.v1\0" + canonical_bytes({
+                "prior_accumulator_digest": checkpoint["accumulator_digest"],
+                "batch_digest": batch_digest,
+                "prior_count": checkpoint["compacted_run_count"],
+                "next_count": next_count,
+            })
+        ).hexdigest()
+        return self._signed_run_authority_checkpoint({
+            "schema_version": _RUN_AUTHORITY_CHECKPOINT_SCHEMA,
+            "namespace": checkpoint["namespace"], "workspace_id": checkpoint["workspace_id"],
+            "runner_id": checkpoint["runner_id"], "runner_key_id": checkpoint["runner_key_id"],
+            "generation": checkpoint["generation"] + 1,
+            "compacted_run_count": next_count,
+            "accumulator_digest": accumulator,
+            "time_floor_ms": max(checkpoint["time_floor_ms"], now_ms),
+            "pending_finalize": pending,
+            "prior_head_digest": index["head_digest"],
+        }, signer=signer)
+
+    def _run_authority_compaction_journal(
+        self, *, context: RunnerContext, identity: RunnerIdentity, signer: SecureSigner,
+        operation: str, index: Mapping[str, Any], checkpoint: Mapping[str, Any],
+        next_index: Mapping[str, Any], next_checkpoint: Mapping[str, Any],
+        entries: list[dict[str, Any]], created_at_ms: int,
+    ) -> dict[str, Any]:
+        if operation not in {"prepare_pruned", "finalize_pruned"} or (
+            type(created_at_ms) is not int or created_at_ms < 0
+        ):
+            raise RunnerStoreError("local run authority compaction journal is invalid")
+        core = {
+            "schema_version": _RUN_AUTHORITY_COMPACTION_JOURNAL_SCHEMA,
+            "namespace": context.namespace, "workspace_id": context.workspace_id,
+            "runner_id": identity.runner_id, "runner_key_id": identity.key_id,
+            "operation": operation,
+            "old_index_digest": self._run_authority_index_digest(index),
+            "old_checkpoint_digest": checkpoint["record_digest"],
+            "next_index": dict(next_index), "next_checkpoint": dict(next_checkpoint),
+            "entries": [dict(entry) for entry in entries], "created_at_ms": created_at_ms,
+        }
+        journal = self._signed_run_authority_value(core, signer=signer, record_digest=False)
+        if len(canonical_bytes(journal)) > _RUN_AUTHORITY_MAX_COMPACTION_JOURNAL_BYTES:
+            raise RunnerStoreError("local run authority compaction journal exceeds size limit")
+        return journal
+
+    def _validate_run_authority_compaction_journal(
+        self, value: object, *, identity: RunnerIdentity,
+    ) -> dict[str, Any]:
+        """Authenticate one closed, roll-forward-only root-retirement journal."""
+        checked = self._verify_signed_run_authority_value(
+            value, identity=identity, schema=_RUN_AUTHORITY_COMPACTION_JOURNAL_SCHEMA,
+            record_digest=False, max_bytes=_RUN_AUTHORITY_MAX_COMPACTION_JOURNAL_BYTES,
+        )
+        fields = {
+            "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
+            "operation", "old_index_digest", "old_checkpoint_digest", "next_index",
+            "next_checkpoint", "entries", "created_at_ms", "signing_key_id", "signature_b64",
+        }
+        if (
+            set(checked) != fields
+            or checked["namespace"] != self.namespace
+            or checked["workspace_id"] != identity.workspace_id
+            or checked["runner_id"] != identity.runner_id
+            or checked["runner_key_id"] != identity.key_id
+            or checked["signing_key_id"] != identity.key_id
+            or checked["operation"] not in {"prepare_pruned", "finalize_pruned"}
+            or _DIGEST.fullmatch(checked["old_index_digest"]) is None
+            or _DIGEST.fullmatch(checked["old_checkpoint_digest"]) is None
+            or type(checked["created_at_ms"]) is not int
+            or not 0 <= checked["created_at_ms"] <= 9_007_199_254_740_991
+            or not isinstance(checked["next_index"], Mapping)
+            or not isinstance(checked["next_checkpoint"], Mapping)
+            or not isinstance(checked["entries"], list)
+        ):
+            raise RunnerStoreError("local run authority compaction journal is invalid")
+        next_index = self._validate_run_authority_index_value(
+            checked["next_index"], identity=identity,
+        )
+        next_checkpoint = self._validate_run_authority_checkpoint_value(
+            checked["next_checkpoint"], identity=identity,
+        )
+        if next_index["head_digest"] != next_checkpoint["record_digest"]:
+            raise RunnerStoreError("local run authority compaction journal is invalid")
+        if checked["operation"] == "prepare_pruned":
+            entries = [self._validate_run_authority_compaction_entry(item) for item in checked["entries"]]
+            if (
+                not entries
+                or len(entries) > _RUN_AUTHORITY_COMPACTION_MAX_PREPARE
+                or entries != sorted(
+                    entries, key=lambda item: (item["retention_expires_at_ms"], item["run_hash"]),
+                )
+                or len({item["run_hash"] for item in entries}) != len(entries)
+            ):
+                raise RunnerStoreError("local run authority compaction journal is invalid")
+            pending = {
+                (
+                    item["run_hash"], item["grant_digest"], item["pruned_record_digest"],
+                    item["runtime_prune_pending_state_digest"], item["retention_expires_at_ms"],
+                    item["pruned_at_ms"],
+                )
+                for item in next_checkpoint["pending_finalize"]
+            }
+            for entry in entries:
+                if (
+                    entry["run_hash"], entry["grant_digest"], entry["pruned_record_digest"],
+                    entry["runtime_prune_pending_state_digest"], entry["retention_expires_at_ms"],
+                    entry["pruned_at_ms"],
+                ) not in pending:
+                    raise RunnerStoreError("local run authority compaction journal is invalid")
+        else:
+            if len(checked["entries"]) != 1:
+                raise RunnerStoreError("local run authority compaction journal is invalid")
+            entry = checked["entries"][0]
+            if not isinstance(entry, Mapping) or set(entry) != {
+                "run_id", "run_hash", "grant_digest", "pruned_record_digest",
+                "runtime_prune_pending_state_digest", "retention_expires_at_ms", "pruned_at_ms",
+            }:
+                raise RunnerStoreError("local run authority compaction journal is invalid")
+            try:
+                run_id = _id(entry["run_id"], "run ID")
+                if self._run_hash(run_id) != entry["run_hash"]:
+                    raise ValueError
+                for field in (
+                    "run_hash", "grant_digest", "pruned_record_digest",
+                    "runtime_prune_pending_state_digest",
+                ):
+                    _digest(entry[field], "local run authority compaction digest")
+                if (
+                    type(entry["retention_expires_at_ms"]) is not int
+                    or type(entry["pruned_at_ms"]) is not int
+                    or not 0 <= entry["retention_expires_at_ms"] <= entry["pruned_at_ms"]
+                    <= 9_007_199_254_740_991
+                    or any(
+                        candidate["run_hash"] == entry["run_hash"]
+                        for candidate in next_checkpoint["pending_finalize"]
+                    )
+                ):
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise RunnerStoreError("local run authority compaction journal is invalid") from None
+        return checked
+
+    def _validate_compaction_prepare_roots_if_present(
+        self, runs_fd: int, *, entry: Mapping[str, Any], identity: RunnerIdentity,
+    ) -> None:
+        """A journal may resume after a subset of its unlink suffix has completed."""
+        marker = _read_json(runs_fd, f"grant-{entry['grant_digest']}.json", None)
+        if marker is not None:
+            try:
+                grant = validate_execution_grant(marker["grant"])
+            except (KeyError, TypeError, ValueError):
+                raise RunnerStoreError("local run authority compaction is invalid") from None
+            if (
+                grant["run_id"] != entry["run_id"]
+                or grant["grant_id"] != entry["grant_id"]
+                or grant["grant_digest"] != entry["grant_digest"]
+                or grant["expires_at_ms"] != entry["grant_expires_at_ms"]
+            ):
+                raise RunnerStoreError("local run authority compaction is invalid")
+        records = (
+            ("reserve", _RUN_RESERVATION_RECORD_SCHEMA, "reservation_record_digest"),
+            ("terminal", _RUN_TERMINAL_RECORD_SCHEMA, "terminal_record_digest"),
+            ("detach_terminal", _RUN_TERMINAL_DETACHED_RECORD_SCHEMA, "detached_record_digest"),
+        )
+        for operation, schema, digest_field in records:
+            value = _read_json(
+                runs_fd, self._run_authority_record_filename(operation, entry["run_hash"]), None,
+            )
+            if value is None:
+                continue
+            record = self._verify_signed_run_authority_value(
+                value, identity=identity, schema=schema, record_digest=True,
+                max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+            )
+            if (
+                record["run_hash"] != entry["run_hash"]
+                or record["grant_id"] != entry["grant_id"]
+                or record["grant_digest"] != entry["grant_digest"]
+                or record["record_digest"] != entry[digest_field]
+            ):
+                raise RunnerStoreError("local run authority compaction is invalid")
+
+    def _complete_run_authority_compaction_journal_locked(
+        self, runs_fd: int, *, identity: RunnerIdentity,
+    ) -> bool:
+        """Finish exactly the signed suffix that survived a process interruption."""
+        value = _read_json(runs_fd, _RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME, None)
+        if value is None:
+            return False
+        journal = self._validate_run_authority_compaction_journal(value, identity=identity)
+        current_index = self._run_authority_index_locked(runs_fd, identity=identity)
+        current_checkpoint = self._run_authority_checkpoint_locked(runs_fd, identity=identity)
+        next_index = self._validate_run_authority_index_value(
+            journal["next_index"], identity=identity,
+        )
+        next_checkpoint = self._validate_run_authority_checkpoint_value(
+            journal["next_checkpoint"], identity=identity,
+        )
+        if (
+            self._run_authority_index_digest(current_index) not in {
+                journal["old_index_digest"], self._run_authority_index_digest(next_index),
+            }
+            or current_checkpoint["record_digest"] not in {
+                journal["old_checkpoint_digest"], next_checkpoint["record_digest"],
+            }
+        ):
+            raise RunnerStoreError("local run authority compaction journal changed")
+        if journal["operation"] == "prepare_pruned":
+            for entry in journal["entries"]:
+                self._validate_compaction_prepare_roots_if_present(
+                    runs_fd, entry=entry, identity=identity,
+                )
+            _write_json(runs_fd, _RUN_AUTHORITY_CHECKPOINT_FILENAME, next_checkpoint)
+            _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
+            for entry in journal["entries"]:
+                for filename in (
+                    f"grant-{entry['grant_digest']}.json",
+                    self._run_authority_record_filename("reserve", entry["run_hash"]),
+                    self._run_authority_record_filename("terminal", entry["run_hash"]),
+                    self._run_authority_record_filename("detach_terminal", entry["run_hash"]),
+                ):
+                    try:
+                        os.unlink(filename, dir_fd=runs_fd)
+                    except FileNotFoundError:
+                        pass
+        else:
+            entry = journal["entries"][0]
+            value = _read_json(
+                runs_fd, self._run_authority_record_filename("prune", entry["run_hash"]), None,
+            )
+            if value is not None:
+                record = self._verify_runtime_pruned_record(value, identity=identity)
+                if any(record[field] != entry[field] for field in entry if field in record):
+                    raise RunnerStoreError("local run authority compaction receipt is invalid")
+                os.unlink(self._run_authority_record_filename("prune", entry["run_hash"]), dir_fd=runs_fd)
+            _write_json(runs_fd, _RUN_AUTHORITY_CHECKPOINT_FILENAME, next_checkpoint)
+            _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
+        os.fsync(runs_fd)
+        os.unlink(_RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME, dir_fd=runs_fd)
+        os.fsync(runs_fd)
+        return True
+
+    def _prepare_pruned_compaction_locked(
+        self, context_fd: int, runs_fd: int, *, context: RunnerContext, identity: RunnerIdentity,
+        signer: SecureSigner, run_id: str, now_ms: int,
+    ) -> None:
+        """Publish a signed root-artifact retirement before removing any root."""
+        if _read_json(runs_fd, _RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME, None) is not None:
+            raise RunnerStoreError("local run authority compaction requires recovery")
+        run_hash = self._run_hash(run_id)
+        index = self._run_authority_index_locked(runs_fd, identity=identity)
+        checkpoint = self._run_authority_checkpoint_locked(runs_fd, identity=identity)
+        # The grant marker name is digest-addressed; resolve it only after the signed pruned
+        # receipt supplies the one digest allowed to name this historical run.
+        pruned_value = _read_json(
+            runs_fd, self._run_authority_record_filename("prune", run_hash), None,
+        )
+        reservation_value = _read_json(
+            runs_fd, self._run_authority_record_filename("reserve", run_hash), None,
+        )
+        terminal_value = _read_json(
+            runs_fd, self._run_authority_record_filename("terminal", run_hash), None,
+        )
+        detached_value = _read_json(
+            runs_fd, self._run_authority_record_filename("detach_terminal", run_hash), None,
+        )
+        if None in (pruned_value, reservation_value, terminal_value, detached_value):
+            raise RunnerStoreError("local run authority compaction is unavailable")
+        pruned = self._verify_runtime_pruned_record(pruned_value, identity=identity)
+        reservation = self._verify_signed_run_authority_value(
+            reservation_value, identity=identity, schema=_RUN_RESERVATION_RECORD_SCHEMA,
+            record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+        )
+        terminal = self._verify_signed_run_authority_value(
+            terminal_value, identity=identity, schema=_RUN_TERMINAL_RECORD_SCHEMA,
+            record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+        )
+        detached = self._verify_signed_run_authority_value(
+            detached_value, identity=identity, schema=_RUN_TERMINAL_DETACHED_RECORD_SCHEMA,
+            record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+        )
+        marker_name = f"grant-{pruned['grant_digest']}.json"
+        marker = _read_json(runs_fd, marker_name, None)
+        try:
+            grant = validate_execution_grant(marker["grant"])
+        except (KeyError, TypeError, ValueError):
+            raise RunnerStoreError("local run authority compaction is unavailable") from None
+        entry = self._validate_run_authority_compaction_entry({
+            "run_id": run_id, "run_hash": run_hash,
+            "grant_id": grant["grant_id"], "grant_digest": grant["grant_digest"],
+            "grant_expires_at_ms": grant["expires_at_ms"],
+            "reservation_record_digest": reservation["record_digest"],
+            "terminal_record_digest": terminal["record_digest"],
+            "detached_record_digest": detached["record_digest"],
+            "pruned_record_digest": pruned["record_digest"],
+            "runtime_prune_pending_state_digest": pruned["runtime_prune_pending_state_digest"],
+            "retention_expires_at_ms": pruned["retention_expires_at_ms"],
+            "pruned_at_ms": pruned["pruned_at_ms"],
+        })
+        if (
+            grant["run_id"] != run_id or reservation["run_hash"] != run_hash
+            or reservation["grant_id"] != grant["grant_id"]
+            or reservation["grant_digest"] != grant["grant_digest"]
+            or terminal["reservation_record_digest"] != reservation["record_digest"]
+            or terminal["grant_id"] != grant["grant_id"]
+            or terminal["grant_digest"] != grant["grant_digest"]
+            or detached["terminal_record_digest"] != terminal["record_digest"]
+            or detached["terminal_projection_digest"] != terminal["terminal_projection_digest"]
+            or pruned["run_id"] != run_id or pruned["grant_id"] != grant["grant_id"]
+            or pruned["grant_digest"] != grant["grant_digest"]
+            or pruned["terminal_record_digest"] != terminal["record_digest"]
+            or pruned["detached_record_digest"] != detached["record_digest"]
+            or pruned["retention_expires_at_ms"] != terminal["retention_expires_at_ms"]
+            or pruned["pruned_at_ms"] > now_ms
+        ):
+            raise RunnerStoreError("local run authority compaction is invalid")
+        next_checkpoint = self._next_run_authority_checkpoint(
+            checkpoint, index, entries=[entry], signer=signer, now_ms=now_ms,
+        )
+        next_index = self._next_run_authority_index(
+            index, signer=signer, delta=0, head_digest=next_checkpoint["record_digest"],
+        )
+        journal = self._run_authority_compaction_journal(
+            context=context, identity=identity, signer=signer, operation="prepare_pruned",
+            index=index, checkpoint=checkpoint, next_index=next_index,
+            next_checkpoint=next_checkpoint, entries=[entry], created_at_ms=now_ms,
+        )
+        _write_json(runs_fd, _RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME, journal)
+        _write_json(runs_fd, _RUN_AUTHORITY_CHECKPOINT_FILENAME, next_checkpoint)
+        _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
+        for filename in (
+            marker_name,
+            self._run_authority_record_filename("reserve", run_hash),
+            self._run_authority_record_filename("terminal", run_hash),
+            self._run_authority_record_filename("detach_terminal", run_hash),
+        ):
+            os.unlink(filename, dir_fd=runs_fd)
+        os.fsync(runs_fd)
+        os.unlink(_RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME, dir_fd=runs_fd)
+        os.fsync(runs_fd)
+
+    def _next_finalized_run_authority_checkpoint(
+        self, checkpoint: Mapping[str, Any], index: Mapping[str, Any], *,
+        pending: Mapping[str, Any], signer: SecureSigner,
+    ) -> dict[str, Any]:
+        pending_item = {
+            key: pending[key]
+            for key in (
+                "run_id", "run_hash", "grant_digest", "pruned_record_digest",
+                "runtime_prune_pending_state_digest", "retention_expires_at_ms", "pruned_at_ms",
+            )
+        }
+        entries = [item for item in checkpoint["pending_finalize"] if item != pending_item]
+        if len(entries) + 1 != len(checkpoint["pending_finalize"]):
+            raise RunnerStoreError("local run authority compaction is invalid")
+        return self._signed_run_authority_checkpoint({
+            "schema_version": _RUN_AUTHORITY_CHECKPOINT_SCHEMA,
+            "namespace": checkpoint["namespace"], "workspace_id": checkpoint["workspace_id"],
+            "runner_id": checkpoint["runner_id"], "runner_key_id": checkpoint["runner_key_id"],
+            "generation": checkpoint["generation"] + 1,
+            "compacted_run_count": checkpoint["compacted_run_count"],
+            "accumulator_digest": checkpoint["accumulator_digest"],
+            "time_floor_ms": checkpoint["time_floor_ms"],
+            "pending_finalize": entries,
+            "prior_head_digest": index["head_digest"],
+        }, signer=signer)
+
+    def finish_pruned_compaction(
+        self, completion: object, *, runtime: object,
+    ) -> None:
+        """Consume one runtime CAS proof and retire its now-unneeded v2 receipt."""
+        if type(completion) is not RuntimePruneCompletion:
+            raise RunnerStoreError("local run authority compaction completion is invalid")
+        identity, signer = self._require_runtime_authority()
+        if (
+            not self._runtime_matches_identity(runtime, identity=identity, signer=signer)
+            or getattr(completion, "_issuer", None) is not getattr(runtime, "_token", None)
+            or getattr(runtime, "_authority_epoch", None) != completion.authority_epoch
+        ):
+            raise RunnerStoreError("local run authority compaction completion is invalid")
+        key = (
+            completion.run_hash, completion.pruned_record_digest,
+            completion.runtime_prune_pending_state_digest, completion.authority_epoch,
+        )
+        if key in self._consumed_prune_completions:
+            raise RunnerStoreError("local run authority compaction completion is unavailable")
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local run authority compaction is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                pending_journal = _read_json(
+                    runs_fd, _RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME, None,
+                )
+                if pending_journal is not None:
+                    journal = self._validate_run_authority_compaction_journal(
+                        pending_journal, identity=identity,
+                    )
+                    if journal["operation"] == "finalize_pruned":
+                        entry = journal["entries"][0]
+                        if (
+                            entry["run_hash"] != completion.run_hash
+                            or entry["pruned_record_digest"] != completion.pruned_record_digest
+                            or entry["runtime_prune_pending_state_digest"]
+                            != completion.runtime_prune_pending_state_digest
+                        ):
+                            raise RunnerStoreError("local run authority compaction requires recovery")
+                        self._complete_run_authority_compaction_journal_locked(
+                            runs_fd, identity=identity,
+                        )
+                        self._consumed_prune_completions.add(key)
+                        return
+                    self._complete_run_authority_compaction_journal_locked(
+                        runs_fd, identity=identity,
+                    )
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                checkpoint = self._run_authority_checkpoint_locked(runs_fd, identity=identity)
+                matches = [
+                    item for item in checkpoint["pending_finalize"]
+                    if item["run_hash"] == completion.run_hash
+                ]
+                if len(matches) != 1:
+                    raise RunnerStoreError("local run authority compaction completion is unavailable")
+                pending = matches[0]
+                if (
+                    pending["pruned_record_digest"] != completion.pruned_record_digest
+                    or pending["runtime_prune_pending_state_digest"]
+                    != completion.runtime_prune_pending_state_digest
+                ):
+                    raise RunnerStoreError("local run authority compaction completion is invalid")
+                pruned_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("prune", completion.run_hash), None,
+                )
+                if pruned_value is None:
+                    raise RunnerStoreError("local run authority compaction receipt is unavailable")
+                pruned = self._verify_runtime_pruned_record(pruned_value, identity=identity)
+                if (
+                    pruned["record_digest"] != pending["pruned_record_digest"]
+                    or pruned["run_hash"] != pending["run_hash"]
+                    or pruned["grant_digest"] != pending["grant_digest"]
+                    or pruned["runtime_prune_pending_state_digest"]
+                    != pending["runtime_prune_pending_state_digest"]
+                    or pruned["retention_expires_at_ms"] != pending["retention_expires_at_ms"]
+                    or pruned["pruned_at_ms"] != pending["pruned_at_ms"]
+                ):
+                    raise RunnerStoreError("local run authority compaction receipt is invalid")
+                next_checkpoint = self._next_finalized_run_authority_checkpoint(
+                    checkpoint, index, pending=pending, signer=signer,
+                )
+                next_index = self._next_run_authority_index(
+                    index, signer=signer, delta=0, head_digest=next_checkpoint["record_digest"],
+                )
+                context = _context_from_dict(self._binding_locked(context_fd)["context"])
+                journal = self._run_authority_compaction_journal(
+                    context=context, identity=identity, signer=signer, operation="finalize_pruned",
+                    index=index, checkpoint=checkpoint, next_index=next_index,
+                    next_checkpoint=next_checkpoint, entries=[dict(pending)],
+                    created_at_ms=pruned["pruned_at_ms"],
+                )
+                _write_json(runs_fd, _RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME, journal)
+                os.unlink(self._run_authority_record_filename("prune", completion.run_hash), dir_fd=runs_fd)
+                os.fsync(runs_fd)
+                _write_json(runs_fd, _RUN_AUTHORITY_CHECKPOINT_FILENAME, next_checkpoint)
+                _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
+                os.unlink(_RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME, dir_fd=runs_fd)
+                os.fsync(runs_fd)
+                self._consumed_prune_completions.add(key)
+            finally:
+                os.close(runs_fd)
+
+    def recover_pruned_compaction_finalizers(self, *, runtime: object) -> int:
+        """Finish the bounded signed checkpoint queue before ordinary run recovery.
+
+        A nominal runtime completion cannot survive a process boundary.  The
+        checkpoint item and retained v2 receipt are therefore the restart
+        authority; ``runtime.finish_prune`` deliberately mints the same nominal
+        completion only after proving the exact row is either prune-pending or
+        already absent with no residual child authority.
+        """
+        identity, signer = self._require_runtime_authority()
+        if not self._runtime_matches_identity(runtime, identity=identity, signer=signer):
+            raise RunnerStoreError("local run authority compaction recovery is unavailable")
+        completed = 0
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local run authority compaction recovery is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                raw_journal = _read_json(
+                    runs_fd, _RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME, None,
+                )
+                if raw_journal is not None:
+                    journal = self._validate_run_authority_compaction_journal(
+                        raw_journal, identity=identity,
+                    )
+                    if journal["operation"] == "finalize_pruned":
+                        self._complete_run_authority_compaction_journal_locked(
+                            runs_fd, identity=identity,
+                        )
+                        completed = 1
+                    else:
+                        self._complete_run_authority_compaction_journal_locked(
+                            runs_fd, identity=identity,
+                        )
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity, runtime=runtime,
+                )
+                checkpoint = self._run_authority_checkpoint_locked(runs_fd, identity=identity)
+                pending = tuple(dict(item) for item in checkpoint["pending_finalize"])
+            finally:
+                os.close(runs_fd)
+        if completed > _RUN_AUTHORITY_COMPACTION_MAX_FINALIZE:
+            raise RunnerStoreError("local run authority compaction recovery is invalid")
+        for item in pending:
+            if completed >= _RUN_AUTHORITY_COMPACTION_MAX_FINALIZE:
+                break
+            receipt = self.load_pruned_run_receipt(
+                item["run_id"],
+                expected_runtime_state_digest=item["runtime_prune_pending_state_digest"],
+            )
+            completion = runtime.finish_prune(
+                receipt=receipt,
+                expected_prune_pending_state_digest=item["runtime_prune_pending_state_digest"],
+            )
+            self.finish_pruned_compaction(completion, runtime=runtime)
+            completed += 1
+        return completed
+
     def _zero_run_authority_index(
         self, *, context: RunnerContext, identity: RunnerIdentity, signer: SecureSigner,
     ) -> dict[str, Any]:
@@ -2409,12 +4503,21 @@ class RunnerStore:
             zero = self._zero_run_authority_index(
                 context=context, identity=identity, signer=signer,
             )
+            zero_checkpoint = self._zero_run_authority_checkpoint(
+                context=context, identity=identity, signer=signer,
+            )
             existing = _read_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, None)
             if existing is None:
                 if not initial_bind:
                     raise RunnerStoreError("local run authority index requires explicit upgrade")
                 with os.scandir(runs_fd) as entries:
-                    if any(entry.name != _RUN_AUTHORITY_INDEX_FILENAME for entry in entries):
+                    if any(
+                        entry.name not in {
+                            _RUN_AUTHORITY_INDEX_FILENAME,
+                            _RUN_AUTHORITY_CHECKPOINT_FILENAME,
+                        }
+                        for entry in entries
+                    ):
                         raise RunnerStoreError("local run authority index requires explicit upgrade")
                 _create_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, zero)
             else:
@@ -2436,6 +4539,22 @@ class RunnerStore:
                     or _DIGEST.fullmatch(checked["head_digest"]) is None
                 ):
                     raise RunnerStoreError("local run authority index differs from bound context")
+            checkpoint = _read_json(runs_fd, _RUN_AUTHORITY_CHECKPOINT_FILENAME, None)
+            if checkpoint is None:
+                if not initial_bind:
+                    raise RunnerStoreError("local run authority checkpoint requires explicit upgrade")
+                _create_json(runs_fd, _RUN_AUTHORITY_CHECKPOINT_FILENAME, zero_checkpoint)
+            else:
+                checked_checkpoint = self._validate_run_authority_checkpoint_value(
+                    checkpoint, identity=identity,
+                )
+                if (
+                    set(checked_checkpoint) != set(zero_checkpoint)
+                    or any(checked_checkpoint[field] != zero_checkpoint[field] for field in (
+                        "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
+                    ))
+                ):
+                    raise RunnerStoreError("local run authority checkpoint differs from bound context")
             os.fsync(runs_fd)
         finally:
             os.close(runs_fd)
@@ -2682,6 +4801,7 @@ class RunnerStore:
         runtime: object | None = None,
     ) -> bool:
         """Roll one signed run-authority mutation forward; never scan or roll back."""
+        self._complete_run_authority_compaction_journal_locked(runs_fd, identity=identity)
         journal_value = _read_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, None)
         if journal_value is None:
             return False
@@ -3174,6 +5294,8 @@ class RunnerStore:
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
             with _flock(runner_fd, ".runner.lock", exclusive=True):
+                if _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None) is not None:
+                    raise RunnerStoreError("runner rotation activation requires recovery")
                 active = _read_json(runner_fd, "active-context.json", None)
                 if active is not None:
                     raise RunnerStoreError("cloud context binding cannot replace active context")
@@ -3191,6 +5313,8 @@ class RunnerStore:
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
             with _flock(runner_fd, ".runner.lock", exclusive=True):
+                if _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None) is not None:
+                    raise RunnerStoreError("runner rotation activation requires recovery")
                 if _read_json(runner_fd, "context-install.json", None) != dict(journal):
                     raise RunnerStoreError("cloud context installation journal changed")
                 authority_commit = journal.get("authority_commit")
@@ -3220,6 +5344,8 @@ class RunnerStore:
         with self._open_runner(create=True) as runner_fd:
             assert runner_fd is not None
             with _flock(runner_fd, ".runner.lock", exclusive=True):
+                if _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None) is not None:
+                    raise RunnerStoreError("runner rotation activation requires recovery")
                 active = _read_json(runner_fd, "active-context.json", None)
                 static = {
                     "schema_version": "heel.active-runner-context.v1",
@@ -3325,6 +5451,8 @@ class RunnerStore:
             with self._open_runner(create=True) as runner_fd:
                 assert runner_fd is not None
                 with _flock(runner_fd, ".runner.lock", exclusive=True):
+                    if _read_json(runner_fd, _ROTATION_ACTIVATION_JOURNAL_FILENAME, None) is not None:
+                        raise RunnerStoreError("runner rotation activation requires recovery")
                     root_install = _read_json(runner_fd, "context-install.json", None)
                     if install_journal is None:
                         if root_install is not None:
@@ -5152,6 +7280,14 @@ class RunnerStore:
                     context_fd, runs_fd, identity=identity,
                 )
                 index = self._run_authority_index_locked(runs_fd, identity=identity)
+                checkpoint = self._run_authority_checkpoint_locked(runs_fd, identity=identity)
+                # The signed floor survives removal of the exact grant marker.  The
+                # grant's issuance time is the already-validated local transaction
+                # time carried by this API; a caller cannot move it below a prior
+                # compaction floor to resurrect an expired grant.
+                effective_now_ms = max(grant["issued_at_ms"], checkpoint["time_floor_ms"])
+                if grant["expires_at_ms"] <= effective_now_ms:
+                    raise RunnerStoreError("execution grant has expired")
                 run_hash = self._run_hash(run_id)
                 consumed_name = f"grant-{grant['grant_digest']}.json"
                 marker = {
@@ -5400,7 +7536,9 @@ class RunnerStore:
                 marker_names: list[str] = []
                 run_names: set[str] = set()
                 for name in names:
-                    if name.startswith("grant-") and name.endswith(".json"):
+                    if name == _RUN_AUTHORITY_CHECKPOINT_FILENAME:
+                        self._run_authority_checkpoint_locked(runs_fd, identity=identity)
+                    elif name.startswith("grant-") and name.endswith(".json"):
                         digest = name[6:-5]
                         if _DIGEST.fullmatch(digest) is None:
                             raise RunnerStoreError("legacy local run authority is invalid")
@@ -5411,7 +7549,7 @@ class RunnerStore:
                             raise RunnerStoreError("legacy local run authority is invalid")
                         run_names.add(name)
                     elif (
-                        name.startswith(("reservation-", "terminal-", "pruned-"))
+                        name.startswith(("reservation-", "terminal-", "detached-", "pruned-"))
                         and name.endswith(".json")
                     ):
                         continue
@@ -5965,6 +8103,161 @@ class RunnerStore:
             pending, now_ms=now_ms,
         )
 
+    def _terminal_result_store_evidence(
+        self,
+        *,
+        identity: RunnerIdentity,
+        runtime_state: object,
+        active_state: object,
+        operational: Mapping[str, object],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Cross-check immutable terminal authority shared by stage and replay."""
+        run_id = getattr(runtime_state, "run_id", None)
+        if type(run_id) is not str:
+            raise RunnerStoreError("local pending terminal replay authority is unavailable")
+        run_hash = self._run_hash(run_id)
+        with self._transaction(exclusive=False) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local pending terminal replay authority is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                if _read_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, None) is not None:
+                    raise RunnerStoreError("local pending terminal replay authority is unavailable")
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                if any(item["run_hash"] == run_hash for item in index["terminal_queue"]):
+                    raise RunnerStoreError("local pending terminal replay authority is unavailable")
+                detached_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("detach_terminal", run_hash), None,
+                )
+                terminal_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("terminal", run_hash), None,
+                )
+                if detached_value is None or terminal_value is None:
+                    raise RunnerStoreError("local pending terminal replay authority is unavailable")
+                detached = self._verify_signed_run_authority_value(
+                    detached_value, identity=identity,
+                    schema=_RUN_TERMINAL_DETACHED_RECORD_SCHEMA,
+                    record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                )
+                terminal = self._verify_signed_run_authority_value(
+                    terminal_value, identity=identity, schema=_RUN_TERMINAL_RECORD_SCHEMA,
+                    record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                )
+                run_fd = _open_child(runs_fd, run_hash, create=False)
+                if run_fd is None:
+                    raise RunnerStoreError("local pending terminal replay authority is unavailable")
+                try:
+                    _secure_directory(run_fd, "Heel retained local run directory")
+                    state = self._run_state_locked(run_fd, run_id)
+                    grant = validate_execution_grant(_read_json(run_fd, "grant.json", None))
+                except (TypeError, ValueError) as exc:
+                    raise RunnerStoreError("local pending terminal replay authority is unavailable") from exc
+                finally:
+                    os.close(run_fd)
+                if (
+                    state["state"] != "terminal"
+                    or state["grant_id"] != grant["grant_id"]
+                    or state["grant_digest"] != grant["grant_digest"]
+                    or getattr(active_state, "approval_projection") != self.load_projection(grant["approval"]["projection_id"])
+                    or getattr(active_state, "grant") != grant
+                    or getattr(active_state, "project_id") != grant["project_id"]
+                    or getattr(active_state, "grant_id") != grant["grant_id"]
+                    or getattr(active_state, "grant_digest") != grant["grant_digest"]
+                    or getattr(active_state, "approval_projection_digest") != grant["approval"]["projection_digest"]
+                    or terminal["run_hash"] != run_hash
+                    or terminal["grant_id"] != grant["grant_id"]
+                    or terminal["grant_digest"] != grant["grant_digest"]
+                    or terminal["terminal_state_digest"] != canonical_digest(state)
+                    or terminal["terminal_projection_digest"] != operational["projection_digest"]
+                    or detached["run_hash"] != run_hash
+                    or detached["grant_id"] != grant["grant_id"]
+                    or detached["grant_digest"] != grant["grant_digest"]
+                    or detached["terminal_record_digest"] != terminal["record_digest"]
+                    or detached["terminal_projection_digest"] != terminal["terminal_projection_digest"]
+                    or detached["terminal_at_ms"] != terminal["terminal_at_ms"]
+                    or detached["retention_expires_at_ms"] != terminal["retention_expires_at_ms"]
+                    or detached["runtime_state_schema"] != "heel.runner-terminal-disclosure-state.v1"
+                    or detached["runtime_state"] != "local_terminal"
+                    or detached["runtime_state_digest"] != getattr(runtime_state, "state_digest", None)
+                    or getattr(runtime_state, "terminal_record_digest", None) != terminal["record_digest"]
+                    or getattr(runtime_state, "terminal_projection_digest", None) != terminal["terminal_projection_digest"]
+                    or getattr(runtime_state, "terminal_at_ms", None) != terminal["terminal_at_ms"]
+                    or getattr(runtime_state, "retention_expires_at_ms", None) != terminal["retention_expires_at_ms"]
+                ):
+                    raise RunnerStoreError("local pending terminal replay authority is invalid")
+                return dict(terminal), dict(detached)
+            finally:
+                os.close(runs_fd)
+
+    def _authorize_unstaged_terminal_result(
+        self,
+        run_id: str,
+        *,
+        runtime: RunnerRuntimeState,
+        now_ms: int,
+        issuer: object,
+    ) -> TerminalResultStageEvidence:
+        """Mint one nominal result-staging capability from retained signed evidence."""
+        if type(now_ms) is not int or now_ms < 0:
+            raise RunnerStoreError("local terminal result stage authority is unavailable")
+        try:
+            run_id = _id(run_id, "run ID")
+        except (AssertionError, TypeError, ValueError):
+            raise RunnerStoreError("local terminal result stage authority is unavailable") from None
+        identity, signer = self._require_runtime_authority()
+        if not self._runtime_matches_identity(runtime, identity=identity, signer=signer):
+            raise RunnerStoreError("local terminal result stage authority is unavailable")
+        try:
+            runtime_state = runtime.load_terminal_state(run_id)
+            active_rows = runtime.load_active_run_controls(limit=64)
+            pending = runtime.load_pending_calls(limit=74)
+        except (TypeError, ValueError) as exc:
+            raise RunnerStoreError("local terminal result stage authority is unavailable") from exc
+        if (
+            runtime_state is None or runtime_state.state != "local_terminal"
+            or now_ms >= runtime_state.retention_expires_at_ms
+            or any(item.run_id == run_id for item in pending)
+        ):
+            raise RunnerStoreError("local terminal result stage authority is unavailable")
+        active = [item for item in active_rows if item.run_id == run_id]
+        if len(active) != 1:
+            raise RunnerStoreError("local terminal result stage authority is unavailable")
+        active_state = active[0]
+        result_cursor = active_state.chains.get("result")
+        if (
+            result_cursor is None
+            or runtime_state.run_hash != self._run_hash(run_id)
+            or runtime_state.project_id != active_state.project_id
+            or runtime_state.grant_id != active_state.grant_id
+            or runtime_state.approval_projection_digest != active_state.approval_projection_digest
+        ):
+            raise RunnerStoreError("local terminal result stage authority is unavailable")
+        try:
+            operational = self.load_final_projections(run_id)["operational_projection"]
+            request = validate_runner_result_request({
+                "schema_version": "heel.runner-result-request.v1", "run_id": run_id,
+                "operational_projection": operational,
+            })
+            body = canonical_bytes(request)
+        except (KeyError, TypeError, ValueError):
+            raise RunnerStoreError("local terminal result stage authority is unavailable") from None
+        terminal, detached = self._terminal_result_store_evidence(
+            identity=identity, runtime_state=runtime_state, active_state=active_state,
+            operational=operational,
+        )
+        return TerminalResultStageEvidence(
+            run_id=run_id, operational_projection=MappingProxyType(dict(operational)),
+            body_sha256=hashlib.sha256(body).hexdigest(),
+            active_state_digest=active_state.state_digest,
+            runtime_terminal_state_digest=runtime_state.state_digest,
+            terminal_record_digest=terminal["record_digest"],
+            detached_record_digest=detached["record_digest"],
+            terminal_projection_digest=terminal["terminal_projection_digest"],
+            retention_expires_at_ms=terminal["retention_expires_at_ms"],
+            _issuer=issuer,
+        )
+
     def _authorize_pending_result_replay(
         self,
         pending: PendingSignedCall,
@@ -6214,7 +8507,11 @@ class RunnerStore:
                 self._complete_run_authority_journal_locked(
                     context_fd, runs_fd, identity=identity, runtime=runtime,
                 )
+                self._complete_run_authority_compaction_journal_locked(
+                    runs_fd, identity=identity,
+                )
                 index = self._run_authority_index_locked(runs_fd, identity=identity)
+                checkpoint = self._run_authority_checkpoint_locked(runs_fd, identity=identity)
                 if any(item["run_hash"] == run_hash for item in index["terminal_queue"]):
                     raise RunnerStoreError("local terminal prune authority is unavailable")
                 detached_value = _read_json(
@@ -6248,6 +8545,8 @@ class RunnerStore:
                     ):
                         raise RunnerStoreError("local terminal prune authority is invalid")
                     return VerifiedPrunedRunReceipt(record=pruned)
+                if len(checkpoint["pending_finalize"]) >= _RUN_AUTHORITY_COMPACTION_MAX_FINALIZE:
+                    raise RunnerStoreError("local run authority compaction queue is full")
                 run_fd = _open_child(runs_fd, run_hash, create=False)
                 if run_fd is None:
                     raise RunnerStoreError("local terminal prune authority is unavailable")
@@ -6299,7 +8598,7 @@ class RunnerStore:
                         created_at_ms=now_ms,
                     )
                     _write_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, journal)
-                    self._ensure_json_exact(
+                    _ensure_json_exact_without_scan(
                         runs_fd, self._run_authority_record_filename("prune", run_hash), record,
                     )
                     self._delete_directory_contents(run_fd)
@@ -6309,6 +8608,10 @@ class RunnerStore:
                 _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
                 os.unlink(_RUN_AUTHORITY_JOURNAL_FILENAME, dir_fd=runs_fd)
                 os.fsync(runs_fd)
+                self._prepare_pruned_compaction_locked(
+                    context_fd, runs_fd, context=context, identity=identity, signer=signer,
+                    run_id=run_id, now_ms=now_ms,
+                )
                 return VerifiedPrunedRunReceipt(record=record)
             finally:
                 os.close(runs_fd)
@@ -6332,6 +8635,9 @@ class RunnerStore:
                 raise RunnerStoreError("local runtime prune receipt is unavailable")
             try:
                 _secure_directory(runs_fd, "Heel runner runs directory")
+                self._complete_run_authority_compaction_journal_locked(
+                    runs_fd, identity=identity,
+                )
                 # A journal means only prune_runtime_terminal may roll the mutation forward;
                 # no caller may finish the runtime row from a merely prepared receipt.
                 if _read_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, None) is not None:

@@ -77,11 +77,15 @@ from .canary_runs import CanaryRunError, CanaryRunService
 from .runner_contexts import RunnerContextBindingService, RunnerContextError
 from .runner_auth import (
     RunnerActivationAbortConflict,
+    RunnerActivationAbortDeferred,
+    RunnerActivationReceiptExpired,
     RunnerAuthError,
     RunnerHttpAction,
     RunnerAuthRateLimited,
     RunnerAuthStore,
     RunnerProtocolUpgradeRequired,
+    RunnerRotationBusy,
+    RunnerRotationInProgress,
     initialize_runner_auth_schema,
 )
 from .catalog import CATALOG_VERSION, Feature, Meter, get_plan, self_serve_plans
@@ -391,6 +395,21 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _json(self, status: int, obj: dict, headers: dict | None = None) -> None:
         body = json.dumps(obj).encode()
+        response_headers = dict(headers or {})
+        if getattr(self, "_defer_json_response", False):
+            self._pending_json_response = (status, body, response_headers)
+            return
+        self._write_json(status, body, response_headers)
+
+    def _canonical_json(self, status: int, obj: dict, headers: dict | None = None) -> None:
+        """Write a receipt-bearing response with its persisted canonical bytes.
+
+        Ordinary public routes retain their historical ``json.dumps`` wire
+        encoding.  Executable activation replies are replayed from immutable
+        receipts, so their first and replay responses deliberately share this
+        one canonical serializer.
+        """
+        body = canonical_bytes(obj)
         response_headers = dict(headers or {})
         if getattr(self, "_defer_json_response", False):
             self._pending_json_response = (status, body, response_headers)
@@ -1067,11 +1086,12 @@ class _Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
         if pairing.control_protocol is not None:
             self._json(201, {
-                "schema_version": "heel.runner-pairing-pending.v2", "pairing_id": pairing.pairing_id,
+                "schema_version": "heel.runner-pairing-pending.v3", "pairing_id": pairing.pairing_id,
                 "runner_id": pairing.runner_id, "fingerprint": pairing.fingerprint, "status": pairing.status,
                 "activation_challenge": pairing.activation_challenge,
                 "control_protocol": pairing.control_protocol,
                 "pairing_exchange_digest": pairing.pairing_exchange_digest,
+                "challenge_expires_at_ms": int(pairing.expires_at * 1000),
             })
             return
         self._json(201, {"schema_version": "heel.runner-pairing-pending.v1", "pairing_id": pairing.pairing_id, "runner_id": pairing.runner_id, "fingerprint": pairing.fingerprint, "status": pairing.status, "activation_challenge": pairing.activation_challenge})
@@ -1103,13 +1123,19 @@ class _Handler(BaseHTTPRequestHandler):
                 response = store.activate_executable(
                     pairing_id, body, max_active=self.cp.runner_active_limit(store, pairing_id),
                 )
-                self._json(200, response)
+                self._canonical_json(200, response)
                 return
             if set(body) != {"schema_version", "signature_b64"} or body["schema_version"] != "heel.runner-pairing-activate.v1":
                 raise ValueError
             # The plan read is intentionally on the same short runner connection, never on
             # cp.store.conn; activation and its active-runner count then share one transaction.
             wid, runner_id, nonce = store.activate(pairing_id, body["signature_b64"], max_active=self.cp.runner_active_limit(store, pairing_id))
+        except RunnerActivationReceiptExpired:
+            self._json(410, {
+                "schema_version": "heel.runner-error.v1",
+                "code": "runner_activation_receipt_expired",
+            })
+            return
         except (KeyError, ValueError, RunnerAuthError):
             raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
         self._json(200, {"schema_version": "heel.runner-pairing-activated.v1", "workspace_id": wid, "runner_id": runner_id, "initial_claim_nonce": nonce, "capabilities": ["runner_claim", "runner_heartbeat", "runner_progress", "runner_result"]})
@@ -1123,15 +1149,24 @@ class _Handler(BaseHTTPRequestHandler):
             if canonical_bytes(body) != self._raw_body():
                 raise ValueError
             response = self._runner_store().abort_executable_pairing_activation(pairing_id, body)
+        except RunnerActivationAbortDeferred as error:
+            self._canonical_json(409, error.response)
+            return
         except RunnerActivationAbortConflict as error:
             payload = {"schema_version": "heel.runner-error.v1", "code": error.code}
             if error.retry_after_ms is not None:
                 payload["retry_after_ms"] = error.retry_after_ms
             self._json(409, payload)
             return
+        except RunnerActivationReceiptExpired:
+            self._json(410, {
+                "schema_version": "heel.runner-error.v1",
+                "code": "runner_activation_receipt_expired",
+            })
+            return
         except (KeyError, TypeError, ValueError, RunnerAuthError):
             raise ApiError(400, "invalid runner pairing request", code="invalid_runner_pairing") from None
-        self._json(200, response)
+        self._canonical_json(200, response)
 
     def _runner_rotation_poll(self, pairing_id: str) -> None:
         try:
@@ -1146,9 +1181,18 @@ class _Handler(BaseHTTPRequestHandler):
             if set(body) != {"schema_version", "signature_b64"} or body["schema_version"] != "heel.runner-rotation-activate.v2":
                 raise ValueError
             wid, runner_id, nonce, sequence, generation = self._runner_store().activate_rotation(pairing_id, body["signature_b64"])
+        except RunnerRotationBusy:
+            self._json(409, {"schema_version": "heel.runner-error.v1", "code": "runner_rotation_busy"})
+            return
+        except RunnerActivationReceiptExpired:
+            self._json(410, {
+                "schema_version": "heel.runner-error.v1",
+                "code": "runner_activation_receipt_expired",
+            })
+            return
         except (KeyError, ValueError, RunnerAuthError):
             raise ApiError(400, "invalid runner rotation", code="invalid_runner_rotation") from None
-        self._json(200, {
+        self._canonical_json(200, {
             "schema_version": "heel.runner-rotation-activated.v2",
             "workspace_id": wid,
             "runner_id": runner_id,
@@ -1171,9 +1215,15 @@ class _Handler(BaseHTTPRequestHandler):
                 payload["retry_after_ms"] = error.retry_after_ms
             self._json(409, payload)
             return
+        except RunnerActivationReceiptExpired:
+            self._json(410, {
+                "schema_version": "heel.runner-error.v1",
+                "code": "runner_activation_receipt_expired",
+            })
+            return
         except (KeyError, TypeError, ValueError, RunnerAuthError):
             raise ApiError(400, "invalid runner rotation", code="invalid_runner_rotation") from None
-        self._json(200, response)
+        self._canonical_json(200, response)
 
     def _runner_rotation_start(self, wid: str, runner_id: str) -> None:
         self._recent_owner_admin(wid)
@@ -1182,6 +1232,9 @@ class _Handler(BaseHTTPRequestHandler):
             required = {"schema_version", "previous_fingerprint", "public_key_b64", "pairing_phrase", "runner_version", "adapters"}
             if set(body) != required or body["schema_version"] != "heel.runner-rotation-start.v1": raise ValueError
             view = self._runner_store().start_rotation(wid, runner_id, previous_fingerprint=body["previous_fingerprint"], public_key_b64=body["public_key_b64"], phrase=body["pairing_phrase"], runner_version=body["runner_version"], adapters=body["adapters"])
+        except RunnerRotationInProgress:
+            self._json(409, {"schema_version": "heel.runner-error.v1", "code": "runner_rotation_in_progress"})
+            return
         except (KeyError, TypeError, ValueError, RunnerAuthError):
             raise ApiError(400, "invalid runner rotation", code="invalid_runner_rotation") from None
         self._json(201, {"schema_version": "heel.runner-rotation-pending.v1", "pairing_id": view.pairing_id, "fingerprint": view.fingerprint, "pairing_phrase": view.phrase})
