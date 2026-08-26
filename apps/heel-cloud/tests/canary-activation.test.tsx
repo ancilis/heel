@@ -39,6 +39,15 @@ describe("canary activation dashboard", () => {
     expect(source).toContain("!selectedRunnerAvailable");
     expect(source).toContain("value={selectedRunnerAvailable ? selectedRunner : \"\"}");
   });
+  test("keys approval-dialog state to the discovered request and clears it on identity loss", () => {
+    const source = readFileSync(resolve(process.cwd(), "app/dashboard/page.tsx"), "utf8");
+    expect(source).toContain("type ApprovalDialogState = { requestKey: string; open: boolean } | null");
+    expect(source).toContain("function approvalRequestKey");
+    expect(source).toContain("const clearApprovalIdentity");
+    expect(source).toContain("setApprovalDialog({ requestKey: approvalKey, open: true })");
+    expect(source).toContain("<ApprovalDialog key={approvalKey}");
+    expect(source).not.toContain("const [approvalOpen");
+  });
   test("leads with four ordered steps and one unambiguous next action", () => {
     render(<Dashboard />);
 

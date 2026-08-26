@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import unittest
 from copy import deepcopy
 
@@ -106,6 +107,23 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
             "SELECT COUNT(*) FROM canary_runner_context_events WHERE rcb_id=? AND action='expired'",
             (other["binding_id"],),
         ).fetchone()[0], 0)
+
+    def test_affinity_request_checks_do_not_rescan_retained_claim_history(self):
+        statements: list[str] = []
+        self.conn.set_trace_callback(statements.append)
+        try:
+            self.service.list_for_human(WORKSPACE, PROJECT, actor="user_owner")
+            self.service.create(
+                WORKSPACE, PROJECT,
+                {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+                 "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+                 "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+            )
+        finally:
+            self.conn.set_trace_callback(None)
+        self.assertFalse(any(
+            "first_claimed_at_ms is not null" in statement.lower() for statement in statements
+        ))
 
     def test_generic_approval_expiry_anti_join_binds_the_full_context_link_identity(self):
         runs = service(self.conn, self.clock)
@@ -221,7 +239,7 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
             self.service.list_for_human(WORKSPACE, other_project, actor="user_owner")["runners"], [],
         )
 
-    def test_missing_affinity_with_claimed_history_fails_closed_for_dashboard_create_and_claim(self):
+    def test_claimed_runner_affinity_is_immutable(self):
         first = self.service.create(
             WORKSPACE, PROJECT,
             {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
@@ -235,90 +253,15 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
              "binding_digest": first["binding_digest"]},
         )
         self.conn.commit()
-        self.service.revoke(WORKSPACE, PROJECT, first["binding_id"], actor="user_owner", role="owner")
-
-        other_project, other_environment = "prj_history_other", "env_history_other"
-        self.conn.execute(
-            "INSERT INTO projects VALUES(?,?,?,?,?)", (WORKSPACE, other_project, "Other", "user_owner", NOW_MS / 1000),
-        )
-        source = self.conn.execute(
-            "SELECT * FROM canary_environments WHERE workspace_id=? AND project_ref=? AND environment_id=?",
-            (WORKSPACE, PROJECT, ENVIRONMENT),
-        ).fetchone()
-        columns = tuple(source.keys())
-        values = [source[column] for column in columns]
-        values[columns.index("project_ref")] = other_project
-        values[columns.index("environment_id")] = other_environment
-        self.conn.execute(
-            f"INSERT INTO canary_environments({','.join(columns)}) VALUES({','.join('?' for _ in columns)})", values,
-        )
-        self.conn.execute(
-            "DELETE FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
-            (WORKSPACE, RUNNER),
-        )
-        self.conn.commit()
-
-        with self.assertRaisesRegex(RunnerContextError, "canary_authority_unavailable"):
-            self.service.list_for_human(WORKSPACE, other_project, actor="user_owner")
-        with self.assertRaisesRegex(RunnerContextError, "canary_authority_unavailable"):
-            self.service.create(
-                WORKSPACE, other_project,
-                {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": other_environment,
-                 "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
-                 "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "affinity is immutable"):
+            self.conn.execute(
+                "DELETE FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
+                (WORKSPACE, RUNNER),
             )
         self.assertEqual(self.conn.execute(
-            "SELECT COUNT(*) FROM canary_runner_context_bindings WHERE workspace_id=? AND project_ref=?",
-            (WORKSPACE, other_project),
-        ).fetchone()[0], 0)
-
-        # Claim must not rebuild the deleted A affinity from an unclaimed B row.
-        unsigned = {
-            key: value for key, value in first.items()
-            if key not in {"binding_digest", "signing_key_id", "signature_b64"}
-        }
-        unsigned["binding_id"] = "rcb_" + "f" * 32
-        unsigned["project_id"] = other_project
-        unsigned["environment"] = {**unsigned["environment"], "environment_id": other_environment}
-        second = {**unsigned, "binding_digest": canonical_digest(unsigned)}
-        second.update(self.cloud.sign(CONTEXT_DOMAIN + canonical_bytes(unsigned)))
-        original = self.conn.execute(
-            "SELECT * FROM canary_runner_context_bindings WHERE rcb_id=?", (first["binding_id"],),
-        ).fetchone()
-        self.conn.execute(
-            "INSERT INTO canary_runner_context_bindings("
-            "rcb_id,workspace_id,project_ref,environment_id,runner_id,runner_key_id,environment_origin,environment_class,"
-            "binding_digest,public_key_digest,verification_record_digest,binding_json,status,created_by,created_role,"
-            "issued_at_ms,expires_at_ms,first_claimed_at_ms,revoked_by,revoked_at_ms,revoke_reason,purge_at_ms) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,?)",
-            (
-                second["binding_id"], WORKSPACE, other_project, other_environment, RUNNER, self.runner.key_id,
-                original["environment_origin"], original["environment_class"], second["binding_digest"],
-                original["public_key_digest"], VERIFICATION_DIGEST, canonical_bytes(second).decode(), "active",
-                "user_owner", "owner", second["issued_at_ms"], second["expires_at_ms"],
-                second["expires_at_ms"] + 30 * 24 * 60 * 60 * 1000,
-            ),
-        )
-        self.conn.commit()
-        with self.assertRaisesRegex(RunnerContextError, "canary_authority_unavailable"):
-            self.service.create(
-                WORKSPACE, other_project,
-                {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": other_environment,
-                 "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
-                 "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
-            )
-        self.conn.execute("BEGIN IMMEDIATE")
-        with self.assertRaisesRegex(RunnerContextError, "runner_context_binding_not_found"):
-            self.service.claim_in_transaction(
-                WORKSPACE, RUNNER, self.runner.key_id, second["binding_id"],
-                {"schema_version": "heel.runner-context-claim.v1", "binding_id": second["binding_id"],
-                 "binding_digest": second["binding_digest"]},
-            )
-        self.conn.rollback()
-        self.assertEqual(self.conn.execute(
-            "SELECT COUNT(*) FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
+            "SELECT established_rcb_id FROM canary_runner_context_affinities WHERE workspace_id=? AND runner_id=?",
             (WORKSPACE, RUNNER),
-        ).fetchone()[0], 0)
+        ).fetchone()[0], first["binding_id"])
 
     def test_dashboard_hides_runner_occupied_by_another_project_until_revoke(self):
         binding = self.service.create(
@@ -631,9 +574,60 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
             return projection
 
         self.conn.execute("BEGIN IMMEDIATE")
-        for index in range(129):
+        # The public submission boundary admits at most 64 live requests.  The
+        # remaining records model an older retained queue so this reaper test
+        # continues to exercise the 128/129 cursor boundary without bypassing
+        # the admission invariant.
+        for index in range(64):
             runs.submit_projection_from_runner_in_transaction(
                 unique_projection(index), binding, uploaded_by_runner_id=RUNNER,
+            )
+        approval_columns = (
+            "approval_id", "workspace_id", "project_ref", "run_id", "environment_id", "runner_id",
+            "runner_key_id", "manifest_digest", "projection_digest", "signing_key_id", "status",
+            "projection_json", "scenario_ids_json", "budgets_json", "uploaded_by", "approved_by",
+            "reason", "created_at", "expires_at", "approved_at", "purge_at",
+        )
+        run_columns = (
+            "run_id", "workspace_id", "project_ref", "approval_id", "grant_id", "environment_id",
+            "runner_id", "runner_key_id", "status", "execution_disposition", "error_category",
+            "stop_reason", "source_event_sequence", "source_projection_digest", "cloud_event_sequence",
+            "last_heartbeat_at_ms", "last_gate_at_ms", "claimed_at_ms", "started_at_ms",
+            "stop_requested_at_ms", "stop_acknowledged_at_ms", "terminal_at_ms", "stop_generation",
+            "stop_deadline_ms", "stop_ack_late", "reservation_id", "quota_state",
+            "kill_switch_generation", "created_at", "updated_at", "purge_at",
+        )
+        link_columns = (
+            "workspace_id", "project_ref", "approval_id", "run_id", "environment_id", "runner_id",
+            "runner_key_id", "rcb_id", "binding_digest", "projection_digest", "created_at_ms",
+        )
+        source_approval = dict(self.conn.execute(
+            "SELECT * FROM canary_approval_projections ORDER BY approval_id LIMIT 1",
+        ).fetchone())
+        source_run = dict(self.conn.execute(
+            "SELECT * FROM canary_runs ORDER BY run_id LIMIT 1",
+        ).fetchone())
+        source_link = dict(self.conn.execute(
+            "SELECT * FROM canary_runner_context_projection_links ORDER BY run_id LIMIT 1",
+        ).fetchone())
+        for index in range(64, 129):
+            approval_id = f"ap_{index:032x}"
+            run_id = f"crun_{index:032x}"
+            digest = f"{index + 4096:064x}"
+            approval = {**source_approval, "approval_id": approval_id, "run_id": run_id, "projection_digest": digest}
+            run = {**source_run, "run_id": run_id, "approval_id": approval_id}
+            link = {**source_link, "approval_id": approval_id, "run_id": run_id, "projection_digest": digest}
+            self.conn.execute(
+                f"INSERT INTO canary_approval_projections({','.join(approval_columns)}) VALUES({','.join('?' for _ in approval_columns)})",
+                tuple(approval[column] for column in approval_columns),
+            )
+            self.conn.execute(
+                f"INSERT INTO canary_runs({','.join(run_columns)}) VALUES({','.join('?' for _ in run_columns)})",
+                tuple(run[column] for column in run_columns),
+            )
+            self.conn.execute(
+                f"INSERT INTO canary_runner_context_projection_links({','.join(link_columns)}) VALUES({','.join('?' for _ in link_columns)})",
+                tuple(link[column] for column in link_columns),
             )
         self.conn.commit()
         run_ids = [row[0] for row in self.conn.execute(
@@ -702,8 +696,8 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         self.conn.execute("PRAGMA foreign_keys=ON")
 
         self.conn.execute("BEGIN IMMEDIATE")
-        with self.assertRaisesRegex(RuntimeError, "purge has linked corrupt authority"):
-            self.service.expire_and_purge_in_transaction(purge_now)
+        with self.assertRaisesRegex(RuntimeError, "cancellation queue link is inconsistent"):
+            self.service.cancel_due_batch_in_transaction(purge_now)
         self.conn.rollback()
         self.assertIsNotNone(self.conn.execute(
             "SELECT 1 FROM canary_runner_context_bindings WHERE rcb_id=?", (binding["rcb_id"],),
@@ -772,6 +766,28 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         self.assertEqual(counts["purged_bindings"], 1)
         self.assertEqual(counts["purged_events"], 2)
         self.assertIsNone(conn.execute(
+            "SELECT 1 FROM canary_runner_context_bindings WHERE rcb_id=?", (binding["binding_id"],),
+        ).fetchone())
+
+    def test_retention_purge_consumes_a_global_child_deletion_budget(self):
+        binding = self.service.create(
+            WORKSPACE, PROJECT,
+            {"schema_version": "heel.runner-context-binding-create.v1", "environment_id": ENVIRONMENT,
+             "verification_record_digest": VERIFICATION_DIGEST, "runner_id": RUNNER,
+             "runner_key_id": self.runner.key_id}, actor="user_owner", role="owner",
+        )
+        self.service.revoke(WORKSPACE, PROJECT, binding["binding_id"], actor="user_owner", role="owner")
+        now = self.service._now_ms() + 1
+        self.conn.execute("UPDATE canary_runner_context_bindings SET purge_at_ms=?", (now,))
+        self.conn.execute("UPDATE canary_runner_context_events SET purge_at_ms=?", (now,))
+        self.conn.commit()
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        counts = self.service.expire_and_purge_in_transaction(now, limit=1)
+        self.conn.commit()
+
+        self.assertEqual(counts["purged_links"] + counts["purged_events"] + counts["purged_bindings"], 1)
+        self.assertIsNotNone(self.conn.execute(
             "SELECT 1 FROM canary_runner_context_bindings WHERE rcb_id=?", (binding["binding_id"],),
         ).fetchone())
 
@@ -860,22 +876,18 @@ class RunnerContextBindingServiceTests(unittest.TestCase):
         self.conn.execute("UPDATE canary_runner_context_events SET purge_at_ms=?", (now,))
         self.conn.commit()
 
-        expected = self.conn.execute(
-            "SELECT purge_at_ms,rcb_id FROM canary_runner_context_bindings ORDER BY purge_at_ms,rcb_id LIMIT 128"
-        ).fetchall()[-1]
         self.conn.execute("BEGIN IMMEDIATE")
         first = self.service.expire_and_purge_in_transaction(now, limit=128)
         self.conn.commit()
-        self.assertEqual(first["purged_bindings"], 128)
-        self.assertEqual(first["purged_events"], 256)
-        self.assertEqual(first["next_cursor"], {"purge_at_ms": expected["purge_at_ms"], "rcb_id": expected["rcb_id"]})
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM canary_runner_context_bindings").fetchone()[0], 1)
-
-        self.conn.execute("BEGIN IMMEDIATE")
-        second = self.service.expire_and_purge_in_transaction(now, limit=128)
-        self.conn.commit()
-        self.assertEqual(second["purged_bindings"], 1)
-        self.assertEqual(second["next_cursor"], None)
+        self.assertLessEqual(
+            first["purged_links"] + first["purged_events"] + first["purged_bindings"], 128,
+        )
+        self.assertIsNotNone(first["next_cursor"])
+        for _ in range(4):
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.service.expire_and_purge_in_transaction(now, limit=128)
+            self.conn.commit()
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM canary_runner_context_bindings").fetchone()[0], 0)
 
     def test_runner_projection_replay_is_idempotent_without_new_authority_side_effects(self):
         self.service.create(

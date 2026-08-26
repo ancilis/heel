@@ -156,24 +156,22 @@ def test_pairing_display_name_is_closed_nfc_and_has_no_edge_whitespace():
     assert material.display_name == "Caf\u00e9"
 
 
-def test_named_control_methods_emit_closed_bodies_and_separate_stop_ack_chain():
+def test_named_run_control_requires_an_authenticated_active_claim_before_transport():
     signer, transport, nonces = Signer(), Transport(), NonceSource()
     client = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer,
                                  clock=lambda: 1000, transport=transport, nonce_source=nonces)
     client.claim()
-    methods = ((client.heartbeat, "heartbeat", operational_projection("claimed")),
-               (client.progress, "progress", operational_projection("running")),
-               (client.result, "result", operational_projection("terminal")),
-               (client.stop_ack, "stop-ack", operational_projection("stop_requested")))
-    for method, _, projection in methods:
-        method(run_id="run", operational_projection=projection)
+    for method, projection in (
+        (client.heartbeat, operational_projection("claimed")),
+        (client.progress, operational_projection("running")),
+        (client.result, operational_projection("terminal")),
+        (client.stop_ack, operational_projection("stop_requested")),
+    ):
+        with pytest.raises(ValueError, match="active runner claim is required"):
+            method(run_id="run", operational_projection=projection)
     assert transport.requests[0][2] == b'{"schema_version":"heel.runner-claim-request.v1"}'
-    for request, (_, operation, projection) in zip(transport.requests[1:], methods, strict=True):
-        assert request[2] == canonical_bytes({"schema_version": f"heel.runner-{operation}-request.v1", "run_id": "run", "operational_projection": projection})
-        assert request[1]["X-Heel-Runner-Sequence"] == "1"
-    assert nonces.keys == [("claim", None), ("heartbeat", "run"), ("progress", "run"),
-                           ("result", "run"), ("stop-ack", "run")]
-    assert transport.requests[1][1]["X-Heel-Runner-Nonce"] != transport.requests[4][1]["X-Heel-Runner-Nonce"]
+    assert len(transport.requests) == 1
+    assert nonces.keys == [("claim", None)]
     public = {name for name, method in vars(RunnerControlClient).items() if callable(method) and not name.startswith("_")}
     assert public == {"claim", "heartbeat", "progress", "result", "stop_ack",
                       "start_resync", "complete_resync", "install_rotation_claim",
@@ -205,6 +203,21 @@ def test_control_diagnostics_are_bounded_frozen_and_sensitive_field_free():
     ))
     diagnostics.pop()
     assert len(client.calls) == 128
+
+
+def test_run_control_uses_fixed_striped_locks_without_per_run_lock_retention():
+    client = RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner", signer=Signer(),
+        clock=lambda: 1000, transport=Transport(), nonce_source=NonceSource(),
+    )
+    stripes = client._run_lock_stripes
+    assert len(stripes) == 64
+    assert len({id(lock) for lock in stripes}) == 64
+    assert {
+        id(client._operation_lock("heartbeat", f"run-{ordinal}"))
+        for ordinal in range(10_000)
+    }.issubset({id(lock) for lock in stripes})
+    assert not hasattr(client, "_chain_locks")
 
 
 @pytest.mark.parametrize(("method_name", "projection"), [
@@ -282,6 +295,9 @@ def test_resync_install_serializes_behind_inflight_control_and_wins_generation()
         signer=signer, clock=lambda: 1000, transport=transport,
         nonce_source=NonceSource(),
     )
+    with client._state_lock:
+        client._tracked_runs.add("run")
+        client._chains["heartbeat:run"] = (base64.b64encode(b"h" * 32).decode(), 8, 1)
     pending = PendingRunnerResync(
         "rrs_" + "a" * 32, "heartbeat", "run",
         base64.b64encode(b"c" * 32).decode(), base64.b64encode(b"s" * 32).decode(),
@@ -361,6 +377,8 @@ def test_resync_signs_its_own_closed_envelopes_and_installs_recovered_sequence()
     client = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer,
                                  clock=lambda: 1000, transport=transport, nonce_source=NonceSource(),
                                  resync_random_source=lambda count: b"c" * count)
+    with client._state_lock:
+        client._tracked_runs.add("run")
     pending = client.start_resync(operation="heartbeat", run_id="run")
     assert pending.next_sequence == 8 and pending.generation == 4
     path, headers, body = transport.requests[0]
@@ -400,6 +418,8 @@ def test_resync_generation_install_is_monotonic_and_idempotent():
     client = RunnerControlClient(origin="https://control.example", workspace_id="ws", runner_id="runner",
                                  signer=signer, clock=lambda: 1000, transport=transport,
                                  nonce_source=NonceSource())
+    with client._state_lock:
+        client._tracked_runs.add("run")
     pending = PendingRunnerResync("rrs_" + "a" * 32, "heartbeat", "run",
                                   base64.b64encode(b"c" * 32).decode(),
                                   base64.b64encode(b"s" * 32).decode(), 8, 2000, 4)

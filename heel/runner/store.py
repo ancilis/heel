@@ -96,6 +96,26 @@ _CONTEXT_DOMAIN = b"heel.runner-context-binding.v1\0"
 _CLOUD_CONTEXT_PROVENANCE_SCHEMA = "heel.cloud-context-provenance.v1"
 _CONTEXT_ROLLOVER_SCHEMA = "heel.runner-context-rollover.v1"
 _CONTEXT_INSTALL_SCHEMA = "heel.runner-context-install.v1"
+_RUN_AUTHORITY_INDEX_SCHEMA = "heel.local-run-authority-index.v1"
+_RUN_RESERVATION_RECORD_SCHEMA = "heel.local-run-reservation.v1"
+_RUN_TERMINAL_RECORD_SCHEMA = "heel.local-run-terminal.v1"
+_RUN_PRUNED_RECORD_SCHEMA = "heel.local-run-pruned.v1"
+_RUN_AUTHORITY_MUTATION_SCHEMA = "heel.local-run-authority-mutation.v1"
+_RUN_AUTHORITY_INDEX_FILENAME = "run-authority-index.json"
+_RUN_AUTHORITY_JOURNAL_FILENAME = "run-authority-journal.json"
+_RUN_AUTHORITY_MAX_RECORD_BYTES = 16 * 1024
+_RUN_AUTHORITY_MAX_JOURNAL_BYTES = 128 * 1024
+_RUN_AUTHORITY_MAX_TRACKED = 64
+_RUN_AUTHORITY_MAX_NONTERMINAL = _RUN_AUTHORITY_MAX_TRACKED
+_RUN_PRUNE_BATCH = 16
+_RUN_AUTHORITY_ZERO_HEAD = "0" * 64
+_RUN_AUTHORITY_DOMAINS = {
+    _RUN_AUTHORITY_INDEX_SCHEMA: b"heel.local-run-authority-index.v1\0",
+    _RUN_RESERVATION_RECORD_SCHEMA: b"heel.local-run-reservation.v1\0",
+    _RUN_TERMINAL_RECORD_SCHEMA: b"heel.local-run-terminal.v1\0",
+    _RUN_PRUNED_RECORD_SCHEMA: b"heel.local-run-pruned.v1\0",
+    _RUN_AUTHORITY_MUTATION_SCHEMA: b"heel.local-run-authority-mutation.v1\0",
+}
 
 
 def _require_capabilities() -> None:
@@ -372,15 +392,17 @@ def _create_json(directory_fd: int, filename: str, value: Any) -> None:
         raise RunnerStoreError("runner state exceeds size limit")
     temporary_prefix = f".{filename}."
     removed_stale = False
-    for name in os.listdir(directory_fd):
-        if not name.startswith(temporary_prefix) or _CREATE_TEMP_FILENAME.fullmatch(name) is None:
-            continue
-        _secure_regular(
-            os.stat(name, dir_fd=directory_fd, follow_symlinks=False),
-            "unfinished runner state",
-        )
-        os.unlink(name, dir_fd=directory_fd)
-        removed_stale = True
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            name = entry.name
+            if not name.startswith(temporary_prefix) or _CREATE_TEMP_FILENAME.fullmatch(name) is None:
+                continue
+            _secure_regular(
+                os.stat(name, dir_fd=directory_fd, follow_symlinks=False),
+                "unfinished runner state",
+            )
+            os.unlink(name, dir_fd=directory_fd)
+            removed_stale = True
     if removed_stale:
         os.fsync(directory_fd)
     temporary = temporary_prefix + secrets.token_hex(12) + ".tmp"
@@ -617,9 +639,461 @@ class RunnerStore:
         _require_capabilities()
         self.root = _absolute(Path(heel_home()) if root is None else Path(root))
         self._namespace: str | None = None
+        self._runtime_authority: tuple[RunnerIdentity, SecureSigner] | None = None
         with self._open_runner(create=True):
             pass
         self._select_active_if_present()
+
+    @classmethod
+    def for_runtime(
+        cls, root: Path | None = None, *, identity: RunnerIdentity, signer: SecureSigner,
+    ) -> "RunnerStore":
+        """Open a store whose mutation authority is pinned to one paired identity."""
+        store = cls(root)
+        store._pin_runtime_authority(identity, signer)
+        return store
+
+    def _pin_runtime_authority(self, identity: RunnerIdentity, signer: SecureSigner) -> None:
+        record = _identity_record(identity, signer)
+        existing = self._runtime_authority
+        if existing is not None:
+            if _identity_record(*existing) != record:
+                raise RunnerStoreError("authenticated runner store identity changed")
+            return
+        if self._namespace is not None:
+            with self._transaction(exclusive=False, allow_rollover_journal=True) as context_fd:
+                if self._binding_locked(context_fd)["identity"] != record:
+                    raise RunnerStoreError("authenticated runner store identity differs from bound context")
+        self._runtime_authority = (identity, signer)
+
+    def _require_runtime_authority(self) -> tuple[RunnerIdentity, SecureSigner]:
+        authority = self._runtime_authority
+        if authority is None:
+            raise RunnerStoreError("authenticated runner store is required")
+        _identity_record(*authority)
+        return authority
+
+    def _assert_runtime_authority(self, identity: RunnerIdentity, signer: SecureSigner) -> None:
+        expected = _identity_record(identity, signer)
+        actual = self._require_runtime_authority()
+        if _identity_record(*actual) != expected:
+            raise RunnerStoreError("authenticated runner store identity changed")
+
+    @staticmethod
+    def _signed_run_authority_value(
+        core: Mapping[str, Any], *, signer: SecureSigner, record_digest: bool,
+    ) -> dict[str, Any]:
+        schema = core.get("schema_version") if isinstance(core, Mapping) else None
+        if schema not in _RUN_AUTHORITY_DOMAINS:
+            raise ValueError("invalid local run authority schema")
+        unsigned = dict(core)
+        if record_digest:
+            unsigned["record_digest"] = canonical_digest(unsigned)
+        signature = signer.sign(_RUN_AUTHORITY_DOMAINS[schema] + canonical_bytes(unsigned))
+        if not isinstance(signature, bytes) or len(signature) != 64:
+            raise RunnerStoreError("runner signer returned an invalid local authority signature")
+        return {
+            **unsigned,
+            "signing_key_id": signer.key_id,
+            "signature_b64": base64.b64encode(signature).decode("ascii"),
+        }
+
+    @staticmethod
+    def _verify_signed_run_authority_value(
+        value: object, *, identity: RunnerIdentity, schema: str, record_digest: bool,
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        if schema not in _RUN_AUTHORITY_DOMAINS or not isinstance(value, Mapping):
+            raise RunnerStoreError("invalid local run authority record")
+        fields = set(value)
+        required = {"schema_version", "signing_key_id", "signature_b64"}
+        if record_digest:
+            required.add("record_digest")
+        if not required <= fields or value.get("schema_version") != schema:
+            raise RunnerStoreError("invalid local run authority record")
+        record_fields = {
+            _RUN_RESERVATION_RECORD_SCHEMA: {
+                "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
+                "run_hash", "grant_id", "grant_digest", "initial_state_digest",
+                "retention_expires_at_ms", "created_at_ms", "prior_head_digest", "record_digest",
+                "signing_key_id", "signature_b64",
+            },
+            _RUN_TERMINAL_RECORD_SCHEMA: {
+                "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
+                "run_hash", "grant_id", "grant_digest", "reservation_record_digest",
+                "terminal_state_digest", "terminal_projection_digest", "retention_expires_at_ms",
+                "terminal_at_ms", "prior_head_digest", "record_digest", "signing_key_id", "signature_b64",
+            },
+            _RUN_PRUNED_RECORD_SCHEMA: {
+                "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
+                "run_hash", "grant_id", "grant_digest", "terminal_record_digest",
+                "terminal_projection_digest", "retention_expires_at_ms", "terminal_at_ms", "pruned_at_ms",
+                "prior_head_digest", "record_digest", "signing_key_id", "signature_b64",
+            },
+        }.get(schema)
+        if record_fields is not None and fields != record_fields:
+            raise RunnerStoreError("invalid local run authority record")
+        try:
+            unsigned = {
+                key: value[key] for key in fields - {"signing_key_id", "signature_b64"}
+            }
+            if record_digest:
+                digest = _digest(unsigned.pop("record_digest"), "local run authority digest")
+                if digest != canonical_digest(unsigned):
+                    raise ValueError
+                unsigned["record_digest"] = digest
+            payload = canonical_bytes(unsigned)
+            if len(payload) > max_bytes:
+                raise ValueError
+            signature_b64 = value["signature_b64"]
+            if type(signature_b64) is not str or base64.b64encode(
+                base64.b64decode(signature_b64, validate=True)
+            ).decode("ascii") != signature_b64:
+                raise ValueError
+            verify_envelope(
+                {identity.key_id: load_public_key_base64(identity.public_key_b64)},
+                {"signing_key_id": value["signing_key_id"], "signature_b64": signature_b64},
+                _RUN_AUTHORITY_DOMAINS[schema] + payload,
+            )
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid local run authority record") from None
+        return dict(value)
+
+    def _zero_run_authority_index(
+        self, *, context: RunnerContext, identity: RunnerIdentity, signer: SecureSigner,
+    ) -> dict[str, Any]:
+        return self._signed_run_authority_value({
+            "schema_version": _RUN_AUTHORITY_INDEX_SCHEMA,
+            "namespace": context.namespace,
+            "workspace_id": context.workspace_id,
+            "runner_id": identity.runner_id,
+            "runner_key_id": identity.key_id,
+            "generation": 0,
+            "nonterminal_count": 0,
+            "terminal_queue": [],
+            "head_digest": _RUN_AUTHORITY_ZERO_HEAD,
+        }, signer=signer, record_digest=False)
+
+    def _initialize_run_authority_index_locked(
+        self, context_fd: int, *, context: RunnerContext, identity: RunnerIdentity,
+        signer: SecureSigner, initial_bind: bool,
+    ) -> None:
+        runs_fd = _open_child(context_fd, "runs", create=True)
+        assert runs_fd is not None
+        try:
+            _secure_directory(runs_fd, "Heel runner runs directory")
+            zero = self._zero_run_authority_index(
+                context=context, identity=identity, signer=signer,
+            )
+            existing = _read_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, None)
+            if existing is None:
+                if not initial_bind:
+                    raise RunnerStoreError("local run authority index requires explicit upgrade")
+                with os.scandir(runs_fd) as entries:
+                    if any(entry.name != _RUN_AUTHORITY_INDEX_FILENAME for entry in entries):
+                        raise RunnerStoreError("local run authority index requires explicit upgrade")
+                _create_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, zero)
+            else:
+                checked = self._verify_signed_run_authority_value(
+                    existing, identity=identity, schema=_RUN_AUTHORITY_INDEX_SCHEMA,
+                    record_digest=False, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                )
+                if (
+                    set(checked) != set(zero)
+                    or any(checked[field] != zero[field] for field in (
+                        "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
+                    ))
+                    or type(checked["generation"]) is not int or checked["generation"] < 0
+                    or type(checked["nonterminal_count"]) is not int
+                    or not 0 <= checked["nonterminal_count"] <= _RUN_AUTHORITY_MAX_NONTERMINAL
+                    or not isinstance(checked["terminal_queue"], list)
+                    or len(checked["terminal_queue"]) > _RUN_AUTHORITY_MAX_TRACKED
+                    or _DIGEST.fullmatch(checked["head_digest"]) is None
+                ):
+                    raise RunnerStoreError("local run authority index differs from bound context")
+            os.fsync(runs_fd)
+        finally:
+            os.close(runs_fd)
+
+    @staticmethod
+    def _run_authority_index_digest(index: Mapping[str, Any]) -> str:
+        return canonical_digest(dict(index))
+
+    def _validate_run_authority_index_value(
+        self, value: object, *, identity: RunnerIdentity,
+    ) -> dict[str, Any]:
+        checked = self._verify_signed_run_authority_value(
+            value, identity=identity, schema=_RUN_AUTHORITY_INDEX_SCHEMA,
+            record_digest=False, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+        )
+        if (
+            set(checked) != {
+                "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id",
+                "generation", "nonterminal_count", "terminal_queue", "head_digest", "signing_key_id", "signature_b64",
+            }
+            or checked["namespace"] != self.namespace
+            or checked["workspace_id"] != identity.workspace_id
+            or checked["runner_id"] != identity.runner_id
+            or checked["runner_key_id"] != identity.key_id
+            or type(checked["generation"]) is not int or checked["generation"] < 0
+            or type(checked["nonterminal_count"]) is not int
+            or not 0 <= checked["nonterminal_count"] <= _RUN_AUTHORITY_MAX_NONTERMINAL
+            or not isinstance(checked["terminal_queue"], list)
+            or len(checked["terminal_queue"]) > _RUN_AUTHORITY_MAX_TRACKED
+            or checked["nonterminal_count"] + len(checked["terminal_queue"]) > _RUN_AUTHORITY_MAX_TRACKED
+            or _DIGEST.fullmatch(checked["head_digest"]) is None
+        ):
+            raise RunnerStoreError("local run authority index is invalid")
+        previous: tuple[int, str] | None = None
+        seen_hashes: set[str] = set()
+        for item in checked["terminal_queue"]:
+            if (
+                not isinstance(item, Mapping)
+                or set(item) != {"retention_expires_at_ms", "run_hash", "terminal_record_digest"}
+                or type(item["retention_expires_at_ms"]) is not int
+                or item["retention_expires_at_ms"] < 0
+                or _RUN_FILENAME.fullmatch(item["run_hash"]) is None
+                or _DIGEST.fullmatch(item["terminal_record_digest"]) is None
+                or item["run_hash"] in seen_hashes
+                or (previous is not None and (item["retention_expires_at_ms"], item["run_hash"]) <= previous)
+            ):
+                raise RunnerStoreError("local run authority index is invalid")
+            seen_hashes.add(item["run_hash"])
+            previous = (item["retention_expires_at_ms"], item["run_hash"])
+        return checked
+
+    def _run_authority_index_locked(
+        self, runs_fd: int, *, identity: RunnerIdentity,
+    ) -> dict[str, Any]:
+        value = _read_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, None)
+        if value is None:
+            raise RunnerStoreError("local run authority index is unavailable")
+        return self._validate_run_authority_index_value(value, identity=identity)
+
+    def _next_run_authority_index(
+        self, index: Mapping[str, Any], *, signer: SecureSigner, delta: int, head_digest: str,
+        terminal_queue: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        next_count = index["nonterminal_count"] + delta
+        queue = list(index["terminal_queue"] if terminal_queue is None else terminal_queue)
+        if not 0 <= next_count or next_count + len(queue) > _RUN_AUTHORITY_MAX_TRACKED:
+            raise RunnerStoreError("local run authority capacity is exhausted")
+        return self._signed_run_authority_value({
+            "schema_version": _RUN_AUTHORITY_INDEX_SCHEMA,
+            "namespace": index["namespace"], "workspace_id": index["workspace_id"],
+            "runner_id": index["runner_id"], "runner_key_id": index["runner_key_id"],
+            "generation": index["generation"] + 1, "nonterminal_count": next_count,
+            "terminal_queue": queue,
+            "head_digest": _digest(head_digest, "local run authority head"),
+        }, signer=signer, record_digest=False)
+
+    @staticmethod
+    def _run_authority_record_filename(kind: str, run_hash: str) -> str:
+        if _RUN_FILENAME.fullmatch(run_hash) is None:
+            raise RunnerStoreError("invalid local run authority hash")
+        prefix = {
+            "reserve": "reservation-", "terminal": "terminal-", "prune": "pruned-",
+        }.get(kind)
+        if prefix is None:
+            raise RunnerStoreError("invalid local run authority operation")
+        return f"{prefix}{run_hash}.json"
+
+    def _run_authority_record(
+        self, *, operation: str, context: RunnerContext, identity: RunnerIdentity,
+        signer: SecureSigner, run_hash: str, grant: Mapping[str, Any], state: Mapping[str, Any],
+        index: Mapping[str, Any], terminal: Mapping[str, Any] | None = None,
+        pruned_at_ms: int | None = None,
+    ) -> dict[str, Any]:
+        header = {
+            "namespace": context.namespace, "workspace_id": context.workspace_id,
+            "runner_id": identity.runner_id, "runner_key_id": identity.key_id,
+            "run_hash": run_hash, "grant_id": grant["grant_id"], "grant_digest": grant["grant_digest"],
+            "retention_expires_at_ms": state["retention_expires_at_ms"],
+            "prior_head_digest": index["head_digest"],
+        }
+        if operation == "reserve":
+            core = {
+                "schema_version": _RUN_RESERVATION_RECORD_SCHEMA, **header,
+                "initial_state_digest": canonical_digest(dict(state)),
+                "created_at_ms": grant["issued_at_ms"],
+            }
+        elif operation == "terminal":
+            if terminal is None:
+                raise RunnerStoreError("local terminal authority requires final projections")
+            core = {
+                "schema_version": _RUN_TERMINAL_RECORD_SCHEMA, **header,
+                "reservation_record_digest": _digest(
+                    terminal["reservation_record_digest"], "local reservation record digest",
+                ),
+                "terminal_state_digest": canonical_digest(dict(state)),
+                "terminal_projection_digest": _digest(
+                    terminal["terminal_projection_digest"], "local terminal projection digest",
+                ),
+                "terminal_at_ms": state["updated_at_ms"],
+            }
+        elif operation == "prune":
+            if terminal is None or pruned_at_ms is None:
+                raise RunnerStoreError("local prune authority requires terminal record")
+            core = {
+                "schema_version": _RUN_PRUNED_RECORD_SCHEMA, **header,
+                "terminal_record_digest": _digest(
+                    terminal["terminal_record_digest"], "local terminal record digest",
+                ),
+                "terminal_projection_digest": _digest(
+                    terminal["terminal_projection_digest"], "local terminal projection digest",
+                ),
+                "terminal_at_ms": terminal["terminal_at_ms"], "pruned_at_ms": pruned_at_ms,
+            }
+        else:
+            raise RunnerStoreError("invalid local run authority operation")
+        return self._signed_run_authority_value(core, signer=signer, record_digest=True)
+
+    def _run_authority_journal(
+        self, *, context: RunnerContext, identity: RunnerIdentity, signer: SecureSigner,
+        operation: str, run_hash: str, index: Mapping[str, Any], next_index: Mapping[str, Any],
+        record: Mapping[str, Any], recovery: Mapping[str, Any], created_at_ms: int,
+    ) -> dict[str, Any]:
+        if operation not in {"reserve", "terminal", "prune"}:
+            raise RunnerStoreError("invalid local run authority operation")
+        core = {
+            "schema_version": _RUN_AUTHORITY_MUTATION_SCHEMA, "namespace": context.namespace,
+            "workspace_id": context.workspace_id, "runner_id": identity.runner_id,
+            "runner_key_id": identity.key_id, "operation": operation, "run_hash": run_hash,
+            "old_index_digest": self._run_authority_index_digest(index),
+            "next_index": dict(next_index), "record": dict(record), "recovery": dict(recovery),
+            "created_at_ms": created_at_ms,
+        }
+        value = self._signed_run_authority_value(core, signer=signer, record_digest=False)
+        if len(canonical_bytes(value)) > _RUN_AUTHORITY_MAX_JOURNAL_BYTES:
+            raise RunnerStoreError("local run authority journal exceeds size limit")
+        return value
+
+    def _validate_run_authority_journal(
+        self, value: object, *, identity: RunnerIdentity,
+    ) -> dict[str, Any]:
+        checked = self._verify_signed_run_authority_value(
+            value, identity=identity, schema=_RUN_AUTHORITY_MUTATION_SCHEMA,
+            record_digest=False, max_bytes=_RUN_AUTHORITY_MAX_JOURNAL_BYTES,
+        )
+        fields = {
+            "schema_version", "namespace", "workspace_id", "runner_id", "runner_key_id", "operation",
+            "run_hash", "old_index_digest", "next_index", "record", "recovery", "created_at_ms",
+            "signing_key_id", "signature_b64",
+        }
+        if (
+            set(checked) != fields or checked["namespace"] != self.namespace
+            or checked["workspace_id"] != identity.workspace_id or checked["runner_id"] != identity.runner_id
+            or checked["runner_key_id"] != identity.key_id or checked["operation"] not in {"reserve", "terminal", "prune"}
+            or _RUN_FILENAME.fullmatch(checked["run_hash"]) is None
+            or _DIGEST.fullmatch(checked["old_index_digest"]) is None
+            or type(checked["created_at_ms"]) is not int or checked["created_at_ms"] < 0
+            or not isinstance(checked["next_index"], Mapping) or not isinstance(checked["record"], Mapping)
+            or not isinstance(checked["recovery"], Mapping)
+        ):
+            raise RunnerStoreError("local run authority journal is invalid")
+        return checked
+
+    @staticmethod
+    def _ensure_json_exact(directory_fd: int, filename: str, value: Mapping[str, Any]) -> None:
+        existing = _read_json(directory_fd, filename, None)
+        if existing is None:
+            _create_json(directory_fd, filename, dict(value))
+        elif existing != dict(value):
+            raise RunnerStoreError("local run authority record collision")
+
+    def _complete_run_authority_journal_locked(
+        self, context_fd: int, runs_fd: int, *, identity: RunnerIdentity,
+    ) -> bool:
+        """Roll one signed run-authority mutation forward; never scan or roll back."""
+        journal_value = _read_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, None)
+        if journal_value is None:
+            return False
+        journal = self._validate_run_authority_journal(journal_value, identity=identity)
+        current = self._run_authority_index_locked(runs_fd, identity=identity)
+        next_index = self._validate_run_authority_index_value(
+            journal["next_index"], identity=identity,
+        )
+        if self._run_authority_index_digest(current) not in {
+            journal["old_index_digest"], self._run_authority_index_digest(next_index),
+        }:
+            raise RunnerStoreError("local run authority journal index changed")
+        operation = journal["operation"]
+        run_hash = journal["run_hash"]
+        record_schema = {
+            "reserve": _RUN_RESERVATION_RECORD_SCHEMA,
+            "terminal": _RUN_TERMINAL_RECORD_SCHEMA,
+            "prune": _RUN_PRUNED_RECORD_SCHEMA,
+        }[operation]
+        record = self._verify_signed_run_authority_value(
+            journal["record"], identity=identity, schema=record_schema,
+            record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+        )
+        if record.get("run_hash") != run_hash:
+            raise RunnerStoreError("local run authority journal record changed")
+        recovery = journal["recovery"]
+        if operation == "reserve":
+            try:
+                grant = validate_execution_grant(recovery["grant"])
+            except (KeyError, TypeError, ValueError):
+                raise RunnerStoreError("local run authority reservation recovery is invalid") from None
+            state = recovery.get("initial_state")
+            if (
+                not isinstance(state, Mapping) or grant["run_id"] != state.get("run_id")
+                or record.get("grant_id") != grant["grant_id"]
+                or record.get("grant_digest") != grant["grant_digest"]
+                or record.get("initial_state_digest") != canonical_digest(dict(state))
+            ):
+                raise RunnerStoreError("local run authority reservation recovery is invalid")
+            self._ensure_json_exact(runs_fd, f"grant-{grant['grant_digest']}.json", {
+                "schema_version": _RESERVATION_SCHEMA, "grant": grant, "initial_state": dict(state),
+            })
+            run_fd = _open_child(runs_fd, run_hash, create=True)
+            assert run_fd is not None
+            try:
+                _secure_directory(run_fd, "Heel local run directory")
+                self._ensure_json_exact(run_fd, "grant.json", grant)
+                self._ensure_json_exact(run_fd, "state.json", dict(state))
+            finally:
+                os.close(run_fd)
+            self._ensure_json_exact(
+                runs_fd, self._run_authority_record_filename("reserve", run_hash), record,
+            )
+        elif operation == "terminal":
+            state = recovery.get("terminal_state")
+            if not isinstance(state, Mapping) or state.get("state") != "terminal":
+                raise RunnerStoreError("local run authority terminal recovery is invalid")
+            run_fd = _open_child(runs_fd, run_hash, create=False)
+            if run_fd is None:
+                raise RunnerStoreError("local run authority terminal recovery is invalid")
+            try:
+                _secure_directory(run_fd, "Heel local run directory")
+                stored_state = _read_json(run_fd, "state.json", None)
+                if stored_state is None or stored_state != dict(state):
+                    _write_json(run_fd, "state.json", dict(state))
+            finally:
+                os.close(run_fd)
+            self._ensure_json_exact(
+                runs_fd, self._run_authority_record_filename("terminal", run_hash), record,
+            )
+        else:
+            if set(recovery) != {"retention_expires_at_ms"} or recovery["retention_expires_at_ms"] != record.get("retention_expires_at_ms"):
+                raise RunnerStoreError("local run authority prune recovery is invalid")
+            self._ensure_json_exact(
+                runs_fd, self._run_authority_record_filename("prune", run_hash), record,
+            )
+            run_fd = _open_child(runs_fd, run_hash, create=False)
+            if run_fd is not None:
+                try:
+                    _secure_directory(run_fd, "Heel retained local run directory")
+                    self._delete_directory_contents(run_fd)
+                finally:
+                    os.close(run_fd)
+                os.rmdir(run_hash, dir_fd=runs_fd)
+        if self._run_authority_index_digest(current) == journal["old_index_digest"]:
+            _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
+        os.unlink(_RUN_AUTHORITY_JOURNAL_FILENAME, dir_fd=runs_fd)
+        os.fsync(runs_fd)
+        return True
 
     @property
     def namespace(self) -> str:
@@ -819,6 +1293,7 @@ class RunnerStore:
         self._bind_context(
             context, identity=identity, signer=signer, signer_label=signer_label, publish_active=True,
         )
+        self._pin_runtime_authority(identity, signer)
 
     def _bind_context(
         self,
@@ -867,8 +1342,13 @@ class RunnerStore:
                                 raise ValueError(
                                     "bound context cannot be rebound to another runner or target"
                                 )
+                            initial_bind = existing is None
                             if existing is None:
                                 _write_json(context_fd, "binding.json", binding)
+                            self._initialize_run_authority_index_locked(
+                                context_fd, context=context, identity=identity, signer=signer,
+                                initial_bind=initial_bind,
+                            )
                         if publish_active:
                             _write_json(runner_fd, "active-context.json", {
                                 "schema_version": "heel.active-runner-context.v1",
@@ -888,11 +1368,14 @@ class RunnerStore:
         rollover_evidence: RunnerContextRolloverEvidence | None = None,
     ) -> RunnerContext:
         """Install first/idempotent/expired authority; current rollover is coordinator-only."""
-        return self._install_cloud_context_binding(
+        self._pin_runtime_authority(identity, signer)
+        context = self._install_cloud_context_binding(
             artifact, identity=identity, signer=signer, signer_label=signer_label,
             trusted_cloud_keys=trusted_cloud_keys, now_ms=now_ms,
             rollover_evidence=rollover_evidence, rollover_receipt=None,
         )
+        self._pin_runtime_authority(identity, signer)
+        return context
 
     def _install_cloud_context_binding_from_control(
         self, artifact: object, *, identity: RunnerIdentity, signer: SecureSigner,
@@ -900,16 +1383,19 @@ class RunnerStore:
         rollover_receipt: object,
     ) -> RunnerContext:
         """Internal coordinator path for a one-use authenticated list→claim receipt."""
+        self._pin_runtime_authority(identity, signer)
         try:
             from heel.runner.control_client import _registered_rollover_receipt
             _registered_rollover_receipt(rollover_receipt, self)
         except (ImportError, ValueError):
             raise RunnerStoreError("cloud context rollover receipt is invalid") from None
-        return self._install_cloud_context_binding(
+        context = self._install_cloud_context_binding(
             artifact, identity=identity, signer=signer, signer_label=signer_label,
             trusted_cloud_keys=trusted_cloud_keys, now_ms=now_ms,
             rollover_evidence=None, rollover_receipt=rollover_receipt,
         )
+        self._pin_runtime_authority(identity, signer)
+        return context
 
     def _install_cloud_context_binding(
         self, artifact: object, *, identity: RunnerIdentity, signer: SecureSigner,
@@ -1228,52 +1714,18 @@ class RunnerStore:
         }
 
     def _has_nonterminal_local_run(self, context_fd: int) -> bool:
+        identity, _signer = self._require_runtime_authority()
         runs_fd = _open_child(context_fd, "runs", create=False)
         if runs_fd is None:
-            return False
+            raise RunnerStoreError("local run authority index is unavailable")
         try:
             _secure_directory(runs_fd, "Heel runner runs directory")
-            run_names: set[str] = set()
-            reservation_names: set[str] = set()
-            for run_name in sorted(os.listdir(runs_fd)):
-                if _RUN_FILENAME.fullmatch(run_name) is not None:
-                    run_names.add(run_name)
-                    continue
-                marker = _RUN_RESERVATION_FILENAME.fullmatch(run_name)
-                if marker is None:
-                    raise RunnerStoreError("invalid local run reservation")
-                value = _read_json(runs_fd, run_name, None)
-                try:
-                    if not isinstance(value, Mapping) or set(value) != {
-                        "schema_version", "grant", "initial_state",
-                    } or value["schema_version"] != _RESERVATION_SCHEMA:
-                        raise ValueError
-                    grant = validate_execution_grant(value["grant"])
-                    if grant["grant_digest"] != marker.group(1):
-                        raise ValueError
-                except (TypeError, ValueError):
-                    raise RunnerStoreError("invalid local run reservation") from None
-                reservation_names.add(self._run_hash(grant["run_id"]))
-            # A durable consumption marker with no run directory is an unfinished
-            # reservation.  It is nonterminal authority, never safe to carry across
-            # a proof-generation rollover.
-            if not reservation_names.issubset(run_names):
-                return True
-            for run_name in sorted(run_names):
-                if run_name not in reservation_names:
-                    raise RunnerStoreError("invalid local run reservation")
-                run_fd = os.open(run_name, _DIRECTORY_FLAGS, dir_fd=runs_fd)
-                try:
-                    _secure_directory(run_fd, "Heel local run directory")
-                    state = _read_json(run_fd, "state.json", None)
-                    if not isinstance(state, Mapping) or type(state.get("run_id")) is not str:
-                        raise RunnerStoreError("invalid local run state")
-                    checked = self._run_state_locked(run_fd, state["run_id"])
-                    if checked["state"] != "terminal":
-                        return True
-                finally:
-                    os.close(run_fd)
-            return False
+            self._complete_run_authority_journal_locked(
+                context_fd, runs_fd, identity=identity,
+            )
+            return self._run_authority_index_locked(
+                runs_fd, identity=identity,
+            )["nonterminal_count"] != 0
         finally:
             os.close(runs_fd)
 
@@ -2130,6 +2582,7 @@ class RunnerStore:
         self, grant: Mapping[str, Any], *, retention_expires_at_ms: int,
     ) -> dict[str, Any]:
         """Atomically consume one exact grant into a new local run namespace."""
+        identity, signer = self._require_runtime_authority()
         grant = validate_execution_grant(grant)
         if (
             isinstance(retention_expires_at_ms, bool)
@@ -2174,28 +2627,60 @@ class RunnerStore:
             assert runs_fd is not None
             try:
                 _secure_directory(runs_fd, "Heel runner runs directory")
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity,
+                )
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                run_hash = self._run_hash(run_id)
                 consumed_name = f"grant-{grant['grant_digest']}.json"
+                marker = {
+                    "schema_version": _RESERVATION_SCHEMA,
+                    "grant": grant,
+                    "initial_state": state,
+                }
+                existing_marker = _read_json(runs_fd, consumed_name, None)
+                reservation_name = self._run_authority_record_filename("reserve", run_hash)
+                if existing_marker is not None:
+                    if existing_marker != marker:
+                        raise ValueError("execution grant was already consumed")
+                    record = _read_json(runs_fd, reservation_name, None)
+                    if record is None:
+                        raise RunnerStoreError("local run authority reservation is unavailable")
+                    self._verify_signed_run_authority_value(
+                        record, identity=identity, schema=_RUN_RESERVATION_RECORD_SCHEMA,
+                        record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                    )
+                    with self._open_run(context_fd, run_id, create=False) as run_fd:
+                        return self._run_state_locked(run_fd, run_id)
+                if index["nonterminal_count"] + len(index["terminal_queue"]) >= _RUN_AUTHORITY_MAX_TRACKED:
+                    raise RunnerStoreError("local run authority capacity is exhausted")
+                record = self._run_authority_record(
+                    operation="reserve", context=context, identity=identity, signer=signer,
+                    run_hash=run_hash, grant=grant, state=state, index=index,
+                )
+                next_index = self._next_run_authority_index(
+                    index, signer=signer, delta=1, head_digest=record["record_digest"],
+                )
+                journal = self._run_authority_journal(
+                    context=context, identity=identity, signer=signer, operation="reserve",
+                    run_hash=run_hash, index=index, next_index=next_index, record=record,
+                    recovery={"grant": grant, "initial_state": state},
+                    created_at_ms=grant["issued_at_ms"],
+                )
+                _write_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, journal)
+                self._ensure_json_exact(runs_fd, consumed_name, marker)
+                run_fd = _open_child(runs_fd, run_hash, create=True)
+                assert run_fd is not None
                 try:
-                    _create_json(runs_fd, consumed_name, {
-                        "schema_version": _RESERVATION_SCHEMA,
-                        "grant": grant,
-                        "initial_state": state,
-                    })
-                except FileExistsError:
-                    raise ValueError("execution grant was already consumed") from None
-                run_fd = -1
-                try:
-                    opened = _open_child(runs_fd, self._run_hash(run_id), create=True)
-                    assert opened is not None
-                    run_fd = opened
                     _secure_directory(run_fd, "Heel local run directory")
-                    if _read_json(run_fd, "state.json", None) is not None:
-                        raise RunnerStoreError("immutable local run collision")
-                    _create_json(run_fd, "grant.json", grant)
-                    _create_json(run_fd, "state.json", state)
+                    self._ensure_json_exact(run_fd, "grant.json", grant)
+                    self._ensure_json_exact(run_fd, "state.json", state)
                 finally:
-                    if run_fd >= 0:
-                        os.close(run_fd)
+                    os.close(run_fd)
+                self._ensure_json_exact(runs_fd, reservation_name, record)
+                _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
+                os.unlink(_RUN_AUTHORITY_JOURNAL_FILENAME, dir_fd=runs_fd)
+                os.fsync(runs_fd)
             finally:
                 os.close(runs_fd)
         return state
@@ -2203,55 +2688,49 @@ class RunnerStore:
     def recover_run_reservation(self, run_id: str) -> dict[str, Any]:
         """Reconstruct the run namespace from its immutable consumption journal."""
         run_id = _id(run_id, "run ID")
+        identity, _signer = self._require_runtime_authority()
         with self._transaction(exclusive=True) as context_fd:
             runs_fd = _open_child(context_fd, "runs", create=False)
             if runs_fd is None:
                 raise RunnerStoreError("local run reservation is unavailable")
             try:
                 _secure_directory(runs_fd, "Heel runner runs directory")
-                matching: list[tuple[dict[str, Any], dict[str, Any]]] = []
-                legacy_seen = False
-                for name in sorted(os.listdir(runs_fd)):
-                    if not name.startswith("grant-") or not name.endswith(".json"):
-                        continue
-                    value = _read_json(runs_fd, name, None)
-                    if (
-                        isinstance(value, Mapping)
-                        and value.get("schema_version") == "heel.local-grant-consumption.v1"
-                        and value.get("run_id") == run_id
-                    ):
-                        legacy_seen = True
-                        continue
-                    if (
-                        not isinstance(value, Mapping)
-                        or set(value) != {"schema_version", "grant", "initial_state"}
-                        or value["schema_version"] != _RESERVATION_SCHEMA
-                    ):
-                        continue
-                    try:
-                        grant = validate_execution_grant(value["grant"])
-                    except (TypeError, ValueError):
-                        raise RunnerStoreError("invalid local run reservation journal") from None
-                    state = value["initial_state"]
-                    if grant["run_id"] != run_id:
-                        continue
-                    if (
-                        not isinstance(state, Mapping)
-                        or state.get("run_id") != run_id
-                        or state.get("state") != "verified"
-                        or state.get("grant_id") != grant["grant_id"]
-                        or state.get("grant_digest") != grant["grant_digest"]
-                        or state.get("manifest_digest") != grant["approval"]["manifest_digest"]
-                    ):
-                        raise RunnerStoreError("invalid local run reservation journal")
-                    matching.append((grant, dict(state)))
-                if len(matching) != 1:
-                    if legacy_seen:
-                        raise RunnerStoreError(
-                            "legacy grant marker cannot reconstruct missing run state"
-                        )
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity,
+                )
+                self._run_authority_index_locked(runs_fd, identity=identity)
+                run_hash = self._run_hash(run_id)
+                if _read_json(runs_fd, self._run_authority_record_filename("prune", run_hash), None) is not None:
                     raise RunnerStoreError("local run reservation is unavailable")
-                grant, state = matching[0]
+                record = _read_json(
+                    runs_fd, self._run_authority_record_filename("reserve", run_hash), None,
+                )
+                if record is None:
+                    raise RunnerStoreError("local run reservation is unavailable")
+                checked = self._verify_signed_run_authority_value(
+                    record, identity=identity, schema=_RUN_RESERVATION_RECORD_SCHEMA,
+                    record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                )
+                marker = _read_json(runs_fd, f"grant-{checked.get('grant_digest')}.json", None)
+                if (
+                    not isinstance(marker, Mapping) or set(marker) != {
+                        "schema_version", "grant", "initial_state",
+                    } or marker["schema_version"] != _RESERVATION_SCHEMA
+                ):
+                    raise RunnerStoreError("invalid local run reservation journal")
+                try:
+                    grant = validate_execution_grant(marker["grant"])
+                except (TypeError, ValueError):
+                    raise RunnerStoreError("invalid local run reservation journal") from None
+                state = marker["initial_state"]
+                if (
+                    grant["run_id"] != run_id or checked.get("run_hash") != run_hash
+                    or checked.get("grant_id") != grant["grant_id"]
+                    or checked.get("grant_digest") != grant["grant_digest"]
+                    or not isinstance(state, Mapping) or state.get("run_id") != run_id
+                    or state.get("state") != "verified" or checked.get("initial_state_digest") != canonical_digest(dict(state))
+                ):
+                    raise RunnerStoreError("invalid local run reservation journal")
                 run_fd = _open_child(runs_fd, self._run_hash(run_id), create=True)
                 assert run_fd is not None
                 try:
@@ -2263,13 +2742,162 @@ class RunnerStore:
                         raise RunnerStoreError("immutable local run grant collision")
                     stored_state = _read_json(run_fd, "state.json", None)
                     if stored_state is None:
-                        _create_json(run_fd, "state.json", state)
+                        _create_json(run_fd, "state.json", dict(state))
                     recovered = self._run_state_locked(run_fd, run_id)
                     os.fsync(run_fd)
                 finally:
                     os.close(run_fd)
                 os.fsync(runs_fd)
                 return recovered
+            finally:
+                os.close(runs_fd)
+
+    def upgrade_legacy_run_authority_index(self) -> None:
+        """Perform the one explicit, authenticated audit for a pre-ledger run tree."""
+        identity, signer = self._require_runtime_authority()
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local run authority index is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                if _read_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, None) is not None:
+                    raise RunnerStoreError("local run authority upgrade requires journal recovery")
+                existing_index = _read_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, None)
+                if existing_index is not None:
+                    self._run_authority_index_locked(runs_fd, identity=identity)
+                    return
+                with os.scandir(runs_fd) as entries:
+                    names = sorted(entry.name for entry in entries)
+                marker_names: list[str] = []
+                run_names: set[str] = set()
+                for name in names:
+                    if name.startswith("grant-") and name.endswith(".json"):
+                        digest = name[6:-5]
+                        if _DIGEST.fullmatch(digest) is None:
+                            raise RunnerStoreError("legacy local run authority is invalid")
+                        marker_names.append(name)
+                    elif _RUN_FILENAME.fullmatch(name) is not None:
+                        status = os.stat(name, dir_fd=runs_fd, follow_symlinks=False)
+                        if not stat.S_ISDIR(status.st_mode):
+                            raise RunnerStoreError("legacy local run authority is invalid")
+                        run_names.add(name)
+                    elif (
+                        name.startswith(("reservation-", "terminal-", "pruned-"))
+                        and name.endswith(".json")
+                    ):
+                        continue
+                    else:
+                        raise RunnerStoreError("legacy local run authority is invalid")
+
+                context = _context_from_dict(self._binding_locked(context_fd)["context"])
+                index = self._zero_run_authority_index(
+                    context=context, identity=identity, signer=signer,
+                )
+                seen_runs: set[str] = set()
+                terminal_items: list[dict[str, Any]] = []
+                for marker_name in marker_names:
+                    marker = _read_json(runs_fd, marker_name, None)
+                    if not isinstance(marker, Mapping) or set(marker) != {
+                        "schema_version", "grant", "initial_state",
+                    } or marker["schema_version"] != _RESERVATION_SCHEMA:
+                        raise RunnerStoreError("legacy local run authority is invalid")
+                    try:
+                        grant = validate_execution_grant(marker["grant"])
+                    except (TypeError, ValueError):
+                        raise RunnerStoreError("legacy local run authority is invalid") from None
+                    run_hash = self._run_hash(grant["run_id"])
+                    if run_hash not in run_names or run_hash in seen_runs or marker_name != f"grant-{grant['grant_digest']}.json":
+                        raise RunnerStoreError("legacy local run authority is invalid")
+                    seen_runs.add(run_hash)
+                    initial_state = marker["initial_state"]
+                    if (
+                        not isinstance(initial_state, Mapping)
+                        or set(initial_state) != {
+                            "schema_version", "run_id", "grant_id", "grant_digest", "manifest_digest",
+                            "runner_authority", "state", "retention_expires_at_ms", "updated_at_ms",
+                        }
+                        or initial_state.get("schema_version") != "heel.local-run-state.v1"
+                        or initial_state.get("run_id") != grant["run_id"]
+                        or initial_state.get("grant_id") != grant["grant_id"]
+                        or initial_state.get("grant_digest") != grant["grant_digest"]
+                        or initial_state.get("manifest_digest") != grant["approval"]["manifest_digest"]
+                        or initial_state.get("state") != "verified"
+                        or any(
+                            type(initial_state.get(field)) is not int or initial_state[field] < 0
+                            for field in ("retention_expires_at_ms", "updated_at_ms")
+                        )
+                    ):
+                        raise RunnerStoreError("legacy local run authority is invalid")
+                    run_fd = _open_child(runs_fd, run_hash, create=False)
+                    if run_fd is None:
+                        raise RunnerStoreError("legacy local run authority is invalid")
+                    try:
+                        _secure_directory(run_fd, "Heel legacy local run directory")
+                        current_state = self._run_state_locked(run_fd, grant["run_id"])
+                        if (
+                            current_state["grant_id"] != grant["grant_id"]
+                            or current_state["grant_digest"] != grant["grant_digest"]
+                            or current_state["manifest_digest"] != initial_state["manifest_digest"]
+                            or current_state["runner_authority"] != initial_state["runner_authority"]
+                            or current_state["retention_expires_at_ms"] != initial_state["retention_expires_at_ms"]
+                        ):
+                            raise RunnerStoreError("legacy local run authority is invalid")
+                        reservation = self._run_authority_record(
+                            operation="reserve", context=context, identity=identity, signer=signer,
+                            run_hash=run_hash, grant=grant, state=initial_state, index=index,
+                        )
+                        self._ensure_json_exact(
+                            runs_fd, self._run_authority_record_filename("reserve", run_hash), reservation,
+                        )
+                        index = self._next_run_authority_index(
+                            index, signer=signer, delta=1, head_digest=reservation["record_digest"],
+                        )
+                        if current_state["state"] == "terminal":
+                            finals = _read_json(run_fd, "finals.json", None)
+                            if (
+                                not isinstance(finals, Mapping)
+                                or set(finals) != {
+                                    "schema_version", "operational_projection", "findings_projection",
+                                    "local_view", "disclosure_preview", "finals_digest",
+                                }
+                                or finals["schema_version"] != _FINALS_SCHEMA
+                            ):
+                                raise RunnerStoreError("legacy terminal local run is invalid")
+                            final_core = {
+                                key: finals[key] for key in finals if key != "finals_digest"
+                            }
+                            if finals["finals_digest"] != canonical_digest(final_core):
+                                raise RunnerStoreError("legacy terminal local run is invalid")
+                            operational = validate_operational_run(finals["operational_projection"])
+                            terminal = self._run_authority_record(
+                                operation="terminal", context=context, identity=identity, signer=signer,
+                                run_hash=run_hash, grant=grant, state=current_state, index=index,
+                                terminal={
+                                    "reservation_record_digest": reservation["record_digest"],
+                                    "terminal_projection_digest": operational["projection_digest"],
+                                },
+                            )
+                            self._ensure_json_exact(
+                                runs_fd, self._run_authority_record_filename("terminal", run_hash), terminal,
+                            )
+                            terminal_items.append({
+                                "retention_expires_at_ms": current_state["retention_expires_at_ms"],
+                                "run_hash": run_hash,
+                                "terminal_record_digest": terminal["record_digest"],
+                            })
+                            index = self._next_run_authority_index(
+                                index, signer=signer, delta=-1, head_digest=terminal["record_digest"],
+                                terminal_queue=sorted(
+                                    terminal_items,
+                                    key=lambda item: (item["retention_expires_at_ms"], item["run_hash"]),
+                                ),
+                            )
+                    finally:
+                        os.close(run_fd)
+                if run_names != seen_runs:
+                    raise RunnerStoreError("legacy local run authority is invalid")
+                _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, index)
             finally:
                 os.close(runs_fd)
 
@@ -2305,20 +2933,119 @@ class RunnerStore:
             raise RunnerStoreError("invalid stored execution grant") from None
 
     def transition_run(self, run_id: str, next_state: str, *, now_ms: int) -> dict[str, Any]:
+        identity, signer = self._require_runtime_authority()
         if next_state not in _RUN_STATES:
             raise ValueError("invalid local run state")
         if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
             raise ValueError("invalid local run timestamp")
+        terminal_projection_digest: str | None = None
+        bound_context: RunnerContext | None = None
+        if next_state == "terminal":
+            terminal_projection_digest = self.load_final_projections(run_id)["operational_projection"]["projection_digest"]
+            bound_context = self.load_context()
         with self._transaction(exclusive=True) as context_fd:
-            with self._open_run(context_fd, run_id, create=False) as run_fd:
-                current = self._run_state_locked(run_fd, run_id)
-                if next_state not in _RUN_TRANSITIONS[current["state"]]:
-                    raise RunnerStoreError("illegal local run transition")
-                if now_ms < current["updated_at_ms"]:
-                    raise RunnerStoreError("local run timestamp moved backward")
-                updated = {**current, "state": next_state, "updated_at_ms": now_ms}
-                _write_json(run_fd, "state.json", updated)
-                return updated
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local run is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity,
+                )
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                run_hash = self._run_hash(run_id)
+                run_fd = _open_child(runs_fd, run_hash, create=False)
+                if run_fd is None:
+                    raise RunnerStoreError("local run is unavailable")
+                try:
+                    _secure_directory(run_fd, "Heel local run directory")
+                    current = self._run_state_locked(run_fd, run_id)
+                    if next_state not in _RUN_TRANSITIONS[current["state"]]:
+                        raise RunnerStoreError("illegal local run transition")
+                    if now_ms < current["updated_at_ms"]:
+                        raise RunnerStoreError("local run timestamp moved backward")
+                    updated = {**current, "state": next_state, "updated_at_ms": now_ms}
+                    if next_state != "terminal":
+                        _write_json(run_fd, "state.json", updated)
+                        return updated
+                    existing_terminal = next(
+                        (item for item in index["terminal_queue"] if item["run_hash"] == run_hash),
+                        None,
+                    )
+                    if existing_terminal is not None:
+                        existing_record = _read_json(
+                            runs_fd,
+                            self._run_authority_record_filename("terminal", run_hash),
+                            None,
+                        )
+                        if existing_record is None:
+                            raise RunnerStoreError("local run authority terminal queue is invalid")
+                        existing_record = self._verify_signed_run_authority_value(
+                            existing_record, identity=identity, schema=_RUN_TERMINAL_RECORD_SCHEMA,
+                            record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                        )
+                        if (
+                            existing_record["record_digest"] != existing_terminal["terminal_record_digest"]
+                            or existing_record.get("terminal_projection_digest") != terminal_projection_digest
+                        ):
+                            raise RunnerStoreError("local run authority terminal queue is invalid")
+                        # A crash can leave the durable authority terminal record/index ahead of
+                        # the mutable run state.  The immutable record is the commitment; restore
+                        # only the state marker instead of minting a second terminal record.
+                        _write_json(run_fd, "state.json", updated)
+                        return updated
+                    reservation = _read_json(
+                        runs_fd, self._run_authority_record_filename("reserve", run_hash), None,
+                    )
+                    if reservation is None:
+                        raise RunnerStoreError("local run authority reservation is unavailable")
+                    reservation = self._verify_signed_run_authority_value(
+                        reservation, identity=identity, schema=_RUN_RESERVATION_RECORD_SCHEMA,
+                        record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                    )
+                    grant = _read_json(run_fd, "grant.json", None)
+                    try:
+                        grant = validate_execution_grant(grant)
+                    except (TypeError, ValueError):
+                        raise RunnerStoreError("invalid stored execution grant") from None
+                    terminal = {
+                        "reservation_record_digest": reservation["record_digest"],
+                        "terminal_projection_digest": terminal_projection_digest,
+                    }
+                    record = self._run_authority_record(
+                        operation="terminal", context=bound_context, identity=identity, signer=signer,
+                        run_hash=run_hash, grant=grant, state=updated, index=index, terminal=terminal,
+                    )
+                    queue_item = {
+                        "retention_expires_at_ms": updated["retention_expires_at_ms"],
+                        "run_hash": run_hash, "terminal_record_digest": record["record_digest"],
+                    }
+                    terminal_queue = sorted(
+                        [*index["terminal_queue"], queue_item],
+                        key=lambda item: (item["retention_expires_at_ms"], item["run_hash"]),
+                    )
+                    next_index = self._next_run_authority_index(
+                        index, signer=signer, delta=-1, head_digest=record["record_digest"],
+                        terminal_queue=terminal_queue,
+                    )
+                    journal = self._run_authority_journal(
+                        context=bound_context, identity=identity, signer=signer, operation="terminal",
+                        run_hash=run_hash, index=index, next_index=next_index, record=record,
+                        recovery={"terminal_state": updated}, created_at_ms=now_ms,
+                    )
+                    _write_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, journal)
+                    _write_json(run_fd, "state.json", updated)
+                    self._ensure_json_exact(
+                        runs_fd, self._run_authority_record_filename("terminal", run_hash), record,
+                    )
+                    _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
+                    os.unlink(_RUN_AUTHORITY_JOURNAL_FILENAME, dir_fd=runs_fd)
+                    os.fsync(runs_fd)
+                    return updated
+                finally:
+                    os.close(run_fd)
+            finally:
+                os.close(runs_fd)
 
     def load_run_events(self, run_id: str) -> list[dict[str, Any]]:
         with self._transaction(exclusive=False) as context_fd:
@@ -2460,6 +3187,7 @@ class RunnerStore:
     ) -> None:
         from heel.runner.companion import validate_disclosure_preview, validate_local_result_view
 
+        identity, _signer = self._require_runtime_authority()
         operational = validate_operational_run(operational_projection)
         findings = validate_canary_findings(findings_projection)
         keys = self.load_run_trusted_keys(run_id)
@@ -2504,13 +3232,44 @@ class RunnerStore:
         }
         envelope = {**final_core, "finals_digest": canonical_digest(final_core)}
         with self._transaction(exclusive=True) as context_fd:
-            with self._open_run(context_fd, run_id, create=False) as run_fd:
-                self._run_state_locked(run_fd, run_id)
-                try:
-                    _create_json(run_fd, "finals.json", envelope)
-                except FileExistsError:
-                    if _read_json(run_fd, "finals.json", None) != envelope:
-                        raise RunnerStoreError("immutable final projection collision") from None
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local run is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity,
+                )
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                run_hash = self._run_hash(run_id)
+                terminal = next(
+                    (item for item in index["terminal_queue"] if item["run_hash"] == run_hash),
+                    None,
+                )
+                if terminal is not None:
+                    record = _read_json(
+                        runs_fd, self._run_authority_record_filename("terminal", run_hash), None,
+                    )
+                    if record is None:
+                        raise RunnerStoreError("local run authority terminal queue is invalid")
+                    record = self._verify_signed_run_authority_value(
+                        record, identity=identity, schema=_RUN_TERMINAL_RECORD_SCHEMA,
+                        record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                    )
+                    if (
+                        record["record_digest"] != terminal["terminal_record_digest"]
+                        or record["terminal_projection_digest"] != operational["projection_digest"]
+                    ):
+                        raise RunnerStoreError("local run authority terminal queue is invalid")
+                with self._open_run(context_fd, run_id, create=False) as run_fd:
+                    self._run_state_locked(run_fd, run_id)
+                    try:
+                        _create_json(run_fd, "finals.json", envelope)
+                    except FileExistsError:
+                        if _read_json(run_fd, "finals.json", None) != envelope:
+                            raise RunnerStoreError("immutable final projection collision") from None
+            finally:
+                os.close(runs_fd)
 
     def load_final_projections(self, run_id: str) -> dict[str, Any]:
         with self._transaction(exclusive=False) as context_fd:
@@ -2746,7 +3505,9 @@ class RunnerStore:
     @staticmethod
     def _delete_directory_contents(directory_fd: int) -> None:
         """Delete only validated owner-controlled files/directories below an anchored fd."""
-        for name in os.listdir(directory_fd):
+        with os.scandir(directory_fd) as entries:
+            names = [entry.name for entry in entries]
+        for name in names:
             if name in {".", ".."} or "/" in name or "\x00" in name:
                 raise RunnerStoreError("unsafe local retention entry")
             status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -2840,6 +3601,7 @@ class RunnerStore:
         return removed
 
     def prune_expired_runs(self, *, now_ms: int) -> int:
+        identity, signer = self._require_runtime_authority()
         if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
             raise ValueError("invalid local retention time")
         removed = 0
@@ -2849,28 +3611,80 @@ class RunnerStore:
                 return 0
             try:
                 _secure_directory(runs_fd, "Heel runner runs directory")
-                for name in sorted(os.listdir(runs_fd)):
-                    if _RUN_FILENAME.fullmatch(name) is None:
-                        continue  # immutable grant-consumption markers intentionally remain
-                    run_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=runs_fd)
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity,
+                )
+                for _ in range(_RUN_PRUNE_BATCH):
+                    index = self._run_authority_index_locked(runs_fd, identity=identity)
+                    if not index["terminal_queue"] or index["terminal_queue"][0]["retention_expires_at_ms"] > now_ms:
+                        break
+                    queue_item = index["terminal_queue"][0]
+                    run_hash = queue_item["run_hash"]
+                    terminal_record = _read_json(
+                        runs_fd, self._run_authority_record_filename("terminal", run_hash), None,
+                    )
+                    if terminal_record is None:
+                        raise RunnerStoreError("local terminal authority record is unavailable")
+                    terminal_record = self._verify_signed_run_authority_value(
+                        terminal_record, identity=identity, schema=_RUN_TERMINAL_RECORD_SCHEMA,
+                        record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                    )
+                    if terminal_record.get("record_digest") != queue_item["terminal_record_digest"]:
+                        raise RunnerStoreError("local terminal authority queue is invalid")
+                    run_fd = _open_child(runs_fd, run_hash, create=False)
+                    if run_fd is None:
+                        raise RunnerStoreError("local terminal authority run is unavailable")
                     try:
                         _secure_directory(run_fd, "Heel retained local run directory")
-                        state = _read_json(run_fd, "state.json", None)
+                        grant = _read_json(run_fd, "grant.json", None)
+                        try:
+                            grant = validate_execution_grant(grant)
+                        except (TypeError, ValueError):
+                            raise RunnerStoreError("invalid stored execution grant") from None
+                        state = self._run_state_locked(run_fd, grant["run_id"])
+                        finals = _read_json(run_fd, "finals.json", None)
                         if (
-                            not isinstance(state, Mapping)
-                            or state.get("state") != "terminal"
-                            or isinstance(state.get("retention_expires_at_ms"), bool)
-                            or not isinstance(state.get("retention_expires_at_ms"), int)
-                            or state["retention_expires_at_ms"] > now_ms
+                            state["state"] != "terminal"
+                            or state["retention_expires_at_ms"] != queue_item["retention_expires_at_ms"]
+                            or not isinstance(finals, Mapping)
+                            or finals.get("schema_version") != _FINALS_SCHEMA
+                            or terminal_record.get("terminal_state_digest") != canonical_digest(state)
+                            or terminal_record.get("terminal_projection_digest")
+                            != finals.get("operational_projection", {}).get("projection_digest")
                         ):
-                            continue
+                            raise RunnerStoreError("local terminal authority state is invalid")
+                        context = _context_from_dict(self._binding_locked(context_fd)["context"])
+                        record = self._run_authority_record(
+                            operation="prune", context=context, identity=identity, signer=signer,
+                            run_hash=run_hash, grant=grant, state=state, index=index,
+                            terminal={
+                                "terminal_record_digest": terminal_record["record_digest"],
+                                "terminal_projection_digest": terminal_record["terminal_projection_digest"],
+                                "terminal_at_ms": terminal_record["terminal_at_ms"],
+                            }, pruned_at_ms=now_ms,
+                        )
+                        next_index = self._next_run_authority_index(
+                            index, signer=signer, delta=0, head_digest=record["record_digest"],
+                            terminal_queue=list(index["terminal_queue"])[1:],
+                        )
+                        journal = self._run_authority_journal(
+                            context=context, identity=identity, signer=signer, operation="prune",
+                            run_hash=run_hash, index=index, next_index=next_index, record=record,
+                            recovery={"retention_expires_at_ms": state["retention_expires_at_ms"]},
+                            created_at_ms=now_ms,
+                        )
+                        _write_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, journal)
+                        self._ensure_json_exact(
+                            runs_fd, self._run_authority_record_filename("prune", run_hash), record,
+                        )
                         self._delete_directory_contents(run_fd)
                     finally:
                         os.close(run_fd)
-                    os.rmdir(name, dir_fd=runs_fd)
-                    removed += 1
-                if removed:
+                    os.rmdir(run_hash, dir_fd=runs_fd)
+                    _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
+                    os.unlink(_RUN_AUTHORITY_JOURNAL_FILENAME, dir_fd=runs_fd)
                     os.fsync(runs_fd)
+                    removed += 1
             finally:
                 os.close(runs_fd)
         return removed

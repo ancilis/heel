@@ -110,6 +110,7 @@ _CALL_DIAGNOSTIC_OPERATIONS = frozenset({
     "list-contexts", "claim-context", "submit-context-approval-projection",
 })
 _MAX_CALL_DIAGNOSTICS = 128
+_MAX_TRACKED_RUNS = 64
 _FINDINGS_RECEIPT_FIELDS = {
     "schema_version", "receipt_id", "workspace_id", "project_id", "run_id",
     "grant_id", "permit_id", "projection_id", "projection_digest", "byte_count",
@@ -216,7 +217,8 @@ class RunnerControlClient:
         )
         self._chains: dict[str, tuple[str, int, int]] = {}
         self._state_lock = threading.Lock()
-        self._chain_locks: dict[str, threading.Lock] = {}
+        self._run_lock_stripes = tuple(threading.Lock() for _ in range(_MAX_TRACKED_RUNS))
+        self._tracked_runs: set[str] = set()
         self._terminal_runs: set[str] = set()
         self._terminal_bindings: dict[str, tuple[str, str, str, str]] = {}
         self._context_receipt_client_instance = object()
@@ -259,8 +261,14 @@ class RunnerControlClient:
     def _next_chain(self, operation: str, run_id: str | None) -> tuple[str, int, int, str]:
         self._validate_chain(operation, run_id)
         chain = self._chain(operation, run_id)
+        if operation != "claim":
+            with self._state_lock:
+                if run_id not in self._tracked_runs:
+                    raise ValueError("active runner claim is required")
         current = self._chains.get(chain)
         if current is None:
+            if operation != "claim":
+                raise ValueError("active runner claim is required")
             nonce = self.nonce_source((operation, run_id))
             if type(nonce) is not str or not nonce: raise ValueError("a non-empty next nonce is required")
             # Do not persist speculative state. A malformed or rejected response must leave
@@ -361,12 +369,38 @@ class RunnerControlClient:
             ):
                 raise ValueError("runner control chain changed during request")
             staged[call.chain] = (next_nonce, call.sequence + 1, call.generation)
-            for chain_name, state in run_states.items():
-                self._stage_chain(staged, chain_name, state)
-            self._chains = staged
+            if operation == "claim" and body is not None:
+                claimed_run_id = body["run_id"]
+                if (
+                    claimed_run_id in self._tracked_runs
+                    or claimed_run_id in self._terminal_runs
+                    or claimed_run_id in self._terminal_bindings
+                    or any(name.endswith(":" + claimed_run_id) for name in staged)
+                ):
+                    raise ValueError("runner returned an already active claim")
+                if len(self._tracked_runs) >= _MAX_TRACKED_RUNS:
+                    raise ValueError("active runner claim capacity is exhausted")
+                for chain_name, state in run_states.items():
+                    self._stage_chain(staged, chain_name, state)
+                self._tracked_runs.add(claimed_run_id)
+            else:
+                for chain_name, state in run_states.items():
+                    self._stage_chain(staged, chain_name, state)
             if operation == "result" and body["status"] == "terminal":
+                if run_id not in self._tracked_runs or projection_binding is None:
+                    raise ValueError("active runner claim is required")
                 self._terminal_runs.add(run_id)
                 self._terminal_bindings[run_id] = projection_binding
+                for retired_operation in ("heartbeat", "progress", "stop-ack"):
+                    staged.pop(self._chain(retired_operation, run_id), None)
+            if operation == "upload-findings":
+                if run_id not in self._terminal_runs:
+                    raise ValueError("terminal runner result is required before disclosure")
+                staged.pop(self._chain("result", run_id), None)
+                self._tracked_runs.discard(run_id)
+                self._terminal_runs.discard(run_id)
+                self._terminal_bindings.pop(run_id, None)
+            self._chains = staged
             self._append_call_diagnostic_locked(operation, status, call)
         if include_response_metadata:
             return body, status, dict(headers)
@@ -374,12 +408,8 @@ class RunnerControlClient:
 
     def _operation_lock(self, operation: str, run_id: str | None) -> threading.Lock:
         chain = self._chain(operation, run_id)
-        with self._state_lock:
-            lock = self._chain_locks.get(chain)
-            if lock is None:
-                lock = threading.Lock()
-                self._chain_locks[chain] = lock
-            return lock
+        bucket = int.from_bytes(hashlib.sha256(chain.encode("utf-8")).digest()[:8], "big") % _MAX_TRACKED_RUNS
+        return self._run_lock_stripes[bucket]
 
     @staticmethod
     def _stage_chain(
@@ -553,6 +583,9 @@ class RunnerControlClient:
     ):
         projection_binding = None
         if operation == "claim":
+            with self._state_lock:
+                if len(self._tracked_runs) >= _MAX_TRACKED_RUNS:
+                    raise ValueError("active runner claim capacity is exhausted")
             request = validate_runner_claim_request({
                 "schema_version": "heel.runner-claim-request.v1",
             })
@@ -599,6 +632,10 @@ class RunnerControlClient:
         *, include_response_metadata: bool = False,
     ):
         self._validate_chain(operation, run_id)
+        if operation == "result":
+            with self._state_lock:
+                if run_id in self._terminal_runs:
+                    raise ValueError("terminal runner result is already recorded")
         with self._operation_lock(operation, run_id):
             return self._closed_control_locked(
                 operation, run_id, operational_projection,
@@ -991,6 +1028,10 @@ class RunnerControlClient:
 
     def start_resync(self, *, operation: str, run_id: str | None = None) -> PendingRunnerResync:
         self._validate_chain(operation, run_id)
+        if operation != "claim":
+            with self._state_lock:
+                if run_id not in self._tracked_runs:
+                    raise ValueError("active runner claim is required")
         client_nonce, chain = self._random_b64(), {"operation": operation, "run_id": run_id}
         path = f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/resync/start"
         body = canonical_bytes({"schema_version": "heel.runner-resync-start.v2", "chain": chain, "client_nonce_b64": client_nonce})
@@ -1018,6 +1059,10 @@ class RunnerControlClient:
     def complete_resync(self, pending: PendingRunnerResync) -> RecoveredRunnerChain:
         if not isinstance(pending, PendingRunnerResync): raise ValueError("pending runner resync is required")
         self._validate_chain(pending.operation, pending.run_id)
+        if pending.operation != "claim":
+            with self._state_lock:
+                if pending.run_id not in self._tracked_runs:
+                    raise ValueError("active runner claim is required")
         with self._operation_lock(pending.operation, pending.run_id):
             return self._complete_resync_locked(pending)
 

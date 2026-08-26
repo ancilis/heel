@@ -134,9 +134,88 @@ def test_context_cancellation_queue_defers_the_one_hundred_twenty_ninth_link_wit
         source.execute("BEGIN IMMEDIATE")
         linked = [coordinator.submit_projection_from_runner_in_transaction(
             unique_projection(index), binding, uploaded_by_runner_id=RUNNER,
-        ) for index in range(129)]
+        ) for index in range(64)]
+        # M22 intentionally admits at most 64 live signed submissions.  The
+        # cancellation-queue boundary remains a database/reaper concern, so
+        # retain 129 linked awaiting rows with canonical fixture copies rather
+        # than bypassing the new admission rule.
+        template_approval = linked[0]["approval_id"]
+        template_run = linked[0]["run_id"]
+        for index in range(64, 129):
+            approval_id = f"ap_{index:032x}"
+            run_id = f"crun_{index:032x}"
+            projection_digest = f"{index:064x}"
+            source.execute(
+                "INSERT INTO canary_approval_projections("
+                "approval_id,workspace_id,project_ref,run_id,environment_id,runner_id,runner_key_id,"
+                "manifest_digest,projection_digest,signing_key_id,status,projection_json,scenario_ids_json,"
+                "budgets_json,uploaded_by,created_at,expires_at,purge_at) "
+                "SELECT ?,workspace_id,project_ref,?,environment_id,runner_id,runner_key_id,"
+                "manifest_digest,?,signing_key_id,status,projection_json,scenario_ids_json,budgets_json,"
+                "uploaded_by,created_at,expires_at,purge_at "
+                "FROM canary_approval_projections WHERE approval_id=?",
+                (approval_id, run_id, projection_digest, template_approval),
+            )
+            source.execute(
+                "INSERT INTO canary_runs("
+                "run_id,workspace_id,project_ref,approval_id,grant_id,environment_id,runner_id,runner_key_id,"
+                "status,execution_disposition,error_category,stop_reason,source_event_sequence,"
+                "source_projection_digest,cloud_event_sequence,last_heartbeat_at_ms,last_gate_at_ms,"
+                "claimed_at_ms,started_at_ms,stop_requested_at_ms,stop_acknowledged_at_ms,terminal_at_ms,"
+                "stop_generation,stop_deadline_ms,stop_ack_late,reservation_id,quota_state,"
+                "kill_switch_generation,created_at,updated_at,purge_at) "
+                "SELECT ?,workspace_id,project_ref,?,grant_id,environment_id,runner_id,runner_key_id,"
+                "status,execution_disposition,error_category,stop_reason,source_event_sequence,"
+                "source_projection_digest,cloud_event_sequence,last_heartbeat_at_ms,last_gate_at_ms,"
+                "claimed_at_ms,started_at_ms,stop_requested_at_ms,stop_acknowledged_at_ms,terminal_at_ms,"
+                "stop_generation,stop_deadline_ms,stop_ack_late,reservation_id,quota_state,"
+                "kill_switch_generation,created_at,updated_at,purge_at "
+                "FROM canary_runs WHERE run_id=?",
+                (run_id, approval_id, template_run),
+            )
+            source.execute(
+                "INSERT INTO canary_runner_context_projection_links("
+                "workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id,"
+                "rcb_id,binding_digest,projection_digest,created_at_ms) "
+                "SELECT workspace_id,project_ref,?,?,environment_id,runner_id,runner_key_id,"
+                "rcb_id,binding_digest,?,created_at_ms "
+                "FROM canary_runner_context_projection_links WHERE approval_id=? AND run_id=?",
+                (approval_id, run_id, projection_digest, template_approval, template_run),
+            )
+            linked.append({"approval_id": approval_id, "run_id": run_id})
+        unlinked_approval = "ap_" + "f" * 32
+        unlinked_run = "crun_" + "f" * 32
+        unlinked_digest = "f" * 63 + "e"
+        source.execute(
+            "INSERT INTO canary_approval_projections("
+            "approval_id,workspace_id,project_ref,run_id,environment_id,runner_id,runner_key_id,"
+            "manifest_digest,projection_digest,signing_key_id,status,projection_json,scenario_ids_json,"
+            "budgets_json,uploaded_by,created_at,expires_at,purge_at) "
+            "SELECT ?,workspace_id,project_ref,?,environment_id,runner_id,runner_key_id,"
+            "manifest_digest,?,signing_key_id,status,projection_json,scenario_ids_json,budgets_json,"
+            "'user_owner',created_at,expires_at,purge_at "
+            "FROM canary_approval_projections WHERE approval_id=?",
+            (unlinked_approval, unlinked_run, unlinked_digest, template_approval),
+        )
+        source.execute(
+            "INSERT INTO canary_runs("
+            "run_id,workspace_id,project_ref,approval_id,grant_id,environment_id,runner_id,runner_key_id,"
+            "status,execution_disposition,error_category,stop_reason,source_event_sequence,"
+            "source_projection_digest,cloud_event_sequence,last_heartbeat_at_ms,last_gate_at_ms,"
+            "claimed_at_ms,started_at_ms,stop_requested_at_ms,stop_acknowledged_at_ms,terminal_at_ms,"
+            "stop_generation,stop_deadline_ms,stop_ack_late,reservation_id,quota_state,"
+            "kill_switch_generation,created_at,updated_at,purge_at) "
+            "SELECT ?,workspace_id,project_ref,?,grant_id,environment_id,runner_id,runner_key_id,"
+            "status,execution_disposition,error_category,stop_reason,source_event_sequence,"
+            "source_projection_digest,cloud_event_sequence,last_heartbeat_at_ms,last_gate_at_ms,"
+            "claimed_at_ms,started_at_ms,stop_requested_at_ms,stop_acknowledged_at_ms,terminal_at_ms,"
+            "stop_generation,stop_deadline_ms,stop_ack_late,reservation_id,quota_state,"
+            "kill_switch_generation,created_at,updated_at,purge_at "
+            "FROM canary_runs WHERE run_id=?",
+            (unlinked_run, unlinked_approval, template_run),
+        )
         source.commit()
-        unlinked = coordinator.submit_projection(unique_projection(999), uploaded_by="user_owner")
+        unlinked = {"approval_id": unlinked_approval, "run_id": unlinked_run}
 
         database = Path(tmp) / "heel.sqlite3"
         durable = sqlite3.connect(database)

@@ -385,12 +385,8 @@ def test_proof_generation_rollover_refuses_a_nonterminal_reserved_local_run(tmp_
             rollover_evidence=evidence,
         )
     store.transition_run(grant["run_id"], "finalizing", now_ms=2_000)
-    store.transition_run(grant["run_id"], "terminal", now_ms=2_001)
-    assert store.install_cloud_context_binding(
-        new, identity=identity, signer=signer, signer_label="test-signer",
-        trusted_cloud_keys={authority.key_id: authority.public_key}, now_ms=60_002,
-        rollover_evidence=evidence,
-    ).verification_record_digest == "6" * 64
+    with pytest.raises(RunnerStoreError, match="final projections are unavailable"):
+        store.transition_run(grant["run_id"], "terminal", now_ms=2_001)
 
 
 def test_rollover_journal_blocks_normal_load_then_recovers_exact_crash_state(tmp_path, monkeypatch):

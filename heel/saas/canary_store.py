@@ -709,6 +709,101 @@ WHERE b.first_claimed_at_ms IS NOT NULL AND NOT EXISTS(
 DROP TABLE canary_runner_context_affinity_backfill_guard;
 """
 
+# Migration 20 keeps terminal context cleanup bounded even when a single binding
+# accumulated a very large, retained projection/event history.
+RUNNER_CONTEXT_BOUNDED_PURGE_MIGRATION = r"""
+CREATE UNIQUE INDEX idx_runner_context_binding_purge_ref
+ ON canary_runner_context_bindings(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,purge_at_ms);
+CREATE TABLE canary_runner_context_purge_queue(
+ workspace_id TEXT NOT NULL CHECK(length(CAST(workspace_id AS BLOB)) BETWEEN 1 AND 128),
+ project_ref TEXT NOT NULL CHECK(length(CAST(project_ref AS BLOB)) BETWEEN 1 AND 128),
+ environment_id TEXT NOT NULL CHECK(length(CAST(environment_id AS BLOB)) BETWEEN 1 AND 128),
+ runner_id TEXT NOT NULL CHECK(length(CAST(runner_id AS BLOB)) BETWEEN 1 AND 128),
+ runner_key_id TEXT NOT NULL CHECK(length(CAST(runner_key_id AS BLOB)) BETWEEN 1 AND 128),
+ rcb_id TEXT NOT NULL COLLATE BINARY CHECK(length(rcb_id)=36 AND substr(rcb_id,1,4)='rcb_' AND substr(rcb_id,5) NOT GLOB '*[^0-9a-f]*'),
+ binding_digest TEXT NOT NULL CHECK(length(binding_digest)=64 AND binding_digest NOT GLOB '*[^0-9a-f]*'),
+ binding_purge_at_ms INTEGER NOT NULL CHECK(binding_purge_at_ms>0),
+ enqueued_at_ms INTEGER NOT NULL CHECK(enqueued_at_ms>=binding_purge_at_ms AND enqueued_at_ms<=9007199254740991),
+ phase TEXT NOT NULL CHECK(phase IN ('links','events','binding')),
+ last_purged_run_id TEXT COLLATE BINARY CHECK(last_purged_run_id IS NULL OR (length(last_purged_run_id)=37 AND substr(last_purged_run_id,1,5)='crun_' AND substr(last_purged_run_id,6) NOT GLOB '*[^0-9a-f]*')),
+ last_purged_event_id TEXT COLLATE BINARY CHECK(last_purged_event_id IS NULL OR (length(last_purged_event_id)=36 AND substr(last_purged_event_id,1,4)='rce_' AND substr(last_purged_event_id,5) NOT GLOB '*[^0-9a-f]*')),
+ CHECK(phase<>'links' OR last_purged_event_id IS NULL),
+ PRIMARY KEY(workspace_id,project_ref,rcb_id,binding_digest),
+ FOREIGN KEY(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,binding_purge_at_ms)
+  REFERENCES canary_runner_context_bindings(workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,purge_at_ms));
+CREATE INDEX idx_runner_context_purge_queue_order
+ ON canary_runner_context_purge_queue(binding_purge_at_ms,rcb_id);
+CREATE INDEX idx_runner_context_events_binding_event
+ ON canary_runner_context_events(workspace_id,project_ref,rcb_id,binding_digest,rce_id);
+CREATE TRIGGER trg_runner_context_purge_queue_insert_guard
+BEFORE INSERT ON canary_runner_context_purge_queue
+WHEN NEW.phase<>'links' OR NEW.last_purged_run_id IS NOT NULL OR NEW.last_purged_event_id IS NOT NULL
+ OR NOT EXISTS(SELECT 1 FROM canary_runner_context_bindings b WHERE b.workspace_id=NEW.workspace_id AND b.project_ref=NEW.project_ref AND b.environment_id=NEW.environment_id AND b.runner_id=NEW.runner_id AND b.runner_key_id=NEW.runner_key_id AND b.rcb_id=NEW.rcb_id AND b.binding_digest=NEW.binding_digest AND b.purge_at_ms=NEW.binding_purge_at_ms AND b.status IN ('revoked','expired') AND b.purge_at_ms<=NEW.enqueued_at_ms)
+ OR EXISTS(SELECT 1 FROM canary_runner_context_cancellation_queue c WHERE c.workspace_id=NEW.workspace_id AND c.project_ref=NEW.project_ref AND c.environment_id=NEW.environment_id AND c.runner_id=NEW.runner_id AND c.runner_key_id=NEW.runner_key_id AND c.rcb_id=NEW.rcb_id AND c.binding_digest=NEW.binding_digest)
+ OR EXISTS(SELECT 1 FROM canary_runner_context_events e INDEXED BY idx_runner_context_events_binding_purge WHERE e.workspace_id=NEW.workspace_id AND e.project_ref=NEW.project_ref AND e.environment_id=NEW.environment_id AND e.runner_id=NEW.runner_id AND e.runner_key_id=NEW.runner_key_id AND e.rcb_id=NEW.rcb_id AND e.binding_digest=NEW.binding_digest AND e.purge_at_ms>NEW.enqueued_at_ms LIMIT 1)
+BEGIN SELECT RAISE(ABORT,'invalid runner context purge queue insert'); END;
+CREATE TRIGGER trg_runner_context_purge_queue_update_guard
+BEFORE UPDATE ON canary_runner_context_purge_queue
+WHEN NEW.workspace_id<>OLD.workspace_id OR NEW.project_ref<>OLD.project_ref OR NEW.environment_id<>OLD.environment_id OR NEW.runner_id<>OLD.runner_id OR NEW.runner_key_id<>OLD.runner_key_id OR NEW.rcb_id<>OLD.rcb_id OR NEW.binding_digest<>OLD.binding_digest OR NEW.binding_purge_at_ms<>OLD.binding_purge_at_ms OR NEW.enqueued_at_ms<>OLD.enqueued_at_ms
+ OR NOT ((OLD.phase='links' AND NEW.phase='links' AND NEW.last_purged_event_id IS NULL AND NEW.last_purged_run_id IS NOT NULL AND (OLD.last_purged_run_id IS NULL OR NEW.last_purged_run_id>OLD.last_purged_run_id)) OR (OLD.phase='links' AND NEW.phase='events' AND NEW.last_purged_run_id IS OLD.last_purged_run_id AND NEW.last_purged_event_id IS NULL) OR (OLD.phase='events' AND NEW.phase='events' AND NEW.last_purged_run_id IS OLD.last_purged_run_id AND NEW.last_purged_event_id IS NOT NULL AND (OLD.last_purged_event_id IS NULL OR NEW.last_purged_event_id>OLD.last_purged_event_id)) OR (OLD.phase='events' AND NEW.phase='binding' AND NEW.last_purged_run_id IS OLD.last_purged_run_id AND NEW.last_purged_event_id IS OLD.last_purged_event_id))
+BEGIN SELECT RAISE(ABORT,'invalid runner context purge queue update'); END;
+CREATE TRIGGER trg_runner_context_projection_link_purge_guard
+BEFORE INSERT ON canary_runner_context_projection_links
+WHEN EXISTS(SELECT 1 FROM canary_runner_context_purge_queue q WHERE q.workspace_id=NEW.workspace_id AND q.project_ref=NEW.project_ref AND q.environment_id=NEW.environment_id AND q.runner_id=NEW.runner_id AND q.runner_key_id=NEW.runner_key_id AND q.rcb_id=NEW.rcb_id AND q.binding_digest=NEW.binding_digest)
+BEGIN SELECT RAISE(ABORT,'runner context purge queue rejects new projection link'); END;
+CREATE TRIGGER trg_runner_context_event_purge_guard
+BEFORE INSERT ON canary_runner_context_events
+WHEN EXISTS(SELECT 1 FROM canary_runner_context_purge_queue q WHERE q.workspace_id=NEW.workspace_id AND q.project_ref=NEW.project_ref AND q.environment_id=NEW.environment_id AND q.runner_id=NEW.runner_id AND q.runner_key_id=NEW.runner_key_id AND q.rcb_id=NEW.rcb_id AND q.binding_digest=NEW.binding_digest)
+BEGIN SELECT RAISE(ABORT,'runner context purge queue rejects new event'); END;
+"""
+
+RUNNER_CONTEXT_AFFINITY_GUARDS_MIGRATION = r"""
+CREATE INDEX idx_runner_context_claimed_runner
+ ON canary_runner_context_bindings(workspace_id,runner_id,rcb_id)
+ WHERE first_claimed_at_ms IS NOT NULL;
+CREATE TABLE canary_runner_context_affinity_invariant_guard(
+ ok INTEGER NOT NULL CHECK(ok=1));
+INSERT INTO canary_runner_context_affinity_invariant_guard(ok)
+SELECT CASE WHEN EXISTS(
+ SELECT 1 FROM canary_runner_context_bindings b INDEXED BY idx_runner_context_claimed_runner
+ LEFT JOIN canary_runner_context_affinities a ON a.workspace_id=b.workspace_id AND a.runner_id=b.runner_id
+ WHERE b.first_claimed_at_ms IS NOT NULL AND (a.workspace_id IS NULL OR a.runner_key_id<>b.runner_key_id OR a.project_ref<>b.project_ref OR a.environment_id<>b.environment_id OR a.environment_origin<>b.environment_origin OR a.environment_class<>b.environment_class OR a.public_key_digest<>b.public_key_digest) LIMIT 1
+) OR EXISTS(
+ SELECT 1 FROM canary_runner_context_bindings b
+ JOIN canary_runner_context_affinities a ON a.workspace_id=b.workspace_id AND a.runner_id=b.runner_id
+ WHERE b.status='active' AND (a.runner_key_id<>b.runner_key_id OR a.project_ref<>b.project_ref OR a.environment_id<>b.environment_id OR a.environment_origin<>b.environment_origin OR a.environment_class<>b.environment_class OR a.public_key_digest<>b.public_key_digest) LIMIT 1
+) THEN 0 ELSE 1 END;
+DROP TABLE canary_runner_context_affinity_invariant_guard;
+CREATE TRIGGER trg_runner_context_affinity_insert_guard
+BEFORE INSERT ON canary_runner_context_affinities
+WHEN EXISTS(SELECT 1 FROM canary_runner_context_bindings b INDEXED BY idx_runner_context_claimed_runner WHERE b.workspace_id=NEW.workspace_id AND b.runner_id=NEW.runner_id AND b.first_claimed_at_ms IS NOT NULL LIMIT 1)
+ OR NOT EXISTS(SELECT 1 FROM canary_runner_context_bindings b WHERE b.workspace_id=NEW.workspace_id AND b.runner_id=NEW.runner_id AND b.runner_key_id=NEW.runner_key_id AND b.project_ref=NEW.project_ref AND b.environment_id=NEW.environment_id AND b.environment_origin=NEW.environment_origin AND b.environment_class=NEW.environment_class AND b.public_key_digest=NEW.public_key_digest AND b.rcb_id=NEW.established_rcb_id AND b.binding_digest=NEW.established_binding_digest AND b.status='active' AND b.first_claimed_at_ms IS NULL AND b.issued_at_ms<=NEW.established_at_ms AND NEW.established_at_ms<b.expires_at_ms)
+BEGIN SELECT RAISE(ABORT,'invalid runner context affinity insert'); END;
+CREATE TRIGGER trg_runner_context_affinity_update_guard
+BEFORE UPDATE ON canary_runner_context_affinities
+BEGIN SELECT RAISE(ABORT,'runner context affinity is immutable'); END;
+CREATE TRIGGER trg_runner_context_affinity_delete_guard
+BEFORE DELETE ON canary_runner_context_affinities
+BEGIN SELECT RAISE(ABORT,'runner context affinity is immutable'); END;
+CREATE TRIGGER trg_runner_context_binding_affinity_guard
+BEFORE INSERT ON canary_runner_context_bindings
+WHEN (NEW.first_claimed_at_ms IS NOT NULL AND NOT EXISTS(SELECT 1 FROM canary_runner_context_affinities a WHERE a.workspace_id=NEW.workspace_id AND a.runner_id=NEW.runner_id AND a.runner_key_id=NEW.runner_key_id AND a.project_ref=NEW.project_ref AND a.environment_id=NEW.environment_id AND a.environment_origin=NEW.environment_origin AND a.environment_class=NEW.environment_class AND a.public_key_digest=NEW.public_key_digest))
+ OR (NEW.status='active' AND EXISTS(SELECT 1 FROM canary_runner_context_affinities a WHERE a.workspace_id=NEW.workspace_id AND a.runner_id=NEW.runner_id) AND NOT EXISTS(SELECT 1 FROM canary_runner_context_affinities a WHERE a.workspace_id=NEW.workspace_id AND a.runner_id=NEW.runner_id AND a.runner_key_id=NEW.runner_key_id AND a.project_ref=NEW.project_ref AND a.environment_id=NEW.environment_id AND a.environment_origin=NEW.environment_origin AND a.environment_class=NEW.environment_class AND a.public_key_digest=NEW.public_key_digest))
+BEGIN SELECT RAISE(ABORT,'runner context binding violates affinity'); END;
+CREATE TRIGGER trg_runner_context_binding_affinity_update_guard
+BEFORE UPDATE ON canary_runner_context_bindings
+WHEN (OLD.first_claimed_at_ms IS NOT NULL AND NEW.first_claimed_at_ms IS NOT OLD.first_claimed_at_ms)
+ OR (NEW.first_claimed_at_ms IS NOT NULL AND NOT EXISTS(SELECT 1 FROM canary_runner_context_affinities a WHERE a.workspace_id=NEW.workspace_id AND a.runner_id=NEW.runner_id AND a.runner_key_id=NEW.runner_key_id AND a.project_ref=NEW.project_ref AND a.environment_id=NEW.environment_id AND a.environment_origin=NEW.environment_origin AND a.environment_class=NEW.environment_class AND a.public_key_digest=NEW.public_key_digest))
+ OR (NEW.status='active' AND EXISTS(SELECT 1 FROM canary_runner_context_affinities a WHERE a.workspace_id=NEW.workspace_id AND a.runner_id=NEW.runner_id) AND NOT EXISTS(SELECT 1 FROM canary_runner_context_affinities a WHERE a.workspace_id=NEW.workspace_id AND a.runner_id=NEW.runner_id AND a.runner_key_id=NEW.runner_key_id AND a.project_ref=NEW.project_ref AND a.environment_id=NEW.environment_id AND a.environment_origin=NEW.environment_origin AND a.environment_class=NEW.environment_class AND a.public_key_digest=NEW.public_key_digest))
+BEGIN SELECT RAISE(ABORT,'runner context binding violates affinity'); END;
+"""
+
+PENDING_APPROVAL_LIVE_SEEK_MIGRATION = r"""
+CREATE INDEX idx_canary_approval_pending_live_seek
+ ON canary_approval_projections(workspace_id,project_ref,expires_at ASC,created_at DESC,run_id ASC,approval_id ASC)
+ WHERE status='awaiting_execution_approval';
+"""
+
 _ENVIRONMENT_COLUMNS = (
     "attestation_text", "attestation_version", "attested_by", "attested_at", "proof_method",
     "proof_version", "normalization_version", "challenge_generation", "challenge_digest",
@@ -790,8 +885,8 @@ def ensure_runner_context_schema(conn: sqlite3.Connection) -> None:
     if found and found != tables:
         raise RuntimeError("runner context binding schema is partially initialized")
     if not found:
-        conn.executescript(RUNNER_CONTEXT_BINDINGS_MIGRATION)
-        conn.executescript(RUNNER_CONTEXT_ONE_ACTIVE_PER_RUNNER_MIGRATION)
+        _apply_runner_context_schema_script(conn, RUNNER_CONTEXT_BINDINGS_MIGRATION, label="binding")
+        _apply_runner_context_schema_script(conn, RUNNER_CONTEXT_ONE_ACTIVE_PER_RUNNER_MIGRATION, label="one active")
     # A names-only or fragment check is unsafe: a hand-created table can omit the
     # composite FK/check that keeps pairing authorization from becoming broader
     # authority.  Compare the frozen v16 definitions, then independently inspect
@@ -1057,6 +1152,115 @@ def ensure_runner_context_schema(conn: sqlite3.Connection) -> None:
         })),
     }:
         raise RuntimeError("runner context affinity schema foreign keys do not match migration 19")
+
+    def verify_named_statements(
+        script: str, *, label: str, tables: tuple[str, ...] = (),
+        indexes: tuple[str, ...] = (), triggers: tuple[str, ...] = (),
+    ) -> None:
+        """Compare every direct-runtime object against its append-only literal."""
+        for name in tables:
+            expected = re.search(
+                rf"CREATE TABLE {re.escape(name)}\((.*?)\);", script, flags=re.DOTALL,
+            )
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,),
+            ).fetchone()
+            if (
+                expected is None or row is None or row[0] is None
+                or normalize(row[0]) != normalize(f"CREATE TABLE {name}({expected.group(1)})")
+            ):
+                raise RuntimeError(f"runner context {label} schema does not match frozen migration")
+        for name in indexes:
+            expected = re.search(
+                rf"(CREATE (?:UNIQUE )?INDEX {re.escape(name)}\s+ON .*?);", script, flags=re.DOTALL,
+            )
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,),
+            ).fetchone()
+            if (
+                expected is None or row is None or row[0] is None
+                or normalize(row[0]) != normalize(expected.group(1))
+            ):
+                raise RuntimeError(f"runner context {label} schema does not match frozen migration")
+        for name in triggers:
+            expected = re.search(
+                rf"(CREATE TRIGGER {re.escape(name)}\b.*?END;)", script, flags=re.DOTALL,
+            )
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,),
+            ).fetchone()
+            if (
+                expected is None or row is None or row[0] is None
+                or normalize(row[0]).rstrip(";") != normalize(expected.group(1)).rstrip(";")
+            ):
+                raise RuntimeError(f"runner context {label} schema does not match frozen migration")
+
+    purge_tables = ("canary_runner_context_purge_queue",)
+    purge_indexes = (
+        "idx_runner_context_binding_purge_ref", "idx_runner_context_purge_queue_order",
+        "idx_runner_context_events_binding_event",
+    )
+    purge_triggers = (
+        "trg_runner_context_purge_queue_insert_guard", "trg_runner_context_purge_queue_update_guard",
+        "trg_runner_context_projection_link_purge_guard", "trg_runner_context_event_purge_guard",
+    )
+    purge_objects = set(purge_tables + purge_indexes + purge_triggers)
+    present_purge = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN (%s)" % ",".join("?" for _ in purge_objects),
+            tuple(purge_objects),
+        )
+    }
+    if not present_purge:
+        _apply_runner_context_schema_script(conn, RUNNER_CONTEXT_BOUNDED_PURGE_MIGRATION, label="bounded purge")
+    elif present_purge != purge_objects:
+        raise RuntimeError("runner context bounded purge schema is partially initialized")
+    verify_named_statements(
+        RUNNER_CONTEXT_BOUNDED_PURGE_MIGRATION, label="bounded purge", tables=purge_tables,
+        indexes=purge_indexes, triggers=purge_triggers,
+    )
+    purge_columns = tuple(row[1] for row in conn.execute("PRAGMA table_info(canary_runner_context_purge_queue)"))
+    if purge_columns != (
+        "workspace_id", "project_ref", "environment_id", "runner_id", "runner_key_id", "rcb_id",
+        "binding_digest", "binding_purge_at_ms", "enqueued_at_ms", "phase", "last_purged_run_id",
+        "last_purged_event_id",
+    ):
+        raise RuntimeError("runner context bounded purge columns do not match migration 20")
+
+    affinity_guard_indexes = ("idx_runner_context_claimed_runner",)
+    affinity_guard_triggers = (
+        "trg_runner_context_affinity_insert_guard", "trg_runner_context_affinity_update_guard",
+        "trg_runner_context_affinity_delete_guard", "trg_runner_context_binding_affinity_guard",
+        "trg_runner_context_binding_affinity_update_guard",
+    )
+    affinity_guard_names = set(affinity_guard_indexes + affinity_guard_triggers)
+    present_affinity_guards = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN (%s)" % ",".join("?" for _ in affinity_guard_names),
+            tuple(affinity_guard_names),
+        )
+    }
+    invariant_guard = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='canary_runner_context_affinity_invariant_guard'"
+    ).fetchone()
+    if not present_affinity_guards and invariant_guard is None:
+        _apply_runner_context_schema_script(conn, RUNNER_CONTEXT_AFFINITY_GUARDS_MIGRATION, label="affinity guards")
+    elif present_affinity_guards != affinity_guard_names or invariant_guard is not None:
+        raise RuntimeError("runner context affinity guards schema is partially initialized")
+    verify_named_statements(
+        RUNNER_CONTEXT_AFFINITY_GUARDS_MIGRATION, label="affinity guards",
+        indexes=affinity_guard_indexes, triggers=affinity_guard_triggers,
+    )
+
+    live_seek = "idx_canary_approval_pending_live_seek"
+    live_seek_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (live_seek,),
+    ).fetchone()
+    if live_seek_row is None:
+        _apply_runner_context_schema_script(conn, PENDING_APPROVAL_LIVE_SEEK_MIGRATION, label="live approval seek")
+    verify_named_statements(
+        PENDING_APPROVAL_LIVE_SEEK_MIGRATION, label="live approval seek", indexes=(live_seek,),
+    )
     if conn.execute(
         "SELECT 1 FROM canary_runner_context_bindings b "
         "LEFT JOIN canary_runner_context_affinities a "

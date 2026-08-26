@@ -357,6 +357,7 @@ class LocalCanaryExecutor:
             raise ValueError("bound runner store and identity are required")
         if not isinstance(signer, SecureSigner) or signer.key_id != identity.key_id:
             raise ValueError("paired runner signer is required")
+        store._assert_runtime_authority(identity, signer)
         self.store = store
         self.identity = identity
         self.signer = signer

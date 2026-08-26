@@ -93,6 +93,15 @@ def client_projection(signer, phase="running"):
     value["projection_digest"] = canonical_digest(payload); value["signature_b64"] = base64.b64encode(signer.sign(canonical_bytes(payload))).decode()
     return value
 
+
+def activate_claimed_run(control, run_id="run"):
+    """Install the exact post-200 claim state without a generic client API."""
+    nonce = base64.b64encode(b"q" * 32).decode()
+    with control._state_lock:
+        control._tracked_runs.add(run_id)
+        for operation in ("heartbeat", "progress", "result", "stop-ack"):
+            control._chains[f"{operation}:{run_id}"] = (nonce, 1, 0)
+
 def test_named_methods_use_fixed_workspace_paths_and_exact_pop_headers():
     control, transport, signer = client()
     control.claim()
@@ -216,6 +225,7 @@ def test_context_list_does_not_replace_server_issued_order_with_expiry_order():
 
 def test_sequences_are_independent_per_run_capability_and_stop_ack_is_heartbeat():
     control, transport, signer = client()
+    activate_claimed_run(control)
     control.heartbeat(run_id="run", operational_projection=client_projection(signer))
     control.heartbeat(run_id="run", operational_projection=client_projection(signer))
     control.progress(run_id="run", operational_projection=client_projection(signer))
@@ -231,7 +241,8 @@ def test_refuses_noncanonical_origin_bad_nonce_and_prohibited_generic_retry():
     with pytest.raises(ValueError, match="nonce"):
         bad.claim()
     control, _, signer = client()
-    control.progress(run_id="run", operational_projection=client_projection(signer))
+    with pytest.raises(ValueError, match="active runner claim is required"):
+        control.progress(run_id="run", operational_projection=client_projection(signer))
     assert not hasattr(control, "retry_last")
 
 def test_has_no_public_generic_request_api():

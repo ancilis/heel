@@ -82,6 +82,10 @@ class RunnerCoordinator:
             raise ValueError("trusted grant authority is required")
         if not callable(clock_ms) or not callable(monotonic):
             raise TypeError("runner coordinator clocks are required")
+        # A coordinator is the authenticated runtime boundary for a store opened
+        # during restart recovery.  Pin once here; the store rejects a different
+        # identity on every later mutation.
+        store._pin_runtime_authority(identity, signer)
         self.control = control
         self.store = store
         self.identity = identity
@@ -375,6 +379,8 @@ class RunnerCoordinator:
         if response["status"] != "terminal":
             raise ValueError("runner result did not reach terminal state")
         with self._lock:
+            self._gates.pop(run_id, None)
+            self._gate_receipts.pop(run_id, None)
             self._terminal_runs.add(run_id)
         return response
 
@@ -438,7 +444,8 @@ class RunnerCoordinator:
     def upload_findings(
         self, run_id: str, *, permit: object, findings_projection: object,
     ) -> dict[str, Any]:
-        self._known_run(run_id)
+        if type(run_id) is not str or not run_id:
+            raise ValueError("active runner claim is required")
         with self._lock:
             terminal = run_id in self._terminal_runs
             binding = self._bindings.get(run_id)
@@ -473,9 +480,13 @@ class RunnerCoordinator:
             )
         except (TypeError, ValueError):
             raise ValueError("invalid disclosure permit authority") from None
-        return self.control.upload_findings(
+        receipt = self.control.upload_findings(
             run_id=run_id, permit=permit_value, findings_projection=findings,
         )
+        with self._lock:
+            self._bindings.pop(run_id, None)
+            self._terminal_runs.discard(run_id)
+        return receipt
 
 
 class RunnerExecutionAdapter:

@@ -136,9 +136,8 @@ def test_execution_bundle_is_exactly_bound_signed_fresh_and_reserved_once(tmp_pa
         now_ms=2_000, gate=active_gate(),
     )
     assert validated.grant["grant_digest"] == grant["grant_digest"]
-    store.reserve_run(validated.grant, retention_expires_at_ms=86_400_000)
-    with pytest.raises(ValueError, match="already consumed"):
-        store.reserve_run(validated.grant, retention_expires_at_ms=86_400_000)
+    reserved = store.reserve_run(validated.grant, retention_expires_at_ms=86_400_000)
+    assert store.reserve_run(validated.grant, retention_expires_at_ms=86_400_000) == reserved
 
     mutations = []
     wrong_runner = copy.deepcopy(grant)
@@ -161,6 +160,135 @@ def test_execution_bundle_is_exactly_bound_signed_fresh_and_reserved_once(tmp_pa
             bundle, store=store, identity=identity, trusted_grant_keys=trusted,
             now_ms=10_000, gate=active_gate(10_000),
             )
+
+
+def test_run_authority_rejects_a_signed_reservation_with_an_extra_field(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    store.reserve_run(grant, retention_expires_at_ms=86_400_000)
+    run_path = store.run_path(grant["run_id"])
+    record_path = run_path.parent / f"reservation-{run_path.name}.json"
+    stored = json.loads(record_path.read_text())
+    core = {
+        key: value for key, value in stored.items()
+        if key not in {"record_digest", "signing_key_id", "signature_b64"}
+    }
+    core["unexpected"] = "authority extension"
+    record_path.write_bytes(canonical_bytes(
+        store._signed_run_authority_value(core, signer=signer, record_digest=True)
+    ))
+
+    with pytest.raises(RunnerStoreError, match="invalid local run authority record"):
+        store.recover_run_reservation(grant["run_id"])
+
+
+def test_run_authority_journal_rejects_a_signed_noncanonical_next_index_before_recovery(
+    tmp_path, monkeypatch,
+):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(store, "_ensure_json_exact", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("interrupted")))
+        with pytest.raises(OSError, match="interrupted"):
+            store.reserve_run(grant, retention_expires_at_ms=86_400_000)
+
+    journal_path = store.run_path(grant["run_id"]).parent / "run-authority-journal.json"
+    journal = json.loads(journal_path.read_text())
+    index_core = {
+        key: value for key, value in journal["next_index"].items()
+        if key not in {"signing_key_id", "signature_b64"}
+    }
+    index_core["unexpected"] = "authority extension"
+    journal_core = {
+        key: value for key, value in journal.items()
+        if key not in {"signing_key_id", "signature_b64"}
+    }
+    journal_core["next_index"] = store._signed_run_authority_value(
+        index_core, signer=signer, record_digest=False,
+    )
+    journal_path.write_bytes(canonical_bytes(
+        store._signed_run_authority_value(journal_core, signer=signer, record_digest=False)
+    ))
+
+    with pytest.raises(RunnerStoreError, match="local run authority index is invalid"):
+        store.recover_run_reservation(grant["run_id"])
+    assert not (store.run_path(grant["run_id"]) / "state.json").exists()
+
+
+def test_terminal_run_pruning_uses_the_signed_queue_without_listing_run_history(tmp_path, monkeypatch):
+    import heel.runner.store as store_module
+
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    deadline = store.load_run(grant["run_id"])["retention_expires_at_ms"]
+    with monkeypatch.context() as fault:
+        fault.setattr(store_module.os, "listdir", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("history listing")))
+        assert store.prune_expired_runs(now_ms=deadline) == 1
+    run_path = store.run_path(grant["run_id"])
+    assert not run_path.exists()
+    assert (run_path.parent / f"pruned-{run_path.name}.json").is_file()
+
+
+def test_nonempty_legacy_run_root_never_receives_a_zero_authority_index_implicitly(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    store.reserve_run(grant, retention_expires_at_ms=86_400_000)
+    run_path = store.run_path(grant["run_id"])
+    index_path = run_path.parent / "run-authority-index.json"
+    index_path.unlink()
+    assert run_path.is_dir()
+    assert not index_path.exists()
+    assert run_path.name in {entry.name for entry in run_path.parent.iterdir()}
+    assert (run_path.parent.parent / "binding.json").is_file()
+
+    restarted = type(store)(store.root)
+    assert restarted.namespace == store.namespace
+    context = store.load_context()
+    assert not index_path.exists()
+    with pytest.raises(RunnerStoreError, match="requires explicit upgrade"):
+        restarted.bind_context(
+            context, identity=identity, signer=signer, signer_label="runner-test-key",
+        )
+    assert not index_path.exists()
+
+
+def test_authenticated_legacy_authority_upgrade_rebuilds_one_reservation_index(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    expected = store.reserve_run(grant, retention_expires_at_ms=86_400_000)
+    index_path = store.run_path(grant["run_id"]).parent / "run-authority-index.json"
+    index_path.unlink()
+
+    restarted = type(store).for_runtime(store.root, identity=identity, signer=signer)
+    restarted.upgrade_legacy_run_authority_index()
+
+    assert restarted.recover_run_reservation(grant["run_id"]) == expected
+
+
+def test_executor_refuses_a_restart_store_without_pinned_runtime_authority(tmp_path):
+    store, identity, signer, _manifest, _projection = compiled_pair(tmp_path)
+    restarted = type(store)(store.root)
+
+    with pytest.raises(RunnerStoreError, match="authenticated runner store is required"):
+        LocalCanaryExecutor(
+            store=restarted, identity=identity, signer=signer,
+            trusted_grant_keys={"unused": SigningAuthority.generate().public_key},
+        )
 
 
 @pytest.mark.parametrize("checkpoint", ["write", "fsync", "rename"])
@@ -295,13 +423,8 @@ def test_local_evidence_is_opaque_owner_only_bounded_and_retention_pruned(tmp_pa
         store.load_response_evidence(grant["run_id"], reference, now_ms=40_000)
     assert store.prune_expired_evidence(now_ms=40_000) == 1
     assert store.run_path(grant["run_id"]).is_dir()
-    with pytest.raises(RunnerStoreError, match="transition"):
+    with pytest.raises(RunnerStoreError, match="final projections are unavailable"):
         store.transition_run(grant["run_id"], "terminal", now_ms=3_000)
-    store.transition_run(grant["run_id"], "finalizing", now_ms=3_000)
-    store.transition_run(grant["run_id"], "terminal", now_ms=4_000)
-    assert store.prune_expired_runs(now_ms=49_999) == 0
-    assert store.prune_expired_runs(now_ms=50_000) == 1
-    assert not store.run_path(grant["run_id"]).exists()
 
 
 def test_evidence_references_are_random_and_integrity_digest_stays_local(tmp_path):
@@ -564,7 +687,7 @@ def test_recovery_reconstructs_run_after_consumption_marker_before_state(tmp_pat
 
 
 @pytest.mark.parametrize("visible_legacy_files", [1, 2, 3])
-def test_recovery_never_observes_partial_legacy_final_writes(tmp_path, visible_legacy_files):
+def test_recovery_rejects_partial_final_replacement_after_terminal_authority(tmp_path, visible_legacy_files):
     store, identity, signer, manifest, projection = compiled_pair(tmp_path)
     authority = SigningAuthority.generate()
     grant = signed_grant(manifest, projection, identity, authority)
@@ -592,15 +715,15 @@ def test_recovery_never_observes_partial_legacy_final_writes(tmp_path, visible_l
     state["state"] = "finalizing"
     state_path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
     transport = ScriptedTransport([200])
-    recovered = LocalCanaryExecutor(
-        store=store, identity=identity, signer=signer,
-        trusted_grant_keys={authority.key_id: authority.public_key},
-        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 3_000,
-        monotonic=lambda: 1.0,
-    ).recover(grant["run_id"], transport=transport)
+    with pytest.raises(RunnerStoreError, match="terminal queue is invalid"):
+        LocalCanaryExecutor(
+            store=store, identity=identity, signer=signer,
+            trusted_grant_keys={authority.key_id: authority.public_key},
+            vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 3_000,
+            monotonic=lambda: 1.0,
+        ).recover(grant["run_id"], transport=transport)
     assert transport.calls == []
-    assert recovered.execution_disposition == "incomplete"
-    assert (run_path / "finals.json").is_file()
+    assert not (run_path / "finals.json").exists()
 
 
 class StaticVault:

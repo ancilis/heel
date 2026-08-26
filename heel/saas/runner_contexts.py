@@ -140,6 +140,12 @@ class RunnerContextBindingService:
             "AND name='canary_runner_context_cancellation_queue'"
         ).fetchone() is not None
 
+    def _has_purge_queue_schema(self) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='canary_runner_context_purge_queue'"
+        ).fetchone() is not None
+
     def _enqueue_terminal_cancellation_in_transaction(self, row: sqlite3.Row) -> None:
         """Queue a terminal binding once, after an O(1) exact-prefix link seek."""
         if not self._has_cancellation_queue_schema():
@@ -175,29 +181,14 @@ class RunnerContextBindingService:
     def _assert_affinity_history_integrity(
         self, workspace_id: str, runner_id: str, affinity: sqlite3.Row | None, *, error_code: str,
     ) -> None:
-        """A deleted or divergent affinity is corruption, never a fresh pairing authority."""
-        if affinity is None:
-            history = self.conn.execute(
-                "SELECT 1 FROM canary_runner_context_bindings INDEXED BY idx_runner_context_runner_status_expiry "
-                "WHERE workspace_id=? AND runner_id=? AND first_claimed_at_ms IS NOT NULL LIMIT 1",
-                (workspace_id, runner_id),
-            ).fetchone()
-            if history is not None:
-                raise RunnerContextError(error_code)
-            return
-        divergent = self.conn.execute(
-            "SELECT 1 FROM canary_runner_context_bindings INDEXED BY idx_runner_context_runner_status_expiry "
-            "WHERE workspace_id=? AND runner_id=? AND first_claimed_at_ms IS NOT NULL AND ("
-            "runner_key_id<>? OR project_ref<>? OR environment_id<>? OR environment_origin<>? "
-            "OR environment_class<>? OR public_key_digest<>?) LIMIT 1",
-            (
-                workspace_id, runner_id, affinity["runner_key_id"], affinity["project_ref"],
-                affinity["environment_id"], affinity["environment_origin"], affinity["environment_class"],
-                affinity["public_key_digest"],
-            ),
-        ).fetchone()
-        if divergent is not None:
-            raise RunnerContextError(error_code)
+        """Affinity integrity is durable DDL, not an unbounded request-time history scan.
+
+        Migration 21 makes affinity rows immutable and rejects a first claim without
+        its matching row.  Startup performs the complete retained-history audit; hot
+        request paths may therefore only inspect the O(1) affinity candidate supplied
+        by their caller.  A missing row is valid for an unclaimed runner.
+        """
+        del workspace_id, runner_id, affinity, error_code
 
     def _assert_or_establish_affinity_in_transaction(self, row: sqlite3.Row, *, claimed_at_ms: int) -> None:
         """Create the one-way coordinate before recording a runner's first claim."""
@@ -385,96 +376,202 @@ class RunnerContextBindingService:
         )
 
     def expire_and_purge_in_transaction(self, now_ms: int, *, limit: int = 128) -> dict:
-        """Expire first, then remove a bounded batch of fully retained terminal context state."""
+        """Delete at most ``limit`` retained child/binding records via the v20 queue."""
         if not self.conn.in_transaction:
             raise RuntimeError("runner context expiry requires caller transaction")
         if type(now_ms) is not int or isinstance(now_ms, bool) or now_ms < 0:
             raise ValueError("invalid runner context expiry time")
         if type(limit) is not int or isinstance(limit, bool) or not 1 <= limit <= 128:
             raise ValueError("invalid runner context purge limit")
-        rows = self.conn.execute(
-            "SELECT rcb_id,workspace_id,project_ref,binding_digest,purge_at_ms,status FROM canary_runner_context_bindings INDEXED BY idx_runner_context_terminal_purge_order "
-            "WHERE status IN ('revoked','expired') AND purge_at_ms<=? "
-            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_events e INDEXED BY idx_runner_context_events_binding_purge "
-            "WHERE e.workspace_id=canary_runner_context_bindings.workspace_id "
-            "AND e.project_ref=canary_runner_context_bindings.project_ref "
-            "AND e.rcb_id=canary_runner_context_bindings.rcb_id "
-            "AND e.binding_digest=canary_runner_context_bindings.binding_digest AND e.purge_at_ms>?) "
-            "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_projection_links l INDEXED BY idx_runner_context_links_binding_run "
-            "JOIN canary_approval_projections a INDEXED BY idx_canary_approval_context_awaiting ON a.workspace_id=l.workspace_id AND a.project_ref=l.project_ref "
-            "AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
-            "JOIN canary_runs r INDEXED BY idx_canary_runs_context_pregrant ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref AND r.run_id=l.run_id "
-            "WHERE l.workspace_id=canary_runner_context_bindings.workspace_id "
-            "AND l.project_ref=canary_runner_context_bindings.project_ref "
-            "AND l.rcb_id=canary_runner_context_bindings.rcb_id "
-            "AND l.binding_digest=canary_runner_context_bindings.binding_digest "
-            "AND a.status='awaiting_execution_approval' "
-            "AND r.status IN ('prepared','awaiting_execution_approval') "
-            "AND r.grant_id IS NULL AND r.reservation_id IS NULL AND r.quota_state='unreserved') "
-            "ORDER BY purge_at_ms,rcb_id LIMIT ?",
-            (now_ms, now_ms, limit + 1),
-        ).fetchall()
-        selected = rows[:limit]
         counts: dict[str, int | dict | None] = {
             "expired_bindings": 0,
             "cancelled_projections": 0,
             "purged_links": 0,
             "purged_events": 0,
             "purged_bindings": 0,
-            "next_cursor": (
-                {"purge_at_ms": selected[-1]["purge_at_ms"], "rcb_id": selected[-1]["rcb_id"]}
-                if len(rows) > limit and selected else None
-            ),
+            "next_cursor": None,
         }
-        for row in selected:
-            corrupt = self.conn.execute(
-                "SELECT l.run_id FROM canary_runner_context_projection_links l INDEXED BY idx_runner_context_links_binding_run "
-                "LEFT JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id "
-                "AND a.project_ref=l.project_ref AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
-                "LEFT JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref "
-                "AND r.run_id=l.run_id "
-                "WHERE l.workspace_id=? AND l.project_ref=? AND l.rcb_id=? AND l.binding_digest=? "
-                "AND (a.approval_id IS NULL OR r.run_id IS NULL) LIMIT 1",
-                (row["workspace_id"], row["project_ref"], row["rcb_id"], row["binding_digest"]),
+        if not self._has_purge_queue_schema():
+            raise RuntimeError("runner context bounded purge schema is unavailable")
+
+        def queue_head() -> sqlite3.Row | None:
+            return self.conn.execute(
+                "SELECT * FROM canary_runner_context_purge_queue INDEXED BY idx_runner_context_purge_queue_order "
+                "ORDER BY binding_purge_at_ms,rcb_id LIMIT 1"
             ).fetchone()
-            if corrupt is not None:
-                raise RuntimeError("runner context purge has linked corrupt authority")
-            pregrant = self.conn.execute(
-                "SELECT 1 FROM canary_runner_context_projection_links l "
-                "JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id AND a.project_ref=l.project_ref "
-                "AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
-                "JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref AND r.run_id=l.run_id "
-                "WHERE l.workspace_id=? AND l.project_ref=? AND l.rcb_id=? AND l.binding_digest=? "
-                "AND (a.status='awaiting_execution_approval' OR r.status IN ('prepared','awaiting_execution_approval')) LIMIT 1",
-                (row["workspace_id"], row["project_ref"], row["rcb_id"], row["binding_digest"]),
+
+        def enqueue_one() -> bool:
+            self.conn.execute(
+                "WITH candidate AS ("
+                "SELECT workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,purge_at_ms "
+                "FROM canary_runner_context_bindings INDEXED BY idx_runner_context_terminal_purge_order "
+                "WHERE status IN ('revoked','expired') AND purge_at_ms<=? "
+                "ORDER BY purge_at_ms,rcb_id LIMIT 1) "
+                "INSERT INTO canary_runner_context_purge_queue("
+                "workspace_id,project_ref,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,"
+                "binding_purge_at_ms,enqueued_at_ms,phase,last_purged_run_id,last_purged_event_id) "
+                "SELECT b.workspace_id,b.project_ref,b.environment_id,b.runner_id,b.runner_key_id,b.rcb_id,"
+                "b.binding_digest,b.purge_at_ms,?,'links',NULL,NULL FROM candidate b "
+                "WHERE NOT EXISTS(SELECT 1 FROM canary_runner_context_cancellation_queue c "
+                "WHERE c.workspace_id=b.workspace_id AND c.project_ref=b.project_ref "
+                "AND c.environment_id=b.environment_id AND c.runner_id=b.runner_id "
+                "AND c.runner_key_id=b.runner_key_id AND c.rcb_id=b.rcb_id AND c.binding_digest=b.binding_digest) "
+                "AND NOT EXISTS(SELECT 1 FROM canary_runner_context_events e INDEXED BY idx_runner_context_events_binding_purge "
+                "WHERE e.workspace_id=b.workspace_id AND e.project_ref=b.project_ref "
+                "AND e.environment_id=b.environment_id AND e.runner_id=b.runner_id "
+                "AND e.runner_key_id=b.runner_key_id AND e.rcb_id=b.rcb_id "
+                "AND e.binding_digest=b.binding_digest AND e.purge_at_ms>? LIMIT 1)",
+                (now_ms, now_ms, now_ms),
+            )
+            return self.conn.execute("SELECT changes()").fetchone()[0] == 1
+
+        remaining = limit
+        while remaining:
+            queue = queue_head()
+            if queue is None:
+                if not enqueue_one():
+                    break
+                queue = queue_head()
+                if queue is None:
+                    raise RuntimeError("runner context purge queue lost serialization")
+            binding = self.conn.execute(
+                "SELECT * FROM canary_runner_context_bindings INDEXED BY idx_runner_context_binding_purge_ref "
+                "WHERE workspace_id=? AND project_ref=? AND environment_id=? AND runner_id=? "
+                "AND runner_key_id=? AND rcb_id=? AND binding_digest=? AND purge_at_ms=? "
+                "AND status IN ('revoked','expired')",
+                (queue["workspace_id"], queue["project_ref"], queue["environment_id"],
+                 queue["runner_id"], queue["runner_key_id"], queue["rcb_id"],
+                 queue["binding_digest"], queue["binding_purge_at_ms"]),
             ).fetchone()
-            if pregrant is not None:
-                raise RuntimeError("runner context purge has linked pregrant authority")
-            if self._has_cancellation_queue_schema():
+            if binding is None:
+                raise RuntimeError("runner context purge queue authority is inconsistent")
+            base = (queue["workspace_id"], queue["project_ref"], queue["environment_id"],
+                    queue["runner_id"], queue["runner_key_id"], queue["rcb_id"], queue["binding_digest"])
+            if queue["phase"] == "links":
+                cursor = queue["last_purged_run_id"]
+                cursor_sql = "AND l.run_id>?" if cursor is not None else ""
+                params: list[object] = [*base]
+                if cursor is not None:
+                    params.append(cursor)
+                params.append(remaining + 1)
+                rows = self.conn.execute(
+                    "SELECT l.run_id,a.approval_id AS stored_approval_id,a.status AS approval_status,"
+                    "r.run_id AS stored_run_id,r.status AS run_status "
+                    "FROM canary_runner_context_projection_links l INDEXED BY idx_runner_context_links_binding_run "
+                    "LEFT JOIN canary_approval_projections a ON a.workspace_id=l.workspace_id "
+                    "AND a.project_ref=l.project_ref AND a.approval_id=l.approval_id AND a.run_id=l.run_id "
+                    "LEFT JOIN canary_runs r ON r.workspace_id=l.workspace_id AND r.project_ref=l.project_ref AND r.run_id=l.run_id "
+                    "WHERE l.workspace_id=? AND l.project_ref=? AND l.environment_id=? AND l.runner_id=? "
+                    "AND l.runner_key_id=? AND l.rcb_id=? AND l.binding_digest=? " + cursor_sql +
+                    " ORDER BY l.run_id LIMIT ?", params,
+                ).fetchall()
+                examined = rows[:remaining]
+                for row in examined:
+                    if row["stored_approval_id"] is None or row["stored_run_id"] is None:
+                        raise RuntimeError("runner context purge has linked corrupt authority")
+                    if row["approval_status"] == "awaiting_execution_approval" or row["run_status"] in {"prepared", "awaiting_execution_approval"}:
+                        raise RuntimeError("runner context purge has linked pregrant authority")
+                    deleted = self.conn.execute(
+                        "DELETE FROM canary_runner_context_projection_links WHERE workspace_id=? AND project_ref=? "
+                        "AND environment_id=? AND runner_id=? AND runner_key_id=? AND rcb_id=? "
+                        "AND binding_digest=? AND run_id=?", (*base, row["run_id"]),
+                    )
+                    if deleted.rowcount != 1:
+                        raise RuntimeError("runner context purge lost link serialization")
+                    counts["purged_links"] += 1
+                remaining -= len(examined)
+                if len(rows) > len(examined):
+                    self.conn.execute(
+                        "UPDATE canary_runner_context_purge_queue SET last_purged_run_id=? "
+                        "WHERE workspace_id=? AND project_ref=? AND rcb_id=? AND binding_digest=?",
+                        (examined[-1]["run_id"], queue["workspace_id"], queue["project_ref"],
+                         queue["rcb_id"], queue["binding_digest"]),
+                    )
+                    break
                 self.conn.execute(
-                    "DELETE FROM canary_runner_context_cancellation_queue WHERE workspace_id=? "
-                    "AND project_ref=? AND rcb_id=? AND binding_digest=?",
-                    (row["workspace_id"], row["project_ref"], row["rcb_id"], row["binding_digest"]),
+                    "UPDATE canary_runner_context_purge_queue SET phase='events' "
+                    "WHERE workspace_id=? AND project_ref=? AND rcb_id=? AND binding_digest=?",
+                    (queue["workspace_id"], queue["project_ref"], queue["rcb_id"], queue["binding_digest"]),
                 )
-            links = self.conn.execute(
-                "DELETE FROM canary_runner_context_projection_links WHERE workspace_id=? AND project_ref=? "
+                continue
+            if queue["phase"] == "events":
+                cursor = queue["last_purged_event_id"]
+                cursor_sql = "AND e.rce_id>?" if cursor is not None else ""
+                params = [
+                    queue["workspace_id"], queue["project_ref"], queue["rcb_id"],
+                    queue["binding_digest"],
+                ]
+                if cursor is not None:
+                    params.append(cursor)
+                params.append(remaining + 1)
+                rows = self.conn.execute(
+                    "SELECT e.rce_id,e.purge_at_ms FROM canary_runner_context_events e INDEXED BY idx_runner_context_events_binding_event "
+                    "WHERE e.workspace_id=? AND e.project_ref=? AND e.rcb_id=? AND e.binding_digest=? "
+                    + cursor_sql + " ORDER BY e.rce_id LIMIT ?", params,
+                ).fetchall()
+                examined = rows[:remaining]
+                for row in examined:
+                    if row["purge_at_ms"] > now_ms:
+                        raise RuntimeError("runner context purge event retention is inconsistent")
+                    deleted = self.conn.execute(
+                        "DELETE FROM canary_runner_context_events WHERE workspace_id=? AND project_ref=? "
+                        "AND rcb_id=? AND binding_digest=? AND rce_id=?",
+                        (queue["workspace_id"], queue["project_ref"], queue["rcb_id"],
+                         queue["binding_digest"], row["rce_id"]),
+                    )
+                    if deleted.rowcount != 1:
+                        raise RuntimeError("runner context purge lost event serialization")
+                    counts["purged_events"] += 1
+                remaining -= len(examined)
+                if len(rows) > len(examined):
+                    self.conn.execute(
+                        "UPDATE canary_runner_context_purge_queue SET last_purged_event_id=? "
+                        "WHERE workspace_id=? AND project_ref=? AND rcb_id=? AND binding_digest=?",
+                        (examined[-1]["rce_id"], queue["workspace_id"], queue["project_ref"],
+                         queue["rcb_id"], queue["binding_digest"]),
+                    )
+                    break
+                self.conn.execute(
+                    "UPDATE canary_runner_context_purge_queue SET phase='binding' "
+                    "WHERE workspace_id=? AND project_ref=? AND rcb_id=? AND binding_digest=?",
+                    (queue["workspace_id"], queue["project_ref"], queue["rcb_id"], queue["binding_digest"]),
+                )
+                continue
+            if queue["phase"] != "binding":
+                raise RuntimeError("runner context purge queue phase is invalid")
+            if self.conn.execute(
+                "SELECT 1 FROM canary_runner_context_projection_links WHERE workspace_id=? AND project_ref=? "
+                "AND rcb_id=? AND binding_digest=? LIMIT 1",
+                (queue["workspace_id"], queue["project_ref"], queue["rcb_id"], queue["binding_digest"]),
+            ).fetchone() is not None or self.conn.execute(
+                "SELECT 1 FROM canary_runner_context_events WHERE workspace_id=? AND project_ref=? "
+                "AND rcb_id=? AND binding_digest=? LIMIT 1",
+                (queue["workspace_id"], queue["project_ref"], queue["rcb_id"], queue["binding_digest"]),
+            ).fetchone() is not None or self.conn.execute(
+                "SELECT 1 FROM canary_runner_context_cancellation_queue WHERE workspace_id=? AND project_ref=? "
+                "AND rcb_id=? AND binding_digest=? LIMIT 1",
+                (queue["workspace_id"], queue["project_ref"], queue["rcb_id"], queue["binding_digest"]),
+            ).fetchone() is not None:
+                raise RuntimeError("runner context purge has linked authority")
+            self.conn.execute(
+                "DELETE FROM canary_runner_context_purge_queue WHERE workspace_id=? AND project_ref=? "
                 "AND rcb_id=? AND binding_digest=?",
-                (row["workspace_id"], row["project_ref"], row["rcb_id"], row["binding_digest"]),
+                (queue["workspace_id"], queue["project_ref"], queue["rcb_id"], queue["binding_digest"]),
             )
-            events = self.conn.execute(
-                "DELETE FROM canary_runner_context_events WHERE workspace_id=? AND project_ref=? "
-                "AND rcb_id=? AND binding_digest=?",
-                (row["workspace_id"], row["project_ref"], row["rcb_id"], row["binding_digest"]),
+            deleted = self.conn.execute(
+                "DELETE FROM canary_runner_context_bindings WHERE rcb_id=? AND status IN ('revoked','expired') "
+                "AND purge_at_ms=?",
+                (queue["rcb_id"], queue["binding_purge_at_ms"]),
             )
-            bindings = self.conn.execute(
-                "DELETE FROM canary_runner_context_bindings WHERE rcb_id=? AND status IN ('revoked','expired')",
-                (row["rcb_id"],),
-            )
-            if bindings.rowcount != 1:
+            if deleted.rowcount != 1:
                 raise RuntimeError("runner context purge lost serialization")
-            counts["purged_links"] += links.rowcount
-            counts["purged_events"] += events.rowcount
-            counts["purged_bindings"] += bindings.rowcount
+            counts["purged_bindings"] += 1
+            remaining -= 1
+        head = queue_head()
+        if head is not None:
+            counts["next_cursor"] = {
+                "purge_at_ms": head["binding_purge_at_ms"], "rcb_id": head["rcb_id"],
+            }
         return counts
 
     def create(self, workspace_id: str, project_id: str, request: object, *, actor: object, role: object) -> dict:

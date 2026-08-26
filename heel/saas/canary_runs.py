@@ -374,6 +374,15 @@ class CanaryRunService:
                 if not _transaction_owned:
                     self.conn.commit()
                 return result
+            live = self.conn.execute(
+                "SELECT approval_id FROM canary_approval_projections "
+                "INDEXED BY idx_canary_approval_pending_live_seek "
+                "WHERE workspace_id=? AND project_ref=? "
+                "AND status='awaiting_execution_approval' AND expires_at>? LIMIT 64",
+                (validated["workspace_id"], validated["project_id"], now),
+            ).fetchall()
+            if len(live) == 64:
+                raise CanaryRunError("canary_authority_unavailable")
             run_id = "crun_" + secrets.token_hex(16)
             expires = min(now + APPROVAL_TTL_MS, int(authority["proof_expires_at"] * 1000))
             if expires <= now:
@@ -1848,11 +1857,15 @@ class CanaryRunService:
         rows = self.conn.execute(
             "SELECT a.*,r.status AS run_status,r.workspace_id AS run_workspace_id,r.project_ref AS run_project_ref,"
             "r.approval_id AS run_approval_id,r.environment_id AS run_environment_id,r.runner_id AS run_runner_id,r.runner_key_id AS run_runner_key_id "
-            "FROM canary_approval_projections a INDEXED BY idx_canary_approval_pending_discovery_order "
-            "JOIN canary_runs r INDEXED BY idx_canary_runs_pending_approval_discovery ON r.workspace_id=a.workspace_id AND r.project_ref=a.project_ref AND r.approval_id=a.approval_id AND r.run_id=a.run_id "
-            "WHERE a.workspace_id=? AND a.project_ref=? AND a.status='awaiting_execution_approval' AND r.status='awaiting_execution_approval' AND a.expires_at>? "
-            "ORDER BY a.created_at DESC,a.run_id ASC LIMIT 2", (workspace_id, project_ref, now),
+            "FROM canary_approval_projections a INDEXED BY idx_canary_approval_pending_live_seek "
+            "LEFT JOIN canary_runs r INDEXED BY idx_canary_runs_pending_approval_discovery ON r.workspace_id=a.workspace_id "
+            "AND r.project_ref=a.project_ref AND r.approval_id=a.approval_id AND r.run_id=a.run_id "
+            "AND r.status='awaiting_execution_approval' "
+            "WHERE a.workspace_id=? AND a.project_ref=? AND a.status='awaiting_execution_approval' AND a.expires_at>? "
+            "ORDER BY a.expires_at ASC,a.created_at DESC,a.run_id ASC,a.approval_id ASC LIMIT 65", (workspace_id, project_ref, now),
         ).fetchall()
+        if len(rows) == 65:
+            raise CanaryRunError("canary_authority_unavailable")
         requests: list[dict[str, object]] = []
         for row in rows:
             try:
@@ -1895,7 +1908,8 @@ class CanaryRunService:
                 requests.append({"approval_id": row["approval_id"], "run_id": row["run_id"], "projection_digest": row["projection_digest"], "status": "awaiting_execution_approval", "submitted_at_ms": row["created_at"], "expires_at_ms": row["expires_at"], "origin": projection["environment"]["origin"], "hostname": hostname, "routes": [f"{item['method']} {item['route_template']}" for item in projection["actions"]], "scenarios": [item["scenario_id"] for item in projection["scenarios"]], "request_budget": projection["budgets"]["maximum_requests"], "duration_seconds": math.ceil(projection["budgets"]["wall_timeout_ms"] / 1000), "egress": f"{hostname}:443"})
             except (KeyError, TypeError, ValueError, LookupError):
                 raise CanaryRunError("canary_authority_unavailable") from None
-        return {"schema_version": "heel.canary-approval-request-list.v1", "server_time_ms": now, "requests": requests[:1], "has_more": len(rows) > 1}
+        requests.sort(key=lambda item: (-int(item["submitted_at_ms"]), str(item["run_id"])))
+        return {"schema_version": "heel.canary-approval-request-list.v1", "server_time_ms": now, "requests": requests[:1], "has_more": len(requests) > 1}
 
     def list_events(self, workspace_id: str, project_ref: str, run_id: str) -> list[dict]:
         self._run(workspace_id, project_ref, run_id)

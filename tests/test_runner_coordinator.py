@@ -728,7 +728,7 @@ def test_progress_result_and_stop_ack_decode_only_exact_service_responses(tmp_pa
     assert coordinator.result(grant["run_id"], terminal)["status"] == "terminal"
 
     now[0] = 2.0
-    with pytest.raises(TimeoutError, match="deadline elapsed"):
+    with pytest.raises(ValueError, match="active runner claim is required"):
         coordinator.stop_ack(grant["run_id"], stopping, deadline=2.0)
 
 
@@ -866,6 +866,12 @@ def test_findings_upload_is_closed_bounded_and_continues_the_terminal_result_cha
     assert lease is not None
     terminal = _phase(lease.operational_projection, coordinator.signer, "terminal")
     coordinator.result(grant["run_id"], terminal)
+    assert grant["run_id"] not in coordinator._gates
+    assert grant["run_id"] not in coordinator._gate_receipts
+    assert client._tracked_runs == {grant["run_id"]}
+    assert {chain for chain in client._chains if chain.endswith(":" + grant["run_id"])} == {
+        "result:" + grant["run_id"],
+    }
     findings = _findings_projection(coordinator, manifest, projection, grant)
     permit = _permit(authority, coordinator, grant, findings)
     receipt_holder.update({
@@ -884,6 +890,10 @@ def test_findings_upload_is_closed_bounded_and_continues_the_terminal_result_cha
         grant["run_id"], permit=permit, findings_projection=findings,
     )
     assert receipt == receipt_holder
+    assert grant["run_id"] not in client._tracked_runs
+    assert not any(chain.endswith(":" + grant["run_id"]) for chain in client._chains)
+    assert grant["run_id"] not in coordinator._bindings
+    assert grant["run_id"] not in coordinator._terminal_runs
     path, headers, body = transport.requests[-1]
     assert path.endswith(f"/runs/{grant['run_id']}/result-projection")
     assert headers["X-Heel-Runner-Nonce"] == _nonce(b"x")

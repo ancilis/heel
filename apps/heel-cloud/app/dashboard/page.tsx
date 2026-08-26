@@ -40,6 +40,7 @@ type DisclosurePreview = CanaryDisclosureMetadata & {
   completedScenarios: number;
   outcomeCounts: { blocked: number; observed: number; inconclusive: number };
 };
+type ApprovalDialogState = { requestKey: string; open: boolean } | null;
 
 
 function messageOf(error: unknown): string {
@@ -50,6 +51,10 @@ function messageOf(error: unknown): string {
 function idempotencyKey(): `ca1-${string}` {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return `ca1-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function approvalRequestKey(workspaceRef: string, projectRef: string, approval: CanaryApprovalSummary): string {
+  return `${workspaceRef}\0${projectRef}\0${approval.approvalId}\0${approval.runId}\0${approval.projectionDigest}`;
 }
 
 async function loadConnection(): Promise<Connection> {
@@ -82,7 +87,7 @@ export default function Dashboard() {
   const [proofMethod, setProofMethod] = useState<"https-file" | "dns-txt">("https-file");
   const [proofChallenge, setProofChallenge] = useState<ProofChallenge | null>(null);
   const [approval, setApproval] = useState<CanaryApprovalSummary | null>(null);
-  const [approvalOpen, setApprovalOpen] = useState(false);
+  const [approvalDialog, setApprovalDialog] = useState<ApprovalDialogState>(null);
   const [run, setRun] = useState<CanaryRunDashboard | null>(null);
   const [disclosurePreview, setDisclosurePreview] = useState<DisclosurePreview | null>(null);
   const [disclosureOpen, setDisclosureOpen] = useState(false);
@@ -90,13 +95,27 @@ export default function Dashboard() {
   const [selectedBindingEnvironment, setSelectedBindingEnvironment] = useState("");
   const [pendingHasMore, setPendingHasMore] = useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    void loadConnection().then((next) => { if (!cancelled) setConnection(next); });
-    return () => { cancelled = true; };
+  const clearApprovalIdentity = useCallback((): void => {
+    setApproval(null);
+    setRun(null);
+    setApprovalDialog(null);
+    setPendingHasMore(false);
+    setDisclosurePreview(null);
+    setDisclosureOpen(false);
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    void loadConnection().then((next) => {
+      if (cancelled) return;
+      if (next.phase !== "ready") clearApprovalIdentity();
+      setConnection(next);
+    });
+    return () => { cancelled = true; };
+  }, [clearApprovalIdentity]);
+
   async function connect(): Promise<void> {
+    clearApprovalIdentity();
     setConnection(await loadConnection());
   }
 
@@ -153,20 +172,23 @@ export default function Dashboard() {
       void canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId)
         .then((next) => { if (!cancelled) {
           setRun(next);
-          if (["cancelled", "expired"].includes(next.run.status)) { setApproval(null); setRun(null); }
+          if (["cancelled", "expired"].includes(next.run.status)) clearApprovalIdentity();
         } })
         .catch((error: unknown) => { if (!cancelled) {
-          if (error instanceof CanaryApiError && error.status === 404) { setApproval(null); setRun(null); }
+          if (error instanceof CanaryApiError && error.status === 404) clearApprovalIdentity();
           else setNotice(messageOf(error));
         } });
     }, 1_000);
     return () => { cancelled = true; clearInterval(timer); };
-  }, [approval, connection, run]);
+  }, [approval, clearApprovalIdentity, connection, run]);
 
   const executable = connection.phase === "ready"
     ? connection.context.environments.find((item) => item.isExecutable) : undefined;
   const selectedRunnerAvailable = connection.phase === "ready"
     && connection.context.contextBindings.runners.some((runner) => runner.runnerId === selectedRunner);
+  const approvalKey = connection.phase === "ready" && approval !== null
+    ? approvalRequestKey(connection.context.workspaceRef, connection.context.project.projectRef, approval) : null;
+  const approvalDialogOpen = approvalKey !== null && approvalDialog?.requestKey === approvalKey && approvalDialog.open;
   const hasPlan = approval !== null;
   const snapshot: ActivationSnapshot = {
     environment: executable ? "verified" : proofChallenge ? "checking" : "unverified",
@@ -189,6 +211,7 @@ export default function Dashboard() {
     if (connection.phase !== "ready") return;
     const project = connection.context.projects.find((item) => item.projectRef === projectRef);
     if (project === undefined) return;
+    clearApprovalIdentity();
     setWorking(true);
     setNotice(null);
     try {
@@ -196,7 +219,7 @@ export default function Dashboard() {
       const contextBindings = await canaryApi.listRunnerContextBindings(connection.context.workspaceRef, project.projectRef);
       setConnection({ phase: "ready", context: { ...connection.context, project, environments, contextBindings } });
       setSelectedRunner(""); setSelectedBindingEnvironment("");
-      setApproval(null); setRun(null); setProofChallenge(null); setDisclosurePreview(null);
+      setProofChallenge(null);
     } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
   }
 
@@ -262,7 +285,7 @@ export default function Dashboard() {
         projectionDigest: approval.projectionDigest, hostnameRetype: approval.hostname, reason,
         idempotencyKey: idempotencyKey(), controlGeneration: run.approvalControlGeneration,
       });
-      setApprovalOpen(false);
+      setApprovalDialog(null);
       setRun(await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, approval.runId));
     } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
   }
@@ -327,7 +350,7 @@ export default function Dashboard() {
 
       <div className="dashboard-grid"><div>
         <ActivationCard completedSteps={completedSteps} environmentOrigin={executable?.origin}
-          onReviewApproval={approval ? () => setApprovalOpen(true) : undefined}
+          onReviewApproval={approval && approvalKey ? () => setApprovalDialog({ requestKey: approvalKey, open: true }) : undefined}
           scenarioCount={approval?.scenarios.length ?? 0} snapshot={snapshot} />
         {context && !executable ? <section className="runner-recovery" id="verify-origin" aria-labelledby="verify-origin-title"><p className="canary-kicker">Exact public HTTPS origin</p><h2 id="verify-origin-title">Verify staging now</h2>
           <label>Staging origin<input autoComplete="url" onChange={(event) => setOrigin(event.target.value)} placeholder="https://staging.yourcompany.com" value={origin} /></label>
@@ -348,7 +371,7 @@ export default function Dashboard() {
         {progress?.localResultReady ? <label className="disclosure-entry"><span>Optional history</span><strong>Load local summary to review separate sharing →</strong><input accept="application/json,.json" hidden onChange={(event) => void loadDisclosurePreview(event.target.files?.[0])} type="file" /></label> : null}
       </aside></div>
 
-      {approval ? <ApprovalDialog durationSeconds={approval.durationSeconds} egress={approval.egress} onApprove={(reason) => void approveRun(reason)} onClose={() => setApprovalOpen(false)} open={approvalOpen} origin={approval.origin} requestBudget={approval.requestBudget} routes={approval.routes} scenarios={approval.scenarios} /> : null}
+      {approval && approvalKey ? <ApprovalDialog key={approvalKey} durationSeconds={approval.durationSeconds} egress={approval.egress} onApprove={(reason) => void approveRun(reason)} onClose={() => setApprovalDialog(null)} open={approvalDialogOpen} origin={approval.origin} requestBudget={approval.requestBudget} routes={approval.routes} scenarios={approval.scenarios} /> : null}
       {disclosurePreview ? <DisclosureDialog byteCount={disclosurePreview.projectionBytes} completedScenarios={disclosurePreview.completedScenarios} onClose={() => setDisclosureOpen(false)} onKeepLocal={() => void decideDisclosure(false)} onPermit={() => void decideDisclosure(true)} open={disclosureOpen} outcomeCounts={disclosurePreview.outcomeCounts} /> : null}
     </main>
   );
