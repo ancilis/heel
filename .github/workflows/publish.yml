@@ -1,49 +1,190 @@
-name: Publish to PyPI
+name: Publish verified Heel Agent to PyPI
 
-# Publishes arceo to PyPI when a GitHub Release is published, using PyPI Trusted
-# Publishing (OIDC) — NO API token is stored anywhere. One-time setup on PyPI:
-#   PyPI → your project (or "pending publisher") → Publishing → add a GitHub publisher:
-#     owner: ancilis   repo: arceo   workflow: publish.yml   environment: pypi
-# Then publish a GitHub Release and this workflow uploads the wheel + sdist.
+# Release-owner prerequisite: configure the protected `pypi` environment and a
+# PyPI Trusted Publisher for this exact owner/repository/workflow/environment.
+# Until that is done and a matching GitHub Release exists, PyPI is unavailable.
 
 on:
   release:
     types: [published]
-  workflow_dispatch: {}
+
+concurrency:
+  group: heel-pypi-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  build-and-publish:
+  verify-release:
+    name: verify exact Apache-only release bytes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EVENT_SHA: ${{ github.sha }}
+      EVENT_REF: ${{ github.ref }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    if: github.event.release.draft == false && github.event.release.prerelease == false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - name: Require a stable immutable release identity
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          descriptor = json.loads(Path("release/open-core-v1.json").read_text())
+          expected = f"v{descriptor['version']}"
+          actual = os.environ["RELEASE_TAG"]
+          if actual != expected:
+              raise SystemExit(f"release tag {actual!r} must equal {expected!r}")
+          if os.environ["EVENT_REF"] != f"refs/tags/{actual}":
+              raise SystemExit("release event ref does not match its tag")
+          head = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          if head != os.environ["EVENT_SHA"]:
+              raise SystemExit("checkout does not match the immutable release event SHA")
+          PY
+      - name: Install pinned release verification tools
+        run: >-
+          env PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1
+          python -m pip --isolated install --require-hashes --only-binary=:all:
+          -r release/requirements-release.txt
+      - name: Build and verify the deterministic Apache-only bytes
+        run: |
+          test ! -e dist
+          mkdir dist
+          python scripts/build_open_core_release.py --output dist
+          python scripts/build_open_core_release.py --output dist --check
+          HEEL_REQUIRE_STANDARD_BUILD=1 python -m unittest tests.test_open_core_release -v
+          python scripts/build_open_core_release.py --output dist --check
+          cmp dist/heel_sim-1.2.0-py3-none-any.whl \
+            apps/heel-cloud/public/downloads/heel_sim-1.2.0-py3-none-any.whl
+          cmp dist/heel_sim-1.2.0.tar.gz \
+            apps/heel-cloud/public/downloads/heel_sim-1.2.0.tar.gz
+          cmp dist/heel-open-core-manifest.json \
+            apps/heel-cloud/public/downloads/heel-open-core-manifest.json
+      - name: Stage only the verified publishable files
+        run: |
+          mkdir publish release-evidence
+          cp dist/heel_sim-1.2.0-py3-none-any.whl publish/
+          cp dist/heel_sim-1.2.0.tar.gz publish/
+          cp dist/heel-open-core-manifest.json \
+            release-evidence/heel-open-core-manifest.json
+          python -m twine check \
+            publish/heel_sim-1.2.0-py3-none-any.whl \
+            publish/heel_sim-1.2.0.tar.gz
+          python - <<'PY'
+          from pathlib import Path
+
+          expected = [
+              "heel_sim-1.2.0-py3-none-any.whl",
+              "heel_sim-1.2.0.tar.gz",
+          ]
+          assert sorted(path.name for path in Path("publish").iterdir()) == expected
+          assert [path.name for path in Path("release-evidence").iterdir()] == [
+              "heel-open-core-manifest.json"
+          ]
+          PY
+      - name: Transfer exact verified bytes to the identity-only job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: heel-pypi-${{ github.event.release.tag_name }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          path: |
+            publish/heel_sim-1.2.0-py3-none-any.whl
+            publish/heel_sim-1.2.0.tar.gz
+            release-evidence/heel-open-core-manifest.json
+
+  publish:
+    name: attest and publish verified bytes
+    needs: verify-release
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      id-token: write       # PyPI Trusted Publishing (OIDC) + provenance signing
       contents: read
-      attestations: write   # signed build-provenance attestation for the artifacts
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
-      - name: Build sdist + wheel
-        run: |
-          python -m pip install --upgrade build
-          python -m build
-      - name: Verify metadata
-        run: |
-          python -m pip install --upgrade twine
-          python -m twine check dist/*
-      - name: Generate SBOM (CycloneDX)
-        run: |
-          python -m pip install --upgrade cyclonedx-bom
-          cyclonedx-py environment -o dist/sbom.cdx.json || true
-      - name: Attest build provenance (Sigstore)
-        uses: actions/attest-build-provenance@v1
+          python-version: "3.13"
+      - name: Download the verification job's immutable artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          subject-path: "dist/*.whl, dist/*.tar.gz"
-      - name: Publish to PyPI (trusted publishing — no token stored)
-        uses: pypa/gh-action-pypi-publish@release/v1
+          name: heel-pypi-${{ github.event.release.tag_name }}
+          path: release
+      - name: Recheck the transferred manifest and exact file set
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path("release")
+          publish = root / "publish"
+          manifest_path = root / "release-evidence/heel-open-core-manifest.json"
+          manifest_source = manifest_path.read_text(encoding="utf-8")
+          manifest = json.loads(manifest_source)
+          canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+          if manifest_source != canonical:
+              raise SystemExit("release manifest is not canonical JSON")
+          if manifest.get("schema_version") != "heel.open-core-artifacts.v1":
+              raise SystemExit("unexpected release manifest schema")
+          if manifest.get("version") != "1.2.0" or set(manifest) != {
+              "artifacts", "schema_version", "version"
+          }:
+              raise SystemExit("unexpected release manifest fields")
+          expected_names = {
+              "heel_sim-1.2.0-py3-none-any.whl",
+              "heel_sim-1.2.0.tar.gz",
+          }
+          artifacts = manifest.get("artifacts")
+          if not isinstance(artifacts, list):
+              raise SystemExit("release manifest artifacts must be a list")
+          if [record.get("name") for record in artifacts] != [
+              "heel_sim-1.2.0-py3-none-any.whl",
+              "heel_sim-1.2.0.tar.gz",
+          ]:
+              raise SystemExit("release manifest artifact order mismatch")
+          if any(set(record) != {"name", "sha256", "size"} for record in artifacts):
+              raise SystemExit("release manifest artifact fields mismatch")
+          records = {record.get("name"): record for record in artifacts}
+          if set(records) != expected_names:
+              raise SystemExit("release manifest file set mismatch")
+          if {path.name for path in publish.iterdir()} != expected_names:
+              raise SystemExit("publish directory file set mismatch")
+          for name in sorted(expected_names):
+              path = publish / name
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"{name}: must be a regular file")
+              payload = path.read_bytes()
+              record = records[name]
+              if len(payload) != record.get("size"):
+                  raise SystemExit(f"{name}: size mismatch")
+              if hashlib.sha256(payload).hexdigest() != record.get("sha256"):
+                  raise SystemExit(f"{name}: digest mismatch")
+          PY
+      - name: Attest the exact wheel and source archive
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
-          attestations: true   # upload PEP 740 attestations to PyPI
+          subject-path: |
+            release/publish/heel_sim-1.2.0-py3-none-any.whl
+            release/publish/heel_sim-1.2.0.tar.gz
+      - name: Publish to PyPI with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: release/publish
+          attestations: true

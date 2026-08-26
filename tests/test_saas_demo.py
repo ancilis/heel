@@ -6,13 +6,13 @@ from pathlib import Path
 import tempfile
 import unittest
 
-os.environ["ARCEO_HOME"] = tempfile.mkdtemp()
+os.environ["HEEL_HOME"] = tempfile.mkdtemp()
 
-from arceo import cli  # noqa: E402
-from arceo import scope as scopemod  # noqa: E402
-from arceo.contracts import Category  # noqa: E402
-from arceo.importers import target_from_product_model, validate_product_model  # noqa: E402
-from arceo.targets import clear_imported_targets  # noqa: E402
+from heel import cli  # noqa: E402
+from heel import scope as scopemod  # noqa: E402
+from heel.contracts import Category  # noqa: E402
+from heel.importers import target_from_product_model, validate_product_model  # noqa: E402
+from heel.targets import clear_imported_targets  # noqa: E402
 
 
 DEMO_DIR = Path("examples/saas_demo")
@@ -40,7 +40,7 @@ def _walk_json(value):
 class TestSaasDemoExample(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
-        os.environ["ARCEO_HOME"] = self.home
+        os.environ["HEEL_HOME"] = self.home
         clear_imported_targets()
 
     def tearDown(self):
@@ -61,7 +61,7 @@ class TestSaasDemoExample(unittest.TestCase):
         result = validate_product_model(model)
 
         self.assertTrue(result.ok, result.errors)
-        self.assertEqual(result.target_id, "imported:arceo-saas-demo")
+        self.assertEqual(result.target_id, "imported:heel-saas-demo")
         self.assertEqual(model["environments"], ["staging", "sandbox"])
         self.assertIn("canary-only", " ".join(model["safety_notes"]))
 
@@ -107,7 +107,7 @@ class TestSaasDemoExample(unittest.TestCase):
         self.assertTrue(target.safety_metadata["live_probing_disabled"])
 
     def test_demo_run_produces_expected_categories(self):
-        scope = scopemod.create_scope(["imported:arceo-saas-demo"], operator="demo-tester")
+        scope = scopemod.create_scope(["imported:heel-saas-demo"], operator="demo-tester")
 
         rc, out = self._run_cli([
             "run",
@@ -146,14 +146,14 @@ class TestSaasDemoExample(unittest.TestCase):
 
     def test_demo_readme_commands_are_accurate(self):
         doc = README.read_text(encoding="utf-8")
-        self.assertIn("arceo import validate examples/saas_demo/product_model.json", doc)
-        self.assertIn("arceo scope create --target imported:arceo-saas-demo --operator you --confirm", doc)
+        self.assertIn("heel import validate examples/saas_demo/product_model.json", doc)
+        self.assertIn("heel scope create --target imported:heel-saas-demo --operator you --confirm", doc)
         self.assertIn(
-            "arceo run --mode existing-imported --target examples/saas_demo/product_model.json --scope <scope>",
+            "heel run --mode existing-imported --target examples/saas_demo/product_model.json --scope <scope>",
             doc,
         )
         self.assertIn(
-            "arceo launch-review --before examples/saas_demo/product_model.json --after examples/saas_demo/product_model.json",
+            "heel launch-review --before examples/saas_demo/product_model.json --after examples/saas_demo/product_model.json",
             doc,
         )
         self.assertIn("local/canary-only", doc)

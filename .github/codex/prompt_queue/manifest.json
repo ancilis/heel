@@ -1,10 +1,10 @@
 {
-  "project": "ancilis/arceo",
+  "project": "ancilis/heel",
   "queue_version": "0.1",
-  "branch_prefix": "codex/arceo-uplift",
+  "branch_prefix": "codex/heel-uplift",
   "labels": [
     "codex-queue",
-    "arceo-uplift",
+    "heel-uplift",
     "needs-human-review"
   ],
   "mode": "merge_gated",
@@ -76,9 +76,9 @@
     },
     {
       "id": 10,
-      "slug": "10_arceobench",
-      "file": "prompts/10_arceobench.md",
-      "title": "Prompt 10 \u2014 Build public benchmark scaffolding: ArceoBench",
+      "slug": "10_heelbench",
+      "file": "prompts/10_heelbench.md",
+      "title": "Prompt 10 \u2014 Build public benchmark scaffolding: HeelBench",
       "requires_human_review": true
     },
     {
@@ -99,7 +99,7 @@
       "id": 13,
       "slug": "13_openapi_import_mvp",
       "file": "prompts/13_openapi_import_mvp.md",
-      "title": "Prompt 13 \u2014 Add OpenAPI import MVP: `arceo init --from-openapi`",
+      "title": "Prompt 13 \u2014 Add OpenAPI import MVP: `heel init --from-openapi`",
       "requires_human_review": true
     },
     {

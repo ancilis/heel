@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from arceo import scope as scopemod  # noqa: E402
+from heel import scope as scopemod  # noqa: E402
 
 
 def incident(**overrides):
@@ -39,7 +39,7 @@ def incident(**overrides):
 class IncidentBase(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
-        os.environ["ARCEO_HOME"] = self.home
+        os.environ["HEEL_HOME"] = self.home
 
     def write_incident(self, data):
         path = Path(self.home) / f"{data['incident_id']}.json"
@@ -49,7 +49,7 @@ class IncidentBase(unittest.TestCase):
 
 class TestIncidentToScenario(IncidentBase):
     def test_sanitized_coupon_stacking_becomes_license_entitlement_scenario_draft(self):
-        from arceo.incident import draft_scenario, import_incident
+        from heel.incident import draft_scenario, import_incident
 
         record = import_incident(self.write_incident(incident()))
         draft = draft_scenario(record["incident_id"])
@@ -64,7 +64,7 @@ class TestIncidentToScenario(IncidentBase):
         self.assertFalse(draft["auto_enabled"])
 
     def test_export_scraping_becomes_data_harvesting_scenario_draft(self):
-        from arceo.incident import draft_scenario, import_incident
+        from heel.incident import draft_scenario, import_incident
 
         data = incident(
             incident_id="inc-export-001",
@@ -85,7 +85,7 @@ class TestIncidentToScenario(IncidentBase):
         self.assertEqual(scenario["success_criterion"]["prop"], "export_scraping")
 
     def test_support_workflow_gaming_becomes_workflow_scenario_draft(self):
-        from arceo.incident import draft_scenario, import_incident
+        from heel.incident import draft_scenario, import_incident
 
         data = incident(
             incident_id="inc-support-001",
@@ -107,7 +107,7 @@ class TestIncidentToScenario(IncidentBase):
         self.assertEqual(draft["scenario"]["kind"], "support_workflow")
 
     def test_secrets_looking_evidence_is_rejected(self):
-        from arceo.incident import IncidentError, import_incident
+        from heel.incident import IncidentError, import_incident
 
         data = incident(
             sanitized_evidence={
@@ -121,7 +121,7 @@ class TestIncidentToScenario(IncidentBase):
         self.assertIn("sanitized_evidence", str(err.exception))
 
     def test_generated_scenario_is_declarative_json_without_payloads(self):
-        from arceo.incident import draft_scenario, import_incident
+        from heel.incident import draft_scenario, import_incident
 
         record = import_incident(self.write_incident(incident()))
         scenario = draft_scenario(record["incident_id"])["scenario"]
@@ -134,7 +134,7 @@ class TestIncidentToScenario(IncidentBase):
         self.assertNotIn("steps", scenario)
 
     def test_generated_regression_is_canary_only(self):
-        from arceo.incident import add_regression_draft, import_incident
+        from heel.incident import add_regression_draft, import_incident
 
         record = import_incident(self.write_incident(incident()))
         regression = add_regression_draft(record["incident_id"])
@@ -147,12 +147,12 @@ class TestIncidentToScenario(IncidentBase):
         self.assertTrue(Path(regression["draft_path"]).exists())
 
     def test_incident_cli_does_not_create_or_widen_scope(self):
-        from arceo import cli
+        from heel import cli
 
         data = incident()
         path = self.write_incident(data)
         scope = scopemod.create_scope(["synthetic-saas"], operator="tester")
-        scope_path = Path(scopemod.arceo_home()) / "scopes" / f"{scope.scope_id}.json"
+        scope_path = Path(scopemod.heel_home()) / "scopes" / f"{scope.scope_id}.json"
         before = json.loads(scope_path.read_text())
 
         for argv in (
@@ -171,7 +171,7 @@ class TestIncidentToScenario(IncidentBase):
         self.assertIsNone(scopemod.get_scope("scope-forged"))
 
     def test_incident_review_prints_exactly_what_would_be_added(self):
-        from arceo import cli
+        from heel import cli
 
         data = incident()
         path = self.write_incident(data)

@@ -1,0 +1,43 @@
+# ADR-0001 — Brand name and open-core boundary
+
+Status: Accepted · Date: 2026-07-13 · Decider: Fable (autonomous, delegated)
+
+## Context
+The canonical product identity is Heel. Evidence verified: `pyproject.toml` uses the
+`heel-sim` distribution, `[project.scripts]` exposes `heel`, `heel-mcp`, and `heel-rest`, the
+Python package is `heel/`, and project URLs point to `github.com/ancilis/heel`. The core is
+Apache-2.0 with a DCO and NOTICE.
+
+## Decision
+1. **Canonical product/CLI name: `heel`; distribution: `heel-sim`; Python package: `heel`.**
+   Build artifact directories are ignored and not authoritative.
+2. **Repo rename to `ancilis/heel` is an OWNER action** (GitHub-side). Code keeps working via the
+   existing remote until then; badge/URL references already point to `heel`.
+3. **Open-core boundary:**
+   - **Open core (Apache-2.0, stays in this repo, `heel/` package):** the engine — scope safety
+     spine, synthetic targets, agents, scenarios, entitlement graph, importers, evaluation honesty,
+     containment log, CLI, MCP server, loopback REST. This is the reusable, auditable value.
+     The pre-existing Next.js control-room UI under `web/` reads only the engine's static
+     snapshot export and predates the hosted layer; it belongs to the engine side and stays
+     Apache-2.0. Relabeling existing open code proprietary would move the boundary after the
+     fact; the boundary only ever applies to new commercial code.
+   - **Commercial hosted layer (proprietary, isolated under `heel/saas/`):** multi-tenant
+     control plane, billing, metering, quotas, hosted auth, managed workers, admin, and the
+     hosted app UI (v1: the server-rendered app in `heel/saas/dashboard.py`; any future hosted
+     web frontend is new code under this boundary, not a relabel of `web/`). This code is a
+     **separate licensing unit** and MUST carry its own proprietary header, NOT the Apache grant.
+4. **Do not relicense the Apache core.** Adding proprietary hosted code to an Apache repo is
+   permitted (Apache-2.0 does not virally relicense combined/aggregate works), but the boundary must
+   be explicit per-file. A dedicated `LICENSE-COMMERCIAL.md` documents the hosted-layer terms; the
+   root `LICENSE` (Apache-2.0) and `NOTICE` are preserved unchanged. This is a documentation of
+   intent, **not legal advice** — flagged for owner counsel review in OWNER_ACTIONS.
+
+## Alternatives rejected
+- Keep dual "Heel" aliases in user-facing copy: rejected — the rebrand is committed; aliases add
+  confusion. Retain only compatibility shims where a hard break would harm existing installs.
+- Full proprietary relicense: rejected — destroys the open-source trust that is the top-of-funnel.
+- AGPL the core: rejected — deters the developer/security ICP and complicates hosted use.
+
+## Consequences / reversibility
+Reversible via a follow-up ADR. Migration cost of the open-core split is low because hosted code is
+greenfield under `heel/saas/`. Per-file license headers make the boundary machine-checkable.

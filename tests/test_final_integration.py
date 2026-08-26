@@ -20,7 +20,7 @@ class FinalIntegrationDocsTests(unittest.TestCase):
             "docs/CONTROL_SIMULATOR.md",
             "docs/ECONOMIC_SEVERITY.md",
             "docs/ENTITLEMENTS.md",
-            "docs/ARCEOBENCH.md",
+            "docs/HEELBENCH.md",
             "docs/HELDOUT_PROVENANCE.md",
             "docs/INCIDENTS.md",
             "docs/LAUNCH_REVIEW.md",
@@ -50,7 +50,7 @@ class FinalIntegrationDocsTests(unittest.TestCase):
             "personas",
             "scenario packs",
             "control simulator",
-            "ArceoBench",
+            "HeelBench",
             "incident-to-scenario",
             "dashboard war room",
         ):
@@ -82,13 +82,14 @@ class FinalIntegrationDocsTests(unittest.TestCase):
     def test_pyproject_keeps_zero_runtime_dependencies_and_matches_readme_positioning(self):
         with (ROOT / "pyproject.toml").open("rb") as fh:
             project = tomllib.load(fh)["project"]
-        readme = self.read("README.md").lower()
         description = project["description"].lower()
 
         self.assertEqual(project["dependencies"], [])
-        self.assertIn("abuse rehearsal", description)
-        self.assertIn("pre-launch", description)
-        self.assertIn("existing-product", description)
+        self.assertEqual(
+            description,
+            "privacy-first local saas launch review for browser, cli, and mcp workflows.",
+        )
+        readme = self.read("README.md").lower()
         self.assertIn("abuse rehearsal", readme)
         self.assertIn("pre-launch", readme)
         self.assertIn("existing products", readme)
@@ -97,7 +98,7 @@ class FinalIntegrationDocsTests(unittest.TestCase):
 class FinalIntegrationCliTests(unittest.TestCase):
     def run_cli_help(self, *args):
         proc = subprocess.run(
-            [sys.executable, "-m", "arceo.cli", *args, "--help"],
+            [sys.executable, "-m", "heel.cli", *args, "--help"],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,

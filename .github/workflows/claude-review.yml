@@ -1,4 +1,4 @@
-# Claude reviewer workflow for Arceo.
+# Claude reviewer workflow for Heel.
 #
 # Required repo secret: CLAUDE_CODE_OAUTH_TOKEN
 # Generate it through Claude Code /install-github-app or the Claude Code
@@ -82,7 +82,7 @@ jobs:
             --allowed-tools "Read,Glob,Grep,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*)"
             --max-turns 12
           prompt: |
-            You are the Claude reviewer for Arceo. Review PR #${{ steps.pr.outputs.number }} in this repo.
+            You are the Claude reviewer for Heel. Review PR #${{ steps.pr.outputs.number }} in this repo.
 
             ## How to gather context
 
@@ -99,9 +99,9 @@ jobs:
             - `comment` - the change has questions, suggestions, or context worth surfacing, but nothing blocking.
             - `request_changes` - there is a real defect, safety regression, security issue, missing required test, unjustified runtime dependency, inaccurate public claim, or CI failure that is not a known flake.
 
-            ## Arceo review priorities
+            ## Heel review priorities
 
-            - Arceo is synthetic-first abuse rehearsal software. It must not drift into real exploitation, prohibited content generation, or production probing without explicit authorization.
+            - Heel is synthetic-first abuse rehearsal software. It must not drift into real exploitation, prohibited content generation, or production probing without explicit authorization.
             - The authorization gate is non-negotiable: agent, MCP, REST, and CLI surfaces must not be able to create, widen, forge, or mutate human-approved scopes.
             - Scope files, HMAC signing, audit logs, and containment evidence must remain tamper-evident.
             - Runtime dependencies should stay zero unless the PR explicitly justifies a change and updates packaging, docs, and tests.

@@ -1,16 +1,16 @@
 # Adapter Contract
 
-Arceo adapters start with a product model, not a live connection. The first contract is
+Heel adapters start with a product model, not a live connection. The first contract is
 `ProductModel.v0.1`: an operator-authored JSON document that describes the observable affordances
 of a SaaS product using sanitized metadata. Validation and conversion are local, stdlib-only, and
 make no network calls.
 
-During conversion, Arceo also builds an entitlement graph from the same sanitized metadata. The graph
+During conversion, Heel also builds an entitlement graph from the same sanitized metadata. The graph
 derives scenario-ready affordances for plan, role, tenant, quota, audit, OAuth, and agent-tool scope
 mismatches. See [ENTITLEMENTS.md](ENTITLEMENTS.md).
 
 The purpose is abuse rehearsal before launch or against an existing product model while preserving
-Arceo's safety boundary:
+Heel's safety boundary:
 
 - Imported models are rehearsal inputs, not permission to probe a system.
 - Every imported target run still requires a human-created, HMAC-signed `AuthorizationScope`.
@@ -60,7 +60,7 @@ The converted target id is `imported:<product_id>`, for example `imported:acme-c
 authorize that exact target id out of band before it can run:
 
 ```bash
-arceo scope create --target imported:acme-crm --operator you --confirm
+heel scope create --target imported:acme-crm --operator you --confirm
 ```
 
 ## Safe Modeling
@@ -131,7 +131,7 @@ Never import:
 
 The validator rejects common secret-looking keys and values. Treat that as a safety rail, not a
 complete data-loss-prevention system. Operators are responsible for sanitizing the model before it is
-given to Arceo.
+given to Heel.
 
 ## Canary And Environment Use
 
@@ -146,7 +146,7 @@ operator chooses a separate, scoped, canary-only validation path.
 
 ## Imported-Model Rehearsal Vs Live Probing
 
-Imported-model rehearsal is static analysis over a sanitized ProductModel. Arceo converts the JSON
+Imported-model rehearsal is static analysis over a sanitized ProductModel. Heel converts the JSON
 into affordances and runs its scenario engine over those affordances. It does not call routes, open
 webhooks, execute agent tools, authenticate to SaaS systems, send messages, create payments, or fetch
 data.
@@ -159,7 +159,7 @@ real exfiltration, no credential abuse, no payment abuse, no spam, and no resour
 ## Validate A Model
 
 ```bash
-arceo import validate product_model.json
+heel import validate product_model.json
 ```
 
 The command validates required fields, environment names, list shapes, `safety_notes`, and
@@ -168,7 +168,7 @@ It does not register a persistent target, create a scope, or run a rehearsal.
 
 ## Conversion Notes
 
-`arceo.importers.target_from_product_model()` returns an `ImportedTarget` compatible with the existing
+`heel.importers.target_from_product_model()` returns an `ImportedTarget` compatible with the existing
 scenario engine. The target contains:
 
 - affordances derived from the ProductModel lists,

@@ -40,7 +40,7 @@ def cmd_next(args: argparse.Namespace) -> int:
         "slug": item["slug"],
         "file": item["file"],
         "title": item["title"],
-        "branch": f"{manifest.get('branch_prefix', 'codex/arceo-uplift')}-{item['id']:02d}-{item['slug']}",
+        "branch": f"{manifest.get('branch_prefix', 'codex/heel-uplift')}-{item['id']:02d}-{item['slug']}",
     }))
     return 0
 

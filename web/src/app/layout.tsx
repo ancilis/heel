@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
@@ -13,7 +14,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Arceo — control room",
+  title: "Heel — control room",
   description: "Rehearse SaaS abuse before launch and continuously after.",
 };
 

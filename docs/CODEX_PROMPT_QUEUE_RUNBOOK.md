@@ -1,6 +1,6 @@
-# Local Codex prompt queue runbook for `ancilis/arceo`
+# Local Codex prompt queue runbook for `ancilis/heel`
 
-This repo stores the Arceo uplift prompts as a merge-gated queue. The queue is
+This repo stores the Heel uplift prompts as a merge-gated queue. The queue is
 run by the local Codex CLI, authenticated with your ChatGPT/Codex subscription,
 not by a GitHub Action and not by an OpenAI API key.
 

@@ -1,0 +1,54 @@
+{
+  "name": "@heel/cloud",
+  "version": "1.2.0",
+  "private": true,
+  "engines": {
+    "node": ">=24.13.1"
+  },
+  "scripts": {
+    "predev": "node scripts/prepare-runtime.mjs",
+    "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
+    "prebuild": "node scripts/prepare-runtime.mjs",
+    "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
+    "deploy": "npm run build && wrangler deploy",
+    "deploy:dry-run": "npm run build && wrangler deploy --dry-run",
+    "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
+    "test:unit": "vitest run",
+    "test:node": "node --test tests/*.test.mjs",
+    "test": "npm run test:unit && npm run test:node",
+    "typecheck": "tsc --noEmit --incremental false",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern public/heel-runtime"
+  },
+  "dependencies": {
+    "next": "16.3.2",
+    "pyodide": "314.0.3",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "1.53.1",
+    "@tailwindcss/postcss": "4.2.1",
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "@vitejs/plugin-react": "6.0.2",
+    "@vitejs/plugin-rsc": "0.5.34",
+    "eslint": "9.39.4",
+    "eslint-config-next": "16.3.2",
+    "fake-indexeddb": "6.2.5",
+    "jsdom": "29.1.1",
+    "react-server-dom-webpack": "19.2.8",
+    "tailwindcss": "4.2.1",
+    "typescript": "5.9.3",
+    "vinext": "1.0.0-beta.8",
+    "vite": "8.2.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.125.0"
+  },
+  "overrides": {
+    "ws": "8.21.0"
+  },
+  "type": "module"
+}

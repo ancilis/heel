@@ -1,21 +1,21 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "arceo"
-version = "1.1.0"
-description = "Arceo is MCP-first continuous SaaS abuse rehearsal for pre-launch review and authorized canary-only existing-product runs."
-readme = "README.md"
+name = "heel-sim"
+version = "1.2.0"
+description = "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows."
+readme = "release/open-core/README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Ancilis" }]
 keywords = ["security", "abuse-simulation", "mcp", "red-team", "agent", "appsec", "ai-safety"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Security",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -23,26 +23,17 @@ classifiers = [
 # v1 core is PURE STANDARD LIBRARY by design (DECISIONS D-001) — zero runtime dependencies.
 dependencies = []
 
-[project.urls]
-Homepage = "https://github.com/ancilis/arceo"
-Source = "https://github.com/ancilis/arceo"
-Issues = "https://github.com/ancilis/arceo/issues"
+[project.scripts]
+heel = "heel.cli:main"
+heel-mcp = "heel.mcp_server:main"
+heel-rest = "heel.rest:serve"
 
 [project.optional-dependencies]
-# the LLM control loop uses the Anthropic Messages API via stdlib urllib (no SDK needed);
-# this extra is only a convenience marker — no package is actually required.
-llm = []
-
-[project.scripts]
-arceo = "arceo.cli:main"
-arceo-mcp = "arceo.mcp_server:main"
-arceo-rest = "arceo.rest:serve"
+runner = ["cryptography==45.0.7"]
 
 [tool.setuptools]
-packages = ["arceo"]
+include-package-data = false
+packages = ["heel", "heel.runner"]
 
 [tool.setuptools.package-data]
-arceo = ["scenarios_lib/*.json", "heldout/*.json"]
-
-[tool.setuptools.exclude-package-data]
-arceo = ["**/__pycache__/*"]
+heel = ["heldout/targets.json", "scenarios_lib/community.json"]

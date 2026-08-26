@@ -13,7 +13,7 @@ class DemoCommandTests(unittest.TestCase):
     def run_make(self, target):
         with tempfile.TemporaryDirectory() as home:
             env = os.environ.copy()
-            env["ARCEO_HOME"] = home
+            env["HEEL_HOME"] = home
             proc = subprocess.run(
                 ["make", target],
                 cwd=ROOT,
@@ -77,7 +77,7 @@ class DemoCommandTests(unittest.TestCase):
         out = self.run_make("demo-bench")
 
         self.assertIn("mode: synthetic benchmark", out)
-        self.assertIn("ArceoBench", out)
+        self.assertIn("HeelBench", out)
         self.assertIn("Held-out TEST", out)
 
     def test_cli_help_surfaces_new_workflows(self):
@@ -91,7 +91,7 @@ class DemoCommandTests(unittest.TestCase):
         ]
         for args, expected in checks:
             proc = subprocess.run(
-                [sys.executable, "-m", "arceo.cli", *args],
+                [sys.executable, "-m", "heel.cli", *args],
                 cwd=ROOT,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -106,14 +106,14 @@ class DemoCommandTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
 
         self.assertIn("Try a SaaS abuse review", readme)
-        self.assertIn("arceo import validate examples/saas_demo/product_model.json", readme)
+        self.assertIn("heel import validate examples/saas_demo/product_model.json", readme)
         self.assertIn(
-            "arceo launch-review --before examples/saas_demo/product_model.json "
+            "heel launch-review --before examples/saas_demo/product_model.json "
             "--after examples/saas_demo/product_model.json",
             readme,
         )
-        self.assertIn("arceo regress add", readme)
-        self.assertIn("arceo regress run", readme)
+        self.assertIn("heel regress add", readme)
+        self.assertIn("heel regress run", readme)
 
 
 if __name__ == "__main__":

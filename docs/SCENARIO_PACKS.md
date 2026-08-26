@@ -1,6 +1,6 @@
 # Scenario Packs
 
-Arceo covers SaaS abuse broadly. Agent/MCP is a premium pack for products with agentic surfaces.
+Heel covers SaaS abuse broadly. Agent/MCP is a premium pack for products with agentic surfaces.
 
 Scenario packs let operators focus a run without changing the safety model. Every run still requires
 a human-created signed scope for non-synthetic targets, every finding remains canary-contained, and
@@ -17,7 +17,7 @@ MCP/REST/agent callers still cannot create, widen, or mutate scopes.
 | `compliance` | Tenant isolation, audit, residency, retention, and admin/support workflow boundaries. |
 | `agent_mcp` | Agent tools, MCP connectors, RAG/retrieval, tool authorization, and model-to-tool action surfaces. |
 
-By default, Arceo keeps current behavior: it loads all relevant packs, and Agent/MCP scenarios only
+By default, Heel keeps current behavior: it loads all relevant packs, and Agent/MCP scenarios only
 apply when the target declares an agentic surface. Explicit pack filters narrow the library.
 
 ## CLI Examples
@@ -25,13 +25,13 @@ apply when the target declares an agentic surface. Explicit pack filters narrow 
 List only Agent/MCP scenarios:
 
 ```bash
-arceo scenarios --pack agent_mcp
+heel scenarios --pack agent_mcp
 ```
 
 Run a scoped rehearsal with selected packs:
 
 ```bash
-arceo run --scope scope-123 --target imported:acme-crm --packs core_saas,agent_mcp
+heel run --scope scope-123 --target imported:acme-crm --packs core_saas,agent_mcp
 ```
 
 ## Agent/MCP Examples

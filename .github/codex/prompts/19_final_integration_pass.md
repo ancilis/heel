@@ -42,7 +42,7 @@ Add an “Unreleased” section with:
 - personas
 - scenario packs
 - control simulator
-- ArceoBench
+- HeelBench
 - incident-to-scenario
 - dashboard war room
 

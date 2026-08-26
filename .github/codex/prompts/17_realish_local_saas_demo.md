@@ -43,9 +43,9 @@ Add docs:
 How to run:
 
 ```bash
-arceo import validate examples/saas_demo/product_model.json
-arceo run --mode existing-imported --target examples/saas_demo/product_model.json --scope <scope>
-arceo launch-review --before ... --after ...
+heel import validate examples/saas_demo/product_model.json
+heel run --mode existing-imported --target examples/saas_demo/product_model.json --scope <scope>
+heel launch-review --before ... --after ...
 ```
 
 Explain this is local/canary-only.
@@ -60,4 +60,4 @@ Tests:
 
 Acceptance criteria:
 
-- A new user can understand Arceo’s real-product story without needing a real customer system.
+- A new user can understand Heel’s real-product story without needing a real customer system.

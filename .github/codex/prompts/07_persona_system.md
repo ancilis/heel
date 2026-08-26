@@ -3,12 +3,12 @@
 Task: Make opportunistic-human profiles a first-class abuse persona system.
 
 Current state:
-Arceo already has an opportunistic-human class and motivation-gated profiles. Expand it into a richer persona library.
+Heel already has an opportunistic-human class and motivation-gated profiles. Expand it into a richer persona library.
 
 Create/update:
 
-- arceo/profiles.py
-- arceo/agents_human.py
+- heel/profiles.py
+- heel/agents_human.py
 - docs/PERSONAS.md
 - tests
 
@@ -61,4 +61,4 @@ Docs:
 
 Acceptance criteria:
 
-- Arceo can explain not just “what is weak,” but “which motivated customer archetype would game it.”
+- Heel can explain not just “what is weak,” but “which motivated customer archetype would game it.”
