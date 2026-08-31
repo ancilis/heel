@@ -1295,8 +1295,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _expected_control_generation(self) -> int:
         values = self._header_values("If-Heel-Control-Generation")
-        if (len(values) != 1 or _CONTROL_GENERATION.fullmatch(values[0]) is None
-                or len(values[0]) > 20):
+        if (len(values) != 1 or len(values[0]) > 20
+                or _CONTROL_GENERATION.fullmatch(values[0]) is None):
             raise ApiError(
                 400, "invalid canary control generation",
                 code="invalid_canary_approval",

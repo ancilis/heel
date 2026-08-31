@@ -245,7 +245,7 @@ class SocketTransport:
 
 class TLSTransport:
     def __init__(self) -> None:
-        self.context = ssl.create_default_context()
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         self.context.verify_mode = ssl.CERT_REQUIRED
         self.context.check_hostname = True
         self.context.minimum_version = ssl.TLSVersion.TLSv1_2

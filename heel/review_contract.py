@@ -119,6 +119,8 @@ def stable_json(value: Any) -> str:
 
 def stable_json_hash(value: Any) -> str:
     """Return the SHA-256 digest of a value's canonical JSON representation."""
+    # lgtm[py/weak-cryptographic-algorithm] SHA-256 is an interoperable content digest here,
+    # never a password verifier or credential storage primitive.
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
 
 

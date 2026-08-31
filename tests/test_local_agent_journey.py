@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import secrets
 import socket
 import subprocess
 import sys
@@ -179,7 +180,7 @@ class LocalAgentJourneyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             home = root / "heel-home"
-            secret = "sk-live-never-print-1234567890abcdef"
+            secret = "sk-" + secrets.token_urlsafe(32)
 
             oversized = root / "oversized-secret.json"
             oversized.write_bytes(b"{" + b"x" * MAX_OPENAPI_PAYLOAD_BYTES)

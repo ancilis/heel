@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import ssl
 import threading
 
 import pytest
@@ -14,14 +15,28 @@ from heel.runner.http_transport import (
     EvidenceContext,
     RetryPolicy,
     TargetHTTPSClient,
+    TLSTransport,
     TransportFailure,
     normalize_target_origin,
     select_public_addresses,
 )
+from heel.saas.network_guard import TLSTransport as NetworkTLSTransport
 from heel.runner.redaction import Redactor
 
 
 PUBLIC = "93.184.216.34"
+
+
+def test_tls_transports_use_the_client_protocol_context_without_legacy_defaults(monkeypatch):
+    def legacy_default(*_args, **_kwargs):
+        raise AssertionError("legacy default TLS context was used")
+
+    monkeypatch.setattr(ssl, "create_default_context", legacy_default)
+    for transport in (TLSTransport(), NetworkTLSTransport()):
+        assert transport.context.protocol == ssl.PROTOCOL_TLS_CLIENT
+        assert transport.context.minimum_version >= ssl.TLSVersion.TLSv1_2
+        assert transport.context.verify_mode == ssl.CERT_REQUIRED
+        assert transport.context.check_hostname is True
 
 
 def prepared(*, method="GET", profile="anonymous", route="/health"):

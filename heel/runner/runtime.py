@@ -886,7 +886,7 @@ class RunnerRuntimeState:
             if (
                 not stat.S_ISDIR(parent_stat.st_mode)
                 or parent_stat.st_uid not in owner_ids
-                or stat.S_IMODE(parent_stat.st_mode) & 0o022
+                or stat.S_IMODE(parent_stat.st_mode) & 0o002
             ):
                 raise RunnerRuntimeCorrupt("runtime state helper is unavailable")
             next_parent = os.path.dirname(parent)

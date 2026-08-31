@@ -381,8 +381,6 @@ def main() -> int:
     _LOGGER.info(json.dumps({
         "billing_mode": config.billing_mode,
         "event": "control_plane_started",
-        "host": config.host,
-        "port": server.server_address[1],
         "schema_version": CONTROL_PLANE_MIGRATIONS[-1].version,
     }, sort_keys=True, separators=(",", ":")))
 

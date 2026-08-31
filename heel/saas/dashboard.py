@@ -44,23 +44,28 @@ def _form_body(handler) -> dict:
     return {k: v[0] for k, v in data.items()}
 
 
-def _html(handler, status: int, body: str, headers: dict | None = None) -> None:
+def _html(handler, status: int, body: str) -> None:
     raw = body.encode()
     handler.send_response(status)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
     handler.send_header("Content-Length", str(len(raw)))
     handler.send_header("Cache-Control", "no-store")
-    for k, v in (headers or {}).items():
-        handler.send_header(k, v)
     handler.end_headers()
     handler.wfile.write(raw)
 
 
-def _redirect(handler, to: str, headers: dict | None = None) -> None:
+def _redirect(handler, to: str, *, session_cookie: str | None = None) -> None:
+    if (
+        type(to) is not str
+        or not to.startswith("/app")
+        or "\r" in to
+        or "\n" in to
+    ):
+        raise ValueError("invalid dashboard redirect")
     handler.send_response(303)
     handler.send_header("Location", to)
-    for k, v in (headers or {}).items():
-        handler.send_header(k, v)
+    if session_cookie is not None:
+        handler.send_header("Set-Cookie", session_cookie)
     handler.send_header("Content-Length", "0")
     handler.end_headers()
 
@@ -121,7 +126,7 @@ def handle(handler, method: str, parts: list) -> bool:
             _redirect(handler, f"/app/{tail[0]}-form?err={msg}")
             return True
         from .http_api import _session_cookie
-        _redirect(handler, "/app", {"Set-Cookie": _session_cookie(ses.token)})
+        _redirect(handler, "/app", session_cookie=_session_cookie(ses.token))
         return True
 
     if tail == ("logout-form",):
@@ -131,7 +136,7 @@ def handle(handler, method: str, parts: list) -> bool:
             if k == "heel_session":
                 handler.cp.auth.revoke_session(v)
         _redirect(handler, "/app/login-form",
-                  {"Set-Cookie": "heel_session=; Max-Age=0; Path=/"})
+                  session_cookie="heel_session=; Max-Age=0; Path=/")
         return True
 
     # Everything below needs a signed-in session (dashboard is human-facing; API keys use /v1).

@@ -571,6 +571,7 @@ class BrowserEngineBuildTests(unittest.TestCase):
 
     def test_wheel_zip_metadata_is_pinned_and_non_executable(self):
         wheel, _manifest = self._require_build()
+        self.assertEqual(stat.S_IMODE(wheel.stat().st_mode), 0o600)
         with zipfile.ZipFile(wheel) as archive:
             for info in archive.infolist():
                 self.assertEqual(info.date_time, (1980, 1, 1, 0, 0, 0), info.filename)
