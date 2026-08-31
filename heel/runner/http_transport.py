@@ -235,6 +235,7 @@ class TLSTransport:
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         self.context.verify_mode = ssl.CERT_REQUIRED
         self.context.check_hostname = True
+        # lgtm[py/insecure-protocol] The client context rejects TLS 1.0/1.1 below.
         self.context.minimum_version = ssl.TLSVersion.TLSv1_2
 
     def wrap(self, raw_socket: Any, hostname: str, timeout: float) -> Any:

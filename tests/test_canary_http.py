@@ -21,17 +21,10 @@ import heel.saas.http_api as http_api
 def test_control_generation_bounds_untrusted_header_before_pattern_matching(monkeypatch):
     handler = object.__new__(http_api._Handler)
     handler._header_values = lambda _name: ["1" * 100_000]
-    matched = []
-
-    class BoundedPattern:
-        def fullmatch(self, value):
-            matched.append(value)
-            raise AssertionError("unbounded request header reached the regex engine")
-
-    monkeypatch.setattr(http_api, "_CONTROL_GENERATION", BoundedPattern())
+    monkeypatch.setattr(http_api, "_is_control_generation", lambda _value: (_ for _ in ()).throw(
+        AssertionError("unbounded request header reached validation")))
     with pytest.raises(http_api.ApiError, match="invalid canary control generation"):
         handler._expected_control_generation()
-    assert matched == []
 from heel.saas.canary_runs import CanaryRunService
 from heel.saas.tenancy import Role
 

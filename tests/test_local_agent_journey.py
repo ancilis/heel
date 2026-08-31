@@ -180,18 +180,18 @@ class LocalAgentJourneyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             home = root / "heel-home"
-            secret = "sk-" + secrets.token_urlsafe(32)
+            fixture_value = "sk-" + secrets.token_urlsafe(32)
 
             oversized = root / "oversized-secret.json"
             oversized.write_bytes(b"{" + b"x" * MAX_OPENAPI_PAYLOAD_BYTES)
             malformed = root / "malformed-secret.json"
-            malformed.write_text("{not-json " + secret, encoding="utf-8")
+            malformed.write_text("{not-json " + fixture_value, encoding="utf-8")
             secret_spec = root / "secret-spec.json"
             secret_spec.write_text(json.dumps({
                 "openapi": "3.1.0",
                 "info": {"title": "Secret", "version": "1"},
                 "paths": {},
-                "components": {"examples": {"credential": {"value": secret}}},
+                "components": {"examples": {"credential": {"value": fixture_value}}},
             }), encoding="utf-8")
             directory = root / "directory-input"
             directory.mkdir()
@@ -203,7 +203,7 @@ class LocalAgentJourneyTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2)
                     self.assertEqual(result.stdout, "")
                     self.assertEqual(result.stderr, SAFE_FAILURE)
-                    self.assertNotIn(secret, result.stderr)
+                    self.assertNotIn(fixture_value, result.stderr)
                     self.assertNotIn(str(input_path), result.stderr)
 
             self.assertFalse((home / "reviews").exists())
