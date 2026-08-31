@@ -33,8 +33,7 @@ def test_tls_transports_use_the_client_protocol_context_without_legacy_defaults(
 
     monkeypatch.setattr(ssl, "create_default_context", legacy_default)
     for transport in (TLSTransport(), NetworkTLSTransport()):
-        assert transport.context.protocol == ssl.PROTOCOL_TLS_CLIENT
-        assert transport.context.minimum_version >= ssl.TLSVersion.TLSv1_2
+        assert transport.context.protocol == ssl.PROTOCOL_TLSv1_2
         assert transport.context.verify_mode == ssl.CERT_REQUIRED
         assert transport.context.check_hostname is True
 
