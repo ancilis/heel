@@ -23,6 +23,11 @@ def _pepper(byte: bytes) -> str:
 
 
 class ProductionConfigurationTests(unittest.TestCase):
+    def test_startup_log_excludes_listener_address_details(self):
+        source = Path("heel/saas/server.py").read_text(encoding="utf-8")
+        self.assertNotIn('"host": config.host', source)
+        self.assertNotIn('"port": server.server_address[1]', source)
+
     def valid_environment(self, root: Path) -> dict[str, str]:
         signing = SigningAuthority.generate()
         return {

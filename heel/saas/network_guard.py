@@ -245,10 +245,9 @@ class SocketTransport:
 
 class TLSTransport:
     def __init__(self) -> None:
-        self.context = ssl.create_default_context()
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
         self.context.verify_mode = ssl.CERT_REQUIRED
         self.context.check_hostname = True
-        self.context.minimum_version = ssl.TLSVersion.TLSv1_2
 
     def wrap(self, connected_socket: Any, hostname: str, timeout: float) -> Any:
         wrapped = self.context.wrap_socket(connected_socket, server_hostname=hostname)

@@ -131,12 +131,22 @@ REQUEST_DRAIN_TIMEOUT_SECONDS = 30
 _LOGGER = logging.getLogger("heel.saas.control_plane")
 _SYNC_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _CANARY_IDEMPOTENCY = re.compile(r"ca1-[0-9a-f]{64}\Z")
-_CONTROL_GENERATION = re.compile(r"0|[1-9][0-9]*\Z")
 
 
 class _NullLock:
     def __enter__(self): return self
     def __exit__(self, *_): return False
+
+
+def _is_control_generation(value: str) -> bool:
+    return (
+        value == "0"
+        or (
+            bool(value)
+            and "1" <= value[0] <= "9"
+            and all("0" <= character <= "9" for character in value[1:])
+        )
+    )
 
 
 class _DuplicateJsonKey(ValueError):
@@ -1295,8 +1305,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _expected_control_generation(self) -> int:
         values = self._header_values("If-Heel-Control-Generation")
-        if (len(values) != 1 or _CONTROL_GENERATION.fullmatch(values[0]) is None
-                or len(values[0]) > 20):
+        if (len(values) != 1 or len(values[0]) > 20
+                or not _is_control_generation(values[0])):
             raise ApiError(
                 400, "invalid canary control generation",
                 code="invalid_canary_approval",

@@ -226,6 +226,24 @@ def test_runtime_inode_guard_rejects_a_group_writable_resolved_interpreter_befor
     assert spawned == []
 
 
+def test_runtime_inode_guard_allows_a_trusted_group_writable_interpreter_parent(tmp_path, monkeypatch):
+    signer = Signer()
+    candidate_parent = os.path.dirname(os.path.realpath(sys.executable, strict=True))
+    original_stat = runtime_module.os.stat
+
+    def stat_with_group_writable_parent(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if os.fspath(path) == candidate_parent:
+            values = list(result)
+            values[0] = (result.st_mode & ~0o777) | 0o775
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(runtime_module.os, "stat", stat_with_group_writable_parent)
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", _identity(signer), signer)
+    runtime.close()
+
+
 @pytest.mark.parametrize("suffix,fixture", [
     ("-wal", "symlink"), ("-shm", "hardlink"), ("-journal", "mode"),
 ])

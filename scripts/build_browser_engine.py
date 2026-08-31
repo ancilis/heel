@@ -805,7 +805,7 @@ def _write_atomic(output: Path, filename: str, payload: bytes) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.chmod(temporary, 0o644)
+        os.chmod(temporary, 0o600)
         _assert_no_symlink_components(output, "browser engine output")
         _assert_no_symlink_components(temporary, "browser engine temporary artifact")
         _assert_no_symlink_components(
