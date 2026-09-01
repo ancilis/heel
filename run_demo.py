@@ -16,13 +16,16 @@ import os
 from heel import scope as scopemod
 from heel.containment import verify_chain
 from heel.contracts import DataHandlingMode
-from heel.mcp_server import TOOL_NAMES, HeelServer
+from heel.mcp_server import TOOL_NAMES, HeelServer, ToolError
 from heel.scenarios import SEED_SCENARIOS
 from heel.store import Store
 
 
 def mcp(server, session, name, args):
-    return server.dispatch("tools/call", {"name": name, "arguments": args}, session)
+    try:
+        return server.dispatch("tools/call", {"name": name, "arguments": args}, session)
+    except ToolError as exc:
+        return {"isError": True, "code": exc.code, "message": str(exc)}
 
 
 def _fresh_home():

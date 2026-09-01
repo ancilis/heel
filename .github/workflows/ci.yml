@@ -43,24 +43,29 @@ jobs:
       - name: Prepare private test scratch
         run: |
           install -d -m 700 "${RUNNER_TEMP}/heel-pytest"
+          python -m venv --copies "${RUNNER_TEMP}/heel-pytest/venv"
           echo "TMPDIR=${RUNNER_TEMP}/heel-pytest" >> "$GITHUB_ENV"
       - name: Install pinned runner/control-plane wheels
         run: |
           env PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1 \
-            python -m pip --isolated install --only-binary=:all: cryptography==45.0.7 pytest==9.0.2
+            "${RUNNER_TEMP}/heel-pytest/venv/bin/python" -m pip --isolated install --only-binary=:all: cryptography==45.0.7 pytest==9.0.2
           env PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1 \
-            python -m pip --isolated download --only-binary=:all: --no-deps -d /tmp/heel-dns dnspython==2.8.0
+            "${RUNNER_TEMP}/heel-pytest/venv/bin/python" -m pip --isolated download --only-binary=:all: --no-deps -d /tmp/heel-dns dnspython==2.8.0
           echo '01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af  /tmp/heel-dns/dnspython-2.8.0-py3-none-any.whl' | sha256sum -c -
           env PIP_CONFIG_FILE=/dev/null PYTHONNOUSERSITE=1 \
-            python -m pip --isolated install --no-index --find-links=/tmp/heel-dns dnspython==2.8.0
+            "${RUNNER_TEMP}/heel-pytest/venv/bin/python" -m pip --isolated install --no-index --find-links=/tmp/heel-dns dnspython==2.8.0
       - name: Full Python acceptance + security suite
-        run: python -m pytest -q tests
+        run: >-
+          "${RUNNER_TEMP}/heel-pytest/venv/bin/python" -m pytest -q tests
       - name: One-command demo (auth gate + honest backtests)
-        run: python run_demo.py
+        run: >-
+          "${RUNNER_TEMP}/heel-pytest/venv/bin/python" run_demo.py
       - name: Hosted control-plane smoke (signup → run → verify → kill switch)
-        run: python scripts/saas_smoke.py
+        run: >-
+          "${RUNNER_TEMP}/heel-pytest/venv/bin/python" scripts/saas_smoke.py
       - name: Static site build
-        run: python -c "from heel.saas.site import build; build('build/site')"
+        run: >-
+          "${RUNNER_TEMP}/heel-pytest/venv/bin/python" -c "from heel.saas.site import build; build('build/site')"
 
   package:
     name: verify + install deterministic Agent release
