@@ -872,7 +872,7 @@ class RunnerRuntimeState:
         if (
             not stat.S_ISREG(executable_stat.st_mode)
             or executable_stat.st_uid not in owner_ids
-            or executable_mode & 0o022
+            or executable_mode & 0o002
             or not executable_mode & 0o111
             or not os.access(candidate, os.X_OK)
         ):

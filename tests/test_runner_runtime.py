@@ -208,11 +208,11 @@ def test_runtime_inode_guard_uses_the_fixed_isolated_stdio_only_bootstrap(tmp_pa
         os.close(sentinel)
 
 
-def test_runtime_inode_guard_rejects_a_group_writable_resolved_interpreter_before_spawn(tmp_path, monkeypatch):
+def test_runtime_inode_guard_rejects_a_world_writable_resolved_interpreter_before_spawn(tmp_path, monkeypatch):
     signer = Signer()
     unsafe = tmp_path / "python"
     unsafe.write_bytes(b"#!not-an-interpreter\n")
-    unsafe.chmod(0o775)
+    unsafe.chmod(0o777)
     spawned = []
 
     def forbidden(*_args, **_kwargs):
@@ -224,6 +224,24 @@ def test_runtime_inode_guard_rejects_a_group_writable_resolved_interpreter_befor
     with pytest.raises(RunnerRuntimeCorrupt, match="runtime state helper is unavailable"):
         RunnerRuntimeState(tmp_path / "runtime.sqlite3", _identity(signer), signer)
     assert spawned == []
+
+
+def test_runtime_inode_guard_allows_a_trusted_group_writable_interpreter(tmp_path, monkeypatch):
+    signer = Signer()
+    candidate = os.path.realpath(sys.executable, strict=True)
+    original_stat = runtime_module.os.stat
+
+    def stat_with_group_writable_executable(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if os.fspath(path) == candidate:
+            values = list(result)
+            values[0] = (result.st_mode & ~0o777) | 0o775
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(runtime_module.os, "stat", stat_with_group_writable_executable)
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", _identity(signer), signer)
+    runtime.close()
 
 
 def test_runtime_inode_guard_allows_a_trusted_group_writable_interpreter_parent(tmp_path, monkeypatch):
