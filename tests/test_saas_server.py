@@ -591,7 +591,13 @@ class ProductionConfigurationTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text()
         self.assertIn('install -d -m 700 "${RUNNER_TEMP}/heel-pytest"', workflow)
         self.assertIn('echo "TMPDIR=${RUNNER_TEMP}/heel-pytest" >> "$GITHUB_ENV"', workflow)
-        self.assertIn("- name: Full Python acceptance + security suite\n        run: python -m pytest -q tests", workflow)
+        self.assertIn('python -m venv --copies "${RUNNER_TEMP}/heel-pytest/venv"', workflow)
+        self.assertIn(
+            "- name: Full Python acceptance + security suite\n"
+            "        run: >-\n"
+            '          "${RUNNER_TEMP}/heel-pytest/venv/bin/python" -m pytest -q tests',
+            workflow,
+        )
         self.assertNotIn("python -m unittest discover -s tests -p 'test_*.py' -v", workflow)
         production_build = (
             "- name: Build Cloudflare-compatible production artifact\n"
