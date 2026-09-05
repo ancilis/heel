@@ -10,10 +10,13 @@ REAL targets) — that is breadth, not false positives. Extra scenarios can also
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import glob
 import json
 import os
 
+from .business_rules import mechanism_for
 from .contracts import AbuseScenario, AppliesWhen, Category, ScenarioPack, ScenarioSource
 
 _AGENT = AppliesWhen.HAS_AGENT_SURFACE
@@ -190,7 +193,8 @@ def load_json_scenarios() -> list[AbuseScenario]:
                         recommended_control=s.get("recommended_control", ""),
                         containment_limits=s.get("containment_limits", {}),
                         exploitability_reduction=s.get("exploitability_reduction", 0.6),
-                        handoff=s.get("handoff", ""), classification_impact=s.get("classification_impact")))
+                        handoff=s.get("handoff", ""), classification_impact=s.get("classification_impact"),
+                        investigation_signals=s.get("investigation_signals", {})))
         except Exception:
             continue
     return out
@@ -198,7 +202,21 @@ def load_json_scenarios() -> list[AbuseScenario]:
 
 def all_seed_scenarios(semantic: bool = True) -> list[AbuseScenario]:
     # semantic family ON by default: it generalizes to vocabularies the library didn't author
-    return SEED_SCENARIOS + (SEMANTIC_SCENARIOS if semantic else []) + load_json_scenarios()
+    scenarios = SEED_SCENARIOS + (SEMANTIC_SCENARIOS if semantic else []) + load_json_scenarios()
+    qualified = []
+    for scenario in scenarios:
+        mechanism = mechanism_for(scenario.id)
+        if mechanism != scenario.id:
+            criterion = {"all_of": [
+                {"prop": "business_rule_applicable", "equals": True},
+                {"prop_exists": "rule_source"}, scenario.success_criterion,
+            ]}
+            qualified.append(replace(scenario, success_criterion=criterion,
+                investigation_signals=scenario.investigation_signals or scenario.success_criterion, mechanism_id=mechanism,
+                objective="Investigate declared rule: " + scenario.objective))
+        else:
+            qualified.append(replace(scenario, mechanism_id=mechanism))
+    return qualified
 
 
 def list_scenarios(filter_category: str | None = None, include_discovered: list | None = None,

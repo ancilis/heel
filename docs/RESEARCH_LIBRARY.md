@@ -1,5 +1,7 @@
 # Heel — research scenario library (`scenarios_lib/research_owasp.json`)
 
+Current evidence boundary (September 4, 2026): library matches are hypotheses or investigation prompts, not verified behavior. Relevant commercial mechanisms require a declared applicable rule and source. Coupon stacking, concurrent sessions, bulk access, sequential IDs, public documentation and versioned/admin routes alone do not establish abuse. Alternate encodings share mechanism IDs and do not multiply executed coverage. Persona characteristics and economic estimates are assumptions. The executable slice and broader gaps are documented in [CAPABILITIES.md](CAPABILITIES.md). Historical vocabulary scores below are not live detection accuracy and are not current after predicate changes.
+
 45 business-logic abuse-detection scenarios across all 10 categories, plus a semantic-vocabulary
 expansion, integrated from an external source-anchored research deliverable. The scenarios are
 declarative JSON (addable without code) and were authored from PRIMARY SOURCES, independently of —

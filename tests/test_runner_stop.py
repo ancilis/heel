@@ -1383,10 +1383,10 @@ def test_executor_builds_frozen_private_and_cloud_projections_without_raw_values
         ExecutionBundle(manifest, projection, grant),
         transport=transport, gate_source=active_gate,
     )
-    assert result.assessment_outcome == "blocked"
+    assert result.assessment_outcome == "inconclusive"
     assert result.execution_disposition == "completed"
     assert [item["assessment_outcome"] for item in result.findings_projection["scenario_results"]] == [
-        "blocked", "blocked",
+        "inconclusive", "inconclusive",
     ]
     validate_operational_run(result.operational_projection)
     validate_canary_findings(result.findings_projection)
@@ -1603,7 +1603,7 @@ def test_systemic_transport_failures_force_inconclusive_and_closed_cloud_disposi
     )
 
 
-def test_run_aggregate_is_observed_if_any_complete_scenario_is_observed(tmp_path):
+def test_status_only_pairs_remain_inconclusive_even_when_execution_completes(tmp_path):
     store, identity, signer, manifest, projection = compiled_pair(tmp_path)
     authority = SigningAuthority.generate()
     grant = signed_grant(manifest, projection, identity, authority)
@@ -1617,10 +1617,10 @@ def test_run_aggregate_is_observed_if_any_complete_scenario_is_observed(tmp_path
         ExecutionBundle(manifest, projection, grant),
         transport=ScriptedTransport([200, 200, 200, 403]), gate_source=active_gate,
     )
-    assert result.assessment_outcome == "observed"
+    assert result.assessment_outcome == "inconclusive"
     assert result.execution_disposition == "completed"
     assert [item["assessment_outcome"] for item in result.findings_projection["scenario_results"]] == [
-        "observed", "blocked",
+        "inconclusive", "inconclusive",
     ]
 
 

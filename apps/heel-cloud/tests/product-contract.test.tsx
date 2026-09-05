@@ -115,12 +115,12 @@ beforeEach(() => {
     receipt: {
       schema_version: "heel.review-presentation.v1",
       assumption: "not declared in this OpenAPI; not proof the control is absent",
-      confidence: "confirmed_gaps",
+      confidence: "declared_gaps",
       items: [{
         surface: "runagenttool",
         field: "tenant_filter",
         value: "not_enforced",
-        receipt: "confirmed_gap",
+        receipt: "declared_gap",
       }],
     },
   });
@@ -470,7 +470,7 @@ describe("Heel anonymous launch review", () => {
     expect(submitted).toEqual(expect.arrayContaining([
       expect.objectContaining({ value: "not_enforced" }),
     ]));
-    expect(await screen.findByText("confirmed_gaps")).toBeTruthy();
+    expect(await screen.findByText("declared_gaps")).toBeTruthy();
     expect(screen.getByText(/not declared in this OpenAPI/i)).toBeTruthy();
     expect(screen.getByText(/findings changed by 0/i)).toBeTruthy();
   });

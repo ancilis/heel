@@ -6,6 +6,7 @@ import { cp, lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "n
 import { basename, extname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 import { deflateRawSync, gunzipSync, inflateRawSync } from "node:zlib";
 
 import { validateReleaseDownloads } from "../scripts/prepare-runtime.mjs";
@@ -250,7 +251,13 @@ function canonicalGzip(payload) {
   const trailer = Buffer.alloc(8);
   trailer.writeUInt32LE(crc32(payload), 0);
   trailer.writeUInt32LE(payload.byteLength >>> 0, 4);
-  return Buffer.concat([header, deflateRawSync(payload, { level: 9 }), trailer]);
+  // Match the Python release builder, not Node's independently changing zlib
+  // implementation. Keep exact canonical-byte validation on Node 26 as well.
+  const compressed = spawnSync("python3", ["-I", "-c",
+    "import sys,zlib; c=zlib.compressobj(9,zlib.DEFLATED,-15); sys.stdout.buffer.write(c.compress(sys.stdin.buffer.read())+c.flush())"],
+    { input: payload, timeout: 10_000, maxBuffer: maxReleaseArchiveBytes });
+  assert.equal(compressed.status, 0, "Python canonical release compressor failed");
+  return Buffer.concat([header, compressed.stdout, trailer]);
 }
 
 
@@ -554,7 +561,7 @@ function tarMembers(archive, label = "source archive") {
   const payload = expanded.buffer;
   assert.equal(archive.readUInt32LE(archive.byteLength - 8), crc32(payload), `${label} gzip CRC mismatch`);
   assert.equal(archive.readUInt32LE(archive.byteLength - 4), payload.byteLength >>> 0, `${label} gzip size mismatch`);
-  assert.deepEqual(archive, canonicalGzip(payload), `${label} gzip DEFLATE stream is noncanonical`);
+  assert.ok(archive.equals(canonicalGzip(payload)), `${label} gzip DEFLATE stream is noncanonical`);
   assert.equal(payload.byteLength % 512, 0, `${label} has a partial TAR block`);
   const members = [];
   const names = new Set();

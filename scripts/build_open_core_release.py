@@ -72,7 +72,9 @@ EXPECTED_DOCUMENTS = (
 EXPECTED_LICENSES = ("DCO", "LICENSE", "NOTICE")
 EXPECTED_PACKAGE_DATA = (
     "heel/heldout/targets.json",
+    "heel/heldout/test_targets.json",
     "heel/scenarios_lib/community.json",
+    "heel/scenarios_lib/research_owasp.json",
 )
 EXPECTED_CONSOLE_SCRIPTS = {
     "heel": "heel.cli:main",

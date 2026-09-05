@@ -422,8 +422,9 @@ it("runner UI keeps invitation material out of argv, URLs, and ambient browser a
   assert.equal(runnerPage.includes("?invitation="), false);
   assert.equal(runnerPage.includes("window"), false);
   assert.equal(runnerPage.includes("navigator"), false);
-  assert.match(runnerPage, /heel runner pair --cloud <origin>/);
-  assert.match(runnerPage, /read --silent|paste it only when the runner prompts/i);
+  assert.doesNotMatch(runnerPage, /heel runner pair --cloud/);
+  assert.match(runnerPage, /heel reference prepare/);
+  assert.match(runnerPage, /MCP cannot authorize itself/);
 });
 
 

@@ -81,7 +81,12 @@ def _vector(target, aff, scenario, vid, evidence) -> AbuseVector:
     return AbuseVector(
         id=vid, scenario_id=scenario.id, category=scenario.category,
         reproduction={"strategy": scenario.probe_strategy, "steps": ["enumerate", "probe", "observe", "halt"],
-                      "observed": evidence, "sample": "canary_only", "contained": True},
+                      "observed": evidence, "sample": "canary_only", "contained": True,
+                      "evidence_state": "inferred", "result": "hypothesis",
+                      "execution_disposition": "model_only",
+                      "rule_source": aff.properties.get("rule_source", "unknown"),
+                      "unknowns": ["intended rule applicability unless declared", "live behavior", "economic magnitude"],
+                      "sequence_executed": False},
         severity=Severity(sev["likelihood"], sev["impact"], 0.2),
         reachability_score=reach, plausible=reach >= PLAUSIBILITY_FLOOR,
         recommended_control=scenario.recommended_control,
@@ -99,6 +104,7 @@ def run_adversarial(target, scenarios: list[AbuseScenario], log, run_id: str, mo
     handoffs: list[dict] = []
     fired: set[str] = set()
     probe_count = 0
+    investigations = {}
     vid = 0
 
     for sc in scenarios:
@@ -109,6 +115,15 @@ def run_adversarial(target, scenarios: list[AbuseScenario], log, run_id: str, mo
             if kind != "*" and aff.kind != kind:
                 continue
             probe_count += 1
+            if (aff.properties.get("bulk_access_permitted") is True and sc.mechanism_id in {"export-read-entitlement", "automation-entitlement", "object-access"}) or (aff.properties.get("stacking_permitted") is True and "coupon" in sc.id):
+                continue
+            if sc.investigation_signals and evaluate_criterion(sc.investigation_signals, aff):
+                investigations[(aff.id, sc.mechanism_id)] = {
+                    "affordance": aff.id, "mechanism_id": sc.mechanism_id,
+                    "evidence_state": "inferred", "result": "investigation_prompt",
+                    "question": "What product rule applies, and what behavior would violate it?",
+                    "execution_support": "static_only",
+                }
             hit = evaluate_criterion(sc.success_criterion, aff)
             log("probe", {"scenario": sc.id, "affordance": aff.id, "fired": hit, "contained": True})
             if not hit:
@@ -128,17 +143,20 @@ def run_adversarial(target, scenarios: list[AbuseScenario], log, run_id: str, mo
                 rank = (semantic_specificity(sc.success_criterion["semantic"], aff), v.severity.score)
             else:
                 rank = (100, v.severity.score)
-            cur = findings.get(aff.id)
-            if cur is None or rank > _rank.get(aff.id, (-1, -1)):
-                findings[aff.id] = v
-                _rank[aff.id] = rank
+            # Imported routes and graph edges may encode the same operation twice.
+            surface = (str(aff.properties.get("method", "")), str(aff.properties["route"])) if aff.properties.get("route") else aff.properties.get("source_id", aff.id)
+            cur = findings.get(surface)
+            if cur is None or rank > _rank.get(surface, (-1, -1)):
+                findings[surface] = v
+                _rank[surface] = rank
             log("finding", {"affordance": aff.id, "category": v.category.value, "severity": v.severity.label})
 
     discovered, extra = model.discover(target, fired, run_id, log)
     for v in extra:
         findings.setdefault(v.affordance_id, v)
     return {"findings": list(findings.values()), "handoffs": handoffs,
-            "discovered_scenarios": discovered, "probe_count": probe_count, "model": model.name}
+            "discovered_scenarios": discovered, "probe_count": probe_count, "model": model.name,
+            "investigations": list(investigations.values())}
 
 
 # --------------------------------------------------------------------------- #

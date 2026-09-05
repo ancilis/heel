@@ -44,6 +44,7 @@ class AbusePersona:
     canary_rehearsal_examples: tuple[str, ...]
     rules: tuple[PersonaRule, ...]
     motivation_intensity: float = 0.75
+    evidence_state: str = "inferred"  # characteristics are assumptions, not telemetry
 
 
 def _r(id, kind, criterion, category, chain, tags, soph, patience, risk, impact, control, match, why):

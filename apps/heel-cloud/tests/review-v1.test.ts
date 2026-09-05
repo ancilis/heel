@@ -125,7 +125,11 @@ describe("parseReviewEnvelopeV1", () => {
       (value.summary as Record<string, unknown>).questions = 0;
     }],
     ["non-canonical finding order", (value: Record<string, unknown>) => {
-      (value.findings as unknown[]).reverse();
+      const items = value.findings as Array<Record<string, unknown>>;
+      items.push({ ...items[0], surface_id: "aaa" });
+      (value.summary as Record<string, unknown>).findings = items.length;
+      value.recommended_controls = [...items];
+      // The original id sorts after aaa, so this array is deliberately noncanonical.
     }],
     ["non-static safety", (value: Record<string, unknown>) => {
       (value.safety as Record<string, unknown>).live_probing = true;
@@ -229,7 +233,7 @@ describe("deriveAnswerReceipt", () => {
   });
 
   test.each([
-    ["not_enforced", "confirmed_gap", "confirmed_gaps"],
+    ["not_enforced", "declared_gap", "declared_gaps"],
     ["unknown", "unanswered", "preliminary"],
   ] as const)("keeps a %s question visible and projects its exact receipt", (value, receipt, confidence) => {
     const before = parseReviewEnvelopeV1(browserEnvelope());

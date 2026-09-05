@@ -1,0 +1,20 @@
+
+> @heel/cloud@1.2.0 test:unit
+> vitest run
+
+
+ RUN  v4.1.11 /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud
+
+
+ Test Files  17 passed (17)
+      Tests  197 passed (197)
+   Start at  23:07:06
+   Duration  3.21s (transform 1.44s, setup 0ms, import 2.77s, tests 5.67s, environment 10.60s)
+
+
+> @heel/cloud@1.2.0 typecheck
+> tsc --noEmit --incremental false
+
+
+> @heel/cloud@1.2.0 lint
+> eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern public/heel-runtime

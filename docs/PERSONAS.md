@@ -1,5 +1,7 @@
 # Abuse Personas
 
+Current evidence boundary (September 4, 2026): library matches are hypotheses or investigation prompts, not verified behavior. Relevant commercial mechanisms require a declared applicable rule and source. Coupon stacking, concurrent sessions, bulk access, sequential IDs, public documentation and versioned/admin routes alone do not establish abuse. Alternate encodings share mechanism IDs and do not multiply executed coverage. Persona characteristics and economic estimates are assumptions. The executable slice and broader gaps are documented in [CAPABILITIES.md](CAPABILITIES.md). Historical vocabulary scores below are not live detection accuracy and are not current after predicate changes.
+
 Heel's opportunistic-human agent uses **customer incentive models**, not criminal personas.
 They describe why an ordinary customer, agency, integration owner, or builder might game a normal
 SaaS affordance when the product makes that path easy.

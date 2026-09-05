@@ -96,6 +96,9 @@ def run_abuse(scope, target_id: str, scenario_ids, caller: CallerContext, store,
     classify_enrich(output["findings"], enabled=classify_enabled)   # optional annotation (off by default)
     score = score_target(target, output)
     score["agent_classes"] = classes
+    score["investigations"] = output.get("investigations", [])
+    score["evidence_state"] = "inferred"
+    score["coverage_limit"] = "Model hypotheses only; no findings does not establish complete coverage or launch safety."
 
     for v in output["findings"]:
         store.add_finding(run_id, v)

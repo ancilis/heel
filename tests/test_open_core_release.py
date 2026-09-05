@@ -123,7 +123,9 @@ EXPECTED_CONTRACT = {
     "licenses": ["DCO", "LICENSE", "NOTICE"],
     "package_data": [
         "heel/heldout/targets.json",
+        "heel/heldout/test_targets.json",
         "heel/scenarios_lib/community.json",
+        "heel/scenarios_lib/research_owasp.json",
     ],
     "python_modules": [
         "heel/__init__.py",
@@ -134,6 +136,7 @@ EXPECTED_CONTRACT = {
         "heel/blind.py",
         "heel/blind_eval.py",
         "heel/browser_review.py",
+        "heel/business_rules.py",
         "heel/canary_contracts.py",
         "heel/chaining.py",
         "heel/classify.py",
@@ -161,6 +164,8 @@ EXPECTED_CONTRACT = {
         "heel/orchestrator.py",
         "heel/product_model.py",
         "heel/profiles.py",
+        "heel/reference_product.py",
+        "heel/reference_rehearsal.py",
         "heel/regressions.py",
         "heel/rest.py",
         "heel/review_answers.py",
@@ -174,6 +179,7 @@ EXPECTED_CONTRACT = {
         "heel/runner/companion.py",
         "heel/runner/compiler.py",
         "heel/runner/containment.py",
+        "heel/runner/content_assertion.py",
         "heel/runner/control_client.py",
         "heel/runner/coordinator.py",
         "heel/runner/execution.py",
@@ -207,8 +213,8 @@ include release/open-core-v1.json
 include release/open-core/MCP_QUICKSTART.md release/open-core/README.md release/open-core/SECURITY.md
 exclude LICENSE-COMMERCIAL.md
 exclude README.md
-exclude heel/heldout/test_targets.json
-exclude heel/scenarios_lib/research_owasp.json
+include heel/heldout/test_targets.json
+include heel/scenarios_lib/research_owasp.json
 prune apps
 prune deploy
 prune docs/saas
@@ -929,7 +935,9 @@ class OpenCoreReleaseTests(unittest.TestCase):
                 "package-data": {
                     "heel": [
                         "heldout/targets.json",
+                        "heldout/test_targets.json",
                         "scenarios_lib/community.json",
+                        "scenarios_lib/research_owasp.json",
                     ],
                 },
             },
@@ -1207,8 +1215,8 @@ class OpenCoreReleaseTests(unittest.TestCase):
                     else:
                         self.assertEqual(payload, (ROOT / relative_name).read_bytes())
                 self.assertLessEqual(total_size, MAX_TOTAL_MEMBER_BYTES)
-            self.assertNotIn("heel/heldout/test_targets.json", sdist_relative_names)
-            self.assertNotIn(
+            self.assertIn("heel/heldout/test_targets.json", sdist_relative_names)
+            self.assertIn(
                 "heel/scenarios_lib/research_owasp.json",
                 sdist_relative_names,
             )

@@ -186,6 +186,11 @@ def _normalize_heel_extensions(
 
     if "x-heel-control" in operation:
         controls = _normalize_controls(operation["x-heel-control"], location=location)
+        raw_controls = operation["x-heel-control"]
+        if isinstance(raw_controls, Mapping):
+            normalized["x-heel-declared-absent-controls"] = sorted(
+                _normalize_control_identifier(key) for key, enabled in raw_controls.items() if enabled is False
+            )
         if controls:
             normalized["x-heel-control"] = controls
         else:
@@ -349,8 +354,8 @@ def _map_operation(
     if _contains_any(text, ("export", "download", "bulk")):
         export = dict(entry)
         export.update({"id": entry["operation_id"], "kind": "export"})
-        export["entitlement_check"] = "declared" if has_entitlement else "missing"
-        export["rate_limit"] = "declared" if has_rate else "missing"
+        export["entitlement_check"] = entry.get("entitlement_check", "declared" if has_entitlement else "unknown")
+        export["rate_limit"] = entry.get("rate_limit", "declared" if has_rate else "unknown")
         model["exports"].append(export)
         if not has_rate:
             _add_warning(
@@ -455,7 +460,16 @@ def _route_entry(route: str, method: str, operation: Mapping[str, Any], tags: li
         "required_plan": operation.get("x-heel-plan"),
         "data_class": operation.get("x-heel-data-class"),
         "controls": controls,
+        "customer_declarations": operation.get("x-heel-customer-declarations", {}),
+        "rule_source": "OpenAPI x-heel-plan declaration" if operation.get("x-heel-plan") else "unknown",
+        "control_evidence_state": "customer_declared" if controls else "unknown",
     }
+    absent = operation.get("x-heel-declared-absent-controls", [])
+    if isinstance(absent, list):
+        for family, field in (("entitlement", "entitlement_check"), ("rate", "rate_limit")):
+            if _has_control(absent, family):
+                entry[field] = "missing"
+                entry["control_evidence_state"] = "customer_declared"
     if _has_control(controls, "entitlement"):
         entry["entitlement_check"] = "declared"
     if _has_control(controls, "rate"):

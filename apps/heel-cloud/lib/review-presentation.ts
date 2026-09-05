@@ -24,22 +24,22 @@ export interface ReviewPresentationVocabularyV1 {
   assumption: "not declared in this OpenAPI; not proof the control is absent";
   answer_receipts: {
     enforced: "applied";
-    not_enforced: "confirmed_gap";
+    not_enforced: "declared_gap";
     unknown: "unanswered";
   };
   confidence: {
     unanswered_or_unknown: "preliminary";
-    not_enforced: "confirmed_gaps";
-    enforced_reduced_questions_without_confirmed_gap: "improved";
+    not_enforced: "declared_gaps";
+    enforced_reduced_questions_without_declared_gap: "improved";
   };
 }
 
 export interface ReviewAnswerReceiptV1 {
   schema_version: "heel.review-presentation.v1";
   assumption: ReviewPresentationVocabularyV1["assumption"];
-  confidence: "preliminary" | "confirmed_gaps" | "improved";
+  confidence: "preliminary" | "declared_gaps" | "improved";
   items: Array<ReviewAnswer & {
-    receipt: "applied" | "confirmed_gap" | "unanswered";
+    receipt: "applied" | "declared_gap" | "unanswered";
   }>;
 }
 
@@ -49,13 +49,13 @@ export const REVIEW_PRESENTATION_VOCABULARY: ReviewPresentationVocabularyV1 = Ob
   assumption: "not declared in this OpenAPI; not proof the control is absent",
   answer_receipts: Object.freeze({
     enforced: "applied",
-    not_enforced: "confirmed_gap",
+    not_enforced: "declared_gap",
     unknown: "unanswered",
   }),
   confidence: Object.freeze({
     unanswered_or_unknown: "preliminary",
-    not_enforced: "confirmed_gaps",
-    enforced_reduced_questions_without_confirmed_gap: "improved",
+    not_enforced: "declared_gaps",
+    enforced_reduced_questions_without_declared_gap: "improved",
   }),
 });
 
@@ -86,7 +86,7 @@ export function parseReviewPresentationVocabulary(value: unknown): ReviewPresent
   exactFields(confidence, [
     "unanswered_or_unknown",
     "not_enforced",
-    "enforced_reduced_questions_without_confirmed_gap",
+    "enforced_reduced_questions_without_declared_gap",
   ], "confidence vocabulary");
   if (
     value.schema_version !== REVIEW_PRESENTATION_VOCABULARY.schema_version
@@ -96,7 +96,7 @@ export function parseReviewPresentationVocabulary(value: unknown): ReviewPresent
     || receipts.unknown !== REVIEW_PRESENTATION_VOCABULARY.answer_receipts.unknown
     || confidence.unanswered_or_unknown !== REVIEW_PRESENTATION_VOCABULARY.confidence.unanswered_or_unknown
     || confidence.not_enforced !== REVIEW_PRESENTATION_VOCABULARY.confidence.not_enforced
-    || confidence.enforced_reduced_questions_without_confirmed_gap !== REVIEW_PRESENTATION_VOCABULARY.confidence.enforced_reduced_questions_without_confirmed_gap
+    || confidence.enforced_reduced_questions_without_declared_gap !== REVIEW_PRESENTATION_VOCABULARY.confidence.enforced_reduced_questions_without_declared_gap
   ) throw new Error("presentation vocabulary does not match heel.review-presentation.v1");
   return {
     schema_version: REVIEW_PRESENTATION_VOCABULARY.schema_version,
@@ -205,11 +205,11 @@ export function deriveAnswerReceipt(
     };
   });
 
-  const hasConfirmedGap = answers.some((answer) => answer.value === "not_enforced");
+  const hasDeclaredGap = answers.some((answer) => answer.value === "not_enforced");
   const hasUnknown = answers.some((answer) => answer.value === "unknown");
   const hasApplied = answers.some((answer) => answer.value === "enforced");
   let confidence: ReviewAnswerReceiptV1["confidence"] = vocabulary.confidence.unanswered_or_unknown;
-  if (hasConfirmedGap) {
+  if (hasDeclaredGap) {
     confidence = vocabulary.confidence.not_enforced;
   } else if (
     !hasUnknown
@@ -217,7 +217,7 @@ export function deriveAnswerReceipt(
     && hasApplied
     && after.questions.length < before.questions.length
   ) {
-    confidence = vocabulary.confidence.enforced_reduced_questions_without_confirmed_gap;
+    confidence = vocabulary.confidence.enforced_reduced_questions_without_declared_gap;
   }
   return {
     schema_version: vocabulary.schema_version,

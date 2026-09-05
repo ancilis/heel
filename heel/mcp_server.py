@@ -302,7 +302,14 @@ SYNC_TOOL_SCHEMAS = [
 ]
 SYNC_TOOL_NAMES = {tool["name"] for tool in SYNC_TOOL_SCHEMAS}
 STRICT_TOOL_NAMES = REVIEW_TOOL_NAMES | SYNC_TOOL_NAMES
-TOOL_SCHEMAS = EXISTING_TOOL_SCHEMAS + REVIEW_TOOL_SCHEMAS + SYNC_TOOL_SCHEMAS
+REFERENCE_TOOL_SCHEMAS = [
+    {"name": "heel_prepare_reference", "description": "Show the synthetic export product rule, hypothesis, coverage gaps and bounded plan; no execution or authority creation.",
+     "inputSchema": {"type":"object", "properties":{}, "additionalProperties":False}},
+    {"name": "heel_execute_reference", "description": "Execute exactly two synthetic export reads under an existing human-created reference:export scope. Never accepts targets or credentials; consumes the attempt once, saves evidence locally, uploads nothing.",
+     "inputSchema": {"type":"object", "required":["scope_id","case","attempt"], "additionalProperties":False,
+                     "properties":{"scope_id":{"type":"string"}, "case":{"type":"string", "enum":["vulnerable","hardened","error_envelope","redacted","public","inconclusive"]}, "attempt":{"type":"string","pattern":"^[0-9a-f]{32}$"}}}},
+]
+TOOL_SCHEMAS = EXISTING_TOOL_SCHEMAS + REVIEW_TOOL_SCHEMAS + SYNC_TOOL_SCHEMAS + REFERENCE_TOOL_SCHEMAS
 TOOL_NAMES = {t["name"] for t in TOOL_SCHEMAS}
 
 
@@ -972,6 +979,19 @@ class HeelServer:
         }
 
     # -- MCP dispatch -------------------------------------------------------- #
+    def heel_prepare_reference(self, args, caller):
+        self._validate_exact_args(args, fields=())
+        from .reference_rehearsal import prepare_reference
+        return prepare_reference()
+
+    def heel_execute_reference(self, args, caller):
+        self._validate_exact_args(args, fields=("scope_id", "case", "attempt"), string_fields=("scope_id", "case", "attempt"))
+        from .reference_rehearsal import run_reference
+        try:
+            return run_reference(args["scope_id"], args["case"], args["attempt"])
+        except Exception:
+            raise ToolError("Reference rehearsal rejected; a valid scope, unused attempt and private local storage are required") from None
+
     def call_tool(self, name, args, caller):
         if name not in TOOL_NAMES:
             # an unknown tool (e.g. a forged scope-mutation tool) — reject + log a security event

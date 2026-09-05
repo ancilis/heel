@@ -1,6 +1,6 @@
 # Heel SaaS Build State
 
-Updated 2026-08-04. This file records the product that exists in the current
+Updated 2026-09-04. The current validation wedge is the [synthetic export entitlement workflow](../EXPORT_DEMO.md); see [capabilities](../CAPABILITIES.md). Cloud pairing is not a supported end-to-end customer journey. Passing static gates does not establish launch safety. This file records the product that exists in the current
 repository state. It does not record a public deployment.
 
 ## Launch decision

@@ -3,11 +3,10 @@
 import vinext from "vinext";
 import { defineConfig } from "vite";
 import { sites } from "./build/sites-vite-plugin.ts";
+import { deploymentConfig } from "./build/deployment-config.ts";
 
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
-
-const VPC_SERVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export default defineConfig(async ({ command }) => {
   // Keep Wrangler and Miniflare state project-local. These are non-secret tool
@@ -18,35 +17,12 @@ export default defineConfig(async ({ command }) => {
 
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import("@cloudflare/vite-plugin");
-  const controlPlaneServiceId = process.env.HEEL_CONTROL_PLANE_VPC_SERVICE_ID?.trim();
-  const publicOrigin = process.env.HEEL_PUBLIC_ORIGIN?.trim();
-  if (command === "build" && !VPC_SERVICE_ID.test(controlPlaneServiceId ?? "")) {
-    throw new Error(
-      "HEEL_CONTROL_PLANE_VPC_SERVICE_ID must be a Cloudflare VPC service UUID for production builds",
-    );
-  }
-  if (command === "build") {
-    let validPublicOrigin = false;
-    try {
-      const parsed = new URL(publicOrigin ?? "");
-      validPublicOrigin = parsed.protocol === "https:" && parsed.origin === publicOrigin;
-    } catch {
-      validPublicOrigin = false;
-    }
-    if (!validPublicOrigin) {
-      throw new Error("HEEL_PUBLIC_ORIGIN must be one canonical HTTPS origin for production builds");
-    }
-  }
-  const publicVars: Record<string, string> = {};
-  if (publicOrigin !== undefined) publicVars.PUBLIC_ORIGIN = publicOrigin;
+  const deployment = deploymentConfig(process.env, command);
   const localBindingConfig = {
     main: "./worker/index.ts",
     compatibility_flags: ["nodejs_compat"],
     observability: { enabled: false },
-    vars: publicVars,
-    vpc_services: controlPlaneServiceId === undefined
-      ? []
-      : [{ binding: "CONTROL_PLANE", service_id: controlPlaneServiceId }],
+    ...deployment,
   };
 
   return {

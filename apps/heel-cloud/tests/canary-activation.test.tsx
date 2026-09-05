@@ -92,10 +92,10 @@ describe("canary activation dashboard", () => {
 
     cleanup();
     render(<Runner />);
-    expect(screen.getByRole("heading", { name: /pair your runner/i })).toBeTruthy();
-    expect(screen.getByText(/connect your signed-in workspace/i)).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /validate an export entitlement/i })).toBeTruthy();
+    expect(screen.getByText(/incomplete public workflows/i)).toBeTruthy();
     expect(screen.queryByText(/copper · field · seven|8C1F · 4E29 · A773/i)).toBeNull();
-    expect(screen.getByRole("link", { name: /return to activation/i }).getAttribute("href"))
+    expect(screen.getByRole("link", { name: /dashboard/i }).getAttribute("href"))
       .toBe("/dashboard");
   });
 });

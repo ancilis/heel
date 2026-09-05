@@ -36,4 +36,4 @@ include-package-data = false
 packages = ["heel", "heel.runner"]
 
 [tool.setuptools.package-data]
-heel = ["heldout/targets.json", "scenarios_lib/community.json"]
+heel = ["heldout/targets.json", "heldout/test_targets.json", "scenarios_lib/community.json", "scenarios_lib/research_owasp.json"]

@@ -44,7 +44,7 @@ def _request(project_ref: str, key: bytes, *, title: str, operation_suffix: str 
     spec = copy.deepcopy(SPEC)
     spec["info"]["title"] = title
     if operation_suffix:
-        operation = spec["paths"]["/api/export/bulk"]["get"]
+        operation = spec["paths"]["/oauth/apps"]["post"]
         operation["operationId"] += operation_suffix
     review = review_openapi(spec, execution_mode="machine_local")
     return project_findings_sync(review, project_ref, key)

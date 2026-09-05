@@ -39,8 +39,6 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertTrue(result["findings"][0]["control"])
         risks = {finding["risk"] for finding in result["findings"]}
         self.assertGreaterEqual(risks, {
-            "endpoint_without_tenant_filter",
-            "export_without_entitlement",
             "oauth_scope_overbroad",
         })
         question_fields = {question["field"] for question in result["questions"]}
@@ -147,7 +145,7 @@ class ReviewServiceTests(unittest.TestCase):
                     {question["field"] for question in result["questions"]},
                     {"tenant_filter", "entitlement_check"},
                 )
-                self.assertTrue(any(
+                self.assertFalse(any(
                     finding["risk"] == "endpoint_without_tenant_filter"
                     for finding in result["findings"]
                 ))
@@ -172,9 +170,7 @@ class ReviewServiceTests(unittest.TestCase):
             for question in result["questions"]
         ))
         risks = {finding["risk"] for finding in result["findings"]}
-        self.assertGreaterEqual(risks, {
-            "export_without_entitlement", "export_without_tenant_quota",
-        })
+        self.assertEqual(risks, set())
 
     def test_shared_broad_scope_vocabulary_is_exact(self):
         from heel.review_rules import BROAD_SCOPE_VALUES, is_broad_scope
@@ -232,7 +228,7 @@ class ReviewServiceTests(unittest.TestCase):
             "paths": {"/records": {"$ref": "#/components/pathItems/Records"}},
         })
 
-        self.assertTrue(any(
+        self.assertFalse(any(
             finding["surface_id"] == "listrecords"
             and finding["risk"] == "endpoint_without_tenant_filter"
             for finding in result["findings"]
@@ -545,9 +541,9 @@ class LaunchReviewProducerRegressionTests(unittest.TestCase):
         model = json.loads(json.dumps(baseline))
         model["source"] = "test:after"
         model["endpoints_routes"] = [{"id": "tenant_route", "tenant_filter": "missing"}]
-        model["exports"] = [{"id": "bulk_export", "entitlement_check": "missing"}]
-        model["meters"] = [{"id": "api_meter", "billable": True}]
-        model["coupons_promotions"] = [{"id": "launch_coupon", "stackable": True}]
+        model["exports"] = [{"id": "bulk_export", "entitlement_check": "missing", "quota": "none"}]
+        model["meters"] = [{"id": "api_meter", "billable": True, "server_side_accounting": False}]
+        model["coupons_promotions"] = [{"id": "launch_coupon", "stackable": True, "redemption_limit": "none"}]
         model["integration_oauth_apps"] = [{"id": "oauth_app", "scope": "all"}]
         model["support_admin_actions"] = [{
             "id": "support_action", "required_role": "admin", "audit_logged": False,

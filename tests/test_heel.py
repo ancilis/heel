@@ -598,7 +598,7 @@ class TestBlindEvaluation(unittest.TestCase):  # the honest real-detection metri
     def test_wilson_ci_and_per_probe_fp_attribution(self):
         self.assertEqual(len(self.r["real_recall_wilson_ci95"]), 2)
         self.assertIsNotNone(self.r["real_precision_pooled"])
-        self.assertTrue(self.r["false_positives_by_probe"])  # FPs attributed to specific probe(s)
+        self.assertIsInstance(self.r["false_positives_by_probe"], dict)  # Zero false positives is valid.
 
     def test_category10_optional_verified_on_blind_non_ai_targets(self):
         clean, total = self.r["category10_clean_on_non_ai"].split("/")
@@ -861,7 +861,7 @@ class TestEntitlementGraph(unittest.TestCase):
                 {"id": "audit_vault", "required_plan": "enterprise", "reachable_by_plan": "free", "gated_by": "client"},
             ],
             "exports": [
-                {"id": "bulk_records", "route": "/api/export", "entitlement_check": "missing", "data_class": "canary_records"},
+                {"id": "bulk_records", "route": "/api/export", "entitlement_check": "missing", "data_class": "canary_records", "business_rule_applicable": True, "rule_source": "test product policy"},
             ],
             "meters": [
                 {"id": "llm_tokens", "billable": True, "server_side_accounting": False},
@@ -934,6 +934,7 @@ class TestEntitlementGraph(unittest.TestCase):
             "kind": "endpoint",
             "ui_backing_endpoint": True,
             "paid_api_equivalent": True,
+            "business_rule_applicable": True, "rule_source": "test product policy",
             "required_plan": "api_bulk",
             "reachable_by_plan": "app",
             "rate_limit": "missing",
@@ -1079,14 +1080,14 @@ class TestLaunchReview(unittest.TestCase):
         warn_report = self._review(lambda m: m["coupons_promotions"].append({
             "id": "launch25",
             "stackable": True,
-            "discount_percent": 25,
+            "discount_percent": 25, "redemption_limit": "none",
         }))
         self.assertEqual(warn_report["launch_gate_status"], "warn")
 
         block_report = self._review(lambda m: m["coupons_promotions"].append({
             "id": "free_year",
             "stackable": True,
-            "discount_percent": 100,
+            "discount_percent": 100, "redemption_limit": "none",
             "applies_to": "all_plans",
             "reachable_by_plan": "trial",
         }))
@@ -1128,7 +1129,7 @@ class TestLaunchReview(unittest.TestCase):
     def test_suggested_regressions_match_changed_surfaces(self):
         report = self._review(lambda m: (
             m["exports"].append({"id": "bulk_records", "route": "/api/export", "entitlement_check": "missing"}),
-            m["coupons_promotions"].append({"id": "launch25", "stackable": True}),
+            m["coupons_promotions"].append({"id": "launch25", "stackable": True, "redemption_limit": "none"}),
         ))
 
         changed = {c["surface_id"] for c in report["changed_surfaces"]}
@@ -1203,10 +1204,11 @@ class TestDocsAndMetadata(unittest.TestCase):
             "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.",
         )
 
-    def test_docs_keep_production_ready_spine_beta_adapters_phrase(self):
+    def test_docs_limit_readiness_to_supported_reference(self):
         readme = self._read("README.md")
 
-        self.assertIn("production-ready spine, beta adapters", readme)
+        self.assertNotIn("production-ready spine, beta adapters", readme)
+        self.assertIn("incomplete public journeys", readme)
 
     def test_readme_positions_agent_mcp_as_one_scenario_pack(self):
         readme = self._read("README.md").lower()

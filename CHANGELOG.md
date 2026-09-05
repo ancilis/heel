@@ -4,6 +4,12 @@ All notable changes to Heel are documented here. Format loosely follows Keep a C
 
 ## [Unreleased]
 
+- Add a signed-scope, customer-local synthetic export entitlement reference through CLI and MCP, plus app instructions and local report viewing.
+- Require protected content and an entitled positive control for boundary results; status-only reads are inconclusive.
+- Preserve unknown metadata as questions, separate evidence state from severity/disposition, deduplicate operation representations and require applicable commercial rules for relevant library hypotheses.
+- Label personas/economics as assumptions and lifecycle models as unexecuted; publish current capability gaps.
+
+
 Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 
 ### Integrated

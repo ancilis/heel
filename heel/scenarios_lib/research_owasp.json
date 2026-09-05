@@ -11,13 +11,8 @@
           "equals": "client"
         },
         {
-          "prop_contains": [
-            "aggregation",
-            "last"
-          ]
-        },
-        {
-          "guard_absent": true
+          "prop": "server_side_accounting",
+          "equals": false
         }
       ]
     },
@@ -29,7 +24,26 @@
     "exploitability_reduction": 0.6,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "investigation_signals": {
+      "any_of": [
+        {
+          "prop": "event_time_window",
+          "equals": "client"
+        },
+        {
+          "prop_contains": [
+            "aggregation",
+            "last"
+          ]
+        },
+        {
+          "guard_absent": true
+        }
+      ]
+    },
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.license_entitlement.seat_share_no_concurrency",
@@ -68,7 +82,9 @@
     "exploitability_reduction": 0.5,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.license_entitlement.trial_serial_signup",
@@ -100,7 +116,9 @@
     "exploitability_reduction": 0.5,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.license_entitlement.tier_gate_client_trusted",
@@ -133,7 +151,9 @@
     "exploitability_reduction": 0.65,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.license_entitlement.region_price_arbitrage",
@@ -163,7 +183,9 @@
     "exploitability_reduction": 0.45,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.data_harvesting.ungated_bulk_export",
@@ -202,7 +224,9 @@
     "exploitability_reduction": 0.55,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": "records"
+    "classification_impact": "records",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.data_harvesting.record_enumeration_seq_id",
@@ -210,6 +234,19 @@
     "objective": "Sequential/guessable object IDs allow record enumeration and scraping at scale (BOLA-adjacent harvest)",
     "kind": "record",
     "success_criterion": {
+      "prop": "object_authorization",
+      "equals": "none"
+    },
+    "severity_model": {
+      "likelihood": 0.5,
+      "impact": 0.55
+    },
+    "recommended_control": "Use unpredictable identifiers (UUID/GUID) AND enforce per-object authorization on every access; add per-principal rate limits to blunt enumeration",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "records",
+    "investigation_signals": {
       "any_of": [
         {
           "prop": "id_scheme",
@@ -224,15 +261,8 @@
         }
       ]
     },
-    "severity_model": {
-      "likelihood": 0.5,
-      "impact": 0.55
-    },
-    "recommended_control": "Use unpredictable identifiers (UUID/GUID) AND enforce per-object authorization on every access; add per-principal rate limits to blunt enumeration",
-    "exploitability_reduction": 0.5,
-    "applies_when": "always",
-    "handoff": "",
-    "classification_impact": "records"
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.data_harvesting.graphql_introspection_open",
@@ -263,7 +293,9 @@
     "exploitability_reduction": 0.5,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": "records"
+    "classification_impact": "records",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.data_harvesting.excessive_field_exposure",
@@ -295,7 +327,9 @@
     "exploitability_reduction": 0.55,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": "pii"
+    "classification_impact": "pii",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.unintended_endpoints.mass_assignment_privilege",
@@ -325,7 +359,9 @@
     "exploitability_reduction": 0.7,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.unintended_endpoints.forced_browsing_admin",
@@ -333,6 +369,19 @@
     "objective": "Hidden/undocumented admin route is reachable via forced browsing because authorization is only enforced in the UI (BFLA)",
     "kind": "endpoint",
     "success_criterion": {
+      "prop": "function_authorization",
+      "equals": "ui_only"
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.65
+    },
+    "recommended_control": "Enforce explicit role checks at controller/middleware for every sensitive route; deny-by-default; audit admin endpoints specifically",
+    "exploitability_reduction": 0.65,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "",
+    "investigation_signals": {
       "any_of": [
         {
           "prop": "function_authorization",
@@ -349,15 +398,8 @@
         }
       ]
     },
-    "severity_model": {
-      "likelihood": 0.4,
-      "impact": 0.65
-    },
-    "recommended_control": "Enforce explicit role checks at controller/middleware for every sensitive route; deny-by-default; audit admin endpoints specifically",
-    "exploitability_reduction": 0.65,
-    "applies_when": "always",
-    "handoff": "",
-    "classification_impact": ""
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.unintended_endpoints.zombie_api_version",
@@ -365,6 +407,27 @@
     "objective": "Deprecated/undocumented API version (v1, beta, test) remains live and unpatched, exposing weaker controls",
     "kind": "endpoint",
     "success_criterion": {
+      "all_of": [
+        {
+          "prop": "deprecated_route_status",
+          "equals": "active"
+        },
+        {
+          "prop": "retirement_required",
+          "equals": true
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.35,
+      "impact": 0.5
+    },
+    "recommended_control": "Maintain a complete API inventory; retire deprecated versions; route all traffic through a gateway with consistent authz",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "",
+    "investigation_signals": {
       "any_of": [
         {
           "prop_contains": [
@@ -382,15 +445,8 @@
         }
       ]
     },
-    "severity_model": {
-      "likelihood": 0.35,
-      "impact": 0.5
-    },
-    "recommended_control": "Maintain a complete API inventory; retire deprecated versions; route all traffic through a gateway with consistent authz",
-    "exploitability_reduction": 0.5,
-    "applies_when": "always",
-    "handoff": "",
-    "classification_impact": ""
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.unintended_endpoints.debug_endpoint_exposed",
@@ -398,6 +454,27 @@
     "objective": "Debug/doc endpoints (swagger, /api-docs, stack traces) exposed in production reveal routes and internals",
     "kind": "endpoint",
     "success_criterion": {
+      "any_of": [
+        {
+          "prop": "debug_mode",
+          "equals": "on"
+        },
+        {
+          "prop": "stack_traces",
+          "equals": "verbose"
+        }
+      ]
+    },
+    "severity_model": {
+      "likelihood": 0.4,
+      "impact": 0.35
+    },
+    "recommended_control": "Disable debug and verbose errors in production; restrict access to API docs/admin; audit configs regularly",
+    "exploitability_reduction": 0.5,
+    "applies_when": "always",
+    "handoff": "",
+    "classification_impact": "",
+    "investigation_signals": {
       "any_of": [
         {
           "prop": "debug_mode",
@@ -415,15 +492,8 @@
         }
       ]
     },
-    "severity_model": {
-      "likelihood": 0.4,
-      "impact": 0.35
-    },
-    "recommended_control": "Disable debug and verbose errors in production; restrict access to API docs/admin; audit configs regularly",
-    "exploitability_reduction": 0.5,
-    "applies_when": "always",
-    "handoff": "",
-    "classification_impact": ""
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.function_abuse.denial_of_wallet_amplification",
@@ -453,7 +523,9 @@
     "exploitability_reduction": 0.55,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.function_abuse.notification_email_spam",
@@ -492,7 +564,9 @@
     "exploitability_reduction": 0.55,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.function_abuse.human_gated_flow_automation",
@@ -522,7 +596,9 @@
     "exploitability_reduction": 0.45,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.function_abuse.ssrf_url_passthrough",
@@ -554,7 +630,9 @@
     "exploitability_reduction": 0.5,
     "applies_when": "always",
     "handoff": "appsec",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.content_policy.guardrail_absent_canary",
@@ -584,7 +662,9 @@
     "exploitability_reduction": 0.5,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.content_policy.export_formula_injection",
@@ -614,7 +694,9 @@
     "exploitability_reduction": 0.6,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.content_policy.guardrail_acts_on_content",
@@ -642,7 +724,9 @@
     "exploitability_reduction": 0.5,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.identity_account.reset_user_enumeration",
@@ -672,7 +756,9 @@
     "exploitability_reduction": 0.6,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.identity_account.reset_token_weak",
@@ -703,7 +789,9 @@
     "exploitability_reduction": 0.65,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.identity_account.reset_no_rate_limit",
@@ -733,7 +821,9 @@
     "exploitability_reduction": 0.55,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.identity_account.sybil_account_farming",
@@ -766,7 +856,9 @@
     "exploitability_reduction": 0.45,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.trust_economy.self_referral_selfdeal",
@@ -796,7 +888,9 @@
     "exploitability_reduction": 0.5,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.trust_economy.coupon_enumeration_farming",
@@ -826,7 +920,9 @@
     "exploitability_reduction": 0.55,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.trust_economy.review_rating_manipulation",
@@ -856,7 +952,9 @@
     "exploitability_reduction": 0.45,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.trust_economy.refund_credit_fraud",
@@ -886,7 +984,9 @@
     "exploitability_reduction": 0.5,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.integration_extensibility.oauth_overbroad_scope",
@@ -919,7 +1019,9 @@
     "exploitability_reduction": 0.55,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.integration_extensibility.webhook_no_signature_replay",
@@ -958,7 +1060,9 @@
     "exploitability_reduction": 0.65,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.integration_extensibility.api_key_exposed_unscoped",
@@ -991,7 +1095,9 @@
     "exploitability_reduction": 0.6,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.integration_extensibility.webhook_payload_overexposure",
@@ -1023,7 +1129,9 @@
     "exploitability_reduction": 0.45,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": "pii"
+    "classification_impact": "pii",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.compliance_boundary.cross_tenant_access",
@@ -1062,7 +1170,9 @@
     "exploitability_reduction": 0.7,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": "records"
+    "classification_impact": "records",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.compliance_boundary.residency_unpinned",
@@ -1092,7 +1202,9 @@
     "exploitability_reduction": 0.5,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": "pii"
+    "classification_impact": "pii",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.compliance_boundary.retention_deletion_gap",
@@ -1123,7 +1235,9 @@
     "exploitability_reduction": 0.5,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": "pii"
+    "classification_impact": "pii",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.compliance_boundary.audit_log_gap",
@@ -1162,7 +1276,9 @@
     "exploitability_reduction": 0.45,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.compliance_boundary.consent_gate_missing",
@@ -1192,7 +1308,9 @@
     "exploitability_reduction": 0.45,
     "applies_when": "always",
     "handoff": "",
-    "classification_impact": "pii"
+    "classification_impact": "pii",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.agent_mcp_surface.tool_overscope_destructive",
@@ -1223,7 +1341,9 @@
     "exploitability_reduction": 0.55,
     "applies_when": "has_agent_surface",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.agent_mcp_surface.no_human_approval_destructive",
@@ -1253,7 +1373,9 @@
     "exploitability_reduction": 0.6,
     "applies_when": "has_agent_surface",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.agent_mcp_surface.confused_deputy_shared_credential",
@@ -1284,7 +1406,9 @@
     "exploitability_reduction": 0.6,
     "applies_when": "has_agent_surface",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.agent_mcp_surface.rag_cross_tenant_retrieval",
@@ -1323,7 +1447,9 @@
     "exploitability_reduction": 0.6,
     "applies_when": "has_agent_surface",
     "handoff": "",
-    "classification_impact": "records"
+    "classification_impact": "records",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.agent_mcp_surface.tool_poisoning_description",
@@ -1353,7 +1479,9 @@
     "exploitability_reduction": 0.45,
     "applies_when": "has_agent_surface",
     "handoff": "model_redteam",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.agent_mcp_surface.cross_server_context_bleed",
@@ -1383,7 +1511,9 @@
     "exploitability_reduction": 0.45,
     "applies_when": "has_agent_surface",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.agent_mcp_surface.indirect_injection_to_action",
@@ -1418,7 +1548,9 @@
     "exploitability_reduction": 0.45,
     "applies_when": "has_agent_surface",
     "handoff": "model_redteam",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   },
   {
     "id": "sc.research.agent_mcp_surface.unbounded_tool_iteration",
@@ -1457,6 +1589,8 @@
     "exploitability_reduction": 0.55,
     "applies_when": "has_agent_surface",
     "handoff": "",
-    "classification_impact": ""
+    "classification_impact": "",
+    "evidence_state": "inferred",
+    "execution_support": "static_only"
   }
 ]

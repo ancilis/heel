@@ -1,0 +1,27 @@
+{
+  "cli": [
+    {
+      "case": "vulnerable",
+      "result": "verified_violation",
+      "regression_passed": false
+    },
+    {
+      "case": "hardened",
+      "result": "invariant_held",
+      "regression_passed": true
+    },
+    {
+      "case": "error_envelope",
+      "result": "invariant_held",
+      "regression_passed": true
+    },
+    {
+      "case": "inconclusive",
+      "result": "inconclusive",
+      "regression_passed": false
+    }
+  ],
+  "mcp": "initialize/list/prepare/execute passed",
+  "replay": "rejected",
+  "unauthorized": "rejected"
+}

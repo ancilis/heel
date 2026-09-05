@@ -31,11 +31,15 @@ def _persona_can_pursue(persona: AbusePersona, rule: PersonaRule) -> bool:
 
 
 def _rule_matches(target, persona: AbusePersona, rule: PersonaRule, aff) -> bool:
+    if (aff.properties.get("bulk_access_permitted") is True and rule.id in {"bulk_export", "record_enumeration"}) or (aff.properties.get("stacking_permitted") is True and rule.id == "coupon_stacking"):
+        return False
     if rule.category == Category.AGENT_MCP_SURFACE and not target.has_agent_surface:
         return False
     if rule.affordance_kind != "*" and aff.kind != rule.affordance_kind:
         return False
     if "*" not in persona.target_affordance_types and aff.kind not in persona.target_affordance_types:
+        return False
+    if aff.properties.get("business_rule_applicable") is not True or not aff.properties.get("rule_source"):
         return False
     if not _persona_can_pursue(persona, rule):
         return False
@@ -57,6 +61,8 @@ def _likelihood(persona: AbusePersona, rule: PersonaRule) -> float:
 def _evidence(persona: AbusePersona, rule: PersonaRule, aff) -> dict:
     return {
         "persona_id": persona.id,
+        "evidence_state": "inferred",
+        "characteristics_are_assumptions": True,
         "motivation": persona.motivation,
         "why_this_customer_would_try_it": rule.why,
         "affordance_match": rule.affordance_match,
@@ -75,6 +81,8 @@ def _vector(target, aff, persona: AbusePersona, rule: PersonaRule, run_id: str, 
         category=rule.category,
         reproduction={
             "strategy": rule.preferred_chain,
+            "evidence_state": "inferred", "result": "hypothesis",
+            "execution_disposition": "model_only", "sequence_executed": False,
             "class": "opportunistic_human",
             "persona": {
                 "id": persona.id,

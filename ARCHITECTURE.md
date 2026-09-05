@@ -1,5 +1,7 @@
 # Heel — Architecture (v1)
 
+Current architecture (September 4, 2026): the shipped vertical slice is a customer-local synthetic export entitlement workflow. See [current validation architecture](docs/saas/ARCHITECTURE.md), [capabilities](docs/CAPABILITIES.md), and [demo](docs/EXPORT_DEMO.md). Static inputs are declarations/hypotheses, and modeled sequences are unexecuted. Cloud pairing remains incomplete; the older broad architecture below describes components and intent, not a completed live customer journey.
+
 > **Heel** is abuse rehearsal for SaaS: a swarm of adversarial and opportunistic agents that
 > probe a product *you own*, prove an abuse path is reachable with a **contained**
 > proof-of-concept, and hand you a ranked report with recommended controls before launch and

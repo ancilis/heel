@@ -148,6 +148,7 @@ REVIEWED_DATA_METHOD_CALLS = {
         "values",
     }),
     "product_model": frozenset({
+        "add",
         "append",
         "extend",
         "get",

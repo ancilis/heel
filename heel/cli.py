@@ -996,6 +996,15 @@ def main(argv=None):
         help="emit the canonical heel.review.v1 JSON envelope",
     )
 
+    reference = sub.add_parser("reference", help="closed synthetic export entitlement validation")
+    reference_sub = reference.add_subparsers(dest="referencecmd", required=True)
+    reference_sub.add_parser("prepare", help="show product rule, hypothesis and exact safe boundary")
+    reference_run = reference_sub.add_parser("run", help="execute one signed-scope synthetic reference attempt")
+    reference_run.add_argument("--scope", required=True)
+    reference_run.add_argument("--case", required=True, choices=("vulnerable", "hardened", "error_envelope", "redacted", "public", "inconclusive"))
+    reference_run.add_argument("--attempt", required=True, help="unique 32 lowercase hex characters; consumed once")
+    reference_run.add_argument("--stop", action="store_true", help="exercise cancellation before execution")
+
     runner = sub.add_parser(
         "runner", help="prepare customer-local verified canary rehearsals",
         allow_abbrev=False,
@@ -1215,6 +1224,16 @@ def main(argv=None):
         return 0
     if args.cmd == "review" and args.reviewcmd == "openapi":
         return _review_openapi_file(args.path, as_json=args.as_json)
+    if args.cmd == "reference":
+        try:
+            from .reference_rehearsal import prepare_reference, run_reference
+            report = prepare_reference() if args.referencecmd == "prepare" else run_reference(
+                args.scope, args.case, args.attempt, stop=args.stop)
+            print(json.dumps(report, indent=2))
+            return 0
+        except Exception:
+            print("Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage.", file=sys.stderr)
+            return 2
     if args.cmd == "runner":
         if args.runnercmd == "import-openapi":
             return _runner_import_openapi(args.path)

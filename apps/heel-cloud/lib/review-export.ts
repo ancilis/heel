@@ -54,6 +54,7 @@ export function reviewToMarkdown(
     `Findings: ${review.summary.findings} · Blockers: ${review.summary.blockers}`,
     "Privacy: Browser-local analysis; source not uploaded; no analyzer network calls.",
     "",
+    "Static triage only. No findings does not establish complete coverage or launch safety.",
     "## Findings",
     "",
   ];
@@ -64,12 +65,16 @@ export function reviewToMarkdown(
       `### ${index + 1}. ${surface}`,
       "",
       `- Severity: **${finding.severity.toUpperCase()}**`,
+      `- Evidence: ${markdownPlaintext(finding.evidence_state ?? "legacy static claim")}; execution: static only`,
       `- Reachable: ${finding.reachable ? "yes" : "not established"}`,
       `- Reason: ${markdownPlaintext(finding.reason)}`,
       `- Recommended control: ${markdownPlaintext(finding.control)}`,
       "",
     );
   });
+  lines.push("## Unanswered questions", "");
+  review.questions.forEach((question) => lines.push(`- ${markdownPlaintext(question.surface)}: ${markdownPlaintext(question.prompt)}`));
+  lines.push("Customer answers declare intent or controls; they do not verify behavior.", "");
   lines.push("## Suggested regressions", "");
   review.suggested_regressions.forEach((regression) => {
     lines.push(

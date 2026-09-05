@@ -24,6 +24,7 @@ from heel.canary_contracts import (
 )
 from heel.crypto import verify_envelope
 from heel.runner.adapters import evaluate_pair, prepare_action
+from heel.runner.content_assertion import protected_content
 from heel.runner.companion import validate_disclosure_preview, validate_local_result_view
 from heel.runner.containment import ContainmentLog, operational_containment_codes
 from heel.runner.http_transport import (
@@ -708,6 +709,10 @@ class LocalCanaryExecutor:
                             action_deadline, wall_deadline, authority_deadline,
                         ))
 
+                content_observation = [None]
+                markers = [b["fixture_id"] for b in source["fixture_bindings"]
+                           if b["fixture_id"].startswith("heel-canary-")]
+
                 def evidence_sink(evidence: BoundedResponseEvidence) -> str:
                     if (
                         not isinstance(evidence, BoundedResponseEvidence)
@@ -719,6 +724,10 @@ class LocalCanaryExecutor:
                         or evidence.attempt != action_attempts[0]
                     ):
                         raise ValueError("response evidence differs from the frozen action")
+                    content_observation[0] = protected_content(
+                        evidence.raw_body, marker=markers[0] if len(markers) == 1 else None,
+                        status=evidence.status_code, method=evidence.method,
+                    )
                     return self.store.store_response_evidence(
                         grant["run_id"], action_ordinal=evidence.action_ordinal,
                         attempt=evidence.attempt, status_code=evidence.status_code,
@@ -785,6 +794,7 @@ class LocalCanaryExecutor:
                     "status_code": response.status_code,
                     "body_shape": response.body_shape,
                     "truncation_state": "complete",
+                    "_protected": content_observation[0],
                 })
                 scenario_codes[source["scenario_id"]].update({"admitted", "action_started", "action_completed"})
                 log.append(
@@ -945,14 +955,19 @@ class LocalCanaryExecutor:
                     method=source_actions[0]["method"],
                     first_body_shape=scenario_observations[0]["body_shape"],
                     second_body_shape=scenario_observations[1]["body_shape"],
+                    first_protected=scenario_observations[0].get("_protected"),
+                    second_protected=scenario_observations[1].get("_protected"),
                 )
                 outcome = pair.outcome
+            # The local content predicate is not part of the disclosure schema.
+            for observation in scenario_observations:
+                observation.pop("_protected", None)
             outcomes.append(outcome)
             finding = None
             if outcome == "observed":
                 finding = {
                     "title": "Canary authorization boundary was crossed",
-                    "reachability_rationale": "Both isolated canary roles received the approved read response.",
+                    "reachability_rationale": "Both isolated canary roles received the exact approved protected marker; the entitled positive control succeeded. Only this read was tested.",
                     "confidence": "high",
                     "recommended_control": "Enforce the selected authorization boundary on every object read.",
                     "regression_suggestion": "Repeat this exact catalog scenario with a new one-shot grant.",

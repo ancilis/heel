@@ -1,0 +1,11 @@
+ok   healthz
+ok   signup
+ok   synthetic run
+ok   target challenge
+ok   target verified
+ok   verified run refused without scope
+ok   verified run queued with scope
+ok   paid checkout disabled
+ok   kill switch 503
+ok   metrics
+SMOKE PASS

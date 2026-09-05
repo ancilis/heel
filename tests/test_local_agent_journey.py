@@ -114,9 +114,9 @@ class LocalAgentJourneyTests(unittest.TestCase):
             "info": {"title": "Many exports", "version": "1"},
             "paths": {
                 f"/exports/{index}": {
-                    "get": {"operationId": f"exportRecord{index}"},
+                    "get": {"operationId": f"exportRecord{index}", "x-heel-control": {"entitlement_check": False, "rate_limit": False}},
                 }
-                for index in range(300)
+                for index in range(1800)
             },
         }
         with tempfile.TemporaryDirectory() as temporary:

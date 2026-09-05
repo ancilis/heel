@@ -1,0 +1,222 @@
+
+> @heel/cloud@1.2.0 test:node
+> node --test tests/*.test.mjs
+
+✖ prepares only integrity-pinned local engine and Pyodide runtime assets (98.194209ms)
+✖ runtime preparation rejects tampering, symlinks, unpinned versions, and unexpected output (9.306834ms)
+✖ loads third-party licenses only from digest-pinned tracked assets (99.579834ms)
+✖ executes the real local wheel in Pyodide with outbound network disabled (89.640834ms)
+✖ executes the real wheel in a Node permission-confined process (103.000125ms)
+✔ the displayed install and verification perform a real handshake against the release wheel (3161.910708ms)
+✔ keeps customer source in the worker message path and out of durable or network sinks (405.086458ms)
+✔ pins the findings message, result, busy-state, and key-zeroization boundaries (150.308416ms)
+✔ the privacy analyzer detects constant-computed global network mutation (0.375375ms)
+✔ the privacy analyzer detects an executable direct fetch alias (0.133833ms)
+✔ the privacy analyzer follows computed-global destructuring and assignment aliases (0.184708ms)
+✔ the privacy analyzer rejects property and object carriers at capability acquisition (0.747375ms)
+✔ the privacy analyzer rejects array, closure, return, and argument carriers (0.575708ms)
+✔ the privacy analyzer rejects Reflect get, apply, and construct retrieval (4.800834ms)
+✔ the privacy analyzer rejects descriptor and legacy getter retrieval (1.009417ms)
+✔ the privacy analyzer rejects reflective method references in every carrier (0.637167ms)
+✔ the privacy analyzer rejects copying Reflect and Object roots (0.175708ms)
+✔ the privacy analyzer rejects ambient-root copying and variable-key destructuring (0.700791ms)
+✔ the privacy analyzer rejects Window authority through document, top, parent, and frames (0.269625ms)
+✔ the privacy analyzer rejects DOM-derived Window and document carriers regardless of base (0.351792ms)
+✔ the privacy analyzer resolves direct const keys for DOM carriers and network sinks (0.329958ms)
+✔ the privacy analyzer rejects destructuring and copying the reviewed worker scope alias (0.272541ms)
+✔ the privacy analyzer rejects direct use of the captured bootstrap fetch authority (0.197583ms)
+✔ the privacy analyzer requires the exact reviewed bootstrap declaration (0.451958ms)
+✔ the privacy analyzer rejects bootstrap aliases, passing, return, reassignment, destructuring, and optional calls (1.608792ms)
+✔ the privacy analyzer rejects non-runtime fetcher calls inside fetchLocal (0.983209ms)
+✔ the privacy analyzer rejects every unreviewed fetchLocal reference and call shape (4.926417ms)
+✔ the privacy analyzer rejects the exact post-boot fetchLocal mutation and missing revocations (154.82375ms)
+✔ the privacy analyzer rejects composed boot reentry, URL shadowing, and early readiness (132.483208ms)
+✔ the privacy analyzer allows only the reviewed boot-time dynamic import (64.034417ms)
+✔ the privacy analyzer rejects every lexical shadow of critical worker authority (88.833542ms)
+✔ the privacy analyzer permits only the reviewed engine and server fetch sites (4.224958ms)
+✔ the privacy analyzer pins the private control-plane fetch and route allowlist (60.884833ms)
+✔ the edge keeps canary human and runner-result authorities on exact route and header families (0.696125ms)
+✔ the privacy analyzer pins the browser client to the same-origin closed control plane (18.328292ms)
+✔ recursive source discovery finds nested originals and excludes tests and vendor trees (7.942917ms)
+✔ pins worker boot to same-origin runtime assets and revokes ambient network/package APIs (1.269208ms)
+✔ attaches a strict CSP and browser security headers to app and image responses (0.714583ms)
+✔ ZIP scanner rejects malformed end records, hidden entries, metadata disagreement, and bombs (610.895959ms)
+✔ ZIP scanner rejects comments and every unreferenced byte before the central directory (99.9495ms)
+✔ ZIP scanner rejects every noncanonical per-entry metadata channel (9.209875ms)
+✔ gzip scanner rejects metadata, concatenated streams, and corrupt trailers (924.501583ms)
+✔ TAR scanner rejects noncanonical and nonempty unused header metadata (5618.870042ms)
+✔ TAR scanner rejects corrupt checksums, padding, termination, and private members (2.494584ms)
+✔ TAR decompression budget includes bounded headers and padding (1792.676875ms)
+✔ ZIP member classification rejects an actual private-member archive (0.381084ms)
+✔ ZIP and TAR scanners reject sensitive canonical member paths (1.9995ms)
+✔ TAR scanner requires the builder's exact name encoding and member order (1.748208ms)
+✔ ZIP scanner requires exact builder central and local member order (0.248542ms)
+✔ release reads are descriptor-bound and no-follow (0.700292ms)
+✔ ships exactly the classified, digest-pinned Heel Agent downloads (179.625167ms)
+✔ release member classification rejects private paths and hostile archive shapes (0.61725ms)
+✔ runtime preparation validates committed downloads without rewriting them (16.660666ms)
+✖ ships the transformed integrity-pinned wheel and Pyodide runtime behind same-origin paths (2.80175ms)
+✔ recursively scans every deployed executable, text manifest, and wheel member (56.283584ms)
+✔ serves the Agent acquisition page only from the canonical route (65.769666ms)
+✔ serves the device confirmation entry point with a no-approval initial state (13.963208ms)
+✔ production worker exposes exact headers, request-URL metadata, and only the private control-plane binding (30.172292ms)
+✔ production worker streams only the approved findings control-plane routes (6.884167ms)
+✔ production source freezes exact canary route families before artifact generation (0.349083ms)
+✔ production worker carries only Heel session cookies on the exact account routes (6.506ms)
+✔ production worker exposes only the closed device ceremony and separates browser from machine authority (5.918375ms)
+✔ findings proxy preserves request and response streaming across the private binding (4.324334ms)
+✔ findings proxy fails closed and leaves anonymous review traffic without a server sink (20.7975ms)
+✔ keeps the anonymous app free of server-side customer capabilities (8.283833ms)
+✔ uses Heel identity, trusted request-origin metadata, and commercial source (29.709916ms)
+✔ ships server-renderable evidence, local interaction semantics, and accessible responsive styles (2.238416ms)
+✔ documents a non-emitting TypeScript validation command (0.822667ms)
+✔ lints tracked build source and ignores compiler state (1458.06175ms)
+✔ commercial source discovery skips generated roots but checks nested namesakes (20.120625ms)
+ℹ tests 70
+ℹ suites 0
+ℹ pass 64
+ℹ fail 6
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 9622.031167
+
+✖ failing tests:
+
+test at tests/browser-engine.test.mjs:376:1
+✖ prepares only integrity-pinned local engine and Pyodide runtime assets (98.194209ms)
+  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules
+
+
+  1 !== 0
+
+      at TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:380:10)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/browser-engine.test.mjs:471:1
+✖ runtime preparation rejects tampering, symlinks, unpinned versions, and unexpected output (9.306834ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /digest|size/i. Input:
+
+  'Error: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules'
+
+      at async TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:480:5)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: Error: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules
+        at assertNoSymlinkComponents (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/scripts/prepare-runtime.mjs?test=1788577627498:132:42)
+        at async validateDirectoryRoot (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/scripts/prepare-runtime.mjs?test=1788577627498:143:3)
+        at async Promise.all (index 1)
+        at async prepareRuntime (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/scripts/prepare-runtime.mjs?test=1788577627498:396:3)
+        at async waitForActual (node:assert:621:5)
+        at async strict.rejects (node:assert:744:25)
+        at async TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:480:5)
+        at async Test.run (node:internal/test_runner/test:1208:7)
+        at async Test.processPendingSubtests (node:internal/test_runner/test:831:7),
+    expected: /digest|size/i,
+    operator: 'rejects',
+    diff: 'simple'
+  }
+
+test at tests/browser-engine.test.mjs:569:1
+✖ loads third-party licenses only from digest-pinned tracked assets (99.579834ms)
+  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules
+
+
+  1 !== 0
+
+      at TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:571:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
+      at Test.postRun (node:internal/test_runner/test:1330:19)
+      at Test.run (node:internal/test_runner/test:1258:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/browser-engine.test.mjs:621:1
+✖ executes the real local wheel in Pyodide with outbound network disabled (89.640834ms)
+  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules
+
+
+  1 !== 0
+
+      at TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:623:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
+      at Test.postRun (node:internal/test_runner/test:1330:19)
+      at Test.run (node:internal/test_runner/test:1258:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/browser-engine.test.mjs:698:1
+✖ executes the real wheel in a Node permission-confined process (103.000125ms)
+  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules
+
+
+  1 !== 0
+
+      at TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:705:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
+      at Test.postRun (node:internal/test_runner/test:1330:19)
+      at Test.run (node:internal/test_runner/test:1258:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/production-artifact.test.mjs:1212:1
+✖ ships the transformed integrity-pinned wheel and Pyodide runtime behind same-origin paths (2.80175ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+
+    {
+      engine_version: '1.2.0',
+      schema_version: 'heel.browser-engine-manifest.v1',
+      wheel: {
+        filename: 'heel_browser-1.2.0-py3-none-any.whl',
+  +     sha256: '7912b138d4e4c51945590e4198e5cb63e6810fbc2fdf16a5edd20fe755299f52',
+  +     size: 123901
+  -     sha256: '60736f2dcf29a040cf635c6ad9ac419abf7d7085e1c527301791830cb7201801',
+  -     size: 129358
+      }
+    }
+
+      at TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/production-artifact.test.mjs:1231:10)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: { engine_version: '1.2.0', schema_version: 'heel.browser-engine-manifest.v1', wheel: { filename: 'heel_browser-1.2.0-py3-none-any.whl', sha256: '7912b138d4e4c51945590e4198e5cb63e6810fbc2fdf16a5edd20fe755299f52', size: 123901 } },
+    expected: { engine_version: '1.2.0', schema_version: 'heel.browser-engine-manifest.v1', wheel: { filename: 'heel_browser-1.2.0-py3-none-any.whl', sha256: '60736f2dcf29a040cf635c6ad9ac419abf7d7085e1c527301791830cb7201801', size: 129358 } },
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }

@@ -500,7 +500,7 @@ def _truthy(value: Any) -> bool:
 
 
 def _bad_control(value: Any) -> bool:
-    if value is False or value is None:
+    if value is False:
         return True
     if isinstance(value, str):
         return value.strip().lower() in {

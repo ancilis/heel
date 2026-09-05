@@ -56,6 +56,8 @@ class EconomicImpact:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "evidence_state": "inferred",
+            "estimates_are_assumptions": True,
             "revenue_leakage": self.revenue_leakage,
             "cloud_cost": self.cloud_cost,
             "support_cost": self.support_cost,

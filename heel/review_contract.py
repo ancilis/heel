@@ -47,6 +47,7 @@ _FINDING_FIELDS = (
     "reason",
     "reachable",
 )
+_FINDING_EVIDENCE_FIELDS = ("evidence_state", "rule_source", "execution_disposition")
 _REGRESSION_FIELDS = (
     "surface_type",
     "surface_id",
@@ -163,7 +164,8 @@ def _require_exact_fields(record: dict[str, Any], fields: tuple[str, ...], path:
 
 def _validate_finding(record: Any, path: str) -> dict[str, Any]:
     item = _require_object(record, path)
-    _require_exact_fields(item, _FINDING_FIELDS, path)
+    fields = _FINDING_FIELDS + _FINDING_EVIDENCE_FIELDS if "evidence_state" in item else _FINDING_FIELDS
+    _require_exact_fields(item, fields, path)
     normalized = {
         field: _require_nonempty_string(item[field], f"{path}.{field}")
         for field in _FINDING_FIELDS[:-1]
@@ -171,6 +173,11 @@ def _validate_finding(record: Any, path: str) -> dict[str, Any]:
     if normalized["severity"] not in {"warn", "block"}:
         raise ValueError(f"{path}.severity must be warn or block")
     normalized["reachable"] = _require_boolean(item["reachable"], f"{path}.reachable")
+    if "evidence_state" in item:
+        if item["evidence_state"] not in {"unknown", "customer_declared", "inferred"} or item["execution_disposition"] != "static_only":
+            raise ValueError("static review cannot assert observed or verified behavior")
+        for field in _FINDING_EVIDENCE_FIELDS:
+            normalized[field] = _require_nonempty_string(item[field], f"{path}.{field}")
     return normalized
 
 

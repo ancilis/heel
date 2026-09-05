@@ -3,12 +3,12 @@
   "assumption": "not declared in this OpenAPI; not proof the control is absent",
   "answer_receipts": {
     "enforced": "applied",
-    "not_enforced": "confirmed_gap",
+    "not_enforced": "declared_gap",
     "unknown": "unanswered"
   },
   "confidence": {
     "unanswered_or_unknown": "preliminary",
-    "not_enforced": "confirmed_gaps",
-    "enforced_reduced_questions_without_confirmed_gap": "improved"
+    "not_enforced": "declared_gaps",
+    "enforced_reduced_questions_without_declared_gap": "improved"
   }
 }

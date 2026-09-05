@@ -169,7 +169,8 @@ class BrowserReviewTests(unittest.TestCase):
 
         after = json.loads(review_openapi_json(source, json.dumps(answers)))
 
-        self.assertGreater(before["summary"]["findings"], after["summary"]["findings"])
+        self.assertEqual(before["summary"]["findings"], 0)
+        self.assertEqual(after["summary"]["findings"], 0)
         self.assertGreater(before["summary"]["questions"], after["summary"]["questions"])
         self.assertFalse(any(
             question["surface"] == "exportusers"
@@ -200,7 +201,10 @@ class BrowserReviewTests(unittest.TestCase):
                     "field": "tenant_filter",
                     "value": value,
                 }])
-                self.assertEqual(review_openapi_json(source, answers), before)
+                after = json.loads(review_openapi_json(source, answers))
+                self.assertNotEqual(after["model_hash"], json.loads(before)["model_hash"])
+                self.assertEqual(after["findings"], [])
+                self.assertEqual(after["questions"], json.loads(before)["questions"])
 
     def test_answer_errors_are_redacted_by_adapter(self):
         source = json.dumps(_minimal_spec(paths={
