@@ -5,9 +5,9 @@ import { headers } from "next/headers";
 import "./globals.css";
 
 
-const title = "Heel — Find launch blockers before customers do";
+const title = "Heel — Discover abuse in normal product use";
 const description =
-  "Turn an OpenAPI document into reachable SaaS abuse evidence, controls, and regression tests without uploading it.";
+  "Help SaaS teams discover and validate how users can extract value, evade commercial limits, or impose costs through the product’s normal capabilities.";
 const internalOriginHeader = "x-heel-internal-origin";
 
 

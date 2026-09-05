@@ -132,12 +132,12 @@ beforeEach(() => {
 
 
 describe("Heel anonymous launch review", () => {
-  test("renders exact executable blocker evidence and immediate actions without a wall", () => {
+  test("renders an abuse hypothesis and immediate actions without a wall", () => {
     const { container } = render(<Home />);
     const hero = container.querySelector(".hero");
     expect(hero).toBeTruthy();
 
-    expect(screen.getByRole("heading", { level: 1 }).textContent).toMatch(/launch blocker/i);
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toMatch(/abuse hiding in normal product use/i);
     expect(container.textContent).toMatch(/global beyond intended tenant/i);
     expect(container.textContent).toContain("tool scope minimization");
     expect(container.textContent).toMatch(/launch_review_runagenttool_agent_surface_overscope/i);
@@ -146,7 +146,7 @@ describe("Heel anonymous launch review", () => {
     expect(screen.getByRole("link", { name: /use heel with an agent/i }).getAttribute("href")).toBe("/agent");
     expect(within(hero as HTMLElement).getByText(/launch_review_runagenttool_agent_surface_overscope/i)).toBeTruthy();
 
-    expect(container.textContent).toMatch(/runs here, not on our server/i);
+    expect(container.textContent).toMatch(/product description stays in this browser/i);
     expect(container.textContent).not.toMatch(/sign up to review|customer count|accuracy rate|testimonial/i);
   });
 
@@ -183,21 +183,20 @@ describe("Heel anonymous launch review", () => {
     render(<Home />);
     const setup = screen.getByRole("link", { name: /open local mcp setup/i });
     expect(setup.getAttribute("href")).toBe("/agent");
-    const section = screen.getByRole("heading", { name: /same review from your local ai surface/i }).closest("section");
+    const section = screen.getByRole("heading", { name: /investigate locally. validate with a bounded rehearsal/i }).closest("section");
     expect(section?.textContent).toContain("heel-sim");
     expect(section?.textContent).toContain("heel-mcp");
-    expect(section?.textContent).toMatch(/first-party apache-2\.0/i);
+    expect(section?.textContent).toMatch(/apache-2\.0/i);
     expect(section?.textContent).toMatch(/no account or package registry is required/i);
   });
 
-  test("markets a usable free launch without pretending paid checkout exists", () => {
+  test("describes the three abuse areas without overstating validation", () => {
     render(<Home />);
-
-    expect(screen.getByText(/free early access now/i)).toBeTruthy();
-    expect(screen.getAllByText(/coming soon/i)).toHaveLength(2);
-    expect(document.body.textContent).toContain("$49/month");
-    expect(document.body.textContent).toContain("$199/month");
-    expect(document.body.textContent).toMatch(/no payment is accepted/i);
+    expect(screen.getByText("Trials & promotions")).toBeTruthy();
+    expect(screen.getByText("Usage & costs")).toBeTruthy();
+    expect(screen.getByText("Exports & automation")).toBeTruthy();
+    expect(document.body.textContent).toContain("evade commercial limits, or impose costs");
+    expect(document.body.textContent).toContain("trial eligibility and cumulative usage remain investigation areas");
   });
 
   test("offers the verified Agent artifacts and exact local install command", () => {

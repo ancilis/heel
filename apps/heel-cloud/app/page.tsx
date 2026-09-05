@@ -14,18 +14,18 @@ export default function Home() {
         </a>
         <span className="local-status">
           <span aria-hidden="true" />
-          Source analysis runs here, not on our server
+          Your product description stays in this browser
         </span>
       </header>
 
       <ReviewWorkspace initialReview={SAMPLE_REVIEW} />
 
       <section className="mcp-section" id="mcp" aria-labelledby="mcp-title">
-        <p className="eyebrow">Agent-first when you want it</p>
-        <h2 id="mcp-title">The same review from your local AI surface.</h2>
+        <p className="eyebrow">From product rules to repeatable checks</p>
+        <h2 id="mcp-title">Investigate locally. Validate with a bounded rehearsal.</h2>
         <p>
-          The first-party Apache-2.0 <code>heel-sim</code> download includes the
-          {" "}<code>heel-mcp</code> executable for an agent-controlled local stdio workflow.
+          Use the Apache-2.0 <code>heel-sim</code> download and local
+          {" "}<code>heel-mcp</code> workflow to investigate product rules and retain checks.
           No account or package registry is required. <a href="/agent">
             Open local MCP setup
           </a>.
@@ -33,27 +33,27 @@ export default function Home() {
       </section>
 
       <section className="availability" id="availability" aria-labelledby="availability-title">
-        <p className="eyebrow">Start local · add continuity when useful</p>
-        <h2 id="availability-title">Free early access now. Paid teams next.</h2>
+        <p className="eyebrow">Three ways normal capabilities become abuse</p>
+        <h2 id="availability-title">What can a user gain—or make you pay for?</h2>
         <div className="price-grid">
           <article>
-            <strong>Free</strong>
-            <span>$0 · no card</span>
-            <p>Browser, CLI, base MCP, and 3 findings-only cloud reviews each month.</p>
+            <strong>Trials &amp; promotions</strong>
+            <span>Eligibility and repeat value</span>
+            <p>Could account changes or coordinated users claim benefits beyond the intended rule? Investigate eligibility assumptions.</p>
           </article>
           <article>
-            <strong>Pro</strong>
-            <span>Coming soon · $49/month</span>
-            <p>25 synced reviews, 3 seats, exports, and email support.</p>
+            <strong>Usage &amp; costs</strong>
+            <span>Consumption and commercial limits</span>
+            <p>Could normal features consume unmetered value or shift unexpected costs onto the product? Investigate accounting assumptions.</p>
           </article>
           <article>
-            <strong>Team</strong>
-            <span>Coming soon · $199/month</span>
-            <p>100 synced reviews, 10 seats, role controls, and priority support.</p>
+            <strong>Exports &amp; automation</strong>
+            <span>Access to paid product value</span>
+            <p>Could users obtain export value their plan does not include? Validate one synthetic read entitlement and repeat after the fix.</p>
           </article>
         </div>
         <p className="quickstart-note">
-          Free early access is usable today. No payment is accepted until live billing is ready.
+          Browser review generates hypotheses. The local export reference validates one read boundary; trial eligibility and cumulative usage remain investigation areas.
         </p>
       </section>
     </main>

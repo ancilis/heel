@@ -37,7 +37,7 @@ const VERIFY_SERVER = `printf '%s\\n' \\
 
 export const metadata: Metadata = {
   title: "Local MCP setup — Heel",
-  description: "Download Heel Agent and connect its local stdio MCP server to an AI client.",
+  description: "Investigate SaaS business-abuse hypotheses and retain checks through Heel’s local MCP workflow.",
 };
 
 
@@ -59,10 +59,10 @@ export default function AgentQuickstart() {
         <header className="quickstart-hero">
           <div>
             <p className="eyebrow">Heel Agent 1.2.0 · local MCP quickstart</p>
-            <h1>Run Heel from your AI client.</h1>
+            <h1>Investigate product abuse from your AI client.</h1>
             <p>
-              Download the verified <code>heel-sim</code> wheel, then point any stdio-capable
-              MCP client at the installed <code>heel-mcp</code> executable.
+              Bring product rules and abuse hypotheses into your workflow. Download
+              <code>heel-sim</code> and connect your client to the local <code>heel-mcp</code> executable.
             </p>
           </div>
           <Link className="button button-secondary" href="/">Back to browser review</Link>

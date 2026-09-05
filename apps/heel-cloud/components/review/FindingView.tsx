@@ -14,13 +14,13 @@ export function FindingView({ finding, regression }: FindingViewProps) {
     <article className="finding-card" aria-labelledby={`finding-${finding.surface_id}`}>
       <div className="finding-meta">
         <span className={`severity severity-${finding.severity}`}>{finding.severity}</span>
-        <span>{finding.reachable ? "Reachable" : "Not proven reachable"}</span>
+        <span>{finding.reachable ? "Reachable in the model" : "Reachability unknown"}</span>
         <code>{finding.surface_id}</code>
       </div>
       <h3 id={`finding-${finding.surface_id}`}>{finding.risk.replaceAll("_", " ")}</h3>
       <dl className="evidence-list">
         <div>
-          <dt>Why Heel stopped the launch</dt>
+          <dt>Why this capability needs investigation</dt>
           <dd>{finding.reason}</dd>
         </div>
         <div>
@@ -29,7 +29,7 @@ export function FindingView({ finding, regression }: FindingViewProps) {
         </div>
         {regression ? (
           <div>
-            <dt>Regression to keep</dt>
+            <dt>Suggested check to retain</dt>
             <dd>
               <code>{regression.name}</code>
               <span>{regression.scenario_hint}</span>

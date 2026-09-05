@@ -1395,7 +1395,7 @@ test("serves the Agent acquisition page only from the canonical route", async ()
   );
   assert.equal(agent.status, 200, "/agent must serve the customer acquisition page");
   const agentBody = await agent.text();
-  assert.match(agentBody, /<h1>Run Heel from your AI client\.<\/h1>/);
+  assert.match(agentBody, /<h1>Investigate product abuse from your AI client\.<\/h1>/);
   assert.match(agentBody, /href="\/downloads\/heel_sim-1\.2\.0-py3-none-any\.whl"/);
   assert.match(agentBody, /href="\/downloads\/heel_sim-1\.2\.0\.tar\.gz"/);
   assert.match(agentBody, /href="\/downloads\/heel-open-core-manifest\.json"/);

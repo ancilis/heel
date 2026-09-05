@@ -3,7 +3,7 @@
 > vitest run
 
 
- RUN  v4.1.11 /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud
+ RUN  v4.1.11 <WORKTREE>/apps/heel-cloud
 
 
  Test Files  17 passed (17)

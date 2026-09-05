@@ -23,11 +23,11 @@
 ........................................................                 [100%]
 =============================== warnings summary ===============================
 tests/test_runner_http_transport.py::test_tls_transports_use_the_client_protocol_context_without_legacy_defaults
-  /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/heel/runner/http_transport.py:235: DeprecationWarning: ssl.PROTOCOL_TLSv1_2 is deprecated
+  <WORKTREE>/heel/runner/http_transport.py:235: DeprecationWarning: ssl.PROTOCOL_TLSv1_2 is deprecated
     self.context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
 
 tests/test_runner_http_transport.py::test_tls_transports_use_the_client_protocol_context_without_legacy_defaults
-  /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/heel/saas/network_guard.py:248: DeprecationWarning: ssl.PROTOCOL_TLSv1_2 is deprecated
+  <WORKTREE>/heel/saas/network_guard.py:248: DeprecationWarning: ssl.PROTOCOL_TLSv1_2 is deprecated
     self.context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html

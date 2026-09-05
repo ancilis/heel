@@ -108,12 +108,12 @@ function publicFailure(error: unknown): string {
 
 
 function statusMessage(phase: ReviewPhase, review: ReviewEnvelopeV1): string {
-  if (phase === "example") return `Example review complete · ${review.summary.findings} findings · ${review.summary.blockers} blocker`;
+  if (phase === "example") return `Example review complete · ${review.summary.findings} findings · ${review.summary.blockers} high-priority hypothesis`;
   if (phase === "loading_engine") return "Loading the browser-local Python engine · your input remains in memory";
   if (phase === "reviewing") return "Reviewing locally · no analyzer network calls";
   if (phase === "failed") return "Review failed · your input and answers remain in memory";
   if (phase === "cancelled") return "Review cancelled · your input and answers remain in memory";
-  return `Review complete · ${review.summary.findings} findings · ${review.summary.blockers} blocker`;
+  return `Review complete · ${review.summary.findings} findings · ${review.summary.blockers} high-priority hypothesis`;
 }
 
 
@@ -439,11 +439,11 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
     <>
       <section className="hero">
         <div className="hero-copy">
-          <p className="eyebrow">Launch abuse review · browser local</p>
-          <h1>Find the launch blocker hidden in your API.</h1>
+          <p className="eyebrow">SaaS business abuse · discover and validate</p>
+          <h1>Find the abuse hiding in normal product use.</h1>
           <p className="hero-lede">
-            Heel turns an OpenAPI document into reachable abuse evidence,
-            recommended controls, and regression tests without uploading the document.
+            Heel helps SaaS teams discover and validate how users can extract value,
+            evade commercial limits, or impose costs through the product’s normal capabilities.
           </p>
           <div className="hero-actions">
             <button className="button button-primary" type="button" onClick={runSample} disabled={disabled}>
@@ -465,9 +465,9 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
           <div className="gate-row">
             <span className={`gate gate-${result.gate_status}`}>{result.gate_status}</span>
             <p>Static hypotheses and declarations only. No findings does not establish coverage or launch safety.</p>
-            <span>{result.summary.blockers} reachable launch blocker</span>
+            <span>{result.summary.blockers} high-priority abuse hypothesis</span>
           </div>
-          {finding ? <p>{finding.reason}</p> : <p>No launch findings in this review.</p>}
+          {finding ? <p>{finding.reason}</p> : <p>No abuse hypotheses flagged in this review.</p>}
           {finding ? (
             <div className="proof-control">
               <span>Control</span>
@@ -487,7 +487,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
       <div className="workspace-bar">
         <div>
           <p className="eyebrow">{provenanceLabel}</p>
-          <h2 id="workspace-title">See the evidence before you install anything.</h2>
+          <h2 id="workspace-title">Start with the product rules users could exploit.</h2>
         </div>
         <div className="workspace-actions cloud-continuity-action">
           <span>{cloudContinuityReviewId === result.review_id
@@ -533,7 +533,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
       ) : null}
 
       {finding ? <FindingView finding={finding} regression={regression} /> : (
-        <p className="empty-result">No launch findings in this review.</p>
+        <p className="empty-result">No abuse hypotheses flagged in this review.</p>
       )}
 
       <div className="evidence-grid">
@@ -569,7 +569,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
         </section>
         {additionalFindings.length > 0 ? (
           <section className="evidence-panel evidence-panel-wide" aria-labelledby="additional-findings-title">
-            <p className="eyebrow">Complete evidence</p>
+            <p className="eyebrow">More exposure hypotheses</p>
             <h3 id="additional-findings-title">Additional findings</h3>
             <ProgressiveList
               key={`${result.review_id}:findings`}
@@ -625,9 +625,9 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
       <div className="local-tools">
         <PrivacyReceipt />
         <section className="export-card" aria-labelledby="export-title">
-          <p className="eyebrow">Take the evidence</p>
+          <p className="eyebrow">Keep the investigation</p>
           <h3 id="export-title">Local exports</h3>
-          <p>Generated in this browser. The JSON envelope is not augmented.</p>
+          <p>Keep the findings, open questions, controls, and suggested checks together.</p>
           <div className="export-actions">
             <a
               className="button button-secondary"

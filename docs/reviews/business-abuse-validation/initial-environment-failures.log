@@ -85,12 +85,12 @@
 
 test at tests/browser-engine.test.mjs:376:1
 ✖ prepares only integrity-pinned local engine and Pyodide runtime assets (98.194209ms)
-  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules
+  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: <WORKTREE>/apps/heel-cloud/node_modules
 
 
   1 !== 0
 
-      at TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:380:10)
+      at TestContext.<anonymous> (file://<WORKTREE>/apps/heel-cloud/tests/browser-engine.test.mjs:380:10)
       at async Test.run (node:internal/test_runner/test:1208:7)
       at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
     generatedMessage: false,
@@ -105,21 +105,21 @@ test at tests/browser-engine.test.mjs:471:1
 ✖ runtime preparation rejects tampering, symlinks, unpinned versions, and unexpected output (9.306834ms)
   AssertionError [ERR_ASSERTION]: The input did not match the regular expression /digest|size/i. Input:
 
-  'Error: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules'
+  'Error: Pyodide root contains a symbolic link: <WORKTREE>/apps/heel-cloud/node_modules'
 
-      at async TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:480:5)
+      at async TestContext.<anonymous> (file://<WORKTREE>/apps/heel-cloud/tests/browser-engine.test.mjs:480:5)
       at async Test.run (node:internal/test_runner/test:1208:7)
       at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
     generatedMessage: true,
     code: 'ERR_ASSERTION',
-    actual: Error: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules
-        at assertNoSymlinkComponents (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/scripts/prepare-runtime.mjs?test=1788577627498:132:42)
-        at async validateDirectoryRoot (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/scripts/prepare-runtime.mjs?test=1788577627498:143:3)
+    actual: Error: Pyodide root contains a symbolic link: <WORKTREE>/apps/heel-cloud/node_modules
+        at assertNoSymlinkComponents (file://<WORKTREE>/apps/heel-cloud/scripts/prepare-runtime.mjs?test=1788577627498:132:42)
+        at async validateDirectoryRoot (file://<WORKTREE>/apps/heel-cloud/scripts/prepare-runtime.mjs?test=1788577627498:143:3)
         at async Promise.all (index 1)
-        at async prepareRuntime (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/scripts/prepare-runtime.mjs?test=1788577627498:396:3)
+        at async prepareRuntime (file://<WORKTREE>/apps/heel-cloud/scripts/prepare-runtime.mjs?test=1788577627498:396:3)
         at async waitForActual (node:assert:621:5)
         at async strict.rejects (node:assert:744:25)
-        at async TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:480:5)
+        at async TestContext.<anonymous> (file://<WORKTREE>/apps/heel-cloud/tests/browser-engine.test.mjs:480:5)
         at async Test.run (node:internal/test_runner/test:1208:7)
         at async Test.processPendingSubtests (node:internal/test_runner/test:831:7),
     expected: /digest|size/i,
@@ -129,12 +129,12 @@ test at tests/browser-engine.test.mjs:471:1
 
 test at tests/browser-engine.test.mjs:569:1
 ✖ loads third-party licenses only from digest-pinned tracked assets (99.579834ms)
-  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules
+  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: <WORKTREE>/apps/heel-cloud/node_modules
 
 
   1 !== 0
 
-      at TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:571:10)
+      at TestContext.<anonymous> (file://<WORKTREE>/apps/heel-cloud/tests/browser-engine.test.mjs:571:10)
       at Test.runInAsyncScope (node:async_hooks:226:14)
       at Test.run (node:internal/test_runner/test:1201:25)
       at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
@@ -151,12 +151,12 @@ test at tests/browser-engine.test.mjs:569:1
 
 test at tests/browser-engine.test.mjs:621:1
 ✖ executes the real local wheel in Pyodide with outbound network disabled (89.640834ms)
-  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules
+  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: <WORKTREE>/apps/heel-cloud/node_modules
 
 
   1 !== 0
 
-      at TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:623:10)
+      at TestContext.<anonymous> (file://<WORKTREE>/apps/heel-cloud/tests/browser-engine.test.mjs:623:10)
       at Test.runInAsyncScope (node:async_hooks:226:14)
       at Test.run (node:internal/test_runner/test:1201:25)
       at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
@@ -173,12 +173,12 @@ test at tests/browser-engine.test.mjs:621:1
 
 test at tests/browser-engine.test.mjs:698:1
 ✖ executes the real wheel in a Node permission-confined process (103.000125ms)
-  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: /Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/node_modules
+  AssertionError [ERR_ASSERTION]: runtime preparation failed: Pyodide root contains a symbolic link: <WORKTREE>/apps/heel-cloud/node_modules
 
 
   1 !== 0
 
-      at TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/browser-engine.test.mjs:705:10)
+      at TestContext.<anonymous> (file://<WORKTREE>/apps/heel-cloud/tests/browser-engine.test.mjs:705:10)
       at Test.runInAsyncScope (node:async_hooks:226:14)
       at Test.run (node:internal/test_runner/test:1201:25)
       at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
@@ -210,7 +210,7 @@ test at tests/production-artifact.test.mjs:1212:1
       }
     }
 
-      at TestContext.<anonymous> (file:///Users/hellohelloalbus/.config/superpowers/worktrees/heel/saas-arceo-build/apps/heel-cloud/tests/production-artifact.test.mjs:1231:10)
+      at TestContext.<anonymous> (file://<WORKTREE>/apps/heel-cloud/tests/production-artifact.test.mjs:1231:10)
       at async Test.run (node:internal/test_runner/test:1208:7)
       at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
     generatedMessage: true,
