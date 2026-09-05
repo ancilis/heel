@@ -1,3 +1,7 @@
+# Latest private deployment
+
+The owner-private Sites update is recorded in [DEPLOYMENT_2026-09-05.md](DEPLOYMENT_2026-09-05.md). No public launch or Python control-plane deployment is claimed.
+
 # Heel SaaS Build State
 
 Updated 2026-09-04. The current validation wedge is the [synthetic export entitlement workflow](../EXPORT_DEMO.md); see [capabilities](../CAPABILITIES.md). Cloud pairing is not a supported end-to-end customer journey. Passing static gates does not establish launch safety. This file records the product that exists in the current
