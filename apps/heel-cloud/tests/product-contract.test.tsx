@@ -196,7 +196,9 @@ describe("Heel anonymous launch review", () => {
     expect(screen.getByText("Usage & costs")).toBeTruthy();
     expect(screen.getByText("Exports & automation")).toBeTruthy();
     expect(document.body.textContent).toContain("evade commercial limits, or impose costs");
-    expect(document.body.textContent).toContain("trial eligibility and cumulative usage remain investigation areas");
+    expect(document.body.textContent).toContain("Browser review generates hypotheses");
+    expect(document.body.textContent).toContain("through your local runner");
+    expect(screen.getAllByRole("link", { name: /Abuse campaigns/ }).length).toBeGreaterThan(0);
   });
 
   test("offers the verified Agent artifacts and exact local install command", () => {

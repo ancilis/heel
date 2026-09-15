@@ -1,0 +1,1069 @@
+{
+  "actors": [
+    {
+      "auth": "bearer",
+      "credential_env": "HEEL_CANARY_OWNER",
+      "id": "owner"
+    },
+    {
+      "auth": "bearer",
+      "credential_env": "HEEL_CANARY_OUTSIDER",
+      "id": "outsider"
+    }
+  ],
+  "allow_mutations": true,
+  "environment": "loopback",
+  "limits": {
+    "max_duration_seconds": 120,
+    "max_requests": 61,
+    "min_interval_ms": 100,
+    "timeout_seconds": 5
+  },
+  "name": "Business-abuse campaign",
+  "origin": "http://127.0.0.1:8765",
+  "scenarios": [
+    {
+      "assertions": [
+        {
+          "id": "boundary",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "after"
+          },
+          "op": "absent"
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/tenant_isolation/reset"
+        }
+      ],
+      "family": "tenant_isolation",
+      "id": "tenant_isolation",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "A customer cannot read a canary object owned by another tenant.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/tenant_isolation/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/tenant_isolation/export"
+        },
+        {
+          "actor": "outsider",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/tenant_isolation/export"
+        }
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "id": "boundary",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "after"
+          },
+          "op": "absent"
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/role_boundary/reset"
+        }
+      ],
+      "family": "role_boundary",
+      "id": "role_boundary",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "A lower-privilege actor cannot read administrator-only data.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/role_boundary/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/role_boundary/export"
+        },
+        {
+          "actor": "outsider",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/role_boundary/export"
+        }
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "id": "boundary",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "after"
+          },
+          "op": "absent"
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/entitlement/reset"
+        }
+      ],
+      "family": "entitlement",
+      "id": "entitlement",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "An account without the paid export entitlement cannot obtain protected export content.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/entitlement/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/entitlement/export"
+        },
+        {
+          "actor": "outsider",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/entitlement/export"
+        }
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "baseline": {
+            "pointer": "/benefits",
+            "step": "before"
+          },
+          "id": "business_value",
+          "left": {
+            "pointer": "/benefits",
+            "step": "after"
+          },
+          "op": "delta_lte",
+          "right": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/trial_eligibility/reset"
+        }
+      ],
+      "family": "trial_eligibility",
+      "id": "trial_eligibility",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/fixture",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "Changing login identity does not give the same eligibility subject a second trial.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/trial_eligibility/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/trial_eligibility/state"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_0",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/trial_eligibility/claim-trial"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_1",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/trial_eligibility/change-identity"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_2",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/trial_eligibility/claim-trial"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/trial_eligibility/state"
+        }
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "baseline": {
+            "pointer": "/benefits",
+            "step": "before"
+          },
+          "id": "business_value",
+          "left": {
+            "pointer": "/benefits",
+            "step": "after"
+          },
+          "op": "delta_lte",
+          "right": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/promotion_limits/reset"
+        }
+      ],
+      "family": "promotion_limits",
+      "id": "promotion_limits",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/fixture",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "Only one promotional benefit may be granted per eligibility subject.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/promotion_limits/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/promotion_limits/state"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_0",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/promotion_limits/promotion-a"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_1",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/promotion_limits/promotion-b"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/promotion_limits/state"
+        }
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "baseline": {
+            "pointer": "/usage",
+            "step": "before"
+          },
+          "id": "business_value",
+          "left": {
+            "pointer": "/usage",
+            "step": "after"
+          },
+          "op": "delta_gte",
+          "right": 2
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/usage_accounting/reset"
+        }
+      ],
+      "family": "usage_accounting",
+      "id": "usage_accounting",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/fixture",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "Both UI and API consumption contribute to the same authoritative usage meter.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/usage_accounting/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/usage_accounting/state"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_0",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/usage_accounting/consume-ui"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_1",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/usage_accounting/consume-api"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/usage_accounting/state"
+        }
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "baseline": {
+            "pointer": "/usage",
+            "step": "before"
+          },
+          "id": "business_value",
+          "left": {
+            "pointer": "/usage",
+            "step": "after"
+          },
+          "op": "delta_lte",
+          "right": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/quota/reset"
+        }
+      ],
+      "family": "quota",
+      "id": "quota",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/fixture",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "Two bounded consumption attempts cannot exceed the one-unit fixture quota.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/quota/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/quota/state"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_0",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/quota/consume-ui"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_1",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/quota/consume-api"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/quota/state"
+        }
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "id": "current_entitlement",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "after"
+          },
+          "op": "absent"
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/lifecycle/reset"
+        }
+      ],
+      "family": "lifecycle",
+      "id": "lifecycle",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "Downgrading a plan removes export entitlement on subsequent reads.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/lifecycle/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/lifecycle/export"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "downgrade",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/lifecycle/downgrade"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/lifecycle/export"
+        }
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "baseline": {
+            "pointer": "/benefits",
+            "step": "before"
+          },
+          "id": "business_value",
+          "left": {
+            "pointer": "/benefits",
+            "step": "after"
+          },
+          "op": "delta_lte",
+          "right": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/idempotency/reset"
+        }
+      ],
+      "family": "idempotency",
+      "id": "idempotency",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/fixture",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "Repeating the same benefit request with the same idempotency key grants value once.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/idempotency/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/idempotency/state"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_0",
+          "idempotency_key": "heel-canary-{run}",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/idempotency/grant-benefit"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_1",
+          "idempotency_key": "heel-canary-{run}",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/idempotency/grant-benefit"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/idempotency/state"
+        }
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "baseline": {
+            "pointer": "/fulfilled",
+            "step": "before"
+          },
+          "id": "business_value",
+          "left": {
+            "pointer": "/fulfilled",
+            "step": "after"
+          },
+          "op": "delta_lte",
+          "right": 0
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/workflow_order/reset"
+        }
+      ],
+      "family": "workflow_order",
+      "id": "workflow_order",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/fixture",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "An unapproved request cannot reach fulfilled state.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/workflow_order/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/workflow_order/state"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200,
+            403,
+            409
+          ],
+          "id": "action_0",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/workflow_order/fulfill"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/workflow_order/state"
+        }
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "id": "boundary",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "after"
+          },
+          "op": "absent"
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/integration_scope/reset"
+        }
+      ],
+      "family": "integration_scope",
+      "id": "integration_scope",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "An integration credential cannot access data outside its granted scope.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/integration_scope/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/integration_scope/export"
+        },
+        {
+          "actor": "outsider",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/integration_scope/export"
+        }
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "id": "boundary",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "after"
+          },
+          "op": "absent"
+        }
+      ],
+      "cleanup": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "cleanup",
+          "method": "DELETE",
+          "path": "/heel-canary-{run}/agent_actions/reset"
+        }
+      ],
+      "family": "agent_actions",
+      "id": "agent_actions",
+      "preconditions": [
+        {
+          "id": "known_fixture",
+          "left": {
+            "pointer": "/protected_canary",
+            "step": "before"
+          },
+          "op": "eq",
+          "right": "heel-canary-{run}"
+        }
+      ],
+      "rule": "A delegated agent credential cannot access owner-only product capabilities.",
+      "steps": [
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "setup",
+          "json": {
+            "subject": "heel-canary-{run}"
+          },
+          "method": "POST",
+          "path": "/heel-canary-{run}/agent_actions/reset"
+        },
+        {
+          "actor": "owner",
+          "expected_status": [
+            200
+          ],
+          "id": "before",
+          "method": "GET",
+          "path": "/heel-canary-{run}/agent_actions/export"
+        },
+        {
+          "actor": "outsider",
+          "expected_status": [
+            200
+          ],
+          "id": "after",
+          "method": "GET",
+          "path": "/heel-canary-{run}/agent_actions/export"
+        }
+      ]
+    }
+  ],
+  "schema_version": "heel.campaign.v1"
+}

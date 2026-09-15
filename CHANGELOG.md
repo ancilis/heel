@@ -4,6 +4,11 @@ All notable changes to Heel are documented here. Format loosely follows Keep a C
 
 ## [Unreleased]
 
+- Add digest-authorized local HTTP campaigns for 12 business-abuse families, including trial/promotion state, cumulative usage, quotas, entitlement transitions, repeated requests and workflow ordering.
+- Add editable campaign templates, OpenAPI discovery, CLI/MCP execution, signed local evidence reports, same-campaign regression comparisons and the browser campaign workspace.
+- Exercise real loopback HTTP fixtures with vulnerable and defended controls; enforce bounded requests, stable public HTTPS egress, explicit canary mutations, replay protection, cancellation and cleanup reporting.
+- Fix declared negative answers, required-plan/enforcement conflation, blanket bulk-access exemptions, removed-control diff coverage and guided-answer capacity.
+
 - Add a signed-scope, customer-local synthetic export entitlement reference through CLI and MCP, plus app instructions and local report viewing.
 - Require protected content and an entitled positive control for boundary results; status-only reads are inconclusive.
 - Preserve unknown metadata as questions, separate evidence state from severity/disposition, deduplicate operation representations and require applicable commercial rules for relevant library hypotheses.

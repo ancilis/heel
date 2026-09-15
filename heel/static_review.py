@@ -181,6 +181,8 @@ def _changed_surfaces(before: Mapping[str, Any], after: Mapping[str, Any]) -> li
     for field_name in SURFACE_FIELDS:
         before_items = _items_by_id(before.get(field_name, []), field_name)
         after_items = _items_by_id(after.get(field_name, []), field_name)
+        for sid in sorted(before_items.keys() - after_items.keys()):
+            changed.append(ChangedSurface(field_name, sid, "removed", before_items[sid], {}))
         for sid in sorted(after_items):
             after_item = after_items[sid]
             before_item = before_items.get(sid)
@@ -193,6 +195,13 @@ def _changed_surfaces(before: Mapping[str, Any], after: Mapping[str, Any]) -> li
 
 def _risk_findings(surface: ChangedSurface) -> list[RiskFinding]:
     props = surface.after
+    if surface.change_type == "removed":
+        if surface.surface_type != "declared_controls":
+            return []
+        return [_finding(surface, risk="declared_control_removed", severity="warn",
+                         control="confirm replacement or continued enforcement",
+                         reason=f"control {surface.surface_id} was removed from the model; runtime status requires confirmation",
+                         reachable=False)]
     if surface.surface_type == "exports":
         return _export_risks(surface, props)
     if surface.surface_type == "endpoints_routes":
@@ -215,12 +224,12 @@ def _risk_findings(surface: ChangedSurface) -> list[RiskFinding]:
 
 
 def _export_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> list[RiskFinding]:
-    if props.get("bulk_access_permitted") is True:
-        return []
+    bulk_permitted = props.get("bulk_access_permitted") is True
+    entitlement_required = bool(_first(props, "required_plan", "entitlement_plan", "business_rule", "entitlement_required"))
     findings = []
     entitlement_missing = _bad_control(_first(props, "entitlement_check", "authz_check", "guard", "guard_present"))
     quota_missing = _bad_control(_first(props, "tenant_quota", "quota", "rate_limit", "export_limit"))
-    if entitlement_missing:
+    if entitlement_missing and (not bulk_permitted or entitlement_required):
         findings.append(_finding(
             surface,
             risk="export_without_entitlement",
@@ -229,7 +238,7 @@ def _export_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> list[Ris
             reason=f"new {surface.surface_id} export reachable without server-side entitlement check",
             reachable=_reachable(props),
         ))
-    if quota_missing:
+    if quota_missing and not bulk_permitted:
         findings.append(_finding(
             surface,
             risk="export_without_tenant_quota",

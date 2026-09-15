@@ -144,3 +144,6 @@ The build verifies the committed Agent downloads without regenerating them.
 These are the repository's deployment commands, not evidence of a completed public
 deployment. The Docker image was not executed in this workspace because a Docker
 daemon was unavailable.
+# Business-abuse campaign workspace
+
+`/campaigns` builds editable local campaigns across 12 rule families and reads the resulting reports without uploading them. The installed Agent executes target requests under a human-created digest-bound scope. This route works in local-review deployment mode and does not depend on cloud pairing. The browser does not authenticate imported local report signatures; the Agent verifies those before export.

@@ -323,7 +323,7 @@ def _map_operation(
     text = _operation_text(entry, operation)
     controls = _controls(operation)
     has_tenant_scope = bool(entry.get("tenant_scope"))
-    has_entitlement = bool(entry.get("required_plan") or _has_control(controls, "entitlement"))
+    has_entitlement = _has_control(controls, "entitlement")
     has_rate = _has_control(controls, "rate")
     if not has_tenant_scope:
         _add_warning(
@@ -476,6 +476,13 @@ def _route_entry(route: str, method: str, operation: Mapping[str, Any], tags: li
         entry["rate_limit"] = "declared"
     if entry.get("tenant_scope"):
         entry["tenant_filter"] = "declared"
+    declarations = operation.get("x-heel-customer-declarations", {})
+    if isinstance(declarations, Mapping):
+        for field in ("tenant_filter", "entitlement_check", "rate_limit"):
+            declaration = declarations.get(field)
+            if isinstance(declaration, Mapping) and declaration.get("value") == "not_enforced":
+                entry[field] = "missing"
+                entry["control_evidence_state"] = "customer_declared"
     return {k: v for k, v in entry.items() if v not in (None, "", [])}
 
 

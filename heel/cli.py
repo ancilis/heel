@@ -957,6 +957,9 @@ def _report(srv: HeelServer, run_id: str, caller: str, economic: bool = False,
 
 def main(argv=None):
     selected_argv = list(sys.argv[1:] if argv is None else argv)
+    if selected_argv and selected_argv[0] == "campaign":
+        from .campaign_cli import main as campaign_main
+        return campaign_main(selected_argv[1:])
     if "runner" in selected_argv and any(
         _runner_secret_shaped_argument(value) for value in selected_argv
     ):
@@ -967,6 +970,7 @@ def main(argv=None):
     )
     ap.add_argument("--version", action="version", version=f"heel {__version__}")
     sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("campaign", help="prepare, authorize and run reusable business-abuse campaigns")
     sub.add_parser("doctor", help="self-check: install, data dir, signing-key posture, capability")
     sub.add_parser("eval", help="run the honest held-out detection eval and print the headline")
     bench = sub.add_parser("bench", help="run or render the HeelBench public benchmark")

@@ -7,8 +7,8 @@ import {
 } from "./review-v1";
 
 
-export const MAX_REVIEW_ANSWER_COUNT = 64;
-export const MAX_REVIEW_ANSWERS_BYTES = 64 * 1024;
+export const MAX_REVIEW_ANSWER_COUNT = 512;
+export const MAX_REVIEW_ANSWERS_BYTES = 256 * 1024;
 
 export type ReviewAnswerValue = "enforced" | "not_enforced" | "unknown";
 export type ReviewAnswerField = "tenant_filter" | "entitlement_check" | "rate_limit";

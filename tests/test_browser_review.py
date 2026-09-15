@@ -186,7 +186,7 @@ class BrowserReviewTests(unittest.TestCase):
             if finding["surface_id"] == "exportusers"
         })
 
-    def test_not_enforced_and_unknown_are_exact_envelope_noops(self):
+    def test_negative_answers_create_hypotheses_and_unknown_remains_uncertain(self):
         from heel.browser_review import review_openapi_json
 
         source = json.dumps(_minimal_spec(paths={
@@ -203,7 +203,11 @@ class BrowserReviewTests(unittest.TestCase):
                 }])
                 after = json.loads(review_openapi_json(source, answers))
                 self.assertNotEqual(after["model_hash"], json.loads(before)["model_hash"])
-                self.assertEqual(after["findings"], [])
+                if value == "not_enforced":
+                    self.assertEqual([item["risk"] for item in after["findings"]], ["endpoint_without_tenant_filter"])
+                    self.assertEqual(after["findings"][0]["evidence_state"], "inferred")
+                else:
+                    self.assertEqual(after["findings"], [])
                 self.assertEqual(after["questions"], json.loads(before)["questions"])
 
     def test_answer_errors_are_redacted_by_adapter(self):

@@ -450,10 +450,11 @@ class FindingsHttpApiTests(unittest.TestCase):
             status, raw, 400, "invalid_findings_sync_request", key_hex,
         )
 
-        too_large = at_limit + b" "
+        # Reject oversized Content-Length before consuming bytes. Sending the
+        # rejected body races the server's early close rather than testing parsing.
         status, raw = self._raw_request(
-            "POST", path, too_large,
-            {"Content-Encoding": "identity", **base_headers},
+            "POST", path, None,
+            {"Content-Encoding": "identity", **base_headers, "Content-Length": str(len(at_limit) + 1)},
         )
         self._assert_error(
             status, raw, 413, "findings_sync_request_too_large", key_hex,

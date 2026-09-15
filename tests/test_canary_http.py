@@ -870,7 +870,10 @@ def test_canary_mutations_reject_non_browser_principals_and_missing_authority(tm
             "missing/result-projection"
         )
         status, _, body = fixture.request(
-            "POST", upload_path, raw=b"{" + b" " * (272 * 1024),
+            # Assert rejection from the oversized declared length before uploading
+            # bytes; otherwise an early 413 races the client's sendall on macOS.
+            "POST", upload_path,
+            headers={"Content-Type": "application/json", "Content-Length": str(272 * 1024 + 1)},
         )
         assert status == 413 and body["error"] == "request body too large"
 

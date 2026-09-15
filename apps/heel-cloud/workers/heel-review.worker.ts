@@ -17,7 +17,7 @@ const RUNTIME_MANIFEST_URL = "/heel-runtime/runtime-manifest.json";
 const WHEEL_FILENAME = "heel_browser-1.2.0-py3-none-any.whl";
 const WHEEL_URL = `${RUNTIME_ROOT}${WHEEL_FILENAME}`;
 const MAX_BROWSER_INPUT_BYTES = 2 * 1024 * 1024;
-const MAX_BROWSER_ANSWERS_BYTES = 64 * 1024;
+const MAX_BROWSER_ANSWERS_BYTES = 256 * 1024;
 // Keep fan-out bounded before the result crosses the structured-clone boundary.
 const MAX_BROWSER_RESULT_BYTES = 4 * 1024 * 1024;
 const MAX_WORKER_REQUEST_BYTES = MAX_BROWSER_INPUT_BYTES * 2 + MAX_BROWSER_ANSWERS_BYTES * 2 + 64 * 1024;

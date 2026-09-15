@@ -8,8 +8,8 @@ from typing import Any
 from .openapi_model import operation_surface_id
 
 
-MAX_REVIEW_ANSWERS_BYTES = 64 * 1024
-MAX_REVIEW_ANSWER_COUNT = 64
+MAX_REVIEW_ANSWERS_BYTES = 256 * 1024
+MAX_REVIEW_ANSWER_COUNT = 512
 MAX_REVIEW_ANSWER_DEPTH = 8
 
 _ANSWER_FIELDS = frozenset({"surface", "field", "value"})

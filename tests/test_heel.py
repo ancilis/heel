@@ -1204,11 +1204,13 @@ class TestDocsAndMetadata(unittest.TestCase):
             "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.",
         )
 
-    def test_docs_limit_readiness_to_supported_reference(self):
+    def test_docs_limit_readiness_to_configured_sandbox_campaigns(self):
         readme = self._read("README.md")
 
         self.assertNotIn("production-ready spine, beta adapters", readme)
-        self.assertIn("incomplete public journeys", readme)
+        self.assertIn("Cloud pairing remains incomplete", readme)
+        self.assertIn("Configuration is required for your application", readme)
+        self.assertIn("not an autonomous completeness claim", readme)
 
     def test_readme_positions_agent_mcp_as_one_scenario_pack(self):
         readme = self._read("README.md").lower()

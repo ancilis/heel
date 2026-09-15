@@ -183,6 +183,7 @@ REVIEWED_DATA_METHOD_CALLS = {
     "review_rules": frozenset({"lower", "strip"}),
     "review_service": frozenset({"append", "get", "to_dict", "update"}),
     "static_review": frozenset({
+        "keys",
         "add",
         "append",
         "extend",

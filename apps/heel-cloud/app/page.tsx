@@ -12,6 +12,7 @@ export default function Home() {
           <span className="brand-mark" aria-hidden="true">H</span>
           <span>Heel</span>
         </a>
+        <a className="text-button" href="/campaigns">Abuse campaigns →</a>
         <span className="local-status">
           <span aria-hidden="true" />
           Your product description stays in this browser
@@ -53,7 +54,7 @@ export default function Home() {
           </article>
         </div>
         <p className="quickstart-note">
-          Browser review generates hypotheses. The local export reference validates one read boundary; trial eligibility and cumulative usage remain investigation areas.
+          Browser review generates hypotheses. <a href="/campaigns">Abuse campaigns</a> execute explicit rules for access, trials, promotions, usage and lifecycle changes through your local runner.
         </p>
       </section>
     </main>

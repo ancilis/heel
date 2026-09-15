@@ -309,7 +309,19 @@ REFERENCE_TOOL_SCHEMAS = [
      "inputSchema": {"type":"object", "required":["scope_id","case","attempt"], "additionalProperties":False,
                      "properties":{"scope_id":{"type":"string"}, "case":{"type":"string", "enum":["vulnerable","hardened","error_envelope","redacted","public","inconclusive"]}, "attempt":{"type":"string","pattern":"^[0-9a-f]{32}$"}}}},
 ]
-TOOL_SCHEMAS = EXISTING_TOOL_SCHEMAS + REVIEW_TOOL_SCHEMAS + SYNC_TOOL_SCHEMAS + REFERENCE_TOOL_SCHEMAS
+CAMPAIGN_TOOL_SCHEMAS = [
+    {"name": "heel_discover_campaigns", "description": "Suggest business-rule campaign families from a sanitized OpenAPI inventory. No execution or authorization; all required fixture and rule bindings remain explicit.",
+     "inputSchema": {"type": "object", "required": ["openapi"], "properties": {"openapi": {"type": "object"}}, "additionalProperties": False}},
+    {"name": "heel_prepare_campaign", "description": "Validate a declarative owned-sandbox campaign and show its exact digest, actions and coverage. No execution or authorization.",
+     "inputSchema": {"type": "object", "required": ["campaign"], "properties": {"campaign": {"type": "object"}}, "additionalProperties": False}},
+    {"name": "heel_execute_campaign", "description": "Run an exact previously human-authorized campaign. Bounded sandbox requests may mutate canary fixtures only if the signed campaign permits them. Credentials stay local; no authority creation.",
+     "inputSchema": {"type": "object", "required": ["campaign", "scope_id", "attempt"], "properties": {"campaign": {"type": "object"}, "scope_id": {"type": "string"}, "attempt": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, "additionalProperties": False}},
+    {"name": "heel_get_campaign_report", "description": "Read a local campaign report after verifying its local signature. Contains predicate outcomes and evidence hashes, never raw responses.",
+     "inputSchema": {"type": "object", "required": ["run_id"], "properties": {"run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, "additionalProperties": False}},
+]
+CAMPAIGN_TOOL_NAMES = {tool["name"] for tool in CAMPAIGN_TOOL_SCHEMAS}
+STRICT_TOOL_NAMES |= CAMPAIGN_TOOL_NAMES
+TOOL_SCHEMAS = EXISTING_TOOL_SCHEMAS + REVIEW_TOOL_SCHEMAS + SYNC_TOOL_SCHEMAS + REFERENCE_TOOL_SCHEMAS + CAMPAIGN_TOOL_SCHEMAS
 TOOL_NAMES = {t["name"] for t in TOOL_SCHEMAS}
 
 
@@ -430,6 +442,8 @@ def _review_tool_text(name: str, *, failed: bool = False) -> str:
 
 
 def _strict_tool_text(name: str, *, failed: bool = False) -> str:
+    if name in CAMPAIGN_TOOL_NAMES:
+        return f"Heel campaign {'rejected' if failed else 'completed'}. {_UNTRUSTED_STRUCTURED_CONTENT_NOTICE}."
     if name in REVIEW_TOOL_NAMES:
         return _review_tool_text(name, failed=failed)
     prefix = (
@@ -979,6 +993,41 @@ class HeelServer:
         }
 
     # -- MCP dispatch -------------------------------------------------------- #
+    def heel_discover_campaigns(self, args, caller):
+        self._validate_exact_args(args, fields=("openapi",))
+        from .campaign_discovery import discover_campaigns
+        try:
+            return discover_campaigns(args["openapi"])
+        except Exception:
+            raise ToolError("Campaign discovery input rejected") from None
+
+    def heel_prepare_campaign(self, args, caller):
+        self._validate_exact_args(args, fields=("campaign",))
+        from .campaign_cli import prepare_campaign
+        try:
+            return prepare_campaign(args["campaign"])
+        except Exception:
+            raise ToolError("Campaign plan rejected") from None
+
+    def heel_execute_campaign(self, args, caller):
+        self._validate_exact_args(args, fields=("campaign", "scope_id", "attempt"), string_fields=("scope_id", "attempt"))
+        from .campaign_runner import run_campaign
+        try:
+            result = run_campaign(args["campaign"], args["scope_id"], args["attempt"])
+            self._security_log(caller, "campaign_completed", {"run_id": result["run_id"], "scope_id": args["scope_id"], "campaign_digest": result["campaign_digest"]})
+            return result
+        except Exception:
+            self._security_log(caller, "campaign_rejected", {"reason": "invalid plan, scope, credentials or attempt"})
+            raise ToolError("Campaign execution rejected; inspect the local plan and signed authorization") from None
+
+    def heel_get_campaign_report(self, args, caller):
+        self._validate_exact_args(args, fields=("run_id",), string_fields=("run_id",))
+        from .campaign_cli import load_report
+        try:
+            return load_report(args["run_id"])
+        except Exception:
+            raise ToolError("Campaign report unavailable or unauthenticated") from None
+
     def heel_prepare_reference(self, args, caller):
         self._validate_exact_args(args, fields=())
         from .reference_rehearsal import prepare_reference

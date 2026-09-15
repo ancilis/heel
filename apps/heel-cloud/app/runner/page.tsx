@@ -28,7 +28,7 @@ export default function Runner() {
     }
   }
   return <main className="runner-page">
-    <header className="dashboard-nav"><Link className="brand" href="/">Heel</Link><Link href="/dashboard">Dashboard</Link></header>
+    <header className="dashboard-nav"><Link className="brand" href="/">Heel</Link><Link href="/campaigns">Abuse campaigns</Link><Link href="/dashboard">Dashboard</Link></header>
     <section className="runner-hero">
       <div><p className="canary-kicker">Customer-local · synthetic reference</p><h1>Validate an export entitlement.</h1>
       <p>Test whether a user can extract paid value through a normal export capability. Validate one protected synthetic row, apply the entitlement fix, and retain the regression.</p></div>

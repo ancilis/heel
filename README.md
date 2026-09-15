@@ -17,11 +17,25 @@ Six months later, the same product may be dealing with trial farming already hap
 on mature accounts, export scraping by legitimate customers, AI-token cost abuse, integration/OAuth
 overreach, or support/workflow gaming after an incident.
 
-**Heel helps product and security teams discover business-abuse hypotheses, validate a bounded behavior, and retain the resulting check.** The initial executable workflow is a synthetic export entitlement reference: a lower-plan user obtains protected export value, the hardened product blocks it, and the same invariant becomes a regression.
+**Heel helps product and security teams discover business-abuse hypotheses, validate a bounded behavior, and retain the resulting check.** Reusable local campaigns now execute declared business rules against owned HTTP sandboxes: access boundaries, trial and promotion eligibility, cumulative usage, quotas, entitlement changes, repeated requests and workflow order. Findings retain evidence hashes and can be compared after an application fix.
 
-Static OpenAPI/ProductModel review and the broader scenario library remain useful investigation tools. They do not prove runtime control failures. Unknown specification fields become questions; customer answers are declarations. AI/agent abuse is one optional surface. Trial/promotion eligibility and cumulative usage are modeled but not live-validated.
+Static OpenAPI/ProductModel review and the broader scenario library remain useful investigation tools. They do not prove runtime control failures. Unknown specification fields become questions; customer answers are declarations. AI/agent abuse is one optional surface. Campaigns can execute trial/promotion and cumulative-usage checks when their actors, fixtures and observations are explicitly mapped.
 
-See the [current capability matrix](docs/CAPABILITIES.md) and [runnable export demo](docs/EXPORT_DEMO.md). The core static analyzer has zero runtime dependencies; the signed reference runner requires the `runner` extra. No production targets, real payments, bulk extraction or exhaustion are supported in this workflow. Cloud pairing and arbitrary customer-target execution are incomplete public journeys.
+See the [current capability matrix](docs/CAPABILITIES.md) and [runnable export demo](docs/EXPORT_DEMO.md). The core static analyzer has zero runtime dependencies; the signed reference runner requires the `runner` extra. No production targets, real payments, bulk extraction or exhaustion are supported in this workflow. Cloud pairing remains incomplete. The separate local campaign workflow supports operator-mapped owned sandboxes without cloud pairing.
+
+## Run business-abuse campaigns
+
+Open the browser **Abuse campaigns** workspace or use the CLI. Start with a local HTTP demo, then map its rules and observations to your own application:
+
+```sh
+heel campaign demo                         # terminal 1: synthetic HTTP product
+heel campaign template > campaign.json     # terminal 2: editable rules and actions
+heel campaign prepare campaign.json
+heel campaign authorize campaign.json --operator "me" --runs 10 --confirm
+heel campaign run campaign.json --scope SCOPE_ID
+```
+
+Set the demo actor variables and follow the vulnerable → hardened → compare walkthrough in [Business-abuse campaigns](docs/CAMPAIGNS.md). To inventory your API first, use `heel campaign discover sanitized-openapi.json`. Every run reports violations, held rules, inconclusive evidence and untested families separately. The browser builds plans and reads reports; your local runner executes target requests.
 
 ## Five-minute local launch review
 
@@ -160,7 +174,7 @@ make demo-bench
 
 ## Intended use before launch, after launch, and after incidents
 
-These are investigation contexts. Current executable support is limited to the export reference described above.
+These contexts are supported by static investigation and explicit local campaigns. Executed coverage is limited to the rules, fixtures and operations configured in each campaign.
 
 - **Pre-launch:** run the launch review before customer traffic arrives. Rehearse trial farming,
   export/rate-limit abuse, weak recovery, entitlement bypass, agent tool over-scope, and integration
@@ -302,7 +316,7 @@ or escape a signed authorization scope.* See **[TRUST.md](TRUST.md)** and **[SEC
 
 ## Status
 
-**Status: local reference validation and static triage preview.** The export reference workflow demonstrates one protected-content invariant and its regression. It does not establish broad SaaS readiness, arbitrary-target onboarding, production transport acceptance, or customer effectiveness.
+**Status: local business-abuse campaigns plus static triage.** The CLI/MCP and browser campaign workspace support explicit sandbox workflows across 12 rule families. Tests cover vulnerable and defended HTTP fixtures. Configuration is required for your application; this is not an autonomous completeness claim or a public cloud deployment.
 
 Pre-launch and existing-product investigations help teams reason about existing products. Legacy documentation references explicitly authorized production-like targets; this reference workflow accepts none. There is no scope creation or widening through MCP. Broader claims require new evidence beyond held-out vocabulary evaluation.
 

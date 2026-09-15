@@ -4,6 +4,7 @@
 
 import { useState } from "react";
 import type { ReviewAnswer, ReviewAnswerField, ReviewAnswerValue } from "../../lib/review-presentation";
+import { MAX_REVIEW_ANSWER_COUNT } from "../../lib/review-presentation";
 import type { ReviewQuestionV1 } from "../../lib/review-v1";
 
 
@@ -80,7 +81,7 @@ export function QuestionList({
                       name={`answer-${question.id}-${index}`}
                       value={answer.value}
                       checked={selected === answer.value}
-                      disabled={disabled}
+                      disabled={disabled || (!selected && answers.size >= MAX_REVIEW_ANSWER_COUNT)}
                       onChange={() => onAnswer({ surface: question.surface, field, value: answer.value })}
                       aria-label={`${answer.label}: ${question.prompt}`}
                     />
@@ -92,6 +93,9 @@ export function QuestionList({
           );
         })}
       </div>
+      {answers.size >= MAX_REVIEW_ANSWER_COUNT ? (
+        <p role="status">This review has reached its {MAX_REVIEW_ANSWER_COUNT}-answer limit. Rerun these answers; split larger APIs into separate reviews.</p>
+      ) : null}
       {visible < questions.length ? (
         <button
           className="text-button load-more"
