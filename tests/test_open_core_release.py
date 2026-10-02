@@ -186,6 +186,7 @@ EXPECTED_CONTRACT = {
         "heel/runner/http_transport.py",
         "heel/runner/identity.py",
         "heel/runner/openapi_routes.py",
+        "heel/runner/plan_differential.py",
         "heel/runner/redaction.py",
         "heel/runner/runtime.py",
         "heel/runner/service.py",
