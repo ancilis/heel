@@ -161,31 +161,40 @@ _DENIAL_WORDS = frozenset({
     "error", "fail", "failed", "failure", "denied", "forbidden", "unauthorized", "required",
 })
 _NO_STRINGS = frozenset({"false", "0", "no"})
-_YES_STRINGS = frozenset({"true", "1", "yes"})
 _WORD_BREAK = re.compile(r"[^a-z0-9]+", flags=re.ASCII)
+# Words and digit groups inside one run: ``PaymentRequired``, ``HTTPError``, ``E403``.
+_CAMEL_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", flags=re.ASCII)
 _MAX_ENVELOPE_DEPTH = 2
 
 
 def _says_no(value: Any) -> bool:
+    """An allow flag denies on any JSON-falsy value or a no-word."""
     if isinstance(value, str):
-        return value.strip().casefold() in _NO_STRINGS
-    return value is False or (type(value) in {int, float} and value == 0)
+        word = value.strip().casefold()
+        return not word or word in _NO_STRINGS
+    return not value
 
 
 def _says_yes(value: Any) -> bool:
+    """A deny flag denies on any JSON-truthy value that is not a no-word."""
     if isinstance(value, str):
-        return value.strip().casefold() in _YES_STRINGS
-    return value is True or (type(value) in {int, float} and value != 0)
+        word = value.strip().casefold()
+        return bool(word) and word not in _NO_STRINGS
+    return bool(value)
 
 
 def _denial_status(value: Any) -> bool:
-    if type(value) is int:
-        return 400 <= value <= 599
+    if type(value) in {int, float}:
+        return 400 <= value <= 599 and value == int(value)
     if not isinstance(value, str):
         return False
+    words = {
+        *_WORD_BREAK.split(value.casefold()),
+        *(word.casefold() for word in _CAMEL_WORD.findall(value)),
+    }
     return any(
         word in _DENIAL_WORDS or (word.isdigit() and len(word) == 3 and word[0] in "45")
-        for word in _WORD_BREAK.split(value.casefold())
+        for word in words
     )
 
 
@@ -209,9 +218,11 @@ def _states_denial(value: Any, depth: int) -> bool:
 def is_denial_envelope(value: Any) -> bool:
     """A 2xx body that says no, in any JSON spelling of the small vocabulary above.
 
-    Keys match without case, ``_`` or ``-``; flags use JSON truthiness and the common
-    string spellings; ``status``/``code`` deny by a 4xx/5xx number or a denial word; one
-    ``data``/``result``/``response`` wrapper is followed to a bounded depth. This only ever
+    Keys match without case, ``_`` or ``-``. An allow flag denies on any JSON-falsy value
+    or no-word; a deny flag on any JSON-truthy value that is not a no-word. ``status``/
+    ``code`` deny by an integral 4xx/5xx number, or by a denial word or 4xx/5xx digit group
+    found across separators, camel-case and letter/digit boundaries. A ``data``/``result``/
+    ``response`` wrapper is followed to a bounded depth. This only ever
     withholds parity (for either plan): it never creates a finding or a ``held`` verdict.
     """
     return _states_denial(value, 0)
