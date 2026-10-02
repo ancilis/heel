@@ -1482,7 +1482,9 @@ def test_r25_tolerant_redactor_matches_base_when_base_succeeds():
             tolerant.count_bytes(*bad)
     # It is a Redactor (the transport requires one) and overrides only the count.
     assert isinstance(tolerant, Redactor)
-    assert set(vars(plan_differential._TolerantRedactor)) & set(vars(Redactor)) == {
-        "__init__", "count_bytes", "__slots__", "__module__", "__doc__",
-    } & set(vars(Redactor))
+    overridden = {
+        name for name in vars(plan_differential._TolerantRedactor)
+        if name in vars(Redactor) and not name.startswith("__")
+    }
+    assert overridden == {"count_bytes"}
     assert tolerant.redact("Bearer abc.def.ghi") == base.redact("Bearer abc.def.ghi")
