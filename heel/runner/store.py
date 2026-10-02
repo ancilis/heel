@@ -6888,20 +6888,39 @@ class RunnerStore:
         value = _read_json(context_fd, "routes.json", None)
         if value is None:
             return []
+        return self._inventory_locked(context_fd, value)["routes"]
+
+    def _inventory_locked(self, context_fd: int, value: Any) -> dict[str, Any]:
         payload = self._validate_envelope(
             context_fd, value,
             schema="heel.runner-route-inventory.v1", payload_field="inventory",
         )
         if not isinstance(payload, Mapping) or set(payload) != {"source_digest", "routes"}:
             raise RunnerStoreError("invalid route inventory")
-        _digest(payload["source_digest"], "OpenAPI source digest")
+        source_digest = _digest(payload["source_digest"], "OpenAPI source digest")
         if not isinstance(payload["routes"], list) or len(payload["routes"]) > 2000:
             raise RunnerStoreError("invalid route inventory")
         result = [_route_record(route, require_canonical=True) for route in payload["routes"]]
         expected = sorted(result, key=lambda item: (item["route_template"], item["method"], item["operation_id"]))
         if result != expected:
             raise RunnerStoreError("route inventory is not canonical")
-        return result
+        return {"source_digest": source_digest, "routes": result}
+
+    def route_inventory(self, artifact: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Return the validated imported inventory: the stored one, or a supplied artifact.
+
+        A supplied artifact must be the complete persisted envelope for this exact bound
+        context. It is only read; the stored inventory is never replaced here.
+        """
+        with self._transaction(exclusive=False) as context_fd:
+            value = _read_json(context_fd, "routes.json", None) if artifact is None else artifact
+            if value is None:
+                raise RunnerStoreError("route inventory is unavailable")
+            return self._inventory_locked(context_fd, value)
+
+    def route_inventory_path(self) -> Path:
+        """Return the stored inventory path of the bound context."""
+        return self.root / "runner" / "contexts" / self.namespace / "routes.json"
 
     def save_mapping(
         self,
