@@ -249,10 +249,11 @@ def test_error_envelope_never_counts_as_parity():
     )
     assert leaked.evidence_state == "verified"
 
-    # The list is closed: near-misses are not envelopes.
+    # Near-misses are not envelopes. Non-boolean spellings of the vocabulary are envelopes
+    # (T3 D1) and are pinned in tests/test_runner_plan_differential_redteam.py.
     for value in (
         {"error": ""}, {"error": None}, {"errors": []}, {"ok": True}, {"success": True},
-        {"ok": 0}, {"denied": "true"}, {"forbidden": 1}, {"message": "upgrade"}, [], "error", None,
+        {"message": "upgrade"}, [], "error", None,
     ):
         assert is_denial_envelope(value) is False
 

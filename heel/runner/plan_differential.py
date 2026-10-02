@@ -152,18 +152,69 @@ def key_paths(value: Any) -> frozenset[str]:
     return frozenset(paths)
 
 
-def is_denial_envelope(value: Any) -> bool:
-    """A 2xx body that says no. This only ever withholds parity."""
+_ALLOW_KEYS = frozenset({"ok", "success", "allowed"})
+_DENY_KEYS = frozenset({"upgraderequired", "paymentrequired", "denied", "forbidden"})
+_ERROR_KEYS = frozenset({"error", "errors", "errorcode"})
+_STATUS_KEYS = frozenset({"status", "statuscode", "code"})
+_WRAPPER_KEYS = frozenset({"data", "result", "response"})
+_DENIAL_WORDS = frozenset({
+    "error", "fail", "failed", "failure", "denied", "forbidden", "unauthorized", "required",
+})
+_NO_STRINGS = frozenset({"false", "0", "no"})
+_YES_STRINGS = frozenset({"true", "1", "yes"})
+_WORD_BREAK = re.compile(r"[^a-z0-9]+", flags=re.ASCII)
+_MAX_ENVELOPE_DEPTH = 2
+
+
+def _says_no(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().casefold() in _NO_STRINGS
+    return value is False or (type(value) in {int, float} and value == 0)
+
+
+def _says_yes(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().casefold() in _YES_STRINGS
+    return value is True or (type(value) in {int, float} and value != 0)
+
+
+def _denial_status(value: Any) -> bool:
+    if type(value) is int:
+        return 400 <= value <= 599
+    if not isinstance(value, str):
+        return False
+    return any(
+        word in _DENIAL_WORDS or (word.isdigit() and len(word) == 3 and word[0] in "45")
+        for word in _WORD_BREAK.split(value.casefold())
+    )
+
+
+def _states_denial(value: Any, depth: int) -> bool:
     if not isinstance(value, dict):
         return False
-    if value.get("error") or value.get("errors"):
-        return True
-    if value.get("ok") is False or value.get("success") is False:
-        return True
-    return any(
-        value.get(name) is True
-        for name in ("upgrade_required", "payment_required", "denied", "forbidden")
-    )
+    for key, item in value.items():
+        name = key.casefold().replace("_", "").replace("-", "")
+        if (
+            (name in _ERROR_KEYS and bool(item))
+            or (name in _ALLOW_KEYS and _says_no(item))
+            or (name in _DENY_KEYS and _says_yes(item))
+            or (name in _STATUS_KEYS and _denial_status(item))
+            or (name in _WRAPPER_KEYS and depth < _MAX_ENVELOPE_DEPTH
+                and _states_denial(item, depth + 1))
+        ):
+            return True
+    return False
+
+
+def is_denial_envelope(value: Any) -> bool:
+    """A 2xx body that says no, in any JSON spelling of the small vocabulary above.
+
+    Keys match without case, ``_`` or ``-``; flags use JSON truthiness and the common
+    string spellings; ``status``/``code`` deny by a 4xx/5xx number or a denial word; one
+    ``data``/``result``/``response`` wrapper is followed to a bounded depth. This only ever
+    withholds parity (for either plan): it never creates a finding or a ``held`` verdict.
+    """
+    return _states_denial(value, 0)
 
 
 def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -817,15 +868,51 @@ class _RunLog:
             self._delegate.append(action, detail)
 
 
-def _secret_forms(text: str) -> frozenset[bytes]:
-    """A secret as raw bytes and as it appears inside a JSON string."""
-    escaped = json.dumps(text)[1:-1]
-    return frozenset(
-        form.encode("utf-8")
-        for form in (
-            text, escaped, escaped.replace("/", "\\/"),
-            json.dumps(text, ensure_ascii=False)[1:-1],
+_JSON_SHORT_ESCAPES = {
+    '"': b'\\"', "\\": b"\\\\", "/": b"\\/", "\b": b"\\b", "\f": b"\\f", "\n": b"\\n",
+    "\r": b"\\r", "\t": b"\\t",
+}
+
+
+def _unit_escape(unit: int) -> bytes:
+    """Regex for one UTF-16 code unit written ``\\uXXXX`` with hex digits in either case."""
+    return b"\\\\u" + b"".join(
+        b"[" + digit.encode("ascii") + digit.upper().encode("ascii") + b"]"
+        if digit.isalpha() else digit.encode("ascii")
+        for digit in f"{unit:04x}"
+    )
+
+
+def _secret_pattern(text: str) -> re.Pattern[bytes]:
+    """Match every spelling of a secret that a JSON parser decodes to it, and its raw bytes.
+
+    Each character independently matches its UTF-8 bytes, its ``\\uXXXX`` escape (a
+    surrogate pair outside the BMP) or its short escape, so mixed escaping matches too.
+    No body is parsed; the pattern has no repetition, so matching is bounded.
+    """
+    parts: list[bytes] = []
+    for character in text:
+        code = ord(character)
+        units = (
+            (0xD800 + ((code - 0x10000) >> 10), 0xDC00 + ((code - 0x10000) & 0x3FF))
+            if code > 0xFFFF else (code,)
         )
+        forms = [
+            re.escape(character.encode("utf-8")),
+            b"".join(_unit_escape(unit) for unit in units),
+        ]
+        short = _JSON_SHORT_ESCAPES.get(character)
+        if short is not None:
+            forms.append(re.escape(short))
+        parts.append(b"(?:" + b"|".join(forms) + b")")
+    return re.compile(b"".join(parts))
+
+
+def _secret_patterns(secrets: Sequence[str]) -> tuple[re.Pattern[bytes], ...]:
+    # Longest first, so a secret that contains another is replaced whole.
+    return tuple(
+        _secret_pattern(secret)
+        for secret in sorted(set(secrets), key=lambda item: (-len(item), item))
     )
 
 
@@ -836,14 +923,11 @@ class _TolerantRedactor(Redactor):
     ``_RedactingRunnerStore`` for every body shape.
     """
 
-    __slots__ = ("_needles",)
+    __slots__ = ("_patterns",)
 
     def __init__(self, secrets: Sequence[str] = ()) -> None:
         super().__init__(secrets)
-        needles: set[bytes] = set()
-        for secret in secrets:
-            needles.update(_secret_forms(secret))
-        self._needles = tuple(sorted(needles, key=lambda item: (-len(item), item)))
+        self._patterns = _secret_patterns(secrets)
 
     def count_bytes(self, *chunks: bytes) -> int:
         try:
@@ -856,35 +940,34 @@ class _TolerantRedactor(Redactor):
                     raise
         total = 0
         for chunk in chunks:
-            for needle in self._needles:
-                total += chunk.count(needle)
-                chunk = chunk.replace(needle, _REDACTED)
+            for pattern in self._patterns:
+                chunk, count = pattern.subn(_REDACTED, chunk)
+                total += count
         return min(1024, total)
 
 
 class _RedactingRunnerStore(RunnerStore):
-    """Attempt store that never persists a registered credential byte string."""
+    """Attempt store that never persists a registered credential, raw or JSON-escaped."""
 
     def __init__(self, root: Path) -> None:
         super().__init__(root)
         self._secrets: set[str] = set()
-        self._needles: set[bytes] = set()
+        self._patterns: tuple[re.Pattern[bytes], ...] = ()
 
     def register_secret(self, value: bytes) -> None:
-        text = value.decode("utf-8")
-        self._secrets.add(text)
-        self._needles.update(_secret_forms(text))
+        self._secrets.add(value.decode("utf-8"))
+        self._patterns = _secret_patterns(tuple(self._secrets))
 
     def registered_secrets(self) -> tuple[str, ...]:
         return tuple(sorted(self._secrets))
 
     def clear_secrets(self) -> None:
         self._secrets.clear()
-        self._needles.clear()
+        self._patterns = ()
 
     def _redact(self, value: bytes) -> bytes:
-        for needle in sorted(self._needles, key=lambda item: (-len(item), item)):
-            value = value.replace(needle, _REDACTED)
+        for pattern in self._patterns:
+            value = pattern.sub(_REDACTED, value)
         return value
 
     def store_response_evidence(
