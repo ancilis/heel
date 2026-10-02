@@ -146,6 +146,95 @@ def test_redteam_break_d1_denial_body_observed_finding_through_the_cli(tmp_path,
 
 
 # --------------------------------------------------------------------------- #
+# BREAK D1, T3 rerun after T4 loop 1 (REDTEAM_PLAN_DIFFERENTIAL.md section 9)
+# --------------------------------------------------------------------------- #
+# Each body is inside the contract of the loop-1 remediation (the spec vocabulary under
+# JSON truthiness, a 4xx/5xx status number, a denial word in a status or code string) and
+# differs from a recognized envelope only in value type or word separator.
+RERUN_DENIAL_BODIES = {
+    # JSON-falsy values of the allow flags.
+    "ok_null": {**_DENIED, "ok": None},
+    "ok_empty_string": {**_DENIED, "ok": ""},
+    "success_empty_string": {**_DENIED, "success": ""},
+    # JSON-truthy values of the deny flags that are not a yes-word.
+    "denied_reason_string": {**_DENIED, "denied": "plan does not include exports"},
+    "upgrade_required_plan_name": {**_DENIED, "upgrade_required": "pro"},
+    "forbidden_reason_list": {**_DENIED, "forbidden": ["exports"]},
+    "payment_required_object": {**_DENIED, "payment_required": {"url": "https://x/upgrade"}},
+    # A 4xx status number that is not a JSON integer literal.
+    "status_float_403": {**_DENIED, "status": 403.0},
+    "status_code_exponent_402": (
+        b'{"ok": true, "success": true, "status": "ok", "status_code": 4.02e2, '
+        b'"export_url": null, "rows": null}'
+    ),
+    # A denial word or status number without a separator around it.
+    "code_pascal_case_payment_required": {**_DENIED, "code": "PaymentRequired"},
+    "code_pascal_case_access_denied": {**_DENIED, "code": "AccessDenied"},
+    "code_prefixed_e403": {**_DENIED, "code": "E403"},
+}
+
+
+def _body(value) -> bytes:
+    return value if isinstance(value, bytes) else json.dumps(value).encode()
+
+
+@pytest.mark.parametrize("name", sorted(RERUN_DENIAL_BODIES))
+def test_redteam_break_d1_rerun_denial_value_spellings_never_yield_observed(name):
+    """EXPECTED TO FAIL (D1, rerun). Same pair as the D1 test above, with a denial value the
+    loop-1 remediation does not read. The verdict is `finding` / `observed`."""
+    verdict = evaluate_plan_pair(
+        PlanObservation(200, _body(RERUN_DENIAL_BODIES[name])),
+        PlanObservation(200, json.dumps(_HIGHER).encode()),
+        method="GET", marker=None, executor_outcome=ExecutorOutcome("completed", "inconclusive"),
+    )
+    assert verdict.body_superset is not True, verdict
+    assert verdict.status_parity is not True, verdict
+    assert (verdict.verdict, verdict.evidence_state) == ("inconclusive", "inconclusive"), verdict
+
+
+@pytest.mark.parametrize("name", [
+    "code_pascal_case_payment_required", "status_float_403", "upgrade_required_plan_name",
+])
+def test_redteam_break_d1_rerun_observed_finding_through_the_cli(name, tmp_path, monkeypatch):
+    """EXPECTED TO FAIL (D1, rerun). The same false positive end to end: stored finding, exit 1."""
+    def responder(plan, _method, _path, _token):
+        return 200, {}, json.dumps(_HIGHER).encode() if plan == "pro" else _body(
+            RERUN_DENIAL_BODIES[name]
+        )
+
+    with _World(tmp_path, monkeypatch, responder, {"/api/export": ("GET",)}) as world:
+        code, result, error = world.journey.run()
+        assert error == "" and result["requests_sent"] == 2
+        states = [
+            finding["reproduction"]["evidence_state"]
+            for finding in world.journey.findings(result["run_id"])
+        ]
+        assert "observed" not in states, states
+        assert code == 0
+
+
+@pytest.mark.parametrize("body", [
+    {"ok": "yes", "rows": 3}, {"ok": 1.0, "rows": 3}, {"success": "true", "rows": 3},
+    {"denied": "no", "rows": 3}, {"denied": "", "rows": 3}, {"denied": None, "rows": 3},
+    {"forbidden": 0, "upgrade_required": "false", "rows": 3},
+    {"error": None, "errors": [], "rows": 3},
+    {"status": 200.0, "rows": 3}, {"status": "ok", "code": "OK", "rows": 3},
+    # status, code and flags inside list rows are data, not an envelope.
+    {"items": [{"status": "error", "code": 403, "denied": True, "ok": False}], "total": 1},
+], ids=lambda body: "+".join(sorted(body)))
+def test_redteam_holds_affirmative_bodies_keep_the_positive_control(body):
+    """Guard for the D1 fix: a body that affirms access, or carries the vocabulary only in
+    list rows, is not an envelope, so the same body for both plans is still `observed`."""
+    raw = json.dumps(body).encode()
+    verdict = evaluate_plan_pair(
+        PlanObservation(200, raw), PlanObservation(200, raw),
+        method="GET", marker=None, executor_outcome=ExecutorOutcome("completed", "inconclusive"),
+    )
+    assert verdict.positive_control is True, verdict
+    assert (verdict.verdict, verdict.evidence_state) == ("finding", "observed"), verdict
+
+
+# --------------------------------------------------------------------------- #
 # BREAK D2 (spec 7, I5): an echoed credential in another JSON escaping is persisted
 # --------------------------------------------------------------------------- #
 ESCAPED_LOWER = "redteam+free/session=0001"

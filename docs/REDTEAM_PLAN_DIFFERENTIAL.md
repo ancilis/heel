@@ -431,3 +431,187 @@ result.
 - That the hosted cloud accepts a `HEAD` plan pair (§5, INFERRED).
 - Everything about real TLS, real DNS and real address selection: no probe here touches
   them, by instruction.
+
+## 9. Remediation rerun after T4 loop 1 (fresh T3 session)
+
+Date: 2026-10-02. Branch at `3cb0af1` (T4 commits `93521ed`, `3cb0af1`). Reviewer: Claude
+Fable 5.1, fresh session. No product code, existing test, spec or artifact was edited.
+Sections 1–8 above describe `17ffd0e` and are kept as written.
+
+### 9.1 Result
+
+**FAIL: D1 is not closed. T4 loop 2 is required.** D2 survived every adaptive attack.
+Every egress, scope, reservation, logging, caller and chain boundary held again.
+
+| Item | Verdict | Basis |
+|---|---|---|
+| I1 host confinement | **PASS** | §9.5 |
+| I2 GET/HEAD and inventoried routes, in the compiler | **PASS** | §9.5 |
+| I3 verified signed scope | **PASS** | §9.5 |
+| I4 one-shot reserved attempt | **PASS** | §9.5 (D3 unchanged) |
+| I5 secret exclusion, including JSON-escaped forms (D2) | **PASS** | §9.4 |
+| I6 every request logged first | **PASS** | §9.5 |
+| I7 caller attribution | **PASS** | §9.5 |
+| I8 chain integrity | **PASS** | §9.5 (D7 unchanged) |
+| Two requests per route, none anonymous; budget | **PASS** | §9.5 |
+| MCP/REST absence, package `--check` | **PASS** | §9.5 |
+| R11 fail-closed predicates (D1) | **FAIL** | §9.3 |
+| D2 escaped-credential storage | **PASS** | §9.4 |
+
+### 9.2 Committed red-team file first
+
+`.venv/bin/python -m pytest -q tests/test_runner_plan_differential_redteam.py` with
+`TMPDIR=/private/var/folders/yc/l85h50j14_96655zkm2z_mdw0000gn/T`, before any edit:
+**31 passed**.
+
+### 9.3 D1 — still open (MEDIUM, FAIL, needs T4 loop 2)
+
+The loop-1 `is_denial_envelope` (`heel/runner/plan_differential.py:155-217`) closes every
+shape named in §2. It does not hold its own stated contract ("the denial vocabulary under
+JSON truthiness", "a 4xx/5xx number", "a denial word") for nearby value spellings. Each
+body below is a 200 lower-plan response with the higher plan's key shape and null data,
+against a normal higher body. All are CONFIRMED `finding / observed / body_superset`.
+
+| Class | Cause in the code | Bodies that still yield `observed` |
+|---|---|---|
+| JSON-falsy allow flag | `_says_no` (`:169-172`) accepts only `false`, numeric zero and the strings `false/0/no` | `"ok": null`, `"ok": ""`, `"success": ""`, `"success": null`, `"allowed": null`, `"ok": []`, `"ok": {}` |
+| JSON-truthy deny flag | `_says_yes` (`:175-178`) accepts only `true`, non-zero numbers and `true/1/yes` | `"denied": "plan does not include exports"`, `"upgrade_required": "pro"`, `"forbidden": ["exports"]`, `"payment_required": {"url": …}` |
+| Status number type | `_denial_status` (`:181-183`) requires `type(value) is int` | `"status": 403.0`, `"status_code": 4.02e2` |
+| Word separators | `_denial_status` (`:186-189`) splits only on non-alphanumerics | `"code": "PaymentRequired"`, `"AccessDenied"`, `"UpgradeRequired"`, `"E403"`, `"HTTP403"`, `"403x"` |
+
+CONFIRMED end to end through the CLI, transport, executor and store for
+`"code": "PaymentRequired"`, `"status": 403.0` and `"upgrade_required": "pro"`: a stored
+finding with `evidence_state: observed`, exit 1.
+
+Reproduction, added to `tests/test_runner_plan_differential_redteam.py` and left failing:
+`test_redteam_break_d1_rerun_denial_value_spellings_never_yield_observed` (12 cases) and
+`test_redteam_break_d1_rerun_observed_finding_through_the_cli` (3 cases). 15 failing.
+
+What held (unit, 166 lower bodies and 23 higher bodies probed):
+
+- Every §2 shape; key case and `_`/`-` variants (`OK`, `Error-Code`, `ERROR__CODE`,
+  `statusCode`); `0.0`, `-0.0`, `" FALSE "`, `"denied": 2`; status strings with
+  punctuation (`"Error!"`, `"[error]"`, `"ERROR: plan"`, `"403 Forbidden"`,
+  `"access.denied"`, `"ERR_403"`).
+- Wrappers: `data`/`result`/`response` are followed at one and two levels (the code's
+  bound is two, the docstring says one). A third level, a list under a wrapper and a JSON
+  document inside a string are not followed.
+- Conflicting fields: any deny signal wins over an allow signal
+  (`ok: true` + `denied: true`, `ok: false` + `allowed: true`).
+- Rows in arrays (`{"items": [{"status": "error", "code": 403}]}`) are data, not an
+  envelope.
+- An envelope never produces a finding or `held`; from the higher plan it gives
+  `no_positive_control`. Row 7 (`held`) still requires a lower 401/402/403/404 status.
+
+Higher-plan loss of positive control (CONFIRMED, fail-closed, not a break): a top-level
+or wrapped record whose own `status` or `code` is ordinary data is now an envelope, so the
+pair is `inconclusive / no_positive_control` and a real gating gap on that route is not
+reported. Examples: `{"code": 450, "name": "Widget"}`, a job `"status": "failed"`, an
+invoice `"status": "payment_required"`, `"status": "action_required"`,
+`"status": "No error"`, `"errors": 3`, `{"success": 0, "failure": 0}`,
+`{"data": {"id": 1, "status": "failed"}}`. With a supplied marker the same loss hides a
+`verified` leak. This is the cost of the wider vocabulary and needs stating in the docs.
+
+Outside the loop-1 contract, recorded and not counted as the break (all `observed`):
+other key names (`is_allowed`, `access_denied`, `error_message`, `err`, `http_status`,
+`entitled`, `authorized`), other words (`unauthorised`, `rejected`, `blocked`, `invalid`,
+`not_allowed`), other wrappers (`meta`, `body`, `payload`, `d`), a message-only body, and
+look-alike characters. Each needs the shape-preserving null body of D4 to become
+`observed`; a denial body that drops the data keys is `inconclusive / lower_subset`.
+
+For T4 loop 2, the bounded closure this report will test: (1) an allow flag denies on any
+JSON-falsy value or no-word; (2) a deny flag denies on any JSON-truthy value that is not a
+no-word; (3) a status number denies as an integer or integral float in 400–599; (4) denial
+words and 4xx/5xx digit groups are found across camel-case and letter/digit boundaries.
+The 11 cases of `test_redteam_holds_affirmative_bodies_keep_the_positive_control` (new,
+passing) must stay green: affirmative values and list rows are not envelopes.
+
+### 9.4 D2 — closed (PASS)
+
+`_secret_pattern` (`plan_differential.py:886-908`) matches each credential character as
+UTF-8, `\uXXXX` in either hex case, or its short escape.
+
+CONFIRMED end to end, two token pairs (one with `+ / = " \`), 28 routes per run, 52
+requests. After each run every file under `HEEL_HOME` (652 files), stdout, stderr,
+`findings --run`, `log --run` and `report --run` were scanned raw, after one exact JSON
+string decode, as parsed JSON strings and keys, and as UTF-16/32.
+
+| Echo form | Stored evidence decodes to a credential |
+|---|---|
+| `\u` lower, upper and per-digit mixed case; raw and escaped characters alternating | no |
+| short escapes `\/`, `\"`, `\\` | no |
+| credential as a JSON key; nested in arrays and objects; inside a longer string | no |
+| float body (tolerant redactor path); 200 KB body with the echo at the end | no |
+| three spellings adjacent; both credentials in one body in different spellings | no |
+| response header and `Set-Cookie`, raw and escaped | no |
+| 403, 404 and 500 bodies | no |
+| non-JSON and truncated JSON bodies, UTF-16 bodies | not stored (`transport:response_rejected`) |
+
+CONFIRMED, unit: 7 secrets (ASCII punctuation, control characters, BMP and non-BMP
+characters, U+2028) in 8 spellings each, including surrogate pairs in both hex cases, as
+value, key and adjacent pair: all 56 redacted. Overlapping and nested credentials leave
+at most a fragment of one. The redaction count agrees between the float and plain paths.
+
+Limits, not counted as a break (spec §16 class, "other encodings"):
+
+- A JSON document embedded as a string inside the body (double encoding) still decodes to
+  the credential after two decodes, when the inner document escaped a credential
+  character (4 evidence files in the probe). A credential of only `[A-Za-z0-9-]` is
+  redacted at any nesting depth.
+- A credential split across two strings, and the base64, hex and percent forms of §2.
+- INFO: matching is quadratic for a self-repeating credential (a 4 KB run of one
+  character against a 1 MB near-miss body took 11.9 s). An ordinary token is linear.
+
+### 9.5 Original attacks and I1–I8 probes rerun
+
+The 56 scratch probes of the first T3 session were rerun unchanged against `3cb0af1`
+(56 ran, no error); observations match §4 unless noted.
+
+- I1: redirects 301/302/303/307/308 for GET and HEAD sent nothing to the second
+  listener; only `93.184.216.34:443` was dialed; 62 base-URL forms and the 24 DNS and
+  peer cases gave the same codes as §4.3–4.4; `Host` was always the synthetic host.
+- I2: 35 `--routes` inputs and the direct compiler calls gave the same results; `POST`
+  is refused at compile ("route inventory permits GET or HEAD only"); only GET and HEAD
+  reached the target; forged `_ScopedTransport` actions were `gate_rejected` except D5.
+- I3: 17 pre-run scope edits exit 2 with 0 requests; 7 mid-run edits sent nothing further.
+- I4: plain replay rejected; reservation removed, renamed or replaced mid-run stopped
+  after 1 request.
+- I5: 28 echo forms and 7 error paths, no plaintext credential anywhere; `x_api_key` and
+  `cookie_jar` clean. The first session's decoded-evidence scan now finds 0 files.
+- I6–I8, budget: connects never exceeded the cap in the six retry cases; the entry was
+  present on each arrival; every row carried `cli:<user>`; edits and middle deletions
+  were detected in both chains.
+- Two requests per route: the `--max-ops 100` case logged ops as lower then higher per
+  route, 8 requests for 4 pairs, none anonymous.
+- MCP/REST: 23 MCP tools, none for this feature; `heel/mcp_server.py` and `heel/rest.py`
+  contain no reference.
+- Package: `.venv/bin/python scripts/build_open_core_release.py --output
+  apps/heel-cloud/public/downloads --check` printed `open-core release artifacts are
+  current`, exit 0.
+- D3–D8: unchanged and not promoted. Reuse after `rmtree` still accepted (D3); all-null
+  same-key body still `observed` (D4); another fixture under the same template still sent
+  by a forged action (D5); accounting as before (D6); tail truncation still verifies
+  (D7); a hand-written sorted route still planned (D8).
+
+### 9.6 Suite and path gates
+
+- Full suite, `TMPDIR` as above: **15 failed, 1579 passed, 5 skipped.** The 15 failures
+  are exactly the two `test_redteam_break_d1_rerun_*` tests. Against the T4 final of 1568
+  passed, 5 skipped: +11 passed (the new guard test), +15 failed, all from the red-team
+  file; no earlier test changed result.
+- `git diff --name-only 844fc1f HEAD -- apps/`: the three authorized artifacts.
+- `git diff --name-only 844fc1f HEAD -- heel/runner/`: the same five modules.
+- Changed paths in this rerun: this report and
+  `tests/test_runner_plan_differential_redteam.py`.
+- Spec sync: not done. The rerun instruction allows it only if D1 and D2 both survive.
+  Spec §8.3 and the §7 secret-form text still describe the pre-T4 code.
+
+### 9.7 Least-certain claims
+
+- That the four classes in §9.3 are a break and the "outside the contract" list is not.
+  The line is drawn at the remediation's own stated contract; a stricter reader could
+  count the other key names too, a looser one could accept `"ok": null` as not a denial.
+- That the closure in §9.3 ends the D1 loop. Denial vocabularies are open-ended, and
+  every residual case depends on D4 (a null body in the higher plan's shape counts as a
+  superset). A decision on D4 would remove the whole class; a longer word list will not.
+- Real TLS, DNS and address selection remain untested, as in §8.
