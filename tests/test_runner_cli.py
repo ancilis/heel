@@ -72,7 +72,15 @@ def test_cli_outputs_only_counts_digests_and_scenario_ids_with_no_network(tmp_pa
         "--backend", "ephemeral-env",
     )
     assert (code, error) == (0, "")
-    assert json.loads(output) == {"registered_count": 1}
+    handle = json.loads(output)["credential_handle"]
+    assert json.loads(output) == {
+        "credential_handle": handle,
+        "credential_source": {
+            "kind": "environment",
+            "variable": "HEEL_RUNNER_CREDENTIAL_" + handle.upper(),
+        },
+        "registered_count": 1,
+    }
     assert "LOCAL SECRET LABEL" not in output
 
     code, output, error = invoke(

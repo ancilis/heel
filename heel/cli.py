@@ -161,7 +161,7 @@ def _runner_secret_from_fd(descriptor: int) -> bytes:
 
 
 def _runner_credential_add(args) -> int:
-    from .runner.vault import select_vault
+    from .runner.vault import ephemeral_environment_name, select_vault
 
     try:
         store = _runner_store()
@@ -171,7 +171,7 @@ def _runner_credential_add(args) -> int:
             source_kind = (
                 "environment" if args.backend == "ephemeral-env" else "inherited_fd"
             )
-            store.register_ephemeral_credential(
+            record = store.register_ephemeral_credential(
                 semantic_role=args.role,
                 auth_profile=args.profile,
                 source_kind=source_kind,
@@ -185,7 +185,7 @@ def _runner_credential_add(args) -> int:
                     raise ValueError("interactive secret input requires a TTY")
                 secret = getpass.getpass("Canary credential: ").encode("utf-8")
             vault = select_vault(args.backend)
-            store.create_os_credential(
+            record = store.create_os_credential(
                 semantic_role=args.role,
                 auth_profile=args.profile,
                 label=args.label,
@@ -193,10 +193,25 @@ def _runner_credential_add(args) -> int:
                 secret=secret,
             )
             secret = b""
+        # The handle is a random index into the vault, never derived from the secret.
+        handle = record["credential_handle_id"]
+        if record["source_kind"] is None:
+            source = {"kind": "os_vault"}
+        else:
+            source = {
+                "kind": record["source_kind"],
+                "variable": ephemeral_environment_name(
+                    handle, source_kind=record["source_kind"],
+                ),
+            }
     except Exception:
         print(_SAFE_RUNNER_CREDENTIAL_FAILURE, file=sys.stderr)
         return 2
-    print(json.dumps({"registered_count": 1}, sort_keys=True))
+    print(json.dumps({
+        "credential_handle": handle,
+        "credential_source": source,
+        "registered_count": 1,
+    }, sort_keys=True))
     return 0
 
 
@@ -332,6 +347,40 @@ def _runner_prepare(args) -> int:
         "scenario_ids": [item["scenario_id"] for item in result.manifest["scenarios"]],
     }, sort_keys=True))
     return 0
+
+
+def _runner_run(args) -> int:
+    """Plan or execute one plan-differential run. Reflects no input on rejection."""
+    try:
+        from .runner.plan_differential import plan_differential, run_plan_differential
+
+        if type(args.max_ops) is not str or not args.max_ops.isascii() or not args.max_ops.isdecimal():
+            raise ValueError("max ops must be a decimal integer")
+        plans = []
+        for value in args.identity or []:
+            label, separator, handle = value.partition("=")
+            if not separator or "=" in handle:
+                raise ValueError("identity must be LABEL=HANDLE")
+            plans.append((label, handle))
+        artifact = None if args.routes is None else _load_bounded_openapi(args.routes)
+        run = plan_differential if args.dry_run else run_plan_differential
+        result = run(
+            args.scope, args.base_url, plans, caller=_caller(),
+            routes_artifact=artifact, max_ops=int(args.max_ops),
+        )
+        if result["mode"] == "dry_run" and artifact is not None:
+            result["inventory"]["path"] = os.path.abspath(args.routes)
+        rendered = json.dumps(result, indent=2, sort_keys=True)
+    # Command trust boundary: no path, URL, label, handle, route, or exception text escapes.
+    except Exception:
+        print(_SAFE_RUNNER_COMMAND_FAILURE, file=sys.stderr)
+        return 2
+    print(rendered)
+    if result["mode"] == "dry_run":
+        return 0 if result["authorized"] else 3
+    return 1 if any(
+        finding["evidence_state"] in {"observed", "verified"} for finding in result["findings"]
+    ) else 0
 
 
 def _cloud_services(origin: str):
@@ -1059,6 +1108,15 @@ def main(argv=None):
         "prepare", help="review readiness or compile one local immutable rehearsal",
     )
     runner_prepare.add_argument("--live", action="store_true")
+    runner_run = runner_sub.add_parser(
+        "run", help="replay imported GET/HEAD reads as two canary plans under a signed scope",
+    )
+    runner_run.add_argument("--scope", required=True)
+    runner_run.add_argument("--base-url", required=True)
+    runner_run.add_argument("--as", dest="identity", action="append", metavar="LABEL=HANDLE")
+    runner_run.add_argument("--routes")
+    runner_run.add_argument("--max-ops", default="50")
+    runner_run.add_argument("--dry-run", action="store_true")
 
     cloud = sub.add_parser(
         "cloud",
@@ -1243,6 +1301,8 @@ def main(argv=None):
             return _runner_map(args)
         if args.runnercmd == "prepare":
             return _runner_prepare(args)
+        if args.runnercmd == "run":
+            return _runner_run(args)
     if args.cmd == "cloud":
         if not args.origin:
             print(
