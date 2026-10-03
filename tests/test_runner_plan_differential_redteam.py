@@ -432,3 +432,30 @@ def test_redteam_holds_credential_material_cannot_inject_a_header(credential, tm
         assert world.target.requests == [] and result["requests_sent"] == 0
         assert result["findings"] == []
         assert home_contains(world.journey.home, credential.encode()) == []
+
+
+# --------------------------------------------------------------------------- #
+# BREAK D1, final rerun after T4 loop 2 (REDTEAM_PLAN_DIFFERENTIAL.md section 10)
+# --------------------------------------------------------------------------- #
+# Concrete 2xx denial bodies outside the loop-2 vocabulary. Each stored an `observed`
+# finding through the CLI in the final rerun; brief 1.5 says none may count as parity.
+FINAL_DENIAL_BODIES = {
+    "status_false_with_message": {**_DENIED, "status": False, "message": "Upgrade required"},
+    "message_only_denial": {**_DENIED, "message": "Upgrade required"},
+    "code_run_on_PAYMENTREQUIRED": {**_DENIED, "code": "PAYMENTREQUIRED"},
+    "status_run_on_accessdenied": {**_DENIED, "status": "accessdenied"},
+}
+
+
+@pytest.mark.parametrize("name", sorted(FINAL_DENIAL_BODIES))
+def test_redteam_break_d1_final_unrecognized_denial_body_yields_observed(name):
+    """EXPECTED TO FAIL (D1, final rerun). Same pair as the D1 tests above with a denial body
+    the loop-2 recognizer does not read. The verdict is `finding` / `observed`."""
+    verdict = evaluate_plan_pair(
+        PlanObservation(200, _body(FINAL_DENIAL_BODIES[name])),
+        PlanObservation(200, json.dumps(_HIGHER).encode()),
+        method="GET", marker=None, executor_outcome=ExecutorOutcome("completed", "inconclusive"),
+    )
+    assert verdict.body_superset is not True, verdict
+    assert verdict.status_parity is not True, verdict
+    assert (verdict.verdict, verdict.evidence_state) == ("inconclusive", "inconclusive"), verdict
