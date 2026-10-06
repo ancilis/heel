@@ -146,6 +146,33 @@ def run_regressions(store, server, scope_id: str, target: str, caller: str,
     regressions = [r for r in store.list_regressions() if not wanted or r["regression_id"] in wanted]
     results = []
     for regression in regressions:
+        # A plan-differential regression replays its saved pair against its https origin and
+        # never reaches the synthetic-target run path; the two kinds never share a target.
+        plan_differential = str(regression.get("scenario_id", "")).startswith("plan_differential.")
+        if plan_differential != target.startswith("https://"):
+            continue
+        if plan_differential:
+            from .runner.plan_differential import replay_plan_differential
+
+            result = replay_plan_differential(
+                store, regression, scope_id=scope_id, target=target, caller=caller,
+            )
+            ContainmentLog(store, result["run_id"] or "security", caller).append(
+                "regression_result",
+                {
+                    "regression_id": regression["regression_id"],
+                    "name": regression["name"],
+                    "result": result["result"],
+                    "current_status": result["current_status"],
+                    "expected_status": regression["expected_status"],
+                    "scope_id": scope_id,
+                    "target": target,
+                    "canary_only": True,
+                },
+            )
+            store.add_regression_result(result)
+            results.append(result)
+            continue
         args = {
             "scope_id": scope_id,
             "target": target,

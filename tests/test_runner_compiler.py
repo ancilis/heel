@@ -129,7 +129,8 @@ def test_catalog_has_exact_differential_roles_methods_and_closed_auth_profiles()
         ("lower_plan", "higher_plan"),
     ]
     assert CATALOG[0]["allowed_methods"] == ("GET", "HEAD")
-    assert all(entry["allowed_methods"] == ("GET",) for entry in CATALOG[1:])
+    assert all(entry["allowed_methods"] == ("GET",) for entry in CATALOG[1:3])
+    assert CATALOG[3]["allowed_methods"] == ("GET", "HEAD")
     assert all(entry["side_effect_class"] == "read_only" for entry in CATALOG)
     with pytest.raises(TypeError):
         CATALOG[0]["semantic_roles"] = ("invented",)  # type: ignore[index]
