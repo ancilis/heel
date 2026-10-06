@@ -8,11 +8,11 @@ Heel discovers hypotheses about customers extracting excess product value, evadi
 | Explicit product rules | ProductModel optional business_rules | Statement, source, evidence state; customer answers are declarations; arbitrary prose rules are not compiled into tests |
 | Trial / promotion eligibility | Static library and lifecycle model | No lifecycle execution, payments, account cycling or live verification |
 | Usage / expensive features | Static library and lifecycle model | No cumulative metering, load or cost validation |
-| Export read entitlement | Executable synthetic reference, CLI and MCP; app instructions/report viewer | Two actual read handlers under signed local runner execution; exact protected marker and positive control |
+| Export read entitlement | Executable synthetic reference, CLI and MCP; app instructions/report viewer; CLI-only plan-differential runner (`heel runner run`) | Two actual read handlers under signed local runner execution; exact protected marker and positive control. The runner replays imported GET/HEAD reads as two operator-labelled canary plans under a signed scope and records an `observed` finding, declared in no input, where the lower plan's body contains every key path of the higher plan's; shown end to end from the installed wheel against a loopback synthetic target only, not a customer or public HTTPS target |
 | Export bulk access / automation limits | Static investigation | A read entitlement result does not verify scraping, throughput or usage accounting |
 | Plan downgrade / alternate-path lifecycle | Ordered model | Sequence is explicitly unexecuted; properties matching cannot certify it |
-| Other four runner catalog reads | Internal bounded primitives | Missing protected-content assertions are inconclusive; customer-target CLI/cloud journey incomplete |
-| Cloud pairing | Incomplete public journey | No advertised `heel runner pair` command; no customer target onboarding claim |
+| Other four runner catalog reads | Internal bounded primitives | Missing protected-content assertions are inconclusive; the public CLI journey (scope, credentials, import, dry-run, run, findings, regress add, regress run) is complete only for plan-differential GET/HEAD reads against a synthetic target; catalog-read customer-target CLI/cloud journey incomplete |
+| Cloud pairing | Incomplete public journey | No advertised `heel runner pair` command; `heel runner run` is CLI only, with no MCP, REST or cloud path; no customer target onboarding claim |
 | Cloud account / findings continuity | Implemented separately | Does not constitute a completed live validation journey; production acceptance remains separate |
 | Economic/persona analysis | Assumptions | No measured customer motives, incident rates or dollar impact |
 | Synthetic vocabulary evaluation | Repository and supplied wheel | Measures model matching, not live detection accuracy; revised predicates change old scores |
