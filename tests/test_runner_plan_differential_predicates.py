@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import random
 
 import pytest
 
@@ -711,3 +712,376 @@ def test_d4_reflexive_bodies_unchanged(case_id):
                 continue
             result = evaluate(observation(200, body), observation(200, body))
             assert _d4_columns(result) == D4_OBSERVED, body
+
+
+# --------------------------------------------------------------------------- #
+# D5 (spec §8.7): path identity is structural; the string is an injective rendering
+# --------------------------------------------------------------------------- #
+# Bodies are JSON text, as in §8.7.6, so the parsed keys are the ones the product walks.
+# Expected columns: (row, reason, status_parity, body_superset, candidate, evidence_state,
+# stores_finding).
+D5_OBS = (6, "lower_superset", True, True, False, "observed", True)
+D5_SUB = (8, "lower_subset", True, False, True, "inconclusive", True)
+D5_HOL = (9, "lower_hollow_shape", None, None, False, "inconclusive", True)
+D5_ALL = [
+    "BodyTooComplex", "ExecutorOutcome", "PairVerdict", "PlanDifferentialRejected",
+    "PlanObservation", "evaluate_plan_pair", "is_denial_envelope", "key_paths",
+    "material_paths", "plan_differential", "replay_plan_differential", "run_plan_differential",
+]
+
+# Truth table T5: (body, key_paths).
+D5_RENDERING = [
+    (r'{"a": {"b": 1}}', {r"$.a", r"$.a.b"}),
+    (r'{"a.b": 1}', {r"$.a\.b"}),
+    (r'{"a": {"b": 1}, "a.b": 1}', {r"$.a", r"$.a.b", r"$.a\.b"}),
+    (r'{"x": [1]}', {r"$.x", r"$.x[]"}),
+    (r'{"x[]": 1}', {r"$.x\[\]"}),
+    (r'{"[]": 1}', {r"$.\[\]"}),
+    (r'{"$": 1}', {r"$.$"}),
+    (r'{"": 1}', {r"$."}),
+    (r'{"": {"": 1}}', {r"$.", r"$.."}),
+    (r'{".": 1}', {r"$.\."}),
+    (r'{"\\": 1}', {"$." + "\\" * 2}),
+    (r'{"q\\": {"r": 1}}', {"$.q" + "\\" * 2, "$.q" + "\\" * 2 + ".r"}),
+    (r'{"q\\.r": 1}', {"$.q" + "\\" * 3 + ".r"}),
+    ('{"a/b": 1, "a~1b": 1, "é": 1}', {"$.a/b", "$.a~1b", "$.é"}),
+]
+# Every key of T5 and its rendered segment.
+D5_SEGMENTS = [
+    ("a", "a"), ("b", "b"), ("x", "x"), ("r", "r"), ("a.b", "a\\.b"), ("x[]", "x\\[\\]"),
+    ("[]", "\\[\\]"), ("$", "$"), ("", ""), (".", "\\."), ("\\", "\\\\"), ("q\\", "q\\\\"),
+    ("q\\.r", "q\\\\\\.r"), ("a/b", "a/b"), ("a~1b", "a~1b"), ("é", "é"),
+]
+
+
+def _d5_case(case_id, lower, higher, expected):
+    return pytest.param(lower, higher, expected, id=case_id)
+
+
+# Truth table T4: status 200 both sides, GET, no marker, positive control present.
+D5_ALIAS_ROWS = [
+    _d5_case("dot_alias_hollow_nested", r'{"a": {"b": null}, "a.b": 1}', r'{"a": {"b": 1}}', D5_HOL),
+    _d5_case(
+        "dot_alias_wrapped_hollow",
+        r'{"data": {"url": null, "n": null}, "data.url": "https://files/x.csv", "data.n": 2, "ok": true}',
+        r'{"data": {"url": "https://files/x.csv", "n": 2}, "ok": true}', D5_HOL,
+    ),
+    _d5_case("dot_literal_lower_vs_nested_higher", r'{"a.b": 1}', r'{"a": {"b": 1}}', D5_SUB),
+    _d5_case("nested_lower_vs_dot_literal_higher", r'{"a": {"b": 1}}', r'{"a.b": 1}', D5_SUB),
+    _d5_case("dot_alias_in_higher_only", r'{"a": {"b": 1}}', r'{"a": {"b": null}, "a.b": 1}', D5_SUB),
+    _d5_case("dot_literal_both_sides_truthy", r'{"a.b": 2}', r'{"a.b": 1}', D5_OBS),
+    _d5_case("dot_literal_both_sides_hollow", r'{"a.b": null}', r'{"a.b": 1}', D5_HOL),
+    _d5_case("nested_both_sides_truthy", r'{"a": {"b": "x"}}', r'{"a": {"b": 1}}', D5_OBS),
+    _d5_case("nested_both_sides_hollow", r'{"a": {"b": 0}}', r'{"a": {"b": 1}}', D5_HOL),
+    _d5_case(
+        "nested_and_literal_both_truthy_both_sides",
+        r'{"a": {"b": "p"}, "a.b": "q"}', r'{"a": {"b": "x"}, "a.b": "y"}', D5_OBS,
+    ),
+    _d5_case(
+        "nested_and_literal_literal_hollow",
+        r'{"a": {"b": 1}, "a.b": null}', r'{"a": {"b": 1}, "a.b": 2}', D5_HOL,
+    ),
+    _d5_case("lower_carries_literal_and_nested", r'{"a": {"b": 1}, "a.b": 1}', r'{"a.b": 1}', D5_OBS),
+    _d5_case("array_token_alias_hollow_list", r'{"x": [0], "x[]": 1}', r'{"x": [1]}', D5_HOL),
+    _d5_case("array_token_literal_vs_list", r'{"x[]": 1}', r'{"x": [1]}', D5_SUB),
+    _d5_case(
+        "array_element_object_alias",
+        r'{"a": [{"b": null}], "a[]": {"b": 1}}', r'{"a": [{"b": 1}]}', D5_HOL,
+    ),
+    _d5_case("array_vs_literal_both_truthy", r'{"x": [2], "x[]": 2}', r'{"x": [1], "x[]": 1}', D5_OBS),
+    _d5_case("dollar_literal_key_hollow", r'{"$": 1, "a": null}', r'{"$": 1, "a": 1}', D5_HOL),
+    _d5_case("dollar_key_nested_alias", r'{"a": {"$": null}, "a.$": 1}', r'{"a": {"$": 1}}', D5_HOL),
+    _d5_case("dollar_dot_a_literal_vs_a", r'{"$.a": 1}', r'{"a": 1}', D5_SUB),
+    _d5_case("dollar_literal_both_sides", r'{"$": "y"}', r'{"$": "x"}', D5_OBS),
+    _d5_case("empty_key_nested_alias", r'{"": {"a": null}, ".a": 1}', r'{"": {"a": 1}}', D5_HOL),
+    _d5_case("empty_key_double_alias", r'{"": {"": null}, ".": 1}', r'{"": {"": 1}}', D5_HOL),
+    _d5_case("empty_key_both_sides", r'{"": 2}', r'{"": 1}', D5_OBS),
+    _d5_case("empty_key_hollow", r'{"": ""}', r'{"": 1}', D5_HOL),
+    _d5_case("dot_key_vs_empty_nested", r'{".": 1}', r'{"": {"": 1}}', D5_SUB),
+    _d5_case(
+        "slash_tilde_keys_truthy",
+        r'{"a/b": 2, "a~b": "y", "~1": 1}', r'{"a/b": 1, "a~b": "x", "~1": 1}', D5_OBS,
+    ),
+    _d5_case("slash_tilde_keys_hollow", r'{"a/b": null, "a~b": "y"}', r'{"a/b": 1, "a~b": "x"}', D5_HOL),
+    _d5_case("slash_literal_vs_nested", r'{"a/b": 1}', r'{"a": {"b": 1}}', D5_SUB),
+    _d5_case("pointer_escape_vs_slash", r'{"a~1b": 1}', r'{"a/b": 1}', D5_SUB),
+    _d5_case("backslash_key_vs_nested", r'{"a\\": {"b": 1}}', r'{"a\\.b": 1}', D5_SUB),
+    _d5_case("backslash_dot_alias", r'{"a\\": {"b": null}, "a\\.b": 1}', r'{"a\\": {"b": 1}}', D5_HOL),
+    _d5_case(
+        "unicode_nested_alias", '{"ключ": {"数": null}, "ключ.数": 1}', '{"ключ": {"数": 1}}', D5_HOL,
+    ),
+    _d5_case("unicode_same_key_both_sides", '{"ключ": {"数": "y"}}', '{"ключ": {"数": "x"}}', D5_OBS),
+    # Decomposed e + U+0301 against precomposed U+00E9: two different keys.
+    _d5_case("unicode_nfc_vs_nfd_distinct", r'{"é": 1}', '{"é": 1}', D5_SUB),
+    # The JSON escape é and the literal character are the same key after parsing.
+    _d5_case("unicode_escaped_spelling_same_key", r'{"é": 2}', '{"é": 1}', D5_OBS),
+    _d5_case(
+        "secret_subtree_alias_never_material",
+        r'{"token": {"a": null}, "token.a": 1}', r'{"token": {"a": 1}}', D5_OBS,
+    ),
+    _d5_case(
+        "secret_sibling_hollow",
+        r'{"token": {"a": 1}, "rows": null}', r'{"token": {"a": 1}, "rows": 3}', D5_HOL,
+    ),
+    _d5_case(
+        "secret_literal_vs_secret_nested",
+        r'{"token.a": 1, "rows": 3}', r'{"token": {"a": 1}, "rows": 3}', D5_SUB,
+    ),
+    _d5_case(
+        "same_shape_different_truthy_values_with_literal_keys",
+        r'{"a": {"b": "p"}, "a.b": "q", "x[]": [0, 1]}', r'{"a": {"b": 1}, "a.b": 2, "x[]": [3]}',
+        D5_OBS,
+    ),
+    _d5_case(
+        "reflexive_alias_body", r'{"a": {"b": null}, "a.b": 1}', r'{"a": {"b": null}, "a.b": 1}', D5_OBS,
+    ),
+]
+
+D5_KEYS = [
+    "a", "b", "a.b", ".", "..", "[]", "a[]", "$", "$.a", "", "\\", "a\\.b", "\\.", "/", "~", "~1",
+    "é", "é", "数", "token", "ok", "x]", "[", "]",
+]
+D5_SCALARS = [None, 0, 1, "", "x", True, False, 2.5, "0"]
+_D5_INDEX = object()
+
+
+def _d5_columns(result):
+    return (*_d4_columns(result), result.evidence_state, result.stores_finding)
+
+
+def _d5_decode(path: str) -> tuple:
+    """The decoder D of §8.7.2: a rendered path back to its segment sequence."""
+    assert path[:1] == "$"
+    segments: list = []
+    index = 1
+    while index < len(path):
+        if path[index] == "[":
+            assert path[index + 1] == "]"
+            segments.append(_D5_INDEX)
+            index += 2
+            continue
+        assert path[index] == "."
+        index += 1
+        key = []
+        while index < len(path) and path[index] not in ".[":
+            if path[index] == "\\":
+                assert path[index + 1] in "\\.[]"
+                key.append(path[index + 1])
+                index += 2
+            else:
+                assert path[index] != "]"
+                key.append(path[index])
+                index += 1
+        segments.append("".join(key))
+    return tuple(segments)
+
+
+def _d5_legacy(path: tuple) -> str:
+    """The pre-D5 spelling of a structural path, which merged distinct paths (D9)."""
+    return "$" + "".join("[]" if segment is _D5_INDEX else "." + segment for segment in path)
+
+
+def _d5_reference(value, prefix: tuple = ()) -> tuple[set, set]:
+    """Independent recursive walk: (structural paths, structurally material paths) as tuples."""
+    shape: set = set()
+    material: set = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            path = (*prefix, key)
+            shape.add(path)
+            if plan_differential._secret_key(key):
+                continue
+            if child:
+                material.add(path)
+            below = _d5_reference(child, path)
+            shape |= below[0]
+            material |= below[1]
+    elif isinstance(value, list):
+        path = (*prefix, _D5_INDEX)
+        shape.add(path)
+        for child in value:
+            if child:
+                material.add(path)
+            below = _d5_reference(child, path)
+            shape |= below[0]
+            material |= below[1]
+    return shape, material
+
+
+def _d5_random_value(rng: random.Random, depth: int):
+    kind = rng.random()
+    if depth == 0 or kind < 0.3:
+        return rng.choice(D5_SCALARS)
+    if kind < 0.8:
+        return {rng.choice(D5_KEYS): _d5_random_value(rng, depth - 1) for _ in range(rng.randint(0, 4))}
+    return [_d5_random_value(rng, depth - 1) for _ in range(rng.randint(0, 4))]
+
+
+def _d5_random_body(rng: random.Random) -> dict:
+    body: dict = {}
+    for _ in range(rng.randint(1, 4)):
+        body[rng.choice(D5_KEYS)] = _d5_random_value(rng, 3)
+    return body
+
+
+def _d5_material_leaves(node, parents: tuple = ()) -> list:
+    """Truthy scalar leaves outside secret-named subtrees: (container, key, ancestors)."""
+    found: list = []
+    if isinstance(node, dict):
+        for key, child in node.items():
+            if plan_differential._secret_key(key):
+                continue
+            trail = (*parents, (node, key, key))
+            if isinstance(child, (dict, list)):
+                found += _d5_material_leaves(child, trail)
+            elif child:
+                found.append(trail)
+    elif isinstance(node, list):
+        for position, child in enumerate(node):
+            trail = (*parents, (node, position, None))
+            if isinstance(child, (dict, list)):
+                found += _d5_material_leaves(child, trail)
+            elif child:
+                found.append(trail)
+    return found
+
+
+def _d5_alias_lower(rng: random.Random, higher: dict) -> dict:
+    """``higher`` with one material leaf set to null and truthy alias-spelled keys added."""
+    lower = json.loads(json.dumps(higher))
+    leaves = _d5_material_leaves(lower)
+    if leaves:
+        trail = rng.choice(leaves)
+        container, key, _name = trail[-1]
+        container[key] = None
+        # At every enclosing object, a literal key spelling the rest of the path the way the
+        # pre-D5 renderer wrote it (`a.b`, `x[].id`).
+        for start, (node, _key, name) in enumerate(trail[:-1]):
+            if name is None:
+                continue
+            spelling = name
+            for _node, _position, later in trail[start + 1:]:
+                spelling += "[]" if later is None else "." + later
+            node[spelling] = rng.choice([1, "x", True, 2.5])
+    lower.setdefault(rng.choice(D5_KEYS), rng.choice([1, "x"]))
+    return lower
+
+
+def test_d5_path_segments_render_injectively():
+    material_paths = plan_differential.material_paths
+    assert len(D5_RENDERING) == 14
+    for text, expected in D5_RENDERING:
+        body = json.loads(text)
+        assert key_paths(body) == frozenset(expected), text
+        # Every value of T5 is truthy and no key is secret-named.
+        assert material_paths(body) == frozenset(expected), text
+        for function in (key_paths, material_paths):
+            paths = function(body)
+            assert type(paths) is frozenset and all(type(path) is str for path in paths)
+    paths = {path for text, _expected in D5_RENDERING for path in _d5_reference(json.loads(text))[0]}
+    assert {segment for path in paths for segment in path} - {_D5_INDEX} == {
+        key for key, _segment in D5_SEGMENTS
+    }
+    for key, segment in D5_SEGMENTS:
+        assert plan_differential._path_segment(key) == segment, key
+        assert key_paths({key: 1}) == frozenset({"$." + segment})
+        assert _d5_decode("$." + segment) == (key,)
+    # Only the renderer's own four metacharacters are escaped.
+    for character in "$/~'\" \t\n\x00\x7fé́数\ud800":
+        assert plan_differential._path_segment(character) == character
+    assert len(key_paths({"a": {"b": 1}, "a.b": 1})) == 3
+    assert len(material_paths({"a": {"b": 1}, "a.b": 1})) == 3
+    # The helper is private: the public surface is unchanged.
+    assert plan_differential.__all__ == D5_ALL
+    assert "_path_segment" not in plan_differential.__all__
+
+
+@pytest.mark.parametrize("lower,higher,expected", D5_ALIAS_ROWS)
+def test_d5_alias_truth_table(lower, higher, expected):
+    assert len(D5_ALIAS_ROWS) == 40
+    assert len({case.id for case in D5_ALIAS_ROWS}) == 40
+    statuses = (200, 201, 204, 299) if expected == D5_HOL else (200,)
+    for status in statuses:
+        result = evaluate(
+            observation(status, raw=lower.encode()), observation(200, raw=higher.encode()),
+        )
+        assert _d5_columns(result) == expected, status
+        row = expected[0]
+        assert result.verdict == ("finding" if row == 6 else "inconclusive")
+        assert result.predicate == (
+            "body_superset" if row == 6 else "status_parity" if row == 8 else "inconclusive"
+        )
+        assert result.positive_control is True and result.marker_leak is None
+        # The string verdict agrees with the independent structural walk.
+        lower_shape, lower_material = _d5_reference(json.loads(lower))
+        higher_shape, higher_material = _d5_reference(json.loads(higher))
+        shape = lower_shape >= higher_shape
+        hollow = shape and not lower_material >= higher_material
+        assert result.body_superset is (None if hollow else shape)
+
+
+@pytest.mark.parametrize("case_id", ["bounds_wide_alias"])
+def test_d5_bounds_count_alias_keys_as_nodes(case_id):
+    status_only = (8, "status_only", True, None, True, "inconclusive", True)
+    limit = plan_differential.MAX_KEY_PATH_NODES
+    higher = {f"k{index}": index + 1 for index in range(limit + 1)}
+    lower = {**{key: None for key in higher}, "k0.k1": 1}
+    for body in (higher, lower):
+        for function in (key_paths, plan_differential.material_paths):
+            with pytest.raises(plan_differential.BodyTooComplex):
+                function(body)
+    for low, high in ((lower, higher), (higher, lower), (lower, lower)):
+        result = evaluate(observation(200, low), observation(200, high))
+        assert _d5_columns(result) == status_only
+    # Alias-spelled keys are ordinary members: one node each, exactly at the limit.
+    for function in (key_paths, plan_differential.material_paths):
+        assert len(function({f"a.{index}": 1 for index in range(limit - 1)})) == limit - 1
+        assert len(function({f"k{index}[]": 1 for index in range(limit - 1)})) == limit - 1
+        with pytest.raises(plan_differential.BodyTooComplex):
+            function({f"a.{index}": 1 for index in range(limit)})
+
+
+@pytest.mark.parametrize("seed", [20261006, 1, 2])
+def test_d5_structural_identity_fixed_seed_corpus(seed):
+    rng = random.Random(seed)
+    material_paths = plan_differential.material_paths
+    counts = {None: 0, True: 0, False: 0}
+    hollow_observed = 0
+    aliased = 0
+    for _ in range(1500):
+        higher = _d5_random_body(rng)
+        shape, material = _d5_reference(higher)
+        # (a), (b): the rendered key paths decode to exactly the structural paths, one each.
+        rendered = key_paths(higher)
+        assert {_d5_decode(path) for path in rendered} == shape, higher
+        assert len(rendered) == len(shape), higher
+        # (c): the same for the material walk.
+        rendered = material_paths(higher)
+        assert {_d5_decode(path) for path in rendered} == material, higher
+        assert len(rendered) == len(material), higher
+
+        # (d): the verdict agrees with the structural reference in both directions.
+        lower = _d5_alias_lower(rng, higher)
+        aliased += len({_d5_legacy(path) for path in _d5_reference(lower)[0]}) < len(key_paths(lower))
+        for low, high in ((lower, higher), (higher, lower)):
+            result = evaluate(observation(200, low), observation(200, high))
+            if result.row == 2 or result.reason == "lower_denial_envelope":
+                continue
+            low_shape, low_material = _d5_reference(low)
+            high_shape, high_material = _d5_reference(high)
+            superset = low_shape >= high_shape
+            hollow = superset and not low_material >= high_material
+            expected = None if hollow else superset
+            assert result.body_superset is expected, (low, high)
+            counts[expected] += 1
+            if hollow:
+                assert _d5_columns(result) == D5_HOL, (low, high)
+                hollow_observed += result.evidence_state == "observed" or result.candidate
+            elif superset:
+                assert _d5_columns(result) == D5_OBS, (low, high)
+            else:
+                assert _d5_columns(result) == D5_SUB, (low, high)
+    # (e): no structurally hollow pair is observed; and every class was exercised.
+    assert hollow_observed == 0
+    assert all(counts.values()), counts
+    assert aliased, "no body carried two paths that the pre-D5 renderer would have merged"

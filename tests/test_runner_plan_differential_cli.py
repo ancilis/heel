@@ -797,3 +797,62 @@ def test_synthetic_harness_runs_the_documented_journey(tmp_path):
     assert not port_file.exists()
     for token in (FREE_TOKEN, PRO_TOKEN):
         assert home_contains(tmp_path / "heel-home", token.encode()) == []
+
+
+# --------------------------------------------------------------------------- #
+# D5 (spec §8.7): a literal alias key does not populate the nested path
+# --------------------------------------------------------------------------- #
+def test_d5_alias_lower_body_is_hollow_in_fresh_run_and_regression_replay(tmp_path, monkeypatch):
+    from plan_differential_support import EXPORT as export_body
+
+    # Hollow at `rows[].id` and `rows[].amount_cents`, with truthy literal keys spelled the
+    # way the pre-D5 renderer wrote those two nested paths.
+    alias_body = {
+        **export_body,
+        "rows": [{"id": None, "amount_cents": None}],
+        "rows[].id": "row_1",
+        "rows[].amount_cents": 1200,
+    }
+    with World(tmp_path, monkeypatch) as world:
+        journey = world.journey
+        code, result, error = journey.run()
+        assert (code, error) == (1, "")
+        assert finding_for(result)["evidence_state"] == "observed"
+        add_regression(world, result, "export-plan-gate")
+
+        original = world.target.respond
+        alias = {"enabled": True}
+
+        def respond(method: str, path: str, token: str):
+            if alias["enabled"] and path == EXPORT[1] and world.target.sessions.get(token) == "free":
+                return 200, {"Content-Type": "application/json"}, json.dumps(alias_body).encode("utf-8")
+            return original(method, path, token)
+
+        # The listener looks `respond` up on the instance for every request.
+        monkeypatch.setattr(world.target, "respond", respond)
+
+        code, result, error = journey.run()
+        assert error == ""
+        pair = pairs_by_route(result)[EXPORT]
+        assert (pair["verdict"], pair["predicate"], pair["reason"], pair["candidate"]) == (
+            "inconclusive", "inconclusive", "lower_hollow_shape", False,
+        )
+        assert pair["execution_disposition"] == "completed"
+        assert finding_for(result)["evidence_state"] == "inconclusive"
+        (stored,) = [
+            item for item in journey.findings(result["run_id"])
+            if item["reproduction"].get("reason") == "lower_hollow_shape"
+        ]
+        assert stored["reproduction"]["evidence_state"] == "inconclusive"
+
+        (item,) = regress(world)
+        assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+        assert item["matches_expected"] is False and item["run_id"].startswith("pdrun-")
+        (stored,) = journey.findings(item["run_id"])
+        assert stored["reproduction"]["evidence_state"] == "inconclusive"
+        assert stored["reproduction"]["reason"] == "lower_hollow_shape"
+
+        # Wrapper disabled: the same regression fails again on the vulnerable target.
+        alias["enabled"] = False
+        (item,) = regress(world)
+        assert (item["result"], item["current_status"]) == ("fail", "still_reachable")
