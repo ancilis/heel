@@ -470,8 +470,8 @@ def test_d4_truthy_leaf_table(text, material):
     # Absent: no path at all.
     assert plan_differential.material_paths({}) == frozenset()
     # Under a secret-named key the path is kept, never material and not descended.
-    secret = plan_differential._parsed(f'{{"token": {text}, "api_key": {{"inner": {text}}}}}'.encode())
-    assert key_paths(secret) == frozenset({"$.token", "$.api_key"})
+    secret = plan_differential._parsed(f'{{"token": {text}, "password": {{"inner": {text}}}}}'.encode())
+    assert key_paths(secret) == frozenset({"$.token", "$.password"})
     assert plan_differential.material_paths(secret) == frozenset()
 
 
