@@ -152,6 +152,32 @@ def key_paths(value: Any) -> frozenset[str]:
     return frozenset(paths)
 
 
+def material_paths(value: Any) -> frozenset[str]:
+    """The key paths of a parsed body at which the value is JSON-truthy; same walk and bounds."""
+    paths: set[str] = set()
+    visited = 0
+    stack: list[tuple[Any, str, int]] = [(value, "$", 0)]
+    while stack:
+        node, path, depth = stack.pop()
+        visited += 1
+        if visited > MAX_KEY_PATH_NODES or depth > MAX_KEY_PATH_DEPTH:
+            raise BodyTooComplex("response body exceeds the key-path bound")
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if not _secret_key(key):
+                    child_path = f"{path}.{key}"
+                    if child:
+                        paths.add(child_path)
+                    stack.append((child, child_path, depth + 1))
+        elif isinstance(node, list):
+            element_path = path + "[]"
+            for child in node:
+                if child:
+                    paths.add(element_path)
+                stack.append((child, element_path, depth + 1))
+    return frozenset(paths)
+
+
 _ALLOW_KEYS = frozenset({"ok", "success", "allowed"})
 _DENY_KEYS = frozenset({"upgraderequired", "paymentrequired", "denied", "forbidden"})
 _ERROR_KEYS = frozenset({"error", "errors", "errorcode"})
@@ -280,27 +306,36 @@ def _evaluate(
         not marker or (higher.status == 200 and higher_marker is True)
     )
 
-    status_parity: bool | None = None
-    if positive_control:
-        if _is_2xx(lower.status):
-            status_parity = None if lower_denial else True
-        elif lower.status in _DENIAL_STATUSES:
-            status_parity = False
-
     body_superset: bool | None = None
+    hollow = False
     if positive_control and method != "HEAD" and isinstance(higher_json, dict):
         try:
             higher_paths = key_paths(higher_json)
             lower_paths = key_paths(lower_json) if isinstance(lower_json, dict) else frozenset()
+            higher_material = material_paths(higher_json)
+            lower_material = (
+                material_paths(lower_json) if isinstance(lower_json, dict) else frozenset()
+            )
         except BodyTooComplex:
             pass
         else:
             if higher_paths and not lower_denial:
-                body_superset = (
+                shape = (
                     _is_2xx(lower.status)
                     and isinstance(lower_json, dict)
                     and lower_paths >= higher_paths
                 )
+                # A lower body that echoes the higher key shape but is not truthy at a path
+                # the higher body populates withholds parity, as a denial envelope does.
+                hollow = shape and not lower_material >= higher_material
+                body_superset = None if hollow else shape
+
+    status_parity: bool | None = None
+    if positive_control:
+        if _is_2xx(lower.status):
+            status_parity = None if lower_denial or hollow else True
+        elif lower.status in _DENIAL_STATUSES:
+            status_parity = False
 
     marker_leak: bool | None = None
     if marker and method != "HEAD" and positive_control:
@@ -345,6 +380,7 @@ def _evaluate(
         return PairVerdict("inconclusive", "inconclusive", "status_parity", reason, True, True, 8, **common)
     reason = (
         "lower_denial_envelope" if _is_2xx(lower.status) and lower_denial
+        else "lower_hollow_shape" if hollow
         else "unexpected_status" if not _is_2xx(lower.status)
         else "body_too_complex"
     )
@@ -1813,5 +1849,5 @@ def replay_plan_differential(
 __all__ = [
     "BodyTooComplex", "ExecutorOutcome", "PairVerdict", "PlanDifferentialRejected",
     "PlanObservation", "evaluate_plan_pair", "is_denial_envelope", "key_paths",
-    "plan_differential", "replay_plan_differential", "run_plan_differential",
+    "material_paths", "plan_differential", "replay_plan_differential", "run_plan_differential",
 ]
