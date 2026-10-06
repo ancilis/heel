@@ -3,7 +3,7 @@
 Date: 2026-10-02. Branch: `feat/plan-differential-runner` (base `main` @ `844fc1f`).
 Blast radius: **medium — adds network egress under a signed scope.**
 Role: design only (T1 apps-exception revision; fourth revision; post-escalation D4
-correction of 2026-10-05, §0.1). It replaces the revision committed at `1c6b324` in full. This document is the contract for T2 (implementation), T3 (red team),
+correction of 2026-10-05, §0.1; post-escalation D5 correction of 2026-10-06, §0.2). It replaces the revision committed at `1c6b324` in full. This document is the contract for T2 (implementation), T3 (red team),
 T4 (remediation) and T5 (acceptance). It makes no acceptance claim and contains no product
 code.
 
@@ -94,6 +94,56 @@ Unchanged by this correction, explicitly: Phase 1 scope (§1), the CLI surface (
 and identity rules (§3.2–§3.4), authorization and egress (§7.1–§7.2, §9), the verdict rows
 and their order (§8.5), finding schema (§11), the eight invariants (§12), the T2 file list
 (§14.1–§14.4) and the artifact procedure (§14.5).
+
+### 0.2 Post-escalation correction record (2026-10-06): D5 — structural path identity
+
+Written by a fresh Fable design session at `d479ff9`. Design only: no product code, test or
+artifact was changed by this record. Normative content is §8.7, §14.7 and §17.6.
+
+Why. The fresh red team after D4 (report §11) found D9, a fourth R11 break. `key_paths`
+and `material_paths` render a path as `f"{path}.{key}"` and `path + "[]"`
+(`heel/runner/plan_differential.py:131-179`), so the rendering is not injective: a literal
+top-level key spelled `a.b` renders as `$.a.b`, the same string as the nested member `b` of
+`a`. Lower `{"a": {"b": null}, "a.b": 1}` against higher `{"a": {"b": 1}}` is therefore a
+string superset in both the shape and the material set, and the pair is stored `finding` /
+`observed` and replays `fail` / `still_reachable` (report §11.3 item 5, §11.4). The same
+collision exists for `[]`, `$`, the empty key, deeper nesting and lists. The committed
+failing test is `test_redteam_break_d9_path_alias_turns_hollow_lower_body_into_observed`
+(`tests/test_runner_plan_differential_redteam.py`). A literal key is not the nested path.
+Kevin authorized continued execution; the orchestrator opened one D5 structural-path cycle.
+
+Decision (D5). **Path identity is structural**: two paths are equal if and only if their
+segment sequences are equal, where a segment is either an object key (any string, the empty
+string included) or the array-element token. The representation stays `frozenset[str]`: the
+string is now an **injective rendering** of the segment sequence, obtained by escaping the
+renderer's own four metacharacters (`\`, `.`, `[`, `]`) inside every key with a leading `\`
+(§8.7.1). Injectivity is proven for arbitrary JSON keys in §8.7.2 and machine-checked by a
+fixed-seed corpus test (§8.7.7). The rejected alternative, tuple paths with a non-string
+array sentinel, is recorded in §8.7.3 with the reason. No denial word, key, wrapper,
+heuristic, classifier, annotation, network behavior or value comparison is added. The escape
+set is fixed by the grammar of the renderer, not by observed attack spellings: it is the set
+of characters the renderer itself uses, and the proof covers every other character.
+
+| # | Change in this correction | Where |
+|---|---|---|
+| D5.1 | Path type, segment grammar, injective rendering, equality, bounds and secret-key stop | §8.2, §8.7.1, §8.7.2 |
+| D5.2 | `key_paths` and `material_paths` render each key through `_path_segment`; `_evaluate`, `_observation_view` and `__all__` byte-unchanged | §7, §8.7.4 |
+| D5.3 | Compatibility statement: internal helpers with a stable signature; no stored run, finding or regression format changes | §8.7.5 |
+| D5.4 | Truth tables T4 (alias rows, before and after) and T5 (rendering) | §8.7.6 |
+| D5.5 | Named tests Opus MUST add and MUST preserve; R29 | §8.7.7, §12 |
+| D5.6 | Red-team acceptance attacks and stop conditions | §8.7.8 |
+| D5.7 | Exhaustive post-escalation D5 file allowlist for Opus | §14.7 |
+| D5.8 | Baseline → final counts and gate | §17.6 |
+
+Unchanged by this correction, explicitly: Phase 1 scope (§1), the CLI surface (§3), route
+and identity rules (§3.2–§3.4), authorization and egress (§7.1–§7.2, §9), the predicate
+rules of §8.4, every verdict row and its order (§8.5), every D4 rule, row and case id
+(§8.6), the denial-envelope recognizer (§8.3), redaction (§7.4–§7.5), the finding schema
+(§11), replay (§10), the eight invariants (§12), the T2 file list (§14.1–§14.4) and the
+artifact procedure (§14.5). Signed scope, host/redirect/DNS confinement, GET/HEAD only,
+attempt reservations, budgets, credential secrecy, containment attribution and chain
+verification are byte-for-byte unchanged in behavior: D5 touches two pure functions that
+read a parsed body and nothing else.
 
 ## 1. What ships
 
@@ -533,8 +583,8 @@ Public functions (everything else underscore-private):
 | `run_plan_differential(scope_id, base_url, plans, *, caller, routes_artifact=None, max_ops=50, attempt=None) -> dict` | Execute. Returns the executed object of §3.6. |
 | `replay_plan_differential(store, regression, *, scope_id, target, caller) -> dict` | One-pair replay for `heel regress run` (§10). |
 | `evaluate_plan_pair(lower, higher, *, method, marker, executor_outcome) -> PairVerdict` | Pure function implementing §8. No I/O. |
-| `key_paths(value) -> frozenset[str]` | Pure, bounded (§8.2). |
-| `material_paths(value) -> frozenset[str]` | Pure, bounded, same walk and bounds as `key_paths` (§8.2, §8.6). Post-escalation D4. |
+| `key_paths(value) -> frozenset[str]` | Pure, bounded (§8.2). Each element is the injective rendering of one structural path (§8.7.1, post-escalation D5). |
+| `material_paths(value) -> frozenset[str]` | Pure, bounded, same walk, bounds and rendering as `key_paths` (§8.2, §8.6, §8.7). Post-escalation D4; rendering corrected by D5. |
 | `is_denial_envelope(value) -> bool` | Pure (§8.3). |
 
 `plans` is `[(label, handle), (label, handle)]`, lower first. `routes_artifact` is the
@@ -729,6 +779,13 @@ nonempty object is. String content is never read and no value is compared with a
 Same walk, same secret-key stop, same bounds and same `BodyTooComplex` as `key_paths`.
 `_evaluate` MUST still obtain the shape sets through `key_paths` (the fault-injection case
 of `test_r11_predicates_fail_closed` patches that name).
+
+Rendering (post-escalation D5, §8.7). `p.k` above means `p + "." + esc(k)`, where `esc`
+prefixes each of the four characters `\`, `.`, `[`, `]` inside the key with `\` and leaves
+every other code point unchanged; `p[]` is unchanged. Before D5 the key was inserted
+verbatim, so distinct structural paths could render as one string (D9). For a key that
+contains none of the four characters, `esc` is the identity and every string in this
+section, in §8.6 and in the existing tests is unchanged.
 
 ### 8.3 Denial envelope
 
@@ -1006,6 +1063,337 @@ value at every path the higher body populates (for example an upgrade URL in `ex
 and `1` in `rows`); Phase 1 cannot separate that from entitled data without comparing
 values, which the brief forbids, and it is recorded in §16.
 
+### 8.7 D5: structural path identity (post-escalation correction, 2026-10-06)
+
+**Invariant (encode this).** For every parsed body `B`, `key_paths(B)` and
+`material_paths(B)` are in one-to-one correspondence with the *structural* paths of `B`
+(sequences of object keys and array-element tokens). Consequently, for comparable bodies,
+
+    key_paths(L) ⊇ key_paths(H)        ⟺  every structural path of H is a structural path of L
+    material_paths(L) ⊇ material_paths(H) ⟺  every structurally material path of H is structurally material in L
+
+and a lower body that is hollow at a structural path the higher body populates is a hollow
+shape (§8.6) whatever other keys it carries. Nothing in §8.4–§8.6 changes; only the identity
+of a path does.
+
+#### 8.7.1 Path type, segment grammar, equality, rendering, bounds, secret-key stop
+
+- **Structural path.** A finite sequence of segments. A segment is `Key(k)` for an object
+  member whose key is the string `k` (any JSON string, the empty string included) or `Index`
+  for an array element. The root is the empty sequence and is never itself a path in either
+  set; the walk adds the child paths of the root.
+- **Type.** `str`, returned inside `frozenset[str]`. The annotation and the public signature
+  of both functions are unchanged. A path string is an **identity token**: product code
+  MUST NOT parse, split, join, prefix-match or hand-build one. The only producers are the
+  two walks; the only consumers are set algebra in `_evaluate` and `len` in
+  `_observation_view`.
+- **Rendering `R`.** `R(ε) = "$"`; `R(s · Key(k)) = R(s) + "." + esc(k)`;
+  `R(s · Index) = R(s) + "[]"`. `esc(k)` maps each code point `c` of `k` to `"\\" + c` when
+  `c ∈ {"\\", ".", "[", "]"}` and to `c` otherwise. Implementation: one module constant
+  `_PATH_ESCAPES = str.maketrans({"\\": "\\\\", ".": "\\.", "[": "\\[", "]": "\\]"})` and
+  one helper `_path_segment(key: str) -> str` returning `key.translate(_PATH_ESCAPES)`. No
+  other character is escaped: `$`, `/`, `~`, quotes, whitespace, control characters, `NUL`,
+  non-ASCII and lone surrogates pass through unchanged.
+- **Equality.** Python `str` equality on `R`. By §8.7.2 this is exactly structural equality
+  of segment sequences.
+- **Determinism.** `R` is a pure function of the segment sequence. It reads no locale,
+  environment, hash seed or normalization table. Two keys are the same key iff they are the
+  same sequence of code points, as in JSON (RFC 8259 §4) and in a Python `dict`; NFC and NFD
+  spellings of one glyph are distinct keys, and `"é"` and `"é"` in JSON text are the
+  same key because the parser already unified them.
+- **Bounds.** Unchanged: `MAX_KEY_PATH_DEPTH = 16`, `MAX_KEY_PATH_NODES = 4096`, counted on
+  visited nodes, raising `BodyTooComplex` from either walk. Alias-spelled keys are ordinary
+  members and count as nodes. The rendered length is at most `1 + Σ (1 + 2·len(k))` over the
+  segments and is not bounded separately; the transport's 256 KiB body cap (F13) bounds it.
+- **Secret-key stop.** Unchanged: `redaction._secret_key(k)` is evaluated on the **raw** key
+  `k`, before escaping. A secret-named key's path is added by `key_paths`, never by
+  `material_paths`, and is not descended. Note that `_secret_key` splits on non-alphanumerics,
+  so a literal key `a.token` or `token.a` is itself secret-named (never material, not
+  descended); that is pre-existing behaviour, unchanged by D5 and harmless to the rule (a
+  path that is never material cannot satisfy a material requirement). The hash-seed defect of
+  report §11.5 is unchanged and outside this correction.
+
+#### 8.7.2 Injectivity of `R` (proof)
+
+Claim: `R(s₁) = R(s₂)` implies `s₁ = s₂` for all segment sequences `s₁`, `s₂`.
+
+Proof: exhibit a decoder `D` with `D(R(s)) = s`. `D` reads the string left to right by code
+point after the leading `$`:
+
+1. If the next code point is `[`, the following one is `]` (see below) and the segment is
+   `Index`; advance two.
+2. Otherwise the next code point is `.` (see below); advance one and read a key: repeat
+   while there is a code point and it is neither `.` nor `[`: if it is `\`, take the
+   following code point literally and advance two; otherwise take it and advance one. The
+   collected code points are `k`; the segment is `Key(k)`.
+3. Stop at the end of the string.
+
+`D` is well defined and inverts `R` because of three properties of `esc`:
+
+- (E1) `esc(k)` contains no unescaped `.`, `[` or `]`: every occurrence of those three
+  characters in `k` is emitted with a `\` in front, and `esc` never emits a bare one.
+- (E2) every `\` in `esc(k)` is the first of an escaped pair `\c` with
+  `c ∈ {\, ., [, ]}`: a `\` in `k` is emitted as `\\`, and no other `\` is emitted. So the
+  decoder's "take the following code point literally" step always consumes exactly the
+  escaped pair and never runs past the key.
+- (E3) `esc` is injective and its inverse is "drop the `\` of each escaped pair", which is
+  what step 2 computes.
+
+Hence after `$`, the string is a concatenation of blocks that each begin with `[` (exactly
+`[]`, the only source of a bare `[`, by E1) or with `.` followed by `esc(k)` for one key,
+and the first code point of each block decides which case applies. Step 2 stops exactly at
+the first bare `.` or `[` after the key, which by E1 is the start of the next block, or at
+the end. So `D` recovers the segment sequence, `D ∘ R = id`, and `R` is injective. ∎
+
+Coverage of the cases the brief names:
+
+| Key content | Treatment | Why it cannot collide |
+|---|---|---|
+| separator `.` | escaped `\.` | E1: the only bare `.` starts a key block |
+| brackets `[`, `]` | escaped `\[`, `\]` | E1: the only bare `[` is the `[]` token |
+| backslash `\` | escaped `\\` | E2: pairs are consumed as pairs; `\\.` is `\` then separator, `\\\.` is `\` then `.` |
+| `$` | literal | only position 0 is the root; inside a key it is always preceded by `.` or by other key text |
+| `/`, `~` | literal | not metacharacters of this grammar; `a/b` and nested `a`→`b` differ in the presence of a bare `.` |
+| empty string | `.` followed by `.`, `[` or end | step 2 reads zero code points; `{"": {"": 1}}` is `$..`, `{".": 1}` is `$.\.` |
+| Unicode, control, `NUL`, surrogates | literal | the decoder is per code point and only four ASCII code points are special |
+| key equal to a whole path spelling (`$.a.b`, `a[]`, `[]`) | escaped per character | E1 |
+
+**Lemma (D4 preservation).** If no key of a body contains `\`, `.`, `[` or `]`, then `esc`
+is the identity on every key and `R` equals the pre-D5 rendering, so `key_paths`,
+`material_paths`, their cardinalities and every §8.4–§8.6 result for that body are
+unchanged byte for byte. Every body in §8.6 T1–T3, the 11 affirmative guards, `FULL`,
+`SUBSET`, `ENVELOPE`, `protected()` and the synthetic target of §13 is such a body.
+CONFIRMED by the design session with the renderer patched in memory (no file changed):
+`tests/test_runner_plan_differential_predicates.py` + `_redteam.py` **183 passed, 0 failed**
+(the D9 test green); `_cli.py` + `_safety.py` + `_release.py` **35 passed**.
+
+#### 8.7.3 Rejected alternative: typed tuple paths
+
+Representation: `tuple[str | _ArraySegment, ...]` with a frozen, field-less dataclass
+singleton as the array token, so `("a", "b") != ("a.b",)` by construction and no rendering
+exists. The design session implemented it in memory as well (not committed) and confirmed
+that it also turns the D9 test green and gives the identical T4 table. It is rejected for
+this cycle because, for the same fail-closed outcome, it
+
+- changes the return type of two exported functions shipped in the open-core wheel and adds
+  a public sentinel type to the module;
+- breaks **28** preserved test cases in three D4-pinned tests, purely on notation
+  (`test_d4_truthy_leaf_table` ×26, `test_d4_material_paths_are_structural_and_bounded`,
+  `test_key_paths_are_structural_and_skip_secret_named_subtrees`; CONFIRMED), so the fresh
+  red team would have to re-verify 28 rewritten expectations instead of reading an unchanged
+  file;
+- buys injectivity "by construction" where §8.7.2 already gives it by a one-paragraph proof
+  that the fixed-seed corpus test checks mechanically against an independent tuple walk.
+
+A hybrid (tuples inside, rendered strings outside) carries the same proof obligation as the
+chosen option with strictly more code, and no caller needs a string. Should a later phase
+need to print or persist a path, the tuple form MAY be introduced then, with a renderer
+equal to `R`; that is out of Phase 1.
+
+#### 8.7.4 Exact changes (Opus)
+
+`heel/runner/plan_differential.py`, and nothing else in product code:
+
+1. Immediately above `def key_paths`, add the constant `_PATH_ESCAPES` and the helper
+   `_path_segment` of §8.7.1 (a two-line function with a one-line docstring is enough).
+2. In `key_paths`, replace `child_path = f"{path}.{key}"` with
+   `child_path = f"{path}.{_path_segment(key)}"`.
+3. In `material_paths`, make the same one-token replacement.
+4. The docstrings of the two functions MAY gain one sentence naming the rendering.
+
+Everything else in the file is byte-unchanged: `_evaluate` (its set algebra is over opaque
+strings and needs no edit; the fault-injection seams of `test_r11_predicates_fail_closed`
+and `test_d4_bounds_leave_body_superset_undetermined` still patch the module names),
+`_observation_view`, `__all__` (no new export; `_path_segment` is private), every
+constant, class, reason string, row and import. No new import: `str.maketrans` and
+`str.translate` are builtins. `_secret_key(key)` keeps receiving the raw key.
+
+Callers, reports and persisted data:
+
+- `_evaluate`: unchanged code; behaviour changes only for bodies whose keys contain one of
+  the four metacharacters (T4), always in the fail-closed direction or toward the correct
+  `lower_subset`.
+- `_observation_view` → `reproduction.observations[].key_path_count`: unchanged code, still
+  an integer count of distinct paths. It now counts structural paths, so for an alias body
+  it may be larger than before (`{"a": {"b": 1}, "a.b": 1}`: 3, previously 2); for any body
+  without metacharacters it is identical. It is informational; nothing reads it back.
+- No path string is persisted or printed anywhere: not in findings (§11: "No key-path
+  names … appear in a finding"), `report.json`, regressions, containment entries, stdout or
+  stderr (CONFIRMED: the only derived field is `key_path_count`; grep over `heel/`, `docs/`
+  and `tests/` finds no other consumer of either function outside the predicates test).
+- Replay (§10): unchanged code. A regression saved from an alias body (report §11.4) now
+  replays `fail` / `inconclusive` (`lower_hollow_shape`) instead of `fail` /
+  `still_reachable`; never `pass` on a 2xx lower.
+- Every D4 predicate row, case id and precedence is preserved; path identity required no
+  correction to any rule.
+
+#### 8.7.5 Compatibility
+
+- `key_paths` and `material_paths` are in `__all__` and shipped in the open-core wheel
+  (R26), so they are importable by third parties. No importer exists in this repository
+  outside the module itself and `tests/test_runner_plan_differential_predicates.py`, and no
+  operator document describes them (CONFIRMED by grep). They are **internal helpers with a
+  stable signature**: name, parameters, return type `frozenset[str]`, bounds and exception
+  are unchanged.
+- What changes for an external importer: only the rendered string of a key containing `\`,
+  `.`, `[` or `]`, and the set cardinality for a body with such keys. Any code that parsed
+  the old strings as JSONPath was already wrong (D9) and is not supported.
+- Stored run, finding and regression formats: **no change**. Existing `HEEL_HOME` stores,
+  findings and `regress` entries load and replay unchanged; only re-evaluated verdicts on
+  alias bodies move, in the fail-closed direction.
+- The three release artifacts regenerate because `plan_differential.py` changes (R26, R27,
+  §14.5). No other package content changes.
+
+#### 8.7.6 Truth tables
+
+**T4: alias rows.** `GET`, no marker, status 200 both sides unless stated, positive control
+present. Columns: verdict row, reason, `status_parity`, `body_superset`, candidate, and the
+result at `d479ff9` before D5 where it differs. `OBS` = row 6 `lower_superset` T T no
+(`observed`); `SUB` = row 8 `lower_subset` T F yes; `HOL` = row 9 `lower_hollow_shape`
+— — no. Every row CONFIRMED by the design session against the in-memory renderer and at
+`d479ff9`.
+
+| Case id | `L` | `H` | D5 | Before D5 |
+|---|---|---|---|---|
+| `dot_alias_hollow_nested` (D9) | `{"a": {"b": null}, "a.b": 1}` | `{"a": {"b": 1}}` | HOL | OBS |
+| `dot_alias_wrapped_hollow` | `{"data": {"url": null, "n": null}, "data.url": "https://files/x.csv", "data.n": 2, "ok": true}` | `{"data": {"url": "https://files/x.csv", "n": 2}, "ok": true}` | HOL | OBS |
+| `dot_literal_lower_vs_nested_higher` | `{"a.b": 1}` | `{"a": {"b": 1}}` | SUB | SUB |
+| `nested_lower_vs_dot_literal_higher` | `{"a": {"b": 1}}` | `{"a.b": 1}` | SUB | OBS |
+| `dot_alias_in_higher_only` (reverse) | `{"a": {"b": 1}}` | `{"a": {"b": null}, "a.b": 1}` | SUB | OBS |
+| `dot_literal_both_sides_truthy` | `{"a.b": 2}` | `{"a.b": 1}` | OBS | OBS |
+| `dot_literal_both_sides_hollow` | `{"a.b": null}` | `{"a.b": 1}` | HOL | HOL |
+| `nested_both_sides_truthy` | `{"a": {"b": "x"}}` | `{"a": {"b": 1}}` | OBS | OBS |
+| `nested_both_sides_hollow` | `{"a": {"b": 0}}` | `{"a": {"b": 1}}` | HOL | HOL |
+| `nested_and_literal_both_truthy_both_sides` | `{"a": {"b": "p"}, "a.b": "q"}` | `{"a": {"b": "x"}, "a.b": "y"}` | OBS | OBS |
+| `nested_and_literal_literal_hollow` | `{"a": {"b": 1}, "a.b": null}` | `{"a": {"b": 1}, "a.b": 2}` | HOL | OBS |
+| `lower_carries_literal_and_nested` | `{"a": {"b": 1}, "a.b": 1}` | `{"a.b": 1}` | OBS | OBS |
+| `array_token_alias_hollow_list` | `{"x": [0], "x[]": 1}` | `{"x": [1]}` | HOL | OBS |
+| `array_token_literal_vs_list` | `{"x[]": 1}` | `{"x": [1]}` | SUB | SUB |
+| `array_element_object_alias` | `{"a": [{"b": null}], "a[]": {"b": 1}}` | `{"a": [{"b": 1}]}` | HOL | OBS |
+| `array_vs_literal_both_truthy` | `{"x": [2], "x[]": 2}` | `{"x": [1], "x[]": 1}` | OBS | OBS |
+| `dollar_literal_key_hollow` | `{"$": 1, "a": null}` | `{"$": 1, "a": 1}` | HOL | HOL |
+| `dollar_key_nested_alias` | `{"a": {"$": null}, "a.$": 1}` | `{"a": {"$": 1}}` | HOL | OBS |
+| `dollar_dot_a_literal_vs_a` | `{"$.a": 1}` | `{"a": 1}` | SUB | SUB |
+| `dollar_literal_both_sides` | `{"$": "y"}` | `{"$": "x"}` | OBS | OBS |
+| `empty_key_nested_alias` | `{"": {"a": null}, ".a": 1}` | `{"": {"a": 1}}` | HOL | OBS |
+| `empty_key_double_alias` | `{"": {"": null}, ".": 1}` | `{"": {"": 1}}` | HOL | OBS |
+| `empty_key_both_sides` | `{"": 2}` | `{"": 1}` | OBS | OBS |
+| `empty_key_hollow` | `{"": ""}` | `{"": 1}` | HOL | HOL |
+| `dot_key_vs_empty_nested` | `{".": 1}` | `{"": {"": 1}}` | SUB | SUB |
+| `slash_tilde_keys_truthy` | `{"a/b": 2, "a~b": "y", "~1": 1}` | `{"a/b": 1, "a~b": "x", "~1": 1}` | OBS | OBS |
+| `slash_tilde_keys_hollow` | `{"a/b": null, "a~b": "y"}` | `{"a/b": 1, "a~b": "x"}` | HOL | HOL |
+| `slash_literal_vs_nested` | `{"a/b": 1}` | `{"a": {"b": 1}}` | SUB | SUB |
+| `pointer_escape_vs_slash` | `{"a~1b": 1}` | `{"a/b": 1}` | SUB | SUB |
+| `backslash_key_vs_nested` | `{"a\\": {"b": 1}}` | `{"a\\.b": 1}` | SUB | OBS |
+| `backslash_dot_alias` | `{"a\\": {"b": null}, "a\\.b": 1}` | `{"a\\": {"b": 1}}` | HOL | OBS |
+| `unicode_nested_alias` | `{"ключ": {"数": null}, "ключ.数": 1}` | `{"ключ": {"数": 1}}` | HOL | OBS |
+| `unicode_same_key_both_sides` | `{"ключ": {"数": "y"}}` | `{"ключ": {"数": "x"}}` | OBS | OBS |
+| `unicode_nfc_vs_nfd_distinct` | `{"é": 1}` (decomposed) | `{"é": 1}` | SUB | SUB |
+| `unicode_escaped_spelling_same_key` | JSON text `{"é": 2}` | `{"é": 1}` | OBS | OBS |
+| `secret_subtree_alias_never_material` | `{"token": {"a": null}, "token.a": 1}` | `{"token": {"a": 1}}` | OBS | OBS |
+| `secret_sibling_hollow` | `{"token": {"a": 1}, "rows": null}` | `{"token": {"a": 1}, "rows": 3}` | HOL | HOL |
+| `secret_literal_vs_secret_nested` | `{"token.a": 1, "rows": 3}` | `{"token": {"a": 1}, "rows": 3}` | SUB | SUB |
+| `same_shape_different_truthy_values_with_literal_keys` | `{"a": {"b": "p"}, "a.b": "q", "x[]": [0, 1]}` | `{"a": {"b": 1}, "a.b": 2, "x[]": [3]}` | OBS | OBS |
+| `reflexive_alias_body` | `{"a": {"b": null}, "a.b": 1}` | same | OBS | OBS |
+
+Bounds rows (CONFIRMED): `bounds_wide_alias` — `H` with 4097 plain keys, `L` the same keys
+all `null` plus one alias key → `BodyTooComplex` from both walks, row 8 `status_only`, `bs`
+None, candidate, as §8.6 `bounds_wide_or_deep_body`; `bounds_deep` unchanged. Thirteen T4
+rows change from `d479ff9`; every change is OBS → HOL (a structurally hollow lower body) or
+OBS → SUB (a structurally non-superset lower body). No row moves toward `observed`.
+
+**T5: rendering** (`key_paths` of the body; CONFIRMED).
+
+| Body | `key_paths` |
+|---|---|
+| `{"a": {"b": 1}}` | `$.a`, `$.a.b` |
+| `{"a.b": 1}` | `$.a\.b` |
+| `{"a": {"b": 1}, "a.b": 1}` | `$.a`, `$.a.b`, `$.a\.b` (3 paths) |
+| `{"x": [1]}` | `$.x`, `$.x[]` |
+| `{"x[]": 1}` | `$.x\[\]` |
+| `{"[]": 1}` | `$.\[\]` |
+| `{"$": 1}` | `$.$` |
+| `{"": 1}` | `$.` |
+| `{"": {"": 1}}` | `$.`, `$..` |
+| `{".": 1}` | `$.\.` |
+| `{"\\": 1}` | `$.\\` |
+| `{"q\\": {"r": 1}}` | `$.q\\`, `$.q\\.r` |
+| `{"q\\.r": 1}` | `$.q\\\.r` |
+| `{"a/b": 1, "a~1b": 1, "é": 1}` | `$.a/b`, `$.a~1b`, `$.é` |
+
+#### 8.7.7 Named tests
+
+Opus adds the following. Each T4 case id MUST be the parametrize id of a case so a reviewer
+can find every row by name. Only existing dependencies: `json`, `random`, `pytest`, the
+module under test and the existing support helpers.
+
+In `tests/test_runner_plan_differential_predicates.py` (additive only):
+
+| Named test | Proves |
+|---|---|
+| `test_d5_path_segments_render_injectively` | every T5 row by exact set equality; `_path_segment` on each T5 key; `len(key_paths({"a": {"b": 1}, "a.b": 1})) == 3`; both functions still return `frozenset` of `str`; `__all__` unchanged (no `_path_segment`) |
+| `test_d5_alias_truth_table` | every T4 row (40 ids) through `evaluate_plan_pair`: `(row, reason, status_parity, body_superset, candidate, evidence_state, stores_finding)`; the HOL rows additionally at lower status 201, 204 and 299 |
+| `test_d5_bounds_count_alias_keys_as_nodes` | `bounds_wide_alias`: `BodyTooComplex` from both walks and row 8 `status_only` |
+| `test_d5_structural_identity_fixed_seed_corpus` | parametrized over seeds `20261006`, `1`, `2`; `random.Random(seed)`; 1 500 random bodies per seed, depth ≤ 4, width ≤ 4, lists, scalars from `{null, 0, 1, "", "x", true, false, 2.5, "0"}`, keys drawn from the alphabet `a`, `b`, `a.b`, `.`, `..`, `[]`, `a[]`, `$`, `$.a`, `""`, `\`, `a\.b`, `\.`, `/`, `~`, `~1`, `é`, `e+U+0301`, `数`, `token`, `ok`, `x]`, `[`, `]`. The test defines an **independent** recursive reference walk returning tuples (with a private object as the array token, honouring `_secret_key`) and the decoder `D` of §8.7.2, and asserts for every body: (a) `{D(p) for p in key_paths(B)}` equals the reference structural path set; (b) `len(key_paths(B))` equals its size (injective on `B`); (c) the same two for `material_paths` against the reference material walk; (d) **two-direction check**: for `L` built by setting one random material leaf of `H` to `null` and adding truthy alias-spelled keys, `evaluate_plan_pair(L, H).body_superset` is `None` exactly when the reference says `L` is a hollow shape of `H`, `True` exactly when the reference shape superset holds and it is not hollow, and `False` otherwise (pairs on row 2 or `lower_denial_envelope` are skipped); and (e) the count of structurally hollow pairs judged `observed` is 0. CONFIRMED by the design prototype: passes under the D5 renderer on all three seeds and **fails at `d479ff9` on all three seeds**, so it detects D9. |
+
+In `tests/test_runner_plan_differential_cli.py` (additive only; no edit to
+`tests/plan_differential_support.py` or the harness):
+
+| Named test | Proves |
+|---|---|
+| `test_d5_alias_lower_body_is_hollow_in_fresh_run_and_regression_replay` | with `World`: vulnerable run → `GET /api/export` `observed`, `add_regression`; then `monkeypatch.setattr(world.target, "respond", …)` with a wrapper that answers the **free** session on `/api/export` with `{**EXPORT, "rows": [{"id": null, "amount_cents": null}], "rows[].id": "row_1", "rows[].amount_cents": 1200}` and delegates everything else to the original `respond` (the listener looks `respond` up on the instance per request); fresh run → pair `inconclusive` / `inconclusive` / `lower_hollow_shape`, `candidate` false, `execution_disposition` `completed`, stored finding `evidence_state: inconclusive`; `regress run` → `fail` / `inconclusive`, the replay's stored reproduction reason `lower_hollow_shape`; wrapper disabled → `fail` / `still_reachable`. CONFIRMED by the design prototype under the D5 renderer; at `d479ff9` the same test fails with the pair `finding` / `lower_superset` (the D9 end-to-end reproduction of report §11.4). |
+
+The committed D9 regression `test_redteam_break_d9_path_alias_turns_hollow_lower_body_into_observed`
+MUST turn green from change 1 of §8.7.4 alone and MUST NOT be edited, weakened, skipped,
+xfailed or deleted.
+
+Tests Opus MUST preserve unedited, all green on the final commit: every existing test of
+the five plan-differential files, in particular the three notation-pinned tests
+`test_key_paths_are_structural_and_skip_secret_named_subtrees`, `test_d4_truthy_leaf_table`
+and `test_d4_material_paths_are_structural_and_bounded` (their `$.k` expectations are
+unchanged by the lemma of §8.7.2), the seven `test_d4_*` tests, `test_r11_*`,
+`test_error_envelope_never_counts_as_parity`, the 62 cases of the red-team file, and the
+I1–I8, R9–R27 tests of §12.
+
+#### 8.7.8 Red-team acceptance attacks and stop conditions
+
+The fresh Fable red team after Opus MUST at least:
+
+1. Run every T4 row end to end through the unmodified CLI, transport, executor, store,
+   `heel findings --run`, `regress add` and `regress run`, by the `respond` wrapper of
+   §8.7.7 or a scratch `World`; record pair verdict, stored `evidence_state`, replay result.
+2. Fuzz with a seed other than the three committed ones and a wider alphabet: control
+   characters, `NUL`, lone surrogates (`"\ud800"` in JSON text), keys of 1 000+ code
+   points, runs of metacharacters (`\\\\`, `..`, `[[]]`, `.[`, `\.`, `\[]`), keys equal to
+   whole rendered paths (`$`, `$.a.b`, `$.x[]`), keys that are secret-named only because of
+   a separator (`a.token`, `token.a`), aliases on both sides, aliases in the higher body
+   only, aliases at depth 15 and 16, and 4 096-node bodies composed of alias keys. Classify
+   each pair with an independent tuple walk and compare both directions, as the corpus test
+   does.
+3. Re-run the §11.4 journey of the report (the D9 pair, the wrapped alias, hollow at
+   201/204/299, hardened 403) and the I1–I8 and original adversarial sets.
+4. Check `key_paths` output for every body of the five test files is byte-identical to
+   `d479ff9` (the lemma of §8.7.2), and that `git diff d479ff9..HEAD -- heel/` adds no
+   import, regex, word list, key set, classifier, annotation or network call.
+
+Stop conditions, each a **FAIL** for D5:
+
+- any alias, spelling or encoding under which a lower body that is structurally hollow at a
+  path the higher body populates, or structurally not a shape superset, is `observed`, a
+  candidate, or `held` without a marker;
+- any regression replay returning `pass` on a 2xx lower body;
+- any preserved test edited, skipped, xfailed or deleted, or the D9 test not green from the
+  product change alone;
+- any change outside the §14.7 allowlist; any new import or vocabulary in product code;
+- any rendered path for a metacharacter-free body that differs from `d479ff9`;
+- any change to egress, scope verification, method set, reservation, budget, redaction,
+  containment or chain behaviour (the I1–I8 tests and R9, R12, R13, R17 must be unchanged
+  and green).
+
+Recorded limits that are **not** D5 failures: the value-blind boundary of §16 (a truthy
+denial-shaped value at every higher-material path is still `observed`); the hash-seed
+`_secret_key` defect of report §11.5; `key_path_count` growing for alias bodies.
+
 ## 9. Requests, budget, reservation, logging
 
 - **Unit**: one op is one request attempt on the wire, including a retry. Every op carries
@@ -1187,6 +1575,7 @@ Independent requirements:
 | R10 | CLI-only entry | `test_r10_no_mcp_or_rest_entry` | safety — `mcp_server.TOOL_NAMES` equals an explicit expected set; nothing in `mcp_server.py` or `rest.py` references `plan_differential`. |
 | R11 | Fail-closed predicates | `test_r11_verdict_table_rows` (one case per §8.5 row), `test_r11_predicates_fail_closed`, `test_error_envelope_never_counts_as_parity`; and, from the red-team file, `test_redteam_break_d1_*` (all three generations, 29 cases, green after D4) and `test_redteam_holds_affirmative_bodies_keep_the_positive_control` | `tests/test_runner_plan_differential_predicates.py` — status-only, 2xx denial envelope, empty, HEAD, missing positive control, executor disagreement, exception in evaluation; `candidate` is `true` on row 8 only; an envelope makes `body_superset` `None`, not `False`. |
 | R28 | Material superset (D4, §8.6) | `test_d4_truthy_leaf_table`, `test_d4_material_paths_are_structural_and_bounded`, `test_d4_verdict_truth_table`, `test_d4_same_shape_different_values_stay_observed`, `test_d4_hollow_shape_is_never_observed_candidate_or_held`, `test_d4_bounds_leave_body_superset_undetermined`, `test_d4_reflexive_bodies_unchanged` | `tests/test_runner_plan_differential_predicates.py` — every row of §8.6 T1–T3 by case id; a hollow shape is never `observed`, never a candidate, never `held` without a marker; a same-shape materially populated lower body with different values is still `observed`. |
+| R29 | Structural path identity (D5, §8.7) | `test_d5_path_segments_render_injectively`, `test_d5_alias_truth_table`, `test_d5_bounds_count_alias_keys_as_nodes`, `test_d5_structural_identity_fixed_seed_corpus` (predicates); `test_d5_alias_lower_body_is_hollow_in_fresh_run_and_regression_replay` (cli); `test_redteam_break_d9_path_alias_turns_hollow_lower_body_into_observed` (red team, unedited) | every T4 and T5 row by case id; a fixed-seed corpus checked against an independent tuple walk in both directions; the D9 pair end to end through CLI, findings and replay. |
 | R12 | No scope creation or mutation | `test_r12_scope_files_are_never_written` | safety — the scopes directory's file list, bytes and mtimes are identical before and after bootstrap, dry-run, run, failed run and replay; the new module does not import `create_scope`. |
 | R13 | Dry-run sends nothing | `test_r13_dry_run_sends_nothing` | safety, no seam — zero sockets, no resolver call, no attempt directory, no credential variable consumed. |
 | R14 | No transport selection from the CLI | `test_r14_cli_cannot_select_transport` | `tests/test_runner_plan_differential_cli.py` — the `run` option set equals the six of §3.1; `_build_client` takes only `origin`; setting `HEEL_CA_BUNDLE`, `HEEL_RUNNER_CA_FILE`, `HEEL_RUNNER_TRANSPORT`, `HEEL_RUNNER_RESOLVER`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` leaves the constructed client's resolver, socket and TLS classes and its CA count unchanged. It makes no claim about `SSL_CERT_FILE` (see R23). |
@@ -1440,6 +1829,41 @@ Gate the orchestrator reads: the final test command of §17.2 gives **0 failed**
 contains no new denial word, key, wrapper, regex, classifier, annotation, network call or
 import.
 
+### 14.7 Post-escalation D5 implementation allowlist (2026-10-06) — exhaustive
+
+The Opus D5 session starts at the commit that carries this record and may make the
+following changes and no other. `git diff --name-only <that commit> HEAD` on its final
+commit MUST list exactly paths 1–6 below.
+
+1. `heel/runner/plan_differential.py` — only the four edits of §8.7.4: add `_PATH_ESCAPES`
+   and `_path_segment` above `key_paths`; the one-token replacement in `key_paths`; the same
+   in `material_paths`; optional one-sentence docstring additions. `_evaluate`,
+   `_observation_view`, `__all__`, every other function, class, constant, reason string and
+   import MUST be byte-unchanged. No new import.
+2. `tests/test_runner_plan_differential_predicates.py` — additive only: the four named tests
+   of §8.7.7. No existing line edited or deleted (checked by `git diff` of the file showing
+   only `+` lines outside hunk headers). Existing helpers (`observation`, `evaluate`,
+   `FULL`, `SUBSET`, `ENVELOPE`, `protected`, `_d4_columns`, `_d4_complex_bodies`) may be
+   reused.
+3. `tests/test_runner_plan_differential_cli.py` — additive only: the one named test of
+   §8.7.7, reusing `World`, `finding_for`, `add_regression`, `regress`, `pairs_by_route`
+   and `EXPORT` of that file and of `plan_differential_support`.
+4. `apps/heel-cloud/public/downloads/heel-open-core-manifest.json` }
+5. `apps/heel-cloud/public/downloads/heel_sim-1.2.0-py3-none-any.whl` } regenerated only by
+6. `apps/heel-cloud/public/downloads/heel_sim-1.2.0.tar.gz` } the procedure of §14.5
+
+Explicitly not touched by Opus in this cycle: `tests/test_runner_plan_differential_redteam.py`
+(the D9 regression MUST turn green by change 1 alone), `tests/plan_differential_support.py`,
+`tests/plan_differential_harness.py`, `tests/test_runner_plan_differential_safety.py`,
+`tests/test_runner_plan_differential_release.py`, `heel/runner/redaction.py` (the §11.5
+hash-seed defect is a separate decision), `docs/REDTEAM_PLAN_DIFFERENTIAL.md`, this spec,
+`docs/PLAN_DIFFERENTIAL_RUNNER.md`, `docs/CAPABILITIES.md`, every file of §14.1 items 2,
+4–19, and everything in §14.4. No new dependency of any kind.
+
+Commits: small, `git commit -s`, `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
+as the last trailer; the artifact commit alone holds paths 4–6. No push, no PR, no branch
+change. Gate: §17.6.
+
 ## 15. Limits the docs must state
 
 Inherited from the existing transport and contracts, unchanged by this work:
@@ -1494,6 +1918,9 @@ Chosen for Phase 1:
 | Credentials registered before this change have handles that were never displayed. | Operator uses a fresh `HEEL_HOME`. |
 | `SYNTHETIC_ONLY` is the only data mode `heel scope create` issues; this design relies on canary accounts holding synthetic data. | Operator decision; not testable in code. |
 | Whether the `apps/` exception lets a T4 remediation regenerate the artifacts again. The brief says "after the product implementation is final"; §14.5 reads that as "whenever a shipped file last changed". | Orchestrator to confirm before any T4. |
+| D5 (§8.7): `reproduction.observations[].key_path_count` counts structural paths, so it may exceed the pre-D5 value for a body with alias-spelled keys. Informational; nothing reads it back. | T5 to note the count on the documented journey (expected unchanged: the synthetic target has no such keys). |
+| D5 does not change `_secret_key`, so a literal key with a separator and a secret word (`a.token`) is secret-named: path kept, never material, not descended. Pre-existing; cannot create a false `observed` because a never-material path cannot satisfy a material requirement. | Fresh red team item 2 of §8.7.8. |
+| Doc lag: `docs/PLAN_DIFFERENTIAL_RUNNER.md` does not describe the path rendering; it never named `key_paths`, so no operator-visible statement is wrong. | A later Fable-authorized doc commit, with the `lower_hollow_shape` lag above. |
 
 ## 17. Baseline, final commands and T2 gates
 
@@ -1558,3 +1985,26 @@ Run only as steps 2 and 3 of §14.5. The second is the command of the CI `packag
 The T2 closing status MUST list: baseline → final delta, every changed file, the
 invariant → test map, the output of §17.3 and of each gate of §17.4, the dry-run plan
 against the synthetic target, and its least-certain claim.
+
+### 17.6 Post-escalation D5 gate (2026-10-06)
+
+Baseline, CONFIRMED by the design session at `d479ff9` with the §17.2 command and
+`TMPDIR=/private/var/folders/yc/l85h50j14_96655zkm2z_mdw0000gn/T`: **1 failed, 1703 passed,
+5 skipped** (640 subtests, 259 s); the one failure is
+`test_redteam_break_d9_path_alias_turns_hollow_lower_body_into_observed`.
+
+Required on the Opus final commit:
+
+| Gate | Required |
+|---|---|
+| §17.2 full suite | **0 failed**; passed = **1704 + N**, where N is the number of D5 cases added by §8.7.7 (with exactly the named cases: 1 + 40 + 1 + 3 + 1 = 46, so **1750 passed**); **5 skipped**; no baseline test missing |
+| `tests/test_runner_plan_differential_redteam.py` alone | **62 passed, 0 failed**, file unchanged from `d479ff9` |
+| the three notation-pinned tests of §8.7.7 | present, unedited, green |
+| §17.3 `--check` | `open-core release artifacts are current`, exit 0 |
+| §17.4 P1–P3 | unchanged (P2 still the same five runner modules) |
+| `git diff --name-only <spec commit> HEAD` | exactly the six paths of §14.7 |
+| `git diff <spec commit> HEAD -- heel/` | adds one constant, one two-line helper and changes two f-string tokens; no new import, regex, word, key set, classifier, annotation or network call |
+| `git diff --check` | clean |
+
+Delta to report: from the D5 baseline (1 / 1703 / 5) and from the T2 baseline
+(0 / 1486 / 5).
