@@ -2,8 +2,8 @@
 
 Date: 2026-10-02. Branch: `feat/plan-differential-runner` (base `main` @ `844fc1f`).
 Blast radius: **medium — adds network egress under a signed scope.**
-Role: design only (T1 apps-exception revision; fourth revision). It replaces the revision
-committed at `1c6b324` in full. This document is the contract for T2 (implementation), T3 (red team),
+Role: design only (T1 apps-exception revision; fourth revision; post-escalation D4
+correction of 2026-10-05, §0.1). It replaces the revision committed at `1c6b324` in full. This document is the contract for T2 (implementation), T3 (red team),
 T4 (remediation) and T5 (acceptance). It makes no acceptance claim and contains no product
 code.
 
@@ -54,6 +54,46 @@ Corrections from `1c6b324` that remain valid and are kept unchanged:
 
 C1 and C2 of `1c6b324` (no runner module may change; `HEAD` under
 `anonymous_authenticated_read`) are **withdrawn**.
+
+### 0.1 Post-escalation correction record (2026-10-05): D4
+
+Written by a fresh Fable design session after the run stopped at `85d14cd`. Design only:
+no product code, test or artifact was changed by this record.
+
+Why. T3 found D1 (a 2xx denial body counted as parity, R11) at `0c456f1`. T4 loop 1
+(`93521ed`) and loop 2 (`a1c2acd`) widened the denial-envelope recognizer to the closure
+of report §9.3; the final T3 rerun (report §10, commit `85d14cd`) showed four concrete
+denial bodies outside that closure still stored as `observed`, and named the structural
+cause: a body that repeats the higher plan's key paths with `null` data is a key-path
+superset, so every denial the recognizer misses becomes `observed`. That was the third
+R11 break; the run stopped and escalated. On 2026-10-05 Kevin said "Continue", which the
+orchestrator reads as authorization for one structural D4 cycle, a fresh red team and the
+remaining gates, and not for another vocabulary extension or any scope change.
+
+Decision (D4). `body_superset` now requires a **material** superset as well as a key-path
+superset: the lower body must carry a JSON-truthy value at every path where the higher body
+carries one. A lower 2xx body that echoes the higher key shape but is hollow at any such
+path withholds parity exactly as a recognized denial envelope does (`inconclusive`,
+`lower_hollow_shape`, row 9, not a candidate). No denial word, key, wrapper, heuristic,
+classifier, annotation or network behavior is added. No value is compared with another:
+a same-shape lower body with different URLs, IDs, names, counts or tenant values is still
+`observed`. The exact rule, truth tables and test map are §8.6.
+
+| # | Change in this correction | Where |
+|---|---|---|
+| D4.1 | `material_paths` beside `key_paths`; `body_superset` true only when shape and material supersets both hold; hollow shape withholds `status_parity` and `body_superset` | §7, §8.2, §8.4, §8.5, §8.6 |
+| D4.2 | Row-9 reason list gains `lower_hollow_shape` | §8.5 |
+| D4.3 | §8.3 synced to the accepted T4 loop-2 recognizer (report §9.3 closure), which it had understated since loop 1 | §8.3 |
+| D4.4 | §7 and §7.4 redaction wording synced to the accepted T4 loop-1 D2 remediation (every JSON spelling of each secret character), with its known limits | §7, §7.4, §7.5, §16 |
+| D4.5 | The fail-closed bullet "never yields `verified`" corrected: a 2xx envelope that discloses the supplied marker is row 3, `verified`, as `test_error_envelope_never_counts_as_parity` already pins | §8.5 |
+| D4.6 | Replay: a hollow lower shape is `fail` / `inconclusive`, never a pass | §10 |
+| D4.7 | Named tests Opus MUST add and MUST preserve; R28 | §8.6, §12 |
+| D4.8 | Exhaustive post-escalation file allowlist for Opus | §14.6 |
+
+Unchanged by this correction, explicitly: Phase 1 scope (§1), the CLI surface (§3), route
+and identity rules (§3.2–§3.4), authorization and egress (§7.1–§7.2, §9), the verdict rows
+and their order (§8.5), finding schema (§11), the eight invariants (§12), the T2 file list
+(§14.1–§14.4) and the artifact procedure (§14.5).
 
 ## 1. What ships
 
@@ -494,6 +534,7 @@ Public functions (everything else underscore-private):
 | `replay_plan_differential(store, regression, *, scope_id, target, caller) -> dict` | One-pair replay for `heel regress run` (§10). |
 | `evaluate_plan_pair(lower, higher, *, method, marker, executor_outcome) -> PairVerdict` | Pure function implementing §8. No I/O. |
 | `key_paths(value) -> frozenset[str]` | Pure, bounded (§8.2). |
+| `material_paths(value) -> frozenset[str]` | Pure, bounded, same walk and bounds as `key_paths` (§8.2, §8.6). Post-escalation D4. |
 | `is_denial_envelope(value) -> bool` | Pure (§8.3). |
 
 `plans` is `[(label, handle), (label, handle)]`, lower first. `routes_artifact` is the
@@ -511,7 +552,7 @@ Private pieces:
 | `_build_client(origin) -> TargetHTTPSClient` | The only client constructor. One bounded `BoundedResolver()` preflight, then `TargetHTTPSClient(origin=origin, preflight_addresses=answers)` with **no** `resolver`, `sockets` or `tls` argument, so the defaults `BoundedResolver`, `SocketTransport` and `TLSTransport` (with §6.4 trust loading) are used. It takes no other parameter and reads no Heel environment variable, file or config. |
 | `_AttemptReservation` | Result of the exclusive `os.mkdir`. Holds attempt ID and root. Constructed only by `_reserve_attempt`. |
 | `_PlanVault` | `supported=True`, `backend_id="ephemeral_env"`. Maps each of the two attempt-store handles to its setup-store record. Loads each real secret **once per invocation** from its real vault (`EphemeralVault` or `select_vault(backend)`), keeps it in memory only, registers it with the redacting store and the tolerant redactor, and clears it at exit. Refuses (`VaultUnavailable`) a bearer or API-key value, or any cookie value, shorter than 8 bytes, because it cannot be redacted reliably. |
-| `_RedactingRunnerStore(RunnerStore)` | Overrides only `store_response_evidence`: before delegating, replaces every registered secret, in raw form and in JSON-string-escaped form, in `raw_headers` and `raw_body` with `b"[REDACTED:secret]"`. Needed because the executor stores raw bytes (F14). |
+| `_RedactingRunnerStore(RunnerStore)` | Overrides only `store_response_evidence`: before delegating, replaces every registered secret, in every spelling of §7.5, in `raw_headers` and `raw_body` with `b"[REDACTED:secret]"`. Needed because the executor stores raw bytes (F14). |
 | `_TolerantRedactor(Redactor)` | §7.4. |
 | `_ScopedTransport` | Wraps the client for **one compiled pair**. Requires an `_AttemptReservation` whose directory exists, else raises `TransportFailure("gate_rejected")`. Refuses any action that is not that pair (§6.7 item 3). Replaces the `redactor` argument with the `_TolerantRedactor` (§7.4). Wraps the executor's `before_attempt` as in §9. |
 | `_gate(scope_id, host)` | `gate_source` for the executor. Calls `_authorize` each time; inactive if the scope no longer verifies or no longer lists the host. |
@@ -622,7 +663,7 @@ Seam (F28, proven in F30): the executor hands its `Redactor` to `transport.reque
 2. If it raises `TypeError` or `ValueError`, re-check the inherited argument rules itself
    (at least one chunk, every chunk `bytes`, every chunk ≤ 256 KiB) and re-raise if they
    fail. Otherwise return `min(1024, n)` where `n` is the number of occurrences of the
-   registered secrets (raw and JSON-string-escaped) in the chunks.
+   registered secrets (every spelling of §7.5) in the chunks.
 3. It overrides nothing else and reads no private attribute of the base class.
 
 Why this is safe:
@@ -642,6 +683,22 @@ predicate parser of §8.1 is the module's own and accepts all finite JSON number
 If the store itself refuses evidence, the pair is still `transport:evidence_rejected` and
 the run stops (step 10): that is a local storage fault, not a response property.
 
+### 7.5 Secret spellings that are redacted (synced 2026-10-05 to the accepted D2 remediation)
+
+As implemented in T4 loop 1 (`93521ed`, `_secret_pattern`) and confirmed by report §9.4 and
+§10.4. For each registered secret, one bytes pattern is built in which every character
+matches, independently of its neighbours, any of: its raw UTF-8 bytes; its `\uXXXX` escape
+with hex digits in either case (two escapes, a surrogate pair, for a code point above
+U+FFFF); its JSON short escape when one exists (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`,
+`\t`). Mixed escapings of one secret therefore match. Secrets are applied longest first so
+a secret that contains another is replaced whole. No body is parsed and the pattern has no
+repetition, so matching is bounded. The same patterns serve `_RedactingRunnerStore` (what
+reaches disk, headers and body) and `_TolerantRedactor` (the count).
+
+Known limits, unchanged and stated in report §9.4: a secret that reaches the body double
+encoded, split across strings, or in base64, hex or percent form is not matched. I5
+covers raw and single-decoded views.
+
 ## 8. Predicates
 
 ### 8.1 Inputs
@@ -660,15 +717,44 @@ Computed on the parsed, redacted body. For an object, each key `k` at path `p` a
 `p.k`; recursion continues into the value unless `redaction._secret_key(k)` is true. For
 an array at path `p`, add `p[]` and recurse into every element, unioning results. Scalars
 add nothing. Bounds: depth ≤ 16, visited nodes ≤ 4096; exceeding either makes
-`body_superset` undetermined (`body_too_complex`).
+`body_superset` undetermined.
+
+`material_paths` (post-escalation D4, §8.6) is the subset of those paths at which the value
+is JSON-truthy: for an object member `k` with value `v` at path `p`, `p.k` is material iff
+`truthy(v)` and `k` is not a secret-named key; for an array at `p`, `p[]` is material iff at
+least one element is truthy. `truthy(v)` is exactly Python `bool(v)` on the parsed value:
+`null`, `false`, `0`, `0.0`, `-0.0`, `""`, `[]` and `{}` are not truthy; every other string
+(including `"0"`, `"false"`, `"null"` and `" "`), number, `true`, nonempty array and
+nonempty object is. String content is never read and no value is compared with another.
+Same walk, same secret-key stop, same bounds and same `BodyTooComplex` as `key_paths`.
+`_evaluate` MUST still obtain the shape sets through `key_paths` (the fault-injection case
+of `test_r11_predicates_fail_closed` patches that name).
 
 ### 8.3 Denial envelope
 
-A parsed top-level object is a denial envelope when any of: `error` or `errors` is truthy;
-`ok` or `success` is exactly `false`; any of `upgrade_required`, `payment_required`,
-`denied`, `forbidden` is exactly `true`. The list is closed and small. It only ever
-**withholds** parity; it never creates a finding, never creates a `held` verdict and never
-creates a regression pass.
+Synced 2026-10-05 to the accepted T4 loop-2 recognizer (`a1c2acd`, `is_denial_envelope`;
+the closure of report §9.3). A parsed top-level object is a denial envelope when any member
+satisfies one of the following, its key compared after case-folding and removing `_` and
+`-`:
+
+1. key in {`error`, `errors`, `errorcode`} and the value is JSON-truthy;
+2. key in {`ok`, `success`, `allowed`} and the value is JSON-falsy, or a string that after
+   strip and casefold is empty or one of `false`, `0`, `no`;
+3. key in {`upgraderequired`, `paymentrequired`, `denied`, `forbidden`} and the value is
+   JSON-truthy and not a string that after strip and casefold is one of `false`, `0`, `no`;
+4. key in {`status`, `statuscode`, `code`} and the value is an `int` or `float` with an
+   integral value in 400–599, or a string in which a denial word (`error`, `fail`,
+   `failed`, `failure`, `denied`, `forbidden`, `unauthorized`, `required`) or a three-digit
+   group beginning `4` or `5` is found after splitting on non-alphanumerics or on
+   camel-case and letter/digit boundaries;
+5. key in {`data`, `result`, `response`} and the value is an object that satisfies 1–5,
+   followed through at most two wrapper levels.
+
+Arrays are never inspected. The vocabulary is closed and is not extended again: it is not
+by itself the rule of brief §1.5, and report §10.3 lists what it does not read. The
+structural rule that closes the remainder is D4 (§8.6). An envelope only ever
+**withholds** parity, for either plan; it never creates a finding, never creates a `held`
+verdict and never creates a regression pass.
 
 ### 8.4 Three-valued predicates
 
@@ -682,12 +768,14 @@ records load and verify.
 
 | Predicate | `None` when | `True` when | `False` when |
 |---|---|---|---|
-| `status_parity` | no `positive_control`; or `L.status` is neither 2xx nor a denial status; or `L.status` is 2xx and `L.json` is a denial envelope | `L.status` is 2xx and `L.json` is not a denial envelope | `L.status` is a denial status |
-| `body_superset` | no `positive_control`; or `method` is `HEAD`; or `H.json` is not an object; or `key_paths(H)` is empty; or a bound is exceeded; or `L.json` is a denial envelope | `L.status` is 2xx, `L.json` is an object, not a denial envelope, and `key_paths(L) ⊇ key_paths(H)` | otherwise (lower denied by status, lower empty, or lower lacks a higher key path) |
+| `status_parity` | no `positive_control`; or `L.status` is neither 2xx nor a denial status; or `L.status` is 2xx and `L.json` is a denial envelope; or `L.status` is 2xx and `L` is a hollow shape of `H` (§8.6) | `L.status` is 2xx, `L.json` is not a denial envelope and `L` is not a hollow shape of `H` | `L.status` is a denial status |
+| `body_superset` | no `positive_control`; or `method` is `HEAD`; or `H.json` is not an object; or `key_paths(H)` is empty; or a bound is exceeded; or `L.json` is a denial envelope; or `L` is a hollow shape of `H` (§8.6) | `L.status` is 2xx, `L.json` is an object, not a denial envelope, `key_paths(L) ⊇ key_paths(H)` and `material_paths(L) ⊇ material_paths(H)` | otherwise (lower denied by status, lower empty or not an object, or lower lacks a higher key path) |
 | `marker_leak` | no marker; or `method` is `HEAD`; or no `positive_control`; or `P(L)` is `None`; or the executor's `assessment_outcome` disagrees | `P(L)` is `True` and executor outcome is `observed` | `P(L)` is `False` and executor outcome is `blocked` |
 
-A 2xx denial envelope therefore makes `status_parity` and `body_superset` undetermined,
-never true and never false.
+A 2xx denial envelope, and likewise a 2xx hollow shape (§8.6), therefore makes
+`status_parity` and `body_superset` undetermined, never true and never false. The two are
+decided in that order: an envelope is reported as `lower_denial_envelope` whether or not it
+is also hollow.
 
 ### 8.5 Verdict table — first matching row wins
 
@@ -701,7 +789,7 @@ never true and never false.
 | 6 | `body_superset` is `True` | finding | `observed` | `body_superset` |
 | 7 | `status_parity` is `False` | held | — | `lower_denied` |
 | 8 | `status_parity` is `True` | inconclusive, `candidate: true` | `inconclusive` | `status_parity` / `head_status_only`, `status_only` (no comparable bodies) or `lower_subset` |
-| 9 | otherwise | inconclusive | `inconclusive` | `inconclusive` / `lower_denial_envelope`, `unexpected_status` or `body_too_complex` |
+| 9 | otherwise | inconclusive | `inconclusive` | `inconclusive` / `lower_denial_envelope`, `lower_hollow_shape`, `unexpected_status` or `body_too_complex` |
 
 Row-1 reasons (closed): `transport:<code>` where `<code>` is the transport failure code
 recorded by the runner's signed log; `stopped`; `budget_exhausted`;
@@ -714,7 +802,16 @@ category; `executor_rejected` when `execute` raised before producing a result;
 Fail-closed requirements (tested, R11):
 
 - Status parity alone never yields `observed`, `verified` or `held`.
-- A 2xx denial envelope never yields `observed`, `verified` or, without a marker, `held`.
+- A 2xx denial envelope never yields `observed` or, without a marker, `held`, and is never
+  a candidate. With a marker, rows 3–5 precede: an envelope body that still discloses the
+  supplied marker is row 3, `verified` (corrected 2026-10-05; pinned by
+  `test_error_envelope_never_counts_as_parity`).
+- A 2xx hollow shape (§8.6) never yields `observed`, is never a candidate and, without a
+  marker, is never `held` (post-escalation D4).
+- A key-path bound exceeded leaves `body_superset` `None`; with a 2xx lower body that is
+  neither an envelope nor hollow the pair lands on row 8 `status_only` (as implemented and
+  tested; the row-9 reason `body_too_complex` is kept for completeness and is not reached
+  from a 2xx lower body). Unchanged by D4.
 - A HEAD pair can only be `held` (row 7) or `inconclusive`.
 - `verified` is reachable only through row 3; `observed` only through row 6.
 - An exception inside evaluation yields `inconclusive` (`predicate_error`), never a pass.
@@ -732,6 +829,182 @@ received on that one read. Heel holds no declaration that the route is plan-gate
 route that is ungated by design will also be reported. The finding text MUST say this.
 `held` (row 7) says only that the lower plan was refused by status on this one read while
 the higher plan succeeded.
+
+### 8.6 D4: material superset (post-escalation correction, 2026-10-05)
+
+**Invariant (encode this).** With a positive control, a `GET` pair and comparable object
+bodies, `observed` requires both
+
+    key_paths(L) ⊇ key_paths(H)          (shape, unchanged)
+    material_paths(L) ⊇ material_paths(H)   (material, new)
+
+and a lower 2xx object body for which the shape test passes and the material test fails is
+a **hollow shape**: it withholds `status_parity` and `body_superset` (both `None`), lands
+on row 9 with reason `lower_hollow_shape`, stores an `inconclusive` finding, and is not a
+candidate. Everything else in §8.4–§8.5 is unchanged.
+
+Definitions, on the parsed and redacted bodies of §8.1 (`L` lower, `H` higher):
+
+- `truthy(v)` and `material_paths(B)`: §8.2.
+- `shape(L, H)` := `key_paths(L) ⊇ key_paths(H)`.
+- `material(L, H)` := `material_paths(L) ⊇ material_paths(H)`.
+- `hollow(L, H)` := `L.status` is 2xx ∧ `L.json` is an object ∧ `L.json` is not a denial
+  envelope ∧ `shape(L, H)` ∧ ¬`material(L, H)`.
+- Computed only when `positive_control` ∧ `method ≠ HEAD` ∧ `H.json` is an object ∧
+  `key_paths(H)` is nonempty ∧ no bound is exceeded by either body. Otherwise `hollow` is
+  false and the pre-D4 rules apply unchanged.
+
+Deterministic evaluation order inside `_evaluate`: parse; `lower_denial`; positive control;
+shape and material sets (`key_paths` then `material_paths`, each body; `BodyTooComplex`
+from any of the four walks ⇒ `body_superset = None`, `hollow = False`); then
+`body_superset` := `None` if hollow, else `2xx(L) ∧ object(L) ∧ shape(L, H)`; then
+`status_parity` := `None` if `lower_denial` or `hollow`, else as §8.4; then `marker_leak`;
+then rows 1–9 in order. Row-9 reason precedence: `lower_denial_envelope`, then
+`lower_hollow_shape`, then `unexpected_status`, then `body_too_complex`.
+
+Properties the tests pin:
+
+- Reflexive: `L.json == H.json` is `observed` exactly as before, so the 53 affirmative
+  controls of report §10.3 and the 11 committed guards are unchanged.
+- Value-blind: replacing any truthy value in `L` by any other truthy value of any JSON
+  type changes nothing. Heel never compares a URL, ID, name, count or tenant value for
+  equality. Only the truthy/non-truthy class of a value at a path is read.
+- Monotone: adding a truthy value or a key to `L` never turns `observed` into anything
+  else; removing one never turns a non-finding into `observed`.
+- Not required: a path that is `null`, `false`, `0`, `""`, `[]` or `{}` in `H` is not in
+  `material_paths(H)`, so `L` may hold anything there. A higher body with no truthy value at
+  all has an empty material set and behaves as before.
+- Missing versus hollow: a higher key path absent from `L` is the pre-D4 `lower_subset`
+  (row 8, candidate); present with a non-truthy value it is hollow (row 9, not a
+  candidate). The distinction is the point of D4: an omitted field is a narrower response,
+  an echoed-but-empty field is the signature of a schema-shaped denial.
+
+**Truth table T1: leaf materiality** (`material_paths` of `{"k": v}` contains `$.k`?)
+
+| `v` | material | `v` | material |
+|---|---|---|---|
+| absent | no (no path at all) | `"x"`, `"0"`, `"false"`, `"null"`, `" "` | yes |
+| `null` | no | `1`, `-1`, `0.5`, `2**60`, `1e-9` | yes |
+| `false` | no | `true` | yes |
+| `0`, `0.0`, `-0.0`, `0e0` | no | `[0]`, `[null]`, `[""]`, `{"a": null}` (the container path) | yes |
+| `""` | no | `["a"]`, `{"a": 1}` | yes |
+| `[]`, `{}` | no | value under a secret-named key, any `v` | no (path kept, never material, not descended) |
+
+For `{"k": [e1, e2, …]}`: `$.k[]` is material iff some `ei` is truthy; `$.k[].m` is material
+iff some element object has a truthy `m`. `NaN`, `Infinity` and duplicate keys never reach
+this table (§8.1 parse rejects them: `json = None`).
+
+**Truth table T2: pair rows.** All with `status 200` both sides, `GET`, no marker, positive
+control present. `H` = `{"ok": true, "success": true, "status": "ok", "export_url":
+"https://files/x.csv", "rows": 3}` unless stated. Columns: verdict row, reason,
+`status_parity`, `body_superset`, candidate.
+
+| Case id | `L` (relative to `H`) | Row | Reason | `sp` | `bs` | cand. |
+|---|---|---|---|---|---|---|
+| `missing_key` | `rows` absent | 8 | `lower_subset` | T | F | yes |
+| `null_key` | `rows: null` | 9 | `lower_hollow_shape` | — | — | no |
+| `empty_string` | `export_url: ""` | 9 | `lower_hollow_shape` | — | — | no |
+| `empty_list_for_scalar` | `rows: []` | 9 | `lower_hollow_shape` | — | — | no |
+| `empty_object_for_scalar` | `rows: {}` | 9 | `lower_hollow_shape` | — | — | no |
+| `false_for_true` | `H` has `verified: true`; `L` same but `verified: false` | 9 | `lower_hollow_shape` | — | — | no |
+| `zero_for_three` | `rows: 0` | 9 | `lower_hollow_shape` | — | — | no |
+| `zero_float` | `rows: 0.0` | 9 | `lower_hollow_shape` | — | — | no |
+| `different_string` | `export_url: "https://files/other.csv"` | 6 | `lower_superset` | T | T | no |
+| `different_number` | `rows: 7` | 6 | `lower_superset` | T | T | no |
+| `negative_number` | `rows: -1` | 6 | `lower_superset` | T | T | no |
+| `string_for_number` | `rows: "seven"` | 6 | `lower_superset` | T | T | no |
+| `number_for_string` | `export_url: 42` | 6 | `lower_superset` | T | T | no |
+| `true_for_string` | `export_url: true` | 6 | `lower_superset` | T | T | no |
+| `whitespace_string` | `export_url: " "` | 6 | `lower_superset` | T | T | no |
+| `string_zero` | `rows: "0"` | 6 | `lower_superset` | T | T | no |
+| `list_for_scalar` | `rows: [1]` | 6 | `lower_superset` | T | T | no |
+| `object_for_scalar` | `rows: {"n": 1}` | 6 | `lower_superset` | T | T | no |
+| `nested_same_shape_other_values` | `H` `{"a": {"b": "x", "c": 1}}`, `L` `{"a": {"b": "y", "c": 2}}` | 6 | `lower_superset` | T | T | no |
+| `nested_null_leaf` | same `H`, `L` `{"a": {"b": null, "c": 2}}` | 9 | `lower_hollow_shape` | — | — | no |
+| `nested_empty_object` | `H` `{"a": {"b": "x"}}`, `L` `{"a": {}}` | 8 | `lower_subset` | T | F | yes |
+| `list_rows_other_values` | `H` `{"rows": [{"id": "r1", "amount": 1}]}`, `L` `{"rows": [{"id": "z", "amount": 9}]}` | 6 | `lower_superset` | T | T | no |
+| `list_rows_null_stuffed` | same `H`, `L` `{"rows": [{"id": null, "amount": null}]}` | 9 | `lower_hollow_shape` | — | — | no |
+| `list_rows_one_material_element` | same `H`, `L` `{"rows": [{"id": null, "amount": null}, {"id": "z", "amount": 2}]}` | 6 | `lower_superset` | T | T | no |
+| `list_empty_for_populated` | `H` `{"rows": [{"id": "r1"}]}`, `L` `{"rows": []}` | 8 | `lower_subset` | T | F | yes |
+| `list_of_nulls_for_scalars` | `H` `{"tags": ["a", "b"]}`, `L` `{"tags": [null]}` | 9 | `lower_hollow_shape` | — | — | no |
+| `list_fewer_elements` | same `H`, `L` `{"tags": ["z"]}` | 6 | `lower_superset` | T | T | no |
+| `higher_null_lower_null` | `H` = `L` = `{"a": 1, "b": null}` | 6 | `lower_superset` | T | T | no |
+| `higher_null_lower_material` | `H` `{"a": 1, "b": null}`, `L` `{"a": 2, "b": "x"}` | 6 | `lower_superset` | T | T | no |
+| `higher_empty_list_lower_empty_list` | `H` = `L` = `{"a": 1, "b": []}` | 6 | `lower_superset` | T | T | no |
+| `higher_empty_list_lower_null` | `H` `{"a": 1, "b": []}`, `L` `{"a": 1, "b": null}` | 8 | `lower_subset` | T | F | yes |
+| `higher_false_lower_false` | `H` = `L` = `{"a": 1, "f": false}` | 6 | `lower_superset` | T | T | no |
+| `higher_false_lower_true` | `H` `{"a": 1, "f": false}`, `L` `{"a": 1, "f": true}` | 6 | `lower_superset` | T | T | no |
+| `higher_all_hollow` | `H` = `L` = `{"a": null, "b": ""}` | 6 | `lower_superset` | T | T | no |
+| `mixed_one_hollow` | `export_url: "https://files/y.csv"`, `rows: null` | 9 | `lower_hollow_shape` | — | — | no |
+| `mixed_extra_keys_hollow` | `rows: null`, plus `extra: "more"` | 9 | `lower_hollow_shape` | — | — | no |
+| `extra_hollow_keys_only` | `H` plus `extra: null` | 6 | `lower_superset` | T | T | no |
+| `final_status_false` | `export_url: null`, `rows: null`, `status: false`, `message: "Upgrade required"` | 9 | `lower_hollow_shape` | — | — | no |
+| `final_message_only` | `export_url: null`, `rows: null`, `message: "Upgrade required"` | 9 | `lower_hollow_shape` | — | — | no |
+| `final_PAYMENTREQUIRED` | `export_url: null`, `rows: null`, `code: "PAYMENTREQUIRED"` | 9 | `lower_hollow_shape` | — | — | no |
+| `final_accessdenied` | `export_url: null`, `rows: null`, `status: "accessdenied"` | 9 | `lower_hollow_shape` | — | — | no |
+| `denial_and_hollow` | `export_url: null`, `rows: null`, `ok: false` | 9 | `lower_denial_envelope` | — | — | no |
+
+The four `final_*` rows are the bodies of
+`test_redteam_break_d1_final_unrecognized_denial_body_yields_observed`; the three `ok`,
+`success`, `status: "ok"` members are truthy in both bodies and are not what decides them.
+
+**Truth table T3: ordering, bounds, HEAD, marker, replay.** `Hn` = `H` with `rows: null`
+(a hollow echo of `H`).
+
+| Case id | Pair | Result |
+|---|---|---|
+| `hollow_higher_denial_is_row_2` | `L` = `Hn`, `H` = `H` with `ok: false` | row 2 `no_positive_control`; hollow is not computed |
+| `hollow_lower_denial_status_is_held` | `L` = 403 `Hn`, `H` | row 7 `held` `lower_denied` (status decides; hollow needs a 2xx lower) |
+| `hollow_lower_500_is_unexpected` | `L` = 500 `Hn`, `H` | row 9 `unexpected_status` |
+| `hollow_lower_201_204_299` | `L` = 201/204/299 `Hn`, `H` | row 9 `lower_hollow_shape` at each 2xx status |
+| `head_unaffected` | `L` = `Hn`, `H`, `method = HEAD` | row 8 `head_status_only`, `sp` T, `bs` None, candidate; a HEAD pair never reads bodies |
+| `marker_present_in_hollow_body` | marker `M`; `H` `{"protected_canary": M, "rows": [{"id": "r1"}], "n": 1}`; `L` same with `rows: [{"id": null}]`, `n: null`; executor `observed` | row 3 `verified`: marker verification precedes D4 |
+| `marker_undetermined_in_hollow_body` | same, executor `inconclusive` | row 5 `marker_undetermined`; never row 6 or 9 |
+| `marker_absent_hollow_body` | same `H`; `L` `{"protected_canary": "", "rows": [{"id": null}], "n": null}`, executor `blocked` | row 4 `held` when `P(L)` is `False`, else row 5; never row 6 |
+| `bounds_wide_or_deep_body` | 4097 keys, or depth 18, either side | `BodyTooComplex` from both `key_paths` and `material_paths`; `bs` None, hollow false, pair on row 8 `status_only` as before D4 |
+| `secret_key_never_material` | `H` `{"a": 1, "token": "abc"}`, `L` `{"a": 1, "token": null}` | row 6: a secret-named key's value is never required |
+| `hollow_lower_replay` | saved `body_superset` regression; replay lower = 2xx `Hn` | §10 row 3: `fail` / `inconclusive` (verdict row 9 is neither `p` true nor `held`) |
+| `hollow_lower_in_fresh_run` | CLI run, lower answers 2xx `Hn` | stored `inconclusive` finding, `candidate: false`, exit code as for any inconclusive-only run; two requests on the route, lower then higher |
+| `reflexive_guards` | the 11 bodies of `test_redteam_holds_affirmative_bodies_keep_the_positive_control`, same body both sides | row 6 `observed`, unchanged |
+
+**Test map.** Opus adds the following to `tests/test_runner_plan_differential_predicates.py`
+(additive only; see §14.6). Each T2 and T3 case id above MUST be the parametrize id of a
+case in the named test, so a reviewer can find every row by name.
+
+| Named test | Rows it proves |
+|---|---|
+| `test_d4_truthy_leaf_table` | every T1 row, through `material_paths` directly |
+| `test_d4_material_paths_are_structural_and_bounded` | T1 array and secret-key rows; same output notation as `key_paths`; `BodyTooComplex` on the §8.2 bounds; `material_paths(x) ⊆ key_paths(x)` for every body of this file |
+| `test_d4_verdict_truth_table` | every T2 row and the T3 rows `hollow_higher_denial_is_row_2`, `hollow_lower_denial_status_is_held`, `hollow_lower_500_is_unexpected`, `hollow_lower_201_204_299`, `head_unaffected`, `secret_key_never_material`; asserts row, reason, `status_parity`, `body_superset`, `candidate`, `evidence_state`, `stores_finding` |
+| `test_d4_same_shape_different_values_stay_observed` | the mission guard: the T2 rows with row 6 whose `L` differs from `H` in value or type (`different_*`, `string_for_number`, `number_for_string`, `true_for_string`, `whitespace_string`, `string_zero`, `list_for_scalar`, `object_for_scalar`, `nested_same_shape_other_values`, `list_rows_other_values`, `list_fewer_elements`, `higher_null_lower_material`, `higher_false_lower_true`), plus a body whose every leaf is replaced by a different account-specific URL, ID, name and tenant value; every one `finding` / `observed` / row 6 |
+| `test_d4_hollow_shape_is_never_observed_candidate_or_held` | a grid over lower status {200, 201, 204, 299}, marker {none, `M`}, executor outcome {`observed`, `blocked`, `inconclusive`}, method {GET, HEAD} and the five hollow bodies `null_key`, `empty_string`, `zero_for_three`, `list_rows_null_stuffed`, `final_message_only`: `evidence_state` is never `observed`, `candidate` is true only for HEAD (row 8), `held` only on row 4; the marker rows `marker_present_in_hollow_body`, `marker_undetermined_in_hollow_body`, `marker_absent_hollow_body` |
+| `test_d4_bounds_leave_body_superset_undetermined` | `bounds_wide_or_deep_body` |
+| `test_d4_reflexive_bodies_unchanged` | `reflexive_guards`, plus `FULL`, `SUBSET`, `protected()` and `{"rows": []}` of this file, same body both sides, each row 6 |
+
+`hollow_lower_replay` and `hollow_lower_in_fresh_run` are proven at unit level by
+`test_d4_verdict_truth_table` (row 9, `body_superset` `None`, verdict not `held`) together
+with the unchanged §10 mapping that `test_r24_denial_envelope_is_inconclusive_in_fresh_run_and_regression_replay`
+already exercises end to end for row 9. The end-to-end hollow replay and fresh-run probes
+are reserved for the fresh Fable red team after Opus (§14.6), which may add them to
+`tests/test_runner_plan_differential_redteam.py`.
+
+Tests Opus MUST preserve unedited, all green on the final commit: the four
+`test_redteam_break_d1_final_unrecognized_denial_body_yields_observed` cases and the other
+57 cases of `tests/test_runner_plan_differential_redteam.py` (the D1 and rerun breaks,
+the 11 affirmative guards, D2, redirects, scope tamper, DNS rebinding, header injection);
+`test_r11_verdict_table_rows`, `test_r11_predicates_fail_closed`,
+`test_error_envelope_never_counts_as_parity`,
+`test_key_paths_are_structural_and_skip_secret_named_subtrees`; the I1–I8, R9–R27 tests of
+§12 including `test_r17_*` (exactly two requests per route) and `test_r24_*`.
+
+Accepted losses, stated so T5 and operators are not surprised: a genuine lower response
+that echoes the higher shape but is `false`, `0`, `null` or empty at any path where the
+higher body is truthy (a pagination flag that differs, a count of zero, an optional field
+left null for that account) is `inconclusive` / `lower_hollow_shape`, not `observed`. It
+fails closed. The residual false-positive surface is a denial body that puts a truthy
+value at every path the higher body populates (for example an upgrade URL in `export_url`
+and `1` in `rows`); Phase 1 cannot separate that from entitled data without comparing
+values, which the brief forbids, and it is recorded in §16.
 
 ## 9. Requests, budget, reservation, logging
 
@@ -809,6 +1082,9 @@ So a pass needs an affirmative denial. In particular:
   and `status_parity` are undetermined (§8.4), the verdict is `inconclusive`
   (`lower_denial_envelope`), and row 3 applies. `body_superset` becoming not-true is never
   a pass by itself.
+- **A 2xx hollow shape (§8.6) is `fail` / `inconclusive`** for the same reason
+  (`lower_hollow_shape`, verdict row 9, not `held`). Post-escalation D4; the replay code is
+  unchanged.
 - A lower response that is 2xx with fewer fields (`lower_subset`) is `fail` /
   `inconclusive`: the lower plan still received content.
 - A replay pair that does not complete is `fail` / `inconclusive` and stores no finding.
@@ -909,7 +1185,8 @@ Independent requirements:
 |---|---|---|---|
 | R9 | Total request budget | `test_r9_max_ops_hard_caps_total_requests` | safety — with `max_ops=5` and retries forced the target sees ≤ 5 requests; `--max-ops` 1, 101 and non-integer are rejected; a lower scope `max_requests` wins. |
 | R10 | CLI-only entry | `test_r10_no_mcp_or_rest_entry` | safety — `mcp_server.TOOL_NAMES` equals an explicit expected set; nothing in `mcp_server.py` or `rest.py` references `plan_differential`. |
-| R11 | Fail-closed predicates | `test_r11_verdict_table_rows` (one case per §8.5 row), `test_r11_predicates_fail_closed`, `test_error_envelope_never_counts_as_parity` | `tests/test_runner_plan_differential_predicates.py` — status-only, 2xx denial envelope, empty, HEAD, missing positive control, executor disagreement, exception in evaluation; `candidate` is `true` on row 8 only; an envelope makes `body_superset` `None`, not `False`. |
+| R11 | Fail-closed predicates | `test_r11_verdict_table_rows` (one case per §8.5 row), `test_r11_predicates_fail_closed`, `test_error_envelope_never_counts_as_parity`; and, from the red-team file, `test_redteam_break_d1_*` (all three generations, 29 cases, green after D4) and `test_redteam_holds_affirmative_bodies_keep_the_positive_control` | `tests/test_runner_plan_differential_predicates.py` — status-only, 2xx denial envelope, empty, HEAD, missing positive control, executor disagreement, exception in evaluation; `candidate` is `true` on row 8 only; an envelope makes `body_superset` `None`, not `False`. |
+| R28 | Material superset (D4, §8.6) | `test_d4_truthy_leaf_table`, `test_d4_material_paths_are_structural_and_bounded`, `test_d4_verdict_truth_table`, `test_d4_same_shape_different_values_stay_observed`, `test_d4_hollow_shape_is_never_observed_candidate_or_held`, `test_d4_bounds_leave_body_superset_undetermined`, `test_d4_reflexive_bodies_unchanged` | `tests/test_runner_plan_differential_predicates.py` — every row of §8.6 T1–T3 by case id; a hollow shape is never `observed`, never a candidate, never `held` without a marker; a same-shape materially populated lower body with different values is still `observed`. |
 | R12 | No scope creation or mutation | `test_r12_scope_files_are_never_written` | safety — the scopes directory's file list, bytes and mtimes are identical before and after bootstrap, dry-run, run, failed run and replay; the new module does not import `create_scope`. |
 | R13 | Dry-run sends nothing | `test_r13_dry_run_sends_nothing` | safety, no seam — zero sockets, no resolver call, no attempt directory, no credential variable consumed. |
 | R14 | No transport selection from the CLI | `test_r14_cli_cannot_select_transport` | `tests/test_runner_plan_differential_cli.py` — the `run` option set equals the six of §3.1; `_build_client` takes only `origin`; setting `HEEL_CA_BUNDLE`, `HEEL_RUNNER_CA_FILE`, `HEEL_RUNNER_TRANSPORT`, `HEEL_RUNNER_RESOLVER`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` leaves the constructed client's resolver, socket and TLS classes and its CA count unchanged. It makes no claim about `SSL_CERT_FILE` (see R23). |
@@ -1122,6 +1399,47 @@ If any shipped file changes after step 5 — in T2, or in a T4 remediation — s
 repeated in that same task before its closing status, and the artifact commit again
 contains only the three paths.
 
+### 14.6 Post-escalation D4 implementation allowlist (2026-10-05) — exhaustive
+
+The Opus D4 session starts at the commit that carries this record and may make the
+following changes and no other. `git diff --name-only <that commit> HEAD` on its final
+commit MUST list exactly paths 1–5 below.
+
+1. `heel/runner/plan_differential.py` — only: add `material_paths` (and export it in
+   `__all__`); change `_evaluate` to §8.6 (shape and material sets, `hollow`, the
+   `status_parity` and `body_superset` rules of §8.4, the row-9 reason
+   `lower_hollow_shape`); nothing else. `is_denial_envelope` and its helpers, `key_paths`,
+   the row order and row numbers, `PairVerdict`, the redaction classes, `_ScopedTransport`,
+   `_build_client`, `_prepare`, `_execute`, `replay_plan_differential`, every constant and
+   every reason string other than the one added MUST be byte-unchanged. No new import.
+2. `tests/test_runner_plan_differential_predicates.py` — additive only: the seven named
+   tests of §8.6. No existing line of the file may be edited or deleted (checked by
+   `git diff` of the file showing only `+` lines outside hunk headers). Shared helpers of
+   the file (`observation`, `evaluate`, `protected`, `FULL`, `SUBSET`, `ENVELOPE`) may be
+   reused.
+3. `apps/heel-cloud/public/downloads/heel-open-core-manifest.json` }
+4. `apps/heel-cloud/public/downloads/heel_sim-1.2.0-py3-none-any.whl` } regenerated only by
+5. `apps/heel-cloud/public/downloads/heel_sim-1.2.0.tar.gz` } the procedure of §14.5
+
+Explicitly not touched by Opus in this cycle: `tests/test_runner_plan_differential_redteam.py`
+(the Fable regression; its four failing cases MUST turn green by change 1 alone, and no
+case may be edited, weakened, skipped, xfailed or deleted), `docs/REDTEAM_PLAN_DIFFERENTIAL.md`,
+this spec, `docs/PLAN_DIFFERENTIAL_RUNNER.md` and `docs/CAPABILITIES.md` (their one-line lag
+on the hollow-shape reason is recorded in §16 for a later Fable doc commit), every file of
+§14.1 items 2, 4–19, and everything in §14.4.
+
+Commits: small, `git commit -s`, `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
+as the last trailer; the artifact commit alone holds paths 3–5. No push, no PR, no branch
+change.
+
+Gate the orchestrator reads: the final test command of §17.2 gives **0 failed**, passed =
+1598 + the number of cases Opus added (1594 + the 4 D1 final cases now green), 5 skipped;
+`tests/test_runner_plan_differential_redteam.py` alone gives **61 passed, 0 failed**;
+§17.3 `--check` prints `open-core release artifacts are current`; §17.4 P1–P3 unchanged
+(P2 still the same five runner modules); `git diff --check` clean; the diff of change 1
+contains no new denial word, key, wrapper, regex, classifier, annotation, network call or
+import.
+
 ## 15. Limits the docs must state
 
 Inherited from the existing transport and contracts, unchanged by this work:
@@ -1147,7 +1465,9 @@ Chosen for Phase 1:
 - `observed` means the lower plan received every field the higher plan received on one
   read. It is a hypothesis about a missing plan gate; ungated-by-design routes will appear.
 - A 2xx denial body is never counted as parity, never as `held` without a marker, and
-  never as a regression pass.
+  never as a regression pass. Nor is a 2xx body that repeats the higher plan's key shape
+  but is `null`, `false`, `0` or empty at a path where the higher plan's body carries a
+  value (§8.6); it is reported `inconclusive` / `lower_hollow_shape`.
 - A regression passes only when the lower plan is denied by status (or the marker is
   absent) while the higher plan still succeeds.
 - Target ownership is asserted only by the operator's signed local scope.
@@ -1167,7 +1487,10 @@ Chosen for Phase 1:
 | The frozen-pair check in `_ScopedTransport` is enforcement inside one module, not a separate trust domain. The compiler and the transport's own route check stand behind it. | I2 (b), (d), (e); T3 to attack `_ScopedTransport` directly. |
 | The HMAC append inside `before_attempt` runs under the transport's attempt deadline; a slow disk becomes `gate_rejected`. Fails closed, may be flaky. | I6 under repeated runs. |
 | Up to 50 reserved runs in one attempt store against the 64-run bound. | R9 at `--max-ops 100`. |
-| Redaction matches raw and JSON-escaped forms only; other encodings of an echoed secret are not matched. | I5 echo cases; T3 to attack. |
+| Redaction matches every single-level JSON spelling of each secret character (§7.5); a double-encoded, split, base64, hex or percent-encoded echo is not matched (report §9.4, §10.4, D2 accepted). | I5 echo cases held through three T3 sessions. Remaining forms are out of Phase 1 scope. |
+| D4 (§8.6) loses genuine observations where the lower body is `false`, `0`, `null` or empty at a path the higher body populates (a differing pagination flag, a zero count, an optional field). Fails closed to `inconclusive`. | T5 to note how many pairs land on `lower_hollow_shape` against the synthetic target (expected: none of the documented journey's routes). |
+| D4 does not read values, so a 2xx denial body that places a truthy value at every path the higher body populates (an upgrade URL where a file URL was, `1` where a count was) is still `observed`. This is the stated boundary of a value-blind rule; closing it needs value comparison, which the brief forbids. | Fresh Fable red team after Opus to probe and record it as a documented limit or a break; a break here is a Phase 2 question, not a vocabulary patch. |
+| Doc lag: `docs/PLAN_DIFFERENTIAL_RUNNER.md` and the finding text do not yet name `lower_hollow_shape`. | A later Fable-authorized doc commit; not Opus, not T5 (brief T5 limits doc edits to three `CAPABILITIES.md` rows). |
 | Credentials registered before this change have handles that were never displayed. | Operator uses a fresh `HEEL_HOME`. |
 | `SYNTHETIC_ONLY` is the only data mode `heel scope create` issues; this design relies on canary accounts holding synthetic data. | Operator decision; not testable in code. |
 | Whether the `apps/` exception lets a T4 remediation regenerate the artifacts again. The brief says "after the product implementation is final"; §14.5 reads that as "whenever a shipped file last changed". | Orchestrator to confirm before any T4. |
