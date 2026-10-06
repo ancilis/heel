@@ -879,3 +879,279 @@ promoted.
   **4 failed, 1594 passed, 5 skipped**; delta from the T4 loop-2 final is the 4 new
   failing cases only.
 - Package `--check` current; `git diff --check` clean; path gates unchanged (§10.6).
+
+## 11. Post-escalation D4 review (fresh Fable session)
+
+Date: 2026-10-05. Branch at `2b55ab7` (D4 commits `835e59d`, `5182887`, `db013a2`,
+`4a44265`, `2b55ab7`). Reviewer: Claude Fable 5.1, fresh session. No product code, existing
+test or artifact was edited; this section and one failing regression test appended to
+`tests/test_runner_plan_differential_redteam.py` are the only changes. Sections 1–10 describe earlier
+commits and are kept as written. Every request in this section went to the loopback
+synthetic listener through the one disclosed seam.
+
+### 11.1 Result
+
+**FAIL: D9, a fourth R11 break. T5 and T6 must not start.** D4 closes D1: every 2xx
+denial body of §§2–10 is now `inconclusive`, and every egress, scope, reservation, logging,
+caller and chain boundary held again. But the material-superset rule compares path
+*strings*, and a lower body that is hollow at the one path the higher body populates is
+stored `finding` / `observed` when a literal key spelled like that path carries a truthy
+value (§11.3 item 5, §11.4, §11.9). The brief's test for this item is explicit: if an alias
+can turn a materially hollow lower response into `observed`, D4/R11 fails. It can.
+
+| Item | Verdict | Basis |
+|---|---|---|
+| I1 host confinement, redirects included | **PASS** | §11.6 |
+| I2 GET/HEAD and inventoried routes, in the compiler | **PASS** | §11.6 |
+| I3 verified signed scope | **PASS** | §11.6 |
+| I4 one-shot reserved attempt | **PASS** | §11.6 |
+| I5 secret exclusion | **PASS** | §11.5, §11.6 |
+| I6 every request logged first | **PASS** | §11.6 |
+| I7 caller attribution | **PASS** | §11.6 |
+| I8 chain integrity | **PASS** | §11.6 |
+| D4 / R11 fail-closed predicates: a 2xx denial body never parity, never `observed` | **FAIL** (D9, path-string aliasing) | §11.3 item 5, §11.4, §11.9 |
+| Exactly two requests per route, none anonymous; budget | **PASS** | §11.4, §11.6 |
+| Package freshness, path gates, allowlist | **PASS** | §11.7 |
+
+The hash-seed-dependent `_secret_key` (§11.5) is recorded as a bounded defect, not a
+break. The truthy value-blind boundary (§11.3 item 6) is recorded as the documented limit
+of spec §16. Nothing in this section exposes a credential or lets a regression replay pass
+falsely; D9 is a false `observed` on a hollow body, the class D4 was adopted to end.
+
+### 11.2 Committed red-team file first
+
+`TMPDIR=/private/var/folders/yc/l85h50j14_96655zkm2z_mdw0000gn/T .venv/bin/python -m pytest -q
+tests/test_runner_plan_differential_redteam.py` at `2b55ab7`, before any edit:
+**61 passed, 0 failed** (25.2 s). CONFIRMED. The file has an empty diff against `835e59d`;
+the four `test_redteam_break_d1_final_*` cases turned green from the product change alone.
+
+### 11.3 D4 predicate attacks (unit, `evaluate_plan_pair`)
+
+Code read: `material_paths` (`heel/runner/plan_differential.py:155-179`), `_evaluate`
+(`:293-389`), `git diff 835e59d HEAD -- heel/runner/plan_differential.py` (+45/−9, one new
+function, six hunks in `_evaluate`, one in `__all__`; no new import, regex, word, key set or
+network call). Scratch file of 149 cases, not committed; all CONFIRMED unless marked.
+
+1. **Every D1 body of this report** (9 first-session, 12 rerun, 4 final): row 9,
+   `inconclusive`, `candidate` false, `status_parity` None, `body_superset` None. Reasons:
+   21 `lower_denial_envelope`; the four §10 bodies (`status_false_with_message`,
+   `message_only_denial`, `code_run_on_PAYMENTREQUIRED`, `status_run_on_accessdenied`) are
+   `lower_hollow_shape`. The structural rule catches exactly what the recognizer missed.
+2. **Hollow matrix.** Six hollow lower bodies (nulls; `false`/`0`; `""`/`[]`; `{}`/`{}`; one
+   field full and one hollow; hollow data with extra truthy `message`/`hint` keys) × lower
+   status {200, 201, 204, 206, 299} × executor outcome {observed, blocked, inconclusive}:
+   90 cases, every one row 9 `lower_hollow_shape`, never `held`, never `observed`. Three
+   nested hollows (leaf null under `data`, list element `[null]`, list `[0, false, ""]`) are
+   `lower_hollow_shape`. HEAD with the same bodies and statuses: 24 cases
+   `head_status_only`; HEAD 403 → `held`. Bounds: 4097 keys or depth 18 on either side →
+   `BodyTooComplex` from both walks, row 8 `status_only`, `body_superset` None, `candidate`
+   true; at 4095 keys `material_paths == key_paths`.
+3. **Precedence.** Marker present in a hollow lower body with executor `observed` → row 3
+   `verified` at 200, 201, 204, 299; with another executor outcome → row 5. Marker null in
+   a hollow body → row 5 `marker_undetermined`. Marker absent (`visibility: "redacted"`,
+   executor `blocked`, status 200) → row 4 `held`: the only `held` on a 2xx, and it needs
+   the marker. A hollow body carrying any vocabulary signal (`error`, `ok: false`,
+   `status: "error"`, `code: "PaymentRequired"`, `denied: true`) → `lower_denial_envelope`.
+   Higher-plan envelope → row 2. Hollow at 403 → row 7 `held`; at 500 →
+   `unexpected_status`; executor not completed → row 1 with the transport reason.
+4. **Same shape, different truthy values stay `observed`** (12 bodies): another account's
+   URL, another host, counts 3000, −1, 0.5, `"3"`, a list or object in place of a scalar,
+   an upgrade URL, denial text inside the data fields, an extra `message` key, and nested
+   objects and lists with different ids and lengths. A list empty where the higher list has
+   elements is the pre-D4 `lower_subset`; a list with one truthy element among falsy ones
+   keeps the path material.
+5. **Path identity (Opus residual).** Eleven alias constructions. Eight yield `observed`
+   where a tuple-path reading of the same JSON is hollow or not even a shape superset:
+   `{"a": {"b": null}, "a.b": 1}` against `{"a": {"b": 1}}`; the same with `data.url` /
+   `data.n`; `{"x": [0], "x[]": 1}` against `{"x": [1]}`; `{"a": [{"b": null}], "a[]": {"b": 1}}`;
+   a `$` key; an empty key against a `.` key; a literal `b.c` key nested inside `a`; and
+   `{"a": {"b": 1}}` against a flat `{"a.b": 1}`. Three fail closed: a flat `a.b` lower
+   against a nested higher is `lower_subset`; `{"a": null, "a.b": 1}` and `{"x": [], "x[]": 1}`
+   are `lower_hollow_shape`, because the container path itself is falsy.
+   Fuzz: 30 000 random pairs (seed 20261005; keys drawn from `a`, `b`, `a.b`, `""`, `[]`,
+   `$`, `a[]`, `.`, `b.a`, `ok`, `error`, `token`; 40 % of lowers derived by hollowing the
+   higher, half of those with a truthy alias key added; statuses 200–299, 403, 500): 2 219
+   `observed`; 5 structurally hollow `observed`, every one carrying a truthy value under an
+   alias-spelled key; **0** hollow `observed` without such a key; **0** envelope `observed`;
+   **0** `held` without a denial status; **0** `observed` where every non-secret leaf of the
+   lower is falsy.
+   **Decision: D4/R11 FAIL (D9).** I first drafted this item as a documented limit, on the
+   reading that spec §8.6 defines "material" over the path strings of §8.2, so a body with
+   a truthy value at the string `$.a.b` is by definition not hollow, and on the argument
+   that every alias case also needs a truthy value for each higher-material path and so
+   adds nothing beyond the §16 value-blind boundary. That reading contradicts the brief.
+   The brief's item 5 sets the test in JSON terms ("turn a materially hollow lower response
+   into `observed`"), and `{"a": {"b": null}, "a.b": 1}` is hollow at the only path
+   `{"a": {"b": 1}}` populates: the nested field the higher plan filled is `null` in the
+   lower response, and the value that satisfies the rule sits under a different key whose
+   spelling happens to collide with the notation. The orchestrator ruled on the brief's
+   reading; the two sentences above are my own earlier position, kept so the contradiction
+   is visible. The spec's notation is not the requirement, as §10.3 said of the vocabulary.
+   The consequence is an `observed` finding, `operator_declared: false`, exit 1, and a
+   regression that reports `fail` / `still_reachable` against the hollow-with-alias body
+   (§11.4). No credential, egress or replay-pass boundary is involved, and the §16 truthy
+   boundary is unchanged by this item; the break is that D4's own promise, "a hollow lower
+   body is never `observed`", is false under a key spelling the product does not control.
+   Fix direction for whoever decides: compare structural paths (tuples, or an escaped
+   notation) in both `key_paths` and `material_paths`; not a vocabulary patch.
+6. **Truthy denial-shaped bodies at every higher-material path** (7 bodies): an upgrade
+   URL with `rows: 1`; `"payment required"` as the value of both data fields; `_HIGHER`
+   plus `message` or `reason`; `rows: -1`; `export_url: "#"`; `export_url: " "`. All
+   `observed`, `is_denial_envelope` false. With any recognized signal added (`ok: false`,
+   `status: "error"`, `error`, `upgrade_required: true`, `code: 402`) each becomes
+   `lower_denial_envelope`. **Recorded as the documented D4 boundary of spec §16, not a
+   violation**: these bodies carry a value at every field the higher plan populated; a rule
+   that reads no values cannot separate them from a genuine lower response with different
+   content (item 4), and the brief forbids value comparison. Whether Phase 2 compares
+   values or reports such pairs as `candidate` only is the open question §16 already names.
+7. **Secret-named paths are never material.** Higher `{"token", "password",
+   "authorization", "rows": 3}`: lower with `rows: null` is hollow; lower with all three
+   secret fields null and `rows: 3` is `observed`; `material_paths(higher) == {"$.rows"}`.
+
+### 11.4 End to end through the public CLI, transport, executor, store and replay
+
+One `_World` journey (scratch, the committed red-team helpers), routes `GET` + `HEAD`
+`/api/export` and `GET /api/nested`, 15 fresh runs and 13 `regress run` replays. Every
+claim CONFIRMED.
+
+- **Vulnerable**: exit 1, `GET /api/export` and `GET /api/nested` `observed`,
+  `HEAD /api/export` `head_status_only`; the export finding added with `regress add`;
+  `regress run` → `fail` / `still_reachable`.
+- **The four §10 bodies plus `false`/`0` and `""`/`[]` variants as the lower 200 body**:
+  pair `inconclusive` / `inconclusive` / `lower_hollow_shape`, `candidate: false`,
+  `execution_disposition: completed`; `heel findings --run` stores it with
+  `evidence_state: inconclusive`, reason `lower_hollow_shape`, and no `observed`
+  hypothesis for that route; `regress run` → `fail` / `inconclusive`,
+  `matches_expected: false`, the replay's stored reproduction `inconclusive` /
+  `lower_hollow_shape`.
+- **`regress add` accepts the hollow inconclusive finding itself** (exit 0, scenario
+  `plan_differential.inconclusive`, `expected_status: blocked`), as it accepts the envelope
+  finding (§2). Its replay: lower still hollow → `fail` / `inconclusive`; lower now the full
+  body → `fail`; lower 403 → `pass` / `blocked`. Never a pass on a 2xx.
+- **Hollow at 201, 204 and 299**: `lower_hollow_shape`, `completed`; replay `fail`. A 204
+  with a body was carried by the transport and judged like a 200.
+- **Alias through the CLI**: `{"data": {"url": null, "n": null}, "data.url": "https://files/x.csv",
+  "data.n": 2, "ok": true}` against `{"data": {"url": "https://files/x.csv", "n": 2}, "ok": true}`
+  is stored `observed`; the same body without the two alias keys is `lower_hollow_shape`.
+- **The D9 pair end to end** (second scratch journey, one route `GET /api/alias`, 10
+  requests, lower then higher each time, none anonymous, `HEEL_HOME` scan clean): higher
+  `{"a": {"b": 1}}`, lower `{"a": {"b": null}, "a.b": 1}` → fresh run exit 1, pair
+  `finding` / `body_superset` / `lower_superset`, `candidate: false`; `heel findings --run`
+  stores `evidence_state: observed`, `operator_declared: false`; `regress add` accepts it
+  (`expected_status: blocked`). `regress run`: lower still the alias body → `fail` /
+  `still_reachable`, replay finding `observed`; lower hollow without the alias key → `fail`
+  / `inconclusive` (`lower_hollow_shape`); lower the full body → `fail` / `still_reachable`;
+  lower 403 → `pass` / `blocked`. The false `observed` therefore reproduces through the
+  transport, executor, store and replay, and persists as a regression that will "still be
+  reachable" for as long as the target emits the alias key.
+- **Different values and the truthy denial-shaped body**: `observed`, replay `fail` /
+  `still_reachable`. **Hardened (403)**: `held` / `lower_denied` for GET and HEAD, no
+  finding, replay `pass` / `blocked`.
+- **Accounting over the whole journey**: the target saw 116 requests: 15 × 6 (three pairs,
+  lower then higher, GET and HEAD) + 13 × 2 replays; 30 HEAD; 0 with no or an unknown
+  credential; methods `GET` and `HEAD` only; `Host` the synthetic host on every request;
+  the second listener saw nothing; 14 containment entries per fresh run, `chain_valid`
+  true each time. Byte scan of `HEEL_HOME` for both tokens after the journey: no hit.
+- **Budget**: `--max-ops 5` with connects 0 and 2 forced to fail on a six-route inventory:
+  the target saw 1 request, `requests_sent` 4, the first pair `incomplete` /
+  `budget_exhausted`, the rest `not_started`. INFERRED that `requests_sent` counts reserved
+  attempts rather than deliveries; the hard cap held either way, and
+  `test_r9_max_ops_hard_caps_total_requests` passes.
+
+### 11.5 Hash-seed-dependent `_secret_key` (Opus residual)
+
+`heel/runner/redaction.py:42-51` joins a *set* of name parts into `compact`, so a
+multi-part compact name matches only when the set iterates in one order.
+`PYTHONHASHSEED` 0–7 and random, CONFIRMED:
+
+- Unstable: `api_key`, `x-api-key`, `apiKey`, `API-Key`, `X-Api-Key`, `key_api` (`api_key`
+  true under seeds 2–6 and random, false under 0, 1, 7; `x-api-key` true under 2, 5,
+  random only). Stable: `access_token`, `refresh_token`, `client_secret`,
+  `proxy-authorization`, `set-cookie`, `token`, `password` and every single-word name,
+  because the first clause matches a part, not the join. Only the api-key spellings are
+  affected.
+- **No credential exposure.** A configured credential under `api_key`, `x-api-key`, nested,
+  or an ordinary key is `[REDACTED:secret]` under every seed: redaction of the registered
+  credential is by value, not by key name. `test_i5_*`, `test_r24_*`, `test_r25_*`, every
+  `test_d4_*`, the D2 red-team cases, `test_error_envelope_never_counts_as_parity` and
+  `test_key_paths_*` pass under seeds 0 and 2 (114 passed each). A value that is not a
+  registered credential under an `api_key` key is masked only under a "secret" seed; that
+  is the key-name courtesy layer, outside I5's wording.
+- **Verdict instability, bounded.** Higher `{"api_key": "k", "rows": 3}`, lower
+  `{"api_key": null, "rows": 3}`: `lower_hollow_shape` under seeds 0, 1, 7 and `observed`
+  under 2–6. The flip exists only for paths under an api-key-named key; `rows: null` is
+  hollow under every seed. It cannot make a 2xx denial envelope `observed` (the recognizer
+  does not use `_secret_key`), cannot make a body hollow at a non-secret path `observed`,
+  and cannot turn a replay into `pass`.
+- **Disposition**: a correctness defect in `heel/runner/redaction.py`, unchanged since
+  `844fc1f`, outside the D4 allowlist and outside this review's edits. It needs its own
+  decision (a sorted join, or testing every part order). Not a safety failure under the
+  brief's test.
+
+### 11.6 Original adversarial set and the eight invariants
+
+Commands and results, all at `2b55ab7` with the §17.2 `TMPDIR`, CONFIRMED:
+
+- `pytest -q tests/test_runner_plan_differential_safety.py -k "test_i1_ or … or test_i8_"`:
+  **11 passed** (`test_i1_*` ×2, `test_i2_*` ×3, `test_i3_*`, `test_i4_*`, `test_i5_*`,
+  `test_i6_*`, `test_i7_*`, `test_i8_*`).
+- `pytest -q` over the four plan-differential files `-k "holds or r9_ or r17_ or r24_ or
+  r22_ or r12_ or r13_ or r10_ or error_envelope or r11_ or test_i"`: **63 passed**:
+  redirect 301/302/303/307/308 for GET and HEAD refused (5), DNS rebinding between
+  preflight, retry and peer check (6), scope tamper between the lower and higher request
+  (3), credential material cannot inject a header (4), affirmative bodies keep the positive
+  control (11), budget (R9), two requests per route and HEAD never anonymous (R17 ×2),
+  envelope in fresh run and replay (R24), completed-only findings (R22), scope files never
+  written (R12), dry-run sends nothing (R13), no MCP/REST entry (R10), the 13 R11 rows,
+  `test_r11_predicates_fail_closed`, `test_error_envelope_never_counts_as_parity`, and the
+  11 invariant tests.
+- Host header, IPv6 literal, attempt-ID replay and credential leak through error paths are
+  inside `test_i1_*`, `test_i4_*` and `test_i5_*` above; the §11.4 journey adds the Host
+  check on 116 live requests and the whole-`HEEL_HOME` scan after 28 runs.
+
+### 11.7 Suite, package, gates, allowlist
+
+- Full suite, `TMPDIR=/private/var/folders/yc/l85h50j14_96655zkm2z_mdw0000gn/T
+  .venv/bin/python -m pytest -q tests` at `2b55ab7`: **1703 passed, 5 skipped, 0 failed**
+  (640 subtests, 252 s). Delta from the T2 baseline 1486 / 5: +217 passed, skips
+  unchanged. Delta from the D4 Opus gate 1703 / 5: none. Expected by spec §14.6:
+  1598 + 105 added D4 cases = 1703.
+- `.venv/bin/python scripts/build_open_core_release.py --output apps/heel-cloud/public/downloads
+  --check`: `open-core release artifacts are current`, exit 0.
+- `git diff --name-only 835e59d HEAD`: exactly the five §14.6 paths. The predicates test
+  diff has no removed line (+443/−0 across the two Opus test commits).
+- P1 `git diff --name-only 844fc1f HEAD -- apps/`: the three artifacts;
+  `git status --porcelain -- apps/` empty. P2: `catalog.py`, `compiler.py`,
+  `http_transport.py`, `plan_differential.py`, `store.py`. P3: §14.1 items 1–22, the spec,
+  and the two §14.4 T3 files (this report and the red-team test). `git diff --check` clean
+  for the working tree and for `844fc1f..HEAD`.
+- Every D4 commit is `Signed-off-by: Ancilis Codex Agent` with the co-author trailer last
+  (Fable for `835e59d`, Opus for the other four).
+
+### 11.8 Least-certain claim
+
+That D9 has no reach beyond a false positive. I probed it only in the direction the brief
+names (hollow → `observed`) and in replay (never a false `pass`: §11.4). I did not search
+for an alias that makes a *genuine* superset read as hollow in a way an operator would act
+on, nor for one inside `protected_content`, which does not use `key_paths`. A fuzz over
+tuple-path versus string-path classification across both directions would confirm it.
+
+### 11.9 Regression, counts and disposition
+
+- Added, left failing, product untouched:
+  `test_redteam_break_d9_path_alias_turns_hollow_lower_body_into_observed`
+  (`tests/test_runner_plan_differential_redteam.py`): higher `{"a": {"b": 1}}`, lower
+  `{"a": {"b": null}, "a.b": 1}`, GET, no marker, executor completed; asserts
+  `body_superset is not True`, `status_parity is not True`, verdict `inconclusive` /
+  `inconclusive`. Current result: `finding` / `observed` / `lower_superset`, row 6,
+  `status_parity True`, `body_superset True`.
+- Red-team file with the regression: **1 failed, 61 passed**; the failure is the D9 test.
+- Full suite, `TMPDIR` as above: **1 failed, 1703 passed, 5 skipped** (640 subtests, 257 s); the failure is the D9 test. Delta from the D4 Opus gate 1703 / 5 /
+  0: the one new failing case only. Delta from the T2 baseline 1486 / 5 / 0: +217 passed,
+  +1 failed.
+- Package `--check` current; `git diff --check` clean; P1–P3 unchanged (§11.7).
+- Changed paths in this review: this report and `tests/test_runner_plan_differential_redteam.py`.
+  The drafted sync of `docs/PLAN_DIFFERENTIAL_RUNNER.md` was dropped with the verdict, as
+  the brief requires on FAIL; its doc lag on `lower_hollow_shape` stands (spec §16).
+- **Disposition: FAIL. T5 and T6 must not start.** The next step is a product decision on
+  path identity (D9) by Kevin, not a vocabulary patch and not a T4 loop on `_evaluate`.

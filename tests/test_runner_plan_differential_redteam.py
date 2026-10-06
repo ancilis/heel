@@ -459,3 +459,21 @@ def test_redteam_break_d1_final_unrecognized_denial_body_yields_observed(name):
     assert verdict.body_superset is not True, verdict
     assert verdict.status_parity is not True, verdict
     assert (verdict.verdict, verdict.evidence_state) == ("inconclusive", "inconclusive"), verdict
+
+
+# --------------------------------------------------------------------------- #
+# BREAK D9, post-escalation D4 review (REDTEAM_PLAN_DIFFERENTIAL.md section 11)
+# --------------------------------------------------------------------------- #
+def test_redteam_break_d9_path_alias_turns_hollow_lower_body_into_observed():
+    """EXPECTED TO FAIL (D9). The lower body is hollow at the one path the higher body
+    populates (`$.a.b` is null). A literal top-level key spelled `a.b` yields the same path
+    string, so the material-superset rule reads the hollow body as populated and the pair is
+    stored `finding` / `observed`. A hollow lower body must stay fail-closed."""
+    verdict = evaluate_plan_pair(
+        PlanObservation(200, json.dumps({"a": {"b": None}, "a.b": 1}).encode()),
+        PlanObservation(200, json.dumps({"a": {"b": 1}}).encode()),
+        method="GET", marker=None, executor_outcome=ExecutorOutcome("completed", "inconclusive"),
+    )
+    assert verdict.body_superset is not True, verdict
+    assert verdict.status_parity is not True, verdict
+    assert (verdict.verdict, verdict.evidence_state) == ("inconclusive", "inconclusive"), verdict
