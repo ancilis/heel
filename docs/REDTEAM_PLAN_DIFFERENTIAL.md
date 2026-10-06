@@ -1155,3 +1155,267 @@ tuple-path versus string-path classification across both directions would confir
   the brief requires on FAIL; its doc lag on `lower_hollow_shape` stands (spec §16).
 - **Disposition: FAIL. T5 and T6 must not start.** The next step is a product decision on
   path identity (D9) by Kevin, not a vocabulary patch and not a T4 loop on `_evaluate`.
+
+## 12. Post-escalation D5 review (fresh Fable session)
+
+Stakes: medium-blast: adds network egress under scope. Fresh Claude Fable 5.1 adversarial
+reviewer, 2026-10-06, branch `feat/plan-differential-runner`, HEAD `5219177` (D5 Opus final,
+base `main` at `844fc1f`). No product code edited. Every claim below is CONFIRMED by the named
+command or file unless marked INFERRED. Environment: Python 3.12.13, `pytest==9.0.2`,
+`dnspython==2.8.0`, `TMPDIR=/private/var/folders/yc/l85h50j14_96655zkm2z_mdw0000gn/T`
+(CONFIRMED `pip list`, `python --version`). Loopback synthetic targets only; no public egress.
+Ancilis Brain `orient` was called; coverage sparse (3 of 36), nothing load-bearing.
+
+### 12.1 Result
+
+**PASS on every controlling verdict. I1–I8 PASS, D5 structural path identity PASS. The D5 gate
+is green; T5 may start (not performed by this session).**
+
+| Verdict | Result | Evidence |
+|---|---|---|
+| I1 host confinement | PASS | `test_i1_*` ×2 green, unedited; 5 redirect-status and 6 DNS-rebinding `holds` cases green; 2 776 live requests in §12.3–§12.4 all carried `Host: plan-differential-synthetic.heel.dev`; the second listener saw 0 requests |
+| I2 GET/HEAD and inventory | PASS | `test_i2_*` ×3 green, unedited; live request methods were exactly `{GET, HEAD}` on planned paths only |
+| I3 verified signed scope | PASS | `test_i3_*` green, unedited; 3 scope-tamper `holds` cases green |
+| I4 one-shot attempt | PASS | `test_i4_*` green, unedited |
+| I5 credential secrecy | PASS | `test_i5_*` green, unedited; 4 credential-header `holds` cases green; byte scan of six `HEEL_HOME` trees after 2 776 requests found neither token |
+| I6 logged before send | PASS | `test_i6_*` green, unedited |
+| I7 caller attribution | PASS | `test_i7_*` green, unedited |
+| I8 chain integrity | PASS | `test_i8_*` green, unedited |
+| D5 structural path identity | PASS | §12.3 (127 end-to-end rows), §12.4 (journey), §12.5 (fuzz: 0 mismatches in 51 342 compared pairs over two seeds), §12.6 (8 899 bodies, lemma holds byte for byte), §12.7 (diff audit) |
+
+No stop condition of spec §8.7.8 fired. Observations O1–O5 (§12.9) are recorded limits or
+pre-existing behaviour, none introduced or worsened in kind by D5, none a false positive, a
+2xx replay pass, or a safety change.
+
+### 12.2 Committed red-team file first; D9 green from the product change alone
+
+- `git diff d479ff9 HEAD --stat -- tests/test_runner_plan_differential_redteam.py`: empty.
+- `pytest -q tests/test_runner_plan_differential_redteam.py`: **62 passed in 25.26 s**, the D9
+  test green and unedited.
+- `git show e05841b:heel/runner/plan_differential.py | diff -q - heel/runner/plan_differential.py`:
+  identical, so the module that made D9 green at the product commit is the module at HEAD.
+- Detection check: with the `d479ff9` walks exec'd over the HEAD module (scratch plugin, no
+  file changed) and `-k "d5 or d9 or d4 or key_paths"` on the predicates and red-team files:
+  **18 failed, 134 passed** — D9, `test_d5_path_segments_render_injectively`, the three corpus
+  seeds, and exactly the 13 T4 rows the spec marks "before D5 = OBS" (`dot_alias_hollow_nested`,
+  `dot_alias_wrapped_hollow`, `nested_lower_vs_dot_literal_higher`, `dot_alias_in_higher_only`,
+  `nested_and_literal_literal_hollow`, `array_token_alias_hollow_list`, `array_element_object_alias`,
+  `dollar_key_nested_alias`, `empty_key_nested_alias`, `empty_key_double_alias`,
+  `backslash_key_vs_nested`, `backslash_dot_alias`, `unicode_nested_alias`). The D4 and
+  notation-pinned tests pass under the old renderer, as the §8.7.2 lemma predicts. The D5 tests
+  are therefore not vacuous. Under `PYTHONHASHSEED` 0, 2 and 7 the same selection at HEAD gives
+  152 passed each.
+
+### 12.3 All 40 T4 rows end to end (spec §8.7.8 item 1)
+
+Scratch pytest file (not committed) using the committed `World`, `invoke`, `pairs_by_route` and
+`home_contains` helpers and a `respond` wrapper on the synthetic target that answers the free
+session's `GET /api/export` with the row's lower JSON **text** (so `é`, `é` and the NFD
+spelling reach the parser as written) and the pro session with the higher text; everything else
+delegates to the original `respond`. Product seam: the existing test-only `_build_client`
+replacement only. Each row: fresh `heel runner run` → `heel findings --run` → `heel regress run`
+against the body-superset regression saved from the vulnerable baseline.
+
+Five fresh `World`s (one per 8 rows) because the default scope's `max_requests` of 200 counts
+fresh runs and replays and ended my first single-`World` attempt at its ~80th run with the fixed
+rejection line and zero further requests (O4; correct budget behaviour).
+
+| Set | Rows | Pair (`verdict` / `predicate` / `reason` / `candidate`) | Stored finding | Replay |
+|---|---|---|---|---|
+| 40 forward rows at 200 | 40 | every row equals the spec's T4 column **and** my independent tuple reference | as below | as below |
+| 39 swapped rows (L↔H; the reflexive row has no swap) at 200 | 39 | 17 OBS, 21 SUB, 1 HOL, each equal to the reference | | |
+| 16 HOL rows at lower 201, 204, 299 | 48 | all `lower_hollow_shape` | | |
+| **HOL total** | 65 | `inconclusive` / `inconclusive` / `lower_hollow_shape` / `false` | `evidence_state: inconclusive`, reason `lower_hollow_shape`, `candidate: false` | **65 × `fail` / `inconclusive`**, replay finding `lower_hollow_shape` |
+| **OBS total** | 30 | `finding` / `body_superset` / `lower_superset` / `false` | `observed` | 30 × `fail` / `still_reachable` |
+| **SUB total** | 32 | `inconclusive` / `status_parity` / `lower_subset` / `true` | `inconclusive`, reason `lower_subset` | 32 × `fail` / `inconclusive` |
+
+127 rows, 127 `execution_disposition: completed`, **0 replay `pass`**, 0 `held`, 0 `observed`
+outside the structural-superset class. Accounting over the five worlds: 2 630 target requests,
+methods `{GET, HEAD}`, `Host` always the synthetic host, plan sessions `{free, pro}` only (none
+anonymous or unknown), second listener 0, `HEEL_HOME` byte scans for both tokens empty.
+`key_path_count` in stored observations for the alias rows: `dot_alias_hollow_nested` lower 3 /
+higher 2 (pre-D5 2 / 2), `dot_alias_wrapped_hollow` 6 / 4, `reflexive_alias_body` 3 / 3 — the
+§8.7.4 growth, informational.
+
+Reading of the stop condition: SUB rows are `candidate: true` by the standing row-8 rule
+(`status_parity` findings are candidates, spec §11), and the T4 table itself says so; I read
+"a candidate" in §8.7.8 as applying to hollow bodies, and "observed or held" to non-superset
+bodies. Under that reading no row violates it; under the literal reading the T4 table would
+contradict its own stop condition on 11 SUB rows that D5 did not change (O5).
+
+### 12.4 Report §11.4 journey rerun
+
+One further `World`, 146 requests, same accounting (GET/HEAD only, Host correct, second listener
+0, home scan clean):
+
+- Vulnerable baseline: `observed`, `regress add` accepted.
+- **D9 pair fresh**: exit 1 (other routes still find), pair `inconclusive` / `inconclusive` /
+  `lower_hollow_shape` / `candidate: false` / `completed`; `heel findings --run` stores
+  `evidence_state: inconclusive`, reason `lower_hollow_shape`, `operator_declared: false`,
+  `scenario_id: plan_differential.inconclusive`. The §11.4 false `observed` is gone.
+- `regress add` of that hollow inconclusive finding: exit 0, `expected_status: blocked`.
+- Replays of the body-superset regression with the lower body set to: the alias-hollow body →
+  `fail` / `inconclusive` (`lower_hollow_shape`); hollow without alias → `fail` / `inconclusive`;
+  the full body → `fail` / `still_reachable`; `{"error": "upgrade required"}` at 200 → `fail` /
+  `inconclusive` (`lower_denial_envelope`); `{"a": {"b": 1}, "a.b": null, "extra": 1}` (a genuine
+  structural superset carrying a null literal alias) → `fail` / `still_reachable`.
+- Wrapped alias hollow (`data.url` / `data.n`) at lower **201, 204, 299**: each
+  `lower_hollow_shape`, `completed`, stored `inconclusive`; replay `fail` / `inconclusive`.
+- **Hardened 403**: `held` / `status_parity` / `lower_denied`, no finding; replay of the
+  body-superset regression `pass` / `blocked` — the only `pass` in this review, on a 403.
+- Vulnerable again: `finding` / `body_superset` / `lower_superset`; replay `fail` / `still_reachable`.
+- The hollow inconclusive regression, second in the same `regress run`, returned `fail` /
+  `inconclusive` at every step including the 403. Cause isolated in a separate probe (O2): the
+  containment log of that replay run holds `plan_differential_pair` with reason
+  `credential_unavailable`, `execution_disposition: incomplete`, `requests_sent: 0`. When the
+  same alias-hollow inconclusive regression was **first** in the invocation it replayed `pass` /
+  `blocked` on 403, matching §11.4. Pre-existing, fail-closed, not D5.
+
+### 12.5 Independent structural fuzz (spec §8.7.8 item 2)
+
+Scratch script, my own reference (`ref_walk.py`: a recursive generator over tuples with a private
+array token, honouring the product's `_secret_key` on raw keys; a decoder written from the §8.7.1
+grammar; not derived from the committed `_d5_*` helpers), seeds **8675309** (6 000 iterations)
+and **424242** (4 000). Alphabet of 81 keys: plain words; `a.b`, `b.a`, `a.b.c`, `.`, `..`,
+`...`, `[]`, `[[]]`, `.[`, `[.`, `\.`, `\[]`, `\\`, `\`, `\\.`, `]]`, `[`, `]`, `x]`, `[x`,
+`a[]`, `a[].b`, `x[]`; whole rendered paths `$`, `$.a.b`, `$.x[]`, `$.`, `$..`, `$.$`;
+separator-secret names `a.token`, `token.a`, `x.password`, `secret[]`, `api.key`; `""`, space,
+tab, newline, `\x00`, `\x01`, `\x1f`, `\x7f`, U+2028, U+FEFF, U+200B, U+202E; lone surrogates
+`\ud800`, `\udfff`, `a\ud800b`, `\ud83d`; `é`, `e+U+0301`, `数`, `ключ`, an emoji, `~`, `/`,
+`a/b`, `a~1b`, `a~0b`, quotes; six keys of 1 000–1 500 code points (`.`×1200, `\`×1001,
+`[]`×600, `a.b[]\`×250, 1 000 `k` + `.`, 1 100 CJK). Bodies depth ≤ 5, width ≤ 5, scalars
+including `[]` and `{}`. Lower bodies: one material leaf hollowed to one of `null`, `0`, `""`,
+`false`, `[]`, `{}`, then at every enclosing object a truthy alias key spelled the **old** way
+(`a.b`, `x[].id`) or the **new** way (`a\.b`, escaped) or as the whole legacy path (`$.a.b`), plus
+a random extra key; variants with aliases added on both sides, in the higher body only and in
+the lower body only; lower statuses 200 and a sample of 201/204/206/299.
+
+| Seed | Bodies identity-checked (a)–(c) | Pairs compared (d) | HOL | OBS | SUB | Skipped row 2 / envelope | Lower bodies the old renderer merged | Mismatches | Hollow or non-superset `observed`/`held` |
+|---|---|---|---|---|---|---|---|---|---|
+| 8675309 | 18 000 | 25 671 | 2 596 | 11 203 | 11 872 | 327 / 2 | 7 394 | **0** | **0** |
+| 424242 | 12 000 | 17 175 | 1 749 | 7 517 | 7 909 | 158 / 1 | 4 875 | **0** | **0** |
+
+Identity check per body: `{D(p)}` of `key_paths` equals the reference shape set with equal
+cardinality, likewise `material_paths` against the reference material set, and for every
+metacharacter-free body both walks equal the `d479ff9` walks byte for byte. Deterministic
+cases, all as the reference: alias chains at depth 14, 15 and 16 → `lower_hollow_shape`;
+depth 17 → `BodyTooComplex` from old and new walks alike → row 8 `status_only`; flat alias
+bodies of 4 094 and 4 095 keys render 4 094 / 4 095 paths in all four walks, 4 096 raise in all
+four; `{"d": {k0..k2046: null}, "d.k0".."d.k2046": 1}` (4 095 nodes) → `lower_hollow_shape`;
+4 097 nodes → `status_only`; a 1 500-code-point key alias, `\ud800` and `\udfff` aliases via
+JSON text, `$.a.b`, `$.x[]` and `$.a` literal keys, new-spelling aliases `a\.b`, `a\\.b`,
+`a\[\].b`, `..\...`/`....`, `\u0000.\u0000`, `[[]]..[`, and the separator-secret rows
+(`a.token`, `token.a`) → every hollow case `lower_hollow_shape` / not candidate / stored
+`inconclusive`, `{"a.token": 1, "b": 1}` vs nested → `lower_subset`. A lower JSON text with a
+duplicate key parses to `None` (`_unique_pairs`) and is `lower_subset` (O3, pre-existing).
+
+### 12.6 Rendering compared with `d479ff9` (spec §8.7.8 item 4)
+
+A scratch pytest plugin wrapped `plan_differential.key_paths` and `material_paths` to record
+every parsed body that reached either walk while the five plan-differential files ran
+(**264 passed** with the plugin; 116 s). Enumerated: **8 899 distinct bodies** (JSON-canonical
+dedup), every body of every test in the five files that reaches the walks in-process, including
+the CLI, safety, release and red-team journeys and the 4 500 corpus bodies. Not enumerated:
+bodies of `test_synthetic_harness_runs_the_documented_journey` (a subprocess; its target bodies
+are the same `EXPORT`/pricing bodies recorded by the in-process tests) and any literal that no
+test feeds to the walks (which by construction cannot change a rendering).
+
+| Class | Bodies | Result |
+|---|---|---|
+| Metacharacter-free (no key anywhere contains `\`, `.`, `[`, `]`) | 693 | `key_paths` and `material_paths` **byte-identical** to the `d479ff9` walks: 693 / 693 |
+| Metacharacter bodies | 8 185 | every rendered set decodes bijectively onto the reference tuple set (unique structural identity): 8 185 / 8 185; 8 116 render differently from `d479ff9`; 3 052 are bodies the old renderer merged |
+| `BodyTooComplex` | 21 | raised by old and new walks alike |
+
+0 problems. The 118 bodies Opus enumerated are a subset.
+
+### 12.7 Diff audit (spec §8.7.8 item 4, §14.7, §17.6)
+
+- `git diff --name-only e652a3d HEAD`: exactly the six §14.7 paths. `--numstat`: manifest 1/1,
+  two binaries, `heel/runner/plan_differential.py` **+10/−2**, `..._cli.py` **+59/−0**,
+  `..._predicates.py` **+374/−0**; deleted test lines against `e652a3d` and `d479ff9`: 0 and 0.
+- The product diff is `_PATH_ESCAPES`, `_path_segment` (two lines plus docstring) and the two
+  f-string tokens (`heel/runner/plan_differential.py:131-136, :151, :176`). Added lines grep
+  for `import`, `re.`, `frozenset`, `socket`, `http`, `urlopen`, `compile`, `open(`, `request`:
+  no match. `_secret_key(key)` still receives the raw key (`:153`, `:175`).
+- Unchanged since `d479ff9` (`git diff --stat` empty): the red-team, safety and release test
+  files, `plan_differential_support.py`, `plan_differential_harness.py`, `redaction.py`,
+  `scripts/`, `release/`, `pyproject.toml`, `MANIFEST.in`, README. `docs/` differs only in the
+  spec, from the Fable design commit `e652a3d`, outside the Opus allowlist by design.
+- The three notation-pinned tests are present at `..._predicates.py:262`, `:463`, `:479`,
+  unedited and green.
+- Commits `4dd3c5f` (tests only), `e05841b` (product only), `5219177` (the three artifacts
+  only): each `Signed-off-by: Ancilis Codex Agent <agents@ancilis.ai>` then
+  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` as the last trailer.
+- `git diff --check` clean against `e652a3d` and `844fc1f`.
+
+### 12.8 Suite, package, gates
+
+- Full suite (§17.2 command): **1750 passed, 5 skipped, 0 failed**, 640 subtests, 265.52 s,
+  exit 0. Delta from the T2 baseline 1486 / 5: **+264 passed**, skips unchanged. Delta from the
+  D5 red baseline 1 / 1703 / 5: **−1 failed, +47 passed**. Equal to Opus's claimed final.
+- Five plan-differential files: **264 passed** (§12.6 run); red-team file alone **62 passed**.
+- Safety selection across the four test files (`-k` on `test_i1_`…`test_i8_`, `r9_`, `r10_`,
+  `r11_`, `r12_`, `r13_`, `r17_`, `r20_`, `r22_`, `r24_`, `holds`, `error_envelope`):
+  **64 passed, 0 failed** — the 11 invariant tests, `test_r9_max_ops_hard_caps_total_requests`,
+  `test_r12_scope_files_are_never_written`, `test_r13_dry_run_sends_nothing`, both `test_r17_*`,
+  `test_r10_*`, `test_r20_*`, `test_r22_*`, `test_r24_*`, the 13 `test_r11_verdict_table_rows`,
+  `test_r11_predicates_fail_closed`, `test_error_envelope_never_counts_as_parity`, and the
+  `holds` cases (redirect ×5, DNS rebinding ×6, scope tamper ×3, credential header ×4,
+  affirmative bodies ×11).
+- `scripts/build_open_core_release.py --output apps/heel-cloud/public/downloads --check`:
+  `open-core release artifacts are current`, exit 0. SHA-256 manifest `8d89af45…34e8ea`, wheel
+  `e447a9ac…68e51e92`, sdist `97623d09…fc2d7ec`, equal to Opus's record.
+- P1: `apps/` differs from `844fc1f` in the three artifacts only; P2: `catalog.py`,
+  `compiler.py`, `http_transport.py`, `plan_differential.py`, `store.py`; P3: 25 paths.
+
+### 12.9 Observations (not D5 failures) and recorded limits
+
+- **O1 — path-string memory amplification, pre-existing, constant doubled by D5.** Each rendered
+  path repeats its prefix, so a body with one long key and many children materialises
+  `children × key length` characters. Measured on a 122 896-byte body with a 100 000-character
+  key and 2 000 children: `d479ff9` and HEAD both 2 001 paths, 200 MB of path text, peak
+  191 MiB; with the key spelled as 100 000 dots HEAD renders 400 MB, peak 382 MiB (old: 191).
+  The 256 KiB body cap bounds it, but the bound is on the order of `4 096 × 2 × 256 KiB` per walk
+  in the worst case. Not a stop condition (no behaviour class changes; §8.7.1 states the rendered
+  length is not separately bounded). Recommend a Phase 2 decision on a rendered-length or
+  total-path-bytes bound raising `BodyTooComplex`.
+- **O2 — only the first plan-differential regression in one `heel regress run` executes.** The
+  `ephemeral-env` vault pops `HEEL_RUNNER_CREDENTIAL_*` on first read
+  (`heel/runner/vault.py:260-272`), so the second and later plan-differential regressions get
+  `credential_unavailable`, `incomplete`, 0 requests, `fail` / `inconclusive`. Pre-existing
+  (`heel/regressions.py` and `replay_plan_differential` unchanged since `d479ff9`), fail-closed,
+  never a false `pass`. Operator-visible; worth a doc line or a decision.
+- **O3** — a lower JSON body with a duplicate key parses to `None` and is judged `lower_subset`
+  (candidate). Pre-existing `_unique_pairs` behaviour.
+- **O4** — the default scope's `max_requests` (200) counts replays and fresh runs together and
+  rejected my 80th-odd run with the fixed line and zero requests. Correct; noted for operators.
+- **O5** — the §8.7.8 stop-condition sentence reads literally as forbidding `candidate` for
+  non-superset bodies while the T4 table makes SUB rows candidates (standing row 8). Resolved
+  as in §12.3; a one-word spec clarification would remove the ambiguity.
+- Recorded limits confirmed not to combine with D5 into a stop condition: the §16 value-blind
+  boundary is unchanged (the `same_shape_different_truthy_values_with_literal_keys` and
+  `*_both_sides_truthy` rows are `observed` end to end, as specified); the §11.5 `_secret_key`
+  hash-seed defect is unchanged (`redaction.py` identical; `_secret_key` sees the raw key; the
+  D5 selection passes under seeds 0, 2, 7; a never-material path cannot satisfy a material
+  requirement, so an alias cannot exploit the flip); `key_path_count` grows only for alias bodies
+  (§12.3).
+
+### 12.10 Least-certain claim
+
+INFERRED: that my decoder-based identity check is independent of the thing it checks. The
+decoder is written from the same §8.7.1 grammar the renderer implements, so a spelling that
+fooled both identically would pass (a)–(c). The two-direction verdict comparison (d) does not
+use the grammar — it compares `evaluate_plan_pair` against the tuple walk directly — and found
+0 mismatches in 42 846 pairs, which is what carries the PASS. A third reference that renders
+tuples with an unrelated encoding (for example length-prefixed segments) and compares set
+cardinalities would confirm.
+
+### 12.11 Changed paths and disposition
+
+- Changed by this review: this report (appended §12 only; the preceding 76 397 bytes have MD5
+  `f2384995304026825340b28d83d50ec3` before and after). No test added: no break was
+  demonstrated. Nothing under `heel/`, `apps/`, `web/`, `scripts/`, the spec or the operator
+  docs touched. The untracked `docs/RESEARCH_LIBRARY_EXPANSION_PROMPT.md` and `launch/` are
+  preserved.
+- **Disposition: PASS. The D5 gate is green. T5 may start.** T5 was not performed in this
+  session. O1 and O2 are handed to the orchestrator as decisions, not blockers.
