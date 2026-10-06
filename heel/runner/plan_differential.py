@@ -128,6 +128,14 @@ class PairVerdict:
     marker_leak: bool | None = None
 
 
+_PATH_ESCAPES = str.maketrans({"\\": "\\\\", ".": "\\.", "[": "\\[", "]": "\\]"})
+
+
+def _path_segment(key: str) -> str:
+    """One object key as a path segment, the renderer's four metacharacters escaped."""
+    return key.translate(_PATH_ESCAPES)
+
+
 def key_paths(value: Any) -> frozenset[str]:
     """Key paths of a parsed body, never descending below a secret-named key."""
     paths: set[str] = set()
@@ -140,7 +148,7 @@ def key_paths(value: Any) -> frozenset[str]:
             raise BodyTooComplex("response body exceeds the key-path bound")
         if isinstance(node, dict):
             for key, child in node.items():
-                child_path = f"{path}.{key}"
+                child_path = f"{path}.{_path_segment(key)}"
                 paths.add(child_path)
                 if not _secret_key(key):
                     stack.append((child, child_path, depth + 1))
@@ -165,7 +173,7 @@ def material_paths(value: Any) -> frozenset[str]:
         if isinstance(node, dict):
             for key, child in node.items():
                 if not _secret_key(key):
-                    child_path = f"{path}.{key}"
+                    child_path = f"{path}.{_path_segment(key)}"
                     if child:
                         paths.add(child_path)
                     stack.append((child, child_path, depth + 1))
