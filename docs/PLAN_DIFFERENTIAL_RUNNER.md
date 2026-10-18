@@ -296,9 +296,36 @@ pair with a new invitation).
   and is never rewritten. Recover with `heel runner unpair` (it deletes the item) and pair
   again with a new invitation.
 - `$HEEL_HOME/runner-daemon/pairing.json` holds public coordinates only: the pinned origin,
-  the random installation ID naming the secret-store account, and the cloud-assigned IDs.
+  the random installation ID naming the secret-store account, the cloud-assigned IDs and the
+  cloud's grant-signing public key (`grant_authority_key_id`, `grant_authority_public_key_b64`).
   The signed pairing journal, paired identity and claim cursor are the existing runner
   store and runtime records.
+- **Cloud grant authority.** The activation the owner approved
+  (`heel.runner-pairing-activated.v4`; `control_protocol` stays `heel.runner-control.v2`)
+  carries `grant_authority: {key_id, public_key_b64}`: the raw 32-byte Ed25519 public key of
+  the control plane's own configured grant-signing authority, whose key ID must be derived
+  from the key. It is public material; it is the key the runner will use to verify context
+  bindings and grants the cloud signs. The runner never fetches it separately and there is
+  no flag or variable that supplies another key. A control plane without a configured
+  authority refuses new activations. The control plane replays a stored activation receipt
+  exactly as stored, including a receipt stored before this change (`v3`, no key), and never
+  rewrites it.
+- **Key rotation requires re-pairing.** The control plane signs with one grant key
+  (`HEEL_GRANT_SIGNING_KEY_ID`). After it changes, every paired runner holds the old public
+  key: `unpair`, then pair with a new invitation. This is a launch limitation, not a promise
+  of automatic re-trust.
+- **Version mismatch fails closed.** This runner accepts only a `v4` activation. Against a
+  control plane that answers `v3`, and for the runner in the pre-grant-authority download
+  artifact (which accepts only `v3`) against a control plane that answers `v4`, `pair` fails with `response_rejected` and nothing is
+  downgraded. This is a closed failure, **not** backward compatibility: the control plane has
+  already activated the pairing, so Heel Cloud lists an **active** runner that no local
+  runner can use, and it stays active after the local `unpair`. It counts against the
+  workspace's runner quota, so an owner must revoke it in Heel Cloud before a retry can
+  activate; then `unpair` and pair once both sides match. Both that artifact and the current
+  one report version `1.2.0`, so the version string does not tell them apart: the `v3`-only
+  wheel is the one committed before this change (commit `b426fc2`, sha256
+  `4dd9eec27ee57df187ccb5664a816cc3fdc17f6f132c166ab8d27bb1b6c428bf`). Whether anyone
+  installed it is unknown; this path is tested, not assumed unused.
 - Control traffic goes only to the `--origin` given at pairing: `https://` only, exact
   pathless lowercase origin, system trust with TLS 1.2 or newer and hostname checks, no
   redirects, no proxies, at most 256 KiB of JSON per response, one 30-second deadline per
@@ -308,8 +335,14 @@ pair with a new invitation).
   own duration, after which the call fails with `timeout` without connecting or sending. There
   is no CA-bundle flag or variable (the same `SSL_CERT_FILE` caveat below applies).
 - `status` reports `active`, `offline` (control plane unreachable), `runner_revoked` (the
-  control plane rejects the runner key), `pairing_incomplete`, `local_identity_unavailable`
-  or `unpaired`, plus the self-serve access state. `unpair` refuses while a context binding
+  control plane rejects the runner key), `pairing_incomplete`, `local_identity_unavailable`,
+  `cloud_authority_missing` or `unpaired`, plus the self-serve access state.
+  `cloud_authority_missing` means the record was written by a runner paired before the grant
+  authority was delivered (or its key does not match its key ID); it is reported without any
+  network call or secret-store access, with the next steps `heel runner unpair` and
+  `heel runner pair --origin <origin> --invite <new token>`. Such a record still loads, `pair`
+  still refuses it as `already_paired`, and `unpair` removes it and its seed. A record with
+  only one of the two key fields is `local_state_invalid`. `unpair` refuses while a context binding
   is installed; it removes the local identity and the OS-stored seed but cannot revoke the
   runner in Heel Cloud. An owner or admin revokes it there from a recent same-origin browser
   session with `POST /v1/workspaces/{ws}/runners/{id}/revoke` and the body
