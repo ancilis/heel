@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import http.client
 import inspect
 import io
 import json
@@ -61,6 +62,9 @@ class RecordingSecretBackend:
     def delete(self, label):
         self.deleted.append(label)
         self.values.pop(label, None)
+
+
+REVOKE_BODY = {"schema_version": "heel.runner-revoke.v1", "reason_code": "human_revocation"}
 
 
 @pytest.fixture
@@ -191,17 +195,14 @@ def test_real_pairing_over_tls_edge_harness_activates_persists_heartbeats_and_re
     assert offline["state"] == "active" and offline["control_plane"] == {"state": "not_checked"}
     assert offline["access"]["state"] == "access.incomplete"
 
-    # Owner revokes through the browser session over HTTP; the runner's next call must fail
-    # closed. SCOPE_DEPENDENCY (heel/saas/http_api.py, outside T2a): this step FAILS today —
-    # request framing refuses any DELETE body (`ambiguous_request_framing`) while
-    # `_runner_revoke` requires a `heel.runner-revoke.v1` body. It is left failing on purpose
-    # until the server route is repaired; no direct server call substitutes for it here.
-    revoke_path = f"/v1/workspaces/{workspace_id}/runners/{runner_id}"
-    status_code, body, _ = harness.request(
-        "DELETE", revoke_path,
-        {"schema_version": "heel.runner-revoke.v1", "reason_code": "human_revocation"}, cookie=cookie,
-    )
+    # Owner revokes through the browser session over HTTP (the reasoned-revocation POST, not a
+    # server-side store call); the runner's next call must fail closed.
+    revoke_path = f"/v1/workspaces/{workspace_id}/runners/{runner_id}/revoke"
+    status_code, body, _ = harness.request("POST", revoke_path, REVOKE_BODY, cookie=cookie)
     assert (status_code, body) == (200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
+    assert ("POST", revoke_path) in harness.forwarded
+    owner = harness.request("GET", "/v1/me", cookie=cookie)[1]["user_id"]
+    assert _revocation_audit(harness, workspace_id, runner_id) == [(owner, "human_revocation")]
     revoked = _daemon(home, harness, backend).status()
     assert revoked["state"] == "runner_revoked"
     assert revoked["control_plane"] == {"state": "rejected", "reason": "runner_revoked"}
@@ -212,46 +213,154 @@ def test_real_pairing_over_tls_edge_harness_activates_persists_heartbeats_and_re
     assert _daemon(home, harness, backend).status() == {"state": "unpaired"}
 
 
-def test_diagnostic_http_runner_revoke_route_is_unreachable_both_framings(tmp_path, harness):
-    """DIAGNOSTIC for the SCOPE_DEPENDENCY above, not gate evidence: pins today's defect."""
-    workspace_id, cookie = harness.signup_owner("owner-revoke-defect@example.test")
-    home, backend = _home(tmp_path, "runner"), RecordingSecretBackend()
+def _revocation_audit(harness, workspace_id, runner_id):
+    return [tuple(row) for row in harness.control_plane.store.conn.execute(
+        "SELECT actor, reason_code FROM canary_runner_audit_records "
+        "WHERE workspace_id=? AND runner_id=? AND action='runner_revoked' ORDER BY created_at",
+        (workspace_id, runner_id),
+    )]
+
+
+def _pair_runner(tmp_path, harness, workspace_id, cookie, name):
+    home, backend = _home(tmp_path, name), RecordingSecretBackend()
     _, outcome = _pair_with_owner_approval(
         harness, _daemon(home, harness, backend), workspace_id, cookie, _invite(harness, workspace_id, cookie),
     )
-    revoke_path = f"/v1/workspaces/{workspace_id}/runners/{outcome['result']['runner_id']}"
-    assert harness.request("DELETE", revoke_path, cookie=cookie)[:2] == (
-        400, {"error": "invalid runner revocation", "code": "invalid_runner_revocation"},
-    )
+    assert outcome["result"]["state"] == "active", outcome
+    return home, backend, outcome["result"]["runner_id"]
+
+
+def _raw_tls(harness, request: bytes) -> int:
+    context = ssl.create_default_context(cafile=str(harness.ca.ca_path))
+    with socket.create_connection(("127.0.0.1", harness.port), timeout=10) as raw:
+        with context.wrap_socket(raw, server_hostname="localhost") as tls:
+            tls.sendall(request)
+            head = tls.recv(4096)
+    return int(head.split(b" ", 2)[1])
+
+
+def _direct_backend(harness, method, path, body, headers):
+    """Bypass the edge on purpose to pin the server's own framing order (never gate evidence)."""
+    connection = http.client.HTTPConnection("127.0.0.1", harness.backend_port, timeout=10)
+    try:
+        connection.putrequest(method, path)
+        for name, value in headers:
+            connection.putheader(name, value)
+        connection.endheaders(body)
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+
+
+def test_runner_revoke_is_post_only_same_origin_exact_body_and_bounded_at_edge_and_server(tmp_path, harness):
+    """Replaces the T2a diagnostic that pinned the unreachable DELETE route."""
+    workspace_id, cookie = harness.signup_owner("owner-revoke-route@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "runner")
+    retired = f"/v1/workspaces/{workspace_id}/runners/{runner_id}"
+    revoke_path = retired + "/revoke"
+    refused = (400, {"error": "invalid control plane request"})
+
+    # The retired DELETE is no longer allowlisted at the edge, with or without a body.
+    sent = len(harness.forwarded)
+    assert harness.request("DELETE", retired, cookie=cookie)[:2] == (404, {"error": "not found"})
+    assert harness.request("DELETE", retired, REVOKE_BODY, cookie=cookie)[:2] == (404, {"error": "not found"})
+    # Server semantics behind the edge: generic framing runs before route matching, so a
+    # DELETE body is still ambiguous framing, while the bodiless retired route is unrouted.
+    edge_auth = ("X-Heel-Edge-Auth", harness.edge_secret)
+    body = json.dumps(REVOKE_BODY).encode()
+    assert _direct_backend(harness, "DELETE", retired, body, [edge_auth, ("Content-Length", str(len(body)))]) == (
+        400, {"error": "request body is not allowed", "code": "ambiguous_request_framing"})
+    assert _direct_backend(harness, "DELETE", retired, None, [edge_auth]) == (404, {"error": "not found"})
+    # Other methods on the new path are not allowlisted either.
+    assert harness.request("GET", revoke_path, cookie=cookie)[:2] == (404, {"error": "not found"})
+    assert harness.request("DELETE", revoke_path, cookie=cookie)[:2] == (404, {"error": "not found"})
+
+    # Edge: browser same-origin ceremony, cookie-only credentials, POST body contract and cap.
+    for options in (
+        {"origin": "https://evil.example"}, {"origin": None}, {"fetch_site": None},
+        {"fetch_site": "cross-site"}, {"fetch_site": "same-site"}, {"cookie": None},
+        {"headers": {"Authorization": "Bearer heel_sk_" + "a" * 32}},
+        {"headers": {"Content-Type": "text/plain"}},
+        {"headers": {"Content-Encoding": "gzip"}},
+        {"raw": b'{"schema_version":"heel.runner-revoke.v1","reason_code":"' + b"x" * (16 * 1024) + b'"}'},
+    ):
+        options = {"cookie": cookie, **options}
+        payload = None if "raw" in options else REVOKE_BODY
+        assert harness.request("POST", revoke_path, payload, **options)[:2] == refused, options
+    origin = harness.origin.encode()
+    head = (b"POST " + revoke_path.encode() + b" HTTP/1.1\r\nHost: localhost\r\nOrigin: " + origin
+            + b"\r\nSec-Fetch-Site: same-origin\r\nCookie: " + cookie.encode()
+            + b"\r\nContent-Type: application/json\r\n")
+    assert _raw_tls(harness, head + b"Content-Length: %d\r\nContent-Length: %d\r\n\r\n" % (len(body), len(body)) + body) == 400
+    assert _raw_tls(harness, head + b"Transfer-Encoding: chunked\r\n\r\n%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n") == 400
+    assert harness.forwarded[sent:] == [], "edge refusals must not reach the control plane"
+
+    # Server, behind a satisfied edge: the exact closed body schema, checked after the ceremony.
+    invalid = (400, {"error": "invalid runner revocation", "code": "invalid_runner_revocation"})
+    for candidate in (
+        {}, {"schema_version": "heel.runner-revoke.v1"},
+        {"schema_version": "heel.runner-revoke.v2", "reason_code": "human_revocation"},
+        {**REVOKE_BODY, "extra": True}, {"schema_version": "heel.runner-revoke.v1", "reason_code": 7},
+        {"schema_version": "heel.runner-revoke.v1", "reason_code": ""},
+        {"schema_version": "heel.runner-revoke.v1", "reason_code": " human_revocation"},
+        {"schema_version": "heel.runner-revoke.v1", "reason_code": "r" * 129},
+    ):
+        assert harness.request("POST", revoke_path, candidate, cookie=cookie)[:2] == invalid, candidate
+    assert harness.request("POST", revoke_path, raw=b"{not json", cookie=cookie)[:2] == (400, {"error": "invalid JSON body"})
+    assert harness.request("POST", revoke_path, raw=b"", cookie=cookie)[:2] == invalid
     assert harness.request(
-        "DELETE", revoke_path,
-        {"schema_version": "heel.runner-revoke.v1", "reason_code": "human_revocation"}, cookie=cookie,
-    )[:2] == (400, {"error": "request body is not allowed", "code": "ambiguous_request_framing"})
+        "POST", revoke_path, raw=b'{"schema_version":"heel.runner-revoke.v1","reason_code":"a","reason_code":"b"}',
+        cookie=cookie,
+    )[:2] == (400, {"error": "invalid JSON body"})
+    assert _revocation_audit(harness, workspace_id, runner_id) == []
     assert _daemon(home, harness, backend).status()["state"] == "active"
 
-
-def test_diagnostic_runner_fails_closed_after_server_side_revocation_not_gate_evidence(tmp_path, harness):
-    """DIAGNOSTIC ONLY (not gate evidence): revokes via the server's own
-    ``RunnerAuthStore.revoke`` — the function the broken HTTP route calls — to exercise the
-    runner's fail-closed handling while the HTTP route is unrepaired."""
-    workspace_id, cookie = harness.signup_owner("owner-revoke-diagnostic@example.test")
-    home, backend = _home(tmp_path, "runner"), RecordingSecretBackend()
-    _, outcome = _pair_with_owner_approval(
-        harness, _daemon(home, harness, backend), workspace_id, cookie, _invite(harness, workspace_id, cookie),
+    status, body_out, _ = harness.request(
+        "POST", revoke_path, {"schema_version": "heel.runner-revoke.v1", "reason_code": "device_lost"}, cookie=cookie,
     )
-    runner_id = outcome["result"]["runner_id"]
-    (label,) = backend.values
-    assert _daemon(home, harness, backend).status()["control_plane"]["state"] == "confirmed"
+    assert (status, body_out) == (200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
     owner = harness.request("GET", "/v1/me", cookie=cookie)[1]["user_id"]
-    with harness.control_plane.request_lock:
-        assert harness.control_plane.runner_auth.revoke(
-            workspace_id, runner_id, actor=owner, reason_code="human_revocation",
-        ) is True
+    assert _revocation_audit(harness, workspace_id, runner_id) == [(owner, "device_lost")]
+    assert _daemon(home, harness, backend).status()["state"] == "runner_revoked"
+
+
+def test_http_runner_revoke_retries_and_other_workspaces_have_no_effect(tmp_path, harness):
+    """Replaces the T2a direct ``RunnerAuthStore.revoke`` diagnostic with real HTTP revocation."""
+    workspace_id, cookie = harness.signup_owner("owner-revoke-scope@example.test")
+    other_workspace, other_cookie = harness.signup_owner("owner-revoke-other@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "runner")
+    # The free plan allows one active runner per workspace, so the bystander lives in workspace B.
+    other_home, other_backend, other_id = _pair_runner(tmp_path, harness, other_workspace, other_cookie, "other")
+    (label,) = backend.values
+    revoke_path = f"/v1/workspaces/{workspace_id}/runners/{runner_id}/revoke"
+    invalid = (400, {"error": "invalid runner revocation", "code": "invalid_runner_revocation"})
+
+    # Another workspace's owner cannot revoke it, through either workspace's path.
+    assert harness.request("POST", revoke_path, REVOKE_BODY, cookie=other_cookie)[:2] == (
+        403, {"error": "a recent owner or admin browser session is required", "code": "recent_auth_required"})
+    assert harness.request(
+        "POST", f"/v1/workspaces/{other_workspace}/runners/{runner_id}/revoke", REVOKE_BODY, cookie=other_cookie,
+    )[:2] == invalid
+    # Nor can this owner revoke workspace B's runner through workspace A's path.
+    assert harness.request(
+        "POST", f"/v1/workspaces/{workspace_id}/runners/{other_id}/revoke", REVOKE_BODY, cookie=cookie,
+    )[:2] == invalid
+    assert _daemon(home, harness, backend).status()["state"] == "active"
+
+    assert harness.request("POST", revoke_path, REVOKE_BODY, cookie=cookie)[:2] == (
+        200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
+    # A retry is refused and has no second effect.
+    assert harness.request("POST", revoke_path, REVOKE_BODY, cookie=cookie)[:2] == invalid
+    owner = harness.request("GET", "/v1/me", cookie=cookie)[1]["user_id"]
+    assert _revocation_audit(harness, workspace_id, runner_id) == [(owner, "human_revocation")]
     revoked = _daemon(home, harness, backend).status()
-    assert revoked["state"] == "runner_revoked"
     assert revoked["control_plane"] == {"state": "rejected", "reason": "runner_revoked"}
     # It stays rejected after another restart (the staged call is replayed, never re-signed).
     assert _daemon(home, harness, backend).status()["state"] == "runner_revoked"
+    # Workspace B's runner is untouched.
+    assert _daemon(other_home, harness, other_backend).status()["state"] == "active"
+    assert _revocation_audit(harness, other_workspace, other_id) == []
     result = _daemon(home, harness, backend).unpair()
     assert result["state"] == "unpaired" and result["removed"] is True
     assert backend.values == {} and backend.deleted == [label]

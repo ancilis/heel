@@ -105,6 +105,67 @@ describe("runner edge routes", () => {
     expect(await upstream.text()).toBe("{}");
   });
 
+  it("forwards the reasoned runner revoke as a same-origin cookie POST with its exact body", async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response("{}", { headers: { "Content-Type": "application/json" } }));
+    const body = '{"schema_version":"heel.runner-revoke.v1","reason_code":"human_revocation"}';
+    const response = await worker.fetch(request(`/api/control-plane/v1/workspaces/${workspace}/runners/${runner}/revoke`, {
+      Origin: "https://heel.example", "Sec-Fetch-Site": "same-origin", Cookie: "__Host-heel_session=abc",
+      "X-Heel-Internal-Origin": "caller-forged", "X-Heel-Edge-Auth": "caller-forged",
+    }, body), env(fetcher), { waitUntil() {}, passThroughOnException() {} });
+    expect(response.status).toBe(200);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const upstream = fetcher.mock.calls[0][0] as Request;
+    expect(upstream.method).toBe("POST");
+    expect(upstream.url).toBe(`https://heel-control-plane.internal/v1/workspaces/${workspace}/runners/${runner}/revoke`);
+    expect([...upstream.headers.keys()].sort()).toEqual([
+      "content-encoding", "content-length", "content-type", "cookie", "origin", "x-heel-edge-auth", "x-heel-internal-origin",
+    ]);
+    expect(upstream.headers.get("X-Heel-Internal-Origin")).toBe("same-origin");
+    expect(upstream.headers.get("X-Heel-Edge-Auth")).toBe(edge);
+    expect(upstream.headers.get("Origin")).toBe("https://heel.example");
+    expect(upstream.headers.get("Content-Length")).toBe(String(body.length));
+    expect(await upstream.text()).toBe(body);
+  });
+
+  it("rejects the retired DELETE, other methods, cross-origin, non-cookie and oversized runner revokes before upstream", async () => {
+    const fetcher = vi.fn();
+    const context = { waitUntil() {}, passThroughOnException() {} };
+    const retired = `https://heel.example/api/control-plane/v1/workspaces/${workspace}/runners/${runner}`;
+    const path = `/api/control-plane/v1/workspaces/${workspace}/runners/${runner}/revoke`;
+    const browser = { Origin: "https://heel.example", "Sec-Fetch-Site": "same-origin", Cookie: "__Host-heel_session=abc" };
+    const body = '{"schema_version":"heel.runner-revoke.v1","reason_code":"human_revocation"}';
+    for (const candidate of [
+      new Request(retired, { method: "DELETE", headers: browser }),
+      new Request(`https://heel.example${path}`, { method: "DELETE", headers: browser }),
+      new Request(`https://heel.example${path}`, { method: "GET", headers: browser }),
+      new Request(`https://heel.example${path}`, { method: "PUT", headers: { ...browser, "Content-Type": "application/json" }, body }),
+      request(`${path}/extra`, browser, body),
+      request(`/api/control-plane/v1/workspaces/${workspace}/runners/${runner}/revoked`, browser, body),
+    ]) {
+      expect((await worker.fetch(candidate, env(fetcher), context)).status).toBe(404);
+    }
+    const noOrigin = { "Sec-Fetch-Site": browser["Sec-Fetch-Site"], Cookie: browser.Cookie };
+    const noFetchSite = { Origin: browser.Origin, Cookie: browser.Cookie };
+    const noCookie = { Origin: browser.Origin, "Sec-Fetch-Site": browser["Sec-Fetch-Site"] };
+    for (const [headers, payload] of [
+      [{ ...browser, Origin: "https://evil.example" }, body],
+      [noOrigin, body],
+      [noFetchSite, body],
+      [{ ...browser, "Sec-Fetch-Site": "cross-site" }, body],
+      [{ ...browser, "Sec-Fetch-Site": "same-site" }, body],
+      [noCookie, body],
+      [{ ...noCookie, Authorization: "Bearer heel_sk_abc" }, body],
+      [{ ...browser, Authorization: "Bearer heel_sk_abc" }, body],
+      [{ ...browser, "Content-Type": "text/plain" }, body],
+      [{ ...browser, "Content-Encoding": "gzip" }, body],
+      [{ ...browser, "Content-Length": "1000000" }, body],
+      [browser, "x".repeat(16 * 1024 + 1)],
+    ] as Array<[Record<string, string>, string]>) {
+      expect((await worker.fetch(request(path, headers, payload), env(fetcher), context)).status).toBe(400);
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("rejects nonce headers on resync and per-family oversized bodies before upstream", async () => {
     const fetcher = vi.fn();
     const resync = request(`/api/control-plane/v1/workspaces/${workspace}/runners/${runner}/resync/complete`, {

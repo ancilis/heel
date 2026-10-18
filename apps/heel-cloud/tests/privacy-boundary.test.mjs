@@ -297,7 +297,7 @@ function analyzeSource(fileName, text) {
   if ((upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath) || RUNNER_ROTATION_PUBLIC.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
   if ((RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath)) && method === "POST") return upstreamPath;
-  if (RUNNER_REVOKE.test(upstreamPath) && method === "DELETE") return upstreamPath;
+  if (RUNNER_REVOKE.test(upstreamPath) && method === "POST") return upstreamPath;
   if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (isHumanCanaryRoute(method, upstreamPath) || isHumanEnvironmentRoute(method, upstreamPath)) return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {

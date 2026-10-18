@@ -969,7 +969,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return lambda: self._runner_rotation_start(wid, tail[1])
             if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "rotations" and tail[4] == "approve":
                 return lambda: self._runner_rotation_approve(wid, tail[3])
-            if method == "DELETE" and len(tail) == 2 and tail[0] == "runners":
+            if method == "POST" and len(tail) == 3 and tail[0] == "runners" and tail[2] == "revoke":
                 return lambda: self._runner_revoke(wid, tail[1])
             if method == "POST" and len(tail) == 3 and tail[0] == "runners" and tail[2] == "claim":
                 return lambda: self._runner_request(wid, tail[1], "runner_claim", None, "claim")
