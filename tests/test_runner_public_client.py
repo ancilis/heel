@@ -2236,3 +2236,498 @@ def test_rotation_claim_install_rejects_v1_invalid_and_nonmonotonic_responses_wi
     client.claim()
     assert transport.requests[-1][1]["X-Heel-Runner-Nonce"] == newer["initial_claim_nonce"]
     assert transport.requests[-1][1]["X-Heel-Runner-Sequence"] == "12"
+
+
+# ---------------------------------------------------------------------------
+# T2b2R1: claim-chain authority recovery through the one fixed resync protocol.
+
+from heel.runner.control_client import (  # noqa: E402 - grouped with the recovery tests
+    RunnerAuthenticationRejected, RunnerChainRecoveryDeferred, RunnerChainRecoveryRequired,
+)
+
+
+class _Down(ConnectionError):
+    """A transport failure: the request may or may not have reached the server."""
+
+
+class RecoveryTransport:
+    """Answers by fixed route suffix from per-route queues; records every request exactly."""
+
+    def __init__(self, routes):
+        self.routes = {key: list(value) for key, value in routes.items()}
+        self.requests = []
+
+    def post(self, path, *, headers, body):
+        self.requests.append((path, dict(headers), body))
+        for suffix, queue in self.routes.items():
+            if path.endswith(suffix):
+                assert queue, f"unexpected request to {path}"
+                answer = queue.pop(0)
+                if isinstance(answer, BaseException):
+                    raise answer
+                return answer(path, headers, body) if callable(answer) else answer
+        raise AssertionError(f"unrouted request to {path}")
+
+    def paths(self):
+        return [path.rsplit("/runners/runner", 1)[1] for path, _headers, _body in self.requests]
+
+
+_REJECTED = (401, {}, {"schema_version": "heel.runner-error.v1", "code": "invalid_runner_auth"})
+_RATE_LIMITED = (429, {}, {"schema_version": "heel.runner-error.v1", "code": "runner_resync_rate_limited",
+                           "retry_after_ms": 60_000})
+_BINDING_ID = "rcb_" + "b" * 32
+
+
+def _nonce_b64(fill: bytes) -> str:
+    return base64.b64encode(fill * 32).decode()
+
+
+def _listed(fill=b"L"):
+    return (200, {"X-Heel-Runner-Next-Nonce": _nonce_b64(fill)}, {
+        "schema_version": "heel.runner-context-list-result.v1", "server_time_ms": 5_000,
+        "contexts": [], "has_more": False,
+    })
+
+
+def _challenge(*, generation=0, next_sequence=1, chain=None, challenge_id="rrs_" + "c" * 32):
+    return (200, {}, {
+        "schema_version": "heel.runner-resync-challenge.v2", "challenge_id": challenge_id,
+        "chain": chain or {"operation": "claim", "run_id": None},
+        "server_challenge_b64": _nonce_b64(b"S"), "next_sequence": next_sequence,
+        "expires_at_ms": 65_000, "generation": generation,
+    })
+
+
+def _completed(*, generation=1, next_sequence=1, chain=None, nonce=b"R"):
+    return (200, {}, {
+        "schema_version": "heel.runner-resync-completed.v2",
+        "chain": chain or {"operation": "claim", "run_id": None},
+        "next_sequence": next_sequence, "next_nonce_b64": _nonce_b64(nonce),
+        "expires_at_ms": 65_000, "generation": generation,
+    })
+
+
+def _recovery_client(transport, *, runtime=None, signer=None, clock=lambda: 5_000):
+    signer = signer or Signer()
+    return RunnerControlClient(
+        origin="https://control.example", workspace_id="ws", runner_id="runner", signer=signer,
+        clock=clock, transport=transport, nonce_source=NonceSource(),
+        resync_random_source=lambda count: b"c" * count,
+        runtime=runtime or _runtime(signer),
+    )
+
+
+def _claim_cursor(client):
+    cursor = client.runtime.load_chain("claim", None)
+    return cursor.next_nonce_b64, cursor.next_sequence, cursor.generation
+
+
+def test_lost_claim_chain_authority_resyncs_once_supersedes_the_call_and_reissues_it():
+    transport = RecoveryTransport({
+        "/contexts/list": [_REJECTED, _listed()],
+        "/resync/start": [_challenge()], "/resync/complete": [_completed()],
+    })
+    client = _recovery_client(transport)
+
+    listed = client.list_contexts()
+
+    assert listed["contexts"] == []
+    assert transport.paths() == ["/contexts/list", "/resync/start", "/resync/complete", "/contexts/list"]
+    first, reissued = transport.requests[0], transport.requests[3]
+    assert first[2] == reissued[2]  # the same idempotent request ...
+    assert first[1]["X-Heel-Runner-Nonce"] == _nonce_b64(b"p")
+    assert reissued[1]["X-Heel-Runner-Nonce"] == _nonce_b64(b"R")  # ... under the recovered chain
+    assert (first[1]["X-Heel-Runner-Sequence"], reissued[1]["X-Heel-Runner-Sequence"]) == ("1", "1")
+    assert _claim_cursor(client) == (_nonce_b64(b"L"), 2, 1)
+    assert client._chains["claim"] == (_nonce_b64(b"L"), 2, 1)
+    assert client.runtime.load_pending_calls() == ()
+    assert client.runtime.load_resync_attempt("claim") is None
+    (tombstone,) = client.runtime.load_superseded_calls()
+    assert (tombstone.request_operation, tombstone.generation, tombstone.superseded_by_generation,
+            tombstone.resync_challenge_id) == ("list-contexts", 0, 1, "rrs_" + "c" * 32)
+
+
+def test_a_staged_call_with_a_recorded_reply_replays_without_any_resync():
+    transport = RecoveryTransport({"/contexts/list": [_Down(), _listed(b"A"), _listed(b"B")]})
+    client = _recovery_client(transport)
+    with pytest.raises(_Down):
+        client.list_contexts()
+    staged = client.runtime.load_pending_calls()
+    assert [item.request_operation for item in staged] == ["list-contexts"]
+
+    restarted = _recovery_client(transport, runtime=client.runtime, signer=client.signer)
+    (outcome,) = restarted.replay_all_pending(now_ms=5_000)
+    restarted.list_contexts()
+
+    assert (outcome.status, outcome.superseded) == (200, False)
+    assert transport.paths() == ["/contexts/list"] * 3
+    assert transport.requests[1][1] == transport.requests[0][1]  # byte-identical replay
+    assert _claim_cursor(restarted) == (_nonce_b64(b"B"), 3, 0)
+    assert restarted.runtime.load_superseded_calls() == ()
+
+
+def test_a_replayed_stale_staged_list_is_superseded_after_an_accepted_resync():
+    transport = RecoveryTransport({
+        "/contexts/list": [_Down(), _REJECTED, _listed()],
+        "/resync/start": [_challenge()], "/resync/complete": [_completed()],
+    })
+    client = _recovery_client(transport)
+    with pytest.raises(_Down):
+        client.list_contexts()
+    (staged,) = client.runtime.load_pending_calls()
+
+    restarted = _recovery_client(transport, runtime=client.runtime, signer=client.signer)
+    (outcome,) = restarted.replay_all_pending(now_ms=5_000)
+
+    assert (outcome.call_id, outcome.status, outcome.body, outcome.superseded) == (staged.call_id, 401, None, True)
+    assert transport.requests[1][1] == transport.requests[0][1]  # replay first, never re-signed
+    assert restarted.runtime.load_pending_calls() == ()
+    assert _claim_cursor(restarted) == (_nonce_b64(b"R"), 1, 1)
+    restarted.list_contexts()
+    assert transport.paths() == [
+        "/contexts/list", "/contexts/list", "/resync/start", "/resync/complete", "/contexts/list",
+    ]
+    assert [item.call_id for item in restarted.runtime.load_superseded_calls()] == [staged.call_id]
+
+
+def test_claim_context_is_reissued_for_the_same_binding_after_recovery():
+    digest = "d" * 64
+
+    def claimed(_path, headers, body):
+        request = json.loads(body)
+        assert (request["binding_id"], request["binding_digest"]) == (_BINDING_ID, digest)
+        return 200, {"X-Heel-Runner-Next-Nonce": _nonce_b64(b"K")}, {"marker": True}
+
+    transport = RecoveryTransport({
+        f"/contexts/{_BINDING_ID}/claim": [_REJECTED, claimed],
+        "/resync/start": [_challenge()], "/resync/complete": [_completed()],
+    })
+    client = _recovery_client(transport)
+    with pytest.raises(ValueError, match="invalid runner context response"):
+        # The scripted claim answer is deliberately not a signed binding: the point here is the
+        # re-issued request, which must be the same binding claim under the recovered chain.
+        client.claim_context(_BINDING_ID, digest)
+    assert transport.paths() == [
+        f"/contexts/{_BINDING_ID}/claim", "/resync/start", "/resync/complete", f"/contexts/{_BINDING_ID}/claim",
+    ]
+    assert transport.requests[0][2] == transport.requests[3][2]
+    (tombstone,) = client.runtime.load_superseded_calls()
+    assert tombstone.request_operation == "claim-context"
+
+
+def test_a_refused_fresh_resync_is_an_authentication_rejection_and_keeps_the_staged_call():
+    transport = RecoveryTransport({"/contexts/list": [_REJECTED], "/resync/start": [_REJECTED]})
+    client = _recovery_client(transport)
+
+    with pytest.raises(RunnerAuthenticationRejected) as raised:
+        client.list_contexts()
+
+    assert raised.value.code == "runner_authentication_rejected"
+    assert transport.paths() == ["/contexts/list", "/resync/start"]
+    (kept,) = client.runtime.load_pending_calls()
+    assert (kept.request_operation, kept.generation) == ("list-contexts", 0)
+    assert client.runtime.load_resync_attempt("claim") is None
+    assert client.runtime.load_superseded_calls() == ()
+    assert _claim_cursor(client) == (_nonce_b64(b"p"), 1, 0)
+
+
+@pytest.mark.parametrize("retry_after_ms, expected", [
+    (60_000, 60_000), (1_500, 1_500), (0, 60_000), (-1, 60_000), (True, 60_000),
+    ("60000", 60_000), (10**12, 300_000), (None, 60_000),
+])
+def test_a_rate_limited_resync_defers_with_a_validated_bounded_delay(retry_after_ms, expected):
+    body = {"schema_version": "heel.runner-error.v1", "code": "runner_resync_rate_limited"}
+    if retry_after_ms is not None:
+        body["retry_after_ms"] = retry_after_ms
+    transport = RecoveryTransport({"/contexts/list": [_REJECTED], "/resync/start": [(429, {}, body)]})
+    client = _recovery_client(transport)
+
+    with pytest.raises(RunnerChainRecoveryDeferred) as raised:
+        client.list_contexts()
+
+    assert (raised.value.code, raised.value.retry_after_ms) == ("recovery_rate_limited", expected)
+    assert not isinstance(raised.value, RunnerAuthenticationRejected)
+    assert [item.request_operation for item in client.runtime.load_pending_calls()] == ["list-contexts"]
+    assert client.runtime.load_resync_attempt("claim") is None
+
+
+def test_run_chain_and_unproven_staged_kinds_are_preserved_and_require_explicit_recovery():
+    # Run chains (T4a) are outside R1's recovery: a 401 keeps the staged call and signs no resync.
+    transport = RecoveryTransport({"/heartbeat": [_REJECTED]})
+    client = _recovery_client(transport)
+    activate_claimed_run(client, RUN_ID)
+    with pytest.raises(RunnerChainRecoveryRequired) as raised:
+        client.heartbeat(run_id=RUN_ID, operational_projection=operational_projection("claimed"))
+    assert (raised.value.code, raised.value.operation, raised.value.reason) == (
+        "recovery_required", "heartbeat", "unsupported_operation",
+    )
+    assert transport.paths() == [f"/runs/{RUN_ID}/heartbeat"]
+    assert [item.request_operation for item in client.runtime.load_pending_calls()] == ["heartbeat"]
+    assert client.runtime.load_superseded_calls() == ()
+
+
+def test_a_never_recorded_job_claim_is_superseded_and_the_next_poll_is_a_fresh_claim():
+    idle = (204, {"X-Heel-Runner-Next-Nonce": _nonce_b64(b"J")}, None)
+    transport = RecoveryTransport({
+        "/runner/claim": [_Down(), _REJECTED, idle],
+        "/resync/start": [_challenge(next_sequence=1)],
+        "/resync/complete": [_completed(next_sequence=1)],
+    })
+    client = _recovery_client(transport)
+    with pytest.raises(_Down):
+        client.claim()
+    (staged,) = client.runtime.load_pending_calls()
+
+    restarted = _recovery_client(transport, runtime=client.runtime, signer=client.signer)
+    (outcome,) = restarted.replay_all_pending(now_ms=5_000)
+    # Superseded without being issued again; the serve loop's next poll is a NEW signed claim.
+    assert (outcome.call_id, outcome.superseded) == (staged.call_id, True)
+    assert restarted.claim()[0] == 204
+    assert transport.paths() == ["/claim", "/claim", "/resync/start", "/resync/complete", "/claim"]
+    replayed, fresh = transport.requests[1], transport.requests[4]
+    assert replayed[1] == transport.requests[0][1]  # the retired proof was only ever replayed
+    assert fresh[1]["X-Heel-Runner-Nonce"] == _nonce_b64(b"R") and fresh[1] != replayed[1]
+    (tombstone,) = restarted.runtime.load_superseded_calls()
+    assert (tombstone.request_operation, tombstone.sequence, tombstone.challenge_next_sequence,
+            tombstone.completed_next_sequence) == ("claim", 1, 1, 1)
+    assert _claim_cursor(restarted) == (_nonce_b64(b"J"), 2, 1)
+
+
+def test_a_fresh_job_claim_recovers_once_then_polls_once_more():
+    idle = (204, {"X-Heel-Runner-Next-Nonce": _nonce_b64(b"J")}, None)
+    transport = RecoveryTransport({
+        "/runner/claim": [_REJECTED, idle],
+        "/resync/start": [_challenge(next_sequence=1)], "/resync/complete": [_completed(next_sequence=1)],
+    })
+    client = _recovery_client(transport)
+    assert client.claim()[0] == 204
+    assert transport.paths() == ["/claim", "/resync/start", "/resync/complete", "/claim"]
+    assert [t.request_operation for t in client.runtime.load_superseded_calls()] == ["claim"]
+
+
+def test_a_consumed_claim_sequence_is_kept_as_recovery_required_never_tombstoned():
+    transport = RecoveryTransport({
+        "/runner/claim": [_Down(), _REJECTED, _REJECTED],
+        "/resync/start": [_challenge(next_sequence=2)],
+        "/resync/complete": [_completed(next_sequence=2), _completed(next_sequence=2)],
+    })
+    client = _recovery_client(transport)
+    with pytest.raises(_Down):
+        client.claim()
+    (staged,) = client.runtime.load_pending_calls()
+    for _restart in range(2):
+        restarted = _recovery_client(transport, runtime=client.runtime, signer=client.signer)
+        with pytest.raises(RunnerChainRecoveryRequired) as raised:
+            restarted.replay_all_pending(now_ms=5_000)
+        assert (raised.value.operation, raised.value.reason) == ("claim", "claim_sequence_consumed")
+        assert restarted.runtime.load_pending_calls() == (staged,)
+        assert _claim_cursor(restarted) == (_nonce_b64(b"p"), 1, 0)  # nothing installed
+        assert restarted.runtime.load_superseded_calls() == ()
+        # The completed attempt is kept so its completion stays retransmittable, never re-signed.
+        assert restarted.runtime.load_resync_attempt("claim").complete_body is not None
+    assert transport.paths() == [
+        "/claim", "/claim", "/resync/start", "/resync/complete", "/claim", "/resync/complete",
+    ]
+    completes = [r for r in transport.requests if r[0].endswith("/resync/complete")]
+    assert completes[0][1:] == completes[1][1:]
+
+
+@pytest.mark.parametrize("challenge, completion", [
+    (_challenge(next_sequence=1), _completed(next_sequence=2)),   # completion moved past the challenge
+    (_challenge(next_sequence=1), _completed(next_sequence=1, generation=2)),  # forged generation
+])
+def test_an_inconsistent_claim_resync_never_supersedes(challenge, completion):
+    transport = RecoveryTransport({
+        "/runner/claim": [_REJECTED], "/resync/start": [challenge], "/resync/complete": [completion],
+    })
+    client = _recovery_client(transport)
+    with pytest.raises((ValueError, RunnerChainRecoveryRequired)):
+        client.claim()
+    assert [item.request_operation for item in client.runtime.load_pending_calls()] == ["claim"]
+    assert _claim_cursor(client) == (_nonce_b64(b"p"), 1, 0)
+    assert client.runtime.load_superseded_calls() == ()
+
+
+def test_a_lost_start_answer_is_retransmitted_byte_identically_after_restart():
+    transport = RecoveryTransport({
+        "/contexts/list": [_REJECTED, _REJECTED, _listed()],
+        "/resync/start": [_Down(), _challenge()], "/resync/complete": [_completed()],
+    })
+    clock = iter(range(5_000, 6_000)).__next__
+    client = _recovery_client(transport, clock=clock)
+    with pytest.raises(_Down):
+        client.list_contexts()
+    attempt = client.runtime.load_resync_attempt("claim")
+    assert attempt is not None and attempt.challenge_id is None
+
+    restarted = _recovery_client(transport, runtime=client.runtime, signer=client.signer, clock=clock)
+    (outcome,) = restarted.replay_all_pending(now_ms=5_500)
+
+    assert outcome.superseded is True
+    starts = [request for request in transport.requests if request[0].endswith("/resync/start")]
+    assert len(starts) == 2 and starts[0][1:] == starts[1][1:]
+    assert restarted.runtime.load_resync_attempt("claim") is None
+
+
+def test_a_lost_completion_answer_is_retransmitted_byte_identically_after_restart():
+    transport = RecoveryTransport({
+        "/contexts/list": [_REJECTED, _REJECTED, _listed()],
+        "/resync/start": [_challenge()], "/resync/complete": [_Down(), _completed()],
+    })
+    clock = iter(range(5_000, 6_000)).__next__
+    client = _recovery_client(transport, clock=clock)
+    with pytest.raises(_Down):
+        client.list_contexts()
+
+    restarted = _recovery_client(transport, runtime=client.runtime, signer=client.signer, clock=clock)
+    restarted.replay_all_pending(now_ms=5_500)
+
+    completes = [request for request in transport.requests if request[0].endswith("/resync/complete")]
+    assert len(completes) == 2 and completes[0][1:] == completes[1][1:]
+    assert len([r for r in transport.requests if r[0].endswith("/resync/start")]) == 1
+    assert _claim_cursor(restarted)[2] == 1
+
+
+def test_a_refused_retransmission_falls_back_to_exactly_one_fresh_start():
+    transport = RecoveryTransport({
+        "/contexts/list": [_REJECTED, _REJECTED, _REJECTED],
+        "/resync/start": [_Down(), _REJECTED, _REJECTED],
+    })
+    clock = iter(range(5_000, 6_000)).__next__
+    client = _recovery_client(transport, clock=clock)
+    with pytest.raises(_Down):
+        client.list_contexts()
+    restarted = _recovery_client(transport, runtime=client.runtime, signer=client.signer, clock=clock)
+    with pytest.raises(RunnerAuthenticationRejected):
+        restarted.replay_all_pending(now_ms=5_500)
+    starts = [request for request in transport.requests if request[0].endswith("/resync/start")]
+    assert len(starts) == 3
+    assert starts[0][1:] == starts[1][1:] and starts[2][1] != starts[1][1]  # one fresh start only
+    assert [item.request_operation for item in restarted.runtime.load_pending_calls()] == ["list-contexts"]
+    assert restarted.runtime.load_resync_attempt("claim") is None
+
+
+@pytest.mark.parametrize("start, complete", [
+    (_challenge(chain={"operation": "heartbeat", "run_id": RUN_ID}), None),
+    (_challenge(challenge_id="rrs_short"), None),
+    ((200, {}, {"schema_version": "heel.runner-resync-challenge.v1"}), None),
+    (_challenge(), _completed(generation=2)),
+    (_challenge(), _completed(generation=0)),
+    (_challenge(), _completed(chain={"operation": "heartbeat", "run_id": RUN_ID})),
+    (_challenge(), (200, {}, {**_completed()[2], "next_nonce_b64": "not-a-nonce"})),
+    (_challenge(), (403, {}, {"schema_version": "heel.runner-error.v1", "code": "forbidden"})),
+])
+def test_an_invalid_challenge_or_completion_never_supersedes_or_advances(start, complete):
+    routes = {"/contexts/list": [_REJECTED], "/resync/start": [start]}
+    if complete is not None:
+        routes["/resync/complete"] = [complete]
+    transport = RecoveryTransport(routes)
+    client = _recovery_client(transport)
+
+    with pytest.raises(ValueError):
+        client.list_contexts()
+
+    assert [item.request_operation for item in client.runtime.load_pending_calls()] == ["list-contexts"]
+    assert _claim_cursor(client) == (_nonce_b64(b"p"), 1, 0)
+    assert client._chains["claim"] == (_nonce_b64(b"p"), 1, 0)
+    assert client.runtime.load_superseded_calls() == ()
+    assert transport.paths()[-1] != "/contexts/list" or len(transport.requests) == 1
+
+
+def test_a_challenge_below_the_local_generation_is_refused():
+    signer = Signer()
+    runtime = _runtime(signer)
+    runtime._commit_resync_chain(
+        operation="claim", run_id=None, next_nonce_b64=_nonce_b64(b"p"), next_sequence=1,
+        generation=1, now_ms=1,
+    )
+    transport = RecoveryTransport({"/contexts/list": [_REJECTED], "/resync/start": [_challenge(generation=0)]})
+    client = _recovery_client(transport, runtime=runtime, signer=signer)
+    with pytest.raises(ValueError, match="resync challenge"):
+        client.list_contexts()
+    assert _claim_cursor(client)[2] == 1 and client.runtime.load_superseded_calls() == ()
+    assert client.runtime.load_resync_attempt("claim") is None
+
+
+def test_a_second_rejection_after_an_accepted_resync_never_loops():
+    transport = RecoveryTransport({
+        "/contexts/list": [_REJECTED, _REJECTED],
+        "/resync/start": [_challenge()], "/resync/complete": [_completed()],
+    })
+    client = _recovery_client(transport)
+    with pytest.raises(RunnerAuthenticationRejected):
+        client.list_contexts()
+    assert transport.paths() == ["/contexts/list", "/resync/start", "/resync/complete", "/contexts/list"]
+    # The re-issued call stays staged at the recovered generation for the next recovery cycle.
+    (kept,) = client.runtime.load_pending_calls()
+    assert (kept.request_operation, kept.generation) == ("list-contexts", 1)
+
+
+def test_an_expired_challenge_after_restart_is_dropped_and_recovered_with_one_fresh_start():
+    # Start answered, completion answer lost; the restart comes after the challenge expired, so
+    # the byte-identical completion is refused. The stale attempt must not trap the chain.
+    transport = RecoveryTransport({
+        "/contexts/list": [_REJECTED, _REJECTED, _listed()],
+        "/resync/start": [_challenge(challenge_id="rrs_" + "1" * 32), _challenge(challenge_id="rrs_" + "2" * 32)],
+        "/resync/complete": [_Down(), _REJECTED, _completed()],
+    })
+    times = iter([5_000] * 8 + [200_000] * 40).__next__
+    client = _recovery_client(transport, clock=times)
+    with pytest.raises(_Down):
+        client.list_contexts()
+    assert client.runtime.load_resync_attempt("claim").complete_body is not None
+
+    restarted = _recovery_client(transport, runtime=client.runtime, signer=client.signer, clock=times)
+    (outcome,) = restarted.replay_all_pending(now_ms=200_000)
+
+    assert outcome.superseded is True
+    assert transport.paths() == [
+        "/contexts/list", "/resync/start", "/resync/complete",          # first episode, answer lost
+        "/contexts/list", "/resync/complete",                           # restart: replay, retransmit
+        "/resync/start", "/resync/complete",                            # exactly one fresh start
+    ]
+    completes = [r for r in transport.requests if r[0].endswith("/resync/complete")]
+    assert completes[0][1:] == completes[1][1:] and completes[2][2] != completes[1][2]
+    (tombstone,) = restarted.runtime.load_superseded_calls()
+    assert tombstone.resync_challenge_id == "rrs_" + "2" * 32
+    assert restarted.runtime.load_resync_attempt("claim") is None
+
+
+def test_an_expired_recovered_nonce_needs_a_new_bounded_cycle_not_a_loop():
+    # Recovery committed, then nothing used the recovered nonce before its TTL passed (a crash or
+    # a long idle): the next call fails once more and is recovered by a new, separate cycle.
+    transport = RecoveryTransport({
+        "/contexts/list": [_REJECTED, _listed(), _REJECTED, _listed()],
+        "/resync/start": [_challenge(), _challenge(generation=1, next_sequence=2)],
+        "/resync/complete": [_completed(), _completed(generation=2, next_sequence=2, nonce=b"T")],
+    })
+    client = _recovery_client(transport)
+    client.list_contexts()
+    restarted = _recovery_client(transport, runtime=client.runtime, signer=client.signer)
+    restarted.list_contexts()
+
+    assert transport.paths() == [
+        "/contexts/list", "/resync/start", "/resync/complete", "/contexts/list",
+        "/contexts/list", "/resync/start", "/resync/complete", "/contexts/list",
+    ]
+    assert _claim_cursor(restarted) == (_nonce_b64(b"L"), 3, 2)
+    # The fixed test clock gives both tombstones one timestamp; compare them as a set.
+    assert sorted((t.generation, t.superseded_by_generation) for t in restarted.runtime.load_superseded_calls()) == [
+        (0, 1), (1, 2),
+    ]
+
+
+def test_a_rate_limited_cycle_signs_nothing_more_until_the_next_cycle():
+    transport = RecoveryTransport({
+        "/contexts/list": [_REJECTED, _REJECTED, _listed()],
+        "/resync/start": [_RATE_LIMITED, _challenge()], "/resync/complete": [_completed()],
+    })
+    client = _recovery_client(transport)
+    with pytest.raises(RunnerChainRecoveryDeferred):
+        client.list_contexts()
+    assert transport.paths() == ["/contexts/list", "/resync/start"]
+    # The next cycle (after the caller's backoff) replays the same staged call, then recovers.
+    restarted = _recovery_client(transport, runtime=client.runtime, signer=client.signer)
+    (outcome,) = restarted.replay_all_pending(now_ms=70_000)
+    assert outcome.superseded is True
+    assert transport.requests[2][1] == transport.requests[0][1]
