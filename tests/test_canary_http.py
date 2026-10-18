@@ -869,9 +869,21 @@ def test_canary_mutations_reject_non_browser_principals_and_missing_authority(tm
             f"/v1/workspaces/{fixture.workspace}/runners/{fixture.runner_id}/runs/"
             "missing/result-projection"
         )
-        status, _, body = fixture.request(
-            "POST", upload_path, raw=b"{" + b" " * (272 * 1024),
+        # The server answers 413 from the declared Content-Length and closes without reading
+        # the body, so only the headers are sent: writing the body would race that close
+        # (BrokenPipe/reset) and could lose the very 413 this asserts.
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", fixture.server.server_address[1], timeout=5,
         )
+        try:
+            connection.putrequest("POST", upload_path)
+            connection.putheader("Content-Type", "application/json")
+            connection.putheader("Content-Length", str(272 * 1024 + 1))
+            connection.endheaders()
+            response = connection.getresponse()
+            status, body = response.status, json.loads(response.read())
+        finally:
+            connection.close()
         assert status == 413 and body["error"] == "request body too large"
 
         unavailable_projection = approval_projection(
