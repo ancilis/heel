@@ -19,6 +19,14 @@ Revision T1R (2026-10-18, fresh Fable adversarial specification review): correct
 `2026-10-18-self-serve-product-design-review.md` (same directory). T1R artifacts live in
 `.git/self-serve-launch/sessions/T1R-artifacts/`. No product code changed in either revision.
 
+Revision R4R (2026-10-18, fresh Fable combined T2a gate review after R4 integration, HEAD
+`c749d345a89265809532239711393470c3e4bf8e`): adds §11.1, the explicit real-customer-SaaS
+execution requirement that Kevin clarified during R4 (canonical text in
+`.git/self-serve-launch/CUSTOMER-EXECUTION-REQUIREMENT.md`), and the matching owner/gate
+updates in §12, §13 and §14. It is a clarification of the existing goal, not new scope: it
+does not add write operations, and it does not require access to any real customer's secrets
+now. No product code changed in this revision. Evidence: `sessions/R4R-closing.md`.
+
 ---
 
 ## 1. Baseline (captured before any tracked change)
@@ -565,7 +573,101 @@ URLs, commands, screenshots, artifact digests, finding ids and timestamps at eve
 The final reviewer answers verbatim: "Can a new user with no repository access sign up for Heel
 and obtain an evidence-backed, undeclared product-abuse finding against a staging SaaS?" Only an
 unqualified YES with the captured evidence passes. Mocked boundaries, loopback seams or the
-synthetic harness are not journey proof.
+synthetic harness are not journey proof. The run behind that YES MUST also satisfy §11.1.
+
+### 11.1 Real execution against a user's SaaS is mandatory (Kevin clarification, R4R)
+
+Kevin, during R4 (2026-10-18): "if the goal doesn't include it one thing that is missing and
+maybe it's assumed was as part of a self-serve product was it actually being functional and
+able to run against a user's SaaS product, it was currently simulation only which needs to
+change". This subsection makes that an explicit, load-bearing acceptance requirement.
+
+**Requirement.** The product MUST actually execute authorized GET/HEAD requests against an
+unrelated user's verified staging SaaS, and the final acceptance MUST prove it:
+
+1. **Through the released path only.** The requests are sent by the customer-local runner
+   installed from the public download path (§8.1, §11 step 4), paired through the production
+   browser → Worker → control-plane API path, holding two locally supplied credentials with
+   operator plan labels (§11 step 6), against an inventory the user imported through the
+   product (any supported OpenAPI document with GET/HEAD routes, §11 step 7). The same binary,
+   the same routes and the same code path MUST serve an arbitrary verified customer target;
+   normal user target URLs, inventories and credentials MUST traverse the identical code with no
+   special case.
+2. **Findings come from observed responses.** An `observed` or `verified` finding MUST be
+   derived from the responses the runner actually received from the target. Findings declared
+   in input, canned results, scripted or mocked target responses, replayed fixtures and
+   simulated executors cannot produce one.
+3. **What cannot satisfy this gate** (they MAY remain shipped, separately and truthfully
+   labeled, §14): the abuse simulator (`heel run`), control simulation (`heel controls
+   simulate`), static OpenAPI review, the cloud `synthetic` run kind
+   (`http_api.py:2225`), demo or sample targets wired through a fixture-only adapter, a
+   hidden enable flag, a target-specific branch, source-checkout execution, seeded or
+   hand-edited persistence, admin or database seeding of inventories, plans, grants, runs or
+   findings, manual copying of evidence between machines, or any mocked integration seam
+   (CA bundle and injected secret backends are test seams, never acceptance evidence).
+4. **The synthetic acceptance target is a real running HTTP SaaS.** The target used in §11 is
+   a live HTTP(S) server the team controls, reached through exactly the public execution path
+   of item 1. Nothing in product code may recognise it: the T8 reviewer MUST read the product
+   diff for target-host, fixture or demo conditionals and MUST confirm that a second target
+   with a different host, inventory shape and credentials follows the same code (a loopback
+   target started for that purpose is acceptable for the second run; it is not the acceptance
+   target).
+5. **Required evidence, captured by the T8 reviewer, all CONFIRMED-tagged:**
+   - target-side request receipt (the target's own access log or request capture) for each
+     executed route, correlated to the signed scope id, the reserved one-shot attempt id and
+     the runner containment entry (`heel log --run` names the same attempt; §10 rows 3 and 6);
+   - an undeclared `observed` (or marker `verified`) finding whose verdict is traceable to the
+     captured response digests (§11 step 10), with the two credential secrets absent from
+     cloud rows, Worker logs, browser capture and `HEEL_HOME` (§10 row 4);
+   - the real target patched to enforce its plan gate, then the saved regression replayed from
+     the product: `fail/still_reachable` before the patch and `pass/blocked` after
+     (§11 steps 12–13), again with target-side receipts.
+6. **Preserved, unchanged:** GET/HEAD only (§10 row 2); credentials and raw evidence stay on
+   the runner machine (§10 rows 4–5); signed scope and one-shot attempt reservation per
+   request (§10 row 3); workspace isolation, revocation and fail-closed behaviour (§10 rows
+   7–12); every exclusion in §14. This requirement adds no write operation and no production
+   attack traffic. Testing a real customer's target still requires that customer's written
+   authorization and their own locally stored credentials; nobody asks for those secrets
+   before that task exists.
+
+**Current state at `c749d34` (R4R audit; CONFIRMED by `sessions/R4R-closing.md` §5).**
+Kevin's "currently simulation only" is the motivation, not a code fact, so the audit
+distinguishes implemented foundations from the product bridge:
+
+- Implemented, real, not simulation: the standalone CLI `heel runner run --scope … --base-url …`
+  sends real HTTPS GET/HEAD requests to the target through `TargetHTTPSClient` under a local
+  signed scope with reserved attempts, containment chain, local raw evidence and redacted
+  findings (`heel/cli.py:406-437`, `heel/runner/plan_differential.py:846,1650-1659`; T1
+  journey log `journey-synthetic-plan-differential.log`). Runner pairing, live status, owner
+  HTTP revocation, unpair and re-pair work over the TLS edge harness and the real macOS
+  Keychain (R1R, R23R, R4R). The open-core wheel ships `heel runner pair/status/unpair/
+  import-openapi/credential/map/prepare/run`.
+- Absent (the product bridge): no `heel runner serve` command; `RunnerService` and
+  `RunnerCoordinator` are constructed only by tests (zero constructors under `heel/`); no cloud
+  route inventory, grant-bound plan projection, cloud-approved plan-differential execution,
+  result projection, product regression replay or runner-revoke UI. The browser path therefore
+  cannot start a live execution today; the only product-initiated runs are the pre-existing
+  scenario-catalog `synthetic`/`verified` jobs, which are not the inventory-driven
+  plan-differential path this launch is about.
+- Consequence: no claim of live customer execution exists yet and none may be made before T8
+  passes under this subsection.
+
+**Ownership and gates (binding; they refine §12 and §13).**
+
+| Owner | Added obligation | Gate addition (green before its Fable review) |
+|---|---|---|
+| T2b design (next fresh Fable session, before any T2b code) | design the `serve` loop so that a cloud-granted plan is executed by the same `TargetHTTPSClient`/executor path as the CLI, with request receipts observable on the target; carry the credential-before-binding cycle and the plan-label report (§7.5) into the design; re-split T3/T4 | design review names the exact code path from browser Approve to the first target request and the exact evidence surfaces for item 5 |
+| T2b implementation | `heel runner serve` executes a granted plan against a real loopback HTTP target started by the test (not a scripted responder) | a test asserts target-side receipt of each route with the attempt id, plus `test_runner_serve_stops_within_deadline_on_revoke` and `test_runner_serve_offline_shows_offline_state_and_resumes` |
+| T3 | inventory and grant carry the user's own imported routes, unchanged, to the runner | mismatch tests of §12 T3 plus a test that an arbitrary second inventory shape binds without a code change |
+| T4 | execution and result projection from observed responses only | the result-projection test derives the verdict from captured response digests; no finding may be injected by the projection, the dashboard or a fixture |
+| T5 | regression replay reaches the real target again | replay test against a patched loopback target shows `fail/still_reachable` → `pass/blocked` |
+| T6 | product copy MUST NOT claim live execution before T8 PASS; simulation and static features stay labeled as such | copy contract tests |
+| T7 | the install line in §11 step 4 is the only runner installation used in T8 | wheel digest equals the manifest on `/agent` |
+| T8 | the clean-room run per §11 and this subsection | all item 5 evidence captured; FAIL otherwise |
+
+No implementer, and no review, may satisfy any of the gates above with a simulated, mocked,
+seeded or demo-only execution. A review that finds such a substitution records a FAIL on the
+owning task.
 
 ---
 
@@ -584,7 +686,7 @@ property before escalation). Allowed files are exhaustive; anything else is out 
 | T5 | Regressions from product + quotas + revoke end-to-end (§7.4, §7.6) | `heel/saas/http_api.py`, `heel/saas/canary_runs.py`, `heel/saas/migrate.py`, `heel/regressions.py`, `heel/runner/daemon.py`, `apps/heel-cloud/**` (regression UI), tests | `test_regression_replay_reserves_once_under_retry`, `test_new_routes_require_same_origin_and_recent_auth`, `test_runner_serve_offline_shows_offline_state_and_resumes`, `test_metrics_and_structured_logs_never_contain_handles_or_secrets`; red-team: quota/billing races, regression with expired/missing credentials, session fixation, invitation replay on the new routes |
 | T6 | Product surface: OpenAPI import step, pairing/access instructions, device page, status/recovery states (§6), legal/support/security pages (drafts for Kevin's approval), truthful docs (`CAPABILITIES.md`, `BUILD_STATE.md`, `README.md`, `/agent` copy) | `apps/heel-cloud/app/**`, `apps/heel-cloud/components/**`, `apps/heel-cloud/tests/**`, `docs/**`, `README.md` | vitest + `test:node` + `rendered-html.test.mjs` green; copy contract tests for every state id in §6 |
 | T7 | Release and deployment: version 1.3.0, deterministic artifacts, GitHub Release assets step, `fixed_origin` Worker mode **only if** the §8.2 restrictions can be enforced on the chosen host (otherwise the implemented VPC topology), `HEEL_INGRESS_ACK` in `ProductionConfiguration`, staging env, runbook additions, acceptance tooling | `pyproject.toml`, `release/**`, `scripts/build_open_core_release.py`, `apps/heel-cloud/public/downloads/*` (regenerated only), `apps/heel-cloud/build/deployment-config.ts`, `apps/heel-cloud/scripts/prepare-runtime.mjs`, `apps/heel-cloud/tests/mcp-quickstart.test.mjs`, `apps/heel-cloud/app/agent/page.tsx` (install string only), `heel/saas/server.py` (ingress ack only), `tests/test_saas_server.py`, `.github/workflows/*.yml`, `deploy/**`, `docs/saas/**`, release tests | `build_open_core_release.py --check`; `test_open_core_release`; `test_runner_plan_differential_release.py`; `deployment-config.test.ts`; `actionlint`; staging deploy green with `/v1/readyz` 200 privately and anonymous review working publicly |
-| T8 | Final clean-room acceptance (§11) by a fresh Fable session | none (evidence only) | verbatim YES with evidence, or FAIL with the failing step |
+| T8 | Final clean-room acceptance (§11 and §11.1) by a fresh Fable session | none (evidence only) | verbatim YES with evidence, or FAIL with the failing step; a simulated, mocked, seeded or demo-only execution is a FAIL (§11.1) |
 
 T3 and T4 as listed each touch more than ten files; the Fable review of T2b MUST confirm or
 re-split them before T3 starts (candidate split: T3a inventory route + Worker allowlist + v2
@@ -614,11 +716,11 @@ No commit of this launch goes to PR #41's branch.
 | 7 | Two local credentials with plan labels | T2a | §11 step 6; labels visible in UI, handles never, secrets nowhere |
 | 8 | Import OpenAPI | T3, T6 | §11 step 7; raw spec absent from network capture |
 | 9 | Review dry-run | T3 | §11 step 8; `plan_sha256` equal on both sides, `requests_sent 0` |
-| 10 | Start scan from product | T4 | §11 step 9; first target request only after Approve |
+| 10 | Start scan from product | T4 | §11 step 9; first target request only after Approve; target-side receipt of that request correlated to the signed scope and reserved attempt (§11.1 item 5) |
 | 11 | Live status / recovery | T2b, T4, T5 | §11 step 9 and the §10 #12 offline check |
-| 12 | Undeclared observed/verified finding | T4 | §11 step 10 |
+| 12 | Undeclared observed/verified finding | T4 | §11 step 10; derived from the real target's observed responses, never declared in input, simulated or canned (§11.1 items 2–5) |
 | 13 | Inspect redacted evidence | T4 | §11 step 11 |
-| 14 | Save / replay regression | T5 | §11 steps 12–13 |
+| 14 | Save / replay regression | T5 | §11 steps 12–13 against the real target before and after its patch, with target-side receipts (§11.1 item 5) |
 | 15 | Revoke runner / target | existing; T5 wiring | §11 step 14 |
 
 ---
@@ -634,8 +736,11 @@ Accurate claims after T8 PASS: "A SaaS operator can sign up, verify a staging or
 local runner, and receive evidence-backed observed (and, with a marker, verified) findings that a
 lower plan receives a higher plan's read responses on routes not declared as gated. Credentials
 and raw responses never leave the operator's machine; Heel Cloud stores route templates, labels,
-counts, digests and verdicts." Static OpenAPI review remains a separate, static capability with
-its own truthful state (`docs/CAPABILITIES.md`). Error envelopes are inconclusive; status-only
+counts, digests and verdicts." That claim is permitted only after T8 passes under §11.1, that
+is, after real authorized requests reached a real staging SaaS through the released path and
+the findings came from its responses. Until then no copy may say Heel runs against, scans or
+tests a user's SaaS. Static OpenAPI review and the abuse simulator remain separate capabilities
+with their own truthful state (`docs/CAPABILITIES.md`); neither satisfies any §11.1 gate. Error envelopes are inconclusive; status-only
 matches are insufficient; plan labels are never inferred from responses.
 
 ---
