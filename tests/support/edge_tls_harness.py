@@ -59,6 +59,10 @@ _RUNNER_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}(?:/claim
 _RUNNER_CONTEXT_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/contexts(?:/list|/rcb_[0-9a-f]{{32}}/(?:claim|approval-projections))$")
 _RUNNER_RESULT_PROJECTION = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/runs/crun_[0-9a-f]{{32}}/result-projection$")
 _RUNNER_RESYNC = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/resync/(?:start|complete)$")
+# ``index.ts`` ``API_KEY_AUTHORIZATION`` / ``DEVICE_AUTHORIZATION``: the only Authorization values
+# ``controlPlaneCredentials`` forwards (trimmed); any other non-empty value refuses the request.
+_API_KEY_AUTHORIZATION = re.compile(r"Bearer heel_sk_[A-Za-z0-9_-]+")
+_DEVICE_AUTHORIZATION = re.compile(r"Bearer heel_at_[A-Za-z0-9_-]{43}")
 # Owner project/environment/context-binding routes (``index.ts`` PROJECTS_ROUTE, ENVIRONMENTS_ROUTE,
 # ENVIRONMENT_CHECK_ROUTE, ENVIRONMENT_REVOKE_ROUTE, RUNNER_CONTEXT_BINDINGS_ROUTE,
 # RUNNER_CONTEXT_REVOKE_ROUTE), mirrored for the T2b-2 binding gate (Astra-approved scope).
@@ -256,11 +260,25 @@ class EdgeTLSHarness:
                 return values[0] if values else None
 
             def _credentials(self) -> dict[str, str]:
+                """Mirror ``controlPlaneCredentials``' Authorization filter.
+
+                A malformed Authorization value refuses the request before anything is forwarded;
+                a valid API-key or device bearer is forwarded trimmed; an empty one is dropped.
+                Known limitation: the cookie is forwarded as sent (harness clients use the upstream
+                ``heel_session`` name, not the browser ``__Host-`` name the Worker rewrites), so
+                the Worker's session-token pattern and its bearer-plus-session refusal are not
+                mirrored here.
+                """
                 headers = {}
-                for name in ("Cookie", "Authorization"):
-                    value = self._single(name)
-                    if value is not None:
-                        headers[name] = value
+                cookie = self._single("Cookie")
+                if cookie is not None:
+                    headers["Cookie"] = cookie
+                authorization = (self._single("Authorization") or "").strip()
+                if authorization:
+                    if not (_API_KEY_AUTHORIZATION.fullmatch(authorization)
+                            or _DEVICE_AUTHORIZATION.fullmatch(authorization)):
+                        raise _EdgeRefusal(400, "invalid control plane request")
+                    headers["Authorization"] = authorization
                 return headers
 
             def _upstream_headers(self, path: str) -> dict[str, str]:

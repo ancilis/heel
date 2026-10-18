@@ -218,10 +218,12 @@ def test_real_pairing_over_tls_edge_harness_activates_persists_heartbeats_and_re
     assert ("POST", revoke_path) in harness.forwarded
     owner = harness.request("GET", "/v1/me", cookie=cookie)[1]["user_id"]
     assert _revocation_audit(harness, workspace_id, runner_id) == [(owner, "human_revocation")]
+    # T2b2R1: the refused fresh resync is reported as an authentication rejection, never as a
+    # proven revocation (the server answers a wrong clock the same way).
     revoked = _daemon(home, harness, backend).status()
-    assert revoked["state"] == "runner_revoked"
-    assert revoked["control_plane"] == {"state": "rejected", "reason": "runner_revoked"}
-    assert _daemon(home, harness, backend).status()["state"] == "runner_revoked"
+    assert revoked["state"] == "runner_authentication_rejected"
+    assert revoked["control_plane"] == {"state": "rejected", "reason": "runner_authentication_rejected"}
+    assert _daemon(home, harness, backend).status()["state"] == "runner_authentication_rejected"
     result = _daemon(home, harness, backend).unpair()
     assert result["state"] == "unpaired" and result["removed"] is True
     assert backend.values == {} and backend.deleted == [label]
@@ -354,7 +356,7 @@ def test_runner_revoke_is_post_only_same_origin_exact_body_and_bounded_at_edge_a
     assert (status, body_out) == (200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
     owner = harness.request("GET", "/v1/me", cookie=cookie)[1]["user_id"]
     assert _revocation_audit(harness, workspace_id, runner_id) == [(owner, "device_lost")]
-    assert _daemon(home, harness, backend).status()["state"] == "runner_revoked"
+    assert _daemon(home, harness, backend).status()["state"] == "runner_authentication_rejected"
 
 
 def test_http_runner_revoke_retries_and_other_workspaces_have_no_effect(tmp_path, harness):
@@ -387,9 +389,10 @@ def test_http_runner_revoke_retries_and_other_workspaces_have_no_effect(tmp_path
     owner = harness.request("GET", "/v1/me", cookie=cookie)[1]["user_id"]
     assert _revocation_audit(harness, workspace_id, runner_id) == [(owner, "human_revocation")]
     revoked = _daemon(home, harness, backend).status()
-    assert revoked["control_plane"] == {"state": "rejected", "reason": "runner_revoked"}
-    # It stays rejected after another restart (the staged call is replayed, never re-signed).
-    assert _daemon(home, harness, backend).status()["state"] == "runner_revoked"
+    assert revoked["control_plane"] == {"state": "rejected", "reason": "runner_authentication_rejected"}
+    # It stays rejected after another restart: the staged call is replayed (never re-signed) and
+    # the one fresh resync per check is refused again; no authority comes back.
+    assert _daemon(home, harness, backend).status()["state"] == "runner_authentication_rejected"
     # Workspace B's runner is untouched.
     assert _daemon(other_home, harness, other_backend).status()["state"] == "active"
     assert _revocation_audit(harness, other_workspace, other_id) == []
@@ -449,7 +452,7 @@ def test_real_pair_revoke_unpair_and_fresh_invitation_pairs_again_over_tls(tmp_p
     assert harness.request("POST", revoke_path, REVOKE_BODY, cookie=cookie)[:2] == (
         200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
     assert ("POST", revoke_path) in harness.forwarded
-    assert _daemon(home, harness, backend).status()["state"] == "runner_revoked"
+    assert _daemon(home, harness, backend).status()["state"] == "runner_authentication_rejected"
     result = _daemon(home, harness, backend).unpair()
     assert result["state"] == "unpaired" and result["removed"] is True
     assert backend.values == {} and backend.deleted == [first_label]
@@ -1185,7 +1188,8 @@ def test_runner_serve_offline_shows_offline_state_and_resumes(tmp_path, harness)
 
 
 def test_runner_serve_stops_within_deadline_on_revoke(tmp_path, harness):
-    """Gate: owner POST revoke at the edge → serve ends ``revoked`` within 5 s, then no control call."""
+    """Gate: owner POST revoke at the edge → serve ends ``rejected`` (exit 3) within 5 s, then no
+    control call. The refused fresh resync is the signal; it is not labelled a proven revocation."""
     workspace_id, cookie = harness.signup_owner("owner-serve-revoke@example.test")
     home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-revoke")
     daemon = _daemon(home, harness, backend, serve_backoff_seconds=(0.4, 1.0))
@@ -1207,10 +1211,10 @@ def test_runner_serve_stops_within_deadline_on_revoke(tmp_path, harness):
     assert not thread.is_alive() and elapsed <= 5.0, elapsed
     error = outcome["error"]
     assert isinstance(error, daemon_module.RunnerServeError)
-    assert (error.code, error.state) == ("runner_revoked", "revoked")
+    assert (error.code, error.state) == ("runner_authentication_rejected", "rejected")
     state = _serve_state(home)
-    assert (state["state"], state["last_error_code"]) == ("revoked", "runner_revoked")
-    assert _states(events)[-1] == "revoked"
+    assert (state["state"], state["last_error_code"]) == ("rejected", "runner_authentication_rejected")
+    assert _states(events)[-1] == "rejected"
     calls = len(_runner_calls(harness, runner_id))
     time.sleep(2.5)
     assert len(_runner_calls(harness, runner_id)) == calls  # no call after shutdown
@@ -1418,7 +1422,7 @@ def test_shutdown_during_a_pending_control_call_keeps_ownership_until_the_call_e
     assert status["serve"]["state"] == "online"
     assert status["control_plane"] == {"state": "not_checked", "reason": "serve_running"}
     with pytest.raises(daemon_module.RunnerServeError) as again:
-        _daemon(home, harness, backend).serve()
+        _daemon(home, harness, backend).serve(once=True)  # bounded negative check
     assert again.value.code == "already_serving"
     with pytest.raises(RunnerPairingError) as unpair:
         _daemon(home, harness, backend).unpair()
@@ -1594,7 +1598,9 @@ def test_serve_failure_classification_is_attributed_to_the_failing_call(ca):
         assert outcomes == {
             "/v1/t/unavailable": ("offline", "upstream_unavailable"),
             "/v1/t/gateway": ("offline", "upstream_unavailable"),
-            "/v1/t/revoked": ("revoked", "runner_revoked"),
+            # T2b2R1: 401 is returned to the control client (lost chain authority is recovered
+            # there); a raw 401 that reaches this classification is a decoding error.
+            "/v1/t/revoked": ("failed", "response_rejected"),
             "/v1/t/unauthorized": ("failed", "response_rejected"),
             "/v1/t/upgrade": ("failed", "protocol_upgrade_required"),
             "/v1/t/internal": ("failed", "response_rejected"),
@@ -1625,6 +1631,16 @@ def test_serve_failure_classification_is_attributed_to_the_failing_call(ca):
     for code in ("tls_trust_failed", "redirect_refused", "response_too_large", "malformed_response"):
         assert daemon_module._serve_failure(ControlTransportError(code)) == ("failed", code)
     assert daemon_module._serve_failure(RunnerStoreError("x")) == ("failed", "local_state_invalid")
+    from heel.runner.control_client import (
+        RunnerAuthenticationRejected, RunnerChainRecoveryDeferred, RunnerChainRecoveryRequired,
+    )
+    assert daemon_module._serve_failure(RunnerAuthenticationRejected()) == ("rejected", "runner_authentication_rejected")
+    deferred = RuntimeError("cycle failed")
+    deferred.__cause__ = RunnerChainRecoveryDeferred(1_500)
+    assert daemon_module._serve_failure(deferred) == ("offline", "recovery_rate_limited")
+    assert daemon_module._recovery_delay_seconds(deferred) == 1.5
+    assert daemon_module._recovery_delay_seconds(RuntimeError("x")) == 0.0
+    assert daemon_module._serve_failure(RunnerChainRecoveryRequired("claim")) == ("failed", "recovery_required")
     # The serve path never consults the transport's shared last-call attributes.
     for item in (daemon_module._AttributedTransport, daemon_module._serve_failure,
                  daemon_module._ServeSession, daemon_module._ServeCoordinator):
@@ -1766,7 +1782,7 @@ def test_serve_lock_first_creation_race_and_unsafe_lock_files_fail_closed(tmp_pa
         os.close(directory)
     monkeypatch.setattr(daemon_module.os, "open", real_open)
 
-    def persistent_enoent(_directory):
+    def persistent_enoent(_directory, _name=daemon_module._SERVE_LOCK):
         raise FileNotFoundError(2, "No such file or directory")
 
     with monkeypatch.context() as patched:
@@ -1799,8 +1815,20 @@ def test_serve_startup_racing_unpair_and_re_pair_serves_only_the_current_pairing
     # 1. Serve starting while an unpair owns the instance: refused at once, no network.
     in_unpair, release = threading.Event(), threading.Event()
 
+    owned: dict[str, bool] = {}
+
     class SlowUnpair(RunnerDaemon):
         def _unpair_locked(self, store):
+            # The injection point: instance ownership is already held (nobody else can take the
+            # lock) and no removal or network I/O has started yet.
+            directory = self._daemon_fd(store, create=False)
+            try:
+                probe = daemon_module._open_serve_lock(directory)
+                owned["serve_lock_held"] = not daemon_module._try_flock(probe, daemon_module.fcntl.LOCK_EX)
+                os.close(probe)
+            finally:
+                os.close(directory)
+            owned["record_present"] = _daemon_record(home) is not None
             in_unpair.set()
             assert release.wait(30)
             return super()._unpair_locked(store)
@@ -1810,15 +1838,19 @@ def test_serve_startup_racing_unpair_and_re_pair_serves_only_the_current_pairing
         "result", SlowUnpair(home, secret_backend=backend).unpair()), daemon=True)
     unpairing.start()
     assert in_unpair.wait(10)
+    assert owned == {"serve_lock_held": True, "record_present": True}
     forwarded = len(harness.forwarded)
-    with pytest.raises(daemon_module.RunnerServeError) as refused:
-        _daemon(home, harness, backend).serve()
+    # Bounded: a missed refusal returns after one cycle and fails here instead of serving forever.
+    try:
+        with pytest.raises(daemon_module.RunnerServeError) as refused:
+            _daemon(home, harness, backend).serve(once=True)
+    finally:
+        release.set()
     assert refused.value.code == "already_serving" and len(harness.forwarded) == forwarded
-    release.set()
     unpairing.join(10)
     assert unpair_outcome["result"]["removed"] is True
     with pytest.raises(daemon_module.RunnerServeError) as gone:
-        _daemon(home, harness, backend).serve()
+        _daemon(home, harness, backend).serve(once=True)  # bounded negative check
     assert gone.value.code == "unpaired"
     assert harness.request("POST", f"/v1/workspaces/{workspace_id}/runners/{old_runner}/revoke",
                            REVOKE_BODY, cookie=cookie)[0] == 200
@@ -1841,7 +1873,7 @@ def test_serve_startup_racing_unpair_and_re_pair_serves_only_the_current_pairing
     assert pending.wait(30) and "error" not in outcome
     forwarded = len(harness.forwarded)
     with pytest.raises(daemon_module.RunnerServeError) as incomplete:
-        _daemon(home, harness, backend).serve()
+        _daemon(home, harness, backend).serve(once=True)  # bounded negative check
     assert incomplete.value.code == "pairing_incomplete"
     assert all("/runners/" not in path for _m, path in harness.forwarded[forwarded:])
     printed = events[0]
@@ -2371,3 +2403,689 @@ def test_transport_never_reaches_a_plain_http_listener(tmp_path):
     finally:
         listener.close()
         thread.join(3)
+
+
+# ---------------------------------------------------------------------------
+# T2b2R1: chain-authority recovery over the real TLS edge and control plane.
+#
+# SEAM-CLOCK (labelled): the loopback control plane runs in this process, so shifting
+# ``time.time``/``time.time_ns`` advances the server's clock AND the runner's signing clock
+# (``RunnerDaemon`` defaults to ``time.time_ns``) together, exactly like that much wall time passing.
+# Monotonic time (locks, backoff, test deadlines) is untouched. Real waits of 35 s / 65 s are run
+# separately in the real Keychain acceptance (T2b2R1-artifacts); the server code is unchanged.
+
+from heel.runner.runtime import RunnerRuntimeState  # noqa: E402
+
+
+@contextlib.contextmanager
+def _seam_clock(seconds: float):
+    real_time, real_time_ns = time.time, time.time_ns
+    time.time = lambda: real_time() + seconds
+    time.time_ns = lambda: real_time_ns() + int(seconds * 1_000_000_000)
+    try:
+        yield
+    finally:
+        time.time, time.time_ns = real_time, real_time_ns
+
+
+class _FaultTransport:
+    """Test-only faults around the real HTTPS transport, by exact route suffix and in order.
+
+    ``drop_before``: the request never leaves (refused connect); ``drop_after``: the real edge and
+    server answer, then the answer is lost; a callable rewrites ``(path, headers, body)`` before
+    sending.
+    """
+
+    def __init__(self, transport, faults):
+        self._transport, self._faults = transport, faults
+        self.last_status = self.last_error_code = None
+
+    def post(self, path, *, headers=None, body=b""):
+        for suffix, queue in self._faults.items():
+            if path.endswith(suffix) and queue:
+                fault = queue.pop(0)
+                if fault == "drop_before":
+                    raise ControlTransportError("connection_failed")
+                if fault == "drop_after":
+                    self._transport.post(path, headers=headers, body=body)
+                    raise ControlTransportError("timeout")
+                if callable(fault):
+                    path, headers, body = fault(path, dict(headers or {}), body)
+                break
+        answer = self._transport.post(path, headers=headers, body=body)
+        self.last_status = self._transport.last_status
+        self.last_error_code = self._transport.last_error_code
+        return answer
+
+
+def _fault_daemon(daemon, faults):
+    real = daemon._transport
+    daemon._transport = lambda origin: _FaultTransport(real(origin), faults)
+    return daemon
+
+
+def _runtime_view(home, harness, backend):
+    view_daemon = _daemon(home, harness, backend)
+    record = _daemon_record(home)
+    identity, signer = view_daemon._active_identity(view_daemon._store(), record)
+    runtime = RunnerRuntimeState(view_daemon.runtime_path, identity, signer)
+    try:
+        cursor = runtime.load_chain("claim", None)
+        return {
+            "pending": [(item.request_operation, item.generation) for item in runtime.load_pending_calls()],
+            "tombstones": [(item.request_operation, item.generation, item.superseded_by_generation)
+                           for item in runtime.load_superseded_calls()],
+            "generation": cursor.generation, "attempt": runtime.load_resync_attempt("claim"),
+            "active_runs": [item.run_id for item in runtime.load_active_run_controls(limit=64)],
+        }
+    finally:
+        runtime.close()
+
+
+def _server_claim_generation(harness, workspace_id, runner_id):
+    return harness.control_plane.store.conn.execute(
+        "SELECT generation FROM canary_runner_chain_cursors WHERE workspace_id=? AND runner_id=? AND chain_name='claim'",
+        (workspace_id, runner_id),
+    ).fetchone()[0]
+
+
+def _server_resyncs(harness, workspace_id, runner_id):
+    return [row[0] for row in harness.control_plane.store.conn.execute(
+        "SELECT status FROM canary_runner_resync_challenges WHERE workspace_id=? AND runner_id=? ORDER BY created_at",
+        (workspace_id, runner_id),
+    )]
+
+
+def _serve_once(daemon):
+    try:
+        return daemon.serve(once=True)
+    except daemon_module.RunnerServeError as error:
+        return error
+
+
+def test_first_serve_after_pairing_idle_beyond_nonce_ttl_resyncs_and_is_online(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("r1-first-serve@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-first")
+    record_before = _daemon_record(home)
+    with _seam_clock(65.0):  # SEAM-CLOCK: pair, then 65 s idle (> 60 s nonce TTL) before the first serve
+        daemon = _daemon(home, harness, backend)
+        thread, events, outcome = _serve_in_thread(daemon)
+        _wait_serve_state(home, lambda state: state["state"] == "online")
+        daemon.request_stop()
+        thread.join(10)
+    assert outcome["result"]["state"] == "stopped", outcome
+    assert _states(events) == ["starting", "online", "stopped"]
+    assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+    assert _server_claim_generation(harness, workspace_id, runner_id) == 1
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [] and view["attempt"] is None and view["generation"] == 1
+    assert view["tombstones"] == [("list-contexts", 0, 1)]
+    assert _daemon_record(home) == record_before  # identity and pairing untouched by recovery
+    status = _daemon(home, harness, backend).status()
+    assert (status["state"], status["control_plane"]["state"]) == ("active", "confirmed")
+
+
+def test_status_after_idle_beyond_nonce_ttl_resyncs_and_confirms(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("r1-status-idle@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-status")
+    with _seam_clock(65.0):  # SEAM-CLOCK
+        first = _daemon(home, harness, backend).status()
+        second = _daemon(home, harness, backend).status()
+    assert (first["state"], first["control_plane"]["state"]) == ("active", "confirmed"), first
+    assert (second["state"], second["control_plane"]["state"]) == ("active", "confirmed")
+    # A fresh chain needs no further resync: exactly one recovery for the idle gap.
+    assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+    assert _runtime_view(home, harness, backend)["tombstones"] == [("list-contexts", 0, 1)]
+
+
+@pytest.mark.parametrize("outage_seconds", [35.0, 65.0])
+def test_serve_resumes_after_an_outage_longer_than_the_proof_window_with_a_staged_call(tmp_path, harness, outage_seconds):
+    workspace_id, cookie = harness.signup_owner(f"r1-outage-{int(outage_seconds)}@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-outage")
+    daemon = _daemon(home, harness, backend, serve_backoff_seconds=(0.4, 1.0))
+    thread, events, outcome = _serve_in_thread(daemon)
+    try:
+        _wait_serve_state(home, lambda state: state["state"] == "online")
+        harness.pause_upstream()
+        _wait_serve_state(home, lambda state: state["state"] == "offline")
+        with _seam_clock(outage_seconds):  # SEAM-CLOCK: the outage lasts this long
+            harness.resume_upstream()
+            _wait_serve_state(home, lambda state: state["state"] == "online", timeout=30)
+            daemon.request_stop()
+            thread.join(10)
+    finally:
+        harness.resume_upstream()
+        daemon.request_stop()
+        thread.join(10)
+    assert outcome["result"]["state"] == "stopped", outcome
+    assert "revoked" not in _states(events) and "rejected" not in _states(events)
+    assert _states(events)[-3:] == ["offline", "online", "stopped"]
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [] and view["attempt"] is None
+    assert view["tombstones"] == [("list-contexts", 0, 1)]
+    assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+    status = _daemon(home, harness, backend).status()
+    assert status["control_plane"]["state"] == "confirmed"
+
+
+def _bound_events(harness, binding_id):
+    return [row[0] for row in harness.control_plane.store.conn.execute(
+        "SELECT action FROM canary_runner_context_events WHERE rcb_id=? ORDER BY created_at_ms,rowid", (binding_id,),
+    )]
+
+
+@pytest.mark.parametrize("fault, shift", [("drop_before", 35.0), ("drop_after", 65.0)])
+def test_staged_claim_context_lost_before_or_after_commit_recovers_one_binding(tmp_path, serve_harness, fault, shift):
+    harness, zone = serve_harness
+    workspace_id, cookie = harness.signup_owner(f"r1-claim-{fault}@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-claim")
+    record = _daemon_record(home)
+    _base, binding = _authorize_binding(harness, zone, workspace_id, cookie, runner_id, record["runner_key_id"])
+    binding_id = binding["binding_id"]
+    first = _fault_daemon(_daemon(home, harness, backend), {f"/contexts/{binding_id}/claim": [fault]})
+    assert isinstance(_serve_once(first), daemon_module.RunnerServeError)  # offline: claim answer lost
+    assert _runtime_view(home, harness, backend)["pending"] == [("claim-context", 0)]
+    with _seam_clock(shift):  # SEAM-CLOCK
+        result = _serve_once(_daemon(home, harness, backend))
+    assert not isinstance(result, BaseException), (result.state, result.code)
+    assert (result["state"], result["binding_id"]) == ("stopped", binding_id), result
+    assert RunnerStore(home).is_context_bound
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [] and view["attempt"] is None
+    if fault == "drop_before":
+        # Never recorded: the stale claim is superseded and the same binding is claimed again.
+        assert view["tombstones"] == [("claim-context", 0, 1)]
+    else:
+        # Recorded: its sealed receipt replays with no resync for it; the later fresh list found an
+        # expired nonce and that is what was recovered.
+        assert view["tombstones"] == [("list-contexts", 0, 1)]
+    assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+    # Exactly one first claim server-side, whichever path ran: no duplicate binding effect.
+    assert _bound_events(harness, binding_id).count("claimed") == 1
+
+
+def test_real_revocation_still_stops_promptly_and_never_regains_authority(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("r1-revoked@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-revoked")
+    daemon = _daemon(home, harness, backend)
+    thread, events, outcome = _serve_in_thread(daemon)
+    _wait_serve_state(home, lambda state: state["state"] == "online")
+    started = time.monotonic()
+    assert harness.request(
+        "POST", f"/v1/workspaces/{workspace_id}/runners/{runner_id}/revoke", REVOKE_BODY, cookie=cookie,
+    )[0] == 200
+    thread.join(10)
+    assert not thread.is_alive() and time.monotonic() - started <= 5.0
+    error = outcome["error"]
+    assert (error.code, error.state) == ("runner_authentication_rejected", "rejected")
+    assert daemon_module.SERVE_EXIT_CODES[error.state] == 3
+    calls = len(_runner_calls(harness, runner_id))
+    time.sleep(2.5)
+    assert len(_runner_calls(harness, runner_id)) == calls
+    # Later and even far in the future: a revoked key is refused before any challenge is created.
+    for shift in (0.0, 120.0):
+        with _seam_clock(shift):  # SEAM-CLOCK
+            status = _daemon(home, harness, backend).status()
+        assert status["state"] == "runner_authentication_rejected", status
+        assert status["control_plane"] == {"state": "rejected", "reason": "runner_authentication_rejected"}
+        assert "revoked" not in json.dumps(status["control_plane"])
+    assert _server_resyncs(harness, workspace_id, runner_id) == []
+    view = _runtime_view(home, harness, backend)
+    assert view["tombstones"] == [] and view["attempt"] is None and view["generation"] == 0
+
+
+def test_a_wrong_local_clock_is_reported_honestly_and_correcting_it_recovers(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("r1-clock@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-clock")
+    skewed = _daemon(home, harness, backend, clock_ms=lambda: time.time_ns() // 1_000_000 + 120_000)
+    status = skewed.status()
+    assert status["state"] == "runner_authentication_rejected"
+    assert any("clock" in step for step in status["next_steps"])
+    assert _runtime_view(home, harness, backend)["pending"] == [("list-contexts", 0)]
+    corrected = _daemon(home, harness, backend).status()
+    assert (corrected["state"], corrected["control_plane"]["state"]) == ("active", "confirmed"), corrected
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [] and view["tombstones"] == [("list-contexts", 0, 1)]
+
+
+def test_resync_rate_limit_429_backs_off_and_never_reports_revoked(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("r1-rate@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-rate")
+    # SEAM-TAMPER-429: the control plane's exact rate-limit answer (http_api.py), with a short
+    # retry_after_ms so the retry is observable; the real start is not sent for that one answer.
+    limited = (429, {}, {"schema_version": "heel.runner-error.v1", "code": "runner_resync_rate_limited",
+                         "retry_after_ms": 1_500})
+    daemon = _daemon(home, harness, backend, serve_backoff_seconds=(0.1, 0.2))
+
+    class Limited(_FaultTransport):
+        starts = []
+
+        def post(self, path, *, headers=None, body=b""):
+            if path.endswith("/resync/start"):
+                Limited.starts.append(time.monotonic())
+                if len(Limited.starts) == 1:
+                    return limited
+            return super().post(path, headers=headers, body=body)
+
+    real = RunnerDaemon._transport
+    daemon._transport = lambda origin: Limited(real(daemon, origin), {})
+    with _seam_clock(65.0):  # SEAM-CLOCK
+        thread, events, outcome = _serve_in_thread(daemon)
+        state = _wait_serve_state(home, lambda item: item["state"] == "offline")
+        assert state["last_error_code"] == "recovery_rate_limited"
+        _wait_serve_state(home, lambda item: item["state"] == "online", timeout=20)
+        daemon.request_stop()
+        thread.join(10)
+    assert outcome["result"]["state"] == "stopped"
+    assert len(Limited.starts) == 2 and Limited.starts[1] - Limited.starts[0] >= 1.4  # honoured, no busy loop
+    assert "revoked" not in _states(events) and "rejected" not in _states(events)
+
+
+def test_lost_resync_answers_and_restart_recover_by_retransmission_or_one_fresh_start(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("r1-lost@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-lost")
+    # (1) Idle 65 s; the start's answer is lost after the server created the challenge.
+    with _seam_clock(65.0):  # SEAM-CLOCK
+        lost_start = _fault_daemon(_daemon(home, harness, backend), {"/resync/start": ["drop_after"]})
+        assert lost_start.status()["state"] == "offline"
+        assert _runtime_view(home, harness, backend)["attempt"].challenge_id is None
+        # Restart within the challenge lifetime: the byte-identical start returns the same challenge.
+        assert _daemon(home, harness, backend).status()["control_plane"]["state"] == "confirmed"
+    assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+    # (2) Idle again; now the completion's answer is lost after the server completed it.
+    with _seam_clock(140.0):  # SEAM-CLOCK
+        lost_complete = _fault_daemon(_daemon(home, harness, backend), {"/resync/complete": ["drop_after"]})
+        assert lost_complete.status()["state"] == "offline"
+        assert _server_claim_generation(harness, workspace_id, runner_id) == 2
+        assert _runtime_view(home, harness, backend)["generation"] == 1
+        # The exact completion is answered from the server's sealed record: no second challenge.
+        assert _daemon(home, harness, backend).status()["control_plane"]["state"] == "confirmed"
+    assert _server_resyncs(harness, workspace_id, runner_id) == ["completed", "completed"]
+    # (3) Start answer lost, restart only after the challenge expired: the stale retransmission is
+    # refused and exactly one fresh start recovers; recovery itself is never a stale-proof trap.
+    with _seam_clock(215.0):  # SEAM-CLOCK
+        assert _fault_daemon(_daemon(home, harness, backend), {"/resync/start": ["drop_after"]}).status()["state"] == "offline"
+    with _seam_clock(290.0):  # SEAM-CLOCK: +75 s, the challenge (60 s) and its proof window expired
+        assert _daemon(home, harness, backend).status()["control_plane"]["state"] == "confirmed"
+    assert _server_resyncs(harness, workspace_id, runner_id)[-1] == "completed"
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [] and view["attempt"] is None
+    assert view["generation"] == _server_claim_generation(harness, workspace_id, runner_id) == 3
+
+
+def _rewrite_signature(path, headers, body):
+    signature = base64.b64decode(headers["X-Heel-Runner-Signature"])
+    headers["X-Heel-Runner-Signature"] = base64.b64encode(bytes([signature[0] ^ 1]) + signature[1:]).decode()
+    return path, headers, body
+
+
+def _rewrite_workspace(path, headers, body):
+    workspace = path.split("/")[3]
+    # A well-formed workspace that is not this runner's: the edge forwards it, the server refuses.
+    return path.replace(workspace, "ws_" + "0" * 16, 1), headers, body
+
+
+@pytest.mark.parametrize("route, fault, expected", [
+    ("/resync/complete", _rewrite_signature, "runner_authentication_rejected"),
+    ("/resync/start", _rewrite_signature, "runner_authentication_rejected"),
+    # The server's protocol gate answers first for a runner unknown in that workspace (unchanged).
+    ("/resync/start", _rewrite_workspace, "protocol_upgrade_required"),
+])
+def test_forged_or_misdirected_resync_never_supersedes(tmp_path, harness, route, fault, expected):
+    workspace_id, cookie = harness.signup_owner(f"r1-forged-{route[8:]}-{fault.__name__}@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-forged")
+    with _seam_clock(65.0):  # SEAM-CLOCK
+        status = _fault_daemon(_daemon(home, harness, backend), {route: [fault, fault]}).status()
+    assert status["control_plane"] == {"state": "rejected", "reason": expected}, status
+    assert status["state"] in {"runner_authentication_rejected", "active"} and "revoked" not in status["state"]
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [("list-contexts", 0)] and view["tombstones"] == [] and view["generation"] == 0
+    assert _server_claim_generation(harness, workspace_id, runner_id) == 0
+
+
+def test_a_wrong_generation_in_the_completion_is_refused_then_the_chain_converges(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("r1-generation@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-generation")
+
+    class WrongGeneration(_FaultTransport):
+        """Test-only: the real server completed; the runner is shown a generation one past it."""
+
+        done = False
+
+        def post(self, path, *, headers=None, body=b""):
+            status, response_headers, payload = super().post(path, headers=headers, body=body)
+            if path.endswith("/resync/complete") and not WrongGeneration.done:
+                WrongGeneration.done = True
+                return status, response_headers, {**payload, "generation": payload["generation"] + 1}
+            return status, response_headers, payload
+
+    with _seam_clock(65.0):  # SEAM-CLOCK
+        daemon = _daemon(home, harness, backend)
+        real = RunnerDaemon._transport
+        daemon._transport = lambda origin: WrongGeneration(real(daemon, origin), {})
+        status = daemon.status()
+        assert status["control_plane"] == {"state": "rejected", "reason": "response_rejected"}
+        view = _runtime_view(home, harness, backend)
+        assert view["pending"] == [("list-contexts", 0)] and view["tombstones"] == [] and view["generation"] == 0
+        assert _server_claim_generation(harness, workspace_id, runner_id) == 1  # the server did advance
+        # The next check signs one fresh resync from the server's generation and converges.
+        assert _daemon(home, harness, backend).status()["control_plane"]["state"] == "confirmed"
+    view = _runtime_view(home, harness, backend)
+    assert view["generation"] == _server_claim_generation(harness, workspace_id, runner_id) == 2
+    assert view["tombstones"] == [("list-contexts", 0, 2)]
+
+
+def _issue_grant_fixture(harness, workspace_id, cookie, base, binding, runner_id, runner_key_id, seed):
+    """SEAM-GRANT-FIXTURE (explicit): issue ONE real grant for this paired runner.
+
+    The owner's projection submit and execution approval go straight to the control plane backend
+    (``_direct_backend``: the edge harness does not mirror those routes) with the owner session; the
+    approval projection is signed with the paired runner's own key, as the runner will in T3b. It
+    proves recovery against a real issued grant only, not browser approval or launch acceptance.
+    """
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from heel.canary_contracts import canonical_digest
+    from tests.canary_test_support import approval_projection
+
+    runner_key = SigningAuthority.from_private_key(Ed25519PrivateKey.from_private_bytes(seed), runner_key_id)
+    environment = binding["environment"]
+    projection = approval_projection(
+        runner_key, workspace_id=workspace_id, project_ref=binding["project_id"],
+        environment_id=environment["environment_id"], runner_id=runner_id,
+        verification_digest=environment["verification_record_digest"],
+    )
+    identity = json.loads(harness.control_plane.store.conn.execute(
+        "SELECT identity_json FROM canary_runner_identity_records WHERE workspace_id=? AND runner_id=?",
+        (workspace_id, runner_id),
+    ).fetchone()[0])
+    projection = {k: v for k, v in projection.items() if k not in {"projection_digest", "signing_key_id", "signature_b64"}}
+    projection["environment"]["origin"] = environment["origin"]
+    projection["egress"]["hostname"] = environment["origin"].split("//", 1)[1]
+    projection["runner"].update(runner_version=identity["runner_version"], adapter_versions=identity["adapter_versions"])
+    for item in projection["scenarios"] + projection["actions"]:
+        item["adapter_version"] = identity["adapter_versions"][0]
+    projection["projection_digest"] = canonical_digest(projection)
+    projection.update(runner_key.sign(canonical_bytes({k: v for k, v in projection.items() if k != "projection_digest"})))
+    owner = [("X-Heel-Edge-Auth", harness.edge_secret), ("Cookie", cookie), ("Origin", harness.origin),
+             ("X-Heel-Internal-Origin", "same-origin"), ("Content-Type", "application/json")]
+    body = canonical_bytes(projection)
+    status, submitted = _direct_backend(harness, "POST", f"{base}/canary-approval-projections", body,
+                                        owner + [("Content-Length", str(len(body)))])
+    assert status == 201, submitted
+    approve = canonical_bytes({
+        "schema_version": "heel.canary-execution-approval.v1", "projection_digest": projection["projection_digest"],
+        "hostname_retype": projection["egress"]["hostname"], "reason": "Run the exact bounded staging rehearsal",
+    })
+    status, approved = _direct_backend(harness, "POST", f"{base}/canary-runs/{submitted['run_id']}/approve", approve, owner + [
+        ("Content-Length", str(len(approve))), ("Idempotency-Key", "ca1-" + "a" * 64), ("If-Heel-Control-Generation", "0"),
+    ])
+    assert status == 201, approved
+    return approved["grant"]["grant_id"]
+
+
+def _grant_effects(harness, workspace_id):
+    conn = harness.control_plane.store.conn
+    return {
+        "grants": [row[0] for row in conn.execute(
+            "SELECT status FROM canary_execution_grants WHERE workspace_id=?", (workspace_id,))],
+        "consumed_nonces": conn.execute(
+            "SELECT COUNT(*) FROM canary_consumed_nonces WHERE workspace_id=?", (workspace_id,)).fetchone()[0],
+        "run_chains": conn.execute(
+            "SELECT COUNT(*) FROM canary_runner_chain_cursors WHERE workspace_id=? AND chain_name!='claim'",
+            (workspace_id,)).fetchone()[0],
+    }
+
+
+def _bound_runner_with_staged_claim(tmp_path, serve_harness, name, *, fault="drop_before", grant=False):
+    harness, zone = serve_harness
+    workspace_id, cookie = harness.signup_owner(f"r1-{name}@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, name)
+    record = _daemon_record(home)
+    base, binding = _authorize_binding(harness, zone, workspace_id, cookie, runner_id, record["runner_key_id"])
+    assert _serve_once(_daemon(home, harness, backend))["state"] == "stopped"  # bound, online, idle
+    if grant and fault == "drop_after":
+        # The grant exists before the lost answer: the server claims it, the runner never hears.
+        _issue_grant_fixture(harness, workspace_id, cookie, base, binding, runner_id,
+                             record["runner_key_id"], next(iter(backend.values.values())))
+    lost = _fault_daemon(_daemon(home, harness, backend), {f"/runners/{runner_id}/claim": [fault]})
+    assert isinstance(_serve_once(lost), daemon_module.RunnerServeError)
+    assert _runtime_view(home, harness, backend)["pending"] == [("claim", 0)]
+    if grant and fault == "drop_before":
+        _issue_grant_fixture(harness, workspace_id, cookie, base, binding, runner_id,
+                             record["runner_key_id"], next(iter(backend.values.values())))
+    return harness, workspace_id, home, backend, runner_id
+
+
+def _claim_ledger(harness, workspace_id, runner_id):
+    return [tuple(row) for row in harness.control_plane.store.conn.execute(
+        "SELECT sequence,generation,response_status,path FROM canary_runner_request_ledger "
+        "WHERE workspace_id=? AND runner_id=? AND chain_name='claim'", (workspace_id, runner_id))]
+
+
+def test_serve_resumes_after_an_outage_longer_than_the_proof_window_with_a_staged_job_claim(tmp_path, serve_harness):
+    harness, workspace_id, home, backend, runner_id = _bound_runner_with_staged_claim(tmp_path, serve_harness, "r1-jobq")
+    with _seam_clock(35.0):  # SEAM-CLOCK
+        result = _serve_once(_daemon(home, harness, backend))
+    assert not isinstance(result, BaseException), (result.state, result.code)
+    assert result["state"] == "stopped" and result["binding_id"] is not None
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [] and view["attempt"] is None and view["tombstones"] == [("claim", 0, 1)]
+    assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+    assert _grant_effects(harness, workspace_id) == {"grants": [], "consumed_nonces": 0, "run_chains": 0}
+    # The latest claim-chain receipt is the NEW signed poll at the recovered generation (idle 204).
+    ((_sequence, generation, status, path),) = _claim_ledger(harness, workspace_id, runner_id)
+    assert (generation, status, path.endswith("/claim")) == (1, 204, True)
+
+
+def test_a_superseded_job_claim_then_claims_an_existing_grant_exactly_once(tmp_path, serve_harness):
+    harness, workspace_id, home, backend, runner_id = _bound_runner_with_staged_claim(
+        tmp_path, serve_harness, "r1-jobg", grant=True,
+    )
+    assert _grant_effects(harness, workspace_id)["grants"] == ["issued"]
+    with _seam_clock(35.0):  # SEAM-CLOCK
+        result = _serve_once(_daemon(home, harness, backend))
+    # The fresh poll takes the grant; serve has no execution bridge yet and fails closed.
+    assert (result.state, result.code) == ("failed", "execution_unavailable")
+    assert _grant_effects(harness, workspace_id) == {"grants": ["claimed"], "consumed_nonces": 1, "run_chains": 4}
+    view = _runtime_view(home, harness, backend)
+    assert view["tombstones"] == [("claim", 0, 1)] and view["pending"] == []
+
+
+def test_a_job_claim_answer_lost_after_commit_replays_its_receipt_without_resync(tmp_path, serve_harness):
+    harness, workspace_id, home, backend, runner_id = _bound_runner_with_staged_claim(
+        tmp_path, serve_harness, "r1-jobc", fault="drop_after", grant=True,
+    )
+    assert _grant_effects(harness, workspace_id)["grants"] == ["claimed"]
+    receipt = _claim_ledger(harness, workspace_id, runner_id)
+    (claimed_run,) = [row[0] for row in harness.control_plane.store.conn.execute(
+        "SELECT run_id FROM canary_runs WHERE workspace_id=? AND status='claimed'", (workspace_id,))]
+    with _seam_clock(65.0):  # SEAM-CLOCK: beyond the proof window; the receipt lookup comes first
+        result = _serve_once(_daemon(home, harness, backend))
+    # Recovery part, proven: the staged call resolved from its sealed receipt (no resync, no new
+    # claim, server effects unchanged) and the claimed run is durably installed locally, not lost.
+    assert _server_resyncs(harness, workspace_id, runner_id) == []
+    assert _grant_effects(harness, workspace_id) == {"grants": ["claimed"], "consumed_nonces": 1, "run_chains": 4}
+    assert _claim_ledger(harness, workspace_id, runner_id) == receipt
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [] and view["tombstones"] == [] and view["active_runs"] == [claimed_run]
+    # NOT functional recovery: a pre-T4a limitation. The claimed run has no local approved pair, so
+    # startup hydration fails closed; restart-after-claim is owned by T4a (recorded for review).
+    assert (result.state, result.code) == ("failed", "local_state_invalid")
+
+
+def test_a_consumed_job_claim_sequence_behind_an_expired_receipt_is_kept_as_recovery_required(tmp_path, serve_harness):
+    harness, workspace_id, home, backend, runner_id = _bound_runner_with_staged_claim(
+        tmp_path, serve_harness, "r1-jobx", fault="drop_after",
+    )
+    ((sequence, generation, status, _path),) = _claim_ledger(harness, workspace_id, runner_id)
+    assert (generation, status) == (0, 204)  # committed idle poll, answer lost
+    # SEAM-CLOCK: past the 30-day receipt retention -> the exact replay answers 401 although the
+    # sequence was consumed; the accepted resync's cursor (S + 1) proves it and nothing is retired.
+    with _seam_clock(31 * 86_400.0):
+        result = _serve_once(_daemon(home, harness, backend))
+        status_view = _daemon(home, harness, backend).status()
+    assert (result.state, result.code) == ("failed", "recovery_required")
+    assert status_view["state"] == "recovery_required"
+    assert status_view["control_plane"] == {
+        "state": "recovery_required", "reason": "claim_sequence_consumed", "operation": "claim",
+    }
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [("claim", 0)] and view["tombstones"] == [] and view["generation"] == 0
+    assert view["attempt"] is not None and view["attempt"].complete_body is not None
+    assert _server_claim_generation(harness, workspace_id, runner_id) == 1
+
+
+def test_a_forged_completion_for_a_staged_job_claim_never_supersedes(tmp_path, serve_harness):
+    harness, workspace_id, home, backend, runner_id = _bound_runner_with_staged_claim(tmp_path, serve_harness, "r1-jobf")
+
+    class ForgedCompletion(_FaultTransport):
+        """Test-only: the real server completed; the runner is shown a sequence past it."""
+
+        def post(self, path, *, headers=None, body=b""):
+            status, response_headers, payload = super().post(path, headers=headers, body=body)
+            if path.endswith("/resync/complete"):
+                return status, response_headers, {**payload, "next_sequence": payload["next_sequence"] + 1}
+            return status, response_headers, payload
+
+    daemon = _daemon(home, harness, backend)
+    real = RunnerDaemon._transport
+    daemon._transport = lambda origin: ForgedCompletion(real(daemon, origin), {})
+    with _seam_clock(35.0):  # SEAM-CLOCK
+        result = _serve_once(daemon)
+    assert (result.state, result.code) == ("failed", "recovery_required")
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [("claim", 0)] and view["tombstones"] == [] and view["generation"] == 0
+    assert _grant_effects(harness, workspace_id)["consumed_nonces"] == 0
+
+
+# --------------------------------------------------------------- T2b2R1 F2/F3/F4: live status ownership
+
+
+def test_concurrent_live_status_checks_are_serialized_and_both_confirm(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("r1-f4@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-f4")
+    holder = _daemon(home, harness, backend)
+    gate = _gate_daemon(holder)
+    gate["armed"].set()
+    results: dict[str, dict] = {}
+    first = threading.Thread(target=lambda: results.setdefault("first", holder.status()))
+    first.start()
+    assert gate["holding"].wait(10)  # the first check's answer is in flight
+    second = threading.Thread(target=lambda: results.setdefault("second", _daemon(home, harness, backend).status()))
+    second.start()
+    time.sleep(0.5)
+    assert second.is_alive()  # waits for the turnstile; it never shares the claim chain
+    gate["release"].set()
+    first.join(10); second.join(10)
+    assert results["first"]["control_plane"]["state"] == "confirmed", results
+    assert results["second"]["control_plane"]["state"] == "confirmed", results
+
+
+def test_serve_start_waits_for_a_status_check_and_reports_contention_distinctly(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("r1-f2@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-f2")
+    holder = _daemon(home, harness, backend)
+    gate = _gate_daemon(holder)
+    gate["armed"].set()
+    checked: dict[str, dict] = {}
+    status_thread = threading.Thread(target=lambda: checked.setdefault("status", holder.status()))
+    status_thread.start()
+    assert gate["holding"].wait(10)
+    # A short-grace serve gives up with ``status_busy`` (never ``already_serving``) ...
+    impatient = _daemon(home, harness, backend, transport_timeout_seconds=0.1)
+    started = time.monotonic()
+    with pytest.raises(daemon_module.RunnerServeError) as busy:
+        impatient.serve()
+    assert busy.value.code == "status_busy" and time.monotonic() - started < 5
+    # ... and a normal serve simply starts once the check is over.
+    serving = _daemon(home, harness, backend)
+    thread, events, outcome = _serve_in_thread(serving)
+    time.sleep(0.3)
+    assert thread.is_alive() and _serve_state(home) is None
+    gate["release"].set()
+    status_thread.join(10)
+    _wait_serve_state(home, lambda state: state["state"] == "online")
+    serving.request_stop()
+    thread.join(10)
+    assert outcome["result"]["state"] == "stopped" and checked["status"]["control_plane"]["state"] == "confirmed"
+
+
+class _GatedLoadBackend(RecordingSecretBackend):
+    """Holds identity loads while armed (a slow OS secret store during serve startup or unpair)."""
+
+    def __init__(self, values):
+        super().__init__()
+        self.values = values
+        self.armed, self.entered, self.release = threading.Event(), threading.Event(), threading.Event()
+
+    def load(self, label):
+        if self.armed.is_set():
+            self.armed.clear()
+            self.entered.set()
+            assert self.release.wait(30)
+        return super().load(label)
+
+    def delete(self, label):
+        if self.armed.is_set():
+            self.armed.clear()
+            self.entered.set()
+            assert self.release.wait(30)
+        super().delete(label)
+
+
+def test_status_never_presents_a_previous_serve_file_during_startup_or_unpair(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("r1-f3@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r1-f3")
+    assert _serve_once(_daemon(home, harness, backend))["state"] == "stopped"
+    previous = _serve_state(home)
+    assert previous["state"] == "stopped"
+    gated = _GatedLoadBackend(backend.values)
+    gated.armed.set()
+    serving = _daemon(home, harness, gated)
+    thread, _events, outcome = _serve_in_thread(serving)
+    assert gated.entered.wait(10)  # serve owns the instance and is still loading its identity
+    view = _daemon(home, harness, backend).status(check_control_plane=False)
+    assert view["serve"]["state"] == "starting" and view["serve"]["since_ms"] > previous["updated_at_ms"]
+    gated.release.set()
+    _wait_serve_state(home, lambda state: state["state"] == "online")
+    serving.request_stop()
+    thread.join(10)
+    assert outcome["result"]["state"] == "stopped"
+    # During an unpair (held inside its seed removal), status says so instead of describing a
+    # half-removed instance or a previous serve as live; a serve is still refused at once.
+    gated = _GatedLoadBackend(backend.values)
+    unpairing = _daemon(home, harness, gated)
+    gated.armed.set()
+    done: dict[str, dict] = {}
+    unpair_thread = threading.Thread(target=lambda: done.setdefault("unpair", unpairing.unpair()))
+    unpair_thread.start()
+    assert gated.entered.wait(10)
+    during = _daemon(home, harness, backend).status()
+    assert during["state"] == "unpairing" and during["serve"]["state"] == "unpairing", during
+    assert during["control_plane"] == {"state": "not_checked", "reason": "unpair_running"}
+    with pytest.raises(daemon_module.RunnerServeError) as refused:
+        _daemon(home, harness, backend).serve(once=True)
+    assert refused.value.code == "already_serving"
+    gated.release.set()
+    unpair_thread.join(10)
+    assert done["unpair"]["removed"] is True
+    assert _daemon(home, harness, backend).status() == {"state": "unpaired"} and _serve_state(home) is None
+
+
+def test_edge_harness_default_route_refuses_a_malformed_bearer_like_the_worker(tmp_path, harness):
+    """F5: ``controlPlaneCredentials`` refuses any non-empty Authorization that is not an API-key or
+    device bearer before forwarding; valid project routes still work with the session cookie."""
+    workspace_id, cookie = harness.signup_owner("r1-f5@example.test")
+    path = f"/v1/workspaces/{workspace_id}/projects"
+    for value in ("Bearer not-an-api-key", "Basic abc", "Bearer heel_sk_", "Bearer heel_at_" + "a" * 42, "x"):
+        forwarded = len(harness.forwarded)
+        status, _body, _ = harness.request("POST", path, {"name": "P"}, cookie=cookie, headers={"Authorization": value})
+        assert status == 400 and len(harness.forwarded) == forwarded, value
+    forwarded = len(harness.forwarded)
+    assert harness.request("POST", path, {"name": "P"}, cookie=cookie)[0] == 201
+    assert harness.request("POST", path, {"name": "Q"}, cookie=cookie, headers={"Authorization": "  "})[0] == 201
+    assert len(harness.forwarded) == forwarded + 2
+    # A well-formed API-key bearer is forwarded (the control plane, not the edge, decides on it).
+    forwarded = len(harness.forwarded)
+    harness.request("GET", path, headers={"Authorization": "Bearer heel_sk_" + "a" * 32})
+    assert len(harness.forwarded) == forwarded + 1
