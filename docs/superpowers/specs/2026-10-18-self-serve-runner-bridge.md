@@ -111,7 +111,8 @@ would offer a silent re-trust path on key change):
   ed25519_key_id(public_key)`; built in `RunnerAuthStore.activate_executable`
   (`runner_auth.py:1776-1830`), validated by `_validated_v3_activation_response` (renamed
   accordingly) on replay, and by `RunnerStore._activation_response` (`store.py:1162-1195`).
-  `control_protocol` stays `heel.runner-control.v2`. No v3 runner exists outside tests.
+  `control_protocol` stays `heel.runner-control.v2`. Provenance of v3 peers: see the version
+  transition bullet below.
 - Daemon record gains `grant_authority_key_id` and `grant_authority_public_key_b64`
   (`_RECORD_FIELDS`, `daemon.py:60-63`); `pair` writes them from the accepted response; `status`
   and `serve` recompute the key id and fail closed `cloud_authority_missing` if absent or mismatched
@@ -119,10 +120,13 @@ would offer a silent re-trust path on key change):
 - Key rotation on the control plane therefore requires re-pairing runners; this is a documented
   launch limitation (single grant key, `HEEL_GRANT_SIGNING_KEY_ID`), not a product promise. The
   existing `grant_trusted_keys` set on the server (`server.py:119,220-225`) is unaffected.
-- **Version transition (Astra 2).** The claim "no v3 runner exists outside tests" is withdrawn as a
-  universal; what is CONFIRMED is narrower: no runner release carries pairing at all (GitHub
-  Release v1.2.0 has zero assets, launch spec §8.1; the committed 1.2.0 wheel is the pre-release
-  artifact of this branch), so the peer matrix below is stated, not assumed:
+- **Version transition (Astra 2).** No universal claim about deployed v3 peers is made. Audited
+  provenance only: the v3 activation protocol exists in this branch's source and in the committed
+  1.2.0 download artifacts under `apps/heel-cloud/public/downloads` and raw GitHub (CONFIRMED
+  launch spec §2 row 5), GitHub Release v1.2.0 has zero assets (CONFIRMED T1D), and this audit
+  observed no deployed control plane or distributed runner through the access it had (launch
+  spec §15); whether anyone installed the committed artifact is unknown. The peer matrix below is
+  therefore stated and tested, not assumed:
   - **Daemon record.** `_validate_record` requires the exact closed field set
     (CONFIRMED `daemon.py:212-233`), so adding fields needs an explicit transition: records are
     accepted with either the v1 set or the v1 set plus the two key fields (schema id stays
@@ -139,6 +143,21 @@ would offer a silent re-trust path on key change):
     receives v4 and fails closed `response_rejected` (strict set check, CONFIRMED `store.py:1162-1178`);
     a new runner against an old server receives v3 and fails closed the same way. Neither
     combination is a supported deployment; both are tested so the failure is closed, not a traceback.
+  - **Persistence through the existing chain (Astra final).** The validated authority reaches the
+    daemon record without new store surfaces: `RunnerStore._activation_response`
+    (`store.py:1158-1195`) is the only place that validates and shapes the accepted response; it
+    gains the `grant_authority` field check (32-byte Ed25519 key, `key_id == ed25519_key_id(key)`)
+    and includes the field in the dict it returns. `accept_pairing_activation` writes that dict
+    into the signed journal unchanged (`:1306-1316`); `finish_pairing_activation` and
+    `recover_pairing_activation` read the journal and use only `initial_claim_nonce`,
+    `runner_id`, `workspace_id` and the digest of the whole response (`:2665-2681`,
+    `:2822-2832`); they do not re-check the inner field set, so they carry the new field with no
+    edit of their own, and the journal's own closed field set lists journal keys, not inner
+    response keys (`:1281`, `:2649`). `RunnerDaemon.pair` already holds the exact response that
+    `accept_pairing_activation` validated (`daemon.py:362-367`) and copies `grant_authority`
+    into the record after acceptance. Hence
+    the `store.py` allowlist for T2b-1 is exactly `_activation_response`; no other store helper
+    needs to change, and T2b-1 MUST NOT widen it.
   - **Exact literal inventory for the T2b-1 allowlist (CONFIRMED `grep` at the design base):**
     `heel.runner-pairing-activated.v3` / `activate.v3` / `_validated_v3_activation_response` /
     `_PENDING_V3_FIELDS` occur in `heel/runner/daemon.py` (3), `heel/runner/store.py` (8),
@@ -212,7 +231,7 @@ would offer a silent re-trust path on key change):
 - **Control-plane POSTs vs target GET/HEAD.** Every control call is a PoP-signed `POST` to the
   pinned Heel origin over `HTTPSControlTransport` (`contexts/list`, `claim`, `heartbeat`,
   `progress`, `result`, `stop-ack`, `result-projection`, and the two proposed routes of §3.3 and
-  §4.2). None of them is target traffic. Target traffic is only `GET`/`HEAD` from
+  §4 rows 3 and 12). None of them is target traffic. Target traffic is only `GET`/`HEAD` from
   `TargetHTTPSClient` to the verified origin under a frozen manifest action
   (CONFIRMED `execution.py:639-770`, compiler `GET`/`HEAD` only `compiler.py:374-408`).
 
@@ -277,7 +296,7 @@ one record per semantic role, label never inferred (CONFIRMED `store.py:800-845,
 
 ### 3.3 Label report and liveness (proposed, T3a-s server + T3b runner)
 
-The runner reports labels in the body of the plan-request claim poll (§4.2): `credential_roles:
+The runner reports labels in the body of the plan-request claim poll (§4 row 3): `credential_roles:
 [{role, plan_label}]` (labels only; handles, profiles, backends and secrets are never sent). The
 server stores `plan_labels_json` and `last_reported_at_ms` on the binding row (migration 30) and
 `GET …/runner-context-bindings` surfaces `plan_labels` and `last_seen_ms` per binding so the Access
@@ -338,7 +357,7 @@ contract is extended rather than aliased:
   `execution.py`, `runtime.py`, `store.py`; `lib/canary-api.ts:552` checks the schema id).
 - **Snapshots.** A plan request row is immutable after creation: `plan_request_id`, a random
   `plan_request_nonce`, the `inventory_digest` of the inventory row at creation, the user's
-  selected routes (§4.2 item 7) and their `selection_digest`, `max_ops`, `expires_at_ms` (24 h),
+  selected routes (§4 row 2) and their `selection_digest`, `max_ops`, `expires_at_ms` (24 h),
   `status` (open → projected → approved | expired | cancelled). The runner receives exactly that
   snapshot in the plan-request claim and echoes it in `plan`.
 - **Server checks at submit** (`submit_projection_from_runner_in_transaction`, extended): the
@@ -536,10 +555,10 @@ Target applications in tests obey §5.
 | **T2b-2** | `heel runner serve` loop (§2.1, §2.3, §2.4): composition, non-blocking instance lock, cycle/backoff/resume, signals, state file, `status --offline` reading it, `_ExecutionUnavailable` | Source (6): `heel/cli.py`, `heel/runner/daemon.py`, `heel/runner/coordinator.py` (adapter glue only, if any), `tests/test_runner_daemon.py`, `tests/support/edge_tls_harness.py` (upstream pause/resume helper only), `docs/PLAN_DIFFERENTIAL_RUNNER.md`. Mechanical: the three download artifacts | `test_runner_serve_claims_a_context_binding_and_reports_access_over_tls` (owner creates the binding over the harness; serve installs it; `credential add` ×2 then succeeds against the cloud-installed context and `status --offline` shows `access.ready`; this also confirms the §2.3 INFERRED item); `test_runner_serve_offline_shows_offline_state_and_resumes` (upstream paused → `offline` with backoff → resumed → `online`, fresh heartbeat required); `test_runner_serve_stops_within_deadline_on_revoke` (owner POST revoke → `revoked` exit within 5 s, zero later control calls); the four locking tests of §2.3, `test_serve_handles_sigterm_with_local_stop_and_exits_stopped`, `test_serve_exits_execution_unavailable_closed_without_traffic_or_traceback`; red-team: replayed server time, regressed control generation (existing coordinator tests re-run), disconnect mid-claim |
 | **T2c** | Pairing hygiene: R-B (§6) and R-C (§7) | Source (7): `heel/saas/runner_auth.py`, `heel/saas/http_api.py` (invite + activate handlers only), `heel/runner/daemon.py` (`_await_activation` mapping only), `apps/heel-cloud/lib/canary-api.ts` (error code → message only), `tests/test_runner_control_http.py`, `tests/test_runner_daemon.py`, `apps/heel-cloud/tests/canary-api.test.ts`. Mechanical: the three download artifacts | the four tests named in §6 and §7; existing invite/origin/CSRF tests green |
 | **T2d** | R-A first-lock ENOENT (§8) | Source (2): `heel/runner/store.py` (`_flock` only), `tests/test_runner_daemon.py`. Mechanical: the three download artifacts | `test_first_time_pair_storm_losers_raise_closed_codes`; `test_runner_vault.py`, `test_runner_stop.py` unchanged and green |
-| **T3a-s** | Server side of inventory, plan requests (with user selection), v2 projection contract and §4.1 snapshot checks, label/liveness report, approval-request enrichment (§4 rows 1–3, 5–6; §3.3; §4.1). Loopback HTTP tests only; no edge | Source (8): `heel/saas/http_api.py`, `heel/saas/runner_contexts.py`, `heel/saas/canary_runs.py`, `heel/saas/migrate.py` (migration 30, additive), `heel/canary_contracts.py`, `tests/test_canary_http.py`, `tests/test_canary_migrations.py`, `tests/test_canary_contracts.py`. Mechanical: none (`canary_contracts.py` is shipped → the three download artifacts) | `test_inventory_put_rejects_non_get_head`, `test_inventory_put_rejects_more_than_200_routes_without_truncation`, `test_cloud_inventory_mismatch_rejects_plan`, `test_inventory_and_regressions_are_project_scoped` (inventory part), `test_plan_request_claim_returns_the_users_exact_selection_and_records_labels_only`, `test_new_routes_require_same_origin_and_recent_auth` (inventory + plan request), the four §4.1 binding tests; red-team: malicious OpenAPI (oversized, duplicate templates, unicode, traversal), forged labels with handle-like values rejected, cross-project inventory, selection outside the inventory |
+| **T3a-s** | Server side of inventory, plan requests (with user selection), v2 projection contract and §4.1 snapshot checks, label/liveness report, approval-request enrichment (§4 rows 1–3, 5–6; §3.3; §4.1). Loopback HTTP tests only; no edge | Source (8): `heel/saas/http_api.py`, `heel/saas/runner_contexts.py`, `heel/saas/canary_runs.py`, `heel/saas/migrate.py` (migration 30, additive), `heel/canary_contracts.py`, `tests/test_canary_http.py`, `tests/test_canary_migrations.py`, `tests/test_canary_contracts.py`. Mechanical: the three download artifacts (`canary_contracts.py` is shipped) | `test_inventory_put_rejects_non_get_head`, `test_inventory_put_rejects_more_than_200_routes_without_truncation`, `test_cloud_inventory_mismatch_rejects_plan`, `test_inventory_and_regressions_are_project_scoped` (inventory part), `test_plan_request_claim_returns_the_users_exact_selection_and_records_labels_only`, `test_new_routes_require_same_origin_and_recent_auth` (inventory + plan request), the four §4.1 binding tests; red-team: malicious OpenAPI (oversized, duplicate templates, unicode, traversal), forged labels with handle-like values rejected, cross-project inventory, selection outside the inventory |
 | **T3a-e** | Edge and browser client for T3a-s: Worker allowlist regexes and body caps (inventory 64 KiB, plan request 2 KiB, plan-request claim 2 KiB), harness mirror, `CanaryApi` methods and v2 projection acceptance (`lib/canary-api.ts:552`) | Source (6): `apps/heel-cloud/worker/index.ts`, `apps/heel-cloud/lib/canary-api.ts`, `tests/support/edge_tls_harness.py` (route mirror), `apps/heel-cloud/tests/runner-edge-route.test.ts`, `apps/heel-cloud/tests/privacy-boundary.test.mjs`, `apps/heel-cloud/tests/canary-api.test.ts`. Mechanical: none | `runner-edge-route.test.ts` and `privacy-boundary.test.mjs` cover every new route (method, cap, same-origin rule); `canary-api.test.ts` accepts v2 and rejects an unknown schema; harness mirror parity test; `npm run test:unit`, `test:node`, typecheck, lint, build green |
 | **T3b** | Runner plan cycle: plan-request claim (control client method), local inventory install, one-pair compile emitting the v2 projection with the `plan` object, submit; `credential set-plan-label` / `remove`; `status` shows `plan_sha256` (= v2 `projection_digest`) and `not_executed` (§4 rows 3–5, §3.4, §4.1) | Source (10): `heel/runner/control_client.py`, `heel/runner/daemon.py`, `heel/runner/compiler.py` (`plan` object only), `heel/runner/store.py` (`set_credential_plan_label` only), `heel/cli.py`, `tests/test_runner_control_http.py`, `tests/test_runner_daemon.py`, `tests/test_runner_cli.py`, `tests/test_runner_compiler.py`, `docs/PLAN_DIFFERENTIAL_RUNNER.md`. Mechanical: the three download artifacts | `test_cloud_grant_plan_sha256_mismatch_sends_nothing` (claim with a projection digest that differs from the local pair → nothing sent); `test_runner_serve_compiles_only_from_the_cloud_delivered_inventory_and_submits_one_pair`; `test_an_arbitrary_second_inventory_shape_binds_without_a_code_change` (two different inventories, no special case); `test_credential_set_plan_label_updates_the_label_and_never_prints_the_handle`; red-team: scope tamper (inventory route not in list), label inference attempts |
-| **T4a** | **First target execution proof** (§4 rows 7–10, §5): `RunnerExecutionAdapter` wiring, `_PerRunTargetTransport` over `_build_client`, vault selection (`macos_keychain`/`linux_secret_service`), local plan-differential report, real HTTPS synthetic target support module | Source (7): `heel/runner/daemon.py`, `heel/runner/plan_differential.py` (expose `load_pair_observations`/`evaluate_plan_pair` for the report; no executor change), new `tests/support/synthetic_tls_target.py`, new `tests/test_runner_serve_execution.py`, `tests/test_runner_plan_differential_safety.py` (seam-label assertions only), `docs/PLAN_DIFFERENTIAL_RUNNER.md`. Mechanical: the three download artifacts | `test_cloud_approved_pair_executes_against_a_real_https_target_with_receipts` (approve over the harness → claim → two real GETs → target access log lines correlated to `(run_id, action_ordinal, attempt)` and the containment chain → local report shows `observed/body_superset` derived from the stored `ev1_` bodies); `test_cloud_plan_run_refuses_origin_outside_grant`; `test_cloud_run_containment_entries_carry_workspace_project_runner_grant`; `test_cloud_run_revoke_stops_target_traffic_within_five_seconds`; `test_cloud_run_browser_stop_cancels_in_flight_target_socket_within_five_seconds`; `test_cloud_run_never_sends_credentials_to_heel_home_or_control_plane` (byte scan of the harness forwarded bodies and `HEEL_HOME`); `test_serve_refuses_a_catalog_projection_lease_with_execution_unavailable`; red-team: egress tricks (redirect route in the target), attempt replay (second claim of the same grant → nothing sent), oversized response, D1 denial-envelope closure through the cloud path |
+| **T4a** | **First target execution proof** (§4 rows 7–10, §5): `RunnerExecutionAdapter` wiring, `_PerRunTargetTransport` over `_build_client`, vault selection (`macos_keychain`/`linux_secret_service`), local plan-differential report, real HTTPS synthetic target support module | Source (6): `heel/runner/daemon.py`, `heel/runner/plan_differential.py` (expose `load_pair_observations`/`evaluate_plan_pair` for the report; no executor change), new `tests/support/synthetic_tls_target.py`, new `tests/test_runner_serve_execution.py`, `tests/test_runner_plan_differential_safety.py` (seam-label assertions only), `docs/PLAN_DIFFERENTIAL_RUNNER.md`. Mechanical: the three download artifacts | `test_cloud_approved_pair_executes_against_a_real_https_target_with_receipts` (approve over the harness → claim → two real GETs → target access log lines correlated to `(run_id, action_ordinal, attempt)` and the containment chain → local report shows `observed/body_superset` derived from the stored `ev1_` bodies); `test_cloud_plan_run_refuses_origin_outside_grant`; `test_cloud_run_containment_entries_carry_workspace_project_runner_grant`; `test_cloud_run_revoke_stops_target_traffic_within_five_seconds`; `test_cloud_run_browser_stop_cancels_in_flight_target_socket_within_five_seconds`; `test_cloud_run_never_sends_credentials_to_heel_home_or_control_plane` (byte scan of the harness forwarded bodies and `HEEL_HOME`); `test_serve_refuses_a_catalog_projection_lease_with_execution_unavailable`; red-team: egress tricks (redirect route in the target), attempt replay (second claim of the same grant → nothing sent), oversized response, D1 denial-envelope closure through the cloud path |
 | **T4b-c** | Cloud contract and server for the result projection (§4 rows 11–13): `heel.plan-differential-result.v1`, permit schema enum (`pair_count`/`finding_count` ≤10), `result-projection` upload branch, permit-claim route, `GET …/plan-differential-result`, table `plan_differential_results` (migration 31), Worker allowlist + harness mirror | Source (10): `heel/canary_contracts.py`, `heel/saas/canary_disclosure.py`, `heel/saas/http_api.py`, `heel/saas/migrate.py`, `apps/heel-cloud/worker/index.ts`, `tests/support/edge_tls_harness.py`, `tests/test_canary_privacy.py`, `tests/test_canary_disclosure.py`, `tests/test_canary_http.py`, `apps/heel-cloud/tests/runner-edge-route.test.ts`. Mechanical: the three download artifacts (`canary_contracts.py` is shipped) | `test_plan_differential_result_projection_is_bounded_and_bodyless`, `test_result_projection_rejects_header_and_body_values`, `test_permit_claim_route_returns_204_permit_or_local_only_and_consumes_once`, `test_result_projection_upload_requires_terminal_result_and_matching_permit`; red-team: forged projection/reference, duplicate upload, projection for another run, permit for another run |
 | **T4b-r** | Runner side: `compile_plan_differential_plan` (≤10 pairs, one scenario, 2N actions), the plan-differential projector (verdicts from local evidence → signed result projection), permit-claim poll, upload through `coordinator.upload_findings`-style verification with the new schema | Source (7): `heel/runner/compiler.py`, `heel/runner/control_client.py`, `heel/runner/daemon.py`, `heel/runner/plan_differential.py` (projector only), `tests/test_runner_serve_execution.py`, `tests/test_runner_compiler.py`, `tests/test_runner_control_http.py`. Mechanical: the three download artifacts. Depends on T4b-c | `test_result_projection_verdict_is_derived_from_captured_response_digests` (the uploaded row's `evidence_refs` resolve to local evidence whose body digest produced the verdict; a projection with a verdict not supported by its refs is rejected locally), `test_permit_claim_poll_uploads_once_and_local_only_stops_polling`, `test_ten_pair_plan_executes_twenty_requests_and_rows_match_the_access_log` (real HTTPS target, §5) |
 | **T4b-u** | Dashboard: `CanaryApi` methods for the result projection, `findings.visible` rows, `plan.review` showing the v2 `plan` object and `inventory_changed`, route selection control for "Prepare plan" (default first ten, checkboxes) | Source (8): `apps/heel-cloud/lib/canary-api.ts`, `apps/heel-cloud/components/canary/ApprovalDialog.tsx`, `apps/heel-cloud/components/canary/RehearsalStep.tsx`, new `apps/heel-cloud/components/canary/PlanFindings.tsx`, `apps/heel-cloud/app/dashboard/page.tsx`, `apps/heel-cloud/tests/canary-api.test.ts`, `apps/heel-cloud/tests/canary-activation.test.tsx`, `apps/heel-cloud/tests/product-contract.test.tsx`. Mechanical: none. Depends on T4b-c | component tests render every verdict/predicate/evidence_state combination from a fixture that is the exact server schema; no finding text is derived client-side; `test:unit`, `test:node`, typecheck, lint, build green |
@@ -565,10 +584,16 @@ address, no cloud finding row yet (T4b-c/T4b-r), no regression (T5).
 ### 9.3 Immediate next Opus assignment: T2b-1
 
 Fresh Opus, root this worktree at `d9455b4` or later docs commit, allowed files exactly as the
-T2b-1 row. Steps: (1) write the three tests red; (2) add `grant_authority` to the v4 activation
-response in `RunnerAuthStore.activate_executable` and its replay validator; (3) accept and persist
-it in `RunnerStore._activation_response` and the daemon record; (4) `status` fails closed without
-it; (5) focused (`tests/test_runner_daemon.py tests/test_runner_control_http.py
+T2b-1 row. Steps: (1) write every gate test of the T2b-1 row red: the extended real-pairing gate,
+`test_v4_activation_response_carries_the_grant_authority_and_replays_byte_identically`,
+`test_status_reports_cloud_authority_missing_for_a_legacy_record_and_unpair_still_works`,
+`test_old_and_new_activation_peers_fail_closed_with_response_rejected`, and the tampered/extra
+field red-team cases on both sides; (2) add `grant_authority` to the v4 activation response in
+`RunnerAuthStore.activate_executable` and make the replay validator accept stored v3 and v4
+receipts byte for byte; (3) validate and carry it in `RunnerStore._activation_response` only
+(§2.2 persistence bullet) and copy it into the daemon record in `RunnerDaemon.pair`, with the
+record transition of §2.2; (4) `status` and `serve` fail closed `cloud_authority_missing`
+without it while `unpair` still works; (5) focused (`tests/test_runner_daemon.py tests/test_runner_control_http.py
 tests/test_runner_public_client.py tests/test_runner_identity.py tests/test_runner_vault.py
 tests/test_runner_cli.py`) green with the source final; (6) regenerate the three artifacts from
 the pinned release venv, `--check` EXIT 0, record digests and source fingerprint; (7) affected
