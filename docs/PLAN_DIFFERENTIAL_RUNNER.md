@@ -268,11 +268,12 @@ request.
   `[REDACTED:secret]`. The report at `report_path` holds references only. Nothing is
   uploaded.
 
-## Pairing with Heel Cloud (`pair`, `status`, `unpair`)
+## Pairing with Heel Cloud (`pair`, `status`, `serve`, `unpair`)
 
 ```sh
 heel runner pair --origin https://<heel origin> --invite <one-time invitation>
 heel runner status            # live check over the claim chain; --offline skips it
+heel runner serve             # stay online until stopped or revoked; --once polls once
 heel runner unpair
 ```
 
@@ -349,7 +350,70 @@ pair with a new invitation).
   `{"schema_version":"heel.runner-revoke.v1","reason_code":"<reason>"}`; the reason and actor
   are audited, a repeat is refused, and the runner's next `status` reports `runner_revoked`.
   The dashboard has no runner-revoke control yet.
-- There is no `serve` loop yet; pairing alone authorizes no target traffic.
+- Pairing alone authorizes no target traffic, and neither does `serve` (below).
+
+### `heel runner serve`
+
+`serve` keeps the paired runner online with the control plane. It polls over the existing
+signed claim chain every 2 seconds (`contexts/list`, then `claim` once a binding is
+installed); every call is a PoP-signed `POST` to the pairing origin and none is target
+traffic. The trust anchor is only the grant-authority key in `pairing.json`; a record
+without a consistent key exits `cloud_authority_missing` before any secret-store access or
+network call, and there is no flag or variable that supplies another key.
+
+Order of onboarding: `pair` → `serve` → the owner authorizes the runner for one verified
+environment in Heel Cloud → `serve` claims that cloud-signed context binding and installs it
+→ `heel runner credential add --role lower_plan --plan-label <name> …` and the same for
+`higher_plan` (refused before the binding exists) → `status` reports `access.ready`. Plan
+labels, never credential handles or values, appear in `status` and in `serve` output.
+
+Output is JSON lines (`serve_state` events, then `serve_stopped`); failures print one fixed
+line `Heel runner serve stopped: <reason>.` and never a traceback, response body or key.
+Exit codes: `0` stopped (SIGINT, SIGTERM or `--once` done), `1` offline (`--once` only),
+`2` failed closed, `3` revoked.
+
+- **One serve per `HEEL_HOME`.** `serve` holds a non-blocking kernel `flock` on
+  `$HEEL_HOME/runner-daemon/.serve.lock` (no symlink, single link, mode 0600, never
+  unlinked). A second `serve` exits `already_serving` at once; `unpair` refuses
+  `serve_running` until the serve has stopped. The kernel releases the lock when the process
+  ends, including `SIGKILL`; no PID is ever trusted. `status` and `credential add` work while
+  serving; `status` does not make its own control call then (the serve owns the claim chain)
+  and reports `control_plane: not_checked, reason: serve_running`.
+- **Visible state.** `$HEEL_HOME/runner-daemon/serve-state.json`
+  (`heel.runner-serve-state.v1`: `state` ∈ starting, online, offline, revoked, stopped,
+  failed; `runner_id`, `since_ms`, `updated_at_ms`, `last_error_code`, `binding_id`,
+  `access` (labels only), informational `pid`). `status` shows it under `serve`, and only
+  while the lock is held does it describe a running serve; otherwise it is reported as
+  `not_running` with the last state, so a file left by a crash never implies a live process.
+  It is never authority for anything. `unpair` removes it.
+- **Offline and resume.** A connection failure, a timeout or an edge answer that its control
+  plane is unreachable (`502`/`503`/`504`) marks the serve `offline` and retries with
+  exponential backoff from 2 s to 60 s (±25 % jitter), interruptible by a signal. Each retry
+  rebuilds the coordinator, which first replays any staged signed call exactly; the serve is
+  `online` again only after a new authenticated answer. Each failure is classified from the
+  exception the failing call raised, never from transport state another call may have set.
+- **Closed failures, no retry.** `401 invalid_runner_auth` → `revoked` (exit 3, no further
+  call). `403 runner_protocol_upgrade_required` → `protocol_upgrade_required`. Any other
+  status, a malformed answer, a non-advancing server time or a regressed control generation →
+  `response_rejected`; local store/runtime problems → `local_state_invalid`. Before each cycle
+  the pairing record is re-read and must still name the same pairing.
+- **Stop.** SIGINT/SIGTERM end the idle wait or backoff at once and request the existing
+  local stop of any in-flight work. A control call already in progress finishes first (its
+  30-second deadline applies, and system name resolution can extend it, see above); the serve
+  keeps the lock until its own workers can make no further call.
+- **No execution yet.** `serve` executes nothing. If a run is ever claimed (only reachable
+  through a legacy catalog projection a human submitted and approved), `serve` exits
+  `execution_unavailable` without acknowledging, heartbeating or sending any target request;
+  the server's reaper ends that run. The local runtime may keep that run's sealed record, in
+  which case a later `serve` is expected to fail closed `local_state_invalid` until the runner
+  is re-provisioned (separate `HEEL_HOME`, re-pair); this restart path is not yet tested.
+  Revocation therefore cannot yet be shown to
+  stop target traffic; that is proven when execution exists.
+- **Unpair after a binding: open gap, no recovery path yet.** Once a context binding is
+  installed, `unpair` refuses `context_bound` (unchanged) and `pair` refuses the same
+  `HEEL_HOME`. There is no product command that retires the bound context, its credential
+  items in the OS secret store or the pairing seed; a new `HEEL_HOME` leaves all of them
+  behind. Retirement is being designed separately and is not part of this release.
 
 ## Trust boundary
 
