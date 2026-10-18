@@ -273,7 +273,7 @@ request.
 ```sh
 heel runner pair --origin https://<heel origin> --invite <one-time invitation>
 heel runner status            # live check over the claim chain; --offline skips it
-heel runner serve             # stay online until stopped or revoked; --once polls once
+heel runner serve             # stay online until stopped or rejected; --once polls once
 heel runner unpair
 ```
 
@@ -335,9 +335,11 @@ pair with a new invitation).
   resolver cannot be interrupted: a resolver slower than the deadline extends the call by its
   own duration, after which the call fails with `timeout` without connecting or sending. There
   is no CA-bundle flag or variable (the same `SSL_CERT_FILE` caveat below applies).
-- `status` reports `active`, `offline` (control plane unreachable), `runner_revoked` (the
-  control plane rejects the runner key), `pairing_incomplete`, `local_identity_unavailable`,
-  `cloud_authority_missing` or `unpaired`, plus the self-serve access state.
+- `status` reports `active`, `offline` (control plane unreachable, or recovery rate-limited),
+  `runner_authentication_rejected` (see "Lost chain authority" below), `recovery_required`,
+  `status_busy` (another status check is still running), `pairing_incomplete`,
+  `local_identity_unavailable`, `cloud_authority_missing` or `unpaired`, plus the self-serve
+  access state.
   `cloud_authority_missing` means the record was written by a runner paired before the grant
   authority was delivered (or its key does not match its key ID); it is reported without any
   network call or secret-store access, with the next steps `heel runner unpair` and
@@ -348,7 +350,9 @@ pair with a new invitation).
   runner in Heel Cloud. An owner or admin revokes it there from a recent same-origin browser
   session with `POST /v1/workspaces/{ws}/runners/{id}/revoke` and the body
   `{"schema_version":"heel.runner-revoke.v1","reason_code":"<reason>"}`; the reason and actor
-  are audited, a repeat is refused, and the runner's next `status` reports `runner_revoked`.
+  are audited, a repeat is refused, and the runner's next `status` reports
+  `runner_authentication_rejected` (the control plane gives a revoked key and a wrong clock the
+  same answer, so the runner does not claim which one it saw).
   The dashboard has no runner-revoke control yet.
 - Pairing alone authorizes no target traffic, and neither does `serve` (below).
 
@@ -370,7 +374,7 @@ labels, never credential handles or values, appear in `status` and in `serve` ou
 Output is JSON lines (`serve_state` events, then `serve_stopped`); failures print one fixed
 line `Heel runner serve stopped: <reason>.` and never a traceback, response body or key.
 Exit codes: `0` stopped (SIGINT, SIGTERM or `--once` done), `1` offline (`--once` only),
-`2` failed closed, `3` revoked.
+`2` failed closed, `3` authentication rejected (`rejected`).
 
 - **One serve per `HEEL_HOME`.** `serve` holds a non-blocking kernel `flock` on
   `$HEEL_HOME/runner-daemon/.serve.lock` (no symlink, single link, mode 0600, never
@@ -379,9 +383,20 @@ Exit codes: `0` stopped (SIGINT, SIGTERM or `--once` done), `1` offline (`--once
   ends, including `SIGKILL`; no PID is ever trusted. `status` and `credential add` work while
   serving; `status` does not make its own control call then (the serve owns the claim chain)
   and reports `control_plane: not_checked, reason: serve_running`.
+- **Status turnstile.** `$HEEL_HOME/runner-daemon/.status.lock` (same file rules) serializes
+  every live `status` check: one check at a time holds it together with `.serve.lock`, so two
+  checks never sign on one claim chain. `serve` and `unpair` take it while they acquire
+  `.serve.lock` and publish (or remove) their state; `serve` takes it again to publish its
+  final state together with releasing `.serve.lock`. A status therefore never shows a previous
+  serve's file as a new live serve during startup, nor a half-removed instance during `unpair`.
+  Waits are bounded (seven control-call deadlines plus one second); a `serve` that cannot get
+  past a running status check exits `status_busy` (exit 2), never `already_serving`, and a
+  `status` that cannot reports `status_busy`. `serve` and `unpair` poll the turnstile faster
+  than `status`, so repeated status checks do not keep a waiting serve out. Nothing blocks on
+  `.serve.lock` while holding `.status.lock`.
 - **Visible state.** `$HEEL_HOME/runner-daemon/serve-state.json`
-  (`heel.runner-serve-state.v1`: `state` ∈ starting, online, offline, revoked, stopped,
-  failed; `runner_id`, `since_ms`, `updated_at_ms`, `last_error_code`, `binding_id`,
+  (`heel.runner-serve-state.v1`: `state` ∈ starting, online, offline, rejected, stopped,
+  failed, and `revoked` only in files written before this change; `runner_id`, `since_ms`, `updated_at_ms`, `last_error_code`, `binding_id`,
   `access` (labels only), informational `pid`). `status` shows it under `serve`, and only
   while the lock is held does it describe a running serve; otherwise it is reported as
   `not_running` with the last state, so a file left by a crash never implies a live process.
@@ -392,11 +407,59 @@ Exit codes: `0` stopped (SIGINT, SIGTERM or `--once` done), `1` offline (`--once
   rebuilds the coordinator, which first replays any staged signed call exactly; the serve is
   `online` again only after a new authenticated answer. Each failure is classified from the
   exception the failing call raised, never from transport state another call may have set.
-- **Closed failures, no retry.** `401 invalid_runner_auth` → `revoked` (exit 3, no further
-  call). `403 runner_protocol_upgrade_required` → `protocol_upgrade_required`. Any other
+- **Closed failures, no retry.** A refused recovery (below) → `rejected` /
+  `runner_authentication_rejected` (exit 3, no further call). A staged call that cannot be
+  recovered automatically → `failed` / `recovery_required`. `403 runner_protocol_upgrade_required` → `protocol_upgrade_required`. Any other
   status, a malformed answer, a non-advancing server time or a regressed control generation →
   `response_rejected`; local store/runtime problems → `local_state_invalid`. Before each cycle
   the pairing record is re-read and must still name the same pairing.
+- **Lost chain authority and recovery.** Every control call is staged durably before it is
+  sent and replayed byte for byte after a restart, so an answer the control plane recorded is
+  never lost. The control plane answers one code, `401 invalid_runner_auth`, for a revoked or
+  unknown key, a timestamp outside its 30-second window and an expired (60 s) or mismatched
+  nonce chain; it looks up a recorded reply before any of those freshness checks. A 401 on a
+  claim-chain call is therefore first treated as lost chain authority, for fresh calls and for
+  replays alike, in `serve` (coordinator startup replay, context discovery and claim) and in
+  live `status` through the same client path:
+  1. A replay whose reply was recorded resolves from that reply; no resync is made.
+  2. Otherwise the runner signs **one** fresh `resync/start` + `resync/complete` (the existing
+     protocol; server guards unchanged). Each request is stored durably before it is sent; after
+     a lost answer or a restart the exact bytes are retransmitted (the server answers them from
+     its own record), and a refused retransmission is followed by at most one fresh start.
+  3. Only a valid completion (same chain, generation = challenge generation + 1, never below the
+     local generation, next sequence not below the challenge's) is accepted. In one runtime
+     transaction the claim cursor advances and the one staged call is moved into a sealed
+     tombstone naming the accepted generation, the challenge and the server's cursor evidence.
+     Eligible are this runner's exact `list-contexts`, `claim-context` and job `claim` intents
+     (exact method, path, body and identity). The context calls are re-issued idempotently (list
+     again; claim the same binding again, which the server answers with the same signed binding
+     and audits once). A job `claim` is **not** idempotent, so it is retired only if the resync
+     proves its sequence was never consumed: the challenge's and the completion's `next_sequence`
+     both equal the staged call's sequence (the server's cursor sequence is monotonic, independent
+     of the generation and moves only with a committed call). It is never re-issued: after a
+     replay the serve loop's next poll is a new signed claim; after a fresh call exactly one new
+     poll follows under the recovered chain. No local clock, call age or "no local run" inference
+     is used as evidence; a local active run only blocks the supersession. Pending calls are
+     never removed by generation.
+  4. If the resync shows the job claim's sequence was consumed (a lost answer whose receipt has
+     expired, been replaced or sits under an older generation), the call is **kept**, nothing is
+     installed or tombstoned, the completed resync stays retransmittable, and the serve ends
+     `recovery_required` with reason `claim_sequence_consumed` (a claimed run may exist in Heel
+     Cloud; owner-side reconciliation is later work, T4a). An approval-projection submission, any
+     run-chain call or an unknown kind is likewise kept, reason `unsupported_operation`
+     (T3b approval projections, T4a run chains). A recorded reply is always replayed first, so an
+     answer the server committed at the current generation never triggers a resync.
+  5. A refused fresh start or completion (`401`) ends the serve `rejected` with
+     `runner_authentication_rejected` and next steps: check that the clock is set automatically,
+     then run `status`; if the runner was revoked in Heel Cloud, unpair and pair again. The
+     staged call is kept, so correcting the clock and running `status` or `serve` again recovers
+     it with no manual cleanup. A revoked key can never resync, so it never regains authority.
+  6. `429 runner_resync_rate_limited` (3 starts per runner per minute) is `offline` with
+     `recovery_rate_limited`: the serve waits at least the server's `retry_after_ms` (bounded to
+     1–300 s; a missing or invalid value means 60 s), interruptibly, and never reports a
+     rejection for it.
+  Recovery never changes the identity, the pairing record, an installed binding, local
+  credentials or raw evidence.
 - **Stop.** SIGINT/SIGTERM end the idle wait or backoff at once and request the existing
   local stop of any in-flight work. A control call already in progress finishes first (its
   30-second deadline applies, and system name resolution can extend it, see above); the serve
@@ -404,9 +467,11 @@ Exit codes: `0` stopped (SIGINT, SIGTERM or `--once` done), `1` offline (`--once
 - **No execution yet.** `serve` executes nothing. If a run is ever claimed (only reachable
   through a legacy catalog projection a human submitted and approved), `serve` exits
   `execution_unavailable` without acknowledging, heartbeating or sending any target request;
-  the server's reaper ends that run. The local runtime may keep that run's sealed record, in
-  which case a later `serve` is expected to fail closed `local_state_invalid` until the runner
-  is re-provisioned (separate `HEEL_HOME`, re-pair); this restart path is not yet tested.
+  the server's reaper ends that run. The local runtime keeps that run's sealed record (also when
+  the claim's answer was lost and is later resolved from its receipt), and a later `serve` then
+  fails closed `local_state_invalid`: the run has no local approved pair. This is tested and is a
+  known limitation, not a recovery: restart after a claimed run is owned by T4a; until then the
+  runner must be re-provisioned (separate `HEEL_HOME`, re-pair).
   Revocation therefore cannot yet be shown to
   stop target traffic; that is proven when execution exists.
 - **Unpair after a binding: open gap, no recovery path yet.** Once a context binding is
@@ -414,6 +479,33 @@ Exit codes: `0` stopped (SIGINT, SIGTERM or `--once` done), `1` offline (`--once
   `HEEL_HOME`. There is no product command that retires the bound context, its credential
   items in the OS secret store or the pairing seed; a new `HEEL_HOME` leaves all of them
   behind. Retirement is being designed separately and is not part of this release.
+
+### Runtime state `heel.runner-runtime-state.v4` (for later retirement work)
+
+`$HEEL_HOME/runner/runtime.sqlite3` is migrated in place to `v4` the first time this version
+opens it (`v1`/`v2`/`v3` → `v4` in one transaction). Every `v3` table and row, including the
+metadata identity, authority epoch, rotation fence and wrapped state key, is copied unchanged;
+`v4` only adds one table. A file that matches no known schema is refused
+(`RunnerRuntimeCorrupt`), never recreated. An earlier Heel version refuses a `v4` file.
+
+Tables: `metadata`, `control_chains`, `pending_calls`, `terminal_disclosures`, `active_runs`
+(all as in `v3`) and `chain_recovery(record_id, kind, chain, generation, sealed_blob,
+created_at_ms)` with two kinds:
+
+| `kind` | Meaning | Lifecycle state |
+|---|---|---|
+| `resync_attempt` | one in-flight claim-chain resync: its exact signed start request, then the server challenge, then its exact signed completion request (sealed under the runner identity) | **pending / incomplete** while present; at most one per chain (unique index); removed when the server refuses it or in the same transaction that accepts its completion |
+| `superseded_call` | sealed tombstone of one staged `list-contexts`/`claim-context` call retired by an accepted resync: the full original sealed request, the accepted generation, next sequence and challenge ID, and the time | **terminal audit**; never replayed; sealed with the stable runtime key bound to the record ID so it survives key rotation; the newest 512 are kept, older ones are reclaimed when a new one is written |
+
+Read enumeration today: `RunnerRuntimeState.load_resync_attempt("claim")` (the open attempt or
+`None`), `load_superseded_calls(limit=…)` (oldest first, any unreadable row fails closed),
+`load_pending_calls()`, `load_active_run_controls()`, `load_terminal_state()` and
+`load_prune_pending()`. **These are not a read-only preflight:** constructing
+`RunnerRuntimeState` initializes or migrates the file. A retirement preflight must enumerate
+`chain_recovery` as well as the `v3` tables and must treat an open `resync_attempt` (and any
+`pending_calls` row, including a kept `recovery_required` call) as incomplete state, not assume
+only `pending_calls`/`active_runs`/`terminal_disclosures` matter. Key rotation already refuses
+while a `resync_attempt` exists.
 
 ## Trust boundary
 
