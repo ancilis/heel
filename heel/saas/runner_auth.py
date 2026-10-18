@@ -1679,17 +1679,58 @@ class RunnerAuthStore:
             raise ValueError("invalid pairing")
         return value
 
-    def _validated_v3_activation_response(self, value: object, row: sqlite3.Row,
-                                          protocol: sqlite3.Row) -> dict:
-        if not isinstance(value, dict) or set(value) != {
+    @staticmethod
+    def _grant_authority_field(value: object) -> dict[str, str]:
+        """The public grant-signing key carried by a v4 activation: raw Ed25519, derived ID."""
+        if not isinstance(value, dict) or set(value) != {"key_id", "public_key_b64"}:
+            raise RunnerAuthError("invalid pairing")
+        key_id, public_key_b64 = value["key_id"], value["public_key_b64"]
+        if type(key_id) is not str or type(public_key_b64) is not str or len(public_key_b64) != 44:
+            raise RunnerAuthError("invalid pairing")
+        try:
+            raw = base64.b64decode(public_key_b64, validate=True)
+            load_public_key_base64(public_key_b64)
+            derived = ed25519_key_id(raw)
+        except (TypeError, ValueError):
+            raise RunnerAuthError("invalid pairing") from None
+        if derived != key_id:  # public identifiers: no constant-time comparison needed
+            raise RunnerAuthError("invalid pairing")
+        return value
+
+    @classmethod
+    def _configured_grant_authority(cls, authority: object) -> dict[str, str]:
+        """Public half of the control plane's own grant authority; absent or inconsistent fails."""
+        if authority is None:
+            raise RunnerAuthError("invalid pairing")
+        try:
+            public_key_bytes, key_id = authority.public_key_bytes, authority.key_id
+            if type(public_key_bytes) is not bytes:
+                raise TypeError
+            published = authority.public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+        except (AttributeError, TypeError, ValueError):
+            raise RunnerAuthError("invalid pairing") from None
+        if published != public_key_bytes:
+            raise RunnerAuthError("invalid pairing")
+        return cls._grant_authority_field({"key_id": key_id, "public_key_b64": _b64(public_key_bytes)})
+
+    def _validated_activation_response(self, value: object, row: sqlite3.Row,
+                                       protocol: sqlite3.Row) -> dict:
+        """Validate a v3 (stored before grant-authority bootstrap) or v4 activation response."""
+        v3_fields = {
             "schema_version", "workspace_id", "runner_id", "runner_key_id",
             "pairing_exchange_digest", "initial_claim_nonce", "initial_claim_sequence",
             "initial_claim_generation", "capabilities", "control_protocol", "activated_at_ms",
-        }:
+        }
+        if not isinstance(value, dict):
+            raise RunnerAuthError("invalid pairing")
+        if set(value) == v3_fields | {"grant_authority"}:
+            if value["schema_version"] != "heel.runner-pairing-activated.v4":
+                raise RunnerAuthError("invalid pairing")
+            self._grant_authority_field(value["grant_authority"])
+        elif set(value) != v3_fields or value["schema_version"] != "heel.runner-pairing-activated.v3":
             raise RunnerAuthError("invalid pairing")
         if (
-            value["schema_version"] != "heel.runner-pairing-activated.v3"
-            or value["workspace_id"] != row["workspace_id"]
+            value["workspace_id"] != row["workspace_id"]
             or value["runner_id"] != row["runner_id"]
             or value["runner_key_id"] != row["key_id"]
             or value["pairing_exchange_digest"] != protocol["exchange_digest"]
@@ -1705,8 +1746,14 @@ class RunnerAuthStore:
         return value
 
     def activate_executable(self, pairing_id: str, request: Mapping[str, object], *,
-                            max_active: int | None = None) -> dict:
-        """Activate one v3 pairing and persist the exact response before answering it."""
+                            max_active: int | None = None, grant_authority: object = None) -> dict:
+        """Activate one v3 pairing and persist the exact response before answering it.
+
+        A new activation answers ``heel.runner-pairing-activated.v4``, which carries the public
+        half of ``grant_authority`` (the control plane's own grant-signing authority). Without
+        one, a new activation fails before any state changes. A stored receipt replays exactly
+        as stored (v3 receipts written before v4 included) and is never rewritten.
+        """
         if not isinstance(request, Mapping) or set(request) != {
             "schema_version", "client_activation_nonce_b64", "signature_b64",
         } or request.get("schema_version") != "heel.runner-pairing-activate.v3":
@@ -1739,11 +1786,12 @@ class RunnerAuthStore:
                     ))
                 except (TypeError, ValueError, RunnerAuthError):
                     raise RunnerAuthError("invalid pairing") from None
-                response = self._validated_v3_activation_response(response, row, protocol)
+                response = self._validated_activation_response(response, row, protocol)
                 self.conn.commit()
                 return response
             if row["status"] != "approved" or row["expires_at"] <= instant:
                 raise RunnerAuthError("invalid pairing")
+            authority = self._configured_grant_authority(grant_authority)
             try:
                 signature = base64.b64decode(request["signature_b64"], validate=True)
                 if len(signature) != 64 or _b64(signature) != request["signature_b64"]:
@@ -1796,14 +1844,14 @@ class RunnerAuthStore:
                 ("runner_audit_" + secrets.token_hex(16), row["workspace_id"], row["runner_id"], "runner_activated", row["approved_by"], None, instant),
             )
             response = {
-                "schema_version": "heel.runner-pairing-activated.v3", "workspace_id": row["workspace_id"],
+                "schema_version": "heel.runner-pairing-activated.v4", "workspace_id": row["workspace_id"],
                 "runner_id": row["runner_id"], "runner_key_id": row["key_id"],
                 "pairing_exchange_digest": protocol["exchange_digest"], "initial_claim_nonce": nonce,
                 "initial_claim_sequence": 1, "initial_claim_generation": 0,
                 "capabilities": sorted(RUNNER_CAPABILITIES), "control_protocol": "heel.runner-control.v2",
-                "activated_at_ms": self._milliseconds(instant),
+                "activated_at_ms": self._milliseconds(instant), "grant_authority": authority,
             }
-            self._validated_v3_activation_response(response, row, protocol)
+            self._validated_activation_response(response, row, protocol)
             receipt_expiry = instant + 2_592_000.0
             self.conn.execute(
                 "INSERT INTO canary_runner_pairing_activation_receipts(pairing_id,request_digest,response_ciphertext,created_at,expires_at) VALUES(?,?,?,?,?)",

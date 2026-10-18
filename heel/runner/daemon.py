@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from heel.canary_contracts import canonical_bytes
+from heel.crypto import ed25519_key_id, load_public_key_base64
 from heel.scope import heel_home
 
 from . import identity as _identity
@@ -61,6 +62,10 @@ _RECORD_FIELDS = frozenset({
     "schema_version", "state", "origin", "installation_id", "display_name", "created_at_ms",
     "pairing_id", "runner_id", "workspace_id", "runner_key_id", "fingerprint",
 })
+# Written with an active record from a v4 activation. A record without both (paired before the
+# grant-authority bootstrap) stays loadable so it can be inspected and unpaired.
+_AUTHORITY_FIELDS = frozenset({"grant_authority_key_id", "grant_authority_public_key_b64"})
+_REPAIR_STEPS = ["heel runner unpair", "heel runner pair --origin <origin> --invite <new token>"]
 _PLAN_ROLES = ("lower_plan", "higher_plan")
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 NO_SECRET_SERVICE = "no supported runner OS secret service"
@@ -210,9 +215,14 @@ class RunnerDaemon:
 
     @staticmethod
     def _validate_record(value: object) -> dict[str, Any]:
-        if not isinstance(value, Mapping) or set(value) != _RECORD_FIELDS:
+        if not isinstance(value, Mapping) or set(value) not in (_RECORD_FIELDS, _RECORD_FIELDS | _AUTHORITY_FIELDS):
             raise RunnerPairingError("local_state_invalid")
         record = dict(value)
+        if _AUTHORITY_FIELDS <= set(record) and (
+            record["state"] != "active"
+            or not all(type(record[field]) is str for field in _AUTHORITY_FIELDS)
+        ):
+            raise RunnerPairingError("local_state_invalid")
         try:
             validate_control_origin(record["origin"])
             runner_pairing_signer_label(record["installation_id"])
@@ -231,6 +241,22 @@ class RunnerDaemon:
         ):
             raise RunnerPairingError("local_state_invalid")
         return record
+
+    @staticmethod
+    def _grant_authority(record: Mapping[str, Any]) -> dict[str, str] | None:
+        """The record's cloud grant-signing key, or None when absent or inconsistent."""
+        if not _AUTHORITY_FIELDS <= set(record):
+            return None
+        key_id, public_key_b64 = record["grant_authority_key_id"], record["grant_authority_public_key_b64"]
+        try:
+            if len(public_key_b64) != 44:
+                return None
+            load_public_key_base64(public_key_b64)
+            if ed25519_key_id(base64.b64decode(public_key_b64, validate=True)) != key_id:
+                return None
+        except (TypeError, ValueError):
+            return None
+        return {"key_id": key_id, "public_key_b64": public_key_b64}
 
     def _reserve_record(self, store: RunnerStore, record: Mapping[str, Any]) -> None:
         """Check for local pairing state and write this attempt's record in one critical section."""
@@ -372,6 +398,15 @@ class RunnerDaemon:
                     runtime.close()
             except (RunnerStoreError, RunnerRuntimeStateError, ValueError):
                 raise RunnerPairingError("response_rejected") from None
+            # ``accept_pairing_activation`` validated this exact response (v4 only), including the
+            # derived key ID; the record keeps the same public key for status and serve.
+            authority = response["grant_authority"]
+            authority = self._grant_authority({
+                "grant_authority_key_id": authority["key_id"],
+                "grant_authority_public_key_b64": authority["public_key_b64"],
+            })
+            if authority is None:
+                raise RunnerPairingError("response_rejected")
         except BaseException as error:
             if not exchanged or isinstance(error, _RecordOwnershipLost):
                 # Nothing reached the cloud's pairing state, or no record names this seed any more
@@ -387,6 +422,8 @@ class RunnerDaemon:
         record.update(
             state="active", workspace_id=identity.workspace_id, runner_id=identity.runner_id,
             runner_key_id=identity.key_id, fingerprint=identity.fingerprint,
+            grant_authority_key_id=authority["key_id"],
+            grant_authority_public_key_b64=authority["public_key_b64"],
         )
         try:
             self._write_record(store, record)
@@ -487,13 +524,19 @@ class RunnerDaemon:
         if record["state"] != "active":
             return {
                 "state": "pairing_incomplete", "origin": record["origin"],
-                "next_steps": ["heel runner unpair", "heel runner pair --origin <origin> --invite <new token>"],
+                "next_steps": list(_REPAIR_STEPS),
             }
         coordinates = {
             "origin": record["origin"], "workspace_id": record["workspace_id"],
             "runner_id": record["runner_id"], "runner_key_id": record["runner_key_id"],
             "fingerprint": record["fingerprint"],
         }
+        authority = self._grant_authority(record)
+        if authority is None:
+            # Paired before the grant-authority bootstrap (or the key is inconsistent): nothing the
+            # cloud signs can be verified, so no secret store or network is touched. Re-pair.
+            return {"state": "cloud_authority_missing", **coordinates, "next_steps": list(_REPAIR_STEPS)}
+        coordinates["grant_authority_key_id"] = authority["key_id"]
         try:
             identity, signer = self._active_identity(store, record)
         except RunnerPairingError as error:

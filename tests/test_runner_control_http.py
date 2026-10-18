@@ -1902,7 +1902,8 @@ def test_http_runner_revoke_requires_same_origin_recent_owner_and_exact_body():
 
 def test_http_v3_pairing_activation_replays_one_sealed_executable_cursor():
     cp = ControlPlane(device_token_pepper=b"d" * 32, runner_auth_pepper=b"r" * 32,
-                      enable_device_auth=True, public_origin="https://heel.test")
+                      enable_device_auth=True, public_origin="https://heel.test",
+                      grant_authority=SigningAuthority.generate())
     server = serve(cp)
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
 
@@ -1973,9 +1974,9 @@ def test_http_v3_pairing_activation_replays_one_sealed_executable_cursor():
         assert set(first) == {
             "schema_version", "workspace_id", "runner_id", "runner_key_id", "pairing_exchange_digest",
             "initial_claim_nonce", "initial_claim_sequence", "initial_claim_generation", "capabilities",
-            "control_protocol", "activated_at_ms",
+            "control_protocol", "activated_at_ms", "grant_authority",
         }
-        assert first["schema_version"] == "heel.runner-pairing-activated.v3"
+        assert first["schema_version"] == "heel.runner-pairing-activated.v4"
         assert first["initial_claim_sequence"] == 1 and first["initial_claim_generation"] == 0
         replay_status, replay_raw, _ = request("POST", route, activation, raw_response=True)
         assert replay_status == 200 and replay_raw == first_raw
@@ -2365,3 +2366,400 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
             assert conn.getresponse().status == 409; conn.close()
         finally:
             server.shutdown(); server.server_close(); cp.close()
+
+
+# --- T2b-1: grant-authority bootstrap in the v4 activation response -------------------------
+
+V3_ACTIVATED_FIELDS = {
+    "schema_version", "workspace_id", "runner_id", "runner_key_id", "pairing_exchange_digest",
+    "initial_claim_nonce", "initial_claim_sequence", "initial_claim_generation", "capabilities",
+    "control_protocol", "activated_at_ms",
+}
+
+
+class _PairingCeremony:
+    """A real loopback control plane driven over HTTP: owner invite, runner exchange, owner approve.
+
+    No row is seeded; the runner side is a locally held Ed25519 key. ``grant_authority`` is passed to
+    ``ControlPlane`` exactly as production configuration does (``server.py``).
+    """
+
+    def __init__(self, grant_authority):
+        self.cp = ControlPlane(device_token_pepper=b"d" * 32, runner_auth_pepper=b"r" * 32,
+                               enable_device_auth=True, public_origin="https://heel.test",
+                               grant_authority=grant_authority)
+        self.server = serve(self.cp)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown(); self.server.server_close(); self.cp.close()
+
+    def request(self, method, path, body=None, headers=None, *, raw=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        payload = raw if raw is not None else (
+            json.dumps(body, separators=(",", ":")).encode() if method == "POST" else None
+        )
+        request_headers = ({"Content-Type": "application/json", **(headers or {})}
+                           if method == "POST" else (headers or {}))
+        conn.request(method, path, payload, request_headers)
+        response = conn.getresponse(); data = response.read(); cookie = response.getheader("Set-Cookie"); conn.close()
+        return response.status, data, cookie
+
+    def owner(self, email):
+        status, data, cookie = self.request("POST", "/v1/signup", {"email": email, "password": "correct-horse-battery"})
+        assert status == 201, data
+        browser = {"Cookie": cookie.split(";", 1)[0], "Origin": "https://heel.test", "X-Heel-Internal-Origin": "same-origin"}
+        return json.loads(data)["workspace_id"], browser
+
+    def invite(self, workspace_id, browser):
+        status, data, _ = self.request("POST", f"/v1/workspaces/{workspace_id}/runner-pairings",
+                                       {"schema_version": "heel.runner-pairing-invite.v1"}, browser)
+        assert status == 201, data
+        return json.loads(data)["invitation_token"]
+
+    def approve(self, workspace_id, browser, pairing_id, phrase, fingerprint):
+        status, data, _ = self.request(
+            "POST", f"/v1/workspaces/{workspace_id}/runner-pairings/{pairing_id}/approve",
+            {"schema_version": "heel.runner-pairing-approve.v1", "pairing_phrase": phrase, "fingerprint": fingerprint},
+            browser,
+        )
+        assert status == 200, data
+
+    def approved_pairing(self, email):
+        workspace_id, browser = self.owner(email)
+        private = Ed25519PrivateKey.generate()
+        public = base64.b64encode(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+        phrase = " ".join(runner_phrase_words()[:6])
+        exchange = {
+            "schema_version": "heel.runner-pairing-exchange.v3", "invitation_token": self.invite(workspace_id, browser),
+            "public_key_b64": public, "pairing_phrase": phrase, "display_name": "Runner V4",
+            "runner_version": "v4", "adapters": {}, "control_protocol": "heel.runner-control.v2",
+        }
+        status, data, _ = self.request("POST", "/v1/runner-pairings/exchange", exchange)
+        assert status == 201, data
+        pending = json.loads(data)
+        self.approve(workspace_id, browser, pending["pairing_id"], phrase, pending["fingerprint"])
+        client_nonce = base64.b64encode(secrets_bytes(32)).decode()
+        core = {
+            "pairing_id": pending["pairing_id"], "activation_challenge": pending["activation_challenge"],
+            "pairing_exchange_digest": pending["pairing_exchange_digest"],
+            "client_activation_nonce_b64": client_nonce, "control_protocol": "heel.runner-control.v2",
+        }
+        activation = {
+            "schema_version": "heel.runner-pairing-activate.v3", "client_activation_nonce_b64": client_nonce,
+            "signature_b64": base64.b64encode(private.sign(b"heel.runner-pairing-activate.v3\0" + canonical_bytes(core))).decode(),
+        }
+        return {"workspace_id": workspace_id, "pending": pending, "activation": activation,
+                "route": f"/v1/runner-pairings/{pending['pairing_id']}/activate"}
+
+    def state(self, pairing):
+        conn = self.cp.store.conn
+        return {
+            "pairing": tuple(conn.execute("SELECT status FROM canary_runner_pairings WHERE pairing_id=?",
+                                          (pairing["pending"]["pairing_id"],)).fetchone()),
+            "runners": [tuple(row) for row in conn.execute(
+                "SELECT runner_id,status FROM canary_runners WHERE workspace_id=?", (pairing["workspace_id"],))],
+            "keys": conn.execute("SELECT COUNT(*) FROM canary_runner_keys WHERE workspace_id=?",
+                                 (pairing["workspace_id"],)).fetchone()[0],
+            "receipt": self.receipt(pairing),
+        }
+
+    def receipt(self, pairing):
+        row = self.cp.store.conn.execute(
+            "SELECT response_ciphertext FROM canary_runner_pairing_activation_receipts WHERE pairing_id=?",
+            (pairing["pending"]["pairing_id"],),
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def seal_receipt(self, pairing, response):
+        """Write a receipt exactly as the server seals one (to model a receipt stored by an older server)."""
+        pairing_id = pairing["pending"]["pairing_id"]
+        try:
+            text = canonical_bytes(response).decode()
+        except ValueError:  # a tampered value the canonical encoder itself refuses (e.g. null)
+            text = json.dumps(response, separators=(",", ":"), sort_keys=True)
+        sealed = self.cp.runner_auth._seal(text, aad=f"pairing-v3-activation\0{pairing_id}".encode())
+        self.cp.store.conn.execute(
+            "UPDATE canary_runner_pairing_activation_receipts SET response_ciphertext=? WHERE pairing_id=?",
+            (sealed, pairing_id),
+        )
+        self.cp.store.conn.commit()
+        return sealed
+
+
+def secrets_bytes(count):
+    import secrets  # noqa: PLC0415 - local to keep the module import list unchanged.
+    return secrets.token_bytes(count)
+
+
+def test_v4_activation_response_carries_the_grant_authority_and_replays_byte_identically():
+    from heel.crypto import load_public_key_base64, verify_envelope  # noqa: PLC0415
+    from heel.saas.runner_contexts import CONTEXT_DOMAIN  # noqa: PLC0415
+    cloud = SigningAuthority.generate()
+    ceremony = _PairingCeremony(cloud)
+    try:
+        pairing = ceremony.approved_pairing("v4-runner@example.test")
+        # Request injection: the runner cannot choose the authority it will trust.
+        attacker = SigningAuthority.generate()
+        injected = {**pairing["activation"], "grant_authority": {
+            "key_id": attacker.key_id, "public_key_b64": attacker.canonical_public_key}}
+        before = ceremony.state(pairing)
+        status, data, _ = ceremony.request("POST", pairing["route"], injected)
+        assert status == 400 and json.loads(data)["code"] == "invalid_runner_pairing"
+        assert ceremony.state(pairing) == before and before["pairing"] == ("approved",) and before["receipt"] is None
+
+        status, first_raw, _ = ceremony.request("POST", pairing["route"], pairing["activation"])
+        assert status == 200
+        first = json.loads(first_raw)
+        assert set(first) == V3_ACTIVATED_FIELDS | {"grant_authority"}
+        assert first["schema_version"] == "heel.runner-pairing-activated.v4"
+        assert first["control_protocol"] == "heel.runner-control.v2"
+        # The key is the control plane's own configured grant authority, nothing else.
+        assert ceremony.cp.grant_authority is cloud
+        assert first["grant_authority"] == {"key_id": cloud.key_id, "public_key_b64": cloud.canonical_public_key}
+        assert ed25519_key_id(base64.b64decode(first["grant_authority"]["public_key_b64"])) == first["grant_authority"]["key_id"]
+        assert first_raw == canonical_bytes(first)
+        # The delivered key verifies what the control plane's binding service signs, and only that.
+        trusted = {first["grant_authority"]["key_id"]: load_public_key_base64(first["grant_authority"]["public_key_b64"])}
+        payload = CONTEXT_DOMAIN + canonical_bytes({"binding": "probe"})
+        verify_envelope(trusted, ceremony.cp.runner_contexts.signing.sign(payload), payload)
+        with pytest.raises(ValueError):
+            verify_envelope(trusted, attacker.sign(payload), payload)
+
+        receipt = ceremony.receipt(pairing)
+        results, errors = [], []
+
+        def replay():
+            try:
+                results.append(ceremony.request("POST", pairing["route"], pairing["activation"])[:2])
+            except BaseException as error:  # surfaced below
+                errors.append(error)
+
+        threads = [threading.Thread(target=replay) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        assert errors == [] and len(results) == 8
+        assert all(item == (200, first_raw) for item in results)
+        # A key change on the control plane never re-keys a stored receipt: it replays as stored.
+        ceremony.cp.grant_authority = SigningAuthority.generate()
+        assert ceremony.request("POST", pairing["route"], pairing["activation"])[:2] == (200, first_raw)
+        assert ceremony.request("POST", pairing["route"], injected)[0] == 400
+        after = ceremony.state(pairing)
+        assert after["receipt"] == receipt
+        assert after["runners"] == [(pairing["pending"]["runner_id"], "active")] and after["keys"] == 1
+    finally:
+        ceremony.close()
+
+
+def test_v4_activation_without_or_with_an_inconsistent_grant_authority_fails_before_state_changes():
+    from types import SimpleNamespace  # noqa: PLC0415
+    ceremony = _PairingCeremony(None)
+    try:
+        pairing = ceremony.approved_pairing("v4-absent@example.test")
+        before = ceremony.state(pairing)
+        status, data, _ = ceremony.request("POST", pairing["route"], pairing["activation"])
+        assert status == 400 and json.loads(data)["code"] == "invalid_runner_pairing"
+        assert ceremony.state(pairing) == before
+        assert before == {"pairing": ("approved",), "runners": [], "keys": 0, "receipt": None}
+        good, other = SigningAuthority.generate(), SigningAuthority.generate()
+        inconsistent = [
+            SimpleNamespace(public_key=good.public_key, public_key_bytes=good.public_key_bytes, key_id=other.key_id),
+            SimpleNamespace(public_key=other.public_key, public_key_bytes=good.public_key_bytes, key_id=good.key_id),
+            SimpleNamespace(public_key=good.public_key, public_key_bytes=good.public_key_bytes[:31], key_id=good.key_id),
+            SimpleNamespace(public_key=good.public_key, public_key_bytes=bytearray(good.public_key_bytes), key_id=good.key_id),
+            SimpleNamespace(public_key_bytes=good.public_key_bytes, key_id=good.key_id),
+            {"key_id": good.key_id, "public_key_b64": good.canonical_public_key},
+        ]
+        for authority in inconsistent:
+            with pytest.raises(RunnerAuthError):
+                ceremony.cp.runner_auth.activate_executable(
+                    pairing["pending"]["pairing_id"], pairing["activation"], grant_authority=authority,
+                )
+            assert ceremony.state(pairing) == before
+        # The same approved pairing then activates once the control plane holds its authority.
+        ceremony.cp.grant_authority = good
+        status, data, _ = ceremony.request("POST", pairing["route"], pairing["activation"])
+        assert status == 200
+        assert json.loads(data)["grant_authority"] == {"key_id": good.key_id, "public_key_b64": good.canonical_public_key}
+    finally:
+        ceremony.close()
+
+
+def test_stored_v3_and_v4_activation_receipts_replay_exactly_and_tampered_receipts_fail_closed():
+    cloud = SigningAuthority.generate()
+    ceremony = _PairingCeremony(cloud)
+    try:
+        pairing = ceremony.approved_pairing("v4-receipts@example.test")
+        status, v4_raw, _ = ceremony.request("POST", pairing["route"], pairing["activation"])
+        assert status == 200
+        v4 = json.loads(v4_raw)
+        # A receipt stored by the pre-v4 server: the identical response without the authority.
+        v3 = {key: value for key, value in v4.items() if key != "grant_authority"}
+        v3["schema_version"] = "heel.runner-pairing-activated.v3"
+        sealed_v3 = ceremony.seal_receipt(pairing, v3)
+        assert ceremony.request("POST", pairing["route"], pairing["activation"])[:2] == (200, canonical_bytes(v3))
+        assert ceremony.receipt(pairing) == sealed_v3  # replay never rewrites or upgrades it
+        other = SigningAuthority.generate()
+        flipped = bytearray(base64.b64decode(cloud.canonical_public_key)); flipped[0] ^= 1
+        noncanonical = cloud.canonical_public_key[:-2] + chr(ord(cloud.canonical_public_key[-2]) + 1) + "="
+        tampered = [
+            {**v4, "extra": True},
+            {key: value for key, value in v4.items() if key != "grant_authority"},
+            {**v3, "grant_authority": v4["grant_authority"]},
+            {**v4, "schema_version": "heel.runner-pairing-activated.v5"},
+            {**v4, "grant_authority": {**v4["grant_authority"], "extra": "x"}},
+            {**v4, "grant_authority": {"key_id": other.key_id, "public_key_b64": cloud.canonical_public_key}},
+            {**v4, "grant_authority": {"key_id": cloud.key_id, "public_key_b64": base64.b64encode(bytes(flipped)).decode()}},
+            {**v4, "grant_authority": {"key_id": cloud.key_id, "public_key_b64": base64.b64encode(cloud.public_key_bytes[:31]).decode()}},
+            {**v4, "grant_authority": {"key_id": cloud.key_id, "public_key_b64": noncanonical}},
+            {**v4, "grant_authority": {"key_id": 1, "public_key_b64": cloud.canonical_public_key}},
+            {**v4, "grant_authority": {"key_id": "k_\u00e9" + cloud.key_id[3:], "public_key_b64": cloud.canonical_public_key}},
+            {**v4, "grant_authority": {"key_id": cloud.key_id, "public_key_b64": cloud.canonical_public_key[:-1] + "\u00e9"}},
+            {**v4, "grant_authority": [cloud.key_id, cloud.canonical_public_key]},
+            {**v4, "grant_authority": None},
+        ]
+        for response in tampered:
+            sealed = ceremony.seal_receipt(pairing, response)
+            status, data, _ = ceremony.request("POST", pairing["route"], pairing["activation"])
+            assert status == 400 and json.loads(data)["code"] == "invalid_runner_pairing", response
+            assert ceremony.receipt(pairing) == sealed
+        # The original v4 receipt still replays byte for byte.
+        ceremony.seal_receipt(pairing, v4)
+        assert ceremony.request("POST", pairing["route"], pairing["activation"])[:2] == (200, v4_raw)
+    finally:
+        ceremony.close()
+
+
+class _RecordingSecretBackend:
+    """Test-only in-memory secret backend, injected through ``RunnerDaemon(secret_backend=...)``."""
+
+    def __init__(self):
+        self.values: dict[str, bytes] = {}
+
+    def load(self, label):
+        value = self.values.get(label)
+        return None if value is None else bytes(value)
+
+    def store(self, label, seed):
+        if label in self.values:
+            raise ValueError("runner signing identity already exists")
+        self.values[label] = bytes(seed)
+
+    def delete(self, label):
+        self.values.pop(label, None)
+
+
+class _LoopbackControlTransport:
+    """Plain-HTTP stand-in for ``HTTPSControlTransport.post`` against the loopback control plane."""
+
+    def __init__(self, ceremony):
+        self.ceremony = ceremony
+
+    def post(self, path, *, headers=None, body=b""):
+        status, data, _ = self.ceremony.request("POST", path, headers=headers, raw=body)
+        return status, {}, (json.loads(data) if data else None)
+
+
+def _released_v3_activation_response(cls, value, *, material, pending):
+    """The closed-set gate of ``RunnerStore._activation_response`` as shipped in heel_sim 1.2.0
+    (b426fc2, ``store.py:1162-1170``): exactly the v3 field set and schema. The real 1.2.0 wheel
+    against the new server is recorded separately in the T2b1 acceptance artifacts."""
+    from heel.runner.store import RunnerStoreError  # noqa: PLC0415
+    if not isinstance(value, dict) or set(value) != V3_ACTIVATED_FIELDS:
+        raise RunnerStoreError("invalid executable pairing activation response")
+    if value["schema_version"] != "heel.runner-pairing-activated.v3":
+        raise RunnerStoreError("invalid executable pairing activation response")
+    raise AssertionError("this model only gates; a v3 response is out of scope here")  # pragma: no cover
+
+
+def _pair_daemon_over_loopback(ceremony, tmp_path, email, monkeypatch):
+    from heel.runner.daemon import RunnerDaemon  # noqa: PLC0415
+
+    class LoopbackDaemon(RunnerDaemon):
+        def _transport(self, origin):
+            return _LoopbackControlTransport(ceremony)
+
+    workspace_id, browser = ceremony.owner(email)
+    token = ceremony.invite(workspace_id, browser)
+    home = tmp_path / email.split("@", 1)[0]
+    home.mkdir(mode=0o700)
+    backend = _RecordingSecretBackend()
+    daemon = LoopbackDaemon(home, secret_backend=backend, poll_interval_seconds=0.05)
+    outcome = {}
+    pending = threading.Event()
+
+    def emit(event):
+        if event["event"] == "pairing_pending":
+            outcome["pending"] = event
+            pending.set()
+
+    def run():
+        try:
+            outcome["result"] = daemon.pair("https://heel.test", token, emit=emit)
+        except BaseException as error:  # inspected by the test
+            outcome["error"] = error
+            pending.set()
+
+    thread = threading.Thread(target=run, daemon=True); thread.start()
+    assert pending.wait(30)
+    assert "error" not in outcome, outcome
+    event = outcome["pending"]
+    ceremony.approve(workspace_id, browser, event["pairing_id"], event["pairing_phrase"], event["fingerprint"])
+    thread.join(30)
+    assert not thread.is_alive()
+    return daemon, backend, outcome
+
+
+def test_old_and_new_activation_peers_fail_closed_with_response_rejected(tmp_path, monkeypatch):
+    from heel.runner.daemon import RunnerPairingError  # noqa: PLC0415
+    from heel.runner.store import RunnerStore  # noqa: PLC0415
+    cloud = SigningAuthority.generate()
+
+    # New runner (v4 only) against an old server, which answered the same state with v3.
+    ceremony = _PairingCeremony(cloud)
+    original = RunnerAuthStore.activate_executable
+
+    def old_server(self, *args, **kwargs):
+        response = original(self, *args, **kwargs)
+        old = {key: value for key, value in response.items() if key != "grant_authority"}
+        old["schema_version"] = "heel.runner-pairing-activated.v3"
+        return old
+
+    try:
+        monkeypatch.setattr(RunnerAuthStore, "activate_executable", old_server)
+        daemon, backend, outcome = _pair_daemon_over_loopback(ceremony, tmp_path, "new-runner@example.test", monkeypatch)
+        assert isinstance(outcome.get("error"), RunnerPairingError), outcome
+        assert outcome["error"].code == "response_rejected"
+        status = daemon.status()
+        assert status["state"] == "pairing_incomplete" and status["next_steps"][0] == "heel runner unpair"
+        assert daemon.unpair()["removed"] is True and backend.values == {}
+        assert daemon.status() == {"state": "unpaired"}
+        monkeypatch.setattr(RunnerAuthStore, "activate_executable", original)
+
+        # Old runner (1.2.0 strict v3 set) against the new server, which answers v4.
+        monkeypatch.setattr(RunnerStore, "_activation_response", classmethod(_released_v3_activation_response))
+        daemon, backend, outcome = _pair_daemon_over_loopback(ceremony, tmp_path, "old-runner@example.test", monkeypatch)
+        assert isinstance(outcome.get("error"), RunnerPairingError), outcome
+        assert outcome["error"].code == "response_rejected"
+        assert daemon.status()["state"] == "pairing_incomplete"
+        assert daemon.unpair()["removed"] is True and backend.values == {}
+        monkeypatch.undo()
+
+        # New runner against a server whose v4 authority was tampered in transit or at rest.
+        attacker = SigningAuthority.generate()
+
+        def tampering_server(self, *args, **kwargs):
+            response = original(self, *args, **kwargs)
+            return {**response, "grant_authority": {
+                "key_id": response["grant_authority"]["key_id"], "public_key_b64": attacker.canonical_public_key}}
+
+        monkeypatch.setattr(RunnerAuthStore, "activate_executable", tampering_server)
+        daemon, backend, outcome = _pair_daemon_over_loopback(ceremony, tmp_path, "tampered@example.test", monkeypatch)
+        assert isinstance(outcome.get("error"), RunnerPairingError), outcome
+        assert outcome["error"].code == "response_rejected"
+        assert daemon.status()["state"] == "pairing_incomplete"
+        assert daemon.unpair()["removed"] is True and backend.values == {}
+    finally:
+        ceremony.close()

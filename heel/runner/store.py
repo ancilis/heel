@@ -1163,11 +1163,26 @@ class RunnerStore:
             "schema_version", "workspace_id", "runner_id", "runner_key_id",
             "pairing_exchange_digest", "initial_claim_nonce", "initial_claim_sequence",
             "initial_claim_generation", "capabilities", "control_protocol", "activated_at_ms",
+            "grant_authority",
         }
         if not isinstance(value, Mapping) or set(value) != fields:
             raise RunnerStoreError("invalid executable pairing activation response")
+        # v4 only: the control plane's grant-signing public key arrives inside the approved
+        # ceremony, as raw Ed25519 whose key ID is derived from the key, never chosen by it.
+        authority = value["grant_authority"]
+        if not isinstance(authority, Mapping) or set(authority) != {"key_id", "public_key_b64"}:
+            raise RunnerStoreError("invalid executable pairing activation response")
+        authority_key_id, authority_public_b64 = authority["key_id"], authority["public_key_b64"]
+        try:
+            if type(authority_key_id) is not str or type(authority_public_b64) is not str or len(authority_public_b64) != 44:
+                raise ValueError
+            load_public_key_base64(authority_public_b64)
+            derived_key_id = ed25519_key_id(base64.b64decode(authority_public_b64, validate=True))
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid executable pairing activation response") from None
         if (
-            value["schema_version"] != "heel.runner-pairing-activated.v3"
+            value["schema_version"] != "heel.runner-pairing-activated.v4"
+            or derived_key_id != authority_key_id
             or value["runner_id"] != pending["runner_id"]
             or value["runner_key_id"] != material.key_id
             or value["pairing_exchange_digest"] != pending["pairing_exchange_digest"]
@@ -1192,6 +1207,7 @@ class RunnerStore:
             "initial_claim_sequence": 1, "initial_claim_generation": 0,
             "capabilities": list(value["capabilities"]), "control_protocol": value["control_protocol"],
             "activated_at_ms": cls._pairing_time(value["activated_at_ms"], "pairing activation time"),
+            "grant_authority": {"key_id": authority_key_id, "public_key_b64": authority_public_b64},
         }, identity)
 
     def _prepare_pairing_activation(
