@@ -181,7 +181,9 @@ EXPECTED_CONTRACT = {
         "heel/runner/containment.py",
         "heel/runner/content_assertion.py",
         "heel/runner/control_client.py",
+        "heel/runner/control_transport.py",
         "heel/runner/coordinator.py",
+        "heel/runner/daemon.py",
         "heel/runner/execution.py",
         "heel/runner/http_transport.py",
         "heel/runner/identity.py",
@@ -959,9 +961,9 @@ class OpenCoreReleaseTests(unittest.TestCase):
             f"heel/runner/{name}": (ROOT / "heel" / "runner" / name).read_bytes()
             for name in (
                 "__init__.py", "adapters.py", "catalog.py", "companion.py", "compiler.py",
-                "containment.py", "control_client.py", "coordinator.py", "execution.py", "http_transport.py",
-                "identity.py", "openapi_routes.py", "redaction.py", "runtime.py", "service.py", "store.py",
-                "vault.py",
+                "containment.py", "control_client.py", "control_transport.py", "coordinator.py", "daemon.py",
+                "execution.py", "http_transport.py", "identity.py", "openapi_routes.py", "redaction.py",
+                "runtime.py", "service.py", "store.py", "vault.py",
             )
         }
         for required in (
