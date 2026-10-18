@@ -302,8 +302,11 @@ pair with a new invitation).
 - Control traffic goes only to the `--origin` given at pairing: `https://` only, exact
   pathless lowercase origin, system trust with TLS 1.2 or newer and hostname checks, no
   redirects, no proxies, at most 256 KiB of JSON per response, one 30-second deadline per
-  call. There is no CA-bundle flag or variable (the same `SSL_CERT_FILE` caveat below
-  applies).
+  call covering connect (all resolved addresses together), TLS handshake, request, status
+  line, headers and body, however slowly the peer sends. Host name resolution by the system
+  resolver cannot be interrupted: a resolver slower than the deadline extends the call by its
+  own duration, after which the call fails with `timeout` without connecting or sending. There
+  is no CA-bundle flag or variable (the same `SSL_CERT_FILE` caveat below applies).
 - `status` reports `active`, `offline` (control plane unreachable), `runner_revoked` (the
   control plane rejects the runner key), `pairing_incomplete`, `local_identity_unavailable`
   or `unpaired`, plus the self-serve access state. `unpair` refuses while a context binding

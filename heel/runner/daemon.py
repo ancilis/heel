@@ -74,6 +74,13 @@ class RunnerPairingError(RuntimeError):
         self.code = code
 
 
+class _RecordOwnershipLost(RunnerPairingError):
+    """The daemon record no longer names this pair attempt (unpaired or replaced meanwhile)."""
+
+    def __init__(self):
+        super().__init__("local_state_invalid")
+
+
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -225,27 +232,53 @@ class RunnerDaemon:
             raise RunnerPairingError("local_state_invalid")
         return record
 
-    def _write_record(self, store: RunnerStore, record: Mapping[str, Any]) -> None:
+    def _reserve_record(self, store: RunnerStore, record: Mapping[str, Any]) -> None:
+        """Check for local pairing state and write this attempt's record in one critical section."""
         validated = self._validate_record(record)
         directory = self._daemon_fd(store, create=True)
         assert directory is not None
         try:
             with _flock(directory, ".daemon.lock", exclusive=True):
+                existing = _read_json(directory, _DAEMON_RECORD, None)
+                if existing is not None:
+                    existing = self._validate_record(existing)
+                    raise RunnerPairingError(
+                        "already_paired" if existing["state"] == "active" else "pairing_incomplete",
+                    )
+                if self._store_pairing_files(store) or store.is_context_bound:
+                    raise RunnerPairingError("local_state_invalid")
                 _write_json(directory, _DAEMON_RECORD, validated)
         finally:
             os.close(directory)
 
-    def _remove_record(self, store: RunnerStore) -> None:
+    def _write_record(self, store: RunnerStore, record: Mapping[str, Any]) -> None:
+        """Update this attempt's record; never write over another attempt's or a removed one."""
+        validated = self._validate_record(record)
         directory = self._daemon_fd(store, create=False)
         if directory is None:
-            return
+            raise _RecordOwnershipLost()
         try:
             with _flock(directory, ".daemon.lock", exclusive=True):
-                try:
-                    os.unlink(_DAEMON_RECORD, dir_fd=directory)
-                except FileNotFoundError:
-                    pass
+                current = _read_json(directory, _DAEMON_RECORD, None)
+                if not isinstance(current, Mapping) or current.get("installation_id") != validated["installation_id"]:
+                    raise _RecordOwnershipLost()
+                _write_json(directory, _DAEMON_RECORD, validated)
+        finally:
+            os.close(directory)
+
+    def _remove_record(self, store: RunnerStore, installation_id: str) -> bool:
+        """Remove the record only while it still names ``installation_id``."""
+        directory = self._daemon_fd(store, create=False)
+        if directory is None:
+            return False
+        try:
+            with _flock(directory, ".daemon.lock", exclusive=True):
+                current = _read_json(directory, _DAEMON_RECORD, None)
+                if not isinstance(current, Mapping) or current.get("installation_id") != installation_id:
+                    return False
+                os.unlink(_DAEMON_RECORD, dir_fd=directory)
                 os.fsync(directory)
+                return True
         finally:
             os.close(directory)
 
@@ -286,8 +319,9 @@ class RunnerDaemon:
             "created_at_ms": self._clock_ms(), "pairing_id": None, "runner_id": None,
             "workspace_id": None, "runner_key_id": None, "fingerprint": None,
         }
-        # The record is written before the seed so an interrupted pair can always be unpaired.
-        self._write_record(store, record)
+        # The record is reserved before the seed so an interrupted pair can always be unpaired,
+        # and a concurrent pair on this HEEL_HOME either sees it or is seen by it.
+        self._reserve_record(store, record)
         exchanged = seed_created = False
         try:
             try:
@@ -338,14 +372,15 @@ class RunnerDaemon:
                     runtime.close()
             except (RunnerStoreError, RunnerRuntimeStateError, ValueError):
                 raise RunnerPairingError("response_rejected") from None
-        except BaseException:
-            if not exchanged:
-                # Nothing reached the cloud's pairing state: drop the seed, then the record that
-                # names it. If the seed cannot be removed the record stays so unpair can retry.
+        except BaseException as error:
+            if not exchanged or isinstance(error, _RecordOwnershipLost):
+                # Nothing reached the cloud's pairing state, or no record names this seed any more
+                # (a concurrent unpair removed it): drop the seed, then our record if it is still
+                # ours. If the seed cannot be removed the record stays so unpair can retry.
                 try:
                     if seed_created:
                         _delete_signer_seed(backend, label)
-                    self._remove_record(store)
+                    self._remove_record(store, installation_id)
                 except Exception:
                     pass
             raise
@@ -353,7 +388,14 @@ class RunnerDaemon:
             state="active", workspace_id=identity.workspace_id, runner_id=identity.runner_id,
             runner_key_id=identity.key_id, fingerprint=identity.fingerprint,
         )
-        self._write_record(store, record)
+        try:
+            self._write_record(store, record)
+        except _RecordOwnershipLost:
+            try:
+                _delete_signer_seed(backend, label)
+            except Exception:
+                pass
+            raise
         result = {
             "event": "paired", "state": "active", "origin": origin,
             "workspace_id": identity.workspace_id, "runner_id": identity.runner_id,
@@ -535,7 +577,8 @@ class RunnerDaemon:
                 _delete_signer_seed(backend, runner_pairing_signer_label(record["installation_id"]))
             except (RuntimeError, ValueError):
                 raise RunnerPairingError("secret_removal_failed") from None
-            self._remove_record(store)
+            # A record written by a newer pair attempt after our read is left alone.
+            self._remove_record(store, record["installation_id"])
         result = {"state": "unpaired", "removed": True}
         if record is not None and record.get("runner_id"):
             result["runner_id"] = record["runner_id"]
