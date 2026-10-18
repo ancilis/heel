@@ -447,6 +447,168 @@ def test_unapproved_pairing_times_out_fails_closed_and_unpair_allows_a_fresh_inv
     assert outcome["result"]["state"] == "active"
 
 
+class GatedSecretBackend(RecordingSecretBackend):
+    """Holds the first ``store`` (after the pair record is reserved) until released."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._gated = True
+
+    def store(self, label, seed):
+        if self._gated:
+            self._gated = False
+            self.entered.set()
+            assert self.release.wait(30)
+        super().store(label, seed)
+
+
+def _server_runner_statuses(harness, workspace_id):
+    rows = harness.control_plane.store.conn.execute(
+        "SELECT status FROM canary_runners WHERE workspace_id=?", (workspace_id,),
+    ).fetchall()
+    return sorted(row[0] for row in rows)
+
+
+def _daemon_record(home):
+    path = home / "runner-daemon" / "pairing.json"
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+@pytest.mark.parametrize("invitations", ["same", "distinct"])
+def test_concurrent_pair_attempts_never_clobber_an_active_pairing(tmp_path, harness, invitations):
+    # T2aR D5: B passed the local checks, was descheduled, A paired, then B overwrote and removed A's record.
+    workspace_id, cookie = harness.signup_owner(f"owner-race-{invitations}@example.test")
+    token_a = _invite(harness, workspace_id, cookie)
+    tokens = {"b": token_a}
+    home, backend = _home(tmp_path, "race"), RecordingSecretBackend()
+    a_done, b_checked = threading.Event(), threading.Event()
+
+    class DescheduledDaemon(RunnerDaemon):
+        def _backend(self):
+            b_checked.set()
+            assert a_done.wait(30)  # after the early already-paired check, before the reservation
+            return super()._backend()
+
+    b = DescheduledDaemon(home, secret_backend=backend, ca_bundle=harness.ca.ca_path, poll_interval_seconds=0.05)
+    b_outcome = {}
+
+    def run_b():
+        try:
+            b_outcome["result"] = b.pair(harness.origin, tokens["b"])
+        except RunnerPairingError as error:
+            b_outcome["error"] = error.code
+        except BaseException as error:  # surfaced by the equality assertion below
+            b_outcome["unexpected"] = repr(error)
+
+    thread = threading.Thread(target=run_b, daemon=True)
+    thread.start()
+    assert b_checked.wait(30)
+    _, outcome = _pair_with_owner_approval(harness, _daemon(home, harness, backend), workspace_id, cookie, token_a)
+    assert outcome["result"]["state"] == "active"
+    record_a = _daemon_record(home)
+    if invitations == "distinct":
+        # The workspace holds one open invitation at a time; B's is minted once A's is spent.
+        tokens["b"] = _invite(harness, workspace_id, cookie)
+    sent = len(harness.forwarded)
+    a_done.set()
+    thread.join(30)
+    assert not thread.is_alive()
+    assert b_outcome == {"error": "already_paired"}
+    assert len(harness.forwarded) == sent  # B never reached the cloud
+    assert _daemon_record(home) == record_a
+    assert len(backend.values) == 1 and backend.deleted == []
+    status = _daemon(home, harness, backend).status()
+    assert status["state"] == "active" and status["control_plane"]["state"] == "confirmed"
+    assert status["runner_id"] == outcome["result"]["runner_id"]
+    assert _server_runner_statuses(harness, workspace_id) == ["active"]
+    assert _daemon(home, harness, backend).unpair()["removed"] is True
+    assert backend.values == {} and _daemon_record(home) is None
+
+
+def test_a_reserved_incomplete_pairing_blocks_a_second_attempt_until_it_completes(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("owner-reserved@example.test")
+    token_b = _invite(harness, workspace_id, cookie)
+    token_a = "A" * 43 + "="  # refused locally before any use, so it need not be a live invitation
+    home, backend = _home(tmp_path, "reserved"), GatedSecretBackend()
+    result = {}
+    first = threading.Thread(target=lambda: result.update(pair=_pair_with_owner_approval(
+        harness, _daemon(home, harness, backend), workspace_id, cookie, token_b)), daemon=True)
+    first.start()
+    assert backend.entered.wait(30)
+    reserved = _daemon_record(home)
+    assert reserved["state"] == "preparing"
+    sent = len(harness.forwarded)
+    with pytest.raises(RunnerPairingError) as blocked:
+        _daemon(home, harness, backend).pair(harness.origin, token_a)
+    assert blocked.value.code == "pairing_incomplete"
+    assert len(harness.forwarded) == sent and backend.values == {}
+    assert _daemon_record(home) == reserved
+    assert _daemon(home, harness, backend).status()["state"] == "pairing_incomplete"
+    backend.release.set()
+    first.join(60)
+    assert result["pair"][1]["result"]["state"] == "active"
+    assert _daemon_record(home)["installation_id"] == reserved["installation_id"]
+    assert len(backend.values) == 1
+    assert _daemon(home, harness, backend).status()["state"] == "active"
+
+
+def test_unpair_during_pair_leaves_no_unreachable_seed_and_the_attempt_fails_closed(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("owner-unpair-race@example.test")
+    token = _invite(harness, workspace_id, cookie)
+    home, backend = _home(tmp_path, "unpair-race"), GatedSecretBackend()
+    outcome = {}
+
+    def run():
+        try:
+            outcome["result"] = _daemon(home, harness, backend).pair(harness.origin, token)
+        except RunnerPairingError as error:
+            outcome["error"] = error.code
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    assert backend.entered.wait(30)
+    # The operator unpairs the incomplete attempt while it is between reservation and exchange.
+    assert _daemon(home, harness, backend).unpair()["removed"] is True
+    assert _daemon_record(home) is None
+    backend.release.set()
+    thread.join(30)
+    assert outcome == {"error": "local_state_invalid"}
+    # The attempt noticed its record was gone and removed its own seed; nothing names a key.
+    assert backend.values == {} and len(backend.deleted) == 2
+    assert _daemon_record(home) is None
+    assert _daemon(home, harness, backend).status() == {"state": "unpaired"}
+    assert "active" not in _server_runner_statuses(harness, workspace_id)
+
+
+def test_pair_record_updates_and_removals_are_bound_to_the_attempt_installation_id(tmp_path):
+    home = _home(tmp_path, "bound")
+    daemon, store = RunnerDaemon(home), RunnerStore(home)
+    record = {
+        "schema_version": "heel.runner-daemon-pairing.v1", "state": "preparing",
+        "origin": "https://heel.example", "installation_id": "a" * 32, "display_name": "Heel runner",
+        "created_at_ms": 1, "pairing_id": None, "runner_id": None, "workspace_id": None,
+        "runner_key_id": None, "fingerprint": None,
+    }
+    with pytest.raises(RunnerPairingError) as absent:
+        daemon._write_record(store, record)
+    assert absent.value.code == "local_state_invalid" and _daemon_record(home) is None
+    daemon._reserve_record(store, record)
+    with pytest.raises(RunnerPairingError) as twice:
+        daemon._reserve_record(store, {**record, "installation_id": "b" * 32})
+    assert twice.value.code == "pairing_incomplete"
+    other = {**record, "installation_id": "b" * 32, "state": "exchanged"}
+    with pytest.raises(RunnerPairingError) as foreign:
+        daemon._write_record(store, other)
+    assert foreign.value.code == "local_state_invalid"
+    assert daemon._remove_record(store, "b" * 32) is False
+    assert _daemon_record(home) == record
+    daemon._write_record(store, {**record, "state": "exchanged"})
+    assert _daemon_record(home)["state"] == "exchanged"
+    assert daemon._remove_record(store, "a" * 32) is True and _daemon_record(home) is None
+
+
 def test_pair_without_a_supported_secret_service_fails_closed_without_file_fallback(tmp_path, monkeypatch):
     # The Linux helper is pinned to /usr/bin/secret-tool; moving the constant out of the
     # allowlist makes the real backend unavailable on every platform.
@@ -639,6 +801,238 @@ def test_transport_enforces_one_deadline_against_a_trickling_peer(ca):
         assert time.monotonic() - started < 3
     with pytest.raises(ValueError):
         HTTPSControlTransport("https://heel.example", timeout_seconds=31)
+
+
+class _PacedPeer:
+    """One-connection loopback peer that follows a script of TLS/byte-pacing steps.
+
+    ``after_tls`` is the response to drip; ``fast_prefix`` bytes go at once, the next
+    ``slow_bytes`` one per ``step`` seconds, then the rest. ``tls=False`` accepts TCP and stays
+    silent; ``respond=False`` completes TLS, reads the request and stays silent.
+    """
+
+    def __init__(self, ca, response=b"", *, tls=True, respond=True, fast_prefix=0, slow_bytes=0,
+                 step=0.2, reset_after=None):
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.port = self.listener.getsockname()[1]
+        self.origin = f"https://localhost:{self.port}"
+        self.peer_saw_close = threading.Event()
+        self._stop = threading.Event()
+        self._context = ca.server_context()
+        self._args = (response, tls, respond, fast_prefix, slow_bytes, step, reset_after)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _wait_for_close(self, conn):
+        conn.settimeout(0.05)
+        while not self._stop.is_set():
+            try:
+                if conn.recv(65536) == b"":
+                    break
+            except (socket.timeout, TimeoutError):
+                continue
+            except (OSError, ssl.SSLError):
+                break
+        self.peer_saw_close.set()
+
+    def _serve(self):
+        response, tls, respond, fast_prefix, slow_bytes, step, reset_after = self._args
+        try:
+            conn, _ = self.listener.accept()
+        except OSError:
+            return
+        try:
+            if tls:
+                conn.settimeout(5)
+                conn = self._context.wrap_socket(conn, server_side=True)
+                try:
+                    conn.recv(65536)
+                except OSError:
+                    pass
+            if tls and respond:
+                conn.sendall(response[:fast_prefix])
+                for index in range(fast_prefix, min(len(response), fast_prefix + slow_bytes)):
+                    if self._stop.wait(step):
+                        return
+                    try:
+                        conn.sendall(response[index:index + 1])
+                    except OSError:
+                        self.peer_saw_close.set()
+                        return
+                if reset_after is not None:
+                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+                    conn.close()
+                    return
+                conn.sendall(response[fast_prefix + slow_bytes:])
+            self._wait_for_close(conn)
+        except OSError:
+            self.peer_saw_close.set()
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def close(self):
+        self._stop.set()
+        self.listener.close()
+        self.thread.join(5)
+
+
+_SLOW_RESPONSE = raw_json_response(200, b'{"ok":true}')
+
+
+def _timed_post(ca, peer, timeout_seconds):
+    transport = HTTPSControlTransport(peer.origin, ca_bundle=ca.ca_path, timeout_seconds=timeout_seconds)
+    threads_before = threading.active_count()
+    started = time.monotonic()
+    try:
+        _post(transport)
+    except ControlTransportError as error:
+        outcome = error.code
+    else:
+        outcome = "completed"
+    elapsed = time.monotonic() - started
+    # The deadline is enforced on the calling thread: no watchdog thread is left behind.
+    assert threading.active_count() <= threads_before
+    return outcome, elapsed
+
+
+def test_transport_enforces_one_deadline_against_a_trickling_status_line(ca):
+    # T2aR D4: 12 status-line bytes at 0.5 s each held a 1 s call open for 6.1 s.
+    peer = _PacedPeer(ca, _SLOW_RESPONSE, slow_bytes=12, step=0.25)
+    try:
+        outcome, elapsed = _timed_post(ca, peer, 0.75)
+        assert outcome == "timeout"
+        assert 0.7 <= elapsed < 1.5
+        # The socket is closed with the call: the peer observes it, no background read remains.
+        assert peer.peer_saw_close.wait(2)
+    finally:
+        peer.close()
+
+
+@pytest.mark.parametrize("phase, options", [
+    ("silent-before-tls-handshake", {"tls": False}),
+    ("silent-after-tls-handshake", {"respond": False}),
+    ("trickled-headers", {"fast_prefix": _SLOW_RESPONSE.index(b"\r\n") + 2, "slow_bytes": 40}),
+    ("trickled-body", {"fast_prefix": _SLOW_RESPONSE.index(b"\r\n\r\n") + 4, "slow_bytes": 11, "step": 0.3}),
+])
+def test_transport_deadline_covers_handshake_header_and_body_phases(ca, phase, options):
+    peer = _PacedPeer(ca, _SLOW_RESPONSE, **options)
+    try:
+        outcome, elapsed = _timed_post(ca, peer, 0.75)
+        assert outcome == "timeout", phase
+        assert 0.7 <= elapsed < 1.5, (phase, elapsed)
+        assert peer.peer_saw_close.wait(2), phase
+    finally:
+        peer.close()
+
+
+def test_transport_completes_a_paced_response_inside_the_deadline_and_maps_resets(ca):
+    peer = _PacedPeer(ca, _SLOW_RESPONSE, slow_bytes=4, step=0.05)
+    try:
+        assert _timed_post(ca, peer, 2.0)[0] == "completed"
+    finally:
+        peer.close()
+    # A peer that resets mid-headers fails closed promptly, never as a hang or a partial result.
+    peer = _PacedPeer(ca, _SLOW_RESPONSE, fast_prefix=20, reset_after=True)
+    try:
+        outcome, elapsed = _timed_post(ca, peer, 2.0)
+        assert outcome in {"connection_failed", "malformed_response"}
+        assert elapsed < 1.5
+    finally:
+        peer.close()
+    # Nothing listening: refused before any deadline, closed code.
+    closed = socket.create_server(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+    closed.close()
+    transport = HTTPSControlTransport(f"https://localhost:{port}", ca_bundle=ca.ca_path, timeout_seconds=1.0)
+    with pytest.raises(ControlTransportError) as refused:
+        _post(transport)
+    assert refused.value.code == "connection_failed"
+
+
+class _ScriptedSocket:
+    """Stands in for ``socket.socket`` inside the transport: connects stall or fail, never send."""
+
+    created: list["_ScriptedSocket"] = []
+
+    def __init__(self, family, kind, protocol, *, behaviour):
+        self.behaviour, self.timeouts, self.sent, self.closed = behaviour, [], [], False
+        _ScriptedSocket.created.append(self)
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def connect(self, address):
+        if self.behaviour == "blackhole":
+            time.sleep(self.timeouts[-1])  # a dropped SYN waits for the whole socket timeout
+            raise TimeoutError("timed out")
+        raise ConnectionRefusedError("refused")
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def close(self):
+        self.closed = True
+
+
+def _patch_resolution(monkeypatch, *, delay, behaviours):
+    _ScriptedSocket.created = []
+    addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"192.0.2.{index + 1}", 443))
+                 for index in range(len(behaviours))]
+
+    def resolve(host, port, type=0):
+        time.sleep(delay)
+        return addresses
+
+    queue = list(behaviours)
+    monkeypatch.setattr(control_transport.socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(control_transport.socket, "socket",
+                        lambda family, kind, protocol: _ScriptedSocket(family, kind, protocol, behaviour=queue.pop(0)))
+
+
+def test_transport_deadline_spans_resolution_and_every_resolved_address(monkeypatch):
+    # Slow resolver (0.3 s), then three addresses that each drop SYNs: one deadline covers all.
+    _patch_resolution(monkeypatch, delay=0.3, behaviours=["refused", "blackhole", "blackhole"])
+    transport = HTTPSControlTransport("https://heel.example", timeout_seconds=0.75)
+    started = time.monotonic()
+    with pytest.raises(ControlTransportError) as refused:
+        _post(transport)
+    elapsed = time.monotonic() - started
+    assert refused.value.code == "timeout"
+    assert 0.7 <= elapsed < 1.1
+    # The refused address and the first blackhole shared the time left after resolution; the
+    # third address was never tried, nothing was ever sent and every socket was closed.
+    assert len(_ScriptedSocket.created) == 2
+    first, second = _ScriptedSocket.created
+    assert first.timeouts[0] <= 0.45 + 0.05 and second.timeouts[0] <= first.timeouts[0]
+    assert all(not item.sent and item.closed for item in _ScriptedSocket.created)
+
+
+def test_transport_reports_the_resolver_overrun_limit_without_any_network_io(monkeypatch):
+    # Known limit: a resolver slower than the deadline is not interrupted. The call then ends
+    # with ``timeout`` as soon as resolution returns, having created no socket and sent nothing.
+    _patch_resolution(monkeypatch, delay=0.9, behaviours=["refused"])
+    transport = HTTPSControlTransport("https://heel.example", timeout_seconds=0.5)
+    threads_before = threading.active_count()
+    started = time.monotonic()
+    with pytest.raises(ControlTransportError) as refused:
+        _post(transport)
+    elapsed = time.monotonic() - started
+    assert refused.value.code == "timeout"
+    assert 0.9 <= elapsed < 1.2
+    assert _ScriptedSocket.created == []
+    assert threading.active_count() <= threads_before
+
+
+def test_transport_all_addresses_refused_fails_fast_with_connection_failed(monkeypatch):
+    _patch_resolution(monkeypatch, delay=0, behaviours=["refused", "refused"])
+    transport = HTTPSControlTransport("https://heel.example", timeout_seconds=1.0)
+    with pytest.raises(ControlTransportError) as refused:
+        _post(transport)
+    assert refused.value.code == "connection_failed"
+    assert len(_ScriptedSocket.created) == 2 and all(item.closed for item in _ScriptedSocket.created)
 
 
 def test_transport_tls_trust_failures_fail_closed(ca, tmp_path):

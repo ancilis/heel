@@ -2,7 +2,8 @@
 
 This is the only network path from the customer runner to Heel Cloud. It is deliberately
 narrow: one configured ``https://`` origin, system trust (TLS 1.2+, hostname checked), no
-redirects, no proxies, a bounded JSON response and a fixed per-call deadline. Failures are
+redirects, no proxies, a bounded JSON response and one deadline per call covering connect,
+TLS handshake, request, status line, headers and body. Failures are
 reported as closed reason codes and never carry request or response material.
 
 The optional ``ca_bundle`` argument exists so tests can trust an ephemeral loopback CA.
@@ -12,6 +13,7 @@ selects it, and it replaces (never extends) the trust store when given.
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import os
 import re
@@ -139,6 +141,111 @@ def _strict_json(raw: bytes) -> dict[str, Any]:
     return decoded
 
 
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("runner control deadline expired")
+    return remaining
+
+
+class _DeadlineReader(io.RawIOBase):
+    """Socket reads that each wait at most until the one per-call deadline."""
+
+    def __init__(self, owner: "_DeadlineSocket"):
+        super().__init__()
+        self._owner = owner
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        sock = self._owner._sock
+        sock.settimeout(_remaining(self._owner._deadline))
+        return sock.recv_into(buffer)
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                super().close()
+            finally:
+                self._owner._release()
+
+
+class _DeadlineSocket:
+    """The only socket surface ``http.client`` sees; every wait is bounded by one deadline.
+
+    ``http.client`` reads the status line and each header line through ``makefile``; with a
+    plain socket timeout every recv restarts the clock, so a peer trickling one byte at a time
+    could hold a call open for minutes. Here each recv and send gets only the time left. Like
+    ``socket.makefile``, an open reader keeps the TLS socket open after ``close`` (``http.client``
+    closes the connection before a ``Connection: close`` body is read); the last one closes it.
+    """
+
+    def __init__(self, sock: ssl.SSLSocket, deadline: float):
+        self._sock = sock
+        self._deadline = deadline
+        self._readers = 0
+        self._closed = False
+
+    def makefile(self, mode: str = "r", *_args: Any, **_kwargs: Any) -> io.BufferedReader:
+        if mode != "rb" or self._closed:
+            raise ValueError("runner control socket is read as binary only, while open")
+        self._readers += 1
+        return io.BufferedReader(_DeadlineReader(self))
+
+    def sendall(self, data: bytes) -> None:
+        self._sock.settimeout(_remaining(self._deadline))
+        self._sock.sendall(data)
+
+    def _release(self) -> None:
+        self._readers -= 1
+        self._close_when_unused()
+
+    def close(self) -> None:
+        self._closed = True
+        self._close_when_unused()
+
+    def _close_when_unused(self) -> None:
+        if self._closed and self._readers <= 0:
+            self._sock.close()
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    """One connection whose connect, TLS handshake, request and response share one deadline."""
+
+    def __init__(self, host: str, port: int, *, context: ssl.SSLContext, deadline: float):
+        super().__init__(host, port, context=context, timeout=_remaining(deadline))
+        self._deadline_context = context
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        # Name resolution (the system resolver) cannot be interrupted portably: a slow resolver can
+        # overrun the deadline by its own duration, after which nothing is connected or sent. Every
+        # later wait, across all resolved addresses together, gets only the time left.
+        addresses = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)
+        failure: OSError | None = None
+        for family, kind, protocol, _name, address in addresses:
+            timeout = _remaining(self._deadline)
+            raw = socket.socket(family, kind, protocol)
+            try:
+                raw.settimeout(timeout)
+                raw.connect(address)
+                raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # The handshake honours one timeout for its whole duration (CPython _ssl).
+                raw.settimeout(_remaining(self._deadline))
+                tls = self._deadline_context.wrap_socket(raw, server_hostname=self.host)
+            except (TimeoutError, ssl.SSLError):
+                raw.close()
+                raise
+            except OSError as error:
+                raw.close()
+                failure = error
+                continue
+            self.sock = _DeadlineSocket(tls, self._deadline)
+            return
+        raise failure if failure is not None else OSError("no address")
+
+
 class HTTPSControlTransport:
     """``post(path, *, headers, body) -> (status, headers, json | None)`` over pinned HTTPS."""
 
@@ -180,9 +287,10 @@ class HTTPSControlTransport:
         self.last_status = None
         self.last_error_code = None
         deadline = time.monotonic() + self._timeout
-        connection = http.client.HTTPSConnection(
-            self._host, self._port, context=self._context, timeout=self._timeout,
+        connection = _DeadlineHTTPSConnection(
+            self._host, self._port, context=self._context, deadline=deadline,
         )
+        response: http.client.HTTPResponse | None = None
         try:
             try:
                 connection.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
@@ -203,7 +311,12 @@ class HTTPSControlTransport:
                 raise ControlTransportError("connection_failed") from None
             return self._decode(response, connection, deadline)
         finally:
-            connection.close()
+            # The response owns the socket after a ``Connection: close`` header; close both.
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                connection.close()
 
     def _decode(
         self, response: http.client.HTTPResponse, connection: http.client.HTTPSConnection,
@@ -263,13 +376,9 @@ class HTTPSControlTransport:
         total = 0
         try:
             while True:
-                remaining_time = deadline - time.monotonic()
-                if remaining_time <= 0:
+                if deadline - time.monotonic() <= 0:
                     raise ControlTransportError("timeout")
-                if connection.sock is not None:
-                    # One fixed deadline for the whole call, so a trickling peer cannot extend it.
-                    connection.sock.settimeout(remaining_time)
-                # read1 returns after at most one socket read, so the deadline is checked per recv.
+                # Every socket read below waits only for the time left (``_DeadlineSocket``).
                 chunk = response.read1(min(_READ_CHUNK, MAX_CONTROL_RESPONSE_BYTES + 1 - total))
                 if not chunk:
                     break
