@@ -41,6 +41,7 @@ _SAFE_RUNNER_MAPPING_FAILURE = "Heel runner mapping could not be saved safely."
 _SAFE_RUNNER_LIVE_FAILURE = "Heel runner live preparation is unavailable."
 _SAFE_RUNNER_COMMAND_FAILURE = "Heel runner command was rejected."
 _SAFE_RUNNER_PAIRING_FAILURE = "Heel runner pairing failed: {}."
+_SAFE_RUNNER_SERVE_FAILURE = "Heel runner serve stopped: {}."
 _OPENAPI_READ_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
@@ -256,6 +257,58 @@ def _runner_status(args) -> int:
         return _runner_pairing_failure(error)
     print(json.dumps(status, sort_keys=True))
     return 0 if status["state"] == "active" else 1
+
+
+def _runner_serve(args) -> int:
+    import signal
+    import threading
+
+    from .runner.daemon import SERVE_EXIT_CODES, RunnerDaemon, RunnerPairingError, RunnerServeError
+
+    daemon = RunnerDaemon()
+    # The handler only writes one byte; a watcher thread requests the stop, so no lock the
+    # interrupted main thread may hold is ever taken inside the handler.
+    wake_read, wake_write = os.pipe()
+    os.set_blocking(wake_write, False)
+
+    def on_signal(_signum, _frame):
+        try:
+            os.write(wake_write, b"\0")
+        except OSError:
+            pass
+
+    def watch():
+        try:
+            if os.read(wake_read, 1):
+                daemon.request_stop()
+        except OSError:
+            pass
+
+    def emit(event: dict) -> None:
+        print(json.dumps(event, sort_keys=True), flush=True)
+
+    watcher = threading.Thread(target=watch, daemon=True, name="heel-runner-serve-signals")
+    watcher.start()
+    previous = {
+        number: signal.signal(number, on_signal) for number in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        result = daemon.serve(once=args.once, emit=emit)
+    except Exception as error:
+        code = error.code if isinstance(error, RunnerPairingError) else "local_state_invalid"
+        if code == "no_supported_secret_service":
+            code = "no supported runner OS secret service"
+        print(_SAFE_RUNNER_SERVE_FAILURE.format(code), file=sys.stderr)
+        state = error.state if isinstance(error, RunnerServeError) else "failed"
+        return SERVE_EXIT_CODES.get(state, 2)
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+        os.close(wake_write)
+        watcher.join(1)
+        os.close(wake_read)
+    emit(result)
+    return 0
 
 
 def _runner_unpair(_args) -> int:
@@ -1130,6 +1183,12 @@ def main(argv=None):
     runner_sub.add_parser(
         "unpair", help="forget the local runner identity and remove its OS-stored key",
     )
+    runner_serve = runner_sub.add_parser(
+        "serve", help="keep the paired runner online with Heel Cloud until stopped or revoked",
+    )
+    runner_serve.add_argument(
+        "--once", action="store_true", help="poll the control plane once, then exit",
+    )
     runner_import = runner_sub.add_parser(
         "import-openapi", help="import only a minimized local GET/HEAD route inventory",
     )
@@ -1372,6 +1431,8 @@ def main(argv=None):
             return _runner_status(args)
         if args.runnercmd == "unpair":
             return _runner_unpair(args)
+        if args.runnercmd == "serve":
+            return _runner_serve(args)
         if args.runnercmd == "import-openapi":
             return _runner_import_openapi(args.path)
         if args.runnercmd == "credential" and args.runnercredentialcmd == "add":

@@ -17,8 +17,11 @@ import io
 import json
 import os
 import re
+import signal
 import socket
 import ssl
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -38,7 +41,7 @@ from heel.runner.daemon import RunnerDaemon, RunnerPairingError, self_serve_acce
 from heel.runner.identity import (
     RUNNER_PAIRING_SIGNER_LABEL_PREFIX, LinuxSecretServiceBackend, MacOSKeychainSecretBackend,
 )
-from heel.runner.store import RunnerStore
+from heel.runner.store import RunnerStore, RunnerStoreError
 from heel.saas.tenancy import hash_api_key
 from tests.support.edge_tls_harness import (
     EdgeTLSHarness, EphemeralCA, ScriptedTLSServer, raw_json_response,
@@ -756,7 +759,10 @@ def test_status_reports_cloud_authority_missing_for_a_legacy_record_and_unpair_s
         {**legacy, "grant_authority_key_id": other.key_id,
          "grant_authority_public_key_b64": current["grant_authority_public_key_b64"]},
         {**legacy, "grant_authority_key_id": current["grant_authority_key_id"],
-         "grant_authority_public_key_b64": current["grant_authority_public_key_b64"][:-2] + "A="},
+         # A canonical but different key: the replaced final character must differ (it was "A" in
+         # about one run in sixteen, which left the key unchanged and made this case flaky).
+         "grant_authority_public_key_b64": current["grant_authority_public_key_b64"][:-2]
+         + ("E=" if current["grant_authority_public_key_b64"][-2] == "A" else "A=")},
     ):
         record_path.write_text(json.dumps(bad))
         assert _daemon(home, harness, backend).status()["state"] == "cloud_authority_missing"
@@ -824,7 +830,7 @@ def test_pair_refuses_a_secret_store_that_does_not_return_the_stored_seed(tmp_pa
 
 def test_cli_paths_cannot_select_an_in_memory_backend_or_a_ca_bundle():
     # The CLI constructs the daemon with defaults only; neither seam is reachable from argv.
-    for function in (cli._runner_pair, cli._runner_status, cli._runner_unpair):
+    for function in (cli._runner_pair, cli._runner_status, cli._runner_unpair, cli._runner_serve):
         source = inspect.getsource(function)
         assert "RunnerDaemon()" in source
         assert "ca_bundle" not in source and "secret_backend" not in source
@@ -886,6 +892,1058 @@ def test_self_serve_access_requires_both_plan_labels_and_never_infers_them(tmp_p
     assert partial["state"] == "access.incomplete" and partial["reason"] == "plan_label_missing"
     assert partial["plan_labels"] == [{"role": "higher_plan", "label": "pro"}]
     assert "credential_handle" not in json.dumps(partial)
+
+
+# --------------------------------------------------------------------------- serve (T2b-2)
+#
+# Seams, each labelled where used: SEAM-EDGE-CA (explicit CA bundle for the loopback TLS edge),
+# SEAM-SECRET-BACKEND (injected seed store; real macOS Keychain acceptance runs separately) and
+# SEAM-ENV-DNS (``ControlPlane(environment_dns_txt=…)`` answers the TXT record the owner publishes;
+# environment start/check/list and binding creation run through the real HTTP API at the edge).
+# No row is seeded, no binding or activation is installed by hand, no backend is called directly.
+
+_ROOT = Path(__file__).resolve().parents[1]
+_STAGING = "staging.example.com"
+
+
+@pytest.fixture
+def serve_harness(tmp_path):
+    zone: dict[str, list[str]] = {}
+    authority = SigningAuthority.generate()
+    with EdgeTLSHarness(
+        tmp_path / "cloud", grant_authority=authority,
+        grant_trusted_keys={authority.key_id: authority.public_key},
+        environment_dns_txt=lambda name: list(zone.get(name, ())),  # SEAM-ENV-DNS
+    ) as edge:
+        yield edge, zone
+
+
+def _owner(harness, method, path, body, cookie):
+    # The dashboard sends canonical JSON; the binding routes compare the raw bytes to it.
+    raw = None if body is None else canonical_bytes(body)
+    status, payload, _ = harness.request(method, path, raw=raw, cookie=cookie)
+    return status, payload
+
+
+def _authorize_binding(harness, zone, workspace_id, cookie, runner_id, runner_key_id):
+    """The owner's browser flow over the TLS edge: project → verified environment → binding."""
+    status, project = _owner(harness, "POST", f"/v1/workspaces/{workspace_id}/projects", {"name": "Staging"}, cookie)
+    assert status == 201, project
+    base = f"/v1/workspaces/{workspace_id}/projects/{project['project_ref']}"
+    status, challenge = _owner(harness, "POST", f"{base}/environments", {
+        "schema_version": "heel.verified-environment-start.v1", "origin": f"https://{_STAGING}",
+        "environment_class": "staging", "proof_method": "dns-txt",
+        "attestation_text": "ownership verified; environment classification supplied by you",
+        "attestation_version": "v1", "attestation_acknowledgement": "accepted",
+    }, cookie)
+    assert status == 201, challenge
+    # SEAM-ENV-DNS: the owner publishes the record the server asked for; the server checks it.
+    zone[f"_heel.{_STAGING}"] = ["heel-verify=" + challenge["token"]]
+    status, checked = _owner(harness, "POST", f"{base}/environments/{challenge['environment_id']}/check",
+                             {"schema_version": "heel.verified-environment-check.v1"}, cookie)
+    assert (status, checked["verified"]) == (200, True), checked
+    status, listed = _owner(harness, "GET", f"{base}/environments", None, cookie)
+    (environment,) = [item for item in listed["environments"] if item["environment_id"] == challenge["environment_id"]]
+    assert environment["status"] == "verified" and environment["is_executable"] is True
+    status, created = _owner(harness, "POST", f"{base}/runner-context-bindings", {
+        "schema_version": "heel.runner-context-binding-create.v1",
+        "environment_id": environment["environment_id"],
+        "verification_record_digest": environment["verification_record_digest"],
+        "runner_id": runner_id, "runner_key_id": runner_key_id,
+    }, cookie)
+    assert status == 201, created
+    return base, created["context_binding"]
+
+
+def _serve_in_thread(daemon, **options):
+    events: list[dict] = []
+    outcome: dict[str, object] = {}
+
+    def run():
+        try:
+            outcome["result"] = daemon.serve(emit=events.append, **options)
+        except BaseException as error:  # surfaced to the test thread
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, events, outcome
+
+
+def _serve_state(home):
+    try:
+        return json.loads((home / "runner-daemon" / "serve-state.json").read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _wait_serve_state(home, predicate, timeout=20.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = _serve_state(home)
+        if state is not None and predicate(state):
+            return state
+        time.sleep(0.02)
+    raise AssertionError(f"serve state not reached: {_serve_state(home)}")
+
+
+def _states(events):
+    sequence = []
+    for event in events:
+        if event.get("event") == "serve_state" and (not sequence or sequence[-1] != event["state"]):
+            sequence.append(event["state"])
+    return sequence
+
+
+def _runner_calls(harness, runner_id):
+    return [path for _method, path in harness.forwarded if f"/runners/{runner_id}/" in path]
+
+
+# Child processes run the real ``heel.cli.main`` from an empty working directory with
+# ``python -I``. ``RunnerDaemon()`` is swapped for one with SEAM-SECRET-BACKEND (seeds read from a
+# 0600 file the parent wrote) and SEAM-EDGE-CA; argv cannot reach either seam.
+_CHILD = r"""
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from heel import cli
+from heel.runner import daemon as daemon_module
+home, ca_bundle, seeds, options = Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]), json.loads(sys.argv[5])
+
+class FileSecretBackend:
+    def load(self, label):
+        value = json.loads(seeds.read_text()).get(label)
+        return None if value is None else bytes.fromhex(value)
+    def store(self, label, seed):
+        raise ValueError("the child never creates runner seeds")
+    def delete(self, label):
+        raise ValueError("the child never deletes runner seeds")
+
+Real = daemon_module.RunnerDaemon
+daemon_module.RunnerDaemon = lambda: Real(home, secret_backend=FileSecretBackend(), ca_bundle=ca_bundle, **options)
+sys.exit(cli.main(sys.argv[6:]))
+"""
+
+
+def _child_seeds(tmp_path, backend):
+    path = tmp_path / f"child-seeds-{len(list(tmp_path.glob('child-seeds-*')))}.json"
+    path.write_text(json.dumps({label: seed.hex() for label, seed in backend.values.items()}))
+    path.chmod(0o600)
+    return path
+
+
+def _child_env(home, tmp_path):
+    workdir = tmp_path / "child-cwd"
+    workdir.mkdir(exist_ok=True)
+    return workdir, {
+        "HEEL_HOME": str(home), "PATH": "/usr/bin:/bin", "LC_ALL": "C",
+        "TMPDIR": os.environ.get("TMPDIR", str(tmp_path)), "HOME": str(tmp_path),
+    }
+
+
+def _child_argv(harness, home, seeds, options, *argv):
+    return [sys.executable, "-I", "-c", _CHILD, str(_ROOT), str(home), str(harness.ca.ca_path),
+            str(seeds), json.dumps(options), *argv]
+
+
+def _child_cli(tmp_path, harness, home, seeds, *argv, options=None, timeout=60):
+    workdir, env = _child_env(home, tmp_path)
+    completed = subprocess.run(
+        _child_argv(harness, home, seeds, options or {}, *argv), cwd=workdir, env=env,
+        capture_output=True, text=True, timeout=timeout,
+    )
+    return completed.returncode, completed.stdout, completed.stderr
+
+
+def _child_serve(tmp_path, harness, home, seeds, *argv, options=None):
+    workdir, env = _child_env(home, tmp_path)
+    return subprocess.Popen(
+        _child_argv(harness, home, seeds, options or {}, "runner", "serve", *argv), cwd=workdir,
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def _serve_lock_inode(home):
+    return os.stat(home / "runner-daemon" / ".serve.lock", follow_symlinks=False).st_ino
+
+
+def test_runner_serve_claims_a_context_binding_and_reports_access_over_tls(tmp_path, serve_harness):
+    """Gate: pair → serve → owner authorizes a binding at the edge → serve claims and installs it
+    → two labelled credential adds through the CLI → ``access.ready``. Control plane only: no
+    target traffic exists in T2b-2."""
+    harness, zone = serve_harness
+    workspace_id, cookie = harness.signup_owner("owner-serve-bind@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-bind")
+    record = _daemon_record(home)
+    seeds = _child_seeds(tmp_path, backend)
+    daemon = _daemon(home, harness, backend)
+    thread, events, outcome = _serve_in_thread(daemon)
+    online = _wait_serve_state(home, lambda state: state["state"] == "online")
+    assert online["binding_id"] is None and online["runner_id"] == runner_id and online["access"] is None
+    assert not RunnerStore(home).is_context_bound
+    # Before the owner authorizes the runner nothing can bind the store: credential add refuses.
+    add = ("runner", "credential", "add", "--role", "lower_plan", "--plan-label", "Free",
+           "--profile", "bearer", "--label", "lower", "--backend", "ephemeral-env")
+    assert _child_cli(tmp_path, harness, home, seeds, *add)[0] == 2
+
+    base, binding = _authorize_binding(harness, zone, workspace_id, cookie, runner_id, record["runner_key_id"])
+    assert binding["signing_key_id"] == record["grant_authority_key_id"]
+    bound = _wait_serve_state(home, lambda state: state["binding_id"] == binding["binding_id"])
+    assert bound["state"] == "online" and bound["access"]["state"] == "access.incomplete"
+    claim_path = f"/v1/workspaces/{workspace_id}/runners/{runner_id}/contexts/{binding['binding_id']}/claim"
+    assert ("POST", claim_path) in harness.forwarded
+    # The store is bound only by the claimed, cloud-signed artifact, verified with the record's key.
+    store = RunnerStore(home)
+    assert store.is_context_bound
+    trusted = {record["grant_authority_key_id"]: load_public_key_base64(record["grant_authority_public_key_b64"])}
+    installed = store.load_cloud_context_binding()
+    assert installed["binding_id"] == binding["binding_id"] and installed["signature_b64"] == binding["signature_b64"]
+    payload = {key: installed[key] for key in ("schema_version", "binding_id", "workspace_id", "project_id",
+                                               "environment", "runner_binding", "authorization",
+                                               "issued_at_ms", "expires_at_ms")}
+    from heel.saas.runner_contexts import CONTEXT_DOMAIN  # noqa: PLC0415 - verification constant only
+    envelope = {"signing_key_id": installed["signing_key_id"], "signature_b64": installed["signature_b64"]}
+    verify_envelope(trusted, envelope, CONTEXT_DOMAIN + canonical_bytes(payload))
+
+    # Two labelled credential adds through the CLI entrypoint in child processes, while serving.
+    handles = []
+    for role, label in (("lower_plan", "Free"), ("higher_plan", "Pro")):
+        argv = ("runner", "credential", "add", "--role", role, "--plan-label", label, "--profile",
+                "bearer", "--label", role, "--backend", "ephemeral-env")
+        code, out, err = _child_cli(tmp_path, harness, home, seeds, *argv)
+        assert (code, err) == (0, ""), err
+        printed = json.loads(out)
+        assert (printed["role"], printed["plan_label"]) == (role, label)
+        handles.append(printed["credential_handle"])
+    ready = _wait_serve_state(home, lambda state: (state["access"] or {}).get("state") == "access.ready")
+    assert ready["access"]["plan_labels"] == [{"role": "lower_plan", "label": "Free"},
+                                              {"role": "higher_plan", "label": "Pro"}]
+    # ``status`` works while serving, reads the serve state and does not touch the claim chain.
+    forwarded = len(harness.forwarded)
+    code, out, err = _child_cli(tmp_path, harness, home, seeds, "runner", "status", "--offline")
+    assert code == 0, err
+    offline = json.loads(out)
+    assert offline["access"]["state"] == "access.ready"
+    assert offline["serve"]["state"] == "online" and offline["serve"]["binding_id"] == binding["binding_id"]
+    live = _daemon(home, harness, backend).status()
+    assert live["state"] == "active" and live["control_plane"] == {"state": "not_checked", "reason": "serve_running"}
+    assert not [path for path in harness.forwarded[forwarded:] if "/runners/" in path and "/contexts/list" not in path]
+
+    daemon.request_stop()
+    thread.join(10)
+    assert not thread.is_alive() and outcome["result"]["state"] == "stopped", outcome
+    assert _serve_state(home)["state"] == "stopped"
+    assert _states(events) == ["starting", "online", "stopped"]
+    # Handles and seeds never leave the local credential records: not in serve state, events,
+    # status output or anything sent to the control plane (labels only).
+    owner_view = _owner(harness, "GET", f"{base}/runner-context-bindings", None, cookie)[1]
+    exposed = json.dumps([_serve_state(home), events, offline, live, owner_view, harness.forwarded])
+    for handle in handles:
+        assert handle not in exposed
+    for seed in backend.values.values():
+        assert seed.hex() not in exposed and base64.b64encode(seed).decode() not in exposed
+
+
+def test_runner_serve_offline_shows_offline_state_and_resumes(tmp_path, harness):
+    """Gate: the edge stays up while its upstream is unreachable (the Worker's 502) → ``offline``
+    with bounded backoff → upstream back → ``online`` only after a fresh authenticated answer."""
+    workspace_id, cookie = harness.signup_owner("owner-serve-offline@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-offline")
+    daemon = _daemon(home, harness, backend, serve_backoff_seconds=(0.4, 1.0))
+    thread, events, outcome = _serve_in_thread(daemon)
+    first = _wait_serve_state(home, lambda state: state["state"] == "online")
+
+    harness.pause_upstream()
+    paused_at = len(harness.forwarded)
+    offline = _wait_serve_state(home, lambda state: state["state"] == "offline")
+    assert offline["last_error_code"] == "upstream_unavailable" and offline["since_ms"] >= first["since_ms"]
+    status = _daemon(home, harness, backend).status()
+    assert status["state"] == "offline" and status["serve"]["state"] == "offline"
+    assert status["control_plane"] == {"state": "not_checked", "reason": "serve_running"}
+    time.sleep(3.0)
+    during = [path for _method, path in harness.forwarded[paused_at:] if path.endswith("/contexts/list")]
+    # Each retry resends the one staged signed call; backoff 0.4 s doubling to a 1.0 s cap (±25 %).
+    assert 2 <= len(during) <= 8, during
+    assert _serve_state(home)["state"] == "offline" and thread.is_alive()
+
+    harness.resume_upstream()
+    resumed_at = len(harness.forwarded)
+    resumed = _wait_serve_state(home, lambda state: state["state"] == "online" and state["since_ms"] > offline["since_ms"])
+    assert resumed["last_error_code"] is None
+    # Online again only after a new answer to an authenticated call made after the outage.
+    assert any(path.endswith("/contexts/list") for _method, path in harness.forwarded[resumed_at:])
+    daemon.request_stop()
+    thread.join(10)
+    assert outcome["result"]["state"] == "stopped", outcome
+    assert _states(events) == ["starting", "online", "offline", "online", "stopped"]
+    # The staged call was replayed exactly once and the chain continued: nothing left pending and
+    # a fresh status confirms the same identity with the control plane.
+    after = _daemon(home, harness, backend).status()
+    assert after["state"] == "active" and after["control_plane"]["state"] == "confirmed", after
+    assert after["serve"] == {"state": "not_running", "last_state": "stopped", "last_error_code": None,
+                              "updated_at_ms": _serve_state(home)["updated_at_ms"]}
+
+
+def test_runner_serve_stops_within_deadline_on_revoke(tmp_path, harness):
+    """Gate: owner POST revoke at the edge → serve ends ``revoked`` within 5 s, then no control call."""
+    workspace_id, cookie = harness.signup_owner("owner-serve-revoke@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-revoke")
+    daemon = _daemon(home, harness, backend, serve_backoff_seconds=(0.4, 1.0))
+    thread, events, outcome = _serve_in_thread(daemon)
+    _wait_serve_state(home, lambda state: state["state"] == "online")
+    # A previous outage on this serve must not colour the later refusal (no shared transport status).
+    harness.pause_upstream()
+    _wait_serve_state(home, lambda state: state["state"] == "offline")
+    harness.resume_upstream()
+    _wait_serve_state(home, lambda state: state["state"] == "online")
+
+    started = time.monotonic()
+    status, body, _ = harness.request(
+        "POST", f"/v1/workspaces/{workspace_id}/runners/{runner_id}/revoke", REVOKE_BODY, cookie=cookie,
+    )
+    assert (status, body["revoked"]) == (200, True)
+    thread.join(10)
+    elapsed = time.monotonic() - started
+    assert not thread.is_alive() and elapsed <= 5.0, elapsed
+    error = outcome["error"]
+    assert isinstance(error, daemon_module.RunnerServeError)
+    assert (error.code, error.state) == ("runner_revoked", "revoked")
+    state = _serve_state(home)
+    assert (state["state"], state["last_error_code"]) == ("revoked", "runner_revoked")
+    assert _states(events)[-1] == "revoked"
+    calls = len(_runner_calls(harness, runner_id))
+    time.sleep(2.5)
+    assert len(_runner_calls(harness, runner_id)) == calls  # no call after shutdown
+
+
+def _wait_child_online(proc, home, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = _serve_state(home)
+        if state is not None and state["state"] == "online" and state["pid"] == proc.pid:
+            return state
+        if proc.poll() is not None:
+            raise AssertionError(f"child serve exited {proc.returncode}: {proc.stderr.read()}")
+        time.sleep(0.02)
+    raise AssertionError(f"child serve not online: {_serve_state(home)}")
+
+
+def _stop_child(proc, sig=signal.SIGTERM, timeout=10.0):
+    proc.send_signal(sig)
+    started = time.monotonic()
+    out, err = proc.communicate(timeout=timeout)
+    return proc.returncode, out, err, time.monotonic() - started
+
+
+def test_second_serve_exits_already_serving_without_touching_the_record(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("owner-serve-second@example.test")
+    home, backend, _runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-second")
+    seeds = _child_seeds(tmp_path, backend)
+    first = _child_serve(tmp_path, harness, home, seeds)
+    try:
+        _wait_child_online(first, home)
+        record_bytes = (home / "runner-daemon" / "pairing.json").read_bytes()
+        inode = _serve_lock_inode(home)
+        forwarded = len(harness.forwarded)
+
+        class Untouchable(RecordingSecretBackend):
+            def load(self, label):
+                raise AssertionError("a refused serve must not reach the secret store")
+
+        started = time.monotonic()
+        with pytest.raises(daemon_module.RunnerServeError) as refused:
+            _daemon(home, harness, Untouchable()).serve()
+        assert refused.value.code == "already_serving" and time.monotonic() - started < 1.0
+        # The CLI entrypoint in another process: fixed line, exit 2, no traceback.
+        code, out, err = _child_cli(tmp_path, harness, home, seeds, "runner", "serve")
+        assert (code, out, err) == (2, "", "Heel runner serve stopped: already_serving.\n")
+        assert (home / "runner-daemon" / "pairing.json").read_bytes() == record_bytes
+        assert _serve_state(home)["pid"] == first.pid and _serve_lock_inode(home) == inode
+        assert len(harness.forwarded) - forwarded <= 4  # only the first serve's idle polls
+    finally:
+        code, _out, err, _elapsed = _stop_child(first)
+    assert code == 0, err
+
+
+def test_status_and_credential_add_succeed_while_serve_holds_the_instance_lock(tmp_path, serve_harness):
+    harness, zone = serve_harness
+    workspace_id, cookie = harness.signup_owner("owner-serve-concurrent@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-concurrent")
+    record = _daemon_record(home)
+    seeds = _child_seeds(tmp_path, backend)
+    proc = _child_serve(tmp_path, harness, home, seeds)
+    try:
+        _wait_child_online(proc, home)
+        _base, binding = _authorize_binding(harness, zone, workspace_id, cookie, runner_id, record["runner_key_id"])
+        _wait_serve_state(home, lambda state: state["binding_id"] == binding["binding_id"])
+        results: list[tuple] = []
+
+        def add(role, label):
+            results.append(_child_cli(
+                tmp_path, harness, home, seeds, "runner", "credential", "add", "--role", role,
+                "--plan-label", label, "--profile", "x_api_key", "--label", role, "--backend", "ephemeral-fd",
+            ))
+
+        def status():
+            results.append(("status", _daemon(home, harness, backend).status()))
+
+        workers = [threading.Thread(target=add, args=("lower_plan", "Starter")),
+                   threading.Thread(target=add, args=("higher_plan", "Business")),
+                   threading.Thread(target=status), threading.Thread(target=status)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(60)
+        adds = [item for item in results if item[0] != "status"]
+        assert [code for code, _out, _err in adds] == [0, 0], adds
+        for _tag, view in (item for item in results if item[0] == "status"):
+            assert view["state"] == "active" and view["serve"]["state"] == "online"
+            assert view["control_plane"] == {"state": "not_checked", "reason": "serve_running"}
+        assert _wait_serve_state(home, lambda state: (state["access"] or {}).get("state") == "access.ready")
+        assert proc.poll() is None  # serve kept running through the concurrent local commands
+    finally:
+        code, _out, err, _elapsed = _stop_child(proc)
+    assert code == 0, err
+
+
+def test_unpair_refuses_while_serve_runs_and_succeeds_after_sigterm(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("owner-serve-unpair@example.test")
+    home, backend, _runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-unpair")
+    seeds = _child_seeds(tmp_path, backend)
+    proc = _child_serve(tmp_path, harness, home, seeds)
+    _wait_child_online(proc, home)
+    inode = _serve_lock_inode(home)
+    started = time.monotonic()
+    with pytest.raises(RunnerPairingError) as refused:
+        _daemon(home, harness, backend).unpair()
+    assert refused.value.code == "serve_running" and time.monotonic() - started < 1.0
+    assert backend.values and _daemon_record(home) is not None  # nothing removed
+    code, out, err, elapsed = _stop_child(proc)
+    assert (code, err) == (0, "") and elapsed < 5.0, (code, err, elapsed)
+    assert json.loads(out.splitlines()[-1]) == {"access": None, "binding_id": None, "event": "serve_stopped",
+                                                "state": "stopped"}
+    assert _serve_state(home)["state"] == "stopped"
+    result = _daemon(home, harness, backend).unpair()
+    assert result["removed"] is True and backend.values == {}
+    assert _serve_state(home) is None and _serve_lock_inode(home) == inode  # lock file never unlinked
+
+
+def test_serve_instance_lock_is_released_on_sigkill_without_a_stale_pid_check(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("owner-serve-kill@example.test")
+    home, backend, _runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-kill")
+    seeds = _child_seeds(tmp_path, backend)
+    proc = _child_serve(tmp_path, harness, home, seeds)
+    killed = _wait_child_online(proc, home)
+    inode = _serve_lock_inode(home)
+    proc.kill()
+    proc.communicate(timeout=10)
+    # The stale file still says online with a dead PID; only the kernel lock is authority.
+    assert _serve_state(home) == killed
+    view = _daemon(home, harness, backend).status(check_control_plane=False)["serve"]
+    assert view == {"state": "not_running", "last_state": "online", "last_error_code": None,
+                    "updated_at_ms": killed["updated_at_ms"]}
+    daemon = _daemon(home, harness, backend)
+    thread, _events, outcome = _serve_in_thread(daemon)
+    restarted = _wait_serve_state(home, lambda state: state["state"] == "online" and state["pid"] == os.getpid(), timeout=10)
+    assert restarted["since_ms"] > killed["since_ms"] and _serve_lock_inode(home) == inode
+    daemon.request_stop()
+    thread.join(10)
+    assert outcome["result"]["state"] == "stopped", outcome
+
+
+def test_serve_handles_sigterm_with_local_stop_and_exits_stopped(tmp_path, harness):
+    """SIGINT/SIGTERM interrupt the idle poll and the offline backoff; exit 0 ``stopped``."""
+    workspace_id, cookie = harness.signup_owner("owner-serve-signal@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-signal")
+    seeds = _child_seeds(tmp_path, backend)
+    # Idle poll: SIGINT.
+    proc = _child_serve(tmp_path, harness, home, seeds)
+    _wait_child_online(proc, home)
+    code, out, err, elapsed = _stop_child(proc, signal.SIGINT)
+    assert (code, err) == (0, "") and elapsed < 3.0, (code, err, elapsed)
+    assert "Traceback" not in out and json.loads(out.splitlines()[-1])["state"] == "stopped"
+    # Offline backoff of up to 60 s: SIGTERM ends it at once, and no call follows.
+    proc = _child_serve(tmp_path, harness, home, seeds, options={"serve_backoff_seconds": [30.0, 60.0]})
+    _wait_child_online(proc, home)
+    harness.pause_upstream()
+    try:
+        _wait_serve_state(home, lambda state: state["state"] == "offline")
+        calls = len(_runner_calls(harness, runner_id))
+        code, out, err, elapsed = _stop_child(proc, signal.SIGTERM)
+    finally:
+        harness.resume_upstream()
+    assert (code, err) == (0, "") and elapsed < 3.0, (code, err, elapsed)
+    assert [json.loads(line)["state"] for line in out.splitlines()] == ["starting", "online", "offline", "stopped", "stopped"]
+    assert len(_runner_calls(harness, runner_id)) == calls
+    assert _serve_state(home)["state"] == "stopped"
+
+
+class _GatedTransport:
+    """Test-only timing gate around the real HTTPS transport: while armed, the next call is sent
+    to the real edge and its answer is held until released (a response still in flight)."""
+
+    def __init__(self, transport, gate):
+        self._transport, self._gate = transport, gate
+
+    def post(self, path, **options):
+        answer = self._transport.post(path, **options)
+        if self._gate["armed"].is_set():
+            self._gate["armed"].clear()
+            self._gate["holding"].set()
+            assert self._gate["release"].wait(30)
+        return answer
+
+
+def _gate_daemon(daemon):
+    gate = {"armed": threading.Event(), "holding": threading.Event(), "release": threading.Event()}
+    real = daemon._transport
+    daemon._transport = lambda origin: _GatedTransport(real(origin), gate)
+    return gate
+
+
+def test_shutdown_during_a_pending_control_call_keeps_ownership_until_the_call_ends(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("owner-serve-pending@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-pending")
+    daemon = _daemon(home, harness, backend)
+    gate = _gate_daemon(daemon)
+    thread, _events, outcome = _serve_in_thread(daemon)
+    _wait_serve_state(home, lambda state: state["state"] == "online")
+    gate["armed"].set()
+    assert gate["holding"].wait(10)  # the server answered; the runner has not consumed it yet
+    daemon.request_stop()
+    time.sleep(0.3)
+    assert thread.is_alive()
+    # Immediately: status, restart and unpair all see the old serve still owning the instance.
+    status = _daemon(home, harness, backend).status()
+    assert status["serve"]["state"] == "online"
+    assert status["control_plane"] == {"state": "not_checked", "reason": "serve_running"}
+    with pytest.raises(daemon_module.RunnerServeError) as again:
+        _daemon(home, harness, backend).serve()
+    assert again.value.code == "already_serving"
+    with pytest.raises(RunnerPairingError) as unpair:
+        _daemon(home, harness, backend).unpair()
+    assert unpair.value.code == "serve_running"
+    calls = len(_runner_calls(harness, runner_id))
+    gate["release"].set()
+    thread.join(10)
+    assert outcome["result"]["state"] == "stopped", outcome
+    assert len(_runner_calls(harness, runner_id)) == calls  # the stop issued no further call
+    # The in-flight answer was committed: the next client continues the same chain.
+    assert _daemon(home, harness, backend).status()["control_plane"]["state"] == "confirmed"
+    restarted = _daemon(home, harness, backend)
+    thread, _events, outcome = _serve_in_thread(restarted)
+    _wait_serve_state(home, lambda state: state["state"] == "online" and state["since_ms"] > 0)
+    restarted.request_stop()
+    thread.join(10)
+    assert outcome["result"]["state"] == "stopped", outcome
+
+
+def test_serve_keeps_the_instance_lock_until_its_own_cycle_workers_have_ended(tmp_path, harness, monkeypatch):
+    """Two independent serves in one process: stopping A waits only for A's own in-flight worker
+    call (through A's cycle adapter), never for B's, and A's adapter refuses any later call."""
+    homes = []
+    for name in ("a", "b"):  # one active runner per free workspace: two owners
+        workspace_id, cookie = harness.signup_owner(f"owner-serve-workers-{name}@example.test")
+        homes.append(_pair_runner(tmp_path, harness, workspace_id, cookie, f"serve-workers-{name}")[:2])
+    (home_a, backend_a), (home_b, backend_b) = homes
+    from heel.runner.coordinator import RunnerCoordinator, RunnerMaintenanceResult
+
+    entered = {"a": threading.Event(), "b": threading.Event()}
+    finish = {"a": threading.Event(), "b": threading.Event()}
+    done = {"a": threading.Event(), "b": threading.Event()}
+    owners: dict[str, object] = {}
+
+    def slow_maintenance(coordinator, *, limit=16, now_ms=None):
+        name = "a" if Path(coordinator.store.root) == home_a else "b"
+        entered[name].set()
+        assert finish[name].wait(30)  # e.g. a maintenance batch still writing local runtime state
+        done[name].set()
+        return RunnerMaintenanceResult(processed=0, has_more=False)
+
+    real_serve = daemon_module.RunnerService.serve
+
+    def serve_with_an_early_maintenance_call(service, stop_event):
+        # The service's own worker waits 60 s before its first tick; call the same adapter method
+        # on a worker thread now so the cycle has an in-flight worker call to own.
+        name = "a" if Path(service.coordinator._coordinator.store.root) == home_a else "b"
+        owners[name] = service.coordinator
+        threading.Thread(target=lambda: service.coordinator.maintenance_once(limit=16), daemon=True).start()
+        real_serve(service, stop_event)
+
+    monkeypatch.setattr(RunnerCoordinator, "maintenance_once", slow_maintenance)
+    monkeypatch.setattr(daemon_module.RunnerService, "serve", serve_with_an_early_maintenance_call)
+    serve_a, serve_b = _daemon(home_a, harness, backend_a), _daemon(home_b, harness, backend_b)
+    thread_a, _ev_a, outcome_a = _serve_in_thread(serve_a)
+    thread_b, _ev_b, outcome_b = _serve_in_thread(serve_b)
+    assert entered["a"].wait(20) and entered["b"].wait(20)
+    _wait_serve_state(home_a, lambda state: state["state"] == "online")
+
+    serve_a.request_stop()
+    time.sleep(0.3)
+    assert thread_a.is_alive()  # A's own worker call is still in flight: A keeps ownership
+    assert _daemon(home_a, harness, backend_a).status(check_control_plane=False)["serve"]["state"] == "online"
+    finish["a"].set()
+    thread_a.join(10)
+    assert not thread_a.is_alive() and outcome_a["result"]["state"] == "stopped", outcome_a
+    assert not finish["b"].is_set() and thread_b.is_alive()  # A never waited on B's worker
+    with pytest.raises(daemon_module.RunnerServeError):
+        owners["a"].maintenance_once(limit=16)  # a stale worker of A can no longer reach A's store
+
+    serve_b.request_stop()
+    finish["b"].set()
+    thread_b.join(10)
+    assert outcome_b["result"]["state"] == "stopped", outcome_b
+
+
+def test_serve_exits_execution_unavailable_closed_without_traffic_or_traceback(monkeypatch):
+    """Unit (mock coordinator): any lease is refused before the heartbeat worker starts. A real
+    legacy catalog lease over HTTP is T4a's ``test_serve_refuses_a_catalog_projection_lease_…``."""
+    from heel.runner.service import ClaimLease, RunnerService
+
+    calls: list[str] = []
+
+    class Runtime:
+        def __init__(self):
+            self.active = []
+
+        def load_active_run_controls(self, limit):
+            return list(self.active)
+
+    class Coordinator:
+        def __init__(self, lease=None, record_then_fail=False):
+            self.control = type("Control", (), {"runtime": Runtime()})()
+            self.lease, self.record_then_fail = lease, record_then_fail
+
+        def ensure_runner_context(self):
+            calls.append("ensure")
+            return True
+
+        def claim(self):
+            calls.append("claim")
+            if self.record_then_fail:
+                self.control.runtime.active.append(type("Active", (), {"run_id": "crun_" + "a" * 32})())
+                raise RunnerStoreError("local approved pair is unavailable")
+            return self.lease
+
+        def __getattr__(self, name):
+            def forbidden(*_args, **_kwargs):
+                calls.append(name)
+                raise AssertionError(f"{name} must not be called")
+            return forbidden
+
+    lease = ClaimLease("crun_" + "b" * 32, object(), {"schema_version": "x"})
+    for coordinator in (Coordinator(lease=lease), Coordinator(record_then_fail=True)):
+        calls.clear()
+        contacts: list[int] = []
+        service = RunnerService(
+            coordinator=daemon_module._ServeCoordinator(coordinator, lambda: contacts.append(1)),
+            executor=daemon_module._ExecutionUnavailable(),
+        )
+        with pytest.raises(daemon_module.RunnerServeError) as refused:
+            service.run_once()
+        assert refused.value.code == "execution_unavailable"
+        assert calls == ["ensure", "claim"]  # no heartbeat, progress, result or stop-ack
+        assert daemon_module._serve_failure(refused.value) == ("failed", "execution_unavailable")
+    # A claim that fails without recording a run keeps its own failure.
+    plain = Coordinator()
+    plain.claim = lambda: (_ for _ in ()).throw(ValueError("invalid runner claim response"))
+    with pytest.raises(ValueError):
+        daemon_module._ServeCoordinator(plain, lambda: None).claim()
+    # The CLI turns the closed code into its fixed line: exit 2, no traceback.
+    def refuse(self, **_options):
+        raise daemon_module.RunnerServeError("execution_unavailable")
+    monkeypatch.setattr(daemon_module.RunnerDaemon, "serve", refuse)
+    assert _invoke("runner", "serve") == (2, "", "Heel runner serve stopped: execution_unavailable.\n")
+
+
+def test_serve_failure_classification_is_attributed_to_the_failing_call(ca):
+    """A stale or concurrent 503 never turns a malformed, unauthorized or upgrade answer into an
+    offline retry: each call raises its own outcome and nothing reads shared transport status."""
+    answers = {
+        "/v1/t/unavailable": raw_json_response(503, b'{"error":"control plane unavailable"}'),
+        "/v1/t/gateway": raw_json_response(502, b'{"error":"control plane request failed"}'),
+        "/v1/t/revoked": raw_json_response(401, b'{"code":"invalid_runner_auth","error":"unauthorized"}'),
+        "/v1/t/unauthorized": raw_json_response(401, b'{"code":"invalid_signature","error":"unauthorized"}'),
+        "/v1/t/upgrade": raw_json_response(403, b'{"code":"runner_protocol_upgrade_required","error":"upgrade"}'),
+        "/v1/t/internal": raw_json_response(500, b'{"error":"internal error"}'),
+        "/v1/t/malformed": raw_json_response(200, b'{"schema_version":"unexpected"}'),
+    }
+    server = ScriptedTLSServer(ca, lambda path: answers[path], delay_seconds=0.002)
+    try:
+        transport = daemon_module._AttributedTransport(HTTPSControlTransport(server.origin, ca_bundle=ca.ca_path))
+        outcomes: dict[str, tuple[str, str]] = {}
+
+        def call(path):
+            try:
+                status, _headers, payload = transport.post(path, headers={"Content-Type": "application/json"}, body=b"{}")
+                if status != 200 or payload.get("schema_version") != "expected":
+                    raise ValueError("invalid runner context response")  # the client's own check
+            except Exception as error:
+                outcomes[path] = daemon_module._serve_failure(error)
+
+        # The calls share one transport concurrently, as the service's threads would. Each batch
+        # mixes an outage with closed answers and stays within the scripted server's listen backlog
+        # (5; it completes TLS handshakes one at a time), so no connect is refused under load.
+        for batch in (("/v1/t/unavailable", "/v1/t/revoked", "/v1/t/malformed", "/v1/t/upgrade"),
+                      ("/v1/t/gateway", "/v1/t/unauthorized", "/v1/t/internal")):
+            workers = [threading.Thread(target=call, args=(path,)) for path in batch]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(30)
+        assert outcomes == {
+            "/v1/t/unavailable": ("offline", "upstream_unavailable"),
+            "/v1/t/gateway": ("offline", "upstream_unavailable"),
+            "/v1/t/revoked": ("revoked", "runner_revoked"),
+            "/v1/t/unauthorized": ("failed", "response_rejected"),
+            "/v1/t/upgrade": ("failed", "protocol_upgrade_required"),
+            "/v1/t/internal": ("failed", "response_rejected"),
+            "/v1/t/malformed": ("failed", "response_rejected"),
+        }
+        # Sequentially: the shared attributes now say 503, yet a malformed answer stays closed.
+        with pytest.raises(daemon_module._ControlCallRejected):
+            transport.post("/v1/t/unavailable", body=b"{}")
+        assert transport._transport.last_status == 503
+        try:
+            call("/v1/t/malformed")
+        finally:
+            assert outcomes["/v1/t/malformed"] == ("failed", "response_rejected")
+    finally:
+        server.close()
+    # Only an explicit cause counts: a decoding error raised while handling an earlier outage
+    # (implicit context) is a decoding error.
+    try:
+        try:
+            raise daemon_module._ControlCallRejected("upstream_unavailable")
+        except daemon_module._ControlCallRejected:
+            raise ValueError("invalid runner context response")
+    except ValueError as error:
+        assert daemon_module._serve_failure(error) == ("failed", "response_rejected")
+    wrapped = RuntimeError("runner heartbeat failed closed")
+    wrapped.__cause__ = ControlTransportError("timeout")
+    assert daemon_module._serve_failure(wrapped) == ("offline", "timeout")
+    for code in ("tls_trust_failed", "redirect_refused", "response_too_large", "malformed_response"):
+        assert daemon_module._serve_failure(ControlTransportError(code)) == ("failed", code)
+    assert daemon_module._serve_failure(RunnerStoreError("x")) == ("failed", "local_state_invalid")
+    # The serve path never consults the transport's shared last-call attributes.
+    for item in (daemon_module._AttributedTransport, daemon_module._serve_failure,
+                 daemon_module._ServeSession, daemon_module._ServeCoordinator):
+        source = inspect.getsource(item)
+        assert ".last_status" not in source and ".last_error_code" not in source
+
+
+@pytest.mark.parametrize("answer, expected", [
+    ((200, {"schema_version": "heel.runner-context-list-result.v1"}), "response_rejected"),
+    ((401, {"code": "invalid_signature", "error": "unauthorized"}), "response_rejected"),
+    ((403, {"code": "runner_protocol_upgrade_required", "error": "upgrade"}), "protocol_upgrade_required"),
+    ((500, {"error": "internal error"}), "response_rejected"),
+])
+def test_serve_fails_closed_on_malformed_or_unauthorized_answers_after_an_outage(tmp_path, harness, answer, expected):
+    """After a real outage (edge 502) a bad answer ends the serve closed, with no retry."""
+    workspace_id, cookie = harness.signup_owner(f"owner-serve-bad-{answer[0]}-{expected}@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-bad")
+    daemon = _daemon(home, harness, backend, serve_backoff_seconds=(0.4, 1.0))
+    tamper = threading.Event()
+    real = daemon._transport
+
+    class Tampering:
+        """Test-only: replaces one real answer after the real edge produced it."""
+
+        def __init__(self, transport):
+            self._transport = transport
+
+        def post(self, path, **options):
+            status, headers, payload = self._transport.post(path, **options)
+            if tamper.is_set() and path.endswith("/contexts/list"):
+                tamper.clear()
+                self._transport.last_status = 503  # a stale shared value must not matter
+                return answer[0], headers, dict(answer[1])
+            return status, headers, payload
+
+    daemon._transport = lambda origin: Tampering(real(origin))
+    thread, events, outcome = _serve_in_thread(daemon)
+    _wait_serve_state(home, lambda state: state["state"] == "online")
+    harness.pause_upstream()
+    _wait_serve_state(home, lambda state: state["state"] == "offline")
+    tamper.set()
+    harness.resume_upstream()
+    thread.join(15)
+    assert not thread.is_alive()
+    error = outcome["error"]
+    assert isinstance(error, daemon_module.RunnerServeError) and (error.state, error.code) == ("failed", expected)
+    assert _states(events)[-2:] == ["offline", "failed"]
+    calls = len(_runner_calls(harness, runner_id))
+    time.sleep(2.5)
+    assert len(_runner_calls(harness, runner_id)) == calls
+
+
+def test_serve_refuses_a_legacy_record_before_secret_store_or_network(tmp_path, harness, monkeypatch):
+    workspace_id, cookie = harness.signup_owner("owner-serve-legacy@example.test")
+    home, backend, _runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-legacy")
+    record_path = home / "runner-daemon" / "pairing.json"
+    current = _daemon_record(home)
+    record_path.write_text(json.dumps({key: value for key, value in current.items()
+                                       if not key.startswith("grant_authority_")}))
+    forwarded = len(harness.forwarded)
+
+    class Untouchable(RecordingSecretBackend):
+        def load(self, label):
+            raise AssertionError("no secret-store access without a cloud authority")
+
+    with pytest.raises(daemon_module.RunnerServeError) as refused:
+        _daemon(home, harness, Untouchable()).serve()
+    assert (refused.value.code, refused.value.state) == ("cloud_authority_missing", "failed")
+    assert len(harness.forwarded) == forwarded
+    assert _serve_state(home)["last_error_code"] == "cloud_authority_missing"
+    monkeypatch.setenv("HEEL_HOME", str(home))
+    code, out, err = _invoke("runner", "serve")
+    assert (code, err) == (2, "Heel runner serve stopped: cloud_authority_missing.\n")
+    assert [json.loads(line) for line in out.splitlines()] == [{
+        "access": None, "binding_id": None, "event": "serve_state",
+        "last_error_code": "cloud_authority_missing", "state": "failed",
+    }]
+    assert len(harness.forwarded) == forwarded
+    # Unpaired and incomplete homes refuse the same way, without creating state.
+    empty = _home(tmp_path, "serve-empty")
+    with pytest.raises(daemon_module.RunnerServeError) as unpaired:
+        _daemon(empty, harness, backend).serve()
+    assert unpaired.value.code == "unpaired" and not (empty / "runner-daemon").exists()
+
+
+def test_serve_lock_first_creation_race_and_unsafe_lock_files_fail_closed(tmp_path, monkeypatch):
+    # Many simultaneous first opens of a not-yet-existing lock: exactly one exclusive owner per
+    # round, every other contender sees a closed refusal, never a raw OS error.
+    for round_number in range(20):
+        directory_path = tmp_path / f"race-{round_number}"
+        directory_path.mkdir(mode=0o700)
+        directory = os.open(directory_path, os.O_RDONLY)
+        barrier, outcomes = threading.Barrier(12), []
+
+        def contend():
+            barrier.wait()
+            try:
+                descriptor = daemon_module._open_serve_lock(directory)
+            except OSError as error:
+                outcomes.append(("oserror", error))
+                return
+            if daemon_module._try_flock(descriptor, daemon_module.fcntl.LOCK_EX):
+                outcomes.append(("owner", descriptor))
+            else:
+                os.close(descriptor)
+                outcomes.append(("busy", None))
+
+        workers = [threading.Thread(target=contend) for _ in range(12)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(10)
+        kinds = sorted(kind for kind, _ in outcomes)
+        assert kinds.count("owner") == 1 and "oserror" not in kinds, outcomes
+        for kind, descriptor in outcomes:
+            if kind == "owner":
+                daemon_module._release_serve_lock(descriptor)
+        os.close(directory)
+    # The macOS ENOENT race is retried; a persistent one is reported as closed local state.
+    real_open = os.open
+    failures = {"count": 2}
+
+    def flaky(path, flags, mode=0o777, *, dir_fd=None):
+        if path == ".serve.lock" and failures["count"]:
+            failures["count"] -= 1
+            raise FileNotFoundError(2, "No such file or directory")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(daemon_module.os, "open", flaky)
+    home = _home(tmp_path, "flaky")
+    (home / "runner-daemon").mkdir(mode=0o700)
+    directory = real_open(home / "runner-daemon", os.O_RDONLY)
+    try:
+        daemon_module._release_serve_lock(daemon_module._open_serve_lock(directory))
+        failures["count"] = 100
+        with pytest.raises(FileNotFoundError):
+            daemon_module._open_serve_lock(directory)
+    finally:
+        os.close(directory)
+    monkeypatch.setattr(daemon_module.os, "open", real_open)
+
+    def persistent_enoent(_directory):
+        raise FileNotFoundError(2, "No such file or directory")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(daemon_module, "_open_serve_lock", persistent_enoent)
+        patched.setattr(daemon_module.RunnerDaemon, "_load_record", lambda *_a: pytest.fail("record read"))
+        with pytest.raises(daemon_module.RunnerServeError) as refused:
+            RunnerDaemon(home).serve()
+    assert refused.value.code == "local_state_invalid"
+    # A symlinked or hard-linked lock is refused, closed, by serve, status and unpair alike.
+    lock = home / "runner-daemon" / ".serve.lock"
+    lock.unlink()
+    (home / "elsewhere").write_text("")
+    lock.symlink_to(home / "elsewhere")
+    with pytest.raises(daemon_module.RunnerServeError) as symlinked:
+        RunnerDaemon(home).serve()
+    assert symlinked.value.code == "local_state_invalid"
+    lock.unlink()
+    os.link(home / "elsewhere", lock)
+    with pytest.raises(daemon_module.RunnerServeError) as linked:
+        RunnerDaemon(home).serve()
+    assert linked.value.code == "local_state_invalid"
+    with pytest.raises(RunnerPairingError) as unpair:
+        RunnerDaemon(home).unpair()
+    assert unpair.value.code == "local_state_invalid"
+
+
+def test_serve_startup_racing_unpair_and_re_pair_serves_only_the_current_pairing(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("owner-serve-repair@example.test")
+    home, backend, old_runner = _pair_runner(tmp_path, harness, workspace_id, cookie, "serve-repair")
+    # 1. Serve starting while an unpair owns the instance: refused at once, no network.
+    in_unpair, release = threading.Event(), threading.Event()
+
+    class SlowUnpair(RunnerDaemon):
+        def _unpair_locked(self, store):
+            in_unpair.set()
+            assert release.wait(30)
+            return super()._unpair_locked(store)
+
+    unpair_outcome: dict = {}
+    unpairing = threading.Thread(target=lambda: unpair_outcome.setdefault(
+        "result", SlowUnpair(home, secret_backend=backend).unpair()), daemon=True)
+    unpairing.start()
+    assert in_unpair.wait(10)
+    forwarded = len(harness.forwarded)
+    with pytest.raises(daemon_module.RunnerServeError) as refused:
+        _daemon(home, harness, backend).serve()
+    assert refused.value.code == "already_serving" and len(harness.forwarded) == forwarded
+    release.set()
+    unpairing.join(10)
+    assert unpair_outcome["result"]["removed"] is True
+    with pytest.raises(daemon_module.RunnerServeError) as gone:
+        _daemon(home, harness, backend).serve()
+    assert gone.value.code == "unpaired"
+    assert harness.request("POST", f"/v1/workspaces/{workspace_id}/runners/{old_runner}/revoke",
+                           REVOKE_BODY, cookie=cookie)[0] == 200
+
+    # 2. A re-pair in progress (record exchanged, not active): serve refuses, nothing sent.
+    token = _invite(harness, workspace_id, cookie)
+    events, outcome = [], {}
+    pending = threading.Event()
+
+    def pair():
+        try:
+            outcome["result"] = _daemon(home, harness, backend).pair(
+                harness.origin, token, emit=lambda event: (events.append(event), pending.set()))
+        except BaseException as error:
+            outcome["error"] = error
+            pending.set()
+
+    pairing = threading.Thread(target=pair, daemon=True)
+    pairing.start()
+    assert pending.wait(30) and "error" not in outcome
+    forwarded = len(harness.forwarded)
+    with pytest.raises(daemon_module.RunnerServeError) as incomplete:
+        _daemon(home, harness, backend).serve()
+    assert incomplete.value.code == "pairing_incomplete"
+    assert all("/runners/" not in path for _m, path in harness.forwarded[forwarded:])
+    printed = events[0]
+    view = harness.request("GET", f"/v1/workspaces/{workspace_id}/runner-pairings/{printed['pairing_id']}", cookie=cookie)[1]
+    assert harness.request(
+        "POST", f"/v1/workspaces/{workspace_id}/runner-pairings/{printed['pairing_id']}/approve",
+        {"schema_version": "heel.runner-pairing-approve.v1", "pairing_phrase": view["pairing_phrase"],
+         "fingerprint": view["fingerprint"]}, cookie=cookie,
+    )[0] == 200
+    pairing.join(30)
+    new_runner = outcome["result"]["runner_id"]
+    assert new_runner != old_runner
+    # 3. Serve now runs the new pairing only; a record changed under it fails closed before the
+    #    next cycle's first call (simulated corruption: no product path rewrites it while serving).
+    daemon = _daemon(home, harness, backend, serve_backoff_seconds=(0.4, 1.0))
+    thread, _events, serve_outcome = _serve_in_thread(daemon)
+    online = _wait_serve_state(home, lambda state: state["state"] == "online")
+    assert online["runner_id"] == new_runner
+    assert not [path for path in _runner_calls(harness, old_runner) if path.endswith("/contexts/list")
+                and harness.forwarded.index(("POST", path)) >= forwarded]
+    record_path = home / "runner-daemon" / "pairing.json"
+    changed = {**_daemon_record(home), "display_name": "changed"}
+    harness.pause_upstream()  # force a new cycle
+    _wait_serve_state(home, lambda state: state["state"] == "offline")
+    record_path.write_text(json.dumps(changed))
+    calls = len(_runner_calls(harness, new_runner))
+    harness.resume_upstream()
+    thread.join(10)
+    error = serve_outcome["error"]
+    assert (error.code, error.state) == ("local_state_invalid", "failed")
+    assert len(_runner_calls(harness, new_runner)) == calls
+
+
+def test_edge_harness_owner_routes_mirror_the_worker_methods_headers_and_caps(tmp_path, harness):
+    """The mirrored owner routes refuse what ``index.ts`` refuses (wrong method, bearer, no cookie,
+    cross-site or missing origin on POST, oversize body) before anything reaches the server."""
+    workspace_id, cookie = harness.signup_owner("owner-edge-mirror@example.test")
+    project = harness.request("POST", f"/v1/workspaces/{workspace_id}/projects", {"name": "Mirror"}, cookie=cookie)[1]
+    base = f"/v1/workspaces/{workspace_id}/projects/{project['project_ref']}"
+    env, rcb = "env_" + "a" * 32, "rcb_" + "b" * 32
+    routes = {
+        f"{base}/environments": {"GET", "POST"},
+        f"{base}/environments/{env}/check": {"POST"},
+        f"{base}/environments/{env}/revoke": {"POST"},
+        f"{base}/runner-context-bindings": {"GET", "POST"},
+        f"{base}/runner-context-bindings/{rcb}/revoke": {"POST"},
+        f"/v1/workspaces/{workspace_id}/projects": {"GET", "POST"},
+    }
+    caps = {
+        f"{base}/environments": 16 * 1024, f"{base}/environments/{env}/check": 16 * 1024,
+        f"{base}/environments/{env}/revoke": 16 * 1024, f"{base}/runner-context-bindings": 2 * 1024,
+        f"{base}/runner-context-bindings/{rcb}/revoke": 256,
+    }
+    for path, allowed in routes.items():
+        for method in ("GET", "POST", "DELETE"):  # the methods the loopback edge dispatches
+            if method in allowed:
+                continue
+            before = len(harness.forwarded)
+            status, _body, _ = harness.request(method, path, cookie=cookie, raw=b"{}" if method != "GET" else None)
+            assert status == 404 and len(harness.forwarded) == before, (method, path, status)
+        # Known harness limitation (not parity): ``BaseHTTPRequestHandler`` answers methods it does
+        # not dispatch with 501 where the Worker answers 404. Both deny and forward nothing.
+        for method in ("PUT", "PATCH"):
+            before = len(harness.forwarded)
+            context = ssl.create_default_context(cafile=str(harness.ca.ca_path))
+            connection = http.client.HTTPSConnection("localhost", harness.port, context=context, timeout=10)
+            try:
+                connection.request(method, path, b"{}", {"Cookie": cookie, "Origin": harness.origin,
+                                                         "Sec-Fetch-Site": "same-origin",
+                                                         "Content-Type": "application/json"})
+                status = connection.getresponse().status
+            finally:
+                connection.close()
+            assert status == 501 and len(harness.forwarded) == before, (method, path, status)
+    for path, cap in caps.items():
+        refusals = [
+            dict(cookie=None, raw=b"{}"),
+            dict(cookie=cookie, raw=b"{}", headers={"Authorization": "Bearer " + "x" * 40}),
+            dict(cookie=cookie, raw=b"{}", origin="https://evil.example"),
+            dict(cookie=cookie, raw=b"{}", origin=None),
+            dict(cookie=cookie, raw=b"{}", fetch_site="cross-site"),
+            dict(cookie=cookie, raw=b"{}", fetch_site=None),
+            dict(cookie=cookie, raw=b" " * (cap + 1)),
+            dict(cookie=cookie, raw=b"{}", headers={"Content-Type": "text/plain"}),
+            dict(cookie=cookie, raw=b"{}", headers={"Content-Encoding": "gzip"}),
+        ]
+        for options in refusals:
+            before = len(harness.forwarded)
+            status, body, _ = harness.request("POST", path, **options)
+            assert (status, body) == (400, {"error": "invalid control plane request"}), (path, options)
+            assert len(harness.forwarded) == before
+        # At the cap the edge forwards (the server then judges the body itself).
+        before = len(harness.forwarded)
+        status, _body, _ = harness.request("POST", path, cookie=cookie, raw=b" " * cap)
+        assert status != 404 and len(harness.forwarded) == before + 1, (path, status)
+    # GET carries only the cookie; a bearer on a human environment/binding route is refused.
+    for path in (f"{base}/environments", f"{base}/runner-context-bindings"):
+        assert harness.request("GET", path, cookie=cookie, origin=None, fetch_site=None)[0] == 200
+        assert harness.request("GET", path, cookie=None)[0] == 400
+        assert harness.request("GET", path, cookie=cookie, headers={"Authorization": "Bearer " + "x" * 40})[0] == 400
+    # Projects take the default credential branch (no origin rule), like the Worker.
+    assert harness.request("GET", f"/v1/workspaces/{workspace_id}/projects", cookie=cookie, origin=None, fetch_site=None)[0] == 200
 
 
 # --------------------------------------------------------------------------- transport

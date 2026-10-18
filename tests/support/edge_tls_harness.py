@@ -59,6 +59,16 @@ _RUNNER_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}(?:/claim
 _RUNNER_CONTEXT_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/contexts(?:/list|/rcb_[0-9a-f]{{32}}/(?:claim|approval-projections))$")
 _RUNNER_RESULT_PROJECTION = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/runs/crun_[0-9a-f]{{32}}/result-projection$")
 _RUNNER_RESYNC = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/resync/(?:start|complete)$")
+# Owner project/environment/context-binding routes (``index.ts`` PROJECTS_ROUTE, ENVIRONMENTS_ROUTE,
+# ENVIRONMENT_CHECK_ROUTE, ENVIRONMENT_REVOKE_ROUTE, RUNNER_CONTEXT_BINDINGS_ROUTE,
+# RUNNER_CONTEXT_REVOKE_ROUTE), mirrored for the T2b-2 binding gate (Astra-approved scope).
+_PRJ = "prj_[0-9a-f]{32}"
+_PROJECTS = re.compile(rf"^/v1/workspaces/{_WS}/projects$")
+_ENVIRONMENTS = re.compile(rf"^/v1/workspaces/{_WS}/projects/{_PRJ}/environments$")
+_ENVIRONMENT_CHECK = re.compile(rf"^/v1/workspaces/{_WS}/projects/{_PRJ}/environments/env_[0-9a-f]{{32}}/check$")
+_ENVIRONMENT_REVOKE = re.compile(rf"^/v1/workspaces/{_WS}/projects/{_PRJ}/environments/env_[0-9a-f]{{32}}/revoke$")
+_RUNNER_CONTEXT_BINDINGS = re.compile(rf"^/v1/workspaces/{_WS}/projects/{_PRJ}/runner-context-bindings$")
+_RUNNER_CONTEXT_REVOKE = re.compile(rf"^/v1/workspaces/{_WS}/projects/{_PRJ}/runner-context-bindings/rcb_[0-9a-f]{{32}}/revoke$")
 _RUNNER_HEADERS = ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
                    "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature")
 _RUNNER_RESYNC_HEADERS = ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
@@ -76,8 +86,21 @@ class _EdgeRefusal(Exception):
         self.status, self.error = status, error
 
 
+def _human_owner_route(method: str, path: str) -> bool:
+    """``isHumanCanaryRoute`` (context bindings only) or ``isHumanEnvironmentRoute``."""
+    if _RUNNER_CONTEXT_BINDINGS.match(path) or _ENVIRONMENTS.match(path):
+        return method in {"GET", "POST"}
+    return method == "POST" and bool(
+        _RUNNER_CONTEXT_REVOKE.match(path) or _ENVIRONMENT_CHECK.match(path) or _ENVIRONMENT_REVOKE.match(path)
+    )
+
+
 def _edge_route(method: str, path: str) -> bool:
     """The subset of the Worker's ``controlPlaneRoute`` allowlist these tests reach."""
+    if _human_owner_route(method, path):
+        return True
+    if _PROJECTS.match(path):
+        return method in {"GET", "POST"}
     if path in _SESSION_ROUTES or path == _LOGOUT_ROUTE:
         return method == "POST"
     if path == _ME_ROUTE:
@@ -96,6 +119,12 @@ def _edge_route(method: str, path: str) -> bool:
 
 def _body_cap(path: str) -> int:
     """The Worker's per-family POST body maximum for the routes above."""
+    if _RUNNER_CONTEXT_BINDINGS.match(path):
+        return 2 * 1024
+    if _RUNNER_CONTEXT_REVOKE.match(path):
+        return 256
+    if _ENVIRONMENTS.match(path) or _ENVIRONMENT_CHECK.match(path) or _ENVIRONMENT_REVOKE.match(path):
+        return 16 * 1024
     if _RUNNER_RESULT_PROJECTION.match(path):
         return 272 * 1024
     if _RUNNER_CONTEXT_CONTROL.match(path):
@@ -244,6 +273,7 @@ class EdgeTLSHarness:
                               or _RUNNER_ROTATION_PUBLIC.match(path))
                 human = bool(_RUNNER_PAIRING_MANAGE.match(path) or _RUNNER_ROTATION_START.match(path)
                              or _RUNNER_ROTATION_APPROVE.match(path) or _RUNNER_REVOKE.match(path))
+                owner = _human_owner_route(method, path)
                 if runner_control or _RUNNER_RESYNC.match(path):
                     names = _RUNNER_HEADERS if runner_control else _RUNNER_RESYNC_HEADERS
                     forbidden = ("Authorization", "Cookie", "X-Heel-Internal-Origin", "Content-Encoding") if runner_control \
@@ -260,6 +290,20 @@ class EdgeTLSHarness:
                     if method != "POST" or has("Authorization") or has("Cookie"):
                         raise _EdgeRefusal(400, "invalid control plane request")
                     headers = {}
+                elif owner:
+                    # ``controlPlaneRequestHeaders`` human canary/environment branch: cookie only;
+                    # a POST also needs the configured origin and ``Sec-Fetch-Site: same-origin``.
+                    if has("Authorization"):
+                        raise _EdgeRefusal(400, "invalid control plane request")
+                    headers = self._credentials()
+                    if "Cookie" not in headers or "Authorization" in headers:
+                        raise _EdgeRefusal(400, "invalid control plane request")
+                    if method == "POST":
+                        origin = self._single("Origin") or ""
+                        if origin != harness.origin or self._single("Sec-Fetch-Site") != "same-origin":
+                            raise _EdgeRefusal(400, "invalid control plane request")
+                        headers["X-Heel-Internal-Origin"] = "same-origin"
+                        headers["Origin"] = origin
                 elif human:
                     origin = self._single("Origin") or ""
                     if origin != harness.origin or self._single("Sec-Fetch-Site") != "same-origin":
@@ -325,11 +369,16 @@ class EdgeTLSHarness:
                 else:
                     self.close_connection = True
                 harness.forwarded.append((self.command, path))
-                upstream = http.client.HTTPConnection("127.0.0.1", harness.backend_port, timeout=10)
+                upstream = http.client.HTTPConnection("127.0.0.1", harness.upstream_port, timeout=10)
                 try:
-                    upstream.request(self.command, path, body, headers)
-                    response = upstream.getresponse()
-                    payload = response.read()
+                    try:
+                        upstream.request(self.command, path, body, headers)
+                        response = upstream.getresponse()
+                        payload = response.read()
+                    except (OSError, http.client.HTTPException):
+                        # The Worker's ``catch`` around ``CONTROL_PLANE.fetch``: the edge stays up.
+                        self._refuse(502, "control plane request failed")
+                        return
                     self.send_response(response.status)
                     for name, value in response.getheaders():
                         if name.lower() not in _HOP_BY_HOP:
@@ -356,7 +405,15 @@ class EdgeTLSHarness:
         )
         self._backend = serve(self.control_plane)
         self.backend_port = self._backend.server_address[1]
+        self.upstream_port = self.backend_port
         self._threads = [_start(self._backend), _start(self._edge)]
+
+    def pause_upstream(self) -> None:
+        """Make the control plane unreachable from the edge while the edge itself stays up."""
+        self.upstream_port = free_loopback_port()
+
+    def resume_upstream(self) -> None:
+        self.upstream_port = self.backend_port
 
     # Browser-side helpers: these go through the TLS edge like a real browser session.
     def request(self, method: str, path: str, body: object | None = None, *,
