@@ -37,7 +37,10 @@ from heel.scope import heel_home
 
 from . import identity as _identity
 from .catalog import CATALOG
-from .control_client import RunnerControlClient
+from .control_client import (
+    RunnerAuthenticationRejected, RunnerChainRecoveryDeferred, RunnerChainRecoveryRequired,
+    RunnerControlClient,
+)
 from .control_transport import (
     CONTROL_TIMEOUT_SECONDS, ControlTransportError, HTTPSControlTransport, validate_control_origin,
 )
@@ -86,9 +89,17 @@ _PLAN_ROLES = ("lower_plan", "higher_plan")
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 NO_SECRET_SERVICE = "no supported runner OS secret service"
 _SERVE_LOCK = ".serve.lock"
+# Turnstile for every live use of the claim chain and for serve/unpair ownership changes. A status
+# live check holds it with ``.serve.lock`` for one bounded check; serve and unpair hold it while
+# they take ``.serve.lock`` and publish (or remove) their state, so no reader sees a half-changed
+# instance. Nothing ever blocks on ``.serve.lock`` while holding this lock.
+_STATUS_LOCK = ".status.lock"
 _SERVE_STATE = "serve-state.json"
 _SERVE_STATE_SCHEMA = "heel.runner-serve-state.v1"
-_SERVE_STATES = frozenset({"starting", "online", "offline", "revoked", "stopped", "failed"})
+# ``revoked`` stays readable for state files written before T2b2R1; nothing writes it any more.
+_SERVE_STATES = frozenset({
+    "starting", "online", "offline", "revoked", "rejected", "stopped", "failed", "unpairing",
+})
 _SERVE_STATE_FIELDS = frozenset({
     "schema_version", "state", "runner_id", "since_ms", "updated_at_ms", "last_error_code",
     "binding_id", "access", "pid",
@@ -98,8 +109,25 @@ _UPSTREAM_UNAVAILABLE = frozenset({502, 503, 504})
 SERVE_IDLE_POLL_SECONDS = 2.0
 SERVE_BACKOFF_SECONDS = (2.0, 60.0)
 _SERVE_STATE_REFRESH_SECONDS = 15.0
-# Exit codes of ``heel runner serve``: stopped, offline (``--once`` only), failed, revoked.
-SERVE_EXIT_CODES = {"stopped": 0, "offline": 1, "failed": 2, "revoked": 3}
+# Upper bound for a server-requested recovery delay (the client already bounds the value).
+_MAX_RECOVERY_DEFER_SECONDS = 300.0
+# Turnstile polling: serve and unpair poll faster than status, so a stream of status checks cannot
+# keep a waiting serve out (each check holds the turnstile for one bounded check only).
+_TURNSTILE_POLL_OWNER = 0.005
+_TURNSTILE_POLL_STATUS = 0.05
+# Exit codes of ``heel runner serve``: stopped, offline (``--once`` only), failed, and authority
+# loss (3). ``rejected`` replaces ``revoked``: the server's single 401 answer cannot tell a revoked
+# key from a local clock outside its window, so nothing claims which one it was.
+SERVE_EXIT_CODES = {"stopped": 0, "offline": 1, "failed": 2, "revoked": 3, "rejected": 3}
+_AUTH_REJECTED_STEPS = [
+    "Check that this computer's clock is set automatically and correct, then run: heel runner status",
+    "If the runner was revoked or removed in Heel Cloud, run: heel runner unpair, then pair it again"
+    " with a new invitation",
+]
+_RECOVERY_REQUIRED_STEPS = [
+    "A staged control request of this kind cannot be recovered automatically by this version;"
+    " it is kept unchanged. Contact Heel support before unpairing this runner.",
+]
 
 
 class RunnerPairingError(RuntimeError):
@@ -149,8 +177,8 @@ class _AttributedTransport:
         code = payload.get("code") if isinstance(payload, dict) else None
         if status in _UPSTREAM_UNAVAILABLE:
             raise _ControlCallRejected("upstream_unavailable")
-        if status == 401 and code == "invalid_runner_auth":
-            raise _ControlCallRejected("runner_revoked")
+        # ``401 invalid_runner_auth`` is returned to the control client: it is lost chain
+        # authority first, recovered through the resync protocol, and final only if refused.
         if status == 403 and code == "runner_protocol_upgrade_required":
             raise _ControlCallRejected("protocol_upgrade_required")
         return status, response_headers, payload
@@ -165,7 +193,13 @@ def _serve_failure(error: BaseException) -> tuple[str, str]:
         if isinstance(current, _ControlCallRejected):
             if current.code == "upstream_unavailable":
                 return "offline", current.code
-            return ("revoked" if current.code == "runner_revoked" else "failed"), current.code
+            return "failed", current.code
+        if isinstance(current, RunnerAuthenticationRejected):
+            return "rejected", current.code
+        if isinstance(current, RunnerChainRecoveryDeferred):
+            return "offline", current.code
+        if isinstance(current, RunnerChainRecoveryRequired):
+            return "failed", current.code
         if isinstance(current, ControlTransportError):
             if current.code in {"connection_failed", "timeout"}:
                 return "offline", current.code
@@ -183,13 +217,25 @@ def _serve_failure(error: BaseException) -> tuple[str, str]:
     return "failed", "local_state_invalid"
 
 
-def _open_serve_lock(directory: int) -> int:
-    """Open the instance lock: no symlink, one link, owner-only, never unlinked (stable inode)."""
+def _recovery_delay_seconds(error: BaseException) -> float:
+    """The server-requested resync delay carried by this failure's explicit cause chain, if any."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen and len(seen) < 32:
+        seen.add(id(current))
+        if isinstance(current, RunnerChainRecoveryDeferred):
+            return min(current.retry_after_ms / 1000.0, _MAX_RECOVERY_DEFER_SECONDS)
+        current = current.__cause__
+    return 0.0
+
+
+def _open_serve_lock(directory: int, name: str = _SERVE_LOCK) -> int:
+    """Open a daemon lock file: no symlink, one link, owner-only, never unlinked (stable inode)."""
     # Concurrent first ``O_CREAT`` opens can fail with ENOENT on macOS (the R-A ``openat`` race);
     # retry a few times, then let the caller fail closed.
     for attempt in range(8):
         try:
-            descriptor = os.open(_SERVE_LOCK, _LOCK_FLAGS, 0o600, dir_fd=directory)
+            descriptor = os.open(name, _LOCK_FLAGS, 0o600, dir_fd=directory)
             break
         except FileNotFoundError:
             if attempt == 7:
@@ -547,38 +593,54 @@ class RunnerDaemon:
 
     # ------------------------------------------------------------------ serve instance
     def _lock_grace_seconds(self) -> float:
-        # A status probe holds the lock shared for at most one bounded control call.
-        return (self._transport_timeout or CONTROL_TIMEOUT_SECONDS) + 1.0
+        # A status live check holds the turnstile for one bounded check: at most a replay, a
+        # resync start and completion (each possibly a byte-identical retransmission) and a list.
+        return (self._transport_timeout or CONTROL_TIMEOUT_SECONDS) * 7 + 1.0
 
-    def _acquire_serve_lock(self, directory: int, *, refusal: str) -> int:
-        """Hold ``.serve.lock`` exclusively, or refuse at once while another serve/unpair holds it.
-
-        Kernel ``flock`` ownership ends with the process (SIGKILL included), so no PID or state
-        file is ever consulted. Shared holders are ``status`` probes; wait for those briefly.
-        """
+    def _acquire_turnstile(self, directory: int, *, poll: float) -> int | None:
+        """Hold ``.status.lock`` exclusively, waiting at most one bounded status check; else None."""
         assert fcntl is not None
         deadline = time.monotonic() + self._lock_grace_seconds()
-        descriptor = _open_serve_lock(directory)
+        descriptor = _open_serve_lock(directory, _STATUS_LOCK)
         try:
             while not _try_flock(descriptor, fcntl.LOCK_EX):
-                probe = _open_serve_lock(directory)
-                try:
-                    shared_only = _try_flock(probe, fcntl.LOCK_SH)
-                finally:
-                    os.close(probe)
-                if not shared_only or time.monotonic() >= deadline:
-                    raise RunnerServeError(refusal)
-                time.sleep(0.02)
+                if time.monotonic() >= deadline:
+                    os.close(descriptor)
+                    return None
+                time.sleep(poll)
         except BaseException:
             os.close(descriptor)
             raise
         return descriptor
 
+    def _acquire_serve_lock(self, directory: int, *, refusal: str) -> tuple[int, int]:
+        """Hold ``.serve.lock`` exclusively under the turnstile; return ``(serve lock, turnstile)``.
+
+        Kernel ``flock`` ownership ends with the process (SIGKILL included), so no PID or state
+        file is ever consulted. Status holds ``.serve.lock`` only while it holds the turnstile,
+        so once this caller has the turnstile any other ``.serve.lock`` holder is a serve or an
+        unpair: refuse at once. A status check still running is reported as ``status_busy``.
+        The caller releases the turnstile after publishing its starting state.
+        """
+        assert fcntl is not None
+        turnstile = self._acquire_turnstile(directory, poll=_TURNSTILE_POLL_OWNER)
+        if turnstile is None:
+            raise RunnerServeError("status_busy")
+        try:
+            descriptor = _open_serve_lock(directory)
+            if not _try_flock(descriptor, fcntl.LOCK_EX):
+                os.close(descriptor)
+                raise RunnerServeError(refusal)
+        except BaseException:
+            _release_serve_lock(turnstile)
+            raise
+        return descriptor, turnstile
+
     def _probe_serve_lock(self, directory: int) -> int | None:
-        """Hold ``.serve.lock`` shared when no serve runs (keeps one serve off the claim chain)."""
+        """Under the turnstile, hold ``.serve.lock`` when no serve runs (one claim-chain client)."""
         assert fcntl is not None
         descriptor = _open_serve_lock(directory)
-        if _try_flock(descriptor, fcntl.LOCK_SH):
+        if _try_flock(descriptor, fcntl.LOCK_EX):
             return descriptor
         os.close(descriptor)
         return None
@@ -632,8 +694,10 @@ class RunnerDaemon:
         if directory is None:
             raise RunnerServeError("unpaired")
         lock: int | None = None
+        turnstile: int | None = None
+        session: _ServeSession | None = None
         try:
-            lock = self._acquire_serve_lock(directory, refusal="already_serving")
+            lock, turnstile = self._acquire_serve_lock(directory, refusal="already_serving")
             # Read the pairing only under instance ownership: an unpair or re-pair that finished
             # before this point is what we serve; neither can run while the lock is held.
             record = self._load_record(store)
@@ -641,7 +705,16 @@ class RunnerDaemon:
                 raise RunnerServeError("unpaired")
             if record["state"] != "active":
                 raise RunnerServeError("pairing_incomplete")
-            return _ServeSession(self, directory, record, once=once, emit=emit).run()
+            session = _ServeSession(self, directory, record, once=once, emit=emit)
+            if self._grant_authority(record) is None:
+                # Nothing the cloud signs could be verified: no secret store, no network. Re-pair.
+                raise session._end("failed", "cloud_authority_missing")
+            # Published before the turnstile opens: status never shows a previous serve's file
+            # as this one (the identity load that follows may be slow).
+            session._publish("starting", force=True)
+            _release_serve_lock(turnstile)
+            turnstile = None
+            return session.run()
         except RunnerServeError:
             raise
         except RunnerPairingError as error:
@@ -649,9 +722,19 @@ class RunnerDaemon:
         except (OSError, RunnerStoreError):
             raise RunnerServeError("local_state_invalid") from None
         finally:
-            if lock is not None:
-                _release_serve_lock(lock)
-            os.close(directory)
+            try:
+                if lock is not None and session is not None and session.final is not None:
+                    # The final state and the release are one step for status readers.
+                    if turnstile is None:
+                        turnstile = self._acquire_turnstile(directory, poll=_TURNSTILE_POLL_OWNER)
+                    state, code = session.final
+                    session._publish(state, error_code=code, force=True)
+            finally:
+                if lock is not None:
+                    _release_serve_lock(lock)
+                if turnstile is not None:
+                    _release_serve_lock(turnstile)
+                os.close(directory)
 
     # ------------------------------------------------------------------ pair
     def pair(
@@ -856,6 +939,28 @@ class RunnerDaemon:
 
     def status(self, *, check_control_plane: bool = True) -> dict[str, Any]:
         store = self._store()
+        directory = self._daemon_fd(store, create=False)
+        if directory is None:
+            return {"state": "unpaired"}
+        turnstile: int | None = None
+        try:
+            try:
+                # Taken before the record is read: a serve start or an unpair is then either
+                # complete or not begun, never half-visible, and live checks are serialized.
+                turnstile = self._acquire_turnstile(directory, poll=_TURNSTILE_POLL_STATUS)
+            except OSError:
+                raise RunnerPairingError("local_state_invalid") from None
+            if turnstile is None:
+                # Another status check is still using the claim chain, or a serve/unpair is
+                # changing ownership: contention, not a running serve and not an error.
+                return {"state": "status_busy", "next_steps": ["heel runner status"]}
+            return self._status_locked(store, directory, check_control_plane=check_control_plane)
+        finally:
+            if turnstile is not None:
+                _release_serve_lock(turnstile)
+            os.close(directory)
+
+    def _status_locked(self, store: RunnerStore, directory: int, *, check_control_plane: bool) -> dict[str, Any]:
         record = self._load_record(store)
         if record is None:
             return {"state": "unpaired"}
@@ -869,6 +974,13 @@ class RunnerDaemon:
             "runner_id": record["runner_id"], "runner_key_id": record["runner_key_id"],
             "fingerprint": record["fingerprint"],
         }
+        unpairing = self._unpair_in_progress(directory, record)
+        if unpairing is not None:
+            # The identity is being removed right now; reading it would only show a partial state.
+            return {
+                "state": "unpairing", **coordinates, "serve": unpairing,
+                "control_plane": {"state": "not_checked", "reason": "unpair_running"},
+            }
         authority = self._grant_authority(record)
         if authority is None:
             # Paired before the grant-authority bootstrap (or the key is inconsistent): nothing the
@@ -884,9 +996,6 @@ class RunnerDaemon:
             result["access"] = self_serve_access(store)
         except (RunnerStoreError, ValueError):
             result["access"] = {"state": "access.incomplete", "reason": "local_state_invalid"}
-        directory = self._daemon_fd(store, create=False)
-        if directory is None:
-            raise RunnerPairingError("local_state_invalid")
         probe: int | None = None
         try:
             try:
@@ -896,8 +1005,12 @@ class RunnerDaemon:
             # Only the lock says whether a serve runs; the state file alone is history.
             result["serve"] = self._serve_view(directory, record, running=probe is None)
             if probe is None:
-                # A running serve owns the signed claim chain; a second client would fork it.
-                result["control_plane"] = {"state": "not_checked", "reason": "serve_running"}
+                # A running serve owns the signed claim chain; a second client would fork it. An
+                # unpair holds the same lock and says so in its state.
+                unpairing = result["serve"]["state"] == "unpairing"
+                result["control_plane"] = {
+                    "state": "not_checked", "reason": "unpair_running" if unpairing else "serve_running",
+                }
                 if result["serve"]["state"] == "offline":
                     result["state"] = "offline"
                 return result
@@ -915,12 +1028,30 @@ class RunnerDaemon:
         finally:
             if probe is not None:
                 _release_serve_lock(probe)
-            os.close(directory)
-        if result["control_plane"]["state"] == "rejected" and result["control_plane"].get("reason") == "runner_revoked":
-            result["state"] = "runner_revoked"
-        elif result["control_plane"]["state"] == "unreachable":
+        control = result["control_plane"]
+        if control["state"] == "rejected" and control.get("reason") == "runner_authentication_rejected":
+            result["state"] = "runner_authentication_rejected"
+            result["next_steps"] = list(_AUTH_REJECTED_STEPS)
+        elif control["state"] == "recovery_required":
+            result["state"] = "recovery_required"
+            result["next_steps"] = list(_RECOVERY_REQUIRED_STEPS)
+        elif control["state"] in {"unreachable", "deferred"}:
             result["state"] = "offline"
         return result
+
+    def _unpair_in_progress(self, directory: int, record: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Under the turnstile: the ``unpairing`` view while an unpair holds the instance lock."""
+        state = self._read_serve_state(directory, record["runner_id"])
+        if state is None or state["state"] != "unpairing":
+            return None
+        try:
+            probe = self._probe_serve_lock(directory)
+        except OSError:
+            raise RunnerPairingError("local_state_invalid") from None
+        if probe is not None:
+            _release_serve_lock(probe)
+            return None  # a file left by an interrupted unpair is history, not a running unpair
+        return {key: state[key] for key in ("state", "since_ms", "updated_at_ms", "pid")}
 
     def _live_check(self, record, identity, signer, runtime) -> dict[str, Any]:
         transport = self._transport(record["origin"])
@@ -930,6 +1061,8 @@ class RunnerDaemon:
                 runner_id=identity.runner_id, signer=signer, clock=self._clock_ms,
                 transport=transport, nonce_source=_random_nonce, runtime=runtime,
             )
+            # Staged calls replay first (a recorded reply needs no resync); lost claim-chain
+            # authority is recovered inside the client, exactly as in serve.
             if runtime.load_pending_calls():
                 client.replay_all_pending(now_ms=self._clock_ms())
             listed = client.list_contexts()
@@ -937,10 +1070,14 @@ class RunnerDaemon:
             if error.code in {"connection_failed", "timeout"}:
                 return {"state": "unreachable", "reason": error.code}
             return {"state": "rejected", "reason": error.code}
+        except RunnerAuthenticationRejected as error:
+            # Refused fresh resync: revoked or unknown key, or a local clock outside the window.
+            return {"state": "rejected", "reason": error.code}
+        except RunnerChainRecoveryDeferred as error:
+            return {"state": "deferred", "reason": error.code, "retry_after_ms": error.retry_after_ms}
+        except RunnerChainRecoveryRequired as error:
+            return {"state": "recovery_required", "reason": error.reason, "operation": error.operation}
         except (ValueError, RunnerRuntimeStateError):
-            if transport.last_status == 401 and transport.last_error_code == "invalid_runner_auth":
-                # The control plane no longer accepts this key: revoked (or never known).
-                return {"state": "rejected", "reason": "runner_revoked"}
             if transport.last_status == 403 and transport.last_error_code == "runner_protocol_upgrade_required":
                 return {"state": "rejected", "reason": "protocol_upgrade_required"}
             return {"state": "rejected", "reason": "response_rejected"}
@@ -955,25 +1092,61 @@ class RunnerDaemon:
         store = self._store()
         directory = self._daemon_fd(store, create=False)
         lock: int | None = None
+        turnstile: int | None = None
+        previous: dict[str, Any] | None = None
+        marked = False
         try:
             if directory is not None:
                 try:
-                    lock = self._acquire_serve_lock(directory, refusal="serve_running")
+                    lock, turnstile = self._acquire_serve_lock(directory, refusal="serve_running")
+                    # Published under the turnstile: a status during the unpair reports it as such,
+                    # never a previous serve's file as a live serve. A serve or another unpair is
+                    # still refused at once by the instance lock.
+                    record = self._load_record(store)
+                    if record is not None and type(record.get("runner_id")) is str:
+                        previous = self._read_serve_state(directory, record["runner_id"])
+                        now = self._clock_ms()
+                        _write_json(directory, _SERVE_STATE, {
+                            "schema_version": _SERVE_STATE_SCHEMA, "state": "unpairing",
+                            "runner_id": record["runner_id"], "since_ms": now, "updated_at_ms": now,
+                            "last_error_code": None, "binding_id": None, "access": None,
+                            "pid": os.getpid(),
+                        })
+                        marked = True
+                    _release_serve_lock(turnstile)
+                    turnstile = None
                 except OSError:
                     raise RunnerPairingError("local_state_invalid") from None
-            result = self._unpair_locked(store)
-            if directory is not None and result["removed"]:
-                try:
-                    os.unlink(_SERVE_STATE, dir_fd=directory)
-                    os.fsync(directory)
-                except FileNotFoundError:
-                    pass
+            try:
+                result = self._unpair_locked(store)
+            except BaseException:
+                if marked:
+                    # Refused or failed: put the previous visible state back, under the turnstile.
+                    turnstile = self._acquire_turnstile(directory, poll=_TURNSTILE_POLL_OWNER)
+                    if previous is not None:
+                        _write_json(directory, _SERVE_STATE, previous)
+                    else:
+                        self._unlink_serve_state(directory)
+                raise
+            if directory is not None and (result["removed"] or marked):
+                turnstile = self._acquire_turnstile(directory, poll=_TURNSTILE_POLL_OWNER)
+                self._unlink_serve_state(directory)
             return result
         finally:
             if lock is not None:
                 _release_serve_lock(lock)
+            if turnstile is not None:
+                _release_serve_lock(turnstile)
             if directory is not None:
                 os.close(directory)
+
+    @staticmethod
+    def _unlink_serve_state(directory: int) -> None:
+        try:
+            os.unlink(_SERVE_STATE, dir_fd=directory)
+            os.fsync(directory)
+        except FileNotFoundError:
+            pass
 
     def _unpair_locked(self, store: RunnerStore) -> dict[str, Any]:
         record = self._load_record(store)
@@ -1025,6 +1198,9 @@ class _ServeSession:
         self.attempt = 0
         self._last_key: tuple | None = None
         self._last_write = 0.0
+        # The final (state, code), published by ``RunnerDaemon.serve`` under the turnstile together
+        # with the instance-lock release.
+        self.final: tuple[str, str | None] | None = None
 
     def _publish(self, state: str, *, error_code: str | None = None, force: bool = False) -> None:
         now = self.daemon._clock_ms()
@@ -1044,11 +1220,11 @@ class _ServeSession:
         self.state, self._last_key, self._last_write = state, key, time.monotonic()
 
     def _end(self, state: str, code: str) -> RunnerServeError:
-        self._publish(state, error_code=code, force=True)
+        self.final = (state, code)
         return RunnerServeError(code, state=state)
 
     def _stopped(self) -> dict[str, Any]:
-        self._publish("stopped", force=True)
+        self.final = ("stopped", None)
         return {"event": "serve_stopped", "state": "stopped", "binding_id": self.binding_id,
                 "access": self.access}
 
@@ -1080,16 +1256,13 @@ class _ServeSession:
     def run(self) -> dict[str, Any]:
         daemon = self.daemon
         authority = daemon._grant_authority(self.record)
-        if authority is None:
-            # Nothing the cloud signs could be verified: no secret store, no network. Re-pair.
-            raise self._end("failed", "cloud_authority_missing")
+        assert authority is not None  # checked by ``RunnerDaemon.serve`` before ``starting``
         try:
             self.identity, self.signer = daemon._active_identity(daemon._store(), self.record)
         except RunnerPairingError as error:
             raise self._end("failed", error.code) from None
         # The only trust anchor is the key validated at pairing and persisted in the record.
         self.trusted = {authority["key_id"]: load_public_key_base64(authority["public_key_b64"])}
-        self._publish("starting", force=True)
         while True:
             if daemon._shutdown.is_set():
                 return self._stopped()
@@ -1100,8 +1273,9 @@ class _ServeSession:
                 if state == "offline" and not self.once:
                     # Fresh authority is required again: the next cycle rebuilds the coordinator,
                     # replays staged calls and is online only after a new authenticated answer.
+                    # A rate-limited resync waits at least as long as the server asked.
                     self._publish("offline", error_code=code)
-                    if daemon._shutdown.wait(self._backoff()):
+                    if daemon._shutdown.wait(max(self._backoff(), _recovery_delay_seconds(error))):
                         return self._stopped()
                     continue
                 raise self._end(state, code) from None
