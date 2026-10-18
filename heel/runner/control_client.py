@@ -32,8 +32,8 @@ from heel.canary_contracts import (
 )
 from heel.crypto import ed25519_key_id, verify_envelope
 from heel.runner.runtime import (
-    ActiveGateUpdate, ActiveRunInstall, PendingResultReplayVerifier, PendingSignedCall,
-    RunnerRuntimeConflict, RunnerRuntimeCorrupt, RunnerRuntimeState,
+    ActiveGateUpdate, ActiveRunInstall, ChainResyncAttempt, PendingResultReplayVerifier, PendingSignedCall,
+    RunnerRuntimeConflict, RunnerRuntimeCorrupt, RunnerRuntimeState, RuntimeClaimSequenceConsumed,
     TerminalResultStageEvidence, _active_json_bytes,
 )
 
@@ -66,13 +66,70 @@ class _CallDiagnostic:
 
 @dataclass(frozen=True, slots=True)
 class PendingReplayOutcome:
-    """The closed response committed for one byte-identical durable request replay."""
+    """The closed response committed for one byte-identical durable request replay.
+
+    ``superseded`` marks a staged call the server never recorded whose proof could no longer be
+    accepted: an accepted resync retired it into a sealed tombstone (``status`` 401, no body).
+    """
 
     call_id: str
     request_operation: str
     run_id: str | None
     status: int
     body: object | None
+    superseded: bool = False
+
+
+class RunnerControlRecoveryError(RuntimeError):
+    """A closed claim-chain authority outcome; ``code`` is a fixed, secret-free reason."""
+
+    code = "recovery_required"
+
+    def __init__(self, message: str | None = None):
+        super().__init__(message or self.code)
+
+
+class RunnerAuthenticationRejected(RunnerControlRecoveryError):
+    """A freshly signed resync was refused with the server's single 401 answer.
+
+    That answer is the same for a revoked or unknown key, a local clock outside the server's
+    window and a mismatched pairing, so this never claims which one it was.
+    """
+
+    code = "runner_authentication_rejected"
+
+
+class RunnerChainRecoveryRequired(RunnerControlRecoveryError):
+    """A staged call that cannot be retired safely blocks the chain; it is kept unchanged.
+
+    ``reason`` is ``unsupported_operation`` (a kind outside this phase's recovery) or
+    ``claim_sequence_consumed`` (the server consumed the staged job claim's sequence).
+    """
+
+    code = "recovery_required"
+
+    def __init__(self, operation: str, reason: str = "unsupported_operation"):
+        super().__init__(f"runner chain recovery is required for a staged {operation} call")
+        self.operation = operation
+        self.reason = reason
+
+
+class RunnerChainRecoveryDeferred(RunnerControlRecoveryError):
+    """The server rate-limited resync; retry after ``retry_after_ms`` (validated and bounded)."""
+
+    code = "recovery_rate_limited"
+
+    def __init__(self, retry_after_ms: int):
+        super().__init__("runner chain recovery is rate limited")
+        self.retry_after_ms = retry_after_ms
+
+
+class _ClaimChainAuthorityLost(Exception):
+    """Internal: this staged claim-chain call received ``401 invalid_runner_auth``."""
+
+    def __init__(self, pending: PendingSignedCall):
+        super().__init__("runner claim chain authority lost")
+        self.pending = pending
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +199,10 @@ _FINDINGS_RECEIPT_FIELDS = {
     "grant_id", "permit_id", "projection_id", "projection_digest", "byte_count",
     "scenario_count", "finding_count", "accepted_at_ms", "status",
 }
+_SUPERSEDABLE_CLAIM_CHAIN_OPERATIONS = frozenset({"list-contexts", "claim-context", "claim"})
+_DEFAULT_RETRY_AFTER_MS = 60_000
+_MIN_RETRY_AFTER_MS = 1_000
+_MAX_RETRY_AFTER_MS = 300_000
 _ROLLOVER_RECEIPT_CONSTRUCTOR = object()
 _ROLLOVER_RECEIPT_REGISTRY: dict[bytes, tuple["RunnerControlClient", "_RunnerContextRolloverReceipt", object]] = {}
 _ROLLOVER_RECEIPT_REGISTRY_LOCK = threading.Lock()
@@ -340,6 +401,12 @@ class RunnerControlClient:
             self.transport.post(pending.path, headers=dict(pending.headers), body=pending.body),
             error="invalid runner context response",
         )
+        if self._authority_rejected(status, payload):
+            # No receipt exists at this generation (receipt lookup precedes every freshness check
+            # on the server), so the call was never recorded: recover, then retire it.
+            with self._claim_lock:
+                self._recover_claim_chain_locked(pending)
+            return PendingReplayOutcome(pending.call_id, operation, None, status, None, superseded=True)
         expected_status, schema = shapes[operation]
         if status != expected_status or not isinstance(payload, dict) or payload.get("schema_version") != schema:
             raise ValueError("invalid runner context response")
@@ -533,9 +600,15 @@ class RunnerControlClient:
             pending.path, dict(pending.headers), pending.body, pending.capability,
             "claim", pending.sequence, pending.generation,
         )
-        body, status, _headers = self._post_closed(
-            call, "claim", None, include_response_metadata=True, runtime_pending=current,
-        )
+        try:
+            body, status, _headers = self._post_closed(
+                call, "claim", None, include_response_metadata=True, runtime_pending=current,
+            )
+        except _ClaimChainAuthorityLost:
+            with self._claim_lock:
+                self._recover_claim_chain_locked(current)
+            # Retired, not issued again: the serve loop's next poll is a new signed claim.
+            return PendingReplayOutcome(pending.call_id, "claim", None, 401, None, superseded=True)
         return PendingReplayOutcome(pending.call_id, "claim", None, status, body)
 
     def replay_all_pending(
@@ -636,6 +709,12 @@ class RunnerControlClient:
         ):
             raise ValueError("invalid runner control response")
         status, headers, body = response
+        if self._authority_rejected(status, body):
+            if operation == "claim" and isinstance(runtime_pending, PendingSignedCall):
+                # Recovered by the caller; the job claim is retired only on the server's proof.
+                raise _ClaimChainAuthorityLost(runtime_pending)
+            # Run chains are outside this phase's recovery (T4a): the staged call is kept.
+            raise RunnerChainRecoveryRequired(operation)
         next_nonce = headers.get("X-Heel-Runner-Next-Nonce")
         if not self._b64_32(next_nonce):
             raise ValueError("invalid runner control response")
@@ -1064,10 +1143,21 @@ class RunnerControlClient:
         self._validate_chain(operation, run_id)
         if operation == "claim":
             with self._claim_lock:
-                return self._closed_control_locked(
-                    operation, run_id, operational_projection,
-                    include_response_metadata=include_response_metadata,
-                )
+                try:
+                    return self._closed_control_locked(
+                        operation, run_id, operational_projection,
+                        include_response_metadata=include_response_metadata,
+                    )
+                except _ClaimChainAuthorityLost as lost:
+                    self._recover_claim_chain_locked(lost.pending)
+                # One new poll under the recovered chain, only after the non-consumption proof.
+                try:
+                    return self._closed_control_locked(
+                        operation, run_id, operational_projection,
+                        include_response_metadata=include_response_metadata,
+                    )
+                except _ClaimChainAuthorityLost:
+                    raise RunnerAuthenticationRejected() from None
         with self._run_guard(run_id) as guard_token:
             if operation == "result":
                 with self._state_lock:
@@ -1238,96 +1328,126 @@ class RunnerControlClient:
         diagnostic_operation: str,
         include_call: bool = False,
     ) -> dict | tuple[dict, _Call]:
-        """Use the existing claim PoP chain for the three fixed pairing-only calls."""
+        """Use the existing claim PoP chain for the three fixed pairing-only calls.
+
+        A ``401 invalid_runner_auth`` answer means this chain's authority was lost (the proof
+        window or nonce TTL passed, or the key is no longer accepted). It is recovered at most
+        once per call through the fixed resync protocol and the same request is then issued
+        again under the recovered chain; a second refusal is final for this call.
+        """
         with self._claim_lock:
-            nonce, sequence, generation, chain = self._next_chain("claim", None)
-            body, timestamp_ms = canonical_bytes(request), self._timestamp()
-            proof = {
-                "schema_version": "heel.runner-request-proof.v1", "workspace_id": self.workspace_id,
-                "runner_id": self.runner_id, "key_id": self.signer.key_id,
-                "capability": "runner_claim", "method": "POST", "path": path,
-                "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms,
-                "server_nonce": nonce, "sequence": sequence,
-            }
-            headers = self._headers(
-                self._signature(b"heel.runner-pop.v1\0" + canonical_bytes(proof)), timestamp_ms,
-                nonce=nonce, sequence=sequence,
+            try:
+                return self._context_control_locked(
+                    path, request, expected_status=expected_status, schema=schema,
+                    diagnostic_operation=diagnostic_operation, include_call=include_call,
+                )
+            except _ClaimChainAuthorityLost as lost:
+                self._recover_claim_chain_locked(lost.pending)
+            try:
+                return self._context_control_locked(
+                    path, request, expected_status=expected_status, schema=schema,
+                    diagnostic_operation=diagnostic_operation, include_call=include_call,
+                )
+            except _ClaimChainAuthorityLost:
+                raise RunnerAuthenticationRejected() from None
+
+    def _context_control_locked(
+        self, path: str, request: dict, *, expected_status: int, schema: str,
+        diagnostic_operation: str, include_call: bool,
+    ) -> dict | tuple[dict, _Call]:
+        nonce, sequence, generation, chain = self._next_chain("claim", None)
+        body, timestamp_ms = canonical_bytes(request), self._timestamp()
+        proof = {
+            "schema_version": "heel.runner-request-proof.v1", "workspace_id": self.workspace_id,
+            "runner_id": self.runner_id, "key_id": self.signer.key_id,
+            "capability": "runner_claim", "method": "POST", "path": path,
+            "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms,
+            "server_nonce": nonce, "sequence": sequence,
+        }
+        headers = self._headers(
+            self._signature(b"heel.runner-pop.v1\0" + canonical_bytes(proof)), timestamp_ms,
+            nonce=nonce, sequence=sequence,
+        )
+        runtime_cursor = self.runtime.load_chain("claim", None)
+        if runtime_cursor is None or (
+            runtime_cursor.next_nonce_b64, runtime_cursor.next_sequence,
+            runtime_cursor.generation,
+        ) != (nonce, sequence, generation):
+            raise ValueError("runner runtime state chain differs from control client")
+        try:
+            runtime_pending = self.runtime.stage_call(
+                request_operation=diagnostic_operation, chain_operation="claim", run_id=None,
+                path=path, capability="runner_claim", headers=headers, body=body,
+                expected_state_digest=runtime_cursor.state_digest, now_ms=timestamp_ms,
             )
-            runtime_cursor = self.runtime.load_chain("claim", None)
-            if runtime_cursor is None or (
-                runtime_cursor.next_nonce_b64, runtime_cursor.next_sequence,
-                runtime_cursor.generation,
-            ) != (nonce, sequence, generation):
-                raise ValueError("runner runtime state chain differs from control client")
-            try:
-                runtime_pending = self.runtime.stage_call(
-                    request_operation=diagnostic_operation, chain_operation="claim", run_id=None,
-                    path=path, capability="runner_claim", headers=headers, body=body,
-                    expected_state_digest=runtime_cursor.state_digest, now_ms=timestamp_ms,
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValueError("runner runtime state did not stage context call") from exc
-            response = self.transport.post(path, headers=headers, body=body)
-            if (not isinstance(response, tuple) or len(response) != 3 or response[0] != expected_status
-                    or not isinstance(response[1], dict) or not isinstance(response[2], dict)
-                    or set(response[2]) == set() or response[2].get("schema_version") != schema):
-                raise ValueError("invalid runner context response")
-            payload = response[2]
-            try:
-                if schema == "heel.runner-context-list-result.v1":
-                    if set(payload) != {"schema_version", "server_time_ms", "contexts", "has_more"}:
+        except (TypeError, ValueError) as exc:
+            raise ValueError("runner runtime state did not stage context call") from exc
+        response = self.transport.post(path, headers=headers, body=body)
+        if (
+            isinstance(response, tuple) and len(response) == 3
+            and self._authority_rejected(response[0], response[2])
+        ):
+            raise _ClaimChainAuthorityLost(runtime_pending)
+        if (not isinstance(response, tuple) or len(response) != 3 or response[0] != expected_status
+                or not isinstance(response[1], dict) or not isinstance(response[2], dict)
+                or set(response[2]) == set() or response[2].get("schema_version") != schema):
+            raise ValueError("invalid runner context response")
+        payload = response[2]
+        try:
+            if schema == "heel.runner-context-list-result.v1":
+                if set(payload) != {"schema_version", "server_time_ms", "contexts", "has_more"}:
+                    raise ValueError
+                if type(payload["server_time_ms"]) is not int or payload["server_time_ms"] < 0 or type(payload["has_more"]) is not bool:
+                    raise ValueError
+                contexts = payload["contexts"]
+                if not isinstance(contexts, list) or len(contexts) > 16:
+                    raise ValueError
+                for item in contexts:
+                    if not isinstance(item, dict) or set(item) != {"binding_id", "binding_digest", "project_id", "environment_id", "origin", "environment_class", "verification_record_digest", "expires_at_ms", "claimed"}:
                         raise ValueError
-                    if type(payload["server_time_ms"]) is not int or payload["server_time_ms"] < 0 or type(payload["has_more"]) is not bool:
+                    validate_runner_context_claim({"schema_version": "heel.runner-context-claim.v1", "binding_id": item["binding_id"], "binding_digest": item["binding_digest"]})
+                    if (type(item["project_id"]) is not str or not item["project_id"] or type(item["environment_id"]) is not str or not item["environment_id"]
+                            or type(item["origin"]) is not str or not item["origin"] or item["environment_class"] not in {"staging", "sandbox"}
+                            or type(item["verification_record_digest"]) is not str or len(item["verification_record_digest"]) != 64
+                            or type(item["expires_at_ms"]) is not int or item["expires_at_ms"] < 0 or type(item["claimed"]) is not bool):
                         raise ValueError
-                    contexts = payload["contexts"]
-                    if not isinstance(contexts, list) or len(contexts) > 16:
-                        raise ValueError
-                    for item in contexts:
-                        if not isinstance(item, dict) or set(item) != {"binding_id", "binding_digest", "project_id", "environment_id", "origin", "environment_class", "verification_record_digest", "expires_at_ms", "claimed"}:
-                            raise ValueError
-                        validate_runner_context_claim({"schema_version": "heel.runner-context-claim.v1", "binding_id": item["binding_id"], "binding_digest": item["binding_digest"]})
-                        if (type(item["project_id"]) is not str or not item["project_id"] or type(item["environment_id"]) is not str or not item["environment_id"]
-                                or type(item["origin"]) is not str or not item["origin"] or item["environment_class"] not in {"staging", "sandbox"}
-                                or type(item["verification_record_digest"]) is not str or len(item["verification_record_digest"]) != 64
-                                or type(item["expires_at_ms"]) is not int or item["expires_at_ms"] < 0 or type(item["claimed"]) is not bool):
-                            raise ValueError
-                elif schema == "heel.runner-context-claim-result.v1":
-                    if set(payload) != {"schema_version", "context_binding", "claimed_at_ms"} or type(payload["claimed_at_ms"]) is not int or payload["claimed_at_ms"] < 0:
-                        raise ValueError
-                    binding = validate_runner_context_binding(payload["context_binding"])
-                    if (binding["workspace_id"] != self.workspace_id or binding["runner_binding"]["runner_id"] != self.runner_id
-                            or binding["runner_binding"]["runner_key_id"] != self.signer.key_id
-                            or binding["binding_id"] != request["binding_id"] or binding["binding_digest"] != request["binding_digest"]):
-                        raise ValueError
-                elif schema == "heel.canary-projection-submitted.v1":
-                    if set(payload) != {"schema_version", "approval_id", "run_id", "status", "projection_digest"} or payload["status"] not in {"awaiting_execution_approval", "approved", "cancelled", "expired"}:
-                        raise ValueError
-                    submitted = request["approval_projection"]
-                    if (type(payload["approval_id"]) is not str or payload["approval_id"] != submitted["projection_id"]
-                            or type(payload["projection_digest"]) is not str or payload["projection_digest"] != submitted["projection_digest"]
-                            or type(payload["run_id"]) is not str or re.fullmatch(r"crun_[0-9a-f]{32}", payload["run_id"]) is None):
-                        raise ValueError
-            except (KeyError, TypeError, ValueError):
-                raise ValueError("invalid runner context response") from None
-            next_nonce = response[1].get("X-Heel-Runner-Next-Nonce")
-            if not self._b64_32(next_nonce):
-                raise ValueError("invalid runner context response")
-            call = _Call(path, headers, body, "runner_claim", chain, sequence, generation)
-            try:
-                self.runtime.commit_call(
-                    runtime_pending.call_id, next_nonce_b64=next_nonce,
-                    now_ms=self._timestamp(),
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValueError("runner runtime state did not commit context response") from exc
-            with self._state_lock:
-                current = self._chains.get(chain)
-                if current is not None and current != (nonce, sequence, generation):
-                    raise ValueError("runner control chain changed during request")
-                self._chains[chain] = (next_nonce, sequence + 1, generation)
-                self._append_call_diagnostic_locked(diagnostic_operation, response[0], call)
-            payload = dict(response[2])
-            return (payload, call) if include_call else payload
+            elif schema == "heel.runner-context-claim-result.v1":
+                if set(payload) != {"schema_version", "context_binding", "claimed_at_ms"} or type(payload["claimed_at_ms"]) is not int or payload["claimed_at_ms"] < 0:
+                    raise ValueError
+                binding = validate_runner_context_binding(payload["context_binding"])
+                if (binding["workspace_id"] != self.workspace_id or binding["runner_binding"]["runner_id"] != self.runner_id
+                        or binding["runner_binding"]["runner_key_id"] != self.signer.key_id
+                        or binding["binding_id"] != request["binding_id"] or binding["binding_digest"] != request["binding_digest"]):
+                    raise ValueError
+            elif schema == "heel.canary-projection-submitted.v1":
+                if set(payload) != {"schema_version", "approval_id", "run_id", "status", "projection_digest"} or payload["status"] not in {"awaiting_execution_approval", "approved", "cancelled", "expired"}:
+                    raise ValueError
+                submitted = request["approval_projection"]
+                if (type(payload["approval_id"]) is not str or payload["approval_id"] != submitted["projection_id"]
+                        or type(payload["projection_digest"]) is not str or payload["projection_digest"] != submitted["projection_digest"]
+                        or type(payload["run_id"]) is not str or re.fullmatch(r"crun_[0-9a-f]{32}", payload["run_id"]) is None):
+                    raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("invalid runner context response") from None
+        next_nonce = response[1].get("X-Heel-Runner-Next-Nonce")
+        if not self._b64_32(next_nonce):
+            raise ValueError("invalid runner context response")
+        call = _Call(path, headers, body, "runner_claim", chain, sequence, generation)
+        try:
+            self.runtime.commit_call(
+                runtime_pending.call_id, next_nonce_b64=next_nonce,
+                now_ms=self._timestamp(),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("runner runtime state did not commit context response") from exc
+        with self._state_lock:
+            current = self._chains.get(chain)
+            if current is not None and current != (nonce, sequence, generation):
+                raise ValueError("runner control chain changed during request")
+            self._chains[chain] = (next_nonce, sequence + 1, generation)
+            self._append_call_diagnostic_locked(diagnostic_operation, response[0], call)
+        payload = dict(response[2])
+        return (payload, call) if include_call else payload
 
     def list_contexts(self) -> dict:
         request = validate_runner_context_list({"schema_version": "heel.runner-context-list.v1"})
@@ -1717,6 +1837,209 @@ class RunnerControlClient:
             response["initial_claim_nonce"], response["initial_claim_sequence"],
             response["initial_claim_generation"],
         )
+
+    @staticmethod
+    def _authority_rejected(status: object, payload: object) -> bool:
+        """The server's single answer for a refused proof: revoked, stale, or chain-mismatched."""
+        return (
+            status == 401 and isinstance(payload, dict)
+            and payload.get("code") == "invalid_runner_auth"
+        )
+
+    @staticmethod
+    def _retry_after_ms(payload: object) -> int:
+        value = payload.get("retry_after_ms") if isinstance(payload, dict) else None
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return _DEFAULT_RETRY_AFTER_MS
+        return max(_MIN_RETRY_AFTER_MS, min(value, _MAX_RETRY_AFTER_MS))
+
+    def _assert_supersedable(self, pending: PendingSignedCall) -> None:
+        """Only an exact list/claim-context or fixed job-claim intent of this runner may be retired."""
+        operation = pending.request_operation
+        if (
+            operation not in _SUPERSEDABLE_CLAIM_CHAIN_OPERATIONS
+            or pending.chain_operation != "claim" or pending.run_id is not None
+        ):
+            raise RunnerChainRecoveryRequired(operation)
+        prefix = f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}"
+        try:
+            request = json.loads(pending.body)
+            if not isinstance(request, dict) or canonical_bytes(request) != pending.body:
+                raise ValueError
+            if operation == "list-contexts":
+                exact = (
+                    validate_runner_context_list(request) == request
+                    and pending.path == f"{prefix}/contexts/list"
+                )
+            elif operation == "claim":
+                exact = (
+                    validate_runner_claim_request(request) == request
+                    and request == {"schema_version": "heel.runner-claim-request.v1"}
+                    and pending.path == f"{prefix}/claim"
+                )
+            else:
+                exact = (
+                    validate_runner_context_claim(request) == request
+                    and pending.path == f"{prefix}/contexts/{request['binding_id']}/claim"
+                )
+        except (KeyError, TypeError, ValueError):
+            exact = False
+        if (
+            not exact or pending.capability != "runner_claim"
+            or pending.headers.get("X-Heel-Runner-Id") != self.runner_id
+            or pending.headers.get("X-Heel-Runner-Key-Id") != self.signer.key_id
+        ):
+            raise RunnerChainRecoveryRequired(operation)
+
+    def _signed_resync_request(self, phase: str, body: bytes) -> tuple[str, dict[str, str], int]:
+        path = f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/resync/{phase}"
+        timestamp_ms = self._timestamp()
+        proof = {
+            "schema_version": f"heel.runner-resync-{phase}-proof.v2", "workspace_id": self.workspace_id,
+            "runner_id": self.runner_id, "key_id": self.signer.key_id, "method": "POST", "path": path,
+            "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms,
+        }
+        domain = f"heel.runner-resync-{phase}-pop.v2".encode("ascii") + b"\0"
+        return path, self._headers(self._signature(domain + canonical_bytes(proof)), timestamp_ms), timestamp_ms
+
+    def _recover_claim_chain_locked(self, failed: PendingSignedCall) -> None:
+        """Recover lost claim-chain authority for ``failed``; the caller holds ``_claim_lock``.
+
+        At most one *fresh* resync start is signed per recovery. A start or completion that was
+        durably recorded before a lost answer is first retransmitted byte for byte (the server
+        answers an exact retransmission from its own record), so a crash or timeout never
+        leaves an orphaned server challenge that would block the next start. Only a verified
+        completion advances the chain, and in the same runtime transaction the one staged call
+        is moved into a sealed tombstone. Any refusal keeps the staged call.
+        """
+        self._assert_supersedable(failed)
+        attempt: ChainResyncAttempt | None = self.runtime.load_resync_attempt("claim")
+        fresh_started = False
+        while True:
+            if attempt is None:
+                if fresh_started:
+                    raise RunnerAuthenticationRejected()
+                fresh_started = True
+                client_nonce = self._random_b64()
+                body = canonical_bytes({
+                    "schema_version": "heel.runner-resync-start.v2",
+                    "chain": {"operation": "claim", "run_id": None}, "client_nonce_b64": client_nonce,
+                })
+                path, headers, timestamp_ms = self._signed_resync_request("start", body)
+                attempt = self.runtime.begin_resync_attempt(
+                    operation="claim", path=path, headers=headers, body=body,
+                    client_nonce_b64=client_nonce, timestamp_ms=timestamp_ms, now_ms=timestamp_ms,
+                )
+            if attempt.challenge_id is None:
+                response = self.transport.post(
+                    attempt.start_path, headers=dict(attempt.start_headers), body=attempt.start_body,
+                )
+                status, payload = self._resync_answer(response)
+                if self._authority_rejected(status, payload):
+                    # A refused retransmission means the server holds no usable challenge for it.
+                    self.runtime.discard_resync_attempt(attempt)
+                    attempt = None
+                    continue
+                if status == 429 and isinstance(payload, dict) and payload.get("code") == "runner_resync_rate_limited":
+                    self.runtime.discard_resync_attempt(attempt)
+                    raise RunnerChainRecoveryDeferred(self._retry_after_ms(payload))
+                try:
+                    data = self._response_data(
+                        response, "heel.runner-resync-challenge.v2",
+                        {"schema_version", "challenge_id", "chain", "server_challenge_b64",
+                         "next_sequence", "expires_at_ms", "generation"},
+                    )
+                    cursor = self.runtime.load_chain("claim", None)
+                    challenge_id = data["challenge_id"]
+                    if (
+                        data["chain"] != {"operation": "claim", "run_id": None}
+                        or not self._b64_32(data["server_challenge_b64"])
+                        or type(challenge_id) is not str or len(challenge_id) != 36
+                        or not challenge_id.startswith("rrs_")
+                        or any(char not in "0123456789abcdef" for char in challenge_id[4:])
+                        or not self._positive_int(data["next_sequence"])
+                        or not self._positive_int(data["expires_at_ms"])
+                        or not self._generation(data["generation"])
+                        or cursor is None or data["generation"] < cursor.generation
+                    ):
+                        raise ValueError
+                except ValueError:
+                    self.runtime.discard_resync_attempt(attempt)
+                    raise ValueError("invalid runner resync challenge") from None
+                attempt = self.runtime.record_resync_challenge(
+                    attempt, challenge_id=challenge_id, server_challenge_b64=data["server_challenge_b64"],
+                    next_sequence=data["next_sequence"], generation=data["generation"],
+                    expires_at_ms=data["expires_at_ms"], now_ms=self._timestamp(),
+                )
+            if attempt.complete_body is None:
+                body = canonical_bytes({
+                    "schema_version": "heel.runner-resync-complete.v2",
+                    "challenge_id": attempt.challenge_id,
+                    "chain": {"operation": "claim", "run_id": None},
+                    "client_nonce_b64": attempt.client_nonce_b64,
+                    "server_challenge_b64": attempt.server_challenge_b64,
+                    "generation": attempt.challenge_generation,
+                })
+                path, headers, timestamp_ms = self._signed_resync_request("complete", body)
+                attempt = self.runtime.record_resync_completion(
+                    attempt, path=path, headers=headers, body=body, timestamp_ms=timestamp_ms,
+                    now_ms=timestamp_ms,
+                )
+            assert attempt.complete_path is not None and attempt.complete_headers is not None
+            response = self.transport.post(
+                attempt.complete_path, headers=dict(attempt.complete_headers), body=attempt.complete_body,
+            )
+            status, payload = self._resync_answer(response)
+            if self._authority_rejected(status, payload):
+                # Expired, already-invalidated or refused challenge: never an accepted resync.
+                self.runtime.discard_resync_attempt(attempt)
+                attempt = None
+                continue
+            try:
+                data = self._response_data(
+                    response, "heel.runner-resync-completed.v2",
+                    {"schema_version", "chain", "next_sequence", "next_nonce_b64",
+                     "expires_at_ms", "generation"},
+                )
+                if (
+                    data["chain"] != {"operation": "claim", "run_id": None}
+                    or not self._b64_32(data["next_nonce_b64"])
+                    or not self._positive_int(data["next_sequence"])
+                    or not self._positive_int(data["expires_at_ms"])
+                    or not self._generation(data["generation"])
+                    or data["generation"] != attempt.challenge_generation + 1
+                    or data["next_sequence"] < attempt.challenge_next_sequence
+                ):
+                    raise ValueError
+            except ValueError:
+                self.runtime.discard_resync_attempt(attempt)
+                raise ValueError("invalid runner resync completion") from None
+            with self._state_lock:
+                before = self._chains.get("claim")
+            try:
+                cursor = self.runtime.commit_resync_supersession(
+                    attempt, failed, next_nonce_b64=data["next_nonce_b64"],
+                    next_sequence=data["next_sequence"], generation=data["generation"],
+                    now_ms=self._timestamp(),
+                )
+            except RuntimeClaimSequenceConsumed:
+                # The server consumed the staged claim's sequence: a claimed run may exist there.
+                # Keep the call, install nothing; the completed attempt stays retransmittable.
+                raise RunnerChainRecoveryRequired("claim", "claim_sequence_consumed") from None
+            with self._state_lock:
+                if self._chains.get("claim") != before:
+                    raise RunnerRuntimeCorrupt("runner control claim chain changed during recovery")
+                self._chains["claim"] = (cursor.next_nonce_b64, cursor.next_sequence, cursor.generation)
+            return
+
+    @staticmethod
+    def _resync_answer(response: object) -> tuple[int | None, object]:
+        if (
+            isinstance(response, tuple) and len(response) == 3
+            and not isinstance(response[0], bool) and isinstance(response[0], int)
+        ):
+            return response[0], response[2]
+        return None, None
 
     def start_resync(self, *, operation: str, run_id: str | None = None) -> PendingRunnerResync:
         self._validate_chain(operation, run_id)
