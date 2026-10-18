@@ -67,6 +67,16 @@ export HEEL_HOME="$PWD/.heel"
    Profiles are `bearer`, `x_api_key` and `cookie_jar`; both credentials must use the same
    one. Backends are `ephemeral-env`, `ephemeral-fd`, `keychain` and `secret-service`.
 
+   Optional for this standalone CLI, required for the self-serve (Heel Cloud) path:
+   `--plan-label <your name for the plan>`, for example `--plan-label free` on `lower_plan`
+   and `--plan-label pro` on `higher_plan`. The plan label is your own word, 1–32 printable
+   ASCII characters, no leading or trailing space, and different between the two roles; it
+   is not a closed list and Heel never infers it from responses. Unlike `--label`, the plan
+   label is public and is printed back with its role; the secret never is. Credentials
+   registered without it keep working here; `heel runner status` then reports
+   `access.incomplete` with reason `plan_label_missing` (or `credential_missing`) and the
+   exact command to run.
+
 4. Import the route inventory from your OpenAPI document. Only `GET` and `HEAD` operations
    are kept.
 
@@ -244,6 +254,44 @@ request.
   `$HEEL_HOME/plan-runs/<attempt>/`, with both credentials replaced by
   `[REDACTED:secret]`. The report at `report_path` holds references only. Nothing is
   uploaded.
+
+## Pairing with Heel Cloud (`pair`, `status`, `unpair`)
+
+```sh
+heel runner pair --origin https://<heel origin> --invite <one-time invitation>
+heel runner status            # live check over the claim chain; --offline skips it
+heel runner unpair
+```
+
+`pair` uses the existing ceremony: the dashboard's one-time invitation (10 minutes) →
+exchange → the runner prints six words and a key fingerprint → the owner compares both in
+the browser and approves → the runner activates and prints `"state": "active"`. Output is
+JSON lines; failures print one fixed line `Heel runner pairing failed: <reason>.` and never
+echo the invitation, responses or keys. A reused, expired or unknown invitation reports
+`invitation_rejected`; an unapproved pairing reports `approval_timeout` (run `unpair`, then
+pair with a new invitation).
+
+- The Ed25519 key seed is generated into and kept only in macOS Keychain or the Linux
+  secret service (`secret-tool`). Without either, `pair` fails with
+  `no supported runner OS secret service`; there is no file fallback and no flag or
+  variable that selects another store.
+- `$HEEL_HOME/runner-daemon/pairing.json` holds public coordinates only: the pinned origin,
+  the random installation ID naming the secret-store account, and the cloud-assigned IDs.
+  The signed pairing journal, paired identity and claim cursor are the existing runner
+  store and runtime records.
+- Control traffic goes only to the `--origin` given at pairing: `https://` only, exact
+  pathless lowercase origin, system trust with TLS 1.2 or newer and hostname checks, no
+  redirects, no proxies, at most 256 KiB of JSON per response, one 30-second deadline per
+  call. There is no CA-bundle flag or variable (the same `SSL_CERT_FILE` caveat below
+  applies).
+- `status` reports `active`, `offline` (control plane unreachable), `runner_revoked` (the
+  control plane rejects the runner key), `pairing_incomplete`, `local_identity_unavailable`
+  or `unpaired`, plus the self-serve access state. `unpair` refuses while a context binding
+  is installed; it removes the local identity and the OS-stored seed but cannot revoke the
+  runner in Heel Cloud — revoke it in the dashboard. Known gap: the control plane's
+  `DELETE …/runners/{id}` route currently rejects every request (a DELETE body is refused
+  by request framing, and the handler requires one); it is tracked for a server-side repair.
+- There is no `serve` loop yet; pairing alone authorizes no target traffic.
 
 ## Trust boundary
 

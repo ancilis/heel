@@ -28,6 +28,8 @@ _LINUX_SECRET_TOOL_PATH = "/usr/bin/secret-tool"
 _LINUX_SECRET_TOOL_ALLOWLIST = frozenset({_LINUX_SECRET_TOOL_PATH})
 _SECRET_HELPER_TIMEOUT_SECONDS = 5
 _MAX_SECRET_HELPER_OUTPUT_BYTES = 1024
+# One OS secret-store account per local pairing installation; never derived from a secret.
+RUNNER_PAIRING_SIGNER_LABEL_PREFIX = "heel-runner-pairing-v1-"
 
 
 def _phrase_words() -> tuple[str, ...]:
@@ -58,6 +60,16 @@ def validate_pairing_phrase(value: object) -> str:
     if len(words) != 6 or any(word not in _RUNNER_PHRASE_WORDS for word in words):
         raise ValueError("invalid pairing phrase")
     return value
+
+
+def runner_pairing_signer_label(installation_id: str) -> str:
+    """Return the OS secret-store label for one random 32-hex local pairing installation."""
+    if (
+        type(installation_id) is not str or len(installation_id) != 32
+        or any(char not in "0123456789abcdef" for char in installation_id)
+    ):
+        raise ValueError("invalid runner pairing installation ID")
+    return RUNNER_PAIRING_SIGNER_LABEL_PREFIX + installation_id
 
 
 class SecureSigner:

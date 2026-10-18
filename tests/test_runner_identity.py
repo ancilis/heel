@@ -296,3 +296,15 @@ def test_linux_helper_rejects_path_resolution_before_process_launch(
     with pytest.raises(RuntimeError, match="secret service unavailable"):
         backend.load("runner-linux")
     assert calls == []
+
+
+def test_pairing_signer_label_namespace_is_fixed_bounded_and_random_id_only():
+    from heel.runner.identity import RUNNER_PAIRING_SIGNER_LABEL_PREFIX, runner_pairing_signer_label
+
+    label = runner_pairing_signer_label("0123456789abcdef0123456789abcdef")
+    assert label == RUNNER_PAIRING_SIGNER_LABEL_PREFIX + "0123456789abcdef0123456789abcdef"
+    assert len(label) <= 128 and SystemSecureSigner._label(label) == label
+    for bad in ("", "0" * 31, "0" * 33, "0123456789ABCDEF0123456789abcdef", "g" * 32, None, b"0" * 32,
+                "../" + "0" * 29, "0" * 31 + "\x00"):
+        with pytest.raises(ValueError):
+            runner_pairing_signer_label(bad)
