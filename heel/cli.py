@@ -40,6 +40,7 @@ _SAFE_RUNNER_CREDENTIAL_FAILURE = "Heel runner credential could not be stored sa
 _SAFE_RUNNER_MAPPING_FAILURE = "Heel runner mapping could not be saved safely."
 _SAFE_RUNNER_LIVE_FAILURE = "Heel runner live preparation is unavailable."
 _SAFE_RUNNER_COMMAND_FAILURE = "Heel runner command was rejected."
+_SAFE_RUNNER_PAIRING_FAILURE = "Heel runner pairing failed: {}."
 _OPENAPI_READ_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
@@ -219,6 +220,52 @@ def _runner_credential_add(args) -> int:
         printed["plan_label"] = record["plan_label"]
         printed["role"] = record["semantic_role"]
     print(json.dumps(printed, sort_keys=True))
+    return 0
+
+
+def _runner_pairing_failure(error: Exception) -> int:
+    from .runner.daemon import RunnerPairingError
+
+    code = error.code if isinstance(error, RunnerPairingError) else "local_state_invalid"
+    if code == "no_supported_secret_service":
+        print(_SAFE_RUNNER_PAIRING_FAILURE.format("no supported runner OS secret service"), file=sys.stderr)
+    else:
+        print(_SAFE_RUNNER_PAIRING_FAILURE.format(code), file=sys.stderr)
+    return 2
+
+
+def _runner_pair(args) -> int:
+    from .runner.daemon import RunnerDaemon
+
+    def emit(event: dict) -> None:
+        print(json.dumps(event, sort_keys=True), flush=True)
+
+    try:
+        RunnerDaemon().pair(args.origin, args.invite, display_name=args.name, emit=emit)
+    except Exception as error:
+        return _runner_pairing_failure(error)
+    return 0
+
+
+def _runner_status(args) -> int:
+    from .runner.daemon import RunnerDaemon
+
+    try:
+        status = RunnerDaemon().status(check_control_plane=not args.offline)
+    except Exception as error:
+        return _runner_pairing_failure(error)
+    print(json.dumps(status, sort_keys=True))
+    return 0 if status["state"] == "active" else 1
+
+
+def _runner_unpair(_args) -> int:
+    from .runner.daemon import RunnerDaemon
+
+    try:
+        result = RunnerDaemon().unpair()
+    except Exception as error:
+        return _runner_pairing_failure(error)
+    print(json.dumps(result, sort_keys=True))
     return 0
 
 
@@ -1068,6 +1115,21 @@ def main(argv=None):
     runner_sub = runner.add_subparsers(
         dest="runnercmd", required=True, parser_class=_RunnerArgumentParser,
     )
+    runner_pair = runner_sub.add_parser(
+        "pair", help="pair this machine with Heel Cloud using a one-time invitation",
+    )
+    runner_pair.add_argument("--origin", required=True, help="exact https:// Heel Cloud origin")
+    runner_pair.add_argument("--invite", required=True, help="one-time invitation from the dashboard")
+    runner_pair.add_argument("--name", help="display name shown to the approving owner")
+    runner_status = runner_sub.add_parser(
+        "status", help="show the paired runner and confirm it with the control plane",
+    )
+    runner_status.add_argument(
+        "--offline", action="store_true", help="report local state without contacting the control plane",
+    )
+    runner_sub.add_parser(
+        "unpair", help="forget the local runner identity and remove its OS-stored key",
+    )
     runner_import = runner_sub.add_parser(
         "import-openapi", help="import only a minimized local GET/HEAD route inventory",
     )
@@ -1304,6 +1366,12 @@ def main(argv=None):
             print("Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage.", file=sys.stderr)
             return 2
     if args.cmd == "runner":
+        if args.runnercmd == "pair":
+            return _runner_pair(args)
+        if args.runnercmd == "status":
+            return _runner_status(args)
+        if args.runnercmd == "unpair":
+            return _runner_unpair(args)
         if args.runnercmd == "import-openapi":
             return _runner_import_openapi(args.path)
         if args.runnercmd == "credential" and args.runnercredentialcmd == "add":
