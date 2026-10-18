@@ -25,7 +25,12 @@ execution requirement that Kevin clarified during R4 (canonical text in
 `.git/self-serve-launch/CUSTOMER-EXECUTION-REQUIREMENT.md`), and the matching owner/gate
 updates in §12, §13 and §14. It is a clarification of the existing goal, not new scope: it
 does not add write operations, and it does not require access to any real customer's secrets
-now. No product code changed in this revision. Evidence: `sessions/R4R-closing.md`.
+now. No product code changed in this revision. Evidence: `sessions/R4R-closing.md`. Second
+R4R docs commit: resolves Astra's four consistency comments
+(`sessions/R4R-spec-clarification-review.md`): dependency order of the T2b/T3/T4 gates, the
+distinction between a deterministic real synthetic SaaS and mocked runner-side seams, production
+target/transport/scope rules for any test target, and explicit recorded operator authorization
+rather than a new paperwork gate.
 
 ---
 
@@ -595,8 +600,11 @@ unrelated user's verified staging SaaS, and the final acceptance MUST prove it:
    special case.
 2. **Findings come from observed responses.** An `observed` or `verified` finding MUST be
    derived from the responses the runner actually received from the target. Findings declared
-   in input, canned results, scripted or mocked target responses, replayed fixtures and
-   simulated executors cannot produce one.
+   in input, canned runner findings, mocked or stubbed runner transports, runner-side scripted
+   responders standing in for the target, replayed response fixtures and simulated executors
+   cannot produce one. A real target application that deterministically returns the same data
+   from its own HTTP business logic is fine, and is what the synthetic acceptance SaaS is; what
+   matters is that the runner actually requested it and evaluated what came back.
 3. **What cannot satisfy this gate** (they MAY remain shipped, separately and truthfully
    labeled, §14): the abuse simulator (`heel run`), control simulation (`heel controls
    simulate`), static OpenAPI review, the cloud `synthetic` run kind
@@ -609,9 +617,14 @@ unrelated user's verified staging SaaS, and the final acceptance MUST prove it:
    a live HTTP(S) server the team controls, reached through exactly the public execution path
    of item 1. Nothing in product code may recognise it: the T8 reviewer MUST read the product
    diff for target-host, fixture or demo conditionals and MUST confirm that a second target
-   with a different host, inventory shape and credentials follows the same code (a loopback
-   target started for that purpose is acceptable for the second run; it is not the acceptance
-   target).
+   with a different host, inventory shape and credentials follows the same code. That second
+   target MAY be a team-run HTTPS application started for the purpose; it is not the acceptance
+   target. Every target in every gate, test or acceptance run obeys the existing production
+   target, transport and scope rules (verified origin, TLS, host pinning, no redirects, GET/HEAD,
+   signed scope, reserved attempt): no HTTP downgrade, no loopback or private-address allowlist
+   bypass, no relaxed transport. Automated tests MAY use the existing explicit test seams (the
+   TLS edge harness with its ephemeral CA bundle, an injected secret backend) and MUST label them
+   as seams in the test and in the review; final acceptance (T8) MUST NOT rely on any test seam.
 5. **Required evidence, captured by the T8 reviewer, all CONFIRMED-tagged:**
    - target-side request receipt (the target's own access log or request capture) for each
      executed route, correlated to the signed scope id, the reserved one-shot attempt id and
@@ -626,9 +639,11 @@ unrelated user's verified staging SaaS, and the final acceptance MUST prove it:
    the runner machine (§10 rows 4–5); signed scope and one-shot attempt reservation per
    request (§10 row 3); workspace isolation, revocation and fail-closed behaviour (§10 rows
    7–12); every exclusion in §14. This requirement adds no write operation and no production
-   attack traffic. Testing a real customer's target still requires that customer's written
-   authorization and their own locally stored credentials; nobody asks for those secrets
-   before that task exists.
+   attack traffic. Testing a real customer's target still requires that operator's explicit,
+   recorded authorization, which the product already captures as verified-environment ownership
+   proof plus the operator's Approve of the plan (§7.2, §11 steps 2 and 9), and their own locally
+   stored credentials; this adds no new approval or legal gate, and nobody asks for those
+   secrets before that task exists.
 
 **Current state at `c749d34` (R4R audit; CONFIRMED by `sessions/R4R-closing.md` §5).**
 Kevin's "currently simulation only" is the motivation, not a code fact, so the audit
@@ -656,11 +671,11 @@ distinguishes implemented foundations from the product bridge:
 
 | Owner | Added obligation | Gate addition (green before its Fable review) |
 |---|---|---|
-| T2b design (next fresh Fable session, before any T2b code) | design the `serve` loop so that a cloud-granted plan is executed by the same `TargetHTTPSClient`/executor path as the CLI, with request receipts observable on the target; carry the credential-before-binding cycle and the plan-label report (§7.5) into the design; re-split T3/T4 | design review names the exact code path from browser Approve to the first target request and the exact evidence surfaces for item 5 |
-| T2b implementation | `heel runner serve` executes a granted plan against a real loopback HTTP target started by the test (not a scripted responder) | a test asserts target-side receipt of each route with the attempt id, plus `test_runner_serve_stops_within_deadline_on_revoke` and `test_runner_serve_offline_shows_offline_state_and_resumes` |
+| T2b design (next fresh Fable session, before any T2b code) | design the `serve` loop (§12 T2b scope: heartbeat, binding claim, offline/resume, stop/revoke) **and stage** how the cloud-granted plan will later be executed by the same `TargetHTTPSClient`/executor path as the CLI, with request receipts observable on the target; carry the credential-before-binding cycle, the plan-label report (§7.5), R-B quota distinguishability and R-C invitation recovery into the design; confirm or re-split T3/T4 | design review names the exact code path from browser Approve to the first target request, which task lands each segment of it, and the exact evidence surfaces for item 5. It assigns no gate that its task cannot meet |
+| T2b implementation | `serve` loop over the real server as §12 T2b already states; **no target execution proof is required or accepted here** because grant binding (T3) and the execution bridge (T4) do not exist yet. A grant, inventory or plan fabricated or mocked for a T2b test MUST NOT be presented as journey readiness | §12 T2b gate unchanged: `test_runner_serve_stops_within_deadline_on_revoke`, `test_runner_serve_offline_shows_offline_state_and_resumes`, outage/resume over the harness |
 | T3 | inventory and grant carry the user's own imported routes, unchanged, to the runner | mismatch tests of §12 T3 plus a test that an arbitrary second inventory shape binds without a code change |
-| T4 | execution and result projection from observed responses only | the result-projection test derives the verdict from captured response digests; no finding may be injected by the projection, the dashboard or a fixture |
-| T5 | regression replay reaches the real target again | replay test against a patched loopback target shows `fail/still_reachable` → `pass/blocked` |
+| T4 (first target execution proof) | execution of a cloud-granted plan through the released executor path against a real HTTPS target application run by the test under production target/transport/scope rules (item 4), and result projection from observed responses only | a test asserts target-side receipt of each executed route correlated with the attempt id and the grant; the result-projection test derives the verdict from captured response digests; no finding may be injected by the projection, the dashboard or a fixture |
+| T5 | regression replay reaches the real target again | replay test against the same kind of real HTTPS target, patched between runs, shows `fail/still_reachable` → `pass/blocked` |
 | T6 | product copy MUST NOT claim live execution before T8 PASS; simulation and static features stay labeled as such | copy contract tests |
 | T7 | the install line in §11 step 4 is the only runner installation used in T8 | wheel digest equals the manifest on `/agent` |
 | T8 | the clean-room run per §11 and this subsection | all item 5 evidence captured; FAIL otherwise |
