@@ -38,6 +38,7 @@ from heel.runner.identity import (
     RUNNER_PAIRING_SIGNER_LABEL_PREFIX, LinuxSecretServiceBackend, MacOSKeychainSecretBackend,
 )
 from heel.runner.store import RunnerStore
+from heel.saas.tenancy import hash_api_key
 from tests.support.edge_tls_harness import (
     EdgeTLSHarness, EphemeralCA, ScriptedTLSServer, raw_json_response,
 )
@@ -365,6 +366,84 @@ def test_http_runner_revoke_retries_and_other_workspaces_have_no_effect(tmp_path
     assert result["state"] == "unpaired" and result["removed"] is True
     assert backend.values == {} and backend.deleted == [label]
     assert _daemon(home, harness, backend).status() == {"state": "unpaired"}
+
+
+def _session_revoked_at(harness, cookie):
+    token = cookie.split("=", 1)[1]
+    (revoked_at,), = harness.control_plane.auth.conn.execute(
+        "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_api_key(token),),
+    ).fetchall()
+    return revoked_at
+
+
+def _runner_rows(harness, workspace_id):
+    return sorted(tuple(row) for row in harness.control_plane.store.conn.execute(
+        "SELECT runner_id, status FROM canary_runners WHERE workspace_id=?", (workspace_id,),
+    ))
+
+
+def test_edge_harness_logout_forwards_the_cookie_and_revokes_the_session(tmp_path, harness):
+    """Like the Worker, logout carries the session cookie upstream, so the session really ends."""
+    workspace_id, cookie = harness.signup_owner("owner-logout@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "runner")
+    status, _, _ = harness.request("GET", "/v1/me", cookie=cookie)
+    assert status == 200 and _session_revoked_at(harness, cookie) is None
+
+    status, body, set_cookie = harness.request("POST", "/v1/logout", {}, cookie=cookie)
+    assert (status, body) == (200, {"ok": True})
+    assert set_cookie == "heel_session=; Max-Age=0; Path=/"
+    assert harness.forwarded[-1] == ("POST", "/v1/logout")
+    assert _session_revoked_at(harness, cookie) is not None
+
+    # The old cookie is refused afterwards, for reads and for the owner's revoke ceremony.
+    assert harness.request("GET", "/v1/me", cookie=cookie)[0] == 401
+    revoke_path = f"/v1/workspaces/{workspace_id}/runners/{runner_id}/revoke"
+    assert harness.request("POST", revoke_path, REVOKE_BODY, cookie=cookie)[:2] == (
+        403, {"error": "a recent owner or admin browser session is required", "code": "recent_auth_required"})
+    assert ("POST", revoke_path) in harness.forwarded
+    assert _revocation_audit(harness, workspace_id, runner_id) == []
+    assert _daemon(home, harness, backend).status()["state"] == "active"
+
+
+def test_real_pair_revoke_unpair_and_fresh_invitation_pairs_again_over_tls(tmp_path, harness):
+    """Owner HTTP revocation frees the plan's runner slot, so a re-pair after unpair activates."""
+    workspace_id, cookie = harness.signup_owner("owner-repair@example.test")
+    other_workspace, other_cookie = harness.signup_owner("owner-repair-other@example.test")
+    other_home, other_backend, other_id = _pair_runner(tmp_path, harness, other_workspace, other_cookie, "other")
+    home, backend, first_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "runner")
+    (first_label,) = backend.values
+    assert _daemon(home, harness, backend).status()["control_plane"]["state"] == "confirmed"
+
+    revoke_path = f"/v1/workspaces/{workspace_id}/runners/{first_id}/revoke"
+    assert harness.request("POST", revoke_path, REVOKE_BODY, cookie=cookie)[:2] == (
+        200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
+    assert ("POST", revoke_path) in harness.forwarded
+    assert _daemon(home, harness, backend).status()["state"] == "runner_revoked"
+    result = _daemon(home, harness, backend).unpair()
+    assert result["state"] == "unpaired" and result["removed"] is True
+    assert backend.values == {} and backend.deleted == [first_label]
+
+    # A fresh invitation pairs the same home again through the full exchange/approve/activate
+    # flow; activation is not refused by the runner quota because the old row is revoked.
+    events, outcome = _pair_with_owner_approval(
+        harness, _daemon(home, harness, backend), workspace_id, cookie, _invite(harness, workspace_id, cookie),
+    )
+    assert "error" not in outcome, outcome
+    assert [event["event"] for event in events] == ["pairing_pending", "paired"]
+    second_id = outcome["result"]["runner_id"]
+    assert outcome["result"]["state"] == "active" and second_id != first_id
+    assert ("POST", f"/v1/runner-pairings/{events[0]['pairing_id']}/activate") in harness.forwarded
+    (second_label,) = backend.values
+    assert second_label != first_label
+    status = _daemon(home, harness, backend).status()
+    assert status["state"] == "active" and status["runner_id"] == second_id
+    assert status["control_plane"]["state"] == "confirmed"
+    assert _runner_rows(harness, workspace_id) == sorted([(first_id, "revoked"), (second_id, "active")])
+
+    # The bystander in another workspace was never touched.
+    assert _daemon(other_home, harness, other_backend).status()["state"] == "active"
+    assert _runner_rows(harness, other_workspace) == [(other_id, "active")]
+    assert _revocation_audit(harness, other_workspace, other_id) == []
 
 
 def test_runner_pair_cli_refuses_reused_invitation_and_wrong_origin(tmp_path, harness, monkeypatch):
