@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -228,6 +229,27 @@ def _run_bounded_secret_helper(
     return subprocess.CompletedProcess(argv, returncode, bytes(retained), None)
 
 
+# ``security add-generic-password -w`` without a value prompts twice and reads stdin line-wise
+# through a 128-byte password buffer: one value on stdin stores an EMPTY item with exit 0, and a
+# longer value is silently truncated. ``security -i`` (documented interactive mode) instead reads
+# one command per stdin line, so the value never reaches argv. Its line buffer is about 4 KiB: a
+# longer line is cut, stores a truncated value and the rest is parsed as further commands. Every
+# token is therefore restricted to a tokenizer-inert alphabet and the line is length-capped here.
+_SECURITY_INTERACTIVE_TOKEN = re.compile(r"^(?!-)[A-Za-z0-9+/=_.:-]{1,3200}$", flags=re.ASCII)
+SECURITY_INTERACTIVE_MAX_LINE_BYTES = 3584
+
+
+def security_interactive_add_command(service: str, account: str, value: bytes) -> bytes:
+    """Return one ``security -i`` stdin line that adds a generic password without ``-U``."""
+    tokens = (service, account, value.decode("ascii") if isinstance(value, bytes) else value)
+    if any(type(token) is not str or _SECURITY_INTERACTIVE_TOKEN.fullmatch(token) is None for token in tokens):
+        raise ValueError("invalid keychain command token")
+    line = f"add-generic-password -s {tokens[0]} -a {tokens[1]} -w {tokens[2]}\n".encode("ascii")
+    if len(line) > SECURITY_INTERACTIVE_MAX_LINE_BYTES:
+        raise ValueError("keychain command exceeds the interactive line limit")
+    return line
+
+
 def _run_bounded_security(
     arguments: tuple[str, ...], *, payload: bytes | None, popen: Callable[..., object],
 ) -> subprocess.CompletedProcess:
@@ -271,19 +293,42 @@ class MacOSKeychainSecretBackend:
             seed = base64.b64decode(result.stdout.strip(), validate=True)
         except (TypeError, ValueError):
             raise RuntimeError("runner OS secret service returned invalid material") from None
+        if len(seed) != 32:
+            # Includes the empty items earlier releases stored; they are reported, never rewritten.
+            raise RuntimeError("runner OS secret service returned invalid material")
         return seed
 
     def store(self, label: str, seed: bytes) -> None:
         label = self._label(label)
         if not isinstance(seed, bytes) or len(seed) != 32:
             raise RuntimeError("runner OS secret service returned invalid material")
-        encoded = base64.b64encode(seed)
+        try:
+            command = security_interactive_add_command(self.service, label, base64.b64encode(seed))
+        except ValueError:
+            raise ValueError("invalid runner signing label") from None
+        result = _run_bounded_security(("-i",), payload=command, popen=self._popen)
+        if result.returncode != 0:
+            raise RuntimeError("runner OS secret service unavailable")
+        # Exit 0 created this item; keep it only when it reads back as exactly this seed.
+        try:
+            stored = self.load(label)
+        except RuntimeError:
+            stored = None
+        if stored != seed:
+            try:
+                self.delete(label)
+            except RuntimeError:
+                pass
+            raise RuntimeError("runner OS secret service unavailable")
+
+    def delete(self, label: str) -> None:
+        """Remove one item; a missing item is already removed."""
         result = _run_bounded_security(
-            ("add-generic-password", "-s", self.service, "-a", label, "-w"),
-            payload=encoded,
+            ("delete-generic-password", "-s", self.service, "-a", self._label(label)),
+            payload=None,
             popen=self._popen,
         )
-        if result.returncode != 0:
+        if result.returncode not in (0, 44):
             raise RuntimeError("runner OS secret service unavailable")
 
 

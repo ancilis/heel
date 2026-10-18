@@ -7213,6 +7213,13 @@ class RunnerStore:
                 if vault.exists(handle_id):
                     self.activate_credential(handle_id)
                 else:
+                    if record["backend"] == "macos_keychain":
+                        # A Keychain store interrupted before its header commit leaves chunk
+                        # items under this handle; sweep them, or keep the record to retry.
+                        try:
+                            vault.delete(handle_id)
+                        except Exception:
+                            continue
                     self._set_credential_state(handle_id, None)
             else:
                 try:

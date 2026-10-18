@@ -67,6 +67,19 @@ export HEEL_HOME="$PWD/.heel"
    Profiles are `bearer`, `x_api_key` and `cookie_jar`; both credentials must use the same
    one. Backends are `ephemeral-env`, `ephemeral-fd`, `keychain` and `secret-service`.
 
+   macOS `keychain` stores a credential (up to 16 KiB) as format v2 under the Keychain service
+   `heel.runner.canary.v2`: base64 chunk items `<handle>.0`…`<handle>.7` (at most 3072
+   characters each) committed by a header item `<handle>` written last and read back before
+   the credential is used. Each item is written with one `security -i` command on standard
+   input, never in process arguments, because `/usr/bin/security` keeps at most 128 bytes of a
+   prompted password and cuts `security -i` lines longer than 4095 bytes. Earlier releases wrote
+   `heel.runner.canary.v1` items through the prompted form, which stored them **empty**: Heel
+   reads such an item as `secure credential is empty; remove it and add it again` and never
+   rewrites it; a non-empty v1 item is still read unchanged. A store interrupted before its
+   header leaves chunk items that are not a credential; the next credential recovery deletes
+   them (and retries later if the Keychain refuses), and removing a credential deletes the
+   header, all eight chunk slots and any v1 item.
+
    Optional for this standalone CLI, required for the self-serve (Heel Cloud) path:
    `--plan-label <your name for the plan>`, for example `--plan-label free` on `lower_plan`
    and `--plan-label pro` on `higher_plan`. The plan label is your own word, 1–32 printable
@@ -275,6 +288,13 @@ pair with a new invitation).
   secret service (`secret-tool`). Without either, `pair` fails with
   `no supported runner OS secret service`; there is no file fallback and no flag or
   variable that selects another store.
+- On macOS the seed is written with one `security -i` command on standard input (never in
+  process arguments) and is kept only after it reads back as exactly the generated seed;
+  otherwise the new item is deleted and `pair` fails closed. Earlier releases stored an
+  **empty** Keychain item (the prompted `security … -w` form reads its value twice); such an
+  item is reported as `local_identity_unavailable` or `no supported runner OS secret service`
+  and is never rewritten. Recover with `heel runner unpair` (it deletes the item) and pair
+  again with a new invitation.
 - `$HEEL_HOME/runner-daemon/pairing.json` holds public coordinates only: the pinned origin,
   the random installation ID naming the secret-store account, and the cloud-assigned IDs.
   The signed pairing journal, paired identity and claim cursor are the existing runner
