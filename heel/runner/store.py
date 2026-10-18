@@ -345,6 +345,34 @@ def _label(value: object) -> str:
     return normalized
 
 
+PLAN_LABEL_ROLES = frozenset({"lower_plan", "higher_plan"})
+
+
+def _plan_label(value: object) -> str:
+    """Validate an operator-chosen plan label (e.g. ``free``); it is a name, never a rule."""
+    if (
+        type(value) is not str or not 1 <= len(value) <= 32
+        or any(not 0x20 <= ord(char) <= 0x7E for char in value)
+        or value != value.strip(" ")
+    ):
+        raise ValueError("plan label must be 1-32 printable ASCII characters")
+    return value
+
+
+def _assert_plan_label_distinct(
+    records: list[dict[str, Any]], semantic_role: str, plan_label: str | None,
+) -> None:
+    if plan_label is None:
+        return
+    if semantic_role not in PLAN_LABEL_ROLES:
+        raise ValueError("plan labels apply only to lower_plan and higher_plan")
+    if any(
+        item.get("plan_label") == plan_label and item["semantic_role"] != semantic_role
+        for item in records
+    ):
+        raise ValueError("plan labels must differ between plan roles")
+
+
 def _handle(value: object) -> str:
     if type(value) is not str or _HANDLE.fullmatch(value) is None:
         raise ValueError("invalid credential handle")
@@ -774,7 +802,8 @@ def _credential_record(value: Any) -> dict[str, Any]:
         "credential_handle_id", "semantic_role", "auth_profile", "label",
         "backend", "source_kind", "state",
     }
-    if not isinstance(value, Mapping) or set(value) != fields:
+    # Records written before plan labels existed stay valid; the label is optional.
+    if not isinstance(value, Mapping) or set(value) not in (fields, fields | {"plan_label"}):
         raise RunnerStoreError("invalid credential metadata")
     role = value["semantic_role"]
     profile = value["auth_profile"]
@@ -794,7 +823,7 @@ def _credential_record(value: Any) -> dict[str, Any]:
     )
     if source_kind != expected_source:
         raise RunnerStoreError("invalid credential source convention")
-    return {
+    record = {
         "credential_handle_id": _handle(value["credential_handle_id"]),
         "semantic_role": role,
         "auth_profile": profile,
@@ -803,6 +832,14 @@ def _credential_record(value: Any) -> dict[str, Any]:
         "source_kind": source_kind,
         "state": state,
     }
+    if "plan_label" in value:
+        if role not in PLAN_LABEL_ROLES:
+            raise RunnerStoreError("invalid credential plan label")
+        try:
+            record["plan_label"] = _plan_label(value["plan_label"])
+        except ValueError:
+            raise RunnerStoreError("invalid credential plan label") from None
+    return record
 
 
 def _route_record(value: Any, *, require_canonical: bool) -> dict[str, Any]:
@@ -7012,8 +7049,9 @@ class RunnerStore:
     def _new_credential(
         *, semantic_role: str, auth_profile: str, label: str,
         backend: str, source_kind: str | None, state: str,
+        plan_label: str | None = None,
     ) -> dict[str, Any]:
-        return _credential_record({
+        value = {
             "credential_handle_id": secrets.token_hex(16),
             "semantic_role": semantic_role,
             "auth_profile": auth_profile,
@@ -7021,7 +7059,12 @@ class RunnerStore:
             "backend": backend,
             "source_kind": source_kind,
             "state": state,
-        })
+        }
+        if plan_label is not None:
+            if semantic_role not in PLAN_LABEL_ROLES:
+                raise ValueError("plan labels apply only to lower_plan and higher_plan")
+            value["plan_label"] = _plan_label(plan_label)
+        return _credential_record(value)
 
     def register_ephemeral_credential(
         self,
@@ -7030,18 +7073,20 @@ class RunnerStore:
         auth_profile: str,
         source_kind: str,
         label: str,
+        plan_label: str | None = None,
     ) -> dict[str, Any]:
         backend = {"environment": "ephemeral_env", "inherited_fd": "ephemeral_fd"}.get(source_kind)
         if backend is None:
             raise ValueError("ephemeral source must be environment or inherited_fd")
         record = self._new_credential(
             semantic_role=semantic_role, auth_profile=auth_profile, label=label,
-            backend=backend, source_kind=source_kind, state="active",
+            backend=backend, source_kind=source_kind, state="active", plan_label=plan_label,
         )
         with self._transaction(exclusive=True) as context_fd:
             records = self._credentials_locked(context_fd)
             if any(item["semantic_role"] == semantic_role for item in records):
                 raise ValueError("credential semantic role already registered")
+            _assert_plan_label_distinct(records, semantic_role, record.get("plan_label"))
             records.append(record)
             self._write_credentials_locked(context_fd, records)
         return record
@@ -7052,17 +7097,19 @@ class RunnerStore:
         auth_profile: str,
         label: str,
         backend: str,
+        plan_label: str | None = None,
     ) -> dict[str, Any]:
         if backend not in {"macos_keychain", "linux_secret_service"}:
             raise ValueError("invalid OS credential backend")
         record = self._new_credential(
             semantic_role=semantic_role, auth_profile=auth_profile, label=label,
-            backend=backend, source_kind=None, state="pending",
+            backend=backend, source_kind=None, state="pending", plan_label=plan_label,
         )
         with self._transaction(exclusive=True) as context_fd:
             records = self._credentials_locked(context_fd)
             if any(item["semantic_role"] == semantic_role for item in records):
                 raise ValueError("credential semantic role already registered")
+            _assert_plan_label_distinct(records, semantic_role, record.get("plan_label"))
             records.append(record)
             self._write_credentials_locked(context_fd, records)
         return record
@@ -7096,6 +7143,7 @@ class RunnerStore:
         label: str,
         vault: object,
         secret: bytes,
+        plan_label: str | None = None,
     ) -> dict[str, Any]:
         backend = getattr(vault, "backend_id", None)
         if backend not in {"macos_keychain", "linux_secret_service"}:
@@ -7107,12 +7155,14 @@ class RunnerStore:
             backend=backend,
             source_kind=None,
             state="pending",
+            plan_label=plan_label,
         )
         handle_id = record["credential_handle_id"]
         with self._transaction(exclusive=True) as context_fd:
             records = self._credentials_locked(context_fd)
             if any(item["semantic_role"] == semantic_role for item in records):
                 raise ValueError("credential semantic role already registered")
+            _assert_plan_label_distinct(records, semantic_role, record.get("plan_label"))
             records.append(record)
             self._write_credentials_locked(context_fd, records)
             attempted = False

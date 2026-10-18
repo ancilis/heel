@@ -154,3 +154,77 @@ def test_runner_parser_disables_abbreviations_and_never_reflects_secret_shaped_a
             "Heel runner credential could not be stored safely.\n",
         }
         assert marker not in error
+
+
+def test_credential_add_plan_label_is_printed_and_the_secret_never_is(tmp_path, monkeypatch):
+    home = tmp_path / "heel-home"
+    monkeypatch.setenv("HEEL_HOME", str(home))
+    bind_home(home)
+    secret = "private-plan-secret-0001"
+    monkeypatch.setenv("HEEL_PRIVATE_SECRET", secret)
+    code, output, error = invoke(
+        "runner", "credential", "add", "--role", "lower_plan", "--profile", "bearer",
+        "--label", "PRIVATE LOCAL LABEL", "--plan-label", "free", "--backend", "ephemeral-env",
+    )
+    assert (code, error) == (0, "")
+    printed = json.loads(output)
+    handle = printed["credential_handle"]
+    assert printed == {
+        "credential_handle": handle,
+        "credential_source": {"kind": "environment", "variable": "HEEL_RUNNER_CREDENTIAL_" + handle.upper()},
+        "plan_label": "free",
+        "registered_count": 1,
+        "role": "lower_plan",
+    }
+    assert secret not in output and "PRIVATE LOCAL LABEL" not in output
+    # Labels are the operator's own words, not a closed set; roles stay fixed.
+    code, output, error = invoke(
+        "runner", "credential", "add", "--role", "higher_plan", "--profile", "bearer",
+        "--label", "local", "--plan-label", "Team Plus 2026", "--backend", "ephemeral-env",
+    )
+    assert code == 0 and json.loads(output)["plan_label"] == "Team Plus 2026"
+    labels = {item["semantic_role"]: item["plan_label"] for item in RunnerStore(home).list_credentials()}
+    assert labels == {"lower_plan": "free", "higher_plan": "Team Plus 2026"}
+
+
+def test_credential_add_rejects_invalid_or_duplicate_plan_labels_without_echo(tmp_path, monkeypatch):
+    home = tmp_path / "heel-home"
+    monkeypatch.setenv("HEEL_HOME", str(home))
+    bind_home(home)
+    failure = "Heel runner credential could not be stored safely.\n"
+    for role, plan_label in (
+        ("lower_plan", "x" * 33), ("lower_plan", " free"), ("lower_plan", "free "), ("lower_plan", ""),
+        ("lower_plan", "frée"), ("lower_plan", "fr\tee"), ("authenticated", "free"),
+    ):
+        code, output, error = invoke(
+            "runner", "credential", "add", "--role", role, "--profile", "bearer",
+            "--label", "local", "--plan-label", plan_label, "--backend", "ephemeral-env",
+        )
+        assert (code, output, error) == (2, "", failure), (role, plan_label)
+    assert RunnerStore(home).list_credentials() == []
+    assert invoke(
+        "runner", "credential", "add", "--role", "lower_plan", "--profile", "bearer",
+        "--label", "local", "--plan-label", "pro", "--backend", "ephemeral-env",
+    )[0] == 0
+    code, output, error = invoke(
+        "runner", "credential", "add", "--role", "higher_plan", "--profile", "bearer",
+        "--label", "local", "--plan-label", "pro", "--backend", "ephemeral-env",
+    )
+    assert (code, output, error) == (2, "", failure)
+
+
+def test_legacy_credential_records_without_plan_label_stay_usable(tmp_path, monkeypatch):
+    home = tmp_path / "heel-home"
+    monkeypatch.setenv("HEEL_HOME", str(home))
+    bind_home(home)
+    code, output, _ = invoke(
+        "runner", "credential", "add", "--role", "lower_plan", "--profile", "bearer",
+        "--label", "free", "--backend", "ephemeral-env",
+    )
+    assert code == 0 and set(json.loads(output)) == {"credential_handle", "credential_source", "registered_count"}
+    (record,) = RunnerStore(home).list_credentials()
+    assert set(record) == {
+        "credential_handle_id", "semantic_role", "auth_profile", "label", "backend", "source_kind", "state",
+    }
+    # The on-disk record keeps the pre-T2a field set exactly.
+    assert "plan_label" not in next((home / "runner" / "contexts").rglob("credentials.json")).read_text()
