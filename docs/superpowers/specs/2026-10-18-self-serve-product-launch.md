@@ -14,6 +14,11 @@ checkout; names below refer to that directory.
 
 Normative words: **MUST**, **MUST NOT**, **MAY**.
 
+Revision T1R (2026-10-18, fresh Fable adversarial specification review): corrections to §1–§3,
+§6–§8, §10, §12, §13 and §15. The list of defects found, with evidence, is in
+`2026-10-18-self-serve-product-design-review.md` (same directory). T1R artifacts live in
+`.git/self-serve-launch/sessions/T1R-artifacts/`. No product code changed in either revision.
+
 ---
 
 ## 1. Baseline (captured before any tracked change)
@@ -37,7 +42,7 @@ branch's base, so hosted CI on Linux is green for exactly the audited tree.
 
 | Suite | Interpreter / tool | Result |
 |---|---|---|
-| `pytest -q tests` | Python 3.13.5, venv under `$HOME/.cache` | **1 failed, 1752 passed, 2 skipped, 36 warnings, 653 subtests passed** in 306 s; pytest exit 1 (`python-baseline-v2-py313.log`, full output `python-baseline-v2-py313-pytest-full.log`) |
+| `pytest -q tests` | Python 3.13.5, venv under `$HOME/.cache` | **1 failed, 1752 passed, 2 skipped, 36 warnings, 653 subtests passed** in 306 s; pytest exit 1 (`python-baseline-v2-py313.log`, full output `python-baseline-v2-py313-pytest-full.log`). This is the baseline of record; no later full rerun was performed (T1R), so no "clean full run" is claimed |
 | same | Python 3.13.5, venv under `/private/tmp` | 145 failed, 1608 passed, 2 skipped (`python-baseline-py313.log`) |
 | same | Python 3.11.13, venv under `/private/tmp` | 145 failed, 1608 passed, 2 skipped (`python-baseline-py311.log`) |
 | `run_demo.py` | 3.13 | exit 0, auth gate PASS |
@@ -53,12 +58,18 @@ identical on 26; confirmed only by the green PR #41 checks.
 
 ### 1.3 Existing failures, each diagnosed to an environment cause (no product change made)
 
-1. **145 runner runtime/stop failures under a `/tmp` venv.** `RunnerRuntimeCorrupt("runtime
-   state helper is unavailable")` from `heel/runner/runtime.py:853-891` (`_start_inode_guard`),
-   which refuses a `sys.executable` whose ancestor directory is world-writable; `/private/tmp`
-   is `drwxrwxrwt`. Re-running with the venv under `$HOME/.cache` removes all 145
-   (`python-baseline-py313-failure-diagnosis.log`, `python-baseline-v2-py313.log`). CI uses
-   `$RUNNER_TEMP`, which is not world-writable. CONFIRMED.
+1. **145 failures under a `/tmp` venv, 144 of them removed by relocating the venv.**
+   `RunnerRuntimeCorrupt("runtime state helper is unavailable")` from
+   `heel/runner/runtime.py:853-891` (`_start_inode_guard`) refuses a `sys.executable` whose
+   ancestor directory is world-writable; `/private/tmp` is `drwxrwxrwt`
+   (`python-baseline-py313-failure-diagnosis.log`, one reproduced failure). The `/tmp` run ended
+   145 failed / 1608 passed / 2 skipped; the `$HOME/.cache` run ended 1 failed / 1752 passed /
+   2 skipped (same 1755 tests), so **144** failures are attributable to the venv location and
+   **1** (item 2) persists in both. CONFIRMED by the two summary lines. The `/tmp` log lists only
+   39 of the 145 `FAILED` rows (32 `test_runner_runtime.py`, 7 `test_runner_stop.py`) because
+   the first wrapper piped pytest through `tail`; that all 144 are inode-guard failures is
+   INFERRED (confirming action: rerun the `/tmp` venv with `pytest -q -rf tests` and compare the
+   full list; not done, to avoid another full suite). CI uses `$RUNNER_TEMP`, not world-writable.
 2. **`test_demo_bench_is_fast_synthetic_benchmark`.** `make demo-bench` runs `python3` from
    PATH (`Makefile` `PY ?= python3`); macOS system Python 3.9.6 lacks `datetime.UTC` used at
    `scripts/demo_workflows.py:167`. With a 3.13 `python3` first on PATH the test and the whole
@@ -71,8 +82,12 @@ identical on 26; confirmed only by the green PR #41 checks.
    after a `| tail` pipeline. The v2 script captures the unpiped status (`pytest EXIT=1`). The
    original log is preserved unmodified.
 
-Net: **no product-attributable failure exists in the baseline.** The 2 skipped tests are not
-identified by `-q`; INFERRED harmless, confirmable with `pytest -rs`.
+Net: **no product-attributable failure exists in the baseline.** The 2 skipped tests are
+CONFIRMED (T1R, focused `pytest -q -rs` on the three modules that contain skip markers, same venv;
+`T1R-artifacts/focused-skip-reasons-py313.log`): `tests/test_open_core_release.py:1604`
+"clean source rebuild requires locally installed release tooling: setuptools, wheel" and
+`tests/test_open_core_release.py:1908` "optional integration requires importable
+build.__main__" — both environment tooling, neither product.
 
 ### 1.4 Environment facts that bound later work
 
@@ -82,6 +97,11 @@ identified by `-q`; INFERRED harmless, confirmable with `pytest -rs`.
 - Ancilis Brain `orient` returned no Heel-specific canonical memory (3 of 48 confirmed, none on
   Heel); `search_evidence` found only the Astra brief and the agent-first design. Nothing in this
   spec rests on canonical memory.
+- Evidence provenance (T1R): the cloud UI dev-server run of T1 (`vinext dev`, `local_review`
+  mode) left no artifact log; its observations below are INFERRED from the T1 closing report
+  (confirming action: rerun with the page responses captured to a log). The loopback API walk
+  is direct HTTP to the Python control plane; it is not a browser, not the Worker, not a deployed
+  origin. Nothing in §2 is browser end-to-end proof; only §11 produces that.
 
 ---
 
@@ -95,13 +115,13 @@ control-plane/v1/me` 503 fail-closed), the committed public wheel installed into
 
 | # | DoD step | Today | Evidence | Verdict |
 |---|---|---|---|---|
-| 1 | Visit public HTTPS | Worker app builds and renders; no public deployment of the full mode exists; the only live URL is owner-gated (401 anonymous) | T1D §A; `js-baseline.log` build | **missing (deploy)** |
-| 2 | Sign up / login via production auth | `POST /v1/signup` 201 with `__Host` session translation at the edge; login lockout, signup throttles, `X-Heel-Client-Key` required when edge-trusted | `http_api.py:1800-1835`, walk log | **works (API + UI)** |
-| 3 | Create/select workspace/project | signup creates org+workspace (free, catalog 2026-08-24); `POST …/projects` 201; dashboard auto-selects first project | walk log; `dashboard/page.tsx:60-80` | **works** |
-| 4 | Register/verify staging target | `POST …/environments` issues https-file or dns-txt challenge with exact ownership attestation; `check`/`revoke` routes; UI "Verify staging now" | `http_api.py:2730-2760`, `verification.py:224-311`, walk log (env_… pending) | **works** (real check needs a reachable public host) |
+| 1 | Visit public HTTPS | Worker app builds; this audit found no public deployment of the full mode (the one live URL found is owner-gated, 401 anonymous). Absence elsewhere is not proven: no provider credentials beyond Sites/Railway/GitHub were available (T1D §D) | T1D §A, §D; `js-baseline.log` build | **missing (deploy) as far as this audit could see** |
+| 2 | Sign up / login via production auth | `POST /v1/signup` 201 over loopback HTTP to the Python control plane; login lockout, signup throttles, `X-Heel-Client-Key` required when edge-trusted. The browser form path through the Worker was **not** exercised (dev server ran in `local_review`, where `/api/control-plane/v1/me` is 503) | `http_api.py:1800-1835`, walk log | **works (loopback API)**; browser/Worker path **untested** |
+| 3 | Create/select workspace/project | signup creates org+workspace (free, catalog 2026-08-24); `POST …/projects` 201 over loopback; dashboard auto-select is code-read only | walk log; `dashboard/page.tsx:60-80` | **works (loopback API)**; UI untested |
+| 4 | Register/verify staging target | `POST …/environments` issues the https-file or dns-txt challenge (201) with exact ownership attestation; `check`/`revoke` routes exist; UI copy "Verify staging now" exists. **Challenge issuance is not proof verification**: no `check` succeeded in this audit (needs a reachable public host). Verification logic is covered at unit level by `test_verified_environments.py` (67 collected) | `http_api.py:2730-2760`, `verification.py:224-311`, walk log (env_… pending) | **challenge issuance works (loopback API)**; successful verification **untested** |
 | 5 | Install public runner via one release command | wheel is committed under `apps/heel-cloud/public/downloads` and on raw GitHub; GitHub Release v1.2.0 has zero assets; no PyPI | `python-package-release-check.log`; T1D §B | **manual** (no one-liner yet) |
-| 6 | Pair runner via browser/device | Server: invite → exchange → approve (phrase+fingerprint) → activate (v3 executable), rotate, revoke, resync all implemented and tested over HTTP; UI RunnerStep copy exists. **No runner-side command performs the exchange** (`heel runner --help`: `import-openapi, credential, map, prepare, run`); control client, coordinator and service exist only as library code driven by tests | `http_api.py:1066-1130`, `runner_auth.py:1530-2545`, `worker/index.ts:146-158`, `wheel-cli-surface.log`, dashboard copy "No customer-target pairing command is available in this release" (`dashboard/page.tsx:386`) | **missing (runner CLI)** |
-| 7 | Store two local credentials with explicit free/pro labels | `heel runner credential add --role lower_plan|higher_plan --label … --backend ephemeral-env|ephemeral-fd|keychain|secret-service`; handle printed, label and secret never | journey log (two handles) | **works locally**; label is free text, not an explicit plan label shown in product |
+| 6 | Pair runner via browser/device | Server: invite → exchange → approve (phrase+fingerprint) → activate (v3 executable), rotate, revoke, resync implemented; the `test_http_*` tests in `test_runner_control_http.py` drive a real loopback `serve(ControlPlane(...))` over **plain HTTP, no TLS, no edge secret** (`public_origin="http://127.0.0.1"`, line 681-700). UI RunnerStep copy exists. **No runner-side command performs the exchange** (`heel runner --help`: `import-openapi, credential, map, prepare, run`); `RunnerControlClient`, `RunnerCoordinator`, `RunnerService` are constructed by tests only (zero constructors under `heel/` or `scripts/`, T1R fact-check log), and the control client has **no HTTPS transport** (`transport` is injected; `control_client.py` imports only `urlsplit`) | `http_api.py:1066-1130`, `runner_auth.py:1530-2545`, `worker/index.ts:146-158`, `wheel-cli-surface.log`, dashboard copy "No customer-target pairing command is available in this release" (`dashboard/page.tsx:386`) | **missing (runner CLI)** |
+| 7 | Store two local credentials with explicit free/pro labels | `heel runner credential add --role <lower_plan or higher_plan> --label … --backend <ephemeral-env, ephemeral-fd, keychain or secret-service>`; handle printed, label and secret never | journey log (two handles) | **works locally**; label is free text, not an explicit plan label shown in product |
 | 8 | Import OpenAPI | CLI `heel runner import-openapi` keeps GET/HEAD only (12 routes from fixture); browser review parses OpenAPI locally but does not produce a runner inventory | journey log; `review-v1.ts` | **works CLI; missing from product** |
 | 9 | Review dry-run | `heel runner run … --dry-run` prints plan, `plan_sha256`, `requests_sent: 0`; cloud approval projection flow shows scenario/route plan for mapped routes only (≤4) | journey log; `test_canary_http.py:292-420` | **works CLI; product shows mapped-route plan only** |
 | 10 | Start plan-differential scan from product | Cloud approve → grant → runner claim → heartbeat/progress/result exists for the 4-scenario catalog (`plan_entitlement_read` included), but the full-inventory plan-differential runner is CLI-only (`R10` test) | `test_runner_plan_differential_safety.py:1026`; `canary_runs.py` | **missing (bridge)** |
@@ -115,6 +135,10 @@ Time to first finding today: the synthetic CLI journey took 4 minutes wall clock
 install` to `observed` (05:20:39 → 05:24:37 in the journey log), with no account. The product
 path cannot be timed because steps 6, 8–10 do not exist.
 
+Reading the verdict column: "works (loopback API)" means a direct HTTP call to the Python
+control plane succeeded in this audit; it does not mean the Worker, the browser or a deployed
+origin were exercised. Those remain the job of §11.
+
 ---
 
 ## 3. Reuse / gap matrix
@@ -125,7 +149,7 @@ path cannot be timed because steps 6, 8–10 do not exist.
 | Accounts, sessions, device auth | `heel/saas/auth.py`, `device_auth.py`, `cloud_auth.py` (`heel cloud login`) | — | — |
 | Workspace/project/tenancy | `tenancy.py`, `projects.py`, `ledger.py`, `entitlement.py`, `catalog.py` (launch quotas `active_runners=1`, `canary_runs=10`) | regression records per project | — |
 | Target verification | `verification.py` (`VerifiedEnvironmentService`, attestation, https-file/dns-txt), `network_guard.py` | — | — |
-| Runner pairing / auth | `runner_auth.py` (PoP Ed25519, nonces, rotation, revoke, resync), `runner_contexts.py`, migrations 9–29 | — | **runner CLI `heel runner pair/serve/status/unpair`** |
+| Runner pairing / auth | `runner_auth.py` (PoP Ed25519, nonces, rotation, revoke, resync), `runner_contexts.py`, migrations 9–29; runner side: `RunnerStore` pairing journal / identity records / credential records (`store.py`), `SystemSecureSigner` with macOS Keychain or Linux secret-service seed storage (`identity.py:317`), `RunnerRuntimeState` (`runtime.py`) | credential record gains `plan_label` (`store.py` `_credential_record`, `_new_credential`) | **runner CLI `heel runner pair/serve/status/unpair`**; **HTTPS control transport** for `RunnerControlClient` (none exists; see §12 T2a) |
 | Run coordination | `canary_runs.py` (approval projection, grant, claim, chains, stop, reaper), `canary_store.py`, `canary_disclosure.py` | approval projection v2 carrying plan-differential plan; result projection for ≤100 route pairs | — |
 | Runner execution | `heel/runner/{execution,compiler,adapters,catalog,http_transport,containment,redaction,store,vault}.py`, `plan_differential.py` | execute `run_plan_differential` under a cloud `ExecutionGate` | — |
 | Route inventory | `heel runner import-openapi`, `openapi_routes.py` | — | cloud-stored minimized inventory (method + template only) submitted from the browser |
@@ -219,12 +243,12 @@ map to one card state and one API condition.
 | Runner | `runner.invite` | owner clicks "Pair a runner": invitation token displayed once (10 min TTL) with the exact command `heel runner pair --origin <origin> --invite <token>` | — | token expiry |
 | Runner | `runner.pending_approval` | pairing visible via `GET …/runner-pairings/{id}` with phrase + fingerprint | human compares the six words and fingerprint printed by the runner, clicks Approve | mismatch → Deny, pairing abort |
 | Runner | `runner.active` | activation completed; runner heartbeat recent | enables Access step | `runner.offline` ("Restart it on the paired machine") |
-| Access | `access.incomplete` | binding lists `plan_labels: []` or one role | instructions: `heel runner credential add --role lower_plan --plan-label free …` and `--role higher_plan --plan-label pro …` | — |
+| Access | `access.incomplete` | binding lists `plan_labels: []` or one role | instructions: `heel runner credential add --role lower_plan --plan-label <your lower-plan name> …` and `--role higher_plan --plan-label <your higher-plan name> …` (labels are the operator's own words, e.g. `free` / `pro`; roles are fixed) | — |
 | Access | `access.ready` | runner reported both role handles with plan labels (labels only, never secrets) | enables Inventory | — |
 | Inventory | `inventory.empty` | no inventory row for this environment | "Import OpenAPI": browser parses locally, extracts GET/HEAD `method + route_template` only, shows the count, user confirms upload of that minimized list (raw spec stays in browser) | invalid/oversized spec rejected locally |
 | Inventory | `inventory.stored` | row with `inventory_digest`, `route_count` | enables Plan | — |
-| Plan | `plan.requested` | browser posts "prepare plan"; runner claims context, compiles, submits approval projection | — | `plan.rejected` with closed reason (e.g. `inventory_mismatch`, `credential_missing`) |
-| Plan | `plan.review` | approval request shows `plan_sha256`, pairs (method, template, both labels), `not_executed` list, request budget, `requests_sent: 0` | Approve dialog: retype hostname, reason, exact digest | expiry 24 h |
+| Plan | `plan.requested` | "Prepare plan" = the existing `POST …/runner-context-bindings` (no new route) carrying `plan_kind`, `inventory_digest`, `max_ops`; the paired runner lists and claims the binding, compiles locally, submits the v2 approval projection (§7.2 order) | — | `plan.rejected` with closed reason (`inventory_mismatch`, `inventory_too_large`, `credential_missing`, `plan_label_missing`, `binding_expired`) |
+| Plan | `plan.review` | approval request shows `plan_sha256`, `pairs_planned` (method, template, `bindings_sha256`), both plan labels, `not_executed_count`, `max_ops`, `requests_sent: 0`; `heel runner status` prints the same `plan_sha256` | Approve dialog: retype hostname, reason, exact digest | expiry 24 h (`APPROVAL_TTL_MS`) |
 | Run | `run.approved` → `run.claimed` → `run.running` | `progress` counters (`requests_completed`, `remaining_requests`, `retries_used`, `redaction_count`) | Stop (generation-bound) | `run.stopped`, `run.expired`, `run.runner_revoked` |
 | Result | `run.completed_local` | `local_result_ready: true`, projection pending disclosure | "Share minimized findings" or "Keep local only" | — |
 | Findings | `findings.visible` | per-route rows: verdict, predicate, evidence state, `key_path_count` per plan, `ev1_` refs; link "open raw evidence on the runner machine" (`heel findings --run`, companion URL) | "Save as regression" | — |
@@ -250,6 +274,18 @@ the Worker allowlist with a body cap.
   `{schema_version, routes:[{method:"GET"|"HEAD", route_template}], source_digest}`; ≤200 routes,
   template ≤512 bytes, normalized as `openapi_routes.py` does. Server stores
   `inventory_digest = canonical_digest(routes)`; replaces any previous row (one per environment).
+- Bounds are **reject, never truncate**: >200 routes → 413 with closed reason
+  `inventory_too_large` and no row written; any method other than GET/HEAD, a duplicate
+  `(method, route_template)`, or a template that fails normalization → 400 `inventory_invalid`,
+  no row written. The browser shows the count before upload so the user trims the spec locally.
+  200 is a cloud-side bound chosen below the runner's own `MAX_PLAN_DIFFERENTIAL_ROUTES = 2000`
+  (`compiler.py:77`) and the Worker body cap for this route (64 KiB); it is a technical bound,
+  not an entitlement.
+- Dynamic path parameters: the cloud stores templates only (`/users/{id}`). Concrete values come
+  from the runner's local mapping store (`heel runner map`) and enter the signed approval as
+  `bindings_sha256` per pair (`plan_differential.py` `_bindings_sha256`), never as values. A pair
+  whose template has parameters without a local mapping is listed in `not_executed` with reason
+  `unmapped`; it is never sent.
 - `GET …/environments/{env}/route-inventory` returns the same plus `inventory_digest`,
   `route_count`, `updated_at_ms`.
 - Runner receives `inventory_digest` and `routes` inside the context claim response
@@ -259,9 +295,48 @@ the Worker allowlist with a body cap.
 
 Add `plan_kind: "plan_differential" | "regression"`, `plan_sha256`, `inventory_digest`,
 `plan_labels: [{role, label}]` (labels ≤32 chars, two entries, roles fixed), `pairs_planned`,
-`not_executed_count`, `max_ops`. Existing v1 projections remain accepted for the catalog run kind.
-Grants (`heel.canary-execution-grant.v1`) gain the same `plan_kind` and `plan_sha256`; the runner
-MUST refuse a grant whose `plan_sha256` differs from its compiled plan.
+`not_executed_count`, `not_executed_digest`, `max_ops`. Existing v1 projections remain accepted
+for the catalog run kind. Grants (`heel.canary-execution-grant.v1`) gain the same `plan_kind` and
+`plan_sha256`; the runner MUST refuse a grant whose `plan_sha256` differs from its compiled plan.
+
+Bounds (T1R): v1 `actions` is capped at 20 entries and the projection at 64 KiB
+(`canary_contracts.py:402-410`); the Worker caps the context-submit body at 69 632 bytes
+(`worker/index.ts` `MAX_RUNNER_CONTEXT_SUBMIT_BODY_BYTES`). The runner executes at most
+`effective_max_ops // 2` pairs (`plan_differential.py` `allowed = effective // 2`,
+`MAX_MAX_OPS = 100`), i.e. **≤50 pairs, ≤100 requests per run**; every further compiled pair is
+listed as `not_executed` with reason `over_budget`. Therefore `pairs_planned` is a list of ≤50
+`{method, route_template, bindings_sha256}` entries (no values, no handles, no labels per entry),
+`not_executed_count` is an integer and `not_executed_digest` is the canonical digest of the local
+`not_executed` list (so the human-approved digest binds the whole plan while the body stays
+under the caps). The v2 `actions` cap becomes 100 for `plan_kind: plan_differential` only; v1
+keeps 20. `heel runner status` prints the full `not_executed` list locally.
+
+Ownership and order (normative). A run exists only if every step below happened in this order,
+and each step is attributable:
+
+1. **Human, browser**: `PUT route-inventory` (§7.1) → `inventory_digest`.
+2. **Human, browser**: "Prepare plan" = existing `POST …/runner-context-bindings` with
+   `plan_kind`, `inventory_digest`, `max_ops` (≤100). The binding is cloud-signed, scoped to
+   workspace + project + verified environment, 24 h TTL (`CONTEXT_TTL_MS`). It can create a
+   projection but cannot reserve quota, issue a grant, claim a run or authorize traffic
+   (`runner_contexts.py` docstring).
+3. **Runner, `heel runner serve`**: lists and claims the binding (existing `contexts/list`,
+   `contexts/{id}/claim`); the claim response carries `inventory_digest` and the route list.
+4. **Runner, local**: compiles `routes ∩ inventory`, GET/HEAD only, deterministic order, both
+   credential roles resolved by opaque handle from the local store; the compiled plan carries
+   `plan_sha256`. If the local credential records lack a `plan_label` for either role, or the
+   local signed scope origin differs from the environment origin, compile fails closed with the
+   §6 reason and nothing is submitted.
+5. **Runner**: submits the v2 approval projection (existing `contexts/{id}/approval-projections`).
+6. **Human, browser**: approves the exact `plan_sha256` with hostname retype; the existing
+   one-transaction path reserves quota and issues the signed grant
+   (`approval_reserves_and_issues_exact_signed_grant_in_one_transaction`).
+7. **Runner**: claims the grant, compares `plan_sha256`, and only then executes under
+   `ExecutionGate` with the local signed scope **and** the grant both verified per request.
+
+The signed scope stays immutable: it is bound at pairing/binding time to the verified origin and
+is never widened by inventory, plan or grant. The cloud never receives credential handles, header
+values, parameter values, raw OpenAPI or response bodies at any step.
 
 ### 7.3 Result projection (new schema `heel.plan-differential-result.v1`)
 
@@ -270,13 +345,24 @@ evidence_state|null, finding_id|null, lower:{status_code, body_shape, key_path_c
 response_bytes}, higher:{…}, evidence_refs:[ev1_…]}`, plus `requests_sent`, `retries_used`,
 `redaction_count`, `plan_sha256`, `containment_head_digest`, signature. Forbidden keys inherit
 `_FORBIDDEN_FINDINGS_KEYS`; no key names from target bodies, no header values. Stored in a new
-table `plan_differential_results` (migration 30) keyed by `run_id`; retention 30 days like
-audit rows.
+table `plan_differential_results` (migration 30) keyed by `run_id`. Row cap: ≤50 executed pair
+rows (= the §7.2 execution bound) plus `not_executed_count`; the schema cap stays 100 so a
+future `max_ops` change does not need a schema change. Retention follows the existing constants,
+not a new policy: result rows expire with `FINDINGS_RETENTION_MS` = 7 days
+(`canary_disclosure.py:38`, equal to the free plan's `retention_days=7`, `catalog.py:92`);
+operational receipts 7 days (`OPERATIONAL_RETENTION_MS`, `canary_runs.py:37`); audit rows 30 days
+(`AUDIT_RETENTION_MS`, `canary_runs.py:38`). The earlier "30 days" for result rows was wrong.
 
 ### 7.4 Regressions (new, migration 30 `regressions`)
 
 - `POST …/regressions` from a finding row → `{regression_id, finding_id, route, predicate,
-  plan_labels, environment_id}`; ≤50 per project (free tier).
+  plan_labels, environment_id}`. Bound: ≤100 stored regressions per project, a **technical
+  storage bound** equal to the result-row schema cap, not an entitlement or pricing term (no
+  existing decision sets a regression count; the catalog lists `scheduled_regressions` as
+  `unavailable` on free, `catalog.py`, so replay is manual only and nothing is scheduled).
+  Regression records are configuration, not findings, and are kept until deleted or until the
+  project is deleted; the finding they point at expires after 7 days (§7.3) and the record then
+  shows `finding_expired` while remaining replayable.
 - `POST …/regressions/{id}/replay` creates an approval request of `plan_kind: regression`
   limited to that one pair; result row carries `result: pass|fail|inconclusive` using the
   existing `heel/regressions.py` rules (lower denied by status with higher success = pass; 2xx
@@ -292,7 +378,8 @@ secrets); `GET …/runner-context-bindings` surfaces them so the Access card can
 
 Reuse `Meter.CANARY_RUNS` (free: 10 per period) for every plan-differential or regression run
 reservation at approval time (existing `approval_reserves_and_issues_exact_signed_grant_in_one_
-transaction`). No new meter, no pricing change. `Meter.ACTIVE_RUNNERS` stays 1 on free.
+transaction`). No new meter, no pricing change, no new retention period. `Meter.ACTIVE_RUNNERS`
+stays 1 on free. Free retention stays 7 days for everything findings-like.
 
 ### 7.7 Worker
 
@@ -312,11 +399,35 @@ Allowlist additions: inventory `GET/PUT` (cap 64 KiB), regressions `GET/POST` an
 - A release workflow step uploads `heel_sim-1.3.0-py3-none-any.whl`, `.tar.gz` and the manifest as
   GitHub Release assets (today v1.2.0 has none, CONFIRMED T1D §B item 6). PyPI remains optional
   and is not a gate.
-- Documented command (the `/agent` page and `docs/PLAN_DIFFERENTIAL_RUNNER.md` MUST show the same
-  string, tested by `mcp-quickstart.test.mjs` style contract test):
-  `python3 -m pip install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0/heel_sim-1.3.0-py3-none-any.whl'`
-  followed by `heel runner pair --origin https://<heel origin> --invite <token>` and
-  `heel runner serve`. The manifest SHA-256 is printed next to the command.
+- Documented command (the `/agent` page, the dashboard `runner.invite` card and
+  `docs/PLAN_DIFFERENTIAL_RUNNER.md` MUST show the same string; `mcp-quickstart.test.mjs:26`
+  asserts the exact `INSTALL_AGENT` constant today and MUST be updated in the same change):
+
+  ```
+  python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else "Heel runner needs Python 3.11 or newer")' \
+    && python3 -m venv "$HOME/.heel-runner" \
+    && "$HOME/.heel-runner/bin/python" -m pip install \
+         'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0/heel_sim-1.3.0-py3-none-any.whl#sha256=<wheel sha256 from the release manifest>'
+  ```
+
+  One chain, fail-fast: a version failure prints the message, exits non-zero and nothing after
+  `&&` runs; the `#sha256=` URL fragment makes pip itself refuse a wheel whose bytes do not
+  match, so verification is bound to the artifact, not to a later manual check. The literal
+  digest is substituted by the T7 release step from the deterministic manifest the builder
+  already produces; **no v1.3.0 release exists today** (v1.2.0 has zero assets), so the string
+  above is the contract for T7, not a working command. The same three lines, with the real
+  digest, MUST appear on `/agent`, on the `runner.invite` card and in
+  `docs/PLAN_DIFFERENTIAL_RUNNER.md`, and the contract test MUST install from a local copy of
+  the wheel with the same `#sha256=` fragment so the displayed digest is proven against the
+  committed bytes. Then `"$HOME/.heel-runner/bin/heel" runner pair --origin https://<heel origin>
+  --invite <token>` and `… runner serve`. Coherence requirements (T1R): the wheel's `runner`
+  extra is exactly `cryptography==45.0.7` (`pyproject.toml:32`) and `requires-python >=3.11`
+  (`:10`); macOS system `python3` is 3.9 (baseline failures 2 and 3), hence the check; the venv
+  MUST live under `$HOME`, not `/tmp`, because the runner's inode guard refuses a world-writable
+  ancestor (baseline failure 1) and `serve` would fail closed; runner key storage requires macOS
+  Keychain or a Linux secret-service (`identity.py:317-340`); on a machine without either,
+  `heel runner pair` MUST fail closed with the message "no supported runner OS secret service"
+  and MUST NOT fall back to a file. Windows is unsupported (§14).
 
 ### 8.2 Hosting topology
 
@@ -327,20 +438,44 @@ bindings do not exist (the existing Sites app is Worker hosting with only `PUBLI
 configured, CONFIRMED `sessions/astra-sites-access.md`), the Worker MUST gain one additional,
 equally fixed binding mode: `HEEL_DEPLOYMENT_MODE=fixed_origin` with
 `HEEL_CONTROL_PLANE_ORIGIN=https://<private host>` compiled into `vars` at build time, never
-read from a request, reached over TLS with the existing `X-Heel-Edge-Auth` secret. The control
-plane keeps `HEEL_PRIVATE_NETWORK_ACK=private-vpc-only` semantics by requiring the edge secret on
-every route (already true) and binding only behind a TLS terminator that admits the Worker's
-egress. This preserves "hosted infrastructure is never an unrestricted proxy": the origin is one
-build-time constant and the route allowlist is unchanged. Choice between the two modes is a
-hosting-access decision (§15), not a product decision.
+read from a request, reached over TLS with the existing `X-Heel-Edge-Auth` secret.
+
+`HEEL_PRIVATE_NETWORK_ACK=private-vpc-only` MUST NOT be reused for this mode. Today that value
+only acknowledges a non-loopback bind (`server.py:183-186`); it asserts a private network and a
+public-ingress host would make that assertion false. The mode therefore requires, as product
+changes in T7 (allowed files extended in §12): a distinct acknowledgement
+`HEEL_INGRESS_ACK=edge-authenticated-tls-ingress` accepted by `ProductionConfiguration` only
+together with `HEEL_CONTROL_PLANE_HOST=127.0.0.1` (the app binds loopback; a host-local TLS
+terminator is the only listener on 443), and these enforceable ingress restrictions, each with a
+deployment acceptance check that T7 MUST record before T8:
+
+| Restriction | Enforced by | Acceptance (recorded with command and output) |
+|---|---|---|
+| Only TCP 443 reachable from the Internet | host firewall / provider network policy | external port scan of the origin host shows 443 only |
+| Requests lacking the exact `X-Heel-Edge-Auth` value never reach the app | TLS terminator rule (header match before proxying) **and** the existing app check (`http_api.py:787`, defense in depth) | anonymous `GET https://<origin>/v1/me` → 401 from the terminator, and no app request log line for it |
+| The edge secret is distributed to exactly three holders and nowhere else | one value generated in the provider secret manager and delivered to the Worker secret store (`CONTROL_PLANE_EDGE_SECRET`), the terminator rule, and the control-plane env (`HEEL_EDGE_AUTH_SECRET_B64`, §8.3); never in the repo, image, build logs or `wrangler.toml` | `wrangler secret list` names it; `git grep` and the image layers do not contain it; the deployment record names the three holders |
+| Optional, if the provider supports it: mTLS from the Worker to the origin | Worker mTLS certificate binding + terminator client-cert verification | a request without the client certificate is refused at TLS |
+
+The header proves possession of the shared secret, not that the caller is the Worker and not
+that the network is private; anyone holding the value can reach the app, which is why the
+distribution row above is a restriction and why rotation (`ops.py`-style runbook entry) is part
+of T7. Until a host exists and those checks are recorded, `fixed_origin` is **deferred and
+INFERRED**; this spec makes no private-network claim for it. The Worker side still never proxies to a
+caller-chosen origin: the origin is one build-time constant and the route allowlist is unchanged.
+Choice between the two modes is a hosting-access decision (§15), not a product decision.
 
 ### 8.3 Reproducible release, secrets, migrations, rollback, runbooks, kill switch
 
 - Control-plane image `heel-control-plane:1.3.0` built from `deploy/Dockerfile.control-plane`;
   digest recorded in the deployment record as `DEPLOYMENT_2026-09-05.md` does.
-- Secrets: the eight names in `deploy/.env.production.example` plus Worker
-  `CONTROL_PLANE_EDGE_SECRET`; generated in the provider secret manager; never in logs
-  (`server.py:120-245` validates formats, CONFIRMED).
+- Secrets: `deploy/.env.production.example` lists 12 keys, of which 6 carry secret values
+  (`HEEL_DEVICE_TOKEN_PEPPER_B64`, `HEEL_RUNNER_AUTH_PEPPER_B64`, `HEEL_API_KEY_PEPPER`,
+  `HEEL_EDGE_AUTH_SECRET_B64`, `HEEL_GRANT_SIGNING_PRIVATE_KEY_B64`,
+  `HEEL_CLOUDFLARE_TUNNEL_TOKEN`); plus the Worker secret `CONTROL_PLANE_EDGE_SECRET`, which
+  holds the same value as `HEEL_EDGE_AUTH_SECRET_B64` (one secret, two holders in the VPC
+  topology; three in `fixed_origin`, §8.2). All are generated in the provider secret manager
+  and never logged (`server.py:120-245` validates formats, CONFIRMED). The `fixed_origin` mode
+  adds `HEEL_INGRESS_ACK` (non-secret) and drops the tunnel token.
 - Migrations apply at start (`migrate.py`, currently 29, launch adds 30); rollback = redeploy the
   previous image against the restore-verified backup (`scripts/saas_backup.py verify`);
   migration 30 is additive only so the previous image can read the database.
@@ -373,23 +508,27 @@ not Heel plans.
 
 ## 10. Twelve safety properties → named automated tests and clean-room acceptance
 
-Existing tests are CONFIRMED present at the cited lines and passing in the v2 baseline. "New"
-tests are names the implementer MUST create; the Fable review reads them first.
+Existing tests are CONFIRMED present by `def <name>` in the named file and passing in the v2
+baseline (T1R re-checked every id: `T1R-artifacts/t1r-spec-fact-checks.log`; every name below is
+complete and runnable as `pytest tests/<file>::<name>`). Whole-file counts are
+`pytest --collect-only -q` counts. "Proposed" tests are **not yet implemented**; they are the
+exact ids the implementer MUST create in the task named in §12, and the Fable review reads them
+first. Where a file name is omitted inside a cell, it is the last file named in that cell.
 
-| # | Property | Existing named tests | New named tests | Clean-room acceptance check |
+| # | Property | Existing named tests (CONFIRMED) | Proposed tests (not yet implemented; owning task) | Clean-room acceptance check |
 |---|---|---|---|---|
-| 1 | No requests outside signed hosts (redirects, IPv4/IPv6/encoded hosts, Host manipulation, DNS rebinding) | `test_runner_plan_differential_safety.py::test_i1_host_confinement_refuses_off_allowlist_redirect_and_rebinding`, `::test_i1_host_header_is_always_the_normalized_host`; `test_runner_http_transport.py::test_dns_is_full_set_pinned_and_rechecked_before_authorized_retry`, `::test_dns_drift_mixed_answer_and_peer_mismatch_fail_closed`; `test_verified_environments.py` (30 tests) | `test_cloud_plan_run_refuses_origin_outside_grant` | staging target logs show only the verified origin; a redirect route in the synthetic target yields `transport:response_rejected` |
-| 2 | Only GET/HEAD in imported inventory execute | `::test_i2_post_inventory_is_rejected_at_compile`, `::test_i2_only_inventoried_get_and_head_reach_the_wire`, `::test_i2_every_transport_action_is_the_compiled_pair` | `test_cloud_inventory_mismatch_rejects_plan`, `test_inventory_put_rejects_non_get_head` | inventory with a POST route is rejected at upload; a route absent from inventory never appears in target logs |
-| 3 | Each request verifies signed scope and reserves one-shot attempt | `::test_i3_no_request_without_verified_signed_scope`, `::test_i4_no_request_without_one_shot_reserved_attempt`; `test_canary_grants.py::test_claim_consumes_oldest_exact_nonce_and_provisions_four_chains_atomically`; `test_runner_stop.py::test_execution_bundle_is_exactly_bound_signed_fresh_and_reserved_once` | `test_cloud_grant_plan_sha256_mismatch_sends_nothing` | replaying an approved run id yields no second traffic |
-| 4 | No credentials in cloud/browser/findings/logs/traces/metrics/crashes/containment/CI/support exports | `::test_i5_credential_plaintext_absent_from_heel_home_and_output`; `test_runner_redaction.py` (6); `test_canary_privacy.py::test_findings_upload_recursively_rejects_raw_credential_fixture_and_local_path_l…`; `test_runner_plan_differential_cli.py::test_r18_credential_add_prints_handle_never_label_or_secret` | `test_result_projection_rejects_header_and_body_values`, `test_metrics_and_structured_logs_never_contain_handles_or_secrets` | byte scan of control-plane DB, Worker logs, browser network capture and `HEEL_HOME` for both canary secrets = 0 hits |
-| 5 | Raw evidence local; bounded redacted cloud projections | `test_runner_http_transport.py::test_completed_response_is_written_only_to_required_local_evidence_sink`; `test_canary_privacy.py::test_operational_cloud_storage_cannot_be_repurposed_for_blocked_or_observed_asse…`; `test_runner_coordinator.py::test_findings_upload_is_closed_bounded_and_continues_the_terminal_result_chain` | `test_plan_differential_result_projection_is_bounded_and_bodyless` | cloud DB rows contain refs and counts only; `ev1_` bodies open only on the runner machine |
-| 6 | Verifiable containment chain with caller/workspace/project/runner/scope/route/attempt attribution | `::test_i6_every_request_is_logged_before_it_is_sent`, `::test_i7_every_containment_entry_carries_cli_caller`, `::test_i8_containment_chains_verify_and_detect_tamper` | `test_cloud_run_containment_entries_carry_workspace_project_runner_grant` | `heel log --run` verifies and names workspace, project, runner, grant, route, attempt |
-| 7 | Workspace/project isolation (IDs, roles, API keys, sessions, queues, findings sync) | `test_saas_adversarial.py::test_cross_tenant_objects_unreachable`, `::test_client_supplied_role_ignored`, `::test_invite_token_wrong_workspace_rejected`; `test_saas_http_api.py::test_tenant_isolation`, `::test_api_keys_scoped_and_never_privileged`; `test_canary_http.py::test_context_dashboard_hides_runner_bound_in_another_project_until_revoke` | `test_inventory_and_regressions_are_project_scoped` | second account cannot read the first account's environment, inventory, run or findings (404/403 only) |
-| 8 | Verification/pairing non-replayable, cannot widen or cross workspaces | `test_saas_device_auth.py::test_exchange_is_one_time_and_access_is_workspace_bound`, `::test_refresh_rotates_both_tokens_and_reuse_revokes_family`; `test_runner_control_http.py::test_http_pairing_exchange_returns_runner_only_challenge_for_activation`, `::test_http_v3_pairing_activation_replays_one_sealed_executable_cursor`; `test_canary_grants.py::test_rotation_start_has_one_immutable_old_key_bound_ceremony` | `test_runner_pair_cli_refuses_reused_invitation_and_wrong_origin` | reused invitation token → rejected; runner paired to workspace A cannot claim in workspace B |
-| 9 | Quotas/billing idempotent under races/retries | `test_saas_adversarial.py::test_duplicate_idempotent_run_charged_once`, `::test_concurrent_reservations_never_exceed_quota`; `test_canary_quota.py` (8); `test_canary_grants.py::test_approval_is_exactly_idempotent_and_cross_run_key_reuse_conflicts` | `test_regression_replay_reserves_once_under_retry` | double-click Approve consumes one `canary_runs` unit; usage endpoint matches |
-| 10 | Prompt revocation of scopes/runners/credentials/active jobs | `test_canary_stop.py` (21), `test_canary_quota.py::test_revoked_runner_zero_request_claim_is_stopped_and_refunded_after_deadline`; `test_runner_stop.py` | `test_runner_serve_stops_within_deadline_on_revoke` | revoke runner during a run → heartbeat gate inactive, target logs stop within 5 s, UI shows `runner_revoked` |
-| 11 | Production sessions, CSRF/origin, rate limiting/audit for signup/login/device/state changes | `test_saas_http_api.py::test_lockout_after_failures`, `::test_session_lifecycle`; `test_saas_device_auth.py::test_start_rate_limit_caps_one_client_and_repeated_challenge`, `::test_verify_requires_browser_session_same_origin_and_live_sync_role`; `test_launch_journey.py`; `apps/heel-cloud/tests/privacy-boundary.test.mjs`, `runner-edge-route.test.ts` | `test_new_routes_require_same_origin_and_recent_auth` | cross-origin POST to inventory/regressions rejected; signup throttle observed with a 4th signup from one client |
-| 12 | Offline/lost authorization/malformed input fail closed with visible state | `test_runner_coordinator.py::test_restart_rehydrates_active_binding_but_requires_fresh_heartbeat`, `::test_live_gate_rejects_replayed_server_time_and_regressed_control_generation`; `test_saas_adversarial.py::test_malformed_and_oversized_bodies`; `test_runner_plan_differential_cli.py::test_r16_rejections_use_the_existing_fixed_line_and_reflect_nothing` | `test_runner_serve_offline_shows_offline_state_and_resumes` | kill the runner mid-run: dashboard shows `runner.offline`; restart: run resumes or terminalizes with reason; malformed OpenAPI upload shows a reason, no server error |
+| 1 | No requests outside signed hosts (redirects, IPv4/IPv6/encoded hosts, Host manipulation, DNS rebinding) | `test_runner_plan_differential_safety.py::test_i1_host_confinement_refuses_off_allowlist_redirect_and_rebinding`, `::test_i1_host_header_is_always_the_normalized_host`; `test_runner_http_transport.py::test_dns_is_full_set_pinned_and_rechecked_before_authorized_retry`, `::test_dns_drift_mixed_answer_and_peer_mismatch_fail_closed`; `test_verified_environments.py` (67 collected) | `tests/test_canary_http.py::test_cloud_plan_run_refuses_origin_outside_grant` (T4) | staging target logs show only the verified origin; a redirect route in the synthetic target yields `transport:response_rejected` |
+| 2 | Only GET/HEAD in imported inventory execute | `::test_i2_post_inventory_is_rejected_at_compile`, `::test_i2_only_inventoried_get_and_head_reach_the_wire`, `::test_i2_every_transport_action_is_the_compiled_pair` | `tests/test_canary_http.py::test_cloud_inventory_mismatch_rejects_plan`, `::test_inventory_put_rejects_non_get_head`, `::test_inventory_put_rejects_more_than_200_routes_without_truncation` (T3) | inventory with a POST route is rejected at upload; a route absent from inventory never appears in target logs |
+| 3 | Each request verifies signed scope and reserves one-shot attempt | `::test_i3_no_request_without_verified_signed_scope`, `::test_i4_no_request_without_one_shot_reserved_attempt`; `test_canary_grants.py::test_claim_consumes_oldest_exact_nonce_and_provisions_four_chains_atomically`; `test_runner_stop.py::test_execution_bundle_is_exactly_bound_signed_fresh_and_reserved_once` | `tests/test_runner_daemon.py::test_cloud_grant_plan_sha256_mismatch_sends_nothing` (T3) | replaying an approved run id yields no second traffic |
+| 4 | No credentials in cloud/browser/findings/logs/traces/metrics/crashes/containment/CI/support exports | `test_runner_plan_differential_safety.py::test_i5_credential_plaintext_absent_from_heel_home_and_output`; `test_runner_redaction.py` (12 collected); `test_canary_privacy.py::test_findings_upload_recursively_rejects_raw_credential_fixture_and_local_path_leakage`; `test_runner_plan_differential_cli.py::test_r18_credential_add_prints_handle_never_label_or_secret` | `tests/test_canary_privacy.py::test_result_projection_rejects_header_and_body_values` (T4), `tests/test_saas_ops.py::test_metrics_and_structured_logs_never_contain_handles_or_secrets` (T5) | byte scan of control-plane DB, Worker logs, browser network capture and `HEEL_HOME` for both canary secrets = 0 hits |
+| 5 | Raw evidence local; bounded redacted cloud projections | `test_runner_http_transport.py::test_completed_response_is_written_only_to_required_local_evidence_sink`; `test_canary_privacy.py::test_operational_cloud_storage_cannot_be_repurposed_for_blocked_or_observed_assessment`; `test_runner_coordinator.py::test_findings_upload_is_closed_bounded_and_continues_the_terminal_result_chain` | `tests/test_canary_privacy.py::test_plan_differential_result_projection_is_bounded_and_bodyless` (T4) | cloud DB rows contain refs and counts only; `ev1_` bodies open only on the runner machine |
+| 6 | Verifiable containment chain with caller/workspace/project/runner/scope/route/attempt attribution | `::test_i6_every_request_is_logged_before_it_is_sent`, `::test_i7_every_containment_entry_carries_cli_caller`, `::test_i8_containment_chains_verify_and_detect_tamper` | `tests/test_runner_daemon.py::test_cloud_run_containment_entries_carry_workspace_project_runner_grant` (T4) | `heel log --run` verifies and names workspace, project, runner, grant, route, attempt |
+| 7 | Workspace/project isolation (IDs, roles, API keys, sessions, queues, findings sync) | `test_saas_adversarial.py::test_cross_tenant_objects_unreachable`, `::test_client_supplied_role_ignored`, `::test_invite_token_wrong_workspace_rejected`; `test_saas_http_api.py::test_tenant_isolation`, `::test_api_keys_scoped_and_never_privileged`; `test_canary_http.py::test_context_dashboard_hides_runner_bound_in_another_project_until_revoke` | `tests/test_canary_http.py::test_inventory_and_regressions_are_project_scoped` (T3, extended in T5) | second account cannot read the first account's environment, inventory, run or findings (404/403 only) |
+| 8 | Verification/pairing non-replayable, cannot widen or cross workspaces | `test_saas_device_auth.py::test_exchange_is_one_time_and_access_is_workspace_bound`, `::test_refresh_rotates_both_tokens_and_reuse_revokes_family`; `test_runner_control_http.py::test_http_pairing_exchange_returns_runner_only_challenge_for_activation`, `::test_http_v3_pairing_activation_replays_one_sealed_executable_cursor`; `test_canary_grants.py::test_rotation_start_has_one_immutable_old_key_bound_ceremony` (note: the `test_http_*` tests run a real loopback server over plain HTTP without TLS or edge secret) | `tests/test_runner_daemon.py::test_runner_pair_cli_refuses_reused_invitation_and_wrong_origin`, `::test_real_pairing_over_tls_edge_harness_activates_persists_heartbeats_and_revokes` (T2a) | reused invitation token → rejected; runner paired to workspace A cannot claim in workspace B |
+| 9 | Quotas/billing idempotent under races/retries | `test_saas_adversarial.py::test_duplicate_idempotent_run_charged_once`, `::test_concurrent_reservations_never_exceed_quota`; `test_canary_quota.py` (7 collected); `test_canary_grants.py::test_approval_is_exactly_idempotent_and_cross_run_key_reuse_conflicts` | `tests/test_canary_quota.py::test_regression_replay_reserves_once_under_retry` (T5) | double-click Approve consumes one `canary_runs` unit; usage endpoint matches |
+| 10 | Prompt revocation of scopes/runners/credentials/active jobs | `test_canary_stop.py` (18 collected), `test_canary_quota.py::test_revoked_runner_zero_request_claim_is_stopped_and_refunded_after_deadline`; `test_runner_stop.py` (61 collected) | `tests/test_runner_daemon.py::test_runner_serve_stops_within_deadline_on_revoke` (T2b) | revoke runner during a run → heartbeat gate inactive, target logs stop within 5 s, UI shows `runner_revoked` |
+| 11 | Production sessions, CSRF/origin, rate limiting/audit for signup/login/device/state changes | `test_saas_http_api.py::test_lockout_after_failures`, `::test_session_lifecycle`; `test_saas_device_auth.py::test_start_rate_limit_caps_one_client_and_repeated_challenge`, `::test_verify_requires_browser_session_same_origin_and_live_sync_role`; `test_launch_journey.py`; `apps/heel-cloud/tests/privacy-boundary.test.mjs`, `runner-edge-route.test.ts` | `tests/test_canary_http.py::test_new_routes_require_same_origin_and_recent_auth` (T3, extended in T5) | cross-origin POST to inventory/regressions rejected; signup throttle observed with a 4th signup from one client |
+| 12 | Offline/lost authorization/malformed input fail closed with visible state | `test_runner_coordinator.py::test_restart_coordinator_rehydrates_active_binding_but_requires_fresh_heartbeat`, `::test_live_gate_rejects_replayed_server_time_and_regressed_control_generation`; `test_saas_adversarial.py::test_malformed_and_oversized_bodies`; `test_runner_plan_differential_cli.py::test_r16_rejections_use_the_existing_fixed_line_and_reflect_nothing` | `tests/test_runner_daemon.py::test_runner_serve_offline_shows_offline_state_and_resumes` (T2b) | kill the runner mid-run: dashboard shows `runner.offline`; restart: run resumes or terminalizes with reason; malformed OpenAPI upload shows a reason, no server error |
 
 ---
 
@@ -408,8 +547,8 @@ URLs, commands, screenshots, artifact digests, finding ids and timestamps at eve
 # 4. machine: python3 -m pip install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0/heel_sim-1.3.0-py3-none-any.whl'
 #             sha256sum of the wheel equals the manifest shown on /agent
 # 5. machine: heel runner pair --origin https://<staging origin> --invite <token>   → prints six words + fingerprint
-#    browser: compare, Approve → runner prints "active"
-# 6. machine: heel runner credential add --role lower_plan --plan-label free --profile bearer --backend keychain   (secret via prompt/fd, never argv)
+#    browser: compare, Approve → runner prints "active" ; kill and restart the runner process → heel runner status still active (real OS keychain persistence)
+# 6. machine: heel runner credential add --role lower_plan --plan-label free --profile bearer --backend keychain   (secret via prompt/fd, never argv; "free"/"pro" are this operator's chosen labels)
 #             heel runner credential add --role higher_plan --plan-label pro --profile bearer --backend keychain
 #             heel runner serve   (leave running)
 # 7. browser: Import OpenAPI (the synthetic SaaS spec) → shows N GET/HEAD routes → Upload minimized inventory
@@ -438,13 +577,18 @@ property before escalation). Allowed files are exhaustive; anything else is out 
 
 | # | Task | Allowed files | Gate (must be green before review) |
 |---|---|---|---|
-| T2 | Runner pairing and daemon CLI: `heel runner pair`, `serve`, `status`, `unpair`; glue over `RunnerControlClient`, `RunnerCoordinator`, `RunnerService`, `SystemSecureSigner`; keychain/secret-service key storage; offline/resync behaviour; credential `--plan-label` | `heel/cli.py`, new `heel/runner/daemon.py`, `heel/runner/__init__.py`, `tests/test_runner_daemon.py` (new), `docs/PLAN_DIFFERENTIAL_RUNNER.md` | pairing + heartbeat against a real loopback `heel.saas.server` over HTTP in a test; `test_runner_pair_cli_refuses_reused_invitation_and_wrong_origin`; `test_runner_serve_stops_within_deadline_on_revoke`; red-team: device-code theft, invitation replay, rotation races, disconnect/revocation |
+| T2a | Runner pairing CLI and transport: `heel runner pair`, `status`, `unpair`; new HTTPS control transport (`transport.post` adapter for `RunnerControlClient`: TLS 1.2+ default trust plus an optional explicit CA bundle argument used only by tests, origin pinned to the `--origin` value, no redirects, 256 KiB response cap, 30 s timeout); runner identity seed in `SystemSecureSigner` (Keychain/secret-service, fail closed otherwise); pairing journal and identity record persisted in the existing `RunnerStore`; credential records gain an optional `plan_label` and `heel runner credential add --plan-label <operator label>`: an operator-chosen label (1–32 printable ASCII characters, no whitespace at the ends, distinct between the two roles, e.g. `free` / `pro`); the roles stay the fixed `lower_plan` / `higher_plan`; labels are never inferred from responses or from the label text. The flag is **optional for the standalone CLI**: `credential add` without it, and records written before T2a, keep working for `heel runner run` and the existing CLI tests; only the self-serve path (binding claim / plan compile, §7.2 step 4) requires both labels and otherwise reports `access.incomplete` / `plan_label_missing` with the exact command to run. No `serve` loop yet | `heel/cli.py`, new `heel/runner/daemon.py`, new `heel/runner/control_transport.py`, `heel/runner/store.py` (credential record `plan_label` only), `heel/runner/identity.py` (label namespace only), `heel/runner/__init__.py`, new `tests/test_runner_daemon.py`, `tests/test_runner_cli.py`, `tests/test_runner_vault.py`, `tests/test_runner_identity.py`, new test-only `tests/support/edge_tls_harness.py`, `docs/PLAN_DIFFERENTIAL_RUNNER.md` | **Real pairing integration gate**: `test_real_pairing_over_tls_edge_harness_activates_persists_heartbeats_and_revokes` drives, over the **test TLS + edge harness** (a loopback TLS listener with an ephemeral self-signed CA that injects `X-Heel-Edge-Auth` and forwards to `serve(ControlPlane(edge_auth_secret=…))`; the product keeps every guard, the only test seam is the CA bundle argument): owner session creates the invitation over HTTP → `heel runner pair` exchanges → browser-session `approve` over HTTP with phrase + fingerprint → runner `activate` → identity seed present in an in-memory `OSSecretBackend` that the **test code** passes through the existing explicit `backend=` constructor parameter (limited proof: it shows the seed flows into the injected backend and survives a process restart that re-injects the same object; it does not prove OS keychain persistence) → runner record active in the store → process restart reloads it → `heel runner status` shows active → owner `DELETE …/runners/{id}` → next runner call fails closed `runner_revoked`. No seeded rows, no hand-edited activation, no fabricated runner credential. Plus `test_runner_pair_cli_refuses_reused_invitation_and_wrong_origin`, `test_r18`-style assertion that `--plan-label` is printed and the secret never is. **Real OS secret-store acceptance (separate, required)**: on a macOS machine with Keychain (or Linux with secret-service) Opus records, with commands and output in the T2a closing, `heel runner pair` → `heel runner status` active → kill and restart the process → `status` still active with the same runner key id → `unpair` removes the seed; this is the only proof of persistence and is repeated by Fable in §11 step 5. **Forbidden**: any new environment variable, flag or config value that selects an insecure or in-memory backend in product code; the existing `PYTEST_CURRENT_TEST` check in `identity.py:_backend` MUST NOT be extended. Constructor injection of a backend is ordinary dependency injection, not by itself a vulnerability; the T2a Fable review treats that check as a defect only if it shows concrete runtime reachability (a CLI or daemon path by which an `InMemorySecretBackend` can be selected at all), and otherwise records it as not reachable. Red-team: device-code theft, invitation replay, rotation races, wrong-origin / downgrade-to-http, CA-bundle argument cannot be set from env or config, in-memory backend unreachable from any CLI path |
+| T2b | Runner daemon loop: `heel runner serve` over `RunnerService` + `RunnerCoordinator`; heartbeat cadence; binding list/claim; offline state and resume; stop/revoke handling; runtime persistence in `RunnerRuntimeState` | `heel/cli.py`, `heel/runner/daemon.py`, `heel/runner/coordinator.py` (adapter glue only), `tests/test_runner_daemon.py`, `tests/test_runner_coordinator.py`, `docs/PLAN_DIFFERENTIAL_RUNNER.md` | over the same harness: `serve` heartbeats against the real server, claims a context binding, survives a server outage with `runner.offline` visible, resumes; `test_runner_serve_stops_within_deadline_on_revoke` (target traffic stops ≤5 s after revoke); `test_runner_serve_offline_shows_offline_state_and_resumes`; red-team: disconnect/revocation, replayed server time, regressed control generation |
 | T3 | Cloud route inventory + plan projection v2 + grant binding (§7.1, §7.2, §7.5) | `heel/saas/http_api.py`, `heel/saas/runner_contexts.py`, `heel/saas/canary_runs.py`, `heel/saas/migrate.py` (migration 30), `heel/canary_contracts.py`, `heel/runner/compiler.py`, `heel/runner/daemon.py`, `apps/heel-cloud/worker/index.ts`, `apps/heel-cloud/lib/canary-api.ts`, tests `test_canary_http.py`, `test_canary_grants.py`, `test_canary_migrations.py`, `runner-edge-route.test.ts`, `canary-api.test.ts` | `test_cloud_inventory_mismatch_rejects_plan`, `test_inventory_put_rejects_non_get_head`, `test_cloud_grant_plan_sha256_mismatch_sends_nothing`, `test_inventory_and_regressions_are_project_scoped`; red-team: scope tamper/allowlist, malicious OpenAPI (oversized, duplicate templates, unicode), forged projection |
 | T4 | Cloud-approved plan-differential execution + result projection + dashboard findings (§7.3) | `heel/runner/execution.py`, `heel/runner/plan_differential.py`, `heel/runner/daemon.py`, `heel/saas/canary_runs.py`, `heel/saas/http_api.py`, `heel/canary_contracts.py`, `apps/heel-cloud/components/canary/*`, `apps/heel-cloud/app/dashboard/page.tsx`, `apps/heel-cloud/lib/canary-api.ts`, tests `test_runner_plan_differential_safety.py`, `test_canary_privacy.py`, `test_canary_http.py`, component tests | `test_cloud_plan_run_refuses_origin_outside_grant`, `test_plan_differential_result_projection_is_bounded_and_bodyless`, `test_result_projection_rejects_header_and_body_values`, `test_cloud_run_containment_entries_carry_workspace_project_runner_grant`; red-team: egress tricks, attempt replay/concurrency, leakage paths, oversized responses, error false positives (D1 closure must hold through the cloud path) |
 | T5 | Regressions from product + quotas + revoke end-to-end (§7.4, §7.6) | `heel/saas/http_api.py`, `heel/saas/canary_runs.py`, `heel/saas/migrate.py`, `heel/regressions.py`, `heel/runner/daemon.py`, `apps/heel-cloud/**` (regression UI), tests | `test_regression_replay_reserves_once_under_retry`, `test_new_routes_require_same_origin_and_recent_auth`, `test_runner_serve_offline_shows_offline_state_and_resumes`, `test_metrics_and_structured_logs_never_contain_handles_or_secrets`; red-team: quota/billing races, regression with expired/missing credentials, session fixation, invitation replay on the new routes |
 | T6 | Product surface: OpenAPI import step, pairing/access instructions, device page, status/recovery states (§6), legal/support/security pages (drafts for Kevin's approval), truthful docs (`CAPABILITIES.md`, `BUILD_STATE.md`, `README.md`, `/agent` copy) | `apps/heel-cloud/app/**`, `apps/heel-cloud/components/**`, `apps/heel-cloud/tests/**`, `docs/**`, `README.md` | vitest + `test:node` + `rendered-html.test.mjs` green; copy contract tests for every state id in §6 |
-| T7 | Release and deployment: version 1.3.0, deterministic artifacts, GitHub Release assets step, `fixed_origin` Worker mode if required (§8.2), staging env, runbook additions, acceptance tooling | `pyproject.toml`, `release/**`, `scripts/build_open_core_release.py`, `apps/heel-cloud/public/downloads/*` (regenerated only), `apps/heel-cloud/build/deployment-config.ts`, `apps/heel-cloud/scripts/prepare-runtime.mjs`, `.github/workflows/*.yml`, `deploy/**`, `docs/saas/**`, release tests | `build_open_core_release.py --check`; `test_open_core_release`; `test_runner_plan_differential_release.py`; `deployment-config.test.ts`; `actionlint`; staging deploy green with `/v1/readyz` 200 privately and anonymous review working publicly |
+| T7 | Release and deployment: version 1.3.0, deterministic artifacts, GitHub Release assets step, `fixed_origin` Worker mode **only if** the §8.2 restrictions can be enforced on the chosen host (otherwise the implemented VPC topology), `HEEL_INGRESS_ACK` in `ProductionConfiguration`, staging env, runbook additions, acceptance tooling | `pyproject.toml`, `release/**`, `scripts/build_open_core_release.py`, `apps/heel-cloud/public/downloads/*` (regenerated only), `apps/heel-cloud/build/deployment-config.ts`, `apps/heel-cloud/scripts/prepare-runtime.mjs`, `apps/heel-cloud/tests/mcp-quickstart.test.mjs`, `apps/heel-cloud/app/agent/page.tsx` (install string only), `heel/saas/server.py` (ingress ack only), `tests/test_saas_server.py`, `.github/workflows/*.yml`, `deploy/**`, `docs/saas/**`, release tests | `build_open_core_release.py --check`; `test_open_core_release`; `test_runner_plan_differential_release.py`; `deployment-config.test.ts`; `actionlint`; staging deploy green with `/v1/readyz` 200 privately and anonymous review working publicly |
 | T8 | Final clean-room acceptance (§11) by a fresh Fable session | none (evidence only) | verbatim YES with evidence, or FAIL with the failing step |
+
+T3 and T4 as listed each touch more than ten files; the Fable review of T2b MUST confirm or
+re-split them before T3 starts (candidate split: T3a inventory route + Worker allowlist + v2
+projection validation; T3b context-claim payload + grant `plan_sha256` + runner compile binding).
 
 Required red-team coverage across T2–T5 (each item named in at least one review): session
 fixation, device code theft, invitation replay, rotation races, scope tamper/allowlist, egress
@@ -462,16 +606,16 @@ No commit of this launch goes to PR #41's branch.
 | # | Step | Implementation owner | Acceptance check (Fable) |
 |---|---|---|---|
 | 1 | Visit public HTTPS | T7 | anonymous GET `/` 200 on the production origin; `/api/control-plane/v1/me` 401 not 503 |
-| 2 | Sign up / login | existing; T6 copy | §11 step 1; lockout and throttle observed |
-| 3 | Workspace/project | existing | §11 step 2 |
-| 4 | Register/verify staging target | existing | §11 step 2 with a real https-file proof |
+| 2 | Sign up / login | existing API; browser path untested until T8; T6 copy | §11 step 1 in a real browser through the Worker; lockout and throttle observed |
+| 3 | Workspace/project | existing API; browser path untested until T8 | §11 step 2 |
+| 4 | Register/verify staging target | existing API (challenge issuance proven; verification not yet) | §11 step 2 with a real https-file proof reaching `status: verified` |
 | 5 | Install runner, one command | T7 | §11 step 4; wheel digest equals manifest |
-| 6 | Pair via browser/device | T2 | §11 step 5; reused token rejected |
-| 7 | Two local credentials with plan labels | T2 | §11 step 6; labels visible in UI, handles never, secrets nowhere |
+| 6 | Pair via browser/device | T2a (pair), T2b (serve) | §11 step 5; reused token rejected |
+| 7 | Two local credentials with plan labels | T2a | §11 step 6; labels visible in UI, handles never, secrets nowhere |
 | 8 | Import OpenAPI | T3, T6 | §11 step 7; raw spec absent from network capture |
 | 9 | Review dry-run | T3 | §11 step 8; `plan_sha256` equal on both sides, `requests_sent 0` |
 | 10 | Start scan from product | T4 | §11 step 9; first target request only after Approve |
-| 11 | Live status / recovery | T4, T5 | §11 step 9 and the §10 #12 offline check |
+| 11 | Live status / recovery | T2b, T4, T5 | §11 step 9 and the §10 #12 offline check |
 | 12 | Undeclared observed/verified finding | T4 | §11 step 10 |
 | 13 | Inspect redacted evidence | T4 | §11 step 11 |
 | 14 | Save / replay regression | T5 | §11 steps 12–13 |
@@ -502,7 +646,9 @@ CONFIRMED gaps on this machine (details in `sessions/T1D-closing.md`, read as ev
 no Cloudflare login (`wrangler whoami` "Not logged in"); no Docker daemon; GitHub Release
 v1.2.0 has no assets; no Actions secrets; Sites management access exists for the Worker only.
 Railway access exists (personal workspace, two unrelated projects) but hosting the control plane
-there is new spend.
+there is new spend. This audit found no deployed Python control plane through the access it had;
+that is not proof that none exists under credentials this machine lacks (Cloudflare account state
+untested, T1D §D item 14).
 
 Concrete escalations for Kevin, each needed only when its task starts:
 
