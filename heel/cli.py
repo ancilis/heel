@@ -176,6 +176,7 @@ def _runner_credential_add(args) -> int:
                 auth_profile=args.profile,
                 source_kind=source_kind,
                 label=args.label,
+                plan_label=args.plan_label,
             )
         else:
             if args.secret_fd is not None:
@@ -191,6 +192,7 @@ def _runner_credential_add(args) -> int:
                 label=args.label,
                 vault=vault,
                 secret=secret,
+                plan_label=args.plan_label,
             )
             secret = b""
         # The handle is a random index into the vault, never derived from the secret.
@@ -207,11 +209,16 @@ def _runner_credential_add(args) -> int:
     except Exception:
         print(_SAFE_RUNNER_CREDENTIAL_FAILURE, file=sys.stderr)
         return 2
-    print(json.dumps({
+    printed = {
         "credential_handle": handle,
         "credential_source": source,
         "registered_count": 1,
-    }, sort_keys=True))
+    }
+    if "plan_label" in record:
+        # The plan label is the operator's own public name for this plan, unlike --label.
+        printed["plan_label"] = record["plan_label"]
+        printed["role"] = record["semantic_role"]
+    print(json.dumps(printed, sort_keys=True))
     return 0
 
 
@@ -1086,6 +1093,10 @@ def main(argv=None):
         ),
     )
     runner_credential_add.add_argument("--label", required=True)
+    runner_credential_add.add_argument(
+        "--plan-label",
+        help="your own name for this plan (for example free or pro); lower_plan/higher_plan only",
+    )
     runner_credential_add.add_argument(
         "--backend", required=True,
         choices=("keychain", "secret-service", "ephemeral-env", "ephemeral-fd"),
