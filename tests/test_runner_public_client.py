@@ -27,6 +27,8 @@ from tests.test_runner_stop import compiled_pair, resign_grant, signed_grant
 
 
 RUN_ID = "crun_" + "a" * 32
+GRANT_AUTHORITY = SigningAuthority.generate()
+GRANT_AUTHORITY_FIELD = {"key_id": GRANT_AUTHORITY.key_id, "public_key_b64": GRANT_AUTHORITY.canonical_public_key}
 
 
 def test_open_core_runner_package_exports_pairing_and_recovery_types():
@@ -117,13 +119,14 @@ def _complete_v3_pairing(root: Path, signer: SecureSigner, *, suffix: str):
         pending, store=store, now_ms=10, random_source=lambda count: b"n" * count,
     )
     response = {
-        "schema_version": "heel.runner-pairing-activated.v3", "workspace_id": "ws",
+        "schema_version": "heel.runner-pairing-activated.v4", "workspace_id": "ws",
         "runner_id": pending["runner_id"], "runner_key_id": signer.key_id,
         "pairing_exchange_digest": pending["pairing_exchange_digest"],
         "initial_claim_nonce": base64.b64encode(b"s" * 32).decode(),
         "initial_claim_sequence": 1, "initial_claim_generation": 0,
         "capabilities": ["runner_claim", "runner_heartbeat", "runner_progress", "runner_result"],
         "control_protocol": "heel.runner-control.v2", "activated_at_ms": 11,
+        "grant_authority": dict(GRANT_AUTHORITY_FIELD),
     }
     identity = store.accept_pairing_activation(activation, response, now_ms=11)
     runtime_path = root / "runner" / "runtime.sqlite3"
@@ -470,13 +473,14 @@ def test_v3_pairing_journal_installs_the_server_claim_cursor_before_it_is_execut
     assert activation.request["schema_version"] == "heel.runner-pairing-activate.v3"
     assert (tmp_path / "home" / "runner" / "pairing-activation.json").is_file()
     response = {
-        "schema_version": "heel.runner-pairing-activated.v3", "workspace_id": "ws",
+        "schema_version": "heel.runner-pairing-activated.v4", "workspace_id": "ws",
         "runner_id": pending["runner_id"], "runner_key_id": signer.key_id,
         "pairing_exchange_digest": pending["pairing_exchange_digest"],
         "initial_claim_nonce": base64.b64encode(b"s" * 32).decode(),
         "initial_claim_sequence": 1, "initial_claim_generation": 0,
         "capabilities": ["runner_claim", "runner_heartbeat", "runner_progress", "runner_result"],
         "control_protocol": "heel.runner-control.v2", "activated_at_ms": 11,
+        "grant_authority": dict(GRANT_AUTHORITY_FIELD),
     }
     identity = store.accept_pairing_activation(activation, response, now_ms=11)
     runtime = RunnerRuntimeState(tmp_path / "home" / "runner" / "runtime.sqlite3", identity, signer)
@@ -486,6 +490,83 @@ def test_v3_pairing_journal_installs_the_server_claim_cursor_before_it_is_execut
     assert cursor.next_sequence == 1 and cursor.generation == 0
     assert not (tmp_path / "home" / "runner" / "pairing-activation.json").exists()
     assert (tmp_path / "home" / "runner" / "paired-identity.json").is_file()
+
+
+def test_runner_accepts_only_a_v4_activation_with_a_consistent_grant_authority_and_journals_it(tmp_path):
+    signer = Signer()
+    material = create_runner_pairing_material(
+        display_name="Runner One", runner_version="1.0", adapters={"http": "1.0"},
+        signer=signer, random_source=lambda count: bytes(range(count)),
+    )
+    exchange = material.executable_exchange_request("invitation")
+    pending = {
+        "schema_version": "heel.runner-pairing-pending.v2", "pairing_id": "pending_" + "9" * 32,
+        "runner_id": "runr_" + "9" * 32, "fingerprint": material.fingerprint, "status": "pending",
+        "activation_challenge": base64.b64encode(b"c" * 32).decode(),
+        "control_protocol": "heel.runner-control.v2",
+        "pairing_exchange_digest": hashlib.sha256(canonical_bytes(exchange)).hexdigest(),
+    }
+    root = tmp_path / "home"
+    store = RunnerStore(root)
+    activation = material.prepare_executable_activation(
+        pending, store=store, now_ms=10, random_source=lambda count: b"n" * count,
+    )
+    journal_path = root / "runner" / "pairing-activation.json"
+    prepared = journal_path.read_bytes()
+    v4 = {
+        "schema_version": "heel.runner-pairing-activated.v4", "workspace_id": "ws",
+        "runner_id": pending["runner_id"], "runner_key_id": signer.key_id,
+        "pairing_exchange_digest": pending["pairing_exchange_digest"],
+        "initial_claim_nonce": base64.b64encode(b"s" * 32).decode(),
+        "initial_claim_sequence": 1, "initial_claim_generation": 0,
+        "capabilities": ["runner_claim", "runner_heartbeat", "runner_progress", "runner_result"],
+        "control_protocol": "heel.runner-control.v2", "activated_at_ms": 11,
+        "grant_authority": dict(GRANT_AUTHORITY_FIELD),
+    }
+    v3 = {key: value for key, value in v4.items() if key != "grant_authority"}
+    v3["schema_version"] = "heel.runner-pairing-activated.v3"
+    other = SigningAuthority.generate()
+    key = GRANT_AUTHORITY.canonical_public_key
+    flipped = bytearray(GRANT_AUTHORITY.public_key_bytes); flipped[0] ^= 1
+    rejected = [
+        v3,  # an old (pre-v4) server: no silent downgrade
+        {key_: value for key_, value in v4.items() if key_ != "grant_authority"},
+        {**v3, "grant_authority": dict(GRANT_AUTHORITY_FIELD)},
+        {**v4, "schema_version": "heel.runner-pairing-activated.v5"},
+        {**v4, "grant_authority_hint": "x"},
+        {**v4, "grant_authority": {**GRANT_AUTHORITY_FIELD, "extra": "x"}},
+        {**v4, "grant_authority": {"key_id": GRANT_AUTHORITY.key_id}},
+        {**v4, "grant_authority": {"key_id": other.key_id, "public_key_b64": key}},
+        {**v4, "grant_authority": {"key_id": GRANT_AUTHORITY.key_id, "public_key_b64": other.canonical_public_key}},
+        {**v4, "grant_authority": {"key_id": GRANT_AUTHORITY.key_id,
+                                    "public_key_b64": base64.b64encode(bytes(flipped)).decode()}},
+        {**v4, "grant_authority": {"key_id": GRANT_AUTHORITY.key_id,
+                                    "public_key_b64": base64.b64encode(GRANT_AUTHORITY.public_key_bytes[:31]).decode()}},
+        {**v4, "grant_authority": {"key_id": GRANT_AUTHORITY.key_id,
+                                    "public_key_b64": key[:-2] + chr(ord(key[-2]) + 1) + "="}},
+        {**v4, "grant_authority": {"key_id": GRANT_AUTHORITY.key_id, "public_key_b64": key + "\n"}},
+        {**v4, "grant_authority": {"key_id": 7, "public_key_b64": key}},
+        {**v4, "grant_authority": {"key_id": "k_\u00e9" + GRANT_AUTHORITY.key_id[3:], "public_key_b64": key}},
+        {**v4, "grant_authority": {"key_id": GRANT_AUTHORITY.key_id, "public_key_b64": key[:-1] + "\u00e9"}},
+        {**v4, "grant_authority": [GRANT_AUTHORITY.key_id, key]},
+        {**v4, "grant_authority": None},
+        {**v4, "grant_authority": key},
+    ]
+    for response in rejected:
+        with pytest.raises(ValueError):
+            store.accept_pairing_activation(activation, copy.deepcopy(response), now_ms=11)
+        assert journal_path.read_bytes() == prepared
+        assert not (root / "runner" / "paired-identity.json").exists()
+    store.accept_pairing_activation(activation, copy.deepcopy(v4), now_ms=11)
+    accepted = json.loads(journal_path.read_text())
+    assert accepted["state"] == "accepted"
+    assert accepted["activation_response"]["grant_authority"] == GRANT_AUTHORITY_FIELD
+    assert accepted["activation_response"]["schema_version"] == "heel.runner-pairing-activated.v4"
+    # Crash after acceptance: recovery finishes from the journal and carries the response unchanged.
+    restarted = RunnerStore(root)
+    identity = restarted.recover_pairing_activation(material, runtime_path=root / "runner" / "runtime.sqlite3")
+    assert identity is not None and identity.runner_id == pending["runner_id"]
+    assert not journal_path.exists() and (root / "runner" / "paired-identity.json").is_file()
 
 
 def test_pending_v3_preserves_cloud_challenge_expiry_in_the_signed_prepared_journal(tmp_path):
@@ -581,13 +662,14 @@ def test_v3_accepted_pairing_journal_recovers_the_cursor_without_reissuing_activ
         pending, store=store, now_ms=10, random_source=lambda count: b"n" * count,
     )
     response = {
-        "schema_version": "heel.runner-pairing-activated.v3", "workspace_id": "ws",
+        "schema_version": "heel.runner-pairing-activated.v4", "workspace_id": "ws",
         "runner_id": pending["runner_id"], "runner_key_id": signer.key_id,
         "pairing_exchange_digest": pending["pairing_exchange_digest"],
         "initial_claim_nonce": base64.b64encode(b"s" * 32).decode(),
         "initial_claim_sequence": 1, "initial_claim_generation": 0,
         "capabilities": ["runner_claim", "runner_heartbeat", "runner_progress", "runner_result"],
         "control_protocol": "heel.runner-control.v2", "activated_at_ms": 11,
+        "grant_authority": dict(GRANT_AUTHORITY_FIELD),
     }
     store.accept_pairing_activation(activation, response, now_ms=11)
     restarted = RunnerStore(root)
@@ -861,13 +943,14 @@ def test_v3_prepared_pairing_recovery_binds_the_signed_runner_before_accepting_r
 
     def response_for(runner_id):
         return {
-            "schema_version": "heel.runner-pairing-activated.v3", "workspace_id": "ws",
+            "schema_version": "heel.runner-pairing-activated.v4", "workspace_id": "ws",
             "runner_id": runner_id, "runner_key_id": signer.key_id,
             "pairing_exchange_digest": pending["pairing_exchange_digest"],
             "initial_claim_nonce": base64.b64encode(b"s" * 32).decode(),
             "initial_claim_sequence": 1, "initial_claim_generation": 0,
             "capabilities": ["runner_claim", "runner_heartbeat", "runner_progress", "runner_result"],
             "control_protocol": "heel.runner-control.v2", "activated_at_ms": 11,
+            "grant_authority": dict(GRANT_AUTHORITY_FIELD),
         }
 
     with pytest.raises(ValueError):

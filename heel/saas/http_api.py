@@ -1132,6 +1132,7 @@ class _Handler(BaseHTTPRequestHandler):
             if set(body) == {"schema_version", "client_activation_nonce_b64", "signature_b64"} and body["schema_version"] == "heel.runner-pairing-activate.v3":
                 response = store.activate_executable(
                     pairing_id, body, max_active=self.cp.runner_active_limit(store, pairing_id),
+                    grant_authority=self.cp.grant_authority,
                 )
                 self._canonical_json(200, response)
                 return

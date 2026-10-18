@@ -26,7 +26,8 @@ from pathlib import Path
 import pytest
 
 from heel import cli
-from heel.crypto import SigningAuthority
+from heel.canary_contracts import canonical_bytes
+from heel.crypto import SigningAuthority, ed25519_key_id, load_public_key_base64, verify_envelope
 from heel.runner import daemon as daemon_module
 from heel.runner import control_transport
 from heel.runner.control_transport import (
@@ -182,12 +183,22 @@ def test_real_pairing_over_tls_edge_harness_activates_persists_heartbeats_and_re
         "SELECT status FROM canary_runners WHERE workspace_id=? AND runner_id=?", (workspace_id, runner_id),
     ).fetchone()
     assert tuple(row) == ("active",)
+    # T2b-1: the record holds the control plane's own grant-signing public key, delivered inside the
+    # approved activation (no seeding, no separate fetch), and its key ID is derived from the key.
+    record = _daemon_record(home)
+    cloud = harness.control_plane.grant_authority
+    assert record["grant_authority_key_id"] == cloud.key_id
+    assert record["grant_authority_public_key_b64"] == cloud.canonical_public_key
+    public_key = base64.b64decode(record["grant_authority_public_key_b64"], validate=True)
+    assert ed25519_key_id(public_key) == record["grant_authority_key_id"]
+    _assert_record_key_verifies_context_bindings(harness, record, workspace_id, runner_id, key_id)
 
     # Process restart: a fresh daemon object re-reads the store and re-loads the same seed.
     restarted = _daemon(home, harness, backend)
     status = restarted.status()
     assert status["state"] == "active", status
     assert status["runner_id"] == runner_id and status["runner_key_id"] == key_id
+    assert status["grant_authority_key_id"] == cloud.key_id
     assert status["control_plane"]["state"] == "confirmed"
     assert status["control_plane"]["context_bindings"] == 0
     # A second live call proves the claim chain cursor advanced and persisted.
@@ -212,6 +223,23 @@ def test_real_pairing_over_tls_edge_harness_activates_persists_heartbeats_and_re
     assert result["state"] == "unpaired" and result["removed"] is True
     assert backend.values == {} and backend.deleted == [label]
     assert _daemon(home, harness, backend).status() == {"state": "unpaired"}
+
+
+def _assert_record_key_verifies_context_bindings(harness, record, workspace_id, runner_id, runner_key_id):
+    """The persisted key verifies a context-binding signature made by the control plane's binding
+    service (the service the coordinator's binding claim relies on) and nothing signed by another key."""
+    from heel.saas.runner_contexts import CONTEXT_DOMAIN  # noqa: PLC0415 - server-side test import only
+    trusted = {record["grant_authority_key_id"]: load_public_key_base64(record["grant_authority_public_key_b64"])}
+    unsigned = {"schema_version": "heel.runner-context-binding.v1", "workspace_id": workspace_id,
+                "runner_binding": {"runner_id": runner_id, "runner_key_id": runner_key_id}}
+    payload = CONTEXT_DOMAIN + canonical_bytes(unsigned)
+    signing = harness.control_plane.runner_contexts.signing
+    assert signing is harness.control_plane.grant_authority
+    verify_envelope(trusted, signing.sign(payload), payload)
+    with pytest.raises(ValueError):
+        verify_envelope(trusted, SigningAuthority.generate().sign(payload), payload)
+    with pytest.raises(ValueError):
+        verify_envelope(trusted, signing.sign(payload), payload + b"x")
 
 
 def _revocation_audit(harness, workspace_id, runner_id):
@@ -686,6 +714,79 @@ def test_pair_record_updates_and_removals_are_bound_to_the_attempt_installation_
     daemon._write_record(store, {**record, "state": "exchanged"})
     assert _daemon_record(home)["state"] == "exchanged"
     assert daemon._remove_record(store, "a" * 32) is True and _daemon_record(home) is None
+
+
+def test_status_reports_cloud_authority_missing_for_a_legacy_record_and_unpair_still_works(tmp_path, harness, monkeypatch):
+    """A record written before the grant-authority bootstrap stays inspectable and removable."""
+    workspace_id, cookie = harness.signup_owner("owner-legacy@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "legacy")
+    (label,) = backend.values
+    record_path = home / "runner-daemon" / "pairing.json"
+    current = _daemon_record(home)
+    legacy = {key: value for key, value in current.items() if not key.startswith("grant_authority_")}
+    assert set(current) - set(legacy) == {"grant_authority_key_id", "grant_authority_public_key_b64"}
+    record_path.write_text(json.dumps(legacy))
+    spare_token = _invite(harness, workspace_id, cookie)  # owner browser call, before the baseline
+    forwarded = len(harness.forwarded)
+    expected_steps = ["heel runner unpair", "heel runner pair --origin <origin> --invite <new token>"]
+    for check in (True, False):
+        status = _daemon(home, harness, backend).status(check_control_plane=check)
+        assert status == {
+            "state": "cloud_authority_missing", "origin": harness.origin, "workspace_id": workspace_id,
+            "runner_id": runner_id, "runner_key_id": legacy["runner_key_id"],
+            "fingerprint": legacy["fingerprint"], "next_steps": expected_steps,
+        }
+    # The shipped CLI prints the same closed state and exits non-zero, live or offline.
+    monkeypatch.setenv("HEEL_HOME", str(home))
+    for argv in (["runner", "status"], ["runner", "status", "--offline"]):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            assert cli.main(argv) == 1
+        printed = json.loads(stdout.getvalue())
+        assert printed["state"] == "cloud_authority_missing" and printed["next_steps"] == expected_steps
+    assert len(harness.forwarded) == forwarded  # no network call
+    with pytest.raises(RunnerPairingError) as again:
+        _daemon(home, harness, backend).pair(harness.origin, spare_token)
+    assert again.value.code == "already_paired"
+    assert _daemon_record(home) == legacy
+
+    # Inconsistent key material is also reported as missing; a half transition is invalid state.
+    other = SigningAuthority.generate()
+    for bad in (
+        {**legacy, "grant_authority_key_id": other.key_id,
+         "grant_authority_public_key_b64": current["grant_authority_public_key_b64"]},
+        {**legacy, "grant_authority_key_id": current["grant_authority_key_id"],
+         "grant_authority_public_key_b64": current["grant_authority_public_key_b64"][:-2] + "A="},
+    ):
+        record_path.write_text(json.dumps(bad))
+        assert _daemon(home, harness, backend).status()["state"] == "cloud_authority_missing"
+    for invalid in (
+        {**legacy, "grant_authority_key_id": current["grant_authority_key_id"]},
+        {**legacy, "grant_authority_public_key_b64": current["grant_authority_public_key_b64"]},
+        {**current, "grant_authority_key_id": None},
+        {**current, "state": "exchanged"},
+        {**current, "grant_authority_hint": "x"},
+    ):
+        record_path.write_text(json.dumps(invalid))
+        with pytest.raises(RunnerPairingError) as refused:
+            _daemon(home, harness, backend).status()
+        assert refused.value.code == "local_state_invalid"
+    assert len(harness.forwarded) == forwarded
+
+    # The legacy record unpairs normally: its seed is removed and the home pairs afresh with a key.
+    record_path.write_text(json.dumps(legacy))
+    result = _daemon(home, harness, backend).unpair()
+    assert result["state"] == "unpaired" and result["removed"] is True and result["runner_id"] == runner_id
+    assert backend.values == {} and _daemon_record(home) is None
+    assert harness.request("POST", f"/v1/workspaces/{workspace_id}/runners/{runner_id}/revoke",
+                           REVOKE_BODY, cookie=cookie)[0] == 200
+    # The refused ``already_paired`` attempt sent nothing, so its invitation is still unused.
+    _, outcome = _pair_with_owner_approval(
+        harness, _daemon(home, harness, backend), workspace_id, cookie, spare_token,
+    )
+    assert outcome["result"]["state"] == "active", outcome
+    assert _daemon_record(home)["grant_authority_key_id"] == harness.control_plane.grant_authority.key_id
+    assert _daemon(home, harness, backend).status()["state"] == "active"
 
 
 def test_pair_without_a_supported_secret_service_fails_closed_without_file_fallback(tmp_path, monkeypatch):
