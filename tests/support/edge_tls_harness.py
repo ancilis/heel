@@ -63,7 +63,10 @@ _RUNNER_HEADERS = ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Ti
                    "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature")
 _RUNNER_RESYNC_HEADERS = ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
                           "X-Heel-Runner-Signature")
-_SESSION_ROUTES = ("/v1/signup", "/v1/login", "/v1/logout")
+# Anonymous like the Worker's SIGNUP_ROUTE/LOGIN_ROUTE branch. Logout is not anonymous: it takes
+# the default credential branch so the session cookie reaches the server and is revoked.
+_SESSION_ROUTES = ("/v1/signup", "/v1/login")
+_LOGOUT_ROUTE = "/v1/logout"
 _ME_ROUTE = "/v1/me"
 
 
@@ -75,7 +78,7 @@ class _EdgeRefusal(Exception):
 
 def _edge_route(method: str, path: str) -> bool:
     """The subset of the Worker's ``controlPlaneRoute`` allowlist these tests reach."""
-    if path in _SESSION_ROUTES:
+    if path in _SESSION_ROUTES or path == _LOGOUT_ROUTE:
         return method == "POST"
     if path == _ME_ROUTE:
         return method == "GET"
