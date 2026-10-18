@@ -1,11 +1,16 @@
 """Test-only loopback TLS edge in front of the real Python control plane.
 
 ``EdgeTLSHarness`` plays the public Worker's part for runner pairing tests: it terminates
-TLS with an ephemeral CA (``localhost`` only), strips any caller-supplied edge headers,
-injects ``X-Heel-Edge-Auth`` / ``X-Heel-Client-Key`` and the same-origin marker exactly as
-the Worker does, and forwards to ``serve(ControlPlane(edge_auth_secret=...))``. The control
+TLS with an ephemeral CA (``localhost`` only) and mirrors the Worker's control-plane contract
+for the routes these tests use (``apps/heel-cloud/worker/index.ts`` ``controlPlaneRoute`` and
+``controlPlaneRequestHeaders``): the exact route/method allowlist (anything else is 404),
+fresh per-family upstream headers, the same-origin + ``Sec-Fetch-Site`` + cookie-only rule for
+the human runner routes, request bodies forwarded for POST only with the Worker's per-family
+caps, and ``X-Heel-Edge-Auth`` / ``X-Heel-Client-Key`` / ``X-Heel-Internal-Origin`` injected
+by the edge alone. It forwards to ``serve(ControlPlane(edge_auth_secret=...))``. The control
 plane keeps every production guard; the only seam the runner sees is the explicit CA bundle
-path handed to ``HTTPSControlTransport``.
+path handed to ``HTTPSControlTransport``. It is not the Worker: final acceptance still needs
+the deployed edge.
 
 ``ScriptedTLSServer`` answers every request with a fixed raw response, for transport
 failure tests (redirects, malformed or oversized bodies, slow peers).
@@ -17,6 +22,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import re
 import secrets
 import socket
 import ssl
@@ -38,7 +44,71 @@ _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer",
     "upgrade", "host", "content-length",
 })
-_EDGE_OWNED = frozenset({"x-heel-edge-auth", "x-heel-client-key", "x-heel-internal-origin"})
+
+# Route families copied from apps/heel-cloud/worker/index.ts (same names, same patterns).
+_WS = "ws_[0-9a-f]{16}"
+_RUNNER = "[A-Za-z0-9_-]{1,128}"
+_RUNNER_PAIRING_EXCHANGE = "/v1/runner-pairings/exchange"
+_RUNNER_PAIRING_ACTIVATE = re.compile(r"^/v1/runner-pairings/pending_[0-9a-f]{32}/(?:activate|activation-abort)$")
+_RUNNER_ROTATION_PUBLIC = re.compile(r"^/v1/runner-rotations/rotation_[0-9a-f]{32}/(?:activate|poll|activation-abort)$")
+_RUNNER_PAIRING_MANAGE = re.compile(rf"^/v1/workspaces/{_WS}/runner-pairings(?:/pending_[0-9a-f]{{32}}(?:/approve)?)?$")
+_RUNNER_ROTATION_START = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/rotate$")
+_RUNNER_ROTATION_APPROVE = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/rotations/rotation_[0-9a-f]{{32}}/approve$")
+_RUNNER_REVOKE = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/revoke$")
+_RUNNER_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}(?:/claim|/runs/{_RUNNER}/(?:heartbeat|progress|result|stop-ack))$")
+_RUNNER_CONTEXT_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/contexts(?:/list|/rcb_[0-9a-f]{{32}}/(?:claim|approval-projections))$")
+_RUNNER_RESULT_PROJECTION = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/runs/crun_[0-9a-f]{{32}}/result-projection$")
+_RUNNER_RESYNC = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/resync/(?:start|complete)$")
+_RUNNER_HEADERS = ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
+                   "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature")
+_RUNNER_RESYNC_HEADERS = ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
+                          "X-Heel-Runner-Signature")
+_SESSION_ROUTES = ("/v1/signup", "/v1/login", "/v1/logout")
+_ME_ROUTE = "/v1/me"
+
+
+class _EdgeRefusal(Exception):
+    def __init__(self, status: int, error: str):
+        super().__init__(error)
+        self.status, self.error = status, error
+
+
+def _edge_route(method: str, path: str) -> bool:
+    """The subset of the Worker's ``controlPlaneRoute`` allowlist these tests reach."""
+    if path in _SESSION_ROUTES:
+        return method == "POST"
+    if path == _ME_ROUTE:
+        return method == "GET"
+    if path == _RUNNER_PAIRING_EXCHANGE or _RUNNER_PAIRING_ACTIVATE.match(path) or _RUNNER_ROTATION_PUBLIC.match(path):
+        return method == "POST"
+    if _RUNNER_PAIRING_MANAGE.match(path):
+        return method in {"GET", "POST", "DELETE"}
+    if _RUNNER_ROTATION_START.match(path) or _RUNNER_ROTATION_APPROVE.match(path) or _RUNNER_REVOKE.match(path):
+        return method == "POST"
+    if (_RUNNER_CONTROL.match(path) or _RUNNER_CONTEXT_CONTROL.match(path)
+            or _RUNNER_RESULT_PROJECTION.match(path) or _RUNNER_RESYNC.match(path)):
+        return method == "POST"
+    return False
+
+
+def _body_cap(path: str) -> int:
+    """The Worker's per-family POST body maximum for the routes above."""
+    if _RUNNER_RESULT_PROJECTION.match(path):
+        return 272 * 1024
+    if _RUNNER_CONTEXT_CONTROL.match(path):
+        if path.endswith("/contexts/list"):
+            return 128
+        return 256 if path.endswith("/claim") else 69632
+    if _RUNNER_CONTROL.match(path):
+        return 256 if path.endswith("/claim") else 36 * 1024
+    if _RUNNER_RESYNC.match(path):
+        return 2 * 1024
+    if (path == _RUNNER_PAIRING_EXCHANGE or _RUNNER_PAIRING_ACTIVATE.match(path)
+            or _RUNNER_ROTATION_PUBLIC.match(path) or _RUNNER_PAIRING_MANAGE.match(path)
+            or _RUNNER_ROTATION_START.match(path) or _RUNNER_ROTATION_APPROVE.match(path)
+            or _RUNNER_REVOKE.match(path)):
+        return 16 * 1024
+    return 256 * 1024
 
 
 class EphemeralCA:
@@ -147,25 +217,114 @@ class EdgeTLSHarness:
             def log_message(self, *_args):
                 return
 
-            def _proxy(self):
-                length = int(self.headers.get("Content-Length") or 0)
-                body = self.rfile.read(length) if length else b""
+            def _single(self, name: str) -> str | None:
+                values = self.headers.get_all(name) or []
+                if len(values) > 1:
+                    raise _EdgeRefusal(400, "invalid control plane request")
+                return values[0] if values else None
+
+            def _credentials(self) -> dict[str, str]:
                 headers = {}
-                for name, value in self.headers.items():
-                    lowered = name.lower()
-                    if lowered in _HOP_BY_HOP or lowered in _EDGE_OWNED:
-                        continue
-                    headers[name] = value
-                headers["X-Heel-Edge-Auth"] = harness.edge_secret
-                headers["X-Heel-Client-Key"] = hashlib.sha256(
-                    ("edge-client\0" + self.client_address[0]).encode()
-                ).hexdigest()
-                if self.headers.get("Origin") == harness.origin:
+                for name in ("Cookie", "Authorization"):
+                    value = self._single(name)
+                    if value is not None:
+                        headers[name] = value
+                return headers
+
+            def _upstream_headers(self, path: str) -> dict[str, str]:
+                """Mirror ``controlPlaneRequestHeaders``: a fresh header set per family."""
+                method = self.command
+                has = lambda name: self.headers.get(name) is not None  # noqa: E731
+                runner_control = bool(_RUNNER_CONTROL.match(path) or _RUNNER_CONTEXT_CONTROL.match(path)
+                                      or _RUNNER_RESULT_PROJECTION.match(path))
+                public = bool(path == _RUNNER_PAIRING_EXCHANGE or _RUNNER_PAIRING_ACTIVATE.match(path)
+                              or _RUNNER_ROTATION_PUBLIC.match(path))
+                human = bool(_RUNNER_PAIRING_MANAGE.match(path) or _RUNNER_ROTATION_START.match(path)
+                             or _RUNNER_ROTATION_APPROVE.match(path) or _RUNNER_REVOKE.match(path))
+                if runner_control or _RUNNER_RESYNC.match(path):
+                    names = _RUNNER_HEADERS if runner_control else _RUNNER_RESYNC_HEADERS
+                    forbidden = ("Authorization", "Cookie", "X-Heel-Internal-Origin", "Content-Encoding") if runner_control \
+                        else ("Authorization", "Cookie", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence")
+                    if method != "POST" or any(has(name) for name in forbidden):
+                        raise _EdgeRefusal(400, "invalid control plane request")
+                    headers = {}
+                    for name in names:
+                        value = self._single(name)
+                        if value is None:
+                            raise _EdgeRefusal(400, "invalid control plane request")
+                        headers[name] = value
+                elif public:
+                    if method != "POST" or has("Authorization") or has("Cookie"):
+                        raise _EdgeRefusal(400, "invalid control plane request")
+                    headers = {}
+                elif human:
+                    origin = self._single("Origin") or ""
+                    if origin != harness.origin or self._single("Sec-Fetch-Site") != "same-origin":
+                        raise _EdgeRefusal(400, "invalid control plane request")
+                    headers = self._credentials()
+                    if "Cookie" not in headers or "Authorization" in headers:
+                        raise _EdgeRefusal(400, "invalid control plane request")
                     headers["X-Heel-Internal-Origin"] = "same-origin"
-                harness.forwarded.append((self.command, self.path))
+                    headers["Origin"] = origin
+                elif path in _SESSION_ROUTES:
+                    headers = {}
+                else:
+                    headers = self._credentials()
+                headers["X-Heel-Edge-Auth"] = harness.edge_secret
+                if method != "POST":
+                    return headers
+                if has("Transfer-Encoding"):
+                    raise _EdgeRefusal(400, "invalid control plane request")
+                content_type = (self._single("Content-Type") or "").strip().lower()
+                if content_type.split(";", 1)[0] != "application/json" or "," in content_type:
+                    raise _EdgeRefusal(400, "invalid control plane request")
+                if (self._single("Content-Encoding") or "identity").strip().lower() != "identity":
+                    raise _EdgeRefusal(400, "invalid control plane request")
+                declared = self._single("Content-Length") or ""
+                if re.fullmatch(r"(?:0|[1-9][0-9]*)", declared) is None or len(declared) > 6 \
+                        or int(declared) > _body_cap(path):
+                    raise _EdgeRefusal(400, "invalid control plane request")
+                headers["Content-Type"] = "application/json"
+                headers["Content-Encoding"] = "identity"
+                headers["Content-Length"] = declared
+                if path == "/v1/signup":
+                    headers["X-Heel-Client-Key"] = hashlib.sha256(
+                        ("edge-client\0" + self.client_address[0]).encode()
+                    ).hexdigest()
+                return headers
+
+            def _refuse(self, status: int, error: str) -> None:
+                payload = json.dumps({"error": error}).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+                self.close_connection = True
+
+            def _proxy(self):
+                path = self.path
+                if not _edge_route(self.command, path):
+                    self.close_connection = True
+                    self._refuse(404, "not found")
+                    return
+                try:
+                    headers = self._upstream_headers(path)
+                except _EdgeRefusal as refusal:
+                    self._refuse(refusal.status, refusal.error)
+                    return
+                # Like the Worker, only POST carries a body upstream; any other method is
+                # forwarded bodiless (the caller's bytes are discarded with the connection).
+                body = None
+                if self.command == "POST":
+                    body = self.rfile.read(int(headers["Content-Length"]))
+                else:
+                    self.close_connection = True
+                harness.forwarded.append((self.command, path))
                 upstream = http.client.HTTPConnection("127.0.0.1", harness.backend_port, timeout=10)
                 try:
-                    upstream.request(self.command, self.path, body if self.command != "GET" else None, headers)
+                    upstream.request(self.command, path, body, headers)
                     response = upstream.getresponse()
                     payload = response.read()
                     self.send_response(response.status)
@@ -198,18 +357,24 @@ class EdgeTLSHarness:
 
     # Browser-side helpers: these go through the TLS edge like a real browser session.
     def request(self, method: str, path: str, body: object | None = None, *,
-                cookie: str | None = None, origin: str | None = "same") -> tuple[int, object, str | None]:
+                cookie: str | None = None, origin: str | None = "same",
+                fetch_site: str | None = "same-origin", raw: bytes | None = None,
+                headers: dict[str, str] | None = None) -> tuple[int, object, str | None]:
         context = ssl.create_default_context(cafile=str(self.ca.ca_path))
         connection = http.client.HTTPSConnection("localhost", self.port, context=context, timeout=10)
-        headers = {}
+        extra, headers = headers or {}, {}
         if origin is not None:
             headers["Origin"] = self.origin if origin == "same" else origin
+        if fetch_site is not None:
+            headers["Sec-Fetch-Site"] = fetch_site
         if cookie is not None:
             headers["Cookie"] = cookie
-        payload = None
+        payload = raw
         if body is not None:
             payload = json.dumps(body, separators=(",", ":")).encode()
+        if payload is not None:
             headers["Content-Type"] = "application/json"
+        headers.update(extra)
         try:
             connection.request(method, path, payload, headers)
             response = connection.getresponse()

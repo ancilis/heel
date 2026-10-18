@@ -288,9 +288,11 @@ pair with a new invitation).
   control plane rejects the runner key), `pairing_incomplete`, `local_identity_unavailable`
   or `unpaired`, plus the self-serve access state. `unpair` refuses while a context binding
   is installed; it removes the local identity and the OS-stored seed but cannot revoke the
-  runner in Heel Cloud — revoke it in the dashboard. Known gap: the control plane's
-  `DELETE …/runners/{id}` route currently rejects every request (a DELETE body is refused
-  by request framing, and the handler requires one); it is tracked for a server-side repair.
+  runner in Heel Cloud. An owner or admin revokes it there from a recent same-origin browser
+  session with `POST /v1/workspaces/{ws}/runners/{id}/revoke` and the body
+  `{"schema_version":"heel.runner-revoke.v1","reason_code":"<reason>"}`; the reason and actor
+  are audited, a repeat is refused, and the runner's next `status` reports `runner_revoked`.
+  The dashboard has no runner-revoke control yet.
 - There is no `serve` loop yet; pairing alone authorizes no target traffic.
 
 ## Trust boundary

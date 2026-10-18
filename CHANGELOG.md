@@ -4,6 +4,7 @@ All notable changes to Heel are documented here. Format loosely follows Keep a C
 
 ## [Unreleased]
 
+- Move owner runner revocation to `POST /v1/workspaces/{ws}/runners/{id}/revoke` (same `heel.runner-revoke.v1` body and recent owner/admin same-origin checks) at the control plane and the edge Worker; the old `DELETE …/runners/{id}` could never succeed and is no longer routed.
 - Add a signed-scope, customer-local synthetic export entitlement reference through CLI and MCP, plus app instructions and local report viewing.
 - Require protected content and an entitled positive control for boundary results; status-only reads are inconclusive.
 - Preserve unknown metadata as questions, separate evidence state from severity/disposition, deduplicate operation representations and require applicable commercial rules for relevant library hypotheses.

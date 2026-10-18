@@ -6,6 +6,7 @@ import time
 import http.client
 import json
 import re
+import socket
 import threading
 import tempfile
 from pathlib import Path
@@ -28,6 +29,7 @@ from heel.saas.runner_auth import (
 )
 import heel.saas.runner_auth as runner_auth
 from heel.saas.http_api import ControlPlane, serve
+from heel.saas.tenancy import Role
 
 SIGNING_PRIVATE = Ed25519PrivateKey.from_private_bytes(b"0123456789abcdef0123456789abcdef")
 PUBLIC_KEY = SIGNING_PRIVATE.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
@@ -1790,6 +1792,110 @@ def test_http_pairing_exchange_returns_runner_only_challenge_for_activation():
             "WHERE workspace_id=? AND runner_id=? AND chain_name='claim'",
             (signup["workspace_id"], exchanged["runner_id"]),
         ).fetchone()[0] == 1
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_http_runner_revoke_requires_same_origin_recent_owner_and_exact_body():
+    """POST /v1/workspaces/{ws}/runners/{id}/revoke over a real loopback server."""
+    cp = ControlPlane(device_token_pepper=b"d" * 32, runner_auth_pepper=b"r" * 32,
+                      enable_device_auth=True, public_origin="https://heel.test")
+    server = serve(cp)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    port = server.server_address[1]
+    def request(method, path, body=None, headers=None, *, raw=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        payload = raw if raw is not None else (json.dumps(body, separators=(",", ":")).encode() if body is not None else None)
+        conn.request(method, path, payload, {**({"Content-Type": "application/json"} if payload is not None else {}), **(headers or {})})
+        response = conn.getresponse(); data = response.read(); cookie = response.getheader("Set-Cookie"); conn.close()
+        return response.status, json.loads(data), cookie
+    def raw_status(head):
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+            sock.sendall(head); return int(sock.recv(4096).split(b" ", 2)[1])
+    try:
+        _, signup, cookie = request("POST", "/v1/signup", {"email": "revoke@example.test", "password": "correct-horse-battery"})
+        wid = signup["workspace_id"]
+        owner = cp.store.conn.execute("SELECT user_id FROM memberships WHERE workspace_id=?", (wid,)).fetchone()[0]
+        browser = {"Cookie": cookie.split(";", 1)[0], "Origin": "https://heel.test", "X-Heel-Internal-Origin": "same-origin"}
+        # A real runner: invite -> exchange -> owner approval of phrase + fingerprint -> activate.
+        _, invitation, _ = request("POST", f"/v1/workspaces/{wid}/runner-pairings", {"schema_version": "heel.runner-pairing-invite.v1"}, browser)
+        private = Ed25519PrivateKey.generate()
+        public_raw = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        from heel.saas.runner_auth import WORDS
+        phrase = " ".join(WORDS[:6])
+        status, exchanged, _ = request("POST", "/v1/runner-pairings/exchange", {"schema_version": "heel.runner-pairing-exchange.v2", "invitation_token": invitation["invitation_token"], "public_key_b64": base64.b64encode(public_raw).decode(), "pairing_phrase": phrase, "display_name": "Runner revoke", "runner_version": "v1", "adapters": {}})
+        assert status == 201
+        assert request("POST", f"/v1/workspaces/{wid}/runner-pairings/{exchanged['pairing_id']}/approve", {"schema_version": "heel.runner-pairing-approve.v1", "pairing_phrase": phrase, "fingerprint": hashlib.sha256(public_raw).hexdigest()}, browser)[0] == 200
+        activation = b"heel.runner-pairing-activate.v1\0" + canonical_bytes({"pairing_id": exchanged["pairing_id"], "challenge": exchanged["activation_challenge"]})
+        assert request("POST", f"/v1/runner-pairings/{exchanged['pairing_id']}/activate", {"schema_version": "heel.runner-pairing-activate.v1", "signature_b64": base64.b64encode(private.sign(activation)).decode()})[0] == 200
+        runner_id = exchanged["runner_id"]
+        path = f"/v1/workspaces/{wid}/runners/{runner_id}/revoke"
+        body = {"schema_version": "heel.runner-revoke.v1", "reason_code": "human_revocation"}
+        def runner_status():
+            return cp.store.conn.execute("SELECT status FROM canary_runners WHERE workspace_id=? AND runner_id=?", (wid, runner_id)).fetchone()[0]
+        def audit():
+            return [tuple(row) for row in cp.store.conn.execute("SELECT actor,reason_code FROM canary_runner_audit_records WHERE workspace_id=? AND runner_id=? AND action='runner_revoked'", (wid, runner_id))]
+        same_origin = (403, {"error": "same-origin browser ceremony is required", "code": "same_origin_required"})
+        recent_auth = (403, {"error": "a recent owner or admin browser session is required", "code": "recent_auth_required"})
+        invalid = (400, {"error": "invalid runner revocation", "code": "invalid_runner_revocation"})
+
+        # The retired DELETE: generic framing still runs first (a body is ambiguous framing);
+        # without a body the old route is simply unrouted.
+        assert request("DELETE", f"/v1/workspaces/{wid}/runners/{runner_id}", body, browser)[:2] == (400, {"error": "request body is not allowed", "code": "ambiguous_request_framing"})
+        assert request("DELETE", f"/v1/workspaces/{wid}/runners/{runner_id}", None, browser)[:2] == (404, {"error": "not found"})
+
+        # Same-origin ceremony: Origin and the edge-derived internal-origin marker, checked first.
+        for headers in ({k: v for k, v in browser.items() if k != "Origin"}, {**browser, "Origin": "https://evil.example"},
+                        {k: v for k, v in browser.items() if k != "X-Heel-Internal-Origin"}, {**browser, "X-Heel-Internal-Origin": "cross-site"}):
+            assert request("POST", path, body, headers)[:2] == same_origin
+        assert request("POST", path, {"bad": True}, {"Origin": "https://heel.test"})[:2] == same_origin
+        # Recent owner/admin browser session: anonymous, API key, stale, member/billing/viewer, other workspace.
+        no_cookie = {k: v for k, v in browser.items() if k != "Cookie"}
+        assert request("POST", path, body, no_cookie)[:2] == recent_auth
+        api_key = cp.store.issue_api_key(wid, Role.MEMBER, "revoke-test")
+        assert request("POST", path, body, {**no_cookie, "Authorization": f"Bearer {api_key.secret}"})[:2] == recent_auth
+        assert request("POST", path, body, {**browser, "Authorization": f"Bearer {api_key.secret}"})[:2] == (400, {"error": "ambiguous authentication headers", "code": "ambiguous_request_headers"})
+        for role in (Role.MEMBER, Role.BILLING, Role.VIEWER):
+            user = cp.store.create_user(f"{role.value}@example.test"); cp.store.add_member(wid, user, role)
+            assert request("POST", path, body, {**browser, "Cookie": f"heel_session={cp.auth.create_session(user).token}"})[:2] == recent_auth
+        stranger = cp.store.create_user("stranger@example.test")
+        assert request("POST", path, body, {**browser, "Cookie": f"heel_session={cp.auth.create_session(stranger).token}"})[:2] == recent_auth
+        cp.store.conn.execute("UPDATE sessions SET created_at=? WHERE user_id=?", (time.time() - 901, owner)); cp.store.conn.commit()
+        assert request("POST", path, body, browser)[:2] == recent_auth
+        cp.store.conn.execute("UPDATE sessions SET created_at=? WHERE user_id=?", (time.time(), owner)); cp.store.conn.commit()
+
+        # Exact closed body, checked only after the ceremony.
+        for candidate in ({}, {"schema_version": "heel.runner-revoke.v1"}, {**body, "extra": 1},
+                          {**body, "schema_version": "heel.runner-revoke.v0"}, {**body, "reason_code": None},
+                          {**body, "reason_code": ["human_revocation"]}, {**body, "reason_code": ""}, {**body, "reason_code": " x"}):
+            assert request("POST", path, candidate, browser)[:2] == invalid, candidate
+        assert request("POST", path, None, browser, raw=b"")[:2] == invalid
+        assert request("POST", path, None, browser, raw=b"[1]")[:2] == (400, {"error": "body must be a JSON object"})
+        for malformed in (b"{", b'{"schema_version":"heel.runner-revoke.v1","reason_code":"a","reason_code":"b"}', b'{"x":NaN}', b"\xff"):
+            assert request("POST", path, None, browser, raw=malformed)[:2] == (400, {"error": "invalid JSON body"}), malformed
+        # Generic POST framing: one numeric Content-Length, no transfer coding, bounded size.
+        head = (f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://heel.test\r\nX-Heel-Internal-Origin: same-origin\r\n"
+                f"Cookie: {browser['Cookie']}\r\nContent-Type: application/json\r\n").encode()
+        wire = canonical_bytes(body)
+        assert raw_status(head + b"Content-Length: %d\r\nContent-Length: %d\r\n\r\n" % (len(wire), len(wire)) + wire) == 400
+        assert raw_status(head + b"Transfer-Encoding: chunked\r\n\r\n%x\r\n" % len(wire) + wire + b"\r\n0\r\n\r\n") == 400
+        assert raw_status(head + b"\r\n") == 400
+        assert raw_status(head + b"Content-Length: %d\r\n\r\n" % (64 * 1024 + 1)) == 413
+        assert request("POST", f"/v1/workspaces/{wid}/runners/runr_unknown/revoke", body, browser)[:2] == invalid
+        assert runner_status() == "active" and audit() == []
+
+        # An admin's recent browser session may revoke; the reason and actor are audited once.
+        admin = cp.store.create_user("admin@example.test"); cp.store.add_member(wid, admin, Role.ADMIN)
+        admin_browser = {**browser, "Cookie": f"heel_session={cp.auth.create_session(admin).token}"}
+        assert request("POST", path, {**body, "reason_code": "device_lost"}, admin_browser)[:2] == (200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
+        assert runner_status() == "revoked" and audit() == [(admin, "device_lost")]
+        identity = cp.runner_auth.identity(wid, runner_id)
+        assert identity["state"] == "revoked" and identity["revocation"]["revoked_by"] == admin
+        assert identity["revocation"]["reason_code"] == "device_lost"
+        # Retries are refused without a second effect.
+        assert request("POST", path, body, browser)[:2] == invalid
+        assert request("POST", path, {**body, "reason_code": "device_lost"}, admin_browser)[:2] == invalid
+        assert audit() == [(admin, "device_lost")]
     finally:
         server.shutdown(); server.server_close()
 
