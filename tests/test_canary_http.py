@@ -1647,7 +1647,8 @@ def test_discovery_round_projection_is_auto_issued_only_within_the_recorded_boun
     status, _, first = driver.submit(driver.projection(1, None))
     assert status == 201 and first["status"] == "approved"
     assert first["round_state"] == {"authorization_id": driver.authorization_id, "round": 1, "state": "issued",
-                                    "grant_id": first["grant"]["grant_id"], "actions": 12, "wall_budget_ms": 60_000}
+                                    "grant_id": first["grant"]["grant_id"], "actions": 12, "wall_budget_ms": 60_000,
+                                    "grant_status": "issued"}
     grant = first["grant"]
     assert grant["approval_actor"] == {"user_id": fixture.user, "role": "owner"}
     assert grant["approval_reason"] == "discovery_authorization:" + driver.authorization_id
@@ -2373,4 +2374,98 @@ def test_round_one_seed_ordinal_beyond_the_seed_list_is_seed_mismatch_without_si
     assert driver.row()["quota_state"] == "reserved" and driver.row()["state"] == "open"
     status, _, issued = driver.submit(driver.projection(1, None, projection_id="ap_seed_corrected"))
     assert status == 201 and issued["round_state"]["actions"] == 12
+
+
+def _exact_submit(driver, projection):
+    """Send one round submit on the claim chain and return its exact signed request for raw replay."""
+    fixture, chain = driver.fixture, driver.chain
+    path = (f"/v1/workspaces/{fixture.workspace}/runners/{fixture.runner_id}/contexts/"
+            f"{driver.binding['binding_id']}/approval-projections")
+    raw = canonical_bytes({
+        "schema_version": "heel.runner-approval-projection-submit.v1", "context_binding_id": driver.binding["binding_id"],
+        "context_binding_digest": driver.binding["binding_digest"], "approval_projection": projection,
+    })
+    headers = fixture.pop(path, raw, capability="runner_claim", nonce=chain.nonce, sequence=chain.sequence)
+    status, response_headers, data = fixture.request("POST", path, headers=headers, raw=raw)
+    chain.nonce = response_headers["X-Heel-Runner-Next-Nonce"]
+    chain.sequence += 1
+    return status, data, (path, headers, raw)
+
+
+def _claim_status(driver) -> int:
+    path = f"/v1/workspaces/{driver.fixture.workspace}/runners/{driver.runner_id}/claim"
+    return driver.chain.post(path, {"schema_version": "heel.runner-claim-request.v1"})[0]
+
+
+def _age_discovery(fixture, driver, grant_id: str) -> None:
+    conn = fixture.cp.store.conn
+    conn.execute("UPDATE discovery_authorizations SET created_at_ms=created_at_ms-900001,expires_at_ms=expires_at_ms-900001 "
+                 "WHERE authorization_id=?", (driver.authorization_id,))
+    conn.execute("UPDATE canary_execution_grants SET issued_at=issued_at-900001,expires_at=expires_at-900001 WHERE grant_id=?",
+                 (grant_id,))
+    conn.commit()
+
+
+def test_semantic_round_replay_returns_a_grant_only_while_grant_and_authorization_are_live(canary_http):
+    fixture = canary_http
+    revoke_path = _env_base(fixture) + "/discovery-authorizations/{}/revoke"
+    driver = None
+    for closing in ("revoke", "expire"):
+        driver = DiscoveryDriver(fixture, key=1 if closing == "revoke" else 2,
+                                 chain=driver and driver.chain, binding=driver and driver.binding)
+        projection = driver.projection(1, None)
+        status, _, first = driver.submit(projection)
+        assert status == 201 and first["round_state"]["grant_status"] == "issued"
+        # Live fresh-nonce replay: the same grant, no counter, grant or ledger duplication.
+        before = _discovery_snapshot(fixture, driver)
+        status, _, live = driver.submit(projection)
+        assert status == 201 and live["grant"] == first["grant"] and live["round_state"] == first["round_state"]
+        assert _discovery_snapshot(fixture, driver) == before
+        if closing == "revoke":
+            assert fixture.request("POST", revoke_path.format(driver.authorization_id), headers=fixture.browser)[0] == 200
+        else:
+            _age_discovery(fixture, driver, first["grant"]["grant_id"])
+        status, _, replay = driver.submit(projection)
+        assert status == 201 and "grant" not in replay
+        assert replay["round_state"]["grant_status"] == "revoked"
+        assert replay["round_state"]["grant_id"] == first["grant"]["grant_id"]
+        assert driver.row()["state"] == ("revoked" if closing == "revoke" else "expired")
+        assert driver.row()["quota_state"] == "consumed" and driver.row()["rounds_issued"] == 1
+        assert fixture.cp.store.conn.execute("SELECT COUNT(*) FROM canary_execution_grants WHERE run_id=?",
+                                             (first["run_id"],)).fetchone()[0] == 1
+        assert [kind for kind, ref in _ledger(fixture) if ref == driver.authorization_id] == ["reserve", "consume"]
+        assert _claim_status(driver) == 204
+
+
+def test_exact_raw_round_replay_keeps_its_historical_receipt_but_confers_no_authority(canary_http):
+    fixture = canary_http
+    revoke_path = _env_base(fixture) + "/discovery-authorizations/{}/revoke"
+    driver = None
+    for closing in ("revoke", "expire"):
+        driver = DiscoveryDriver(fixture, key=1 if closing == "revoke" else 2,
+                                 chain=driver and driver.chain, binding=driver and driver.binding)
+        status, first, (path, headers, raw) = _exact_submit(driver, driver.projection(1, None))
+        assert status == 201 and "grant" in first
+        if closing == "revoke":
+            assert fixture.request("POST", revoke_path.format(driver.authorization_id), headers=fixture.browser)[0] == 200
+        else:
+            _age_discovery(fixture, driver, first["grant"]["grant_id"])
+        before = _discovery_snapshot(fixture, driver)
+        status, _, cached = fixture.request("POST", path, headers=headers, raw=raw)
+        # The durable PoP receipt replays byte-for-byte history; it is not a fresh issue.
+        assert status == 201 and cached == first
+        assert _discovery_snapshot(fixture, driver) == before
+        # The historical bytes are never claimable.
+        assert _claim_status(driver) == 204
+    # In-flight: once the claim advanced the chain, the superseded submit is no longer the cursor's
+    # replayable receipt (existing protocol), and the gate stops the claimed round after revoke.
+    driver = DiscoveryDriver(fixture, key=3, chain=driver.chain, binding=driver.binding)
+    status, first, (path, headers, raw) = _exact_submit(driver, driver.projection(1, None))
+    assert status == 201
+    claimed = driver.claim()
+    assert fixture.request("POST", revoke_path.format(driver.authorization_id), headers=fixture.browser)[0] == 200
+    status, _, superseded = fixture.request("POST", path, headers=headers, raw=raw)
+    assert status == 401 and "grant" not in superseded
+    status, gate, _ = driver.heartbeat(claimed, 1)
+    assert status == 200 and gate["active"] is False and gate["stop_reason"] == "cloud_stop"
 
