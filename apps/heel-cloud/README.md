@@ -34,6 +34,30 @@ The exact verified Agent files advertised on `/agent` are:
 - `/downloads/heel_sim-1.2.0.tar.gz`
 - `/downloads/heel-open-core-manifest.json`
 
+## Dashboard account onboarding
+
+`/dashboard` lets a visitor create an account or sign in, then choose a workspace and a
+project, using only the existing `/v1/signup`, `/v1/login`, `/v1/logout`, `/v1/me` and
+`/v1/workspaces/{ws}/projects` routes and the HttpOnly session cookie.
+
+- Signup creates the account and one default workspace (server behavior). There is no route
+  to create another workspace, and free workspaces have one seat, so invites return 402.
+- The selected workspace and project are kept in the address as `?workspace=ws_…&project=prj_…`
+  so a reload restores them. They are opaque refs and are honored only when `/v1/me` and the
+  project list for the current session still include them. No password, session token or
+  selection is written to browser storage.
+- Project creation is offered to owner, admin and member roles. The server still decides; a
+  403 is shown as a role message. Billing-only workspaces cannot list projects.
+- Sign-out, an expired session, or a workspace/project switch starts a new load generation.
+  Responses that arrive for an earlier generation are discarded, so they cannot fill a new view.
+- Error states show fixed messages for invalid input, duplicate email, wrong password, rate
+  limiting, forbidden, signed-out and unavailable. Submitted values are never echoed.
+
+Evidence: `tests/account-onboarding.test.tsx` (stubbed `fetch` and router) and
+`tests/account-loopback.test.ts`, which runs the real Python `ControlPlane` over loopback HTTP
+when `HEEL_LOOPBACK_PYTHON` is set; otherwise it is skipped. Neither test goes through the
+Worker, TLS or a public origin.
+
 ## Production topology
 
 The public artifact targets a Cloudflare Worker. Its proxy has an exact method/path
