@@ -735,28 +735,46 @@ class CanaryRunService:
 
     # --- bounded discovery auto-issue (discovery contract §4, §4a; C2D D3/D4) ---
 
-    def _discovery_round_response(self, round_row: sqlite3.Row, *, runner_key_id: str) -> _RunnerProjectionSubmission:
+    def _discovery_round_response(
+        self, round_row: sqlite3.Row, auth: sqlite3.Row, *, runner_key_id: str,
+    ) -> _RunnerProjectionSubmission:
+        """Fresh semantic replay: current state, never resurrected authority (C2R1 F3).
+
+        An exact raw PoP retry is answered earlier from its durable receipt as history; this path
+        reads live rows, so a closed or expired authorization first closes durably here.
+        """
+        now = self._now_ms()
+        auth = self._expire_discovery_if_due(auth, now)
         run = self._run_any(round_row["run_id"])
         grant_row = self.conn.execute(
-            "SELECT grant_json,runner_key_id FROM canary_execution_grants WHERE grant_id=?", (round_row["grant_id"],),
+            "SELECT grant_json,runner_key_id,status,expires_at FROM canary_execution_grants WHERE grant_id=?",
+            (round_row["grant_id"],),
         ).fetchone()
         response: dict[str, object] = {
             "schema_version": "heel.canary-projection-submitted.v1", "approval_id": round_row["projection_id"],
             "run_id": round_row["run_id"], "status": run["status"], "projection_digest": round_row["projection_digest"],
             "round_state": self._round_state(round_row),
         }
-        # A grant is only ever returned to the runner key it names (contract §4 step 0).
+        # A grant is only ever returned to the runner key it names (contract §4 step 0), and only
+        # while that grant is still claimable under a live authorization.
         if (grant_row is not None and grant_row["grant_json"] is not None
-                and grant_row["runner_key_id"] == runner_key_id and round_row["state"] == "issued"):
+                and grant_row["runner_key_id"] == runner_key_id and round_row["state"] == "issued"
+                and grant_row["status"] == "issued" and int(grant_row["expires_at"]) > now
+                and auth["state"] == "open" and now < int(auth["expires_at_ms"])):
             response["grant"] = json.loads(grant_row["grant_json"])
         return _RunnerProjectionSubmission(response, created=False)
 
-    @staticmethod
-    def _round_state(round_row: sqlite3.Row) -> dict[str, object]:
+    def _round_state(self, round_row: sqlite3.Row) -> dict[str, object]:
+        grant = self.conn.execute(
+            "SELECT status,expires_at FROM canary_execution_grants WHERE grant_id=?", (round_row["grant_id"],),
+        ).fetchone()
+        grant_status = None if grant is None else grant["status"]
+        if grant_status in {"issued", "claimed"} and int(grant["expires_at"]) <= self._now_ms():
+            grant_status = "expired"
         return {
             "authorization_id": round_row["authorization_id"], "round": round_row["round"],
             "state": round_row["state"], "grant_id": round_row["grant_id"], "actions": round_row["actions"],
-            "wall_budget_ms": round_row["wall_budget_ms"],
+            "wall_budget_ms": round_row["wall_budget_ms"], "grant_status": grant_status,
         }
 
     def _discovery_reports(self, authorization_id: str) -> dict[int, list[dict]]:
@@ -788,7 +806,7 @@ class CanaryRunService:
                     or existing["projection_digest"] != validated["projection_digest"]
                     or existing["state"] not in {"issued", "terminal"}):
                 raise DiscoveryError("round_consumed")
-            return self._discovery_round_response(existing, runner_key_id=binding_row["runner_key_id"])
+            return self._discovery_round_response(existing, auth, runner_key_id=binding_row["runner_key_id"])
         self.conn.execute(
             "UPDATE canary_plan_requests SET status='expired' WHERE workspace_id=? AND rcb_id=? "
             "AND status='open' AND expires_at_ms<=?",
