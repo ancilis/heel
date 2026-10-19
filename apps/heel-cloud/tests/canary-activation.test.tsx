@@ -12,6 +12,14 @@ import { DisclosureDialog } from "../components/canary/DisclosureDialog";
 import { RunProgress } from "../components/canary/RunProgress";
 
 
+// SEAM: the dashboard reads its selection from the App Router; these render tests have no router.
+const router = vi.hoisted(() => ({ replace: vi.fn() }));
+vi.mock("next/navigation", () => ({
+  usePathname: () => "/dashboard",
+  useRouter: () => router,
+  useSearchParams: () => new URLSearchParams(),
+}));
+
 afterEach(cleanup);
 
 

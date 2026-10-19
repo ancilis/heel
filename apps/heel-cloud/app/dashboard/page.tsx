@@ -2,9 +2,12 @@
 
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
+import { AccountAccess } from "../../components/account/AccountAccess";
+import { WorkspaceProjectBar } from "../../components/account/WorkspaceProjectBar";
 import { ActivationCard, type ActivationSnapshot } from "../../components/canary/ActivationCard";
 import { ApprovalDialog } from "../../components/canary/ApprovalDialog";
 import { DisclosureDialog } from "../../components/canary/DisclosureDialog";
@@ -13,14 +16,21 @@ import {
   CanaryApi, CanaryApiError, type CanaryApprovalSummary, type CanaryDisclosureMetadata, type CanaryPendingApprovalRequest,
   type CanaryRunDashboard, type RunnerContextBindingDashboard, type VerifiedEnvironmentRecord,
 } from "../../lib/canary-api";
+import {
+  canCreateProject, resolveAccount, selectionFromParams, selectionQuery, type AccountSelection, type AccountWorkspaceView,
+} from "../../lib/account-context";
 import { HeelCloudApi, HeelCloudApiError, type HeelCloudProject } from "../../lib/heel-cloud-api";
 
 
 const OWNERSHIP_ATTESTATION = "ownership verified; environment classification supplied by you";
+const SIGN_IN_MESSAGE = "Create a free account or sign in to set up your first project.";
+const SESSION_ENDED_MESSAGE = "Your session ended. Sign in again to continue; nothing from the previous session is shown.";
+const SIGNED_OUT_MESSAGE = "You signed out. Sign in again to continue.";
 const cloudApi = new HeelCloudApi();
 const canaryApi = new CanaryApi();
 
 type Context = {
+  account: AccountWorkspaceView;
   workspaceRef: string;
   project: HeelCloudProject;
   projects: readonly HeelCloudProject[];
@@ -31,7 +41,9 @@ type Context = {
 type Connection =
   | { phase: "checking" }
   | { phase: "sign_in"; message: string }
-  | { phase: "select_project"; workspaceRef: string }
+  | { phase: "no_workspace"; message: string }
+  | { phase: "forbidden"; account: AccountWorkspaceView; message: string }
+  | { phase: "select_project"; account: AccountWorkspaceView }
   | { phase: "ready"; context: Context }
   | { phase: "error"; message: string };
 
@@ -55,6 +67,12 @@ function messageOf(error: unknown): string {
   return "Heel Cloud is temporarily unavailable. Your local setup is unchanged.";
 }
 
+/** Server rejected the session itself (expired, revoked, or signed out elsewhere). */
+function isSessionLoss(error: unknown): boolean {
+  return (error instanceof HeelCloudApiError && error.code === "auth_required")
+    || (error instanceof CanaryApiError && error.status === 401);
+}
+
 function idempotencyKey(): `ca1-${string}` {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return `ca1-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
@@ -64,25 +82,45 @@ function approvalRequestKey(workspaceRef: string, projectRef: string, approval: 
   return `${workspaceRef}\0${projectRef}\0${approval.approvalId}\0${approval.runId}\0${approval.projectionDigest}`;
 }
 
-async function loadConnection(): Promise<Connection> {
+async function loadConnection(requested: AccountSelection): Promise<Connection> {
   try {
-    const session = await cloudApi.me();
-    const workspace = session.workspaces.find((item) => item.role === "owner" || item.role === "admin")
-      ?? session.workspaces[0];
-    if (workspace === undefined) {
-      return { phase: "sign_in", message: "Sign in or create a workspace to begin your first rehearsal." };
+    const resolved = await resolveAccount(cloudApi, requested);
+    if (resolved.phase === "sign_in") return { phase: "sign_in", message: SIGN_IN_MESSAGE };
+    if (resolved.phase === "no_workspace") {
+      return { phase: "no_workspace", message: "This account is not a member of any workspace. Ask a workspace owner to invite you; creating additional workspaces is not available in this release." };
     }
-    const projects = await cloudApi.listProjects(workspace.workspaceRef);
-    if (projects.length === 0) return { phase: "select_project", workspaceRef: workspace.workspaceRef };
-    const environments = await canaryApi.listEnvironments(workspace.workspaceRef, projects[0].projectRef);
-    const contextBindings = await canaryApi.listRunnerContextBindings(workspace.workspaceRef, projects[0].projectRef);
-    return { phase: "ready", context: { workspaceRef: workspace.workspaceRef, project: projects[0], projects, environments, contextBindings } };
+    if (resolved.phase === "forbidden") {
+      return { phase: "forbidden", account: resolved.account, message: `Your ${resolved.account.workspace.role} role cannot open projects in this workspace. Choose another workspace or ask an owner for access.` };
+    }
+    if (resolved.phase === "select_project") return { phase: "select_project", account: resolved.account };
+    const { account, projects, project } = resolved;
+    const environments = await canaryApi.listEnvironments(account.workspace.workspaceRef, project.projectRef);
+    const contextBindings = await canaryApi.listRunnerContextBindings(account.workspace.workspaceRef, project.projectRef);
+    return { phase: "ready", context: { account, workspaceRef: account.workspace.workspaceRef, project, projects, environments, contextBindings } };
   } catch (error) {
-    const message = messageOf(error);
-    return error instanceof HeelCloudApiError && error.code === "auth_required"
-      ? { phase: "sign_in", message }
-      : { phase: "error", message };
+    return isSessionLoss(error)
+      ? { phase: "sign_in", message: SESSION_ENDED_MESSAGE }
+      : { phase: "error", message: messageOf(error) };
   }
+}
+
+const STATUS_TITLES: Readonly<Record<Exclude<Connection["phase"], "ready">, string>> = Object.freeze({
+  checking: "Checking your session.",
+  sign_in: "Sign in to continue.",
+  no_workspace: "No workspace is available.",
+  forbidden: "This workspace is not available to your role.",
+  select_project: "Create a project first.",
+  error: "Heel Cloud could not load your workspace.",
+});
+
+function connectionSelection(connection: Connection): AccountSelection {
+  if (connection.phase === "ready") {
+    return { workspaceRef: connection.context.workspaceRef, projectRef: connection.context.project.projectRef };
+  }
+  if (connection.phase === "select_project" || connection.phase === "forbidden") {
+    return { workspaceRef: connection.account.workspace.workspaceRef };
+  }
+  return {};
 }
 
 
@@ -115,32 +153,75 @@ export default function Dashboard() {
     setDisclosureOpen(false);
   }, [clearPendingApproval]);
 
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const searchQuery = searchParams?.toString() ?? "";
+  const [initialSelection] = useState(() => selectionFromParams(searchParams));
+  // Every account transition (sign-in, sign-out, session loss, workspace or project switch)
+  // takes a new generation; a response that settles for an older generation is dropped.
+  const generation = useRef(0);
+
+  const resetProjectState = useCallback((): void => {
+    setSelectedRunner(""); setSelectedBindingEnvironment("");
+    setProofChallenge(null);
+    setOrigin("");
+  }, []);
+
   useEffect(() => {
-    let cancelled = false;
-    void loadConnection().then((next) => {
-      if (cancelled) return;
+    const ticket = ++generation.current;
+    void loadConnection(initialSelection).then((next) => {
+      if (ticket !== generation.current) return;
       if (next.phase !== "ready") clearApprovalIdentity();
       setConnection(next);
     });
-    return () => { cancelled = true; };
+    return () => { generation.current += 1; };
+  }, [clearApprovalIdentity, initialSelection]);
+
+  const connect = useCallback(async (requested: AccountSelection): Promise<void> => {
+    const ticket = ++generation.current;
+    clearApprovalIdentity();
+    setConnection({ phase: "checking" });
+    const next = await loadConnection(requested);
+    if (ticket === generation.current) setConnection(next);
   }, [clearApprovalIdentity]);
 
-  async function connect(): Promise<void> {
+  const sessionEnded = useCallback((): void => {
+    generation.current += 1;
     clearApprovalIdentity();
-    setConnection(await loadConnection());
+    resetProjectState();
+    setNotice(null);
+    setConnection({ phase: "sign_in", message: SESSION_ENDED_MESSAGE });
+  }, [clearApprovalIdentity, resetProjectState]);
+
+  function recover(error: unknown): void {
+    if (isSessionLoss(error)) sessionEnded();
+    else setNotice(messageOf(error));
   }
+
+  // Keep the address bar on the server-confirmed selection (opaque refs only) so a reload
+  // restores it; signed-out states carry no refs at all.
+  useEffect(() => {
+    if (connection.phase === "checking" || connection.phase === "error") return;
+    const wanted = selectionQuery(connectionSelection(connection));
+    if (wanted !== (searchQuery ? `?${searchQuery}` : "")) router.replace(`${pathname}${wanted}`, { scroll: false });
+  }, [connection, pathname, router, searchQuery]);
 
   const refreshEnvironments = useCallback(async (): Promise<void> => {
     if (connection.phase !== "ready") return;
     const { context } = connection;
+    const ticket = generation.current;
     const environments = await canaryApi.listEnvironments(context.workspaceRef, context.project.projectRef);
+    if (ticket !== generation.current) return;
     setConnection({ phase: "ready", context: { ...context, environments } });
   }, [connection]);
 
   const refreshContextBindings = useCallback(async (): Promise<void> => {
     if (connection.phase !== "ready") return;
     const { context } = connection;
+    const ticket = generation.current;
     const contextBindings = await canaryApi.listRunnerContextBindings(context.workspaceRef, context.project.projectRef);
+    if (ticket !== generation.current) return;
     setConnection({ phase: "ready", context: { ...context, contextBindings } });
     setSelectedRunner((current) => contextBindings.runners.some((runner) => runner.runnerId === current) ? current : "");
   }, [connection]);
@@ -177,7 +258,9 @@ export default function Dashboard() {
         });
         setObservedRun(status);
       } catch (error) {
-        if (!cancelled && !(error instanceof CanaryApiError && error.code === "unavailable")) setNotice(messageOf(error));
+        if (cancelled) return;
+        if (isSessionLoss(error)) sessionEnded();
+        else if (!(error instanceof CanaryApiError && error.code === "unavailable")) setNotice(messageOf(error));
       } finally { inFlight = false; controller = null; }
     };
     const visibility = () => { if (document.visibilityState === "visible") void discover(); };
@@ -185,7 +268,7 @@ export default function Dashboard() {
     const timer = setInterval(() => void discover(), 2_000);
     document.addEventListener("visibilitychange", visibility);
     return () => { cancelled = true; controller?.abort(); clearInterval(timer); document.removeEventListener("visibilitychange", visibility); };
-  }, [clearPendingApproval, connection, pendingApproval, working]);
+  }, [clearPendingApproval, connection, pendingApproval, sessionEnded, working]);
 
   useEffect(() => {
     if (connection.phase !== "ready" || pendingApproval === null) return;
@@ -205,15 +288,14 @@ export default function Dashboard() {
         } })
         .catch((error: unknown) => { if (!cancelled) {
           if (error instanceof CanaryApiError && (error.status === 401 || error.status === 403)) {
-            clearApprovalIdentity();
-            setConnection({ phase: "checking" });
-            void loadConnection().then((next) => { if (!cancelled) setConnection(next); });
+            if (error.status === 401) sessionEnded();
+            else void connect(connectionSelection(connection));
           } else if (error instanceof CanaryApiError && error.status === 404) clearPendingApproval();
           else setNotice(messageOf(error));
         } });
     }, 1_000);
     return () => { cancelled = true; clearInterval(timer); };
-  }, [clearApprovalIdentity, clearPendingApproval, connection, pendingApproval]);
+  }, [clearPendingApproval, connect, connection, pendingApproval, sessionEnded]);
 
   const executable = connection.phase === "ready"
     ? connection.context.environments.find((item) => item.isExecutable) : undefined;
@@ -244,16 +326,55 @@ export default function Dashboard() {
     if (connection.phase !== "ready") return;
     const project = connection.context.projects.find((item) => item.projectRef === projectRef);
     if (project === undefined) return;
-    clearApprovalIdentity();
-    setWorking(true);
+    resetProjectState();
     setNotice(null);
+    // Re-resolve from /v1/me so the switch is bound to the current server identity and role.
+    await connect({ workspaceRef: connection.context.workspaceRef, projectRef: project.projectRef });
+  }
+
+  async function selectWorkspace(workspaceRef: string): Promise<void> {
+    if (connection.phase !== "ready" && connection.phase !== "select_project" && connection.phase !== "forbidden") return;
+    resetProjectState();
+    setNotice(null);
+    await connect({ workspaceRef });
+  }
+
+  async function createProject(name: string): Promise<void> {
+    const workspaceRef = connectionSelection(connection).workspaceRef;
+    if (workspaceRef === undefined) return;
+    const ticket = generation.current;
+    let project: HeelCloudProject;
     try {
-      const environments = await canaryApi.listEnvironments(connection.context.workspaceRef, project.projectRef);
-      const contextBindings = await canaryApi.listRunnerContextBindings(connection.context.workspaceRef, project.projectRef);
-      setConnection({ phase: "ready", context: { ...connection.context, project, environments, contextBindings } });
-      setSelectedRunner(""); setSelectedBindingEnvironment("");
-      setProofChallenge(null);
-    } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
+      project = await cloudApi.createProject(workspaceRef, name);
+    } catch (error) {
+      if (isSessionLoss(error)) { sessionEnded(); return; }
+      throw error;
+    }
+    if (ticket !== generation.current) return;
+    resetProjectState();
+    await connect({ workspaceRef, projectRef: project.projectRef });
+    setNotice("Project created. Verify a staging origin next.");
+  }
+
+  async function signOut(): Promise<void> {
+    const previous = connectionSelection(connection);
+    const ticket = ++generation.current;
+    clearApprovalIdentity();
+    resetProjectState();
+    setNotice(null);
+    setWorking(true);
+    setConnection({ phase: "checking" });
+    try {
+      await cloudApi.logout();
+      if (ticket === generation.current) setConnection({ phase: "sign_in", message: SIGNED_OUT_MESSAGE });
+    } catch (error) {
+      if (ticket !== generation.current) return;
+      if (isSessionLoss(error)) setConnection({ phase: "sign_in", message: SIGNED_OUT_MESSAGE });
+      else {
+        await connect(previous);
+        setNotice("Heel Cloud could not confirm sign-out, so you are still signed in. Try again.");
+      }
+    } finally { setWorking(false); }
   }
 
   async function createContextBinding(): Promise<void> {
@@ -269,7 +390,7 @@ export default function Dashboard() {
       });
       await refreshContextBindings();
       setNotice("Canary access was authorized for this exact paired runner and verified environment.");
-    } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
+    } catch (error) { recover(error); } finally { setWorking(false); }
   }
 
   async function revokeContextBinding(bindingId: string): Promise<void> {
@@ -279,7 +400,7 @@ export default function Dashboard() {
       await canaryApi.revokeRunnerContextBinding(connection.context.workspaceRef, connection.context.project.projectRef, bindingId);
       await refreshContextBindings();
       setNotice("Canary access was revoked. Issued grants and active work were not changed.");
-    } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
+    } catch (error) { recover(error); } finally { setWorking(false); }
   }
 
   async function startProof(): Promise<void> {
@@ -296,7 +417,7 @@ export default function Dashboard() {
           ? `Place the one-time token at ${value.http_url as string}: ${value.token as string}`
           : `Publish this exact record: ${value.dns_record as string}`,
       });
-    } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
+    } catch (error) { recover(error); } finally { setWorking(false); }
   }
 
   async function checkProof(): Promise<void> {
@@ -307,7 +428,7 @@ export default function Dashboard() {
       setNotice(verified ? "Staging ownership verified. Pair the local runner next." : "Proof did not match yet. No product route was contacted.");
       await refreshEnvironments();
       if (verified) setProofChallenge(null);
-    } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
+    } catch (error) { recover(error); } finally { setWorking(false); }
   }
 
   async function approveRun(requestKey: string, reason: string): Promise<void> {
@@ -327,9 +448,8 @@ export default function Dashboard() {
       setObservedRun(await canaryApi.getRun(pending.workspaceRef, pending.projectRef, pending.summary.runId));
     } catch (error) {
       if (error instanceof CanaryApiError && (error.status === 401 || error.status === 403)) {
-        clearApprovalIdentity();
-        setConnection({ phase: "checking" });
-        void loadConnection().then(setConnection);
+        if (error.status === 401) sessionEnded();
+        else void connect({ workspaceRef: pending.workspaceRef, projectRef: pending.projectRef });
       } else setNotice(messageOf(error));
     } finally { setWorking(false); }
   }
@@ -340,7 +460,7 @@ export default function Dashboard() {
     try {
       await canaryApi.stopRun(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId, observedRun.run.killSwitchGeneration);
       setObservedRun(await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId));
-    } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
+    } catch (error) { recover(error); } finally { setWorking(false); }
   }
 
   async function loadDisclosurePreview(file: File | undefined): Promise<void> {
@@ -372,10 +492,12 @@ export default function Dashboard() {
       else await canaryApi.markDisclosureLocalOnly(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId, disclosurePreview);
       setDisclosureOpen(false);
       setNotice(share ? "One-use disclosure permit created. Return to the local runner to upload this exact summary." : "Result kept local. No summary bytes were uploaded.");
-    } catch (error) { setNotice(messageOf(error)); } finally { setWorking(false); }
+    } catch (error) { recover(error); } finally { setWorking(false); }
   }
 
   const context = connection.phase === "ready" ? connection.context : null;
+  const accountView = context?.account
+    ?? (connection.phase === "select_project" || connection.phase === "forbidden" ? connection.account : null);
   const progress = observedRun?.progress;
 
   return (
@@ -387,9 +509,18 @@ export default function Dashboard() {
       <section className="dashboard-intro" aria-labelledby="dashboard-title"><div><p className="canary-kicker">Verified canary rehearsal</p><h1 id="dashboard-title">Cross the boundary <em>before</em> your customers do.</h1><p>Cloud runner onboarding is an incomplete preview. Use the local export reference to validate a supported synthetic workflow.</p></div>
         <aside className="preview-notice" aria-label="Connection status"><span className="preview-pulse" aria-hidden="true" /><div><strong>{connection.phase === "ready" ? "Ready for customer setup" : "Connect to begin"}</strong><p>{connection.phase === "checking" ? "Checking signed-in context · no request sent" : connection.phase === "ready" ? "Live account state · operational metadata only" : "No sample data is shown"}</p></div></aside></section>
 
-      {connection.phase !== "ready" ? <section className="next-action" role="status"><span aria-hidden="true">↳</span><p><strong>{connection.phase === "checking" ? "Checking your session." : connection.phase === "select_project" ? "Create a project first." : "Connect your signed-in workspace."}</strong> {"message" in connection ? connection.message : "Nothing has been approved or executed."} <button className="text-button" onClick={() => { setConnection({ phase: "checking" }); void connect(); }} type="button">Try again</button></p></section> : null}
+      {connection.phase !== "ready" ? <section className="next-action" role="status"><span aria-hidden="true">↳</span><p><strong>{STATUS_TITLES[connection.phase]}</strong> {"message" in connection ? connection.message
+        : connection.phase === "select_project" ? (canCreateProject(connection.account.workspace.role)
+          ? "Name your first project below. Nothing has been approved or executed."
+          : "No projects exist yet. A workspace owner, admin or member must create one.")
+          : "Nothing has been approved or executed."}
+        {connection.phase === "error" ? <> <button className="text-button" onClick={() => void connect(selectionFromParams(searchParams))} type="button">Try again</button></> : null}
+        {connection.phase === "no_workspace" ? <> <button className="text-button" disabled={working} onClick={() => void signOut()} type="button">Sign out</button></> : null}</p></section> : null}
 
-      {context && context.projects.length > 1 ? <label className="dashboard-context">Project<select disabled={working} onChange={(event) => void selectProject(event.target.value)} value={context.project.projectRef}>{context.projects.map((project) => <option key={project.projectRef} value={project.projectRef}>{project.name}</option>)}</select></label> : null}
+      {connection.phase === "sign_in" ? <AccountAccess api={cloudApi} onAuthenticated={() => connect({})} /> : null}
+      {accountView ? <WorkspaceProjectBar account={accountView} disabled={working} onCreateProject={createProject}
+        onSelectProject={(projectRef) => void selectProject(projectRef)} onSelectWorkspace={(workspaceRef) => void selectWorkspace(workspaceRef)}
+        onSignOut={() => void signOut()} projectRef={context?.project.projectRef ?? null} projects={context?.projects ?? []} /> : null}
       {notice ? <p className="next-action" role="status">{notice}</p> : null}
       {pendingHasMore ? <p className="next-action" role="status">Another pending approval is waiting after this one.</p> : null}
 
