@@ -541,7 +541,8 @@ directory and the user name recorded as caller.
 Trust anchors for TLS are the default locations of the Python build's TLS library, loaded
 with `load_default_certs()`. **`SSL_CERT_FILE` and `SSL_CERT_DIR` in the process
 environment change those locations.** Someone who controls that environment can choose
-the CA set. Heel does not defend against that.
+the CA set. Heel does not defend against that. The Heel cloud's HTTPS ownership-proof
+check (`heel/saas/network_guard.py`) loads the same default locations in the same way.
 
 What Heel guarantees is narrower: no Heel argument, Heel variable, inventory file or scope
 field changes the transport, resolver, port or trust store, and certificate and hostname
@@ -555,7 +556,11 @@ Inherited from the existing runner transport:
 
 - Public HTTPS staging hosts only: port 443, public addresses, a hostname under an IANA
   top-level domain. Private-network, loopback and custom-port staging are not reachable.
-- TLS 1.2 only. No redirect is followed.
+- TLS 1.2 or newer: TLS 1.2 is the explicit minimum and there is no maximum, so a target
+  offering TLS 1.2 or TLS 1.3 can be reached. A target that offers only an older protocol,
+  or none this Python build's TLS library permits, fails the handshake: the pair is
+  `inconclusive` with `transport:tls_error`, and nothing is retried with a weaker protocol
+  or weaker verification. No redirect is followed.
 - Responses must carry `Content-Length`, use no transfer or content encoding, and be empty
   or one JSON object of at most 256 KiB. Chunked, compressed, array and non-JSON responses
   make the pair `inconclusive`.

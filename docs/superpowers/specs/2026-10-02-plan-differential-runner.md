@@ -145,6 +145,36 @@ attempt reservations, budgets, credential secrecy, containment attribution and c
 verification are byte-for-byte unchanged in behavior: D5 touches two pure functions that
 read a parsed body and nothing else.
 
+### 0.3 Amendment (2026-10-18): TLS 1.2 or newer, and default trust in the cloud verifier
+
+This amendment changes the TLS policy rows marked "amended 2026-10-18, §0.3". The rest
+of this spec, and the historical facts F11/F12 as observed at `844fc1f`, stand as written.
+
+- Both production TLS constructors (`heel/runner/http_transport.py` `TLSTransport` and its
+  twin in `heel/saas/network_guard.py`) built `ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)`. That
+  fixed-version constant is absent from CPython builds linked against OpenSSL 4 (observed:
+  Python 3.14.8 / OpenSSL 4.0.3), so neither class could be constructed there. Those builds
+  still negotiate TLS 1.2 and TLS 1.3 through the generic client method, although
+  `ssl.HAS_TLSv1_2` is `False`. The legacy method also pinned the wire protocol to exactly
+  TLS 1.2, so TLS 1.3-only targets were unreachable on every build.
+- Both constructors now build `ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)` with
+  `minimum_version = TLSVersion.TLSv1_2`, no `maximum_version`, `CERT_REQUIRED`,
+  `check_hostname = True` and `load_default_certs()` — the shape the runner control
+  transport already uses. `ssl.create_default_context` is still not used by these two
+  classes. No parameter, argument, variable or config key was added.
+- The cloud twin previously loaded no trust anchors, so the HTTPS ownership-proof check
+  (`PinnedHTTPSVerifier`) failed every real handshake closed. It now loads the same default
+  locations as the runner (§7.2 trust boundary). DNS TXT verification is separate and was
+  not affected.
+- A target with no protocol in common (for example TLS 1.0/1.1 only) fails the handshake
+  closed: `transport:tls_error` and an `inconclusive` pair for the runner, an `SSLError` for
+  the verifier. There is no fallback below TLS 1.2 and no weaker verification.
+- Tests: F12's pinned assertion is now `protocol == PROTOCOL_TLS_CLIENT` with the explicit
+  minimum, plus real loopback handshakes against TLS 1.2-only, TLS 1.3-only and legacy-only
+  servers through the `SSL_CERT_FILE` default location, and a real-handshake test of the
+  default `PinnedHTTPSVerifier` path (`tests/test_runner_http_transport.py`,
+  `tests/test_runner_plan_differential_safety.py`, `tests/test_verified_environments.py`).
+
 ## 1. What ships
 
 One new public command, CLI only:
@@ -661,7 +691,7 @@ credential bytes anywhere under `HEEL_HOME`.
 | Topic | Decision |
 |---|---|
 | Scheme | HTTPS only. No HTTP, loopback, private-address or custom-port capability exists in product code and no switch enables one. |
-| TLS | Certificate required, hostname checked, SNI = normalized host. TLS 1.2 only (inherited, F12). A TLS failure ends the invocation (`transport:tls_error`). |
+| TLS | Certificate required, hostname checked, SNI = normalized host. TLS 1.2 or newer: explicit minimum TLS 1.2, no maximum (amended 2026-10-18, §0.3; was "TLS 1.2 only (inherited, F12)"). A TLS failure ends the invocation (`transport:tls_error`). |
 | Trust anchors | `load_default_certs()` in `TLSTransport.__init__` (§6.4): the default trust locations of the Python build's TLS library. **`SSL_CERT_FILE` and `SSL_CERT_DIR` in the process environment change those locations (F29).** Heel adds no option, `HEEL_*` variable, config key or scope field for trust. |
 | DNS | One bounded preflight per invocation; every answer must be public; the set is pinned. Each attempt re-resolves and requires set equality, connects to the pinned numeric address and re-checks the peer (F10). A change ends the invocation (`dns_changed`). A replay re-preflights and never reuses stored addresses. |
 | Host header | Always the normalized hostname, built by the transport (F9). |
@@ -1870,7 +1900,8 @@ Inherited from the existing transport and contracts, unchanged by this work:
 
 - Public HTTPS staging hosts only: port 443, public addresses, an IANA-TLD hostname.
   Private-network, loopback and custom-port staging are not reachable.
-- TLS 1.2 only. No redirect is followed.
+- TLS 1.2 or newer; no fallback below TLS 1.2 (amended 2026-10-18, §0.3; was "TLS 1.2
+  only"). No redirect is followed.
 - Responses must carry `Content-Length`, no transfer or content encoding, and be empty or
   one JSON object of at most 256 KiB. Chunked, compressed, array and non-JSON responses
   make the pair `inconclusive`.
@@ -1903,7 +1934,7 @@ Chosen for Phase 1:
 | Risk | What would confirm or refute it |
 |---|---|
 | The default trust locations may hold zero CAs on some Python builds; the run then fails closed with `tls_error`. | A real run against a public staging host. Not covered by CI. |
-| TLS 1.2 only and no chunked decoding may make many real targets `inconclusive`. | First real-staging run. Lifting either is a transport change outside Phase 1. |
+| TLS 1.2 only and no chunked decoding may make many real targets `inconclusive`. (Amended 2026-10-18, §0.3: the TLS 1.2-only part is lifted to TLS 1.2 or newer; chunked decoding is unchanged.) | First real-staging run. Lifting either is a transport change outside Phase 1. |
 | Widening `plan_entitlement_read` to `HEAD` under adapter version `"1"` also changes what `runner map`, `runner prepare` and any cloud-approved manifest of that scenario may carry. Grep found no reader of `allowed_methods` outside `heel/runner/` and no mirror of it in `heel/saas`, `apps/` or `web/`, and the full suite passes with it (F35). | T3 to check the cloud projection and approval path for a `HEAD` plan pair. |
 | `load_default_certs()` now runs for every `TLSTransport`. Only this feature constructs one in product code today (F33). | T3 to re-run the grep of F33 on the final tree. |
 | The sdist is gzip-compressed, so its bytes depend on the zlib of the Python that builds it. The artifacts are built locally (Python 3.12, macOS) and checked in CI (Python 3.13, Linux). The artifacts at `HEAD` pass `--check` locally, which is evidence, not proof, that the two agree. | The CI `package` job on the T6 pull request. If it reports `generated artifact is stale` for the sdist only, stop and report to Kevin; do not edit the builder. |
