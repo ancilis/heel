@@ -2076,7 +2076,8 @@ def test_discovery_route_inventory_view_shows_provenance_states_and_truncated_co
     first = _candidates(1, 200)
     driver.run_round(1, None, first)
     overlap = [{**first[0], "provenance_kind": "js_literal", "source_ordinal": 3}]
-    driver.run_round(2, _refs(1, first[:1]), _candidates(2, 1) + overlap)
+    # Round 2 issues four actions, so source ordinal 3 names one of its actual actions (C2R1 F1).
+    driver.run_round(2, _refs(1, first[:4]), _candidates(2, 1) + overlap)
     status, _, view = fixture.request("GET", _env_base(fixture) + "/route-inventory", headers=fixture.browser)
     assert status == 200
     assert (view["route_count"], view["truncated_count"]) == (200, 1)
@@ -2282,3 +2283,94 @@ def test_discovery_closing_refusals_persist_the_close_across_a_reopened_database
     finally:
         reopened.close()
     assert _code(exhausted.submit(refused)) == (409, "authorization_closed")
+
+
+# --- C2R1: recorded provenance, live-role issue, semantic replay and seed bounds (ASTRA-C2R decisions) ---
+
+def _discovery_snapshot(fixture, driver) -> tuple:
+    """Every row a report, settlement, inventory merge or round issue could touch."""
+    conn = fixture.cp.store.conn
+    return (
+        tuple(driver.row()),
+        tuple(tuple(row) for row in conn.execute("SELECT * FROM discovery_rounds ORDER BY round_id")),
+        tuple(tuple(row) for row in conn.execute("SELECT * FROM discovery_round_reports ORDER BY report_id")),
+        tuple(tuple(row) for row in conn.execute("SELECT * FROM route_inventories")),
+        tuple(tuple(row) for row in conn.execute("SELECT run_id,status,stop_reason,quota_state FROM canary_runs ORDER BY run_id")),
+        tuple(tuple(row) for row in conn.execute("SELECT grant_id,status FROM canary_execution_grants ORDER BY grant_id")),
+        tuple(_ledger(fixture)),
+    )
+
+
+def test_report_source_ordinal_must_name_an_action_of_the_actual_originating_round(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    status, _, submitted = driver.submit(driver.projection(1, None))
+    assert status == 201 and submitted["round_state"]["actions"] == 12
+    claimed = driver.claim()
+    before = _discovery_snapshot(fixture, driver)
+    for ordinal in (12, 19):  # == actions, and the schema maximum on a 12-action round
+        forged = [{"method": "GET", "route_template": "/api/forged/item", "provenance_kind": "html_link",
+                   "source_ordinal": ordinal, "status_code": 200}]
+        status, data, _ = driver.finish(claimed, forged, round_number=1)
+        assert (status, data["code"]) == (400, "invalid_discovery_report"), ordinal
+        # No report, inventory, settlement, counter, run, grant or ledger effect.
+        assert _discovery_snapshot(fixture, driver) == before
+    # Corrected retry on the same chain: the last valid ordinal of a 12-action round is accepted.
+    recorded = _candidates(1, 19) + [{"method": "GET", "route_template": "/api/r1/last", "provenance_kind": "html_link",
+                                      "source_ordinal": 11, "status_code": 200}]
+    status, result, _ = driver.finish(claimed, recorded, round_number=1)
+    assert status == 200 and result["round_state"]["state"] == "terminal"
+    driver.reports[1] = sorted(recorded, key=lambda c: (c["method"], c["route_template"]))
+    inventory = json.loads(fixture.cp.store.conn.execute("SELECT routes_json FROM route_inventories").fetchone()[0])
+    last = next(row for row in inventory if row["route_template"] == "/api/r1/last")
+    assert last["provenance"] == [{"kind": "html_link", "round": 1, "source_ordinal": 11, "status_code": 200}]
+    # A 20-action later round keeps its full capacity: ordinal 19 is the last valid one there.
+    status, _, second = driver.submit(driver.projection(2, _refs(1, recorded)))
+    assert status == 201 and second["round_state"]["actions"] == 20
+    claimed = driver.claim()
+    highest = [{"method": "GET", "route_template": "/api/r2/highest", "provenance_kind": "html_link",
+                "source_ordinal": 19, "status_code": 200}]
+    status, result, _ = driver.finish(claimed, highest, round_number=2)
+    assert status == 200 and result["round_state"]["state"] == "terminal"
+    status, _, third = driver.submit(driver.projection(3, _refs(2, highest)))
+    assert status == 201 and third["round_state"]["round"] == 3
+
+
+def test_round_issue_refuses_stored_provenance_whose_ordinal_exceeds_its_recorded_source_round(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    candidates = _candidates(1, 3)
+    driver.run_round(1, None, candidates)
+    conn = fixture.cp.store.conn
+    # A legacy/corrupted stored row: the signed report row is left as found, never edited back or re-signed.
+    stored = json.loads(conn.execute("SELECT candidates_json FROM discovery_round_reports").fetchone()[0])
+    stored[0]["source_ordinal"] = 15
+    conn.execute("UPDATE discovery_round_reports SET candidates_json=?", (canonical_bytes(stored).decode(),))
+    conn.commit()
+    corrupted = conn.execute("SELECT * FROM discovery_round_reports").fetchone()
+    before = _discovery_snapshot(fixture, driver)
+    refused = driver.projection(2, _refs(1, stored[:1]))
+    for _ in range(2):  # the refusal and its fresh-nonce retry are both denied, with no grant
+        status, _, data = driver.submit(refused)
+        assert (status, data["code"]) == (409, "source_ordinal_mismatch") and "grant" not in data
+        assert _discovery_snapshot(fixture, driver) == before
+    assert tuple(conn.execute("SELECT * FROM discovery_round_reports").fetchone()) == tuple(corrupted)
+    # Candidates whose recorded provenance is intact still issue the next round.
+    status, _, issued = driver.submit(driver.projection(2, _refs(1, stored[1:])))
+    assert status == 201 and issued["round_state"]["round"] == 2
+
+
+@pytest.mark.parametrize("ordinal", [12, 19])
+def test_round_one_seed_ordinal_beyond_the_seed_list_is_seed_mismatch_without_side_effects(canary_http, ordinal):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    references = [(0, {"method": "GET", "route_template": path, "source_ordinal": ordinal if index == 0 else index})
+                  for index, path in enumerate(DISCOVERY_SEED_PATHS)]
+    before = _discovery_snapshot(fixture, driver)
+    status, _, data = driver.submit(driver.projection(1, references))
+    assert (status, data) == (409, {"schema_version": "heel.discovery-error.v1", "code": "seed_mismatch"})
+    assert _discovery_snapshot(fixture, driver) == before
+    assert driver.row()["quota_state"] == "reserved" and driver.row()["state"] == "open"
+    status, _, issued = driver.submit(driver.projection(1, None, projection_id="ap_seed_corrected"))
+    assert status == 201 and issued["round_state"]["actions"] == 12
+
