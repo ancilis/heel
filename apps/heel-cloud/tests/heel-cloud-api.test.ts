@@ -251,3 +251,39 @@ describe("HeelCloudApi", () => {
     });
   });
 });
+
+
+describe("HeelCloudApi account errors", () => {
+  const secret = "Pa55word-canary-never-echo";
+
+  test.each([
+    ["signup", 409, "account_exists", /already exists\. Sign in instead/],
+    ["signup", 400, "invalid_signup", /valid email and a password of at least 10/],
+    ["signup", 429, "rate_limited", /Too many attempts/],
+    ["login", 403, "invalid_login", /did not match an account/],
+    ["login", 429, "rate_limited", /Too many attempts/],
+    ["login", 503, "unavailable", /temporarily unavailable/],
+  ] as const)("maps %s %i to the closed %s message without echoing input", async (action, status, code, message) => {
+    const { api } = apiWith([jsonResponse({ error: `server detail for founder@example.com ${secret}` }, status)]);
+    const failure = await api[action]("founder@example.com", secret).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(HeelCloudApiError);
+    expect(failure).toMatchObject({ code, status });
+    expect((failure as Error).message).toMatch(message);
+    expect((failure as Error).message).not.toContain(secret);
+    expect((failure as Error).message).not.toContain("founder@example.com");
+  });
+
+  test("reports a role refusal on project routes as forbidden, not unavailable", async () => {
+    const { api } = apiWith([
+      jsonResponse({ error: "insufficient role" }, 403),
+      jsonResponse({ error: "insufficient role" }, 403),
+    ]);
+    await expect(api.createProject(workspaceRef, "Billing staging")).rejects.toMatchObject({ code: "forbidden", status: 403 });
+    await expect(api.listProjects(workspaceRef)).rejects.toMatchObject({ code: "forbidden", status: 403 });
+  });
+
+  test("keeps the generic status mapping for routes without an account meaning", async () => {
+    const { api } = apiWith([jsonResponse({ error: "conflict" }, 409)]);
+    await expect(api.namespaceKey(workspaceRef, projectRef)).rejects.toMatchObject({ code: "conflict", status: 409 });
+  });
+});
