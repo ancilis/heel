@@ -3,6 +3,7 @@
 /** Cloudflare Worker entry point for Heel Cloud. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { canonicalPublicOrigin } from "../build/deployment-config";
 
 interface AssetFetcher {
   fetch(request: Request): Promise<Response>;
@@ -46,7 +47,6 @@ const RESPONSE_HEADERS = Object.freeze({
 });
 
 const CONTROL_PLANE_PREFIX = "/api/control-plane";
-const CONTROL_PLANE_ORIGIN = "https://heel-control-plane.internal";
 const SIGNUP_ROUTE = "/v1/signup";
 const LOGIN_ROUTE = "/v1/login";
 const LOGOUT_ROUTE = "/v1/logout";
@@ -501,6 +501,10 @@ async function proxyControlPlane(
   if (env.CONTROL_PLANE === undefined) {
     return proxyError(503, "control plane unavailable", csp);
   }
+  // The private binding selects the network service; its URL names the one configured public
+  // origin, never a caller URL, Host, Origin or forwarding header.
+  const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);
+  if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);
   const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET?.trim() ?? "";
   if (!/^[A-Za-z0-9_-]{43,86}$/.test(edgeAuthSecret)) {
     return proxyError(503, "control plane unavailable", csp);
@@ -538,7 +542,7 @@ async function proxyControlPlane(
       request.headers,
       request.method,
       upstreamPath,
-      env.PUBLIC_ORIGIN,
+      controlPlaneOrigin,
       edgeClientKey,
       edgeAuthSecret,
     );
@@ -548,7 +552,7 @@ async function proxyControlPlane(
     }
     throw error;
   }
-  const upstreamUrl = new URL(upstreamPath, CONTROL_PLANE_ORIGIN);
+  const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);
   const init: RequestInit & { duplex?: "half" } = {
     headers: requestContract.headers,
     method: request.method,

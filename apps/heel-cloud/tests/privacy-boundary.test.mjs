@@ -315,7 +315,9 @@ function analyzeSource(fileName, text) {
     }
     for (const fragment of [
       'const CONTROL_PLANE_PREFIX = "/api/control-plane";',
-      'const CONTROL_PLANE_ORIGIN = "https://heel-control-plane.internal";',
+      'import { canonicalPublicOrigin } from "../build/deployment-config";',
+      "const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
+      'if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);',
       'const SIGNUP_ROUTE = "/v1/signup";',
       'const LOGIN_ROUTE = "/v1/login";',
       'const LOGOUT_ROUTE = "/v1/logout";',
@@ -341,7 +343,7 @@ function analyzeSource(fileName, text) {
       'const MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES = 272 * 1024;',
       'const MAX_RUNNER_RESYNC_BODY_BYTES = 2 * 1024;',
       'const MAX_RUNNER_PAIRING_BODY_BYTES = 16 * 1024;',
-      "const upstreamUrl = new URL(upstreamPath, CONTROL_PLANE_ORIGIN);",
+      "const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);",
       "headers: requestContract.headers,",
       'redirect: "manual",',
       "request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength))",
@@ -369,6 +371,102 @@ function analyzeSource(fileName, text) {
       ).length - 1 !== 1
     ) {
       report(parsed, "control-plane response header allowlist is not the reviewed exact contract");
+    }
+    validateControlPlaneDestinationDataflow();
+  }
+
+  // The private binding destination is only the configured PUBLIC_ORIGIN after the shared
+  // canonical validator accepts it; no caller, fixed or substitute origin may reach the URL.
+  function validateControlPlaneDestinationDataflow() {
+    const imports = parsed.statements.filter((statement) => (
+      ts.isImportDeclaration(statement)
+      && ts.isStringLiteral(statement.moduleSpecifier)
+      && statement.moduleSpecifier.text === "../build/deployment-config"
+    ));
+    const clause = imports.length === 1 ? imports[0].importClause : undefined;
+    const named = clause?.namedBindings;
+    if (
+      !clause || clause.isTypeOnly || clause.name || !named || !ts.isNamedImports(named)
+      || named.elements.length !== 1 || named.elements[0].propertyName
+      || named.elements[0].isTypeOnly || named.elements[0].name.text !== "canonicalPublicOrigin"
+    ) report(parsed, "control-plane destination validator is not the shared canonical import");
+    const declarations = { canonicalPublicOrigin: [], controlPlaneOrigin: [], upstreamUrl: [] };
+    const references = [];
+    let configuredOriginReads = 0;
+    let refusal = null;
+    let fetchCall = null;
+    function visit(node) {
+      if (
+        (ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node)
+          || ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) || ts.isImportSpecifier(node))
+        && node.name && ts.isIdentifier(node.name) && Object.hasOwn(declarations, node.name.text)
+      ) declarations[node.name.text].push(node);
+      if (ts.isIdentifier(node) && node.text === "controlPlaneOrigin") references.push(node);
+      if (
+        (ts.isPropertyAccessExpression(node) && node.name.text === "PUBLIC_ORIGIN")
+        || (ts.isElementAccessExpression(node) && resolvedMemberNames(node).has("PUBLIC_ORIGIN"))
+      ) configuredOriginReads += 1;
+      if (
+        ts.isIfStatement(node)
+        && node.getText(parsed) === 'if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);'
+      ) refusal = node;
+      if (ts.isCallExpression(node) && reviewedControlPlaneFetchCall(node)) fetchCall = node;
+      if (
+        (ts.isStringLiteralLike(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node))
+        && /\.internal\b|heel-control-plane/i.test(node.text)
+      ) report(node, "control-plane destination uses a fixed private hostname");
+      ts.forEachChild(node, visit);
+    }
+    visit(parsed);
+    const origin = declarations.controlPlaneOrigin[0];
+    const proxy = origin === undefined ? null : enclosingFunctionDeclaration(origin);
+    const body = proxy?.body?.statements ?? [];
+    const originStatement = origin?.parent?.parent;
+    if (
+      declarations.canonicalPublicOrigin.length !== 1
+      || !ts.isImportSpecifier(declarations.canonicalPublicOrigin[0])
+      || declarations.controlPlaneOrigin.length !== 1
+      || !ts.isVariableDeclaration(origin)
+      || (origin.parent.flags & ts.NodeFlags.Const) === 0
+      || proxy?.name?.text !== "proxyControlPlane"
+      || !body.includes(originStatement)
+      || !origin.initializer
+      || !ts.isCallExpression(origin.initializer)
+      || origin.initializer.questionDotToken
+      || !ts.isIdentifier(origin.initializer.expression)
+      || origin.initializer.expression.text !== "canonicalPublicOrigin"
+      || origin.initializer.arguments.length !== 1
+      || origin.initializer.arguments[0].getText(parsed) !== "env.PUBLIC_ORIGIN"
+      || configuredOriginReads !== 1
+    ) report(parsed, "control-plane destination is not the validated configured origin");
+    const upstream = declarations.upstreamUrl[0];
+    if (
+      declarations.upstreamUrl.length !== 1
+      || !ts.isVariableDeclaration(upstream)
+      || (upstream.parent.flags & ts.NodeFlags.Const) === 0
+      || enclosingFunctionName(upstream) !== "proxyControlPlane"
+      || !upstream.initializer
+      || !ts.isNewExpression(upstream.initializer)
+      || upstream.initializer.expression.getText(parsed) !== "URL"
+      || upstream.initializer.arguments?.length !== 2
+      || !ts.isIdentifier(upstream.initializer.arguments[0])
+      || upstream.initializer.arguments[0].text !== "upstreamPath"
+      || !ts.isIdentifier(upstream.initializer.arguments[1])
+      || upstream.initializer.arguments[1].text !== "controlPlaneOrigin"
+    ) report(parsed, "control-plane destination URL is not built only from the validated configured origin");
+    if (
+      refusal === null
+      || !body.includes(refusal)
+      || originStatement === undefined
+      || body.indexOf(refusal) !== body.indexOf(originStatement) + 1
+      || fetchCall === null
+      || refusal.getEnd() > fetchCall.getStart(parsed)
+      || (upstream !== undefined && refusal.getEnd() > upstream.getStart(parsed))
+    ) report(parsed, "control-plane destination refusal does not precede every private fetch");
+    for (const reference of references) {
+      if (enclosingFunctionName(reference) !== "proxyControlPlane") {
+        report(reference, "control-plane destination escapes the reviewed proxy");
+      }
     }
   }
 
@@ -2275,10 +2373,98 @@ test("the privacy analyzer pins the private control-plane fetch and route allowl
     {
       label: "caller-derived upstream query",
       source: worker.replace(
-        "const upstreamUrl = new URL(upstreamPath, CONTROL_PLANE_ORIGIN);",
-        "const upstreamUrl = new URL(upstreamPath + new URL(request.url).search, CONTROL_PLANE_ORIGIN);",
+        "const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);",
+        "const upstreamUrl = new URL(upstreamPath + new URL(request.url).search, controlPlaneOrigin);",
       ),
       violation: "missing exact const upstreamUrl",
+    },
+    {
+      label: "public fetch fallback",
+      source: worker.replace(
+        "const response = await env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init));",
+        "const response = await fetch(new Request(upstreamUrl, init));",
+      ),
+      violation: "network sink",
+    },
+    {
+      label: "request-derived destination",
+      source: worker.replace(
+        "const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);",
+        "const upstreamUrl = new URL(upstreamPath, new URL(request.url).origin);",
+      ),
+      violation: "not built only from the validated configured origin",
+    },
+    {
+      label: "legacy fixed destination",
+      source: worker.replace(
+        "const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);",
+        'const upstreamUrl = new URL(upstreamPath, "https://heel-control-plane.internal");',
+      ),
+      violation: "fixed private hostname",
+    },
+    {
+      label: "unvalidated configured destination",
+      source: worker.replace(
+        "const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
+        "const controlPlaneOrigin = env.PUBLIC_ORIGIN ?? null;",
+      ),
+      violation: "not the validated configured origin",
+    },
+    {
+      label: "reassignable destination",
+      source: worker.replace(
+        "const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
+        "let controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
+      ),
+      violation: "not the validated configured origin",
+    },
+    {
+      label: "raw configured origin elsewhere",
+      source: worker.replace(
+        "      controlPlaneOrigin,\n      edgeClientKey,",
+        "      env.PUBLIC_ORIGIN,\n      edgeClientKey,",
+      ),
+      violation: "not the validated configured origin",
+    },
+    {
+      label: "missing configuration refusal",
+      source: worker.replace(
+        '  if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);\n',
+        "",
+      ),
+      violation: "refusal does not precede every private fetch",
+    },
+    {
+      label: "conditional configuration refusal",
+      source: worker.replace(
+        'if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);',
+        'if (controlPlaneOrigin === null && upstreamPath !== ME_ROUTE) return proxyError(503, "control plane unavailable", csp);',
+      ),
+      violation: "refusal does not precede every private fetch",
+    },
+    {
+      label: "substitute validator module",
+      source: worker.replace(
+        'import { canonicalPublicOrigin } from "../build/deployment-config";',
+        'import { canonicalPublicOrigin } from "./deployment-config";',
+      ),
+      violation: "not the shared canonical import",
+    },
+    {
+      label: "aliased validator import",
+      source: worker.replace(
+        'import { canonicalPublicOrigin } from "../build/deployment-config";',
+        'import { deploymentConfig as canonicalPublicOrigin } from "../build/deployment-config";',
+      ),
+      violation: "not the shared canonical import",
+    },
+    {
+      label: "shadowed validator",
+      source: worker.replace(
+        "  const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
+        "  const canonicalPublicOrigin = (value: unknown) => String(value);\n  const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
+      ),
+      violation: "not the validated configured origin",
     },
     {
       label: "unbounded request body",
