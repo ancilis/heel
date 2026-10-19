@@ -221,7 +221,8 @@ describe("dashboard account onboarding", () => {
     expect(JSON.parse(created?.body ?? "{}")).toEqual({ name: "Billing staging" });
     const project = screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement;
     expect(project.selectedOptions[0].textContent).toBe("Billing staging");
-    expect(nav.search).toMatch(/^workspace=ws_[0-9a-f]{16}&project=prj_[0-9a-f]{32}$/);
+    // The address is written by the URL-sync effect after the commit that shows the notice, so wait for it.
+    await waitFor(() => expect(nav.search).toMatch(/^workspace=ws_[0-9a-f]{16}&project=prj_[0-9a-f]{32}$/));
     expect(screen.queryByText(/Create your Heel account/)).toBeNull();
     expectNoSecretLeak();
   });
