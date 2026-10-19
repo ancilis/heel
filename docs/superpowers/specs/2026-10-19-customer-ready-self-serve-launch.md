@@ -1,0 +1,604 @@
+# Heel customer-ready self-serve launch — re-scope, reality audit and design (T3S)
+
+Date: 2026-10-19. Branch `feat/self-serve-product`, design base
+`1250918a15902821cb899fd4af1b21a3249194df` (clean). Author: Claude Fable 5.1, fresh interactive
+design session (T3S). **Design and specification only: no product, test, build, package,
+configuration or artifact code changed.** Astra orchestrates under Kevin's persistent
+authorization; Opus implements; a fresh Fable reviews. Nothing here is implementation or launch
+acceptance.
+
+**Authority.** This document is the current launch authority. It implements the approved human
+correction recorded in `.git/self-serve-launch/CUSTOMER-READY-REQUIREMENT-2026-10-19.md` (Kevin:
+"ready for a customer to sign up and use against their SaaS, give it location or url, creds and
+let it go"). Where it conflicts with `2026-10-18-self-serve-product-launch.md` (the launch spec)
+or `2026-10-18-self-serve-runner-bridge.md` (the bridge spec), this document wins; both older
+documents carry a T3S banner naming exactly which of their assumptions are superseded (§2.3).
+Everything in them that is not named there stays in force. Historical session logs and specs are
+evidence, never authority over the latest human requirement.
+
+Tags: **CONFIRMED** (command, test, URL, artifact or `file:line` at the design base) or
+**INFERRED** (with the confirming action). Evidence for this session:
+`.git/self-serve-launch/sessions/T3S-artifacts/`, `sessions/T3S-design.md`,
+`sessions/T3S-closing.md`. All new routes, schemas, modules, tables and tests are marked
+**(proposed)**; none exists.
+
+Normative words: **MUST**, **MUST NOT**, **MAY**.
+
+---
+
+## 0. Verdict summary
+
+| # | Question | Answer |
+|---|---|---|
+| 1 | Can a customer today sign up, give a URL and credentials, and get findings? | **No.** No browser action starts any target traffic; the only real executor is the standalone CLI (`heel runner run`) plus a `serve` loop that executes nothing (§1). |
+| 2 | What does the latest requirement change? | Three previously mandatory things become optional or forbidden as defaults: a customer OpenAPI document, a customer-installed runner, and engineer setup. Discovery becomes a product function. Final acceptance moves from a synthetic-only target to a real, authorized, unprepared SaaS plus a synthetic known-positive (§2, §6). |
+| 3 | Which original invariant cannot be kept unchanged? | "Credentials and raw evidence are customer-local" cannot coexist with "no customer installation". A Heel-operated execution plane must hold them. This is a hard-invariant change that needs Kevin's decision; the exact reviewable proposal is §2.4. Everything else (signed immutable scopes, one-shot attempts, GET/HEAD, containment, isolation, revocation, redacted control-plane data, no credentials in browser/cloud DB/logs/model APIs) is preserved. |
+| 4 | Recommended default | **Managed execution plane** ("Heel-managed scanner"): the existing runner code (`LocalCanaryExecutor`, `TargetHTTPSClient`, containment, redaction, `RunnerStore`) run by Heel in an isolated per-workspace executor that pairs with the control plane through the existing runner protocol. The customer-local runner stays as an **optional private connector**, not the default onboarding (§2.2, §5). |
+| 5 | What can be built before Kevin decides? | Everything that does not store a customer credential or raw body on Heel infrastructure: TLS repair, discovery engine, inventory-with-provenance and plan-request server work, managed executor in anonymous-only mode, findings projection, UI shell, ownership/authorization UX (§7.2). |
+| 6 | Design verdict | **DESIGN PASS** for this specification as a reviewable, dependency-ordered plan with one explicit human decision. **Not** an implemented PASS, **not** a customer-ready PASS (§6.5). |
+
+---
+
+## 1. Proven current journey and barriers (reality audit at `1250918`)
+
+### 1.1 Method
+
+Graph-first per repository instruction: `get_architecture` (11 606 nodes, 31 996 edges, status
+`ready`) and `search_graph` on the indexed project
+`Users-hellohelloalbus-.codex-worktrees-heel-self-serve-product-heel`. Recorded limits:
+regex alternation and `(?i)` patterns returned 0 results for symbols that exist (`RunnerService`
+found with the plain name), and Python control-plane routes are not modelled as `Route` nodes
+(the 20 `Route` nodes are TypeScript worker/header strings), so the `_match` matcher and literal
+strings were read with `grep`/`sed` (fallback permitted for literals). Probe transcript:
+`T3S-artifacts/t3s-reality-probes.log`. No test suite was rerun; the baseline of record stays
+the R2 full validation (Python 1984 pass / 2 skip / 653 subtests; JS 204 unit / 70 Node / 5
+engine / 41 browser / 3 parity; CONFIRMED `RUN-LOG.md` "T2b2R2 COMPLETE") and the T1 baseline
+(1752/1/2, environment-attributed failure) is preserved as history, not erased.
+
+### 1.2 What exists, what each customer step hits today
+
+| # | Customer step (latest requirement) | Today | Evidence | Verdict |
+|---|---|---|---|---|
+| 1 | Sign up in a browser | Control-plane signup/login/session/lockout exist; browser → Worker path untested; no public deployment found | launch spec §2 rows 1–3; `T3S-deployment-facts.md` (no linked Railway project, v1.2.0 release has zero assets) | works (loopback API); **deploy missing** |
+| 2 | Give the SaaS URL | `POST …/environments` issues an https-file or dns-txt ownership challenge with attestation | `heel/saas/verification.py:297-303` (`proof_method in {"https-file","dns-txt"}`), `:229` classes `staging/sandbox/production` | works (challenge); **proof requires the customer to place a file or DNS record** (§4.3) |
+| 3 | Give credentials in the product | **No product credential entry exists.** Credentials exist only as runner-local records written by `heel runner credential add` with profiles `bearer`, `x_api_key`, `cookie_jar` (`anonymous` implicit) | `heel/runner/catalog.py:23-30`, `heel/runner/execution.py:332-337`, `store.py:815` | **missing**; no form-login profile (§3.6) |
+| 4 | Authorize testing | Ownership attestation at challenge + human Approve of an exact projection digest with hostname retype | `verification.py:299`, `canary_runs.py` approve path (launch spec §7.2 step 6) | exists for the approval; **no discovery authorization** (§3.4) |
+| 5 | Heel discovers routes | **Nothing.** Graph: no crawl symbol; `discover` symbols are the abuse-hypothesis model calls (`heel/model.py` `AnthropicModel.discover`, `heel/agents.py:heuristic_discover`), not HTTP route discovery. The only inventory source is an OpenAPI document (`heel/runner/openapi_routes.py:RouteInventory`, GET/HEAD only `:69`; browser parse in `review-v1.ts`) | `search_graph` results in probes log | **missing** (§3) |
+| 6 | Heel scans | Real HTTPS executor exists and is CLI-only: `plan_differential._build_client` (`plan_differential.py:846`), `LocalCanaryExecutor`, 256 KiB JSON cap, public-address preflight (`http_transport.py:159` `not address.is_global` → refused), GET/HEAD compile (`compiler.py:123,384`), budgets `maximum_requests: 20` (`compiler.py:26`). `heel runner serve` exists (`cli.py:1186`, `daemon.py:688`) but its executor is `_ExecutionUnavailable` (`daemon.py:332-336,1307`); `RunnerExecutionAdapter` has graph in-degree 0 (no product constructor) | probes log | **bridge missing**; the control plane never sends target traffic (`canary_runs.py:3`) and there is no hosted worker (the legacy `JobPlane` has no executor in the tree) |
+| 7 | Real HTTPS to a customer host | Both production TLS constructors use `ssl.PROTOCOL_TLSv1_2` (`http_transport.py:235`, `network_guard.py:248`); `AttributeError` on OpenSSL 4 builds; `network_guard.TLSTransport` loads zero CAs so the HTTPS ownership verifier fails closed on every real host | `sessions/T2bTLSD-design.md` F1–F3 (CONFIRMED probes), accepted design `ASTRA-T2bTLS-design-decisions.md` | **blocker for any real target, hosted or local** (§7.1 C1) |
+| 8 | Findings with evidence | Local verdicts from stored responses (`evaluate_plan_pair`, `plan_differential.py:398`), `heel findings` CLI; no cloud result projection, no dashboard finding rows | launch spec §2 rows 12–13 | works CLI; **product missing** |
+| 9 | Delete credentials / revoke | Runner revoke route, environment revoke, binding revoke exist; `unpair` refuses after binding (`context_bound`, open gap); no credential-delete UI | `sessions/T2b2-closing.md` verdict; `docs/PLAN_DIFFERENTIAL_RUNNER.md:500-502` | partial |
+
+**Barriers to the required journey, in order of cost to the customer today:** (a) no deployment;
+(b) must install Python ≥3.11 runner and keep it running (contradicts the requirement);
+(c) must produce an OpenAPI document (contradicts); (d) must place an ownership proof file or DNS
+record (allowed but must be surfaced as a customer action); (e) must type credentials in a CLI
+(contradicts); (f) real HTTPS fails on OpenSSL 4 builds and the ownership verifier fails on all
+builds (defect); (g) nothing turns an approved plan into target traffic from the product.
+
+### 1.3 Authenticated target observation (evidence, not product proof)
+
+Astra signed in to the proposed validation target through the customer-filled browser form
+(`sessions/T3S-zonal-browser-evidence.md`): `/dashboard`, organization "Ancilis Demo Tenant",
+role "ORG ADMIN", navigation Dashboard/Brief/Discovery/Agents/My Work/Certifications/Evidence/
+Integrations/Agent Graph/Runtime Coverage, export buttons Posture PDF / OSCAL JSON / Evidence
+CSV / Evidence NDJSON. CONFIRMED as browser UI evidence only. It proves: a form login with
+organization slug + email + password (no form-login profile exists, row 3); one identity only
+(no second identity, §4.5); export links that an authenticated HTML crawl would surface
+(§3.2). It does **not** prove synthetic data, target provenance, authorization scope, or that the
+application was not prepared for Heel. "ORG ADMIN" is an application string, never a plan label.
+
+### 1.4 Reuse / gap matrix (modules named exactly)
+
+| Capability | Reuse as-is (CONFIRMED present) | Extend | New (proposed) |
+|---|---|---|---|
+| Public edge, sessions, tenancy, quotas | `apps/heel-cloud/worker/index.ts` (fixed origin, allowlist), `heel/saas/{auth,tenancy,projects,entitlement,catalog,ledger}.py` | allowlist rows for §5.1 routes | — |
+| Target ownership/authorization | `heel/saas/verification.py` (`VerifiedEnvironmentService`, attestation), `network_guard.py` (`PinnedHTTPSVerifier`, `BoundedDNSResolver`) | TLS repair (C1); authorization record fields (§4.3) | — |
+| Credentials | `heel/runner/store.py` credential records (opaque handle, `plan_label`), `vault.py` backends, `redaction.py` | new vault backend for the managed plane (§5.3, gated by §2.4); `form_login` profile (§3.6) | browser credential intake routes (§5.1) |
+| Execution | `heel/runner/{execution,compiler,http_transport,containment,coordinator,service,daemon,runtime,control_client,control_transport}.py`, `plan_differential.py` (`_build_client`, `evaluate_plan_pair`, `_load_observations`) | `RunnerExecutionAdapter` wiring in `daemon.serve` (bridge spec T4a, host-agnostic); discovery transport profile (§3.3) | `heel/runner/discovery.py` (§3); managed executor deployment unit (§5.2) |
+| Inventory | `heel/runner/openapi_routes.py` (`RouteInventory`, `normalize_route_template`) | inventory rows carry provenance (§3.5) | discovery candidate store |
+| Plan/approval/grant | `heel/saas/{canary_runs,runner_contexts,canary_disclosure}.py`, `heel/canary_contracts.py` (caps: actions ≤20, 64 KiB projection, 256 KiB findings, ≤20 observations `:314,403,591,646,669`) | v2 projection with `plan` object (bridge spec §4.1, unchanged); new `plan_kind: discovery` (§3.4) | plan-request routes (bridge spec T3a-s, unchanged) |
+| Findings | `heel/regressions.py`, `heel findings`, `canary_contracts.validate_canary_findings` | result projection `heel.plan-differential-result.v1` (launch spec §7.3, unchanged) | dashboard rows, hosted evidence viewer (§4.6) |
+| Packaging/deploy | `scripts/build_open_core_release.py`, `deploy/compose.yaml`, `Dockerfile.control-plane`, `ops.py` kill switch | managed-executor image + env (§5.2) | — |
+
+Mock integrations are not journey evidence anywhere in this document (launch spec §11.1 items
+2–4 remain binding).
+
+---
+
+## 2. Original vs latest requirements, conflicts, and the one decision
+
+### 2.1 Matrix
+
+| # | Original requirement (launch spec / CUSTOMER-EXECUTION-REQUIREMENT) | Latest requirement (CUSTOMER-READY-REQUIREMENT-2026-10-19) | Conflict? | Resolution in this spec |
+|---|---|---|---|---|
+| R1 | Customer imports an OpenAPI document | Customer MUST NOT need to provide OpenAPI | **Yes** | OpenAPI becomes optional input; discovery is the default inventory source (§3). Superseded. |
+| R2 | Customer installs the released runner and keeps `heel runner serve` running | No manual runner installation as a prerequisite | **Yes** | Managed execution plane is the default; local runner is an optional private connector (§2.2, §5.4). Superseded as default. |
+| R3 | Credentials entered by CLI on the customer machine, stored in OS keychain/secret-service | Customer gives credentials in the product and "lets it go" | **Yes** | Browser credential entry into the managed plane's vault (§4.4, §5.3). **Requires Kevin's decision (§2.4).** |
+| R4 | Raw evidence stays on the customer machine; cloud receives bounded redacted projections | Customer receives understandable, evidence-backed findings without a machine | **Yes** | Raw evidence held by the managed plane under bounded retention; control plane still receives projections only (§5.3). **Part of §2.4.** |
+| R5 | No credential in browser, cloud DB, logs, traces, metrics, model prompts | unchanged | No | Preserved and strengthened: the browser transmits a credential exactly once over TLS to one intake route that forwards to the managed vault and never persists it in the control-plane DB; forbidden-key tests extended (§6.1 row 4). |
+| R6 | Signed immutable scopes, one-shot attempts, grants bound to projection digest | unchanged | No | Preserved byte-for-byte; discovery runs use the same grant mechanism in rounds (§3.4). |
+| R7 | GET/HEAD only, from an imported inventory | discovery must not hide writes | No, but needs a rule | Inventory = union of imported and discovered routes with provenance; execution still only from the approved inventory snapshot; a discovered route never widens host or method (§3.5). One narrow, separately authorized login POST for form-login targets (§3.6). |
+| R8 | Isolated workspaces/projects, containment, revocation, safe quotas/auth | unchanged | No | Preserved; managed plane adds per-workspace isolation and egress restriction (§5.2). |
+| R9 | Final acceptance on a synthetic staging SaaS through the public path | Synthetic is intermediate; a real authorized unprepared SaaS must validate the actual flow | **Yes (scope)** | Two acceptance layers (§6.3–§6.4). Synthetic-only PASS is superseded as final. |
+| R10 | Two identities with operator plan labels (`lower_plan`/`higher_plan`) | Customer may have one identity | Partial | Identity slots: anonymous (implicit), identity A (required), identity B (optional). Plan differential needs B; with A only, anonymous-exposure comparison is the honest capability (§4.5). |
+| R11 | Verified-environment ownership proof before any traffic | "give it location or url" | Partial | Ownership proof kept (it is the authorization control); surfaced as an explicit customer action with both methods and a visible gap when neither is possible (§4.3). |
+| R12 | Twelve safety properties with named tests; clean-room acceptance | unchanged | No | Re-mapped to the managed plane (§6). |
+
+### 2.2 Deployment/access options compared
+
+| Option | Customer action | Credential custody | Raw evidence custody | Works for private/VPN SaaS | Keeps every original invariant | Verdict |
+|---|---|---|---|---|---|---|
+| A. Local runner only (current plan) | install Python ≥3.11, run `serve`, CLI credentials | customer | customer | yes | yes | Fails R2/R3 of the latest requirement. Kept as the optional private connector. |
+| B. Browser-executed scanning | none | browser tab | browser | no | partially | Rejected: cross-origin responses are unreadable without the target's CORS consent; a browser extension is an installation; no durable evidence. |
+| C. Managed execution plane (Heel-operated, isolated per workspace, existing runner code) | sign up, URL, credentials, approve | **Heel (new)** | **Heel (new)** | no (public addresses only, by design) | all except R3/R4 custody | **Recommended default.** |
+| D. C by default + A as optional private connector | as C; A for private targets or customers who refuse custody | per choice | per choice | via A | as C | **Recommended shape** (C is the default onboarding; A is advanced). |
+
+### 2.3 What is superseded in the two older specs (exact list)
+
+Launch spec: §6 Access/Inventory rows (CLI credential commands and "Import OpenAPI" as the only
+inventory path), §7.1 "browser parses OpenAPI" as the sole inventory source, §8.1 install
+command as a **prerequisite** (it remains the private-connector install), §11 steps 4–7
+(install/pair/CLI credentials/import) as the **default** clean-room path, §11.1 item 1 "sent by
+the customer-local runner installed from the public download path" as the only released path,
+§14 claim text. Bridge spec: §3.1 onboarding order as the **default** (it remains the
+private-connector order), §9.1 task ownership where this document's §7 reassigns. Everything
+else in both documents stays in force, in particular the v2 projection (§4.1), the serve loop
+(§2), the result projection (§4 rows 11–13), the seams rule (§5), the quota/invitation fixes
+(§6–§8), and the verification order (§9).
+
+### 2.4 Proposal for Kevin: hosted custody of customer credentials and raw evidence
+
+This is the only change to a hard original invariant. It is prepared for review, not assumed.
+No implementation that stores a customer credential or a raw target response on Heel
+infrastructure may start before Kevin records a decision; §7.2 lists the work that continues
+regardless.
+
+| Item | Exact proposal |
+|---|---|
+| Data | (a) per verified environment: up to two identity credentials (profile `bearer`, `x_api_key`, `cookie_jar` or `form_login` fields: username/slug/password), each ≤4 KiB; (b) raw target responses captured during approved runs: ≤256 KiB per response, ≤20 per scan run, ≤100 per discovery authorization (§3.4), headers redacted before write exactly as today (`redaction.py`). |
+| Recipients (holders) | Only the **managed executor** for that workspace (one process/container per workspace, §5.2) and its vault. **Never** the control-plane database, the Worker, structured logs, metrics, traces, crash reports, support exports, CI, or any model API. The browser holds a credential only in the form field until submit. |
+| Lifetime | Credential: until the customer deletes it, revokes the environment, or deletes the project/workspace, whichever first; a credential whose environment verification expires is deleted at expiry. Raw evidence: `FINDINGS_RETENTION_MS` (7 days, `canary_disclosure.py:38`), then purged; deleted immediately on "Delete evidence" or environment revoke. No new retention policy is invented. |
+| Isolation | Per-workspace executor identity (its own runner key, paired through the existing protocol, §5.2); per-workspace vault key (envelope encryption: data key per workspace wrapped by a provider-managed KMS key where the host offers one, otherwise by a server master key held only in the executor's environment); evidence directory per workspace and run, same inode guard and private directories as `HEEL_HOME` today; executor egress limited to the verified origin's pinned addresses on 443 plus the control plane; no shell, no inbound listener. |
+| Security consequences (stated plainly) | Heel becomes a **credential custodian**: a compromise of the executor host or vault key exposes customer SaaS credentials and up to 7 days of response bodies for that workspace. Insider access must be governed (break-glass logging). Terms/Privacy must say so (legal acceptance, launch spec §15). Customers with stricter custody rules keep the private connector. This is not and MUST NOT be described as "customer-local". |
+| UX consequence | Zero installation. The customer types the URL, proves ownership, enters credentials in the browser, clicks "Authorize discovery" and later "Approve scan". "Delete credentials" and "Delete evidence" buttons are one click. The dashboard says where credentials and evidence are held. |
+| Alternatives if declined | (i) Keep option A only: the latest requirement is not met and this is reported as the product gap. (ii) Hosted credentials but **no raw evidence retention** (verdicts computed in executor memory, only digests/key-path sets/redacted excerpts ≤512 bytes stored): findings lose body-level inspectability; honest but weaker evidence. |
+| Recommendation | Accept custody with the lifetime and isolation above, with (ii) as the fallback if raw-body custody is declined. |
+
+Routine, reversible design choices below are made here under the Astra/Fable authorization
+and need no Kevin decision.
+
+---
+
+## 3. Automatic discovery without a customer OpenAPI document
+
+### 3.1 Principles
+
+Discovery is **read-only reconnaissance under an explicit, bounded authorization**, executed by
+the same executor path as scans (frozen manifest, signed grant, one-shot attempts, containment,
+GET/HEAD, pinned host, public addresses only, no redirects followed). It is deterministic
+(regex and HTML/JSON parsing); **no model API receives target bodies, headers or credentials**.
+If model assistance is ever added for ranking, its input is limited to `{method,
+route_template, provenance_kind, status_code}` and this sentence becomes a tested boundary.
+
+### 3.2 Sources, in order (all same-origin, GET/HEAD)
+
+| Phase | Identity | Seed / extraction | Provenance kind | Budget |
+|---|---|---|---|---|
+| 0 passive | none (0 requests) | customer-supplied URL; optional OpenAPI URL or file (kept as a source, not required) | `customer_url`, `imported_openapi` | — |
+| 1 anonymous | anonymous | fixed seed list: `/openapi.json`, `/openapi.yaml`, `/swagger.json`, `/swagger/v1/swagger.json`, `/v3/api-docs`, `/api-docs`, `/api/openapi.json`, `/api/swagger.json`, `/.well-known/openapi`, `/robots.txt`, `/sitemap.xml`, `/` | `well_known_spec`, `robots`, `sitemap`, `html_link`, `script_src` | ≤20 requests (one round) |
+| 2 anonymous | anonymous | same-origin `<a href>`, `<link>`, `<form action>` (GET only), `<script src>` from phase-1 HTML; fetch ≤8 scripts; extract quoted path literals (`"/api/..."`, template literals, `fetch(`/`axios.` first-argument strings) | `js_literal`, `html_link` | ≤20 requests |
+| 3 authenticated | identity A (then B if present) | app shell after login; same extraction as phase 2; follow same-origin navigation links depth ≤2 | `html_link_auth`, `js_literal_auth`, `redirect_location` | ≤40 requests per identity |
+| 4 spec parse | none | any discovered OpenAPI document parsed by the existing `RouteInventory` rules (GET/HEAD only) | `discovered_openapi` | 0 requests |
+
+Totals: ≤100 requests, ≤8 MiB received, ≤120 s wall per discovery authorization. Pages and
+scripts are fetched through a **discovery transport profile** (proposed, `http_transport.py`):
+same `TargetHTTPSClient` guards (resolver pinning, public-address preflight, TLS 1.2+, no
+redirects, host pinned) with accepted content types `text/html`, `application/json`,
+`text/javascript`/`application/javascript`, `text/plain`, `application/xml`/`text/xml` and a
+2 MiB body cap. Scan actions keep the existing 256 KiB JSON-only profile; the profile is part of
+the frozen manifest action and cannot be chosen by a response.
+
+### 3.3 Candidate rules (safe method and path selection)
+
+- Only `GET` and `HEAD` become candidates. A literal that evidently names another method (e.g.
+  `method: "POST"` adjacent to the path) is recorded as `excluded: method_not_allowed` so the
+  customer sees it; it is never executed.
+- Must be same origin as the verified environment after normalization; anything else is
+  `excluded: off_origin` (a discovered route is not authority to widen host scope).
+- Deny-pattern list (case-insensitive path segments and query keys): `logout`, `signout`,
+  `sign-out`, `delete`, `remove`, `destroy`, `reset`, `revoke`, `disable`, `unsubscribe`,
+  `confirm`, `verify`, `accept`, `cancel`, `rotate`, `regenerate`, `impersonate`, `export-all`,
+  `action=`, `token=`, `key=`, `code=` → `excluded: side_effect_risk`. GET with side effects
+  exists in the wild; this list is a heuristic and the exclusion reason is shown.
+- Static assets (`.js`, `.css`, `.map`, `.png`, `.svg`, `.woff*`, `.ico`) are discovery inputs,
+  never scan candidates (`excluded: static_asset`).
+- Query strings are stripped from templates; `page`, `cursor`, `offset`, `limit` keys are noted as
+  `paginated: true` and never enumerated.
+- Path segments that are integers, UUIDs, ULIDs or 16+ hex characters become `{id}` placeholders
+  through `normalize_route_template`; the observed concrete value is kept as a **local mapping**
+  on the executor (today's `heel runner map` store), enters the signed projection only as
+  `bindings_sha256`, and never reaches the control plane.
+- Redirects are never followed by the transport. A same-origin `Location` on a 3xx becomes a
+  candidate with provenance `redirect_location`; a cross-origin one is `excluded: off_origin`.
+- DNS: the existing full-set pinning and recheck per request; a target whose addresses are not
+  all global is refused by the preflight (`http_transport.py:159`) → environment state
+  `target_not_public` (§4.2) → the private connector is the only path.
+- Login walls: a phase-1/2 page that redirects to `/login` is recorded; phase 3 repeats it
+  authenticated.
+- Nothing in discovery captures browser credentials, fuzzes, writes, cycles lifecycle, or
+  compares tenants. Those remain excluded (§8).
+
+### 3.4 Authorization and execution model (reuses grants; no new trust path)
+
+Discovery is a run of `plan_kind: discovery` (proposed value in the v2 `plan` object). The
+customer clicks **"Authorize discovery"** once; the dialog states the exact bound: "up to 100
+GET/HEAD requests to `<origin>` over up to five rounds, anonymous and as the identities you
+entered, within 120 s". The server records an authorization row (environment, bound, actor,
+time) and issues round grants:
+
+1. Round 1 manifest = the fixed seed list (≤20 actions) → signed projection → server-side
+   auto-approval under the recorded authorization (no second human click per round; the
+   human authorized the bound, the server enforces it) → grant → executor claims → executes.
+2. The executor derives the next frontier from stored responses, freezes it into the next
+   manifest (≤20 actions, deny-list applied), submits the projection, receives the next grant.
+3. Stops at 5 rounds, 100 requests, 8 MiB, 120 s, or an empty frontier, whichever first.
+
+Each round is a normal grant with `maximum_requests ≤ 20` (contract cap unchanged), reserved
+one-shot attempts, containment entries, and the live gate (stop/revoke within 5 s). Quota:
+discovery reserves **one** `Meter.CANARY_RUNS` unit per authorization, not per round (the
+existing meter; no new meter, no pricing). Discovery output is a **candidate inventory**, not
+a scan; nothing is scanned until "Approve scan" (§4.2).
+
+### 3.5 Inventory provenance and the GET/HEAD allowlist rule (reconciled)
+
+The original invariant "only GET/HEAD in the imported inventory execute" is restated as:
+**only GET/HEAD routes present in the approved inventory snapshot bound into the signed
+projection execute; every inventory row records its provenance.** Inventory row (proposed
+change to `route_inventories`, launch spec §7.1): `{method, route_template, provenance:
+[{kind, round, status_code}], first_seen_ms, state: candidate|selected|excluded, excluded_reason}`;
+no URLs with values, no bodies. The existing reject-never-truncate bound (≤200 routes) stays; a
+discovery that finds more keeps the first 200 by phase order and reports `truncated_count` as a
+visible number (discovery, unlike import, cannot ask the customer to trim a document). Imported
+OpenAPI routes keep `kind: imported_openapi`. The compiler's GET/HEAD check (`compiler.py:123`)
+and the server's selection ⊆ inventory check (bridge spec §4.1) are unchanged and remain the
+enforcement points.
+
+### 3.6 Authentication types: supported, narrow POST, visible gaps
+
+| Type | Support | Rule |
+|---|---|---|
+| Bearer token, `X-API-Key`, cookie jar pasted by the customer | supported today (`catalog.py:23`) | unchanged |
+| **Form login (username / organization slug / password)** — the Zonal shape | **new profile `form_login` (proposed)** | exactly one `POST` to the login endpoint the discovery found and the customer **confirmed** in the UI (method, path, field names shown), per identity per run, rate-limited to 3/hour/identity, bodies never stored, response cookies kept only in executor memory for the run. This is a **distinct reviewed authorization** ("Authorize sign-in on my behalf" checkbox, recorded), not a general write capability; the manifest action type is `login_post` and the compiler refuses any other POST. The twelve-property tests gain a case that a `login_post` action can target only the confirmed path. |
+| SSO / OAuth redirect flows | **unsupported** | state `auth_unsupported: sso` with the advice to supply an API token or cookie if the SaaS offers one |
+| MFA / TOTP / email codes, CAPTCHA, device-bound sessions | **unsupported** | same, `auth_unsupported: mfa|captcha|device_bound`; never bypassed |
+
+---
+
+## 4. Customer UI and state flow (simple path)
+
+### 4.1 Pages
+
+Existing `/dashboard` step cards remain the skeleton (`components/canary/*`). The default path
+hides the runner install card; it appears only under "Advanced: private connector".
+
+### 4.2 States
+
+| Step | State id | Visible condition | Customer action | Fail-closed / gap state |
+|---|---|---|---|---|
+| Sign in | `sign_in` | `/v1/me` 401 | signup/login | lockout |
+| Target | `target.entered` | URL normalized to origin | "Prove you own it" | `target_invalid`, `target_not_public` (private address: "use the private connector") |
+| Target | `environment.pending` | challenge shown with both methods: file at `/.well-known/heel-verify.txt` **or** DNS TXT; attestation checkbox text names authorization | "Check proof" | `environment.failed` reason; `ownership_unproven` stays visible as a customer-action gap |
+| Target | `environment.verified` | verified record | enables Credentials | `revoked` |
+| Credentials | `credentials.none` | no identity for this environment | "Add identity A": profile picker (bearer / API key / cookie / sign-in form), label field ("name this plan or role, e.g. free"), secret field; "Add identity B" optional | `credentials.unavailable` while §2.4 undecided: card shows "Credential entry is not yet available; use the private connector" |
+| Credentials | `credentials.stored` | labels only, handles never, "held by Heel's managed scanner until you delete them" | "Delete" per identity; "Delete all" | `auth_unsupported: …` for sign-in forms needing SSO/MFA/CAPTCHA |
+| Discovery | `discovery.authorize` | bound text (§3.4) | "Authorize discovery" | — |
+| Discovery | `discovery.running` → `discovery.done` | rounds, requests used, candidates found, excluded counts by reason | — | `discovery.partial` (budget hit, TLS error, login failed) with reason |
+| Inventory | `inventory.candidates` | table: method, template, provenance kinds, state; default selection = first 10 `candidate` rows by phase order; "Import OpenAPI instead/also" link | select ≤10, "Approve scan" | `inventory.empty` ("No GET/HEAD routes were found; add an OpenAPI document or use the private connector") |
+| Plan | `plan.review` | `plan_sha256`, selected pairs, identity labels, pairs `anonymous vs A` and/or `A vs B`, `requests_sent: 0` | Approve with hostname retype | `plan.rejected` closed reason |
+| Run | `run.running` | counters | Stop | `run.stopped`, `run.runner_revoked` |
+| Findings | `findings.visible` | per route: verdict (`finding` / `held` / `inconclusive`), predicate, evidence state, what it means in one sentence, "View evidence" (hosted redacted viewer, §4.6) | "Save as regression" | `findings.none` ("No findings. N routes compared; M inconclusive because …") |
+| Delete | — | "Delete credentials", "Delete evidence", "Revoke target" | — | run stopped with `target_revoked` |
+
+**First useful finding ≤15 min** budget on the default path: signup 1 min; ownership proof is
+customer-paced (file/DNS; typically 2–5 min); credentials 1 min; discovery ≤2 min; approve 1
+min; scan ≤1 min; projection ≤10 s. The measured number is recorded in acceptance (§6.4 step
+14), never assumed.
+
+### 4.3 Ownership verification and explicit authorization
+
+Kept: ownership proof by https-file or dns-txt with the attestation acknowledgement
+(`verification.py:299`), environment class, the hostname retype on Approve. Added (proposed):
+the authorization record `{environment_id, actor, discovery_bound, identities_authorized:
+[labels], login_post_authorized: bool, recorded_at_ms}` shown in the UI and bound into the
+discovery plan. Honest gap: a customer who cannot place a file or a DNS record cannot proceed;
+the card says so. Supplied credentials prove account access, **not** ownership; they never
+substitute for the proof. For the Zonal target, Ancilis must place the proof; this is a
+customer action, recorded as such.
+
+### 4.4 Credential entry, deletion, revocation (default path)
+
+Browser form → `POST …/environments/{env}/identities` (proposed, §5.1) over the Worker →
+control plane validates shape only (profile, label 1–32 printable ASCII, size) and forwards the
+secret **in the same request** to the managed executor's intake over the control channel's
+reverse path (§5.3); the control plane stores `{identity_id, role_slot, plan_label, profile,
+created_at_ms}` and **never the secret**. Deletion: `DELETE …/identities/{id}` → executor
+deletes the vault item (existing `vault.delete` shape) and acknowledges; the UI shows the
+acknowledgement time. Environment revoke deletes all identities and evidence for that
+environment. Rotation = delete + add. Labels are the customer's words; the product never infers
+them from responses or role strings (existing rule, `store.py:7049-7067`).
+
+### 4.5 Identities without engineer setup
+
+Slots: `anonymous` (implicit, no credential), `identity_a` (required for any authenticated
+scan), `identity_b` (optional). Pairs compiled: `(anonymous, identity_a)` → "signed-out vs
+signed-in" comparison using the existing `body_superset`/`marker_leak`/`status_parity` predicates
+with `lower = anonymous`; `(identity_a, identity_b)` → the existing plan differential. Copy
+states: "With one identity Heel can only compare signed-out and signed-in access. Add a second
+identity on a different plan or role to look for plan-gating gaps." Empty bodies, errors,
+denial envelopes and status-only matches remain `held`/`inconclusive` and can never become an
+`observed` finding (`plan_differential.py:252-260,381-395`).
+
+### 4.6 Evidence viewer (hosted, redacted)
+
+`GET …/canary-runs/{run}/evidence/{ev1_ref}` (proposed) served by the control plane **by
+proxying a bounded request to the workspace's executor** (never stored in the control-plane DB):
+redacted headers, body ≤256 KiB, `[REDACTED:secret]` markers as today, owner/admin recent-auth
+same-origin only, audit row per view. Under §2.4 alternative (ii) this viewer shows key paths
+and ≤512-byte excerpts instead.
+
+---
+
+## 5. API, persistence, packaging, deployment, operations
+
+### 5.1 Routes (proposed; all under `/v1/workspaces/{ws}/projects/{prj}/…`, owner/admin, recent-auth same-origin for state changes, Worker allowlist + body cap each)
+
+| Route | Body / cap | Notes |
+|---|---|---|
+| `POST …/environments/{env}/identities` | `heel.environment-identity.v1` ≤8 KiB | §4.4; secret forwarded, never stored; gated by §2.4 |
+| `DELETE …/environments/{env}/identities/{id}` | none | acknowledged deletion |
+| `POST …/environments/{env}/discovery-authorizations` | `heel.discovery-authorization.v1` ≤2 KiB | §3.4; reserves one `CANARY_RUNS` unit |
+| `GET …/environments/{env}/route-inventory` | — | now includes provenance and states (§3.5) |
+| `PUT …/environments/{env}/route-inventory` | ≤64 KiB | optional OpenAPI import (unchanged from launch spec §7.1) |
+| plan requests, claim, approval, result projection, permit, regressions | unchanged | bridge spec §4, launch spec §7.2–§7.4 |
+| `GET …/canary-runs/{run}/evidence/{ref}` | — | §4.6 |
+| executor control routes | unchanged runner protocol | the managed executor is a runner (§5.2) |
+
+Tables (additive migrations, numbering continues from 30/31 of the launch spec):
+`environment_identities` (metadata only), `discovery_authorizations`, `discovery_rounds`,
+`route_inventories` provenance columns, `evidence_views` audit.
+
+### 5.2 Managed execution plane (deployment unit)
+
+- One **managed executor** process per workspace, started on first environment verification,
+  running the existing daemon code path (`RunnerDaemon.serve` with `RunnerExecutionAdapter`,
+  bridge spec T4a) with `HEEL_HOME` on a private per-workspace volume; same inode guard and
+  secure-file helpers.
+- **Pairing** uses the existing invite → exchange → approve → activate protocol, driven by the
+  control plane's own service actor; the phrase/fingerprint human comparison is replaced by the
+  service verifying the fingerprint it generated. This is acceptable because the executor is
+  Heel's infrastructure, not an untrusted customer machine; the human comparison remains for the
+  private connector. `Meter.ACTIVE_RUNNERS` (free = 1) counts the managed executor; a customer
+  who adds a private connector on free must retire the managed one (stated in the UI).
+- **Egress**: the executor host policy allows 443 to the verified origin's pinned addresses and
+  to the control plane only (`EgressPolicy` semantics from `heel/saas/egress.py` applied at the
+  host; the application-level preflight remains). **The default hosted service is never an
+  unrestricted SSRF proxy**: every request is from a frozen, signed, approved manifest to one
+  verified origin; private, loopback, link-local and literal-IP targets are refused at the
+  preflight (`http_transport.py:159`) and by the environment verifier.
+- **Image**: `heel-executor:<version>` from a new `deploy/Dockerfile.executor` (proposed) built
+  from the open-core wheel plus the `runner` extra; non-root, read-only root FS, one writable
+  volume; no shell. Hosting: the same provider as the control plane. Railway project metadata is
+  reachable read-only (`T3S-deployment-facts.md`); new hosted resources are a cost decision for
+  Kevin when C8 starts (no price invented).
+- **Operations**: kill switch (`ops.trip`) stops all executors' new rounds (existing generation
+  gate); runbook entries "delete all identities of a workspace", "rotate executor vault key",
+  "break-glass evidence access" (audited); backups exclude vaults and raw evidence.
+
+### 5.3 Secret path and vault backend
+
+Control plane → executor secret delivery (proposed): the executor's existing PoP channel gains
+a `credential-intake/claim` poll (same shape as the permit claim, bridge spec §4 row 12) that
+returns the pending secret **once**, encrypted to the executor's X25519 key published at
+pairing (derived from the same seed as its Ed25519 identity), then the control plane deletes the
+ciphertext. The control plane therefore holds a secret only as a short-lived ciphertext it
+cannot read, and never in a table that outlives the claim. Vault backend (proposed,
+`vault.py`): `envelope` — data key per workspace wrapped by a KMS key where available, else by
+`HEEL_EXECUTOR_MASTER_KEY_B64` (executor environment only, validated at start like the other
+peppers, `server.py:120-245` pattern). Secrets never appear in argv, env of child processes,
+logs, or metrics (existing redaction and `test_i5` byte scans extended, §6.1 row 4).
+
+### 5.4 Optional private connector (advanced path)
+
+The customer-local runner stays exactly as specified in the launch and bridge specs
+(install one-liner, pair, `serve`, CLI credentials, OS keychain, local raw evidence). The UI
+presents it under "Advanced: private connector" with the honest reasons to choose it: private
+or VPN-only targets, or a custody policy that forbids Heel-held credentials. It is not the
+default onboarding and no copy may imply it is required.
+
+### 5.5 Retained and strengthened controls
+
+Roles (`_recent_owner_admin`), CSRF/origin checks, `__Host` cookie, lockout and signup
+throttles, device auth, edge secret, kill switch, migrations-before-bind, backups: unchanged.
+Strengthened: forbidden-key sets gain `password`, `secret`, `token`, `cookie`, `authorization`
+for every new schema; the evidence viewer is audited; identity deletion is acknowledged by the
+executor, not assumed.
+
+---
+
+## 6. Safety properties, tests, acceptance
+
+### 6.1 Twelve properties → named tests (existing CONFIRMED, proposed with owner)
+
+| # | Property | Existing (CONFIRMED, launch spec §10) | Proposed (owner in §7) |
+|---|---|---|---|
+| 1 | No requests outside the verified origin | `test_i1_host_confinement_refuses_off_allowlist_redirect_and_rebinding`, `test_dns_is_full_set_pinned_and_rechecked_before_authorized_retry` | `tests/test_runner_discovery.py::test_discovery_never_fetches_off_origin_or_follows_redirects` (C3); `tests/test_executor_serve_execution.py::test_managed_run_refuses_origin_outside_grant` (C4) |
+| 2 | Only GET/HEAD from the approved inventory snapshot execute | `test_i2_post_inventory_is_rejected_at_compile`, `test_i2_only_inventoried_get_and_head_reach_the_wire` | `test_runner_discovery.py::test_discovered_candidates_are_get_head_same_origin_and_deny_listed_paths_are_excluded` (C3); `tests/test_canary_http.py::test_inventory_rows_carry_provenance_and_selection_outside_snapshot_is_rejected` (C2); `tests/test_runner_compiler.py::test_login_post_action_targets_only_the_confirmed_path_and_no_other_post_compiles` (C5) |
+| 3 | Signed scope + one-shot attempt per request | `test_i3_no_request_without_verified_signed_scope`, `test_i4_no_request_without_one_shot_reserved_attempt` | `test_runner_discovery.py::test_each_discovery_round_is_a_frozen_manifest_under_its_own_grant_and_stops_at_the_authorized_bound` (C3/C4) |
+| 4 | No credentials in browser/cloud DB/logs/traces/metrics/crashes/model APIs | `test_i5_credential_plaintext_absent_from_heel_home_and_output`, `test_findings_upload_recursively_rejects_raw_credential_fixture_and_local_path_leakage` | `tests/test_canary_privacy.py::test_identity_intake_stores_metadata_only_and_ciphertext_is_deleted_after_executor_claim` (C5); `tests/test_executor_serve_execution.py::test_managed_run_never_writes_credentials_to_control_plane_db_logs_or_metrics` (C5); `test_runner_discovery.py::test_discovery_sends_nothing_to_a_model_api` (C3, asserts no model client import in the module) |
+| 5 | Raw evidence bounded to the executor; control plane holds projections only | `test_completed_response_is_written_only_to_required_local_evidence_sink`, `test_operational_cloud_storage_cannot_be_repurposed_for_blocked_or_observed_assessment` | `test_canary_privacy.py::test_plan_differential_result_projection_is_bounded_and_bodyless` (C6, from launch spec); `tests/test_canary_http.py::test_evidence_view_is_proxied_bounded_audited_and_never_persisted` (C6) |
+| 6 | Verifiable containment with workspace/project/runner/grant/route/attempt | `test_i6_every_request_is_logged_before_it_is_sent`, `test_i8_containment_chains_verify_and_detect_tamper` | `test_executor_serve_execution.py::test_managed_run_containment_entries_carry_workspace_project_executor_grant` (C4) |
+| 7 | Workspace/project isolation | `test_cross_tenant_objects_unreachable`, `test_tenant_isolation`, `test_context_dashboard_hides_runner_bound_in_another_project_until_revoke` | `test_canary_http.py::test_identities_inventory_discovery_and_evidence_are_project_scoped` (C2/C5); `test_executor_serve_execution.py::test_one_executor_per_workspace_cannot_claim_another_workspaces_grant` (C4) |
+| 8 | Pairing/verification non-replayable | `test_exchange_is_one_time_and_access_is_workspace_bound`, `test_http_v3_pairing_activation_replays_one_sealed_executable_cursor` | `test_executor_serve_execution.py::test_managed_executor_pairing_is_service_driven_single_use_and_fingerprint_verified` (C4) |
+| 9 | Quotas idempotent | `test_duplicate_idempotent_run_charged_once`, `test_concurrent_reservations_never_exceed_quota` | `tests/test_canary_quota.py::test_discovery_authorization_reserves_one_unit_for_all_rounds_under_retry` (C2) |
+| 10 | Prompt revocation | `test_canary_stop.py` (18), `test_revoked_runner_zero_request_claim_is_stopped_and_refunded_after_deadline` | `test_executor_serve_execution.py::test_environment_revoke_deletes_identities_and_evidence_and_stops_target_traffic_within_five_seconds` (C5/C6) |
+| 11 | Sessions, CSRF/origin, rate limits, audit | `test_lockout_after_failures`, `test_verify_requires_browser_session_same_origin_and_live_sync_role` | `test_canary_http.py::test_identity_discovery_and_evidence_routes_require_same_origin_recent_auth_and_are_audited` (C2/C5) |
+| 12 | Offline/lost authorization/malformed input fail closed visibly | `test_restart_coordinator_rehydrates_active_binding_but_requires_fresh_heartbeat`, `test_malformed_and_oversized_bodies` | `test_runner_discovery.py::test_discovery_partial_on_tls_error_login_failure_or_budget_is_visible_and_never_a_finding` (C3); `tests/test_runner_http_transport.py::test_both_transports_construct_without_the_legacy_constant_and_negotiate_tls12_and_tls13` (C1) |
+
+Tests of the private-connector path (bridge spec §9.1) remain as specified for that path.
+
+### 6.2 What an acceptance run may and may not use
+
+Unchanged from launch spec §11.1 items 2–4: no mocked transports, canned findings, seeded rows,
+fixture-only adapters, hidden flags, admin seeding, or manual copying. Test seams
+(SEAM-EDGE-CA, SEAM-SECRET-BACKEND, SEAM-TARGET-DIAL) are labelled and are never acceptance
+evidence. Both acceptance layers traverse browser → Worker → control plane → managed executor →
+HTTPS target → projection → dashboard.
+
+### 6.3 Layer 1 — synthetic known positive and patch transition (detection proof)
+
+A team-run real HTTPS application (public address, real certificate) with one export route that
+returns a higher plan's data to the lower identity and is not declared gated; onboarded through
+the **default path only** (no runner install): sign up → URL → proof → two identities →
+Authorize discovery → candidates include the export route with provenance `html_link_auth` or
+`js_literal_auth` → Approve scan → `finding/body_superset/observed` → patch the application →
+Replay → `pass/blocked`. Target-side access-log receipts correlated to `(run_id, action_ordinal,
+attempt)` and containment entries. PASS here proves detection and the mechanism, **not**
+customer readiness.
+
+### 6.4 Layer 2 — real authorized SaaS not prepared for Heel (onboarding proof)
+
+Target: the one Kevin supplies (currently `https://zonal-acceptance-production-d349.up.railway.app`,
+recorded as proposed, provenance and scope still to be confirmed by the product's own
+ownership proof and authorization record, never by chat). Steps, each timestamped:
+
+```
+1  browser: sign up on the deployed origin (new account)
+2  browser: enter the URL; place the proof (file or DNS) on the target; Check → verified
+3  browser: add identity A with the customer's label (form sign-in profile; confirm the login endpoint discovery found); identity B if the customer has one
+4  browser: Authorize discovery → rounds complete or partial with reasons; candidate table shows provenance
+5  browser: select ≤10 candidates → Approve scan (hostname retype) → run completes
+6  browser: findings.visible or findings.none with per-route reasons; open one evidence view
+7  target: access log shows only GET/HEAD (plus the one confirmed login POST per identity) from the executor, each correlated to an attempt
+8  browser: Delete credentials → executor acknowledgement; Delete evidence; Revoke target
+9  byte scan: control-plane DB dump, Worker logs, executor logs and metrics contain neither secret
+10 code review: no target-host, fixture or demo conditional in the product diff; a second target with a different host/inventory/credentials traverses the same code
+11 honesty check: if the target has no plan-gating gap, the result is findings.none or held/inconclusive rows with reasons; no finding is fabricated
+12 record: synthetic-data statement and ownership come from the customer and the product record, not inferred from the hostname words "acceptance" or "production"
+13 unsupported items (SSO/MFA/CAPTCHA, private address, no proof possible) are shown as gaps, not hidden
+14 clock: minutes from step 1 to step 6 (target ≤15, customer-paced step 2 recorded separately)
+```
+
+### 6.5 Final PASS definition and the two questions
+
+**Design PASS** (this document): the plan is coherent, bounded and reviewable, with exactly one
+human decision outstanding (§2.4). **Implemented PASS**: every §7 task reviewed green by a fresh
+Fable. **Customer-ready PASS**: Layer 1 and Layer 2 both PASS on the deployed default path, the
+§2.4 decision is recorded and implemented as decided, legal pages are accepted, and the
+remaining gaps (§8) are shown in the product.
+
+The original verbatim question stays and is answered honestly on its own terms: *"Can a new
+user with no repository access sign up for Heel and obtain an evidence-backed, undeclared
+product-abuse finding against a staging SaaS?"* — answered by Layer 1 (YES only with evidence).
+The stricter customer-readiness question is answered by Layer 2: *"Can a customer sign up, give
+their SaaS URL and credentials, authorize testing, and receive understandable evidence-backed
+findings (or an honest no-findings result) without OpenAPI, installation or an engineer?"* A
+YES to the first with a NO to the second is reported exactly that way.
+
+---
+
+## 7. Bounded, dependency-ordered backlog
+
+Rules unchanged from bridge spec §9 (one fresh Opus per task, exhaustive allowed files ≤10
+source files plus the three regenerated download artifacts when a shipped module changes,
+red-first tests, verification order, DCO + exact model trailer, fresh Fable review, ≤3
+remediation cycles). Every task below emphasises the real usable customer journey; no task
+inherits peripheral runner fixes as a prerequisite unless named.
+
+### 7.1 Tasks
+
+| # | Task | Depends on | Allowed files (exhaustive) | Gate (green before review) | Owner |
+|---|---|---|---|---|---|
+| **C1** | TLS repair, accepted design (`T2bTLSD-design.md` §6): both constructors `PROTOCOL_TLS_CLIENT`, min 1.2, no max, `CERT_REQUIRED`, `check_hostname`, `load_default_certs()`; verifier loopback gate; docs amendment | none | `heel/runner/http_transport.py` (constructor), `heel/saas/network_guard.py` (constructor), `tests/test_runner_http_transport.py`, `tests/test_runner_plan_differential_safety.py`, `tests/plan_differential_support.py`, `tests/test_verified_environments.py`, `docs/PLAN_DIFFERENTIAL_RUNNER.md`, `docs/superpowers/specs/2026-10-02-plan-differential-runner.md` (dated amendment). Mechanical: three download artifacts | the T2bTLSD §4.4 gates on 3.11/3.12/3.13/3.14-OpenSSL4 with controlled test CA; full-suite under the shared lock; CodeQL dispatched by Astra at the candidate ref and inspected (no dismissals) | Opus → fresh Fable |
+| **C2** | Server: inventory with provenance and states, discovery authorizations/rounds tables, plan requests with user selection, v2 projection + `plan_kind: discovery`, approval auto-issue under a recorded discovery authorization, one-unit quota, same-origin/recent-auth | C1 not required | `heel/saas/http_api.py`, `heel/saas/runner_contexts.py`, `heel/saas/canary_runs.py`, `heel/saas/migrate.py`, `heel/canary_contracts.py`, `tests/test_canary_http.py`, `tests/test_canary_migrations.py`, `tests/test_canary_contracts.py`, `tests/test_canary_quota.py`. Mechanical: artifacts (`canary_contracts.py` shipped) | §6.1 rows 2, 7, 9, 11 (C2 ids) + bridge spec §4.1 four binding tests + `test_discovery_round_projection_is_auto_approved_only_within_the_recorded_bound_and_refused_after_it` | Opus → Fable |
+| **C3** | Discovery engine (host-agnostic module): seed list, HTML/JS/sitemap/robots extraction, candidate rules and deny list, templating with local mapping, round frontier compiler (≤20 actions), discovery transport profile, partial-result reasons; fixture pages for unit tests + one real loopback HTTPS target via SEAM-TARGET-DIAL | C1 | new `heel/runner/discovery.py`, `heel/runner/http_transport.py` (profile only), `heel/runner/compiler.py` (`compile_discovery_round`), `heel/runner/openapi_routes.py` (provenance field), new `tests/test_runner_discovery.py`, new `tests/support/discovery_fixture_target.py`, `tests/test_runner_compiler.py`, `docs/PLAN_DIFFERENTIAL_RUNNER.md`. Mechanical: artifacts | §6.1 rows 1, 2, 3, 4, 12 (C3 ids); `test_discovery_finds_export_routes_from_authenticated_html_and_js_on_a_real_https_fixture`; red-team: JS literal injection of other hosts, `javascript:`/`data:` links, 10 000-link page, deeply nested redirects, login loop | Opus → Fable |
+| **C4** | Managed executor, **anonymous-only mode** (no credential, no raw-body persistence beyond the run unless §2.4 is decided): `RunnerExecutionAdapter` wiring in `serve` (bridge spec T4a, host-agnostic), service-driven pairing, discovery rounds end to end against a real HTTPS fixture over the TLS edge harness, `deploy/Dockerfile.executor`, executor egress policy | C2, C3 | `heel/runner/daemon.py`, `heel/runner/plan_differential.py` (expose observation loaders), `heel/saas/http_api.py` (service pairing actor only), `heel/saas/runner_auth.py` (service actor), new `deploy/Dockerfile.executor`, new `tests/test_executor_serve_execution.py`, `tests/support/edge_tls_harness.py`, `tests/support/synthetic_tls_target.py` (new, bridge spec §5.3), `docs/saas/OPERATIONS.md`. Mechanical: artifacts | §6.1 rows 1, 6, 7, 8 (C4 ids); `test_managed_discovery_then_anonymous_scan_reaches_a_real_https_target_with_receipts`; target-traffic stop ≤5 s on revoke; bridge spec T4a red-team list | Opus → Fable |
+| **C5** | Credential intake and identities (**gated by the §2.4 decision**): identity routes, one-shot encrypted delivery and executor claim, `envelope` vault backend, `form_login` profile with confirmed-endpoint rule, delete/revoke acknowledgement, identity slots and pair compile | C4, Kevin §2.4 | `heel/saas/http_api.py`, `heel/saas/migrate.py`, `heel/runner/vault.py`, `heel/runner/catalog.py`, `heel/runner/execution.py` (`form_login` resolve), `heel/runner/compiler.py` (`login_post` action), `heel/runner/control_client.py` (intake claim), `tests/test_canary_privacy.py`, `tests/test_executor_serve_execution.py`, `tests/test_runner_compiler.py`. Mechanical: artifacts | §6.1 rows 2, 4, 7, 10, 11 (C5 ids); `test_managed_scan_with_two_identities_yields_observed_finding_from_a_real_https_target`; red-team: secret in log/metrics/crash, second POST compiled, login to a different path, replayed intake claim | Opus → Fable |
+| **C6** | Result projection, dashboard findings, hosted evidence view, regression save/replay (launch spec §7.3–§7.4, bridge spec T4b-c/r/u + T5, consolidated to the default path) | C4 (C5 for identity pairs) | as bridge spec rows T4b-c, T4b-r, T4b-u, T5 (split into C6a server/runner and C6b UI if >10 files), plus `heel/saas/canary_disclosure.py` evidence proxy | §6.1 rows 5, 10 (C6 ids) + bridge spec T4b/T5 gates | Opus → Fable |
+| **C7** | Product surface and copy for the default path (§4.2 states, gaps shown, private connector under Advanced, legal drafts) | C2 (shell), C5/C6 (full) | as launch spec T6 | copy contract tests for every §4.2 state id; no live-execution claim before Layer 2 PASS | Opus → Fable |
+| **C8** | Release and deployment: control plane + executor images, staging origin, `fixed_origin`/VPC decision (launch spec §8.2 unchanged), hosting cost approval (Kevin), install one-liner kept for the private connector only | C4–C7 | as launch spec T7 + `deploy/Dockerfile.executor` | staging green; anonymous `/` 200; executor pairs with staging | Opus → Fable |
+| **C9** | Acceptance Layer 1 then Layer 2 (§6.3–§6.4) | C8 | none | PASS/FAIL with evidence; verbatim answers to both questions | fresh Fable |
+
+Parallelism: C1 ∥ C2; C3 after C1; C4 after C2+C3; C5 after C4 and the decision; C6 after C4;
+C7 shell after C2. Private-connector tasks from the bridge spec (T2c, T2d, T3b, local T4a
+proof) move to a **connector track** after C9 unless a managed-plane task needs one of them
+(none identified).
+
+### 7.2 Independent work that continues while Kevin decides §2.4
+
+C1, C2, C3, C4 (anonymous-only), C7 shell, C8 preparation. None of them stores a customer
+credential or persists a raw target body beyond the run on Heel infrastructure.
+
+### 7.3 Disposition of held drafts and known issues
+
+| Item | Decision | Scope/impact if deferred |
+|---|---|---|
+| TLS repair (T2bTLS draft) | **C1, first.** Needed by every real HTTPS target and by the ownership verifier | none deferred |
+| CodeQL 7-alert baseline (T2bCQ1, `ASTRA-CodeQL-R1/decision.md`) | classification kept as narrow false positives with the alert-43 hash-confidentiality qualification; **not** a security pass; alerts stay open; the inventory-not-secret assumption is tested in C2 (`INVENTORY-SECRET-BOUNDARY-NOTE.md`: provenance/inventory rows contain templates only, synthetic credential canaries in the C2/C3 tests) | — |
+| R2R item A lingering resync attempt (T2b2R3 draft, LOW) | **kept, re-sequenced**: after C4, before C8, because the managed executor runs the same client and key rotation must not be blocked; not a prerequisite for C1–C4 | LOW: rotation readiness only; no target-traffic or secret effect |
+| F6 force-stop on repeated signals | **connector track** (interactive local runner usability); the managed executor is a service with graceful drain | usability only; not a containment failure (`ASTRA-T2b2F6-design-decisions.md`) |
+| T2b-3 retirement core (bound context/credential/seed retirement) | **split**: the managed plane needs environment-revoke deletion (C5) and executor retirement on workspace delete (C8); the local `unpair`-after-binding gap stays on the connector track and is documented as an open gap | documented gap; no safety blocker lost |
+| R-B quota 500/402, R-C duplicate invitation (T2c), R-A lock ENOENT (T2d) | connector track; the service-driven pairing in C4 reuses the invite path, so C4's review must confirm it does not hit R-C (one open invitation per workspace at a time) | — |
+| T4a recovery handoff (`T4a-recovery-handoff.md`) | binding on C4 (claimed-run restart, consumed-claim reconciliation, credential-missing fail-closed) | — |
+
+### 7.4 Immediate next independent Opus assignment: C1 (TLS) first; C2 may start in parallel
+
+**Status (Astra sequencing decision, 2026-10-19, recorded during T3S):** C1 is launched as a
+fresh Opus task in an isolated worktree from `1250918` with exactly the C1 row's scope (two TLS
+constructors, the named tests, `docs/PLAN_DIFFERENTIAL_RUNNER.md`, the dated amendment to the
+2026-10-02 executor spec, the three release artifacts) and **no edits** to the launch, bridge or
+this spec; no credential-boundary change is implemented by it. Opus roots the C1 worktree at
+`1250918` (not at the T3S docs commit) and does not need this document to do its work.
+
+Fresh Opus, allowed files exactly the C1
+row. Steps: (1) red-first: capability case (`delattr(ssl, "PROTOCOL_TLSv1_2")` then construct
+both transports) and the `PinnedHTTPSVerifier` loopback gate with a controlled CA via
+`SSL_CERT_FILE`; (2) both constructors to the accepted shape; (3) `TLSLoopbackServer` gains
+explicit bounds; assert TLS 1.2-only → 1.2, 1.3-only → 1.3, 1.0/1.1-only → `SSLError`, wrong
+host/CA/pin rejections unchanged; (4) docs amendments dated, R23 trust-boundary sentences kept
+verbatim; (5) focused → regenerate artifacts → affected → full suite on 3.11 and 3.14/OpenSSL 4
+under `full-suite.lock`, true exits recorded; installed-wheel gate with source excluded from
+`sys.path`; (6) DCO commits with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`;
+(7) closing with counts; Astra dispatches CodeQL at the candidate ref. In parallel, a second
+fresh Opus may start **C2** on the server files (disjoint allowed files). C3 starts when C1 is
+reviewed.
+
+---
+
+## 8. Exclusions, launch claims, missing access, provenance, secrets
+
+**Excluded (not built, not claimed):** writes other than the one confirmed `login_post` per
+identity per run; fuzzing; lifecycle automation; tenant differential; limit probing; browser
+credential capture; HAR import; SSO/MFA/CAPTCHA handling; private/VPN targets on the default
+path; paid plans; Windows runner; scanning of targets the customer has not proven ownership
+of; any model-API use with target data.
+
+**Claims permitted after Customer-ready PASS:** "A SaaS operator can sign up, verify a staging
+origin, enter their test identities, authorize discovery, approve a read-only scan, and receive
+evidence-backed findings that a lower plan (or a signed-out visitor) receives a higher plan's
+read responses on routes not declared as gated. Heel's managed scanner holds the entered
+credentials and the captured responses for the retention period, and deletes them on request;
+Heel Cloud stores route templates, labels, counts, digests and verdicts." Until then, no copy
+may say Heel scans a user's SaaS. If §2.4 is declined, the claim is restricted to the private
+connector and the gap is stated.
+
+**Missing real-world access and provenance (not invented):** no deployed control plane or
+executor exists; hosting is a cost decision; GitHub Release v1.2.0 has no assets; the Zonal
+target's ownership proof, authorization scope, synthetic-data status and "not prepared for Heel"
+status are to be established by the product's own records and Kevin's statement, not by
+hostname words; only one identity has been observed there; the browser login Astra performed is
+not Heel integration. No credentials were seen, copied, stored or requested by this session.
+
+**Secrets:** none appear in this document, the session artifacts, the closing, any command,
+test name or log. Any future model-assisted step (§3.1) MUST state its exact input boundary and
+MUST NOT receive credentials, headers or bodies.
