@@ -211,7 +211,8 @@ describe("dashboard account onboarding", () => {
     await screen.findByText("Create a project first.");
     const bar = screen.getByRole("region", { name: "Workspace and project" });
     expect(within(bar).getByRole("combobox", { name: /workspace/i })).toBeTruthy();
-    expect(nav.search).toMatch(/^workspace=ws_[0-9a-f]{16}$/);
+    // The workspace bar renders before the URL-sync effect writes the address, so wait for it.
+    await waitFor(() => expect(nav.search).toMatch(/^workspace=ws_[0-9a-f]{16}$/));
 
     fireEvent.change(within(bar).getByLabelText(/new project/i), { target: { value: "  Billing staging  " } });
     fireEvent.click(within(bar).getByRole("button", { name: "Create project" }));
@@ -477,7 +478,8 @@ describe("C7AR1 R1: a canary service outage keeps the signed-in account usable",
     fireEvent.change(screen.getByRole("combobox", { name: /project/i }), { target: { value: beta } });
     await screen.findByText("Canary setup could not be loaded.");
     expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(beta);
-    expect(nav.search).toBe(`workspace=${ws}&project=${beta}`);
+    // The outage notice can render before the URL-sync effect writes Beta's address, so wait for it.
+    await waitFor(() => expect(nav.search).toBe(`workspace=${ws}&project=${beta}`));
     expectCanaryLocked();
 
     fireEvent.change(screen.getByRole("combobox", { name: /project/i }), { target: { value: alpha } });
