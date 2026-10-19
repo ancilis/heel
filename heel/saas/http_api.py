@@ -123,6 +123,8 @@ from .verification import (
 )
 
 MAX_BODY = 64 * 1024
+# A terminal discovery result carries its <=64 KiB signed round report beside the <=36 KiB envelope.
+DISCOVERY_RESULT_MAX_BYTES = 36 * 1024 + 64 * 1024 + 1024
 MAX_DEVICE_BODY = 8 * 1024
 REQUEST_IO_TIMEOUT_SECONDS = 10
 REQUEST_BODY_TOTAL_DEADLINE_SECONDS = 10
@@ -556,10 +558,15 @@ class _Handler(BaseHTTPRequestHandler):
             and parts[5] == "runs"
             and parts[7] == "result-projection"
         )
+        canary_result = bool(
+            len(parts) == 8 and parts[:2] == ["v1", "workspaces"] and parts[3] == "runners"
+            and parts[5] == "runs" and parts[7] == "result"
+        )
         maximum = (
             MAX_FINDINGS_SYNC_BYTES
             if sync_path
             else MAX_UPLOAD_BYTES if canary_findings_upload
+            else DISCOVERY_RESULT_MAX_BYTES if canary_result
             else MAX_DEVICE_BODY if device_path else MAX_BODY
         )
         if length > maximum:
@@ -1387,6 +1394,7 @@ class _Handler(BaseHTTPRequestHandler):
                 else 2048 if operation == "context-plan-request-claim"
                 else 69632 if operation == "context-approval-projections"
                 else MAX_UPLOAD_BYTES if operation == "result-projection"
+                else DISCOVERY_RESULT_MAX_BYTES if operation == "result"
                 else 36 * 1024
             )
             parsed = parse_json(self._raw_body(), max_bytes=maximum)
@@ -1455,7 +1463,9 @@ class _Handler(BaseHTTPRequestHandler):
                 if operation == "progress":
                     return RunnerHttpAction(200, runs.progress(wid, project_ref, run_id, runner_id, projection))
                 if operation == "result":
-                    return RunnerHttpAction(200, runs.result(wid, project_ref, run_id, runner_id, projection))
+                    return RunnerHttpAction(200, runs.result(
+                        wid, project_ref, run_id, runner_id, projection, parsed.get("discovery_round_report"),
+                    ))
                 acknowledged = runs.ack_stop(
                     wid, project_ref, run_id, runner_id, projection,
                 )
@@ -1475,9 +1485,14 @@ class _Handler(BaseHTTPRequestHandler):
         except _RunnerContextUnavailable:
             self._json(503, {"schema_version": "heel.runner-context-error.v1", "code": "runner_context_unavailable"})
             return
-        except DiscoveryError:
+        except DiscoveryError as error:
             # Closed plan/discovery reasons reach an authenticated runner only after its PoP and
-            # binding checks passed; the refused request consumed no nonce and wrote nothing.
+            # binding checks passed; the refused request consumed no nonce and wrote no round.
+            # A closing refusal's close is then committed on its own, re-derived from server state.
+            if error.close is not None and self.cp.grant_authority is not None:
+                CanaryRunService(
+                    self._runner_store().conn, signing=self.cp.grant_authority, initialize_schema=False,
+                ).close_discovery_after_refusal(*error.close)
             raise
         except RunnerContextError:
             raise RunnerAuthError("invalid runner authentication") from None
