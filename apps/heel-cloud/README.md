@@ -51,11 +51,16 @@ project, using only the existing `/v1/signup`, `/v1/login`, `/v1/logout`, `/v1/m
 - Sign-out, an expired session, a workspace/project switch, or same-document Back/Forward to
   another address starts a new load generation; the address is re-resolved like a reload.
   Responses (successes and failures, including 401) that arrive for an earlier generation are
-  discarded, so they cannot fill or end a newer view.
+  discarded, so they cannot fill or end a newer view. This includes a local summary file read
+  that finishes after the switch. Busy state belongs to the action that started it: a new
+  generation releases it, so an older pending action cannot disable the new view's controls or
+  Sign out, and its late completion cannot release a newer action's busy state.
 - If the canary reads (environments, runner context) fail after the account and project
   resolved, the workspace/project controls and Sign out stay available, the project stays in
   the address, and verification, runner access and rehearsals stay locked until Try again
-  succeeds. A 401 there is still treated as session loss.
+  succeeds. A 401 there is still treated as session loss. When Try again succeeds, the
+  "Project created … blocked" notice is replaced by the ready next step (or removed if staging
+  is already verified); if the outage continues, the notice stays.
 - Error states show fixed messages for invalid input, duplicate email, wrong password, rate
   limiting, forbidden, signed-out and unavailable. Submitted values are never echoed.
 
