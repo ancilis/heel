@@ -26,6 +26,7 @@ const OWNERSHIP_ATTESTATION = "ownership verified; environment classification su
 const SIGN_IN_MESSAGE = "Create a free account or sign in to set up your first project.";
 const SESSION_ENDED_MESSAGE = "Your session ended. Sign in again to continue; nothing from the previous session is shown.";
 const SIGNED_OUT_MESSAGE = "You signed out. Sign in again to continue.";
+const CANARY_LOCKED_MESSAGE = "You are still signed in. Staging verification, runner access and rehearsals stay locked until it loads; nothing has been approved or executed.";
 const cloudApi = new HeelCloudApi();
 const canaryApi = new CanaryApi();
 
@@ -45,6 +46,8 @@ type Connection =
   | { phase: "forbidden"; account: AccountWorkspaceView; message: string }
   | { phase: "select_project"; account: AccountWorkspaceView }
   | { phase: "ready"; context: Context }
+  // The account and project resolved, but a canary read failed: account controls stay, canary stays locked.
+  | { phase: "canary_unavailable"; account: AccountWorkspaceView; projects: readonly HeelCloudProject[]; project: HeelCloudProject; message: string }
   | { phase: "error"; message: string };
 
 type ProofChallenge = { environmentId: string; instruction: string };
@@ -94,9 +97,14 @@ async function loadConnection(requested: AccountSelection): Promise<Connection> 
     }
     if (resolved.phase === "select_project") return { phase: "select_project", account: resolved.account };
     const { account, projects, project } = resolved;
-    const environments = await canaryApi.listEnvironments(account.workspace.workspaceRef, project.projectRef);
-    const contextBindings = await canaryApi.listRunnerContextBindings(account.workspace.workspaceRef, project.projectRef);
-    return { phase: "ready", context: { account, workspaceRef: account.workspace.workspaceRef, project, projects, environments, contextBindings } };
+    try {
+      const environments = await canaryApi.listEnvironments(account.workspace.workspaceRef, project.projectRef);
+      const contextBindings = await canaryApi.listRunnerContextBindings(account.workspace.workspaceRef, project.projectRef);
+      return { phase: "ready", context: { account, workspaceRef: account.workspace.workspaceRef, project, projects, environments, contextBindings } };
+    } catch (error) {
+      if (isSessionLoss(error)) throw error;
+      return { phase: "canary_unavailable", account, projects, project, message: `${messageOf(error)} ${CANARY_LOCKED_MESSAGE}` };
+    }
   } catch (error) {
     return isSessionLoss(error)
       ? { phase: "sign_in", message: SESSION_ENDED_MESSAGE }
@@ -110,12 +118,16 @@ const STATUS_TITLES: Readonly<Record<Exclude<Connection["phase"], "ready">, stri
   no_workspace: "No workspace is available.",
   forbidden: "This workspace is not available to your role.",
   select_project: "Create a project first.",
+  canary_unavailable: "Canary setup could not be loaded.",
   error: "Heel Cloud could not load your workspace.",
 });
 
 function connectionSelection(connection: Connection): AccountSelection {
   if (connection.phase === "ready") {
     return { workspaceRef: connection.context.workspaceRef, projectRef: connection.context.project.projectRef };
+  }
+  if (connection.phase === "canary_unavailable") {
+    return { workspaceRef: connection.account.workspace.workspaceRef, projectRef: connection.project.projectRef };
   }
   if (connection.phase === "select_project" || connection.phase === "forbidden") {
     return { workspaceRef: connection.account.workspace.workspaceRef };
@@ -158,6 +170,13 @@ export default function Dashboard() {
   const searchParams = useSearchParams();
   const searchQuery = searchParams?.toString() ?? "";
   const [initialSelection] = useState(() => selectionFromParams(searchParams));
+  // The address the current connection was resolved from or last wrote. A same-document change
+  // to anything else (Back/Forward, a link) is incoming navigation, not a stale address to undo.
+  const appliedQuery = useRef(searchQuery);
+  // Addresses this page wrote that the router has not echoed back yet; an echo can arrive after a
+  // newer write, so it is recognized by value rather than by being the latest.
+  const pendingWrites = useRef<string[]>([]);
+  const latestQuery = useRef(searchQuery);
   // Every account transition (sign-in, sign-out, session loss, workspace or project switch)
   // takes a new generation; a response that settles for an older generation is dropped.
   const generation = useRef(0);
@@ -178,12 +197,15 @@ export default function Dashboard() {
     return () => { generation.current += 1; };
   }, [clearApprovalIdentity, initialSelection]);
 
-  const connect = useCallback(async (requested: AccountSelection): Promise<void> => {
+  /** Resolves to the applied connection, or null when a newer transition superseded this one. */
+  const connect = useCallback(async (requested: AccountSelection): Promise<Connection | null> => {
     const ticket = ++generation.current;
     clearApprovalIdentity();
     setConnection({ phase: "checking" });
     const next = await loadConnection(requested);
-    if (ticket === generation.current) setConnection(next);
+    if (ticket !== generation.current) return null;
+    setConnection(next);
+    return next;
   }, [clearApprovalIdentity]);
 
   const sessionEnded = useCallback((): void => {
@@ -194,18 +216,40 @@ export default function Dashboard() {
     setConnection({ phase: "sign_in", message: SESSION_ENDED_MESSAGE });
   }, [clearApprovalIdentity, resetProjectState]);
 
-  function recover(error: unknown): void {
+  /** Handles an action failure only while the session that started the action is still current. */
+  function recover(error: unknown, ticket: number): void {
+    if (ticket !== generation.current) return;
     if (isSessionLoss(error)) sessionEnded();
     else setNotice(messageOf(error));
   }
 
+  // Declared before the sync below so it sees this render's address.
+  useEffect(() => { latestQuery.current = searchQuery; }, [searchQuery]);
+
   // Keep the address bar on the server-confirmed selection (opaque refs only) so a reload
-  // restores it; signed-out states carry no refs at all.
+  // restores it; signed-out states carry no refs at all. This runs when the connection changes,
+  // never merely because the address did.
   useEffect(() => {
     if (connection.phase === "checking" || connection.phase === "error") return;
-    const wanted = selectionQuery(connectionSelection(connection));
-    if (wanted !== (searchQuery ? `?${searchQuery}` : "")) router.replace(`${pathname}${wanted}`, { scroll: false });
-  }, [connection, pathname, router, searchQuery]);
+    const wanted = selectionQuery(connectionSelection(connection)).slice(1);
+    appliedQuery.current = wanted;
+    if (wanted === latestQuery.current) return;
+    pendingWrites.current = [...pendingWrites.current.slice(-7), wanted];
+    router.replace(`${pathname}${wanted ? `?${wanted}` : ""}`, { scroll: false });
+  }, [connection, pathname, router]);
+
+  // Same-document navigation to a different address is re-resolved from /v1/me and the project
+  // list like any other hint; the refs themselves grant nothing. `connect` takes a new generation,
+  // so an overlapping navigation or account change drops this one.
+  useEffect(() => {
+    const echoed = pendingWrites.current.indexOf(searchQuery);
+    if (echoed >= 0) { pendingWrites.current = pendingWrites.current.slice(echoed + 1); return; }
+    if (searchQuery === appliedQuery.current) return;
+    appliedQuery.current = searchQuery;
+    resetProjectState();
+    setNotice(null);
+    void connect(selectionFromParams(new URLSearchParams(searchQuery)));
+  }, [connect, resetProjectState, searchQuery]);
 
   const refreshEnvironments = useCallback(async (): Promise<void> => {
     if (connection.phase !== "ready") return;
@@ -323,17 +367,20 @@ export default function Dashboard() {
   }, [observedRun]);
 
   async function selectProject(projectRef: string): Promise<void> {
-    if (connection.phase !== "ready") return;
-    const project = connection.context.projects.find((item) => item.projectRef === projectRef);
-    if (project === undefined) return;
+    const projects = connection.phase === "ready" ? connection.context.projects
+      : connection.phase === "canary_unavailable" ? connection.projects : [];
+    const project = projects.find((item) => item.projectRef === projectRef);
+    const workspaceRef = connectionSelection(connection).workspaceRef;
+    if (project === undefined || workspaceRef === undefined) return;
     resetProjectState();
     setNotice(null);
     // Re-resolve from /v1/me so the switch is bound to the current server identity and role.
-    await connect({ workspaceRef: connection.context.workspaceRef, projectRef: project.projectRef });
+    await connect({ workspaceRef, projectRef: project.projectRef });
   }
 
   async function selectWorkspace(workspaceRef: string): Promise<void> {
-    if (connection.phase !== "ready" && connection.phase !== "select_project" && connection.phase !== "forbidden") return;
+    if (connection.phase !== "ready" && connection.phase !== "canary_unavailable"
+      && connection.phase !== "select_project" && connection.phase !== "forbidden") return;
     resetProjectState();
     setNotice(null);
     await connect({ workspaceRef });
@@ -347,13 +394,17 @@ export default function Dashboard() {
     try {
       project = await cloudApi.createProject(workspaceRef, name);
     } catch (error) {
+      // A failure that settles after sign-out, account switch or navigation belongs to that older
+      // session; it must not end or annotate the current one.
+      if (ticket !== generation.current) return;
       if (isSessionLoss(error)) { sessionEnded(); return; }
       throw error;
     }
     if (ticket !== generation.current) return;
     resetProjectState();
-    await connect({ workspaceRef, projectRef: project.projectRef });
-    setNotice("Project created. Verify a staging origin next.");
+    const next = await connect({ workspaceRef, projectRef: project.projectRef });
+    if (next?.phase === "ready") setNotice("Project created. Verify a staging origin next.");
+    else if (next?.phase === "canary_unavailable") setNotice("Project created. Canary setup is unavailable right now, so staging verification is blocked; use Try again shortly.");
   }
 
   async function signOut(): Promise<void> {
@@ -371,8 +422,7 @@ export default function Dashboard() {
       if (ticket !== generation.current) return;
       if (isSessionLoss(error)) setConnection({ phase: "sign_in", message: SIGNED_OUT_MESSAGE });
       else {
-        await connect(previous);
-        setNotice("Heel Cloud could not confirm sign-out, so you are still signed in. Try again.");
+        if (await connect(previous) !== null) setNotice("Heel Cloud could not confirm sign-out, so you are still signed in. Try again.");
       }
     } finally { setWorking(false); }
   }
@@ -382,6 +432,7 @@ export default function Dashboard() {
     const environment = connection.context.environments.find((item) => item.environmentId === selectedBindingEnvironment);
     const runner = connection.context.contextBindings.runners.find((item) => item.runnerId === selectedRunner);
     if (!environment?.isExecutable || environment.verificationRecordDigest === null || runner === undefined) return;
+    const ticket = generation.current;
     setWorking(true); setNotice(null);
     try {
       await canaryApi.createRunnerContextBinding(connection.context.workspaceRef, connection.context.project.projectRef, {
@@ -389,46 +440,53 @@ export default function Dashboard() {
         runnerId: runner.runnerId, runnerKeyId: runner.runnerKeyId,
       });
       await refreshContextBindings();
+      if (ticket !== generation.current) return;
       setNotice("Canary access was authorized for this exact paired runner and verified environment.");
-    } catch (error) { recover(error); } finally { setWorking(false); }
+    } catch (error) { recover(error, ticket); } finally { setWorking(false); }
   }
 
   async function revokeContextBinding(bindingId: string): Promise<void> {
     if (connection.phase !== "ready") return;
+    const ticket = generation.current;
     setWorking(true); setNotice(null);
     try {
       await canaryApi.revokeRunnerContextBinding(connection.context.workspaceRef, connection.context.project.projectRef, bindingId);
       await refreshContextBindings();
+      if (ticket !== generation.current) return;
       setNotice("Canary access was revoked. Issued grants and active work were not changed.");
-    } catch (error) { recover(error); } finally { setWorking(false); }
+    } catch (error) { recover(error, ticket); } finally { setWorking(false); }
   }
 
   async function startProof(): Promise<void> {
     if (connection.phase !== "ready") return;
+    const ticket = generation.current;
     setWorking(true); setNotice(null);
     try {
       const value = await canaryApi.startEnvironmentProof(connection.context.workspaceRef, connection.context.project.projectRef, {
         origin: origin.trim(), environmentClass: "staging", proofMethod,
         attestationText: OWNERSHIP_ATTESTATION, attestationVersion: "v1", attestationAcknowledgement: "accepted",
       });
+      if (ticket !== generation.current) return;
       setProofChallenge({
         environmentId: value.environment_id as string,
         instruction: proofMethod === "https-file"
           ? `Place the one-time token at ${value.http_url as string}: ${value.token as string}`
           : `Publish this exact record: ${value.dns_record as string}`,
       });
-    } catch (error) { recover(error); } finally { setWorking(false); }
+    } catch (error) { recover(error, ticket); } finally { setWorking(false); }
   }
 
   async function checkProof(): Promise<void> {
     if (connection.phase !== "ready" || proofChallenge === null) return;
+    const ticket = generation.current;
     setWorking(true); setNotice(null);
     try {
       const verified = await canaryApi.checkEnvironmentProof(connection.context.workspaceRef, connection.context.project.projectRef, proofChallenge.environmentId);
+      if (ticket !== generation.current) return;
       setNotice(verified ? "Staging ownership verified. Pair the local runner next." : "Proof did not match yet. No product route was contacted.");
       await refreshEnvironments();
       if (verified) setProofChallenge(null);
-    } catch (error) { recover(error); } finally { setWorking(false); }
+    } catch (error) { recover(error, ticket); } finally { setWorking(false); }
   }
 
   async function approveRun(requestKey: string, reason: string): Promise<void> {
@@ -439,14 +497,17 @@ export default function Dashboard() {
       || pending.projectRef !== connection.context.project.projectRef
       || pending.run.run.status !== "awaiting_execution_approval") return;
     clearPendingApproval();
+    const ticket = generation.current;
     setWorking(true); setNotice(null);
     try {
       await canaryApi.approveRun(pending.workspaceRef, pending.projectRef, pending.summary.runId, {
         projectionDigest: pending.summary.projectionDigest, hostnameRetype: pending.summary.hostname, reason,
         idempotencyKey: idempotencyKey(), controlGeneration: pending.run.approvalControlGeneration,
       });
-      setObservedRun(await canaryApi.getRun(pending.workspaceRef, pending.projectRef, pending.summary.runId));
+      const run = await canaryApi.getRun(pending.workspaceRef, pending.projectRef, pending.summary.runId);
+      if (ticket === generation.current) setObservedRun(run);
     } catch (error) {
+      if (ticket !== generation.current) return;
       if (error instanceof CanaryApiError && (error.status === 401 || error.status === 403)) {
         if (error.status === 401) sessionEnded();
         else void connect({ workspaceRef: pending.workspaceRef, projectRef: pending.projectRef });
@@ -456,11 +517,13 @@ export default function Dashboard() {
 
   async function stopRun(): Promise<void> {
     if (connection.phase !== "ready" || observedRun === null) return;
+    const ticket = generation.current;
     setWorking(true); setNotice(null);
     try {
       await canaryApi.stopRun(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId, observedRun.run.killSwitchGeneration);
-      setObservedRun(await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId));
-    } catch (error) { recover(error); } finally { setWorking(false); }
+      const run = await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId);
+      if (ticket === generation.current) setObservedRun(run);
+    } catch (error) { recover(error, ticket); } finally { setWorking(false); }
   }
 
   async function loadDisclosurePreview(file: File | undefined): Promise<void> {
@@ -486,24 +549,28 @@ export default function Dashboard() {
 
   async function decideDisclosure(share: boolean): Promise<void> {
     if (connection.phase !== "ready" || observedRun === null || disclosurePreview === null) return;
+    const ticket = generation.current;
     setWorking(true); setNotice(null);
     try {
       if (share) await canaryApi.createDisclosurePermit(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId, disclosurePreview);
       else await canaryApi.markDisclosureLocalOnly(connection.context.workspaceRef, connection.context.project.projectRef, observedRun.run.runId, disclosurePreview);
+      if (ticket !== generation.current) return;
       setDisclosureOpen(false);
       setNotice(share ? "One-use disclosure permit created. Return to the local runner to upload this exact summary." : "Result kept local. No summary bytes were uploaded.");
-    } catch (error) { recover(error); } finally { setWorking(false); }
+    } catch (error) { recover(error, ticket); } finally { setWorking(false); }
   }
 
   const context = connection.phase === "ready" ? connection.context : null;
   const accountView = context?.account
-    ?? (connection.phase === "select_project" || connection.phase === "forbidden" ? connection.account : null);
+    ?? (connection.phase === "select_project" || connection.phase === "forbidden" || connection.phase === "canary_unavailable"
+      ? connection.account : null);
+  const selectedProject = context?.project ?? (connection.phase === "canary_unavailable" ? connection.project : null);
   const progress = observedRun?.progress;
 
   return (
     <main className="canary-dashboard">
       <header className="dashboard-nav"><Link className="brand" href="/" aria-label="Heel home"><span className="brand-mark" aria-hidden="true">H</span><span>Heel</span></Link>
-        <div className="dashboard-context"><span className="dashboard-workspace">{context ? context.project.name : "Workspace not connected"}</span><span className="dashboard-presence"><i aria-hidden="true" /> {context ? "Cloud connected" : "Local-first"}</span></div></header>
+        <div className="dashboard-context"><span className="dashboard-workspace">{selectedProject ? selectedProject.name : "Workspace not connected"}</span><span className="dashboard-presence"><i aria-hidden="true" /> {context ? "Cloud connected" : "Local-first"}</span></div></header>
 
       <p className="runner-recovery">Supported validation: <Link href="/runner">export entitlement reference and local report viewer</Link>. No customer-target pairing command is available in this release.</p>
       <section className="dashboard-intro" aria-labelledby="dashboard-title"><div><p className="canary-kicker">Verified canary rehearsal</p><h1 id="dashboard-title">Cross the boundary <em>before</em> your customers do.</h1><p>Cloud runner onboarding is an incomplete preview. Use the local export reference to validate a supported synthetic workflow.</p></div>
@@ -515,12 +582,14 @@ export default function Dashboard() {
           : "No projects exist yet. A workspace owner, admin or member must create one.")
           : "Nothing has been approved or executed."}
         {connection.phase === "error" ? <> <button className="text-button" onClick={() => void connect(selectionFromParams(searchParams))} type="button">Try again</button></> : null}
-        {connection.phase === "no_workspace" ? <> <button className="text-button" disabled={working} onClick={() => void signOut()} type="button">Sign out</button></> : null}</p></section> : null}
+        {connection.phase === "canary_unavailable" ? <> <button className="text-button" disabled={working} onClick={() => void connect(connectionSelection(connection))} type="button">Try again</button></> : null}
+        {connection.phase === "no_workspace" || connection.phase === "error" ? <> <button className="text-button" disabled={working} onClick={() => void signOut()} type="button">Sign out</button></> : null}</p></section> : null}
 
-      {connection.phase === "sign_in" ? <AccountAccess api={cloudApi} onAuthenticated={() => connect({})} /> : null}
+      {connection.phase === "sign_in" ? <AccountAccess api={cloudApi} onAuthenticated={async () => { await connect({}); }} /> : null}
       {accountView ? <WorkspaceProjectBar account={accountView} disabled={working} onCreateProject={createProject}
         onSelectProject={(projectRef) => void selectProject(projectRef)} onSelectWorkspace={(workspaceRef) => void selectWorkspace(workspaceRef)}
-        onSignOut={() => void signOut()} projectRef={context?.project.projectRef ?? null} projects={context?.projects ?? []} /> : null}
+        onSignOut={() => void signOut()} projectRef={selectedProject?.projectRef ?? null}
+        projects={context?.projects ?? (connection.phase === "canary_unavailable" ? connection.projects : [])} /> : null}
       {notice ? <p className="next-action" role="status">{notice}</p> : null}
       {pendingHasMore ? <p className="next-action" role="status">Another pending approval is waiting after this one.</p> : null}
 
