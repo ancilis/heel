@@ -12,6 +12,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import Dashboard from "../app/dashboard/page";
+import { CanaryApi, CanaryApiError } from "../lib/canary-api";
 
 
 const nav = vi.hoisted(() => ({ search: "", replace: vi.fn() }));
@@ -702,5 +703,332 @@ describe("C7AR1 R3: same-document navigation is revalidated and applied", () => 
     await settle();
     expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(beta);
     expect(nav.search).toBe(`workspace=${ws}&project=${beta}`);
+  });
+});
+
+
+// SEAM (C7AR2): besides the fake transport above, `CanaryApi` methods are replaced only to hold or settle a
+// component's async action at a chosen moment. No proof, binding, approval, run or target request is real; the
+// terminal run below is component metadata so the existing local-summary input renders.
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+function projectSelect(): HTMLSelectElement {
+  return screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement;
+}
+
+function signOutButton(): HTMLButtonElement {
+  return screen.getByRole("button", { name: "Sign out" }) as HTMLButtonElement;
+}
+
+function alphaBeta(): { ws: string; alpha: string; beta: string } {
+  const account = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Alpha", "Beta"] }]);
+  server.session = account;
+  const ws = account.memberships[0].workspace_id;
+  const [alpha, beta] = (server.projects.get(ws) ?? []).map((item) => item.project_ref as string);
+  nav.search = `workspace=${ws}&project=${alpha}`;
+  return { ws, alpha, beta };
+}
+
+function challenge(token: string): Record<string, unknown> {
+  return { environment_id: `env_${"1".repeat(32)}`, http_url: "https://synthetic.example.test/proof", token };
+}
+
+async function requestProof(): Promise<void> {
+  fill(/staging origin/i, "https://synthetic.example.test");
+  fireEvent.click(screen.getByRole("button", { name: "Create proof challenge" }));
+}
+
+const BLOCKED_NOTICE = /Project created\. Canary setup is unavailable right now/;
+const RUN_ID = `crun_${"1".repeat(32)}`;
+const SUMMARY = JSON.stringify({
+  schema_version: "heel.canary-findings-projection.v1", projection_digest: "a".repeat(64),
+  scenario_results: [{ assessment_outcome: "observed", finding: null }],
+});
+
+/** Shows a terminal local-result run only where `owns(projectRef)` holds, so the summary input renders there. */
+function terminalRunWhere(owns: (projectRef: string) => boolean): void {
+  vi.spyOn(CanaryApi.prototype, "listPendingApprovalRequests").mockImplementation(async (_workspaceRef, projectRef) =>
+    ({ hasMore: false, request: owns(projectRef) ? { runId: RUN_ID, approvalId: "old-approval" } : null }) as never);
+  vi.spyOn(CanaryApi.prototype, "getRun").mockResolvedValue({
+    run: { runId: RUN_ID, approvalId: "old-approval", status: "terminal" },
+    progress: { available: true, localResultReady: true, scenariosCompleted: 0, scenariosTotal: 0, requestsStarted: 0, remainingRequests: 0, remainingWallMs: 0 },
+  } as never);
+}
+
+/** Chooses a local summary whose read settles only when the returned promise is settled. */
+async function chooseHeldSummary(): Promise<ReturnType<typeof deferred<string>>> {
+  await screen.findByText("Load local summary to review separate sharing →");
+  const read = deferred<string>();
+  fireEvent.change(document.querySelector("input[type=file]") as HTMLInputElement, { target: { files: [{ size: 25, text: () => read.promise }] } });
+  return read;
+}
+
+function expectNoLocalSummaryState(): void {
+  expect(screen.queryByRole("dialog", { name: "Share result summary?" })).toBeNull();
+  expect(screen.queryByText("Share result summary?")).toBeNull();
+  expect(screen.queryByText("That file is not a closed signed canary summary.")).toBeNull();
+}
+
+
+describe("C7AR2 N3: a successful Retry replaces the outage notice with the current state", () => {
+  async function createDuringOutage(): Promise<string> {
+    server.canaryOutage = true;
+    await signUp();
+    await screen.findByText("Create a project first.");
+    fill(/new project/i, "Recovered");
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+    await screen.findByText(BLOCKED_NOTICE);
+    return projectSelect().value;
+  }
+
+  test("after recovery the blocked notice is replaced and the ready form, selection, address and status agree", async () => {
+    const created = await createDuringOutage();
+    server.canaryOutage = false;
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await screen.findByRole("heading", { name: "Verify staging now" });
+
+    expect(screen.queryByText(BLOCKED_NOTICE)).toBeNull();
+    expect(screen.queryByText(/staging verification is blocked/)).toBeNull();
+    expect(screen.getByText("Project created. Verify a staging origin next.")).toBeTruthy();
+    expect(screen.getByText("Ready for customer setup")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(projectSelect().value).toBe(created);
+    expect(projectSelect().selectedOptions[0].textContent).toBe("Recovered");
+    expect(nav.search).toBe(`workspace=${server.session?.memberships[0].workspace_id}&project=${created}`);
+    expect(signOutButton().disabled).toBe(false);
+    expectNoSecretLeak();
+  });
+
+  test("a Retry while the outage continues keeps the truthful blocked notice and Try again", async () => {
+    const created = await createDuringOutage();
+    const reads = () => server.calls.filter((call) => call.path.endsWith("/runner-context-bindings")).length;
+    const before = reads();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(reads()).toBe(before + 1));
+    await screen.findByText("Canary setup could not be loaded.");
+    await settle();
+    expect(screen.getByText(BLOCKED_NOTICE)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+    expect(projectSelect().value).toBe(created);
+    expect(signOutButton().disabled).toBe(false);
+    expectCanaryLocked();
+  });
+
+  test("a Retry that finds the session ended drops the project notice with the private context", async () => {
+    await createDuringOutage();
+    server.session = null;
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    // A re-resolution that finds no session shows the existing sign-in state (resolveAccount's sign_in).
+    await screen.findByRole("heading", { name: "Create your Heel account" });
+    await settle();
+    expect(screen.queryByText(/Project created/)).toBeNull();
+    expect(document.body.textContent).not.toContain("Recovered");
+    expect(nav.search).toBe("");
+  });
+});
+
+
+describe("C7AR2 N2: busy state belongs to the operation and context that started it", () => {
+  test("navigating to another valid project releases an obsolete action's busy state", async () => {
+    const { ws, beta } = alphaBeta();
+    const held = deferred<Record<string, unknown>>();
+    vi.spyOn(CanaryApi.prototype, "startEnvironmentProof").mockReturnValue(held.promise as never);
+    const view = render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Verify staging now" });
+    await requestProof();
+    expect(signOutButton().disabled).toBe(true);
+
+    navigate(view, `workspace=${ws}&project=${beta}`);
+    await waitFor(() => expect(projectSelect().value).toBe(beta));
+    expect(signOutButton().disabled).toBe(false);
+    expect(projectSelect().disabled).toBe(false);
+    expect((screen.getByLabelText(/new project/i) as HTMLInputElement).disabled).toBe(false);
+    fill(/staging origin/i, "https://synthetic.example.test");
+    expect((screen.getByRole("button", { name: "Create proof challenge" }) as HTMLButtonElement).disabled).toBe(false);
+
+    await act(async () => { held.resolve(challenge("challenge-alpha")); });
+    await settle();
+    expect(projectSelect().value).toBe(beta);
+    expect(document.body.textContent).not.toContain("challenge-alpha");
+    expect(signOutButton().disabled).toBe(false);
+  });
+
+  test("an obsolete action's finally cannot clear the newer project's in-flight action", async () => {
+    const { ws, beta } = alphaBeta();
+    const first = deferred<Record<string, unknown>>();
+    const second = deferred<Record<string, unknown>>();
+    const start = vi.spyOn(CanaryApi.prototype, "startEnvironmentProof")
+      .mockReturnValueOnce(first.promise as never).mockReturnValueOnce(second.promise as never);
+    const view = render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Verify staging now" });
+    await requestProof();
+    navigate(view, `workspace=${ws}&project=${beta}`);
+    await waitFor(() => expect(projectSelect().value).toBe(beta));
+    await requestProof();
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(start.mock.calls[1][1]).toBe(beta);
+    expect(signOutButton().disabled).toBe(true);
+
+    await act(async () => { first.resolve(challenge("challenge-alpha")); });
+    await settle();
+    expect(signOutButton().disabled, "Beta's own pending action must keep its controls disabled").toBe(true);
+    expect((screen.getByRole("button", { name: "Create proof challenge" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(document.body.textContent).not.toContain("challenge-alpha");
+
+    await act(async () => { second.resolve(challenge("challenge-beta")); });
+    await screen.findByText(/challenge-beta/);
+    expect(signOutButton().disabled).toBe(false);
+  });
+
+  test("an obsolete action that fails after navigation neither clears the newer action nor annotates it", async () => {
+    const { ws, beta } = alphaBeta();
+    const first = deferred<Record<string, unknown>>();
+    const second = deferred<Record<string, unknown>>();
+    vi.spyOn(CanaryApi.prototype, "startEnvironmentProof")
+      .mockReturnValueOnce(first.promise as never).mockReturnValueOnce(second.promise as never);
+    const view = render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Verify staging now" });
+    await requestProof();
+    navigate(view, `workspace=${ws}&project=${beta}`);
+    await waitFor(() => expect(projectSelect().value).toBe(beta));
+    await requestProof();
+
+    await act(async () => { first.reject(new CanaryApiError("unavailable", 503)); });
+    await settle();
+    expect(signOutButton().disabled).toBe(true);
+    expect(screen.queryByText(/temporarily unavailable/i)).toBeNull();
+    await act(async () => { second.resolve(challenge("challenge-beta")); });
+    await screen.findByText(/challenge-beta/);
+    expect(signOutButton().disabled).toBe(false);
+  });
+
+  test("the current action still blocks a second submit in its own context", async () => {
+    alphaBeta();
+    const held = deferred<Record<string, unknown>>();
+    const start = vi.spyOn(CanaryApi.prototype, "startEnvironmentProof").mockReturnValue(held.promise as never);
+    render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Verify staging now" });
+    await requestProof();
+    const button = screen.getByRole("button", { name: "Create proof challenge" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(signOutButton().disabled).toBe(true);
+    await act(async () => { held.resolve(challenge("challenge-alpha")); });
+    await screen.findByText(/challenge-alpha/);
+    expect(signOutButton().disabled).toBe(false);
+  });
+
+  test("a verified check whose refresh settles after navigation cannot erase the newer project's challenge", async () => {
+    const { ws, alpha, beta } = alphaBeta();
+    vi.spyOn(CanaryApi.prototype, "startEnvironmentProof")
+      .mockResolvedValueOnce(challenge("challenge-alpha") as never).mockResolvedValueOnce(challenge("challenge-beta") as never);
+    vi.spyOn(CanaryApi.prototype, "checkEnvironmentProof").mockResolvedValue(true);
+    const real = CanaryApi.prototype.listEnvironments;
+    const refresh = deferred<never[]>();
+    let holdAlpha = false;
+    vi.spyOn(CanaryApi.prototype, "listEnvironments").mockImplementation(function (this: CanaryApi, workspaceRef: string, projectRef: string) {
+      return holdAlpha && projectRef === alpha ? refresh.promise : real.call(this, workspaceRef, projectRef);
+    });
+    const view = render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Verify staging now" });
+    await requestProof();
+    await screen.findByText(/challenge-alpha/);
+    holdAlpha = true;
+    fireEvent.click(screen.getByRole("button", { name: "Check exact proof" }));
+    await screen.findByText("Staging ownership verified. Pair the local runner next.");
+
+    navigate(view, `workspace=${ws}&project=${beta}`);
+    await waitFor(() => expect(projectSelect().value).toBe(beta));
+    await requestProof();
+    await screen.findByText(/challenge-beta/);
+    await act(async () => { refresh.resolve([]); });
+    await settle();
+    expect(screen.getByText(/challenge-beta/)).toBeTruthy();
+    expect(screen.queryByText("Staging ownership verified. Pair the local runner next.")).toBeNull();
+  });
+});
+
+
+describe("C7AR2 N1: a local summary read belongs to the account and project that chose it", () => {
+  async function chooseThenSwitchAccount(): Promise<{ read: ReturnType<typeof deferred<string>>; second: Account }> {
+    const first = server.account("first@example.test", "first-password", [{ role: "owner", projects: ["First"] }]);
+    const second = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Second"] }]);
+    server.session = first;
+    terminalRunWhere(() => server.session === first);
+    render(<Dashboard />);
+    const read = await chooseHeldSummary();
+    fireEvent.click(signOutButton());
+    await signInFromSignedOut(EMAIL, SECRET);
+    await screen.findByRole("combobox", { name: /project/i });
+    expect(server.session).toBe(second);
+    return { read, second };
+  }
+
+  test("a previous account's summary that reads successfully opens nothing for the new account", async () => {
+    const { read, second } = await chooseThenSwitchAccount();
+    await act(async () => { read.resolve(SUMMARY); });
+    await settle();
+    expectNoLocalSummaryState();
+    expect(projectSelect().selectedOptions[0].textContent).toBe("Second");
+    expect(nav.search).toContain(second.memberships[0].workspace_id);
+    expect(signOutButton().disabled).toBe(false);
+    expectNoSecretLeak();
+  });
+
+  test("a previous account's summary that fails to parse shows no error to the new account", async () => {
+    const { read } = await chooseThenSwitchAccount();
+    await act(async () => { read.resolve("not-json"); });
+    await settle();
+    expectNoLocalSummaryState();
+    expect(projectSelect().selectedOptions[0].textContent).toBe("Second");
+  });
+
+  test("a project switch in the same account drops the previous project's successful read", async () => {
+    const { ws, alpha, beta } = alphaBeta();
+    terminalRunWhere((projectRef) => projectRef === alpha);
+    const view = render(<Dashboard />);
+    const read = await chooseHeldSummary();
+    navigate(view, `workspace=${ws}&project=${beta}`);
+    await waitFor(() => expect(projectSelect().value).toBe(beta));
+    await act(async () => { read.resolve(SUMMARY); });
+    await settle();
+    expectNoLocalSummaryState();
+    expect(projectSelect().value).toBe(beta);
+  });
+
+  test("a project switch in the same account drops the previous project's failed read", async () => {
+    const { ws, alpha, beta } = alphaBeta();
+    terminalRunWhere((projectRef) => projectRef === alpha);
+    const view = render(<Dashboard />);
+    const read = await chooseHeldSummary();
+    navigate(view, `workspace=${ws}&project=${beta}`);
+    await waitFor(() => expect(projectSelect().value).toBe(beta));
+    await act(async () => { read.reject(new DOMException("read failed", "NotReadableError")); });
+    await settle();
+    expectNoLocalSummaryState();
+    expect(projectSelect().value).toBe(beta);
+  });
+
+  test("in the current context an invalid summary is refused and a valid one opens the sharing review", async () => {
+    const { alpha } = alphaBeta();
+    terminalRunWhere((projectRef) => projectRef === alpha);
+    render(<Dashboard />);
+    const invalid = await chooseHeldSummary();
+    await act(async () => { invalid.resolve("not-json"); });
+    await screen.findByText("That file is not a closed signed canary summary.");
+    expect(screen.queryByRole("dialog", { name: "Share result summary?" })).toBeNull();
+
+    const valid = await chooseHeldSummary();
+    await act(async () => { valid.resolve(SUMMARY); });
+    const dialog = await screen.findByRole("dialog", { name: "Share result summary?" });
+    expect(within(dialog).getByText("Crossed").nextSibling?.textContent).toBe("1");
+    expect(within(dialog).getByText("25 B")).toBeTruthy();
+    expect(projectSelect().value).toBe(alpha);
   });
 });
