@@ -23,6 +23,8 @@ from heel.runner.http_transport import (
 from heel.saas.network_guard import TLSTransport as NetworkTLSTransport
 from heel.runner.redaction import Redactor
 
+from plan_differential_support import make_test_ca
+
 
 PUBLIC = "93.184.216.34"
 
@@ -33,9 +35,42 @@ def test_tls_transports_use_the_client_protocol_context_without_legacy_defaults(
 
     monkeypatch.setattr(ssl, "create_default_context", legacy_default)
     for transport in (TLSTransport(), NetworkTLSTransport()):
-        assert transport.context.protocol == ssl.PROTOCOL_TLSv1_2
+        assert transport.context.protocol == ssl.PROTOCOL_TLS_CLIENT
+        # TLS 1.2 or newer: an explicit minimum and no artificial maximum.
+        assert transport.context.minimum_version == ssl.TLSVersion.TLSv1_2
+        assert transport.context.maximum_version == ssl.TLSVersion.MAXIMUM_SUPPORTED
         assert transport.context.verify_mode == ssl.CERT_REQUIRED
         assert transport.context.check_hostname is True
+
+
+def test_tls_transports_construct_without_the_fixed_version_protocol_constant(monkeypatch):
+    # OpenSSL 4 builds of CPython do not define ssl.PROTOCOL_TLSv1_2 at all.
+    monkeypatch.delattr(ssl, "PROTOCOL_TLSv1_2", raising=False)
+    for transport in (TLSTransport(), NetworkTLSTransport()):
+        assert transport.context.protocol == ssl.PROTOCOL_TLS_CLIENT
+        assert transport.context.minimum_version == ssl.TLSVersion.TLSv1_2
+
+
+def test_tls_transports_load_the_default_trust_locations(tmp_path, monkeypatch):
+    if ssl.get_default_verify_paths().openssl_cafile_env != "SSL_CERT_FILE":
+        pytest.skip("this TLS library does not read SSL_CERT_FILE")
+    ca, _, _ = make_test_ca()
+    ca_file = tmp_path / "test-ca.pem"
+    ca_file.write_bytes(ca)
+
+    def trusts_test_ca(transport) -> bool:
+        return any(
+            (("commonName", "Heel plan-differential test CA"),) in item["subject"]
+            for item in transport.context.get_ca_certs()
+        )
+
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_file))
+    for transport_class in (TLSTransport, NetworkTLSTransport):
+        assert trusts_test_ca(transport_class()) is True, transport_class
+    monkeypatch.delenv("SSL_CERT_FILE")
+    for transport_class in (TLSTransport, NetworkTLSTransport):
+        assert trusts_test_ca(transport_class()) is False, transport_class
 
 
 def prepared(*, method="GET", profile="anonymous", route="/health"):

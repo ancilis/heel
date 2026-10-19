@@ -5,6 +5,7 @@ import socket
 import sqlite3
 import http.client
 import json
+import ssl
 import threading
 import time
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ import pytest
 
 from heel.canary_contracts import canonical_digest
 
+from heel.saas import network_guard
 from heel.saas.network_guard import (
     AddressSetValidationError,
     BoundedDNSResolver,
@@ -39,6 +41,8 @@ from heel.saas.verification import (
 )
 from heel.saas.http_api import ControlPlane, serve
 from heel.saas.tenancy import Role
+
+from plan_differential_support import make_test_ca
 
 
 PIN = hashlib.sha256(b"certificate").hexdigest()
@@ -398,6 +402,222 @@ def test_verify_uses_fixed_challenge_path_and_rejects_extra_lf():
     guard = verifier()
     assert guard.verify("https://example.com") == TOKEN
     assert CHALLENGE_PATH == "/.well-known/heel-verify.txt"
+
+
+# --------------------------------------------------------------------------- #
+# Default production TLS path over a real loopback handshake. The resolver and the
+# socket connector are explicit seams (a public answer routed to a loopback server);
+# the TLS transport is the default one the verifier constructs itself.
+# --------------------------------------------------------------------------- #
+LOOPBACK_HOST = "ownership-proof-synthetic.heel.dev"
+LOOPBACK_ORIGIN = "https://" + LOOPBACK_HOST
+LOOPBACK_PUBLIC = "93.184.216.34"
+PRODUCTION_TLS_TRANSPORT = network_guard.TLSTransport
+
+
+class OwnershipLoopbackServer:
+    """A real TLS server on loopback answering one HTTP request per connection."""
+
+    def __init__(self, tmp_path, certificate, key, response=RESPONSE):
+        (tmp_path / "server.pem").write_bytes(certificate)
+        (tmp_path / "server.key").write_bytes(key)
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.load_cert_chain(tmp_path / "server.pem", tmp_path / "server.key")
+        self.response = response
+        self.requests = []
+        self.connections = 0
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.port = self.listener.getsockname()[1]
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+
+    def serve(self):
+        self.listener.settimeout(0.1)
+        while not self.stopped.is_set():
+            try:
+                raw, _ = self.listener.accept()
+            except OSError:
+                continue
+            try:
+                raw.settimeout(5)
+                with self.context.wrap_socket(raw, server_side=True) as wrapped:
+                    request = b""
+                    while b"\r\n\r\n" not in request:
+                        chunk = wrapped.recv(4096)
+                        if not chunk:
+                            break
+                        request += chunk
+                    if request:
+                        self.requests.append(request)
+                        wrapped.sendall(self.response)
+                        wrapped.unwrap()
+            except (OSError, ssl.SSLError):
+                pass
+            finally:
+                raw.close()
+                self.connections += 1
+
+    def settled(self, connections):
+        """Wait until the server has finished handling this many connections."""
+        deadline = time.monotonic() + 5
+        while self.connections < connections and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self.connections == connections
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self.stopped.set()
+        self.thread.join(5)
+        self.listener.close()
+
+
+class LoopbackRoutedSockets(network_guard.SocketTransport):
+    """Connect the selected public address to the loopback server instead."""
+
+    def __init__(self, port):
+        self.port = port
+        self.connected_to = []
+
+    def connect(self, address, timeout):
+        self.connected_to.append(address)
+        return socket.create_connection(("127.0.0.1", self.port), timeout=timeout)
+
+
+class PeerAsRouted:
+    """Report the routed public peer for a real loopback TLS socket; delegate everything else."""
+
+    def __init__(self, inner, peer):
+        self.inner = inner
+        self.peer = peer
+
+    def getpeername(self):
+        assert self.inner.getpeername()[0] == "127.0.0.1"
+        return self.peer
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def default_tls_routed_to(peer):
+    """The production TLS transport (inherited constructor and wrap) with routed peer naming."""
+    class RoutedTLSTransport(PRODUCTION_TLS_TRANSPORT):
+        constructed = []
+
+        def __init__(self):
+            super().__init__()
+            RoutedTLSTransport.constructed.append(self)
+
+        def wrap(self, connected_socket, hostname, timeout):
+            return PeerAsRouted(super().wrap(connected_socket, hostname, timeout), peer)
+
+    return RoutedTLSTransport
+
+
+def loopback_verifier(server, **changes):
+    values = {
+        "resolver": lambda hostname, *, timeout_seconds=None: [LOOPBACK_PUBLIC],
+        "sockets": LoopbackRoutedSockets(server.port),
+    }
+    values.update(changes)
+    return PinnedHTTPSVerifier(**values)
+
+
+@pytest.fixture
+def ownership_ca(tmp_path, monkeypatch):
+    if ssl.get_default_verify_paths().openssl_cafile_env != "SSL_CERT_FILE":
+        pytest.skip("this TLS library does not read SSL_CERT_FILE")
+    ca, certificate, key = make_test_ca(LOOPBACK_HOST)
+    ca_file = tmp_path / "test-ca.pem"
+    ca_file.write_bytes(ca)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_file))
+    return ca_file, certificate, key
+
+
+def test_default_tls_verifier_completes_real_handshake_through_default_trust(
+    tmp_path, monkeypatch, ownership_ca,
+):
+    _, certificate, key = ownership_ca
+    routed = default_tls_routed_to((LOOPBACK_PUBLIC, 443))
+    monkeypatch.setattr(network_guard, "TLSTransport", routed)
+    pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(certificate.decode("ascii"))).hexdigest()
+    with OwnershipLoopbackServer(tmp_path, certificate, key) as server:
+        guard = loopback_verifier(server)
+        assert guard.tls is None
+        assert guard.verify(LOOPBACK_ORIGIN) == TOKEN
+        # The verifier built the production context itself; nothing was injected into it.
+        (transport,) = routed.constructed
+        assert transport.context.protocol == ssl.PROTOCOL_TLS_CLIENT
+        assert transport.context.minimum_version == ssl.TLSVersion.TLSv1_2
+        assert transport.context.verify_mode == ssl.CERT_REQUIRED
+        assert transport.context.check_hostname is True
+        assert guard.sockets.connected_to == [(LOOPBACK_PUBLIC, 443)]
+        assert server.requests[0].startswith(f"GET {CHALLENGE_PATH} HTTP/1.1\r\n".encode())
+        assert f"\r\nHost: {LOOPBACK_HOST}\r\n".encode() in server.requests[0]
+        # The SHA-256 pin of the real leaf is accepted; any other pin is refused.
+        assert loopback_verifier(server, pin_sha256_hex=pin).verify(LOOPBACK_ORIGIN) == TOKEN
+        with pytest.raises(PeerMismatch):
+            loopback_verifier(
+                server, pin_sha256_hex=hashlib.sha256(b"other").hexdigest(),
+            ).verify(LOOPBACK_ORIGIN)
+        assert server.settled(3) and len(server.requests) == 2
+
+
+def test_default_tls_verifier_rejects_untrusted_chain_and_wrong_hostname(
+    tmp_path, monkeypatch, ownership_ca,
+):
+    _, certificate, key = ownership_ca
+    monkeypatch.setattr(network_guard, "TLSTransport", default_tls_routed_to((LOOPBACK_PUBLIC, 443)))
+    other_ca, other_certificate, other_key = make_test_ca("other-host.heel.dev")
+    with OwnershipLoopbackServer(tmp_path, certificate, key) as server:
+        # Default trust unset: the system store does not contain the test CA.
+        monkeypatch.delenv("SSL_CERT_FILE")
+        with pytest.raises(ssl.SSLCertVerificationError):
+            loopback_verifier(server).verify(LOOPBACK_ORIGIN)
+        # Another CA in the default location.
+        other_file = tmp_path / "other-ca.pem"
+        other_file.write_bytes(other_ca)
+        monkeypatch.setenv("SSL_CERT_FILE", str(other_file))
+        with pytest.raises(ssl.SSLCertVerificationError):
+            loopback_verifier(server).verify(LOOPBACK_ORIGIN)
+        assert server.settled(2) and server.requests == []
+    # A chain trusted through other_ca but naming another host.
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    monkeypatch.setenv("SSL_CERT_FILE", str(other_file))
+    with OwnershipLoopbackServer(other_dir, other_certificate, other_key) as server:
+        with pytest.raises(ssl.SSLCertVerificationError):
+            loopback_verifier(server).verify(LOOPBACK_ORIGIN)
+        assert server.settled(1) and server.requests == []
+
+
+def test_default_tls_verifier_keeps_address_peer_and_redirect_guards(
+    tmp_path, monkeypatch, ownership_ca,
+):
+    _, certificate, key = ownership_ca
+    redirect = RESPONSE.replace(b"HTTP/1.1 200 OK", b"HTTP/1.1 302 Found")
+    monkeypatch.setattr(network_guard, "TLSTransport", default_tls_routed_to((LOOPBACK_PUBLIC, 443)))
+    with OwnershipLoopbackServer(tmp_path, certificate, key, response=redirect) as server:
+        # A private answer is refused before any connection.
+        for address in ("127.0.0.1", "10.0.0.5", "169.254.169.254"):
+            guard = loopback_verifier(
+                server, resolver=lambda hostname, *, timeout_seconds=None, _a=address: [_a],
+            )
+            with pytest.raises(AddressSetValidationError):
+                guard.verify(LOOPBACK_ORIGIN)
+            assert guard.sockets.connected_to == []
+        # A redirect over the real channel is not followed.
+        with pytest.raises(VerificationError):
+            loopback_verifier(server).verify(LOOPBACK_ORIGIN)
+        assert server.settled(1) and len(server.requests) == 1
+        # A peer other than the selected address is refused before any request.
+        monkeypatch.setattr(network_guard, "TLSTransport", default_tls_routed_to(("93.184.216.35", 443)))
+        with pytest.raises(PeerMismatch):
+            loopback_verifier(server).verify(LOOPBACK_ORIGIN)
+        assert server.settled(2) and len(server.requests) == 1
 
 
 def test_environment_proof_is_project_bound_and_clears_pending_token():
