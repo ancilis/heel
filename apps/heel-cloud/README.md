@@ -54,7 +54,11 @@ project, using only the existing `/v1/signup`, `/v1/login`, `/v1/logout`, `/v1/m
   discarded, so they cannot fill or end a newer view. This includes a local summary file read
   that finishes after the switch. Busy state belongs to the action that started it: a new
   generation releases it, so an older pending action cannot disable the new view's controls or
-  Sign out, and its late completion cannot release a newer action's busy state.
+  Sign out, and its late completion cannot release a newer action's busy state. A follow-up
+  refresh after a binding create/revoke or proof check runs under the generation of the action
+  that started it: if that generation is gone when the action settles, no refresh is sent, and a
+  refresh that settles later cannot restore the old project, runner selection or address. The
+  server-side change itself is not rolled back.
 - If the canary reads (environments, runner context) fail after the account and project
   resolved, the workspace/project controls and Sign out stay available, the project stays in
   the address, and verification, runner access and rehearsals stay locked until Try again
