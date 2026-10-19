@@ -677,6 +677,11 @@ inherits peripheral runner fixes as a prerequisite unless named.
 | **C8** | Release and deployment: control plane + executor images, staging origin, `fixed_origin`/VPC decision (launch spec §8.2 unchanged), hosting cost approval (Kevin), install one-liner kept for the private connector only | C4–C7 | as launch spec T7 + `deploy/Dockerfile.executor` | staging green; anonymous `/` 200; executor pairs with staging | Opus → Fable |
 | **C9** | Acceptance Layer 1 then Layer 2 (§6.3–§6.4) | C8 | none | PASS/FAIL with evidence; verbatim answers to both questions | fresh Fable |
 
+C2 implementation deltas (migration 30, quota/grant-reference semantics, the signed 2 MiB
+discovery grant profile, and the resulting C3/C4/C7 ownership) are recorded in
+`2026-10-19-self-serve-discovery-contract.md` §9; C3's allowed files additionally include
+`heel/canary_contracts.py` and `tests/test_canary_contracts.py` for the manifest v2 discovery profile.
+
 Parallelism: C1 ∥ C2; C3 after C1; C4 after C2+C3; C5 after C4 and the decision; C6 after C4;
 C7 shell after C2. Private-connector tasks from the bridge spec (T2c, T2d, T3b, local T4a
 proof) move to a **connector track** after C9 unless a managed-plane task needs one of them

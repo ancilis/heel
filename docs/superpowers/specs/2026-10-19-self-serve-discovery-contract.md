@@ -292,3 +292,53 @@ Opus 5.5 <noreply@anthropic.com>`, fresh Fable review.
 | The existing `approve` path can be called with a service actor without a `hostname_retype` (needed for auto-issue) | C2 Opus reads `canary_runs.approve` (`:636-879`) and either reuses it with an internal actor or extracts `_issue_grant`; the review confirms no new human-approval bypass for scan runs |
 | Current latest migration number is 31 (bridge spec) so this is 32 | C2 Opus reads `heel/saas/migrate.py` at task start and renumbers if needed |
 | `runner_contexts.submit_projection_from_runner_in_transaction` is the single submit entry for v2 | CONFIRMED `canary_runs.py:456`; C2 extends it, no second entry |
+
+## 9. Implementation deltas recorded by C2 (2026-10-19, Opus; after Astra D1/D2 and C2D decisions)
+
+The sections above are kept as the accepted design text. These are the factual deltas the C2
+implementation made, each authorized in `ASTRA-C2-deviation-decisions.md` or
+`ASTRA-C2D-decisions.md` (C2D design `C2D-design.md`):
+
+- **Migration number.** The repository was at migration 29 with no T3a-s substrate, so C2's one
+  additive migration is **30** (`self_serve_discovery_and_plan_requests`). It *creates*
+  `route_inventories` (with the §2.5 provenance/state shape and `truncated_count`),
+  `discovery_authorizations`, `discovery_rounds`, `discovery_round_reports` and
+  `canary_plan_requests`; nothing is altered. The §6 test named
+  `test_migration_32_adds_discovery_tables_and_inventory_columns_additively` is implemented as
+  `tests/test_canary_migrations.py::test_migration_30_adds_discovery_tables_and_inventory_columns_additively`
+  (plus an atomic-failure and a direct-construction parity test). No schema 32 exists.
+- **Plan-request link.** The plan request ↔ projection link lives on `canary_plan_requests`
+  (`approval_id`, `run_id`, `projection_digest`, all UNIQUE) instead of a new column on
+  `canary_runner_context_projection_links`, whose frozen v16 definition is verified at startup.
+- **`discovery_rounds.state='refused'` is reserved and unused in C2.** Refusals are returned
+  (`heel.discovery-error.v1`), never stored, so a transient refusal cannot burn its round number.
+  A closing refusal (`authorization_expired`, `bound_exceeded` from the step-8 counters) creates no
+  projection, run or round; its close is committed in a separate transaction that re-derives it
+  from server state, and is durable across a reopened database.
+- **Round 1 seed membership** is the server's step 9 (`seed_mismatch`); the contract validator
+  binds the round-1 frontier digest, `action_count == 12`, `cumulative_requests_before == 0` and
+  `source.round == 0`.
+- **A projection asking for more than the server-computed round budget** (wall time above
+  `min(60 000, remaining)`, body bytes above the recorded bound) is refused `bound_exceeded`
+  without closing the authorization; only the step-8 counter conditions close it.
+- **Quota (D3).** One ledger reservation per authorization, consumed in the transaction that
+  issues round 1 (row-count and ledger-proof guarded) and refunded only when the authorization
+  closes with `rounds_issued == 0`. Round grants carry the parent reference
+  `dauth:<authorization_id>:r<round>` (never a ledger id) and a deterministic `ca1-` key; round runs
+  have `reservation_id NULL` and `quota_state 'unreserved'`, so no per-run consume/refund/
+  compensation path touches the ledger. There is **no platform-fault compensation after a round
+  issued** in C2 (free-launch quota policy, not a price). C7 must display the parent
+  authorization's consumed unit; a round's `unreserved` state does not mean discovery was free.
+  A refunded authorization's `Idempotency-Key` is never replayed (409 `idempotency_conflict`).
+  Expiry and round settlement are also reaper-driven in `expire_and_reconcile`.
+- **Body profile (D4).** `SCAN_BODY_BYTES = 256 KiB` and `DISCOVERY_BODY_BYTES = 2 MiB` are
+  exported. v1 records and scan plans keep 256 KiB; a v2 projection whose signed plan is
+  `plan_kind: discovery` with `transport_profile: discovery` may carry up to 2 MiB, and its
+  round grant is `heel.execution-grant.v2` with `budget_profile: discovery`. Scan approvals still
+  issue byte-compatible v1 grants; `claim()` refuses any grant/projection profile mismatch. The
+  recorded bound's `max_body_bytes` is checked at issue. This prepares contracts only: 2 MiB target
+  reads need **C3** (manifest v2 + discovery transport profile; C3's allowed files are expanded to
+  `heel/canary_contracts.py` and `tests/test_canary_contracts.py`), **C4** (executor wiring) and
+  **C7** (browser validators/views for v2 ids).
+- **Not built in C2:** inventory PUT/OpenAPI import, the §3.3 label-liveness report (labels in the
+  runner plan-request claim are validated, not stored), the four §5.1 identity/evidence routes.
