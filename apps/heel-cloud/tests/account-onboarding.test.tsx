@@ -47,6 +47,8 @@ class FakeControlPlane {
   session: Account | null = null;
   next = 1;
   offline = false;
+  /** Models the real control plane without its canary signing authority: canary reads 503. */
+  canaryOutage = false;
   /** Paths whose response waits for `release(path)`. */
   readonly held = new Map<string, { wait: Promise<void>; release: () => void }>();
   overrides = new Map<string, () => Response>();
@@ -121,6 +123,9 @@ class FakeControlPlane {
       }
       if (!["owner", "admin", "member"].includes(membership.role)) return json({ error: "insufficient role" }, 403);
       return json(this.addProject(projects[1], String(data.name).trim(), this.session.userId), 201);
+    }
+    if (this.canaryOutage && /\/projects\/prj_[0-9a-f]{32}\/runner-context-bindings$/.test(route)) {
+      return json({ code: "canary_authority_unavailable" }, 503);
     }
     if (method === "GET" && /\/projects\/prj_[0-9a-f]{32}\/environments$/.test(route)) {
       return json({ schema_version: "heel.verified-environment-list.v1", environments: [] });
@@ -393,5 +398,309 @@ describe("dashboard account onboarding", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
     await screen.findByText("Heel Cloud could not confirm sign-out, so you are still signed in. Try again.");
     expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).selectedOptions[0].textContent).toBe("Still here");
+  });
+});
+
+
+/** Waits out pending microtasks and the fake's async hops without asserting anything. */
+async function settle(): Promise<void> {
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+}
+
+
+async function signInFromSignedOut(email: string, password: string): Promise<void> {
+  await screen.findByRole("heading", { name: "Create your Heel account" });
+  fireEvent.click(screen.getByRole("button", { name: /already have an account/i }));
+  fill(/^Email/, email);
+  fill(/^Password/, password);
+  fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+}
+
+
+/** Same-document navigation: the App Router re-renders the page with new search params. */
+function navigate(view: ReturnType<typeof render>, search: string): void {
+  nav.search = search;
+  view.rerender(<Dashboard />);
+}
+
+
+function expectCanaryLocked(): void {
+  expect(screen.queryByRole("heading", { name: "Verify staging now" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Create proof challenge" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Authorize paired runner" })).toBeNull();
+  expect(screen.queryByText("Ready for customer setup")).toBeNull();
+}
+
+
+describe("C7AR1 R1: a canary service outage keeps the signed-in account usable", () => {
+  test("a first project created during the outage is kept, with account controls and a truthful blocked next step", async () => {
+    server.canaryOutage = true;
+    await signUp();
+    await screen.findByText("Create a project first.");
+    fill(/new project/i, "Billing staging");
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+
+    await screen.findByText("Canary setup could not be loaded.");
+    await screen.findByText(/Project created\. Canary setup is unavailable right now/);
+    expect(screen.queryByText(/Verify a staging origin next/)).toBeNull();
+    const project = screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement;
+    expect(project.selectedOptions[0].textContent).toBe("Billing staging");
+    expect(nav.search).toMatch(/^workspace=ws_[0-9a-f]{16}&project=prj_[0-9a-f]{32}$/);
+    expect(nav.search).toContain(project.value);
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeTruthy();
+    expect(screen.queryByText("Heel Cloud could not load your workspace.")).toBeNull();
+    expectCanaryLocked();
+    expectNoSecretLeak();
+
+    server.canaryOutage = false;
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await screen.findByRole("heading", { name: "Verify staging now" });
+    expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(project.value);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    await screen.findByText("You signed out. Sign in again to continue.");
+    expect(nav.search).toBe("");
+    expect(document.body.textContent).not.toContain("Billing staging");
+  });
+
+  test("a ready account that loses the canary service keeps project switching and sign-out, then recovers", async () => {
+    const account = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Alpha", "Beta"] }]);
+    server.session = account;
+    const ws = account.memberships[0].workspace_id;
+    const [alpha, beta] = (server.projects.get(ws) ?? []).map((item) => item.project_ref as string);
+    render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Verify staging now" });
+
+    server.canaryOutage = true;
+    fireEvent.change(screen.getByRole("combobox", { name: /project/i }), { target: { value: beta } });
+    await screen.findByText("Canary setup could not be loaded.");
+    expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(beta);
+    expect(nav.search).toBe(`workspace=${ws}&project=${beta}`);
+    expectCanaryLocked();
+
+    fireEvent.change(screen.getByRole("combobox", { name: /project/i }), { target: { value: alpha } });
+    await waitFor(() => expect(nav.search).toBe(`workspace=${ws}&project=${alpha}`));
+    expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(alpha);
+    expectCanaryLocked();
+
+    server.canaryOutage = false;
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await screen.findByRole("heading", { name: "Verify staging now" });
+    expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(alpha);
+
+    server.canaryOutage = true;
+    fireEvent.change(screen.getByRole("combobox", { name: /project/i }), { target: { value: beta } });
+    await screen.findByText("Canary setup could not be loaded.");
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    await screen.findByText("You signed out. Sign in again to continue.");
+    expect(server.session).toBeNull();
+    expect(nav.search).toBe("");
+  });
+
+  test("a canary 401 is still session loss, not an outage", async () => {
+    const account = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Expiring"] }]);
+    server.session = account;
+    const ws = account.memberships[0].workspace_id;
+    const prj = server.projects.get(ws)?.[0].project_ref as string;
+    server.overrides.set(`GET /api/control-plane/v1/workspaces/${ws}/projects/${prj}/runner-context-bindings`,
+      () => json({ error: "authentication required" }, 401));
+    render(<Dashboard />);
+    await screen.findByText(/Your session ended\. Sign in again to continue/);
+    expect(screen.queryByRole("combobox", { name: /project/i })).toBeNull();
+    expect(nav.search).toBe("");
+  });
+
+  test("an account service failure stays distinct from a canary outage and still offers sign-out", async () => {
+    const account = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Main"] }]);
+    server.session = account;
+    server.overrides.set("GET /api/control-plane/v1/me", () => json({ error: "down" }, 503));
+    render(<Dashboard />);
+    await screen.findByText("Heel Cloud could not load your workspace.");
+    expect(screen.queryByText("Canary setup could not be loaded.")).toBeNull();
+    expect(screen.queryByRole("combobox", { name: /project/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    await screen.findByText("You signed out. Sign in again to continue.");
+    expect(server.session).toBeNull();
+  });
+});
+
+
+describe("C7AR1 R2: responses from a previous session never change the current one", () => {
+  async function holdCreateThenSwitchAccount(response: () => Response): Promise<{ release: () => void; second: Account }> {
+    const first = server.account("first@example.test", "first-password", [{ role: "owner", projects: ["First"] }]);
+    const second = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Second"] }]);
+    server.session = first;
+    render(<Dashboard />);
+    await screen.findByRole("combobox", { name: /project/i });
+    const path = `/api/control-plane/v1/workspaces/${first.memberships[0].workspace_id}/projects`;
+    const release = server.hold(path);
+    server.overrides.set(`POST ${path}`, response);
+    fill(/new project/i, "Old request");
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(server.calls.some((call) => call.method === "POST" && call.path === path)).toBe(true));
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    await signInFromSignedOut(EMAIL, SECRET);
+    await screen.findByRole("combobox", { name: /project/i });
+    expect(server.session).toBe(second);
+    return { release, second };
+  }
+
+  test("a delayed 401 from the previous account cannot sign out the new account's view", async () => {
+    const { release, second } = await holdCreateThenSwitchAccount(() => json({ error: "authentication required" }, 401));
+    await act(async () => { release(); });
+    await settle();
+    expect(server.session).toBe(second);
+    expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).selectedOptions[0].textContent).toBe("Second");
+    expect(screen.queryByText(/Your session ended/)).toBeNull();
+    expect(nav.search).toContain(second.memberships[0].workspace_id);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  test("a delayed refusal or late success from the previous account shows nothing in the new account", async () => {
+    const { release, second } = await holdCreateThenSwitchAccount(() => json({ error: "insufficient role" }, 403));
+    await act(async () => { release(); });
+    await settle();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText(/Project created/)).toBeNull();
+    expect(nav.search).toContain(second.memberships[0].workspace_id);
+  });
+
+  test("a create whose follow-up load is overtaken by navigation does not announce or select it", async () => {
+    const account = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Alpha", "Beta"] }]);
+    server.session = account;
+    const ws = account.memberships[0].workspace_id;
+    const beta = server.projects.get(ws)?.[1].project_ref as string;
+    const view = render(<Dashboard />);
+    await screen.findByRole("combobox", { name: /project/i });
+    const meCalls = () => server.calls.filter((call) => call.path.endsWith("/v1/me")).length;
+    const release = server.hold("/api/control-plane/v1/me");
+    fill(/new project/i, "Announced late");
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(meCalls()).toBe(2));
+    navigate(view, `workspace=${ws}&project=${beta}`);
+    await waitFor(() => expect(meCalls()).toBe(3));
+    await act(async () => { release(); });
+    await settle();
+    expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(beta);
+    expect(screen.queryByText(/Project created/)).toBeNull();
+    expect(nav.search).toBe(`workspace=${ws}&project=${beta}`);
+  });
+
+  test("an expiry in the current session still ends the view", async () => {
+    const account = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Current"] }]);
+    server.session = account;
+    render(<Dashboard />);
+    await screen.findByRole("combobox", { name: /project/i });
+    const path = `/api/control-plane/v1/workspaces/${account.memberships[0].workspace_id}/projects`;
+    const release = server.hold(path);
+    server.overrides.set(`POST ${path}`, () => json({ error: "authentication required" }, 401));
+    fill(/new project/i, "Expiring request");
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(server.calls.some((call) => call.method === "POST" && call.path === path)).toBe(true));
+    await act(async () => { release(); });
+    await screen.findByText(/Your session ended\. Sign in again to continue/);
+    expect(document.body.textContent).not.toContain("Current");
+    expect(nav.search).toBe("");
+  });
+});
+
+
+describe("C7AR1 R3: same-document navigation is revalidated and applied", () => {
+  function twoProjects(): { ws: string; alpha: string; beta: string } {
+    const account = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Alpha", "Beta"] }]);
+    server.session = account;
+    const ws = account.memberships[0].workspace_id;
+    const [alpha, beta] = (server.projects.get(ws) ?? []).map((item) => item.project_ref as string);
+    return { ws, alpha, beta };
+  }
+
+  test("Back and Forward between two valid projects apply each entry instead of restoring the old one", async () => {
+    const { ws, alpha, beta } = twoProjects();
+    nav.search = `workspace=${ws}&project=${alpha}`;
+    const view = render(<Dashboard />);
+    const select = await screen.findByRole("combobox", { name: /project/i }) as HTMLSelectElement;
+    expect(select.value).toBe(alpha);
+    const meCalls = () => server.calls.filter((call) => call.path.endsWith("/v1/me")).length;
+    const before = meCalls();
+
+    navigate(view, `workspace=${ws}&project=${beta}`);
+    await waitFor(() => expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(beta));
+    await settle();
+    expect(meCalls()).toBe(before + 1);
+    expect(nav.search).toBe(`workspace=${ws}&project=${beta}`);
+
+    navigate(view, `workspace=${ws}&project=${alpha}`);
+    await waitFor(() => expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(alpha));
+    await settle();
+    expect(nav.search).toBe(`workspace=${ws}&project=${alpha}`);
+    expect(nav.replace).not.toHaveBeenCalled();
+  });
+
+  test("a same-document hint for a foreign or deleted project is checked against live data and corrected", async () => {
+    const { ws, alpha } = twoProjects();
+    const other = server.account("other@example.test", "other-password", [{ role: "owner", projects: ["Theirs"] }]);
+    const otherWs = other.memberships[0].workspace_id;
+    const theirs = server.projects.get(otherWs)?.[0].project_ref as string;
+    nav.search = `workspace=${ws}&project=${alpha}`;
+    const view = render(<Dashboard />);
+    await screen.findByRole("combobox", { name: /project/i });
+
+    navigate(view, `workspace=${otherWs}&project=${theirs}`);
+    await waitFor(() => expect(nav.replace).toHaveBeenCalled());
+    await settle();
+    expect(nav.search).toBe(`workspace=${ws}&project=${alpha}`);
+    expect(document.body.textContent).not.toContain("Theirs");
+    expect(server.calls.some((call) => call.path.includes(otherWs))).toBe(false);
+
+    navigate(view, `workspace=${ws}&project=prj_${"f".repeat(32)}`);
+    await settle();
+    expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(alpha);
+    expect(nav.search).toBe(`workspace=${ws}&project=${alpha}`);
+  });
+
+  test("overlapping navigations settle on the latest entry, not the slowest response", async () => {
+    const account = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Alpha"] }, { role: "owner", projects: ["Gamma"] }]);
+    server.session = account;
+    const [ws1, ws2] = account.memberships.map((item) => item.workspace_id);
+    const alpha = server.projects.get(ws1)?.[0].project_ref as string;
+    const gamma = server.projects.get(ws2)?.[0].project_ref as string;
+    nav.search = `workspace=${ws2}&project=${gamma}`;
+    const view = render(<Dashboard />);
+    await screen.findByRole("combobox", { name: /project/i });
+
+    const release = server.hold(`/api/control-plane/v1/workspaces/${ws1}/projects`);
+    navigate(view, `workspace=${ws1}&project=${alpha}`);
+    await waitFor(() => expect(server.calls.some((call) => call.path.endsWith(`${ws1}/projects`))).toBe(true));
+    navigate(view, `workspace=${ws2}&project=${gamma}`);
+    await waitFor(() => expect((screen.queryByRole("combobox", { name: /project/i }) as HTMLSelectElement | null)?.value).toBe(gamma));
+    await act(async () => { release(); });
+    await settle();
+    expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(gamma);
+    expect(nav.search).toBe(`workspace=${ws2}&project=${gamma}`);
+  });
+
+  test("navigating to an entry with refs while signed out reveals nothing and clears them", async () => {
+    const { ws, beta } = twoProjects();
+    server.session = null;
+    const view = render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Create your Heel account" });
+    navigate(view, `workspace=${ws}&project=${beta}`);
+    await waitFor(() => expect(nav.search).toBe(""));
+    await settle();
+    expect(screen.getByRole("heading", { name: "Create your Heel account" })).toBeTruthy();
+    expect(server.calls.some((call) => call.path.includes(ws))).toBe(false);
+  });
+
+  test("a user's own selection is still written to the address and not undone by the sync", async () => {
+    const { ws, alpha, beta } = twoProjects();
+    nav.search = `workspace=${ws}&project=${alpha}`;
+    const view = render(<Dashboard />);
+    await screen.findByRole("combobox", { name: /project/i });
+    fireEvent.change(screen.getByRole("combobox", { name: /project/i }), { target: { value: beta } });
+    await waitFor(() => expect(nav.search).toBe(`workspace=${ws}&project=${beta}`));
+    view.rerender(<Dashboard />);
+    await settle();
+    expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(beta);
+    expect(nav.search).toBe(`workspace=${ws}&project=${beta}`);
   });
 });
