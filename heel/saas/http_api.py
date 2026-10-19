@@ -54,6 +54,7 @@ from heel.canary_contracts import (
     validate_runner_context_list,
     validate_runner_context_claim,
     validate_runner_approval_projection_submit,
+    validate_runner_plan_request_claim,
 )
 from heel.crypto import load_public_key_base64, verify_envelope
 
@@ -73,7 +74,7 @@ from .canary_disclosure import (
     CanaryDisclosureError,
     CanaryDisclosureService,
 )
-from .canary_runs import CanaryRunError, CanaryRunService
+from .canary_runs import CanaryRunError, CanaryRunService, DiscoveryError, ensure_discovery_plan_schema
 from .runner_contexts import RunnerContextBindingService, RunnerContextError
 from .runner_auth import (
     RunnerActivationAbortConflict,
@@ -254,6 +255,7 @@ class ControlPlane:
             self.runner_connections_are_shared = True if runner_connections_are_shared is None else bool(runner_connections_are_shared)
         conn = self.store.conn
         self.canary_store = CanaryStore(conn)
+        ensure_discovery_plan_schema(conn)
         # Runtime construction (including unit/demo instances) stays schema-parity with the
         # migration, while authentication itself remains disabled absent a distinct pepper.
         initialize_runner_auth_schema(conn)
@@ -848,6 +850,7 @@ class _Handler(BaseHTTPRequestHandler):
             (len(p) == 6 and p[5] == "claim") or
             (len(p) == 7 and p[5] == "contexts" and p[6] == "list") or
             (len(p) == 8 and p[5] == "contexts" and p[7] in {"claim", "approval-projections"}) or
+            (len(p) == 9 and p[5] == "contexts" and p[7] == "plan-requests" and p[8] == "claim") or
             (len(p) == 7 and p[5] == "resync" and p[6] in {"start", "complete"}) or
             (len(p) == 8 and p[5] == "runs" and p[7] in {
                 "heartbeat", "progress", "result", "stop-ack", "result-projection",
@@ -887,6 +890,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(401, {"schema_version": "heel.runner-error.v1", "code": "invalid_runner_auth"})
         except (CanaryRunError, CanaryDisclosureError) as error:
             self._canary_error(error.code)
+        except DiscoveryError as error:
+            self._json(error.status, {"schema_version": "heel.discovery-error.v1", "code": error.code})
         except RunnerContextError as error:
             status = {"same_origin_required": 403, "recent_auth_required": 403,
                       "runner_context_binding_not_found": 404, "conflict": 409,
@@ -977,6 +982,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return lambda: self._runner_request(wid, tail[1], "runner_claim", None, "context-list")
             if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "contexts" and tail[4] in {"claim", "approval-projections"}:
                 return lambda: self._runner_request(wid, tail[1], "runner_claim", tail[3], "context-" + tail[4])
+            if (method == "POST" and len(tail) == 6 and tail[0] == "runners" and tail[2] == "contexts"
+                    and tail[4:] == ("plan-requests", "claim")):
+                return lambda: self._runner_request(wid, tail[1], "runner_claim", tail[3], "context-plan-request-claim")
             if method == "POST" and len(tail) == 4 and tail[0] == "runners" and tail[2] == "resync" and tail[3] in {"start", "complete"}:
                 return lambda: self._runner_resync(wid, tail[1], tail[3])
             if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "runs" and tail[4] in {"heartbeat", "progress", "result", "stop-ack"}:
@@ -1022,6 +1030,15 @@ class _Handler(BaseHTTPRequestHandler):
                     return lambda: self._ws_environment_check(wid, project_ref, tail[3])
                 if len(tail) == 5 and method == "POST" and tail[4] == "revoke":
                     return lambda: self._ws_environment_revoke(wid, project_ref, tail[3])
+                if len(tail) == 5 and tail[4] == "discovery-authorizations" and method == "POST":
+                    return lambda: self._ws_discovery_authorization_create(wid, project_ref, tail[3])
+                if len(tail) == 6 and tail[4] == "discovery-authorizations" and method == "GET":
+                    return lambda: self._ws_discovery_authorization_get(wid, project_ref, tail[3], tail[5])
+                if (len(tail) == 7 and tail[4] == "discovery-authorizations" and tail[6] == "revoke"
+                        and method == "POST"):
+                    return lambda: self._ws_discovery_authorization_revoke(wid, project_ref, tail[3], tail[5])
+                if len(tail) == 5 and tail[4] == "route-inventory" and method == "GET":
+                    return lambda: self._ws_route_inventory(wid, project_ref, tail[3])
             if len(tail) >= 3 and tail[0] == "projects":
                 project_ref = tail[1]
                 if len(tail) == 3 and tail[2] == "runner-context-bindings":
@@ -1032,6 +1049,9 @@ class _Handler(BaseHTTPRequestHandler):
                 if (method == "POST" and len(tail) == 5 and tail[2] == "runner-context-bindings"
                         and tail[4] == "revoke"):
                     return lambda: self._ws_runner_context_revoke(wid, project_ref, tail[3])
+                if (method == "POST" and len(tail) == 5 and tail[2] == "runner-context-bindings"
+                        and tail[4] == "plan-requests"):
+                    return lambda: self._ws_plan_request_create(wid, project_ref, tail[3])
                 if len(tail) == 3 and tail[2] == "canary-approval-projections" and method == "POST":
                     return lambda: self._ws_canary_projection_submit(wid, project_ref)
                 if len(tail) == 3 and tail[2] == "canary-approval-requests" and method == "GET":
@@ -1364,6 +1384,7 @@ class _Handler(BaseHTTPRequestHandler):
             maximum = (
                 128 if operation == "context-list"
                 else 256 if operation in {"claim", "context-claim"}
+                else 2048 if operation == "context-plan-request-claim"
                 else 69632 if operation == "context-approval-projections"
                 else MAX_UPLOAD_BYTES if operation == "result-projection"
                 else 36 * 1024
@@ -1372,13 +1393,14 @@ class _Handler(BaseHTTPRequestHandler):
             validators = {"claim": validate_runner_claim_request, "heartbeat": validate_runner_heartbeat_request,
                           "progress": validate_runner_progress_request, "result": validate_runner_result_request,
                           "stop-ack": validate_runner_stop_ack_request, "context-list": validate_runner_context_list,
-                          "context-claim": validate_runner_context_claim, "context-approval-projections": validate_runner_approval_projection_submit}
+                          "context-claim": validate_runner_context_claim, "context-approval-projections": validate_runner_approval_projection_submit,
+                          "context-plan-request-claim": validate_runner_plan_request_claim}
             if operation != "result-projection":
                 parsed = validators[operation](parsed)
             if (canonical_bytes(parsed) != self._raw_body()
                     or (run_id is not None and (parsed.get("run_id", parsed.get("binding_id", parsed.get("context_binding_id"))) != run_id))):
                 raise RunnerAuthError("invalid runner authentication")
-            if operation not in {"claim", "result-projection", "context-list", "context-claim", "context-approval-projections"} and not self._operational_context_matches(
+            if operation not in {"claim", "result-projection", "context-list", "context-claim", "context-approval-projections", "context-plan-request-claim"} and not self._operational_context_matches(
                     self._runner_store().conn, workspace_id=wid, runner_id=runner_id,
                     projection=parsed["operational_projection"]):
                 raise RunnerAuthError("invalid runner authentication")
@@ -1406,6 +1428,9 @@ class _Handler(BaseHTTPRequestHandler):
                     return RunnerHttpAction(200, context_service.list_for_runner_in_transaction(wid, runner_id, key_id))
                 if operation == "context-claim":
                     return RunnerHttpAction(200, context_service.claim_in_transaction(wid, runner_id, key_id, run_id, parsed))
+                if operation == "context-plan-request-claim":
+                    snapshot = context_service.claim_plan_request_in_transaction(wid, runner_id, key_id, run_id, parsed)
+                    return RunnerHttpAction(200, snapshot) if snapshot is not None else RunnerHttpAction(204, None)
                 if operation == "context-approval-projections":
                     binding = context_service.active_binding_for_projection_in_transaction(
                         wid, runner_id, key_id, run_id, parsed["context_binding_digest"],
@@ -1441,7 +1466,7 @@ class _Handler(BaseHTTPRequestHandler):
                 raw_body=self._raw_body(), headers=all_headers,
                 action=action,
                 chain_name=(
-                    "claim" if operation in {"claim", "context-list", "context-claim", "context-approval-projections"}
+                    "claim" if operation in {"claim", "context-list", "context-claim", "context-approval-projections", "context-plan-request-claim"}
                     else f"result:{run_id}" if operation == "result-projection"
                     else f"{operation}:{run_id}"
                 ),
@@ -1450,6 +1475,10 @@ class _Handler(BaseHTTPRequestHandler):
         except _RunnerContextUnavailable:
             self._json(503, {"schema_version": "heel.runner-context-error.v1", "code": "runner_context_unavailable"})
             return
+        except DiscoveryError:
+            # Closed plan/discovery reasons reach an authenticated runner only after its PoP and
+            # binding checks passed; the refused request consumed no nonce and wrote nothing.
+            raise
         except RunnerContextError:
             raise RunnerAuthError("invalid runner authentication") from None
         except (CanaryRunError, CanaryDisclosureError):
@@ -2376,6 +2405,17 @@ class _Handler(BaseHTTPRequestHandler):
             raise RunnerContextError("invalid_runner_context_binding") from None
         self._json(200, result)
 
+    def _ws_plan_request_create(self, wid: str, project_ref: str, binding_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        actor, role, _ = self._recent_owner_admin_context(wid)
+        try:
+            body = parse_json(self._raw_body(), max_bytes=2048)
+        except ValueError:
+            raise DiscoveryError("invalid_plan_request") from None
+        self._json(201, self._runner_context_service().create_plan_request(
+            wid, project_ref, binding_id, body, actor=actor, role=role,
+        ))
+
     def _ws_runner_context_list(self, wid: str, project_ref: str) -> None:
         self._runner_context_human_path_exact()
         kind, user_id, _ = self._principal()
@@ -2716,6 +2756,56 @@ class _Handler(BaseHTTPRequestHandler):
         self._authorize(wid, "view")
         _, disclosure = self._human_canary_services()
         self._json(200, disclosure.get(wid, project_ref, run_id))
+
+    # --- discovery authorization and inventory (discovery contract §3) ---
+    def _discovery_scope(self, wid: str, project_ref: str) -> str:
+        """Browser-session members of the exact project only; everything else is not found."""
+        if "?" in self.path or "#" in self.path or "%" in self.path:
+            raise DiscoveryError("environment_not_found")
+        kind, user_id, _ = self._principal()
+        if kind != "session" or user_id is None or self.cp.store.get_role(wid, user_id) is None:
+            raise DiscoveryError("environment_not_found")
+        if self.cp.store.conn.execute(
+            "SELECT 1 FROM projects WHERE workspace_id=? AND project_ref=?", (wid, project_ref),
+        ).fetchone() is None:
+            raise DiscoveryError("environment_not_found")
+        if self.cp.canary_runs is None:
+            raise DiscoveryError("discovery_unavailable")
+        return user_id
+
+    def _ws_discovery_authorization_create(self, wid: str, project_ref: str, environment_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        actor, role, _ = self._recent_owner_admin_context(wid)
+        keys = self._header_values("Idempotency-Key")
+        if len(keys) != 1 or _CANARY_IDEMPOTENCY.fullmatch(keys[0]) is None:
+            raise DiscoveryError("idempotency_key_required")
+        if len(self._raw_body()) > 2048:
+            raise DiscoveryError("invalid_discovery_authorization")
+        try:
+            body = self._body()
+        except ApiError:
+            raise DiscoveryError("invalid_discovery_authorization") from None
+        view, _ = self.cp.canary_runs.create_discovery_authorization(
+            wid, project_ref, environment_id, body, actor=actor, role=role, idempotency_key=keys[0],
+        )
+        self._json(201, view)
+
+    def _ws_discovery_authorization_get(self, wid: str, project_ref: str, environment_id: str, authorization_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        self._json(200, self.cp.canary_runs.get_discovery_authorization(wid, project_ref, environment_id, authorization_id))
+
+    def _ws_discovery_authorization_revoke(self, wid: str, project_ref: str, environment_id: str, authorization_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        actor, role, _ = self._recent_owner_admin_context(wid)
+        if self._raw_body():
+            raise DiscoveryError("invalid_discovery_authorization")
+        self._json(200, self.cp.canary_runs.revoke_discovery_authorization(
+            wid, project_ref, environment_id, authorization_id, actor=actor, role=role,
+        ))
+
+    def _ws_route_inventory(self, wid: str, project_ref: str, environment_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        self._json(200, self.cp.canary_runs.route_inventory_view(wid, project_ref, environment_id))
 
     def _ws_environments_list(self, wid: str, project_ref: str):
         self._authorize(wid, "view")

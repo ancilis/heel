@@ -16,8 +16,14 @@ from typing import Callable
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from heel.canary_contracts import (
+    RUNNER_PLAN_REQUEST_SCHEMA,
+    ContractError,
     canonical_bytes,
     canonical_digest,
+    validate_plan_request,
+    validate_route_inventory_rows,
+    validate_runner_plan_request,
+    validate_runner_plan_request_claim,
     validate_runner_context_binding,
     validate_runner_context_create,
     validate_runner_context_revoke,
@@ -25,11 +31,14 @@ from heel.canary_contracts import (
 )
 from heel.crypto import load_public_key_base64
 
+from .canary_runs import DiscoveryError
+
 
 CONTEXT_DOMAIN = b"heel.runner-context-binding.v1\0"
 CONTEXT_TTL_MS = 24 * 60 * 60 * 1000
 CONTEXT_MIN_TTL_MS = 60 * 1000
 CONTEXT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
+PLAN_REQUEST_TTL_MS = 24 * 60 * 60 * 1000
 
 
 class RunnerContextError(ValueError):
@@ -132,6 +141,12 @@ class RunnerContextBindingService:
         """v16/v17 migration rehearsal still exercises the pre-affinity service."""
         return self.conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_runner_context_affinities'"
+        ).fetchone() is not None
+
+    def _has_plan_request_schema(self) -> bool:
+        """Pre-30 migration rehearsals still exercise binding revocation without plan requests."""
+        return self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_plan_requests'"
         ).fetchone() is not None
 
     def _has_cancellation_queue_schema(self) -> bool:
@@ -730,6 +745,12 @@ class RunnerContextBindingService:
                 (actor, now, binding_id),
             )
             changed = self.conn.execute("SELECT * FROM canary_runner_context_bindings WHERE rcb_id=?", (binding_id,)).fetchone()
+            # A plan request is a snapshot for this binding only; it cannot outlive the binding.
+            if self._has_plan_request_schema():
+                self.conn.execute(
+                    "UPDATE canary_plan_requests SET status='cancelled' WHERE workspace_id=? AND rcb_id=? AND status='open'",
+                    (workspace_id, binding_id),
+                )
             self._enqueue_terminal_cancellation_in_transaction(changed)
             self._event(changed, "revoked", "human", actor, reason="operator_requested")
             self.conn.commit()
@@ -949,3 +970,122 @@ class RunnerContextBindingService:
         ):
             raise RunnerContextError("runner_context_binding_not_found")
         return row
+
+
+    # --- plan requests: the immutable user selection a scan projection must bind (bridge §4.1) ---
+
+    def _expire_plan_requests_in_transaction(self, workspace_id: str, binding_id: str, now: int) -> None:
+        self.conn.execute(
+            "UPDATE canary_plan_requests SET status='expired' WHERE workspace_id=? AND rcb_id=? "
+            "AND status='open' AND expires_at_ms<=?",
+            (workspace_id, binding_id, now),
+        )
+
+    def create_plan_request(
+        self, workspace_id: str, project_id: str, binding_id: str, request: object, *, actor: object, role: object,
+    ) -> dict:
+        actor, role = self._require_actor(actor, role)
+        try:
+            request = validate_plan_request(request)
+        except (ContractError, TypeError, ValueError):
+            raise DiscoveryError("invalid_plan_request") from None
+        now = self._now_ms()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._assert_membership(workspace_id, actor, role)
+            binding = self.conn.execute(
+                "SELECT * FROM canary_runner_context_bindings WHERE workspace_id=? AND project_ref=? AND rcb_id=? "
+                "AND status='active' AND expires_at_ms>?",
+                (workspace_id, project_id, binding_id, now),
+            ).fetchone()
+            if binding is None:
+                raise DiscoveryError("runner_context_binding_not_found")
+            open_discovery = self.conn.execute(
+                "SELECT 1 FROM discovery_authorizations WHERE workspace_id=? AND project_ref=? AND environment_id=? "
+                "AND state='open' AND expires_at_ms>?",
+                (workspace_id, project_id, binding["environment_id"], now),
+            ).fetchone()
+            if open_discovery is not None:
+                # Discovery and scan plans never share one binding's open work (contract §2.4).
+                raise DiscoveryError("plan_kind_mismatch")
+            self._expire_plan_requests_in_transaction(workspace_id, binding_id, now)
+            if self.conn.execute(
+                "SELECT 1 FROM canary_plan_requests WHERE workspace_id=? AND rcb_id=? AND status='open'",
+                (workspace_id, binding_id),
+            ).fetchone() is not None:
+                raise DiscoveryError("plan_request_open")
+            inventory = self.conn.execute(
+                "SELECT * FROM route_inventories WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+                (workspace_id, project_id, binding["environment_id"]),
+            ).fetchone()
+            if inventory is None:
+                raise DiscoveryError("selection_outside_inventory")
+            try:
+                rows = validate_route_inventory_rows(json.loads(inventory["routes_json"]))
+            except (ContractError, TypeError, ValueError):
+                raise DiscoveryError("discovery_unavailable") from None
+            if canonical_digest(rows) != inventory["inventory_digest"]:
+                raise DiscoveryError("discovery_unavailable")
+            selectable = {(row["method"], row["route_template"]) for row in rows if row["state"] != "excluded"}
+            selected = sorted(request["routes"], key=lambda item: (item["method"], item["route_template"]))
+            if any((item["method"], item["route_template"]) not in selectable for item in selected):
+                raise DiscoveryError("selection_outside_inventory")
+            plan_request_id = "cpr_" + secrets.token_hex(16)
+            nonce = secrets.token_urlsafe(32)
+            selection_digest = canonical_digest(selected)
+            self.conn.execute(
+                "INSERT INTO canary_plan_requests(plan_request_id,workspace_id,project_ref,environment_id,rcb_id,"
+                "binding_digest,runner_id,runner_key_id,plan_kind,plan_request_nonce,inventory_digest,selection_digest,"
+                "routes_json,selected_count,max_ops,status,created_by,created_at_ms,expires_at_ms) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?)",
+                (
+                    plan_request_id, workspace_id, project_id, binding["environment_id"], binding_id,
+                    binding["binding_digest"], binding["runner_id"], binding["runner_key_id"], request["plan_kind"],
+                    nonce, inventory["inventory_digest"], selection_digest, canonical_bytes(selected).decode(),
+                    len(selected), request["max_ops"], actor, now, now + PLAN_REQUEST_TTL_MS,
+                ),
+            )
+            self.conn.commit()
+            return {
+                "schema_version": "heel.plan-request-created.v1", "plan_request_id": plan_request_id,
+                "binding_id": binding_id, "plan_kind": request["plan_kind"], "status": "open",
+                "inventory_digest": inventory["inventory_digest"], "selection_digest": selection_digest,
+                "selected_count": len(selected), "max_ops": request["max_ops"], "routes": selected,
+                "expires_at_ms": now + PLAN_REQUEST_TTL_MS,
+            }
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def claim_plan_request_in_transaction(
+        self, workspace_id: str, runner_id: str, runner_key_id: str, binding_id: str, request: object,
+    ) -> dict | None:
+        """Deliver the exact open snapshot to its bound runner; labels in the claim are not stored."""
+        if not self.conn.in_transaction:
+            raise RuntimeError("plan request claim requires caller transaction")
+        try:
+            request = validate_runner_plan_request_claim(request)
+        except (ContractError, TypeError, ValueError):
+            raise RunnerContextError("invalid_runner_context_binding") from None
+        if request["binding_id"] != binding_id:
+            raise RunnerContextError("invalid_runner_context_binding")
+        binding = self.active_binding_for_projection_in_transaction(
+            workspace_id, runner_id, runner_key_id, binding_id, request["binding_digest"],
+        )
+        now = self._now_ms()
+        self._expire_plan_requests_in_transaction(workspace_id, binding_id, now)
+        row = self.conn.execute(
+            "SELECT * FROM canary_plan_requests WHERE workspace_id=? AND project_ref=? AND rcb_id=? "
+            "AND binding_digest=? AND runner_id=? AND runner_key_id=? AND status='open'",
+            (workspace_id, binding["project_ref"], binding_id, binding["binding_digest"], runner_id, runner_key_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return validate_runner_plan_request({
+            "schema_version": RUNNER_PLAN_REQUEST_SCHEMA, "plan_request_id": row["plan_request_id"],
+            "plan_request_nonce": row["plan_request_nonce"], "plan_kind": row["plan_kind"],
+            "max_ops": row["max_ops"], "inventory_digest": row["inventory_digest"],
+            "selection_digest": row["selection_digest"], "routes": json.loads(row["routes_json"]),
+            "expires_at_ms": row["expires_at_ms"],
+        })
