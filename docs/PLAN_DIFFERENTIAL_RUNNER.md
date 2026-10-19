@@ -426,6 +426,25 @@ Exit codes: `0` stopped (SIGINT, SIGTERM or `--once` done), `1` offline (`--once
      protocol; server guards unchanged). Each request is stored durably before it is sent; after
      a lost answer or a restart the exact bytes are retransmitted (the server answers them from
      its own record), and a refused retransmission is followed by at most one fresh start.
+     An answer that is not a valid challenge or completion installs nothing and ends the check
+     `response_rejected`, but the stored attempt is **kept**: while its server challenge is live
+     a different fresh start would be refused, so the next check retransmits the exact start (the
+     server answers it from its record even after the 30 s proof window) or the exact completion
+     (answered from the completed record for 600 s). A retransmitted completion that is refused
+     is re-signed **once** over the byte-identical body; the server accepts that only for its
+     still-pending challenge (a completed challenge answers only the original proof, a revoked
+     key or a wrong clock is refused), so a completion request lost before it reached the server
+     recovers after the proof window too. If the completion is still refused, the original
+     completion is kept and the exact start is retransmitted once more: the server answers it
+     with the same pending challenge only while that challenge is pending and the key active
+     (independent of the clock), so the attempt is kept and the check ends
+     `runner_authentication_rejected`; once the clock is right the next check re-signs and
+     completes it. A refused probe (no pending challenge, or a revoked or unknown key) drops the
+     attempt and allows the one fresh start. If the server answers the probe with a new
+     challenge (its proof was still fresh and the old challenge had been answered), that
+     challenge belongs to this start and is completed as the recovery's one fresh start, so no
+     challenge is ever left pending for a start the runner has forgotten. An attempt is dropped only after the server refused
+     it; nothing is inferred from its age or from a 401.
   3. Only a valid completion (same chain, generation = challenge generation + 1, never below the
      local generation, next sequence not below the challenge's) is accepted. In one runtime
      transaction the claim cursor advances and the one staged call is moved into a sealed
@@ -454,6 +473,8 @@ Exit codes: `0` stopped (SIGINT, SIGTERM or `--once` done), `1` offline (`--once
      then run `status`; if the runner was revoked in Heel Cloud, unpair and pair again. The
      staged call is kept, so correcting the clock and running `status` or `serve` again recovers
      it with no manual cleanup. A revoked key can never resync, so it never regains authority.
+     A wrong clock never drops an attempt whose challenge the server still holds (see 2), so
+     correcting the clock recovers at the next check.
   6. `429 runner_resync_rate_limited` (3 starts per runner per minute) is `offline` with
      `recovery_rate_limited`: the serve waits at least the server's `retry_after_ms` (bounded to
      1–300 s; a missing or invalid value means 60 s), interruptibly, and never reports a
@@ -494,18 +515,22 @@ created_at_ms)` with two kinds:
 
 | `kind` | Meaning | Lifecycle state |
 |---|---|---|
-| `resync_attempt` | one in-flight claim-chain resync: its exact signed start request, then the server challenge, then its exact signed completion request (sealed under the runner identity) | **pending / incomplete** while present; at most one per chain (unique index); removed when the server refuses it or in the same transaction that accepts its completion |
-| `superseded_call` | sealed tombstone of one staged `list-contexts`/`claim-context` call retired by an accepted resync: the full original sealed request, the accepted generation, next sequence and challenge ID, and the time | **terminal audit**; never replayed; sealed with the stable runtime key bound to the record ID so it survives key rotation; the newest 512 are kept, older ones are reclaimed when a new one is written |
+| `resync_attempt` | one in-flight claim-chain resync: its exact signed start request, then the server challenge, then its exact signed completion request (sealed under the runner identity; the completion's proof may be re-signed once over the identical body) | **pending / incomplete** while present; at most one per chain (unique index); kept when an answer is malformed; removed only when the server refuses it, or in the same transaction that accepts its completion. A new attempt is never written over an existing row: a corrupt row fails closed unchanged and a valid one is a conflict |
+| `superseded_call` | sealed tombstone of one staged `list-contexts`, `claim-context` or job `claim` call retired by an accepted resync: the full original sealed request, the accepted generation, next sequence and challenge ID, the time, and for a job claim the server-cursor proof (challenge and completion `next_sequence`) | **terminal audit**; never replayed; sealed with the stable runtime key bound to the record ID so it survives key rotation; the newest 512 are kept, older ones are reclaimed when a new one is written (attempts and pending calls are never trimmed) |
 
 Read enumeration today: `RunnerRuntimeState.load_resync_attempt("claim")` (the open attempt or
 `None`), `load_superseded_calls(limit=…)` (oldest first, any unreadable row fails closed),
 `load_pending_calls()`, `load_active_run_controls()`, `load_terminal_state()` and
 `load_prune_pending()`. **These are not a read-only preflight:** constructing
 `RunnerRuntimeState` initializes or migrates the file. A retirement preflight must enumerate
-`chain_recovery` as well as the `v3` tables and must treat an open `resync_attempt` (and any
-`pending_calls` row, including a kept `recovery_required` call) as incomplete state, not assume
-only `pending_calls`/`active_runs`/`terminal_disclosures` matter. Key rotation already refuses
-while a `resync_attempt` exists.
+`chain_recovery` as well as the `v3` tables and must treat an open `resync_attempt`, any
+unreadable `chain_recovery` row, and any `pending_calls` row (including a kept
+`recovery_required` call) as incomplete state, not assume only
+`pending_calls`/`active_runs`/`terminal_disclosures` matter. Job `claim` tombstones are
+expected there. Key rotation already refuses while a `resync_attempt` exists. A tombstone is
+local control evidence only: it is not functional execution recovery; restart after a claimed
+run (today `local_state_invalid`) and reconciliation of a `claim_sequence_consumed` call remain
+T4a work.
 
 ## Trust boundary
 
