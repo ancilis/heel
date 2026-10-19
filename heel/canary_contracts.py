@@ -19,6 +19,8 @@ TEST_MANIFEST_SCHEMA = "heel.test-manifest.v1"
 APPROVAL_PROJECTION_SCHEMA = "heel.approval-manifest-projection.v1"
 RUNNER_IDENTITY_SCHEMA = "heel.runner-identity.v1"
 EXECUTION_GRANT_SCHEMA = "heel.execution-grant.v1"
+# v1 plus one ``budget_profile`` naming the signed discovery body profile (C2D D4).
+EXECUTION_GRANT_V2_SCHEMA = "heel.execution-grant.v2"
 OPERATIONAL_RUN_SCHEMA = "heel.operational-run-projection.v1"
 RUNNER_CLAIM_REQUEST_SCHEMA = "heel.runner-claim-request.v1"
 RUNNER_HEARTBEAT_REQUEST_SCHEMA = "heel.runner-heartbeat-request.v1"
@@ -63,6 +65,11 @@ DISCOVERY_EXCLUDED_REASONS = frozenset({
 })
 
 _SAFE_INT = (1 << 53) - 1
+# Response-body ceilings by signed profile.  ``scan`` is every v1 record and every scan plan;
+# ``discovery`` is reachable only from a signed discovery plan or a v2 grant that names it.
+SCAN_BODY_BYTES = 256 * 1024
+DISCOVERY_BODY_BYTES = 2 * 1024 * 1024
+_BODY_BYTES = {"scan": SCAN_BODY_BYTES, "discovery": DISCOVERY_BODY_BYTES}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 _EVIDENCE = re.compile(r"^ev1_[0-9a-f]{64}$")
@@ -337,14 +344,14 @@ def _statuses(value: Any) -> list[int]:
     return entries
 
 
-def _budgets(value: Any) -> dict[str, Any]:
+def _budgets(value: Any, *, profile: str = "scan") -> dict[str, Any]:
     obj = _object(value, {"maximum_requests", "maximum_concurrency", "action_timeout_ms", "wall_timeout_ms", "maximum_response_bytes"})
     _integer(obj["maximum_requests"], lower=1, upper=20)
     if _integer(obj["maximum_concurrency"], lower=1, upper=1) != 1:
         _fail("concurrency must be one")
     _integer(obj["action_timeout_ms"], lower=1, upper=5000)
     _integer(obj["wall_timeout_ms"], lower=1, upper=60000)
-    _integer(obj["maximum_response_bytes"], lower=1, upper=256 * 1024)
+    _integer(obj["maximum_response_bytes"], lower=1, upper=_BODY_BYTES[profile])
     return obj
 
 
@@ -449,7 +456,7 @@ def validate_approval_projection(value: Any) -> dict[str, Any]:
         _id_fields(action, ("scenario_id", "adapter_version", "semantic_auth_role"))
         if (action["scenario_id"], action["adapter_version"]) not in scenario_ids: _fail("invalid action ordering")
         _method(action["method"]); _route(action["route_template"]); _enum(action["assertion_class"], {"anonymous_authenticated", "object_ownership", "role_boundary", "plan_entitlement"}); _statuses(action["allowed_status_codes"]); _body_shapes(action["allowed_body_shapes"]); _enum(action["side_effect_class"], {"read_only"})
-    _budgets(obj["budgets"]); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["compiled_at_ms"], lower=0); _hash(obj["manifest_digest"])
+    _budgets(obj["budgets"], profile=approval_body_profile(obj)); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["compiled_at_ms"], lower=0); _hash(obj["manifest_digest"])
     if obj["signing_key_id"] != runner["runner_key_id"]: _fail("approval signing key mismatch")
     if v2: _plan(obj["plan"], actions, obj["budgets"])
     _signature(obj, "projection_digest")
@@ -571,9 +578,11 @@ def validate_runner_identity(value: Any) -> dict[str, Any]:
 
 
 def validate_execution_grant(value: Any) -> dict[str, Any]:
-    obj = _contract(value, 32 * 1024); obj = _object(obj, {"schema_version", "grant_id", "run_id", "workspace_id", "project_id", "approval", "environment", "runner_binding", "approval_actor", "approval_reason", "consented_at_ms", "budgets", "egress", "retry_policy", "grant_nonce", "kill_switch_generation", "operational_receipt_policy", "issued_at_ms", "expires_at_ms", "grant_digest", "signing_key_id", "signature_b64"})
-    _enum(obj["schema_version"], {EXECUTION_GRANT_SCHEMA}); _id_fields(obj, ("grant_id", "run_id", "workspace_id", "project_id", "grant_nonce")); approval = _object(obj["approval"], {"projection_id", "projection_digest", "manifest_digest"}); _id_fields(approval, ("projection_id",)); _hash(approval["projection_digest"]); _hash(approval["manifest_digest"]); env = _environment(obj["environment"])
-    binding = _object(obj["runner_binding"], {"runner_id", "runner_key_id", "public_key_digest"}); _id_fields(binding, ("runner_id", "runner_key_id")); _hash(binding["public_key_digest"]); actor = _object(obj["approval_actor"], {"user_id", "role"}); _id_fields(actor, ("user_id",)); _enum(actor["role"], {"owner", "admin"}); _string(obj["approval_reason"], limit=500); _integer(obj["consented_at_ms"], lower=0); _budgets(obj["budgets"]); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["kill_switch_generation"], lower=0)
+    obj = _contract(value, 32 * 1024)
+    v2 = isinstance(obj, Mapping) and obj.get("schema_version") == EXECUTION_GRANT_V2_SCHEMA
+    obj = _object(obj, {"schema_version", "grant_id", "run_id", "workspace_id", "project_id", "approval", "environment", "runner_binding", "approval_actor", "approval_reason", "consented_at_ms", "budgets", "egress", "retry_policy", "grant_nonce", "kill_switch_generation", "operational_receipt_policy", "issued_at_ms", "expires_at_ms", "grant_digest", "signing_key_id", "signature_b64"} | ({"budget_profile"} if v2 else set()))
+    _enum(obj["schema_version"], {EXECUTION_GRANT_SCHEMA, EXECUTION_GRANT_V2_SCHEMA}); profile = _enum(obj["budget_profile"], {"discovery"}) if v2 else "scan"; _id_fields(obj, ("grant_id", "run_id", "workspace_id", "project_id", "grant_nonce")); approval = _object(obj["approval"], {"projection_id", "projection_digest", "manifest_digest"}); _id_fields(approval, ("projection_id",)); _hash(approval["projection_digest"]); _hash(approval["manifest_digest"]); env = _environment(obj["environment"])
+    binding = _object(obj["runner_binding"], {"runner_id", "runner_key_id", "public_key_digest"}); _id_fields(binding, ("runner_id", "runner_key_id")); _hash(binding["public_key_digest"]); actor = _object(obj["approval_actor"], {"user_id", "role"}); _id_fields(actor, ("user_id",)); _enum(actor["role"], {"owner", "admin"}); _string(obj["approval_reason"], limit=500); _integer(obj["consented_at_ms"], lower=0); _budgets(obj["budgets"], profile=profile); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["kill_switch_generation"], lower=0)
     policy = _object(obj["operational_receipt_policy"], {"schema_version", "maximum_bytes", "allowed_error_categories", "allowed_stop_reasons", "allowed_containment_codes"}); _enum(policy["schema_version"], {OPERATIONAL_RUN_SCHEMA}); _integer(policy["maximum_bytes"], lower=1, upper=32768); _enum_list(policy["allowed_error_categories"], _ERRORS); _enum_list(policy["allowed_stop_reasons"], _STOPS); _enum_list(policy["allowed_containment_codes"], _CONTAINMENT)
     issued = _integer(obj["issued_at_ms"], lower=0); expires = _integer(obj["expires_at_ms"], lower=0)
     if not issued < expires <= issued + 600000: _fail("invalid grant expiry")
@@ -795,6 +804,14 @@ def _plan_labels(value: Any, *, minimum: int) -> list[dict[str, Any]]:
     return entries
 
 
+def approval_body_profile(projection: Mapping[str, Any]) -> str:
+    """The body profile a projection's own signed structure selects; never a caller choice."""
+    plan = projection.get("plan") if projection.get("schema_version") == APPROVAL_PROJECTION_V2_SCHEMA else None
+    if isinstance(plan, Mapping) and plan.get("plan_kind") == "discovery" and plan.get("transport_profile") == "discovery":
+        return "discovery"
+    return "scan"
+
+
 def _plan(value: Any, actions: list[Any], budgets: Mapping[str, Any]) -> dict[str, Any]:
     kind = value.get("plan_kind") if isinstance(value, Mapping) else None
     if kind == "discovery":
@@ -846,15 +863,12 @@ def _discovery_plan(value: Any, actions: list[Any], budgets: Mapping[str, Any]) 
             _fail("discovery source round mismatch")
     for action in actions:
         _route_template(action["route_template"])
-    if round_number == 1:
-        routes = [action["route_template"] for action in actions]
-        if (
-            cumulative != 0 or obj["frontier_digest"] != DISCOVERY_SEED_DIGEST
-            or sorted(routes) != sorted(DISCOVERY_SEED_PATHS)
-            or any(DISCOVERY_SEED_PATHS[source["source_ordinal"]] != route
-                   for source, route in zip(sources, routes))
-        ):
-            _fail("discovery round one is not the seed list")
+    # Round 1 is the fixed seed frontier.  Exact seed membership of each action is the server's
+    # recorded-relationship check (``seed_mismatch``); the contract binds its digest and shape.
+    if round_number == 1 and (
+        cumulative != 0 or obj["frontier_digest"] != DISCOVERY_SEED_DIGEST or count != len(DISCOVERY_SEED_PATHS)
+    ):
+        _fail("discovery round one is not the seed list")
     return obj
 
 
