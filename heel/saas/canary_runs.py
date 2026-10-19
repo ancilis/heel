@@ -820,6 +820,10 @@ class CanaryRunService:
         authorization_id = auth["authorization_id"]
         if auth["state"] != "open":                                                            # 2
             raise DiscoveryError("authorization_closed")
+        if not self._discovery_actor_is_owner_admin(auth):                                     # 2a
+            # The recorded delegation ends with its authorizer's role; the close is re-derived
+            # and committed after this transaction rolls back (C2R1 F2).
+            raise DiscoveryError("authorization_closed", close=(authorization_id, "membership", 0))
         if now >= int(auth["expires_at_ms"]):                                                  # 3
             raise DiscoveryError("authorization_expired", close=(authorization_id, "expired", 0))
         if plan["authorization_digest"] != auth["authorization_digest"]:                       # 4
@@ -2677,7 +2681,7 @@ class CanaryRunService:
         separate transaction re-checks the server facts, so a stale or forged refusal cannot close
         an authorization that is still inside its bound (Astra C-4 durability clarification).
         """
-        if kind not in {"expired", "budget"}:
+        if kind not in {"expired", "budget", "membership"}:
             raise ValueError("invalid discovery refusal close")
         owns = not self.conn.in_transaction
         if owns:
@@ -2695,12 +2699,25 @@ class CanaryRunService:
                     or int(row["execution_ms_used"]) + DISCOVERY_ROUND_FLOOR_MS > bound["max_total_execution_ms"]
                 ):
                     self._close_discovery_in_transaction(row, "done", "budget", now)
+                elif kind == "membership" and not self._discovery_actor_is_owner_admin(row):
+                    # A system close: the actor snapshot and digests stay as recorded.
+                    self._close_discovery_in_transaction(
+                        row, "revoked", "revoked", now, revoked_by="membership:" + row["actor_user_id"],
+                    )
             if owns:
                 self.conn.commit()
         except Exception:
             if owns and self.conn.in_transaction:
                 self.conn.rollback()
             raise
+
+    def _discovery_actor_is_owner_admin(self, auth: sqlite3.Row) -> bool:
+        """The recorded authorizer's current membership (logout or session expiry is not loss)."""
+        membership = self.conn.execute(
+            "SELECT role FROM memberships WHERE workspace_id=? AND user_id=?",
+            (auth["workspace_id"], auth["actor_user_id"]),
+        ).fetchone()
+        return membership is not None and membership["role"] in {"owner", "admin"}
 
     def _settle_discovery_round_in_transaction(
         self, round_row: sqlite3.Row, terminal_at_ms: int, requests_completed: int,

@@ -2469,3 +2469,96 @@ def test_exact_raw_round_replay_keeps_its_historical_receipt_but_confers_no_auth
     status, gate, _ = driver.heartbeat(claimed, 1)
     assert status == 200 and gate["active"] is False and gate["stop_reason"] == "cloud_stop"
 
+
+def _membership(fixture, user: str, role: str | None) -> None:
+    conn = fixture.cp.store.conn
+    if role is None:
+        conn.execute("DELETE FROM memberships WHERE workspace_id=? AND user_id=?", (fixture.workspace, user))
+    else:
+        conn.execute("UPDATE memberships SET role=? WHERE workspace_id=? AND user_id=?", (role, fixture.workspace, user))
+    conn.commit()
+
+
+def _durable_authorization(fixture, authorization_id: str) -> dict:
+    reopened = sqlite3.connect(_database_path(fixture))
+    reopened.row_factory = sqlite3.Row
+    try:
+        row = dict(reopened.execute("SELECT * FROM discovery_authorizations WHERE authorization_id=?",
+                                    (authorization_id,)).fetchone())
+        row["ledger"] = [r[0] for r in reopened.execute(
+            "SELECT kind FROM usage_ledger WHERE ref=? ORDER BY ts,entry_id", (authorization_id,))]
+        row["rounds"] = reopened.execute("SELECT COUNT(*) FROM discovery_rounds WHERE authorization_id=?",
+                                         (authorization_id,)).fetchone()[0]
+        return row
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("change", ["demote", "remove"])
+def test_round_issue_requires_the_authorizers_live_owner_admin_membership_before_the_first_round(canary_http, change):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    original = dict(driver.row())
+    _membership(fixture, fixture.user, "member" if change == "demote" else None)
+    projection = driver.projection(1, None)
+    status, _, data = driver.submit(projection)
+    assert (status, data) == (409, {"schema_version": "heel.discovery-error.v1", "code": "authorization_closed"})
+    durable = _durable_authorization(fixture, driver.authorization_id)
+    assert (durable["state"], durable["close_reason"], durable["revoked_by"]) == (
+        "revoked", "revoked", "membership:" + fixture.user)
+    # The recorded consent stays exactly as signed: actor snapshot and digests are immutable.
+    for field in ("actor_user_id", "actor_role", "authorization_digest", "request_digest", "bound_json"):
+        assert durable[field] == original[field]
+    assert durable["quota_state"] == "refunded" and durable["ledger"] == ["reserve", "refund"] and durable["rounds"] == 0
+    assert fixture.cp.store.conn.execute("SELECT COUNT(*) FROM canary_execution_grants").fetchone()[0] == 0
+    # Restoring the role later never reopens the closed authorization.
+    _membership(fixture, fixture.user, "owner") if change == "demote" else fixture.cp.store.add_member(
+        fixture.workspace, fixture.user, Role.OWNER)
+    assert _code(driver.submit(projection)) == (409, "authorization_closed")
+    assert _durable_authorization(fixture, driver.authorization_id)["ledger"] == ["reserve", "refund"]
+
+
+def test_round_issue_closes_on_actor_removal_between_rounds_but_in_flight_grants_keep_their_bounded_rules(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    candidates = _candidates(1, 4)
+    driver.run_round(1, None, candidates)
+    status, _, second = driver.submit(driver.projection(2, _refs(1, candidates[:2])))
+    assert status == 201
+    claimed = driver.claim()
+    # Role loss after a grant issued adds no automatic stop: the in-flight round keeps running.
+    _membership(fixture, fixture.user, None)
+    status, gate, _ = driver.heartbeat(claimed, 1)
+    assert status == 200 and gate["active"] is True
+    assert driver.finish(claimed, _candidates(2, 2), round_number=2)[0] == 200
+    driver.reports[2] = _candidates(2, 2)
+    status, _, data = driver.submit(driver.projection(3, _refs(2, _candidates(2, 1))))
+    assert (status, data["code"]) == (409, "authorization_closed")
+    durable = _durable_authorization(fixture, driver.authorization_id)
+    assert (durable["state"], durable["revoked_by"], durable["rounds_issued"]) == ("revoked", "membership:" + fixture.user, 2)
+    assert durable["actor_user_id"] == fixture.user and durable["actor_role"] == "owner"
+    assert durable["quota_state"] == "consumed" and durable["ledger"] == ["reserve", "consume"] and durable["rounds"] == 2
+
+
+def test_still_privileged_actor_and_logged_out_actor_keep_issuing_and_another_owner_can_revoke(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    candidates = _candidates(1, 4)
+    # owner -> admin is still owner/admin; logout/session expiry is not membership loss.
+    _membership(fixture, fixture.user, "admin")
+    fixture.cp.store.conn.execute("DELETE FROM sessions WHERE user_id=?", (fixture.user,))
+    fixture.cp.store.conn.commit()
+    driver.run_round(1, None, candidates)
+    _membership(fixture, fixture.user, "owner")
+    status, _, second = driver.submit(driver.projection(2, _refs(1, candidates[:2])))
+    assert status == 201 and second["grant"]["approval_actor"] == {"user_id": fixture.user, "role": "owner"}
+    assert driver.row()["state"] == "open" and driver.row()["rounds_issued"] == 2
+    # The actor is then removed; a current different owner revokes the still-open authorization.
+    _membership(fixture, fixture.user, None)
+    other = _session_for(fixture, Role.OWNER, "other-owner@canary.test")
+    other_user = fixture.cp.store.conn.execute("SELECT user_id FROM users WHERE email=?",
+                                               ("other-owner@canary.test",)).fetchone()[0]
+    status, _, revoked = fixture.request(
+        "POST", _env_base(fixture) + f"/discovery-authorizations/{driver.authorization_id}/revoke", headers=other, raw=b"")
+    assert status == 200 and (revoked["state"], revoked["revoked_by"]) == ("revoked", other_user)
+    assert revoked["actor_user_id"] == fixture.user and revoked["quota_state"] == "consumed"

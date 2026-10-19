@@ -299,3 +299,40 @@ def test_discovery_close_proves_an_existing_ledger_refund_instead_of_wedging():
             assert [kind for kind, _, _ in _discovery_ledger(fixture)] == ["reserve", "refund"]
         finally:
             fixture.close()
+
+
+def test_discovery_membership_close_refunds_only_a_zero_issued_authorization():
+    """C2R1 F2: a role-loss close settles quota like any other close (§5), never twice."""
+    with tempfile.TemporaryDirectory() as directory:
+        fixture = CanaryHttpFixture(Path(directory))
+        try:
+            conn = fixture.cp.store.conn
+            untouched = DiscoveryDriver(fixture, key=1)
+            conn.execute("UPDATE memberships SET role='member' WHERE workspace_id=? AND user_id=?",
+                         (fixture.workspace, fixture.user))
+            conn.commit()
+            projection = untouched.projection(1, None)
+            for _ in range(2):
+                status, _, data = untouched.submit(projection)
+                assert (status, data["code"]) == (409, "authorization_closed")
+            assert _discovery_ledger(fixture) == [
+                ("reserve", untouched.authorization_id, 1), ("refund", untouched.authorization_id, 1)]
+            conn.execute("UPDATE memberships SET role='owner' WHERE workspace_id=? AND user_id=?",
+                         (fixture.workspace, fixture.user))
+            conn.commit()
+            used = DiscoveryDriver(fixture, key=2, chain=untouched.chain, binding=untouched.binding)
+            candidates = _candidates(1, 2)
+            used.run_round(1, None, candidates)
+            conn.execute("UPDATE memberships SET role='member' WHERE workspace_id=? AND user_id=?",
+                         (fixture.workspace, fixture.user))
+            conn.commit()
+            for _ in range(2):
+                status, _, data = used.submit(used.projection(2, _refs(1, candidates[:1])))
+                assert (status, data["code"]) == (409, "authorization_closed")
+            assert used.row()["quota_state"] == "consumed"
+            assert _discovery_ledger(fixture)[2:] == [
+                ("reserve", used.authorization_id, 1), ("consume", used.authorization_id, 1)]
+            period = conn.execute("SELECT period FROM usage_ledger LIMIT 1").fetchone()[0]
+            assert fixture.cp.ledger.usage(fixture.workspace, Meter.CANARY_RUNS, period) == 1
+        finally:
+            fixture.close()
