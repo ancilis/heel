@@ -2298,3 +2298,68 @@ test("findings proxy fails closed and leaves anonymous review traffic without a 
   );
   assert.doesNotMatch(workerSource, /\bctx\.waitUntil\s*\(/);
 });
+
+test("production worker refuses out-of-shape control-plane configuration with the fixed 503", async (t) => {
+  const artifact = await import(
+    pathToFileURL(join(serverRoot, "index.js")).href + `?configuration-shape=${Date.now()}`
+  );
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  let ambientCalls = 0;
+  let assetCalls = 0;
+  let bindingCalls = 0;
+  const ambientFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    ambientCalls += 1;
+    throw new Error("ambient fetch must never carry control-plane traffic");
+  };
+  t.after(() => { globalThis.fetch = ambientFetch; });
+  const respond = async () => new Response("{}", { headers: { "Content-Type": "application/json" } });
+  const environment = (configuration) => ({
+    ASSETS: { fetch: async () => { assetCalls += 1; return new Response("asset", { status: 404 }); } },
+    IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    PUBLIC_ORIGIN: "https://heel.example",
+    CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
+    CONTROL_PLANE: { fetch: async (request) => { bindingCalls += 1; return respond(request); } },
+    ...configuration,
+  });
+  const request = () => new Request("https://proxy.heel.invalid/api/control-plane/v1/me", {
+    headers: { Cookie: "__Host-heel_session=private", Host: "attacker.invalid" },
+  });
+
+  for (const [label, configuration] of [
+    ["missing origin", { PUBLIC_ORIGIN: undefined }],
+    ["number secret", { CONTROL_PLANE_EDGE_SECRET: 43 }],
+    ["boolean secret", { CONTROL_PLANE_EDGE_SECRET: false }],
+    ["object secret", { CONTROL_PLANE_EDGE_SECRET: {} }],
+    ["array secret", { CONTROL_PLANE_EDGE_SECRET: [edgeAuthSecret] }],
+    ["String object secret", { CONTROL_PLANE_EDGE_SECRET: new String(edgeAuthSecret) }],
+    ["missing binding", { CONTROL_PLANE: undefined }],
+    ["null binding", { CONTROL_PLANE: null }],
+    ["empty binding", { CONTROL_PLANE: {} }],
+    ["missing fetch binding", { CONTROL_PLANE: { fetch: undefined } }],
+    ["non-callable binding", { CONTROL_PLANE: { fetch: 43 } }],
+  ]) {
+    const response = await artifact.default.fetch(request(), environment(configuration), context);
+    assert.equal(response.status, 503, label);
+    assert.equal(await response.text(), '{"error":"control plane unavailable"}', label);
+    assert.equal(response.headers.get("cache-control"), "no-store", label);
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff", label);
+    assert.equal(response.headers.get("location"), null, label);
+  }
+  assert.deepEqual([ambientCalls, assetCalls, bindingCalls], [0, 0, 0]);
+
+  // Valid configuration keeps its meaning: one attempted private call, upstream failure stays 502.
+  const valid = await artifact.default.fetch(request(), environment({}), context);
+  assert.equal(valid.status, 200);
+  assert.equal(bindingCalls, 1);
+  for (const fetch of [
+    async () => { bindingCalls += 1; throw new Error("private-upstream-marker"); },
+    async () => { bindingCalls += 1; return new Response(null, { status: 302, headers: { Location: "https://attacker.invalid/" } }); },
+  ]) {
+    const failed = await artifact.default.fetch(request(), environment({ CONTROL_PLANE: { fetch } }), context);
+    assert.equal(failed.status, 502);
+    assert.equal(await failed.text(), '{"error":"control plane request failed"}');
+    assert.equal(failed.headers.get("location"), null);
+  }
+  assert.deepEqual([ambientCalls, assetCalls, bindingCalls], [0, 0, 3]);
+});

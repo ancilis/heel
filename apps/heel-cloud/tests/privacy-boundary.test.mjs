@@ -109,6 +109,19 @@ function containsSensitiveInput(node) {
 }
 
 
+// Exact runtime configuration guards that must precede every private control-plane request.
+const controlPlaneBindingGuard = `if (
+    env.CONTROL_PLANE === undefined
+    || env.CONTROL_PLANE === null
+    || typeof env.CONTROL_PLANE.fetch !== "function"
+  ) {
+    return proxyError(503, "control plane unavailable", csp);
+  }`;
+const controlPlaneSecretGuard = `if (typeof env.CONTROL_PLANE_EDGE_SECRET !== "string") {
+    return proxyError(503, "control plane unavailable", csp);
+  }`;
+
+
 function analyzeSource(fileName, text) {
   const parsed = ts.createSourceFile(
     fileName,
@@ -244,11 +257,29 @@ function analyzeSource(fileName, text) {
         && ts.isVariableDeclaration(capture.parent)
         && isReviewedBootstrapDeclaration(capture.parent);
     }
+    if (reviewedControlPlaneCapabilityCheck(node)) return true;
     return serverWorker && ts.isCallExpression(node.parent) && node.parent.expression === node
       && (
         ["env.ASSETS.fetch", "handler.fetch"].includes(expression)
         || reviewedControlPlaneFetchCall(node.parent)
       );
+  }
+
+  // `typeof` inspects the binding capability without calling or capturing it; only the one
+  // reviewed guard at the start of the proxy may do so.
+  function reviewedControlPlaneCapabilityCheck(node) {
+    if (
+      !serverWorker
+      || node.getText(parsed) !== "env.CONTROL_PLANE.fetch"
+      || !ts.isTypeOfExpression(node.parent)
+      || enclosingFunctionName(node) !== "proxyControlPlane"
+    ) return false;
+    const guard = enclosingFunctionDeclaration(node)?.body?.statements[0];
+    return guard !== undefined
+      && ts.isIfStatement(guard)
+      && guard.getText(parsed) === controlPlaneBindingGuard
+      && node.getStart(parsed) >= guard.expression.getStart(parsed)
+      && node.getEnd() <= guard.expression.getEnd();
   }
 
   function allowedFetchCall(node) {
@@ -468,6 +499,217 @@ function analyzeSource(fileName, text) {
         report(reference, "control-plane destination escapes the reviewed proxy");
       }
     }
+    validateControlPlaneSinkDataflow(fetchCall);
+    validateControlPlaneConfigurationGuards();
+  }
+
+  function isWriteTarget(node) {
+    let current = node;
+    let parent = node.parent;
+    while (
+      parent
+      && (
+        ts.isParenthesizedExpression(parent) || ts.isArrayLiteralExpression(parent)
+        || ts.isObjectLiteralExpression(parent) || ts.isSpreadElement(parent)
+        || ts.isSpreadAssignment(parent) || ts.isShorthandPropertyAssignment(parent)
+        || (ts.isPropertyAssignment(parent) && parent.initializer === current)
+      )
+    ) {
+      current = parent;
+      parent = parent.parent;
+    }
+    if (!parent) return false;
+    if (
+      ts.isBinaryExpression(parent)
+      && parent.left === current
+      && parent.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+      && parent.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+    ) return true;
+    if (
+      (ts.isPrefixUnaryExpression(parent) || ts.isPostfixUnaryExpression(parent))
+      && [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(parent.operator)
+    ) return true;
+    return ts.isDeleteExpression(parent)
+      || ((ts.isForOfStatement(parent) || ts.isForInStatement(parent)) && parent.initializer === current);
+  }
+
+  function isBindingDeclarationName(node) {
+    const parent = node.parent;
+    return (
+      ts.isVariableDeclaration(parent) || ts.isParameter(parent) || ts.isBindingElement(parent)
+      || ts.isFunctionDeclaration(parent) || ts.isClassDeclaration(parent) || ts.isImportSpecifier(parent)
+      || ts.isImportClause(parent) || ts.isNamespaceImport(parent)
+    ) && parent.name === node;
+  }
+
+  // A const declaration does not freeze the URL or options object it names. Every reference to a
+  // value that reaches the private fetch must be one reviewed construction, framing or sink use, so
+  // member writes, aliases, call escapes and option overrides are refused wherever they occur.
+  function validateControlPlaneSinkDataflow(fetchCall) {
+    const proxy = parsed.statements.find((statement) => (
+      ts.isFunctionDeclaration(statement) && statement.name?.text === "proxyControlPlane"
+    ));
+    const body = proxy?.body?.statements ?? [];
+    const sinkRequest = fetchCall?.arguments[0];
+    const sinkUrl = sinkRequest?.arguments?.[0];
+    const sinkInit = sinkRequest?.arguments?.[1];
+    const declarations = { upstreamUrl: [], init: [], requestContract: [] };
+    const references = { upstreamUrl: [], init: [], requestContract: [] };
+    const routePathWrites = [];
+    function visit(node) {
+      if (ts.isIdentifier(node) && Object.hasOwn(references, node.text)) {
+        if (isBindingDeclarationName(node)) declarations[node.text].push(node.parent);
+        else if (isRuntimeIdentifierReference(node)) references[node.text].push(node);
+      }
+      if (
+        ts.isIdentifier(node)
+        && node.text === "upstreamPath"
+        && proxy !== undefined
+        && node.getStart(parsed) >= proxy.getStart(parsed)
+        && node.getEnd() <= proxy.getEnd()
+        && node !== proxy.parameters[3]?.name
+        && (isBindingDeclarationName(node) || (isRuntimeIdentifierReference(node) && isWriteTarget(node)))
+      ) routePathWrites.push(node);
+      ts.forEachChild(node, visit);
+    }
+    visit(parsed);
+    const inProxyBeforeSink = (node) => proxy !== undefined
+      && fetchCall !== null
+      && enclosingFunctionDeclaration(node) === proxy
+      && node.getEnd() <= fetchCall.getStart(parsed);
+    const topLevelDeclaration = (name, flag) => {
+      const declaration = declarations[name][0];
+      return declarations[name].length === 1
+        && ts.isVariableDeclaration(declaration)
+        && ts.isVariableDeclarationList(declaration.parent)
+        && (declaration.parent.flags & flag) !== 0
+        && body.includes(declaration.parent.parent);
+    };
+    function reviewedStatementWrite(reference, texts) {
+      const member = reference.parent;
+      const assignment = member?.parent;
+      return ts.isPropertyAccessExpression(member)
+        && member.expression === reference
+        && ts.isBinaryExpression(assignment)
+        && assignment.left === member
+        && assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        && ts.isExpressionStatement(assignment.parent)
+        && texts.delete(assignment.parent.getText(parsed))
+        && inProxyBeforeSink(reference);
+    }
+
+    const destinationEscapes = references.upstreamUrl.filter((reference) => reference !== sinkUrl);
+    if (
+      !topLevelDeclaration("upstreamUrl", ts.NodeFlags.Const)
+      || references.upstreamUrl.length !== 1
+      || destinationEscapes.length !== 0
+    ) {
+      report(
+        destinationEscapes[0] ?? parsed,
+        "control-plane destination URL is mutated, aliased or escapes before the private fetch",
+      );
+    }
+
+    const initDeclaration = declarations.init[0];
+    const literal = initDeclaration?.initializer;
+    const reviewedLiteral = topLevelDeclaration("init", ts.NodeFlags.Const)
+      && initDeclaration.type?.getText(parsed) === 'RequestInit & { duplex?: "half" }'
+      && literal !== undefined
+      && ts.isObjectLiteralExpression(literal)
+      && literal.properties.length === 3
+      && ["headers: requestContract.headers", "method: request.method", 'redirect: "manual"'].every(
+        (expected, index) => ts.isPropertyAssignment(literal.properties[index])
+          && literal.properties[index].getText(parsed) === expected,
+      );
+    const reviewedInitWrites = new Set([
+      `init.body = requestContract.contentLength === 0
+        ? new Uint8Array()
+        : request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength));`,
+      'init.duplex = "half";',
+    ]);
+    const optionEscapes = references.init.filter((reference) => (
+      reference !== sinkInit && !reviewedStatementWrite(reference, reviewedInitWrites)
+    ));
+    if (!reviewedLiteral || references.init.length !== 3 || optionEscapes.length !== 0) {
+      report(
+        optionEscapes[0] ?? parsed,
+        "control-plane request options are overridden, aliased or escape before the private fetch",
+      );
+    }
+
+    const reviewedContractAssignment = new Set([`requestContract = controlPlaneRequestHeaders(
+      request.headers,
+      request.method,
+      upstreamPath,
+      controlPlaneOrigin,
+      edgeClientKey,
+      edgeAuthSecret,
+    );`]);
+    const headersValue = reviewedLiteral ? literal.properties[0].initializer : null;
+    const contractEscapes = references.requestContract.filter((reference) => {
+      const parent = reference.parent;
+      if (ts.isBinaryExpression(parent) && parent.left === reference) {
+        return !(
+          parent.operatorToken.kind === ts.SyntaxKind.EqualsToken
+          && ts.isExpressionStatement(parent.parent)
+          && reviewedContractAssignment.delete(parent.parent.getText(parsed))
+          && inProxyBeforeSink(reference)
+        );
+      }
+      if (parent === headersValue) return false;
+      return !(
+        ts.isPropertyAccessExpression(parent)
+        && parent.expression === reference
+        && parent.name.text === "contentLength"
+        && !isWriteTarget(parent)
+        && inProxyBeforeSink(reference)
+      );
+    });
+    const contractDeclaration = declarations.requestContract[0];
+    if (
+      !topLevelDeclaration("requestContract", ts.NodeFlags.Let)
+      || contractDeclaration.initializer !== undefined
+      || reviewedContractAssignment.size !== 0
+      || headersValue === null
+      || contractEscapes.length !== 0
+    ) {
+      report(
+        contractEscapes[0] ?? parsed,
+        "control-plane request contract is overridden, aliased or escapes before the private fetch",
+      );
+    }
+
+    for (const write of routePathWrites) {
+      report(write, "control-plane route path is reassigned before the private fetch");
+    }
+  }
+
+  // Malformed runtime configuration is unavailable (fixed 503), never an attempted private request.
+  function validateControlPlaneConfigurationGuards() {
+    const proxy = parsed.statements.find((statement) => (
+      ts.isFunctionDeclaration(statement) && statement.name?.text === "proxyControlPlane"
+    ));
+    const body = proxy?.body?.statements ?? [];
+    if (body.length === 0 || body[0].getText(parsed) !== controlPlaneBindingGuard) {
+      report(proxy ?? parsed, "control-plane binding capability is not validated before use");
+    }
+    let secretReads = 0;
+    function visit(node) {
+      if (ts.isPropertyAccessExpression(node) && node.name.text === "CONTROL_PLANE_EDGE_SECRET") secretReads += 1;
+      if (ts.isElementAccessExpression(node) && resolvedMemberNames(node).has("CONTROL_PLANE_EDGE_SECRET")) {
+        secretReads += 1;
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(parsed);
+    const secretIndex = body.findIndex((statement) => (
+      statement.getText(parsed) === "const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET.trim();"
+    ));
+    if (
+      secretIndex < 1
+      || body[secretIndex - 1].getText(parsed) !== controlPlaneSecretGuard
+      || secretReads !== 2
+    ) report(proxy ?? parsed, "control-plane edge secret type is not validated before use");
   }
 
   function isReviewedBootstrapDeclaration(declaration) {
@@ -2536,6 +2778,116 @@ test("the edge keeps canary human and runner-result authorities on exact route a
   ]) assert.equal(worker.split(fragment).length - 1, 1, `missing exact ${fragment}`);
 
   assert.doesNotMatch(worker, /startsWith\("\/v1\/.*(?:runs|jobs|targets)/);
+});
+
+
+test("the privacy analyzer tracks the private request URL, options and configuration guards to the sink", async () => {
+  const worker = await source("worker/index.ts");
+  const analyze = (text) => analyzeSource(join(appRootPath, "worker/index.ts"), text);
+  assert.deepEqual(analyze(worker), []);
+  const url = "  const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);";
+  const sink = "    const response = await env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init));";
+  const contract = "  const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);\n  const init:";
+  const secret = "  const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET.trim();";
+  const mutate = (anchor, replacement) => {
+    assert.equal(worker.split(anchor).length, 2, `mutation anchor is not unique: ${anchor}`);
+    return worker.replace(anchor, replacement);
+  };
+  const afterUrl = (statement) => mutate(url, `${url}\n  ${statement}`);
+  const beforeSink = (statement) => mutate(sink, `    ${statement}\n${sink}`);
+  const destination = "destination URL is mutated, aliased or escapes";
+  const options = "request options are overridden, aliased or escape";
+  const mutations = [
+    ["caller URL host", afterUrl("upstreamUrl.hostname = new URL(request.url).hostname;"), destination],
+    ["caller Host header", afterUrl('upstreamUrl.host = request.headers.get("Host") ?? "attacker.invalid";'), destination],
+    ["caller query", afterUrl("upstreamUrl.search = new URL(request.url).search;"), destination],
+    ["fixed path", afterUrl('upstreamUrl.pathname = "/v1/admin";'), destination],
+    ["whole href", afterUrl("upstreamUrl.href = request.url;"), destination],
+    ["computed member", afterUrl('upstreamUrl["host"] = "attacker.invalid";'), destination],
+    ["query parameters", afterUrl('upstreamUrl.searchParams.set("destination", "attacker.invalid");'), destination],
+    ["port", afterUrl('upstreamUrl.port = "8443";'), destination],
+    ["Object.assign escape", afterUrl('Object.assign(upstreamUrl, { host: "attacker.invalid" });'), destination],
+    ["call escape", afterUrl("retargetControlPlane(upstreamUrl, request);"), destination],
+    ["alias", afterUrl('const destination = upstreamUrl;\n  destination.host = "attacker.invalid";'), destination],
+    ["destructuring alias", afterUrl("const [destination] = [upstreamUrl];"), destination],
+    ["closure escape", afterUrl('const retarget = () => { upstreamUrl.host = "attacker.invalid"; };'), destination],
+    ["route path reassignment", mutate(url, `  upstreamPath = "/v1/admin";\n${url}`), "route path is reassigned"],
+    ["redirect override", beforeSink('init.redirect = "follow";'), options],
+    ["header override", beforeSink("init.headers = request.headers;"), options],
+    ["framing override", beforeSink("init.body = request.body;"), options],
+    ["method override", beforeSink('init.method = "DELETE";'), options],
+    ["computed option", beforeSink('init["redirect"] = "follow";'), options],
+    ["deleted option", beforeSink("delete init.redirect;"), options],
+    ["Object.assign options", beforeSink('Object.assign(init, { redirect: "follow" });'), options],
+    ["options alias", beforeSink('const options = init;\n    options.redirect = "follow";'), options],
+    ["duplicate literal option", mutate('    redirect: "manual",\n', '    redirect: "manual",\n    redirect: "follow",\n'), options],
+    ["spread literal option", mutate('    redirect: "manual",\n', '    redirect: "manual",\n    ...request,\n'), options],
+    [
+      "header object mutation",
+      mutate(contract, '  requestContract.headers.set("Host", "attacker.invalid");\n' + contract),
+      "request contract is overridden, aliased or escapes",
+    ],
+    [
+      "request contract replacement",
+      mutate(contract, "  requestContract = { headers: request.headers, contentLength: 0 };\n" + contract),
+      "request contract is overridden, aliased or escapes",
+    ],
+    [
+      "binding presence only",
+      mutate(
+        "    env.CONTROL_PLANE === undefined\n    || env.CONTROL_PLANE === null\n    || typeof env.CONTROL_PLANE.fetch !== \"function\"\n",
+        "    env.CONTROL_PLANE === undefined\n",
+      ),
+      "binding capability is not validated",
+    ],
+    [
+      "binding null accepted",
+      mutate("    || env.CONTROL_PLANE === null\n", ""),
+      "binding capability is not validated",
+    ],
+    [
+      "binding callability unchecked",
+      mutate('    || typeof env.CONTROL_PLANE.fetch !== "function"\n', ""),
+      "binding capability is not validated",
+    ],
+    [
+      "capability guard moved",
+      mutate("  return proxyError(503, \"control plane unavailable\", csp);\n  }\n  // The private", "  return proxyError(503, \"control plane unavailable\", csp);\n  }\n  const moved = typeof env.CONTROL_PLANE.fetch;\n  // The private"),
+      "network sink capability reference fetch",
+    ],
+    [
+      "secret type unchecked",
+      mutate(`  ${controlPlaneSecretGuard}\n${secret}`, '  const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET?.trim() ?? "";'),
+      "edge secret type is not validated",
+    ],
+    [
+      "secret type weakened",
+      mutate('typeof env.CONTROL_PLANE_EDGE_SECRET !== "string"', 'env.CONTROL_PLANE_EDGE_SECRET === undefined'),
+      "edge secret type is not validated",
+    ],
+    [
+      "secret read elsewhere",
+      mutate(secret, `${secret}\n  const rawSecret = env.CONTROL_PLANE_EDGE_SECRET;`),
+      "edge secret type is not validated",
+    ],
+  ];
+  assert.equal(new Set(mutations.map(([label]) => label)).size, mutations.length);
+  for (const [label, mutated, violation] of mutations) {
+    assert.notEqual(mutated, worker, `${label} mutation did not apply`);
+    const violations = analyze(mutated);
+    assert.ok(violations.some((found) => found.includes(violation)), `${label}: ${violations.join("\n")}`);
+  }
+
+  // Positive controls: source changes that leave the sink values untouched stay accepted, so a
+  // blanket refusal of any changed proxy cannot satisfy the mutations above.
+  for (const [label, unchanged] of [
+    ["comment", afterUrl("// The destination is now final.")],
+    ["unrelated local", afterUrl('const unrelatedLabel = "control-plane";')],
+    ["declared length read", mutate(sink, `    const declaredLength = requestContract.contentLength;\n${sink}`)],
+  ]) {
+    assert.notEqual(unchanged, worker, `${label} control did not apply`);
+    assert.deepEqual(analyze(unchanged), [], label);
+  }
 });
 
 
