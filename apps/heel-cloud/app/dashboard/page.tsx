@@ -271,24 +271,22 @@ export default function Dashboard() {
     void connect(selectionFromParams(new URLSearchParams(searchQuery)));
   }, [connect, resetProjectState, searchQuery]);
 
-  const refreshEnvironments = useCallback(async (): Promise<void> => {
-    if (connection.phase !== "ready") return;
-    const { context } = connection;
-    const ticket = generation.current;
+  // A follow-up refresh runs for the action that requested it: the caller passes the context and generation it
+  // captured when the action began. Reading the live generation here would let an old context adopt a newer one.
+  const refreshEnvironments = useCallback(async (context: Context, ticket: number): Promise<void> => {
+    if (ticket !== generation.current) return;
     const environments = await canaryApi.listEnvironments(context.workspaceRef, context.project.projectRef);
     if (ticket !== generation.current) return;
     setConnection({ phase: "ready", context: { ...context, environments } });
-  }, [connection]);
+  }, []);
 
-  const refreshContextBindings = useCallback(async (): Promise<void> => {
-    if (connection.phase !== "ready") return;
-    const { context } = connection;
-    const ticket = generation.current;
+  const refreshContextBindings = useCallback(async (context: Context, ticket: number): Promise<void> => {
+    if (ticket !== generation.current) return;
     const contextBindings = await canaryApi.listRunnerContextBindings(context.workspaceRef, context.project.projectRef);
     if (ticket !== generation.current) return;
     setConnection({ phase: "ready", context: { ...context, contextBindings } });
     setSelectedRunner((current) => contextBindings.runners.some((runner) => runner.runnerId === current) ? current : "");
-  }, [connection]);
+  }, []);
 
   useEffect(() => {
     if (connection.phase !== "ready" || pendingApproval !== null || working) return;
@@ -461,17 +459,18 @@ export default function Dashboard() {
 
   async function createContextBinding(): Promise<void> {
     if (connection.phase !== "ready") return;
-    const environment = connection.context.environments.find((item) => item.environmentId === selectedBindingEnvironment);
-    const runner = connection.context.contextBindings.runners.find((item) => item.runnerId === selectedRunner);
+    const { context } = connection;
+    const environment = context.environments.find((item) => item.environmentId === selectedBindingEnvironment);
+    const runner = context.contextBindings.runners.find((item) => item.runnerId === selectedRunner);
     if (!environment?.isExecutable || environment.verificationRecordDigest === null || runner === undefined) return;
     const ticket = generation.current;
     const operation = beginWork(); setNotice(null);
     try {
-      await canaryApi.createRunnerContextBinding(connection.context.workspaceRef, connection.context.project.projectRef, {
+      await canaryApi.createRunnerContextBinding(context.workspaceRef, context.project.projectRef, {
         environmentId: environment.environmentId, verificationRecordDigest: environment.verificationRecordDigest,
         runnerId: runner.runnerId, runnerKeyId: runner.runnerKeyId,
       });
-      await refreshContextBindings();
+      await refreshContextBindings(context, ticket);
       if (ticket !== generation.current) return;
       setNotice("Canary access was authorized for this exact paired runner and verified environment.");
     } catch (error) { recover(error, ticket); } finally { endWork(operation); }
@@ -479,11 +478,12 @@ export default function Dashboard() {
 
   async function revokeContextBinding(bindingId: string): Promise<void> {
     if (connection.phase !== "ready") return;
+    const { context } = connection;
     const ticket = generation.current;
     const operation = beginWork(); setNotice(null);
     try {
-      await canaryApi.revokeRunnerContextBinding(connection.context.workspaceRef, connection.context.project.projectRef, bindingId);
-      await refreshContextBindings();
+      await canaryApi.revokeRunnerContextBinding(context.workspaceRef, context.project.projectRef, bindingId);
+      await refreshContextBindings(context, ticket);
       if (ticket !== generation.current) return;
       setNotice("Canary access was revoked. Issued grants and active work were not changed.");
     } catch (error) { recover(error, ticket); } finally { endWork(operation); }
@@ -510,13 +510,14 @@ export default function Dashboard() {
 
   async function checkProof(): Promise<void> {
     if (connection.phase !== "ready" || proofChallenge === null) return;
+    const { context } = connection;
     const ticket = generation.current;
     const operation = beginWork(); setNotice(null);
     try {
-      const verified = await canaryApi.checkEnvironmentProof(connection.context.workspaceRef, connection.context.project.projectRef, proofChallenge.environmentId);
+      const verified = await canaryApi.checkEnvironmentProof(context.workspaceRef, context.project.projectRef, proofChallenge.environmentId);
       if (ticket !== generation.current) return;
       setNotice(verified ? "Staging ownership verified. Pair the local runner next." : "Proof did not match yet. No product route was contacted.");
-      await refreshEnvironments();
+      await refreshEnvironments(context, ticket);
       if (ticket !== generation.current) return;
       if (verified) setProofChallenge(null);
     } catch (error) { recover(error, ticket); } finally { endWork(operation); }
