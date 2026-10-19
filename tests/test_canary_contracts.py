@@ -447,3 +447,300 @@ class CanaryContractTests(unittest.TestCase):
                 with self.assertRaises(ContractError): validator(_digest(record, digest))
         record = approval(); record["signing_key_id"] = "other"
         with self.assertRaises(ContractError): validate_approval_projection(_digest(record, "projection_digest"))
+
+
+# --- C2: discovery authorization, v2 plan object, inventory provenance (contract §2) ---
+
+import pytest
+
+from heel.canary_contracts import (
+    APPROVAL_PROJECTION_V2_SCHEMA,
+    DISCOVERY_ACKNOWLEDGEMENT,
+    DISCOVERY_AUTHORIZATION_SCHEMA,
+    DISCOVERY_ROUND_REPORT_SCHEMA,
+    DISCOVERY_SEED_DIGEST,
+    DISCOVERY_SEED_PATHS,
+    PLAN_REQUEST_SCHEMA,
+    RUNNER_PLAN_REQUEST_CLAIM_SCHEMA,
+    discovery_frontier_digest,
+    validate_discovery_authorization_request,
+    validate_discovery_round_report,
+    validate_plan_request,
+    validate_route_inventory_rows,
+    validate_runner_plan_request_claim,
+)
+
+
+def _v2(plan: dict, actions: list[dict] | None = None, *, maximum_requests: int | None = None) -> dict:
+    record = approval()
+    record["schema_version"] = APPROVAL_PROJECTION_V2_SCHEMA
+    if actions is not None:
+        record["actions"] = actions
+    record["budgets"]["maximum_requests"] = maximum_requests or len(record["actions"])
+    record["plan"] = plan
+    return _digest(record, "projection_digest")
+
+
+def _actions(routes: list[tuple[str, str]]) -> list[dict]:
+    return [{"ordinal": index, "scenario_id": "s", "adapter_version": "1", "method": method,
+             "route_template": route, "semantic_auth_role": "anonymous",
+             "assertion_class": "anonymous_authenticated", "allowed_status_codes": [200],
+             "allowed_body_shapes": ["absent"], "side_effect_class": "read_only"}
+            for index, (method, route) in enumerate(routes)]
+
+
+def _round1_plan(**overrides) -> dict:
+    plan = {
+        "plan_kind": "discovery", "authorization_id": "dau_" + "1" * 32,
+        "authorization_digest": HASH, "round": 1, "frontier_digest": DISCOVERY_SEED_DIGEST,
+        "cumulative_requests_before": 0, "transport_profile": "discovery", "action_count": 12,
+        "sources": [{"ordinal": index, "round": 0, "source_ordinal": index} for index in range(12)],
+    }
+    plan.update(overrides)
+    return plan
+
+
+def _seed_actions() -> list[dict]:
+    return _actions([("GET", path) for path in DISCOVERY_SEED_PATHS])
+
+
+def test_discovery_plan_variant_is_closed_get_head_only_and_round1_matches_seed_digest():
+    assert len(DISCOVERY_SEED_PATHS) == 12 and len(set(DISCOVERY_SEED_PATHS)) == 12
+    assert DISCOVERY_SEED_DIGEST == canonical_digest(list(DISCOVERY_SEED_PATHS))
+    accepted = _v2(_round1_plan(), _seed_actions())
+    assert validate_approval_projection(accepted) == accepted
+    # Seed order is irrelevant; the frozen seed set is what the digest binds.
+    shuffled = list(reversed(DISCOVERY_SEED_PATHS))
+    reordered = _round1_plan(sources=[
+        {"ordinal": index, "round": 0, "source_ordinal": DISCOVERY_SEED_PATHS.index(path)}
+        for index, path in enumerate(shuffled)
+    ])
+    validate_approval_projection(_v2(reordered, _actions([("GET", path) for path in shuffled])))
+
+    rejected = {
+        "unknown plan key": (_round1_plan(extra=1), _seed_actions()),
+        "unknown plan kind": (_round1_plan(plan_kind="crawl"), _seed_actions()),
+        "post action": (_round1_plan(), _actions([("POST", DISCOVERY_SEED_PATHS[0])] + [("GET", p) for p in DISCOVERY_SEED_PATHS[1:]])),
+        "non-seed round 1 path": (_round1_plan(), _actions([("GET", "/admin")] + [("GET", p) for p in DISCOVERY_SEED_PATHS[1:]])),
+        "round 1 frontier digest": (_round1_plan(frontier_digest="b" * 64), _seed_actions()),
+        "action count mismatch": (_round1_plan(action_count=11), _seed_actions()),
+        "round above bound": (_round1_plan(round=6), _seed_actions()),
+        "cumulative above bound": (_round1_plan(cumulative_requests_before=100), _seed_actions()),
+        "transport profile": (_round1_plan(transport_profile="scan"), _seed_actions()),
+        "source names a later round": (_round1_plan(sources=[{"ordinal": i, "round": 1, "source_ordinal": i} for i in range(12)]), _seed_actions()),
+        "source ordinal mismatched": (_round1_plan(sources=[{"ordinal": i, "round": 0, "source_ordinal": (i + 1) % 12} for i in range(12)]), _seed_actions()),
+        "forbidden key in plan": (_round1_plan(token="x"), _seed_actions()),
+    }
+    for name, (plan, actions) in rejected.items():
+        with pytest.raises(ContractError):
+            validate_approval_projection(_v2(plan, actions))
+        assert name
+    # 21 actions is a contract failure on every variant.
+    later = {"plan_kind": "discovery", "authorization_id": "dau_" + "1" * 32, "authorization_digest": HASH,
+             "round": 2, "frontier_digest": HASH, "cumulative_requests_before": 12,
+             "transport_profile": "discovery", "action_count": 21,
+             "sources": [{"ordinal": i, "round": 1, "source_ordinal": 0} for i in range(21)]}
+    with pytest.raises(ContractError):
+        validate_approval_projection(_v2(later, _actions([("GET", f"/r{i}") for i in range(21)]), maximum_requests=20))
+    # maximum_requests is the round's action count, never larger.
+    later.update(action_count=2, sources=[{"ordinal": i, "round": 1, "source_ordinal": 0} for i in range(2)])
+    validate_approval_projection(_v2(later, _actions([("GET", "/a"), ("HEAD", "/b")])))
+    with pytest.raises(ContractError):
+        validate_approval_projection(_v2(later, _actions([("GET", "/a"), ("HEAD", "/b")]), maximum_requests=3))
+    # v1 cannot carry a plan and v2 cannot omit one.
+    v1_with_plan = approval(); v1_with_plan["plan"] = _round1_plan()
+    with pytest.raises(ContractError):
+        validate_approval_projection(_digest(v1_with_plan, "projection_digest"))
+    v2_without_plan = approval(); v2_without_plan["schema_version"] = APPROVAL_PROJECTION_V2_SCHEMA
+    with pytest.raises(ContractError):
+        validate_approval_projection(_digest(v2_without_plan, "projection_digest"))
+
+
+def test_discovery_frontier_digest_is_over_the_referenced_recorded_entries_in_source_order():
+    first = {"round": 1, "candidate": {"method": "GET", "route_template": "/a", "provenance_kind": "html_link", "source_ordinal": 11, "status_code": 200}}
+    second = {"round": 2, "candidate": {"method": "HEAD", "route_template": "/b", "provenance_kind": "js_literal", "source_ordinal": 0, "status_code": 404}}
+    assert discovery_frontier_digest([first, second]) == canonical_digest([first, second])
+    assert discovery_frontier_digest([first, second]) != discovery_frontier_digest([second, first])
+    assert discovery_frontier_digest([first]) != discovery_frontier_digest([first, second])
+
+
+def _scan_plan(**overrides) -> dict:
+    plan = {"plan_kind": "plan_differential", "plan_request_id": "cpr_" + "2" * 32,
+            "plan_request_nonce": "n" * 43, "inventory_digest": HASH, "selection_digest": "b" * 64,
+            "selected_count": 1, "plan_labels": [{"role": "higher_plan", "plan_label": "Pro"},
+                                                  {"role": "lower_plan", "plan_label": "Free"}],
+            "max_ops": 2, "not_executed_count": 0, "not_executed_digest": "c" * 64}
+    plan.update(overrides)
+    return plan
+
+
+def test_scan_plan_variant_is_closed_and_labels_cannot_carry_handles_or_secrets():
+    validate_approval_projection(_v2(_scan_plan()))
+    for bad in (
+        {"extra": 1},
+        {"plan_kind": "regression_all"},
+        {"plan_labels": [{"role": "lower_plan", "plan_label": "Free"}]},
+        {"plan_labels": [{"role": "admin", "plan_label": "Free"}, {"role": "lower_plan", "plan_label": "Pro"}]},
+        {"plan_labels": [{"role": "higher_plan", "plan_label": "a" * 32}, {"role": "lower_plan", "plan_label": "Free"}]},
+        {"plan_labels": [{"role": "higher_plan", "plan_label": "0123456789abcdef0123456789abcdef"}, {"role": "lower_plan", "plan_label": "Free"}]},
+        {"plan_labels": [{"role": "higher_plan", "plan_label": "sk_live_abc"}, {"role": "lower_plan", "plan_label": "Free"}]},
+        {"selected_count": 11},
+        {"max_ops": 21},
+    ):
+        with pytest.raises(ContractError):
+            validate_approval_projection(_v2(_scan_plan(**bad)))
+
+
+ROW = {"method": "GET", "route_template": "/api/v1/orders/{p1}",
+       "provenance": [{"kind": "js_literal", "round": 2, "source_ordinal": 3, "status_code": 200}],
+       "first_seen_ms": 1, "state": "candidate"}
+
+VALUE_CANARIES = (
+    "/users/alice@example.com", "/reset?token=abc", "/t/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln",
+    "/objects/0123456789abcdef0123456789abcdef", "/Users/Alice", "/a/12345", "/k/sk_live_abc123",
+    "/api/v1/orders/{id}", "/x/{p2}", "/script.js", "/a/QmFzZTY0ZW5jb2RlZFNlY3JldA",
+)
+
+
+def test_inventory_rows_with_provenance_reject_urls_queries_bodies_and_forbidden_keys():
+    assert validate_route_inventory_rows([ROW]) == [ROW]
+    for canary in VALUE_CANARIES:
+        with pytest.raises(ContractError):
+            validate_route_inventory_rows([{**ROW, "route_template": canary}])
+    excluded = {**ROW, "state": "excluded", "excluded_reason": "side_effect_risk"}
+    assert validate_route_inventory_rows([excluded]) == [excluded]
+    for bad in (
+        {**ROW, "state": "excluded"},
+        {**ROW, "excluded_reason": "static_asset"},
+        {**ROW, "state": "deleted"},
+        {**ROW, "method": "POST"},
+        {**ROW, "provenance": [{**ROW["provenance"][0], "kind": "model_guess"}]},
+        {**ROW, "provenance": []},
+        {**ROW, "url": "https://canary.example.com/api"},
+        {**ROW, "query": "token=1"},
+        {**ROW, "body": "{}"},
+        {**ROW, "headers": {}},
+        {**ROW, "password": "p"},
+        {**ROW, "cookie": "c"},
+    ):
+        with pytest.raises(ContractError):
+            validate_route_inventory_rows([bad])
+    with pytest.raises(ContractError):
+        validate_route_inventory_rows([ROW, dict(ROW)])
+    with pytest.raises(ContractError):
+        validate_route_inventory_rows([{**ROW, "route_template": f"/r{i}"} for i in range(201)])
+    # Exactly the fixed seed paths keep their file-like segments verbatim.
+    for path in DISCOVERY_SEED_PATHS:
+        validate_route_inventory_rows([{**ROW, "route_template": path}])
+
+
+def _authorization_request(**overrides) -> dict:
+    value = {"schema_version": DISCOVERY_AUTHORIZATION_SCHEMA, "environment_id": "env_staging",
+             "identities_authorized": ["Admin user"], "login_exchange_authorized": False,
+             "acknowledgement": DISCOVERY_ACKNOWLEDGEMENT}
+    value.update(overrides)
+    return value
+
+
+def test_discovery_authorization_request_is_closed_and_login_exchange_is_refused_until_c5():
+    assert DISCOVERY_ACKNOWLEDGEMENT == "I authorize Heel to send up to 100 GET/HEAD requests to this origin"
+    accepted = validate_discovery_authorization_request(_authorization_request())
+    # The boolean is stored in its only C2-legal canonical form.
+    assert accepted["login_exchange_authorized"] == 0
+    validate_discovery_authorization_request(_authorization_request(identities_authorized=[]))
+    for bad in (
+        {"login_exchange_authorized": True},
+        {"login_exchange_authorized": 0},
+        {"acknowledgement": DISCOVERY_ACKNOWLEDGEMENT.lower()},
+        {"identities_authorized": ["a", "b", "c"]},
+        {"identities_authorized": ["x" * 33]},
+        {"identities_authorized": ["tab\there"]},
+        {"identities_authorized": ["same", "same"]},
+        {"password": "hunter2"},
+        {"url": "https://canary.example.com/login"},
+        {"schema_version": "heel.discovery-authorization.v2"},
+    ):
+        with pytest.raises(ContractError):
+            validate_discovery_authorization_request(_authorization_request(**bad))
+
+
+def _report(**overrides) -> dict:
+    value = {"schema_version": DISCOVERY_ROUND_REPORT_SCHEMA, "authorization_id": "dau_" + "1" * 32,
+             "round": 1, "run_id": "run", "grant_id": "g",
+             "candidates": [{"method": "GET", "route_template": "/api/v1/orders", "provenance_kind": "html_link",
+                             "source_ordinal": 11, "status_code": 200}],
+             "excluded_count": 2, "truncated_count": 0, "bytes_received": 1024,
+             "report_digest": HASH, "signing_key_id": "rk", "signature_b64": SIG}
+    value.update(overrides)
+    return _digest(value, "report_digest")
+
+
+def test_discovery_round_report_is_closed_signed_templates_only_and_bounded():
+    accepted = _report()
+    assert validate_discovery_round_report(accepted) == accepted
+    candidate = accepted["candidates"][0]
+    for bad in (
+        {"candidates": [{**candidate, "route_template": canary}] }
+        for canary in VALUE_CANARIES
+    ):
+        with pytest.raises(ContractError):
+            validate_discovery_round_report(_report(**bad))
+    for bad in (
+        {"candidates": [{**candidate, "method": "POST"}]},
+        {"candidates": [{**candidate, "source_ordinal": 20}]},
+        {"candidates": [{**candidate, "status_code": 600}]},
+        {"candidates": [{**candidate, "provenance_kind": "customer_url"}]},
+        {"candidates": [candidate, dict(candidate)]},
+        {"candidates": [{**candidate, "route_template": f"/r{i}"} for i in range(201)]},
+        {"round": 6},
+        {"body": "x"},
+        {"secret": "x"},
+    ):
+        with pytest.raises(ContractError):
+            validate_discovery_round_report(_report(**bad))
+    tampered = _report(); tampered["excluded_count"] = 3
+    with pytest.raises(ContractError):
+        validate_discovery_round_report(tampered)
+
+
+def test_runner_result_request_may_carry_exactly_one_discovery_round_report():
+    projection = operational()
+    projection["lifecycle_phase"] = "terminal"; projection["execution_disposition"] = "completed"
+    projection["timestamps"].update({"claimed_at_ms": 1, "started_at_ms": 1, "terminal_at_ms": 1})
+    projection = _digest(projection, "projection_digest")
+    request = {"schema_version": "heel.runner-result-request.v1", "run_id": "run",
+               "operational_projection": projection, "discovery_round_report": _report()}
+    assert validate_runner_result_request(request) == request
+    with pytest.raises(ContractError):
+        validate_runner_result_request({**request, "discovery_round_report": _report(run_id="other")})
+    with pytest.raises(ContractError):
+        validate_runner_result_request({**request, "discovery_round_report": _report(grant_id="other")})
+
+
+def test_plan_request_and_runner_claim_are_closed_selections_of_route_templates():
+    request = {"schema_version": PLAN_REQUEST_SCHEMA, "plan_kind": "plan_differential", "max_ops": 2,
+               "routes": [{"method": "GET", "route_template": "/api/v1/orders"}]}
+    assert validate_plan_request(request) == request
+    for bad in (
+        {"routes": []},
+        {"routes": [{"method": "GET", "route_template": f"/r{i}"} for i in range(11)]},
+        {"routes": [{"method": "DELETE", "route_template": "/r"}]},
+        {"routes": [{"method": "GET", "route_template": "/r"}, {"method": "GET", "route_template": "/r"}]},
+        {"routes": [{"method": "GET", "route_template": "/u/alice@example.com"}]},
+        {"max_ops": 21},
+        {"plan_kind": "discovery"},
+        {"query": "x"},
+    ):
+        with pytest.raises(ContractError):
+            validate_plan_request({**request, **bad})
+    claim = {"schema_version": RUNNER_PLAN_REQUEST_CLAIM_SCHEMA, "binding_id": "rcb_" + "a" * 32,
+             "binding_digest": HASH, "credential_roles": [{"role": "higher_plan", "plan_label": "Pro"},
+                                                         {"role": "lower_plan", "plan_label": "Free"}]}
+    assert validate_runner_plan_request_claim(claim) == claim
+    for bad in (
+        {"credential_roles": [{"role": "higher_plan", "plan_label": "Pro", "credential_handle_id": "a" * 32}]},
+        {"credential_roles": [{"role": "higher_plan", "plan_label": "0123456789abcdef0123456789abcdef"}]},
+        {"binding_id": "rcb_x"},
+    ):
+        with pytest.raises(ContractError):
+            validate_runner_plan_request_claim({**claim, **bad})
