@@ -521,20 +521,24 @@ def test_discovery_plan_variant_is_closed_get_head_only_and_round1_matches_seed_
         "unknown plan key": (_round1_plan(extra=1), _seed_actions()),
         "unknown plan kind": (_round1_plan(plan_kind="crawl"), _seed_actions()),
         "post action": (_round1_plan(), _actions([("POST", DISCOVERY_SEED_PATHS[0])] + [("GET", p) for p in DISCOVERY_SEED_PATHS[1:]])),
-        "non-seed round 1 path": (_round1_plan(), _actions([("GET", "/admin")] + [("GET", p) for p in DISCOVERY_SEED_PATHS[1:]])),
         "round 1 frontier digest": (_round1_plan(frontier_digest="b" * 64), _seed_actions()),
         "action count mismatch": (_round1_plan(action_count=11), _seed_actions()),
         "round above bound": (_round1_plan(round=6), _seed_actions()),
         "cumulative above bound": (_round1_plan(cumulative_requests_before=100), _seed_actions()),
         "transport profile": (_round1_plan(transport_profile="scan"), _seed_actions()),
         "source names a later round": (_round1_plan(sources=[{"ordinal": i, "round": 1, "source_ordinal": i} for i in range(12)]), _seed_actions()),
-        "source ordinal mismatched": (_round1_plan(sources=[{"ordinal": i, "round": 0, "source_ordinal": (i + 1) % 12} for i in range(12)]), _seed_actions()),
         "forbidden key in plan": (_round1_plan(token="x"), _seed_actions()),
     }
     for name, (plan, actions) in rejected.items():
         with pytest.raises(ContractError):
             validate_approval_projection(_v2(plan, actions))
         assert name
+    # Exact seed membership is the server's round check (``seed_mismatch``, contract §4 step 9),
+    # so a structurally valid round-1 plan naming another vocabulary path still parses here.
+    validate_approval_projection(_v2(_round1_plan(), _actions([("GET", "/admin")] + [("GET", p) for p in DISCOVERY_SEED_PATHS[1:]])))
+    with pytest.raises(ContractError):
+        validate_approval_projection(_v2(_round1_plan(action_count=1, sources=[{"ordinal": 0, "round": 0, "source_ordinal": 0}]),
+                                         _actions([("GET", DISCOVERY_SEED_PATHS[0])])))
     # 21 actions is a contract failure on every variant.
     later = {"plan_kind": "discovery", "authorization_id": "dau_" + "1" * 32, "authorization_digest": HASH,
              "round": 2, "frontier_digest": HASH, "cumulative_requests_before": 12,
@@ -744,3 +748,61 @@ def test_plan_request_and_runner_claim_are_closed_selections_of_route_templates(
     ):
         with pytest.raises(ContractError):
             validate_runner_plan_request_claim({**claim, **bad})
+
+
+# --- C2D D4: finite signed body profile; scan stays 256 KiB, discovery may reach 2 MiB ---
+
+from heel.canary_contracts import DISCOVERY_BODY_BYTES, EXECUTION_GRANT_V2_SCHEMA, SCAN_BODY_BYTES
+
+
+def test_discovery_profile_admits_two_mib_only_for_signed_discovery_plans_and_fails_closed_otherwise():
+    assert (SCAN_BODY_BYTES, DISCOVERY_BODY_BYTES) == (262144, 2097152)
+
+    def discovery(maximum: int, **plan):
+        record = _v2(_round1_plan(**plan), _seed_actions())
+        record = {k: v for k, v in record.items() if k not in {"projection_digest"}}
+        record["budgets"] = {**record["budgets"], "maximum_response_bytes": maximum}
+        return _digest(record, "projection_digest")
+
+    validate_approval_projection(discovery(DISCOVERY_BODY_BYTES))
+    with pytest.raises(ContractError):
+        validate_approval_projection(discovery(DISCOVERY_BODY_BYTES + 1))
+    for profile in ("scan", "discovery-2", "DISCOVERY"):
+        with pytest.raises(ContractError):
+            validate_approval_projection(discovery(1024, transport_profile=profile))
+    without_profile = _round1_plan(); without_profile.pop("transport_profile")
+    with pytest.raises(ContractError):
+        validate_approval_projection(_v2(without_profile, _seed_actions()))
+    scan = _v2(_scan_plan()); scan["budgets"]["maximum_response_bytes"] = SCAN_BODY_BYTES + 1
+    with pytest.raises(ContractError):
+        validate_approval_projection(_digest(scan, "projection_digest"))
+    v1 = approval(); v1["budgets"]["maximum_response_bytes"] = SCAN_BODY_BYTES + 1
+    with pytest.raises(ContractError):
+        validate_approval_projection(_digest(v1, "projection_digest"))
+
+
+def test_execution_grant_v2_budget_profile_is_finite_and_v1_grants_stay_256kib():
+    v1 = grant(); v1["budgets"]["maximum_response_bytes"] = DISCOVERY_BODY_BYTES
+    with pytest.raises(ContractError):
+        validate_execution_grant(_digest(v1, "grant_digest"))
+
+    def v2(maximum: int, **extra):
+        record = grant()
+        record["schema_version"] = EXECUTION_GRANT_V2_SCHEMA
+        record["budget_profile"] = "discovery"
+        record.update(extra)
+        record["budgets"]["maximum_response_bytes"] = maximum
+        return _digest(record, "grant_digest")
+
+    accepted = v2(DISCOVERY_BODY_BYTES)
+    assert validate_execution_grant(accepted) == accepted
+    with pytest.raises(ContractError):
+        validate_execution_grant(v2(DISCOVERY_BODY_BYTES + 1))
+    for profile in ("scan", "other"):
+        with pytest.raises(ContractError):
+            validate_execution_grant(v2(1024, budget_profile=profile))
+    missing = v2(1024); missing.pop("budget_profile")
+    with pytest.raises(ContractError):
+        validate_execution_grant(_digest(missing, "grant_digest"))
+    with pytest.raises(ContractError):
+        validate_execution_grant(_digest({**grant(), "budget_profile": "discovery"}, "grant_digest"))
