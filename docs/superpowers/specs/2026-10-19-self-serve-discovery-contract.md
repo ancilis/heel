@@ -133,6 +133,15 @@ could not change host, method, round count, action count or execution time, and 
 it sends is one-shot, signed-scope and containment-logged exactly as today. No test in this
 document claims response-content proof.
 
+**Source ordinal bound (C2R1 F1).** The generic schema range stays `source_ordinal: 0..19`, but a
+stored candidate's ordinal must name an action the originating round actually issued:
+`source_ordinal < discovery_rounds.actions` of that round (12 for round 1, up to 20 later, so 19
+stays valid on a 20-action round). A report with any candidate outside that range is refused
+`invalid_discovery_report` before report storage, inventory merge or round settlement (the whole
+result transaction rolls back; a corrected retry on the same chain is accepted). This validates
+recorded lineage only, never body contents, and does not assume an ordinal equals completion
+order: a partial or zero-request round may still report candidates for any issued ordinal.
+
 ## 3. Routes and authorization (all `/v1/workspaces/{ws}/projects/{prj}/…`)
 
 | Route | Actor | Checks | Response |
@@ -141,7 +150,7 @@ document claims response-content proof.
 | `GET …/environments/{env}/discovery-authorizations/{id}` | owner/admin/member, same-origin | project scope | 200 view |
 | `POST …/environments/{env}/discovery-authorizations/{id}/revoke` | owner/admin, recent-auth | state `open` | 200 view (`state: revoked`); any issued round's run receives cloud stop (existing path, ≤5 s) |
 | `GET …/environments/{env}/route-inventory` | member+, same-origin | — | rows with provenance/state, `truncated_count`, `inventory_digest` |
-| projection submit (`…/contexts/{rcb}/approval-projections`, existing PoP route) | paired runner key | §4 round check when `plan.plan_kind == "discovery"` | existing responses plus `round_state` |
+| projection submit (`…/contexts/{rcb}/approval-projections`, existing PoP route) | paired runner key | §4 round check when `plan.plan_kind == "discovery"` | existing responses plus `round_state` (including the round grant's current `grant_status`, §4 step 0) |
 
 No new runner-facing route is added in C2: the round grant is issued on the existing
 submit path and claimed on the existing claim path (CONFIRMED `http_api.py:850,978,1367-1444`).
@@ -165,20 +174,38 @@ A. **Authenticate and scope (unconditional, existing code paths).** The request 
 0. **Replay, only after A.** If a `discovery_rounds` row exists for `(authorization_id,
    plan.round)` **in this project**: same `projection_digest` and state ≠ `refused` → return that
    row's current state and, if `issued`, the same grant (idempotent replay, no counter change, no
-   further checks); different `projection_digest` → `round_consumed`. A grant is returned only to
+   further checks); different `projection_digest` → `round_consumed`. **C2R1 F3:** this fresh
+   (new-nonce) semantic replay first applies a due expiry close, then includes the grant only
+   while the grant row is `issued` and unexpired **and** the authorization is `open` and
+   unexpired; `round_state.grant_status` reports the grant's current status (`issued`, `claimed`,
+   `revoked`, `terminal`, or `expired` once its expiry passed), so a revoked or expired round is
+   replayed without usable grant data and never as resurrected authority. An **exact raw PoP
+   retry** of the original request is different: the durable receipt/cursor protocol answers it
+   byte-for-byte from history (which may contain the old grant bytes and `state: issued`), and is
+   unchanged; those historical bytes confer nothing, because claim, the live gate and the
+   authorization close are evaluated on current rows (claim returns 204, a claimed round is
+   stopped `cloud_stop`). A grant is returned only to
    the runner key named in it (`runner_binding.runner_key_id`, CONFIRMED grant schema); a
    different active runner of the **same** project presenting the same digest receives
    `round_consumed`, never the grant. Only when no row exists continue.
 1. (merged into A; kept as the reason code `authorization_unknown`)
 2. `state == open` → else `authorization_closed`
+2a. **C2R1 F2:** the recorded authorizer (`actor_user_id`) still holds a current `owner` or
+   `admin` membership of the workspace (owner→admin or admin→owner stays valid) → else
+   `authorization_closed`; the refusing transaction rolls back, and a separate transaction
+   re-derives the membership fact and closes the row `revoked`/`close_reason: revoked` with
+   `revoked_by: "membership:<actor_user_id>"` (a non-secret system marker; the original
+   `actor_user_id`, `actor_role` and `authorization_digest` stay immutable). Quota follows §5: a
+   zero-issued authorization is refunded, a consumed unit stays consumed. Logout or session expiry
+   is not membership loss.
 3. `now < expires_at_ms` → else `authorization_expired` (row → `expired`, refund rule §5)
 4. `plan.authorization_digest == authorization_digest` → else `authorization_digest_mismatch`
 5. `plan.round == rounds_issued + 1` → else `round_out_of_order`
 6. previous round (if any) `state == terminal` **and** its `discovery_round_reports` row exists → else `previous_round_active` / `previous_report_missing`
 7. `plan.cumulative_requests_before == actions_issued` → else `cumulative_mismatch`
 8. `actions_issued + action_count ≤ 100` and `round ≤ 5` and `execution_ms_used + 10 000 ≤ 120 000` → else `bound_exceeded` (row → `done`, `close_reason: budget`); the round's grant wall budget is `min(60 000, 120 000 − execution_ms_used)`
-9. round 1: `frontier_digest == seed_digest` and the action templates are exactly the 12 seeds → else `seed_mismatch`
-9a. **round > 1, recorded provenance (§4a):** every action's `(method, route_template)` with its `fixture_bindings`-free template and the projection's `source: {round, source_ordinal}` for that action must equal a candidate entry in a stored report of the same authorization with `report.round < plan.round`, and `plan.frontier_digest` must equal the canonical digest of exactly those referenced candidate entries as stored → else `candidate_not_recorded` (route never recorded), `source_ordinal_mismatch` (recorded candidate with a different source), or `frontier_digest_mismatch`
+9. round 1: `frontier_digest == seed_digest` and the action templates are exactly the 12 seeds, each `source.source_ordinal` bounds-checked against the 12-entry seed list before it is looked up (12..19 are schema-valid but name no seed) → else `seed_mismatch`
+9a. **round > 1, recorded provenance (§4a):** every action's `(method, route_template)` with its `fixture_bindings`-free template and the projection's `source: {round, source_ordinal}` for that action must equal a candidate entry in a stored report of the same authorization with `report.round < plan.round`, and `plan.frontier_digest` must equal the canonical digest of exactly those referenced candidate entries as stored → else `candidate_not_recorded` (route never recorded), `source_ordinal_mismatch` (recorded candidate with a different source, **or** a stored candidate whose ordinal is not below its recorded source round's `actions`, including a legacy or corrupted stored row, which is refused and never edited or re-signed; C2R1 F1), or `frontier_digest_mismatch`
 10. every action GET/HEAD on `egress.hostname == environment hostname` → else `action_out_of_scope`
 11. kill switch generation current → else `kill_switch`
 
@@ -252,7 +279,7 @@ the server bounds its size and provenance digest only.
 | `tests/test_canary_migrations.py::test_migration_32_adds_discovery_tables_and_inventory_columns_additively` | forward migration on the launch fixture DB; existing rows readable |
 | `tests/test_canary_http.py::test_discovery_authorization_requires_verified_environment_owner_admin_recent_auth_same_origin_and_idempotency_key` | §3 row 1 authz matrix (member 403, stale auth 403, cross-origin 403, missing key 400) |
 | `tests/test_canary_http.py::test_one_open_discovery_authorization_per_environment` | second create 409 `authorization_open` |
-| `tests/test_canary_http.py::test_discovery_round_projection_is_auto_issued_only_within_the_recorded_bound_and_refused_after_it` | rounds 1–5 issue; round 6 → `bound_exceeded`; 21 actions → contract failure; issued 95 + 10 → `bound_exceeded` with state `done`; a round whose runner reports 3 completed of 20 issued still consumes 20 |
+| `tests/test_canary_http.py::test_discovery_round_projection_is_auto_issued_only_within_the_recorded_bound_and_refused_after_it` | rounds 1–5 issue; after the fifth round issues the authorization closes `done`/`budget` at that round's settlement; a sixth-round projection fails contract validation (`round ∈ 1..5`, no sixth grant) and, once closed, any further submit is `authorization_closed` (or `round_consumed` for a replayed round number); `bound_exceeded` names only the valid-shape step-8 counter refusals; 21 actions → contract failure; issued 95 + 10 → `bound_exceeded` with state `done`; a round whose runner reports 3 completed of 20 issued still consumes 20 |
 | `tests/test_canary_http.py::test_discovery_global_execution_budget_is_server_measured_and_refuses_when_under_ten_seconds_remain` | execution_ms_used 115 000 → `bound_exceeded`; round grant wall budget equals `min(60 000, remaining)`; reaper-terminated round counts its full grant window |
 | `tests/test_canary_http.py::test_discovery_round_actions_must_be_recorded_candidates_of_an_earlier_round_of_the_same_authorization` | round 1 with a non-seed path → `seed_mismatch`; round 2 action never present in any stored report → `candidate_not_recorded`; recorded route with a forged `source_ordinal` → `source_ordinal_mismatch`; frontier digest over a different subset → `frontier_digest_mismatch`; another authorization's digest → `authorization_digest_mismatch`; off-host action → `action_out_of_scope`; round 2 before round 1's report exists → `previous_report_missing`. The test states that it proves the recorded relationship, not body content |
 | `tests/test_canary_http.py::test_discovery_round_submit_replays_identical_round_before_ordering_checks_and_refuses_a_different_projection_for_a_consumed_round` | identical re-submit by the same runner of an issued round returns the same grant with unchanged counters; different digest → `round_consumed`; neither path yields `round_out_of_order` |
@@ -340,5 +367,12 @@ implementation made, each authorized in `ASTRA-C2-deviation-decisions.md` or
   reads need **C3** (manifest v2 + discovery transport profile; C3's allowed files are expanded to
   `heel/canary_contracts.py` and `tests/test_canary_contracts.py`), **C4** (executor wiring) and
   **C7** (browser validators/views for v2 ids).
+- **C2R1 role-loss policy (F2) and its limits.** Live owner/admin membership of the recorded
+  authorizer is required before each **new** round issue only (§4 step 2a). An already-issued
+  grant is not stopped automatically by role loss: it keeps its bounded expiry (≤10 min, ≤ the
+  authorization TTL), the live gate, explicit revoke by any current owner/admin and the kill
+  switch. The demoted or removed actor can no longer revoke (they fail the existing
+  owner/admin check); a current different owner/admin can. A semantic replay of an already-issued
+  round is not a new issue and is governed by step 0, not 2a.
 - **Not built in C2:** inventory PUT/OpenAPI import, the §3.3 label-liveness report (labels in the
   runner plan-request claim are validated, not stored), the four §5.1 identity/evidence routes.

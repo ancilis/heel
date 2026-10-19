@@ -326,12 +326,15 @@ Rounds reuse the existing grant path with no new trust path:
    (templates and source ordinals only, no values; `heel.discovery-round-report.v1`, contract
    spec §2.6) and derives the next frontier **only from its own recorded reports**, naming the
    recording round and ordinal in `sources`. The server grants a later-round action only if that
-   recorded relationship holds (contract spec §4 step 9a). Bodies never reach the server, so the
+   recorded relationship holds (contract spec §4 step 9a), and a report's source ordinal must
+   name an action its round actually issued (contract spec §2.6). Bodies never reach the server, so the
    server proves the recorded relationship, not page content: a compromised executor could
    record a fabricated same-origin GET/HEAD candidate but could not widen host, method, round
    count, action count or execution time (trust boundary, contract spec §2.6).
 2. **Server auto-issue is bounded, not open-ended**: it issues a grant only if the authorization
-   is `open` and unexpired, `r == rounds_issued + 1`, the previous round's run is terminal,
+   is `open` and unexpired, its authorizer still holds owner/admin membership (otherwise it closes
+   `revoked`; an already-issued round keeps its bounded expiry, live gate and revoke, contract spec
+   §4 step 2a), `r == rounds_issued + 1`, the previous round's run is terminal,
    `cumulative_requests_before == actions_issued_so_far`, `actions_issued_so_far + actions ≤
    100`, `execution_ms_used + 10 000 ≤ 120 000`, every action is GET/HEAD (plus the one
    `login_exchange` for the authorization when authorized and not yet performed) on the verified
