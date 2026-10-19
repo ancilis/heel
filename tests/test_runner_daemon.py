@@ -2768,11 +2768,308 @@ def test_a_wrong_generation_in_the_completion_is_refused_then_the_chain_converge
         view = _runtime_view(home, harness, backend)
         assert view["pending"] == [("list-contexts", 0)] and view["tombstones"] == [] and view["generation"] == 0
         assert _server_claim_generation(harness, workspace_id, runner_id) == 1  # the server did advance
-        # The next check signs one fresh resync from the server's generation and converges.
+        # T2b2R2: the completed attempt is kept, so the next check retransmits the exact completion
+        # and the server answers it from its sealed record: no second challenge, no extra generation.
+        assert _runtime_view(home, harness, backend)["attempt"].complete_body is not None
         assert _daemon(home, harness, backend).status()["control_plane"]["state"] == "confirmed"
     view = _runtime_view(home, harness, backend)
+    assert view["generation"] == _server_claim_generation(harness, workspace_id, runner_id) == 1
+    assert view["tombstones"] == [("list-contexts", 0, 1)] and view["attempt"] is None
+    assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+
+
+# --------------------------------------------------------------- T2b2R2: kept attempts (finding 4.1)
+#
+# SEAM-MANGLE (labelled, test-only): the REAL server's 200 resync answer is shown to the runner with
+# one field removed; the server itself is unchanged and its challenge/completion rows are real.
+
+
+class _RouteLog(_FaultTransport):
+    """``_FaultTransport`` that also records every resync request it is asked to send, in order."""
+
+    def __init__(self, transport, faults, log, mangle=None):
+        super().__init__(transport, faults)
+        self._log, self._mangle = log, mangle or {}
+
+    def post(self, path, *, headers=None, body=b""):
+        route = path.rsplit("/", 2)
+        if route[-2] == "resync":
+            self._log.append((route[-1], dict(headers or {}), body))
+        status, response_headers, payload = super().post(path, headers=headers, body=body)
+        for suffix, (count, field) in self._mangle.items():
+            if path.endswith(suffix) and status == 200 and count[0] > 0:
+                count[0] -= 1
+                return status, response_headers, {k: v for k, v in payload.items() if k != field}
+        return status, response_headers, payload
+
+
+def _logged_daemon(home, harness, backend, log, *, faults=None, mangle=None, **options):
+    daemon = _daemon(home, harness, backend, **options)
+    real = RunnerDaemon._transport
+    daemon._transport = lambda origin: _RouteLog(real(daemon, origin), faults or {}, log, mangle)
+    return daemon
+
+
+def _wire(log, phase):
+    return [(headers, body) for name, headers, body in log if name == phase]
+
+
+@pytest.mark.parametrize("scenario", ["next_valid", "repeated", "after_proof_window", "after_challenge_expiry"])
+def test_a_malformed_resync_challenge_keeps_the_signed_start_for_an_exact_retransmission(tmp_path, harness, scenario):
+    workspace_id, cookie = harness.signup_owner(f"r2-challenge-{scenario.replace('_', '-')}@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r2-challenge")
+    log, mangles = [], [2 if scenario == "repeated" else 1]
+    with _seam_clock(65.0):  # SEAM-CLOCK: idle beyond the nonce TTL
+        first = _logged_daemon(home, harness, backend, log,
+                               mangle={"/resync/start": (mangles, "server_challenge_b64")}).status()
+        assert first["control_plane"] == {"state": "rejected", "reason": "response_rejected"}, first
+        assert _server_resyncs(harness, workspace_id, runner_id) == ["pending"]
+        kept = _runtime_view(home, harness, backend)["attempt"]
+        assert kept is not None and kept.challenge_id is None  # the valid signed start is kept
+        if scenario == "repeated":
+            # Restart (a new daemon and runtime handle); the same malformed body again: refused
+            # honestly as a response problem, the start kept, no fresh start, no new challenge.
+            again = _logged_daemon(home, harness, backend, log,
+                                   mangle={"/resync/start": (mangles, "server_challenge_b64")}).status()
+            assert again["control_plane"] == {"state": "rejected", "reason": "response_rejected"}, again
+            assert _server_resyncs(harness, workspace_id, runner_id) == ["pending"]
+            assert _runtime_view(home, harness, backend)["attempt"] == kept
+    shift = {"after_proof_window": 65.0 + 35.0, "after_challenge_expiry": 65.0 + 61.0}.get(scenario, 65.0)
+    with _seam_clock(shift):  # SEAM-CLOCK
+        # Restart between the answers: a new daemon and runtime handle; the key is active and the
+        # clock correct, so this must never be presented as an authentication rejection.
+        later = _logged_daemon(home, harness, backend, log).status()
+    assert (later["state"], later["control_plane"]["state"]) == ("active", "confirmed"), later
+    starts = _wire(log, "start")
+    assert all(item == starts[0] for item in starts[:-1])  # every retransmission is byte-identical
+    if scenario == "after_challenge_expiry":
+        # The server invalidated the expired challenge and refused the stale retransmission; exactly
+        # one fresh start (a different nonce and signature) then recovered.
+        assert _server_resyncs(harness, workspace_id, runner_id) == ["invalidated", "completed"]
+        assert starts[-1] != starts[0] and len(starts) == 3
+    else:
+        # Within the challenge lifetime (even after the 30 s proof window) the exact start is answered
+        # from the server's own record: one challenge, completed, no fresh start.
+        assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+        assert starts[-1] == starts[0] and len(starts) == (3 if scenario == "repeated" else 2)
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [] and view["attempt"] is None and view["tombstones"] == [("list-contexts", 0, 1)]
+    assert view["generation"] == _server_claim_generation(harness, workspace_id, runner_id) == 1
+
+
+@pytest.mark.parametrize("scenario", ["next_valid", "repeated", "after_completed_cache"])
+def test_a_malformed_resync_completion_keeps_the_attempt_and_the_exact_retransmission_converges(tmp_path, harness, scenario):
+    workspace_id, cookie = harness.signup_owner(f"r2-completion-{scenario.replace('_', '-')}@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r2-completion")
+    log, mangles = [], [2 if scenario == "repeated" else 1]
+    with _seam_clock(65.0):  # SEAM-CLOCK
+        first = _logged_daemon(home, harness, backend, log,
+                               mangle={"/resync/complete": (mangles, "next_nonce_b64")}).status()
+        assert first["control_plane"] == {"state": "rejected", "reason": "response_rejected"}, first
+        # The real server committed; nothing was installed locally and the exact completion is kept.
+        assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+        assert _server_claim_generation(harness, workspace_id, runner_id) == 1
+        view = _runtime_view(home, harness, backend)
+        assert view["generation"] == 0 and view["pending"] == [("list-contexts", 0)] and view["tombstones"] == []
+        assert view["attempt"].complete_body is not None
+        if scenario == "repeated":
+            again = _logged_daemon(home, harness, backend, log,
+                                   mangle={"/resync/complete": (mangles, "next_nonce_b64")}).status()
+            assert again["control_plane"] == {"state": "rejected", "reason": "response_rejected"}, again
+            assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+    # The server's completed cache answers an exact completion for 600 s.
+    shift = 65.0 + 601.0 if scenario == "after_completed_cache" else 65.0
+    with _seam_clock(shift):  # SEAM-CLOCK
+        later = _logged_daemon(home, harness, backend, log).status()
+    assert (later["state"], later["control_plane"]["state"]) == ("active", "confirmed"), later
+    completes = _wire(log, "complete")
+    view = _runtime_view(home, harness, backend)
+    if scenario == "after_completed_cache":
+        # Past the cache the exact completion is refused, the single re-sign of the same body is
+        # refused too (the server holds the original digest), the exact start probe is refused (no
+        # pending challenge matches it), then exactly one fresh start.
+        starts = _wire(log, "start")
+        assert _server_resyncs(harness, workspace_id, runner_id) == ["completed", "completed"]
+        assert len(starts) == 3 and starts[1] == starts[0] and starts[2] != starts[0]
+        assert len(completes) == 4 and completes[1] == completes[0]
+        assert completes[2][1] == completes[0][1] and completes[2][0] != completes[0][0]
+        assert view["tombstones"] == [("list-contexts", 0, 2)]
+    else:
+        assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+        assert len(_wire(log, "start")) == 1 and all(item == completes[0] for item in completes)
+        assert view["tombstones"] == [("list-contexts", 0, 1)]
+    assert view["pending"] == [] and view["attempt"] is None
+    assert view["generation"] == _server_claim_generation(harness, workspace_id, runner_id)
+
+
+@pytest.mark.parametrize("phase, fault, shift, expected", [
+    # Start lost after the server created its challenge; retry after the 30 s proof window.
+    ("start", "drop_after", 35.0, "retransmitted"),
+    # Start never reached the server; the stale retransmission is refused, one fresh start.
+    ("start", "drop_before", 35.0, "fresh_start"),
+    # Completion committed, answer lost; the exact completion is answered from the server's cache.
+    ("complete", "drop_after", 35.0, "retransmitted"),
+    # Completion never reached the server: the challenge is still pending and the stale proof is
+    # refused; the identical completion body is re-signed once and the server accepts it.
+    ("complete", "drop_before", 35.0, "resigned"),
+])
+def test_lost_resync_requests_and_answers_at_the_proof_window_boundary(tmp_path, harness, phase, fault, shift, expected):
+    workspace_id, cookie = harness.signup_owner(f"r2-boundary-{phase}-{fault.replace('_', '-')}@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r2-boundary")
+    log = []
+    with _seam_clock(65.0):  # SEAM-CLOCK
+        first = _logged_daemon(home, harness, backend, log, faults={f"/resync/{phase}": [fault]}).status()
+        assert first["state"] == "offline", first
+        assert _server_resyncs(harness, workspace_id, runner_id) == (
+            [] if (phase, fault) == ("start", "drop_before")
+            else ["completed"] if (phase, fault) == ("complete", "drop_after") else ["pending"]
+        )
+    with _seam_clock(65.0 + shift):  # SEAM-CLOCK: past the proof window, inside the challenge lifetime
+        later = _logged_daemon(home, harness, backend, log).status()
+    assert (later["state"], later["control_plane"]["state"]) == ("active", "confirmed"), later
+    starts, completes = _wire(log, "start"), _wire(log, "complete")
+    assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+    if expected == "fresh_start":
+        assert len(starts) == 3 and starts[1] == starts[0] and starts[2] != starts[0]
+    elif phase == "start":
+        assert len(starts) == 2 and starts[1] == starts[0]
+    else:
+        assert len(starts) == 1  # the challenge was recorded; only the completion is retransmitted
+    if expected == "resigned":
+        # The retransmission was byte-identical; the re-signed request carries the same body and a
+        # new proof; the server accepted exactly one completion.
+        assert len(completes) == 3 and completes[1] == completes[0]
+        assert completes[2][1] == completes[0][1] and completes[2][0] != completes[0][0]
+    elif phase == "complete":
+        assert len(completes) == 2 and completes[1] == completes[0]
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [] and view["attempt"] is None and view["tombstones"] == [("list-contexts", 0, 1)]
+    assert view["generation"] == _server_claim_generation(harness, workspace_id, runner_id) == 1
+
+
+def test_a_resigned_completion_is_never_a_second_acceptance_of_a_completed_challenge(tmp_path, harness):
+    """Server idempotency (heel/saas/runner_auth.py complete_resync, unchanged): a completed
+    challenge answers only its original signed digest; a re-signed copy of the same body is refused
+    and never completes that challenge again. SEAM-TAMPER-SIGNATURE (test-only) corrupts one
+    retransmission in transit so the client is made to re-sign a completion the server committed."""
+    workspace_id, cookie = harness.signup_owner("r2-resigned-completed@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r2-resigned")
+    log = []
+    with _seam_clock(65.0):  # SEAM-CLOCK
+        assert _logged_daemon(home, harness, backend, log,
+                              faults={"/resync/complete": ["drop_after"]}).status()["state"] == "offline"
+        assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+        assert _server_claim_generation(harness, workspace_id, runner_id) == 1
+        later = _logged_daemon(home, harness, backend, log,
+                               faults={"/resync/complete": [_rewrite_signature]}).status()
+    completes, starts = _wire(log, "complete"), _wire(log, "start")
+    # original (answer lost), exact retransmission (corrupted in transit, 401), the re-signed same
+    # body (refused: the completed record holds the original digest) -- never a second acceptance.
+    assert completes[1] == completes[0]
+    assert completes[2][1] == completes[0][1] and completes[2][0] != completes[0][0]
+    # The exact start probe: the committed challenge is no longer pending and the start's proof is
+    # still fresh, so the server answers with a NEW challenge for that start; the client adopts it
+    # as this recovery's one fresh start and completes it (no orphaned challenge is left).
+    assert len(starts) == 2 and starts[1] == starts[0]
+    assert len(completes) == 4 and completes[3][1] != completes[0][1]
+    assert (later["state"], later["control_plane"]["state"]) == ("active", "confirmed"), later
+    assert _server_resyncs(harness, workspace_id, runner_id) == ["completed", "completed"]
+    view = _runtime_view(home, harness, backend)
     assert view["generation"] == _server_claim_generation(harness, workspace_id, runner_id) == 2
-    assert view["tombstones"] == [("list-contexts", 0, 2)]
+    assert view["tombstones"] == [("list-contexts", 0, 2)] and view["attempt"] is None
+
+
+def test_a_probe_created_challenge_is_never_orphaned_for_a_later_lost_call(tmp_path, harness):
+    """The start probe inside its 30 s proof window after the first challenge was completed makes
+    the server create a NEW challenge for the same signed start. That challenge must be completed
+    (adopted as this recovery's one fresh start), never left pending: a later call lost before
+    commit and retried after the proof window must not hit it as a false authentication refusal."""
+    workspace_id, cookie = harness.signup_owner("r2-probe-orphan@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r2-orphan")
+    log = []
+    with _seam_clock(65.0):  # SEAM-CLOCK
+        assert _logged_daemon(home, harness, backend, log,
+                              faults={"/resync/complete": ["drop_after"]}).status()["state"] == "offline"
+        # SEAM-TAMPER-SIGNATURE on the exact retransmission: retransmission and re-sign refused,
+        # the probe gets a new challenge for the same start.
+        tampered = _logged_daemon(home, harness, backend, log,
+                                  faults={"/resync/complete": [_rewrite_signature]}).status()
+        print("probe-created challenge outcome:", tampered["state"], tampered["control_plane"],
+              _server_resyncs(harness, workspace_id, runner_id))
+        settled = _logged_daemon(home, harness, backend, log).status()
+        assert (settled["state"], settled["control_plane"]["state"]) == ("active", "confirmed"), settled
+        assert "pending" not in _server_resyncs(harness, workspace_id, runner_id)  # nothing orphaned
+        assert _runtime_view(home, harness, backend)["attempt"] is None
+        # A later control call is lost before it reaches the server ...
+        lost = _logged_daemon(home, harness, backend, log, faults={"/contexts/list": ["drop_before"]}).status()
+        assert lost["state"] == "offline", lost
+    with _seam_clock(65.0 + 35.0):  # SEAM-CLOCK: ... and retried after the proof window
+        retried = _logged_daemon(home, harness, backend, log).status()
+    assert (retried["state"], retried["control_plane"]["state"]) == ("active", "confirmed"), retried
+    resyncs = _server_resyncs(harness, workspace_id, runner_id)
+    assert "pending" not in resyncs and resyncs.count("completed") == len(resyncs)
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [] and view["attempt"] is None
+    assert view["generation"] == _server_claim_generation(harness, workspace_id, runner_id)
+
+
+def test_a_resigned_completion_is_refused_for_a_revoked_key_and_creates_nothing(tmp_path, harness):
+    workspace_id, cookie = harness.signup_owner("r2-resigned-revoked@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r2-revoked")
+    log = []
+    with _seam_clock(65.0):  # SEAM-CLOCK
+        assert _logged_daemon(home, harness, backend, log,
+                              faults={"/resync/complete": ["drop_before"]}).status()["state"] == "offline"
+    assert harness.request(
+        "POST", f"/v1/workspaces/{workspace_id}/runners/{runner_id}/revoke", REVOKE_BODY, cookie=cookie,
+    )[0] == 200
+    resyncs = _server_resyncs(harness, workspace_id, runner_id)
+    generation = _server_claim_generation(harness, workspace_id, runner_id)  # as the revocation left it
+    for shift in (65.0 + 35.0, 65.0 + 200.0):  # inside the challenge lifetime, then long after it
+        with _seam_clock(shift):  # SEAM-CLOCK
+            status = _logged_daemon(home, harness, backend, log).status()
+        assert status["state"] == "runner_authentication_rejected", status
+        assert status["control_plane"] == {"state": "rejected", "reason": "runner_authentication_rejected"}
+    # The revoked key never completed or created a challenge (the server checks the active key first).
+    assert _server_resyncs(harness, workspace_id, runner_id) == resyncs
+    assert all(item != "completed" for item in resyncs)
+    assert _server_claim_generation(harness, workspace_id, runner_id) == generation
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [("list-contexts", 0)] and view["tombstones"] == [] and view["generation"] == 0
+
+
+@pytest.mark.parametrize("skew_ms", [-120_000, 120_000])
+def test_a_wrong_clock_never_drops_a_pending_attempt_and_correcting_it_recovers_at_once(tmp_path, harness, skew_ms):
+    workspace_id, cookie = harness.signup_owner(f"r2-resigned-clock-{skew_ms > 0}@example.test")
+    home, backend, runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "r2-clock")
+    log = []
+    with _seam_clock(65.0):  # SEAM-CLOCK
+        assert _logged_daemon(home, harness, backend, log,
+                              faults={"/resync/complete": ["drop_before"]}).status()["state"] == "offline"
+        original = _runtime_view(home, harness, backend)["attempt"]
+    with _seam_clock(65.0 + 35.0):  # SEAM-CLOCK; the runner's own clock is additionally wrong
+        skewed = _logged_daemon(home, harness, backend, log,
+                                clock_ms=lambda: time.time_ns() // 1_000_000 + skew_ms).status()
+        assert skewed["state"] == "runner_authentication_rejected", skewed
+        assert any("clock" in step for step in skewed["next_steps"])
+        # Retransmission and the one re-sign refused (the proof's clock); the exact start probe was
+        # answered with this attempt's own pending challenge, so nothing is dropped or started.
+        completes, starts = _wire(log, "complete"), _wire(log, "start")
+        assert len(completes) == 3 and len(starts) == 2 and starts[1] == starts[0]
+        assert _server_resyncs(harness, workspace_id, runner_id) == ["pending"]
+        assert _server_claim_generation(harness, workspace_id, runner_id) == 0
+        kept = _runtime_view(home, harness, backend)["attempt"]
+        assert kept.challenge_id == original.challenge_id
+        assert kept.complete_headers == original.complete_headers  # the original completion restored
+        corrected = _logged_daemon(home, harness, backend, log).status()
+    # Corrected clock: the stale retransmission is refused, the identical body is re-signed and
+    # accepted for the same pending challenge. Never "revoked", never a fresh start.
+    assert (corrected["state"], corrected["control_plane"]["state"]) == ("active", "confirmed"), corrected
+    assert _server_resyncs(harness, workspace_id, runner_id) == ["completed"]
+    assert len(_wire(log, "start")) == 2 and len(_wire(log, "complete")) == 5
+    view = _runtime_view(home, harness, backend)
+    assert view["pending"] == [] and view["attempt"] is None and view["tombstones"] == [("list-contexts", 0, 1)]
+    assert view["generation"] == _server_claim_generation(harness, workspace_id, runner_id) == 1
 
 
 def _issue_grant_fixture(harness, workspace_id, cookie, base, binding, runner_id, runner_key_id, seed):

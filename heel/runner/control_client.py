@@ -1911,10 +1911,23 @@ class RunnerControlClient:
         leaves an orphaned server challenge that would block the next start. Only a verified
         completion advances the chain, and in the same runtime transaction the one staged call
         is moved into a sealed tombstone. Any refusal keeps the staged call.
+
+        An answer that is not a valid challenge or completion is never trusted, and the attempt is
+        kept: its exact start can still match the server's live challenge (a different fresh start
+        would be refused while that one is pending), and an exact completion the server committed
+        is answered from its completed record. An attempt is discarded only after the server
+        refused it. A refused retransmitted completion is re-signed once over the byte-identical
+        body: the server accepts it only for its still-pending challenge, and a completed one
+        answers only the original proof, so a re-sign is never a second acceptance. A completion
+        refused after that is followed by one exact start retransmission: the server's answer
+        decides. Its same pending challenge keeps the attempt; a refusal drops it; a new challenge
+        for this start (created because the old one was answered while the start's proof was still
+        fresh) is adopted and completed as the one fresh start, so it is never left orphaned.
         """
         self._assert_supersedable(failed)
         attempt: ChainResyncAttempt | None = self.runtime.load_resync_attempt("claim")
-        fresh_started = False
+        fresh_started = probed = False
+        original: ChainResyncAttempt | None = None
         while True:
             if attempt is None:
                 if fresh_started:
@@ -1943,35 +1956,14 @@ class RunnerControlClient:
                 if status == 429 and isinstance(payload, dict) and payload.get("code") == "runner_resync_rate_limited":
                     self.runtime.discard_resync_attempt(attempt)
                     raise RunnerChainRecoveryDeferred(self._retry_after_ms(payload))
-                try:
-                    data = self._response_data(
-                        response, "heel.runner-resync-challenge.v2",
-                        {"schema_version", "challenge_id", "chain", "server_challenge_b64",
-                         "next_sequence", "expires_at_ms", "generation"},
-                    )
-                    cursor = self.runtime.load_chain("claim", None)
-                    challenge_id = data["challenge_id"]
-                    if (
-                        data["chain"] != {"operation": "claim", "run_id": None}
-                        or not self._b64_32(data["server_challenge_b64"])
-                        or type(challenge_id) is not str or len(challenge_id) != 36
-                        or not challenge_id.startswith("rrs_")
-                        or any(char not in "0123456789abcdef" for char in challenge_id[4:])
-                        or not self._positive_int(data["next_sequence"])
-                        or not self._positive_int(data["expires_at_ms"])
-                        or not self._generation(data["generation"])
-                        or cursor is None or data["generation"] < cursor.generation
-                    ):
-                        raise ValueError
-                except ValueError:
-                    self.runtime.discard_resync_attempt(attempt)
-                    raise ValueError("invalid runner resync challenge") from None
+                data = self._recovery_challenge(response)
                 attempt = self.runtime.record_resync_challenge(
-                    attempt, challenge_id=challenge_id, server_challenge_b64=data["server_challenge_b64"],
+                    attempt, challenge_id=data["challenge_id"], server_challenge_b64=data["server_challenge_b64"],
                     next_sequence=data["next_sequence"], generation=data["generation"],
                     expires_at_ms=data["expires_at_ms"], now_ms=self._timestamp(),
                 )
-            if attempt.complete_body is None:
+            freshly_signed = attempt.complete_body is None
+            if freshly_signed:
                 body = canonical_bytes({
                     "schema_version": "heel.runner-resync-complete.v2",
                     "challenge_id": attempt.challenge_id,
@@ -1991,10 +1983,67 @@ class RunnerControlClient:
             )
             status, payload = self._resync_answer(response)
             if self._authority_rejected(status, payload):
-                # Expired, already-invalidated or refused challenge: never an accepted resync.
-                self.runtime.discard_resync_attempt(attempt)
-                attempt = None
-                continue
+                if not freshly_signed and original is None:
+                    # A retransmitted proof may only be stale while the challenge is still pending;
+                    # a newer proof over the same body is the server's decision, not an inference.
+                    original = attempt
+                    path, headers, timestamp_ms = self._signed_resync_request("complete", attempt.complete_body)
+                    attempt = self.runtime.resign_resync_completion(
+                        attempt, path=path, headers=headers, body=attempt.complete_body,
+                        timestamp_ms=timestamp_ms, now_ms=timestamp_ms,
+                    )
+                    continue
+                if original is not None and attempt.complete_headers != original.complete_headers:
+                    # The re-sign was refused too: keep the original exact completion, which is the
+                    # one a completed server record would answer.
+                    assert original.complete_path is not None and original.complete_headers is not None
+                    assert original.complete_timestamp_ms is not None
+                    attempt = self.runtime.resign_resync_completion(
+                        attempt, path=original.complete_path, headers=original.complete_headers,
+                        body=attempt.complete_body, timestamp_ms=original.complete_timestamp_ms,
+                        now_ms=self._timestamp(),
+                    )
+                if probed:
+                    raise RunnerAuthenticationRejected()
+                probed = True
+                # Whether the challenge is still pending is the server's answer, never an age: the
+                # exact start is answered from its record only while that challenge is pending and
+                # the key active (clock-independent), so a pending attempt is never dropped for a
+                # proof the clock spoiled, and a revoked key or a gone challenge is refused.
+                response = self.transport.post(
+                    attempt.start_path, headers=dict(attempt.start_headers), body=attempt.start_body,
+                )
+                status, payload = self._resync_answer(response)
+                if self._authority_rejected(status, payload):
+                    self.runtime.discard_resync_attempt(attempt)
+                    attempt = original = None
+                    continue
+                if status == 429 and isinstance(payload, dict) and payload.get("code") == "runner_resync_rate_limited":
+                    # No pending challenge matched this start (the server checks that first).
+                    self.runtime.discard_resync_attempt(attempt)
+                    raise RunnerChainRecoveryDeferred(self._retry_after_ms(payload))
+                data = self._recovery_challenge(response)
+                if data["challenge_id"] != attempt.challenge_id:
+                    # This challenge is no longer pending, and the server answered this exact start
+                    # with a NEW challenge (its proof was still fresh). It is bound to this start,
+                    # so it is completed here, as this recovery's fresh start, never orphaned.
+                    fresh_started = True
+                    attempt = self.runtime.replace_resync_challenge(
+                        attempt, challenge_id=data["challenge_id"],
+                        server_challenge_b64=data["server_challenge_b64"],
+                        next_sequence=data["next_sequence"], generation=data["generation"],
+                        expires_at_ms=data["expires_at_ms"], now_ms=self._timestamp(),
+                    )
+                    original = None
+                    continue
+                if (
+                    data["server_challenge_b64"] != attempt.server_challenge_b64
+                    or data["generation"] != attempt.challenge_generation
+                ):
+                    raise ValueError("invalid runner resync challenge")
+                # The server still holds this pending challenge for an active key; only the
+                # completion's fresh proof was refused (the clock). Keep the attempt.
+                raise RunnerAuthenticationRejected()
             try:
                 data = self._response_data(
                     response, "heel.runner-resync-completed.v2",
@@ -2012,7 +2061,6 @@ class RunnerControlClient:
                 ):
                     raise ValueError
             except ValueError:
-                self.runtime.discard_resync_attempt(attempt)
                 raise ValueError("invalid runner resync completion") from None
             with self._state_lock:
                 before = self._chains.get("claim")
@@ -2031,6 +2079,32 @@ class RunnerControlClient:
                     raise RunnerRuntimeCorrupt("runner control claim chain changed during recovery")
                 self._chains["claim"] = (cursor.next_nonce_b64, cursor.next_sequence, cursor.generation)
             return
+
+    def _recovery_challenge(self, response: object) -> dict[str, Any]:
+        """A valid claim-chain challenge answer, or ``ValueError``; nothing is recorded here."""
+        try:
+            data = self._response_data(
+                response, "heel.runner-resync-challenge.v2",
+                {"schema_version", "challenge_id", "chain", "server_challenge_b64",
+                 "next_sequence", "expires_at_ms", "generation"},
+            )
+            cursor = self.runtime.load_chain("claim", None)
+            challenge_id = data["challenge_id"]
+            if (
+                data["chain"] != {"operation": "claim", "run_id": None}
+                or not self._b64_32(data["server_challenge_b64"])
+                or type(challenge_id) is not str or len(challenge_id) != 36
+                or not challenge_id.startswith("rrs_")
+                or any(char not in "0123456789abcdef" for char in challenge_id[4:])
+                or not self._positive_int(data["next_sequence"])
+                or not self._positive_int(data["expires_at_ms"])
+                or not self._generation(data["generation"])
+                or cursor is None or data["generation"] < cursor.generation
+            ):
+                raise ValueError
+        except ValueError:
+            raise ValueError("invalid runner resync challenge") from None
+        return data
 
     @staticmethod
     def _resync_answer(response: object) -> tuple[int | None, object]:
