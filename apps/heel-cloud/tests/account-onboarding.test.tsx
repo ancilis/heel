@@ -1032,3 +1032,415 @@ describe("C7AR2 N1: a local summary read belongs to the account and project that
     expect(projectSelect().value).toBe(alpha);
   });
 });
+
+
+// SEAM (C7AR3): executable-environment, paired-runner and binding metadata are component fixtures returned by
+// `CanaryApi` spies so the binding controls render. A mutation applies its change to the fixture when it settles
+// successfully (as a server would, even when the UI later ignores it), and a held binding read settles on demand.
+// No proof, runner, binding or target request is real.
+const ALPHA_ORIGIN = "https://alpha-private-staging.example.test";
+const ALPHA_RUNNER = "Alpha-private-runner";
+const AUTHORIZED = "Canary access was authorized for this exact paired runner and verified environment.";
+const REVOKED = "Canary access was revoked. Issued grants and active work were not changed.";
+const CANARY_UNAVAILABLE = "Heel Cloud is temporarily unavailable. Your local result is unchanged.";
+
+type BindingWorld = {
+  reads: { mock: { calls: unknown[][] } };
+  mutations: ReturnType<typeof vi.spyOn>;
+  /** The next mutation call waits for this; its rejection is the mutation's failure. */
+  holdMutation: () => ReturnType<typeof deferred<void>>;
+  /** The next binding read for `projectRef` waits for this; its rejection is the read's failure. */
+  holdRead: (projectRef: string) => ReturnType<typeof deferred<void>>;
+};
+
+/** Every project in `origins` gets one executable environment, one paired runner and one active binding. */
+function bindingWorld(action: "create" | "revoke", origins: Record<string, { origin: string; runner: string }>): BindingWorld {
+  const state = new Map<string, { runners: Record<string, unknown>[]; bindings: Record<string, unknown>[] }>();
+  const environments = new Map<string, Record<string, unknown>>();
+  Object.entries(origins).forEach(([projectRef, { origin, runner }], index) => {
+    const n = String(index + 1);
+    environments.set(projectRef, { environmentId: `env_${n.repeat(32)}`, origin, isExecutable: true, verificationRecordDigest: "a".repeat(64) });
+    state.set(projectRef, {
+      runners: [{ runnerId: `runner-${n}`, runnerKeyId: `key-${n}`, displayName: runner, fingerprint: n.repeat(64) }],
+      bindings: [{ bindingId: `rcb_${n.repeat(32)}`, origin, runnerId: `runner-${n}`, status: "active" }],
+    });
+  });
+  const mutationHolds: ReturnType<typeof deferred<void>>[] = [];
+  const readHolds = new Map<string, ReturnType<typeof deferred<void>>>();
+  vi.spyOn(CanaryApi.prototype, "listEnvironments").mockImplementation(async (_workspaceRef, projectRef) =>
+    (environments.has(projectRef) ? [environments.get(projectRef)] : []) as never);
+  const reads = vi.spyOn(CanaryApi.prototype, "listRunnerContextBindings").mockImplementation(async (_workspaceRef, projectRef) => {
+    const held = readHolds.get(projectRef);
+    if (held) { readHolds.delete(projectRef); await held.promise; }
+    const current = state.get(projectRef) ?? { runners: [], bindings: [] };
+    return { runners: [...current.runners], bindings: current.bindings.map((item) => ({ ...item })) } as never;
+  });
+  const mutations = action === "create"
+    ? vi.spyOn(CanaryApi.prototype, "createRunnerContextBinding").mockImplementation(async (_workspaceRef, projectRef, input) => {
+      const held = mutationHolds.shift();
+      if (held) await held.promise;
+      const current = state.get(projectRef);
+      current?.bindings.push({ bindingId: `rcb_${"c".repeat(32)}`, origin: environments.get(projectRef)?.origin, runnerId: input.runnerId, status: "active" });
+      return current?.bindings.at(-1) as never;
+    })
+    : vi.spyOn(CanaryApi.prototype, "revokeRunnerContextBinding").mockImplementation(async (_workspaceRef, projectRef, bindingId) => {
+      const held = mutationHolds.shift();
+      if (held) await held.promise;
+      for (const item of state.get(projectRef)?.bindings ?? []) if (item.bindingId === bindingId) item.status = "revoked";
+    });
+  return {
+    reads, mutations,
+    holdMutation: () => { const held = deferred<void>(); mutationHolds.push(held); return held; },
+    holdRead: (projectRef) => { const held = deferred<void>(); readHolds.set(projectRef, held); return held; },
+  };
+}
+
+function alphaBetaBindings(action: "create" | "revoke"): { ws: string; alpha: string; beta: string; world: BindingWorld } {
+  const { ws, alpha, beta } = alphaBeta();
+  const world = bindingWorld(action, { [alpha]: { origin: ALPHA_ORIGIN, runner: ALPHA_RUNNER }, [beta]: { origin: "https://beta-staging.example.test", runner: "Beta runner" } });
+  return { ws, alpha, beta, world };
+}
+
+/** Waits until the binding section shows exactly `items` (the dashboard's step card repeats the section heading). */
+async function bindingsShown(items: string[]): Promise<void> {
+  await screen.findByRole("button", { name: "Authorize paired runner" });
+  await waitFor(() => expect(bindingItems()).toEqual(items));
+}
+
+function bindingItems(): string[] {
+  return Array.from(document.querySelectorAll(".context-binding-list li span"), (item) => item.textContent ?? "");
+}
+
+function authorizeButton(): HTMLButtonElement {
+  return screen.getByRole("button", { name: "Authorize paired runner" }) as HTMLButtonElement;
+}
+
+/** Chooses the shown project's own environment and runner (no submit). */
+function chooseBindingTarget(): void {
+  const environment = screen.getByLabelText("Verified environment") as HTMLSelectElement;
+  fireEvent.change(environment, { target: { value: environment.options[1].value } });
+  const runner = screen.getByLabelText("Paired runner") as HTMLSelectElement;
+  fireEvent.change(runner, { target: { value: runner.options[1].value } });
+}
+
+/** Starts the binding action in the shown project through its enabled control. */
+function startBindingAction(action: "create" | "revoke"): void {
+  if (action === "create") {
+    chooseBindingTarget();
+    fireEvent.click(authorizeButton());
+  } else fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+}
+
+function readsFor(world: BindingWorld, projectRef: string, from: number): number {
+  return world.reads.mock.calls.slice(from).filter((call) => call[1] === projectRef).length;
+}
+
+/** Beta is shown exactly as Beta loaded it: selection, address, its own binding and runner, no Alpha metadata or feedback. */
+function expectBetaIntact(ws: string, beta: string): void {
+  expect(projectSelect().value).toBe(beta);
+  expect(nav.search).toBe(`workspace=${ws}&project=${beta}`);
+  expect(bindingItems()).toEqual(["https://beta-staging.example.test · runner-2 · active"]);
+  expect(document.body.textContent).not.toContain(ALPHA_ORIGIN);
+  expect(document.body.textContent).not.toContain(ALPHA_RUNNER);
+  expect(screen.queryByText(AUTHORIZED)).toBeNull();
+  expect(screen.queryByText(REVOKED)).toBeNull();
+  expect(screen.queryByText(CANARY_UNAVAILABLE)).toBeNull();
+  expect(screen.queryByText(/Your session ended/)).toBeNull();
+}
+
+type Settlement = "success" | "failure" | "401";
+function settleHeld(held: ReturnType<typeof deferred<void>>, outcome: Settlement): void {
+  if (outcome === "success") held.resolve();
+  else held.reject(new CanaryApiError("unavailable", outcome === "401" ? 401 : 503));
+}
+
+
+describe("C7AR3: a binding action's follow-up refresh belongs to the context that started the action", () => {
+  for (const action of ["create", "revoke"] as const) {
+    test(`${action}: a mutation that succeeds after navigation starts no old-context refresh and keeps Beta's selection, runner and address`, async () => {
+      const { ws, alpha, beta, world } = alphaBetaBindings(action);
+      const mutation = world.holdMutation();
+      const view = render(<Dashboard />);
+      await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
+      startBindingAction(action);
+      expect(world.mutations).toHaveBeenCalledTimes(1);
+      expect(signOutButton().disabled).toBe(true);
+
+      navigate(view, `workspace=${ws}&project=${beta}`);
+      await waitFor(() => expect(projectSelect().value).toBe(beta));
+      await bindingsShown(["https://beta-staging.example.test · runner-2 · active"]);
+      chooseBindingTarget();
+      expect(signOutButton().disabled).toBe(false);
+      const before = world.reads.mock.calls.length;
+
+      await act(async () => { mutation.resolve(); });
+      await settle();
+      expect(readsFor(world, alpha, before), "an obsolete mutation must not start a refresh for its old context").toBe(0);
+      expectBetaIntact(ws, beta);
+      expect((screen.getByLabelText("Paired runner") as HTMLSelectElement).value).toBe("runner-2");
+      expect(signOutButton().disabled).toBe(false);
+      expectNoSecretLeak();
+    });
+
+    for (const outcome of ["success", "failure", "401"] as const) {
+      test(`${action}: a refresh in flight across navigation that settles with ${outcome} changes nothing in Beta`, async () => {
+        const { ws, alpha, beta, world } = alphaBetaBindings(action);
+        const view = render(<Dashboard />);
+        await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
+        const refresh = world.holdRead(alpha);
+        const before = world.reads.mock.calls.length;
+        startBindingAction(action);
+        await waitFor(() => expect(readsFor(world, alpha, before)).toBe(1));
+
+        navigate(view, `workspace=${ws}&project=${beta}`);
+        await waitFor(() => expect(projectSelect().value).toBe(beta));
+        await bindingsShown(["https://beta-staging.example.test · runner-2 · active"]);
+        chooseBindingTarget();
+        expect(signOutButton().disabled).toBe(false);
+
+        await act(async () => { settleHeld(refresh, outcome); });
+        await settle();
+        expect(readsFor(world, alpha, before)).toBe(1);
+        expectBetaIntact(ws, beta);
+        expect((screen.getByLabelText("Paired runner") as HTMLSelectElement).value).toBe("runner-2");
+        expect(signOutButton().disabled).toBe(false);
+        expect(server.session).not.toBeNull();
+      });
+    }
+
+    for (const outcome of ["success", "failure"] as const) {
+      test(`${action}: an obsolete mutation's ${outcome} cannot release or overwrite Beta's own in-flight ${action}`, async () => {
+        const { ws, alpha, beta, world } = alphaBetaBindings(action);
+        const old = world.holdMutation();
+        const view = render(<Dashboard />);
+        await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
+        startBindingAction(action);
+        navigate(view, `workspace=${ws}&project=${beta}`);
+        await waitFor(() => expect(projectSelect().value).toBe(beta));
+        await bindingsShown(["https://beta-staging.example.test · runner-2 · active"]);
+        const current = world.holdMutation();
+        startBindingAction(action);
+        expect(world.mutations).toHaveBeenCalledTimes(2);
+        expect(world.mutations.mock.calls[1][1]).toBe(beta);
+        expect(signOutButton().disabled).toBe(true);
+        const before = world.reads.mock.calls.length;
+
+        await act(async () => { settleHeld(old, outcome); });
+        await settle();
+        expect(readsFor(world, alpha, before)).toBe(0);
+        expect(projectSelect().value).toBe(beta);
+        expect(nav.search).toBe(`workspace=${ws}&project=${beta}`);
+        expect(signOutButton().disabled, "Beta's own pending action must keep its controls disabled").toBe(true);
+        expect(document.body.textContent).not.toContain(ALPHA_ORIGIN);
+        expect(screen.queryByText(action === "create" ? AUTHORIZED : REVOKED)).toBeNull();
+        expect(screen.queryByText(CANARY_UNAVAILABLE)).toBeNull();
+
+        await act(async () => { current.resolve(); });
+        await screen.findByText(action === "create" ? AUTHORIZED : REVOKED);
+        expect(readsFor(world, beta, before)).toBe(1);
+        expect(bindingItems()).toEqual(action === "create"
+          ? ["https://beta-staging.example.test · runner-2 · active", "https://beta-staging.example.test · runner-2 · active"]
+          : ["https://beta-staging.example.test · runner-2 · revoked"]);
+        expect(projectSelect().value).toBe(beta);
+        expect(signOutButton().disabled).toBe(false);
+      });
+    }
+
+    for (const held of ["mutation", "refresh"] as const) {
+      test(`${action}: after sign-out and another account's sign-in, the old account's held ${held} restores nothing`, async () => {
+        const first = server.account("first@example.test", "first-password", [{ role: "owner", projects: ["First-private-alpha", "First-private-beta"] }]);
+        const second = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Second"] }]);
+        server.session = first;
+        const firstWs = first.memberships[0].workspace_id;
+        const [alpha, beta] = (server.projects.get(firstWs) ?? []).map((item) => item.project_ref as string);
+        const secondWs = second.memberships[0].workspace_id;
+        const secondProject = server.projects.get(secondWs)?.[0].project_ref as string;
+        nav.search = `workspace=${firstWs}&project=${alpha}`;
+        const world = bindingWorld(action, {
+          [alpha]: { origin: ALPHA_ORIGIN, runner: ALPHA_RUNNER },
+          [beta]: { origin: "https://first-beta.example.test", runner: "First beta runner" },
+          [secondProject]: { origin: "https://second-staging.example.test", runner: "Second runner" },
+        });
+        const mutation = held === "mutation" ? world.holdMutation() : null;
+        const view = render(<Dashboard />);
+        await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
+        const refresh = held === "refresh" ? world.holdRead(alpha) : null;
+        startBindingAction(action);
+        if (refresh) await waitFor(() => expect(world.reads.mock.calls.at(-1)?.[1]).toBe(alpha));
+
+        // Sign-out is disabled while the action runs; navigation releases it, as a real user would reach it.
+        navigate(view, `workspace=${firstWs}&project=${beta}`);
+        await waitFor(() => expect(projectSelect().value).toBe(beta));
+        fireEvent.click(signOutButton());
+        await signInFromSignedOut(EMAIL, SECRET);
+        await waitFor(() => expect(projectSelect().value).toBe(secondProject));
+        expect(server.session).toBe(second);
+        const before = world.reads.mock.calls.length;
+
+        await act(async () => { (mutation ?? refresh)?.resolve(); });
+        await settle();
+        expect(readsFor(world, alpha, before)).toBe(0);
+        expect(projectSelect().value).toBe(secondProject);
+        expect(Array.from(projectSelect().options, (option) => option.textContent)).not.toContain("First-private-alpha");
+        expect(nav.search).toBe(`workspace=${secondWs}&project=${secondProject}`);
+        expect(bindingItems()).toEqual(["https://second-staging.example.test · runner-3 · active"]);
+        expect(document.body.textContent).not.toContain("First-private");
+        expect(document.body.textContent).not.toContain(ALPHA_ORIGIN);
+        expect(screen.queryByText(action === "create" ? AUTHORIZED : REVOKED)).toBeNull();
+        expect(signOutButton().disabled).toBe(false);
+        expectNoSecretLeak();
+      });
+    }
+  }
+
+  test("a current create refreshes its own bindings, says so, and blocks a second submit until then", async () => {
+    const { alpha, world } = alphaBetaBindings("create");
+    const mutation = world.holdMutation();
+    render(<Dashboard />);
+    await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
+    const before = world.reads.mock.calls.length;
+    startBindingAction("create");
+    expect(authorizeButton().disabled).toBe(true);
+    fireEvent.click(authorizeButton());
+    expect(world.mutations).toHaveBeenCalledTimes(1);
+    expect(signOutButton().disabled).toBe(true);
+
+    await act(async () => { mutation.resolve(); });
+    await screen.findByText(AUTHORIZED);
+    expect(readsFor(world, alpha, before)).toBe(1);
+    expect(bindingItems()).toEqual([`${ALPHA_ORIGIN} · runner-1 · active`, `${ALPHA_ORIGIN} · runner-1 · active`]);
+    expect(projectSelect().value).toBe(alpha);
+    expect(signOutButton().disabled).toBe(false);
+  });
+
+  test("a current revoke refreshes its own binding to revoked and says so", async () => {
+    const { alpha, world } = alphaBetaBindings("revoke");
+    render(<Dashboard />);
+    await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
+    const before = world.reads.mock.calls.length;
+    startBindingAction("revoke");
+    await screen.findByText(REVOKED);
+    expect(readsFor(world, alpha, before)).toBe(1);
+    expect(bindingItems()).toEqual([`${ALPHA_ORIGIN} · runner-1 · revoked`]);
+    expect(screen.queryByRole("button", { name: "Revoke" })).toBeNull();
+    expect(signOutButton().disabled).toBe(false);
+  });
+
+  for (const action of ["create", "revoke"] as const) {
+    test(`${action}: a current refresh failure is shown instead of success feedback`, async () => {
+      const { alpha, world } = alphaBetaBindings(action);
+      render(<Dashboard />);
+      await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
+      const refresh = world.holdRead(alpha);
+      startBindingAction(action);
+      await act(async () => { refresh.reject(new CanaryApiError("unavailable", 503)); });
+      await screen.findByText(CANARY_UNAVAILABLE);
+      expect(screen.queryByText(action === "create" ? AUTHORIZED : REVOKED)).toBeNull();
+      expect(projectSelect().value).toBe(alpha);
+      expect(signOutButton().disabled).toBe(false);
+    });
+
+    for (const step of ["mutation", "refresh"] as const) {
+      test(`${action}: a current ${step} 401 ends the session and clears the private context`, async () => {
+        const { alpha, world } = alphaBetaBindings(action);
+        render(<Dashboard />);
+        await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
+        const held = step === "mutation" ? world.holdMutation() : world.holdRead(alpha);
+        startBindingAction(action);
+        await act(async () => { held.reject(new CanaryApiError("unavailable", 401)); });
+        await screen.findByText(/Your session ended/);
+        expect(document.body.textContent).not.toContain(ALPHA_ORIGIN);
+        expect(document.body.textContent).not.toContain(ALPHA_RUNNER);
+        expect(screen.queryByRole("combobox", { name: /project/i })).toBeNull();
+        expect(screen.queryByText(action === "create" ? AUTHORIZED : REVOKED)).toBeNull();
+        expect(nav.search).toBe("");
+      });
+    }
+  }
+});
+
+
+describe("C7AR3: the proof check's environment refresh keeps the same owner boundary", () => {
+  function proofWorld(alpha: string): { check: ReturnType<typeof deferred<boolean>>; environmentReads: () => string[] } {
+    vi.spyOn(CanaryApi.prototype, "startEnvironmentProof").mockResolvedValue(challenge("challenge-alpha") as never);
+    const check = deferred<boolean>();
+    vi.spyOn(CanaryApi.prototype, "checkEnvironmentProof").mockImplementation((_workspaceRef, projectRef) =>
+      projectRef === alpha ? check.promise : Promise.resolve(false));
+    const real = CanaryApi.prototype.listEnvironments;
+    const spy = vi.spyOn(CanaryApi.prototype, "listEnvironments").mockImplementation(function (this: CanaryApi, workspaceRef: string, projectRef: string) {
+      return real.call(this, workspaceRef, projectRef);
+    });
+    return { check, environmentReads: () => spy.mock.calls.map((call) => call[1]) };
+  }
+
+  for (const outcome of ["verified", "401"] as const) {
+    test(`a check that settles (${outcome}) after navigation starts no environment refresh for the old project`, async () => {
+      const { ws, alpha, beta } = alphaBeta();
+      const { check, environmentReads } = proofWorld(alpha);
+      const view = render(<Dashboard />);
+      await screen.findByRole("heading", { name: "Verify staging now" });
+      await requestProof();
+      await screen.findByText(/challenge-alpha/);
+      fireEvent.click(screen.getByRole("button", { name: "Check exact proof" }));
+
+      navigate(view, `workspace=${ws}&project=${beta}`);
+      await waitFor(() => expect(projectSelect().value).toBe(beta));
+      await screen.findByRole("heading", { name: "Verify staging now" });
+      const before = environmentReads().length;
+      if (outcome === "verified") await act(async () => { check.resolve(true); });
+      else await act(async () => { check.reject(new CanaryApiError("unavailable", 401)); });
+      await settle();
+      expect(environmentReads().slice(before)).not.toContain(alpha);
+      expect(projectSelect().value).toBe(beta);
+      expect(nav.search).toBe(`workspace=${ws}&project=${beta}`);
+      expect(screen.queryByText("Staging ownership verified. Pair the local runner next.")).toBeNull();
+      expect(screen.queryByText(/Your session ended/)).toBeNull();
+      expect(document.body.textContent).not.toContain("challenge-alpha");
+      expect(signOutButton().disabled).toBe(false);
+    });
+  }
+
+  test("a current verified check refreshes environments, says so and clears the challenge", async () => {
+    const { alpha } = alphaBeta();
+    const { check, environmentReads } = proofWorld(alpha);
+    render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Verify staging now" });
+    await requestProof();
+    await screen.findByText(/challenge-alpha/);
+    const before = environmentReads().length;
+    fireEvent.click(screen.getByRole("button", { name: "Check exact proof" }));
+    await act(async () => { check.resolve(true); });
+    await screen.findByText("Staging ownership verified. Pair the local runner next.");
+    await waitFor(() => expect(environmentReads().slice(before)).toEqual([alpha]));
+    await waitFor(() => expect(screen.queryByText(/challenge-alpha/)).toBeNull());
+    expect(signOutButton().disabled).toBe(false);
+  });
+
+  test("a current non-matching check keeps the challenge and says the proof did not match", async () => {
+    const { alpha } = alphaBeta();
+    const { check } = proofWorld(alpha);
+    render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Verify staging now" });
+    await requestProof();
+    await screen.findByText(/challenge-alpha/);
+    fireEvent.click(screen.getByRole("button", { name: "Check exact proof" }));
+    await act(async () => { check.resolve(false); });
+    await screen.findByText("Proof did not match yet. No product route was contacted.");
+    expect(screen.getByText(/challenge-alpha/)).toBeTruthy();
+    expect(signOutButton().disabled).toBe(false);
+  });
+
+  test("a current check 401 ends the session", async () => {
+    const { alpha } = alphaBeta();
+    const { check } = proofWorld(alpha);
+    render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Verify staging now" });
+    await requestProof();
+    await screen.findByText(/challenge-alpha/);
+    fireEvent.click(screen.getByRole("button", { name: "Check exact proof" }));
+    await act(async () => { check.reject(new CanaryApiError("unavailable", 401)); });
+    await screen.findByText(/Your session ended/);
+    expect(document.body.textContent).not.toContain("challenge-alpha");
+    expect(nav.search).toBe("");
+  });
+});
