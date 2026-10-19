@@ -837,11 +837,17 @@ class CanaryRunService:
         if round_number == 1:                                                                  # 9
             routes = [action["route_template"] for action in actions]
             if (sorted(routes) != sorted(DISCOVERY_SEED_PATHS) or any(
-                    source["round"] != 0 or DISCOVERY_SEED_PATHS[source["source_ordinal"]] != action["route_template"]
+                    source["round"] != 0 or source["source_ordinal"] >= len(DISCOVERY_SEED_PATHS)
+                    or DISCOVERY_SEED_PATHS[source["source_ordinal"]] != action["route_template"]
                     for source, action in zip(sources, actions))):
                 raise DiscoveryError("seed_mismatch")
         else:                                                                                  # 9a
             referenced = []
+            source_actions = {
+                int(row["round"]): int(row["actions"]) for row in self.conn.execute(
+                    "SELECT round,actions FROM discovery_rounds WHERE authorization_id=?", (authorization_id,),
+                )
+            }
             for source, action in zip(sources, actions):
                 recorded = [
                     candidate for candidate in reports.get(source["round"], [])
@@ -849,7 +855,9 @@ class CanaryRunService:
                 ] if 1 <= source["round"] < round_number else []
                 if not recorded:
                     raise DiscoveryError("candidate_not_recorded")
-                if recorded[0]["source_ordinal"] != source["source_ordinal"]:
+                if (recorded[0]["source_ordinal"] != source["source_ordinal"]
+                        or source["source_ordinal"] >= source_actions.get(source["round"], 0)):
+                    # Stored provenance (even a legacy or corrupted row) never outranks its round.
                     raise DiscoveryError("source_ordinal_mismatch")
                 referenced.append({"round": source["round"], "candidate": recorded[0]})
             if discovery_frontier_digest(referenced) != plan["frontier_digest"]:
@@ -2394,13 +2402,15 @@ class CanaryRunService:
             if report is not None:
                 raise DiscoveryError("invalid_discovery_report")
             return result
+        if report is not None:
+            report = self._validated_discovery_report(round_row, report, row["public_key"])
         current = self._run(row["workspace_id"], row["project_ref"], row["run_id"])
         if round_row["state"] == "issued" and current["status"] == "terminal":
             round_row = self._settle_discovery_round_in_transaction(
                 round_row, int(current["terminal_at_ms"]), value["counters"]["requests_completed"],
             )
         if report is not None:
-            self._record_discovery_report_in_transaction(round_row, report, row["public_key"])
+            self._record_discovery_report_in_transaction(round_row, report)
         stored = self.conn.execute(
             "SELECT report_digest FROM discovery_round_reports WHERE authorization_id=? AND round=?",
             (round_row["authorization_id"], round_row["round"]),
@@ -2701,7 +2711,11 @@ class CanaryRunService:
                 self._close_discovery_in_transaction(auth, "done", "budget", self._now_ms())
         return self.conn.execute("SELECT * FROM discovery_rounds WHERE round_id=?", (round_row["round_id"],)).fetchone()
 
-    def _record_discovery_report_in_transaction(self, round_row: sqlite3.Row, report: object, public_key: str) -> None:
+    def _validated_discovery_report(self, round_row: sqlite3.Row, report: object, public_key: str) -> dict:
+        """Signed, bound to this round, and every source ordinal names one of its actual actions.
+
+        The server validates the recorded lineage only; candidate contents remain runner-observed.
+        """
         try:
             report = validate_discovery_round_report(report)
             self._verify_signature(report, public_key, "report_digest")
@@ -2709,8 +2723,12 @@ class CanaryRunService:
             raise DiscoveryError("invalid_discovery_report") from None
         if (report["authorization_id"] != round_row["authorization_id"] or report["round"] != round_row["round"]
                 or report["run_id"] != round_row["run_id"] or report["grant_id"] != round_row["grant_id"]
-                or report["signing_key_id"] != round_row["runner_key_id"]):
+                or report["signing_key_id"] != round_row["runner_key_id"]
+                or any(candidate["source_ordinal"] >= int(round_row["actions"]) for candidate in report["candidates"])):
             raise DiscoveryError("invalid_discovery_report")
+        return report
+
+    def _record_discovery_report_in_transaction(self, round_row: sqlite3.Row, report: dict) -> None:
         stored = self.conn.execute(
             "SELECT report_digest FROM discovery_round_reports WHERE authorization_id=? AND round=?",
             (round_row["authorization_id"], round_row["round"]),
