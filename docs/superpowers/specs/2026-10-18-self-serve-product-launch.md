@@ -266,7 +266,7 @@ valid (CONFIRMED by the walk and tests cited in §10). Additions for the self-se
 | Worker ↔ control plane | shared edge secret, fixed service binding | none (no caller URL) | `X-Heel-Edge-Auth` required for every route (`/v1/plans` without it → 401, walk log), `X-Heel-Client-Key` derived at the edge |
 | Human ↔ runner pairing | browser session with recent auth | invitation token, phrase, fingerprint | one-time invitation, phrase+fingerprint compare in browser, activation signature, v3 executable protocol, rotation single-open ceremony, revoke with reason (`runner_auth.py`) |
 | Runner ↔ control plane | runner Ed25519 key in OS keychain/secret-service | all responses | PoP headers, per-capability nonce chains, sequence, 30 s skew, exact response decoding (`control_client.py`), fail-closed on any mismatch |
-| Runner ↔ staging | signed scope + cloud grant | all responses | host pinning, no redirects, TLS 1.2, full DNS set pinned and rechecked, 256 KiB JSON only, budget, attempt reservation (`http_transport.py`, `plan_differential.py`) |
+| Runner ↔ staging | signed scope + cloud grant | all responses | host pinning, no redirects, TLS 1.2 or newer (C1, amended 2026-10-19), full DNS set pinned and rechecked, 256 KiB JSON only, budget, attempt reservation (`http_transport.py`, `plan_differential.py`) |
 | Runner local store | operator's user account | nothing | inode guard, private dirs, redaction before write, HMAC containment chain |
 | Cloud evidence | server | runner projections | closed schemas, size caps, forbidden keys (`_FORBIDDEN_FINDINGS_KEYS`), signature over digest, no bodies |
 
