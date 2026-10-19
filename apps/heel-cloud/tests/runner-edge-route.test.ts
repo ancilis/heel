@@ -47,7 +47,7 @@ describe("runner edge routes", () => {
     expect(fetcher).toHaveBeenCalledTimes(paths.length);
     for (const [index, path] of paths.entries()) {
       const upstream = fetcher.mock.calls[index][0] as Request;
-      expect(upstream.url).toBe(`https://heel-control-plane.internal${path.replace("/api/control-plane", "")}`);
+      expect(upstream.url).toBe(`https://heel.example${path.replace("/api/control-plane", "")}`);
       expect([...upstream.headers.keys()].sort()).toEqual([
         "content-encoding", "content-length", "content-type", "x-heel-edge-auth",
       ]);
@@ -116,7 +116,7 @@ describe("runner edge routes", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
     const upstream = fetcher.mock.calls[0][0] as Request;
     expect(upstream.method).toBe("POST");
-    expect(upstream.url).toBe(`https://heel-control-plane.internal/v1/workspaces/${workspace}/runners/${runner}/revoke`);
+    expect(upstream.url).toBe(`https://heel.example/v1/workspaces/${workspace}/runners/${runner}/revoke`);
     expect([...upstream.headers.keys()].sort()).toEqual([
       "content-encoding", "content-length", "content-type", "cookie", "origin", "x-heel-edge-auth", "x-heel-internal-origin",
     ]);

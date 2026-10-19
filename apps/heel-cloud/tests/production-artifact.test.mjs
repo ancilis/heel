@@ -1598,6 +1598,7 @@ test("production worker streams only the approved findings control-plane routes"
   const environment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    PUBLIC_ORIGIN: "https://heel.example",
     CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
     CONTROL_PLANE: {
       async fetch(request) {
@@ -1701,7 +1702,7 @@ test("production worker streams only the approved findings control-plane routes"
     assert.equal(call.redirect, "manual");
     assert.equal(
       call.url,
-      `https://heel-control-plane.internal${path.replace("/api/control-plane", "")}`,
+      `https://heel.example${path.replace("/api/control-plane", "")}`,
     );
     assert.equal(call.headers.authorization, credentialHeaders.Authorization);
     assert.equal(call.headers.cookie, credentialHeaders.Cookie === undefined ? undefined : "heel_session=private");
@@ -1787,6 +1788,7 @@ test("production worker carries only Heel session cookies on the exact account r
   const environment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    PUBLIC_ORIGIN: "https://heel.example",
     CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
     CONTROL_PLANE: {
       async fetch(request) {
@@ -1836,7 +1838,7 @@ test("production worker carries only Heel session cookies on the exact account r
       "__Host-heel_session=private; HttpOnly; SameSite=Lax; Path=/; Secure",
     );
     const call = calls.at(-1);
-    assert.equal(call.url, `https://heel-control-plane.internal${path}`);
+    assert.equal(call.url, `https://heel.example${path}`);
     assert.equal(call.headers.cookie, undefined, `${path} forwarded a stale session`);
     assert.equal(call.headers["x-customer-metadata"], undefined);
     assert.equal(call.headers["x-heel-edge-auth"], edgeAuthSecret);
@@ -1963,7 +1965,7 @@ test("production worker exposes only the closed device ceremony and separates br
     );
     assert.equal(response.status, 200, route);
     const call = calls.at(-1);
-    assert.equal(call.url, `https://heel-control-plane.internal/v1/device/${route}`);
+    assert.equal(call.url, `https://proxy.heel.invalid/v1/device/${route}`);
     assert.deepEqual(Object.keys(call.headers).sort(), [
       "content-encoding", "content-length", "content-type",
       ...(route === "start" ? ["x-heel-client-key"] : []),
@@ -2082,6 +2084,7 @@ test("findings proxy preserves request and response streaming across the private
   const environment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    PUBLIC_ORIGIN: "https://heel.example",
     CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
     CONTROL_PLANE: {
       async fetch(request) {
@@ -2160,6 +2163,7 @@ test("findings proxy fails closed and leaves anonymous review traffic without a 
   const baseEnvironment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    PUBLIC_ORIGIN: "https://heel.example",
     CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
   };
   const context = { waitUntil() {}, passThroughOnException() {} };
@@ -2209,6 +2213,27 @@ test("findings proxy fails closed and leaves anonymous review traffic without a 
   assert.equal(failed.status, 502);
   assert.equal((await failed.text()).includes(marker), false);
   assert.equal(bindingCalls, 1);
+
+  for (const PUBLIC_ORIGIN of [undefined, "https://heel-control-plane.internal", "http://127.0.0.1:8787"]) {
+    const refused = await artifact.default.fetch(
+      new Request(`https://proxy.heel.invalid${approvedPath}`, {
+        method: "POST",
+        body: marker,
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": String(Buffer.byteLength(marker)),
+          "Idempotency-Key": `fs1-${"e".repeat(64)}`,
+          Cookie: "__Host-heel_session=private",
+        },
+      }),
+      { ...failingEnvironment, PUBLIC_ORIGIN },
+      context,
+    );
+    assert.equal(refused.status, 503, `${PUBLIC_ORIGIN}`);
+    assert.equal(refused.headers.get("cache-control"), "no-store");
+    assert.equal((await refused.text()).includes(marker), false);
+  }
+  assert.equal(bindingCalls, 1, "a missing or refused configured origin reached the private binding");
 
   for (const headers of [
     { "Content-Type": "application/json", Cookie: "__Host-heel_session=private" },
