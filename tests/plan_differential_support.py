@@ -514,14 +514,29 @@ def make_test_ca(hostname: str = SYNTHETIC_HOST) -> tuple[bytes, bytes, bytes]:
 
 
 class TLSLoopbackServer:
-    """A real ``ssl`` server on loopback that answers one byte after each handshake."""
+    """A real ``ssl`` server on loopback that answers one byte after each handshake.
 
-    def __init__(self, tmp_path, certificate: bytes, key: bytes) -> None:
+    ``minimum``/``maximum`` bound the server's protocol versions explicitly; ``ciphers``
+    is only for hosting a legacy-protocol fixture. Setting them may raise on builds that
+    cannot host those bounds; callers decide what that means.
+    """
+
+    def __init__(
+        self, tmp_path, certificate: bytes, key: bytes, *,
+        minimum: ssl.TLSVersion | None = None, maximum: ssl.TLSVersion | None = None,
+        ciphers: str | None = None,
+    ) -> None:
         certificate_path, key_path = tmp_path / "server.pem", tmp_path / "server.key"
         certificate_path.write_bytes(certificate)
         key_path.write_bytes(key)
         self._context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._context.load_cert_chain(certificate_path, key_path)
+        if ciphers is not None:
+            self._context.set_ciphers(ciphers)
+        if minimum is not None:
+            self._context.minimum_version = minimum
+        if maximum is not None:
+            self._context.maximum_version = maximum
         self._listener = socket.create_server(("127.0.0.1", 0))
         self.port = self._listener.getsockname()[1]
         self.handshakes = 0
