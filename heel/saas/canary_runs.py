@@ -19,8 +19,13 @@ from typing import Callable, TypedDict
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from heel.canary_contracts import (
+    DISCOVERY_BOUND,
+    DISCOVERY_SEED_DIGEST,
+    ContractError,
     canonical_bytes,
     canonical_digest,
+    validate_discovery_authorization_request,
+    validate_route_inventory_rows,
     validate_approval_projection,
     validate_execution_grant,
     validate_operational_run,
@@ -29,7 +34,7 @@ from heel.crypto import load_public_key_base64, verify_envelope
 
 from .canary_store import CanaryStore
 from .catalog import Meter, get_plan
-from .ledger import UsageLedger
+from .ledger import QuotaExceeded, UsageLedger
 
 
 APPROVAL_TTL_MS = 24 * 60 * 60 * 1000
@@ -74,6 +79,137 @@ _PUBLIC_ERROR_CODES = {
 }
 
 
+# Migration 30 (C2 discovery contract §2; bridge spec §4.1 snapshots).  Purely additive: new
+# tables only, so every pre-30 row stays byte-identical and readable.  Plain CREATE TABLE makes a
+# conflicting hand-made table fail the whole migration atomically instead of being adopted.
+DISCOVERY_PLAN_MIGRATION = r"""
+CREATE TABLE route_inventories(
+ workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, environment_id TEXT NOT NULL,
+ inventory_digest TEXT NOT NULL CHECK(length(inventory_digest)=64 AND inventory_digest NOT GLOB '*[^0-9a-f]*'),
+ route_count INTEGER NOT NULL CHECK(route_count BETWEEN 0 AND 200),
+ truncated_count INTEGER NOT NULL CHECK(truncated_count>=0),
+ routes_json TEXT NOT NULL CHECK(length(CAST(routes_json AS BLOB)) BETWEEN 2 AND 262144),
+ updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms>=0),
+ PRIMARY KEY(workspace_id,project_ref,environment_id),
+ FOREIGN KEY(workspace_id,project_ref,environment_id)
+  REFERENCES canary_environments(workspace_id,project_ref,environment_id));
+CREATE TABLE discovery_authorizations(
+ authorization_id TEXT PRIMARY KEY CHECK(length(authorization_id)=36 AND substr(authorization_id,1,4)='dau_'
+  AND substr(authorization_id,5) NOT GLOB '*[^0-9a-f]*'),
+ workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, environment_id TEXT NOT NULL,
+ actor_user_id TEXT NOT NULL CHECK(length(CAST(actor_user_id AS BLOB)) BETWEEN 1 AND 128),
+ actor_role TEXT NOT NULL CHECK(actor_role IN ('owner','admin')),
+ bound_json TEXT NOT NULL CHECK(length(CAST(bound_json AS BLOB)) BETWEEN 2 AND 1024),
+ seed_digest TEXT NOT NULL CHECK(length(seed_digest)=64 AND seed_digest NOT GLOB '*[^0-9a-f]*'),
+ identities_json TEXT NOT NULL CHECK(length(CAST(identities_json AS BLOB)) BETWEEN 2 AND 1024),
+ login_exchange_authorized INTEGER NOT NULL CHECK(login_exchange_authorized IN (0,1)),
+ authorization_digest TEXT NOT NULL UNIQUE CHECK(length(authorization_digest)=64 AND authorization_digest NOT GLOB '*[^0-9a-f]*'),
+ request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+ reservation_id TEXT NOT NULL UNIQUE,
+ idempotency_key TEXT NOT NULL CHECK(length(idempotency_key)=68 AND substr(idempotency_key,1,4)='ca1-'
+  AND substr(idempotency_key,5) NOT GLOB '*[^0-9a-f]*'),
+ quota_state TEXT NOT NULL CHECK(quota_state IN ('reserved','consumed','refunded')),
+ state TEXT NOT NULL CHECK(state IN ('open','done','failed','revoked','expired')),
+ rounds_issued INTEGER NOT NULL DEFAULT 0 CHECK(rounds_issued BETWEEN 0 AND 5),
+ actions_issued INTEGER NOT NULL DEFAULT 0 CHECK(actions_issued BETWEEN 0 AND 100),
+ execution_ms_used INTEGER NOT NULL DEFAULT 0 CHECK(execution_ms_used>=0),
+ requests_completed INTEGER NOT NULL DEFAULT 0 CHECK(requests_completed>=0),
+ bytes_received INTEGER NOT NULL DEFAULT 0 CHECK(bytes_received>=0),
+ created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
+ expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms=created_at_ms+900000),
+ closed_at_ms INTEGER, close_reason TEXT CHECK(close_reason IS NULL OR close_reason IN ('budget','expired','revoked')),
+ revoked_by TEXT,
+ CHECK((state='open')=(closed_at_ms IS NULL)),
+ CHECK((state='open')=(close_reason IS NULL)),
+ CHECK((state='revoked')=(revoked_by IS NOT NULL)),
+ CHECK(quota_state!='refunded' OR rounds_issued=0),
+ UNIQUE(workspace_id,idempotency_key),
+ UNIQUE(workspace_id,project_ref,environment_id,authorization_id),
+ FOREIGN KEY(workspace_id,project_ref,environment_id)
+  REFERENCES canary_environments(workspace_id,project_ref,environment_id));
+CREATE UNIQUE INDEX idx_discovery_authorization_one_open
+ ON discovery_authorizations(workspace_id,project_ref,environment_id) WHERE state='open';
+CREATE TABLE discovery_rounds(
+ round_id TEXT PRIMARY KEY CHECK(length(CAST(round_id AS BLOB)) BETWEEN 1 AND 128),
+ authorization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, environment_id TEXT NOT NULL,
+ round INTEGER NOT NULL CHECK(round BETWEEN 1 AND 5),
+ runner_id TEXT NOT NULL, runner_key_id TEXT NOT NULL,
+ run_id TEXT UNIQUE, grant_id TEXT UNIQUE,
+ projection_id TEXT NOT NULL,
+ projection_digest TEXT NOT NULL CHECK(length(projection_digest)=64 AND projection_digest NOT GLOB '*[^0-9a-f]*'),
+ frontier_digest TEXT NOT NULL CHECK(length(frontier_digest)=64 AND frontier_digest NOT GLOB '*[^0-9a-f]*'),
+ actions INTEGER NOT NULL CHECK(actions BETWEEN 1 AND 20),
+ cumulative_requests_before INTEGER NOT NULL CHECK(cumulative_requests_before BETWEEN 0 AND 99),
+ wall_budget_ms INTEGER NOT NULL CHECK(wall_budget_ms BETWEEN 1 AND 60000),
+ state TEXT NOT NULL CHECK(state IN ('projected','issued','terminal','refused')),
+ refuse_reason TEXT,
+ issued_at_ms INTEGER, terminal_at_ms INTEGER,
+ requests_completed INTEGER CHECK(requests_completed IS NULL OR requests_completed>=0),
+ bytes_received INTEGER CHECK(bytes_received IS NULL OR bytes_received>=0),
+ created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0), closed_at_ms INTEGER,
+ CHECK((state IN ('issued','terminal'))=(run_id IS NOT NULL AND grant_id IS NOT NULL AND issued_at_ms IS NOT NULL)),
+ CHECK((state='terminal')=(terminal_at_ms IS NOT NULL)),
+ CHECK(terminal_at_ms IS NULL OR terminal_at_ms>=issued_at_ms),
+ UNIQUE(authorization_id,round),
+ FOREIGN KEY(workspace_id,project_ref,environment_id,authorization_id)
+  REFERENCES discovery_authorizations(workspace_id,project_ref,environment_id,authorization_id));
+CREATE TABLE discovery_round_reports(
+ report_id TEXT PRIMARY KEY CHECK(length(CAST(report_id AS BLOB)) BETWEEN 1 AND 128),
+ authorization_id TEXT NOT NULL REFERENCES discovery_authorizations(authorization_id),
+ round INTEGER NOT NULL CHECK(round BETWEEN 1 AND 5),
+ run_id TEXT NOT NULL UNIQUE, runner_key_id TEXT NOT NULL,
+ report_digest TEXT NOT NULL CHECK(length(report_digest)=64 AND report_digest NOT GLOB '*[^0-9a-f]*'),
+ candidates_json TEXT NOT NULL CHECK(length(CAST(candidates_json AS BLOB)) BETWEEN 2 AND 65536),
+ excluded_count INTEGER NOT NULL CHECK(excluded_count>=0),
+ truncated_count INTEGER NOT NULL CHECK(truncated_count>=0),
+ bytes_received INTEGER NOT NULL CHECK(bytes_received>=0),
+ created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
+ UNIQUE(authorization_id,round),
+ FOREIGN KEY(authorization_id,round) REFERENCES discovery_rounds(authorization_id,round));
+CREATE TABLE canary_plan_requests(
+ plan_request_id TEXT PRIMARY KEY CHECK(length(plan_request_id)=36 AND substr(plan_request_id,1,4)='cpr_'
+  AND substr(plan_request_id,5) NOT GLOB '*[^0-9a-f]*'),
+ workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, environment_id TEXT NOT NULL,
+ rcb_id TEXT NOT NULL, binding_digest TEXT NOT NULL, runner_id TEXT NOT NULL, runner_key_id TEXT NOT NULL,
+ plan_kind TEXT NOT NULL CHECK(plan_kind='plan_differential'),
+ plan_request_nonce TEXT NOT NULL UNIQUE CHECK(length(plan_request_nonce) BETWEEN 32 AND 64),
+ inventory_digest TEXT NOT NULL CHECK(length(inventory_digest)=64 AND inventory_digest NOT GLOB '*[^0-9a-f]*'),
+ selection_digest TEXT NOT NULL CHECK(length(selection_digest)=64 AND selection_digest NOT GLOB '*[^0-9a-f]*'),
+ routes_json TEXT NOT NULL CHECK(length(CAST(routes_json AS BLOB)) BETWEEN 2 AND 16384),
+ selected_count INTEGER NOT NULL CHECK(selected_count BETWEEN 1 AND 10),
+ max_ops INTEGER NOT NULL CHECK(max_ops BETWEEN 1 AND 20),
+ status TEXT NOT NULL CHECK(status IN ('open','projected','approved','expired','cancelled')),
+ created_by TEXT NOT NULL, created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
+ expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms=created_at_ms+86400000),
+ approval_id TEXT UNIQUE, run_id TEXT UNIQUE, projection_digest TEXT UNIQUE,
+ CHECK((status IN ('projected','approved'))=(approval_id IS NOT NULL AND run_id IS NOT NULL AND projection_digest IS NOT NULL)),
+ FOREIGN KEY(workspace_id,project_ref,environment_id)
+  REFERENCES canary_environments(workspace_id,project_ref,environment_id));
+CREATE UNIQUE INDEX idx_canary_plan_request_one_open
+ ON canary_plan_requests(workspace_id,rcb_id) WHERE status='open';
+"""
+_DISCOVERY_PLAN_TABLES = frozenset({
+    "route_inventories", "discovery_authorizations", "discovery_rounds",
+    "discovery_round_reports", "canary_plan_requests",
+})
+
+
+def ensure_discovery_plan_schema(conn: sqlite3.Connection) -> None:
+    """Bring direct (non-migrated) construction to migration-30 parity, never half of it."""
+    present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    found = _DISCOVERY_PLAN_TABLES & present
+    if found == _DISCOVERY_PLAN_TABLES:
+        return
+    if found:
+        raise RuntimeError("discovery and plan request schema is partially initialized")
+    buffer = ""
+    for line in DISCOVERY_PLAN_MIGRATION.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            conn.execute(buffer.strip())
+            buffer = ""
+
+
 class CanaryRunError(ValueError):
     """A stable service-layer failure; HTTP maps the code without reflecting details."""
 
@@ -81,6 +217,39 @@ class CanaryRunError(ValueError):
         self.detail_code = code
         self.code = _PUBLIC_ERROR_CODES.get(code, "canary_state_conflict")
         super().__init__(self.code)
+
+
+DISCOVERY_TTL_MS = 15 * 60 * 1000
+DISCOVERY_ROUND_FLOOR_MS = 10_000
+DISCOVERY_DONE_EXECUTION_MS = 110_000
+# Closed discovery reasons (contract §3-§4) with their HTTP status.  Codes never echo values.
+DISCOVERY_ERROR_STATUS = {
+    "invalid_discovery_authorization": 400, "idempotency_key_required": 400,
+    "canary_quota_exceeded": 402, "owner_admin_required": 403,
+    "authorization_unknown": 404, "environment_not_found": 404,
+    "environment_not_verified": 409, "authorization_open": 409, "idempotency_conflict": 409,
+    "authorization_closed": 409, "authorization_expired": 409, "authorization_digest_mismatch": 409,
+    "round_out_of_order": 409, "round_consumed": 409, "previous_round_active": 409,
+    "previous_report_missing": 409, "cumulative_mismatch": 409, "bound_exceeded": 409,
+    "seed_mismatch": 409, "candidate_not_recorded": 409, "source_ordinal_mismatch": 409,
+    "frontier_digest_mismatch": 409, "action_out_of_scope": 409, "kill_switch": 409,
+    "plan_kind_mismatch": 409, "report_consumed": 409, "invalid_discovery_report": 400,
+    "plan_binding_required": 409, "plan_request_consumed": 409, "inventory_mismatch": 409,
+    "plan_request_open": 409, "selection_outside_inventory": 409, "plan_request_expired": 409,
+    "runner_context_binding_not_found": 404, "invalid_plan_request": 400,
+    "discovery_unavailable": 503,
+}
+
+
+class DiscoveryError(ValueError):
+    """A closed discovery/plan reason; HTTP returns exactly ``{schema_version, code}``."""
+
+    def __init__(self, code: str):
+        if code not in DISCOVERY_ERROR_STATUS:
+            raise ValueError("unknown discovery error")
+        self.code = code
+        self.status = DISCOVERY_ERROR_STATUS[code]
+        super().__init__(code)
 
 
 class _RunnerProjectionSubmission(dict[str, object]):
@@ -143,6 +312,7 @@ class CanaryRunService:
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.execute("PRAGMA busy_timeout=5000")
             CanaryStore(conn)
+            ensure_discovery_plan_schema(conn)
         self.signing = signing
         self.runner_auth = runner_auth
         if ledger is not None:
@@ -346,6 +516,9 @@ class CanaryRunService:
             validated = validate_approval_projection(projection)
         except (TypeError, ValueError):
             raise CanaryRunError("invalid_projection") from None
+        if "plan" in validated and not _transaction_owned:
+            # A v2 plan binds a runner-context snapshot; a browser upload has neither.
+            raise CanaryRunError("invalid_projection")
         now = self._now_ms()
         if not _transaction_owned:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -499,7 +672,16 @@ class CanaryRunService:
                 "schema_version": "heel.canary-projection-submitted.v1", "approval_id": prior["approval_id"],
                 "run_id": prior["run_id"], "status": prior["status"], "projection_digest": prior["projection_digest"],
             }, created=False)
+        plan_request = self._plan_request_for_submission_in_transaction(validated, binding_row)
         result = self.submit_projection(validated, uploaded_by=uploaded_by_runner_id, _transaction_owned=True, _actor_class="runner")
+        if plan_request is not None:
+            linked = self.conn.execute(
+                "UPDATE canary_plan_requests SET status='projected',approval_id=?,run_id=?,projection_digest=? "
+                "WHERE plan_request_id=? AND status='open'",
+                (result["approval_id"], result["run_id"], result["projection_digest"], plan_request["plan_request_id"]),
+            )
+            if linked.rowcount != 1:
+                raise DiscoveryError("plan_request_consumed")
         self.conn.execute(
             "INSERT INTO canary_runner_context_projection_links("
             "workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,projection_digest,created_at_ms) "
@@ -512,6 +694,55 @@ class CanaryRunService:
             ),
         )
         return _RunnerProjectionSubmission(result, created=True)
+
+    def _plan_request_for_submission_in_transaction(
+        self, validated: dict, binding_row: sqlite3.Row,
+    ) -> sqlite3.Row | None:
+        """Bridge §4.1 snapshot checks.  Returns the open plan request a scan projection consumes."""
+        now = self._now_ms()
+        self.conn.execute(
+            "UPDATE canary_plan_requests SET status='expired' WHERE workspace_id=? AND rcb_id=? "
+            "AND status='open' AND expires_at_ms<=?",
+            (binding_row["workspace_id"], binding_row["rcb_id"], now),
+        )
+        open_request = self.conn.execute(
+            "SELECT * FROM canary_plan_requests WHERE workspace_id=? AND rcb_id=? AND status='open'",
+            (binding_row["workspace_id"], binding_row["rcb_id"]),
+        ).fetchone()
+        plan = validated.get("plan")
+        if plan is None:
+            if open_request is not None:
+                raise DiscoveryError("plan_binding_required")
+            return None
+        if plan["plan_kind"] == "discovery":
+            raise DiscoveryError("discovery_unavailable")
+        row = self.conn.execute(
+            "SELECT * FROM canary_plan_requests WHERE plan_request_id=? AND workspace_id=? AND project_ref=?",
+            (plan["plan_request_id"], binding_row["workspace_id"], binding_row["project_ref"]),
+        ).fetchone()
+        if (
+            row is None or row["rcb_id"] != binding_row["rcb_id"]
+            or row["binding_digest"] != binding_row["binding_digest"]
+            or row["runner_id"] != binding_row["runner_id"] or row["runner_key_id"] != binding_row["runner_key_id"]
+        ):
+            raise DiscoveryError("plan_binding_required")
+        if row["status"] in {"projected", "approved"}:
+            raise DiscoveryError("plan_request_consumed")
+        if row["status"] != "open":
+            raise DiscoveryError("plan_request_expired")
+        selected = {(item["method"], item["route_template"]) for item in json.loads(row["routes_json"])}
+        if (
+            plan["plan_kind"] != row["plan_kind"]
+            or plan["plan_request_nonce"] != row["plan_request_nonce"]
+            or plan["inventory_digest"] != row["inventory_digest"]
+            or plan["selection_digest"] != row["selection_digest"]
+            or plan["selected_count"] != row["selected_count"]
+            or plan["max_ops"] != row["max_ops"]
+            or len(validated["actions"]) > row["max_ops"]
+            or any((action["method"], action["route_template"]) not in selected for action in validated["actions"])
+        ):
+            raise DiscoveryError("inventory_mismatch")
+        return row
 
     def cancel_context_pending_in_transaction(
         self,
@@ -740,6 +971,18 @@ class CanaryRunService:
             if approval["expires_at"] <= now or approval["projection_json"] is None:
                 raise CanaryRunError("approval_expired")
             projection = validate_approval_projection(json.loads(approval["projection_json"]))
+            plan_request = None
+            if "plan" in projection:
+                if projection["plan"]["plan_kind"] == "discovery":
+                    raise CanaryRunError("invalid_canary_approval")
+                plan_request = self.conn.execute(
+                    "SELECT plan_request_id FROM canary_plan_requests WHERE workspace_id=? AND project_ref=? "
+                    "AND plan_request_id=? AND approval_id=? AND run_id=? AND projection_digest=? AND status='projected'",
+                    (workspace_id, project_ref, projection["plan"]["plan_request_id"], approval["approval_id"],
+                     run_id, approval["projection_digest"]),
+                ).fetchone()
+                if plan_request is None:
+                    raise CanaryRunError("canary_authority_unavailable")
             hostname = projection["egress"]["hostname"]
             if exact_hostname != hostname:
                 raise CanaryRunError("hostname_confirmation_mismatch")
@@ -853,6 +1096,11 @@ class CanaryRunService:
                     workspace_id, project_ref, run_id,
                 ),
             )
+            if plan_request is not None:
+                self.conn.execute(
+                    "UPDATE canary_plan_requests SET status='approved' WHERE plan_request_id=? AND status='projected'",
+                    (plan_request["plan_request_id"],),
+                )
             run = self._run(workspace_id, project_ref, run_id)
             self._append_event(run, "quota_reserved", actor_class="system", actor_id="quota")
             self._audit(
@@ -1905,7 +2153,19 @@ class CanaryRunService:
                             or hashlib.sha256(public).hexdigest() != link["public_key_digest"] or identity.get("state") != "active" or identity.get("public_key", {}).get("key_id") != link["runner_key_id"]):
                         raise ValueError
                 hostname = projection["egress"]["hostname"]
-                requests.append({"approval_id": row["approval_id"], "run_id": row["run_id"], "projection_digest": row["projection_digest"], "status": "awaiting_execution_approval", "submitted_at_ms": row["created_at"], "expires_at_ms": row["expires_at"], "origin": projection["environment"]["origin"], "hostname": hostname, "routes": [f"{item['method']} {item['route_template']}" for item in projection["actions"]], "scenarios": [item["scenario_id"] for item in projection["scenarios"]], "request_budget": projection["budgets"]["maximum_requests"], "duration_seconds": math.ceil(projection["budgets"]["wall_timeout_ms"] / 1000), "egress": f"{hostname}:443"})
+                enrichment = {}
+                if "plan" in projection:
+                    if projection["plan"]["plan_kind"] == "discovery":
+                        raise ValueError
+                    live = self.conn.execute(
+                        "SELECT inventory_digest FROM route_inventories WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+                        (workspace_id, project_ref, row["environment_id"]),
+                    ).fetchone()
+                    enrichment = {
+                        "plan": projection["plan"],
+                        "inventory_changed": live is None or live["inventory_digest"] != projection["plan"]["inventory_digest"],
+                    }
+                requests.append({**enrichment, "approval_id": row["approval_id"], "run_id": row["run_id"], "projection_digest": row["projection_digest"], "status": "awaiting_execution_approval", "submitted_at_ms": row["created_at"], "expires_at_ms": row["expires_at"], "origin": projection["environment"]["origin"], "hostname": hostname, "routes": [f"{item['method']} {item['route_template']}" for item in projection["actions"]], "scenarios": [item["scenario_id"] for item in projection["scenarios"]], "request_budget": projection["budgets"]["maximum_requests"], "duration_seconds": math.ceil(projection["budgets"]["wall_timeout_ms"] / 1000), "egress": f"{hostname}:443"})
             except (KeyError, TypeError, ValueError, LookupError):
                 raise CanaryRunError("canary_authority_unavailable") from None
         requests.sort(key=lambda item: (-int(item["submitted_at_ms"]), str(item["run_id"])))
@@ -1926,6 +2186,289 @@ class CanaryRunService:
             "actor_class": row["actor_class"], "actor_id": row["actor_id"],
             "reason_code": row["reason_code"], "created_at_ms": row["created_at"],
         } for row in rows]
+
+    # --- discovery authorizations (discovery contract §2.1-§2.2, §3, §5) ---
+
+    @staticmethod
+    def _discovery_view(row: sqlite3.Row) -> dict[str, object]:
+        """The stored row minus its ledger reservation and idempotency key (contract §2.2)."""
+        actions = int(row["actions_issued"])
+        rounds = int(row["rounds_issued"])
+        used = int(row["execution_ms_used"])
+        return {
+            "schema_version": "heel.discovery-authorization-view.v1",
+            "authorization_id": row["authorization_id"], "workspace_id": row["workspace_id"],
+            "project_id": row["project_ref"], "environment_id": row["environment_id"],
+            "actor_user_id": row["actor_user_id"], "actor_role": row["actor_role"],
+            "bound": json.loads(row["bound_json"]), "seed_digest": row["seed_digest"],
+            "identities_authorized": json.loads(row["identities_json"]),
+            "login_exchange_authorized": bool(row["login_exchange_authorized"]),
+            "authorization_digest": row["authorization_digest"], "request_digest": row["request_digest"],
+            "quota_state": row["quota_state"], "state": row["state"],
+            "rounds_issued": rounds, "actions_issued": actions, "execution_ms_used": used,
+            "requests_completed": int(row["requests_completed"]), "bytes_received": int(row["bytes_received"]),
+            "created_at_ms": row["created_at_ms"], "expires_at_ms": row["expires_at_ms"],
+            "closed_at_ms": row["closed_at_ms"], "close_reason": row["close_reason"], "revoked_by": row["revoked_by"],
+            "actions_remaining": max(0, DISCOVERY_BOUND["max_requests"] - actions),
+            "rounds_remaining": max(0, DISCOVERY_BOUND["max_rounds"] - rounds),
+            "execution_ms_remaining": max(0, DISCOVERY_BOUND["max_total_execution_ms"] - used),
+        }
+
+    def _discovery_row(self, workspace_id: str, project_ref: str, environment_id: str, authorization_id: str) -> sqlite3.Row:
+        row = self.conn.execute(
+            "SELECT * FROM discovery_authorizations WHERE authorization_id=? AND workspace_id=? "
+            "AND project_ref=? AND environment_id=?",
+            (authorization_id, workspace_id, project_ref, environment_id),
+        ).fetchone()
+        if row is None:
+            raise DiscoveryError("authorization_unknown")
+        return row
+
+    def _reload_discovery(self, authorization_id: str) -> sqlite3.Row:
+        return self.conn.execute(
+            "SELECT * FROM discovery_authorizations WHERE authorization_id=?", (authorization_id,),
+        ).fetchone()
+
+    def _stop_discovery_rounds_in_transaction(self, authorization_id: str, detail: str, now: int) -> None:
+        """Every issued round of a closed authorization loses its authority now (contract §3, §4)."""
+        rounds = self.conn.execute(
+            "SELECT run_id FROM discovery_rounds WHERE authorization_id=? AND state='issued' ORDER BY round",
+            (authorization_id,),
+        ).fetchall()
+        for item in rounds:
+            run = self._run_any(item["run_id"])
+            if run is None:
+                continue
+            if run["status"] == "approved":
+                revoked = self.conn.execute(
+                    "UPDATE canary_execution_grants SET status='revoked' WHERE workspace_id=? AND project_ref=? "
+                    "AND grant_id=? AND status='issued'",
+                    (run["workspace_id"], run["project_ref"], run["grant_id"]),
+                )
+                if revoked.rowcount == 1:
+                    self._append_event(run, "grant_revoked", actor_class="system", actor_id="control-plane", reason_code=detail)
+            elif run["status"] in {"claimed", "running", "finalizing"} and run["stop_reason"] == "none":
+                self._persist_discovery_stop(run, detail, now)
+
+    def _persist_discovery_stop(self, run: sqlite3.Row, detail: str, now: int) -> None:
+        """Durable cloud stop for one round run; the runner sees it at its next heartbeat/gate."""
+        now = max(now, self._server_receipt_time(run))
+        next_status = "finalizing" if run["status"] == "finalizing" else "stop_requested"
+        changed = self.conn.execute(
+            "UPDATE canary_runs SET status=?,stop_reason='cloud_stop',stop_generation=?,"
+            "stop_requested_at_ms=?,stop_deadline_ms=?,updated_at=? "
+            "WHERE workspace_id=? AND project_ref=? AND run_id=? AND stop_reason='none' "
+            "AND status IN ('claimed','running','finalizing')",
+            (
+                next_status, self._control_generation(), now, now + STOP_DEADLINE_MS, now,
+                run["workspace_id"], run["project_ref"], run["run_id"],
+            ),
+        )
+        if changed.rowcount != 1:
+            return
+        updated = self._run(run["workspace_id"], run["project_ref"], run["run_id"])
+        self._append_event(updated, "stop_requested", actor_class="system", actor_id="control-plane", reason_code=detail)
+        self._audit(updated, "stop_requested", subject_ref=run["run_id"], actor_class="system",
+                    actor_id="control-plane", reason_code=detail)
+
+    def _run_any(self, run_id: str | None) -> sqlite3.Row | None:
+        if run_id is None:
+            return None
+        return self.conn.execute("SELECT * FROM canary_runs WHERE run_id=?", (run_id,)).fetchone()
+
+    def _close_discovery_in_transaction(
+        self, row: sqlite3.Row, state: str, reason: str, now: int, *, revoked_by: str | None = None,
+    ) -> sqlite3.Row:
+        """One conditional open→closed transition; refund only when no round ever issued (§5)."""
+        changed = self.conn.execute(
+            "UPDATE discovery_authorizations SET state=?,close_reason=?,closed_at_ms=?,revoked_by=? "
+            "WHERE authorization_id=? AND state='open'",
+            (state, reason, now, revoked_by, row["authorization_id"]),
+        )
+        current = self._reload_discovery(row["authorization_id"])
+        if changed.rowcount != 1:
+            return current
+        if int(current["rounds_issued"]) == 0 and current["quota_state"] == "reserved":
+            if not self.ledger._settle_in_transaction(current["reservation_id"], "refund"):
+                raise RuntimeError("discovery reservation refund lost serialization")
+            self.conn.execute(
+                "UPDATE discovery_authorizations SET quota_state='refunded' WHERE authorization_id=? "
+                "AND quota_state='reserved' AND rounds_issued=0",
+                (row["authorization_id"],),
+            )
+        if state in {"revoked", "expired"}:
+            self._stop_discovery_rounds_in_transaction(
+                row["authorization_id"], "authorization_" + state, now,
+            )
+        return self._reload_discovery(row["authorization_id"])
+
+    def _expire_discovery_if_due(self, row: sqlite3.Row, now: int) -> sqlite3.Row:
+        if row["state"] == "open" and now >= int(row["expires_at_ms"]):
+            return self._close_discovery_in_transaction(row, "expired", "expired", now)
+        return row
+
+    def create_discovery_authorization(
+        self, workspace_id: str, project_ref: str, environment_id: str, request: object, *,
+        actor: str, role: str, idempotency_key: str,
+    ) -> tuple[dict[str, object], bool]:
+        actor = _identifier(actor, "invalid_approval_actor")
+        if type(idempotency_key) is not str or not _IDEMPOTENCY.fullmatch(idempotency_key):
+            raise DiscoveryError("idempotency_key_required")
+        try:
+            validated = validate_discovery_authorization_request(request)
+        except (ContractError, TypeError, ValueError):
+            raise DiscoveryError("invalid_discovery_authorization") from None
+        if validated["environment_id"] != environment_id:
+            raise DiscoveryError("invalid_discovery_authorization")
+        request_digest = canonical_digest(validated)
+        now = self._now_ms()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            membership = self.conn.execute(
+                "SELECT role FROM memberships WHERE workspace_id=? AND user_id=?", (workspace_id, actor),
+            ).fetchone()
+            if membership is None or membership["role"] not in {"owner", "admin"} or membership["role"] != role:
+                raise DiscoveryError("owner_admin_required")
+            prior = self.conn.execute(
+                "SELECT * FROM discovery_authorizations WHERE workspace_id=? AND idempotency_key=?",
+                (workspace_id, idempotency_key),
+            ).fetchone()
+            if prior is not None:
+                # Same key → same row; the same key can never name a different request.
+                if (prior["request_digest"] != request_digest or prior["project_ref"] != project_ref
+                        or prior["environment_id"] != environment_id or prior["actor_user_id"] != actor):
+                    raise DiscoveryError("idempotency_conflict")
+                prior = self._expire_discovery_if_due(prior, now)
+                self.conn.commit()
+                return self._discovery_view(prior), False
+            # Approval and discovery share the CANARY_RUNS idempotency namespace; a key already
+            # charged for anything else is never silently adopted as this authorization's unit.
+            if self.conn.execute(
+                "SELECT 1 FROM usage_ledger WHERE workspace_id=? AND meter=? AND idempotency_key=?",
+                (workspace_id, Meter.CANARY_RUNS.value, idempotency_key),
+            ).fetchone() is not None:
+                raise DiscoveryError("idempotency_conflict")
+            environment = self.conn.execute(
+                "SELECT * FROM canary_environments WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+                (workspace_id, project_ref, environment_id),
+            ).fetchone()
+            if environment is None:
+                raise DiscoveryError("environment_not_found")
+            if (
+                environment["status"] != "verified" or environment["revoked_at"] is not None
+                or environment["environment_class"] not in {"staging", "sandbox"}
+                or environment["proof_expires_at"] is None
+                or int(environment["proof_expires_at"] * 1000) <= now
+            ):
+                raise DiscoveryError("environment_not_verified")
+            open_row = self.conn.execute(
+                "SELECT * FROM discovery_authorizations WHERE workspace_id=? AND project_ref=? "
+                "AND environment_id=? AND state='open'",
+                (workspace_id, project_ref, environment_id),
+            ).fetchone()
+            if open_row is not None and self._expire_discovery_if_due(open_row, now)["state"] == "open":
+                raise DiscoveryError("authorization_open")
+            period = time.strftime("%Y-%m", time.gmtime(now / 1000))
+            authorization_id = "dau_" + secrets.token_hex(16)
+            try:
+                reservation = self.ledger.reserve_in_transaction(
+                    self.plan_for_workspace(workspace_id), workspace_id, Meter.CANARY_RUNS, 1, period,
+                    idempotency_key=idempotency_key, ref=authorization_id, global_cap=self.global_cap,
+                )
+            except QuotaExceeded:
+                raise DiscoveryError("canary_quota_exceeded") from None
+            identities = validated["identities_authorized"]
+            expires = now + DISCOVERY_TTL_MS
+            digest = canonical_digest({
+                "schema_version": "heel.discovery-authorization-record.v1",
+                "authorization_id": authorization_id, "workspace_id": workspace_id,
+                "project_id": project_ref, "environment_id": environment_id,
+                "actor_user_id": actor, "actor_role": membership["role"], "bound": DISCOVERY_BOUND,
+                "seed_digest": DISCOVERY_SEED_DIGEST, "identities_authorized": identities,
+                "login_exchange_authorized": validated["login_exchange_authorized"],
+                "created_at_ms": now, "expires_at_ms": expires,
+            })
+            self.conn.execute(
+                "INSERT INTO discovery_authorizations(authorization_id,workspace_id,project_ref,environment_id,"
+                "actor_user_id,actor_role,bound_json,seed_digest,identities_json,login_exchange_authorized,"
+                "authorization_digest,request_digest,reservation_id,idempotency_key,quota_state,state,"
+                "created_at_ms,expires_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'reserved','open',?,?)",
+                (
+                    authorization_id, workspace_id, project_ref, environment_id, actor, membership["role"],
+                    canonical_bytes(DISCOVERY_BOUND).decode(), DISCOVERY_SEED_DIGEST,
+                    canonical_bytes(identities).decode(), validated["login_exchange_authorized"], digest,
+                    request_digest, reservation.reservation_id, idempotency_key, now, expires,
+                ),
+            )
+            row = self._reload_discovery(authorization_id)
+            self.conn.commit()
+            return self._discovery_view(row), True
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def get_discovery_authorization(
+        self, workspace_id: str, project_ref: str, environment_id: str, authorization_id: str,
+    ) -> dict[str, object]:
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._expire_discovery_if_due(
+                self._discovery_row(workspace_id, project_ref, environment_id, authorization_id), self._now_ms(),
+            )
+            self.conn.commit()
+            return self._discovery_view(row)
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def revoke_discovery_authorization(
+        self, workspace_id: str, project_ref: str, environment_id: str, authorization_id: str, *,
+        actor: str, role: str,
+    ) -> dict[str, object]:
+        actor = _identifier(actor, "invalid_approval_actor")
+        now = self._now_ms()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            membership = self.conn.execute(
+                "SELECT role FROM memberships WHERE workspace_id=? AND user_id=?", (workspace_id, actor),
+            ).fetchone()
+            if membership is None or membership["role"] not in {"owner", "admin"} or membership["role"] != role:
+                raise DiscoveryError("owner_admin_required")
+            row = self._expire_discovery_if_due(
+                self._discovery_row(workspace_id, project_ref, environment_id, authorization_id), now,
+            )
+            if row["state"] != "open":
+                raise DiscoveryError("authorization_closed")
+            row = self._close_discovery_in_transaction(row, "revoked", "revoked", now, revoked_by=actor)
+            self.conn.commit()
+            return self._discovery_view(row)
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def route_inventory_view(self, workspace_id: str, project_ref: str, environment_id: str) -> dict[str, object]:
+        if self.conn.execute(
+            "SELECT 1 FROM canary_environments WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+            (workspace_id, project_ref, environment_id),
+        ).fetchone() is None:
+            raise DiscoveryError("environment_not_found")
+        row = self.conn.execute(
+            "SELECT * FROM route_inventories WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+            (workspace_id, project_ref, environment_id),
+        ).fetchone()
+        routes = [] if row is None else validate_route_inventory_rows(json.loads(row["routes_json"]))
+        digest = canonical_digest(routes)
+        if row is not None and (digest != row["inventory_digest"] or len(routes) != row["route_count"]):
+            raise DiscoveryError("discovery_unavailable")
+        return {
+            "schema_version": "heel.route-inventory-view.v1", "environment_id": environment_id,
+            "inventory_digest": digest, "route_count": len(routes),
+            "truncated_count": 0 if row is None else int(row["truncated_count"]),
+            "routes": routes, "updated_at_ms": None if row is None else row["updated_at_ms"],
+        }
 
     def expire_and_reconcile(self) -> dict[str, int]:
         now = self._now_ms()
