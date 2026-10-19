@@ -19,9 +19,16 @@ from typing import Callable, TypedDict
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from heel.canary_contracts import (
+    APPROVAL_PROJECTION_V2_SCHEMA,
     DISCOVERY_BOUND,
     DISCOVERY_SEED_DIGEST,
+    DISCOVERY_SEED_PATHS,
+    EXECUTION_GRANT_SCHEMA,
+    EXECUTION_GRANT_V2_SCHEMA,
     ContractError,
+    approval_body_profile,
+    discovery_frontier_digest,
+    validate_discovery_round_report,
     canonical_bytes,
     canonical_digest,
     validate_discovery_authorization_request,
@@ -242,14 +249,39 @@ DISCOVERY_ERROR_STATUS = {
 
 
 class DiscoveryError(ValueError):
-    """A closed discovery/plan reason; HTTP returns exactly ``{schema_version, code}``."""
+    """A closed discovery/plan reason; HTTP returns exactly ``{schema_version, code}``.
 
-    def __init__(self, code: str):
+    ``close`` names the one authorization close a refusal implies (``expired`` or ``budget``).
+    The refusing transaction rolls back so it creates no projection, run or round; the caller
+    then commits that close in its own transaction (``close_discovery_after_refusal``).
+    """
+
+    def __init__(self, code: str, *, close: tuple[str, str, int] | None = None):
         if code not in DISCOVERY_ERROR_STATUS:
             raise ValueError("unknown discovery error")
         self.code = code
         self.status = DISCOVERY_ERROR_STATUS[code]
+        self.close = close
         super().__init__(code)
+
+
+# A round grant names its parent authorization's single ledger reservation in a namespace the
+# ledger cannot resolve (C2D D3).  Round runs are unreserved, so no per-run quota path reads it.
+DISCOVERY_GRANT_RESERVATION_REF = re.compile(r"^dauth:dau_[0-9a-f]{32}:r[1-5]$")
+
+
+def discovery_round_grant_reference(authorization_id: str, round_number: int) -> str:
+    reference = f"dauth:{authorization_id}:r{round_number}"
+    if not DISCOVERY_GRANT_RESERVATION_REF.fullmatch(reference):
+        raise ValueError("invalid discovery round reference")
+    return reference
+
+
+def discovery_round_idempotency_key(authorization_id: str, round_number: int) -> str:
+    # Deterministic, so a rolled-back issue retries to the same key.
+    return "ca1-" + hashlib.sha256(
+        f"heel.discovery-round-grant.v1|{authorization_id}|{round_number}".encode()
+    ).hexdigest()
 
 
 class _RunnerProjectionSubmission(dict[str, object]):
@@ -638,20 +670,9 @@ class CanaryRunService:
             validated = validate_approval_projection(projection)
         except (TypeError, ValueError):
             raise CanaryRunError("invalid_projection") from None
-        environment = validated["environment"]
-        runner = validated["runner"]
-        if (
-            validated["workspace_id"] != binding_row["workspace_id"]
-            or validated["project_id"] != binding_row["project_ref"]
-            or environment["environment_id"] != binding_row["environment_id"]
-            or environment["origin"] != binding_row["environment_origin"]
-            or environment["environment_class"] != binding_row["environment_class"]
-            or environment["verification_record_digest"] != binding_row["verification_record_digest"]
-            or runner["runner_id"] != binding_row["runner_id"]
-            or runner["runner_key_id"] != binding_row["runner_key_id"]
-            or uploaded_by_runner_id != binding_row["runner_id"]
-        ):
-            raise CanaryRunError("canary_authority_unavailable")
+        if validated.get("plan", {}).get("plan_kind") == "discovery":
+            return self._submit_discovery_round_in_transaction(validated, binding_row, uploaded_by_runner_id)
+        self._assert_projection_matches_binding(validated, binding_row, uploaded_by_runner_id)
         prior = self.conn.execute(
             "SELECT approval_id,run_id,status,projection_digest,uploaded_by,projection_json FROM canary_approval_projections "
             "WHERE workspace_id=? AND project_ref=? AND (approval_id=? OR projection_digest=?)",
@@ -694,6 +715,270 @@ class CanaryRunService:
             ),
         )
         return _RunnerProjectionSubmission(result, created=True)
+
+    @staticmethod
+    def _assert_projection_matches_binding(validated: dict, binding_row: sqlite3.Row, uploaded_by_runner_id: str) -> None:
+        environment = validated["environment"]
+        runner = validated["runner"]
+        if (
+            validated["workspace_id"] != binding_row["workspace_id"]
+            or validated["project_id"] != binding_row["project_ref"]
+            or environment["environment_id"] != binding_row["environment_id"]
+            or environment["origin"] != binding_row["environment_origin"]
+            or environment["environment_class"] != binding_row["environment_class"]
+            or environment["verification_record_digest"] != binding_row["verification_record_digest"]
+            or runner["runner_id"] != binding_row["runner_id"]
+            or runner["runner_key_id"] != binding_row["runner_key_id"]
+            or uploaded_by_runner_id != binding_row["runner_id"]
+        ):
+            raise CanaryRunError("canary_authority_unavailable")
+
+    # --- bounded discovery auto-issue (discovery contract §4, §4a; C2D D3/D4) ---
+
+    def _discovery_round_response(self, round_row: sqlite3.Row, *, runner_key_id: str) -> _RunnerProjectionSubmission:
+        run = self._run_any(round_row["run_id"])
+        grant_row = self.conn.execute(
+            "SELECT grant_json,runner_key_id FROM canary_execution_grants WHERE grant_id=?", (round_row["grant_id"],),
+        ).fetchone()
+        response: dict[str, object] = {
+            "schema_version": "heel.canary-projection-submitted.v1", "approval_id": round_row["projection_id"],
+            "run_id": round_row["run_id"], "status": run["status"], "projection_digest": round_row["projection_digest"],
+            "round_state": self._round_state(round_row),
+        }
+        # A grant is only ever returned to the runner key it names (contract §4 step 0).
+        if (grant_row is not None and grant_row["grant_json"] is not None
+                and grant_row["runner_key_id"] == runner_key_id and round_row["state"] == "issued"):
+            response["grant"] = json.loads(grant_row["grant_json"])
+        return _RunnerProjectionSubmission(response, created=False)
+
+    @staticmethod
+    def _round_state(round_row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "authorization_id": round_row["authorization_id"], "round": round_row["round"],
+            "state": round_row["state"], "grant_id": round_row["grant_id"], "actions": round_row["actions"],
+            "wall_budget_ms": round_row["wall_budget_ms"],
+        }
+
+    def _discovery_reports(self, authorization_id: str) -> dict[int, list[dict]]:
+        return {
+            int(row["round"]): json.loads(row["candidates_json"]) for row in self.conn.execute(
+                "SELECT round,candidates_json FROM discovery_round_reports WHERE authorization_id=?", (authorization_id,),
+            )
+        }
+
+    def _submit_discovery_round_in_transaction(
+        self, validated: dict, binding_row: sqlite3.Row, uploaded_by_runner_id: str,
+    ) -> _RunnerProjectionSubmission:
+        plan = validated["plan"]
+        now = self._now_ms()
+        # A. The binding (already PoP- and liveness-checked by the caller) must own the authorization.
+        auth = self.conn.execute(
+            "SELECT * FROM discovery_authorizations WHERE authorization_id=? AND workspace_id=? AND project_ref=? "
+            "AND environment_id=?",
+            (plan["authorization_id"], binding_row["workspace_id"], binding_row["project_ref"], binding_row["environment_id"]),
+        ).fetchone()
+        if auth is None:
+            raise DiscoveryError("authorization_unknown")
+        # 0. Replay only after A; a different digest or another runner key never gets the grant.
+        existing = self.conn.execute(
+            "SELECT * FROM discovery_rounds WHERE authorization_id=? AND round=?", (auth["authorization_id"], plan["round"]),
+        ).fetchone()
+        if existing is not None:
+            if (existing["runner_id"] != binding_row["runner_id"] or existing["runner_key_id"] != binding_row["runner_key_id"]
+                    or existing["projection_digest"] != validated["projection_digest"]
+                    or existing["state"] not in {"issued", "terminal"}):
+                raise DiscoveryError("round_consumed")
+            return self._discovery_round_response(existing, runner_key_id=binding_row["runner_key_id"])
+        self.conn.execute(
+            "UPDATE canary_plan_requests SET status='expired' WHERE workspace_id=? AND rcb_id=? "
+            "AND status='open' AND expires_at_ms<=?",
+            (binding_row["workspace_id"], binding_row["rcb_id"], now),
+        )
+        if self.conn.execute(
+            "SELECT 1 FROM canary_plan_requests WHERE workspace_id=? AND rcb_id=? AND status='open'",
+            (binding_row["workspace_id"], binding_row["rcb_id"]),
+        ).fetchone() is not None:
+            raise DiscoveryError("plan_kind_mismatch")
+        authorization_id = auth["authorization_id"]
+        if auth["state"] != "open":                                                            # 2
+            raise DiscoveryError("authorization_closed")
+        if now >= int(auth["expires_at_ms"]):                                                  # 3
+            raise DiscoveryError("authorization_expired", close=(authorization_id, "expired", 0))
+        if plan["authorization_digest"] != auth["authorization_digest"]:                       # 4
+            raise DiscoveryError("authorization_digest_mismatch")
+        round_number = plan["round"]
+        if round_number != int(auth["rounds_issued"]) + 1:                                     # 5
+            raise DiscoveryError("round_out_of_order")
+        reports = self._discovery_reports(authorization_id)
+        if round_number > 1:                                                                   # 6
+            previous = self.conn.execute(
+                "SELECT state FROM discovery_rounds WHERE authorization_id=? AND round=?", (authorization_id, round_number - 1),
+            ).fetchone()
+            if previous is None or previous["state"] != "terminal":
+                raise DiscoveryError("previous_round_active")
+            if round_number - 1 not in reports:
+                raise DiscoveryError("previous_report_missing")
+        if plan["cumulative_requests_before"] != int(auth["actions_issued"]):                 # 7
+            raise DiscoveryError("cumulative_mismatch")
+        bound = json.loads(auth["bound_json"])                                                 # 8
+        count = plan["action_count"]
+        used = int(auth["execution_ms_used"])
+        if (int(auth["actions_issued"]) + count > bound["max_requests"] or round_number > bound["max_rounds"]
+                or used + DISCOVERY_ROUND_FLOOR_MS > bound["max_total_execution_ms"]):
+            raise DiscoveryError("bound_exceeded", close=(authorization_id, "budget", count))
+        budgets = validated["budgets"]
+        wall_limit = min(bound["max_wall_ms_per_round"], bound["max_total_execution_ms"] - used)
+        if (count > bound["max_actions_per_round"] or budgets["wall_timeout_ms"] > wall_limit
+                or budgets["maximum_response_bytes"] > bound["max_body_bytes"]):
+            # Asking for more than the server-computed round budget is malformed, not exhaustion.
+            raise DiscoveryError("bound_exceeded")
+        actions = validated["actions"]
+        sources = plan["sources"]
+        if round_number == 1:                                                                  # 9
+            routes = [action["route_template"] for action in actions]
+            if (sorted(routes) != sorted(DISCOVERY_SEED_PATHS) or any(
+                    source["round"] != 0 or DISCOVERY_SEED_PATHS[source["source_ordinal"]] != action["route_template"]
+                    for source, action in zip(sources, actions))):
+                raise DiscoveryError("seed_mismatch")
+        else:                                                                                  # 9a
+            referenced = []
+            for source, action in zip(sources, actions):
+                recorded = [
+                    candidate for candidate in reports.get(source["round"], [])
+                    if (candidate["method"], candidate["route_template"]) == (action["method"], action["route_template"])
+                ] if 1 <= source["round"] < round_number else []
+                if not recorded:
+                    raise DiscoveryError("candidate_not_recorded")
+                if recorded[0]["source_ordinal"] != source["source_ordinal"]:
+                    raise DiscoveryError("source_ordinal_mismatch")
+                referenced.append({"round": source["round"], "candidate": recorded[0]})
+            if discovery_frontier_digest(referenced) != plan["frontier_digest"]:
+                raise DiscoveryError("frontier_digest_mismatch")
+        environment = self.conn.execute(                                                       # 10
+            "SELECT origin FROM canary_environments WHERE workspace_id=? AND project_ref=? AND environment_id=?",
+            (auth["workspace_id"], auth["project_ref"], auth["environment_id"]),
+        ).fetchone()
+        if (environment is None or validated["environment"]["origin"] != environment["origin"]
+                or validated["egress"]["hostname"] != environment["origin"][len("https://"):]
+                or any(action["method"] not in {"GET", "HEAD"} for action in actions)):
+            raise DiscoveryError("action_out_of_scope")
+        if self._kill_active(auth["workspace_id"]):                                             # 11
+            raise DiscoveryError("kill_switch")
+        self._assert_projection_matches_binding(validated, binding_row, uploaded_by_runner_id)
+        if approval_body_profile(validated) != "discovery":
+            raise CanaryRunError("invalid_projection")
+
+        result = self.submit_projection(validated, uploaded_by=uploaded_by_runner_id, _transaction_owned=True, _actor_class="runner")
+        self.conn.execute(
+            "INSERT INTO canary_runner_context_projection_links("
+            "workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,projection_digest,created_at_ms) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                binding_row["workspace_id"], binding_row["project_ref"], result["approval_id"], result["run_id"],
+                binding_row["environment_id"], binding_row["runner_id"], binding_row["runner_key_id"], binding_row["rcb_id"],
+                binding_row["binding_digest"], result["projection_digest"], now,
+            ),
+        )
+        grant = self._issue_discovery_grant_in_transaction(auth, validated, result["run_id"], round_number, now)
+        round_id = "drd_" + secrets.token_hex(16)
+        self.conn.execute(
+            "INSERT INTO discovery_rounds(round_id,authorization_id,workspace_id,project_ref,environment_id,round,runner_id,"
+            "runner_key_id,run_id,grant_id,projection_id,projection_digest,frontier_digest,actions,cumulative_requests_before,"
+            "wall_budget_ms,state,issued_at_ms,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'issued',?,?)",
+            (
+                round_id, authorization_id, auth["workspace_id"], auth["project_ref"], auth["environment_id"], round_number,
+                binding_row["runner_id"], binding_row["runner_key_id"], result["run_id"], grant["grant_id"],
+                validated["projection_id"], validated["projection_digest"], plan["frontier_digest"], count,
+                plan["cumulative_requests_before"], budgets["wall_timeout_ms"], now, now,
+            ),
+        )
+        # C-1: counters move at issue, guarded on the exact previous state; the authorization's one
+        # unit is consumed in this same transaction when the first round issues.
+        if round_number == 1:
+            consumed = self.ledger.consume_in_transaction(auth["reservation_id"])
+            if not consumed and self.conn.execute(
+                "SELECT 1 FROM usage_ledger WHERE reservation_id=? AND kind='consume'", (auth["reservation_id"],),
+            ).fetchone() is None:
+                raise RuntimeError("discovery reservation consume lost serialization")
+            changed = self.conn.execute(
+                "UPDATE discovery_authorizations SET quota_state='consumed',rounds_issued=1,actions_issued=? "
+                "WHERE authorization_id=? AND state='open' AND rounds_issued=0 AND quota_state='reserved'",
+                (count, authorization_id),
+            )
+        else:
+            changed = self.conn.execute(
+                "UPDATE discovery_authorizations SET rounds_issued=rounds_issued+1,actions_issued=actions_issued+? "
+                "WHERE authorization_id=? AND state='open' AND rounds_issued=?",
+                (count, authorization_id, round_number - 1),
+            )
+        if changed.rowcount != 1:
+            raise RuntimeError("discovery round issue lost serialization")
+        round_row = self.conn.execute("SELECT * FROM discovery_rounds WHERE round_id=?", (round_id,)).fetchone()
+        return _RunnerProjectionSubmission({
+            "schema_version": "heel.canary-projection-submitted.v1", "approval_id": result["approval_id"],
+            "run_id": result["run_id"], "status": "approved", "projection_digest": result["projection_digest"],
+            "round_state": self._round_state(round_row), "grant": grant,
+        }, created=True)
+
+    def _issue_discovery_grant_in_transaction(
+        self, auth: sqlite3.Row, projection: dict, run_id: str, round_number: int, now: int,
+    ) -> dict:
+        """The existing grant path, issued by the recorded authorization instead of a new human click."""
+        workspace_id, project_ref = auth["workspace_id"], auth["project_ref"]
+        authority = self._projection_authority(projection, now)
+        generation = self._control_generation()
+        grant_id = "cgr_" + secrets.token_hex(16)
+        nonce = secrets.token_urlsafe(32)
+        expires_at = min(now + 600_000, int(authority["proof_expires_at"] * 1000), int(auth["expires_at_ms"]))
+        if expires_at <= now:
+            raise DiscoveryError("authorization_expired", close=(auth["authorization_id"], "expired", 0))
+        reason = "discovery_authorization:" + auth["authorization_id"]
+        grant = self._signed_grant(
+            grant_id=grant_id, run_id=run_id, workspace_id=workspace_id, project_ref=project_ref, projection=projection,
+            authority=authority, actor=auth["actor_user_id"], role=auth["actor_role"], reason=reason, now=now,
+            nonce=nonce, generation=generation, expires_at=expires_at,
+        )
+        period = self.conn.execute(
+            "SELECT period FROM usage_ledger WHERE reservation_id=? AND kind='reserve'", (auth["reservation_id"],),
+        ).fetchone()["period"]
+        changed = self.conn.execute(
+            "UPDATE canary_approval_projections SET status='approved',approved_by=?,reason=?,approved_at=?,purge_at=? "
+            "WHERE workspace_id=? AND project_ref=? AND run_id=? AND status='awaiting_execution_approval'",
+            (auth["actor_user_id"], reason, now, expires_at + PROJECTION_RETENTION_MS, workspace_id, project_ref, run_id),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("discovery approval lost serialization")
+        approval = self.conn.execute(
+            "SELECT * FROM canary_approval_projections WHERE workspace_id=? AND project_ref=? AND run_id=?",
+            (workspace_id, project_ref, run_id),
+        ).fetchone()
+        self.conn.execute(
+            "INSERT INTO canary_execution_grants("
+            "grant_id,workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,"
+            "runner_key_id,nonce_hash,grant_digest,grant_json,status,reservation_id,meter,period,"
+            "idempotency_key,issued_at,expires_at,purge_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                grant_id, workspace_id, project_ref, approval["approval_id"], run_id, approval["environment_id"],
+                approval["runner_id"], approval["runner_key_id"], hashlib.sha256(nonce.encode()).hexdigest(),
+                grant["grant_digest"], canonical_bytes(grant).decode(), "issued",
+                discovery_round_grant_reference(auth["authorization_id"], round_number), Meter.CANARY_RUNS.value, period,
+                discovery_round_idempotency_key(auth["authorization_id"], round_number), now, expires_at,
+                expires_at + PROJECTION_RETENTION_MS,
+            ),
+        )
+        # The round run holds no unit: reservation NULL, quota 'unreserved' (C2D D3).
+        self.conn.execute(
+            "UPDATE canary_runs SET grant_id=?,status='approved',kill_switch_generation=?,updated_at=max(updated_at,?) "
+            "WHERE workspace_id=? AND project_ref=? AND run_id=? AND reservation_id IS NULL AND quota_state='unreserved'",
+            (grant_id, generation, now, workspace_id, project_ref, run_id),
+        )
+        run = self._run(workspace_id, project_ref, run_id)
+        self._append_event(run, "approval_granted", actor_class="system", actor_id="discovery-authorization",
+                           reason_code="discovery_authorization")
+        self._audit(run, "approved", subject_ref=approval["approval_id"], actor_class="system",
+                    actor_id="discovery-authorization", payload={"reason": reason})
+        self._append_event(run, "grant_issued", actor_class="system", actor_id="control-plane")
+        return grant
 
     def _plan_request_for_submission_in_transaction(
         self, validated: dict, binding_row: sqlite3.Row,
@@ -974,7 +1259,8 @@ class CanaryRunService:
             plan_request = None
             if "plan" in projection:
                 if projection["plan"]["plan_kind"] == "discovery":
-                    raise CanaryRunError("invalid_canary_approval")
+                    # Defence in depth: discovery rounds are issued only by their authorization.
+                    raise CanaryRunError("approval_state_conflict")
                 plan_request = self.conn.execute(
                     "SELECT plan_request_id FROM canary_plan_requests WHERE workspace_id=? AND project_ref=? "
                     "AND plan_request_id=? AND approval_id=? AND run_id=? AND projection_digest=? AND status='projected'",
@@ -1028,42 +1314,11 @@ class CanaryRunService:
             expires_at = min(issued_at + 600_000, int(authority["proof_expires_at"] * 1000))
             if expires_at <= issued_at:
                 raise CanaryRunError("proof_not_executable")
-            public_key_bytes = load_public_key_base64(authority["public_key"]).public_bytes(
-                Encoding.Raw, PublicFormat.Raw,
+            grant = self._signed_grant(
+                grant_id=grant_id, run_id=run_id, workspace_id=workspace_id, project_ref=project_ref,
+                projection=projection, authority=authority, actor=actor, role=authorized_role, reason=reason,
+                now=now, nonce=nonce, generation=generation, expires_at=expires_at,
             )
-            unsigned = {
-                "schema_version": "heel.execution-grant.v1",
-                "grant_id": grant_id,
-                "run_id": run_id,
-                "workspace_id": workspace_id,
-                "project_id": project_ref,
-                "approval": {
-                    "projection_id": projection["projection_id"],
-                    "projection_digest": projection["projection_digest"],
-                    "manifest_digest": projection["manifest_digest"],
-                },
-                "environment": projection["environment"],
-                "runner_binding": {
-                    "runner_id": projection["runner"]["runner_id"],
-                    "runner_key_id": projection["runner"]["runner_key_id"],
-                    "public_key_digest": hashlib.sha256(public_key_bytes).hexdigest(),
-                },
-                "approval_actor": {"user_id": actor, "role": authorized_role},
-                "approval_reason": reason,
-                "consented_at_ms": now,
-                "budgets": projection["budgets"],
-                "egress": projection["egress"],
-                "retry_policy": projection["retry_policy"],
-                "grant_nonce": nonce,
-                "kill_switch_generation": generation,
-                "operational_receipt_policy": self._grant_policy(),
-                "issued_at_ms": issued_at,
-                "expires_at_ms": expires_at,
-            }
-            grant = dict(unsigned)
-            grant["grant_digest"] = canonical_digest(unsigned)
-            grant.update(self.signing.sign(canonical_bytes(unsigned)))
-            grant = validate_execution_grant(grant)
             self.conn.execute(
                 "UPDATE canary_approval_projections SET status='approved',approved_by=?,reason=?,"
                 "approved_at=?,purge_at=? WHERE workspace_id=? AND project_ref=? AND run_id=? "
@@ -1124,6 +1379,53 @@ class CanaryRunService:
                 self.conn.rollback()
             raise
 
+    def _signed_grant(
+        self, *, grant_id: str, run_id: str, workspace_id: str, project_ref: str, projection: dict,
+        authority: sqlite3.Row, actor: str, role: str, reason: str, now: int, nonce: str, generation: int,
+        expires_at: int,
+    ) -> dict:
+        """One signed grant shape.  Scan projections keep v1 bytes; only a signed discovery plan
+        yields ``heel.execution-grant.v2`` with ``budget_profile: discovery`` (C2D D4)."""
+        public_key_bytes = load_public_key_base64(authority["public_key"]).public_bytes(
+            Encoding.Raw, PublicFormat.Raw,
+        )
+        discovery = approval_body_profile(projection) == "discovery"
+        unsigned = {
+            "schema_version": EXECUTION_GRANT_V2_SCHEMA if discovery else EXECUTION_GRANT_SCHEMA,
+            "grant_id": grant_id,
+            "run_id": run_id,
+            "workspace_id": workspace_id,
+            "project_id": project_ref,
+            "approval": {
+                "projection_id": projection["projection_id"],
+                "projection_digest": projection["projection_digest"],
+                "manifest_digest": projection["manifest_digest"],
+            },
+            "environment": projection["environment"],
+            "runner_binding": {
+                "runner_id": projection["runner"]["runner_id"],
+                "runner_key_id": projection["runner"]["runner_key_id"],
+                "public_key_digest": hashlib.sha256(public_key_bytes).hexdigest(),
+            },
+            "approval_actor": {"user_id": actor, "role": role},
+            "approval_reason": reason,
+            "consented_at_ms": now,
+            "budgets": projection["budgets"],
+            "egress": projection["egress"],
+            "retry_policy": projection["retry_policy"],
+            "grant_nonce": nonce,
+            "kill_switch_generation": generation,
+            "operational_receipt_policy": self._grant_policy(),
+            "issued_at_ms": now,
+            "expires_at_ms": expires_at,
+        }
+        if discovery:
+            unsigned["budget_profile"] = "discovery"
+        grant = dict(unsigned)
+        grant["grant_digest"] = canonical_digest(unsigned)
+        grant.update(self.signing.sign(canonical_bytes(unsigned)))
+        return validate_execution_grant(grant)
+
     def _validate_stored_grant(self, row: sqlite3.Row, now: int) -> dict:
         if row["grant_json"] is None:
             raise CanaryRunError("grant_unavailable")
@@ -1173,6 +1475,7 @@ class CanaryRunService:
             self.conn.execute("BEGIN IMMEDIATE")
         try:
             now = self._now_ms()
+            self._revoke_closed_discovery_grants_in_transaction(workspace_id, runner_id, now)
             row = self.conn.execute(
                 "SELECT * FROM canary_execution_grants WHERE workspace_id=? AND runner_id=? "
                 "AND runner_key_id=? AND status='issued' AND expires_at>? "
@@ -1208,6 +1511,8 @@ class CanaryRunService:
                 or grant["approval_actor"]["user_id"] != approval["approved_by"]
                 or grant["approval_reason"] != approval["reason"]
                 or grant["consented_at_ms"] != approval["approved_at"]
+                # D4: only a signed discovery projection may pair with a v2 discovery grant.
+                or (grant["schema_version"] == EXECUTION_GRANT_V2_SCHEMA) != (approval_body_profile(projection) == "discovery")
             ):
                 raise CanaryRunError("invalid_grant")
             self._projection_authority(projection, now)
@@ -1479,6 +1784,8 @@ class CanaryRunService:
         return self._context(row["workspace_id"], row["project_ref"], row["run_id"], row["runner_id"])
 
     def _gate(self, row: sqlite3.Row, *, advance: bool) -> CanaryGate:
+        if advance:
+            self._discovery_live_check_in_transaction(row, self._now_ms())
         context = self._context(row["workspace_id"], row["project_ref"], row["run_id"], row["runner_id"])
         now = self._now_ms()
         generation = self._control_generation()
@@ -1954,7 +2261,7 @@ class CanaryRunService:
 
     def result(
         self, workspace_id: str, project_ref: str, run_id: str, runner_id: str,
-        projection: object,
+        projection: object, discovery_report: object | None = None,
     ) -> dict[str, object]:
         owns_transaction = not self.conn.in_transaction
         if owns_transaction:
@@ -1973,7 +2280,7 @@ class CanaryRunService:
                 return closed
             source = self._source_state(row, value)
             if source == "replay" and row["status"] == "terminal":
-                result = self.get_status(workspace_id, project_ref, run_id)
+                result = self._discovery_result_in_transaction(row, value, discovery_report)
                 if owns_transaction:
                     self.conn.commit()
                 return result
@@ -2068,13 +2375,38 @@ class CanaryRunService:
                 reason_code=value["error_category"],
                 payload={"execution_disposition": value["execution_disposition"]},
             )
+            result = self._discovery_result_in_transaction(
+                self._context(workspace_id, project_ref, run_id, runner_id), value, discovery_report,
+            )
             if owns_transaction:
                 self.conn.commit()
-            return self.get_status(workspace_id, project_ref, run_id)
+            return result
         except Exception:
             if owns_transaction and self.conn.in_transaction:
                 self.conn.rollback()
             raise
+
+    def _discovery_result_in_transaction(self, row: sqlite3.Row, value: dict, report: object | None) -> dict[str, object]:
+        """Settle a terminal round now (fast path) and record its signed report exactly once."""
+        result = self.get_status(row["workspace_id"], row["project_ref"], row["run_id"])
+        round_row = self.conn.execute("SELECT * FROM discovery_rounds WHERE run_id=?", (row["run_id"],)).fetchone()
+        if round_row is None:
+            if report is not None:
+                raise DiscoveryError("invalid_discovery_report")
+            return result
+        current = self._run(row["workspace_id"], row["project_ref"], row["run_id"])
+        if round_row["state"] == "issued" and current["status"] == "terminal":
+            round_row = self._settle_discovery_round_in_transaction(
+                round_row, int(current["terminal_at_ms"]), value["counters"]["requests_completed"],
+            )
+        if report is not None:
+            self._record_discovery_report_in_transaction(round_row, report, row["public_key"])
+        stored = self.conn.execute(
+            "SELECT report_digest FROM discovery_round_reports WHERE authorization_id=? AND round=?",
+            (round_row["authorization_id"], round_row["round"]),
+        ).fetchone()
+        return {**result, "round_state": {**self._round_state(round_row),
+                                          "report_digest": None if stored is None else stored["report_digest"]}}
 
     def get_status(self, workspace_id: str, project_ref: str, run_id: str) -> dict[str, object]:
         row = self._run(workspace_id, project_ref, run_id)
@@ -2289,7 +2621,10 @@ class CanaryRunService:
         if changed.rowcount != 1:
             return current
         if int(current["rounds_issued"]) == 0 and current["quota_state"] == "reserved":
-            if not self.ledger._settle_in_transaction(current["reservation_id"], "refund"):
+            if not self.ledger._settle_in_transaction(current["reservation_id"], "refund") and self.conn.execute(
+                "SELECT 1 FROM usage_ledger WHERE reservation_id=? AND kind='refund'", (current["reservation_id"],),
+            ).fetchone() is None:
+                # ``False`` is safe only when it means "already refunded" (e.g. a reconcile repair).
                 raise RuntimeError("discovery reservation refund lost serialization")
             self.conn.execute(
                 "UPDATE discovery_authorizations SET quota_state='refunded' WHERE authorization_id=? "
@@ -2306,6 +2641,187 @@ class CanaryRunService:
         if row["state"] == "open" and now >= int(row["expires_at_ms"]):
             return self._close_discovery_in_transaction(row, "expired", "expired", now)
         return row
+
+    def close_discovery_after_refusal(self, authorization_id: str, kind: str, action_count: int) -> None:
+        """Commit the close a refused round submit implied, re-derived from durable state only.
+
+        The refusing PoP transaction rolled back (no projection, run, round or nonce use). This
+        separate transaction re-checks the server facts, so a stale or forged refusal cannot close
+        an authorization that is still inside its bound (Astra C-4 durability clarification).
+        """
+        if kind not in {"expired", "budget"}:
+            raise ValueError("invalid discovery refusal close")
+        owns = not self.conn.in_transaction
+        if owns:
+            self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._reload_discovery(authorization_id)
+            now = self._now_ms()
+            if row is not None and row["state"] == "open":
+                bound = json.loads(row["bound_json"])
+                if kind == "expired" and now >= int(row["expires_at_ms"]):
+                    self._close_discovery_in_transaction(row, "expired", "expired", now)
+                elif kind == "budget" and (
+                    int(row["actions_issued"]) + action_count > bound["max_requests"]
+                    or int(row["rounds_issued"]) >= bound["max_rounds"]
+                    or int(row["execution_ms_used"]) + DISCOVERY_ROUND_FLOOR_MS > bound["max_total_execution_ms"]
+                ):
+                    self._close_discovery_in_transaction(row, "done", "budget", now)
+            if owns:
+                self.conn.commit()
+        except Exception:
+            if owns and self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def _settle_discovery_round_in_transaction(
+        self, round_row: sqlite3.Row, terminal_at_ms: int, requests_completed: int,
+    ) -> sqlite3.Row:
+        """Exactly-once terminal aggregation: one conditional statement guards every counter."""
+        terminal_at_ms = max(int(terminal_at_ms), int(round_row["issued_at_ms"]))
+        changed = self.conn.execute(
+            "UPDATE discovery_rounds SET state='terminal',terminal_at_ms=?,requests_completed=?,closed_at_ms=? "
+            "WHERE round_id=? AND state='issued'",
+            (terminal_at_ms, requests_completed, terminal_at_ms, round_row["round_id"]),
+        )
+        if changed.rowcount == 1:
+            self.conn.execute(
+                "UPDATE discovery_authorizations SET execution_ms_used=execution_ms_used+?,"
+                "requests_completed=requests_completed+? WHERE authorization_id=?",
+                (terminal_at_ms - int(round_row["issued_at_ms"]), requests_completed, round_row["authorization_id"]),
+            )
+            auth = self._reload_discovery(round_row["authorization_id"])
+            bound = json.loads(auth["bound_json"])
+            if auth["state"] == "open" and (
+                int(auth["rounds_issued"]) >= bound["max_rounds"]
+                or int(auth["actions_issued"]) >= bound["max_requests"]
+                or int(auth["execution_ms_used"]) >= DISCOVERY_DONE_EXECUTION_MS
+            ):
+                # The unit was consumed at the first issued round; a budget close never refunds.
+                self._close_discovery_in_transaction(auth, "done", "budget", self._now_ms())
+        return self.conn.execute("SELECT * FROM discovery_rounds WHERE round_id=?", (round_row["round_id"],)).fetchone()
+
+    def _record_discovery_report_in_transaction(self, round_row: sqlite3.Row, report: object, public_key: str) -> None:
+        try:
+            report = validate_discovery_round_report(report)
+            self._verify_signature(report, public_key, "report_digest")
+        except (TypeError, ValueError):
+            raise DiscoveryError("invalid_discovery_report") from None
+        if (report["authorization_id"] != round_row["authorization_id"] or report["round"] != round_row["round"]
+                or report["run_id"] != round_row["run_id"] or report["grant_id"] != round_row["grant_id"]
+                or report["signing_key_id"] != round_row["runner_key_id"]):
+            raise DiscoveryError("invalid_discovery_report")
+        stored = self.conn.execute(
+            "SELECT report_digest FROM discovery_round_reports WHERE authorization_id=? AND round=?",
+            (round_row["authorization_id"], round_row["round"]),
+        ).fetchone()
+        if stored is not None:
+            # An identical retry is acknowledged with no counter change; anything else is refused.
+            if stored["report_digest"] != report["report_digest"]:
+                raise DiscoveryError("report_consumed")
+            return
+        now = self._now_ms()
+        self.conn.execute(
+            "INSERT INTO discovery_round_reports(report_id,authorization_id,round,run_id,runner_key_id,report_digest,"
+            "candidates_json,excluded_count,truncated_count,bytes_received,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "drp_" + secrets.token_hex(16), round_row["authorization_id"], round_row["round"], round_row["run_id"],
+                round_row["runner_key_id"], report["report_digest"], canonical_bytes(report["candidates"]).decode(),
+                report["excluded_count"], report["truncated_count"], report["bytes_received"], now,
+            ),
+        )
+        # Bytes are runner-reported and informational only (never the enforcement, contract §2.2).
+        self.conn.execute("UPDATE discovery_rounds SET bytes_received=? WHERE round_id=?",
+                          (report["bytes_received"], round_row["round_id"]))
+        self.conn.execute(
+            "UPDATE discovery_authorizations SET bytes_received=bytes_received+? WHERE authorization_id=?",
+            (report["bytes_received"], round_row["authorization_id"]),
+        )
+        self._merge_route_inventory_in_transaction(round_row, report["candidates"], now)
+
+    def _merge_route_inventory_in_transaction(self, round_row: sqlite3.Row, candidates: list[dict], now: int) -> None:
+        """Append recorded templates by phase order; keep the first 200 and count the rest (§2.5)."""
+        key = (round_row["workspace_id"], round_row["project_ref"], round_row["environment_id"])
+        current = self.conn.execute(
+            "SELECT * FROM route_inventories WHERE workspace_id=? AND project_ref=? AND environment_id=?", key,
+        ).fetchone()
+        rows = [] if current is None else validate_route_inventory_rows(json.loads(current["routes_json"]))
+        truncated = 0 if current is None else int(current["truncated_count"])
+        index = {(row["method"], row["route_template"]): row for row in rows}
+        for candidate in candidates:
+            provenance = {"kind": candidate["provenance_kind"], "round": round_row["round"],
+                          "source_ordinal": candidate["source_ordinal"], "status_code": candidate["status_code"]}
+            existing = index.get((candidate["method"], candidate["route_template"]))
+            if existing is not None:
+                sources = {(item["kind"], item["round"], item["source_ordinal"]) for item in existing["provenance"]}
+                if (provenance["kind"], provenance["round"], provenance["source_ordinal"]) not in sources and len(existing["provenance"]) < 8:
+                    existing["provenance"].append(provenance)
+            elif len(rows) < 200:
+                row = {"method": candidate["method"], "route_template": candidate["route_template"],
+                       "provenance": [provenance], "first_seen_ms": now, "state": "candidate"}
+                rows.append(row)
+                index[(row["method"], row["route_template"])] = row
+            else:
+                truncated += 1
+        rows = validate_route_inventory_rows(rows)
+        self.conn.execute(
+            "INSERT INTO route_inventories(workspace_id,project_ref,environment_id,inventory_digest,route_count,"
+            "truncated_count,routes_json,updated_at_ms) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(workspace_id,project_ref,environment_id) DO UPDATE SET inventory_digest=excluded.inventory_digest,"
+            "route_count=excluded.route_count,truncated_count=excluded.truncated_count,routes_json=excluded.routes_json,"
+            "updated_at_ms=excluded.updated_at_ms",
+            key + (canonical_digest(rows), len(rows), truncated, canonical_bytes(rows).decode(), now),
+        )
+
+    def _discovery_live_check_in_transaction(self, run: sqlite3.Row, now: int) -> None:
+        """Permit-time recheck: a closed or expired authorization stops its in-flight round now."""
+        round_row = self.conn.execute(
+            "SELECT authorization_id FROM discovery_rounds WHERE run_id=? AND state='issued'", (run["run_id"],),
+        ).fetchone()
+        if round_row is None:
+            return
+        auth = self._reload_discovery(round_row["authorization_id"])
+        if auth["state"] == "open" and now >= int(auth["expires_at_ms"]):
+            auth = self._close_discovery_in_transaction(auth, "expired", "expired", now)
+        if auth["state"] != "open":
+            current = self._run_any(run["run_id"])
+            if current["status"] == "approved":
+                self._stop_discovery_rounds_in_transaction(auth["authorization_id"], "authorization_" + auth["state"], now)
+            elif current["status"] in {"claimed", "running", "finalizing"} and current["stop_reason"] == "none":
+                self._persist_discovery_stop(current, "authorization_" + auth["state"], now)
+
+    def _revoke_closed_discovery_grants_in_transaction(self, workspace_id: str, runner_id: str, now: int) -> None:
+        rows = self.conn.execute(
+            "SELECT d.run_id FROM discovery_rounds d JOIN canary_execution_grants g ON g.grant_id=d.grant_id "
+            "JOIN discovery_authorizations a ON a.authorization_id=d.authorization_id "
+            "WHERE g.workspace_id=? AND g.runner_id=? AND g.status='issued' AND d.state='issued' "
+            "AND (a.state!='open' OR a.expires_at_ms<=?)",
+            (workspace_id, runner_id, now),
+        ).fetchall()
+        for row in rows:
+            self._discovery_live_check_in_transaction(self._run_any(row["run_id"]), now)
+
+    def _settle_finished_discovery_rounds_in_transaction(self) -> int:
+        """Reaper catch-up (C2D C-3): every terminal/cancelled/expired round run settles once."""
+        rows = self.conn.execute(
+            "SELECT d.*,r.status AS run_status,r.terminal_at_ms AS run_terminal_at_ms,r.updated_at AS run_updated_at,"
+            "g.expires_at AS grant_expires_at,o.receipt_json FROM discovery_rounds d "
+            "JOIN canary_runs r ON r.run_id=d.run_id JOIN canary_execution_grants g ON g.grant_id=d.grant_id "
+            "LEFT JOIN canary_operational_receipts o ON o.run_id=d.run_id "
+            "WHERE d.state='issued' AND r.status IN ('terminal','cancelled','expired')"
+        ).fetchall()
+        for row in rows:
+            if row["run_terminal_at_ms"] is not None:
+                terminal_at = int(row["run_terminal_at_ms"])
+            elif row["run_status"] == "expired":
+                terminal_at = int(row["grant_expires_at"])
+            else:
+                terminal_at = int(row["run_updated_at"])
+            completed = 0
+            if row["receipt_json"] is not None:
+                completed = int(json.loads(row["receipt_json"])["counters"]["requests_completed"])
+            self._settle_discovery_round_in_transaction(row, terminal_at, completed)
+        return len(rows)
 
     def create_discovery_authorization(
         self, workspace_id: str, project_ref: str, environment_id: str, request: object, *,
@@ -2336,7 +2852,9 @@ class CanaryRunService:
             if prior is not None:
                 # Same key → same row; the same key can never name a different request.
                 if (prior["request_digest"] != request_digest or prior["project_ref"] != project_ref
-                        or prior["environment_id"] != environment_id or prior["actor_user_id"] != actor):
+                        or prior["environment_id"] != environment_id or prior["actor_user_id"] != actor
+                        # Like the ledger, a refunded key is never replayed (C2D crash/retry matrix).
+                        or prior["quota_state"] == "refunded"):
                     raise DiscoveryError("idempotency_conflict")
                 prior = self._expire_discovery_if_due(prior, now)
                 self.conn.commit()
@@ -2479,6 +2997,12 @@ class CanaryRunService:
         }
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            # C2D C-3: discovery expiry is reaper-driven, never only request-driven.
+            for authorization in self.conn.execute(
+                "SELECT * FROM discovery_authorizations WHERE state='open' AND expires_at_ms<=? "
+                "ORDER BY expires_at_ms,authorization_id LIMIT 128", (now,),
+            ).fetchall():
+                self._close_discovery_in_transaction(authorization, "expired", "expired", now)
             approvals = self.conn.execute(
                 "SELECT * FROM canary_approval_projections WHERE status='awaiting_execution_approval' "
                 "AND expires_at<=? AND NOT EXISTS(SELECT 1 FROM canary_runner_context_projection_links l "
@@ -2647,6 +3171,7 @@ class CanaryRunService:
                     payload={"execution_disposition": "stopped"},
                 )
                 counts["finalized_orphans"] += 1
+            self._settle_finished_discovery_rounds_in_transaction()
             cursor = self.conn.execute(
                 "UPDATE canary_approval_projections SET projection_json=NULL "
                 "WHERE projection_json IS NOT NULL AND purge_at<=?",

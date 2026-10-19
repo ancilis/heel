@@ -1462,3 +1462,823 @@ def test_plan_request_creation_requires_recent_owner_admin_and_a_selection_insid
     assert _plan_request(fixture, binding)[0] == 201
     status, _, data = _plan_request(fixture, binding)
     assert (status, data["code"]) == (409, "plan_request_open")
+
+
+# --- C2 bounded discovery rounds (contract §4, §4a, §5, §6).  These tests prove the server's
+# recorded relationships, budgets and authority; they never send target traffic and never
+# claim that a candidate was really present in a target response body (trust boundary §2.6). ---
+
+from heel.canary_contracts import DISCOVERY_SEED_PATHS, discovery_frontier_digest
+from canary_test_support import NOW_MS, operational_projection as _base_operational
+
+
+def _sign_record(signer, value: dict, digest_field: str) -> dict:
+    unsigned = {k: v for k, v in value.items() if k not in {digest_field, "signing_key_id", "signature_b64"}}
+    record = {**unsigned, digest_field: canonical_digest(unsigned)}
+    record.update(signer.sign(canonical_bytes(unsigned)))
+    return record
+
+
+class DiscoveryDriver:
+    """One authorization driven over real HTTP: browser routes plus runner PoP chains."""
+
+    def __init__(self, fixture, *, key: int = 1, chain: _RunnerClaimChain | None = None, binding=None, signer=None,
+                 runner_id: str | None = None):
+        self.fixture = fixture
+        self.signer = signer or fixture.runner
+        self.runner_id = runner_id or fixture.runner_id
+        status, _, self.view = _authorize(fixture, key)
+        assert status == 201, self.view
+        self.authorization_id = self.view["authorization_id"]
+        self.binding = binding or _binding(fixture)
+        self.chain = chain or _RunnerClaimChain(fixture)
+        self.reports: dict[int, list[dict]] = {}
+
+    # projections -------------------------------------------------------------------------
+    def projection(self, round_number: int, references, *, projection_id: str | None = None, wall: int = 60_000,
+                   cumulative: int | None = None, routes=None, body_bytes: int = 2_097_152, **plan_overrides) -> dict:
+        """``references``: list of (source_round, candidate) pairs; round 1 uses the seed list."""
+        if round_number == 1 and references is None:
+            references = [(0, {"method": "GET", "route_template": path, "source_ordinal": index})
+                          for index, path in enumerate(DISCOVERY_SEED_PATHS)]
+        if routes is None:
+            routes = [(candidate["method"], candidate["route_template"]) for _, candidate in references]
+        sources = [{"ordinal": index, "round": source_round, "source_ordinal": candidate["source_ordinal"]}
+                   for index, (source_round, candidate) in enumerate(references)]
+        frontier = DISCOVERY_SEED_DIGEST if round_number == 1 else discovery_frontier_digest(
+            [{"round": source_round, "candidate": candidate} for source_round, candidate in references])
+        plan = {"plan_kind": "discovery", "authorization_id": self.authorization_id,
+                "authorization_digest": self.view["authorization_digest"], "round": round_number,
+                "frontier_digest": frontier,
+                "cumulative_requests_before": self.issued_actions() if cumulative is None else cumulative,
+                "transport_profile": "discovery", "action_count": len(routes), "sources": sources}
+        plan.update(plan_overrides)
+        value = approval_projection(self.signer, workspace_id=self.fixture.workspace, project_ref=self.fixture.project,
+                                    runner_id=self.runner_id)
+        for key in ("projection_digest", "signing_key_id", "signature_b64"):
+            value.pop(key)
+        template = value["actions"][0]
+        value["schema_version"] = "heel.approval-manifest-projection.v2"
+        value["projection_id"] = projection_id or f"ap_{self.authorization_id[-8:]}_r{round_number}_{len(routes)}"
+        value["actions"] = [{**template, "ordinal": index, "method": method, "route_template": route}
+                            for index, (method, route) in enumerate(routes)]
+        value["budgets"] = {**value["budgets"], "maximum_requests": len(routes), "wall_timeout_ms": wall,
+                            "maximum_response_bytes": body_bytes}
+        value["plan"] = plan
+        return _sign_record(self.signer, value, "projection_digest")
+
+    def issued_actions(self) -> int:
+        return self.row()["actions_issued"]
+
+    def row(self):
+        return self.fixture.cp.store.conn.execute(
+            "SELECT * FROM discovery_authorizations WHERE authorization_id=?", (self.authorization_id,)).fetchone()
+
+    def submit(self, projection: dict, *, chain=None, binding=None):
+        return _submit(self.fixture, chain or self.chain, binding or self.binding, projection)
+
+    # grants, results and reports -----------------------------------------------------------
+    def claim(self, *, chain=None):
+        chain = chain or self.chain
+        path = f"/v1/workspaces/{self.fixture.workspace}/runners/{self.runner_id}/claim"
+        status, _, claimed = chain.post(path, {"schema_version": "heel.runner-claim-request.v1"})
+        assert status == 200, claimed
+        return claimed
+
+    def operational(self, grant: dict, *, sequence: int, phase: str, completed: int = 0, started: int | None = None,
+                    stop_reason: str = "none", disposition: str | None = None, error_category: str = "none") -> dict:
+        started = completed if started is None else started
+        value = _base_operational(self.signer, grant, sequence=sequence, phase=phase)
+        now_ms = int(time.time() * 1000)
+        value["execution_disposition"] = disposition if phase == "terminal" else None
+        value["stop_reason"] = stop_reason
+        stop_at = now_ms - 50 if stop_reason != "none" else None
+        value["timestamps"] = {
+            "claimed_at_ms": now_ms - 200, "started_at_ms": None if phase == "claimed" else now_ms - 100,
+            "updated_at_ms": now_ms, "stop_requested_at_ms": stop_at,
+            "stop_acknowledged_at_ms": None,
+            "terminal_at_ms": now_ms if phase == "terminal" else None,
+        }
+        maximum = grant["budgets"]["maximum_requests"]
+        value["counters"] = {"requests_started": started, "requests_completed": completed,
+                             "response_bytes_read": completed * 10, "actions_contained": started,
+                             "retries_used": 0, "remaining_requests": maximum - started,
+                             "remaining_wall_ms": grant["budgets"]["wall_timeout_ms"] - 1}
+        value["containment_codes"] = ["admitted"] if started else []
+        value["error_category"] = error_category
+        return _sign_record(self.signer, value, "projection_digest")
+
+    def report(self, round_number: int, grant: dict, candidates: list[dict], *, bytes_received: int = 1234,
+               excluded: int = 0, truncated: int = 0) -> dict:
+        return _sign_record(self.signer, {
+            "schema_version": "heel.discovery-round-report.v1", "authorization_id": self.authorization_id,
+            "round": round_number, "run_id": grant["run_id"], "grant_id": grant["grant_id"],
+            "candidates": sorted(candidates, key=lambda c: (c["method"], c["route_template"])),
+            "excluded_count": excluded, "truncated_count": truncated, "bytes_received": bytes_received,
+        }, "report_digest")
+
+    def run_path(self, run_id: str, operation: str) -> str:
+        return f"/v1/workspaces/{self.fixture.workspace}/runners/{self.runner_id}/runs/{run_id}/{operation}"
+
+    def post_chain(self, claimed: dict, operation: str, body: dict, *, capability: str):
+        """Post on one of the run's own PoP chains, advancing it like the runner does."""
+        state = claimed["chain_states"][operation]
+        raw = canonical_bytes(body)
+        path = self.run_path(claimed["run_id"], operation)
+        headers = self.fixture.pop(path, raw, capability=capability, nonce=state["next_nonce_b64"],
+                                   sequence=state["next_sequence"])
+        status, response_headers, data = self.fixture.request("POST", path, headers=headers, raw=raw)
+        if "X-Heel-Runner-Next-Nonce" in response_headers:
+            state["next_nonce_b64"] = response_headers["X-Heel-Runner-Next-Nonce"]
+            state["next_sequence"] += 1
+        return status, data, (path, raw, headers)
+
+    def heartbeat(self, claimed: dict, sequence: int, phase: str = "running", completed: int = 0):
+        projection = self.operational(claimed["grant"], sequence=sequence, phase=phase, completed=completed)
+        return self.post_chain(claimed, "heartbeat", {"schema_version": "heel.runner-heartbeat-request.v1",
+                                                      "run_id": claimed["run_id"], "operational_projection": projection},
+                               capability="runner_heartbeat")
+
+    def finish(self, claimed: dict, candidates: list[dict] | None, *, completed: int | None = None, sequence: int = 50,
+               report: dict | None = None, round_number: int | None = None, stop_reason: str = "none",
+               started: int | None = None, error_category: str = "none", disposition: str | None = None):
+        grant = claimed["grant"]
+        completed = grant["budgets"]["maximum_requests"] if completed is None else completed
+        disposition = disposition or ("stopped" if stop_reason != "none" else "completed")
+        projection = self.operational(grant, sequence=sequence, phase="terminal", completed=completed, started=started,
+                                      stop_reason=stop_reason, disposition=disposition, error_category=error_category)
+        body = {"schema_version": "heel.runner-result-request.v1", "run_id": claimed["run_id"],
+                "operational_projection": projection}
+        if candidates is not None or report is not None:
+            body["discovery_round_report"] = report or self.report(round_number, grant, candidates)
+        return self.post_chain(claimed, "result", body, capability="runner_result")
+
+    def run_round(self, round_number: int, references=None, candidates: list[dict] | None = None, *,
+                  completed: int | None = None, **projection_options):
+        status, _, submitted = self.submit(self.projection(round_number, references, **projection_options))
+        assert status == 201, submitted
+        claimed = self.claim()
+        assert claimed["run_id"] == submitted["run_id"]
+        status, result, _ = self.finish(claimed, candidates or [], completed=completed, round_number=round_number)
+        assert status == 200, result
+        self.reports[round_number] = sorted(candidates or [], key=lambda c: (c["method"], c["route_template"]))
+        return submitted, claimed, result
+
+
+def _candidates(round_number: int, count: int, *, start: int = 0) -> list[dict]:
+    return [{"method": "GET", "route_template": f"/api/r{round_number}/item{index}", "provenance_kind": "html_link",
+             "source_ordinal": index % 12, "status_code": 200} for index in range(start, start + count)]
+
+
+def _refs(round_number: int, candidates: list[dict]):
+    return [(round_number, candidate) for candidate in candidates]
+
+
+def _code(response) -> tuple[int, str | None]:
+    status, _, data = response
+    return status, (data or {}).get("code")
+
+
+def test_discovery_round_projection_is_auto_issued_only_within_the_recorded_bound_and_refused_after_it(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    ledger_before = _ledger(fixture)
+    candidates = {round_number: _candidates(round_number, 20) for round_number in range(1, 5)}
+    status, _, first = driver.submit(driver.projection(1, None))
+    assert status == 201 and first["status"] == "approved"
+    assert first["round_state"] == {"authorization_id": driver.authorization_id, "round": 1, "state": "issued",
+                                    "grant_id": first["grant"]["grant_id"], "actions": 12, "wall_budget_ms": 60_000}
+    grant = first["grant"]
+    assert grant["approval_actor"] == {"user_id": fixture.user, "role": "owner"}
+    assert grant["approval_reason"] == "discovery_authorization:" + driver.authorization_id
+    assert grant["budgets"]["maximum_requests"] == 12
+    claimed = driver.claim()
+    assert claimed["grant"] == grant
+    # The executor completes only 3 of 12 issued actions: issued actions stay charged.
+    status, result, _ = driver.finish(claimed, candidates[1], completed=3, round_number=1)
+    assert status == 200 and result["round_state"]["state"] == "terminal"
+    row = driver.row()
+    assert (row["rounds_issued"], row["actions_issued"], row["requests_completed"]) == (1, 12, 3)
+    for round_number in range(2, 6):
+        driver.run_round(round_number, _refs(round_number - 1, candidates[round_number - 1][:20]),
+                         candidates.get(round_number))
+    row = driver.row()
+    assert (row["rounds_issued"], row["actions_issued"], row["state"], row["close_reason"]) == (5, 92, "done", "budget")
+    # No sixth grant can ever exist: round 6 is outside the closed contract and the row is done.
+    status, _, data = driver.submit(driver.projection(5, _refs(4, candidates[4][:1]), projection_id="ap_after_done"))
+    assert (status, data["code"]) == (409, "round_consumed")
+    assert fixture.cp.store.conn.execute(
+        "SELECT COUNT(*) FROM discovery_rounds WHERE authorization_id=?", (driver.authorization_id,)).fetchone()[0] == 5
+    # Exactly one CANARY_RUNS unit, consumed once, for all five rounds.
+    assert _ledger(fixture) == ledger_before + [("consume", driver.authorization_id)]
+
+    # 95 issued + a 10-action round would pass 100: refused and the authorization is done.
+    second = DiscoveryDriver(fixture, key=2, chain=driver.chain, binding=driver.binding)
+    second.run_round(1, None, _candidates(1, 10))
+    fixture.cp.store.conn.execute(
+        "UPDATE discovery_authorizations SET actions_issued=95 WHERE authorization_id=?", (second.authorization_id,))
+    fixture.cp.store.conn.commit()
+    over = second.projection(2, _refs(1, second.reports[1][:10]), cumulative=95)
+    assert _code(second.submit(over)) == (409, "bound_exceeded")
+    row = second.row()
+    assert (row["state"], row["close_reason"], row["rounds_issued"], row["actions_issued"]) == ("done", "budget", 1, 95)
+    # A 21-action round is a contract failure (opaque runner refusal), never a grant.
+    third = DiscoveryDriver(fixture, key=3, chain=driver.chain, binding=driver.binding)
+    third.run_round(1, None, _candidates(1, 21))
+    oversize = third.projection(2, _refs(1, third.reports[1][:20]) + [(1, third.reports[1][20])])
+    assert driver.submit(oversize)[0] == 401
+    assert third.row()["rounds_issued"] == 1
+
+
+def test_discovery_global_execution_budget_is_server_measured_and_refuses_when_under_ten_seconds_remain(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    driver.run_round(1, None, _candidates(1, 5))
+    used = driver.row()["execution_ms_used"]
+    round_row = fixture.cp.store.conn.execute(
+        "SELECT issued_at_ms,terminal_at_ms FROM discovery_rounds WHERE authorization_id=? AND round=1",
+        (driver.authorization_id,)).fetchone()
+    assert used == round_row["terminal_at_ms"] - round_row["issued_at_ms"] >= 0
+    # Explicit seam: 95 s already measured.  The next grant gets exactly the remaining 25 s.
+    fixture.cp.store.conn.execute(
+        "UPDATE discovery_authorizations SET execution_ms_used=95000 WHERE authorization_id=?", (driver.authorization_id,))
+    fixture.cp.store.conn.commit()
+    too_long = driver.projection(2, _refs(1, driver.reports[1][:2]), wall=60_000)
+    assert _code(driver.submit(too_long)) == (409, "bound_exceeded")
+    assert driver.row()["state"] == "open"  # asking for more wall time than remains is not exhaustion
+    status, _, issued = driver.submit(driver.projection(2, _refs(1, driver.reports[1][:2]), wall=25_000,
+                                                        projection_id="ap_r2_fit"))
+    assert status == 201 and issued["grant"]["budgets"]["wall_timeout_ms"] == 25_000
+    assert issued["round_state"]["wall_budget_ms"] == 25_000
+    # A round abandoned by its executor is closed by the reaper at grant expiry and charges its
+    # whole issued window (server clock), not a runner-reported duration.
+    fixture.cp.store.conn.execute(
+        "UPDATE discovery_rounds SET issued_at_ms=issued_at_ms-601000 WHERE authorization_id=? AND round=2",
+        (driver.authorization_id,))
+    fixture.cp.store.conn.execute(
+        "UPDATE canary_execution_grants SET issued_at=issued_at-601000,expires_at=expires_at-601000 WHERE grant_id=?",
+        (issued["grant"]["grant_id"],))
+    fixture.cp.store.conn.commit()
+    fixture.cp.canary_runs.expire_and_reconcile()
+    row = driver.row()
+    window = fixture.cp.store.conn.execute(
+        "SELECT g.expires_at-d.issued_at_ms FROM discovery_rounds d JOIN canary_execution_grants g ON g.grant_id=d.grant_id "
+        "WHERE d.authorization_id=? AND d.round=2", (driver.authorization_id,)).fetchone()[0]
+    assert window == 600_000
+    assert row["execution_ms_used"] == 95000 + window and row["state"] == "done"
+    assert fixture.cp.store.conn.execute(
+        "SELECT state FROM discovery_rounds WHERE authorization_id=? AND round=2", (driver.authorization_id,)).fetchone()[0] == "terminal"
+    # 115 s used leaves 5 s (< 10 s): a fresh authorization refuses the next round as exhausted.
+    second = DiscoveryDriver(fixture, key=2, chain=driver.chain, binding=driver.binding)
+    second.run_round(1, None, _candidates(1, 2))
+    fixture.cp.store.conn.execute(
+        "UPDATE discovery_authorizations SET execution_ms_used=115000 WHERE authorization_id=?", (second.authorization_id,))
+    fixture.cp.store.conn.commit()
+    assert _code(second.submit(second.projection(2, _refs(1, second.reports[1][:1]), wall=5_000))) == (409, "bound_exceeded")
+    assert (second.row()["state"], second.row()["close_reason"]) == ("done", "budget")
+
+
+def test_discovery_round_actions_must_be_recorded_candidates_of_an_earlier_round_of_the_same_authorization(canary_http):
+    """Proves the server-recorded relationship only; target body content is executor-attested (§2.6)."""
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    seeds = [(0, {"method": "GET", "route_template": path, "source_ordinal": index})
+             for index, path in enumerate(DISCOVERY_SEED_PATHS)]
+    swapped = [(0, {"method": "GET", "route_template": "/admin", "source_ordinal": 0})] + seeds[1:]
+    assert _code(driver.submit(driver.projection(1, swapped, projection_id="ap_seed_bad"))) == (409, "seed_mismatch")
+    misordered = [(0, {**candidate, "source_ordinal": (candidate["source_ordinal"] + 1) % 12}) for _, candidate in seeds]
+    assert _code(driver.submit(driver.projection(1, misordered, projection_id="ap_seed_order"))) == (409, "seed_mismatch")
+    status, _, first = driver.submit(driver.projection(1, None))
+    assert status == 201
+    claimed = driver.claim()
+    # Round 2 before round 1's report exists.
+    early = driver.projection(2, [(1, _candidates(1, 1)[0])], projection_id="ap_early")
+    assert _code(driver.submit(early))[1] in {"previous_round_active", "previous_report_missing"}
+    recorded = _candidates(1, 3)
+    assert driver.finish(claimed, recorded, round_number=1)[0] == 200
+    driver.reports[1] = recorded
+    never = {"method": "GET", "route_template": "/api/never/recorded", "provenance_kind": "html_link",
+             "source_ordinal": 0, "status_code": 200}
+    assert _code(driver.submit(driver.projection(2, [(1, never)], projection_id="ap_never"))) == (409, "candidate_not_recorded")
+    forged = {**recorded[0], "source_ordinal": recorded[0]["source_ordinal"] + 5}
+    assert _code(driver.submit(driver.projection(2, [(1, forged)], projection_id="ap_forged"))) == (409, "source_ordinal_mismatch")
+    subset = driver.projection(2, _refs(1, recorded[:2]), projection_id="ap_subset",
+                               frontier_digest=discovery_frontier_digest([{"round": 1, "candidate": recorded[0]}]))
+    assert _code(driver.submit(subset)) == (409, "frontier_digest_mismatch")
+    other = DiscoveryDriver.__new__(DiscoveryDriver)
+    other.__dict__.update(driver.__dict__)
+    other.view = {**driver.view, "authorization_digest": "e" * 64}
+    assert _code(driver.submit(other.projection(2, _refs(1, recorded[:1]), projection_id="ap_digest"))) == (409, "authorization_digest_mismatch")
+    off_host = driver.projection(2, _refs(1, recorded[:1]), projection_id="ap_offhost")
+    off_host = {k: v for k, v in off_host.items() if k not in {"projection_digest", "signing_key_id", "signature_b64"}}
+    off_host["environment"] = {**off_host["environment"], "origin": "https://elsewhere.acme.dev"}
+    off_host["egress"] = {**off_host["egress"], "hostname": "elsewhere.acme.dev"}
+    assert _code(driver.submit(_sign_record(fixture.runner, off_host, "projection_digest"))) == (409, "action_out_of_scope")
+    assert driver.row()["rounds_issued"] == 1 and driver.row()["actions_issued"] == 12
+    status, _, second = driver.submit(driver.projection(2, _refs(1, recorded[:2])))
+    assert status == 201 and second["round_state"]["round"] == 2
+    # A terminal round whose executor never delivered its signed report records nothing to draw on.
+    claimed = driver.claim()
+    assert driver.finish(claimed, None, round_number=2)[0] == 200
+    assert _code(driver.submit(driver.projection(3, _refs(1, recorded[2:3])))) == (409, "previous_report_missing")
+
+
+def test_discovery_round_submit_replays_identical_round_before_ordering_checks_and_refuses_a_different_projection_for_a_consumed_round(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    projection = driver.projection(1, None)
+    status, _, first = driver.submit(projection)
+    assert status == 201
+    counters = tuple(driver.row())
+    # rounds_issued is now 1, so round == rounds_issued + 1 would fail; replay precedes ordering.
+    status, _, replay = driver.submit(projection)
+    assert status == 201 and replay["grant"] == first["grant"] and replay["round_state"] == first["round_state"]
+    assert tuple(driver.row()) == counters
+    different = driver.projection(1, None, projection_id="ap_other_round_one", cumulative=0)
+    assert _code(driver.submit(different)) == (409, "round_consumed")
+    assert tuple(driver.row()) == counters
+    assert fixture.cp.store.conn.execute("SELECT COUNT(*) FROM canary_execution_grants").fetchone()[0] == 1
+
+
+def _second_runner(fixture, runner_id: str, *, project: str | None = None, environment: str = ENV,
+                   create_environment: bool = False) -> SigningAuthority:
+    """An additional activated executable runner (same fixture seams as the primary runner)."""
+    conn = fixture.cp.store.conn
+    if create_environment:
+        signer = seed_authority(conn, workspace_id=fixture.workspace, project_ref=project or fixture.project,
+                                environment_id=environment, runner_id=runner_id, proof_expires_at=NOW + 3600)
+    else:
+        signer = SigningAuthority.generate()
+        conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", (runner_id, fixture.workspace, "Second", "active", NOW))
+        conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)",
+                     (signer.key_id, fixture.workspace, runner_id, signer.canonical_public_key, "active", NOW))
+        identity = json.loads(conn.execute(
+            "SELECT identity_json FROM canary_runner_identity_records WHERE runner_id=?", (fixture.runner_id,)).fetchone()[0])
+        identity.pop("identity_digest")
+        identity.update(runner_id=runner_id, public_key={"algorithm": "Ed25519", "key_id": signer.key_id,
+                                                          "public_key_b64": signer.canonical_public_key},
+                        fingerprint=hashlib.sha256(signer.public_key_bytes).hexdigest())
+        identity["identity_digest"] = canonical_digest(identity)
+        conn.execute("INSERT INTO canary_runner_identity_records VALUES(?,?,?,?,?)",
+                     (fixture.workspace, runner_id, canonical_bytes(identity).decode(), identity["identity_digest"], NOW))
+    stamp = time.time()
+    conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)",
+                 (fixture.workspace, runner_id, "claim", fixture.cp.runner_auth._hash("nonce", "claim-" + runner_id), 1, stamp + 600))
+    conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)", (fixture.workspace, runner_id, "claim", 1, 0, stamp))
+    conn.execute("INSERT INTO canary_runner_execution_protocols(workspace_id,runner_id,protocol_version,control_protocol,"
+                 "exchange_digest,activated_at) VALUES(?,?,?,?,?,?)",
+                 (fixture.workspace, runner_id, 3, "heel.runner-control.v2", "a" * 64, stamp))
+    conn.commit()
+    return signer
+
+
+class _OtherRunnerFixture:
+    """The same HTTP fixture seen through another runner's identity and PoP chain."""
+
+    def __init__(self, fixture, runner_id: str, signer, project: str | None = None):
+        self.base, self.runner_id, self.runner = fixture, runner_id, signer
+        self.workspace, self.project = fixture.workspace, project or fixture.project
+        self.claim_nonce, self.cp, self.browser, self.user = "claim-" + runner_id, fixture.cp, fixture.browser, fixture.user
+
+    def request(self, *args, **kwargs):
+        return self.base.request(*args, **kwargs)
+
+    def pop(self, path, body, *, capability, nonce, sequence):
+        saved = (self.base.runner_id, self.base.runner)
+        self.base.runner_id, self.base.runner = self.runner_id, self.runner
+        try:
+            return self.base.pop(path, body, capability=capability, nonce=nonce, sequence=sequence)
+        finally:
+            self.base.runner_id, self.base.runner = saved
+
+
+def _bind(fixture, view: _OtherRunnerFixture, environment: str = ENV, project: str | None = None) -> dict:
+    path = f"/v1/workspaces/{fixture.workspace}/projects/{project or fixture.project}/runner-context-bindings"
+    status, _, created = fixture.request("POST", path, headers=fixture.browser, raw=canonical_bytes({
+        "schema_version": "heel.runner-context-binding-create.v1", "environment_id": environment,
+        "verification_record_digest": "a" * 64, "runner_id": view.runner_id, "runner_key_id": view.runner.key_id,
+    }))
+    assert status == 201, created
+    return created["context_binding"]
+
+
+def test_discovery_round_replay_requires_active_runner_pop_and_project_ownership_and_never_returns_another_projects_grant(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    projection = driver.projection(1, None)
+    status, _, first = driver.submit(projection)
+    assert status == 201
+    grant_bytes = canonical_bytes(first["grant"]).decode()
+
+    # A runner of project B replays project A's exact issued projection and authorization id.
+    other_project = fixture.cp.projects.create(fixture.workspace, "B", created_by=fixture.user).project_ref
+    signer_b = _second_runner(fixture, "runr_project_b", project=other_project, environment="env_b", create_environment=True)
+    view_b = _OtherRunnerFixture(fixture, "runr_project_b", signer_b, other_project)
+    binding_b = _bind(fixture, view_b, "env_b", other_project)
+    chain_b = _RunnerClaimChain(view_b)
+    status, _, data = _submit(view_b, chain_b, binding_b, projection)
+    assert (status, data["code"]) == (404, "authorization_unknown")
+    assert grant_bytes not in json.dumps(data) and first["grant"]["grant_id"] not in json.dumps(data)
+
+    # A second active runner of project A, bound to the same environment, receives no grant.
+    signer_a2 = _second_runner(fixture, "runr_second_a")
+    view_a2 = _OtherRunnerFixture(fixture, "runr_second_a", signer_a2)
+    binding_a2 = _bind(fixture, view_a2)
+    status, _, data = _submit(view_a2, _RunnerClaimChain(view_a2), binding_a2, projection)
+    assert (status, data["code"]) == (409, "round_consumed")
+    assert first["grant"]["grant_id"] not in json.dumps(data)
+
+    # Identical and different round-report retries after the round is terminal.
+    claimed = driver.claim()
+    report = driver.report(1, claimed["grant"], _candidates(1, 2))
+    status, result, (_, raw, _) = driver.finish(claimed, None, report=report)
+    assert status == 200
+    counters = tuple(driver.row())
+    sent = json.loads(raw)
+    # The runner's identical retry: same signed terminal projection and report, next PoP nonce.
+    status, again, _ = driver.post_chain(claimed, "result", sent, capability="runner_result")
+    assert status == 200 and again["round_state"] == result["round_state"] and tuple(driver.row()) == counters
+    changed = {**sent, "discovery_round_report": driver.report(1, claimed["grant"], _candidates(1, 3))}
+    status, data, _ = driver.post_chain(claimed, "result", changed, capability="runner_result")
+    assert (status, data["code"]) == (409, "report_consumed")
+    assert fixture.cp.store.conn.execute("SELECT COUNT(*) FROM discovery_round_reports").fetchone()[0] == 1
+    assert tuple(driver.row()) == counters
+
+    # A revoked key presenting the same digest is refused at PoP, before any replay lookup.
+    fixture.cp.store.conn.execute("UPDATE canary_runner_keys SET status='revoked',revoked_at=? WHERE key_id=?",
+                                  (NOW, fixture.runner.key_id))
+    fixture.cp.store.conn.commit()
+    assert driver.submit(projection)[0] == 401
+
+
+def test_discovery_round_terminal_aggregation_applies_exactly_once_under_concurrent_duplicate_reports(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    status, _, _ = driver.submit(driver.projection(1, None))
+    claimed = driver.claim()
+    grant = claimed["grant"]
+    projection = driver.operational(grant, sequence=9, phase="terminal", completed=12, disposition="completed")
+    body = canonical_bytes({"schema_version": "heel.runner-result-request.v1", "run_id": claimed["run_id"],
+                            "operational_projection": projection,
+                            "discovery_round_report": driver.report(1, grant, _candidates(1, 4), bytes_received=4096)})
+    path = driver.run_path(claimed["run_id"], "result")
+    state = claimed["chain_states"]["result"]
+    headers = fixture.pop(path, body, capability="runner_result", nonce=state["next_nonce_b64"],
+                          sequence=state["next_sequence"])
+    outcomes = []
+    lock = threading.Lock()
+
+    def send():
+        response = fixture.request("POST", path, headers=headers, raw=body)
+        with lock:
+            outcomes.append(response)
+
+    def reap():
+        fixture.cp.canary_runs.expire_and_reconcile()
+
+    threads = [threading.Thread(target=send), threading.Thread(target=send), threading.Thread(target=reap)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert [status for status, _, _ in outcomes] == [200, 200]
+    assert outcomes[0][2] == outcomes[1][2]
+    row = driver.row()
+    round_row = fixture.cp.store.conn.execute(
+        "SELECT * FROM discovery_rounds WHERE authorization_id=?", (driver.authorization_id,)).fetchone()
+    assert round_row["state"] == "terminal"
+    assert row["execution_ms_used"] == round_row["terminal_at_ms"] - round_row["issued_at_ms"]
+    assert (row["requests_completed"], row["bytes_received"]) == (12, 4096)
+    assert fixture.cp.store.conn.execute("SELECT COUNT(*) FROM discovery_round_reports").fetchone()[0] == 1
+    fixture.cp.canary_runs.expire_and_reconcile()
+    assert tuple(driver.row()) == tuple(row)
+
+
+def test_discovery_authorization_expiry_or_revoke_stops_an_in_flight_round_at_the_next_heartbeat_or_attempt_gate(canary_http):
+    fixture = canary_http
+    attempts: list[str] = []
+
+    def executor_stub_next_socket(gate: dict) -> None:
+        """Minimal stand-in for the executor's per-attempt live gate (bridge §4 row 8)."""
+        attempts.append("socket" if gate["active"] else gate["stop_reason"])
+
+    for closing in ("expire", "revoke"):
+        attempts.clear()
+        driver = DiscoveryDriver(fixture, key=1 if closing == "expire" else 2,
+                                 chain=None if closing == "expire" else shared_chain,
+                                 binding=None if closing == "expire" else shared_binding)
+        shared_chain, shared_binding = driver.chain, driver.binding
+        assert driver.submit(driver.projection(1, None))[0] == 201
+        claimed = driver.claim()
+        status, gate, _ = driver.heartbeat(claimed, 1)
+        assert status == 200 and gate["active"] is True
+        executor_stub_next_socket(gate)
+        if closing == "expire":
+            # The grant itself is still valid; only the authorization's server-clock TTL passed.
+            fixture.cp.store.conn.execute(
+                "UPDATE discovery_authorizations SET created_at_ms=created_at_ms-900001,expires_at_ms=expires_at_ms-900001 "
+                "WHERE authorization_id=?", (driver.authorization_id,))
+            fixture.cp.store.conn.commit()
+        else:
+            revoke = _env_base(fixture) + "/discovery-authorizations/" + driver.authorization_id + "/revoke"
+            assert fixture.request("POST", revoke, headers=fixture.browser)[0] == 200
+        status, gate, _ = driver.heartbeat(claimed, 2)
+        assert status == 200 and gate["active"] is False and gate["stop_reason"] == "cloud_stop"
+        executor_stub_next_socket(gate)
+        assert attempts == ["socket", "cloud_stop"]
+        run = fixture.cp.store.conn.execute("SELECT status,stop_reason FROM canary_runs WHERE run_id=?",
+                                            (claimed["run_id"],)).fetchone()
+        assert tuple(run) == ("stop_requested", "cloud_stop")
+        reasons = [row[0] for row in fixture.cp.store.conn.execute(
+            "SELECT reason_code FROM canary_run_events WHERE run_id=? AND event_type='stop_requested'", (claimed["run_id"],))]
+        assert reasons == ["authorization_expired" if closing == "expire" else "authorization_revoked"]
+        assert driver.row()["state"] == ("expired" if closing == "expire" else "revoked")
+        # Closing after a round issued never refunds the authorization's unit.
+        assert driver.row()["quota_state"] == "consumed"
+        status, result, _ = driver.finish(claimed, _candidates(1, 1), completed=1, round_number=1, stop_reason="cloud_stop")
+        assert status == 200 and result["round_state"]["state"] == "terminal"
+
+
+def test_discovery_rounds_are_strictly_sequential_and_previous_round_must_be_terminal(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    assert _code(driver.submit(driver.projection(2, [(1, _candidates(1, 1)[0])], cumulative=0))) == (409, "round_out_of_order")
+    assert driver.submit(driver.projection(1, None))[0] == 201
+    claimed = driver.claim()
+    early = driver.projection(2, [(1, _candidates(1, 1)[0])])
+    assert _code(driver.submit(early)) == (409, "previous_round_active")
+    assert driver.finish(claimed, _candidates(1, 3), round_number=1)[0] == 200
+    driver.reports[1] = _candidates(1, 3)
+    assert _code(driver.submit(driver.projection(3, _refs(1, _candidates(1, 1))))) == (409, "round_out_of_order")
+    assert _code(driver.submit(driver.projection(2, _refs(1, _candidates(1, 1)), cumulative=11,
+                                                 projection_id="ap_cumulative"))) == (409, "cumulative_mismatch")
+    assert driver.row()["rounds_issued"] == 1
+    assert driver.submit(driver.projection(2, _refs(1, _candidates(1, 1))))[0] == 201
+
+
+def test_discovery_authorization_expiry_and_revoke_close_it_and_stop_the_active_round_within_five_seconds(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    assert driver.submit(driver.projection(1, None))[0] == 201
+    claimed = driver.claim()
+    revoke = _env_base(fixture) + "/discovery-authorizations/" + driver.authorization_id + "/revoke"
+    started = time.monotonic()
+    status, _, view = fixture.request("POST", revoke, headers=fixture.browser)
+    assert status == 200 and view["state"] == "revoked"
+    observed = None
+    for sequence in range(1, 40):
+        status, gate, _ = driver.heartbeat(claimed, sequence)
+        if not gate["active"]:
+            observed = time.monotonic() - started
+            break
+        time.sleep(0.25)
+    assert observed is not None and observed <= 5.0
+    run = fixture.cp.store.conn.execute(
+        "SELECT stop_requested_at_ms,stop_deadline_ms FROM canary_runs WHERE run_id=?", (claimed["run_id"],)).fetchone()
+    assert run["stop_deadline_ms"] - run["stop_requested_at_ms"] == 5000
+    # An issued but unclaimed round loses its grant at once; expiry closes the authorization.
+    second = DiscoveryDriver(fixture, key=2, chain=driver.chain, binding=driver.binding)
+    status, _, issued = second.submit(second.projection(1, None))
+    assert status == 201
+    fixture.cp.store.conn.execute(
+        "UPDATE discovery_authorizations SET created_at_ms=created_at_ms-900001,expires_at_ms=expires_at_ms-900001 "
+        "WHERE authorization_id=?", (second.authorization_id,))
+    fixture.cp.store.conn.commit()
+    fixture.cp.canary_runs.expire_and_reconcile()
+    assert second.row()["state"] == "expired"
+    grant = fixture.cp.store.conn.execute("SELECT status FROM canary_execution_grants WHERE grant_id=?",
+                                          (issued["grant"]["grant_id"],)).fetchone()[0]
+    assert grant in {"revoked", "expired"}
+    claim_path = f"/v1/workspaces/{fixture.workspace}/runners/{fixture.runner_id}/claim"
+    assert driver.chain.post(claim_path, {"schema_version": "heel.runner-claim-request.v1"})[0] == 204
+
+
+def test_discovery_plan_kind_and_scan_plan_request_cannot_be_mixed_on_one_binding(canary_http):
+    fixture = canary_http
+    _seed_inventory(fixture)
+    binding = _binding(fixture)
+    chain = _RunnerClaimChain(fixture)
+    assert _plan_request(fixture, binding)[0] == 201
+    driver = DiscoveryDriver(fixture, chain=chain, binding=binding)
+    assert _code(driver.submit(driver.projection(1, None))) == (409, "plan_kind_mismatch")
+    assert driver.row()["rounds_issued"] == 0
+    # Vice versa: while discovery is open, no scan plan request can be prepared on the binding.
+    revoke = f"/v1/workspaces/{fixture.workspace}/projects/{fixture.project}/runner-context-bindings/{binding['binding_id']}/revoke"
+    assert fixture.request("POST", revoke, headers=fixture.browser, raw=canonical_bytes(
+        {"schema_version": "heel.runner-context-binding-revoke.v1", "reason_code": "operator_requested"}))[0] == 200
+    fresh = _binding(fixture)
+    assert _code(_plan_request(fixture, fresh)) == (409, "plan_kind_mismatch")
+
+
+def test_discovery_route_inventory_view_shows_provenance_states_and_truncated_count_without_values(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    first = _candidates(1, 200)
+    driver.run_round(1, None, first)
+    overlap = [{**first[0], "provenance_kind": "js_literal", "source_ordinal": 3}]
+    driver.run_round(2, _refs(1, first[:1]), _candidates(2, 1) + overlap)
+    status, _, view = fixture.request("GET", _env_base(fixture) + "/route-inventory", headers=fixture.browser)
+    assert status == 200
+    assert (view["route_count"], view["truncated_count"]) == (200, 1)
+    assert view["inventory_digest"] == canonical_digest(view["routes"])
+    first_row = next(row for row in view["routes"] if row["route_template"] == first[0]["route_template"])
+    assert first_row["state"] == "candidate" and first_row["provenance"] == [
+        {"kind": "html_link", "round": 1, "source_ordinal": first[0]["source_ordinal"], "status_code": 200},
+        {"kind": "js_literal", "round": 2, "source_ordinal": 3, "status_code": 200},
+    ]
+    assert all(set(row) == {"method", "route_template", "provenance", "first_seen_ms", "state"} for row in view["routes"])
+    serialized = json.dumps(view)
+    for forbidden in ("https://", "?", "@", "canary.acme.dev", "Bearer", "token="):
+        assert forbidden not in serialized
+
+
+def test_discovery_reports_and_inventory_refuse_value_canaries_and_runner_forged_kinds(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    assert driver.submit(driver.projection(1, None))[0] == 201
+    claimed = driver.claim()
+    for canary in ("/users/alice@example.com", "/k/sk_live_abc123", "/objects/0123456789abcdef0123456789abcdef",
+                   "/t/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln", "/reset?token=abc"):
+        bad = driver.report(1, claimed["grant"], [{"method": "GET", "route_template": canary, "provenance_kind": "html_link",
+                                                   "source_ordinal": 0, "status_code": 200}])
+        status, _, _ = driver.finish(claimed, None, report=bad)
+        assert status == 401, canary
+    forged = driver.report(1, claimed["grant"], [{**_candidates(1, 1)[0], "provenance_kind": "imported_openapi"}])
+    assert driver.finish(claimed, None, report=forged)[0] == 401
+    assert fixture.cp.store.conn.execute("SELECT COUNT(*) FROM discovery_round_reports").fetchone()[0] == 0
+    stored = json.dumps([tuple(r) for r in fixture.cp.store.conn.execute("SELECT * FROM route_inventories")])
+    assert "alice" not in stored and "sk_live" not in stored
+
+
+def test_discovery_rounds_never_create_a_human_approval_or_scan_bypass(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    status, _, issued = driver.submit(driver.projection(1, None))
+    assert status == 201
+    base = f"/v1/workspaces/{fixture.workspace}/projects/{fixture.project}"
+    listed = fixture.request("GET", base + "/canary-approval-requests", headers=fixture.browser)[2]
+    assert listed["requests"] == []
+    status, _, data = fixture.request("POST", base + "/canary-runs/" + issued["run_id"] + "/approve", {
+        "schema_version": "heel.canary-execution-approval.v1", "projection_digest": issued["projection_digest"],
+        "hostname_retype": "canary.acme.dev", "reason": "try to approve discovery",
+    }, {**fixture.browser, "Idempotency-Key": _key(77), "If-Heel-Control-Generation": "0"})
+    assert status == 409
+    # A discovery-shaped projection with a non-GET/HEAD action never parses, so never issues.
+    post = driver.projection(1, None, projection_id="ap_post", routes=[("POST", path) for path in DISCOVERY_SEED_PATHS])
+    assert driver.submit(post)[0] == 401
+    # A discovery projection uploaded by a browser is refused like every v2 plan.
+    status, _, data = fixture.request("POST", base + "/canary-approval-projections",
+                                      driver.projection(1, None, projection_id="ap_browser"), fixture.browser)
+    assert (status, data["code"]) == (400, "invalid_canary_projection")
+    assert [kind for kind, _ in _ledger(fixture)] == ["reserve", "consume"]
+
+
+def test_discovery_round_is_refused_while_the_kill_switch_is_tripped(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    fixture.cp.store.conn.execute("INSERT INTO kill_switches VALUES('global','incident','ops',?)", (NOW,))
+    fixture.cp.store.conn.commit()
+    assert _code(driver.submit(driver.projection(1, None))) == (409, "kill_switch")
+    assert driver.row()["rounds_issued"] == 0 and driver.row()["state"] == "open"
+
+
+# --- C2D D3/D4 and durable closing-refusal gates ---
+
+import re as _re
+
+_ROUND_REF = _re.compile(r"^dauth:dau_[0-9a-f]{32}:r[1-5]$")
+
+
+def _round_key(authorization_id: str, round_number: int) -> str:
+    return "ca1-" + hashlib.sha256(
+        f"heel.discovery-round-grant.v1|{authorization_id}|{round_number}".encode()).hexdigest()
+
+
+def _database_path(fixture) -> str:
+    return next(row[2] for row in fixture.cp.store.conn.execute("PRAGMA database_list") if row[1] == "main")
+
+
+def test_discovery_transient_refusal_leaves_no_rows_and_the_round_resubmits(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    assert driver.submit(driver.projection(1, None))[0] == 201
+    claimed = driver.claim()
+    recorded = _candidates(1, 2)
+    round_two = driver.projection(2, _refs(1, recorded))
+    counts = lambda: tuple(fixture.cp.store.conn.execute(
+        "SELECT (SELECT COUNT(*) FROM discovery_rounds),(SELECT COUNT(*) FROM canary_approval_projections),"
+        "(SELECT COUNT(*) FROM canary_runs),(SELECT COUNT(*) FROM canary_execution_grants)").fetchone())
+    before = counts()
+    assert _code(driver.submit(round_two)) == (409, "previous_round_active")
+    assert counts() == before == (1, 1, 1, 1)
+    assert driver.finish(claimed, recorded, round_number=1)[0] == 200
+    status, _, issued = driver.submit(round_two)  # the very same signed projection now issues
+    assert status == 201 and issued["round_state"]["round"] == 2 and counts() == (2, 2, 2, 2)
+
+
+def test_discovery_projection_and_round_grant_key_are_never_human_approvable(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    status, _, issued = driver.submit(driver.projection(1, None))
+    assert status == 201
+    grant_row = fixture.cp.store.conn.execute(
+        "SELECT reservation_id,idempotency_key,meter FROM canary_execution_grants WHERE grant_id=?",
+        (issued["grant"]["grant_id"],)).fetchone()
+    assert _ROUND_REF.fullmatch(grant_row["reservation_id"])
+    assert grant_row["reservation_id"] == f"dauth:{driver.authorization_id}:r1"
+    assert grant_row["idempotency_key"] == _round_key(driver.authorization_id, 1)
+    base = f"/v1/workspaces/{fixture.workspace}/projects/{fixture.project}"
+    assert fixture.request("GET", base + "/canary-approval-requests", headers=fixture.browser)[2]["requests"] == []
+    body = {"schema_version": "heel.canary-execution-approval.v1", "projection_digest": issued["projection_digest"],
+            "hostname_retype": "canary.acme.dev", "reason": "approve a discovery round"}
+    headers = {**fixture.browser, "Idempotency-Key": _key(91), "If-Heel-Control-Generation": "0"}
+    status, _, data = fixture.request("POST", base + "/canary-runs/" + issued["run_id"] + "/approve", body, headers)
+    assert (status, data["code"]) == (409, "canary_state_conflict")
+    # A scan approval presenting the derived round key can never adopt the round's grant.
+    projection = approval_projection(fixture.runner, workspace_id=fixture.workspace, project_ref=fixture.project)
+    status, _, scan = fixture.request("POST", base + "/canary-approval-projections", projection, fixture.browser)
+    assert status == 201
+    status, _, data = fixture.request("POST", base + "/canary-runs/" + scan["run_id"] + "/approve", {
+        **body, "projection_digest": projection["projection_digest"], "reason": "scan"},
+        {**headers, "Idempotency-Key": grant_row["idempotency_key"]})
+    assert (status, data["code"]) == (400, "invalid_canary_approval")
+    assert [kind for kind, _ in _ledger(fixture)] == ["reserve", "consume"]
+
+
+def test_discovery_round_grant_is_v2_discovery_profile_and_scan_grants_remain_v1(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    status, _, issued = driver.submit(driver.projection(1, None))
+    assert status == 201
+    grant = issued["grant"]
+    assert (grant["schema_version"], grant["budget_profile"]) == ("heel.execution-grant.v2", "discovery")
+    assert grant["budgets"]["maximum_response_bytes"] == 2_097_152
+    assert driver.claim()["grant"] == grant
+    # A scan approval still issues the byte-compatible v1 grant ...
+    base = f"/v1/workspaces/{fixture.workspace}/projects/{fixture.project}"
+    projection = approval_projection(fixture.runner, workspace_id=fixture.workspace, project_ref=fixture.project)
+    status, _, scan = fixture.request("POST", base + "/canary-approval-projections", projection, fixture.browser)
+    status, _, approved = fixture.request("POST", base + "/canary-runs/" + scan["run_id"] + "/approve", {
+        "schema_version": "heel.canary-execution-approval.v1", "projection_digest": projection["projection_digest"],
+        "hostname_retype": "canary.acme.dev", "reason": "scan"},
+        {**fixture.browser, "Idempotency-Key": _key(92), "If-Heel-Control-Generation": "0"})
+    assert status == 201 and approved["grant"]["schema_version"] == "heel.execution-grant.v1"
+    assert "budget_profile" not in approved["grant"]
+    # ... and a validly signed v2 grant hand-swapped onto that scan approval is refused at claim.
+    swapped = {k: v for k, v in approved["grant"].items() if k not in {"grant_digest", "signing_key_id", "signature_b64"}}
+    swapped.update(schema_version="heel.execution-grant.v2", budget_profile="discovery")
+    swapped = _sign_record(fixture.cloud, swapped, "grant_digest")
+    fixture.cp.store.conn.execute("UPDATE canary_execution_grants SET grant_json=?,grant_digest=? WHERE grant_id=?",
+                                  (canonical_bytes(swapped).decode(), swapped["grant_digest"], swapped["grant_id"]))
+    fixture.cp.store.conn.commit()
+    claim_path = f"/v1/workspaces/{fixture.workspace}/runners/{fixture.runner_id}/claim"
+    status, _, data = driver.chain.post(claim_path, {"schema_version": "heel.runner-claim-request.v1"})
+    assert status == 503 and data["code"] == "canary_authority_unavailable"
+    assert fixture.cp.store.conn.execute("SELECT status FROM canary_execution_grants WHERE grant_id=?",
+                                         (swapped["grant_id"],)).fetchone()[0] == "issued"
+
+
+def test_discovery_round_submit_refuses_a_projection_whose_body_budget_exceeds_the_authorization_bound(canary_http):
+    fixture = canary_http
+    driver = DiscoveryDriver(fixture)
+    assert driver.submit(driver.projection(1, None, body_bytes=2_097_153))[0] == 401
+    bound = json.loads(driver.row()["bound_json"])
+    fixture.cp.store.conn.execute("UPDATE discovery_authorizations SET bound_json=? WHERE authorization_id=?",
+                                  (canonical_bytes({**bound, "max_body_bytes": 1_048_576}).decode(), driver.authorization_id))
+    fixture.cp.store.conn.commit()
+    assert _code(driver.submit(driver.projection(1, None))) == (409, "bound_exceeded")
+    assert driver.row()["rounds_issued"] == 0
+    assert driver.submit(driver.projection(1, None, body_bytes=1_048_576, projection_id="ap_fits"))[0] == 201
+
+
+def test_discovery_closing_refusals_persist_the_close_across_a_reopened_database(canary_http):
+    """Refusal returns 409, yet the close it implies is committed (Astra C-4 clarification)."""
+    fixture = canary_http
+    path = _database_path(fixture)
+    exhausted = DiscoveryDriver(fixture)
+    exhausted.run_round(1, None, _candidates(1, 10))
+    fixture.cp.store.conn.execute("UPDATE discovery_authorizations SET actions_issued=95 WHERE authorization_id=?",
+                                  (exhausted.authorization_id,))
+    fixture.cp.store.conn.commit()
+    refused = exhausted.projection(2, _refs(1, exhausted.reports[1]), cumulative=95)
+    assert _code(exhausted.submit(refused)) == (409, "bound_exceeded")
+    expired = DiscoveryDriver(fixture, key=2, chain=exhausted.chain, binding=exhausted.binding)
+    fixture.cp.store.conn.execute(
+        "UPDATE discovery_authorizations SET created_at_ms=created_at_ms-900001,expires_at_ms=expires_at_ms-900001 "
+        "WHERE authorization_id=?", (expired.authorization_id,))
+    fixture.cp.store.conn.commit()
+    assert _code(expired.submit(expired.projection(1, None))) == (409, "authorization_expired")
+    reopened = sqlite3.connect(path)
+    try:
+        rows = dict(reopened.execute(
+            "SELECT authorization_id,state||'/'||close_reason||'/'||quota_state FROM discovery_authorizations").fetchall())
+        assert rows[exhausted.authorization_id] == "done/budget/consumed"
+        assert rows[expired.authorization_id] == "expired/expired/refunded"
+        assert reopened.execute("SELECT COUNT(*) FROM discovery_rounds").fetchone()[0] == 1
+        assert reopened.execute("SELECT COUNT(*) FROM canary_approval_projections WHERE approval_id=?",
+                                (refused["projection_id"],)).fetchone()[0] == 0
+        assert [row[0] for row in reopened.execute(
+            "SELECT kind FROM usage_ledger WHERE ref=? ORDER BY ts,entry_id", (expired.authorization_id,))] == ["reserve", "refund"]
+    finally:
+        reopened.close()
+    assert _code(exhausted.submit(refused)) == (409, "authorization_closed")
