@@ -48,8 +48,14 @@ project, using only the existing `/v1/signup`, `/v1/login`, `/v1/logout`, `/v1/m
   selection is written to browser storage.
 - Project creation is offered to owner, admin and member roles. The server still decides; a
   403 is shown as a role message. Billing-only workspaces cannot list projects.
-- Sign-out, an expired session, or a workspace/project switch starts a new load generation.
-  Responses that arrive for an earlier generation are discarded, so they cannot fill a new view.
+- Sign-out, an expired session, a workspace/project switch, or same-document Back/Forward to
+  another address starts a new load generation; the address is re-resolved like a reload.
+  Responses (successes and failures, including 401) that arrive for an earlier generation are
+  discarded, so they cannot fill or end a newer view.
+- If the canary reads (environments, runner context) fail after the account and project
+  resolved, the workspace/project controls and Sign out stay available, the project stays in
+  the address, and verification, runner access and rehearsals stay locked until Try again
+  succeeds. A 401 there is still treated as session loss.
 - Error states show fixed messages for invalid input, duplicate email, wrong password, rate
   limiting, forbidden, signed-out and unavailable. Submitted values are never echoed.
 
