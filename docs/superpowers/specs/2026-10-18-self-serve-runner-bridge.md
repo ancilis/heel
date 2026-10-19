@@ -29,6 +29,12 @@ fixture recognition. The standalone CLI executor is a foundation, not proof of p
 > local T4a proof move to a connector track). The runner has since gained `serve` (T2b-2) and
 > the grant authority (T2b-1); §1's "no `heel runner serve`" row is historical. Nothing here
 > authorizes hosted credential custody; that is new spec §2.4.
+> **T3SR amendment (2026-10-19):** the v2 `plan` object of §4.1 gains the `plan_kind: discovery`
+> variant whose exact fields, states, authorization and budget checks are specified in
+> `2026-10-19-self-serve-discovery-contract.md`; the `plan_differential`/`regression` variants are
+> unchanged. The permit-claim shape of §4 row 12 is reused for the C5 `credential-intake/claim`
+> long-poll (new spec §5.3), which carries plaintext over the mutually authenticated control
+> channel and never a stored ciphertext.
 
 ---
 
