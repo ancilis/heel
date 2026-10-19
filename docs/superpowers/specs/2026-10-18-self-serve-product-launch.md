@@ -14,6 +14,26 @@ checkout; names below refer to that directory.
 
 Normative words: **MUST**, **MUST NOT**, **MAY**.
 
+> **T3S banner (2026-10-19) — authority and superseded assumptions.** The approved human
+> correction in `.git/self-serve-launch/CUSTOMER-READY-REQUIREMENT-2026-10-19.md` (Kevin:
+> "ready for a customer to sign up and use against their SaaS, give it location or url, creds
+> and let it go") is now implemented by `2026-10-19-customer-ready-self-serve-launch.md`, which
+> is the **current launch authority**. Where that document and this one differ, that document
+> wins. Superseded **as defaults** in this document (they remain valid for the optional private
+> connector, §5.4 there): §6 Access/Inventory rows (CLI credential commands and "Import OpenAPI"
+> as the only inventory path); §7.1 browser OpenAPI parse as the sole inventory source; §8.1
+> install command as a prerequisite; §11 steps 4–7 as the default clean-room path; §11.1 item 1
+> "sent by the customer-local runner installed from the public download path" as the only
+> released path; §14 claim text; §12 ownership where the new §7 reassigns. **Not superseded:**
+> the reality audit (§1–§2), the threat model (§5), the v2 projection and plan-request design
+> (§7.2), the result projection (§7.3), regressions (§7.4), quotas (§7.6), hosting topology
+> (§8.2–§8.4), the free-tier facts (§9), the twelve properties and their existing tests (§10),
+> the no-mock rules of §11.1 items 2–6, and §15. The customer-local credential / raw-evidence
+> invariant is **not silently weakened**: the hosted alternative needs Kevin's decision
+> (new spec §2.4) and is never described as customer-local. Final acceptance now has two layers
+> (new spec §6.3–§6.4): a synthetic known positive is intermediate; a real authorized SaaS not
+> prepared for Heel validates onboarding. Historical revision notes above remain as evidence.
+
 Revision T1R (2026-10-18, fresh Fable adversarial specification review): corrections to §1–§3,
 §6–§8, §10, §12, §13 and §15. The list of defects found, with evidence, is in
 `2026-10-18-self-serve-product-design-review.md` (same directory). T1R artifacts live in

@@ -17,6 +17,19 @@ reaches the user's verified staging SaaS through the released local runner, obse
 redacted cloud findings and replay, with no simulation, canned finding, demo adapter, hidden seed or
 fixture recognition. The standalone CLI executor is a foundation, not proof of product functionality.
 
+> **T3S banner (2026-10-19) — authority and superseded assumptions.** The current launch
+> authority is `2026-10-19-customer-ready-self-serve-launch.md` (approved human correction:
+> no required OpenAPI, no manual runner installation, no engineer setup; real authorized SaaS
+> validation). This bridge design stays in force for the **optional private connector** and for
+> every host-agnostic mechanism the managed execution plane reuses: the `serve` lifecycle (§2),
+> grant-authority bootstrap (§2.2), immutable plan binding and the v2 projection (§4.1), the
+> execution segments (§4), the seams rule (§5), R-B/R-C/R-A fixes (§6–§8), and the verification
+> order (§9). Superseded **as defaults**: §3.1 onboarding order (pair → serve → CLI credentials
+> → Import OpenAPI) and §9.1 ownership where new spec §7 reassigns (C1–C9; T2c, T2d, T3b and the
+> local T4a proof move to a connector track). The runner has since gained `serve` (T2b-2) and
+> the grant authority (T2b-1); §1's "no `heel runner serve`" row is historical. Nothing here
+> authorizes hosted credential custody; that is new spec §2.4.
+
 ---
 
 ## 0. Verdict summary
