@@ -291,6 +291,46 @@ describe("canonical control-plane binding destination", () => {
     expectNoFallback();
   });
 
+  it("fails closed with the fixed 503 and no call for out-of-shape secret or binding configuration", async () => {
+    const origin = CONFIGURED_ORIGINS[0];
+    const routes = routeCases(origin).filter((route) => (
+      ["account me", "device verify", "findings sync", "runner claim"].includes(route.label)
+    ));
+    const fetcher = bindingSpy();
+    const malformed: Array<[string, Record<string, unknown>]> = [
+      ...([["number", 43], ["boolean", true], ["object", {}], ["array", [edge]], ["null", null], ["String object", new String(edge)]] as const)
+        .map(([label, value]): [string, Record<string, unknown>] => [`secret ${label}`, { CONTROL_PLANE: { fetch: fetcher }, CONTROL_PLANE_EDGE_SECRET: value }]),
+      ...([["null", null], ["empty object", {}], ["missing fetch", { fetch: undefined }], ["non-callable fetch", { fetch: 43 }], ["number", 43]] as const)
+        .map(([label, value]): [string, Record<string, unknown>] => [`binding ${label}`, { CONTROL_PLANE: value, CONTROL_PLANE_EDGE_SECRET: edge }]),
+    ];
+    for (const [label, configuration] of malformed) {
+      for (const route of routes) {
+        const environment = {
+          ASSETS: { fetch: assetFetch },
+          IMAGES: { input: () => { throw new Error("image transform is not used by the control-plane route"); } },
+          PUBLIC_ORIGIN: origin,
+          ...configuration,
+        } as never;
+        const response = await worker.fetch(incoming("https://heel.example", route), environment, context);
+        expect(response.status, `${label} ${route.label}`).toBe(503);
+        expect(await response.text(), `${label} ${route.label}`).toBe('{"error":"control plane unavailable"}');
+        expect(response.headers.get("cache-control")).toBe("no-store");
+        expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+        expect(response.headers.get("location")).toBeNull();
+      }
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+    expectNoFallback();
+    // The same routes with a valid binding are attempted exactly once each: unavailable configuration
+    // stays distinct from an attempted private request.
+    for (const route of routes) {
+      const response = await worker.fetch(incoming("https://heel.example", route), workerEnv(origin, fetcher), context);
+      expect(response.status, route.label).toBe(200);
+    }
+    expect(fetcher).toHaveBeenCalledTimes(routes.length);
+    expectNoFallback();
+  });
+
   it("refuses upstream redirects and errors without following them or falling back", async () => {
     const origin = CONFIGURED_ORIGINS[0];
     const route = routeCases(origin).find(({ label }) => label === "findings reviews")!;

@@ -498,14 +498,22 @@ async function proxyControlPlane(
   csp: string,
   upstreamPath: string,
 ): Promise<Response> {
-  if (env.CONTROL_PLANE === undefined) {
+  // Configuration outside the declared runtime shapes is unavailable, not an upstream failure.
+  if (
+    env.CONTROL_PLANE === undefined
+    || env.CONTROL_PLANE === null
+    || typeof env.CONTROL_PLANE.fetch !== "function"
+  ) {
     return proxyError(503, "control plane unavailable", csp);
   }
   // The private binding selects the network service; its URL names the one configured public
   // origin, never a caller URL, Host, Origin or forwarding header.
   const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);
   if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);
-  const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET?.trim() ?? "";
+  if (typeof env.CONTROL_PLANE_EDGE_SECRET !== "string") {
+    return proxyError(503, "control plane unavailable", csp);
+  }
+  const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET.trim();
   if (!/^[A-Za-z0-9_-]{43,86}$/.test(edgeAuthSecret)) {
     return proxyError(503, "control plane unavailable", csp);
   }
