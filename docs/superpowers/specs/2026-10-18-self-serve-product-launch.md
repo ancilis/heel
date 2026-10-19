@@ -33,6 +33,13 @@ Normative words: **MUST**, **MUST NOT**, **MAY**.
 > (new spec §2.4) and is never described as customer-local. Final acceptance now has two layers
 > (new spec §6.3–§6.4): a synthetic known positive is intermediate; a real authorized SaaS not
 > prepared for Heel validates onboarding. Historical revision notes above remain as evidence.
+> **T3SR amendment (2026-10-19):** the new spec's revision banner lists the `f6a79ee` draft claims
+> it supersedes. For this document two statements above are refined: safety property 2 (§10 row 2)
+> is **amended** on the default path (GET/HEAD plus at most one `login_exchange` POST per identity
+> per run to a customer-confirmed path, new spec §3.6); and the §5 "no credential in a browser
+> payload" wording is **deliberately excepted** for the one credential-intake request, whose
+> plaintext transit processors (browser, Worker, control plane in memory) are named in new spec
+> §2.4. Neither is implemented or accepted; both await Kevin's §2.4 decision.
 
 Revision T1R (2026-10-18, fresh Fable adversarial specification review): corrections to §1–§3,
 §6–§8, §10, §12, §13 and §15. The list of defects found, with evidence, is in
