@@ -2473,7 +2473,13 @@ class RunnerRuntimeState:
         self, *, operation: str, path: str, headers: Mapping[str, str], body: bytes,
         client_nonce_b64: str, timestamp_ms: int, now_ms: int, run_id: str | None = None,
     ) -> ChainResyncAttempt:
-        """Durably record a fresh start request before it is sent; any previous attempt is replaced."""
+        """Durably record a fresh start request before it is sent.
+
+        Only when no attempt exists: an existing row is opened and validated first, so a corrupt one
+        fails closed with every byte kept, and a valid unfinished one is a conflict (its exact
+        requests may still match a live server challenge). The caller discards that exact attempt
+        first (``discard_resync_attempt``, compare-and-swap) when the server refused it.
+        """
         if operation != "claim" or run_id is not None:
             raise RunnerRuntimeStateError("runtime resync recovery is claim-chain only")
         now_ms = _safe_int(now_ms, "runtime resync time")
@@ -2497,10 +2503,8 @@ class RunnerRuntimeState:
                 cursor = self._load_chain_locked(conn, "claim", None)
                 if cursor is None:
                     raise RunnerRuntimeConflict("runtime resync chain is unavailable")
-                conn.execute(
-                    "DELETE FROM chain_recovery WHERE kind='resync_attempt' AND chain=?",
-                    (self._chain_key("claim", None),),
-                )
+                if self._load_attempt_row_locked(conn) is not None:
+                    raise RunnerRuntimeConflict("runtime resync attempt already exists")
                 attempt = self._write_attempt_locked(conn, {
                     "schema_version": _RESYNC_ATTEMPT_SCHEMA,
                     "workspace_id": self.identity.workspace_id, "runner_id": self.identity.runner_id,
@@ -2560,6 +2564,74 @@ class RunnerRuntimeState:
             try:
                 core = self._current_attempt_locked(conn, attempt)
                 if core["challenge"] is None or core["complete"] is not None:
+                    raise RunnerRuntimeConflict("runtime resync attempt changed")
+                updated = {key: value for key, value in core.items() if key != "state_digest"}
+                updated.update(complete={
+                    "path": path, "headers": values, "body_b64": self._canonical_b64(body),
+                    "timestamp_ms": timestamp_ms,
+                }, updated_at_ms=now_ms)
+                result = self._write_attempt_locked(conn, updated, insert=False)
+                conn.execute("COMMIT")
+                return result
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def replace_resync_challenge(
+        self, attempt: ChainResyncAttempt, *, challenge_id: str, server_challenge_b64: str,
+        next_sequence: int, generation: int, expires_at_ms: int, now_ms: int,
+    ) -> ChainResyncAttempt:
+        """Adopt the server's NEW challenge for this attempt's exact start; the old completion goes.
+
+        Only when the recorded challenge was answered (the server holds no pending one for this
+        start any more and answered the byte-identical start with another): leaving that new
+        challenge unanswered would orphan it on the server. Compare-and-swap on the attempt.
+        """
+        now_ms = _safe_int(now_ms, "runtime resync time")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                core = self._current_attempt_locked(conn, attempt)
+                if core["challenge"] is None or core["challenge"]["challenge_id"] == challenge_id:
+                    raise RunnerRuntimeConflict("runtime resync attempt changed")
+                cursor = self._load_chain_locked(conn, "claim", None)
+                if cursor is None or type(generation) is not int or generation < cursor.generation:
+                    raise RunnerRuntimeCorrupt("runtime resync challenge generation regressed")
+                updated = {key: value for key, value in core.items() if key != "state_digest"}
+                updated.update(challenge={
+                    "challenge_id": challenge_id, "server_challenge_b64": server_challenge_b64,
+                    "next_sequence": next_sequence, "generation": generation,
+                    "expires_at_ms": expires_at_ms,
+                }, complete=None, updated_at_ms=now_ms)
+                result = self._write_attempt_locked(conn, updated, insert=False)
+                conn.execute("COMMIT")
+                return result
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def resign_resync_completion(
+        self, attempt: ChainResyncAttempt, *, path: str, headers: Mapping[str, str], body: bytes,
+        timestamp_ms: int, now_ms: int,
+    ) -> ChainResyncAttempt:
+        """Replace the recorded completion's proof with a newer one over the byte-identical body.
+
+        The path and body must equal the recorded completion exactly (same challenge, nonces and
+        generation); only the signed timestamp and signature change. Durable before it is sent.
+        """
+        now_ms = _safe_int(now_ms, "runtime resync time")
+        path, values, body, timestamp_ms, _decoded = self._validate_resync_request(
+            "complete", path=path, headers=headers, body=body, timestamp_ms=timestamp_ms,
+        )
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                core = self._current_attempt_locked(conn, attempt)
+                recorded = core["complete"]
+                if (
+                    recorded is None or recorded["path"] != path
+                    or recorded["body_b64"] != self._canonical_b64(body)
+                ):
                     raise RunnerRuntimeConflict("runtime resync attempt changed")
                 updated = {key: value for key, value in core.items() if key != "state_digest"}
                 updated.update(complete={
