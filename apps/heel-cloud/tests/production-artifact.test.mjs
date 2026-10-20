@@ -2363,3 +2363,98 @@ test("production worker refuses out-of-shape control-plane configuration with th
   }
   assert.deepEqual([ambientCalls, assetCalls, bindingCalls], [0, 0, 3]);
 });
+
+test("production worker frames every POST family to its declared length and reaches only the private binding", async (t) => {
+  // H0X E3: the frozen build carries the same length authority and sink identity as the source Worker.
+  const artifact = await import(
+    pathToFileURL(join(serverRoot, "index.js")).href + `?sink-identity=${Date.now()}`
+  );
+  const origin = "https://heel.example";
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  const workspace = "ws_0123456789abcdef";
+  const project = `prj_${"a".repeat(32)}`;
+  const runner = "runr_0123456789abcdef0123456789abcdef";
+  const run = `crun_${"c".repeat(32)}`;
+  const session = { Cookie: "__Host-heel_session=private" };
+  const browser = { ...session, Origin: origin, "Sec-Fetch-Site": "same-origin" };
+  const runnerProof = {
+    "X-Heel-Runner-Id": runner, "X-Heel-Runner-Key-Id": "key", "X-Heel-Runner-Timestamp-Ms": "1",
+    "X-Heel-Runner-Nonce": "nonce", "X-Heel-Runner-Sequence": "1", "X-Heel-Runner-Signature": "sig",
+  };
+  const routes = [
+    ["POST", "/v1/signup", { "CF-Connecting-IP": "203.0.113.4" }],
+    ["POST", "/v1/login", {}],
+    ["GET", "/v1/me", session],
+    ["POST", "/v1/logout", session],
+    ["POST", "/v1/device/start", { "CF-Connecting-IP": "203.0.113.4" }],
+    ["POST", "/v1/device/poll", {}],
+    ["POST", "/v1/device/verify", browser],
+    ["GET", `/v1/workspaces/${workspace}/projects`, session],
+    ["POST", `/v1/workspaces/${workspace}/projects`, { Authorization: "Bearer heel_sk_private" }],
+    ["POST", `/v1/workspaces/${workspace}/projects/${project}/findings-sync`, { ...session, "Idempotency-Key": `fs1-${"0".repeat(64)}` }],
+    ["POST", "/v1/runner-pairings/exchange", {}],
+    ["POST", `/v1/workspaces/${workspace}/runners/${runner}/revoke`, browser],
+    ["POST", `/v1/workspaces/${workspace}/runners/${runner}/claim`, runnerProof],
+    ["POST", `/v1/workspaces/${workspace}/runners/${runner}/runs/${run}/result-projection`, runnerProof],
+    ["GET", `/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}`, session],
+    [
+      "POST", `/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}/approve`,
+      { ...browser, "Idempotency-Key": `ca1-${"1".repeat(64)}`, "If-Heel-Control-Generation": "3" },
+    ],
+  ];
+  let ambientCalls = 0;
+  const ambientFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    ambientCalls += 1;
+    throw new Error("ambient fetch must never carry control-plane traffic");
+  };
+  t.after(() => { globalThis.fetch = ambientFetch; });
+  const run1 = async (method, path, headers, body, declared) => {
+    const calls = { asset: 0, binding: [] };
+    const environment = {
+      ASSETS: { fetch: async () => { calls.asset += 1; return new Response("asset", { status: 404 }); } },
+      IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+      PUBLIC_ORIGIN: origin,
+      CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
+      CONTROL_PLANE: {
+        async fetch(upstream) {
+          const call = { url: upstream.url, redirect: upstream.redirect, read: "read" };
+          calls.binding.push(call);
+          try {
+            await upstream.arrayBuffer();
+          } catch (error) {
+            call.read = error.name;
+            throw error;
+          }
+          const setCookie = path === "/v1/logout"
+            ? "heel_session=; Max-Age=0; Path=/"
+            : path === "/v1/signup" || path === "/v1/login" ? "heel_session=private; HttpOnly; SameSite=Lax; Path=/" : null;
+          return new Response("{}", {
+            headers: { "Content-Type": "application/json", ...(setCookie === null ? {} : { "Set-Cookie": setCookie }) },
+          });
+        },
+      },
+    };
+    const requestHeaders = method === "POST"
+      ? { ...headers, "Content-Type": "application/json", "Content-Length": declared }
+      : headers;
+    const response = await artifact.default.fetch(new Request(`https://proxy.heel.invalid/api/control-plane${path}`, {
+      method, headers: requestHeaders, ...(method === "POST" ? { body } : {}),
+    }), environment, context);
+    return { status: response.status, ...calls };
+  };
+  for (const [method, path, headers] of routes) {
+    const exact = await run1(method, path, headers, "{}", "2");
+    assert.deepEqual(exact, {
+      status: 200, asset: 0, binding: [{ url: `${origin}${path}`, redirect: "manual", read: "read" }],
+    }, `${method} ${path}`);
+    if (method !== "POST") continue;
+    for (const declared of ["3", "1"]) {
+      const mismatch = await run1(method, path, headers, "{}", declared);
+      assert.deepEqual(mismatch, {
+        status: 502, asset: 0, binding: [{ url: `${origin}${path}`, redirect: "manual", read: "TypeError" }],
+      }, `${method} ${path} declared ${declared}`);
+    }
+  }
+  assert.equal(ambientCalls, 0);
+});

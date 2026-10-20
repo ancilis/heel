@@ -4,6 +4,7 @@
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
 import { canonicalPublicOrigin } from "../build/deployment-config";
+import { dispatchControlPlane } from "./control-plane-dispatch";
 
 interface AssetFetcher {
   fetch(request: Request): Promise<Response>;
@@ -11,10 +12,6 @@ interface AssetFetcher {
 
 interface PrivateControlPlaneFetcher {
   fetch(request: Request): Promise<Response>;
-}
-
-declare class FixedLengthStream extends TransformStream<Uint8Array, Uint8Array> {
-  constructor(expectedLength: number);
 }
 
 interface Env {
@@ -499,15 +496,8 @@ async function proxyControlPlane(
   upstreamPath: string,
 ): Promise<Response> {
   // Configuration outside the declared runtime shapes is unavailable, not an upstream failure.
-  if (
-    env.CONTROL_PLANE === undefined
-    || env.CONTROL_PLANE === null
-    || typeof env.CONTROL_PLANE.fetch !== "function"
-  ) {
-    return proxyError(503, "control plane unavailable", csp);
-  }
-  // The private binding selects the network service; its URL names the one configured public
-  // origin, never a caller URL, Host, Origin or forwarding header.
+  // The dispatch module checks the binding shape and re-validates the raw configured origin; this
+  // validated origin serves the human Origin checks below.
   const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);
   if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);
   if (typeof env.CONTROL_PLANE_EDGE_SECRET !== "string") {
@@ -560,30 +550,21 @@ async function proxyControlPlane(
     }
     throw error;
   }
-  const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);
-  const init: RequestInit & { duplex?: "half" } = {
-    headers: requestContract.headers,
+  // The only path to the private binding: explicit inputs, one call (H0X).
+  const outcome = await dispatchControlPlane({
+    binding: env.CONTROL_PLANE,
+    publicOrigin: env.PUBLIC_ORIGIN,
+    upstreamPath,
     method: request.method,
-    redirect: "manual",
-  };
-  if (request.method === "POST") {
-    if (requestContract.contentLength !== 0 && request.body === null) {
-      return proxyError(400, "invalid control plane request", csp);
-    }
-    try {
-      init.body = requestContract.contentLength === 0
-        ? new Uint8Array()
-        : request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength));
-      init.duplex = "half";
-    } catch {
-      return proxyError(502, "control plane request failed", csp);
-    }
-  }
+    headers: requestContract.headers,
+    contentLength: requestContract.contentLength,
+    body: request.body,
+  });
+  if (outcome.kind === "unavailable") return proxyError(503, "control plane unavailable", csp);
+  if (outcome.kind === "invalid") return proxyError(400, "invalid control plane request", csp);
+  if (outcome.kind === "failed") return proxyError(502, "control plane request failed", csp);
+  const response = outcome.response;
   try {
-    const response = await env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init));
-    if (response.status >= 300 && response.status <= 399) {
-      return proxyError(502, "control plane request failed", csp);
-    }
     if (CANARY_APPROVAL_REQUESTS_ROUTE.test(upstreamPath) && response.status >= 200 && response.status <= 299) {
       const declared = singletonHeader(response.headers, "Content-Length");
       if (declared === null || !/^(?:0|[1-9][0-9]*)$/.test(declared) || Number(declared) > 69632) {
