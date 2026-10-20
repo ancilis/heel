@@ -515,8 +515,9 @@ function analyzeSource(fileName, text) {
     }
     validateControlPlaneSinkDataflow(fetchCall);
     validateControlPlaneConfigurationGuards();
-    validateControlPlaneReceiverIdentity(fetchCall);
-    validateControlPlaneBodyFraming(fetchCall);
+    const entry = validateControlPlaneReceiverIdentity(fetchCall);
+    const framingBranch = validateControlPlaneBodyFraming(fetchCall);
+    validateControlPlaneFormalLineage(entry, framingBranch);
   }
 
   function isWriteTarget(node) {
@@ -921,6 +922,7 @@ function analyzeSource(fileName, text) {
       ts.forEachChild(node, inspectTypeScriptBindings);
     }
     inspectTypeScriptBindings(parsed);
+    return { scope: entryScope, dispatch: reviewedEntry ? dispatch : undefined };
   }
 
   // The approved framing writes count only on the one reachable POST branch: a direct proxy statement
@@ -973,6 +975,76 @@ function analyzeSource(fileName, text) {
       || streams.length !== 1
       || !withinNode(streams[0], guards[0])
     ) report(guards[0] ?? proxy ?? parsed, framing);
+    return guards.length === 1 ? guards[0] : undefined;
+  }
+
+  // The checks above follow `env` and `request` by name, so neither the entry nor the proxy may read
+  // its own `arguments`, which would alias both formals past them. The reviewed branch pipes the
+  // request's own body through FixedLengthStream with the stream's own pipeThrough: outside reviewed
+  // reads `request` does not escape, its body is read only inside that branch, and no Worker source
+  // writes, names or destructures a pipeThrough member.
+  function validateControlPlaneFormalLineage(entry, framingBranch) {
+    const formals = "control-plane entry or proxy parameters are aliased through arguments";
+    const body = "control-plane request or its body is aliased or altered outside the reviewed framing";
+    const proxy = parsed.statements.find((statement) => (
+      ts.isFunctionDeclaration(statement) && statement.name?.text === "proxyControlPlane"
+    ));
+    const scopes = [proxy, entry.scope].filter((scope) => scope !== undefined);
+    const enclosingFunction = (node, skipArrows) => {
+      let current = node.parent;
+      while (current && !(ts.isFunctionLike(current) && !(skipArrows && ts.isArrowFunction(current)))) {
+        current = current.parent;
+      }
+      return current;
+    };
+
+    for (const reference of runtimeReferences("arguments")) {
+      if (scopes.includes(enclosingFunction(reference, true))) report(reference, formals);
+    }
+
+    for (const scope of scopes) {
+      for (const reference of runtimeReferences("request")) {
+        if (!withinNode(reference, scope)) continue;
+        const member = reference.parent;
+        if (ts.isPropertyAccessExpression(member) && member.expression === reference) {
+          if (isWriteTarget(member) || (member.name.text === "body" && !withinNode(member, framingBranch))) {
+            report(reference, body);
+          }
+          continue;
+        }
+        // Only the one proxy dispatch, and the page request built after it has returned, take `request` itself.
+        const construction = reference.parent;
+        if (!(
+          (entry.dispatch !== undefined && reference === entry.dispatch.arguments[0])
+          || (
+            scope === entry.scope
+            && ts.isNewExpression(construction)
+            && construction.expression.getText(parsed) === "Request"
+            && construction.arguments?.[0] === reference
+            && reference.getStart(parsed) > entry.dispatch.getEnd()
+            && enclosingFunction(reference, false) === scope
+          )
+        )) report(reference, body);
+      }
+    }
+
+    function inspect(node) {
+      if (
+        (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
+        && resolvedMemberNames(node).has("pipeThrough")
+        && (!ts.isPropertyAccessExpression(node) || !withinNode(node, framingBranch) || isWriteTarget(node))
+      ) report(node, body);
+      if (
+        (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node) || ts.isMethodDeclaration(node)
+          || ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node))
+        && ts.isObjectLiteralExpression(node.parent)
+        && propertyNameValues(node.name).has("pipeThrough")
+      ) report(node, body);
+      if (ts.isBindingElement(node) && bindingPropertyNames(node).has("pipeThrough")) report(node, body);
+      if (ts.isStringLiteralLike(node) && node.text === "pipeThrough") report(node, body);
+      ts.forEachChild(node, inspect);
+    }
+    inspect(parsed);
   }
 
   function isReviewedBootstrapDeclaration(declaration) {
@@ -3341,6 +3413,95 @@ test("the privacy analyzer pins the browser client to the same-origin closed con
       violations.some((violation) => violation.includes(mutation.violation)),
       `${mutation.label}: ${violations.join("\n")}`,
     );
+  }
+});
+
+test("the privacy analyzer keeps the entry formals and the request's own body pipe on the path to the sink", async () => {
+  const worker = await source("worker/index.ts");
+  const analyze = (text) => analyzeSource(join(appRootPath, "worker/index.ts"), text);
+  assert.deepEqual(analyze(worker), []);
+  const url = "  const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);";
+  const sink = "    const response = await env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init));";
+  const bodyGuard = '  if (request.method === "POST") {\n    if (requestContract.contentLength';
+  const dispatch = "      return proxyControlPlane(request, env, csp, upstreamPath);";
+  const mutate = (...edits) => {
+    let mutated = worker;
+    for (let index = 0; index < edits.length; index += 2) {
+      assert.equal(mutated.split(edits[index]).length, 2, `mutation anchor is not unique: ${edits[index]}`);
+      mutated = mutated.replace(edits[index], edits[index + 1]);
+    }
+    return mutated;
+  };
+  const beforeDispatch = (statement) => mutate(dispatch, `      ${statement}\n${dispatch}`);
+  const beforeSink = (statement) => mutate(sink, `    ${statement}\n${sink}`);
+  const beforeFraming = (statement) => mutate(bodyGuard, `  ${statement}\n${bodyGuard}`);
+  const substitute = 'supplied[["CONTROL", "PLANE"].join("_")] = supplied.ASSETS;';
+  const skipPipe = "pipeThrough = function () { return this; };";
+  const formals = "parameters are aliased through arguments";
+  const body = "request or its body is aliased or altered outside the reviewed framing";
+  const mutations = [
+    // The H0AR2 review mutants: `arguments` aliases the receiver, and a replaced pipe skips FixedLengthStream.
+    ["entry binding through arguments", beforeDispatch(`const supplied = arguments[1]; ${substitute}`), formals],
+    ["proxy binding through arguments", beforeSink(`const supplied = arguments[1]; ${substitute}`), formals],
+    ["body pipe replaced", beforeFraming(`if (request.body) request.body.${skipPipe}`), body],
+    ["aliased body pipe replaced", beforeFraming(`const incomingBody = request.body; if (incomingBody) incomingBody.${skipPipe}`), body],
+    [
+      "destructured body pipe replaced",
+      beforeFraming(`const { body: incomingBody } = request; if (incomingBody) incomingBody.${skipPipe}`),
+      body,
+    ],
+    // Other reads of the formals through `arguments`.
+    ["destructured entry arguments", beforeDispatch(`const [, supplied] = arguments; ${substitute}`), formals],
+    ["arrow-captured entry arguments", beforeDispatch(`const supplied = (() => arguments[1])(); ${substitute}`), formals],
+    ["proxy body through arguments", beforeFraming(`if (arguments[0].body) arguments[0].body.${skipPipe}`), formals],
+    // Other replacements of the pipe, or of the body it reads, before framing.
+    ["computed body pipe replaced", beforeFraming('if (request.body) request.body[["pipe", "Through"].join("")] = () => request.body;'), body],
+    ["request alias body pipe replaced", beforeFraming(`const incoming = request; if (incoming.body) incoming.body.${skipPipe}`), body],
+    [
+      "Reflect.set body pipe",
+      beforeFraming('if (request.body) Reflect.set(request.body, "pipeThrough", function (this: ReadableStream) { return this; });'),
+      body,
+    ],
+    [
+      "Object.assign body pipe",
+      beforeFraming("if (request.body) Object.assign(request.body, { pipeThrough(this: ReadableStream) { return this; } });"),
+      body,
+    ],
+    ["entry body pipe replaced before dispatch", beforeDispatch(`if (request.body) request.body.${skipPipe}`), body],
+    ["request body redefined", beforeFraming('Object.defineProperty(request, "body", { value: new Response("{}").body });'), body],
+    ["stream prototype pipe replaced", mutate(url, `  ReadableStream.prototype.${skipPipe}\n${url}`), body],
+    [
+      "hoisted helper body pipe",
+      mutate(
+        bodyGuard, `  skipFraming(request.body);\n${bodyGuard}`,
+        "export default worker;",
+        `function skipFraming(stream: ReadableStream | null): void {\n  if (stream) stream.${skipPipe}\n}\n\nexport default worker;`,
+      ),
+      body,
+    ],
+  ];
+  assert.equal(new Set(mutations.map(([label]) => label)).size, mutations.length);
+  for (const [label, mutated, violation] of mutations) {
+    assert.notEqual(mutated, worker, `${label} mutation did not apply`);
+    const parsedMutation = ts.createSourceFile("worker.ts", mutated, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    assert.equal(parsedMutation.parseDiagnostics.length, 0, `${label} mutation does not parse`);
+    const violations = analyze(mutated);
+    assert.ok(violations.some((found) => found.includes(violation)), `${label}: ${violations.join("\n")}`);
+  }
+
+  // Positive controls: ordinary request reads, another function's own `arguments` and a comment
+  // naming the pipe stay accepted.
+  for (const [label, unchanged] of [
+    ["entry method read", beforeDispatch("const incomingMethod = request.method;")],
+    ["proxy header read before framing", beforeFraming('const declaredType = request.headers.get("Content-Type");')],
+    [
+      "unrelated helper arguments",
+      mutate("export default worker;", "function argumentCount(..._values: unknown[]): number {\n  return arguments.length;\n}\n\nexport default worker;"),
+    ],
+    ["comment naming the pipe", mutate('      init.duplex = "half";', '      // pipeThrough enforces the declared length.\n      init.duplex = "half";')],
+  ]) {
+    assert.notEqual(unchanged, worker, `${label} control did not apply`);
+    assert.deepEqual(analyze(unchanged), [], label);
   }
 });
 
