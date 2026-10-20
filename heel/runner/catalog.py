@@ -86,7 +86,7 @@ CATALOG = (
         3,
         CATALOG_IDS[3],
         ("lower_plan", "higher_plan"),
-        ("GET",),
+        ("GET", "HEAD"),
         "plan_entitlement",
         (200, 402, 403, 404),
     ),

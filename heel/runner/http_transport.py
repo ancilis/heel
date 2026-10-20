@@ -235,6 +235,7 @@ class TLSTransport:
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
         self.context.verify_mode = ssl.CERT_REQUIRED
         self.context.check_hostname = True
+        self.context.load_default_certs()
 
     def wrap(self, raw_socket: Any, hostname: str, timeout: float) -> Any:
         raw_socket.settimeout(timeout)
