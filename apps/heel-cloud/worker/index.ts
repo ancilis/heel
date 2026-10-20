@@ -495,9 +495,16 @@ async function proxyControlPlane(
   csp: string,
   upstreamPath: string,
 ): Promise<Response> {
-  // Configuration outside the declared runtime shapes is unavailable, not an upstream failure.
-  // The dispatch module checks the binding shape and re-validates the raw configured origin; this
-  // validated origin serves the human Origin checks below.
+  // Configuration outside the declared runtime shapes is unavailable, not an upstream failure. This
+  // guard runs before any request check so a malformed binding always answers the fixed 503; the
+  // dispatch module checks the binding again and re-validates the raw configured origin.
+  if (
+    env.CONTROL_PLANE === undefined
+    || env.CONTROL_PLANE === null
+    || typeof env.CONTROL_PLANE.fetch !== "function"
+  ) {
+    return proxyError(503, "control plane unavailable", csp);
+  }
   const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);
   if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);
   if (typeof env.CONTROL_PLANE_EDGE_SECRET !== "string") {
