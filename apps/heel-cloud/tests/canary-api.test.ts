@@ -434,15 +434,18 @@ it("actual worker isolates human canary and runner-result authority headers and 
     .replace('import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";', 'const handleImageOptimization = async () => new Response("unused"); const DEFAULT_DEVICE_SIZES: number[] = []; const DEFAULT_IMAGE_SIZES: number[] = [];')
     .replace('import handler from "vinext/server/app-router-entry";', 'const handler = { fetch: async () => new Response("unused", { status: 404 }) };');
   const directory = await mkdtemp(join(tmpdir(), "heel-edge-test-"));
-  // Mirror the app layout so the Worker loads the real shared origin validator, byte for byte.
+  // Mirror the app layout so the Worker loads the real shared origin validator and dispatch module, byte for byte.
   const modulePath = join(directory, "worker", "index.ts");
   const helper = await readFile(join(process.cwd(), "build/deployment-config.ts"));
+  const dispatch = await readFile(join(process.cwd(), "worker/control-plane-dispatch.ts"));
   onTestFinished(() => rm(directory, { recursive: true, force: true }));
   assert.equal(runnable.split('import { canonicalPublicOrigin } from "../build/deployment-config";').length - 1, 1);
   await mkdir(join(directory, "worker"));
   await mkdir(join(directory, "build"));
   await writeFile(join(directory, "build", "deployment-config.ts"), helper);
   assert.deepEqual(await readFile(join(directory, "build", "deployment-config.ts")), helper);
+  await writeFile(join(directory, "worker", "control-plane-dispatch.ts"), dispatch);
+  assert.deepEqual(await readFile(join(directory, "worker", "control-plane-dispatch.ts")), dispatch);
   await writeFile(modulePath, runnable);
   class LengthStream extends TransformStream<Uint8Array, Uint8Array> {
     constructor(expected: number) {

@@ -8,6 +8,7 @@ vi.mock("vinext/server/image-optimization", () => ({
 vi.mock("vinext/server/app-router-entry", () => ({ default: { fetch: vi.fn() } }));
 
 import handler from "vinext/server/app-router-entry";
+import { handleImageOptimization } from "vinext/server/image-optimization";
 import { deploymentConfig } from "../build/deployment-config";
 import worker from "../worker/index";
 
@@ -390,5 +391,78 @@ describe("canonical control-plane binding destination", () => {
       expect(fetcher).not.toHaveBeenCalled();
       expect(globalFetch).not.toHaveBeenCalled();
     }
+  });
+
+  // H0X E2: the composed Worker carries length authority and sink identity for every route family.
+  it("refuses a declared-length mismatch with 502 for every POST route family", async () => {
+    const origin = CONFIGURED_ORIGINS[0];
+    const posts = routeCases(origin).filter((route) => route.method === "POST");
+    for (const [declared, body] of [["3", "{}"], ["1", "{}"]]) {
+      for (const route of posts) {
+        const reads: string[] = [];
+        const fetcher = bindingSpy(async (request) => {
+          try {
+            await request.arrayBuffer();
+          } catch (error) {
+            reads.push((error as Error).name);
+            throw error;
+          }
+          reads.push("read");
+          return upstreamResponse(request);
+        });
+        const headers: Record<string, string> = { ...route.headers, "Content-Type": "application/json", "Content-Length": declared };
+        const response = await worker.fetch(new Request(`https://heel.example/api/control-plane${route.path}`, {
+          method: "POST", headers, body,
+        }), workerEnv(origin, fetcher), context);
+        expect(response.status, `${route.label} declared ${declared}`).toBe(502);
+        expect(fetcher, route.label).toHaveBeenCalledTimes(1);
+        expect(fetcher.mock.calls[0][0].url, route.label).toBe(`${origin}${route.path}`);
+        expect(reads, route.label).toEqual(["TypeError"]);
+      }
+    }
+    expectNoFallback();
+  });
+
+  it("reaches only the private binding, once, for each route on its own", async () => {
+    for (const origin of CONFIGURED_ORIGINS) {
+      for (const route of routeCases(origin)) {
+        const fetcher = bindingSpy();
+        assetFetch.mockClear();
+        vi.mocked(handler.fetch).mockClear();
+        globalFetch.mockClear();
+        const response = await worker.fetch(incoming("https://request-host.invalid", route), workerEnv(origin, fetcher), context);
+        const label = `${origin} ${route.label}`;
+        expect(response.status, label).toBe(200);
+        expect(fetcher, label).toHaveBeenCalledTimes(1);
+        expect(fetcher.mock.calls[0][0].url, label).toBe(`${origin}${route.path}`);
+        expect(assetFetch, label).not.toHaveBeenCalled();
+        expect(handler.fetch, label).not.toHaveBeenCalled();
+        expect(globalFetch, label).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("keeps page and image requests on the page handler and assets only", async () => {
+    const origin = CONFIGURED_ORIGINS[0];
+    const fetcher = bindingSpy();
+    vi.mocked(handler.fetch).mockReset().mockResolvedValue(new Response("page"));
+    const page = await worker.fetch(new Request("https://request-host.invalid/dashboard"), workerEnv(origin, fetcher), context);
+    expect(page.status).toBe(200);
+    expect(handler.fetch).toHaveBeenCalledTimes(1);
+    expect(assetFetch).not.toHaveBeenCalled();
+
+    vi.mocked(handler.fetch).mockReset();
+    vi.mocked(handleImageOptimization).mockImplementation((async (
+      _request: Request, options: { fetchAsset: (path: string) => Promise<Response> },
+    ) => options.fetchAsset("/_next/static/media/probe.png")) as never);
+    const image = await worker.fetch(
+      new Request("https://request-host.invalid/_vinext/image?url=%2Fprobe.png&w=64&q=75"), workerEnv(origin, fetcher), context,
+    );
+    expect(image.status).toBe(404);
+    expect(assetFetch).toHaveBeenCalledTimes(1);
+    expect(handler.fetch).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(globalFetch).not.toHaveBeenCalled();
+    vi.mocked(handleImageOptimization).mockReset();
   });
 });

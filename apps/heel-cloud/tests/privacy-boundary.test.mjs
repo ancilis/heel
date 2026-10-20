@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, relative } from "node:path";
@@ -109,31 +110,46 @@ function containsSensitiveInput(node) {
 }
 
 
-// Exact runtime configuration guards that must precede every private control-plane request.
-const controlPlaneBindingGuard = `if (
-    env.CONTROL_PLANE === undefined
-    || env.CONTROL_PLANE === null
-    || typeof env.CONTROL_PLANE.fetch !== "function"
+// H0X: the private control-plane sink lives only in this module, pinned by bytes (S3) and
+// checked by lexical and token facts (S1, S2). None of these checks claims to model dataflow.
+const CONTROL_PLANE_DISPATCH_PATH = "worker/control-plane-dispatch.ts";
+const CONTROL_PLANE_DISPATCH_SHA256 = "cbebaa836f6ab880ecc5ed93bceb0a8670e72b9bc1aee0983692881b0df711a9";
+const dispatchModuleImport = 'import { canonicalPublicOrigin } from "../build/deployment-config";';
+const dispatchBindingGuard = `if (
+    input.binding === undefined
+    || input.binding === null
+    || typeof input.binding.fetch !== "function"
   ) {
-    return proxyError(503, "control plane unavailable", csp);
+    return { kind: "unavailable" };
   }`;
-const controlPlaneSecretGuard = `if (typeof env.CONTROL_PLANE_EDGE_SECRET !== "string") {
-    return proxyError(503, "control plane unavailable", csp);
-  }`;
-// The one reviewed POST framing branch, compared by syntax structure so comments and layout stay free.
-const controlPlaneBodyFraming = `if (request.method === "POST") {
-    if (requestContract.contentLength !== 0 && request.body === null) {
-      return proxyError(400, "invalid control plane request", csp);
-    }
-    try {
-      init.body = requestContract.contentLength === 0
-        ? new Uint8Array()
-        : request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength));
-      init.duplex = "half";
-    } catch {
-      return proxyError(502, "control plane request failed", csp);
-    }
-  }`;
+const dispatchModuleFragments = [
+  dispatchBindingGuard,
+  "const origin = canonicalPublicOrigin(input.publicOrigin);",
+  'if (origin === null) return { kind: "unavailable" };',
+  "const url = new URL(input.upstreamPath, origin);",
+  'if (input.contentLength !== 0 && input.body === null) return { kind: "invalid" };',
+  "const response = await input.binding.fetch(new Request(url, init));",
+  'if (response.status >= 300 && response.status <= 399) return { kind: "failed" };',
+];
+// Identifiers the module may not name anywhere, including comments and strings. Escaped spellings
+// count: the scanner's normalized token value is compared as well as the raw token text.
+const dispatchForbiddenIdentifiers = [
+  "globalThis", "self", "window", "document", "arguments", "eval", "Function", "Reflect", "Proxy",
+  "defineProperty", "prototype", "ASSETS", "IMAGES", "env", "request", "caches", "process", "require",
+  "fetchLocal",
+];
+const dispatchConstructors = ["URL", "Request", "Uint8Array", "FixedLengthStream"];
+// S4: the Worker's one reviewed call into the module.
+const dispatchImport = 'import { dispatchControlPlane } from "./control-plane-dispatch";';
+const dispatchCallSite = `const outcome = await dispatchControlPlane({
+    binding: env.CONTROL_PLANE,
+    publicOrigin: env.PUBLIC_ORIGIN,
+    upstreamPath,
+    method: request.method,
+    headers: requestContract.headers,
+    contentLength: requestContract.contentLength,
+    body: request.body,
+  });`;
 
 
 function analyzeSource(fileName, text) {
@@ -158,6 +174,7 @@ function analyzeSource(fileName, text) {
   const sinkAliases = new Set();
   const engineWorker = relativeName === "workers/heel-review.worker.ts";
   const serverWorker = relativeName === "worker/index.ts";
+  const dispatchModule = relativeName === CONTROL_PLANE_DISPATCH_PATH;
   const findingsControlPlaneClient = relativeName === "lib/heel-cloud-api.ts";
   const canaryControlPlaneClient = relativeName === "lib/canary-api.ts";
   const controlPlaneClient = findingsControlPlaneClient || canaryControlPlaneClient;
@@ -222,25 +239,16 @@ function analyzeSource(fileName, text) {
     violations.push(`${relativeName}:${location.line + 1}:${location.character + 1}: ${message}`);
   }
 
-  function reviewedControlPlaneFetchCall(call) {
-    if (
-      !serverWorker
-      || !ts.isCallExpression(call)
-      || call.questionDotToken
-      || call.expression.getText(parsed) !== "env.CONTROL_PLANE.fetch"
-      || call.arguments.length !== 1
-      || enclosingFunctionName(call) !== "proxyControlPlane"
-      || !ts.isAwaitExpression(call.parent)
-      || !ts.isVariableDeclaration(call.parent.parent)
-      || !ts.isIdentifier(call.parent.parent.name)
-      || call.parent.parent.name.text !== "response"
-    ) return false;
-    const request = call.arguments[0];
-    return ts.isNewExpression(request)
-      && request.expression.getText(parsed) === "Request"
-      && request.arguments?.length === 2
-      && request.arguments[0].getText(parsed) === "upstreamUrl"
-      && request.arguments[1].getText(parsed) === "init";
+  // The only private control-plane sink: the one awaited binding call in the dispatch module.
+  function reviewedDispatchFetchCall(call) {
+    return dispatchModule
+      && ts.isCallExpression(call)
+      && !call.questionDotToken
+      && call.expression.getText(parsed) === "input.binding.fetch"
+      && call.arguments.length === 1
+      && call.arguments[0].getText(parsed) === "new Request(url, init)"
+      && enclosingFunctionName(call) === "dispatchControlPlane"
+      && ts.isAwaitExpression(call.parent);
   }
 
   function reviewedSameOriginFetchCall(call) {
@@ -271,27 +279,28 @@ function analyzeSource(fileName, text) {
         && ts.isVariableDeclaration(capture.parent)
         && isReviewedBootstrapDeclaration(capture.parent);
     }
-    if (reviewedControlPlaneCapabilityCheck(node)) return true;
+    if (reviewedDispatchCapabilityCheck(node)) return true;
+    if (dispatchModule) {
+      return ts.isCallExpression(node.parent) && node.parent.expression === node
+        && reviewedDispatchFetchCall(node.parent);
+    }
     return serverWorker && ts.isCallExpression(node.parent) && node.parent.expression === node
-      && (
-        ["env.ASSETS.fetch", "handler.fetch"].includes(expression)
-        || reviewedControlPlaneFetchCall(node.parent)
-      );
+      && ["env.ASSETS.fetch", "handler.fetch"].includes(expression);
   }
 
-  // `typeof` inspects the binding capability without calling or capturing it; only the one
-  // reviewed guard at the start of the proxy may do so.
-  function reviewedControlPlaneCapabilityCheck(node) {
+  // `typeof` inspects the binding capability without calling or capturing it; only the module's
+  // configuration guard, the first statement of the dispatch, may do so.
+  function reviewedDispatchCapabilityCheck(node) {
     if (
-      !serverWorker
-      || node.getText(parsed) !== "env.CONTROL_PLANE.fetch"
+      !dispatchModule
+      || node.getText(parsed) !== "input.binding.fetch"
       || !ts.isTypeOfExpression(node.parent)
-      || enclosingFunctionName(node) !== "proxyControlPlane"
+      || enclosingFunctionName(node) !== "dispatchControlPlane"
     ) return false;
     const guard = enclosingFunctionDeclaration(node)?.body?.statements[0];
     return guard !== undefined
       && ts.isIfStatement(guard)
-      && guard.getText(parsed) === controlPlaneBindingGuard
+      && guard.getText(parsed) === dispatchBindingGuard
       && node.getStart(parsed) >= guard.expression.getStart(parsed)
       && node.getEnd() <= guard.expression.getEnd();
   }
@@ -299,7 +308,7 @@ function analyzeSource(fileName, text) {
   function allowedFetchCall(node) {
     const expression = node.expression.getText(parsed);
     if (serverWorker && ["env.ASSETS.fetch", "handler.fetch"].includes(expression)) return true;
-    if (reviewedControlPlaneFetchCall(node)) return true;
+    if (reviewedDispatchFetchCall(node)) return true;
     if (reviewedSameOriginFetchCall(node)) return true;
     return engineWorker && expression === "fetcher" && isReviewedFetcherCall(node);
   }
@@ -388,11 +397,7 @@ function analyzeSource(fileName, text) {
       'const MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES = 272 * 1024;',
       'const MAX_RUNNER_RESYNC_BODY_BYTES = 2 * 1024;',
       'const MAX_RUNNER_PAIRING_BODY_BYTES = 16 * 1024;',
-      "const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);",
       "headers: requestContract.headers,",
-      'redirect: "manual",',
-      "request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength))",
-      "if (response.status >= 300 && response.status <= 399)",
       '`__Host-heel_session=${match[1]}; HttpOnly; SameSite=Lax; Path=/; Secure`',
       '"__Host-heel_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure"',
       'if (requestUrl.search !== "") return proxyError(400, "invalid control plane request", csp);',
@@ -417,634 +422,162 @@ function analyzeSource(fileName, text) {
     ) {
       report(parsed, "control-plane response header allowlist is not the reviewed exact contract");
     }
-    validateControlPlaneDestinationDataflow();
+    validateControlPlaneDispatchCallSite();
   }
 
-  // The private binding destination is only the configured PUBLIC_ORIGIN after the shared
-  // canonical validator accepts it; no caller, fixed or substitute origin may reach the URL.
-  function validateControlPlaneDestinationDataflow() {
-    const imports = parsed.statements.filter((statement) => (
-      ts.isImportDeclaration(statement)
-      && ts.isStringLiteral(statement.moduleSpecifier)
-      && statement.moduleSpecifier.text === "../build/deployment-config"
-    ));
-    const clause = imports.length === 1 ? imports[0].importClause : undefined;
-    const named = clause?.namedBindings;
+  function reportAt(position, message) {
+    const location = parsed.getLineAndCharacterOfPosition(position);
+    violations.push(`${relativeName}:${location.line + 1}:${location.character + 1}: ${message}`);
+  }
+
+  // S4: the Worker reaches the private binding only through the one reviewed module call. These are
+  // exact text and token facts about where the sink is; they do not claim the Worker cannot alias.
+  function validateControlPlaneDispatchCallSite() {
+    const sourceText = parsed.getFullText();
+    if (sourceText.split(dispatchImport).length - 1 !== 1) {
+      report(parsed, `control-plane dispatch call site is missing exact ${dispatchImport}`);
+    }
+    for (const forbidden of ["CONTROL_PLANE.fetch", 'CONTROL_PLANE["fetch"]', ".pipeThrough(", "FixedLengthStream"]) {
+      if (sourceText.includes(forbidden)) {
+        report(parsed, `control-plane worker contains sink text reserved for the dispatch module: ${forbidden}`);
+      }
+    }
+    const calls = [];
+    function inspect(node) {
+      if (
+        (ts.isIdentifier(node) && node.text === "pipeThrough")
+        || (ts.isStringLiteralLike(node) && node.text === "pipeThrough")
+      ) report(node, "control-plane worker names pipeThrough outside the dispatch module");
+      if (ts.isIdentifier(node) && node.text === "dispatchControlPlane" && !ts.isImportSpecifier(node.parent)) {
+        if (ts.isCallExpression(node.parent) && node.parent.expression === node) calls.push(node.parent);
+        else report(node, "control-plane dispatch is referenced outside its one reviewed call");
+      }
+      if (ts.isCallExpression(node)) {
+        const fetchShaped = (ts.isIdentifier(node.expression) && node.expression.text === "fetch")
+          || resolvedMemberNames(node.expression).has("fetch");
+        if (fetchShaped && !["env.ASSETS.fetch", "handler.fetch"].includes(node.expression.getText(parsed))) {
+          report(node, "control-plane worker has an unreviewed fetch-shaped call");
+        }
+      }
+      ts.forEachChild(node, inspect);
+    }
+    inspect(parsed);
+    const statement = calls.length === 1 ? calls[0].parent?.parent?.parent?.parent : undefined;
     if (
-      !clause || clause.isTypeOnly || clause.name || !named || !ts.isNamedImports(named)
-      || named.elements.length !== 1 || named.elements[0].propertyName
-      || named.elements[0].isTypeOnly || named.elements[0].name.text !== "canonicalPublicOrigin"
-    ) report(parsed, "control-plane destination validator is not the shared canonical import");
-    const declarations = { canonicalPublicOrigin: [], controlPlaneOrigin: [], upstreamUrl: [] };
-    const references = [];
-    let configuredOriginReads = 0;
-    let refusal = null;
-    let fetchCall = null;
-    function visit(node) {
+      calls.length !== 1
+      || enclosingFunctionName(calls[0]) !== "proxyControlPlane"
+      || !ts.isAwaitExpression(calls[0].parent)
+      || statement === undefined
+      || !ts.isVariableStatement(statement)
+      || statement.getText(parsed) !== dispatchCallSite
+    ) report(parsed, "control-plane dispatch is not the one reviewed call in proxyControlPlane");
+  }
+
+  // S1 and S2: lexical and token facts about the dispatch module. They prove where the sink is and
+  // what the module can name, not what any value flows to.
+  function validateControlPlaneDispatchModule() {
+    const sourceText = parsed.getFullText();
+    const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.Standard, sourceText);
+    const unescape = (value) => value.replace(
+      /\\u\{([0-9A-Fa-f]+)\}|\\u([0-9A-Fa-f]{4})/g,
+      (_, braced, plain) => String.fromCodePoint(Number.parseInt(braced ?? plain, 16)),
+    );
+    const forbiddenWords = dispatchForbiddenIdentifiers.map((name) => [
+      name, new RegExp(`(?<![A-Za-z0-9_$])${name}(?![A-Za-z0-9_$])`),
+    ]);
+    for (let kind = scanner.scan(); kind !== ts.SyntaxKind.EndOfFileToken; kind = scanner.scan()) {
+      const raw = scanner.getTokenText();
+      // Compare the scanner's normalized token value as well as the raw token text (H0XA).
+      const spellings = [raw, scanner.getTokenValue() ?? "", unescape(raw)];
+      for (const [name, word] of forbiddenWords) {
+        if (spellings.some((spelling) => word.test(spelling))) {
+          reportAt(scanner.getTokenStart(), `control-plane dispatch module names forbidden identifier ${name}`);
+        }
+      }
+    }
+    const imports = parsed.statements.filter((statement) => ts.isImportDeclaration(statement));
+    if (imports.length !== 1 || imports[0].getText(parsed) !== dispatchModuleImport) {
+      report(parsed, "control-plane dispatch module imports anything but the shared origin validator");
+    }
+    const typeSignatures = new Set([
+      ts.SyntaxKind.MethodSignature, ts.SyntaxKind.CallSignature, ts.SyntaxKind.ConstructSignature,
+      ts.SyntaxKind.IndexSignature, ts.SyntaxKind.FunctionType, ts.SyntaxKind.ConstructorType,
+    ]);
+    const fetchAccesses = [];
+    const pipes = [];
+    const redirects = [];
+    let dispatchDeclarations = 0;
+    function inspect(node) {
+      if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        report(node, "control-plane dispatch module uses dynamic import");
+      }
       if (
-        (ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node)
-          || ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) || ts.isImportSpecifier(node))
-        && node.name && ts.isIdentifier(node.name) && Object.hasOwn(declarations, node.name.text)
-      ) declarations[node.name.text].push(node);
-      if (ts.isIdentifier(node) && node.text === "controlPlaneOrigin") references.push(node);
-      if (
-        (ts.isPropertyAccessExpression(node) && node.name.text === "PUBLIC_ORIGIN")
-        || (ts.isElementAccessExpression(node) && resolvedMemberNames(node).has("PUBLIC_ORIGIN"))
-      ) configuredOriginReads += 1;
-      if (
-        ts.isIfStatement(node)
-        && node.getText(parsed) === 'if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);'
-      ) refusal = node;
-      if (ts.isCallExpression(node) && reviewedControlPlaneFetchCall(node)) fetchCall = node;
+        ts.isExportAssignment(node)
+        || (ts.canHaveModifiers(node) && ts.getModifiers(node)?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword))
+      ) report(node, "control-plane dispatch module has a default export");
+      if (ts.isExportDeclaration(node) && node.moduleSpecifier) report(node, "control-plane dispatch module re-exports another module");
+      if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) report(node, "control-plane dispatch module declares a class");
+      if (ts.isFunctionLike(node) && !typeSignatures.has(node.kind)) {
+        if (ts.isFunctionDeclaration(node) && node.name?.text === "dispatchControlPlane" && node.parent === parsed) {
+          dispatchDeclarations += 1;
+        } else report(node, "control-plane dispatch module declares a function other than dispatchControlPlane");
+      }
+      if (ts.isNewExpression(node) && !dispatchConstructors.includes(node.expression.getText(parsed))) {
+        report(node, `control-plane dispatch module constructs ${node.expression.getText(parsed)}`);
+      }
+      if (ts.isElementAccessExpression(node)) report(node, "control-plane dispatch module uses a computed member access");
+      if (ts.isStringLiteralLike(node) && ["fetch", "pipeThrough", "redirect"].includes(node.text)) {
+        report(node, `control-plane dispatch module spells ${node.text} as a string`);
+      }
       if (
         (ts.isStringLiteralLike(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node))
-        && /\.internal\b|heel-control-plane/i.test(node.text)
-      ) report(node, "control-plane destination uses a fixed private hostname");
-      ts.forEachChild(node, visit);
-    }
-    visit(parsed);
-    const origin = declarations.controlPlaneOrigin[0];
-    const proxy = origin === undefined ? null : enclosingFunctionDeclaration(origin);
-    const body = proxy?.body?.statements ?? [];
-    const originStatement = origin?.parent?.parent;
-    if (
-      declarations.canonicalPublicOrigin.length !== 1
-      || !ts.isImportSpecifier(declarations.canonicalPublicOrigin[0])
-      || declarations.controlPlaneOrigin.length !== 1
-      || !ts.isVariableDeclaration(origin)
-      || (origin.parent.flags & ts.NodeFlags.Const) === 0
-      || proxy?.name?.text !== "proxyControlPlane"
-      || !body.includes(originStatement)
-      || !origin.initializer
-      || !ts.isCallExpression(origin.initializer)
-      || origin.initializer.questionDotToken
-      || !ts.isIdentifier(origin.initializer.expression)
-      || origin.initializer.expression.text !== "canonicalPublicOrigin"
-      || origin.initializer.arguments.length !== 1
-      || origin.initializer.arguments[0].getText(parsed) !== "env.PUBLIC_ORIGIN"
-      || configuredOriginReads !== 1
-    ) report(parsed, "control-plane destination is not the validated configured origin");
-    const upstream = declarations.upstreamUrl[0];
-    if (
-      declarations.upstreamUrl.length !== 1
-      || !ts.isVariableDeclaration(upstream)
-      || (upstream.parent.flags & ts.NodeFlags.Const) === 0
-      || enclosingFunctionName(upstream) !== "proxyControlPlane"
-      || !upstream.initializer
-      || !ts.isNewExpression(upstream.initializer)
-      || upstream.initializer.expression.getText(parsed) !== "URL"
-      || upstream.initializer.arguments?.length !== 2
-      || !ts.isIdentifier(upstream.initializer.arguments[0])
-      || upstream.initializer.arguments[0].text !== "upstreamPath"
-      || !ts.isIdentifier(upstream.initializer.arguments[1])
-      || upstream.initializer.arguments[1].text !== "controlPlaneOrigin"
-    ) report(parsed, "control-plane destination URL is not built only from the validated configured origin");
-    if (
-      refusal === null
-      || !body.includes(refusal)
-      || originStatement === undefined
-      || body.indexOf(refusal) !== body.indexOf(originStatement) + 1
-      || fetchCall === null
-      || refusal.getEnd() > fetchCall.getStart(parsed)
-      || (upstream !== undefined && refusal.getEnd() > upstream.getStart(parsed))
-    ) report(parsed, "control-plane destination refusal does not precede every private fetch");
-    for (const reference of references) {
-      if (enclosingFunctionName(reference) !== "proxyControlPlane") {
-        report(reference, "control-plane destination escapes the reviewed proxy");
+        && node.text.includes("://")
+      ) report(node, "control-plane dispatch module names a literal destination");
+      if (ts.isIdentifier(node) && node.text === "fetch") {
+        const parent = node.parent;
+        if (
+          ts.isMethodSignature(parent) && parent.name === node
+          && ts.isInterfaceDeclaration(parent.parent) && parent.parent.name.text === "ControlPlaneBinding"
+        ) {
+          // The binding's declared shape.
+        } else if (ts.isPropertyAccessExpression(parent) && parent.name === node && parent.getText(parsed) === "input.binding.fetch") {
+          fetchAccesses.push(parent);
+        } else report(node, "control-plane dispatch module names fetch outside the binding guard and call");
       }
-    }
-    validateControlPlaneSinkDataflow(fetchCall);
-    validateControlPlaneConfigurationGuards();
-    const entry = validateControlPlaneReceiverIdentity(fetchCall);
-    const framingBranch = validateControlPlaneBodyFraming(fetchCall);
-    validateControlPlaneFormalLineage(entry, framingBranch);
-  }
-
-  function isWriteTarget(node) {
-    let current = node;
-    let parent = node.parent;
-    while (
-      parent
-      && (
-        ts.isParenthesizedExpression(parent) || ts.isArrayLiteralExpression(parent)
-        || ts.isObjectLiteralExpression(parent) || ts.isSpreadElement(parent)
-        || ts.isSpreadAssignment(parent) || ts.isShorthandPropertyAssignment(parent)
-        || (ts.isPropertyAssignment(parent) && parent.initializer === current)
-      )
-    ) {
-      current = parent;
-      parent = parent.parent;
-    }
-    if (!parent) return false;
-    if (
-      ts.isBinaryExpression(parent)
-      && parent.left === current
-      && parent.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
-      && parent.operatorToken.kind <= ts.SyntaxKind.LastAssignment
-    ) return true;
-    if (
-      (ts.isPrefixUnaryExpression(parent) || ts.isPostfixUnaryExpression(parent))
-      && [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(parent.operator)
-    ) return true;
-    return ts.isDeleteExpression(parent)
-      || ((ts.isForOfStatement(parent) || ts.isForInStatement(parent)) && parent.initializer === current);
-  }
-
-  function isBindingDeclarationName(node) {
-    const parent = node.parent;
-    return (
-      ts.isVariableDeclaration(parent) || ts.isParameter(parent) || ts.isBindingElement(parent)
-      || ts.isFunctionDeclaration(parent) || ts.isClassDeclaration(parent) || ts.isImportSpecifier(parent)
-      || ts.isImportClause(parent) || ts.isNamespaceImport(parent)
-    ) && parent.name === node;
-  }
-
-  // A const declaration does not freeze the URL or options object it names. Every reference to a
-  // value that reaches the private fetch must be one reviewed construction, framing or sink use, so
-  // member writes, aliases, call escapes and option overrides are refused wherever they occur.
-  function validateControlPlaneSinkDataflow(fetchCall) {
-    const proxy = parsed.statements.find((statement) => (
-      ts.isFunctionDeclaration(statement) && statement.name?.text === "proxyControlPlane"
-    ));
-    const body = proxy?.body?.statements ?? [];
-    const sinkRequest = fetchCall?.arguments[0];
-    const sinkUrl = sinkRequest?.arguments?.[0];
-    const sinkInit = sinkRequest?.arguments?.[1];
-    const declarations = { upstreamUrl: [], init: [], requestContract: [] };
-    const references = { upstreamUrl: [], init: [], requestContract: [] };
-    const routePathWrites = [];
-    function visit(node) {
-      if (ts.isIdentifier(node) && Object.hasOwn(references, node.text)) {
-        if (isBindingDeclarationName(node)) declarations[node.text].push(node.parent);
-        else if (isRuntimeIdentifierReference(node)) references[node.text].push(node);
+      if (ts.isIdentifier(node) && node.text === "pipeThrough") {
+        if (ts.isPropertyAccessExpression(node.parent) && node.parent.name === node) pipes.push(node.parent);
+        else report(node, "control-plane dispatch module names pipeThrough outside the reviewed framing");
       }
-      if (
-        ts.isIdentifier(node)
-        && node.text === "upstreamPath"
-        && proxy !== undefined
-        && node.getStart(parsed) >= proxy.getStart(parsed)
-        && node.getEnd() <= proxy.getEnd()
-        && node !== proxy.parameters[3]?.name
-        && (isBindingDeclarationName(node) || (isRuntimeIdentifierReference(node) && isWriteTarget(node)))
-      ) routePathWrites.push(node);
-      ts.forEachChild(node, visit);
-    }
-    visit(parsed);
-    const inProxyBeforeSink = (node) => proxy !== undefined
-      && fetchCall !== null
-      && enclosingFunctionDeclaration(node) === proxy
-      && node.getEnd() <= fetchCall.getStart(parsed);
-    const topLevelDeclaration = (name, flag) => {
-      const declaration = declarations[name][0];
-      return declarations[name].length === 1
-        && ts.isVariableDeclaration(declaration)
-        && ts.isVariableDeclarationList(declaration.parent)
-        && (declaration.parent.flags & flag) !== 0
-        && body.includes(declaration.parent.parent);
-    };
-    function reviewedStatementWrite(reference, texts) {
-      const member = reference.parent;
-      const assignment = member?.parent;
-      return ts.isPropertyAccessExpression(member)
-        && member.expression === reference
-        && ts.isBinaryExpression(assignment)
-        && assignment.left === member
-        && assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken
-        && ts.isExpressionStatement(assignment.parent)
-        && texts.delete(assignment.parent.getText(parsed))
-        && inProxyBeforeSink(reference);
-    }
-
-    const destinationEscapes = references.upstreamUrl.filter((reference) => reference !== sinkUrl);
-    if (
-      !topLevelDeclaration("upstreamUrl", ts.NodeFlags.Const)
-      || references.upstreamUrl.length !== 1
-      || destinationEscapes.length !== 0
-    ) {
-      report(
-        destinationEscapes[0] ?? parsed,
-        "control-plane destination URL is mutated, aliased or escapes before the private fetch",
-      );
-    }
-
-    const initDeclaration = declarations.init[0];
-    const literal = initDeclaration?.initializer;
-    const reviewedLiteral = topLevelDeclaration("init", ts.NodeFlags.Const)
-      && initDeclaration.type?.getText(parsed) === 'RequestInit & { duplex?: "half" }'
-      && literal !== undefined
-      && ts.isObjectLiteralExpression(literal)
-      && literal.properties.length === 3
-      && ["headers: requestContract.headers", "method: request.method", 'redirect: "manual"'].every(
-        (expected, index) => ts.isPropertyAssignment(literal.properties[index])
-          && literal.properties[index].getText(parsed) === expected,
-      );
-    const reviewedInitWrites = new Set([
-      `init.body = requestContract.contentLength === 0
-        ? new Uint8Array()
-        : request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength));`,
-      'init.duplex = "half";',
-    ]);
-    const optionEscapes = references.init.filter((reference) => (
-      reference !== sinkInit && !reviewedStatementWrite(reference, reviewedInitWrites)
-    ));
-    if (!reviewedLiteral || references.init.length !== 3 || optionEscapes.length !== 0) {
-      report(
-        optionEscapes[0] ?? parsed,
-        "control-plane request options are overridden, aliased or escape before the private fetch",
-      );
-    }
-
-    const reviewedContractAssignment = new Set([`requestContract = controlPlaneRequestHeaders(
-      request.headers,
-      request.method,
-      upstreamPath,
-      controlPlaneOrigin,
-      edgeClientKey,
-      edgeAuthSecret,
-    );`]);
-    const headersValue = reviewedLiteral ? literal.properties[0].initializer : null;
-    const contractEscapes = references.requestContract.filter((reference) => {
-      const parent = reference.parent;
-      if (ts.isBinaryExpression(parent) && parent.left === reference) {
-        return !(
-          parent.operatorToken.kind === ts.SyntaxKind.EqualsToken
-          && ts.isExpressionStatement(parent.parent)
-          && reviewedContractAssignment.delete(parent.parent.getText(parsed))
-          && inProxyBeforeSink(reference)
-        );
+      if (ts.isIdentifier(node) && node.text === "redirect") {
+        if (ts.isPropertyAssignment(node.parent) && node.parent.name === node) redirects.push(node.parent);
+        else report(node, "control-plane dispatch module writes the redirect mode outside the request options");
       }
-      if (parent === headersValue) return false;
-      return !(
-        ts.isPropertyAccessExpression(parent)
-        && parent.expression === reference
-        && parent.name.text === "contentLength"
-        && !isWriteTarget(parent)
-        && inProxyBeforeSink(reference)
-      );
-    });
-    const contractDeclaration = declarations.requestContract[0];
-    if (
-      !topLevelDeclaration("requestContract", ts.NodeFlags.Let)
-      || contractDeclaration.initializer !== undefined
-      || reviewedContractAssignment.size !== 0
-      || headersValue === null
-      || contractEscapes.length !== 0
-    ) {
-      report(
-        contractEscapes[0] ?? parsed,
-        "control-plane request contract is overridden, aliased or escapes before the private fetch",
-      );
-    }
-
-    for (const write of routePathWrites) {
-      report(write, "control-plane route path is reassigned before the private fetch");
-    }
-  }
-
-  // Malformed runtime configuration is unavailable (fixed 503), never an attempted private request.
-  function validateControlPlaneConfigurationGuards() {
-    const proxy = parsed.statements.find((statement) => (
-      ts.isFunctionDeclaration(statement) && statement.name?.text === "proxyControlPlane"
-    ));
-    const body = proxy?.body?.statements ?? [];
-    if (body.length === 0 || body[0].getText(parsed) !== controlPlaneBindingGuard) {
-      report(proxy ?? parsed, "control-plane binding capability is not validated before use");
-    }
-    let secretReads = 0;
-    function visit(node) {
-      if (ts.isPropertyAccessExpression(node) && node.name.text === "CONTROL_PLANE_EDGE_SECRET") secretReads += 1;
-      if (ts.isElementAccessExpression(node) && resolvedMemberNames(node).has("CONTROL_PLANE_EDGE_SECRET")) {
-        secretReads += 1;
-      }
-      ts.forEachChild(node, visit);
-    }
-    visit(parsed);
-    const secretIndex = body.findIndex((statement) => (
-      statement.getText(parsed) === "const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET.trim();"
-    ));
-    if (
-      secretIndex < 1
-      || body[secretIndex - 1].getText(parsed) !== controlPlaneSecretGuard
-      || secretReads !== 2
-    ) report(proxy ?? parsed, "control-plane edge secret type is not validated before use");
-  }
-
-  function withinNode(node, scope) {
-    return scope !== undefined && scope !== null
-      && node.getStart(parsed) >= scope.getStart(parsed)
-      && node.getEnd() <= scope.getEnd();
-  }
-
-  function runtimeReferences(name) {
-    const references = [];
-    function visit(node) {
-      if (
-        ts.isIdentifier(node) && node.text === name
-        && !isBindingDeclarationName(node) && isRuntimeIdentifierReference(node)
-      ) references.push(node);
-      ts.forEachChild(node, visit);
-    }
-    visit(parsed);
-    return references;
-  }
-
-  function propertyNameValues(name) {
-    if (ts.isComputedPropertyName(name)) return resolvedConstantStrings(name.expression);
-    if (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) return new Set([name.text]);
-    return new Set();
-  }
-
-  // The text `env.CONTROL_PLANE.fetch` names the configured binding only while `env` is the Worker
-  // entry's own environment from the entry, through the one proxy call, to the private fetch: no
-  // replacement, rebinding, alias, shadow or substitute binding object anywhere on that path.
-  function validateControlPlaneReceiverIdentity(fetchCall) {
-    const receiver = "control-plane receiver is not the configured private binding at the private fetch";
-    const parameter = "control-plane request parameter is rebound or shadowed before the private fetch";
-    const proxy = parsed.statements.find((statement) => (
-      ts.isFunctionDeclaration(statement) && statement.name?.text === "proxyControlPlane"
-    ));
-    const proxyReferences = runtimeReferences("proxyControlPlane");
-    const dispatch = proxyReferences[0]?.parent;
-    let entry = dispatch?.parent;
-    while (entry && !ts.isFunctionLike(entry)) entry = entry.parent;
-    const workerStatement = parsed.statements.find((statement) => (
-      ts.isVariableStatement(statement)
-      && statement.declarationList.declarations.some((declaration) => (
-        ts.isIdentifier(declaration.name) && declaration.name.text === "worker"
-      ))
-    ));
-    const workerDeclaration = workerStatement?.declarationList.declarations[0];
-    const workerObject = workerDeclaration?.initializer;
-    const parametersAre = (owner, names) => owner.parameters.length === names.length
-      && names.every((name, index) => (
-        ts.isIdentifier(owner.parameters[index].name)
-        && owner.parameters[index].name.text === name
-        && !owner.parameters[index].initializer
-        && !owner.parameters[index].dotDotDotToken
-      ));
-    const reviewedEntry = proxy !== undefined
-      && lexicalBindings("proxyControlPlane").length === 1
-      && parametersAre(proxy, ["request", "env", "csp", "upstreamPath"])
-      && proxyReferences.length === 1
-      && ts.isCallExpression(dispatch)
-      && dispatch.expression === proxyReferences[0]
-      && ts.isReturnStatement(dispatch.parent)
-      && dispatch.arguments.length === 4
-      && ["request", "env", "csp", "upstreamPath"].every((name, index) => (
-        ts.isIdentifier(dispatch.arguments[index]) && dispatch.arguments[index].text === name
-      ))
-      && lexicalBindings("worker").length === 1
-      && workerStatement !== undefined
-      && workerStatement.declarationList.declarations.length === 1
-      && (workerStatement.declarationList.flags & ts.NodeFlags.Const) !== 0
-      && runtimeReferences("worker").length === 1
-      && parsed.statements.filter((statement) => (
-        ts.isExportAssignment(statement) && !statement.isExportEquals
-        && ts.isIdentifier(statement.expression) && statement.expression.text === "worker"
-      )).length === 1
-      && workerObject !== undefined
-      && ts.isObjectLiteralExpression(workerObject)
-      && workerObject.properties.every((property) => (
-        !ts.isSpreadAssignment(property) && !ts.isComputedPropertyName(property.name)
-      ))
-      && workerObject.properties.filter((property) => propertyNameValues(property.name).has("fetch")).length === 1
-      && entry !== undefined
-      && ts.isMethodDeclaration(entry)
-      && entry.parent === workerObject
-      && propertyNameValues(entry.name).has("fetch")
-      && parametersAre(entry, ["request", "env", "ctx"]);
-    if (!reviewedEntry) report(dispatch ?? proxy ?? parsed, receiver);
-    const entryScope = reviewedEntry ? entry : undefined;
-
-    for (const scope of [proxy, entryScope]) {
-      if (!scope) continue;
-      for (const name of ["env", "request"]) {
-        const message = name === "env" ? receiver : parameter;
-        for (const binding of lexicalBindings(name)) {
-          if (withinNode(binding, scope) && !scope.parameters.includes(binding)) report(binding, message);
-        }
-        for (const reference of runtimeReferences(name)) {
-          if (withinNode(reference, scope) && isWriteTarget(reference)) report(reference, message);
-        }
-      }
-    }
-
-    const bindingGuard = proxy?.body?.statements[0];
-    const reviewedGuard = bindingGuard !== undefined
-      && ts.isIfStatement(bindingGuard)
-      && bindingGuard.getText(parsed) === controlPlaneBindingGuard;
-    const sinkReceiver = fetchCall?.expression.expression;
-    const proxyMembers = new Set(["CONTROL_PLANE", "PUBLIC_ORIGIN", "CONTROL_PLANE_EDGE_SECRET"]);
-    for (const reference of runtimeReferences("env")) {
-      const member = reference.parent;
-      const read = ts.isPropertyAccessExpression(member)
-        && member.expression === reference
-        && !member.questionDotToken
-        && !isWriteTarget(member);
-      if (withinNode(reference, proxy)) {
-        if (!(
-          read && proxyMembers.has(member.name.text)
-          && (
-            member.name.text !== "CONTROL_PLANE"
-            || member === sinkReceiver
-            || (reviewedGuard && withinNode(member, bindingGuard.expression))
-          )
-        )) report(reference, receiver);
-      } else if (withinNode(reference, entryScope)) {
-        const call = reference.parent;
-        // Page and asset handling keep their bindings; only the page handler may receive `env`,
-        // and only after the control-plane dispatch has returned.
-        if (!(
-          reference === dispatch.arguments[1]
-          || (read && ["ASSETS", "IMAGES"].includes(member.name.text))
-          || (
-            ts.isCallExpression(call)
-            && call.expression.getText(parsed) === "handler.fetch"
-            && call.arguments[1] === reference
-            && reference.getStart(parsed) > dispatch.getEnd()
-          )
-        )) report(reference, receiver);
-      }
-    }
-
-    // No source may write the binding member, build a substitute holder for it or name it by string.
-    function inspect(node) {
-      if (
-        (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
-        && resolvedMemberNames(node).has("CONTROL_PLANE")
-        && isWriteTarget(node)
-      ) report(node, receiver);
-      if (
-        (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node) || ts.isMethodDeclaration(node)
-          || ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node))
-        && ts.isObjectLiteralExpression(node.parent)
-        && propertyNameValues(node.name).has("CONTROL_PLANE")
-      ) report(node, receiver);
-      if (ts.isBindingElement(node) && bindingPropertyNames(node).has("CONTROL_PLANE")) report(node, receiver);
-      if (ts.isStringLiteralLike(node) && node.text === "CONTROL_PLANE") report(node, receiver);
       ts.forEachChild(node, inspect);
     }
     inspect(parsed);
-
-    // The request and framing constructors are the runtime globals (FixedLengthStream only through its
-    // ambient declaration) and the header contract is the one reviewed top-level helper.
-    const constructorBinding = "control-plane request construction shadows or rebinds a reviewed constructor or helper";
-    const reviewedBindings = new Map([
-      ["FixedLengthStream", (binding) => (
-        ts.isClassDeclaration(binding)
-        && binding.parent === parsed
-        && (binding.modifiers ?? []).some((modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword)
-      )],
-      ["controlPlaneRequestHeaders", (binding) => (
-        ts.isFunctionDeclaration(binding) && binding.parent === parsed && binding.body !== undefined
-      )],
-      ["Request", () => false],
-      ["URL", () => false],
-      ["Uint8Array", () => false],
-    ]);
-    for (const [name, reviewed] of reviewedBindings) {
-      const bindings = lexicalBindings(name);
-      for (const binding of bindings) {
-        if (!reviewed(binding)) report(binding, constructorBinding);
-      }
-      const expected = ["FixedLengthStream", "controlPlaneRequestHeaders"].includes(name) ? 1 : 0;
-      if (bindings.filter(reviewed).length !== expected) report(parsed, constructorBinding);
-      for (const reference of runtimeReferences(name)) {
-        if (isWriteTarget(reference)) report(reference, constructorBinding);
-      }
+    const guardReads = fetchAccesses.filter(reviewedDispatchCapabilityCheck);
+    const sinkCalls = fetchAccesses.filter((access) => (
+      ts.isCallExpression(access.parent) && access.parent.expression === access && reviewedDispatchFetchCall(access.parent)
+    ));
+    if (dispatchDeclarations !== 1) report(parsed, "control-plane dispatch module does not declare exactly one dispatchControlPlane");
+    if (fetchAccesses.length !== 2 || guardReads.length !== 1 || sinkCalls.length !== 1) {
+      report(parsed, "control-plane dispatch module does not have exactly one binding guard read and one binding call");
     }
-    function inspectTypeScriptBindings(node) {
-      if (
-        (ts.isEnumDeclaration(node) || ts.isModuleDeclaration(node))
-        && ts.isIdentifier(node.name)
-        && reviewedBindings.has(node.name.text)
-      ) report(node, constructorBinding);
-      ts.forEachChild(node, inspectTypeScriptBindings);
-    }
-    inspectTypeScriptBindings(parsed);
-    return { scope: entryScope, dispatch: reviewedEntry ? dispatch : undefined };
-  }
-
-  // The approved framing writes count only on the one reachable POST branch: a direct proxy statement
-  // with the reviewed condition and body, after the options declaration and before the statement that
-  // performs the private fetch. Presence of the write text elsewhere, or under another condition, fails.
-  function validateControlPlaneBodyFraming(fetchCall) {
-    const framing = "control-plane body framing is not the reviewed POST path before the private fetch";
-    const proxy = parsed.statements.find((statement) => (
-      ts.isFunctionDeclaration(statement) && statement.name?.text === "proxyControlPlane"
-    ));
-    const body = proxy?.body?.statements ?? [];
-    const printer = ts.createPrinter({ removeComments: true });
-    const reviewedSource = ts.createSourceFile(
-      "reviewed-framing.ts",
-      `async function reviewed() {\n  ${controlPlaneBodyFraming}\n}`,
-      ts.ScriptTarget.Latest,
-      true,
-      ts.ScriptKind.TS,
-    );
-    const expected = printer.printNode(
-      ts.EmitHint.Unspecified,
-      reviewedSource.statements[0].body.statements[0],
-      reviewedSource,
-    );
-    const guards = body.filter((statement) => (
-      ts.isIfStatement(statement) && printer.printNode(ts.EmitHint.Unspecified, statement, parsed) === expected
-    ));
-    const guardIndex = guards.length === 1 ? body.indexOf(guards[0]) : -1;
-    const initIndex = body.findIndex((statement) => (
-      ts.isVariableStatement(statement)
-      && statement.declarationList.declarations.some((declaration) => (
-        ts.isIdentifier(declaration.name) && declaration.name.text === "init"
-      ))
-    ));
-    const sinkStatement = fetchCall?.parent?.parent?.parent?.parent;
-    const sinkTry = sinkStatement?.parent?.parent;
-    const sinkIndex = sinkTry !== undefined
-      && ts.isVariableStatement(sinkStatement)
-      && ts.isTryStatement(sinkTry)
-      && sinkTry.tryBlock === sinkStatement.parent
-      ? body.indexOf(sinkTry)
-      : -1;
-    const streams = runtimeReferences("FixedLengthStream");
     if (
-      guardIndex < 0
-      || initIndex < 0
-      || sinkIndex < 0
-      || initIndex >= guardIndex
-      || guardIndex >= sinkIndex
-      || streams.length !== 1
-      || !withinNode(streams[0], guards[0])
-    ) report(guards[0] ?? proxy ?? parsed, framing);
-    return guards.length === 1 ? guards[0] : undefined;
-  }
-
-  // The checks above follow `env` and `request` by name, so neither the entry nor the proxy may read
-  // its own `arguments`, which would alias both formals past them. The reviewed branch pipes the
-  // request's own body through FixedLengthStream with the stream's own pipeThrough: outside reviewed
-  // reads `request` does not escape, its body is read only inside that branch, and no Worker source
-  // writes, names or destructures a pipeThrough member.
-  function validateControlPlaneFormalLineage(entry, framingBranch) {
-    const formals = "control-plane entry or proxy parameters are aliased through arguments";
-    const body = "control-plane request or its body is aliased or altered outside the reviewed framing";
-    const proxy = parsed.statements.find((statement) => (
-      ts.isFunctionDeclaration(statement) && statement.name?.text === "proxyControlPlane"
-    ));
-    const scopes = [proxy, entry.scope].filter((scope) => scope !== undefined);
-    const enclosingFunction = (node, skipArrows) => {
-      let current = node.parent;
-      while (current && !(ts.isFunctionLike(current) && !(skipArrows && ts.isArrowFunction(current)))) {
-        current = current.parent;
-      }
-      return current;
-    };
-
-    for (const reference of runtimeReferences("arguments")) {
-      if (scopes.includes(enclosingFunction(reference, true))) report(reference, formals);
+      pipes.length !== 1
+      || !ts.isCallExpression(pipes[0].parent)
+      || pipes[0].parent.expression !== pipes[0]
+      || pipes[0].parent.getText(parsed) !== "input.body!.pipeThrough(new FixedLengthStream(input.contentLength))"
+    ) report(parsed, "control-plane dispatch module does not frame the body through exactly one FixedLengthStream pipe");
+    if (redirects.length !== 1 || redirects[0].getText(parsed) !== 'redirect: "manual"') {
+      report(parsed, "control-plane dispatch module redirect mode is not exactly manual");
     }
-
-    for (const scope of scopes) {
-      for (const reference of runtimeReferences("request")) {
-        if (!withinNode(reference, scope)) continue;
-        const member = reference.parent;
-        if (ts.isPropertyAccessExpression(member) && member.expression === reference) {
-          if (isWriteTarget(member) || (member.name.text === "body" && !withinNode(member, framingBranch))) {
-            report(reference, body);
-          }
-          continue;
-        }
-        // Only the one proxy dispatch, and the page request built after it has returned, take `request` itself.
-        const construction = reference.parent;
-        if (!(
-          (entry.dispatch !== undefined && reference === entry.dispatch.arguments[0])
-          || (
-            scope === entry.scope
-            && ts.isNewExpression(construction)
-            && construction.expression.getText(parsed) === "Request"
-            && construction.arguments?.[0] === reference
-            && reference.getStart(parsed) > entry.dispatch.getEnd()
-            && enclosingFunction(reference, false) === scope
-          )
-        )) report(reference, body);
+    if (/["'`]https?:\/\//.test(sourceText)) report(parsed, "control-plane dispatch module names a literal destination");
+    for (const fragment of dispatchModuleFragments) {
+      if (sourceText.split(fragment).length - 1 !== 1) {
+        report(parsed, `control-plane dispatch module is missing exact ${fragment}`);
       }
     }
-
-    function inspect(node) {
-      if (
-        (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
-        && resolvedMemberNames(node).has("pipeThrough")
-        && (!ts.isPropertyAccessExpression(node) || !withinNode(node, framingBranch) || isWriteTarget(node))
-      ) report(node, body);
-      if (
-        (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node) || ts.isMethodDeclaration(node)
-          || ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node))
-        && ts.isObjectLiteralExpression(node.parent)
-        && propertyNameValues(node.name).has("pipeThrough")
-      ) report(node, body);
-      if (ts.isBindingElement(node) && bindingPropertyNames(node).has("pipeThrough")) report(node, body);
-      if (ts.isStringLiteralLike(node) && node.text === "pipeThrough") report(node, body);
-      ts.forEachChild(node, inspect);
-    }
-    inspect(parsed);
   }
 
   function isReviewedBootstrapDeclaration(declaration) {
@@ -2151,6 +1684,7 @@ function analyzeSource(fileName, text) {
     validateFindingsProjectionContract();
   }
   if (serverWorker) validateControlPlaneProxyContract();
+  if (dispatchModule) validateControlPlaneDispatchModule();
   if (controlPlaneClient) validateControlPlaneClientContract();
   return violations;
 }
@@ -2924,170 +2458,40 @@ Object.fromEntries([]);
 
 test("the privacy analyzer pins the private control-plane fetch and route allowlist", async () => {
   const worker = await source("worker/index.ts");
-  assert.deepEqual(analyzeSource(join(appRootPath, "worker/index.ts"), worker), []);
+  const dispatch = await source(CONTROL_PLANE_DISPATCH_PATH);
+  const analyzeWorker = (text) => analyzeSource(join(appRootPath, "worker/index.ts"), text);
+  const analyzeDispatch = (text) => analyzeSource(join(appRootPath, CONTROL_PLANE_DISPATCH_PATH), text);
+  assert.deepEqual(analyzeWorker(worker), []);
+  assert.deepEqual(analyzeDispatch(dispatch), []);
+  const call = "  const outcome = await dispatchControlPlane({";
+  const sink = "    const response = await input.binding.fetch(new Request(url, init));";
   const mutations = [
-    {
-      label: "fetch location",
-      source: worker.replace(
-        "async function proxyControlPlane(",
-        "async function movedControlPlane(",
-      ),
-      violation: "network sink",
-    },
-    {
-      label: "fetch callee",
-      source: worker.replace(
-        "env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init))",
-        'env.CONTROL_PLANE["fetch"](new Request(upstreamUrl, init))',
-      ),
-      violation: "network sink",
-    },
-    {
-      label: "route broadening",
-      source: worker.replace('  return "";\n}', "  return upstreamPath;\n}"),
-      violation: "route allowlist is not the reviewed exact contract",
-    },
-    {
-      label: "caller-derived upstream query",
-      source: worker.replace(
-        "const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);",
-        "const upstreamUrl = new URL(upstreamPath + new URL(request.url).search, controlPlaneOrigin);",
-      ),
-      violation: "missing exact const upstreamUrl",
-    },
-    {
-      label: "public fetch fallback",
-      source: worker.replace(
-        "const response = await env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init));",
-        "const response = await fetch(new Request(upstreamUrl, init));",
-      ),
-      violation: "network sink",
-    },
-    {
-      label: "request-derived destination",
-      source: worker.replace(
-        "const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);",
-        "const upstreamUrl = new URL(upstreamPath, new URL(request.url).origin);",
-      ),
-      violation: "not built only from the validated configured origin",
-    },
-    {
-      label: "legacy fixed destination",
-      source: worker.replace(
-        "const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);",
-        'const upstreamUrl = new URL(upstreamPath, "https://heel-control-plane.internal");',
-      ),
-      violation: "fixed private hostname",
-    },
-    {
-      label: "unvalidated configured destination",
-      source: worker.replace(
-        "const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
-        "const controlPlaneOrigin = env.PUBLIC_ORIGIN ?? null;",
-      ),
-      violation: "not the validated configured origin",
-    },
-    {
-      label: "reassignable destination",
-      source: worker.replace(
-        "const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
-        "let controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
-      ),
-      violation: "not the validated configured origin",
-    },
-    {
-      label: "raw configured origin elsewhere",
-      source: worker.replace(
-        "      controlPlaneOrigin,\n      edgeClientKey,",
-        "      env.PUBLIC_ORIGIN,\n      edgeClientKey,",
-      ),
-      violation: "not the validated configured origin",
-    },
-    {
-      label: "missing configuration refusal",
-      source: worker.replace(
-        '  if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);\n',
-        "",
-      ),
-      violation: "refusal does not precede every private fetch",
-    },
-    {
-      label: "conditional configuration refusal",
-      source: worker.replace(
-        'if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);',
-        'if (controlPlaneOrigin === null && upstreamPath !== ME_ROUTE) return proxyError(503, "control plane unavailable", csp);',
-      ),
-      violation: "refusal does not precede every private fetch",
-    },
-    {
-      label: "substitute validator module",
-      source: worker.replace(
-        'import { canonicalPublicOrigin } from "../build/deployment-config";',
-        'import { canonicalPublicOrigin } from "./deployment-config";',
-      ),
-      violation: "not the shared canonical import",
-    },
-    {
-      label: "aliased validator import",
-      source: worker.replace(
-        'import { canonicalPublicOrigin } from "../build/deployment-config";',
-        'import { deploymentConfig as canonicalPublicOrigin } from "../build/deployment-config";',
-      ),
-      violation: "not the shared canonical import",
-    },
-    {
-      label: "shadowed validator",
-      source: worker.replace(
-        "  const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
-        "  const canonicalPublicOrigin = (value: unknown) => String(value);\n  const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
-      ),
-      violation: "not the validated configured origin",
-    },
-    {
-      label: "unbounded request body",
-      source: worker.replace(
-        "request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength))",
-        "request.body!",
-      ),
-      violation: "FixedLengthStream",
-    },
-    {
-      label: "request header copying",
-      source: worker.replace("const headers = new Headers();", "const headers = new Headers(source);"),
-      violation: "request/response header allowlists",
-    },
-    {
-      label: "response header copying",
-      source: worker.replace(
+    // Retained H0A cases, re-anchored on the Worker call site (S4) or the dispatch module (S1, S2).
+    ["fetch location", analyzeWorker, worker.replace("async function proxyControlPlane(", "async function movedControlPlane("), "not the one reviewed call in proxyControlPlane"],
+    ["fetch callee", analyzeDispatch, dispatch.replace(sink, sink.replace("input.binding.fetch(", 'input.binding["fetch"](')), "network sink"],
+    ["route broadening", analyzeWorker, worker.replace('  return "";\n}', "  return upstreamPath;\n}"), "route allowlist is not the reviewed exact contract"],
+    ["public fetch fallback in the worker", analyzeWorker, worker.replace(call, `  await fetch(new Request(new URL(upstreamPath, controlPlaneOrigin)));\n${call}`), "network sink"],
+    ["public fetch fallback in the dispatch module", analyzeDispatch, dispatch.replace(sink, sink.replace("input.binding.fetch(", "fetch(")), "network sink"],
+    ["legacy fixed destination", analyzeDispatch, dispatch.replace("new URL(input.upstreamPath, origin)", 'new URL(input.upstreamPath, "https://heel-control-plane.internal")'), "literal destination"],
+    ["unbounded request body", analyzeDispatch, dispatch.replace("input.body!.pipeThrough(new FixedLengthStream(input.contentLength))", "input.body!"), "FixedLengthStream pipe"],
+    ["redirect forwarding", analyzeDispatch, dispatch.replace("if (response.status >= 300 && response.status <= 399)", "if (response.status === 399)"), "missing exact if (response.status >= 300"],
+    ["request header copying", analyzeWorker, worker.replace("const headers = new Headers();", "const headers = new Headers(source);"), "request/response header allowlists"],
+    [
+      "response header copying",
+      analyzeWorker,
+      worker.replace(
         'function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""): Response {\n  const headers = new Headers();',
         'function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""): Response {\n  const headers = new Headers(response.headers);',
       ),
-      violation: "request/response header allowlists",
-    },
-    {
-      label: "redirect forwarding",
-      source: worker.replace(
-        "if (response.status >= 300 && response.status <= 399)",
-        "if (response.status === 399)",
-      ),
-      violation: "response.status >= 300",
-    },
-    {
-      label: "query acceptance",
-      source: worker.replace(
-        '      if (requestUrl.search !== "") return proxyError(400, "invalid control plane request", csp);\n',
-        "",
-      ),
-      violation: "requestUrl.search",
-    },
+      "request/response header allowlists",
+    ],
+    ["query acceptance", analyzeWorker, worker.replace('      if (requestUrl.search !== "") return proxyError(400, "invalid control plane request", csp);\n', ""), "requestUrl.search"],
   ];
-  for (const mutation of mutations) {
-    assert.notEqual(mutation.source, worker, `${mutation.label} mutation did not apply`);
-    const violations = analyzeSource(join(appRootPath, "worker/index.ts"), mutation.source);
-    assert.ok(
-      violations.some((violation) => violation.includes(mutation.violation)),
-      `${mutation.label}: ${violations.join("\n")}`,
-    );
+  assert.equal(new Set(mutations.map(([label]) => label)).size, mutations.length);
+  for (const [label, analyze, mutated, violation] of mutations) {
+    assert.notEqual(mutated, analyze === analyzeWorker ? worker : dispatch, `${label} mutation did not apply`);
+    const violations = analyze(mutated);
+    assert.ok(violations.some((found) => found.includes(violation)), `${label}: ${violations.join("\n")}`);
   }
 });
 
@@ -3113,271 +2517,6 @@ test("the edge keeps canary human and runner-result authorities on exact route a
   ]) assert.equal(worker.split(fragment).length - 1, 1, `missing exact ${fragment}`);
 
   assert.doesNotMatch(worker, /startsWith\("\/v1\/.*(?:runs|jobs|targets)/);
-});
-
-
-test("the privacy analyzer tracks the private request URL, options and configuration guards to the sink", async () => {
-  const worker = await source("worker/index.ts");
-  const analyze = (text) => analyzeSource(join(appRootPath, "worker/index.ts"), text);
-  assert.deepEqual(analyze(worker), []);
-  const url = "  const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);";
-  const sink = "    const response = await env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init));";
-  const contract = "  const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);\n  const init:";
-  const secret = "  const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET.trim();";
-  const mutate = (anchor, replacement) => {
-    assert.equal(worker.split(anchor).length, 2, `mutation anchor is not unique: ${anchor}`);
-    return worker.replace(anchor, replacement);
-  };
-  const afterUrl = (statement) => mutate(url, `${url}\n  ${statement}`);
-  const beforeSink = (statement) => mutate(sink, `    ${statement}\n${sink}`);
-  const destination = "destination URL is mutated, aliased or escapes";
-  const options = "request options are overridden, aliased or escape";
-  const mutations = [
-    ["caller URL host", afterUrl("upstreamUrl.hostname = new URL(request.url).hostname;"), destination],
-    ["caller Host header", afterUrl('upstreamUrl.host = request.headers.get("Host") ?? "attacker.invalid";'), destination],
-    ["caller query", afterUrl("upstreamUrl.search = new URL(request.url).search;"), destination],
-    ["fixed path", afterUrl('upstreamUrl.pathname = "/v1/admin";'), destination],
-    ["whole href", afterUrl("upstreamUrl.href = request.url;"), destination],
-    ["computed member", afterUrl('upstreamUrl["host"] = "attacker.invalid";'), destination],
-    ["query parameters", afterUrl('upstreamUrl.searchParams.set("destination", "attacker.invalid");'), destination],
-    ["port", afterUrl('upstreamUrl.port = "8443";'), destination],
-    ["Object.assign escape", afterUrl('Object.assign(upstreamUrl, { host: "attacker.invalid" });'), destination],
-    ["call escape", afterUrl("retargetControlPlane(upstreamUrl, request);"), destination],
-    ["alias", afterUrl('const destination = upstreamUrl;\n  destination.host = "attacker.invalid";'), destination],
-    ["destructuring alias", afterUrl("const [destination] = [upstreamUrl];"), destination],
-    ["closure escape", afterUrl('const retarget = () => { upstreamUrl.host = "attacker.invalid"; };'), destination],
-    ["route path reassignment", mutate(url, `  upstreamPath = "/v1/admin";\n${url}`), "route path is reassigned"],
-    ["redirect override", beforeSink('init.redirect = "follow";'), options],
-    ["header override", beforeSink("init.headers = request.headers;"), options],
-    ["framing override", beforeSink("init.body = request.body;"), options],
-    ["method override", beforeSink('init.method = "DELETE";'), options],
-    ["computed option", beforeSink('init["redirect"] = "follow";'), options],
-    ["deleted option", beforeSink("delete init.redirect;"), options],
-    ["Object.assign options", beforeSink('Object.assign(init, { redirect: "follow" });'), options],
-    ["options alias", beforeSink('const options = init;\n    options.redirect = "follow";'), options],
-    ["duplicate literal option", mutate('    redirect: "manual",\n', '    redirect: "manual",\n    redirect: "follow",\n'), options],
-    ["spread literal option", mutate('    redirect: "manual",\n', '    redirect: "manual",\n    ...request,\n'), options],
-    [
-      "header object mutation",
-      mutate(contract, '  requestContract.headers.set("Host", "attacker.invalid");\n' + contract),
-      "request contract is overridden, aliased or escapes",
-    ],
-    [
-      "request contract replacement",
-      mutate(contract, "  requestContract = { headers: request.headers, contentLength: 0 };\n" + contract),
-      "request contract is overridden, aliased or escapes",
-    ],
-    [
-      "binding presence only",
-      mutate(
-        "    env.CONTROL_PLANE === undefined\n    || env.CONTROL_PLANE === null\n    || typeof env.CONTROL_PLANE.fetch !== \"function\"\n",
-        "    env.CONTROL_PLANE === undefined\n",
-      ),
-      "binding capability is not validated",
-    ],
-    [
-      "binding null accepted",
-      mutate("    || env.CONTROL_PLANE === null\n", ""),
-      "binding capability is not validated",
-    ],
-    [
-      "binding callability unchecked",
-      mutate('    || typeof env.CONTROL_PLANE.fetch !== "function"\n', ""),
-      "binding capability is not validated",
-    ],
-    [
-      "capability guard moved",
-      mutate("  return proxyError(503, \"control plane unavailable\", csp);\n  }\n  // The private", "  return proxyError(503, \"control plane unavailable\", csp);\n  }\n  const moved = typeof env.CONTROL_PLANE.fetch;\n  // The private"),
-      "network sink capability reference fetch",
-    ],
-    [
-      "secret type unchecked",
-      mutate(`  ${controlPlaneSecretGuard}\n${secret}`, '  const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET?.trim() ?? "";'),
-      "edge secret type is not validated",
-    ],
-    [
-      "secret type weakened",
-      mutate('typeof env.CONTROL_PLANE_EDGE_SECRET !== "string"', 'env.CONTROL_PLANE_EDGE_SECRET === undefined'),
-      "edge secret type is not validated",
-    ],
-    [
-      "secret read elsewhere",
-      mutate(secret, `${secret}\n  const rawSecret = env.CONTROL_PLANE_EDGE_SECRET;`),
-      "edge secret type is not validated",
-    ],
-  ];
-  assert.equal(new Set(mutations.map(([label]) => label)).size, mutations.length);
-  for (const [label, mutated, violation] of mutations) {
-    assert.notEqual(mutated, worker, `${label} mutation did not apply`);
-    const violations = analyze(mutated);
-    assert.ok(violations.some((found) => found.includes(violation)), `${label}: ${violations.join("\n")}`);
-  }
-
-  // Positive controls: source changes that leave the sink values untouched stay accepted, so a
-  // blanket refusal of any changed proxy cannot satisfy the mutations above.
-  for (const [label, unchanged] of [
-    ["comment", afterUrl("// The destination is now final.")],
-    ["unrelated local", afterUrl('const unrelatedLabel = "control-plane";')],
-    ["declared length read", mutate(sink, `    const declaredLength = requestContract.contentLength;\n${sink}`)],
-  ]) {
-    assert.notEqual(unchanged, worker, `${label} control did not apply`);
-    assert.deepEqual(analyze(unchanged), [], label);
-  }
-});
-
-
-test("the privacy analyzer keeps the configured receiver and reviewed POST framing on the path to the sink", async () => {
-  const worker = await source("worker/index.ts");
-  const analyze = (text) => analyzeSource(join(appRootPath, "worker/index.ts"), text);
-  assert.deepEqual(analyze(worker), []);
-  const url = "  const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);";
-  const sink = "    const response = await env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init));";
-  const bodyGuard = '  if (request.method === "POST") {\n    if (requestContract.contentLength';
-  const dispatch = "      return proxyControlPlane(request, env, csp, upstreamPath);";
-  const proxyEnd = '    return proxyError(502, "control plane request failed", csp);\n  }\n}\n';
-  const localStream = "const FixedLengthStream = class extends TransformStream { constructor(_length: number) { super(); } };";
-  const mutate = (...edits) => {
-    let mutated = worker;
-    for (let index = 0; index < edits.length; index += 2) {
-      assert.equal(mutated.split(edits[index]).length, 2, `mutation anchor is not unique: ${edits[index]}`);
-      mutated = mutated.replace(edits[index], edits[index + 1]);
-    }
-    return mutated;
-  };
-  const afterUrl = (statement) => mutate(url, `${url}\n  ${statement}`);
-  const beforeSink = (statement) => mutate(sink, `    ${statement}\n${sink}`);
-  const guardedBy = (condition, extra = "") => mutate(
-    bodyGuard,
-    `  ${condition} {\n${extra}    if (requestContract.contentLength`,
-  );
-  const receiver = "receiver is not the configured private binding at the private fetch";
-  const framing = "body framing is not the reviewed POST path before the private fetch";
-  const constructor = "request construction shadows or rebinds a reviewed constructor or helper";
-  const parameter = "request parameter is rebound or shadowed before the private fetch";
-  const mutations = [
-    // The H0AR1R residual mutants: each changed the actual sink receiver or skipped/replaced framing.
-    ["direct binding replacement", beforeSink("env.CONTROL_PLANE = env.ASSETS;"), receiver],
-    ["computed binding replacement", beforeSink('env["CONTROL_PLANE"] = env.ASSETS;'), receiver],
-    ["whole env replacement", beforeSink("env = { ...env, CONTROL_PLANE: env.ASSETS };"), receiver],
-    ["env alias replacement", beforeSink("const runtime = env; runtime.CONTROL_PLANE = runtime.ASSETS;"), receiver],
-    [
-      "lexical env shadow at the sink",
-      mutate(`  try {\n${sink}`, `  const assets = env.ASSETS;\n  try {\n    const env = { CONTROL_PLANE: assets };\n${sink}`),
-      receiver,
-    ],
-    ["binding cleared after the guard", beforeSink("env.CONTROL_PLANE = null;"), receiver],
-    ["always-false body guard", guardedBy('if (false && request.method === "POST")'), framing],
-    [
-      "caller-controlled body guard",
-      guardedBy('if (request.method === "POST" && request.headers.get("X-Frame-Body") !== "skip")'),
-      framing,
-    ],
-    ["local FixedLengthStream before the URL", mutate(url, `  ${localStream}\n${url}`), constructor],
-    ["local FixedLengthStream after the URL", afterUrl(localStream), constructor],
-    // Equivalent receiver changes inside the proxy.
-    ["Object.assign binding replacement", beforeSink("Object.assign(env, { CONTROL_PLANE: env.ASSETS });"), receiver],
-    ["Reflect.set binding replacement", beforeSink('Reflect.set(env, "CONTROL_PLANE", env.ASSETS);'), receiver],
-    ["binding method replacement", beforeSink("env.CONTROL_PLANE.fetch = env.ASSETS.fetch;"), receiver],
-    ["destructured binding alias", beforeSink("const { CONTROL_PLANE: privateBinding } = env;"), receiver],
-    // The same receiver at the Worker entry and its one proxy call.
-    ["entry env replacement", mutate(dispatch, `      env = { ...env, CONTROL_PLANE: env.ASSETS };\n${dispatch}`), receiver],
-    [
-      "entry argument substitution",
-      mutate(dispatch, "      return proxyControlPlane(request, { ...env, CONTROL_PLANE: env.ASSETS }, csp, upstreamPath);"),
-      receiver,
-    ],
-    [
-      "entry env shadow",
-      mutate(
-        "    if (upstreamPath !== null) {\n",
-        "    const configured = env;\n    if (upstreamPath !== null) {\n      const env = { ...configured, CONTROL_PLANE: configured.ASSETS };\n",
-      ),
-      receiver,
-    ],
-    [
-      "entry env alias replacement",
-      mutate(dispatch, `      const runtime = env;\n      runtime.CONTROL_PLANE = runtime.ASSETS;\n${dispatch}`),
-      receiver,
-    ],
-    [
-      "entry helper rebinding",
-      mutate(
-        dispatch, `      rebindControlPlane(env);\n${dispatch}`,
-        "export default worker;",
-        "function rebindControlPlane(target: Env): void {\n  target.CONTROL_PLANE = target.ASSETS;\n}\n\nexport default worker;",
-      ),
-      receiver,
-    ],
-    [
-      "second proxy dispatch",
-      mutate(dispatch, `      if (upstreamPath === ME_ROUTE) return proxyControlPlane(request, env, csp, ME_ROUTE);\n${dispatch}`),
-      receiver,
-    ],
-    // The approved framing writes on a changed, nested or skippable branch.
-    ["inverted body guard", guardedBy('if (request.method !== "POST")'), framing],
-    ["nested body guard", guardedBy('if (upstreamPath === SIGNUP_ROUTE) if (request.method === "POST")'), framing],
-    [
-      "labelled framing skip",
-      guardedBy('framing: if (request.method === "POST")', '    if (request.headers.has("X-Frame-Body")) break framing;\n'),
-      framing,
-    ],
-    [
-      "request parameter rebound before framing",
-      mutate(bodyGuard, `  request = new Request(upstreamUrl, { method: "GET" });\n${bodyGuard}`),
-      parameter,
-    ],
-    // Local bindings of the reviewed request and framing constructors or header contract helper.
-    [
-      "hoisted local FixedLengthStream",
-      mutate(proxyEnd, `${proxyEnd.slice(0, -2)}  function FixedLengthStream(_length: number) { return new TransformStream(); }\n}\n`),
-      constructor,
-    ],
-    ["local Request constructor", mutate(url, `  const Request = globalThis.Request;\n${url}`), constructor],
-    [
-      "module URL constructor",
-      mutate(
-        'import { canonicalPublicOrigin } from "../build/deployment-config";\n',
-        'import { canonicalPublicOrigin } from "../build/deployment-config";\nconst URL = globalThis.URL;\n',
-      ),
-      constructor,
-    ],
-    [
-      "local header contract helper",
-      mutate(
-        "  let requestContract;\n",
-        "  const controlPlaneRequestHeaders = (headers: Headers) => ({ headers, contentLength: 0 });\n  let requestContract;\n",
-      ),
-      constructor,
-    ],
-  ];
-  assert.equal(new Set(mutations.map(([label]) => label)).size, mutations.length);
-  for (const [label, mutated, violation] of mutations) {
-    assert.notEqual(mutated, worker, `${label} mutation did not apply`);
-    const parsedMutation = ts.createSourceFile("worker.ts", mutated, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-    assert.equal(parsedMutation.parseDiagnostics.length, 0, `${label} mutation does not parse`);
-    const violations = analyze(mutated);
-    assert.ok(violations.some((found) => found.includes(violation)), `${label}: ${violations.join("\n")}`);
-  }
-
-  // Positive controls: comments in the framing branch, ordinary asset reads at the entry and an
-  // unrelated helper with its own environment parameter stay accepted.
-  for (const [label, unchanged] of [
-    ["comment inside framing", mutate('      init.duplex = "half";', '      // Streaming bodies are half-duplex.\n      init.duplex = "half";')],
-    [
-      "entry asset binding read",
-      mutate(
-        "    const csp = contentSecurityPolicy(nonce);\n",
-        "    const csp = contentSecurityPolicy(nonce);\n    const assetsBound = env.ASSETS !== undefined;\n",
-      ),
-    ],
-    [
-      "unrelated environment helper",
-      mutate("export default worker;", "function assetBinding(env: Env): AssetFetcher {\n  return env.ASSETS;\n}\n\nexport default worker;"),
-    ],
-  ]) {
-    assert.notEqual(unchanged, worker, `${label} control did not apply`);
-    assert.deepEqual(analyze(unchanged), [], label);
-  }
 });
 
 
@@ -3416,92 +2555,106 @@ test("the privacy analyzer pins the browser client to the same-origin closed con
   }
 });
 
-test("the privacy analyzer keeps the entry formals and the request's own body pipe on the path to the sink", async () => {
-  const worker = await source("worker/index.ts");
-  const analyze = (text) => analyzeSource(join(appRootPath, "worker/index.ts"), text);
-  assert.deepEqual(analyze(worker), []);
-  const url = "  const upstreamUrl = new URL(upstreamPath, controlPlaneOrigin);";
-  const sink = "    const response = await env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init));";
-  const bodyGuard = '  if (request.method === "POST") {\n    if (requestContract.contentLength';
-  const dispatch = "      return proxyControlPlane(request, env, csp, upstreamPath);";
-  const mutate = (...edits) => {
-    let mutated = worker;
-    for (let index = 0; index < edits.length; index += 2) {
-      assert.equal(mutated.split(edits[index]).length, 2, `mutation anchor is not unique: ${edits[index]}`);
-      mutated = mutated.replace(edits[index], edits[index + 1]);
-    }
-    return mutated;
-  };
-  const beforeDispatch = (statement) => mutate(dispatch, `      ${statement}\n${dispatch}`);
-  const beforeSink = (statement) => mutate(sink, `    ${statement}\n${sink}`);
-  const beforeFraming = (statement) => mutate(bodyGuard, `  ${statement}\n${bodyGuard}`);
-  const substitute = 'supplied[["CONTROL", "PLANE"].join("_")] = supplied.ASSETS;';
-  const skipPipe = "pipeThrough = function () { return this; };";
-  const formals = "parameters are aliased through arguments";
-  const body = "request or its body is aliased or altered outside the reviewed framing";
-  const mutations = [
-    // The H0AR2 review mutants: `arguments` aliases the receiver, and a replaced pipe skips FixedLengthStream.
-    ["entry binding through arguments", beforeDispatch(`const supplied = arguments[1]; ${substitute}`), formals],
-    ["proxy binding through arguments", beforeSink(`const supplied = arguments[1]; ${substitute}`), formals],
-    ["body pipe replaced", beforeFraming(`if (request.body) request.body.${skipPipe}`), body],
-    ["aliased body pipe replaced", beforeFraming(`const incomingBody = request.body; if (incomingBody) incomingBody.${skipPipe}`), body],
+test("S1/S2: the dispatch module is the only private sink and names no ambient authority", async () => {
+  const dispatch = await source(CONTROL_PLANE_DISPATCH_PATH).catch(() => null);
+  assert.notEqual(dispatch, null, `${CONTROL_PLANE_DISPATCH_PATH} is absent`);
+  const analyze = (text) => analyzeSource(join(appRootPath, CONTROL_PLANE_DISPATCH_PATH), text);
+  assert.deepEqual(analyze(dispatch), []);
+  assert.ok(dispatch.split("\n").length <= 121, "the dispatch module exceeds 120 lines");
+  const url = "  const url = new URL(input.upstreamPath, origin);";
+  const sink = "    const response = await input.binding.fetch(new Request(url, init));";
+  const statement = (code) => dispatch.replace(url, `  ${code}\n${url}`);
+  const forbidden = (name) => `forbidden identifier ${name}`;
+  // The Opus assignment red list, plus escaped spellings that only the normalized token value reveals.
+  const red = [
+    ["arguments", statement("const extra = arguments.length;"), forbidden("arguments")],
+    ["escaped arguments", statement("const extra = \\u0061rguments.length;"), forbidden("arguments")],
+    ["braced escaped arguments", statement("const extra = \\u{61}rguments.length;"), forbidden("arguments")],
+    ["globalThis", statement("const extra = globalThis;"), forbidden("globalThis")],
+    ["self", statement("const extra = self;"), forbidden("self")],
+    ["Reflect", statement("const extra = Reflect;"), forbidden("Reflect")],
+    ["Proxy", statement("const extra = Proxy;"), forbidden("Proxy")],
+    ["eval", statement('const extra = eval("1");'), forbidden("eval")],
+    ["Function", statement("const extra = Function;"), forbidden("Function")],
+    ["prototype", statement("const extra = Object.prototype;"), forbidden("prototype")],
+    ["defineProperty", statement('Object.defineProperty(input, "method", { value: "GET" });'), forbidden("defineProperty")],
+    ["env", statement("const env = input;"), forbidden("env")],
+    ["escaped env in a string", statement('const extra = "\\u0065nv";'), forbidden("env")],
+    ["request", statement("const request = input;"), forbidden("request")],
+    ["request in a comment", statement("// forward the caller request"), forbidden("request")],
+    ["ASSETS", statement("const extra = input.binding.ASSETS;"), forbidden("ASSETS")],
     [
-      "destructured body pipe replaced",
-      beforeFraming(`const { body: incomingBody } = request; if (incomingBody) incomingBody.${skipPipe}`),
-      body,
+      "a second import",
+      dispatch.replace(dispatchModuleImport, `${dispatchModuleImport}\nimport { deploymentConfig } from "../build/deployment-config";`),
+      "imports anything but the shared origin validator",
     ],
-    // Other reads of the formals through `arguments`.
-    ["destructured entry arguments", beforeDispatch(`const [, supplied] = arguments; ${substitute}`), formals],
-    ["arrow-captured entry arguments", beforeDispatch(`const supplied = (() => arguments[1])(); ${substitute}`), formals],
-    ["proxy body through arguments", beforeFraming(`if (arguments[0].body) arguments[0].body.${skipPipe}`), formals],
-    // Other replacements of the pipe, or of the body it reads, before framing.
-    ["computed body pipe replaced", beforeFraming('if (request.body) request.body[["pipe", "Through"].join("")] = () => request.body;'), body],
-    ["request alias body pipe replaced", beforeFraming(`const incoming = request; if (incoming.body) incoming.body.${skipPipe}`), body],
-    [
-      "Reflect.set body pipe",
-      beforeFraming('if (request.body) Reflect.set(request.body, "pipeThrough", function (this: ReadableStream) { return this; });'),
-      body,
-    ],
-    [
-      "Object.assign body pipe",
-      beforeFraming("if (request.body) Object.assign(request.body, { pipeThrough(this: ReadableStream) { return this; } });"),
-      body,
-    ],
-    ["entry body pipe replaced before dispatch", beforeDispatch(`if (request.body) request.body.${skipPipe}`), body],
-    ["request body redefined", beforeFraming('Object.defineProperty(request, "body", { value: new Response("{}").body });'), body],
-    ["stream prototype pipe replaced", mutate(url, `  ReadableStream.prototype.${skipPipe}\n${url}`), body],
-    [
-      "hoisted helper body pipe",
-      mutate(
-        bodyGuard, `  skipFraming(request.body);\n${bodyGuard}`,
-        "export default worker;",
-        `function skipFraming(stream: ReadableStream | null): void {\n  if (stream) stream.${skipPipe}\n}\n\nexport default worker;`,
-      ),
-      body,
-    ],
+    ["import(", statement('await import("../build/deployment-config");'), "dynamic import"],
+    ["a second .fetch", dispatch.replace(sink, `    await input.binding.fetch(new Request(url, init));\n${sink}`), "exactly one binding guard read and one binding call"],
+    ['a "https:// literal', statement('const extra = "https://heel.example";'), "literal destination"],
+    ['redirect: "follow"', dispatch.replace('redirect: "manual"', 'redirect: "follow"'), "redirect mode is not exactly manual"],
+    ["removal of pipeThrough", dispatch.replace("input.body!.pipeThrough(new FixedLengthStream(input.contentLength))", "input.body!"), "FixedLengthStream pipe"],
+    // Further S1 syntax rules.
+    ["export default", `${dispatch}\nexport default dispatchControlPlane;\n`, "default export"],
+    ["class", statement("class Local {}"), "declares a class"],
+    ["second function", statement("const local = () => input;"), "function other than dispatchControlPlane"],
+    ["unlisted constructor", statement("const extra = new TransformStream();"), "constructs TransformStream"],
+    ["computed member", statement('const extra = input["body"];'), "computed member access"],
   ];
-  assert.equal(new Set(mutations.map(([label]) => label)).size, mutations.length);
-  for (const [label, mutated, violation] of mutations) {
-    assert.notEqual(mutated, worker, `${label} mutation did not apply`);
-    const parsedMutation = ts.createSourceFile("worker.ts", mutated, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  assert.equal(new Set(red.map(([label]) => label)).size, red.length);
+  for (const [label, mutated, violation] of red) {
+    assert.notEqual(mutated, dispatch, `${label} mutation did not apply`);
+    const parsedMutation = ts.createSourceFile("dispatch.ts", mutated, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
     assert.equal(parsedMutation.parseDiagnostics.length, 0, `${label} mutation does not parse`);
     const violations = analyze(mutated);
     assert.ok(violations.some((found) => found.includes(violation)), `${label}: ${violations.join("\n")}`);
   }
-
-  // Positive controls: ordinary request reads, another function's own `arguments` and a comment
-  // naming the pipe stay accepted.
+  // Controls: a comment and a local read that name nothing forbidden stay accepted.
   for (const [label, unchanged] of [
-    ["entry method read", beforeDispatch("const incomingMethod = request.method;")],
-    ["proxy header read before framing", beforeFraming('const declaredType = request.headers.get("Content-Type");')],
-    [
-      "unrelated helper arguments",
-      mutate("export default worker;", "function argumentCount(..._values: unknown[]): number {\n  return arguments.length;\n}\n\nexport default worker;"),
-    ],
-    ["comment naming the pipe", mutate('      init.duplex = "half";', '      // pipeThrough enforces the declared length.\n      init.duplex = "half";')],
+    ["comment", statement("// The destination is now final.")],
+    ["declared length read", dispatch.replace(sink, `    const declaredLength = input.contentLength;\n${sink}`)],
   ]) {
-    assert.notEqual(unchanged, worker, `${label} control did not apply`);
+    assert.notEqual(unchanged, dispatch, `${label} control did not apply`);
     assert.deepEqual(analyze(unchanged), [], label);
+  }
+});
+
+
+test("S3: the dispatch module bytes equal the reviewed pinned hash", async () => {
+  const bytes = await readFile(new URL(CONTROL_PLANE_DISPATCH_PATH, appRoot)).catch(() => null);
+  assert.notEqual(bytes, null, `${CONTROL_PLANE_DISPATCH_PATH} is absent`);
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), CONTROL_PLANE_DISPATCH_SHA256);
+});
+
+
+test("S4/S5: the worker reaches the private binding only through the one reviewed dispatch call", async () => {
+  const worker = await source("worker/index.ts");
+  const analyze = (text) => analyzeSource(join(appRootPath, "worker/index.ts"), text);
+  assert.deepEqual(analyze(worker), []);
+  const call = "  const outcome = await dispatchControlPlane({";
+  const before = (code) => worker.replace(call, `  ${code}\n${call}`);
+  const red = [
+    ["binding fetch reinserted", before("await env.CONTROL_PLANE.fetch(new Request(new URL(upstreamPath, controlPlaneOrigin)));"), "reserved for the dispatch module: CONTROL_PLANE.fetch"],
+    ["computed binding fetch", before('await env.CONTROL_PLANE["fetch"](new Request(new URL(upstreamPath, controlPlaneOrigin)));'), 'reserved for the dispatch module: CONTROL_PLANE["fetch"]'],
+    ["body pipe in the worker", before("request.body?.pipeThrough(new TransformStream());"), "reserved for the dispatch module: .pipeThrough("],
+    ["bare fetch", before("await fetch(upstreamPath);"), "unreviewed fetch-shaped call"],
+    ["binding argument substituted", worker.replace("    binding: env.CONTROL_PLANE,\n", "    binding: env.ASSETS,\n"), "not the one reviewed call in proxyControlPlane"],
+    ["second dispatch call", before("await dispatchControlPlane({ binding: env.CONTROL_PLANE, publicOrigin: env.PUBLIC_ORIGIN, upstreamPath, method: request.method, headers: requestContract.headers, contentLength: requestContract.contentLength, body: request.body });"), "not the one reviewed call in proxyControlPlane"],
+    ["dispatch captured", before("const send = dispatchControlPlane;"), "referenced outside its one reviewed call"],
+    ["substitute dispatch module", worker.replace(dispatchImport, dispatchImport.replace("./control-plane-dispatch", "./control-plane-dispatch-copy")), "missing exact import { dispatchControlPlane }"],
+  ];
+  assert.equal(new Set(red.map(([label]) => label)).size, red.length);
+  for (const [label, mutated, violation] of red) {
+    assert.notEqual(mutated, worker, `${label} mutation did not apply`);
+    const violations = analyze(mutated);
+    assert.ok(violations.some((found) => found.includes(violation)), `${label}: ${violations.join("\n")}`);
+  }
+  // S5: the app-wide network-sink rule sees exactly one private sink, in the dispatch module.
+  const files = await discoverOriginalSources(appRootPath);
+  const dispatchPath = join(appRootPath, CONTROL_PLANE_DISPATCH_PATH);
+  assert.ok(files.includes(dispatchPath), "source discovery does not include the dispatch module");
+  for (const file of files) {
+    const text = await readFile(file, "utf8");
+    assert.equal(text.includes("input.binding.fetch("), file === dispatchPath, `${relative(appRootPath, file)} binding call`);
   }
 });
 
