@@ -2456,5 +2456,33 @@ test("production worker frames every POST family to its declared length and reac
       }, `${method} ${path} declared ${declared}`);
     }
   }
+  // A malformed binding is refused with the fixed 503 before any request check could answer 400.
+  const refusedRequests = [
+    ["foreign human Origin", () => new Request(`https://proxy.heel.invalid/api/control-plane/v1/device/verify`, {
+      method: "POST", body: "{}",
+      headers: { ...session, Origin: "https://attacker.invalid", "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json", "Content-Length": "2" },
+    })],
+    ["runner proof missing", () => new Request(`https://proxy.heel.invalid/api/control-plane/v1/workspaces/${workspace}/runners/${runner}/claim`, {
+      method: "POST", body: "{}", headers: { "Content-Type": "application/json", "Content-Length": "2" },
+    })],
+    ["wrong content type", () => new Request("https://proxy.heel.invalid/api/control-plane/v1/login", {
+      method: "POST", body: "{}", headers: { "Content-Type": "text/plain", "Content-Length": "2" },
+    })],
+  ];
+  for (const [label, binding] of [["missing", undefined], ["null", null], ["empty object", {}], ["non-callable fetch", { fetch: 43 }]]) {
+    for (const [requestLabel, request] of refusedRequests) {
+      let assets = 0;
+      const response = await artifact.default.fetch(request(), {
+        ASSETS: { fetch: async () => { assets += 1; return new Response("asset", { status: 404 }); } },
+        IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+        PUBLIC_ORIGIN: origin,
+        CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
+        ...(binding === undefined ? {} : { CONTROL_PLANE: binding }),
+      }, context);
+      assert.equal(response.status, 503, `${label} ${requestLabel}`);
+      assert.equal(await response.text(), '{"error":"control plane unavailable"}', `${label} ${requestLabel}`);
+      assert.equal(assets, 0, `${label} ${requestLabel}`);
+    }
+  }
   assert.equal(ambientCalls, 0);
 });

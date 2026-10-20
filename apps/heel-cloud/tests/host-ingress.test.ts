@@ -442,6 +442,41 @@ describe("canonical control-plane binding destination", () => {
     }
   });
 
+  it("refuses a malformed binding with the fixed 503 before any request check could answer 400", async () => {
+    const origin = CONFIGURED_ORIGINS[0];
+    const routes = routeCases(origin);
+    const refusedRequests: Array<[string, () => Request]> = [
+      ["foreign human Origin", () => incoming(origin, routes.find(({ label }) => label === "device verify")!, { Origin: "https://attacker.invalid" })],
+      ["runner proof missing", () => incoming(origin, { ...routes.find(({ label }) => label === "runner claim")!, headers: {} })],
+      ["wrong content type", () => new Request(`${origin}/api/control-plane/v1/login`, {
+        method: "POST", body: "{}", headers: { "Content-Type": "text/plain", "Content-Length": "2" },
+      })],
+      ["client address missing", () => incoming(origin, { ...routes.find(({ label }) => label === "account signup")!, headers: {} })],
+    ];
+    for (const [label, binding] of [["missing", undefined], ["null", null], ["empty object", {}], ["non-callable fetch", { fetch: 43 }]] as const) {
+      for (const [requestLabel, request] of refusedRequests) {
+        const environment = {
+          ASSETS: { fetch: assetFetch },
+          IMAGES: { input: () => { throw new Error("image transform is not used by the control-plane route"); } },
+          PUBLIC_ORIGIN: origin,
+          CONTROL_PLANE_EDGE_SECRET: edge,
+          ...(binding === undefined ? {} : { CONTROL_PLANE: binding }),
+        } as never;
+        const response = await worker.fetch(request(), environment, context);
+        expect(response.status, `${label} ${requestLabel}`).toBe(503);
+        expect(await response.text(), `${label} ${requestLabel}`).toBe('{"error":"control plane unavailable"}');
+      }
+    }
+    // The same refused requests with a valid binding stay 400, so the 503 above is the binding's.
+    const fetcher = bindingSpy();
+    for (const [requestLabel, request] of refusedRequests) {
+      const response = await worker.fetch(request(), workerEnv(origin, fetcher), context);
+      expect(response.status, requestLabel).toBe(400);
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+    expectNoFallback();
+  });
+
   it("keeps page and image requests on the page handler and assets only", async () => {
     const origin = CONFIGURED_ORIGINS[0];
     const fetcher = bindingSpy();

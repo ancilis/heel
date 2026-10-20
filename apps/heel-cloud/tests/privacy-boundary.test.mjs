@@ -139,6 +139,15 @@ const dispatchForbiddenIdentifiers = [
   "fetchLocal",
 ];
 const dispatchConstructors = ["URL", "Request", "Uint8Array", "FixedLengthStream"];
+// S4: the Worker refuses a malformed binding with its own guard, the first statement of the proxy and
+// before any 400-producing check, so the fixed 503 ordering is unchanged; the module rechecks it.
+const workerBindingGuard = `if (
+    env.CONTROL_PLANE === undefined
+    || env.CONTROL_PLANE === null
+    || typeof env.CONTROL_PLANE.fetch !== "function"
+  ) {
+    return proxyError(503, "control plane unavailable", csp);
+  }`;
 // S4: the Worker's one reviewed call into the module.
 const dispatchImport = 'import { dispatchControlPlane } from "./control-plane-dispatch";';
 const dispatchCallSite = `const outcome = await dispatchControlPlane({
@@ -279,13 +288,30 @@ function analyzeSource(fileName, text) {
         && ts.isVariableDeclaration(capture.parent)
         && isReviewedBootstrapDeclaration(capture.parent);
     }
-    if (reviewedDispatchCapabilityCheck(node)) return true;
+    if (reviewedDispatchCapabilityCheck(node) || reviewedWorkerCapabilityCheck(node)) return true;
     if (dispatchModule) {
       return ts.isCallExpression(node.parent) && node.parent.expression === node
         && reviewedDispatchFetchCall(node.parent);
     }
     return serverWorker && ts.isCallExpression(node.parent) && node.parent.expression === node
       && ["env.ASSETS.fetch", "handler.fetch"].includes(expression);
+  }
+
+  // `typeof` inspects the binding capability without calling or capturing it; in the Worker only the
+  // binding-shape guard, the first statement of the proxy, may do so.
+  function reviewedWorkerCapabilityCheck(node) {
+    if (
+      !serverWorker
+      || node.getText(parsed) !== "env.CONTROL_PLANE.fetch"
+      || !ts.isTypeOfExpression(node.parent)
+      || enclosingFunctionName(node) !== "proxyControlPlane"
+    ) return false;
+    const guard = enclosingFunctionDeclaration(node)?.body?.statements[0];
+    return guard !== undefined
+      && ts.isIfStatement(guard)
+      && guard.getText(parsed) === workerBindingGuard
+      && node.getStart(parsed) >= guard.expression.getStart(parsed)
+      && node.getEnd() <= guard.expression.getEnd();
   }
 
   // `typeof` inspects the binding capability without calling or capturing it; only the module's
@@ -437,7 +463,16 @@ function analyzeSource(fileName, text) {
     if (sourceText.split(dispatchImport).length - 1 !== 1) {
       report(parsed, `control-plane dispatch call site is missing exact ${dispatchImport}`);
     }
-    for (const forbidden of ["CONTROL_PLANE.fetch", 'CONTROL_PLANE["fetch"]', ".pipeThrough(", "FixedLengthStream"]) {
+    if (sourceText.split("CONTROL_PLANE.fetch").length - 1 !== 1) {
+      report(parsed, "control-plane worker names CONTROL_PLANE.fetch outside its one binding-shape guard");
+    }
+    const proxy = parsed.statements.find((statement) => (
+      ts.isFunctionDeclaration(statement) && statement.name?.text === "proxyControlPlane"
+    ));
+    if (proxy?.body?.statements[0]?.getText(parsed) !== workerBindingGuard) {
+      report(parsed, "control-plane worker binding-shape guard is not the first statement of proxyControlPlane");
+    }
+    for (const forbidden of ['CONTROL_PLANE["fetch"]', ".pipeThrough(", "FixedLengthStream"]) {
       if (sourceText.includes(forbidden)) {
         report(parsed, `control-plane worker contains sink text reserved for the dispatch module: ${forbidden}`);
       }
@@ -2633,7 +2668,14 @@ test("S4/S5: the worker reaches the private binding only through the one reviewe
   const call = "  const outcome = await dispatchControlPlane({";
   const before = (code) => worker.replace(call, `  ${code}\n${call}`);
   const red = [
-    ["binding fetch reinserted", before("await env.CONTROL_PLANE.fetch(new Request(new URL(upstreamPath, controlPlaneOrigin)));"), "reserved for the dispatch module: CONTROL_PLANE.fetch"],
+    ["binding fetch reinserted", before("await env.CONTROL_PLANE.fetch(new Request(new URL(upstreamPath, controlPlaneOrigin)));"), "names CONTROL_PLANE.fetch outside its one binding-shape guard"],
+    ["binding guard removed", worker.replace(`  ${workerBindingGuard}\n`, ""), "binding-shape guard is not the first statement of proxyControlPlane"],
+    [
+      "binding guard after the request checks",
+      worker.replace(`  ${workerBindingGuard}\n`, "").replace(call, `  ${workerBindingGuard}\n${call}`),
+      "binding-shape guard is not the first statement of proxyControlPlane",
+    ],
+    ["binding guard accepts null", worker.replace("    || env.CONTROL_PLANE === null\n", ""), "binding-shape guard is not the first statement of proxyControlPlane"],
     ["computed binding fetch", before('await env.CONTROL_PLANE["fetch"](new Request(new URL(upstreamPath, controlPlaneOrigin)));'), 'reserved for the dispatch module: CONTROL_PLANE["fetch"]'],
     ["body pipe in the worker", before("request.body?.pipeThrough(new TransformStream());"), "reserved for the dispatch module: .pipeThrough("],
     ["bare fetch", before("await fetch(upstreamPath);"), "unreviewed fetch-shaped call"],

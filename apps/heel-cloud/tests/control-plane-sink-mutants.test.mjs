@@ -188,6 +188,22 @@ function requestSet() {
       cases.push({ label: `binding ${label} ${routeLabel}`, origin, configuration: () => ({ CONTROL_PLANE: value() }), request: () => incoming(routeCase, { base: origin }) });
     }
   }
+  // A malformed binding must win over every 400-producing request check (fixed 503 ordering).
+  const refusedRequests = [
+    ["foreign human Origin", () => incoming(route(origin, "device verify"), { base: origin, extra: { Origin: "https://attacker.invalid" } })],
+    ["runner proof missing", () => incoming({ ...route(origin, "runner claim"), headers: {} }, { base: origin })],
+    ["wrong content type", () => new Request(`${origin}/api/control-plane/v1/login`, {
+      method: "POST", body: "{}", headers: { "Content-Type": "text/plain", "Content-Length": "2" },
+    })],
+    ["client address missing", () => incoming({ ...route(origin, "account signup"), headers: {} }, { base: origin })],
+  ];
+  for (const [label, value] of [
+    ["missing", () => undefined], ["null", () => null], ["empty object", () => ({})], ["non-callable fetch", () => ({ fetch: 43 })],
+  ]) {
+    for (const [requestLabel, request] of refusedRequests) {
+      cases.push({ label: `binding ${label} refused ${requestLabel}`, origin, configuration: () => ({ CONTROL_PLANE: value() }), request });
+    }
+  }
   for (const [label, value] of [
     ["missing", () => undefined], ["number", () => 43], ["empty", () => ""], ["short", () => "short"],
     ["malformed", () => `${edge}=`], ["String object", () => new String(edge)],
@@ -398,6 +414,7 @@ const ENTRY = "      return proxyControlPlane(request, env, csp, upstreamPath);"
 const EXPORT = "export default worker;";
 const SECRET = '  if (typeof env.CONTROL_PLANE_EDGE_SECRET !== "string") {\n    return proxyError(503, "control plane unavailable", csp);\n  }\n  const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET.trim();';
 const ORIGIN = "  const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);";
+const WORKER_GUARD = '  if (\n    env.CONTROL_PLANE === undefined\n    || env.CONTROL_PLANE === null\n    || typeof env.CONTROL_PLANE.fetch !== "function"\n  ) {\n    return proxyError(503, "control plane unavailable", csp);\n  }\n';
 const REFUSAL = '  if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);';
 const IMPORT = 'import { canonicalPublicOrigin } from "../build/deployment-config";';
 const URL_LINE = "  const url = new URL(input.upstreamPath, origin);";
@@ -426,6 +443,8 @@ const D03 = "H0AR2RDB d03 exact lead";
 const C04 = "H0AR3RDB c04 exact challenge";
 const H0A = "H0A first matrix dataflow case (retired)";
 const H0X = "H0X design re-created shape";
+const H0X_ORDER = "H0X implementation 5fc14fb ordering regression";
+const DEFENSE = "the Worker's own guard refuses every malformed binding first, so the module recheck is defense in depth";
 
 // [label, kind, sources, edits, note]. kind: "mutant" must deviate; "neutral" is a retired analyzer case
 // with no sink-boundary behavior change in this layout and must be identical (reported to Astra);
@@ -460,9 +479,14 @@ const CORPUS = [
   ["spread literal option", "neutral", [H0AR1], [["index", `${CALL}\n`, `${CALL}\n    ...request,\n`]], "a Request has no own enumerable fields to spread and every named input follows the spread"],
   ["header object mutation", "mutant", [H0AR1], [beforeCall('requestContract.headers.set("Host", "attacker.invalid");')]],
   ["request contract replacement", "mutant", [H0AR1], [beforeCall("requestContract = { headers: request.headers, contentLength: 0 };")]],
-  ["binding presence only", "mutant", [H0AR1], [["dispatch", '    input.binding === undefined\n    || input.binding === null\n    || typeof input.binding.fetch !== "function"\n', "    input.binding === undefined\n"]]],
-  ["binding null accepted", "mutant", [H0AR1], [["dispatch", "    || input.binding === null\n", ""]]],
-  ["binding callability unchecked", "mutant", [H0AR1], [["dispatch", '    || typeof input.binding.fetch !== "function"\n', ""]]],
+  ["module binding presence only", "neutral", [H0AR1], [["dispatch", '    input.binding === undefined\n    || input.binding === null\n    || typeof input.binding.fetch !== "function"\n', "    input.binding === undefined\n"]], DEFENSE],
+  ["module binding null accepted", "neutral", [H0AR1], [["dispatch", "    || input.binding === null\n", ""]], DEFENSE],
+  ["module binding callability unchecked", "neutral", [H0AR1], [["dispatch", '    || typeof input.binding.fetch !== "function"\n', ""]], DEFENSE],
+  ["worker binding presence only", "mutant", [H0AR1], [["index", '    env.CONTROL_PLANE === undefined\n    || env.CONTROL_PLANE === null\n    || typeof env.CONTROL_PLANE.fetch !== "function"\n', "    env.CONTROL_PLANE === undefined\n"]]],
+  ["worker binding null accepted", "mutant", [H0AR1], [["index", "    || env.CONTROL_PLANE === null\n", ""]]],
+  ["worker binding callability unchecked", "mutant", [H0AR1], [["index", '    || typeof env.CONTROL_PLANE.fetch !== "function"\n', ""]]],
+  ["worker binding guard removed", "mutant", [H0X_ORDER], [["index", WORKER_GUARD, ""]], "the 5fc14fb layout: only the module guard remains"],
+  ["worker binding guard after the request checks", "mutant", [H0X_ORDER], [["index", WORKER_GUARD, ""], ["index", CALL, `${WORKER_GUARD}${CALL}`]]],
   ["capability guard moved", "neutral", [H0AR1], [["dispatch", BINDING_GUARD_END, `${BINDING_GUARD_END}  const moved = typeof input.binding.fetch;\n`]], "a typeof read after the guard changes no sink value"],
   ["secret type unchecked", "mutant", [H0AR1], [["index", SECRET, '  const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET?.trim() ?? "";']]],
   ["secret type weakened", "mutant", [H0AR1], [["index", 'typeof env.CONTROL_PLANE_EDGE_SECRET !== "string"', "env.CONTROL_PLANE_EDGE_SECRET === undefined"]]],
