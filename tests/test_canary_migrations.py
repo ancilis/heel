@@ -36,7 +36,6 @@ class CanaryMigrationTests(unittest.TestCase):
         self.assertEqual(
             [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-11:]],
             [
-                (20, "runner_context_bounded_purge"),
                 (21, "runner_context_affinity_guards"),
                 (22, "pending_approval_live_seek"),
                 (23, "runner_context_purge_readiness"),
@@ -47,6 +46,7 @@ class CanaryMigrationTests(unittest.TestCase):
                 (28, "runner_key_history_expiry"),
                 (29, "runner_auth_bounded_retention"),
                 (30, "self_serve_discovery_and_plan_requests"),
+                (31, "host_authority_generations"),
             ],
         )
         tables = (
@@ -70,7 +70,6 @@ class CanaryMigrationTests(unittest.TestCase):
         self.assertEqual(
             [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-11:]],
             [
-                (20, "runner_context_bounded_purge"),
                 (21, "runner_context_affinity_guards"),
                 (22, "pending_approval_live_seek"),
                 (23, "runner_context_purge_readiness"),
@@ -81,6 +80,7 @@ class CanaryMigrationTests(unittest.TestCase):
                 (28, "runner_key_history_expiry"),
                 (29, "runner_auth_bounded_retention"),
                 (30, "self_serve_discovery_and_plan_requests"),
+                (31, "host_authority_generations"),
             ],
         )
         self.assertIsNotNone(self.conn.execute(
@@ -401,7 +401,7 @@ class CanaryMigrationTests(unittest.TestCase):
         ledger("runner_heartbeat:run", 2, "runner_heartbeat", "/v1/workspaces/ws/runners/runner/runs/run/stop-ack")
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31])
         self.assertEqual([tuple(row) for row in conn.execute(
             "SELECT chain_name,next_sequence,generation FROM canary_runner_chain_cursors ORDER BY chain_name"
         )], [("heartbeat:run", 2, 0), ("progress:run", 3, 0), ("stop-ack:run", 3, 0)])
@@ -446,8 +446,8 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30])
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 30)
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 31)
         self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.assertEqual(
             [tuple(row) for row in conn.execute(
@@ -553,8 +553,8 @@ class CanaryMigrationTests(unittest.TestCase):
         conn.commit()
 
         migration = Migrator(conn, CONTROL_PLANE_MIGRATIONS)
-        self.assertEqual(migration.apply_all(), [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30])
-        self.assertEqual(migration.current_version(), 30)
+        self.assertEqual(migration.apply_all(), [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31])
+        self.assertEqual(migration.current_version(), 31)
         affinity = conn.execute(
             "SELECT project_ref,environment_id,runner_key_id,established_rcb_id,established_binding_digest "
             "FROM canary_runner_context_affinities WHERE workspace_id='ws_affinity' AND runner_id='runr_affinity'",
@@ -828,7 +828,7 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31])
         self.assertEqual(
             [tuple(row) for row in conn.execute("SELECT chain_name,sequence FROM canary_runner_request_ledger")],
             [("progress:real", 1)],
@@ -1088,8 +1088,8 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
         conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
         conn.commit()
-        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30])
-        self.assertEqual(migration.current_version(), 30)
+        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31])
+        self.assertEqual(migration.current_version(), 31)
         self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):
@@ -1209,8 +1209,8 @@ def test_migration_30_adds_discovery_tables_and_inventory_columns_additively():
     conn, workspace, project, environment = _launch_fixture_at_29()
     before = _dump(conn)
     assert before["canary_environments"] and before["usage_ledger"] and before["canary_runner_keys"]
-    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [30]
-    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version() == 30
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS[:30]).apply_all() == [30]
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS[:30]).current_version() == 30
     after = _dump(conn)
     assert after.pop("schema_migrations")[:-1] == before.pop("schema_migrations")
     for table, rows in before.items():
@@ -1220,7 +1220,8 @@ def test_migration_30_adds_discovery_tables_and_inventory_columns_additively():
         assert {row[1] for row in conn.execute(f"PRAGMA table_info({table})")} == columns, table
         assert after[table] == []
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
-    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == []
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS[:30]).apply_all() == []
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [31]
 
     def authorization(suffix: str, state: str = "open"):
         closed = None if state == "open" else 2
