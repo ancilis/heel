@@ -2552,10 +2552,13 @@ class IngressFlows:
         self.confirm_active(paired)
         return paired
 
-    def confirm_active(self, paired: PairedSlot) -> dict:
+    def active_identity(self, paired: PairedSlot) -> dict:
         (key,) = self.env.cp_call("identity", workspace_id=paired.workspace_id, runner_id=paired.runner_id)["rows"]
-        identity = {"runner_id": paired.runner_id, "key_id": key["key_id"],
-                    "public_key_digest": hashlib.sha256(base64.b64decode(key["public_key"])).hexdigest()}
+        return {"runner_id": paired.runner_id, "key_id": key["key_id"],
+                "public_key_digest": hashlib.sha256(base64.b64decode(key["public_key"])).hexdigest()}
+
+    def confirm_active(self, paired: PairedSlot) -> dict:
+        identity = self.active_identity(paired)
         self.env.registry.activate(paired.slot, identity)
         return identity
 

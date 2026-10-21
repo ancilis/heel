@@ -957,14 +957,14 @@ def test_g3_second_slot_pairs_and_claims_independently(world):
     flows = world.flows
     workspace, cookie = flows.signup("owner-b@example.test")
     paired = flows.pair("slot-b", workspace, cookie)
-    base, _binding = flows.authorize_binding(paired, name="Other")
+    base, binding = flows.authorize_binding(paired, name="Other")
     runner = paired.runner
     assert runner.call("open")["ok"] and runner.call("ensure_context", timeout=60)["value"] is True
     submitted = runner.call("compile_submit", timeout=60)
     grant = flows.approve_run(paired, base, submitted)
     claimed = runner.call("claim", timeout=60)
     assert claimed["ok"] and claimed["lease"]["grant_id"] == grant["grant_id"]
-    world.state.update(b=paired, cookie_b=cookie, base_b=base, submitted_b=submitted, grant_b=grant)
+    world.state.update(b=paired, cookie_b=cookie, base_b=base, binding_b=binding, submitted_b=submitted, grant_b=grant)
     harness.record_case("g3.second_slot_claim", "G3")
 
 
@@ -1904,9 +1904,22 @@ def _end_slot_b_run(world) -> None:
     env.registry.set_phase(paired.slot, "active")
 
 
+def _revoke_slot_b_context(world) -> None:
+    """CP also refuses rotation activation (409 runner_rotation_busy) while the old key holds an active
+    runner context binding. The owner revokes slot b's binding through the management listener."""
+    paired = world.state["b"]
+    path = f"{world.state['base_b']}/runner-context-bindings/{world.state['binding_b']['binding_id']}/revoke"
+    revoked = harness.observe(world.env, lambda: world.flows.owner(
+        "POST", path, {"schema_version": "heel.runner-context-binding-revoke.v1", "reason_code": "operator_requested"},
+        paired.cookie))
+    harness.record_case("g3.context_revoke_b", "G3", revoked)
+    assert revoked.status == 200 and revoked.result["body"]["status"] == "revoked", revoked.status
+
+
 def test_g3_registered_rotation_swaps_keys_and_the_old_key_fails(world):
     _two_slots(world)
     _end_slot_b_run(world)
+    _revoke_slot_b_context(world)
     env, flows, paired = world.env, world.flows, world.state["b"]
     keys = paired.runner.call("rotation_keys")
     observed = harness.observe(env, lambda: flows.owner(
@@ -1930,7 +1943,9 @@ def test_g3_registered_rotation_swaps_keys_and_the_old_key_fails(world):
                                      "expires_at_ms": int(row["expires_at"] * 1000)})
     activated = paired.runner.call("rotation_activate", rotation_id=rotation_id, timeout=60)
     assert activated["poll_status"] == 200 and activated["activate_status"] == 200
-    identity = world.flows.confirm_active(harness.PairedSlot(**{**paired.__dict__, "runner_key_id": keys["key_id"]}))
+    # Read the CP's new active key, then publish it with the rotation cleared in one registry write
+    # (activate() alone would publish an active slot still carrying its rotation, which is refused).
+    identity = world.flows.active_identity(harness.PairedSlot(**{**paired.__dict__, "runner_key_id": keys["key_id"]}))
     env.registry.rotated("slot-b", identity)
     old = _slot_wire(world, "slot-b", _claim_request(paired))
     assert old.status == 403 and not old.cp_contacted
