@@ -1484,6 +1484,25 @@ def process_identity(pid: int) -> str:
         return f"{pid}:unknown"
 
 
+def stray_namespace_processes(proc: Path = Path("/proc")) -> list[tuple[int, str, int]]:
+    """Live (non-zombie) processes in this PID namespace other than this process and its PPID-chain
+    ancestors, as (namespace-local PID, state letter, PPID) -- never names, argv or environment."""
+    table: dict[int, tuple[str, int]] = {}
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            table[int(entry.name)] = (fields[0], int(fields[1]))
+        except (OSError, IndexError, ValueError):
+            continue
+    ancestors, pid = set(), os.getpid()
+    while pid in table and pid not in ancestors:
+        ancestors.add(pid)
+        pid = table[pid][1]
+    return sorted((pid, state, ppid) for pid, (state, ppid) in table.items() if pid not in ancestors and state not in "ZX")
+
+
 class Topology:
     """Where each role runs and how a process is placed there."""
 
