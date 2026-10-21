@@ -7,6 +7,7 @@ on:
   schedule:
     - cron: '24 7 * * 1'
   workflow_dispatch: {}
+permissions: {}
 jobs:
   analyze:
     name: Analyze (python)
@@ -16,9 +17,48 @@ jobs:
       actions: read
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: github/codeql-action/init@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
         with:
           languages: python
           queries: security-extended
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
+
+  # H0B: the real nginx+njs ingress proof on an isolated, disposable Linux VM. Manual dispatch of
+  # the literal reviewed proof branch only; no inputs, secrets, environment, cache or write token.
+  # The fixed launcher (docs/saas/HOST_INGRESS_PROOF.md) owns every runtime input and its hash.
+  host-ingress-proof:
+    name: host-ingress-proof (ingress-v1)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/self-serve-host-ingress-proof'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: host-ingress-proof
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13.5"
+      - name: Fixed ingress-v1 launcher (20-minute budget, tests 12 minutes)
+        timeout-minutes: 20
+        run: python scripts/host_ingress_proof.py
+      - name: Upload allowlisted safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: host-ingress-proof
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            host-ingress-proof/summary.json
+            host-ingress-proof/cases.jsonl
+            host-ingress-proof/versions.txt
+            host-ingress-proof/cleanup.json
+            host-ingress-proof/report.txt
+            host-ingress-proof/build-manifest.json
