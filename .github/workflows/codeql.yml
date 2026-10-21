@@ -62,3 +62,41 @@ jobs:
             host-ingress-proof/cleanup.json
             host-ingress-proof/report.txt
             host-ingress-proof/build-manifest.json
+
+  host-lease-feasibility:
+    # H1F: the isolated prepared-gate lease primitive proof on a disposable Linux VM. Manual dispatch
+    # of the literal reviewed proof branch only; no inputs, credentials, deployment target or saved state.
+    # The fixed launcher (docs/saas/HOST_LEASE_FEASIBILITY.md) owns every runtime input and its hash.
+    name: host-lease-feasibility (lease-v1)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/self-serve-host-lease-proof'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    concurrency:
+      group: host-lease-feasibility
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13.5"
+      - name: Fixed lease-v1 launcher (20-minute budget, tests 10 minutes)
+        timeout-minutes: 20
+        run: python scripts/host_lease_feasibility.py
+      - name: Upload allowlisted safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: host-lease-feasibility
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            host-lease-feasibility/summary.json
+            host-lease-feasibility/cases.jsonl
+            host-lease-feasibility/versions.txt
+            host-lease-feasibility/cleanup.json
+            host-lease-feasibility/report.txt
