@@ -71,6 +71,7 @@ REQUIRED_CASES = (
     "test_static_fingerprint_normaliser_strips_timestamps_and_counters",
     "test_static_namespace_init_reaps_orphans_and_publishes_closed_leftover_records",
     "test_static_report_carries_a_failure_locator_for_every_failing_case",
+    "test_static_cap_timing_telemetry_is_closed_bounded_and_published_before_the_cap_assertions",
     "test_g0_runtime_has_no_native_normalize_and_policy_carries_pinned_tables",
     "test_g0_nfc_of_every_code_point_matches_the_pinned_unicodedata",
     "test_g0_nfc_of_composition_and_reordering_sequences_matches_the_pinned_unicodedata",
@@ -691,7 +692,37 @@ def summarize_junit(path: Path) -> dict:
             "failure_locators": sanitize_locators(locators)}
 
 
-_CASE_KEYS = {"case", "gate", "status", "reasons", "cp_contacted", "changed_tables", "seam"}
+_CASE_KEYS = {"case", "gate", "status", "reasons", "cp_contacted", "changed_tables", "seam", "telemetry"}
+MAX_CASE_LINE = 4096
+# The one optional telemetry object (H0BR2, G8 connection-cap timing): exactly these keys, each a plain
+# int in its range (None only for the two envelope keys), plus the consistency rules below. Anything
+# else -- bool, float, string, nesting, a missing or unknown key -- publishes "telemetry": null.
+TELEMETRY_RANGES = {
+    "holds": (0, 8), "holds_unmeasured": (0, 8), "holds_early": (0, 8), "holds_late": (0, 8),
+    "first_byte_ms_min": (-120000, 120000), "first_byte_ms_max": (-120000, 120000),
+    "probes": (0, 64), "probes_503": (0, 64), "probes_admitted": (0, 1),
+}
+TELEMETRY_NULLABLE = frozenset({"first_byte_ms_min", "first_byte_ms_max"})
+
+
+def sanitize_telemetry(value) -> dict | None:
+    if not isinstance(value, dict) or set(value) != set(TELEMETRY_RANGES):
+        return None
+    for key, (low, high) in TELEMETRY_RANGES.items():
+        item = value[key]
+        if not (item is None and key in TELEMETRY_NULLABLE) and not (type(item) is int and low <= item <= high):
+            return None
+    measured = value["holds"] - value["holds_unmeasured"]
+    low, high = value["first_byte_ms_min"], value["first_byte_ms_max"]
+    if not (measured >= 0 and value["holds_early"] + value["holds_late"] <= measured
+            and (low is None) == (high is None) == (measured == 0) and (low is None or low <= high)
+            and value["probes_503"] + value["probes_admitted"] <= value["probes"]):
+        return None
+    return {key: value[key] for key in sorted(TELEMETRY_RANGES)}
+
+
+def _no_constant(name: str):
+    raise ValueError("non-finite number")
 
 
 def sanitize_cases(raw: Path) -> list[dict]:
@@ -699,18 +730,36 @@ def sanitize_cases(raw: Path) -> list[dict]:
     if not raw.exists():
         return cases
     for line in raw.read_text(encoding="utf-8").splitlines()[:5000]:
-        entry = json.loads(line)
-        if not set(entry) <= _CASE_KEYS or not re.fullmatch(r"[a-z0-9_.-]{1,160}", entry["case"]):
+        if len(line) > MAX_CASE_LINE:
             continue
-        clean = {"case": entry["case"], "gate": entry["gate"] if re.fullmatch(r"G[0-9]", entry.get("gate", "")) else "?"}
+        try:
+            entry = json.loads(line, parse_constant=_no_constant)
+        except (ValueError, RecursionError):
+            continue
+        if (not isinstance(entry, dict) or not set(entry) <= _CASE_KEYS or not isinstance(entry.get("case"), str)
+                or not re.fullmatch(r"[a-z0-9_.-]{1,160}", entry["case"])):
+            continue
+        gate = entry.get("gate")
+        clean = {"case": entry["case"], "gate": gate if isinstance(gate, str) and re.fullmatch(r"G[0-9]", gate) else "?"}
         if isinstance(entry.get("status"), int) or entry.get("status") is None:
             clean["status"] = entry.get("status")
         clean["cp_contacted"] = entry.get("cp_contacted") if isinstance(entry.get("cp_contacted"), bool) else None
-        clean["reasons"] = [r for r in entry.get("reasons", []) if isinstance(r, str) and re.fullmatch(r"[a-z_]+:[a-z_:0-9-]{1,80}", r)]
-        clean["changed_tables"] = [t for t in entry.get("changed_tables", []) if isinstance(t, str) and re.fullmatch(r"[a-z_]{1,64}", t)]
+        reasons, tables = entry.get("reasons"), entry.get("changed_tables")
+        clean["reasons"] = [r for r in (reasons if isinstance(reasons, list) else [])
+                            if isinstance(r, str) and re.fullmatch(r"[a-z_]+:[a-z_:0-9-]{1,80}", r)]
+        clean["changed_tables"] = [t for t in (tables if isinstance(tables, list) else [])
+                                   if isinstance(t, str) and re.fullmatch(r"[a-z_]{1,64}", t)]
         clean["seam"] = entry.get("seam") if isinstance(entry.get("seam"), str) and re.fullmatch(r"[A-Za-z0-9 ,._-]{1,80}", entry["seam"]) else None
+        if "telemetry" in entry:
+            clean["telemetry"] = sanitize_telemetry(entry["telemetry"])
         cases.append(clean)
     return cases
+
+
+def cpu_count_line(cpu_count=os.cpu_count) -> str:
+    """Hosted-runner context for timing evidence (not causality): the CPU count, or a fixed unavailable."""
+    value = cpu_count()
+    return f"cpu_count {value}" if type(value) is int and 1 <= value <= 4096 else "cpu_count unavailable"
 
 
 def report_lines(summary: dict, failure: str | None, cleanup: dict) -> list[str]:
@@ -776,7 +825,7 @@ def parent() -> int:
         os.chmod(scratch / "stage", 0o755)
         versions = runtime["nginx_version_lines"] + [runtime["event_method"], f"node {runtime['node_version']}",
                                                       f"python {python['python_version']}", f"kernel {os.uname().release}",
-                                                      f"platform {sys.platform}"]
+                                                      f"platform {sys.platform}", cpu_count_line()]
         build_manifest = {"nginx_sha256": runtime["nginx_sha256"], "verified_sources": runtime["verified_sources"],
                           "verified_tools": tools, "nginx_event_method": runtime["event_method"],
                           "wheels": python["wheels"], **{k: app[k] for k in ("dist_files", "dist_manifest_sha256", "server_index_sha256")}}

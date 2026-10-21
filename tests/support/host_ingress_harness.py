@@ -24,6 +24,7 @@ import datetime
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -2243,10 +2244,61 @@ def observe(env: "IngressEnvironment", action: Callable[[], dict]) -> Observatio
 
 
 # Fixed, value-free case evidence (launcher-collected; never request/response material).
-_CASE_FIELDS = {"case", "gate", "status", "reasons", "cp_contacted", "changed_tables", "seam"}
+_CASE_FIELDS = {"case", "gate", "status", "reasons", "cp_contacted", "changed_tables", "seam", "telemetry"}
+
+# H0BR2: the one optional telemetry object, aggregate integers only (the launcher re-checks the same
+# grammar). Holds: first byte minus the client's existing send mark (appended after sendall, so it is
+# not the server's deadline origin). The ms envelope is floor(min)..ceil(max) of the wall-clock deltas,
+# so it never claims more than 1 ms precision; early/late compare the unrounded deltas with the asserted
+# window. A hold without a finite send mark and first byte (or outside +-120 s) is counted unmeasured;
+# with no measured hold both envelope keys are None.
+CAP_TIMING_RANGES = {
+    "holds": (0, 8), "holds_unmeasured": (0, 8), "holds_early": (0, 8), "holds_late": (0, 8),
+    "first_byte_ms_min": (-120000, 120000), "first_byte_ms_max": (-120000, 120000),
+    "probes": (0, 64), "probes_503": (0, 64), "probes_admitted": (0, 1),
+}
+CAP_TIMING_NULLABLE = frozenset({"first_byte_ms_min", "first_byte_ms_max"})
 
 
-def record_case(case: str, gate: str, observation: "Observation | None" = None, *, seam: str | None = None) -> None:
+def cap_timing_valid(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != set(CAP_TIMING_RANGES):
+        return False
+    for key, (low, high) in CAP_TIMING_RANGES.items():
+        item = value[key]
+        if not (item is None and key in CAP_TIMING_NULLABLE) and not (type(item) is int and low <= item <= high):
+            return False
+    measured = value["holds"] - value["holds_unmeasured"]
+    low, high = value["first_byte_ms_min"], value["first_byte_ms_max"]
+    return (measured >= 0 and value["holds_early"] + value["holds_late"] <= measured
+            and (low is None) == (high is None) == (measured == 0) and (low is None or low <= high)
+            and value["probes_503"] + value["probes_admitted"] <= value["probes"])
+
+
+def cap_timing(held: list, probes: list, lower_s: float, upper_s: float) -> dict:
+    """Aggregate, value-free timing of the connection-cap holds and probes (no per-request data)."""
+    deltas, envelope, unmeasured = [], [], 0
+    for result in held:
+        wall = (result.get("wall") if isinstance(result, dict) else None) or {}
+        sent, first = (wall.get("sent") or [None])[0], wall.get("first_byte")
+        if not all(type(mark) in (int, float) and math.isfinite(mark) for mark in (sent, first)):
+            unmeasured += 1
+            continue
+        delta = first - sent
+        low, high = math.floor(delta * 1000), math.ceil(delta * 1000)
+        if not (-120000 <= low and high <= 120000):
+            unmeasured += 1
+            continue
+        deltas.append(delta)
+        envelope += [low, high]
+    statuses = [status for _sent, status in probes]
+    return {"holds": len(held), "holds_unmeasured": unmeasured,
+            "holds_early": sum(delta < lower_s for delta in deltas), "holds_late": sum(delta > upper_s for delta in deltas),
+            "first_byte_ms_min": min(envelope) if envelope else None, "first_byte_ms_max": max(envelope) if envelope else None,
+            "probes": len(statuses), "probes_503": statuses.count(503), "probes_admitted": statuses.count(401)}
+
+
+def record_case(case: str, gate: str, observation: "Observation | None" = None, *, seam: str | None = None,
+                telemetry: dict | None = None) -> None:
     path = os.environ.get("HEEL_HOST_INGRESS_CASES")
     if not path:
         return
@@ -2255,6 +2307,9 @@ def record_case(case: str, gate: str, observation: "Observation | None" = None, 
         entry.update(status=observation.status, reasons=[reason for reason in observation.reasons
                                                          if re.fullmatch(r"[a-z_]+:[a-z_:0-9-]+", reason)],
                      cp_contacted=observation.cp_contacted, changed_tables=observation.changed_tables)
+    if telemetry is not None:
+        assert cap_timing_valid(telemetry)
+        entry["telemetry"] = telemetry
     assert set(entry) <= _CASE_FIELDS and re.fullmatch(r"[a-z0-9_.-]{1,160}", case)
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, sort_keys=True) + "\n")
