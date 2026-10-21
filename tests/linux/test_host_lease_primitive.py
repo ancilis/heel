@@ -461,7 +461,8 @@ def test_static_workflow_existing_jobs_match_the_recorded_f04ab70_baseline():
 
 def test_static_workflow_lease_job_is_manual_literal_branch_read_only_and_pinned():
     text = WORKFLOW.read_text(encoding="utf-8")
-    baseline, job = text[:BASELINE_WORKFLOW_BYTES], text[BASELINE_WORKFLOW_BYTES:]
+    baseline, job = text[:BASELINE_WORKFLOW_BYTES], _job_block(text, "host-lease-feasibility")
+    assert re.findall(r"^  ([A-Za-z0-9_-]+):\n", text, re.M).count("host-lease-feasibility") == 1
     assert "\npermissions: {}\n" in text and "pull_request_target" not in text and "secrets." not in text
     assert "inputs:" not in text and "workflow_dispatch: {}" in text
     for uses in re.findall(r"uses: (\S+)", text):
