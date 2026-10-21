@@ -125,10 +125,10 @@ the Linux proof job before review.** Results from macOS (kqueue) do not carry ov
 | G0 | Runtime/API compatibility in the real njs/qjs: pinned NFC tables (QuickJS lacks `normalize`), strict UTF-8 and the canonical JSON scanner |
 | G1 | The compiled Worker reaches CP only through the fixed binding destination with TLS name and Host H; no redirect following |
 | G2 | Management boundary: real session/Origin checks through nginx; wrong edge secret, peer, route or header class refused before CP |
-| G3 | Real pairing, exchange, approval, activation, context claim, projection submission, human run approval, claim with the unchanged grant verifier, heartbeat/progress/resync/restart, stop-ack, terminal result, registered rotation; repeated on SQLite |
+| G3 | Real pairing, exchange, approval, activation, context claim, projection submission, human run approval, claim with the unchanged grant verifier, heartbeat/progress/resync/restart, stop-ack, terminal result, registered rotation (slot b's claimed run is first ended by the same stop/stop-ack/terminal ceremony, since CP refuses rotation during an active run); repeated on SQLite |
 | G4 | TLS trust/name/SNI/Host/alias negatives; wrong runner key; forged grant from another key fails the unchanged verifier |
 | G5 | Cross-slot identity swaps, registry faults, phase gates; well-formed forgeries reach CP and fail without state change |
-| G6 | Invitation reuse, exact retained retries, mutated retries, stale and superseded requests |
+| G6 | Invitation reuse, exact retained retries, mutated retries (sequence/signature reach CP and fail; a mutated claim body is refused 403 at ingress with no CP contact), stale and superseded requests |
 | G7 | Raw HTTP: duplicates, folding, framing, encodings, targets and methods refused on the real wire without CP contact |
 | G8 | Caps and boundaries (including the carried 65,536 CP framing limit), truncated and extra bytes, slow headers, scripted response negatives; total deadlines: runner and management dribble refused at 10.0–10.5 s, body complete at 9 s forwarded and at 11 s refused, late body gives one response and no CP contact, eight held slots released by 10.5 s, slow upstream cut at 25.0–25.5 s with the backend seeing EOF before 26 s, a paced in-budget reply delivered unchanged, mixed expiring and valid load |
 | G9 | No sibling/CP/management reach from a slot, no default route, runner processes without capabilities, ingress worker PID unchanged across the whole module, owned processes and namespaces removed; with both module environments closed the only live processes in the launcher's PID namespace are pytest and its PPID-chain ancestors |
@@ -183,6 +183,28 @@ after cleanup.
   `NGX_HAVE_EPOLL 1` or `NGX_HAVE_EPOLL 0` from the built `objs/ngx_auto_config.h`.
   `summary.json` timings carry `inner_pytest` (pytest wall time inside the namespace) separately
   from `privileged_child` (the whole privileged child, including fingerprints and cleanup).
+- **Connection-cap timing telemetry (H0BR2, diagnostic).** Before any assertion of the eight-slot
+  cap gate, the separate case `g8.listener_connection_cap_timing` carries one optional `telemetry`
+  object; `g8.listener_connection_cap` itself is still written only on success. The object has
+  exactly these keys, each a plain integer in a fixed range: `holds` (0–8), `holds_unmeasured`
+  (0–8: no finite send mark or first byte, or a delta outside ±120 s), `holds_early` and
+  `holds_late` (0–8: unrounded delta below 10.0 s or above 10.5 s, the asserted window),
+  `first_byte_ms_min` and `first_byte_ms_max` (−120000–120000, or `null` only when no hold was
+  measured), `probes` and `probes_503` (0–64) and `probes_admitted` (0–1). The delta is the first
+  response byte minus the client's existing send mark, which is taken *after* `sendall` returns,
+  so it is not the server's deadline origin and an early value is possible. The ms envelope is
+  floor(min)..ceil(max), so it never claims more than 1 ms precision. The launcher re-checks the
+  grammar (no bool, float, string, nesting, missing or unknown key; consistent counts) and
+  publishes `"telemetry": null` for anything else; case lines over 4,096 characters, non-JSON or
+  `NaN`/`Infinity` lines are dropped. Records without telemetry keep their seven fields. No
+  per-request timing, payload or identifier is published. `versions.txt` adds `cpu_count <n>` or
+  `cpu_count unavailable` as runner context, not as a cause.
+- **Unresolved: the cap gate's 408 timing on Linux.** Runs 39534930239 and 39540910899 failed
+  `test_g8_listener_connection_cap_holds_at_eight_and_releases_at_the_deadline` at the first-byte
+  window check after the fixed 408 refusal arrived. Whether that first byte was early or late
+  relative to the client mark is not established, and neither the kernel difference between the
+  runs nor CPU contention is a demonstrated cause. The thresholds are unchanged; the next exact-SHA
+  Linux run's telemetry is the confirmation input for any separately reviewed change.
 
 ## Limits
 

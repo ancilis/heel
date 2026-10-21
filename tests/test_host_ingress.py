@@ -505,6 +505,130 @@ def test_static_report_carries_a_failure_locator_for_every_failing_case(tmp_path
     assert "nginx_event_method(" in source[source.index("def stage_runtime("):source.index("def stage_python(")]
 
 
+def test_static_cap_timing_telemetry_is_closed_bounded_and_published_before_the_cap_assertions(tmp_path, monkeypatch):
+    """H0BR2: the G8 cap gate publishes aggregate hold timing (early and late) and probe counts in one
+    closed, optional telemetry object, before any cap assertion and without changing any threshold."""
+    launcher = _launcher()
+    assert launcher.TELEMETRY_RANGES == harness.CAP_TIMING_RANGES
+    assert launcher.TELEMETRY_NULLABLE == harness.CAP_TIMING_NULLABLE
+
+    def hold(sent, first, received=b""):
+        return {"received": received, "wall": {"sent": [sent], "first_byte": first, "closed": first}}
+
+    window = (BODY_READ_S, BODY_READ_S + SLACK_S)
+    # Early, inside, late by a sub-millisecond margin, late, and four holds without usable marks.
+    held = [hold(1000.0, 1009.9874), hold(1000.0, 1010.25), hold(1000.0, 1010.5004), hold(1000.0, 1011.75),
+            hold(1000.0, None), hold(None, 1010.2), hold(1000.0, float("nan")), {"error": "ConnectionRefusedError"}]
+    telemetry = harness.cap_timing(held, [(1001.5, 503), (1002.1, 503), (1011.6, 401)], *window)
+    assert telemetry == {"holds": 8, "holds_unmeasured": 4, "holds_early": 1, "holds_late": 2, "first_byte_ms_min": 9987,
+                         "first_byte_ms_max": 11750, "probes": 3, "probes_503": 2, "probes_admitted": 1}
+    # The integer envelope is floor/ceil: 10.5004 s is late and must not round into the window as 10500.
+    edge = harness.cap_timing([hold(1000.0, 1010.5004)], [], *window)
+    assert (edge["first_byte_ms_min"], edge["first_byte_ms_max"], edge["holds_late"]) == (10500, 10501, 1)
+    unusable = harness.cap_timing([hold(True, 1010.0), hold(1000.0, float("inf")), hold(0.0, 1000.0), hold("1000", 1010.0)],
+                                  [(1.0, 503)], *window)
+    assert unusable == {"holds": 4, "holds_unmeasured": 4, "holds_early": 0, "holds_late": 0, "first_byte_ms_min": None,
+                        "first_byte_ms_max": None, "probes": 1, "probes_503": 1, "probes_admitted": 0}
+    for value in (telemetry, edge, unusable):
+        assert harness.cap_timing_valid(value) and launcher.sanitize_telemetry(value) == value
+
+    # The writer refuses anything outside the grammar; old records keep their exact fields.
+    canary = "edge-" + "q" * 40
+    raw = tmp_path / "cases.raw.jsonl"
+    monkeypatch.setenv("HEEL_HOST_INGRESS_CASES", str(raw))
+    harness.record_case("g8.listener_connection_cap", "G8")
+    harness.record_case("g8.listener_connection_cap_timing", "G8", telemetry=telemetry)
+    invalid = [dict(telemetry, holds=True), dict(telemetry, probes=3.0), dict(telemetry, holds_late="2"),
+               dict(telemetry, extra=1), {key: value for key, value in telemetry.items() if key != "probes"},
+               dict(telemetry, probes_503={"n": 2}), dict(telemetry, probes_503=[2]), dict(telemetry, first_byte_ms_max=10 ** 30),
+               dict(telemetry, first_byte_ms_min=-120001), dict(telemetry, first_byte_ms_min=12000),
+               dict(telemetry, holds_unmeasured=8), dict(telemetry, first_byte_ms_min=None), dict(telemetry, holds_early=4),
+               dict(telemetry, probes_admitted=2), dict(telemetry, holds=9, holds_unmeasured=5),
+               dict(telemetry, first_byte_ms_max=float("inf")), dict(telemetry, probes=canary), [telemetry], None]
+    for value in invalid:
+        assert not harness.cap_timing_valid(value) and launcher.sanitize_telemetry(value) is None, value
+        if isinstance(value, dict):
+            with pytest.raises(AssertionError):
+                harness.record_case("g8.invalid", "G8", telemetry=value)
+    assert raw.read_text(encoding="utf-8").splitlines() == [
+        '{"case": "g8.listener_connection_cap", "gate": "G8", "seam": null}',
+        '{"case": "g8.listener_connection_cap_timing", "gate": "G8", "seam": null, "telemetry": ' + json.dumps(telemetry, sort_keys=True) + "}"]
+
+    # The launcher re-checks every line: secrets, paths, nesting, NaN, huge values and oversize lines never publish.
+    old = ['{"case": "g6.claim_mutated_sequence", "changed_tables": [], "cp_contacted": true, "gate": "G6", "reasons": '
+           '["admitted:claim", "forwarded:claim:401"], "seam": null, "status": 401}',
+           '{"case": "g3.terminal_result", "changed_tables": [], "cp_contacted": null, "gate": "G3", "reasons": [], '
+           '"seam": "runner-built result, no executor", "status": null}']
+    hostile = [
+        json.dumps({"case": "g8.t1", "gate": "G8", "telemetry": dict(telemetry, holds="/home/runner/work")}),
+        json.dumps({"case": "g8.t2", "gate": "G8", "telemetry": dict(telemetry, **{"Bearer x": 1})}),
+        json.dumps({"case": "g8.t3", "gate": "G8", "telemetry": {"nested": telemetry}}),
+        json.dumps({"case": "g8.t4", "gate": "G8", "telemetry": dict(telemetry, probes=canary)}),
+        json.dumps({"case": "g8.t5", "gate": "G8", "telemetry": dict(telemetry, probes=True)}),
+        json.dumps({"case": "g8.t6", "gate": "G8", "telemetry": dict(telemetry, holds_late=2.0)}),
+        json.dumps({"case": "g8.t7", "gate": "G8", "telemetry": dict(telemetry, probes=int("9" * 3000))}),
+        json.dumps({"case": "g8.t8", "gate": "G8", "telemetry": dict(telemetry, probes=float("nan"))}),
+        json.dumps({"case": "g8.t9", "gate": "G8", "telemetry": telemetry, "extra": "secret"}),
+        json.dumps({"case": "g8.t10", "gate": "G8", "seam": "x" * 5000}),
+        "[" * 2040 + "]" * 2040, "not json", json.dumps(["g8.t11"]), json.dumps({"case": 7, "gate": "G8"}),
+        json.dumps({"case": "g8.t12", "gate": ["G8"], "reasons": 5, "changed_tables": {"canary_runs": 1}}),
+    ]
+    with raw.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(old + hostile) + "\n")
+    published = launcher.sanitize_cases(raw)
+    base = {"status": None, "cp_contacted": None, "reasons": [], "changed_tables": [], "seam": None}
+    assert published == [
+        {"case": "g8.listener_connection_cap", "gate": "G8", **base},
+        {"case": "g8.listener_connection_cap_timing", "gate": "G8", **base, "telemetry": dict(sorted(telemetry.items()))},
+        json.loads(old[0]), json.loads(old[1]),
+        *[{"case": f"g8.t{index}", "gate": "G8", **base, "telemetry": None} for index in range(1, 8)],
+        {"case": "g8.t12", "gate": "?", **base},
+    ]
+    assert [json.dumps(case, sort_keys=True) for case in published[2:4]] == old
+    out = tmp_path / "artifacts"
+    out.mkdir()
+    (out / "cases.jsonl").write_text("".join(json.dumps(case, sort_keys=True) + "\n" for case in published))
+    data = (out / "cases.jsonl").read_bytes()
+    assert launcher.canary_scan(out, [canary]) == []
+    for private in (canary, "/home/runner", "Bearer", "secret", "NaN", "Infinity", "nested", "999"):
+        assert private.encode() not in data, private
+    assert max(len(line) for line in data.splitlines()) <= 512
+
+    # Evidence first: the timing record is written although the late hold then fails the unchanged window.
+    late = hold(1000.0, 1010.75, b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 27\r\n\r\n" + FIXED_REFUSAL)
+    order = tmp_path / "order.jsonl"
+    monkeypatch.setenv("HEEL_HOST_INGRESS_CASES", str(order))
+    harness.record_case("g8.listener_connection_cap_timing", "G8", telemetry=harness.cap_timing([late], [], *window))
+    with pytest.raises(AssertionError):
+        _assert_fixed_refusal_at(late, 408, BODY_READ_S)
+    (record,) = launcher.sanitize_cases(order)
+    assert (record["telemetry"]["holds_late"], record["telemetry"]["first_byte_ms_max"]) == (1, 10750)
+    module = Path(__file__).read_text(encoding="utf-8")
+    cap = module[module.index("\ndef test_g8_listener_connection_cap_holds_at_eight"):module.index("\ndef test_g8_mixed_load_of")]
+    evidence = cap.index('harness.record_case("g8.listener_connection_cap_timing", "G8",')
+    assert "assert " not in cap[:evidence] and cap.index("held = [future.result() for future in holds]") < evidence
+    for kept in ("assert [status for _sent, status in probes if status not in {401, 503}] == []",
+                 "_assert_fixed_refusal_at(result, 408, BODY_READ_S)", "assert any(status == 503 for _sent, status in probes)",
+                 "assert all(status == 503 for sent, status in probes if sent < min(starts) + BODY_READ_S - SLACK_S)",
+                 "assert admitted_at is not None and admitted_at - max(starts) <= BODY_READ_S + SLACK_S, admitted_at",
+                 'assert after["requests"] - before["requests"] == 1', "== [401] * 8", "_assert_worker_unchanged(world)"):
+        assert kept in cap[evidence:], kept
+    assert "pool.submit(_hold, world, raw, split) for _ in range(8)]" in cap
+    assert cap.rstrip().endswith('harness.record_case("g8.listener_connection_cap", "G8")')
+
+    # Every existing threshold is unchanged; the CPU count is an int or a fixed "unavailable".
+    assert (BODY_READ_S, TOTAL_BUDGET_S, SLACK_S) == (10.0, 25.0, 0.5)
+    helper = module[module.index("\ndef _assert_fixed_refusal_at("):module.index("\ndef _assert_worker_unchanged(")]
+    assert "assert first is not None and seconds <= first - t0 <= seconds + SLACK_S, first - t0" in helper
+    assert "assert closed is not None and closed - t0 <= seconds + SLACK_S, (closed or 0) - t0" in helper
+    assert "limit_conn heel_listeners 8;" in TEMPLATE.read_text(encoding="utf-8")
+    assert launcher.cpu_count_line(lambda: 4) == "cpu_count 4"
+    for bad in (None, 0, -1, True, 4.0, "4", 10 ** 6):
+        assert launcher.cpu_count_line(lambda bad=bad: bad) == "cpu_count unavailable", bad
+    launcher_source = (ROOT / "scripts" / "host_ingress_proof.py").read_text(encoding="utf-8")
+    assert launcher_source.count("cpu_count_line()") == 1 and 'f"platform {sys.platform}", cpu_count_line()]' in launcher_source
+
+
 # ---------------------------------------------------------------------------------------------
 # Runtime fixtures.
 
@@ -1235,12 +1359,16 @@ def test_g6_mutated_claim_retries_fail_without_a_second_action(world):
     mutated_sequence = dict(entry["headers"], **{"X-Heel-Runner-Sequence": "999"})
     mutated_signature = dict(entry["headers"], **{"X-Heel-Runner-Signature": base64.b64encode(b"z" * 64).decode()})
     mutated_body = base64.b64encode(b'{"schema_version":"heel.runner-claim-request.v2"}').decode()
-    for label, kwargs in (("sequence", {"headers": mutated_sequence}), ("signature", {"headers": mutated_signature}),
-                          ("body", {"body_b64": mutated_body})):
+    for label, kwargs in (("sequence", {"headers": mutated_sequence}), ("signature", {"headers": mutated_signature})):
         observation = harness.observe(world.env, lambda kwargs=kwargs: send(**kwargs))
         assert observation.status in {400, 401, 409}, (label, observation.status)
         assert observation.changed_tables == [], label
         harness.record_case(f"g6.claim_mutated_{label}", "G6", observation)
+    # The only admissible claim body is the v1 literal: the reviewed policy refuses a mutated body at
+    # ingress (403 identity) before any CP contact. Recorded first, so a failure still carries its status.
+    observation = harness.observe(world.env, lambda: send(body_b64=mutated_body))
+    harness.record_case("g6.claim_mutated_body", "G6", observation)
+    assert observation.status == 403 and not observation.cp_contacted and observation.changed_tables == [], observation.status
     mutated_key = dict(entry["headers"], **{"X-Heel-Runner-Key-Id": world.state["b"].runner_key_id})
     observation = harness.observe(world.env, lambda: send(headers=mutated_key))
     assert observation.status == 403 and not observation.cp_contacted
@@ -1657,10 +1785,16 @@ def test_g8_listener_connection_cap_holds_at_eight_and_releases_at_the_deadline(
             probes.append((result["wall"]["sent"][0], status))
             if status == 401:
                 admitted_at = result["wall"]["sent"][0]
+            elif status != 503:
+                break  # asserted below, after the timing evidence is published
             else:
-                assert status == 503, status
                 clock.sleep(0.5)
         held = [future.result() for future in holds]
+    # H0BR2 diagnostic (separate case; g8.listener_connection_cap below stays success-only): aggregate
+    # first-byte-minus-send-mark envelope of the eight holds and probe counts, before any cap assertion.
+    harness.record_case("g8.listener_connection_cap_timing", "G8",
+                        telemetry=harness.cap_timing(held, probes, BODY_READ_S, BODY_READ_S + SLACK_S))
+    assert [status for _sent, status in probes if status not in {401, 503}] == []
     starts = [result["wall"]["sent"][0] for result in held]
     for result in held:
         _assert_fixed_refusal_at(result, 408, BODY_READ_S)
@@ -1746,15 +1880,43 @@ def test_g3_runner_signed_terminal_result_is_accepted_by_cp(world):
     harness.record_case("g3.terminal_result", "G3", seam="runner-built result, no executor")
 
 
+def _end_slot_b_run(world) -> None:
+    """Slot b's run is still claimed (test_g3_second_slot_pairs_and_claims_independently), and CP refuses
+    rotation while a run is claimed, running, stopping or finalizing. End it through the same owner stop ->
+    runner stop-ack -> signed terminal result ceremony as slot a's run above, then restore the registry phase."""
+    env, paired = world.env, world.state["b"]
+    base, run_id = world.state["base_b"], world.state["submitted_b"]["run_id"]
+    dashboard = world.flows.owner("GET", f"{base}/canary-runs/{run_id}", None, paired.cookie)
+    stopped = harness.observe(env, lambda: world.flows.owner(
+        "POST", f"{base}/canary-runs/{run_id}/stop",
+        {"schema_version": "heel.canary-stop-request.v1", "reason_code": "operator_requested"}, paired.cookie,
+        headers={"If-Heel-Control-Generation": str(dashboard["body"]["approval_control_generation"])}))
+    harness.record_case("g3.stop_b", "G3", stopped)
+    assert stopped.status in {200, 201, 202}, stopped.status
+    paired.runner.call("heartbeat", timeout=60)
+    ack = paired.runner.call("stop_ack", timeout=60)
+    assert ack["ok"] and ack["accepted"] is True, ack.get("error")
+    env.registry.set_phase(paired.slot, "stopping")
+    harness.record_case("g3.stop_ack_b", "G3")
+    terminal = harness.observe(env, lambda: paired.runner.call("terminal_result", timeout=60, disposition="stopped"))
+    harness.record_case("g3.terminal_result_b", "G3", terminal, seam="runner-built result, no executor")
+    assert terminal.result["ok"] and terminal.status == 200, (terminal.result.get("error"), terminal.status)
+    env.registry.set_phase(paired.slot, "active")
+
+
 def test_g3_registered_rotation_swaps_keys_and_the_old_key_fails(world):
     _two_slots(world)
+    _end_slot_b_run(world)
     env, flows, paired = world.env, world.flows, world.state["b"]
     keys = paired.runner.call("rotation_keys")
-    started = flows.owner("POST", f"/v1/workspaces/{paired.workspace_id}/runners/{paired.runner_id}/rotate", {
-        "schema_version": "heel.runner-rotation-start.v1", "previous_fingerprint": keys["old_fingerprint"],
-        "public_key_b64": keys["public_key_b64"], "pairing_phrase": paired.pairing_phrase,
-        "runner_version": "1.2.0", "adapters": {},
-    }, paired.cookie)
+    observed = harness.observe(env, lambda: flows.owner(
+        "POST", f"/v1/workspaces/{paired.workspace_id}/runners/{paired.runner_id}/rotate", {
+            "schema_version": "heel.runner-rotation-start.v1", "previous_fingerprint": keys["old_fingerprint"],
+            "public_key_b64": keys["public_key_b64"], "pairing_phrase": paired.pairing_phrase,
+            "runner_version": "1.2.0", "adapters": {},
+        }, paired.cookie))
+    harness.record_case("g3.rotation_start", "G3", observed)
+    started = observed.result
     assert started["status"] == 201, started["status"]
     rotation_id = started["body"]["pairing_id"]
     approved = flows.owner("POST", f"/v1/workspaces/{paired.workspace_id}/runners/{paired.runner_id}/rotations/{rotation_id}/approve",
