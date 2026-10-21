@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
+import crypto from "node:crypto";
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import type { AddressInfo } from "node:net";
+import os from "node:os";
+import path from "node:path";
+import tls from "node:tls";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 
 vi.mock("vinext/server/image-optimization", () => ({
@@ -499,5 +506,223 @@ describe("canonical control-plane binding destination", () => {
     expect(fetcher).not.toHaveBeenCalled();
     expect(globalFetch).not.toHaveBeenCalled();
     vi.mocked(handleImageOptimization).mockReset();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// H0B: the harness's fake VPC adapter (SEAM-FAKE-VPC, not Cloudflare/workerd) over real TLS. The
+// adapter block is read byte-for-byte from tests/support/host_ingress_harness.py and hash-pinned
+// here and in tests/test_host_ingress.py, so the Python ingress proof and this suite run the same
+// adapter. Certificates are minted per run from node:crypto keys; no key material is tracked.
+
+const ADAPTER_BLOCK_SHA256 = "e019d0314bf4f08b5c13d9b1909a65286ef5b6b150b12ad1e5f13d3600709c64";
+
+function der(tag: number, ...parts: Buffer[]): Buffer {
+  const body = Buffer.concat(parts);
+  const length = body.length < 0x80 ? [body.length]
+    : body.length < 0x100 ? [0x81, body.length] : [0x82, body.length >> 8, body.length & 0xff];
+  return Buffer.concat([Buffer.from([tag, ...length]), body]);
+}
+const seq = (...parts: Buffer[]) => der(0x30, ...parts);
+const octets = (value: Buffer) => der(0x04, value);
+const bits = (value: Buffer, unused = 0) => der(0x03, Buffer.from([unused]), value);
+const TRUE = der(0x01, Buffer.from([0xff]));
+function oid(dotted: string): Buffer {
+  const [first, second, ...rest] = dotted.split(".").map(Number);
+  const bytes = [first * 40 + second];
+  for (const arc of rest) {
+    const chunk = [arc & 0x7f];
+    for (let value = arc >> 7; value > 0; value >>= 7) chunk.unshift((value & 0x7f) | 0x80);
+    bytes.push(...chunk);
+  }
+  return der(0x06, Buffer.from(bytes));
+}
+const commonName = (name: string) => seq(der(0x31, seq(oid("2.5.4.3"), der(0x0c, Buffer.from(name)))));
+const utcTime = (date: Date) => der(0x17, Buffer.from(date.toISOString().replace(/[-:T]/g, "").slice(2, 14) + "Z"));
+const extension = (id: string, value: Buffer, critical = false) => seq(oid(id), ...(critical ? [TRUE] : []), octets(value));
+
+interface Minted { cert: string; key: string; publicKey: crypto.KeyObject; privateKey: crypto.KeyObject; ski: Buffer; name: string }
+
+function mint(name: string, { issuer, dns, ca = false }: { issuer?: Minted; dns?: string[]; ca?: boolean }): Minted {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const spki = publicKey.export({ type: "spki", format: "der" });
+  const ski = crypto.createHash("sha1").update(spki).digest();
+  const signer = issuer ?? { privateKey, ski, name };
+  const now = Date.now();
+  const extensions = [
+    extension("2.5.29.19", ca ? seq(TRUE) : seq(), true),
+    extension("2.5.29.15", ca ? bits(Buffer.from([0x06]), 1) : bits(Buffer.from([0x80]), 7), true),
+    extension("2.5.29.14", octets(ski)),
+    extension("2.5.29.35", seq(der(0x80, signer.ski))),
+    ...(dns ? [extension("2.5.29.17", seq(...dns.map((value) => der(0x82, Buffer.from(value))))),
+      extension("2.5.29.37", seq(oid("1.3.6.1.5.5.7.3.1")))] : []),
+  ];
+  const tbs = seq(
+    der(0xa0, der(0x02, Buffer.from([2]))), der(0x02, Buffer.concat([Buffer.from([0x01]), crypto.randomBytes(15)])),
+    seq(oid("1.2.840.10045.4.3.2")), commonName(signer.name),
+    seq(utcTime(new Date(now - 3_600_000)), utcTime(new Date(now + 86_400_000))), commonName(name), spki,
+    der(0xa3, seq(...extensions)),
+  );
+  const signature = crypto.sign("sha256", tbs, signer.privateKey);
+  const body = seq(tbs, seq(oid("1.2.840.10045.4.3.2")), bits(signature)).toString("base64").replace(/.{1,64}/g, "$&\n");
+  return { cert: `-----BEGIN CERTIFICATE-----\n${body}-----END CERTIFICATE-----\n`,
+    key: privateKey.export({ type: "pkcs8", format: "pem" }).toString(), publicKey, privateKey, ski, name };
+}
+
+interface Exchange { servername: string | false | null; raw: Buffer }
+
+// One raw HTTP/1.1-over-TLS peer standing where the ingress management listener would be.
+async function tlsPeer(leaf: Minted, reply: (head: string) => string) {
+  const exchanges: Exchange[] = [];
+  let connections = 0;
+  const server = tls.createServer({ cert: leaf.cert, key: leaf.key, minVersion: "TLSv1.2" }, (socket) => {
+    const chunks: Buffer[] = [];
+    socket.on("data", (chunk: Buffer) => {
+      chunks.push(chunk);
+      const raw = Buffer.concat(chunks);
+      const split = raw.indexOf("\r\n\r\n");
+      if (split < 0) return;
+      const head = raw.subarray(0, split).toString("latin1");
+      const declared = /\r\ncontent-length: ([0-9]+)/i.exec(head);
+      if (raw.length < split + 4 + (declared ? Number(declared[1]) : 0)) return;
+      exchanges.push({ servername: (socket as tls.TLSSocket).servername, raw });
+      socket.end(reply(head), "latin1");
+    });
+    socket.on("error", () => {});
+  });
+  server.on("connection", () => { connections += 1; });
+  server.on("tlsClientError", () => {});
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return { port, exchanges, connections: () => connections, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+
+type Adapter = { fetch: (request: Request) => Promise<Response>; observations: Record<string, unknown>[] };
+let createFakeVpcAdapter: (options: Record<string, unknown>) => Adapter;
+let authority: Minted;
+let primary: Minted;
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "heel-fake-vpc-"));
+
+beforeAll(() => {
+  // vitest runs from apps/heel-cloud (its config root); the harness sits at the repository root.
+  const harness = fs.readFileSync(path.resolve(process.cwd(), "../../tests/support/host_ingress_harness.py"), "utf8");
+  const begin = harness.indexOf("// BEGIN HEEL_FAKE_VPC_ADAPTER");
+  const endMarker = "// END HEEL_FAKE_VPC_ADAPTER";
+  const block = harness.slice(begin, harness.indexOf(endMarker) + endMarker.length) + "\n";
+  expect(begin).toBeGreaterThan(0);
+  expect(crypto.createHash("sha256").update(block).digest("hex")).toBe(ADAPTER_BLOCK_SHA256);
+  const file = path.join(scratch, "fake-vpc-adapter.mjs");
+  fs.writeFileSync(file, block);
+  // Loaded by Node itself (require of an ES module), exactly as the harness's Worker driver runs it.
+  ({ createFakeVpcAdapter } = createRequire(file)(file));
+  authority = mint("heel adapter test CA", { ca: true });
+  primary = mint("primary", { issuer: authority, dns: ["heel.example"] });
+});
+
+function adapterFor(port: number, ca = authority.cert) {
+  return createFakeVpcAdapter({ host: "heel.example", address: "127.0.0.1", port, ca, timeoutMs: 5000 });
+}
+
+// The CP's account replies carry its session cookie, which the Worker rewraps for the browser.
+const OK_REPLY = (head: string) => "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n"
+  + (head.startsWith("POST /v1/login ") ? "Set-Cookie: heel_session=private; HttpOnly; SameSite=Lax; Path=/\r\n" : "")
+  + "Connection: close\r\n\r\n{\"ok\":true}";
+
+describe("fake VPC adapter over real management TLS (SEAM-FAKE-VPC)", () => {
+  it("carries Worker requests unchanged to the fixed destination with TLS name and Host H", async () => {
+    const peer = await tlsPeer(primary, OK_REPLY);
+    try {
+      const adapter = adapterFor(peer.port);
+      const origin = "https://heel.example";
+      const routes = routeCases(origin).filter(({ label }) => label === "account me" || label === "account login");
+      const errors: string[] = [];
+      const binding = bindingSpy((request) => adapter.fetch(request).catch((error: Error) => {
+        errors.push(`${error.name}: ${error.message}`);
+        throw error;
+      }));
+      for (const route of routes) {
+        const noise = { ...destinationNoise, Origin: "https://attacker.invalid" };
+        const response = await worker.fetch(incoming("https://request-host.invalid", route, noise),
+          workerEnv(origin, binding), context);
+        expect(errors, route.label).toEqual([]);
+        expect(response.status, route.label).toBe(200);
+        expect(await response.text(), route.label).toBe("{\"ok\":true}");
+      }
+      expect(peer.exchanges).toHaveLength(2);
+      for (const [index, route] of routes.entries()) {
+        const { servername, raw } = peer.exchanges[index];
+        const split = raw.indexOf("\r\n\r\n");
+        const lines = raw.subarray(0, split).toString("latin1").split("\r\n");
+        expect(servername, route.label).toBe("heel.example");
+        expect(lines[0], route.label).toBe(`${route.method} ${route.path} HTTP/1.1`);
+        expect(lines.filter((line) => /^host:/i.test(line)), route.label).toEqual(["host: heel.example"]);
+        expect(lines.filter((line) => /^connection:/i.test(line)), route.label).toEqual(["connection: close"]);
+        expect(lines, route.label).toContain(`x-heel-edge-auth: ${edge}`);
+        for (const line of lines) expect(line, route.label).not.toMatch(/attacker\.invalid|^forwarded:|^x-forwarded-/i);
+        expect(raw.subarray(split + 4).toString("latin1"), route.label).toBe(route.body ?? "");
+        const observation = adapter.observations[index];
+        expect(observation).toMatchObject({ servername: "heel.example", remote: `127.0.0.1:${peer.port}`, authorized: true,
+          method: route.method, path: route.path });
+        expect(["TLSv1.2", "TLSv1.3"]).toContain(observation.protocol);
+      }
+      expectNoFallback();
+    } finally {
+      await peer.close();
+    }
+  });
+
+  it("refuses a peer certified by another CA or for another name before sending any request bytes", async () => {
+    const other = mint("other CA", { ca: true });
+    const cases: [string, Minted, string][] = [
+      ["wrong CA", mint("wrong-ca", { issuer: other, dns: ["heel.example"] }), authority.cert],
+      ["wrong name", mint("wrong-name", { issuer: authority, dns: ["other.example"] }), authority.cert],
+      ["valid leaf, untrusted by the adapter", primary, other.cert],
+    ];
+    for (const [label, leaf, ca] of cases) {
+      const peer = await tlsPeer(leaf, OK_REPLY);
+      try {
+        const adapter = adapterFor(peer.port, ca);
+        await expect(adapter.fetch(new Request("https://heel.example/v1/me", { redirect: "manual" })), label).rejects.toThrow();
+        expect(peer.exchanges, label).toHaveLength(0);
+        expect(adapter.observations, label).toHaveLength(0);
+      } finally {
+        await peer.close();
+      }
+    }
+  });
+
+  it("refuses a caller-shaped URL or a redirect-following request before any connection", async () => {
+    const peer = await tlsPeer(primary, OK_REPLY);
+    try {
+      const adapter = adapterFor(peer.port);
+      for (const url of ["https://attacker.invalid/v1/me", "https://heel.example/v1/me?x=1", "https://heel.example/v1/me#f",
+        "https://heel.example/api/control-plane/v1/me", "https://heel.example:8443/v1/me", "http://heel.example/v1/me"]) {
+        await expect(adapter.fetch(new Request(url, { redirect: "manual" })), url).rejects.toThrow(TypeError);
+      }
+      await expect(adapter.fetch(new Request("https://heel.example/v1/me"))).rejects.toThrow(TypeError);
+      await expect(adapter.fetch(new Request("https://heel.example/v1/me", { redirect: "manual", headers: { Connection: "keep-alive" } })))
+        .rejects.toThrow(TypeError);
+      expect(peer.connections()).toBe(0);
+    } finally {
+      await peer.close();
+    }
+  });
+
+  it("returns an upstream redirect to the Worker, which refuses it without a second request", async () => {
+    const peer = await tlsPeer(primary, () => "HTTP/1.1 302 Found\r\nLocation: https://attacker.invalid/\r\nContent-Length: 0\r\n\r\n");
+    try {
+      const adapter = adapterFor(peer.port);
+      const origin = "https://heel.example";
+      const route = routeCases(origin).find(({ label }) => label === "account me")!;
+      const response = await worker.fetch(incoming("https://heel.example", route),
+        workerEnv(origin, bindingSpy((request) => adapter.fetch(request))), context);
+      expect(response.status).toBe(502);
+      expect(response.headers.get("location")).toBeNull();
+      expect(peer.exchanges).toHaveLength(1);
+      expect(peer.connections()).toBe(1);
+      expectNoFallback();
+    } finally {
+      await peer.close();
+    }
   });
 });
