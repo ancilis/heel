@@ -1054,7 +1054,10 @@ def _probe_child(config: dict) -> None:
         # Wall-clock marks (comparable with the scripted backend's): when each chunk was sent, the
         # first response byte arrived and the peer closed. Reading interleaves with the send
         # schedule, so a response or close during a dribble is observed when it happens.
-        wall = result["wall"] = {"sent": [], "first_byte": None, "closed": None}
+        # H0BR3: integer time_ns() marks beside them on the same CLOCK_REALTIME as the policy's
+        # Date.now(); the send mark is taken before sendall, so it never trails the server's origin.
+        wall = result["wall"] = {"sent": [], "first_byte": None, "closed": None,
+                                 "sent_ns": [], "first_byte_ns": None, "closed_ns": None}
         received = bytearray()
         limit = config.get("max_bytes", 512 * 1024)
         deadline = None
@@ -1072,13 +1075,16 @@ def _probe_child(config: dict) -> None:
                     return True
                 except (ssl.SSLError, OSError) as error:
                     result["error"] = type(error).__name__
+                    wall["closed_ns"] = time.time_ns()
                     wall["closed"] = time.time()
                     return False
                 if not data:
                     result["peer_closed"] = True
+                    wall["closed_ns"] = time.time_ns()
                     wall["closed"] = time.time()
                     return False
                 if wall["first_byte"] is None:
+                    wall["first_byte_ns"] = time.time_ns()
                     wall["first_byte"] = time.time()
                 received.extend(data)
             return True
@@ -1092,12 +1098,16 @@ def _probe_child(config: dict) -> None:
                     time.sleep(delay_ms / 1000)
             if not open_ and not config.get("send_after_close"):
                 break
+            data = base64.b64decode(chunk)
+            sent_ns = time.time_ns()
             try:
-                sock.sendall(base64.b64decode(chunk))
+                sock.sendall(data)
                 wall["sent"].append(time.time())
+                wall["sent_ns"].append(sent_ns)
             except (ssl.SSLError, OSError) as error:
                 result["send_error"] = type(error).__name__
                 wall["sent"].append(None)
+                wall["sent_ns"].append(None)
                 if not config.get("send_after_close"):
                     break
         if config.get("shutdown_write"):
@@ -2008,9 +2018,16 @@ class IngressEnvironment:
         module.write_text(POLICY_SELFTEST_JS, encoding="utf-8")
         os.chmod(module, 0o644)
         self.selftest_port = self.ops[1] + 1
-        conf = (POLICY_SELFTEST_CONF.replace("@STATE@", str(directory))
-                .replace("@POLICY_DIR@", str(self.installation.root / "src" / "deploy" / "host" / "ingress"))
-                .replace("@SELFTEST_DIR@", str(directory)).replace("@PORT@", str(self.selftest_port)))
+        source = self.installation.root / "src" / "deploy" / "host" / "ingress"
+        # H0BR3: the scaled native body-idle backstop keeps the template's margin over the policy's
+        # body deadline (see body_idle_backstop_ms); never below 1 ms, so a lost margin stays testable.
+        margin = (body_idle_backstop_ms((source / "nginx.conf").read_text(encoding="utf-8"))
+                  - policy_body_read_ms((source / "policy.js").read_text(encoding="utf-8")))
+        self.selftest_backstop_ms = max(1, SELFTEST_BODY_BUDGET_MS + margin)
+        conf = (POLICY_SELFTEST_CONF.replace("@STATE@", str(directory)).replace("@POLICY_DIR@", str(source))
+                .replace("@SELFTEST_DIR@", str(directory)).replace("@PORT@", str(self.selftest_port))
+                .replace("@BACKSTOP_MS@", str(self.selftest_backstop_ms))
+                .replace("@BUDGET_MS@", str(SELFTEST_BODY_BUDGET_MS)))
         conf_path = directory / "selftest.conf"
         conf_path.write_text(conf, encoding="utf-8")
         os.chmod(conf_path, 0o644)
@@ -2246,18 +2263,27 @@ def observe(env: "IngressEnvironment", action: Callable[[], dict]) -> Observatio
 # Fixed, value-free case evidence (launcher-collected; never request/response material).
 _CASE_FIELDS = {"case", "gate", "status", "reasons", "cp_contacted", "changed_tables", "seam", "telemetry"}
 
-# H0BR2: the one optional telemetry object, aggregate integers only (the launcher re-checks the same
-# grammar). Holds: first byte minus the client's existing send mark (appended after sendall, so it is
-# not the server's deadline origin). The ms envelope is floor(min)..ceil(max) of the wall-clock deltas,
-# so it never claims more than 1 ms precision; early/late compare the unrounded deltas with the asserted
-# window. A hold without a finite send mark and first byte (or outside +-120 s) is counted unmeasured;
-# with no measured hold both envelope keys are None.
+# H0BR2/H0BR3: the one optional telemetry object, aggregate integers only (the launcher re-checks
+# the same grammar). Each hold is classified exactly as _assert_fixed_refusal_at checks its first
+# byte: early when the lower bound fails on Date.now()'s integer-millisecond grid (floor(first_ns)
+# minus floor(sent_ns), with the send mark taken before sendall); late when either unrounded upper
+# bound fails (the post-sendall float marks, or first_ns - sent_ns). first_byte_ms_min is the
+# smallest grid delta (the lower-bound domain, exact); first_byte_ms_max is the largest unrounded
+# pre-send delta rounded up, so a hold even 1 ns past the upper bound reads above it. A hold
+# without finite float marks and integer ns marks, or outside +-120 s, is counted unmeasured; with
+# no measured hold both envelope keys are None. The four deadline keys are deltas of the policy's
+# counters across the holds (sums of early:*, early_final:*, deadline_invalid:* and rearm_ms:*):
+# re-arms are expected staleness, the two anomaly keys must stay 0.
+NS_PER_MS = 1_000_000
 CAP_TIMING_RANGES = {
     "holds": (0, 8), "holds_unmeasured": (0, 8), "holds_early": (0, 8), "holds_late": (0, 8),
     "first_byte_ms_min": (-120000, 120000), "first_byte_ms_max": (-120000, 120000),
     "probes": (0, 64), "probes_503": (0, 64), "probes_admitted": (0, 1),
+    "early_fires": (0, 64), "early_final": (0, 8), "deadline_invalid": (0, 8), "rearm_ms": (0, 4000),
 }
 CAP_TIMING_NULLABLE = frozenset({"first_byte_ms_min", "first_byte_ms_max"})
+DEADLINE_COUNTERS = {"early_fires": "early:", "early_final": "early_final:", "deadline_invalid": "deadline_invalid:",
+                     "rearm_ms": "rearm_ms:"}
 
 
 def cap_timing_valid(value: object) -> bool:
@@ -2271,30 +2297,43 @@ def cap_timing_valid(value: object) -> bool:
     low, high = value["first_byte_ms_min"], value["first_byte_ms_max"]
     return (measured >= 0 and value["holds_early"] + value["holds_late"] <= measured
             and (low is None) == (high is None) == (measured == 0) and (low is None or low <= high)
-            and value["probes_503"] + value["probes_admitted"] <= value["probes"])
+            and value["probes_503"] + value["probes_admitted"] <= value["probes"]
+            and value["early_fires"] <= value["rearm_ms"] <= 500 * value["early_fires"])
 
 
-def cap_timing(held: list, probes: list, lower_s: float, upper_s: float) -> dict:
+def _counter_total(counters: object, prefix: str) -> int:
+    items = counters.items() if isinstance(counters, dict) else ()
+    return sum(value for key, value in items if isinstance(key, str) and key.startswith(prefix) and type(value) is int)
+
+
+def cap_timing(held: list, probes: list, lower_s: float, upper_s: float, counters_before: object,
+               counters_after: object) -> dict:
     """Aggregate, value-free timing of the connection-cap holds and probes (no per-request data)."""
-    deltas, envelope, unmeasured = [], [], 0
+    lower_ms, upper_ms = round(lower_s * 1000), round(upper_s * 1000)
+    grid, ceiling, early, late, unmeasured = [], [], 0, 0, 0
     for result in held:
         wall = (result.get("wall") if isinstance(result, dict) else None) or {}
         sent, first = (wall.get("sent") or [None])[0], wall.get("first_byte")
-        if not all(type(mark) in (int, float) and math.isfinite(mark) for mark in (sent, first)):
+        sent_ns, first_ns = (wall.get("sent_ns") or [None])[0], wall.get("first_byte_ns")
+        if not (all(type(mark) in (int, float) and math.isfinite(mark) for mark in (sent, first))
+                and type(sent_ns) is int and type(first_ns) is int):
             unmeasured += 1
             continue
-        delta = first - sent
-        low, high = math.floor(delta * 1000), math.ceil(delta * 1000)
+        low = first_ns // NS_PER_MS - sent_ns // NS_PER_MS
+        high = -((sent_ns - first_ns) // NS_PER_MS)
         if not (-120000 <= low and high <= 120000):
             unmeasured += 1
             continue
-        deltas.append(delta)
-        envelope += [low, high]
+        grid.append(low)
+        ceiling.append(high)
+        early += low < lower_ms
+        late += first - sent > upper_s or first_ns - sent_ns > upper_ms * NS_PER_MS
     statuses = [status for _sent, status in probes]
-    return {"holds": len(held), "holds_unmeasured": unmeasured,
-            "holds_early": sum(delta < lower_s for delta in deltas), "holds_late": sum(delta > upper_s for delta in deltas),
-            "first_byte_ms_min": min(envelope) if envelope else None, "first_byte_ms_max": max(envelope) if envelope else None,
-            "probes": len(statuses), "probes_503": statuses.count(503), "probes_admitted": statuses.count(401)}
+    return {"holds": len(held), "holds_unmeasured": unmeasured, "holds_early": early, "holds_late": late,
+            "first_byte_ms_min": min(grid) if grid else None, "first_byte_ms_max": max(ceiling) if ceiling else None,
+            "probes": len(statuses), "probes_503": statuses.count(503), "probes_admitted": statuses.count(401),
+            **{key: _counter_total(counters_after, prefix) - _counter_total(counters_before, prefix)
+               for key, prefix in DEADLINE_COUNTERS.items()}}
 
 
 def record_case(case: str, gate: str, observation: "Observation | None" = None, *, seam: str | None = None,
@@ -2388,6 +2427,26 @@ def embedded_nfc_block(policy_text: str) -> str:
     return policy_text[begin:end]
 
 
+# H0BR3: nginx's own client_body_timeout ends a quiet body read with a reset and no fixed refusal,
+# keyed from the same stale cached clock as the policy's deadline timer. The selftest runs the
+# policy's deadline at SELFTEST_BODY_BUDGET_MS behind a native backstop with the template's margin.
+SELFTEST_BODY_BUDGET_MS = 200
+
+
+def body_idle_backstop_ms(template: str) -> int:
+    """The template's one client_body_timeout (whole seconds), in milliseconds."""
+    code = re.sub(r"#[^\n]*", "", template)
+    values = re.findall(r"^    client_body_timeout ([1-9][0-9]{0,2})s;$", code, re.M)
+    if len(values) != 1 or code.count("client_body_timeout") != 1:
+        raise ValueError("the template must set client_body_timeout exactly once, in whole seconds")
+    return int(values[0]) * 1000
+
+
+def policy_body_read_ms(policy: str) -> int:
+    (value,) = re.findall(r"^const BODY_READ_MS = ([1-9][0-9]{0,5});$", policy, re.M)
+    return int(value)
+
+
 # A test-only njs module run by the real nginx/njs/qjs runtime: it calls the reviewed policy's own
 # exported helpers on supplied bytes. It is never part of the ingress configuration.
 POLICY_SELFTEST_JS = r"""
@@ -2436,7 +2495,137 @@ function runtime(r) {
     }));
 }
 
-export default { nfc, canonical, runtime };
+// H0BR3: JSON cannot carry every value the deadline helpers must refuse; {"special": name} and
+// {"string": text} stand for them.
+const SPECIALS = { nan: NaN, infinity: Infinity, minus_infinity: -Infinity, undefined: undefined, minus_zero: -0 };
+
+function value(item) {
+    if (item !== null && typeof item === 'object' && !Array.isArray(item)) {
+        if (Object.prototype.hasOwnProperty.call(item, 'special')) return SPECIALS[item.special];
+        if (Object.prototype.hasOwnProperty.call(item, 'string')) return String(item.string);
+        if (Object.prototype.hasOwnProperty.call(item, 'object')) return {};
+    }
+    return item;
+}
+
+async function jsonBody(r) {
+    return JSON.parse(internal.decodeUtf8(await body(r)));
+}
+
+function reply(r, result) {
+    r.headersOut['Content-Type'] = 'application/json';
+    r.return(200, JSON.stringify(result));
+}
+
+// Rows of [now, origin, budget] in; the policy's deadlineStart() result for each out.
+async function deadlineStart(r) {
+    const rows = await jsonBody(r);
+    reply(r, rows.map((row) => internal.deadlineStart(value(row[0]), value(row[1]), value(row[2]))));
+}
+
+// Rows of [now, due, extended, rearms] in; the policy's deadlinePlan() result for each out.
+async function deadlinePlan(r) {
+    const rows = await jsonBody(r);
+    reply(r, rows.map((row) => internal.deadlinePlan(value(row[0]), value(row[1]), value(row[2]), value(row[3]))));
+}
+
+// The policy's own deadlineWith()/settle() under a scripted clock and scheduler (no native timer):
+// "fire" runs the oldest pending timer's callback, "settle" calls settle(). The trace records every
+// clock read, arm (delay), cancel (and the cancelled timer's state), count, refusal and outcome.
+async function deadlineScript(r) {
+    const input = await jsonBody(r);
+    const clock = input.clock.map(value);
+    const trace = [];
+    const timers = [];
+    let reads = 0;
+    const env = {
+        now: () => { const at = reads; reads += 1; trace.push(['now', at]); return clock[at]; },
+        arm: (callback, ms) => { timers.push({ callback: callback, state: 'pending' }); trace.push(['arm', timers.length, ms]); return timers.length; },
+        cancel: (id) => {
+            const timer = timers[id - 1];
+            trace.push(['cancel', id, timer ? timer.state : 'unknown']);
+            if (timer && timer.state === 'pending') timer.state = 'cancelled';
+        },
+        count: (name, by) => { trace.push(['count', name, by === undefined ? 1 : by]); },
+        refuse: (_request, status, reason) => { trace.push(['refuse', status, reason]); },
+    };
+    let d = null;
+    let start = 'armed';
+    try {
+        d = internal.deadlineWith(env, r, value(input.origin), value(input.budget), input.status, input.reason);
+    } catch (e) {
+        start = e instanceof internal.Refusal ? ['refused', e.status, e.reason] : ['error', String(e && e.message)];
+    }
+    for (const step of input.steps) {
+        if (step === 'fire') {
+            const index = timers.findIndex((timer) => timer.state === 'pending');
+            if (index < 0) {
+                trace.push(['fire', 0]);
+                continue;
+            }
+            timers[index].state = 'firing';
+            trace.push(['fire', index + 1]);
+            try {
+                timers[index].callback();
+                trace.push(['returned', index + 1]);
+            } catch (e) {
+                trace.push(['threw', index + 1, String(e && e.message)]);
+            }
+            timers[index].state = 'fired';
+        } else if (step === 'settle' && d !== null) {
+            trace.push(['settled', internal.settle(d)]);
+        }
+    }
+    reply(r, { start: start, trace: trace, state: d === null ? null : { fired: d.fired, rearms: d.rearms, extended: d.extended } });
+}
+
+// js_access: the policy's deadlineWith()/settle() with the real njs timers and the real request
+// body read, as runnerAccess uses them, but a scripted clock (args.clock: comma-separated integers
+// or "nan"). Every step is counted in the selftest zone under args.token.
+async function deadlineNative(r) {
+    const zone = ngx.shared.selftest;
+    const token = String(r.args.token);
+    const clock = String(r.args.clock).split(',').map((item) => (item === 'nan' ? NaN : Number(item)));
+    let reads = 0;
+    const mark = (name, by) => { zone.incr(token + ':' + name, by === undefined ? 1 : by, 0); };
+    const env = {
+        now: () => { reads += 1; mark('now'); return clock[reads - 1]; },
+        arm: (callback, ms) => { mark('arm'); return setTimeout(callback, ms); },
+        cancel: (id) => { mark('cancel'); clearTimeout(id); },
+        count: mark,
+        refuse: (request, status, _reason) => {
+            mark('refuse');
+            request.headersOut['Content-Type'] = 'application/json';
+            request.return(status, '{"error":"ingress refused"}');
+        },
+    };
+    try {
+        const d = internal.deadlineWith(env, r, Number(r.args.origin), Number(r.args.budget), 408, 'selftest');
+        try { await r.readRequestArrayBuffer(); } finally { if (internal.settle(d)) return; }
+        mark('proceeded');
+    } catch (e) {
+        mark(e instanceof internal.Refusal ? 'refused_sync' : 'error');
+        r.headersOut['Content-Type'] = 'application/json';
+        r.return(e instanceof internal.Refusal ? e.status : 500, '{"error":"ingress refused"}');
+    }
+}
+
+function proceeded(r) {
+    r.return(200, 'proceeded');
+}
+
+function deadlineCounts(r) {
+    const zone = ngx.shared.selftest;
+    const prefix = String(r.args.token) + ':';
+    const result = {};
+    for (const key of zone.keys(1024)) {
+        if (key.startsWith(prefix)) result[key.slice(prefix.length)] = zone.get(key);
+    }
+    result.worker_pid = process.pid;
+    reply(r, result);
+}
+
+export default { nfc, canonical, runtime, deadlineStart, deadlinePlan, deadlineScript, deadlineNative, proceeded, deadlineCounts };
 """
 
 POLICY_SELFTEST_CONF = """
@@ -2457,11 +2646,29 @@ http {
     client_body_buffer_size 16m;
     client_body_in_single_buffer on;
     client_body_temp_path @STATE@/body;
+    js_shared_dict_zone zone=selftest:256k type=number;
     server {
         listen 127.0.0.1:@PORT@;
         location = /nfc { js_content selftest.nfc; }
         location = /canonical { js_content selftest.canonical; }
         location = /runtime { js_content selftest.runtime; }
+        location = /deadline_start { js_content selftest.deadlineStart; }
+        location = /deadline_plan { js_content selftest.deadlinePlan; }
+        location = /deadline_script { js_content selftest.deadlineScript; }
+        location = /deadline_native { js_access selftest.deadlineNative; js_content selftest.proceeded; }
+        location = /deadline_backstop {
+            client_body_timeout @BACKSTOP_MS@ms;
+            reset_timedout_connection on;
+            js_access selftest.deadlineNative;
+            js_content selftest.proceeded;
+        }
+        location = /deadline_equal_backstop {
+            client_body_timeout @BUDGET_MS@ms;
+            reset_timedout_connection on;
+            js_access selftest.deadlineNative;
+            js_content selftest.proceeded;
+        }
+        location = /deadline_counts { js_content selftest.deadlineCounts; }
     }
 }
 """
