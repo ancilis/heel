@@ -72,6 +72,7 @@ REQUIRED_CASES = (
     "test_static_namespace_init_reaps_orphans_and_publishes_closed_leftover_records",
     "test_static_report_carries_a_failure_locator_for_every_failing_case",
     "test_static_cap_timing_telemetry_is_closed_bounded_and_published_before_the_cap_assertions",
+    "test_static_probe_marks_precede_sendall_and_every_maximum_stays_unrounded",
     "test_g0_runtime_has_no_native_normalize_and_policy_carries_pinned_tables",
     "test_g0_nfc_of_every_code_point_matches_the_pinned_unicodedata",
     "test_g0_nfc_of_composition_and_reordering_sequences_matches_the_pinned_unicodedata",
@@ -79,6 +80,10 @@ REQUIRED_CASES = (
     "test_g0_request_scanner_refuses_invalid_utf8",
     "test_g0_request_scanner_refuses_a_byte_order_mark",
     "test_g0_request_scanner_accepts_exactly_python_canonical_bytes",
+    "test_g0_deadline_planner_refuses_every_unusable_value_in_the_pinned_runtime",
+    "test_g0_deadline_lifecycle_under_a_scripted_clock_and_scheduler",
+    "test_g0_deadline_native_timers_cancel_rearm_and_expire_in_the_pinned_runtime",
+    "test_g0_native_body_idle_backstop_outlives_the_js_deadline_and_its_rearm_bound",
     "test_g3_owner_signup_and_runner_pairing_over_both_listeners",
     "test_g3_signed_context_list_claim_and_projection_submission",
     "test_g3_human_run_approval_then_claim_passes_the_unchanged_grant_verifier",
@@ -694,13 +699,15 @@ def summarize_junit(path: Path) -> dict:
 
 _CASE_KEYS = {"case", "gate", "status", "reasons", "cp_contacted", "changed_tables", "seam", "telemetry"}
 MAX_CASE_LINE = 4096
-# The one optional telemetry object (H0BR2, G8 connection-cap timing): exactly these keys, each a plain
-# int in its range (None only for the two envelope keys), plus the consistency rules below. Anything
-# else -- bool, float, string, nesting, a missing or unknown key -- publishes "telemetry": null.
+# The one optional telemetry object (H0BR2, G8 connection-cap timing; H0BR3 deadline counters):
+# exactly these keys, each a plain int in its range (None only for the two envelope keys), plus the
+# consistency rules below. Anything else -- bool, float, string, nesting, a missing or unknown key,
+# including an H0BR2-era object without the deadline keys -- publishes "telemetry": null.
 TELEMETRY_RANGES = {
     "holds": (0, 8), "holds_unmeasured": (0, 8), "holds_early": (0, 8), "holds_late": (0, 8),
     "first_byte_ms_min": (-120000, 120000), "first_byte_ms_max": (-120000, 120000),
     "probes": (0, 64), "probes_503": (0, 64), "probes_admitted": (0, 1),
+    "early_fires": (0, 64), "early_final": (0, 8), "deadline_invalid": (0, 8), "rearm_ms": (0, 4000),
 }
 TELEMETRY_NULLABLE = frozenset({"first_byte_ms_min", "first_byte_ms_max"})
 
@@ -716,7 +723,8 @@ def sanitize_telemetry(value) -> dict | None:
     low, high = value["first_byte_ms_min"], value["first_byte_ms_max"]
     if not (measured >= 0 and value["holds_early"] + value["holds_late"] <= measured
             and (low is None) == (high is None) == (measured == 0) and (low is None or low <= high)
-            and value["probes_503"] + value["probes_admitted"] <= value["probes"]):
+            and value["probes_503"] + value["probes_admitted"] <= value["probes"]
+            and value["early_fires"] <= value["rearm_ms"] <= 500 * value["early_fires"]):
         return None
     return {key: value[key] for key in sorted(TELEMETRY_RANGES)}
 
@@ -760,6 +768,15 @@ def cpu_count_line(cpu_count=os.cpu_count) -> str:
     """Hosted-runner context for timing evidence (not causality): the CPU count, or a fixed unavailable."""
     value = cpu_count()
     return f"cpu_count {value}" if type(value) is int and 1 <= value <= 4096 else "cpu_count unavailable"
+
+
+def time_clock_line(clock_info=time.get_clock_info) -> str:
+    """The probe clock (the staged venv copies this interpreter): one fixed literal, never runtime text."""
+    try:
+        implementation = clock_info("time").implementation
+    except Exception:  # noqa: BLE001 - any failure is the fixed unavailable line
+        implementation = None
+    return "time_clock CLOCK_REALTIME" if implementation == "clock_gettime(CLOCK_REALTIME)" else "time_clock unavailable"
 
 
 def report_lines(summary: dict, failure: str | None, cleanup: dict) -> list[str]:
@@ -825,7 +842,7 @@ def parent() -> int:
         os.chmod(scratch / "stage", 0o755)
         versions = runtime["nginx_version_lines"] + [runtime["event_method"], f"node {runtime['node_version']}",
                                                       f"python {python['python_version']}", f"kernel {os.uname().release}",
-                                                      f"platform {sys.platform}", cpu_count_line()]
+                                                      f"platform {sys.platform}", cpu_count_line(), time_clock_line()]
         build_manifest = {"nginx_sha256": runtime["nginx_sha256"], "verified_sources": runtime["verified_sources"],
                           "verified_tools": tools, "nginx_event_method": runtime["event_method"],
                           "wheels": python["wheels"], **{k: app[k] for k in ("dist_files", "dist_manifest_sha256", "server_index_sha256")}}

@@ -72,27 +72,52 @@ without persisted credentials, SHA-pinned actions, no inputs, secrets, environme
 ## Total deadlines and the njs 1.0.2 timer lifecycle
 
 nginx's `client_body_timeout` and `proxy_*_timeout` are idle timers; a 1 byte/s dribble never trips
-them. The policy therefore enforces totals itself:
+them. The policy therefore enforces totals itself (and `client_body_timeout` is only an 11 s idle
+backstop behind it, see "Native body-idle backstop" below):
 
 - body read: 10 s from the access handler's entry (runner listener and management POST);
 - validation plus upstream response: 25 s from the access handler's entry (runner listener).
 
-Both use one primitive (H0BTD section 5.1):
+Both use one primitive (H0BTD section 5.1, absolute due time from H0BR3). `deadline(r, origin,
+budget, status, reason)` calls `deadlineWith()` with the runtime clock and timers
+(`DEADLINE_RUNTIME`: `Date.now()`, `setTimeout`, `clearTimeout`, the counters and the fixed refusal);
+the policy selftest passes a scripted clock and scheduler to the same function. Abridged:
 
 ```js
-function deadline(r, ms, status, reason) {
-    const d = { fired: false, id: null };
-    d.id = setTimeout(() => {
+function deadlineWith(env, r, origin, budget, status, reason) {
+    const start = deadlineStart(env.now(), origin, budget);       // ['arm', delay] | ['due', 0] | ['invalid', 0]
+    if (start[0] !== 'arm') {                                       // synchronous, before any read or subrequest
+        if (start[0] === 'invalid') env.count('deadline_invalid:' + reason);
+        refuse(status, reason);
+    }
+    const due = origin + budget;
+    const d = { fired: false, id: null, extended: 0, rearms: 0, env: env };
+    const fire = () => {
+        let plan = deadlinePlan(env.now(), due, d.extended, d.rearms);   // due | rearm | bound | invalid
+        if (plan[0] === 'rearm') {
+            d.id = env.arm(fire, plan[1]);    // d.id names the pending timer before this callback returns
+            d.rearms += 1; d.extended += plan[1];
+            env.count('early:' + reason); env.count('rearm_ms:' + reason, plan[1]);
+            return;
+        }
         d.fired = true;
-        try { count('expired:' + reason); } catch (e) {}
-        try { sendRefusal(r, status, reason); } catch (e) {}
-        setTimeout(() => {}, 0);        // flush the posted terminate now
-        throw new Error('deadline');    // -> NGX_ERROR -> ngx_http_terminate_request
-    }, ms);
+        if (plan[0] !== 'due') env.count((plan[0] === 'bound' ? 'early_final:' : 'deadline_invalid:') + reason);
+        env.count('expired:' + reason);
+        env.refuse(r, status, reason);       // the fixed refusal
+        env.arm(() => {}, 0);                // flush the posted terminate now
+        throw new Error('deadline');         // -> NGX_ERROR -> ngx_http_terminate_request
+    };
+    d.id = env.arm(fire, start[1]);
     return d;
 }
-function settle(d) { if (!d.fired) clearTimeout(d.id); return d.fired; }
+function settle(d) { if (!d.fired) d.env.cancel(d.id); return d.fired; }
 ```
+
+(The source wraps each count, the refusal and the re-arm in `try`; a re-arm that cannot be armed
+refuses at once as `deadline_invalid`.) The origin is `Date.now()` at the access handler's entry,
+taken after nginx finished reading the header block; the content handler reuses that origin through
+`$heel_t0` (parsed strictly as a positive decimal) for the 25 s budget, so every due time is
+`origin + budget` on one clock and nothing is derived from a shorter remaining interval.
 
 and each awaited operation is wrapped as
 `try { x = await op; } finally { if (settle(d)) return; }`.
@@ -109,8 +134,84 @@ after its callback returns; `clearTimeout()` on that timer from the callback, or
 the callback runs (for example a `Promise.race` continuation), deletes it a second time and the
 worker dies with SIGSEGV. A dead worker never releases the `limit_conn` counts it held, so the
 listener then refuses every request. The previous candidate's `race()` helper did exactly this; it
-is deleted, and a static test allows `clearTimeout()` only inside `settle()` and forbids
-`Promise.race`.
+is deleted. A static test allows exactly one `clearTimeout()` (in `DEADLINE_RUNTIME.cancel`, called
+only from `settle()`) and one `setTimeout()` (its `arm`), forbids `Promise.race`, and pins the
+re-arm's `d.id` replacement before its `return` and the final order (fired flag, fixed refusal,
+zero-delay kick, throw). The G0 deadline cases exercise that lifecycle as behaviour (below).
+
+### Absolute due time and bounded re-arm (H0BR3)
+
+nginx keys a timer to `ngx_current_msec`, its cached, millisecond-truncated `CLOCK_MONOTONIC`
+reading, updated once per event-loop iteration (`timer_resolution` is unset). A `setTimeout(f, ms)`
+called late in a busy iteration is therefore keyed from a stale instant and can fire up to that
+staleness plus 1 ms before `ms` have passed since the policy's own `Date.now()` origin. The Linux
+cap gate measured four of eight holds 1–3 ms early (run 39547871512); how those milliseconds split
+between this server-side staleness and the then post-`sendall` client mark was not measured.
+
+The timer is now only a wake-up. Its callback reads `Date.now()` (the origin's clock, a
+`gettimeofday` reading floored to an integer millisecond): before `due` it re-arms for exactly
+`due − now` and returns normally; at or after `due` it refuses. Bounds: at most
+`DEADLINE_REARMS_MAX = 8` re-arms and `DEADLINE_SLACK_MS = 500` ms re-armed in total (the proof's
+only tolerance, `SLACK_S`), after which an early wake refuses at once and counts `early_final:<reason>`.
+The initial delay is `due − now` in `(0, budget]`; a re-arm is in `(0, 500]`; the kick is 0. Every
+value is checked to be a safe integer before any arithmetic or `setTimeout` (which would otherwise
+coerce `NaN` to 0 and wrap negatives modulo 2^32): a clock reading, origin, budget or counter that is
+not a safe non-negative integer in range, numeric strings, booleans, `null`, objects, fractions,
+`NaN`/`Infinity`, inconsistent counters, or a clock that reads before the origin all yield
+`invalid`. An invalid start refuses synchronously, before the body read or subrequest (arming a
+0 ms timer instead would let an already-complete body settle it first and proceed, which the G0
+native case checks); an invalid wake refuses at once. Both count `deadline_invalid:<reason>`,
+distinct from the ordinary `expired:<reason>`. There is no `$msec` or other cross-clock compensation
+and no padding: a deadline is extended only by the measured shortfall against its own due time.
+
+Clock assumptions, stated rather than assumed away: the host's `CLOCK_REALTIME` must not step
+during one request window (the origin, `$heel_t0` and the post-read belts already rely on this). A
+backward step before arming refuses as `invalid`; one after arming makes wakes early, which re-arm
+within the 500 ms bound and then refuse as `early_final`; a forward step makes the refusal early
+(fail-closed). Re-arming can delay a refusal past `due` by at most 500 ms of scheduled time; it is
+not a hard wall-clock guarantee under arbitrary process suspension, which only the real Linux gate's
+unchanged upper bounds measure. `early:<reason>` and `rearm_ms:<reason>` are diagnostics of the
+staleness (expected non-zero under load); `early_final:` and `deadline_invalid:` must never appear,
+and the G8 deadline gates and the G9 worker sentinel assert that.
+
+### Native body-idle backstop (H0BR3 amendment)
+
+`client_body_timeout` also guards a quiet body read, keyed from the same cached `ngx_current_msec` as
+the policy's timer (`ngx_http_request_body.c:346,438`). When it expires nginx finalizes the request
+with `NGX_HTTP_REQUEST_TIME_OUT`, terminates it without any response (`ngx_http_request_body.c:279-283`,
+`ngx_http_request.c:2688-2697`) and, with `reset_timedout_connection on`, resets the connection
+(`ngx_http_request.c:3955-3957`). At the former 10 s it expired together with the policy's first,
+possibly early wake; once that wake re-arms, nginx's timer ran first and the client got a reset with
+no fixed refusal (local run d00: four re-armed holds of the cap gate, four resets; reproduced
+deterministically in the pinned runtime). The template therefore sets `client_body_timeout 11s`, the
+smallest whole second above the policy's 10 s deadline plus its 0.5 s re-arm bound. Nothing else
+changes: the policy's 10 s total deadline is still the only bound the gates accept, every 10.5 s and
+25.5 s maximum is unchanged, and a request ended by the 11 s backstop (a reset with no fixed body)
+fails every deadline gate. The G0 case `test_g0_native_body_idle_backstop_outlives_the_js_deadline_and_its_rearm_bound`
+derives a scaled backstop from the template's margin and checks, in the pinned runtime, that the
+largest re-arm still refuses first, that a backstop equal to the deadline loses even a 1 ms re-arm
+(reset, no byte), and that the backstop never stands in for the deadline.
+
+### How the gates measure a deadline (H0BR3)
+
+The probe takes `time.time_ns()` immediately **before** `sendall` (CPython's `time.time_ns()` is
+`clock_gettime(CLOCK_REALTIME)`, the clock behind QuickJS's `Date.now()`; the Linux probes and
+nginx share it, no time namespace), keeps the existing float `time.time()` mark **after** `sendall`,
+and records integer ns and float marks for the first response byte (ns read first) and the close.
+`_assert_fixed_refusal_at` then checks:
+
+- lower bound, on `Date.now()`'s integer-millisecond grid:
+  `floor(first_ns / 1 ms) − floor(sent_ns / 1 ms) ≥ budget` (10000 or 25000). Because
+  `floor(sent_ns) ≤ origin` and the refusal is issued only at `Date.now() ≥ origin + budget`, this
+  holds by construction with no slack. It is a statement on the millisecond grid: a true interval
+  up to 1 ms shorter (for example 9999.000001 ms that straddles two grid lines) passes, exactly as
+  `Date.now()` itself cannot see sub-millisecond time;
+- upper bounds, unrounded: the existing post-`sendall` float checks, unchanged
+  (`first − t0 ≤ budget + 0.5 s`, `closed − t0 ≤ budget + 0.5 s`), **and**
+  `first_ns − sent_ns ≤ budget + 500 ms` and `closed_ns − sent_ns ≤ budget + 500 ms` in integer ns
+  from the pre-`sendall` mark (stricter by the `sendall` duration). No maximum is compared after
+  rounding: a reply 10.50005 s after the send whose floored-ms delta is 10500 fails.
+
 
 This primitive relies on pinned njs internals (timer handler order, exception to `NGX_ERROR`,
 zero-delay timer running posted requests). The runtime lock records that dependency. **Any change
@@ -122,7 +223,7 @@ the Linux proof job before review.** Results from macOS (kqueue) do not carry ov
 
 | Gate | Content |
 |---|---|
-| G0 | Runtime/API compatibility in the real njs/qjs: pinned NFC tables (QuickJS lacks `normalize`), strict UTF-8 and the canonical JSON scanner |
+| G0 | Runtime/API compatibility in the real njs/qjs: pinned NFC tables (QuickJS lacks `normalize`), strict UTF-8 and the canonical JSON scanner; the deadline planner's numeric validation, the deadline lifecycle under a scripted clock and scheduler (cancel before a wake, early wake then cancel of the re-armed timer, expiry after re-arms, the 8/500 ms bounds, invalid clock or state) and with the real njs timers and body read (pending cancel, re-arm then cancel, expiry after re-arm, synchronous refusal of an invalid start with the body already complete, one surviving worker); the native body-idle backstop outlives the deadline plus its re-arm bound and never replaces the fixed refusal |
 | G1 | The compiled Worker reaches CP only through the fixed binding destination with TLS name and Host H; no redirect following |
 | G2 | Management boundary: real session/Origin checks through nginx; wrong edge secret, peer, route or header class refused before CP |
 | G3 | Real pairing, exchange, approval, activation, context claim, projection submission, human run approval, claim with the unchanged grant verifier, heartbeat/progress/resync/restart, stop-ack, terminal result, registered rotation (slot b's claimed run is first ended by the same stop/stop-ack/terminal ceremony and the owner revokes slot b's context binding, since CP refuses rotation start during an active run and rotation activation while the old key holds an active binding); repeated on SQLite |
@@ -183,28 +284,38 @@ after cleanup.
   `NGX_HAVE_EPOLL 1` or `NGX_HAVE_EPOLL 0` from the built `objs/ngx_auto_config.h`.
   `summary.json` timings carry `inner_pytest` (pytest wall time inside the namespace) separately
   from `privileged_child` (the whole privileged child, including fingerprints and cleanup).
-- **Connection-cap timing telemetry (H0BR2, diagnostic).** Before any assertion of the eight-slot
-  cap gate, the separate case `g8.listener_connection_cap_timing` carries one optional `telemetry`
-  object; `g8.listener_connection_cap` itself is still written only on success. The object has
-  exactly these keys, each a plain integer in a fixed range: `holds` (0–8), `holds_unmeasured`
-  (0–8: no finite send mark or first byte, or a delta outside ±120 s), `holds_early` and
-  `holds_late` (0–8: unrounded delta below 10.0 s or above 10.5 s, the asserted window),
-  `first_byte_ms_min` and `first_byte_ms_max` (−120000–120000, or `null` only when no hold was
-  measured), `probes` and `probes_503` (0–64) and `probes_admitted` (0–1). The delta is the first
-  response byte minus the client's existing send mark, which is taken *after* `sendall` returns,
-  so it is not the server's deadline origin and an early value is possible. The ms envelope is
-  floor(min)..ceil(max), so it never claims more than 1 ms precision. The launcher re-checks the
-  grammar (no bool, float, string, nesting, missing or unknown key; consistent counts) and
-  publishes `"telemetry": null` for anything else; case lines over 4,096 characters, non-JSON or
-  `NaN`/`Infinity` lines are dropped. Records without telemetry keep their seven fields. No
-  per-request timing, payload or identifier is published. `versions.txt` adds `cpu_count <n>` or
-  `cpu_count unavailable` as runner context, not as a cause.
-- **Unresolved: the cap gate's 408 timing on Linux.** Runs 39534930239 and 39540910899 failed
-  `test_g8_listener_connection_cap_holds_at_eight_and_releases_at_the_deadline` at the first-byte
-  window check after the fixed 408 refusal arrived. Whether that first byte was early or late
-  relative to the client mark is not established, and neither the kernel difference between the
-  runs nor CPU contention is a demonstrated cause. The thresholds are unchanged; the next exact-SHA
-  Linux run's telemetry is the confirmation input for any separately reviewed change.
+- **Connection-cap timing telemetry (H0BR2, extended in H0BR3; diagnostic).** Before any
+  assertion of the eight-slot cap gate, the separate case `g8.listener_connection_cap_timing`
+  carries one optional `telemetry` object; `g8.listener_connection_cap` itself is still written only
+  on success. The object has exactly these keys, each a plain integer in a fixed range: `holds`
+  (0–8), `holds_unmeasured` (0–8: missing or non-finite float marks, non-integer ns marks, or a
+  delta outside ±120 s), `holds_early` (0–8: the grid lower bound above fails), `holds_late` (0–8:
+  either unrounded first-byte upper bound above fails), `first_byte_ms_min` (the smallest grid delta,
+  exact in the lower-bound domain) and `first_byte_ms_max` (the largest pre-send ns delta rounded
+  **up** to a millisecond, so any overrun reads above 10500) (−120000–120000, or `null` only when no
+  hold was measured), `probes` and `probes_503` (0–64), `probes_admitted` (0–1), and four deltas of
+  the policy's counters across the holds: `early_fires` (0–64, sum of `early:*`), `rearm_ms`
+  (0–4000, sum of `rearm_ms:*`), `early_final` (0–8) and `deadline_invalid` (0–8). Consistency:
+  early plus late at most the measured holds, `probes_503 + probes_admitted ≤ probes`, and
+  `early_fires ≤ rearm_ms ≤ 500 × early_fires`. Each hold is classified with exactly the comparisons
+  `_assert_fixed_refusal_at` makes on its first byte (a static test checks agreement on the precision
+  edges); the close bound is asserted but not part of the telemetry. The cap gate asserts
+  `early_final == deadline_invalid == 0` right after writing the record. The launcher re-checks the
+  grammar (no bool, float, string, nesting, missing or unknown key, including an H0BR2-era nine-key
+  object; consistent counts) and publishes `"telemetry": null` for anything else; case lines over
+  4,096 characters, non-JSON or `NaN`/`Infinity` lines are dropped. Records without telemetry keep
+  their seven fields; deadline cases may now list `early:<reason>`/`rearm_ms:<reason>` among their
+  fixed counter `reasons`. No per-request timing, payload or identifier is published.
+  `versions.txt` adds `cpu_count <n>` or `cpu_count unavailable` as runner context, and the fixed
+  line `time_clock CLOCK_REALTIME` (the launcher interpreter, which the staged venv copies, reports
+  `clock_gettime(CLOCK_REALTIME)` for `time.time`) or `time_clock unavailable`; never runtime text.
+- **The cap gate's 408 timing on Linux (cycle 3).** Runs 39534930239, 39540910899 and 39547871512
+  failed `test_g8_listener_connection_cap_holds_at_eight_and_releases_at_the_deadline` at the
+  first-byte window; the last run's telemetry showed the refusals early (four of eight, 9997–10001 ms
+  after the post-`sendall` mark, none late). H0BR3 changes the deadline to the absolute due time
+  above and the probe's lower-bound mark to the pre-`sendall` ns mark, with every threshold, the cap
+  of eight and the refusal bytes unchanged. This is not established on Linux until a new exact-SHA
+  run passes; macOS developer runs are scratch evidence only.
 
 ## Limits
 

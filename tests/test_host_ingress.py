@@ -77,27 +77,46 @@ def _function(source: str, name: str) -> str:
 
 def test_static_policy_has_no_race_and_never_clears_a_fired_timer():
     """H0BTD: clearing a timer from its own firing callback (or a microtask it runs) deletes the
-    njs 1.0.2 timer event twice and kills the worker. Only settle() may clear, and only unfired."""
+    njs 1.0.2 timer event twice and kills the worker. Only settle() may clear, and only unfired.
+    H0BR3: a re-arm replaces d.id before its callback returns, the final refusal keeps the reviewed
+    order, and an unusable start refuses before anything is armed. Behaviour: the G0 deadline cases."""
     code = _code(POLICY.read_text(encoding="utf-8"))
     assert "Promise.race" not in code and not re.search(r"\brace\(", code)
     settle = _function(code, "settle")
-    assert settle == "function settle(d) { if (!d.fired) clearTimeout(d.id); return d.fired; }\n"
-    assert code.count("clearTimeout(") == 1
-    deadline = _function(code, "deadline")
-    for required in ("d.fired = true;", "count('expired:' + reason);", "sendRefusal(r, status, reason);",
-                     "setTimeout(() => {}, 0);", "throw new Error('deadline');"):
-        assert required in deadline, required
-    assert deadline.index("d.fired = true;") < deadline.index("sendRefusal(") < deadline.index("setTimeout(() => {}, 0)")
-    assert code.count("setTimeout(") == 2  # the deadline timer and its zero-delay kick, nowhere else
+    assert settle == "function settle(d) { if (!d.fired) d.env.cancel(d.id); return d.fired; }\n"
+    runtime = code[code.index("const DEADLINE_RUNTIME = {"):]
+    assert runtime[:runtime.index("};\n") + 3] == (
+        "const DEADLINE_RUNTIME = {\n    now: () => Date.now(),\n    arm: (callback, ms) => setTimeout(callback, ms),\n"
+        "    cancel: (id) => clearTimeout(id),\n    count: count,\n    refuse: sendRefusal,\n};\n")
+    assert code.count("clearTimeout(") == 1 and code.count("setTimeout(") == 1 and code.count(".cancel(") == 1
+    assert _function(code, "deadline") == ("function deadline(r, origin, budget, status, reason) "
+                                           "{ return deadlineWith(DEADLINE_RUNTIME, r, origin, budget, status, reason); }\n")
+    core = _function(code, "deadlineWith")
+    assert core.count("env.arm(") == 3  # the wake-up, the one re-arm site and the zero-delay kick
+    assert core.index("refuse(status, reason);") < core.index("const fire = () => {") < core.index("d.id = env.arm(fire, start[1]);")
+    rearm = core[core.index("if (plan[0] === 'rearm') {"):core.index("d.fired = true;")]
+    assert rearm.index("d.id = env.arm(fire, plan[1]);") < rearm.index("return;")
+    final = core[core.index("d.fired = true;"):]
+    for required in ("env.count('expired:' + reason);", "env.refuse(r, status, reason);", "env.arm(() => {}, 0);",
+                     "throw new Error('deadline');"):
+        assert required in final, required
+    assert final.index("env.refuse(") < final.index("env.arm(() => {}, 0);") < final.index("throw new Error('deadline');")
     for handler, status in (("runnerAccess", 408), ("managementAccess", 408), ("runnerContent", 504)):
         body = _function(code, handler)
         assert body.startswith("async function"), handler
         assert body.count("deadline(r, ") == 1 and f", {status}, " in body, handler
         assert re.search(r"finally \{ if \(settle\(d\)\) return; \}", body), handler
-    assert "deadline(r, BODY_READ_MS, 408, 'body_timeout')" in _function(code, "runnerAccess")
-    assert "deadline(r, BODY_READ_MS, 408, 'body_timeout')" in _function(code, "managementAccess")
-    assert "deadline(r, remaining, 504, 'timeout')" in _function(code, "runnerContent")
+        assert body.index("deadline(r, ") < body.index("await r."), handler
+    assert "deadline(r, started, BODY_READ_MS, 408, 'body_timeout')" in _function(code, "runnerAccess")
+    assert "deadline(r, started, BODY_READ_MS, 408, 'body_timeout')" in _function(code, "managementAccess")
+    content = _function(code, "runnerContent")
+    assert "deadline(r, started, TOTAL_BUDGET_MS, 504, 'timeout')" in content
+    assert content.index("deadline(r, started,") < content.index("r.variables.heel_state = 'dispatch';")
+    assert "const started = /^[1-9][0-9]{0,15}$/.test(t0) ? Number(t0) : NaN;" in content and "remaining" not in content
+    assert "msec" not in code  # no cross-clock compensation from nginx's cached $msec
     assert "const BODY_READ_MS = 10000;" in code and "const TOTAL_BUDGET_MS = 25000;" in code
+    assert "const DEADLINE_SLACK_MS = 500;" in code and round(SLACK_S * 1000) == 500
+    assert "const DEADLINE_REARMS_MAX = 8;" in code
 
 
 def _launcher():
@@ -227,7 +246,7 @@ def test_static_nginx_template_keeps_the_reviewed_limits_and_literal_backend():
     template = TEMPLATE.read_text(encoding="utf-8")
     code = re.sub(r"#[^\n]*", "", template)
     for line in ("worker_processes 1;", "error_log /dev/null crit;", "access_log off;", "keepalive_requests 1;",
-                 "client_header_timeout 10s;", "client_body_timeout 10s;", "client_max_body_size 278528;",
+                 "client_header_timeout 10s;", "client_body_timeout 11s;", "client_max_body_size 278528;",
                  "js_engine qjs;", "js_context_reuse 0;", "limit_conn heel_listeners 32;", "limit_conn heel_listeners 8;",
                  "proxy_next_upstream off;", "proxy_max_temp_file_size 0;", "proxy_pass_request_headers off;",
                  "proxy_connect_timeout 2s;", "proxy_read_timeout 10s;", "ssl_reject_handshake on;",
@@ -512,23 +531,33 @@ def test_static_cap_timing_telemetry_is_closed_bounded_and_published_before_the_
     assert launcher.TELEMETRY_RANGES == harness.CAP_TIMING_RANGES
     assert launcher.TELEMETRY_NULLABLE == harness.CAP_TIMING_NULLABLE
 
+    def ns(mark):
+        return round(mark * 1e9) if type(mark) is float and mark == mark and abs(mark) != float("inf") else mark
+
     def hold(sent, first, received=b""):
-        return {"received": received, "wall": {"sent": [sent], "first_byte": first, "closed": first}}
+        return {"received": received, "wall": {"sent": [sent], "first_byte": first, "closed": first,
+                                               "sent_ns": [ns(sent)], "first_byte_ns": ns(first), "closed_ns": ns(first)}}
 
     window = (BODY_READ_S, BODY_READ_S + SLACK_S)
     # Early, inside, late by a sub-millisecond margin, late, and four holds without usable marks.
     held = [hold(1000.0, 1009.9874), hold(1000.0, 1010.25), hold(1000.0, 1010.5004), hold(1000.0, 1011.75),
             hold(1000.0, None), hold(None, 1010.2), hold(1000.0, float("nan")), {"error": "ConnectionRefusedError"}]
-    telemetry = harness.cap_timing(held, [(1001.5, 503), (1002.1, 503), (1011.6, 401)], *window)
+    # Deadline counters: deltas of the prefix sums across the holds; non-int values never count.
+    counters_before = {"early:body_timeout": 3, "rearm_ms:body_timeout": 7, "expired:body_timeout": 2}
+    counters_after = {"early:body_timeout": 5, "rearm_ms:body_timeout": 11, "early:timeout": 1, "rearm_ms:timeout": 2,
+                      "expired:body_timeout": 10, "early_final:body_timeout": 0, "early:odd": True, "rearm_ms:odd": "9"}
+    telemetry = harness.cap_timing(held, [(1001.5, 503), (1002.1, 503), (1011.6, 401)], *window, counters_before, counters_after)
+    zero = {"early_fires": 0, "early_final": 0, "deadline_invalid": 0, "rearm_ms": 0}
     assert telemetry == {"holds": 8, "holds_unmeasured": 4, "holds_early": 1, "holds_late": 2, "first_byte_ms_min": 9987,
-                         "first_byte_ms_max": 11750, "probes": 3, "probes_503": 2, "probes_admitted": 1}
-    # The integer envelope is floor/ceil: 10.5004 s is late and must not round into the window as 10500.
-    edge = harness.cap_timing([hold(1000.0, 1010.5004)], [], *window)
+                         "first_byte_ms_max": 11750, "probes": 3, "probes_503": 2, "probes_admitted": 1,
+                         "early_fires": 3, "early_final": 0, "deadline_invalid": 0, "rearm_ms": 6}
+    # The maximum is the unrounded delta rounded up: 10.5004 s is late and never reads as 10500.
+    edge = harness.cap_timing([hold(1000.0, 1010.5004)], [], *window, {}, {})
     assert (edge["first_byte_ms_min"], edge["first_byte_ms_max"], edge["holds_late"]) == (10500, 10501, 1)
     unusable = harness.cap_timing([hold(True, 1010.0), hold(1000.0, float("inf")), hold(0.0, 1000.0), hold("1000", 1010.0)],
-                                  [(1.0, 503)], *window)
+                                  [(1.0, 503)], *window, None, ["early:x"])
     assert unusable == {"holds": 4, "holds_unmeasured": 4, "holds_early": 0, "holds_late": 0, "first_byte_ms_min": None,
-                        "first_byte_ms_max": None, "probes": 1, "probes_503": 1, "probes_admitted": 0}
+                        "first_byte_ms_max": None, "probes": 1, "probes_503": 1, "probes_admitted": 0, **zero}
     for value in (telemetry, edge, unusable):
         assert harness.cap_timing_valid(value) and launcher.sanitize_telemetry(value) == value
 
@@ -544,7 +573,12 @@ def test_static_cap_timing_telemetry_is_closed_bounded_and_published_before_the_
                dict(telemetry, first_byte_ms_min=-120001), dict(telemetry, first_byte_ms_min=12000),
                dict(telemetry, holds_unmeasured=8), dict(telemetry, first_byte_ms_min=None), dict(telemetry, holds_early=4),
                dict(telemetry, probes_admitted=2), dict(telemetry, holds=9, holds_unmeasured=5),
-               dict(telemetry, first_byte_ms_max=float("inf")), dict(telemetry, probes=canary), [telemetry], None]
+               dict(telemetry, first_byte_ms_max=float("inf")), dict(telemetry, probes=canary), [telemetry], None,
+               dict(telemetry, early_fires=True), dict(telemetry, rearm_ms=6.0), dict(telemetry, early_final="0"),
+               {key: value for key, value in telemetry.items() if key != "deadline_invalid"}, dict(telemetry, early_fires=65),
+               dict(telemetry, rearm_ms=4001), dict(telemetry, early_final=-1), dict(telemetry, deadline_invalid=9),
+               dict(telemetry, early_fires=3, rearm_ms=2), dict(telemetry, early_fires=1, rearm_ms=501),
+               dict(telemetry, early_fires=0, rearm_ms=1), {key: telemetry[key] for key in list(telemetry)[:9]}]
     for value in invalid:
         assert not harness.cap_timing_valid(value) and launcher.sanitize_telemetry(value) is None, value
         if isinstance(value, dict):
@@ -598,7 +632,7 @@ def test_static_cap_timing_telemetry_is_closed_bounded_and_published_before_the_
     late = hold(1000.0, 1010.75, b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 27\r\n\r\n" + FIXED_REFUSAL)
     order = tmp_path / "order.jsonl"
     monkeypatch.setenv("HEEL_HOST_INGRESS_CASES", str(order))
-    harness.record_case("g8.listener_connection_cap_timing", "G8", telemetry=harness.cap_timing([late], [], *window))
+    harness.record_case("g8.listener_connection_cap_timing", "G8", telemetry=harness.cap_timing([late], [], *window, {}, {}))
     with pytest.raises(AssertionError):
         _assert_fixed_refusal_at(late, 408, BODY_READ_S)
     (record,) = launcher.sanitize_cases(order)
@@ -607,6 +641,9 @@ def test_static_cap_timing_telemetry_is_closed_bounded_and_published_before_the_
     cap = module[module.index("\ndef test_g8_listener_connection_cap_holds_at_eight"):module.index("\ndef test_g8_mixed_load_of")]
     evidence = cap.index('harness.record_case("g8.listener_connection_cap_timing", "G8",')
     assert "assert " not in cap[:evidence] and cap.index("held = [future.result() for future in holds]") < evidence
+    assert cap.index("counters_before = world.env.counters()") < cap.index("pool.submit(_hold, world, raw, split)")
+    assert cap[evidence:].index('assert telemetry["early_final"] == telemetry["deadline_invalid"] == 0') < cap[evidence:].index(
+        "_assert_fixed_refusal_at(result, 408, BODY_READ_S)")
     for kept in ("assert [status for _sent, status in probes if status not in {401, 503}] == []",
                  "_assert_fixed_refusal_at(result, 408, BODY_READ_S)", "assert any(status == 503 for _sent, status in probes)",
                  "assert all(status == 503 for sent, status in probes if sent < min(starts) + BODY_READ_S - SLACK_S)",
@@ -619,14 +656,118 @@ def test_static_cap_timing_telemetry_is_closed_bounded_and_published_before_the_
     # Every existing threshold is unchanged; the CPU count is an int or a fixed "unavailable".
     assert (BODY_READ_S, TOTAL_BUDGET_S, SLACK_S) == (10.0, 25.0, 0.5)
     helper = module[module.index("\ndef _assert_fixed_refusal_at("):module.index("\ndef _assert_worker_unchanged(")]
-    assert "assert first is not None and seconds <= first - t0 <= seconds + SLACK_S, first - t0" in helper
-    assert "assert closed is not None and closed - t0 <= seconds + SLACK_S, (closed or 0) - t0" in helper
+    for kept in ("assert first_ns // NS_PER_MS - t0_ns // NS_PER_MS >= round(seconds * 1000), first_ns - t0_ns",
+                 "assert first is not None and first - t0 <= seconds + SLACK_S, first - t0",
+                 "assert first_ns - t0_ns <= limit_ns, first_ns - t0_ns",
+                 "assert closed is not None and closed - t0 <= seconds + SLACK_S, (closed or 0) - t0",
+                 "assert closed_ns - t0_ns <= limit_ns, closed_ns - t0_ns",
+                 "limit_ns = round((seconds + SLACK_S) * 1000) * NS_PER_MS"):
+        assert kept in helper, kept
     assert "limit_conn heel_listeners 8;" in TEMPLATE.read_text(encoding="utf-8")
     assert launcher.cpu_count_line(lambda: 4) == "cpu_count 4"
     for bad in (None, 0, -1, True, 4.0, "4", 10 ** 6):
         assert launcher.cpu_count_line(lambda bad=bad: bad) == "cpu_count unavailable", bad
     launcher_source = (ROOT / "scripts" / "host_ingress_proof.py").read_text(encoding="utf-8")
-    assert launcher_source.count("cpu_count_line()") == 1 and 'f"platform {sys.platform}", cpu_count_line()]' in launcher_source
+    assert launcher_source.count("cpu_count_line()") == 1 and 'f"platform {sys.platform}", cpu_count_line(), time_clock_line()]' in launcher_source
+    # H0BR3 clock provenance: one fixed literal or a fixed "unavailable", never the runtime's own text.
+    import types
+
+    def info(implementation):
+        return lambda name: types.SimpleNamespace(implementation=implementation) if name == "time" else None
+
+    assert launcher.time_clock_line(info("clock_gettime(CLOCK_REALTIME)")) == "time_clock CLOCK_REALTIME"
+    for bad in ("GetSystemTimePreciseAsFileTime()", "clock_gettime(CLOCK_REALTIME) " + canary, None, 7, ""):
+        assert launcher.time_clock_line(info(bad)) == "time_clock unavailable", bad
+    assert launcher.time_clock_line(lambda name: 1 / 0) == "time_clock unavailable"
+    assert launcher_source.count("time_clock_line()") == 1
+
+
+def test_static_probe_marks_precede_sendall_and_every_maximum_stays_unrounded():
+    """H0BR3: the probe takes an integer time_ns() mark before sendall (a lower bound of the server's
+    Date.now() origin on the same CLOCK_REALTIME); the lower bound is checked on Date.now()'s integer
+    millisecond grid; every maximum stays unrounded (the post-sendall float marks as before, plus the
+    pre-sendall ns marks); and the telemetry classifies each hold exactly as the assertion does."""
+    source = (ROOT / "tests" / "support" / "host_ingress_harness.py").read_text(encoding="utf-8")
+    child = source[source.index("def _probe_child("):source.index("def _scripted_child(")]
+    send = child[child.index("data = base64.b64decode(chunk)"):child.index('if config.get("shutdown_write"):')]
+    assert send.index("sent_ns = time.time_ns()") < send.index("sock.sendall(data)") < send.index('wall["sent"].append(time.time())')
+    assert send.index("sock.sendall(data)") < send.index('wall["sent_ns"].append(sent_ns)')
+    assert 'wall["sent_ns"].append(None)' in send and 'wall["sent"].append(None)' in send
+    first = child[child.index('if wall["first_byte"] is None:'):]
+    assert first.index('wall["first_byte_ns"] = time.time_ns()') < first.index('wall["first_byte"] = time.time()')
+    assert child.count('wall["closed_ns"] = time.time_ns()') == 2 == child.count('wall["closed"] = time.time()')
+
+    ms = NS_PER_MS
+    assert harness.NS_PER_MS == ms
+    base = 1_800_000_000_000  # an epoch millisecond
+
+    def hold(sent_ns, first_ns, *, post_send_ns=200_000, read_lag_ns=10_000, close_ns=1_000_000):
+        # Float marks as the probe takes them: after sendall returns, and just after the ns mark.
+        received = b"HTTP/1.1 408 Request Time-out\r\nContent-Length: 27\r\n\r\n" + FIXED_REFUSAL
+        return {"received": received, "wall": {
+            "sent": [(sent_ns + post_send_ns) / 1e9], "first_byte": (first_ns + read_lag_ns) / 1e9,
+            "closed": (first_ns + close_ns) / 1e9, "sent_ns": [sent_ns], "first_byte_ns": first_ns,
+            "closed_ns": first_ns + close_ns - read_lag_ns}}
+
+    def failure(result, seconds):
+        """The failing assertion's message (its first line), or None when the refusal passes."""
+        try:
+            _assert_fixed_refusal_at(result, 408, seconds)
+        except AssertionError as error:
+            return str(error).splitlines()[0]
+        return None
+
+    def passes(result, seconds):
+        return failure(result, seconds) is None
+
+    cases = {
+        # On the grid: sent in ms 0 (late in it), first byte at ms 10000. Passes: Date.now() reads the same grid.
+        "grid_boundary": (hold(base * ms + 999_999, (base + 10000) * ms), True, (0, 0, 10000, 10000)),
+        "early": (hold(base * ms, (base + 9999) * ms + 999_999), False, (1, 0, 9999, 10000)),
+        "inside": (hold(base * ms + 500_000, (base + 10250) * ms), True, (0, 0, 10250, 10250)),
+        "upper_exact": (hold(base * ms, (base + 10500) * ms, read_lag_ns=0, close_ns=0), True, (0, 0, 10500, 10500)),
+        # The precision counterexample: true delay 10500.05 ms, floored-ms delta 10500, float marks
+        # inside the window (the send mark trails by 0.2 ms): the pre-send ns maximum must fail it.
+        "upper_floored": (hold(base * ms + 900_000, (base + 10500) * ms + 950_000), False, (0, 1, 10500, 10501)),
+        # A float-only overrun (the first-byte float read 0.6 ms after its ns mark) fails as before.
+        "upper_float": (hold(base * ms, (base + 10499) * ms + 900_000, post_send_ns=0, read_lag_ns=600_000), False,
+                        (0, 1, 10499, 10500)),
+    }
+    for label, (result, ok, (early, late, low, high)) in cases.items():
+        assert passes(result, BODY_READ_S) is ok, label
+        telemetry = harness.cap_timing([result], [], BODY_READ_S, BODY_READ_S + SLACK_S, {}, {})
+        assert (telemetry["holds_early"], telemetry["holds_late"], telemetry["first_byte_ms_min"],
+                telemetry["first_byte_ms_max"]) == (early, late, low, high), label
+        assert ok == (telemetry["holds_early"] == telemetry["holds_late"] == telemetry["holds_unmeasured"] == 0), label
+    upper = cases["upper_floored"][0]["wall"]
+    assert upper["first_byte_ns"] // ms - upper["sent_ns"][0] // ms == 10500
+    # It is the unrounded first-byte maximum that fails (its message is the ns delta), not the close.
+    assert failure(cases["upper_floored"][0], BODY_READ_S) == str(10500 * ms + 50_000)
+    assert upper["first_byte"] - upper["sent"][0] <= BODY_READ_S + SLACK_S < (upper["first_byte_ns"] - upper["sent_ns"][0]) / 1e9
+    # The close is bounded in both domains, unrounded: exactly 10.5 s passes; 1 ns past it from the
+    # pre-send mark fails although the post-sendall float marks still read inside the window.
+    assert passes(hold(base * ms, (base + 10400) * ms, close_ns=100 * ms, read_lag_ns=0, post_send_ns=0), BODY_READ_S)
+    late_close = hold(base * ms, (base + 10400) * ms, close_ns=100 * ms + 1, read_lag_ns=0, post_send_ns=5_000)
+    assert late_close["wall"]["closed"] - late_close["wall"]["sent"][0] <= BODY_READ_S + SLACK_S and not passes(late_close, BODY_READ_S)
+    assert not passes(hold(base * ms, (base + 10400) * ms, close_ns=101 * ms), BODY_READ_S)
+    # The 25 s budget (the macOS d01 reading was 24.999918 s after the post-sendall mark).
+    assert passes(hold(base * ms + 999_999, (base + 25000) * ms), TOTAL_BUDGET_S)
+    assert not passes(hold(base * ms, (base + 24999) * ms + 999_999), TOTAL_BUDGET_S)
+    # A quiet body ended by nginx's own 11 s idle backstop (reset, no byte) never passes for the JS deadline.
+    backstop = hold(base * ms, (base + 11000) * ms)
+    backstop["received"] = b""
+    backstop["wall"].update(first_byte=None, first_byte_ns=None)
+    assert not passes(backstop, BODY_READ_S)
+    assert harness.cap_timing([backstop], [], BODY_READ_S, BODY_READ_S + SLACK_S, {}, {})["holds_unmeasured"] == 1
+    # Missing or ill-typed ns marks are unmeasured in the telemetry and fail the assertion.
+    for mutate in ({"sent_ns": [None]}, {"sent_ns": []}, {"first_byte_ns": None}, {"first_byte_ns": float(base * ms)},
+                   {"sent_ns": [True]}, {"closed_ns": None}, {"first_byte_ns": str((base + 10250) * ms)}):
+        result = hold(base * ms, (base + 10250) * ms)
+        result["wall"].update(mutate)
+        assert not passes(result, BODY_READ_S), mutate
+        if "closed_ns" not in mutate:
+            telemetry = harness.cap_timing([result], [], BODY_READ_S, BODY_READ_S + SLACK_S, {}, {})
+            assert (telemetry["holds_unmeasured"], telemetry["first_byte_ms_min"]) == (1, None), mutate
 
 
 # ---------------------------------------------------------------------------------------------
@@ -821,6 +962,230 @@ def test_g0_request_scanner_accepts_exactly_python_canonical_bytes(policy_runtim
             assert _verdict(policy_runtime, loose) == "refused:canonical"
         checked += 1
     assert checked >= 200
+
+
+# ---------------------------------------------------------------------------------------------
+# G0 deadline helpers (H0BR3): the policy's own deadline arithmetic and lifecycle, executed by the
+# pinned nginx/njs/qjs selftest. {"special": ...}, {"string": ...} and {"object": 1} carry values
+# JSON cannot (NaN, Infinity, undefined, -0), numeric strings and objects.
+
+NAN, INF, NEG_INF = {"special": "nan"}, {"special": "infinity"}, {"special": "minus_infinity"}
+UNDEFINED, MINUS_ZERO, OBJECT = {"special": "undefined"}, {"special": "minus_zero"}, {"object": 1}
+UNSAFE = 2 ** 53
+SAFE = 2 ** 53 - 1
+# Values no clock reading, origin, budget or counter may take.
+NOT_SAFE_INTEGERS = [NAN, INF, NEG_INF, UNDEFINED, OBJECT, None, True, False, [], {"string": "1000"}, 1000.5, UNSAFE]
+
+
+def _selftest_json(env, path: str, payload) -> object:
+    status, body = env.selftest(path, json.dumps(payload).encode("utf-8"))
+    assert status == 200, (path, status, body[:64])
+    return json.loads(body)
+
+
+def test_g0_deadline_planner_refuses_every_unusable_value_in_the_pinned_runtime(policy_runtime):
+    env = policy_runtime
+    start = [
+        ([20000, 0, 25000], ["arm", 5000]), ([1000, 1000, 10000], ["arm", 10000]), ([10999, 1000, 10000], ["arm", 1]),
+        ([11000, 1000, 10000], ["due", 0]), ([99999, 1000, 10000], ["due", 0]), ([0, 0, 1], ["arm", 1]), ([1, 0, 1], ["due", 0]),
+        ([SAFE - 1, SAFE - 10000, 10000], ["arm", 1]), ([MINUS_ZERO, 0, 25000], ["arm", 25000]),
+        ([999, 1000, 10000], ["invalid", 0]),  # the clock reads before the origin
+        ([1000, SAFE - 9999, 10000], ["invalid", 0]),  # origin + budget is not a safe integer
+        ([1000, 1000, 0], ["invalid", 0]), ([1000, 1000, -1], ["invalid", 0]), ([1000, 1000, 25001], ["invalid", 0]),
+        ([-1, 0, 25000], ["invalid", 0]), ([1000, -1, 25000], ["invalid", 0]),
+    ]
+    for bad in NOT_SAFE_INTEGERS:
+        start += [([bad, 1000, 10000], ["invalid", 0]), ([1000, bad, 10000], ["invalid", 0]), ([1000, 1000, bad], ["invalid", 0])]
+    got = _selftest_json(env, "/deadline_start", [row for row, _ in start])
+    assert got == [expected for _, expected in start]
+
+    plan = [
+        ([24997, 25000, 0, 0], ["rearm", 3]),  # origin 0, due 25000, woken at 24997: 3 ms early on the total budget
+        ([25000, 25000, 0, 0], ["due", 0]), ([25001, 25000, 0, 0], ["due", 0]), ([9999, 10000, 0, 0], ["rearm", 1]),
+        ([24500, 25000, 0, 0], ["rearm", 500]), ([24499, 25000, 0, 0], ["bound", 0]),
+        ([9998, 10000, 498, 1], ["rearm", 2]), ([9998, 10000, 499, 1], ["bound", 0]),
+        ([9999, 10000, 7, 7], ["rearm", 1]), ([9999, 10000, 8, 8], ["bound", 0]), ([10000, 10000, 8, 8], ["due", 0]),
+        ([10000, 10000, 500, 8], ["due", 0]), ([0, SAFE, 0, 0], ["bound", 0]), ([MINUS_ZERO, 1, 0, 0], ["rearm", 1]),
+        # Inconsistent or out-of-range state never plans a re-arm.
+        ([9999, 10000, -1, 0], ["invalid", 0]), ([9999, 10000, 0, -1], ["invalid", 0]), ([9999, 10000, 9, 9], ["invalid", 0]),
+        ([9999, 10000, 501, 1], ["invalid", 0]), ([9999, 10000, 3, 0], ["invalid", 0]), ([9999, 10000, 0, 1], ["invalid", 0]),
+        ([9999, 10000, 2, 3], ["invalid", 0]), ([-1, 10000, 0, 0], ["invalid", 0]), ([9999, -1, 0, 0], ["invalid", 0]),
+    ]
+    for bad in NOT_SAFE_INTEGERS:
+        # NaN would make "now < due" false: it must read as invalid, never as due.
+        plan += [([bad, 25000, 0, 0], ["invalid", 0]), ([24997, bad, 0, 0], ["invalid", 0]),
+                 ([24997, 25000, bad, 1], ["invalid", 0]), ([24997, 25000, 1, bad], ["invalid", 0])]
+    got = _selftest_json(env, "/deadline_plan", [row for row, _ in plan])
+    assert got == [expected for _, expected in plan]
+    # Every delay a plan hands to setTimeout is an integer in (0, budget] or (0, 500]: no ToUint32 wrap.
+    assert all(ms > 0 and type(ms) is int for code, ms in got if code == "rearm") and max(ms for _code, ms in got) == 500
+
+
+def _script(env, clock: list, steps: list[str], *, origin=0, budget=25000, status=504, reason="timeout") -> dict:
+    return _selftest_json(env, "/deadline_script", {"clock": clock, "origin": origin, "budget": budget, "status": status,
+                                                    "reason": reason, "steps": steps})
+
+
+def _final(timer: int, kick: int, reason: str, status: int, anomaly: str | None = None) -> list:
+    counted = [["count", f"{anomaly}:{reason}", 1]] if anomaly else []
+    return counted + [["count", f"expired:{reason}", 1], ["refuse", status, reason], ["arm", kick, 0],
+                      ["threw", timer, "deadline"]]
+
+
+def test_g0_deadline_lifecycle_under_a_scripted_clock_and_scheduler(policy_runtime):
+    """The policy's deadlineWith()/settle() under a scripted clock and scheduler: cancellation before
+    a wake, cancellation of the re-armed timer, expiry after re-arms, the bounds and every anomaly."""
+    env = policy_runtime
+    traces = []
+
+    def run(*args, **kwargs) -> dict:
+        result = _script(env, *args, **kwargs)
+        traces.append((kwargs.get("budget", 25000), result["trace"]))
+        return result
+
+    # Cancelled before any wake: settle() cancels the one pending timer and nothing fires later.
+    result = run([1000], ["settle", "fire"], origin=1000, budget=10000, status=408, reason="body_timeout")
+    assert result["start"] == "armed" and result["state"] == {"fired": False, "rearms": 0, "extended": 0}
+    assert result["trace"] == [["now", 0], ["arm", 1, 10000], ["cancel", 1, "pending"], ["settled", False], ["fire", 0]]
+    # The early total deadline: armed at 20000 for due 25000, woken at 24997. It re-arms for the
+    # 3 ms shortfall (d.id now names the new timer) and settle() cancels that pending timer.
+    result = run([20000, 24997], ["fire", "settle", "fire"])
+    assert result["trace"] == [["now", 0], ["arm", 1, 5000], ["fire", 1], ["now", 1], ["arm", 2, 3],
+                               ["count", "early:timeout", 1], ["count", "rearm_ms:timeout", 3], ["returned", 1],
+                               ["cancel", 2, "pending"], ["settled", False], ["fire", 0]]
+    assert result["state"] == {"fired": False, "rearms": 1, "extended": 3}
+    # Re-armed, then due: refusal, zero-delay kick, throw; settle() afterwards cancels nothing.
+    result = run([20000, 24997, 25000], ["fire", "fire", "fire", "settle"])
+    assert result["trace"] == [["now", 0], ["arm", 1, 5000], ["fire", 1], ["now", 1], ["arm", 2, 3],
+                               ["count", "early:timeout", 1], ["count", "rearm_ms:timeout", 3], ["returned", 1],
+                               ["fire", 2], ["now", 2], *_final(2, 3, "timeout", 504), ["fire", 3], ["returned", 3],
+                               ["settled", True]]
+    assert result["state"] == {"fired": True, "rearms": 1, "extended": 3}
+    # Several stale wakes: each re-arm is exactly the remaining shortfall.
+    result = run([0, 9998, 9999, 10000], ["fire"] * 3, budget=10000, status=408, reason="body_timeout")
+    assert [entry for entry in result["trace"] if entry[0] == "arm"] == [["arm", 1, 10000], ["arm", 2, 2], ["arm", 3, 1], ["arm", 4, 0]]
+    assert result["trace"][-4:] == _final(3, 4, "body_timeout", 408)
+    assert result["state"] == {"fired": True, "rearms": 2, "extended": 3}
+    # At most eight re-arms: the ninth early wake refuses at once and is counted as early_final.
+    result = run([0] + [9999] * 9, ["fire"] * 9, budget=10000, status=408, reason="body_timeout")
+    assert [entry[2] for entry in result["trace"] if entry[0] == "arm"] == [10000] + [1] * 8 + [0]
+    assert result["trace"][-5:] == _final(9, 10, "body_timeout", 408, "early_final")
+    assert result["state"] == {"fired": True, "rearms": 8, "extended": 8}
+    # At most 500 ms re-armed in total: a 500 ms shortfall re-arms, any further shortfall refuses.
+    result = run([0, 9500, 9999], ["fire"] * 2, budget=10000, status=408, reason="body_timeout")
+    assert [entry[2] for entry in result["trace"] if entry[0] == "arm"] == [10000, 500, 0]
+    assert result["trace"][-5:] == _final(2, 3, "body_timeout", 408, "early_final")
+    result = run([0, 9499], ["fire"], budget=10000, status=408, reason="body_timeout")
+    assert result["trace"][-5:] == _final(1, 2, "body_timeout", 408, "early_final")
+    # An unusable clock at a wake refuses at once, counted invalid (never as due), before any arithmetic.
+    for bad in NOT_SAFE_INTEGERS + [-1, {"string": "25000"}]:
+        result = run([20000, bad], ["fire", "settle"])
+        assert result["trace"] == [["now", 0], ["arm", 1, 5000], ["fire", 1], ["now", 1],
+                                   *_final(1, 2, "timeout", 504, "deadline_invalid"), ["settled", True]], bad
+    # An unusable start refuses synchronously: nothing is armed, so no ready body can settle first.
+    starts = [([bad], 0, 25000) for bad in NOT_SAFE_INTEGERS] + [([20000], bad, 25000) for bad in NOT_SAFE_INTEGERS]
+    starts += [([20000], 0, bad) for bad in NOT_SAFE_INTEGERS + [0, 25001, -1]] + [([1], 2, 25000), ([20000], -1, 25000)]
+    for clock, origin, budget in starts:
+        result = run(clock, ["fire", "settle"], origin=origin, budget=budget)
+        assert result["start"] == ["refused", 504, "timeout"] and result["state"] is None, (clock, origin, budget)
+        assert result["trace"] == [["now", 0], ["count", "deadline_invalid:timeout", 1], ["fire", 0]], (clock, origin, budget)
+    # A budget already spent at the start is the ordinary synchronous refusal, not an anomaly.
+    result = run([25000], ["fire"])
+    assert result["start"] == ["refused", 504, "timeout"] and result["trace"] == [["now", 0], ["fire", 0]]
+    # Every delay handed to the scheduler was an integer in [0, budget]; every re-arm in (0, 500].
+    for budget, trace in traces:
+        arms = [entry[2] for entry in trace if entry[0] == "arm"]
+        assert all(type(ms) is int and 0 <= ms <= budget for ms in arms), arms
+        assert all(type(ms) is int and 0 < ms <= 500 for ms in arms[1:] if ms != 0), arms
+        assert [entry for entry in trace if entry[0] == "cancel" and entry[2] != "pending"] == []
+
+
+def _native(env, token: str, query: str, pieces: list[tuple[int, bytes]], *, location: str = "deadline_native") -> dict:
+    head = (f"POST /{location}?token={token}&{query} HTTP/1.1\r\nHost: selftest\r\nContent-Length: 4\r\n"
+            "Connection: close\r\n\r\n").encode("ascii")
+    chunks = [[delay, _b64((head if index == 0 else b"") + piece)] for index, (delay, piece) in enumerate(pieces)]
+    return env.probe("ingress", mode="tcp", address="127.0.0.1", port=env.selftest_port, chunks=chunks, read_timeout=3,
+                     send_after_close=True)
+
+
+def _native_counts(env, token: str) -> dict:
+    return _selftest_json(env, f"/deadline_counts?token={token}", None)
+
+
+def test_g0_deadline_native_timers_cancel_rearm_and_expire_in_the_pinned_runtime(policy_runtime):
+    """The same code with the real njs timers and request body read (js_access, as runnerAccess),
+    a scripted clock only: pending cancellation, re-arm then cancellation of the new timer, expiry
+    after a re-arm, and an unusable start with the body already complete. The single worker survives."""
+    import time as clock
+
+    env = policy_runtime
+    pid = _native_counts(env, "pid")["worker_pid"]
+    # Cancelled before the first wake: the body completes at 0.1 s; the 1 s timer never fires.
+    result = _native(env, "n1", "origin=1000&budget=1000&clock=1000", [(0, b"ab"), (100, b"cd")])
+    assert harness.parse_http(result["received"])[0::2] == (200, b"proceeded")
+    clock.sleep(1.3)
+    assert _native_counts(env, "n1") == {"now": 1, "arm": 1, "cancel": 1, "proceeded": 1, "worker_pid": pid}
+    # Re-armed, then the NEW timer is cancelled: armed for 0.4 s, woken 0.4 s early by the scripted
+    # clock, re-armed for 0.4 s; the body completes at 0.6 s, between the wake and the re-armed fire.
+    result = _native(env, "n2", "origin=1000&budget=500&clock=1100,1100", [(0, b"ab"), (600, b"cd")])
+    assert harness.parse_http(result["received"])[0::2] == (200, b"proceeded")
+    clock.sleep(1.2)
+    assert _native_counts(env, "n2") == {"now": 2, "arm": 2, "early:selftest": 1, "rearm_ms:selftest": 400, "cancel": 1,
+                                         "proceeded": 1, "worker_pid": pid}
+    # Expiry after a re-arm: the body never completes; the fixed 408 at the scripted due time.
+    result = _native(env, "n3", "origin=1000&budget=200&clock=1000,1150,1200", [(0, b"ab")])
+    assert harness.parse_http(result["received"])[0::2] == (408, FIXED_REFUSAL) and result.get("peer_closed")
+    assert result["received"].count(b"HTTP/1.1 ") == 1
+    clock.sleep(0.3)
+    assert _native_counts(env, "n3") == {"now": 3, "arm": 3, "early:selftest": 1, "rearm_ms:selftest": 50,
+                                         "expired:selftest": 1, "refuse": 1, "worker_pid": pid}
+    # An unusable start (NaN, or a clock before the origin) with the whole body already sent: refused
+    # synchronously. Arming a 0 ms timer instead would let the ready body settle it and proceed.
+    for token, query in (("n4", "origin=1000&budget=500&clock=nan"), ("n5", "origin=1000&budget=500&clock=900")):
+        result = _native(env, token, query, [(0, b"abcd")])
+        assert harness.parse_http(result["received"])[0::2] == (408, FIXED_REFUSAL), token
+        assert _native_counts(env, token) == {"now": 1, "deadline_invalid:selftest": 1, "refused_sync": 1, "worker_pid": pid}
+    assert _native_counts(env, "pid") == {"worker_pid": pid}
+
+
+def test_g0_native_body_idle_backstop_outlives_the_js_deadline_and_its_rearm_bound(policy_runtime):
+    """H0BR3 amendment: nginx's own client_body_timeout ends a quiet body read with a reset and no
+    fixed refusal, keyed from the same stale clock as the policy's deadline. It must outlive the 10 s
+    JS deadline plus its 0.5 s re-arm bound, or a re-armed refusal is lost (local run d00); and it can
+    never stand in for that deadline. Selftest scale: a 200 ms JS budget behind the template's margin."""
+    env = policy_runtime
+    template, policy = _code_conf(TEMPLATE.read_text(encoding="utf-8")), POLICY.read_text(encoding="utf-8")
+    backstop_ms = harness.body_idle_backstop_ms(template)
+    assert backstop_ms == 11000 and backstop_ms > round((BODY_READ_S + SLACK_S) * 1000)
+    assert "const BODY_READ_MS = 10000;" in policy and "const DEADLINE_SLACK_MS = 500;" in policy
+    assert harness.policy_body_read_ms(policy) == round(BODY_READ_S * 1000)
+    assert "reset_timedout_connection on;" in template and template.count("client_body_timeout") == 1
+    budget = harness.SELFTEST_BODY_BUDGET_MS
+    assert env.selftest_backstop_ms == budget + backstop_ms - 10000 > budget + 500
+    pid = _native_counts(env, "pid")["worker_pid"]
+    # The largest re-arm the policy allows (the full 500 ms) still delivers the fixed refusal first.
+    result = _native(env, "b1", f"origin=1000&budget={budget}&clock=1000,700,1200", [(0, b"ab")], location="deadline_backstop")
+    assert harness.parse_http(result["received"])[0::2] == (408, FIXED_REFUSAL) and result.get("peer_closed")
+    assert _native_counts(env, "b1") == {"now": 3, "arm": 3, "early:selftest": 1, "rearm_ms:selftest": 500,
+                                         "expired:selftest": 1, "refuse": 1, "worker_pid": pid}
+    # Control: an idle timer equal to the JS budget loses even a 1 ms re-arm: reset, no byte, no refusal.
+    result = _native(env, "b2", f"origin=1000&budget={budget}&clock=1000,1199,1200", [(0, b"ab")],
+                     location="deadline_equal_backstop")
+    assert result["received"] == b"" and result.get("error") == "ConnectionResetError", result.get("error")
+    assert _native_counts(env, "b2") == {"now": 2, "arm": 2, "early:selftest": 1, "rearm_ms:selftest": 1, "worker_pid": pid}
+    # The backstop never stands in for the JS deadline: with the JS deadline beyond it, nginx resets at
+    # the backstop with no fixed refusal, which every deadline gate's assertion refuses.
+    result = _native(env, "b3", "origin=1000&budget=5000&clock=1000", [(0, b"ab")], location="deadline_backstop")
+    assert result["received"] == b"" and result.get("error") == "ConnectionResetError", result.get("error")
+    assert env.selftest_backstop_ms - 100 <= result["elapsed_ms"] < 3000, result["elapsed_ms"]
+    assert _native_counts(env, "b3") == {"now": 1, "arm": 1, "worker_pid": pid}
+    with pytest.raises(AssertionError):
+        _assert_fixed_refusal_at(result, 408, budget / 1000)
+    assert _native_counts(env, "pid") == {"worker_pid": pid}
+
+
+def _code_conf(template: str) -> str:
+    return re.sub(r"#[^\n]*", "", template)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1663,11 +2028,17 @@ def test_g8_client_disconnect_mid_body_leaves_no_pending_work(world):
 # G8 total deadlines (H0BTD section 7). Times are wall-clock marks from the probe child: t0 = the
 # moment the complete header block was sent, then the first response byte and the peer's close.
 # nginx's own client_body_timeout is an idle timer; only the policy deadline bounds a dribble.
+# H0BR3: the policy refuses only once Date.now() reaches origin + budget, so the lower bound is
+# checked on that integer-millisecond grid from the probe's time_ns() mark taken before sendall
+# (never after the server's origin on the same CLOCK_REALTIME). Every maximum stays unrounded: the
+# post-sendall float marks exactly as before, and the pre-sendall ns marks (stricter by the sendall).
 
 BODY_READ_S = 10.0
 TOTAL_BUDGET_S = 25.0
 SLACK_S = 0.5
 FIXED_REFUSAL = b'{"error":"ingress refused"}'
+NS_PER_MS = 1_000_000
+DEADLINE_ANOMALIES = ("early_final:", "deadline_invalid:")
 
 
 def _b64(data: bytes) -> str:
@@ -1679,14 +2050,30 @@ def _marks(result: dict) -> tuple[float, float | None, float | None]:
     return wall["sent"][0], wall.get("first_byte"), wall.get("closed")
 
 
+def _ns_marks(result: dict) -> tuple[object, object, object]:
+    wall = result.get("wall") or {}
+    return (wall.get("sent_ns") or [None])[0], wall.get("first_byte_ns"), wall.get("closed_ns")
+
+
 def _assert_fixed_refusal_at(observation_or_result, status: int, seconds: float) -> None:
     result = observation_or_result.result if isinstance(observation_or_result, harness.Observation) else observation_or_result
     got, _headers, body = harness.parse_http(result["received"])
     t0, first, closed = _marks(result)
+    t0_ns, first_ns, closed_ns = _ns_marks(result)
+    limit_ns = round((seconds + SLACK_S) * 1000) * NS_PER_MS
     assert got == status and body == FIXED_REFUSAL, (got, body[:64])
     assert result["received"].count(b"HTTP/1.1 ") == 1
-    assert first is not None and seconds <= first - t0 <= seconds + SLACK_S, first - t0
+    assert type(t0_ns) is int and type(first_ns) is int and type(closed_ns) is int, (t0_ns, first_ns, closed_ns)
+    assert first_ns // NS_PER_MS - t0_ns // NS_PER_MS >= round(seconds * 1000), first_ns - t0_ns
+    assert first is not None and first - t0 <= seconds + SLACK_S, first - t0
+    assert first_ns - t0_ns <= limit_ns, first_ns - t0_ns
     assert closed is not None and closed - t0 <= seconds + SLACK_S, (closed or 0) - t0
+    assert closed_ns - t0_ns <= limit_ns, closed_ns - t0_ns
+
+
+def _assert_no_deadline_anomaly(names) -> None:
+    # H0BR3: early wakes re-arm (counted early:*, expected staleness); the anomaly paths never run.
+    assert [name for name in names if name.startswith(DEADLINE_ANOMALIES)] == []
 
 
 def _assert_worker_unchanged(world) -> None:
@@ -1708,6 +2095,7 @@ def test_g8_dribbled_runner_body_is_refused_at_the_total_deadline(world):
     _assert_fixed_refusal_at(observation, 408, BODY_READ_S)
     assert not observation.cp_contacted and observation.changed_tables == []
     assert "expired:body_timeout" in observation.reasons
+    _assert_no_deadline_anomaly(observation.reasons)
     _assert_worker_unchanged(world)
     harness.record_case("g8.dribble_body", "G8", observation)
 
@@ -1723,6 +2111,7 @@ def test_g8_dribbled_management_body_is_refused_at_the_total_deadline(world):
     assert not observation.cp_contacted and observation.changed_tables == []
     assert "expired:body_timeout" in observation.reasons
     assert not [reason for reason in observation.reasons if reason.startswith("admitted:management:")]
+    _assert_no_deadline_anomaly(observation.reasons)
     _assert_worker_unchanged(world)
     harness.record_case("g8.dribble_body_management", "G8", observation)
 
@@ -1742,6 +2131,7 @@ def test_g8_body_completed_either_side_of_the_deadline(world, at_ms):
     else:
         _assert_fixed_refusal_at(observation, 408, BODY_READ_S)
         assert not observation.cp_contacted and "admitted:claim" not in observation.reasons
+    _assert_no_deadline_anomaly(observation.reasons)
     _assert_worker_unchanged(world)
     harness.record_case(f"g8.body_at_boundary_{at_ms // 1000}s", "G8", observation)
 
@@ -1755,6 +2145,7 @@ def test_g8_late_body_never_produces_a_second_response_or_cp_contact(world):
         "slot-a", b"", chunks=chunks, send_after_close=True, read_timeout=5))
     _assert_fixed_refusal_at(observation, 408, BODY_READ_S)
     assert not observation.cp_contacted and observation.changed_tables == []
+    _assert_no_deadline_anomaly(observation.reasons)
     _assert_worker_unchanged(world)
     harness.record_case("g8.late_body", "G8", observation)
 
@@ -1773,6 +2164,7 @@ def test_g8_listener_connection_cap_holds_at_eight_and_releases_at_the_deadline(
     raw = _claim_request(paired)
     split = raw.index(b"\r\n\r\n") + 4
     before = world.env.snapshot()
+    counters_before = world.env.counters()
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
         holds = [pool.submit(_hold, world, raw, split) for _ in range(8)]
         clock.sleep(1.5)
@@ -1790,10 +2182,12 @@ def test_g8_listener_connection_cap_holds_at_eight_and_releases_at_the_deadline(
             else:
                 clock.sleep(0.5)
         held = [future.result() for future in holds]
-    # H0BR2 diagnostic (separate case; g8.listener_connection_cap below stays success-only): aggregate
-    # first-byte-minus-send-mark envelope of the eight holds and probe counts, before any cap assertion.
-    harness.record_case("g8.listener_connection_cap_timing", "G8",
-                        telemetry=harness.cap_timing(held, probes, BODY_READ_S, BODY_READ_S + SLACK_S))
+    # H0BR2/H0BR3 diagnostic (separate case; g8.listener_connection_cap below stays success-only): the
+    # holds classified exactly as _assert_fixed_refusal_at checks them, probe counts and the policy's
+    # deadline counters across the holds, before any cap assertion.
+    telemetry = harness.cap_timing(held, probes, BODY_READ_S, BODY_READ_S + SLACK_S, counters_before, world.env.counters())
+    harness.record_case("g8.listener_connection_cap_timing", "G8", telemetry=telemetry)
+    assert telemetry["early_final"] == telemetry["deadline_invalid"] == 0
     assert [status for _sent, status in probes if status not in {401, 503}] == []
     starts = [result["wall"]["sent"][0] for result in held]
     for result in held:
@@ -2077,6 +2471,7 @@ def test_g8_slow_upstream_is_cut_at_the_total_budget_without_late_delivery(world
     assert event["completed"] is None and event["eof"] is not None and event["eof"] - t0 < TOTAL_BUDGET_S + 1.0
     assert counters_after.get("expired:timeout", 0) == counters_before.get("expired:timeout", 0) + 1
     assert not [key for key in counters_after if key.startswith("forwarded:") and counters_after[key] != counters_before.get(key)]
+    _assert_no_deadline_anomaly(key for key in counters_after if counters_after[key] != counters_before.get(key))
     # The slot is free again and the restarted CP answers through it.
     after = _slot_wire(world, "slot-a", _claim_request(world.state["s"]))
     assert after.status == 401 and after.cp_contacted
@@ -2096,6 +2491,7 @@ def test_g8_upstream_reply_inside_the_budget_is_delivered_unchanged(world):
     assert event["completed"] is not None
     assert counters_after.get("forwarded:claim:401", 0) == counters_before.get("forwarded:claim:401", 0) + 1
     assert counters_after.get("expired:timeout", 0) == counters_before.get("expired:timeout", 0)
+    _assert_no_deadline_anomaly(key for key in counters_after if counters_after[key] != counters_before.get(key))
     _assert_worker_unchanged(world)
     harness.record_case("g8.upstream_in_budget", "G8", seam="SEAM-SCRIPTED-BACKEND paced")
 
@@ -2157,7 +2553,9 @@ def test_g9_ingress_worker_survived_every_case(world):
     env = world.env
     assert env.nginx is not None and env.nginx.poll() is None
     assert env.worker_pids() == env.expected_workers != []
-    assert env.counters() != {}  # the private counters endpoint still answers from the same worker
+    counters = env.counters()
+    assert counters != {}  # the private counters endpoint still answers from the same worker
+    _assert_no_deadline_anomaly(counters)  # no deadline anywhere in the module refused early or on a bad clock
     harness.record_case("g9.worker_sentinel", "G9")
 
 

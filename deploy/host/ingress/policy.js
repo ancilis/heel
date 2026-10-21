@@ -27,6 +27,10 @@ const MAX_JSON_DEPTH = 16;
 const MAX_JSON_STRING_BYTES = 4096;
 const BODY_READ_MS = 10000;
 const TOTAL_BUDGET_MS = 25000;
+// H0BR3: a deadline timer that wakes before its due time re-arms for the shortfall, at most
+// DEADLINE_REARMS_MAX times and DEADLINE_SLACK_MS in total (the proof's only tolerance).
+const DEADLINE_SLACK_MS = 500;
+const DEADLINE_REARMS_MAX = 8;
 const SAFE_INT = 9007199254740991;
 const PHASES = ['closed', 'invited', 'pending', 'active', 'rotating', 'stopping', 'retired'];
 const CONTROL_PROTOCOL = 'heel.runner-control.v2';
@@ -77,10 +81,10 @@ function refuse(status, reason) {
     throw new Refusal(status, reason);
 }
 
-function count(name) {
+function count(name, by) {
     try {
         if (typeof ngx !== 'undefined' && ngx.shared && ngx.shared.heel_counters) {
-            ngx.shared.heel_counters.incr(name, 1, 0);
+            ngx.shared.heel_counters.incr(name, by === undefined ? 1 : by, 0);
         }
     } catch (e) {
         // Counters are evidence only; a full zone never changes a decision.
@@ -1377,20 +1381,89 @@ function setUpstream(r, request) {
 //
 // njs deletes a timer's event after its callback returns; clearTimeout() on that timer from the
 // callback or from a microtask it runs deletes the event a second time and kills the worker
-// (every limit_conn slot it held then leaks); settle() is the only clearTimeout() in this file.
-// Fixed refusal at a total deadline. Never clear a timer that has fired.
-function deadline(r, ms, status, reason) {
-    const d = { fired: false, id: null };
-    d.id = setTimeout(() => {
+// (every limit_conn slot it held then leaks); settle() is the only caller of cancel(), the only
+// clearTimeout() in this file.
+//
+// Absolute due time (H0BR3): due = origin + budget on Date.now(), the clock of the origin. nginx
+// keys a timer to its cached monotonic clock, sampled once per event-loop iteration, so the timer
+// can wake early by that staleness plus 1 ms. It is only a wake-up: before due the callback
+// re-arms for the measured shortfall within DEADLINE_REARMS_MAX and DEADLINE_SLACK_MS, and it
+// refuses once Date.now() >= due, or at once (counted) on an unusable clock reading or state or
+// when those bounds are spent. Every delay given to arm() is a validated integer: (0, budget]
+// initially, (0, DEADLINE_SLACK_MS] on a re-arm and 0 for the kick (setTimeout wraps modulo 2^32).
+function clockReading(value) {
+    return Number.isSafeInteger(value) && value >= 0;
+}
+
+// Pure: how to arm a deadline of budget ms from origin when the clock reads now. ['arm', delay]
+// with 0 < delay <= budget; ['due', 0] once the budget is spent; ['invalid', 0] for an unusable
+// reading, origin or budget, or a clock that reads before the origin.
+function deadlineStart(now, origin, budget) {
+    if (!clockReading(now) || !clockReading(origin) || !Number.isSafeInteger(budget)) return ['invalid', 0];
+    if (budget < 1 || budget > TOTAL_BUDGET_MS || origin > SAFE_INT - budget) return ['invalid', 0];
+    const delay = origin + budget - now;
+    if (delay > budget) return ['invalid', 0];
+    return delay > 0 ? ['arm', delay] : ['due', 0];
+}
+
+// Pure: what a woken deadline timer does when the clock reads now. ['due', 0] at or after due;
+// ['rearm', left] for an early wake inside the bounds; ['bound', 0] for an early wake past them;
+// ['invalid', 0] for an unusable reading or inconsistent state.
+function deadlinePlan(now, due, extended, rearms) {
+    if (!clockReading(now) || !clockReading(due) || !Number.isSafeInteger(extended) || !Number.isSafeInteger(rearms)) return ['invalid', 0];
+    if (rearms < 0 || rearms > DEADLINE_REARMS_MAX || extended < rearms || extended > DEADLINE_SLACK_MS) return ['invalid', 0];
+    if (rearms === 0 && extended !== 0) return ['invalid', 0];
+    if (now >= due) return ['due', 0];
+    const left = due - now;
+    if (rearms === DEADLINE_REARMS_MAX || left > DEADLINE_SLACK_MS - extended) return ['bound', 0];
+    return ['rearm', left];
+}
+
+// The runtime clock and timers. The policy selftest passes a scripted clock and scheduler to
+// deadlineWith() through _internal; no ingress route can reach it (nginx.conf names handlers only).
+const DEADLINE_RUNTIME = {
+    now: () => Date.now(),
+    arm: (callback, ms) => setTimeout(callback, ms),
+    cancel: (id) => clearTimeout(id),
+    count: count,
+    refuse: sendRefusal,
+};
+
+// Fixed refusal at origin + budget. Never clear a timer that has fired.
+function deadlineWith(env, r, origin, budget, status, reason) {
+    const start = deadlineStart(env.now(), origin, budget);
+    if (start[0] !== 'arm') {
+        // Synchronous, before any body read or subrequest could settle a timer first.
+        if (start[0] === 'invalid') { try { env.count('deadline_invalid:' + reason); } catch (e) {} }
+        refuse(status, reason);
+    }
+    const due = origin + budget;
+    const d = { fired: false, id: null, extended: 0, rearms: 0, env: env };
+    const fire = () => {
+        let plan = deadlinePlan(env.now(), due, d.extended, d.rearms);
+        if (plan[0] === 'rearm') {
+            try {
+                d.id = env.arm(fire, plan[1]);  // d.id names the pending timer before this callback returns
+                d.rearms += 1;
+                d.extended += plan[1];
+                try { env.count('early:' + reason); env.count('rearm_ms:' + reason, plan[1]); } catch (e) {}
+                return;
+            } catch (e) {
+                plan = ['invalid', 0];
+            }
+        }
         d.fired = true;
-        try { count('expired:' + reason); } catch (e) {}
-        try { sendRefusal(r, status, reason); } catch (e) {}
-        setTimeout(() => {}, 0);        // flush the posted terminate now (section 3)
+        if (plan[0] !== 'due') { try { env.count((plan[0] === 'bound' ? 'early_final:' : 'deadline_invalid:') + reason); } catch (e) {} }
+        try { env.count('expired:' + reason); } catch (e) {}
+        try { env.refuse(r, status, reason); } catch (e) {}
+        env.arm(() => {}, 0);           // flush the posted terminate now (section 3)
         throw new Error('deadline');    // -> NGX_ERROR -> ngx_http_terminate_request
-    }, ms);
+    };
+    d.id = env.arm(fire, start[1]);
     return d;
 }
-function settle(d) { if (!d.fired) clearTimeout(d.id); return d.fired; }
+function deadline(r, origin, budget, status, reason) { return deadlineWith(DEADLINE_RUNTIME, r, origin, budget, status, reason); }
+function settle(d) { if (!d.fired) d.env.cancel(d.id); return d.fired; }
 
 async function runnerAccess(r) {
     const constants = constantsFor(r);
@@ -1399,7 +1472,7 @@ async function runnerAccess(r) {
     r.variables.heel_ok = '';
     try {
         const request = runnerRequest(r, constants, started);
-        const d = deadline(r, BODY_READ_MS, 408, 'body_timeout');
+        const d = deadline(r, started, BODY_READ_MS, 408, 'body_timeout');
         let buffer;
         try { buffer = await r.readRequestArrayBuffer(); } finally { if (settle(d)) return; }
         // Boundary belt: a read that completed in the same tick as the deadline is still late.
@@ -1552,15 +1625,15 @@ async function runnerContent(r) {
     try {
         if (r.variables.heel_ok !== '1') refuse(403, 'not_admitted');
         const generation = r.variables.heel_gen;
-        const started = Number(r.variables.heel_t0);
+        const t0 = r.variables.heel_t0 || '';
+        const started = /^[1-9][0-9]{0,15}$/.test(t0) ? Number(t0) : NaN;
         const bytes = bodyBytesOf(r.requestBuffer);
         // Recheck the whole request against a fresh snapshot immediately before dispatch.
         const request = runnerRequest(r, constants, Date.now(), bytes);
         if (String(request.registry.config_generation) !== generation) refuse(503, 'generation_changed');
-        const remaining = TOTAL_BUDGET_MS - (Date.now() - started);
-        if (!(remaining > 0)) refuse(504, 'timeout');
+        // The total budget runs from the access-phase origin; spent or unusable refuses here.
+        const d = deadline(r, started, TOTAL_BUDGET_MS, 504, 'timeout');
         r.variables.heel_state = 'dispatch';
-        const d = deadline(r, remaining, 504, 'timeout');
         let reply;
         try { reply = await r.subrequest(UPSTREAM_PREFIX + request.target, { method: 'POST', body: bytes }); } finally { if (settle(d)) return; }
         r.variables.heel_state = 'done';
@@ -1765,7 +1838,7 @@ async function managementAccess(r) {
         if (request.method === 'POST') {
             // The body is read here under the same total deadline; proxy_pass then forwards the
             // already-read (preserved) body, never reading the client again.
-            const d = deadline(r, BODY_READ_MS, 408, 'body_timeout');
+            const d = deadline(r, started, BODY_READ_MS, 408, 'body_timeout');
             try { await r.readRequestArrayBuffer(); } finally { if (settle(d)) return; }
             if (Date.now() - started > BODY_READ_MS) refuse(408, 'body_timeout');
         }
@@ -1839,6 +1912,7 @@ export default {
     _internal: {
         Refusal, decodeUtf8, parseJson, canonicalText, nfc, NFC_UNICODE_VERSION, checkRegistry, runnerRoute, managementRoute,
         managementHeaderSet, runnerPrecheck, runnerBodyCheck, checkRunnerResponse, MANAGEMENT_ROUTES,
-        RUNNER_ROUTES, RE,
+        RUNNER_ROUTES, RE, deadlineStart, deadlinePlan, deadlineWith, settle, BODY_READ_MS, TOTAL_BUDGET_MS,
+        DEADLINE_SLACK_MS, DEADLINE_REARMS_MAX,
     },
 };
