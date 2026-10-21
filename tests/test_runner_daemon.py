@@ -3342,7 +3342,9 @@ def test_status_never_presents_a_previous_serve_file_during_startup_or_unpair(tm
     thread, _events, outcome = _serve_in_thread(serving)
     assert gated.entered.wait(10)  # serve owns the instance and is still loading its identity
     view = _daemon(home, harness, backend).status(check_control_plane=False)
-    assert view["serve"]["state"] == "starting" and view["serve"]["since_ms"] > previous["updated_at_ms"]
+    # The published state identifies the new serve's file. since_ms/updated_at_ms are descriptive
+    # wall-clock readings with no order across serves (see the injected-clock restart tests below).
+    assert view["serve"]["state"] == "starting", view
     gated.release.set()
     _wait_serve_state(home, lambda state: state["state"] == "online")
     serving.request_stop()
@@ -3367,6 +3369,79 @@ def test_status_never_presents_a_previous_serve_file_during_startup_or_unpair(tm
     unpair_thread.join(10)
     assert done["unpair"]["removed"] is True
     assert _daemon(home, harness, backend).status() == {"state": "unpaired"} and _serve_state(home) is None
+
+
+_SERVE_VIEW_FIELDS = ("state", "since_ms", "updated_at_ms", "last_error_code", "binding_id", "pid")
+
+
+@contextlib.contextmanager
+def _restart_held_in_identity_load(tmp_path, harness, name, clock_before_load):
+    """Serve once, then restart a serve held in its identity load and yield ``(previous, view)``:
+    the previous serve's file and status while the restart is held. Only the restarted daemon's
+    ``clock_ms`` is injected: ``clock_before_load(previous)`` until the load is entered, real time
+    after it (before any signed call). The gate is released and the serve stopped and joined
+    even when an assertion fails."""
+    workspace_id, cookie = harness.signup_owner(f"{name}@example.test")
+    home, backend, _runner_id = _pair_runner(tmp_path, harness, workspace_id, cookie, name)
+    assert _serve_once(_daemon(home, harness, backend))["state"] == "stopped"
+    previous = _serve_state(home)
+    assert previous["state"] == "stopped"
+    gated = _GatedLoadBackend(backend.values)
+
+    def clock():
+        return daemon_module._now_ms() if gated.entered.is_set() else clock_before_load(previous)
+
+    gated.armed.set()
+    serving = _daemon(home, harness, gated, clock_ms=clock)
+    thread, _events, outcome = _serve_in_thread(serving)
+    try:
+        assert gated.entered.wait(10)  # serve owns the instance and is still loading its identity
+        yield previous, _daemon(home, harness, backend).status(check_control_plane=False)
+        gated.release.set()
+        _wait_serve_state(home, lambda state: state["state"] == "online")
+    finally:
+        gated.release.set()
+        serving.request_stop()
+        thread.join(10)
+    assert not thread.is_alive() and outcome["result"]["state"] == "stopped", outcome
+
+
+def test_status_shows_the_restarted_serve_when_it_starts_in_the_same_millisecond(tmp_path, harness):
+    """D-H1F-1: the restart's ``starting`` publish reads the same millisecond as the previous serve
+    file's last update. Equal stamps are expected; the state identifies the new file."""
+    with _restart_held_in_identity_load(
+        tmp_path, harness, "q1i-equal-ms", lambda previous: previous["updated_at_ms"],
+    ) as (previous, view):
+        assert view["serve"]["state"] == "starting", (view, previous)
+        assert view["serve"]["since_ms"] == view["serve"]["updated_at_ms"] == previous["updated_at_ms"]
+
+
+def test_status_would_present_a_stale_file_without_the_starting_publish(tmp_path, harness, monkeypatch):
+    """Control: without the ``starting`` publish before the turnstile opens, status presents the
+    previous serve's file as the running serve, field for field, under the same-millisecond clock.
+    The state oracle above is what detects that; no timestamp can."""
+    publish = daemon_module._ServeSession._publish
+
+    def without_starting(session, state, **options):
+        if state != "starting":
+            publish(session, state, **options)
+
+    monkeypatch.setattr(daemon_module._ServeSession, "_publish", without_starting)
+    with _restart_held_in_identity_load(
+        tmp_path, harness, "q1i-stale", lambda previous: previous["updated_at_ms"],
+    ) as (previous, view):
+        assert view["serve"] == {key: previous[key] for key in _SERVE_VIEW_FIELDS}, (view, previous)
+        assert view["serve"]["state"] == "stopped"
+
+
+def test_status_shows_the_restarted_serve_when_the_clock_stepped_back(tmp_path, harness):
+    """The wall clock stepped back 5 s across the restart: the new file carries older stamps than
+    the previous one and is still the one status presents."""
+    with _restart_held_in_identity_load(
+        tmp_path, harness, "q1i-step-back", lambda previous: previous["updated_at_ms"] - 5_000,
+    ) as (previous, view):
+        assert view["serve"]["state"] == "starting", (view, previous)
+        assert view["serve"]["since_ms"] == view["serve"]["updated_at_ms"] == previous["updated_at_ms"] - 5_000
 
 
 def test_edge_harness_default_route_refuses_a_malformed_bearer_like_the_worker(tmp_path, harness):
