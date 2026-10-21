@@ -288,56 +288,102 @@ def _spawn(ns_fd: int | None, path: str, argv: list[str], data: bytes) -> tuple[
     return pid, sink_r
 
 
-_UNREAPED: set[int] = set()  # owned children that outlived their reap grace; reaped later, never signalled again
-_REAP_LOCK = threading.Lock()  # one critical section for a registry snapshot, its polls and removals
+_OWNED, _LOOKING, _REAPED, _HANDED_OFF, _SWEEPING, _UNCERTAIN = (
+    "owned", "looking", "reaped", "handed_off", "sweeping", "uncertain")
 
 
-def _settle(pid: int, deadline_ns: int) -> tuple[bool, int | None]:
-    """Poll the owned child ``pid`` (never a blocking wait) until it is reaped or the monotonic
+class _Child:
+    """One forked child and who may still touch its pid. Every change is a single attribute store:
+    owned (only the launching operation polls or signals it) -> looking -> owned | reaped, and
+    owned -> handed_off (only the sweep polls it, under _REAP_LOCK; nothing signals it) -> sweeping
+    -> handed_off | reaped. Reaped and handed_off are terminal for the owner, so its later cleanup
+    never polls or signals the pid, however the registry changed and whatever reused the number. A
+    look interrupted between its waitpid and the store that records it stays looking/sweeping: the pid
+    may already be reaped and reused, so it becomes uncertain and is never polled or signalled again."""
+
+    __slots__ = ("pid", "state", "code", "observed_ns")
+
+    def __init__(self, pid: int, state: str = _OWNED):
+        self.pid, self.state, self.code, self.observed_ns = pid, state, None, 0
+
+
+_UNREAPED: set[_Child] = set()  # handed-off children the sweep reaps later, and uncertain ones kept for accounting
+_REAP_LOCK = threading.Lock()  # one critical section for a registry snapshot, its looks, hand-offs and removals
+
+
+def _look(child: _Child, holder: str) -> bool:
+    """One non-blocking status look by ``holder`` (_OWNED or _HANDED_OFF); a child held by anyone else
+    is never polled. The in-flight state is stored before the waitpid and replaced only after its
+    result is recorded. True when the child is reaped (a pid that is no longer this process's child
+    counts as reaped with an unknown code)."""
+    if child.state != holder:
+        return child.state == _REAPED
+    child.state = _LOOKING if holder == _OWNED else _SWEEPING
+    try:
+        done, status = os.waitpid(child.pid, os.WNOHANG)
+    except ChildProcessError:
+        done, status = child.pid, None
+    child.observed_ns = time.monotonic_ns()
+    if not done:
+        child.state = holder
+        return False
+    child.code = None if status is None else os.waitstatus_to_exitcode(status)
+    child.state = _REAPED
+    return True
+
+
+def _settle(child: _Child, deadline_ns: int) -> tuple[bool, int | None]:
+    """Poll the owned ``child`` (never a blocking wait) until it is reaped or the monotonic
     ``deadline_ns`` passes. Returns (reaped, exit code); the code is None unless the exit was
-    observed by the deadline, so a late exit is never a success. A pid that is no longer this
-    process's child counts as reaped with an unknown code."""
+    observed by the deadline, so a late exit is never a success."""
     pause = 0.0001
     while True:
-        try:
-            done, status = os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            return True, None
-        observed = time.monotonic_ns()
-        if done:
-            return True, os.waitstatus_to_exitcode(status) if observed <= deadline_ns else None
-        if observed >= deadline_ns:
+        if _look(child, _OWNED):
+            return True, child.code if child.observed_ns <= deadline_ns else None
+        if child.state != _OWNED or child.observed_ns >= deadline_ns:
             return False, None
-        time.sleep(min(pause, (deadline_ns - observed) / 1e9))
+        time.sleep(min(pause, (deadline_ns - child.observed_ns) / 1e9))
         pause = min(pause * 2, 0.005)
 
 
-def _kill_and_reap(pid: int) -> bool:
-    """SIGKILL the owned child ``pid`` unless it is already reaped, then reap it within
-    CHILD_REAP_GRACE_MS. A child still unreaped after the grace (for example stuck in the kernel)
-    is recorded in ``_UNREAPED`` and False is returned: its outcome stays uncertain."""
-    if _settle(pid, 0)[0]:
+def _kill_and_reap(child: _Child) -> bool:
+    """The owner's cleanup of ``child``; calling it again finishes an interrupted call. An owned child
+    is SIGKILLed unless already reaped, then reaped within CHILD_REAP_GRACE_MS; one still unreaped
+    after the grace (for example stuck in the kernel) is handed to the sweep and False is returned:
+    its outcome stays uncertain. A reaped or handed-off child is neither polled nor signalled; one
+    whose own look was interrupted is recorded uncertain in ``_UNREAPED`` and never touched again."""
+    if child.state == _LOOKING:
+        with _REAP_LOCK:
+            _UNREAPED.add(child)
+            child.state = _UNCERTAIN
+    if child.state != _OWNED:
+        return child.state == _REAPED
+    if _look(child, _OWNED):
         return True
     with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)  # still unreaped, so the pid cannot have been reused
-    reaped, _code = _settle(pid, time.monotonic_ns() + CHILD_REAP_GRACE_MS * 1_000_000)
+        os.kill(child.pid, signal.SIGKILL)  # still owned and unreaped, so the pid cannot have been reused
+    reaped, _code = _settle(child, time.monotonic_ns() + CHILD_REAP_GRACE_MS * 1_000_000)
     if not reaped:
         with _REAP_LOCK:
-            _UNREAPED.add(pid)
+            _UNREAPED.add(child)
+            child.state = _HANDED_OFF  # the one store that surrenders the pid to the sweep
     return reaped
 
 
 def _sweep_unreaped() -> None:
-    """Non-blocking: reap earlier unreaped children that have ended since (owned pids only). The
-    snapshot, each poll and each removal share one critical section, so no sweep can poll a pid that
-    another sweep already reaped (and the kernel may have reused for a new child)."""
+    """Non-blocking: reap handed-off children that have ended since (owned pids only). The snapshot,
+    each look and each removal share one critical section, so no sweep can poll a child that another
+    sweep already reaped (and the kernel may have reused for a new child). Entries the sweep does not
+    hold are not polled; one whose sweep look was interrupted becomes uncertain and stays recorded."""
     with _REAP_LOCK:
-        for pid in tuple(_UNREAPED):
-            if _settle(pid, 0)[0]:
-                _UNREAPED.discard(pid)
+        for child in tuple(_UNREAPED):
+            if child.state == _SWEEPING:
+                child.state = _UNCERTAIN
+            if _look(child, _HANDED_OFF):
+                _UNREAPED.discard(child)
 
 
-def _await(pid: int, sink_r: int, timeout_ms: int) -> tuple[int | None, bytes]:
+def _await(child: _Child, sink_r: int, timeout_ms: int) -> tuple[int | None, bytes]:
     """One monotonic deadline covers draining the child's output AND collecting its exit status;
     EOF alone completes nothing. On expiry the child is SIGKILLed and reaped (within the finite
     grace, or recorded as unreaped) and the status is None (uncertain), even if it exits 0 later.
@@ -349,7 +395,7 @@ def _await(pid: int, sink_r: int, timeout_ms: int) -> tuple[int | None, bytes]:
     while True:
         remaining_ms = -(-(deadline - time.monotonic_ns()) // 1_000_000)
         if remaining_ms <= 0:
-            _kill_and_reap(pid)
+            _kill_and_reap(child)
             return None, bytes(output)
         if not poller.poll(remaining_ms):
             continue
@@ -358,29 +404,27 @@ def _await(pid: int, sink_r: int, timeout_ms: int) -> tuple[int | None, bytes]:
             break
         if len(output) < MAX_OUTPUT_BYTES:
             output += chunk[:MAX_OUTPUT_BYTES - len(output)]
-    reaped, status = _settle(pid, deadline)
+    reaped, status = _settle(child, deadline)
     if not reaped:
-        _kill_and_reap(pid)
+        _kill_and_reap(child)
     return status, bytes(output)
 
 
 def _run(ns_fd: int | None, path: str | None, argv: list[str], data: bytes = b"",
          timeout_ms: int = PREPARE_CHILD_TIMEOUT_MS) -> tuple[int | None, bytes]:
-    """One bounded child. Whatever happens in the parent, the child is reaped before returning
-    or raising; a status of None means the outcome is uncertain."""
+    """One bounded child. Whatever happens in the parent, the child is reaped, handed to the sweep
+    or (after an interrupted look) recorded uncertain before returning or raising; a status of None
+    means the outcome is uncertain."""
     if path is None:
         raise DomainUnavailable("tool_missing")
     _sweep_unreaped()
     pid, sink_r = _spawn(ns_fd, path, argv, data)
-    reaped = False
+    child = _Child(pid)
     try:
-        status, output = _await(pid, sink_r, timeout_ms)
-        reaped = True
-        return status, output
+        return _await(child, sink_r, timeout_ms)
     finally:
         os.close(sink_r)
-        if not reaped:
-            _kill_and_reap(pid)
+        _kill_and_reap(child)  # nothing once reaped or handed off; otherwise the bounded cleanup
 
 
 def _nft(ns_fd: int, data: bytes) -> tuple[int | None, bytes]:
@@ -425,10 +469,10 @@ class _Namespace:
                 os.read(hold_r, 1)
             finally:
                 os._exit(0)
+        self._child = _Child(self.pid)
         os.close(hold_r)
         os.close(ready_w)
         self._hold_w: int | None = hold_w
-        self._reaped = False
         self.fd: int | None = None
         try:
             ready = _read_ready(ready_r, NAMESPACE_READY_TIMEOUT_MS)
@@ -452,15 +496,14 @@ class _Namespace:
     def release(self, *, kill: bool = False) -> bool:
         """Close the hold pipe once; the helper then exits by itself within CHILD_REAP_GRACE_MS, or
         (at once with ``kill``) is SIGKILLed and given the same finite grace. True only when the
-        helper was reaped; an unreaped helper is left to ``_UNREAPED`` and never signalled from here."""
+        helper was reaped; an unreaped helper is handed to the sweep and never polled or signalled from
+        here. A later call returns that result, or finishes a release an interruption cut short."""
         if self._hold_w is not None:
-            os.close(self._hold_w)
-            self._hold_w = None
+            hold_w, self._hold_w = self._hold_w, None
+            os.close(hold_w)
             if not kill:
-                self._reaped = _settle(self.pid, time.monotonic_ns() + CHILD_REAP_GRACE_MS * 1_000_000)[0]
-            if not self._reaped:
-                self._reaped = _kill_and_reap(self.pid)
-        return self._reaped
+                _settle(self._child, time.monotonic_ns() + CHILD_REAP_GRACE_MS * 1_000_000)
+        return _kill_and_reap(self._child)
 
 
 class LeaseDomain:
@@ -500,13 +543,16 @@ class LeaseDomain:
         if NFT_PATH is None:
             raise DomainUnavailable("nft_missing")
         namespace = _Namespace()
-        if not namespace.release():
+        try:
+            if not namespace.release():
+                raise DomainUnavailable("namespace_helper_unreaped")
+            domain = cls(_seal=_SEAL, ns_fd=namespace.fd)
+            if domain.ns_identity != namespace.identity:
+                raise DomainUnavailable("namespace_identity_changed")
+        except BaseException:
+            namespace.release(kill=True)  # finishes a release an interruption cut short; else returns at once
             os.close(namespace.fd)
-            raise DomainUnavailable("namespace_helper_unreaped")
-        domain = cls(_seal=_SEAL, ns_fd=namespace.fd)
-        if domain.ns_identity != namespace.identity:
-            os.close(namespace.fd)
-            raise DomainUnavailable("namespace_identity_changed")
+            raise
         if _counter is not None:
             domain._counter = _counter
         return domain

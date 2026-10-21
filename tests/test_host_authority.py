@@ -303,6 +303,11 @@ GRACE_S = authority.CHILD_REAP_GRACE_MS / 1000
 SLACK_S = 0.75
 
 
+def _unreaped() -> set[tuple[int, str]]:
+    """The cleanup registry as (pid, state) pairs."""
+    return {(child.pid, child.state) for child in authority._UNREAPED}
+
+
 def _gone(pid: int) -> bool:
     """True when ``pid`` is no longer a child of this process (it was reaped)."""
     try:
@@ -366,7 +371,7 @@ def test_await_counts_an_exit_only_when_observed_by_the_deadline(monkeypatch):
         pid, sink = authority._spawn(None, "/nonexistent/child-double", ["double"], b"")
         started = time.monotonic()
         try:
-            status, output = authority._await(pid, sink, timeout_ms)
+            status, output = authority._await(authority._Child(pid), sink, timeout_ms)
         finally:
             os.close(sink)
         return status, output, time.monotonic() - started, pid
@@ -393,9 +398,10 @@ def test_await_counts_an_exit_only_when_observed_by_the_deadline(monkeypatch):
     pid = os.fork()
     if pid == 0:
         os._exit(0)
+    child = authority._Child(pid)
     deadline = time.monotonic() + 10
     while True:
-        reaped, code = authority._settle(pid, time.monotonic_ns() - 1)  # the deadline has already passed
+        reaped, code = authority._settle(child, time.monotonic_ns() - 1)  # the deadline has already passed
         assert code is None
         if reaped:
             break
@@ -413,7 +419,8 @@ def test_kill_and_reap_never_signals_a_reaped_pid(monkeypatch):
     os.waitpid(pid, 0)
     sent = []
     monkeypatch.setattr(authority.os, "kill", lambda *arguments: sent.append(arguments))
-    assert authority._kill_and_reap(pid) is True and sent == [] and pid not in authority._UNREAPED
+    assert authority._kill_and_reap(authority._Child(pid)) is True and sent == []
+    assert pid not in {child.pid for child in authority._UNREAPED}
 
 
 @POSIX_FORK
@@ -439,7 +446,7 @@ def test_unreapable_child_is_uncertain_tracked_and_never_waited_on(monkeypatch, 
     elapsed = time.monotonic() - started
     assert raised.value.code == "installer_timeout"
     assert DEADLINE_S + GRACE_S <= elapsed < DEADLINE_S + GRACE_S + SLACK_S, elapsed
-    assert ignored == installer.pids == [installer.pids[0]] and authority._UNREAPED == {installer.pids[0]}
+    assert ignored == installer.pids == [installer.pids[0]] and _unreaped() == {(installer.pids[0], "handed_off")}
     assert domain._reservations == {1: authority.CONSUMED} and domain._handles == {}
     monkeypatch.setattr(authority.os, "kill", real_kill)
     real_kill(installer.pids[0], signal.SIGKILL)
@@ -476,7 +483,7 @@ def test_concurrent_sweeps_never_consume_a_reused_pid_status(monkeypatch):
         return pid, table.pop(pid) << 8
 
     monkeypatch.setattr(authority.os, "waitpid", waitpid)
-    monkeypatch.setattr(authority, "_UNREAPED", {fake_pid})
+    monkeypatch.setattr(authority, "_UNREAPED", {authority._Child(fake_pid, authority._HANDED_OFF)})
     progressed = threading.Event()
     lock = getattr(authority, "_REAP_LOCK", None)
     if lock is not None:
@@ -494,7 +501,7 @@ def test_concurrent_sweeps_never_consume_a_reused_pid_status(monkeypatch):
     a = threading.Thread(target=sweep_a, name="sweep-a")
     a.start()
     assert progressed.wait(10)
-    reused_early = fake_pid not in table and fake_pid not in authority._UNREAPED
+    reused_early = fake_pid not in table and fake_pid not in {child.pid for child in authority._UNREAPED}
     if reused_early:
         table[fake_pid] = 0  # A reaped and dropped the old child; the pid now names a new owned child that exited 0
     release_b.set()
@@ -503,7 +510,7 @@ def test_concurrent_sweeps_never_consume_a_reused_pid_status(monkeypatch):
     assert not b.is_alive() and not a.is_alive()
     if not reused_early:
         table[fake_pid] = 0  # the pid is reused only after the old child is reaped and dropped
-    owner = authority._settle(fake_pid, time.monotonic_ns() + 1_000_000_000)
+    owner = authority._settle(authority._Child(fake_pid), time.monotonic_ns() + 1_000_000_000)
     assert owner == (True, 0), f"the new child's status was consumed by a stale sweep: owner saw {owner}, waits {calls}"
     assert not reused_early and authority._UNREAPED == set() and calls == ["sweep-b", "MainThread"]
 
@@ -513,7 +520,8 @@ def test_forked_copy_gets_a_free_registry_lock_and_no_parent_children(monkeypatc
     """OS-PROCESS: the parent holds the registry lock and has an unreaped entry when it forks; the
     copy (still refused by every owner check) starts with an unheld lock and an empty registry, so
     its sweep returns at once; the parent's lock and entry are untouched."""
-    monkeypatch.setattr(authority, "_UNREAPED", {0x7FFF_FFF1})
+    entry = authority._Child(0x7FFF_FFF1, authority._HANDED_OFF)
+    monkeypatch.setattr(authority, "_UNREAPED", {entry})
     monkeypatch.setattr(authority, "_REAP_LOCK", threading.Lock())
     result_r, result_w = os.pipe()
     with authority._REAP_LOCK:
@@ -523,7 +531,7 @@ def test_forked_copy_gets_a_free_registry_lock_and_no_parent_children(monkeypatc
             try:
                 os.close(result_r)
                 outcome["locked"] = authority._REAP_LOCK.locked()
-                outcome["registry"] = sorted(authority._UNREAPED)
+                outcome["registry"] = sorted(child.pid for child in authority._UNREAPED)
                 authority._sweep_unreaped()
                 outcome["forked"] = authority._FORKED
                 os.write(result_w, json.dumps(outcome).encode())
@@ -531,9 +539,258 @@ def test_forked_copy_gets_a_free_registry_lock_and_no_parent_children(monkeypatc
                 os._exit(0)
         os.close(result_w)
         reported, status = _child_result(child, result_r)
-        assert authority._REAP_LOCK.locked() and authority._UNREAPED == {0x7FFF_FFF1}
+        assert authority._REAP_LOCK.locked() and authority._UNREAPED == {entry}
     assert reported == {"locked": False, "registry": [], "forked": True} and status == 0
     assert not authority._FORKED
+
+
+# ---------------------------------------------------------------------------------------------
+# Terminal cleanup ownership (H1A1R2): once its owner has reaped a child or handed it to the sweep,
+# nothing the owner runs later polls or signals that pid, even after the registry entry is gone and
+# the number is reused; an interrupted look is recorded uncertain instead of being retried.
+
+class FakeChildren:
+    """A model process table for ONE fake pid (no real process is forked for it, reused, waited on or
+    signalled); every other pid goes to the real ``os.waitpid``/``os.kill``. ``table[pid]`` is
+    ("running", generation) or ("exited", code, generation). Generation 1 is the interrupted owner's
+    child and ignores the first ``stuck`` SIGKILLs (a stand-in for a child stuck in the kernel);
+    generation 2 is another operation's child that reuses the pid, and SIGKILL ends it.
+    ``interrupt_after_reap`` makes the next reaping waitpid raise KeyboardInterrupt after the
+    table entry is gone (the async exception lands after the syscall, before the caller records it)
+    and then installs ``reuse`` for the pid."""
+
+    PID = 0x7FFF_FFF5
+
+    def __init__(self, monkeypatch, first, stuck=1_000_000):
+        self.table, self.stuck = {self.PID: first}, stuck
+        self.kills, self.waits = [], []
+        self.interrupt_after_reap, self.reuse = False, None
+        real_waitpid, real_kill = os.waitpid, os.kill
+
+        def waitpid(pid, options):
+            if pid != self.PID:
+                return real_waitpid(pid, options)
+            assert options == os.WNOHANG
+            self.waits.append(threading.current_thread().name)
+            entry = self.table.get(pid)
+            if entry is None:
+                raise ChildProcessError(10, "No child processes")
+            if entry[0] == "running":
+                return 0, 0
+            del self.table[pid]
+            if self.interrupt_after_reap:
+                self.interrupt_after_reap = False
+                if self.reuse is not None:
+                    self.table[pid] = self.reuse
+                raise KeyboardInterrupt
+            return pid, entry[1] << 8
+
+        def kill(pid, signum):
+            if pid != self.PID:
+                return real_kill(pid, signum)
+            entry = self.table.get(pid)
+            self.kills.append(entry[-1] if entry else None)
+            if entry and entry[0] == "running" and (entry[-1] == 2 or self.kills.count(1) > self.stuck):
+                self.table[pid] = ("exited", -signum, entry[-1])
+
+        def spawn(ns_fd, path, argv, data):
+            sink_r, sink_w = os.pipe()
+            os.close(sink_w)  # the output drains at once; the deadline then covers the exit status
+            return self.PID, sink_r
+
+        monkeypatch.setattr(authority.os, "waitpid", waitpid)
+        monkeypatch.setattr(authority.os, "kill", kill)
+        monkeypatch.setattr(authority, "_spawn", spawn)
+        monkeypatch.setattr(authority, "_UNREAPED", set())
+        monkeypatch.setattr(authority, "_REAP_LOCK", threading.Lock())
+        monkeypatch.setattr(authority, "CHILD_REAP_GRACE_MS", 20)
+
+    def run(self):
+        authority._run(None, "/nonexistent/nft-double", ["nft"], b"", timeout_ms=30)
+
+    def victim(self):
+        """The reused pid's own owner collects its child: (True, code) or (False, None) while it runs."""
+        return authority._settle(authority._Child(self.PID), time.monotonic_ns() + 200_000_000)
+
+
+@pytest.mark.parametrize("swept, reuse", [(False, None), (True, None), (True, ("exited", 0, 2)), (True, ("running", 2))],
+                         ids=["no-sweep-no-reuse", "swept-no-reuse", "swept-reused-exited", "swept-reused-running"])
+def test_interrupted_owner_never_polls_or_signals_a_handed_off_pid(monkeypatch, swept, reuse):
+    """STATE-MACHINE ONLY (the H1A1R1F section 4 rows): the owner's stuck child outlives the deadline
+    and the grace and is handed to the sweep; then an async exception lands in ``_run`` after
+    ``_await`` returned. Optionally the stuck child dies and another thread's sweep reaps it and drops
+    the entry (so a membership check finds nothing), and optionally the pid is reused by another
+    operation's child. The interrupted owner's cleanup polls and signals nothing: one SIGKILL in
+    total, to its own child; a reused child keeps its status and receives no signal."""
+    fake = FakeChildren(monkeypatch, ("running", 1))
+    real_await, seen = authority._await, []
+
+    def interrupted(child, sink_r, timeout_ms):
+        assert real_await(child, sink_r, timeout_ms) == (None, b"")
+        assert _unreaped() == {(fake.PID, "handed_off")}
+        if swept:
+            fake.table[fake.PID] = ("exited", 9, 1)  # the stuck child finally dies
+            sweep = threading.Thread(target=authority._sweep_unreaped, name="sweep")
+            sweep.start()
+            sweep.join(10)
+            assert fake.PID not in fake.table and not authority._UNREAPED
+        if reuse is not None:
+            fake.table[fake.PID] = reuse
+        seen.append(len(fake.waits))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(authority, "_await", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        fake.run()
+    assert fake.kills == [1], fake.kills
+    assert len(fake.waits) == seen[0], "the interrupted owner polled a pid it had surrendered"
+    if not swept:
+        assert _unreaped() == {(fake.PID, "handed_off")} and fake.table == {fake.PID: ("running", 1)}
+    elif reuse == ("exited", 0, 2):
+        assert fake.victim() == (True, 0)
+    elif reuse == ("running", 2):
+        assert fake.victim() == (False, None) and fake.table == {fake.PID: ("running", 2)}
+
+
+@pytest.mark.parametrize("reuse", [("exited", 0, 2), ("running", 2)], ids=["reused-exited", "reused-running"])
+def test_interrupted_owner_never_polls_or_signals_a_pid_it_reaped(monkeypatch, reuse):
+    """STATE-MACHINE ONLY: the owner's ``_await`` reaps its own exited child (status 0); the async
+    exception lands before ``_run`` records it and the pid is reused. The owner's cleanup neither
+    polls nor signals it; the reused child's owner collects its own status."""
+    fake = FakeChildren(monkeypatch, ("exited", 0, 1))
+    real_await, seen = authority._await, []
+
+    def interrupted(child, sink_r, timeout_ms):
+        assert real_await(child, sink_r, timeout_ms) == (0, b"")
+        fake.table[fake.PID] = reuse
+        seen.append(len(fake.waits))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(authority, "_await", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        fake.run()
+    assert fake.kills == [] and len(fake.waits) == seen[0] and not authority._UNREAPED
+    assert fake.victim() == ((True, 0) if reuse[0] == "exited" else (False, None))
+
+
+@pytest.mark.parametrize("reuse", [("exited", 0, 2), ("running", 2)], ids=["reused-exited", "reused-running"])
+def test_interrupted_owner_look_is_recorded_uncertain_and_never_retried(monkeypatch, reuse):
+    """STATE-MACHINE ONLY: the owner's own waitpid reaps its exited child and the async exception
+    lands before the result is recorded; the pid is then reused. Whether its child was reaped is
+    unknown to the owner, so the cleanup records it uncertain (kept in the registry for accounting)
+    and never polls or signals the pid; the sweep skips it; the reused child keeps its status."""
+    fake = FakeChildren(monkeypatch, ("exited", 0, 1))
+    fake.interrupt_after_reap, fake.reuse = True, reuse
+    with pytest.raises(KeyboardInterrupt):
+        fake.run()
+    authority._sweep_unreaped()
+    assert fake.kills == [] and fake.waits == ["MainThread"], (fake.kills, fake.waits)
+    assert _unreaped() == {(fake.PID, "uncertain")}
+    assert fake.victim() == ((True, 0) if reuse[0] == "exited" else (False, None))
+
+
+def test_interrupted_sweep_look_is_recorded_uncertain_and_never_retried(monkeypatch):
+    """STATE-MACHINE ONLY: a sweep's waitpid reaps a handed-off child and the async exception lands
+    before the removal; the pid is reused by another operation's child that exits 0. The next sweep
+    records the entry uncertain and does not poll it; the reused child's owner gets status 0."""
+    fake = FakeChildren(monkeypatch, ("exited", 9, 1))
+    fake.interrupt_after_reap, fake.reuse = True, ("exited", 0, 2)
+    authority._UNREAPED.add(authority._Child(fake.PID, authority._HANDED_OFF))
+    with pytest.raises(KeyboardInterrupt):
+        authority._sweep_unreaped()
+    assert not authority._REAP_LOCK.locked()
+    authority._sweep_unreaped()
+    assert fake.waits == ["MainThread"] and fake.kills == [] and _unreaped() == {(fake.PID, "uncertain")}
+    assert fake.victim() == (True, 0)
+
+
+@pytest.mark.parametrize("stuck", [1, 2], ids=["dies-on-second-kill", "stays-stuck"])
+def test_interrupt_before_hand_off_still_finishes_bounded_cleanup(monkeypatch, stuck):
+    """STATE-MACHINE ONLY: the async exception lands in the reap grace after the first SIGKILL, before
+    any reap or hand-off. The owner still holds its child (an unreaped pid cannot have been reused),
+    so its cleanup runs once more within one more finite grace: SIGKILL to its own child, then reaped
+    (dies-on-second-kill) or handed to the sweep (stays-stuck). Nothing is lost from the accounting."""
+    fake = FakeChildren(monkeypatch, ("running", 1), stuck=stuck)
+    real_sleep, fired = time.sleep, []
+
+    def sleep(seconds):
+        if fake.kills and not fired:
+            fired.append(seconds)
+            raise KeyboardInterrupt
+        real_sleep(seconds)
+
+    monkeypatch.setattr(authority.time, "sleep", sleep)
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        fake.run()
+    elapsed = time.monotonic() - started
+    assert fired and fake.kills == [1, 1] and elapsed < 0.03 + 2 * 0.02 + SLACK_S, (fake.kills, elapsed)
+    if stuck == 1:
+        assert fake.table == {} and not authority._UNREAPED
+    else:
+        assert _unreaped() == {(fake.PID, "handed_off")} and fake.table == {fake.PID: ("running", 1)}
+
+
+def test_interrupted_hand_off_is_completed_by_the_owner(monkeypatch):
+    """STATE-MACHINE ONLY: the async exception lands inside the hand-off itself, after the registry
+    insert. The owner still holds the child (only the sweep's own entries are polled by the sweep),
+    so its cleanup re-runs on its own unreaped child and completes the hand-off exactly once."""
+    fake = FakeChildren(monkeypatch, ("running", 1))
+
+    class InterruptedAdd(set):
+        fired = False
+
+        def add(self, item):
+            super().add(item)
+            if not InterruptedAdd.fired:
+                InterruptedAdd.fired = True
+                raise KeyboardInterrupt
+
+    monkeypatch.setattr(authority, "_UNREAPED", InterruptedAdd())
+    with pytest.raises(KeyboardInterrupt):
+        fake.run()
+    assert InterruptedAdd.fired and fake.kills == [1, 1] and _unreaped() == {(fake.PID, "handed_off")}
+    fake.table[fake.PID] = ("exited", 9, 1)
+    authority._sweep_unreaped()
+    assert not authority._UNREAPED and fake.table == {}
+
+
+@POSIX_FORK
+def test_interrupted_owner_never_resignals_its_handed_off_real_child(monkeypatch, tmp_path):
+    """OS-PROCESS: a real installer child whose SIGKILL is made ineffective (stuck stand-in) is handed
+    to the sweep; an async exception then lands after ``_await`` returned. The owner sends no second
+    signal and no further poll; the mark is CONSUMED; once the test kills its own child, the sweep
+    reaps it and clears the record."""
+    installer = Installer(monkeypatch, plan=[("sleep", 30, 0)])
+    domain = state_machine_domain(tmp_path)
+    real_kill, real_await, signalled = os.kill, authority._await, []
+
+    def kill(pid, signum):
+        if pid in installer.pids and signum == signal.SIGKILL:
+            signalled.append(pid)
+            return
+        real_kill(pid, signum)
+
+    def interrupted(child, sink_r, timeout_ms):
+        real_await(child, sink_r, timeout_ms)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(authority.os, "kill", kill)
+    monkeypatch.setattr(authority, "_await", interrupted)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            domain.prepare(L, R, 200)
+        assert signalled == installer.pids == [installer.pids[0]] and _unreaped() == {(installer.pids[0], "handed_off")}
+        assert domain._reservations == {1: authority.CONSUMED} and domain._handles == {}
+    finally:
+        monkeypatch.setattr(authority.os, "kill", real_kill)
+        real_kill(installer.pids[0], signal.SIGKILL)  # the test's own child: handed off, never reaped yet
+        deadline = time.monotonic() + 10
+        while authority._UNREAPED:
+            assert time.monotonic() < deadline, "the sweep never reaped the killed child"
+            authority._sweep_unreaped()
+            time.sleep(0.001)
+    assert installer.reaped()
 
 
 def _owned_namespace_helper(monkeypatch, unshare):
@@ -594,6 +851,82 @@ def test_namespace_helper_early_failure_and_ready_controls(monkeypatch):
         monkeypatch.undo()
 
 
+@POSIX_FORK
+def test_interrupted_helper_release_is_finished_not_abandoned(monkeypatch):
+    """OS-PROCESS: a real owned helper blocked on its hold pipe, as ``_Namespace`` leaves it (it then
+    lingers after EOF, so only SIGKILL ends it). The first release closes the pipe and an async
+    exception lands in its grace wait, before any reap or hand-off. The next ``release(kill=True)``,
+    as ``create`` and ``__init__`` cleanup call it, still kills and reaps the helper within the grace;
+    a further release returns the recorded result without looking."""
+    hold_r, hold_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(hold_w)
+            os.read(hold_r, 1)
+            time.sleep(30)
+        finally:
+            os._exit(0)
+    os.close(hold_r)
+    try:
+        namespace = object.__new__(authority._Namespace)
+        namespace.pid, namespace.fd, namespace._hold_w = pid, None, hold_w
+        namespace._child = authority._Child(pid)
+        real_sleep = time.sleep
+
+        def sleep(seconds):
+            monkeypatch.setattr(authority.time, "sleep", real_sleep)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(authority.time, "sleep", sleep)
+        with pytest.raises(KeyboardInterrupt):
+            namespace.release()
+        assert namespace._hold_w is None
+        started = time.monotonic()
+        assert namespace.release(kill=True) is True and time.monotonic() - started < GRACE_S + SLACK_S
+        assert _gone(pid) and not authority._UNREAPED
+        assert namespace.release() is True
+    finally:
+        if not _gone(pid):
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+
+@pytest.mark.parametrize("outcome", ["unreaped", "interrupted"])
+def test_create_finishes_helper_cleanup_and_closes_the_descriptor(monkeypatch, tmp_path, outcome):
+    """STATE-MACHINE ONLY: a stand-in for ``_Namespace`` (a real descriptor on an owned temp file; no
+    fork). A helper whose release cannot be reaped refuses with namespace_helper_unreaped; a release
+    interrupted by an async exception propagates only after ``create`` asked for the finishing
+    ``release(kill=True)``. Either way the descriptor is closed and no domain exists."""
+    calls, helpers = [], []
+
+    class Helper:
+        def __init__(self):
+            self.fd = os.open(tmp_path / "ns-stand-in", os.O_RDONLY | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            info = os.fstat(self.fd)
+            self.identity, self.pid = (info.st_dev, info.st_ino), 0x7FFF_FFF6
+            helpers.append(self)
+
+        def release(self, *, kill=False):
+            calls.append(kill)
+            if outcome == "interrupted" and not kill:
+                raise KeyboardInterrupt
+            return outcome != "unreaped"
+
+    monkeypatch.setattr(authority, "_Namespace", Helper)
+    monkeypatch.setattr(authority, "NFT_PATH", "/nonexistent/nft-double")
+    if outcome == "unreaped":
+        with pytest.raises(authority.DomainUnavailable) as raised:
+            authority.LeaseDomain.create()
+        assert str(raised.value) == "namespace_helper_unreaped"
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            authority.LeaseDomain.create()
+        assert calls == [False, True]
+    with pytest.raises(OSError):
+        os.fstat(helpers[0].fd)
+
+
 def test_read_ready_is_bounded_and_reports_eof():
     """OS-PROCESS: nothing written -> None after the budget; a byte inside it -> the byte; EOF -> b""."""
     read_fd, write_fd = os.pipe()
@@ -618,7 +951,7 @@ def test_child_waits_are_deadline_polled_never_blocking():
     tree = ast.parse(source)
     functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
     waits = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.unparse(node.func) == "os.waitpid"]
-    assert len(waits) == 1 and [ast.unparse(argument) for argument in waits[0].args] == ["pid", "os.WNOHANG"]
+    assert len(waits) == 1 and [ast.unparse(argument) for argument in waits[0].args] == ["child.pid", "os.WNOHANG"]
     assert "_reap" not in functions and "time.sleep" not in ast.get_source_segment(source, functions["_await"])
     namespace = next(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "_Namespace")
     init = ast.get_source_segment(source, next(node for node in namespace.body

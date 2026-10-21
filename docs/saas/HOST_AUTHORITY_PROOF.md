@@ -36,10 +36,14 @@ no customer workload. It is not a deployment or a launch claim.
   **and** collecting its exit status. EOF alone completes nothing, and an exit observed after the
   deadline is uncertain (`installer_timeout`/`flush_timeout`), never a success. On expiry the
   owned child is SIGKILLed and given a finite 250 ms reap grace; a child still unreaped after that
-  (for example stuck in the kernel) stays uncertain, is reaped later without blocking and is never
-  signalled again. The namespace helper must report ready within 2000 ms or it is killed and
-  creation refuses (`namespace_ready_timeout`; `namespace_helper_unreaped` if its release cannot
-  be reaped). A mutating call therefore holds the domain lock for at most about 1250 ms. These are
+  (for example stuck in the kernel) stays uncertain and is handed to a non-blocking sweep that reaps
+  it later and never signals it. Once the launching operation has reaped its child or handed it off,
+  its cleanup never polls or signals that pid again, even after an interruption, after the sweep
+  dropped the entry or after the pid was reused; a status look cut short by an interruption is
+  recorded uncertain and never retried (that child may still run or remain a zombie; it stays in
+  the record). The namespace helper must report ready within 2000 ms or it is killed and creation
+  refuses (`namespace_ready_timeout`; `namespace_helper_unreaped` if its release cannot be
+  reaped). A mutating call therefore holds the domain lock for at most about 1250 ms. These are
   monotonic budgets, not hard real-time guarantees under a stalled or descheduled kernel.
 - Ownership: the creating pid plus a per-process token that `os.register_at_fork` re-mints in every
   forked copy. Every public operation and the counter itself refuse in a forked copy before taking
