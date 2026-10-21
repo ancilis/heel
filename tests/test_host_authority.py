@@ -1620,6 +1620,111 @@ def test_listener_close_unlinks_only_own_inode(socket_dir):
         other.close()
 
 
+# The Linux T4-family connector program, run here on real AF_UNIX sockets against the test's own
+# accept-and-close acceptor. Darwin reports a full accept queue as ECONNREFUSED (Linux: EAGAIN), so a
+# connector that does not wait for acceptance fails the already-listening phase here for exactly that
+# capacity reason; the bound-not-listening phase is the T4N shape and must still show the refusal.
+CONNECTOR_FAILURES = ("n_enoent", "n_econnrefused", "n_eacces", "n_eagain", "n_other", "n_unanswered")
+CONNECTOR_EXPECTED = {"listening": set(), "bound_not_listening": {"n_enoent", "n_econnrefused"},
+                      "chatty_first_peer": {"n_unanswered"}}
+
+
+def _slow_acceptor(sock: socket.socket, chatty_first: bool) -> tuple[threading.Thread, threading.Event]:
+    """Accept and close, pausing 100 ms after every 50 accepts (the pause slows the acceptor; it
+    decides no verdict). ``chatty_first``: the first connection instead gets one byte every 10 ms
+    until the client goes away (capped at 10 s)."""
+    sock.settimeout(0.05)
+    stop = threading.Event()
+
+    def run() -> None:
+        accepted = 0
+        while not stop.is_set():
+            try:
+                connection, _address = sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with connection:
+                end = time.monotonic() + 10 if chatty_first and accepted == 0 else 0
+                try:
+                    while time.monotonic() < end and not stop.is_set():
+                        connection.sendall(b"x")
+                        time.sleep(0.01)
+                except OSError:
+                    pass
+            accepted += 1
+            if accepted % 50 == 0:
+                time.sleep(0.1)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, stop
+
+
+def _run_connector(program: str, path: Path, scenario: str) -> dict:
+    """The connector program with the T4 arguments; ``bound_not_listening`` publishes after its first
+    attempt in the T4N order (bind a temporary name, rename, 200 ms, listen), the others listen first."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    thread = stop = None
+    try:
+        if scenario != "bound_not_listening":
+            sock.bind(str(path))
+            sock.listen(1)
+            thread, stop = _slow_acceptor(sock, scenario == "chatty_first_peer")
+        with subprocess.Popen([sys.executable, "-I", "-c", program, str(path), "2000", "20"], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True) as process:
+            try:
+                assert json.loads(process.stdout.readline()) == {"event": "started"}
+                if scenario == "bound_not_listening":
+                    tmp = path.with_name(path.name + ".wrong.tmp")
+                    sock.bind(str(tmp))
+                    os.rename(tmp, path)
+                    time.sleep(0.2)
+                    sock.listen(1)
+                    thread, stop = _slow_acceptor(sock, False)
+                output, _ = process.communicate(timeout=60)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+    finally:
+        if stop is not None:
+            stop.set()
+            thread.join(5)
+        sock.close()
+    done = json.loads(output.splitlines()[-1])
+    assert done.pop("event") == "done"
+    return done
+
+
+def _check_connector(proof, done: dict, scenario: str) -> None:
+    # The capacity/control property first: it reads only buckets an older connector also reports.
+    failures = {key: done.get(key) for key in CONNECTOR_FAILURES}
+    assert {key for key, value in failures.items() if value} == CONNECTOR_EXPECTED[scenario], failures
+    assert done["attempts"] >= 2000 and done["n_success"] >= 20, done
+    # Then the closed shape and the accounting: one mutually exclusive outcome per attempt.
+    assert set(done) == set(proof.CONNECTOR_INTS) | set(proof.CONNECTOR_TOKENS)
+    assert done["attempts"] == sum(done["n_" + kind] for kind in proof.CONNECTOR_KINDS)
+    assert 1 <= done["first_success"] <= done["attempts"]
+    assert sum(done["after_" + kind] for kind in proof.CONNECTOR_KINDS) == done["attempts"] - done["first_success"]
+    assert done["other_first_errno"] == "none"
+    assert done["unanswered_first"] == ("deadline_after_data" if scenario == "chatty_first_peer" else "none")
+    if scenario == "chatty_first_peer":  # the drain deadline is absolute: a writing peer cannot hold it open
+        assert done["n_unanswered"] == 1 and done["first_success"] == 1 and done["after_unanswered"] == 0
+    entry = {"case": "t4", "verdict": "pass", "control": "listener",
+             "ints": {key: done[key] for key in proof.CONNECTOR_INTS},
+             "tokens": {key: done[key] for key in proof.CONNECTOR_TOKENS}}
+    assert proof.LAUNCHER.sanitize_record(entry) is not None
+
+
+@pytest.mark.parametrize("scenario", sorted(CONNECTOR_EXPECTED))
+def test_t4_family_connector_paces_by_acceptance_and_still_sees_the_refused_window(socket_dir, scenario):
+    """Real AF_UNIX on this OS, the test's own acceptor (not the product listener). The Linux T4,
+    T4N and T4S cases own the publication claim; this pins the probe that measures it."""
+    proof = _proof_module()
+    _check_connector(proof, _run_connector(proof.CONNECTOR, socket_dir / "a.sock", scenario), scenario)
+
+
 # ---------------------------------------------------------------------------------------------
 # Diagnostic readers (no enforcement in H1A-1).
 

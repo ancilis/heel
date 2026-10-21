@@ -113,12 +113,29 @@ the private PID namespace.
 | **T1** | Real listener as uid 10001, pid 1 of a child PID namespace, `external-pidns`, production permissions: the root client outside is answered (`inactive`, `no-store`) and sees uid 10001 and the outer pid; `verify_cp_socket` passes; uid 10002 gets `EACCES`; a root client inside the PID namespace (pid ≠ 0) gets no body |
 | **T2** | Same listener, `shared-pidns`: the outside root client (pid 0) gets no body; the inside client is answered |
 | **T3** | Refusals: user namespace with a non-identity map, peer uid = `overflowuid`, a `0755` directory, a symlinked directory, an unknown profile, a missing peer uid; a correct configuration publishes |
-| **T4** | Connector loop (≥ 2000 attempts from a second process, before and after publication): `ECONNREFUSED` 0, other 0, `ENOENT` ≥ 1, success ≥ 1; published inode = bound inode; no `*.tmp` |
-| **T4N** | Negative control with the test's own wrong-order publisher: `ECONNREFUSED` ≥ 1, or the probe cannot discriminate and the case fails |
+| **T4** | Connector loop (≥ 2000 attempts and ≥ 20 successes from a second process, before and after publication, paced as below): `ECONNREFUSED` 0, `EAGAIN` 0, other 0, unanswered 0, `ENOENT` ≥ 1, success ≥ 1, totals reconciled; published inode = bound inode with production permissions; no `*.tmp` during or after; the path is gone after `close()` |
+| **T4N** | Negative control with the test's own wrong-order publisher and the same connector: `ECONNREFUSED` ≥ 1, `ENOENT` ≥ 1, success ≥ 1, ≥ 2000 attempts, with `EAGAIN`, other and unanswered 0 and totals reconciled; otherwise the probe cannot discriminate and the case fails |
 | **T4F** | Injected listen failure with a working endpoint at the path: exception, final inode unchanged, endpoint still accepts, no `*.tmp` |
 | **T4R** | The final path is replaced by another listening socket; `close()` leaves it, and it still accepts |
-| **T4S** | A stale socket file is replaced by a listening inode; after the first success no `ECONNREFUSED` |
+| **T4S** | A stale socket file is replaced by a listening inode (the bound inode, not the stale one); after the first connect no `ECONNREFUSED`, `EAGAIN` or other; over the whole run no `EAGAIN`, other or unanswered, totals reconciled; no `*.tmp`; the path is gone after `close()` |
 | **C2** | No gate, child, socket, domain, mount, link or other process survives |
+
+The T4-family connector paces itself by acceptance, not by time. A connect counts as a success only
+once the peer has closed it (EOF) within one absolute 2 s drain deadline, read in bounded chunks that
+are never kept; otherwise it is unanswered. EOF is the acceptance signal only because of this
+topology: the real listener refuses the same-PID-namespace connector before reading a byte, and the
+plain acceptors close on accept. So at most one of its connections ever waits in the listener's
+queue, and it cannot overflow the 64-entry backlog it is measuring. Failed connects are not paced:
+the pre-publication and wrong-order windows are sampled as densely as before. Each attempt has one
+outcome: `enoent`, `econnrefused`, `eacces`, `eagain` (a `BlockingIOError` with `EAGAIN`, a full
+Linux accept queue), `other`, `success` or `unanswered`. `attempts` is their sum and the `after_*`
+outcomes are exactly the attempts after `first_success`, the first connect that did not fail. The
+T4, T4N and T4S records carry every one of these counts, `totals_reconciled`, the inode, `*.tmp`
+and path values their oracle reads, and the tokens `other_first_errno` and `unanswered_first`. Each
+token is `none` or a fixed value: a lower-case standard errno name, `timeout`, `deadline`,
+`deadline_after_data` or `unknown`. A token never holds exception text or received bytes. The
+workload is unchanged (2000 attempts, 20 successes, 20 s, no sleep, no retry, no allowance), and
+so is the production backlog.
 
 Labelled seams, each confined by a static test to its case:
 
@@ -149,3 +166,10 @@ else is FAIL. The artifact `host-authority-proof` has five bounded files and 3-d
   H2, H3, the five-second product bound, hosted enablement, launch.
 - The re-add observation is graded by the launcher against the H1F source-tag pin; the production
   self-test records it without grading.
+- The T4 family's pacing holds only for its topology (a refused peer, or an acceptor that closes on
+  accept). It is not a client for an admitted peer that waits for a request body. macOS cannot run
+  the family: Darwin reports a full accept queue as `ECONNREFUSED`, which looks the same as the
+  refused window. `tests/test_host_authority.py` runs the connector program on any OS only against
+  the test's own slow acceptor, and claims no publication result. Run `39636350344` on `2542b1a`
+  stays FAIL: its unpaced connector overflowed the backlog itself and recorded only `other`, with no
+  errno.

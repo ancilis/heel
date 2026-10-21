@@ -329,7 +329,8 @@ def test_static_required_profile_cannot_skip():
 
 
 def test_static_launcher_requires_every_case_function_and_record_in_this_module():
-    functions = _top_functions(Path(__file__).read_text(encoding="utf-8"))
+    module = Path(__file__).read_text(encoding="utf-8")
+    functions = _top_functions(module)
     cases = tuple(name for name in functions if name.startswith("test_"))
     assert cases == LAUNCHER.REQUIRED_CASES
     assert cases[-1] == "test_c2_no_owned_namespace_process_socket_mount_or_link_survives"
@@ -346,6 +347,35 @@ def test_static_launcher_requires_every_case_function_and_record_in_this_module(
     # H1ADR: D1-D6, K8, T1-T3, the five-case T4 family and C2, nothing optional.
     assert set(LAUNCHER.RECORD_CASES) == {"k8", "d1", "d2", "d3", "d4", "d5", "d6", "t1", "t2", "t3", "t4", "t4n", "t4f",
                                           "t4r", "t4s", "c2"}
+    # The T4-family connector: a success waits for the peer's EOF under one bounded drain, EAGAIN is
+    # named before the catch-all, nothing sleeps, and the fixed workload is unchanged.
+    program = ast.parse(CONNECTOR)
+    kinds = [node.value for node in program.body if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "kinds"]
+    assert [ast.literal_eval(value) for value in kinds] == [CONNECTOR_KINDS]
+    (attempt,) = [node for node in ast.walk(program) if isinstance(node, ast.Try) and _calls(node, "connect")]
+    assert [ast.unparse(statement) for statement in attempt.body] == ["client.connect(path)"]
+    assert [ast.unparse(handler.type) for handler in attempt.handlers] == [
+        "FileNotFoundError", "ConnectionRefusedError", "PermissionError", "BlockingIOError", "OSError"]
+    assert [ast.unparse(statement) for statement in attempt.orelse] == [
+        "cause = drain(client)", "kind = 'success' if cause is None else 'unanswered'"]
+    drain = ast.get_source_segment(CONNECTOR, _functions(CONNECTOR)["drain"])
+    assert "until, wrote = min(time.monotonic() + 2, deadline), False" in drain and "client.recv(64)" in drain
+    assert "sleep" not in CONNECTOR and "deadline = time.monotonic() + 20" in CONNECTOR
+    assert 'Child(CONNECTOR, (str(path), "2000", "20"))' in ast.get_source_segment(module, functions["_connector"])
+    # Each case reads only reported keys, records all of them, and requires no EAGAIN, other or
+    # unanswered outcome over the whole run and reconciled totals.
+    for name in ("test_t4_publication_has_no_refused_window", "test_t4n_wrong_order_publisher_shows_refused_window",
+                 "test_t4s_stale_socket_file_is_replaced_by_a_listening_inode"):
+        node = functions[name]
+        read = {sub.slice.value for sub in ast.walk(node) if isinstance(sub, ast.Subscript)
+                and getattr(sub.value, "id", None) == "done"}
+        assert read and read <= set(CONNECTOR_INTS), (name, read - set(CONNECTOR_INTS))
+        assert len(_calls(node, "_connector_record")) == 1, name
+        (call,) = _calls(node, "record")
+        assert ast.unparse(call.args[2]).startswith("ints") and ast.unparse(call.args[3]).startswith("tokens"), name
+        source = ast.get_source_segment(module, node)
+        for term in ('done["n_eagain"] == 0', 'done["n_other"] == 0', 'done["n_unanswered"] == 0', 'ints["totals_reconciled"]'):
+            assert term in source, (name, term)
 
 
 def test_static_launcher_has_one_fixed_profile_fixed_budgets_and_no_inputs(tmp_path, capsys):
@@ -775,34 +805,78 @@ except module.HostAuthorityConfigurationError as error:
 '''
 
 CONNECTOR = r'''
-import json, socket, sys, time
+import errno, json, re, socket, sys, time
 path, minimum, need = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-kinds = ("enoent", "econnrefused", "eacces", "success", "other")
+# One mutually exclusive outcome per attempt; attempts is their sum. A connect counts as "success"
+# only once the peer has accepted and closed it (EOF), otherwise "unanswered", so at most one of this
+# program's connections ever waits in the listener's queue: the probe cannot fill the backlog it
+# measures. Failed connects are not paced and sample the refused window as densely as before.
+kinds = ("enoent", "econnrefused", "eacces", "eagain", "other", "success", "unanswered")
 counts, after = dict.fromkeys(kinds, 0), dict.fromkeys(kinds, 0)
+first = {"other": "none", "unanswered": "none"}
 first_success, attempts, said = 0, 0, False
 deadline = time.monotonic() + 20
+
+
+def errno_token(error):
+    if isinstance(error, socket.timeout) and error.errno is None:
+        return "timeout"
+    name = errno.errorcode.get(error.errno, "")
+    return name.lower() if re.fullmatch(r"E[A-Z0-9]{1,30}", name) else "unknown"
+
+
+def drain(client):
+    # The T4-family peers close without writing (the real listener refuses this same-PID-namespace
+    # peer before reading; the plain acceptors close on accept), so EOF is the acceptance signal.
+    # Bounded reads, nothing kept, one absolute deadline: a peer that keeps writing cannot extend it.
+    # Expiry is "deadline", or "deadline_after_data" if the peer wrote anything first.
+    until, wrote = min(time.monotonic() + 2, deadline), False
+    while True:
+        left = until - time.monotonic()
+        if left <= 0:
+            return "deadline_after_data" if wrote else "deadline"
+        client.settimeout(left)
+        try:
+            if not client.recv(64):
+                return None
+        except socket.timeout as error:
+            if error.errno is None:
+                return "deadline_after_data" if wrote else "deadline"
+            return errno_token(error)
+        except OSError as error:
+            return errno_token(error)
+        wrote = True
+
+
 while time.monotonic() < deadline:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(2)
+    cause = "none"
     try:
         client.connect(path)
-        kind = "success"
     except FileNotFoundError:
         kind = "enoent"
     except ConnectionRefusedError:
         kind = "econnrefused"
     except PermissionError:
         kind = "eacces"
-    except OSError:
-        kind = "other"
+    except BlockingIOError as error:
+        kind, cause = ("eagain", "none") if error.errno == errno.EAGAIN else ("other", errno_token(error))
+    except OSError as error:
+        kind, cause = "other", errno_token(error)
+    else:
+        cause = drain(client)
+        kind = "success" if cause is None else "unanswered"
     finally:
         client.close()
     attempts += 1
     counts[kind] += 1
     if first_success:
         after[kind] += 1
-    elif kind == "success":
+    elif kind in ("success", "unanswered"):
         first_success = attempts
+    if first.get(kind) == "none":
+        first[kind] = cause
     if not said:
         sys.stdout.write(json.dumps({"event": "started"}) + "\n")
         sys.stdout.flush()
@@ -812,9 +886,13 @@ while time.monotonic() < deadline:
 fields = {"event": "done", "attempts": attempts, "first_success": first_success}
 fields.update({"n_" + k: v for k, v in counts.items()})
 fields.update({"after_" + k: v for k, v in after.items()})
+fields.update({"other_first_errno": first["other"], "unanswered_first": first["unanswered"]})
 sys.stdout.write(json.dumps(fields) + "\n")
 sys.stdout.flush()
 '''
+CONNECTOR_KINDS = ("enoent", "econnrefused", "eacces", "eagain", "other", "success", "unanswered")
+CONNECTOR_INTS = ("attempts", "first_success", *(f"{prefix}_{kind}" for prefix in ("n", "after") for kind in CONNECTOR_KINDS))
+CONNECTOR_TOKENS = ("other_first_errno", "unanswered_first")
 
 STALE_SOCKET = "import socket, sys\nsocket.socket(socket.AF_UNIX, socket.SOCK_STREAM).bind(sys.argv[1])\n"
 
@@ -1712,6 +1790,16 @@ def _connector(path: Path) -> Child:
     return connector
 
 
+def _connector_record(done: dict) -> tuple[dict, dict]:
+    """Every count and token the connector reports, plus whether its totals reconcile: attempts is
+    the sum of the n_* outcomes and the after_* outcomes are exactly the attempts after first_success."""
+    window = done["attempts"] - done["first_success"] if done["first_success"] else 0
+    reconciled = (done["attempts"] == sum(done["n_" + kind] for kind in CONNECTOR_KINDS)
+                  and sum(done["after_" + kind] for kind in CONNECTOR_KINDS) == window)
+    return ({key: done[key] for key in CONNECTOR_INTS} | {"totals_reconciled": int(reconciled)},
+            {key: done[key] for key in CONNECTOR_TOKENS})
+
+
 def test_t4_publication_has_no_refused_window():
     _require_runtime()
     directory = _t4_dir("t4")
@@ -1720,7 +1808,8 @@ def test_t4_publication_has_no_refused_window():
     connector = _connector(path)
     try:
         listener.start()
-        published = _inode(path) == listener.own_inode and _production_socket(path, owner=0)
+        bound = _inode(path) == listener.own_inode
+        published = bound and _production_socket(path, owner=0)
         thread = _serve(listener)
         done = connector.expect("done")
         tmp_during = _tmp_files(directory)
@@ -1729,12 +1818,14 @@ def test_t4_publication_has_no_refused_window():
         listener.close()
         if thread is not None:
             thread.join(5)
-    ok = (done["n_econnrefused"] == 0 and done["n_other"] == 0 and done["n_enoent"] >= 1 and done["n_success"] >= 1
-          and done["attempts"] >= 2000 and published and tmp_during == [] and _tmp_files(directory) == []
-          and not path.exists())
-    record("t4", ok, {key: done[key] for key in ("attempts", "n_enoent", "n_econnrefused", "n_eacces", "n_success", "n_other")}
-           | {"published_inode_is_bound_inode": int(published), "tmp_files_left": len(_tmp_files(directory))},
-           {"order": "bind_chmod_listen_rename"})
+    ints, tokens = _connector_record(done)
+    tmp_left, path_left = _tmp_files(directory), path.exists()
+    ok = (done["n_econnrefused"] == 0 and done["n_eagain"] == 0 and done["n_other"] == 0 and done["n_unanswered"] == 0
+          and done["n_enoent"] >= 1 and done["n_success"] >= 1 and done["attempts"] >= 2000 and ints["totals_reconciled"]
+          and published and tmp_during == [] and tmp_left == [] and not path_left)
+    record("t4", ok, ints | {"published_inode_is_bound_inode": int(bound), "published_production_socket": int(published),
+                             "tmp_files_during": len(tmp_during), "tmp_files_left": len(tmp_left), "path_left": int(path_left)},
+           tokens | {"order": "bind_chmod_listen_rename"})
     assert ok, "the published listener was observable before it listened, or left a temporary inode"
 
 
@@ -1786,9 +1877,10 @@ def test_t4n_wrong_order_publisher_shows_refused_window():
             sock.close()
         with contextlib.suppress(OSError):
             path.unlink()
-    ok = done["n_econnrefused"] >= 1 and done["n_enoent"] >= 1 and done["n_success"] >= 1 and done["attempts"] >= 2000
-    record("t4n", ok, {key: done[key] for key in ("attempts", "n_enoent", "n_econnrefused", "n_eacces", "n_success", "n_other")},
-           {"order": "bind_rename_listen"})
+    ints, tokens = _connector_record(done)
+    ok = (done["n_econnrefused"] >= 1 and done["n_enoent"] >= 1 and done["n_success"] >= 1 and done["attempts"] >= 2000
+          and done["n_eagain"] == 0 and done["n_other"] == 0 and done["n_unanswered"] == 0 and ints["totals_reconciled"])
+    record("t4n", ok, ints, tokens | {"order": "bind_rename_listen"})
     assert ok, "the wrong-order negative control showed no refused window: the probe cannot discriminate the order"
 
 
@@ -1857,7 +1949,7 @@ def test_t4s_stale_socket_file_is_replaced_by_a_listening_inode():
     connector = _connector(path)
     try:
         listener.start()
-        published = _inode(path) == listener.own_inode and _inode(path) != stale_inode
+        bound, not_stale = _inode(path) == listener.own_inode, _inode(path) != stale_inode
         thread = _serve(listener)
         done = connector.expect("done")
     finally:
@@ -1865,12 +1957,15 @@ def test_t4s_stale_socket_file_is_replaced_by_a_listening_inode():
         listener.close()
         if thread is not None:
             thread.join(5)
-    ok = (stale.returncode == 0 and stale_inode is not None and published and done["n_success"] >= 1
-          and done["after_econnrefused"] == 0 and done["after_other"] == 0 and done["attempts"] >= 2000
-          and _tmp_files(directory) == [] and not path.exists())
-    record("t4s", ok, {key: done[key] for key in ("attempts", "n_econnrefused", "n_success", "after_econnrefused",
-                                                  "after_success", "first_success")}
-           | {"published_inode_is_bound_inode": int(published)}, {"stale": "replaced"})
+    ints, tokens = _connector_record(done)
+    tmp_left, path_left = _tmp_files(directory), path.exists()
+    ok = (stale.returncode == 0 and stale_inode is not None and bound and not_stale and done["n_success"] >= 1
+          and done["after_econnrefused"] == 0 and done["after_eagain"] == 0 and done["after_other"] == 0
+          and done["n_eagain"] == 0 and done["n_other"] == 0 and done["n_unanswered"] == 0 and done["attempts"] >= 2000
+          and ints["totals_reconciled"] and tmp_left == [] and not path_left)
+    record("t4s", ok, ints | {"stale_exit": stale.returncode, "stale_inode_present": int(stale_inode is not None),
+                              "published_inode_is_bound_inode": int(bound), "published_inode_is_not_stale": int(not_stale),
+                              "tmp_files_left": len(tmp_left), "path_left": int(path_left)}, tokens | {"stale": "replaced"})
     assert ok, "the stale socket file was not replaced by a listening inode in one step"
 
 
