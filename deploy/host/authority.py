@@ -43,14 +43,17 @@ __all__ = (
     "ACTIVATED_MAP", "CLOCK_GAP_TOLERANCE_MS", "ClockSample", "ClockUnavailable", "ClockWitness",
     "ControlPlaneUnavailable", "DomainClosed", "DomainExhausted", "DomainUnavailable", "ForeignHandle",
     "ForeignProcess", "GATE_CHAIN", "HandleState", "HostQuarantined", "IP_PATH", "InstallerFailed", "LeaseDomain",
-    "MARK_MAX", "MAX_PREPARE_TIMEOUT_MS", "NFT_PATH", "PREPARED_SET", "PREPARE_CHILD_TIMEOUT_MS", "PrepareFailed",
+    "CHILD_REAP_GRACE_MS", "MARK_MAX", "MAX_PREPARE_TIMEOUT_MS", "NAMESPACE_READY_TIMEOUT_MS", "NFT_PATH",
+    "PREPARED_SET", "PREPARE_CHILD_TIMEOUT_MS", "PrepareFailed",
     "PreparedKey", "SelfTestReport", "TABLE", "detect_gap", "generation_self_test", "sleep_capability_report",
     "verify_cp_socket",
 )
 
 TABLE, PREPARED_SET, ACTIVATED_MAP, GATE_CHAIN = "heel_lease", "prepared", "activated", "gate"
 MARK_MAX = 0xFFFF_FFFF
-PREPARE_CHILD_TIMEOUT_MS = 1000  # liveness parameter; every installer child gets this bound
+PREPARE_CHILD_TIMEOUT_MS = 1000  # one deadline per installer child: output drained AND exit status collected
+NAMESPACE_READY_TIMEOUT_MS = 2000  # a namespace helper reports ready within this or is killed
+CHILD_REAP_GRACE_MS = 250  # finite reap wait after SIGKILL or a helper release; past it the outcome is uncertain
 MAX_PREPARE_TIMEOUT_MS = 3000  # LEASE_MS bound of H1DR/H1F
 CLOCK_GAP_TOLERANCE_MS = 200
 MAX_BATCH_BYTES = 4096
@@ -139,9 +142,10 @@ _FORKED = False
 
 
 def _remint() -> None:
-    global _PROCESS_TOKEN, _FORKED
+    global _PROCESS_TOKEN, _FORKED, _REAP_LOCK, _UNREAPED
     _PROCESS_TOKEN = object()
     _FORKED = True
+    _REAP_LOCK, _UNREAPED = threading.Lock(), set()  # never a held registry lock, nor the parent's children
 
 
 if hasattr(os, "register_at_fork"):
@@ -284,25 +288,60 @@ def _spawn(ns_fd: int | None, path: str, argv: list[str], data: bytes) -> tuple[
     return pid, sink_r
 
 
-def _reap(pid: int) -> int:
+_UNREAPED: set[int] = set()  # owned children that outlived their reap grace; reaped later, never signalled again
+_REAP_LOCK = threading.Lock()  # one critical section for a registry snapshot, its polls and removals
+
+
+def _settle(pid: int, deadline_ns: int) -> tuple[bool, int | None]:
+    """Poll the owned child ``pid`` (never a blocking wait) until it is reaped or the monotonic
+    ``deadline_ns`` passes. Returns (reaped, exit code); the code is None unless the exit was
+    observed by the deadline, so a late exit is never a success. A pid that is no longer this
+    process's child counts as reaped with an unknown code."""
+    pause = 0.0001
     while True:
         try:
-            _pid, status = os.waitpid(pid, 0)
-        except InterruptedError:
-            continue
-        return os.waitstatus_to_exitcode(status)
+            done, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True, None
+        observed = time.monotonic_ns()
+        if done:
+            return True, os.waitstatus_to_exitcode(status) if observed <= deadline_ns else None
+        if observed >= deadline_ns:
+            return False, None
+        time.sleep(min(pause, (deadline_ns - observed) / 1e9))
+        pause = min(pause * 2, 0.005)
 
 
-def _kill_and_reap(pid: int) -> None:
+def _kill_and_reap(pid: int) -> bool:
+    """SIGKILL the owned child ``pid`` unless it is already reaped, then reap it within
+    CHILD_REAP_GRACE_MS. A child still unreaped after the grace (for example stuck in the kernel)
+    is recorded in ``_UNREAPED`` and False is returned: its outcome stays uncertain."""
+    if _settle(pid, 0)[0]:
+        return True
     with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
-    with contextlib.suppress(ChildProcessError):
-        _reap(pid)
+        os.kill(pid, signal.SIGKILL)  # still unreaped, so the pid cannot have been reused
+    reaped, _code = _settle(pid, time.monotonic_ns() + CHILD_REAP_GRACE_MS * 1_000_000)
+    if not reaped:
+        with _REAP_LOCK:
+            _UNREAPED.add(pid)
+    return reaped
+
+
+def _sweep_unreaped() -> None:
+    """Non-blocking: reap earlier unreaped children that have ended since (owned pids only). The
+    snapshot, each poll and each removal share one critical section, so no sweep can poll a pid that
+    another sweep already reaped (and the kernel may have reused for a new child)."""
+    with _REAP_LOCK:
+        for pid in tuple(_UNREAPED):
+            if _settle(pid, 0)[0]:
+                _UNREAPED.discard(pid)
 
 
 def _await(pid: int, sink_r: int, timeout_ms: int) -> tuple[int | None, bytes]:
-    """Wait for the child's output to end, then reap it. On timeout the child is SIGKILLed and
-    reaped and the status is None (uncertain). Output is bounded and private."""
+    """One monotonic deadline covers draining the child's output AND collecting its exit status;
+    EOF alone completes nothing. On expiry the child is SIGKILLed and reaped (within the finite
+    grace, or recorded as unreaped) and the status is None (uncertain), even if it exits 0 later.
+    Output is bounded and private."""
     deadline = time.monotonic_ns() + timeout_ms * 1_000_000
     output = bytearray()
     poller = select.poll()
@@ -316,9 +355,13 @@ def _await(pid: int, sink_r: int, timeout_ms: int) -> tuple[int | None, bytes]:
             continue
         chunk = os.read(sink_r, 4096)
         if not chunk:
-            return _reap(pid), bytes(output)
+            break
         if len(output) < MAX_OUTPUT_BYTES:
             output += chunk[:MAX_OUTPUT_BYTES - len(output)]
+    reaped, status = _settle(pid, deadline)
+    if not reaped:
+        _kill_and_reap(pid)
+    return status, bytes(output)
 
 
 def _run(ns_fd: int | None, path: str | None, argv: list[str], data: bytes = b"",
@@ -327,6 +370,7 @@ def _run(ns_fd: int | None, path: str | None, argv: list[str], data: bytes = b""
     or raising; a status of None means the outcome is uncertain."""
     if path is None:
         raise DomainUnavailable("tool_missing")
+    _sweep_unreaped()
     pid, sink_r = _spawn(ns_fd, path, argv, data)
     reaped = False
     try:
@@ -346,13 +390,29 @@ def _nft(ns_fd: int, data: bytes) -> tuple[int | None, bytes]:
 # ---------------------------------------------------------------------------------------------
 # Namespaces held only by descriptor.
 
+def _read_ready(ready_r: int, timeout_ms: int) -> bytes | None:
+    """The helper's one ready byte (b"" at EOF) if it arrived by the monotonic deadline, else None."""
+    deadline = time.monotonic_ns() + timeout_ms * 1_000_000
+    poller = select.poll()
+    poller.register(ready_r, select.POLLIN | select.POLLHUP | select.POLLERR)
+    while True:
+        remaining_ms = -(-(deadline - time.monotonic_ns()) // 1_000_000)
+        if remaining_ms <= 0:
+            return None
+        if poller.poll(remaining_ms):
+            ready = os.read(ready_r, 1)
+            return ready if time.monotonic_ns() <= deadline else None
+
+
 class _Namespace:
     """A fresh network namespace: a helper child unshares and blocks on a pipe while the parent
-    opens ``/proc/<helper>/ns/net`` once; ``release`` lets the helper exit and reaps it."""
+    opens ``/proc/<helper>/ns/net`` once; ``release`` lets the helper exit and reaps it. A helper
+    that does not report ready within NAMESPACE_READY_TIMEOUT_MS is killed and nothing is opened."""
 
     def __init__(self) -> None:
         if not sys.platform.startswith("linux") or not hasattr(os, "unshare") or not hasattr(os, "setns"):
             raise DomainUnavailable("namespaces_unavailable")
+        _sweep_unreaped()
         hold_r, hold_w = os.pipe()
         ready_r, ready_w = os.pipe()
         self.pid = os.fork()
@@ -368,10 +428,12 @@ class _Namespace:
         os.close(hold_r)
         os.close(ready_w)
         self._hold_w: int | None = hold_w
+        self._reaped = False
         self.fd: int | None = None
         try:
-            ready = os.read(ready_r, 1)
-            os.close(ready_r)
+            ready = _read_ready(ready_r, NAMESPACE_READY_TIMEOUT_MS)
+            if ready is None:
+                raise DomainUnavailable("namespace_ready_timeout")
             if ready != b"u":
                 raise DomainUnavailable("unshare_failed")
             self.fd = os.open(f"/proc/{self.pid}/ns/net", os.O_RDONLY | os.O_CLOEXEC)
@@ -380,17 +442,25 @@ class _Namespace:
                 raise DomainUnavailable("namespace_not_new")
             self.identity = (info.st_dev, info.st_ino)
         except BaseException:
-            self.release()
+            self.release(kill=True)
             if self.fd is not None:
                 os.close(self.fd)
             raise
+        finally:
+            os.close(ready_r)
 
-    def release(self) -> None:
+    def release(self, *, kill: bool = False) -> bool:
+        """Close the hold pipe once; the helper then exits by itself within CHILD_REAP_GRACE_MS, or
+        (at once with ``kill``) is SIGKILLed and given the same finite grace. True only when the
+        helper was reaped; an unreaped helper is left to ``_UNREAPED`` and never signalled from here."""
         if self._hold_w is not None:
             os.close(self._hold_w)
             self._hold_w = None
-            with contextlib.suppress(ChildProcessError):
-                _reap(self.pid)
+            if not kill:
+                self._reaped = _settle(self.pid, time.monotonic_ns() + CHILD_REAP_GRACE_MS * 1_000_000)[0]
+            if not self._reaped:
+                self._reaped = _kill_and_reap(self.pid)
+        return self._reaped
 
 
 class LeaseDomain:
@@ -430,7 +500,9 @@ class LeaseDomain:
         if NFT_PATH is None:
             raise DomainUnavailable("nft_missing")
         namespace = _Namespace()
-        namespace.release()
+        if not namespace.release():
+            os.close(namespace.fd)
+            raise DomainUnavailable("namespace_helper_unreaped")
         domain = cls(_seal=_SEAL, ns_fd=namespace.fd)
         if domain.ns_identity != namespace.identity:
             os.close(namespace.fd)
@@ -807,7 +879,8 @@ def generation_self_test(domain: LeaseDomain) -> SelfTestReport:
         if peer is not None:
             with contextlib.suppress(OSError):
                 os.close(peer.fd)
-            peer.release()
+            if not peer.release():
+                failures.append("peer_helper_unreaped")
     tokens = {key: value for key, value in tokens.items() if isinstance(value, str) and _TOKEN.fullmatch(value)}
     tokens["selftest"] = "fail" if failures else "pass"
     report = SelfTestReport("fail" if failures else "pass", tuple(failures), types.MappingProxyType(tokens),

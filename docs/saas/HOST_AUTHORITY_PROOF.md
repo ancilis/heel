@@ -32,6 +32,15 @@ no customer workload. It is not a deployment or a launch claim.
 - Every kernel write is a forked child that enters the namespace by descriptor (`setns`), takes the
   frozen batch on stdin and `execve`s `nft -f -`; no Python runs after the exec and no
   `subprocess`/`multiprocessing` is used for batches.
+- Bounded waits: one 1000 ms monotonic deadline per installer child covers draining its output
+  **and** collecting its exit status. EOF alone completes nothing, and an exit observed after the
+  deadline is uncertain (`installer_timeout`/`flush_timeout`), never a success. On expiry the
+  owned child is SIGKILLed and given a finite 250 ms reap grace; a child still unreaped after that
+  (for example stuck in the kernel) stays uncertain, is reaped later without blocking and is never
+  signalled again. The namespace helper must report ready within 2000 ms or it is killed and
+  creation refuses (`namespace_ready_timeout`; `namespace_helper_unreaped` if its release cannot
+  be reaped). A mutating call therefore holds the domain lock for at most about 1250 ms. These are
+  monotonic budgets, not hard real-time guarantees under a stalled or descheduled kernel.
 - Ownership: the creating pid plus a per-process token that `os.register_at_fork` re-mints in every
   forked copy. Every public operation and the counter itself refuse in a forked copy before taking
   any lock. There is no override, argument, environment variable or flag. A legitimate new

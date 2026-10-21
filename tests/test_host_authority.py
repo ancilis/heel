@@ -21,6 +21,7 @@ import pickle
 import re
 import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -58,7 +59,8 @@ POSIX_FORK = pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 
 class Installer:
     """A recorded installer: the parent's batch bytes and child pids are recorded; the forked child
-    runs ``plan[call]`` (an exit code, or ("sleep", seconds, code), or ("wait", fd)) instead of nft."""
+    runs ``plan[call]`` (an exit code, or ("sleep", seconds, code), or ("wait", fd), or ("eof", seconds,
+    code): close its output first, then linger and exit) instead of nft."""
 
     def __init__(self, monkeypatch, plan=None, default=0):
         self.plan, self.default = list(plan or []), default
@@ -84,6 +86,10 @@ class Installer:
         if isinstance(step, tuple) and step[0] == "wait":
             os.read(step[1], 1)  # a pipe barrier released by the test
             os._exit(step[2] if len(step) > 2 else 0)
+        if isinstance(step, tuple) and step[0] == "eof":
+            os.close(sink_fd)  # the parent sees EOF while this child is still running
+            time.sleep(step[1])
+            os._exit(step[2])
         os._exit(step)
 
     def reaped(self) -> bool:
@@ -284,6 +290,340 @@ def test_cancelled_or_uncertain_prepare_consumes_mark(monkeypatch, tmp_path):
     monkeypatch.undo()
     Installer(monkeypatch)
     assert domain.prepare(L, R, 200).mark == 3
+
+
+# ---------------------------------------------------------------------------------------------
+# Bounded completion and readiness (H1A1R1): one deadline covers output EOF AND the exit status; an
+# exit observed after it is never a success; reaping has a finite grace; namespace readiness is bounded.
+# Elapsed ceilings add scheduling slack to the budgets; they are measurements, not real-time guarantees.
+
+DEADLINE_S = authority.PREPARE_CHILD_TIMEOUT_MS / 1000
+READY_S = authority.NAMESPACE_READY_TIMEOUT_MS / 1000
+GRACE_S = authority.CHILD_REAP_GRACE_MS / 1000
+SLACK_S = 0.75
+
+
+def _gone(pid: int) -> bool:
+    """True when ``pid`` is no longer a child of this process (it was reaped)."""
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return True
+    return False
+
+
+@POSIX_FORK
+def test_prepare_child_eof_before_exit_is_not_completion(monkeypatch, tmp_path):
+    """STATE-MACHINE ONLY: the double closes its output (EOF) and lingers 4 s before exiting 0. The
+    1000 ms deadline still covers its exit status, so prepare is refused as uncertain within the
+    budget; the child is killed and reaped, the mark CONSUMED and no handle exists (the 12645a7
+    build blocked 4 s under the domain lock and returned PREPARED)."""
+    installer = Installer(monkeypatch, plan=[("eof", 4, 0)])
+    domain = state_machine_domain(tmp_path)
+    started = time.monotonic()
+    with pytest.raises(authority.PrepareFailed) as raised:
+        domain.prepare(L, R, 200)
+    elapsed = time.monotonic() - started
+    assert raised.value.code == "installer_timeout" and DEADLINE_S <= elapsed < DEADLINE_S + GRACE_S + SLACK_S, elapsed
+    assert domain._reservations == {1: authority.CONSUMED} and domain._handles == {}
+    assert installer.reaped() and not authority._UNREAPED
+    assert domain.prepare(L, R, 200).mark == 2
+
+
+@POSIX_FORK
+def test_activate_close_and_flush_children_share_the_completion_deadline(monkeypatch, tmp_path):
+    """STATE-MACHINE ONLY: EOF-then-linger children for activate, close and the generation flush are
+    each refused as uncertain within the budget; activate and close consume their marks."""
+    installer = Installer(monkeypatch, plan=[0, ("eof", 4, 0), 0, ("eof", 4, 0), ("eof", 4, 0)])
+    domain = state_machine_domain(tmp_path)
+    first = domain.prepare(L, R, 200)
+    timings = []
+
+    def timed(operation, error, code):
+        started = time.monotonic()
+        with pytest.raises(error) as raised:
+            operation()
+        timings.append(time.monotonic() - started)
+        assert raised.value.code == code
+
+    timed(lambda: domain.activate(first), authority.InstallerFailed, "installer_timeout")
+    second = domain.prepare(L, R, 200)
+    timed(lambda: domain.close(second), authority.InstallerFailed, "installer_timeout")
+    timed(domain.close_generation, authority.InstallerFailed, "flush_timeout")
+    assert all(DEADLINE_S <= elapsed < DEADLINE_S + GRACE_S + SLACK_S for elapsed in timings), timings
+    assert domain._reservations == {1: authority.CONSUMED, 2: authority.CONSUMED} and domain._closed
+    assert installer.reaped() and not authority._UNREAPED
+
+
+@POSIX_FORK
+def test_await_counts_an_exit_only_when_observed_by_the_deadline(monkeypatch):
+    """OS-PROCESS: real forked children through the real ``_spawn``/``_await``. Positive controls:
+    output then exit 3 is (3, output); EOF then exit 0 inside the budget is 0. EOF then exit 0
+    after the budget is None (uncertain) and the child is killed and reaped. ``_settle`` never
+    reports a code for an exit observed after its deadline."""
+    def run(child, timeout_ms):
+        monkeypatch.setattr(authority, "_exec_child", child)
+        pid, sink = authority._spawn(None, "/nonexistent/child-double", ["double"], b"")
+        started = time.monotonic()
+        try:
+            status, output = authority._await(pid, sink, timeout_ms)
+        finally:
+            os.close(sink)
+        return status, output, time.monotonic() - started, pid
+
+    def refuses(ns_fd, path, argv, env, stdin_fd, sink_fd):
+        os.write(sink_fd, b"refused")
+        os._exit(3)
+
+    def eof_then_exit(delay):
+        def child(ns_fd, path, argv, env, stdin_fd, sink_fd):
+            os.close(sink_fd)
+            time.sleep(delay)
+            os._exit(0)
+        return child
+
+    status, output, _elapsed, pid = run(refuses, 1000)
+    assert (status, output) == (3, b"refused") and _gone(pid)
+    status, output, elapsed, pid = run(eof_then_exit(0.05), 1000)
+    assert (status, output) == (0, b"") and elapsed < DEADLINE_S and _gone(pid)
+    status, output, elapsed, pid = run(eof_then_exit(0.6), 200)
+    assert status is None and 0.2 <= elapsed < 0.2 + GRACE_S + SLACK_S and _gone(pid), elapsed
+    assert not authority._UNREAPED
+
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    deadline = time.monotonic() + 10
+    while True:
+        reaped, code = authority._settle(pid, time.monotonic_ns() - 1)  # the deadline has already passed
+        assert code is None
+        if reaped:
+            break
+        assert time.monotonic() < deadline, "the exited child was never reaped"
+        time.sleep(0.001)
+    assert _gone(pid)
+
+
+@POSIX_FORK
+def test_kill_and_reap_never_signals_a_reaped_pid(monkeypatch):
+    """OS-PROCESS: once this process has reaped a child its pid may be reused, so no signal is sent."""
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    os.waitpid(pid, 0)
+    sent = []
+    monkeypatch.setattr(authority.os, "kill", lambda *arguments: sent.append(arguments))
+    assert authority._kill_and_reap(pid) is True and sent == [] and pid not in authority._UNREAPED
+
+
+@POSIX_FORK
+def test_unreapable_child_is_uncertain_tracked_and_never_waited_on(monkeypatch, tmp_path):
+    """STATE-MACHINE ONLY: SIGKILL is made ineffective for the double's own pid (a stand-in for a
+    child stuck in the kernel). prepare still returns within deadline + reap grace as
+    installer_timeout with the mark CONSUMED; the pid is tracked as unreaped, not waited on. After
+    the test kills its own child, the non-blocking sweep reaps it and clears the record."""
+    installer = Installer(monkeypatch, plan=[("sleep", 30, 0)])
+    domain = state_machine_domain(tmp_path)
+    real_kill, ignored = os.kill, []
+
+    def kill(pid, signum):
+        if pid in installer.pids and signum == signal.SIGKILL:
+            ignored.append(pid)
+            return
+        real_kill(pid, signum)
+
+    monkeypatch.setattr(authority.os, "kill", kill)
+    started = time.monotonic()
+    with pytest.raises(authority.PrepareFailed) as raised:
+        domain.prepare(L, R, 200)
+    elapsed = time.monotonic() - started
+    assert raised.value.code == "installer_timeout"
+    assert DEADLINE_S + GRACE_S <= elapsed < DEADLINE_S + GRACE_S + SLACK_S, elapsed
+    assert ignored == installer.pids == [installer.pids[0]] and authority._UNREAPED == {installer.pids[0]}
+    assert domain._reservations == {1: authority.CONSUMED} and domain._handles == {}
+    monkeypatch.setattr(authority.os, "kill", real_kill)
+    real_kill(installer.pids[0], signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while authority._UNREAPED:
+        assert time.monotonic() < deadline, "the sweep never reaped the killed child"
+        authority._sweep_unreaped()
+        time.sleep(0.001)
+    assert installer.reaped() and domain.prepare(L, R, 200).mark == 2
+
+
+
+def test_concurrent_sweeps_never_consume_a_reused_pid_status(monkeypatch):
+    """STATE-MACHINE ONLY: a fake process table for one fake pid stands in for the kernel (no real
+    pid is reused, waited on or signalled). Sweep B snapshots the unreaped registry and is held at its
+    first waitpid; sweep A then runs. If A could reap the old child and drop it while B kept its stale
+    snapshot, the pid could be reused by a new owned child whose exit status B would then consume, so
+    its owner would see an unknown status. Sweeps must serialize snapshot, poll and removal: the new
+    child's owner always collects its own exit code."""
+    fake_pid, real_waitpid = 0x7FFF_FFF0, os.waitpid
+    table = {fake_pid: 9}  # the stuck child finally died (exit 9): a status is waiting
+    held, release_b = threading.Event(), threading.Event()
+    calls = []
+
+    def waitpid(pid, options):
+        if pid != fake_pid:
+            return real_waitpid(pid, options)
+        calls.append(threading.current_thread().name)
+        if len(calls) == 1:
+            held.set()  # sweep B has its snapshot and is about to poll
+            assert release_b.wait(10)
+        if pid not in table:
+            raise ChildProcessError(10, "No child processes")
+        return pid, table.pop(pid) << 8
+
+    monkeypatch.setattr(authority.os, "waitpid", waitpid)
+    monkeypatch.setattr(authority, "_UNREAPED", {fake_pid})
+    progressed = threading.Event()
+    lock = getattr(authority, "_REAP_LOCK", None)
+    if lock is not None:
+        signalling = SignallingLock()
+        signalling.contended = progressed  # A reports "blocked on the registry lock" through the same event
+        monkeypatch.setattr(authority, "_REAP_LOCK", signalling)
+
+    def sweep_a():
+        authority._sweep_unreaped()
+        progressed.set()
+
+    b = threading.Thread(target=authority._sweep_unreaped, name="sweep-b")
+    b.start()
+    assert held.wait(10)
+    a = threading.Thread(target=sweep_a, name="sweep-a")
+    a.start()
+    assert progressed.wait(10)
+    reused_early = fake_pid not in table and fake_pid not in authority._UNREAPED
+    if reused_early:
+        table[fake_pid] = 0  # A reaped and dropped the old child; the pid now names a new owned child that exited 0
+    release_b.set()
+    b.join(10)
+    a.join(10)
+    assert not b.is_alive() and not a.is_alive()
+    if not reused_early:
+        table[fake_pid] = 0  # the pid is reused only after the old child is reaped and dropped
+    owner = authority._settle(fake_pid, time.monotonic_ns() + 1_000_000_000)
+    assert owner == (True, 0), f"the new child's status was consumed by a stale sweep: owner saw {owner}, waits {calls}"
+    assert not reused_early and authority._UNREAPED == set() and calls == ["sweep-b", "MainThread"]
+
+
+@POSIX_FORK
+def test_forked_copy_gets_a_free_registry_lock_and_no_parent_children(monkeypatch):
+    """OS-PROCESS: the parent holds the registry lock and has an unreaped entry when it forks; the
+    copy (still refused by every owner check) starts with an unheld lock and an empty registry, so
+    its sweep returns at once; the parent's lock and entry are untouched."""
+    monkeypatch.setattr(authority, "_UNREAPED", {0x7FFF_FFF1})
+    monkeypatch.setattr(authority, "_REAP_LOCK", threading.Lock())
+    result_r, result_w = os.pipe()
+    with authority._REAP_LOCK:
+        child = os.fork()
+        if child == 0:
+            outcome = {}
+            try:
+                os.close(result_r)
+                outcome["locked"] = authority._REAP_LOCK.locked()
+                outcome["registry"] = sorted(authority._UNREAPED)
+                authority._sweep_unreaped()
+                outcome["forked"] = authority._FORKED
+                os.write(result_w, json.dumps(outcome).encode())
+            finally:
+                os._exit(0)
+        os.close(result_w)
+        reported, status = _child_result(child, result_r)
+        assert authority._REAP_LOCK.locked() and authority._UNREAPED == {0x7FFF_FFF1}
+    assert reported == {"locked": False, "registry": [], "forked": True} and status == 0
+    assert not authority._FORKED
+
+
+def _owned_namespace_helper(monkeypatch, unshare):
+    """The real ``_Namespace`` fork, pipes, deadline and cleanup; only the helper's ``unshare`` is
+    replaced (inherited by the fork), so no namespace is created and no host network is touched.
+    Returns the list of pids the parent forked (this test's own children)."""
+    monkeypatch.setattr(authority.sys, "platform", "linux")
+    monkeypatch.setattr(authority.os, "unshare", unshare, raising=False)
+    if not hasattr(os, "setns"):
+        monkeypatch.setattr(authority.os, "setns", lambda *arguments: None, raising=False)
+    forked, real_fork = [], os.fork
+
+    def fork():
+        pid = real_fork()
+        if pid:
+            forked.append(pid)
+        return pid
+
+    monkeypatch.setattr(authority.os, "fork", fork)
+    monkeypatch.setattr(authority, "NFT_PATH", "/nonexistent/nft-double")
+    return forked
+
+
+@POSIX_FORK
+def test_silent_namespace_helper_times_out_and_is_killed(monkeypatch):
+    """OS-PROCESS: ``LeaseDomain.create`` forks the real helper, whose unshare never returns (a
+    controlled stand-in for a deadlocked helper). create refuses with namespace_ready_timeout within
+    NAMESPACE_READY_TIMEOUT_MS + reap grace; the helper is killed and reaped; no domain exists (the
+    12645a7 build blocked here until something outside killed the helper)."""
+    forked = _owned_namespace_helper(monkeypatch, lambda flags: time.sleep(30))
+    started = time.monotonic()
+    with pytest.raises(authority.DomainUnavailable) as raised:
+        authority.LeaseDomain.create()
+    elapsed = time.monotonic() - started
+    assert str(raised.value) == "namespace_ready_timeout" and READY_S <= elapsed < READY_S + GRACE_S + SLACK_S, elapsed
+    assert len(forked) == 1 and _gone(forked[0]) and not authority._UNREAPED
+
+
+@POSIX_FORK
+def test_namespace_helper_early_failure_and_ready_controls(monkeypatch):
+    """OS-PROCESS positive controls on the same path: a helper whose unshare is refused exits at once
+    (EOF, unshare_failed); a helper that reports ready proceeds past readiness to the identity check,
+    which refuses because it never left this namespace (no /proc off Linux), and the helper blocked
+    on the hold pipe is killed and reaped. Neither waits for the readiness budget."""
+    def refused(flags):
+        raise PermissionError(1, "Operation not permitted")
+
+    for unshare, expected in ((refused, {"DomainUnavailable:unshare_failed"}),
+                              (lambda flags: None, {"DomainUnavailable:namespace_not_new", "FileNotFoundError"})):
+        forked = _owned_namespace_helper(monkeypatch, unshare)
+        started = time.monotonic()
+        with pytest.raises(Exception) as raised:
+            authority.LeaseDomain.create()
+        elapsed = time.monotonic() - started
+        outcome = f"{type(raised.value).__name__}" + (f":{raised.value}" if isinstance(raised.value, authority.DomainUnavailable) else "")
+        assert outcome in expected and elapsed < GRACE_S + SLACK_S, (outcome, elapsed)
+        assert len(forked) == 1 and _gone(forked[0]) and not authority._UNREAPED
+        monkeypatch.undo()
+
+
+def test_read_ready_is_bounded_and_reports_eof():
+    """OS-PROCESS: nothing written -> None after the budget; a byte inside it -> the byte; EOF -> b""."""
+    read_fd, write_fd = os.pipe()
+    try:
+        started = time.monotonic()
+        assert authority._read_ready(read_fd, 100) is None and 0.1 <= time.monotonic() - started < 0.1 + SLACK_S
+        os.write(write_fd, b"u")
+        assert authority._read_ready(read_fd, 1000) == b"u"
+        os.close(write_fd)
+        write_fd = None
+        assert authority._read_ready(read_fd, 1000) == b""
+    finally:
+        os.close(read_fd)
+        if write_fd is not None:
+            os.close(write_fd)
+
+
+def test_child_waits_are_deadline_polled_never_blocking():
+    """Static: every waitpid in the domain module is WNOHANG; no blocking reaper remains; the
+    namespace readiness byte is read only through the bounded reader."""
+    source = AUTHORITY_FILE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    waits = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.unparse(node.func) == "os.waitpid"]
+    assert len(waits) == 1 and [ast.unparse(argument) for argument in waits[0].args] == ["pid", "os.WNOHANG"]
+    assert "_reap" not in functions and "time.sleep" not in ast.get_source_segment(source, functions["_await"])
+    namespace = next(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "_Namespace")
+    init = ast.get_source_segment(source, next(node for node in namespace.body
+                                               if isinstance(node, ast.FunctionDef) and node.name == "__init__"))
+    assert "_read_ready(ready_r, NAMESPACE_READY_TIMEOUT_MS)" in init and "os.read(ready_r" not in init
 
 
 @POSIX_FORK
