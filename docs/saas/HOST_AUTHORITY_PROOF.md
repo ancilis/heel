@@ -90,11 +90,14 @@ credentials, expiry or packets.
 ## The Linux proof
 
 Run from the repository root as exactly `python scripts/host_authority_proof.py`. The launcher
-mirrors H1F and imports H1F's pytest closure, profile pin and `READD_EXPECTED` by path. It refuses a
-dirty checkout, stages exactly eleven tracked files (the seven H1A-1 files plus
-`scripts/host_lease_feasibility.py`, `scripts/host_ingress_proof.py`,
-`deploy/host/ingress/runtime-lock.json` and `tests/linux/__init__.py`) and records each SHA-256 and
-`proof_file_count 11` in `summary.json`. It runs `tests/linux/test_host_authority_proof.py` as root
+mirrors H1F and imports H1F's pytest closure by path; since H1A3-2 the supported-kernel pin,
+`READD_EXPECTED` and `kernel_profile` come from the production `deploy/host/profile.py`, also by
+path (equal to the H1F pin, a static test checks both). It refuses a dirty checkout, stages exactly
+fourteen tracked files (the seven H1A-1 files plus `scripts/host_lease_feasibility.py`,
+`scripts/host_ingress_proof.py`, `deploy/host/ingress/runtime-lock.json`, `tests/linux/__init__.py`
+and the three H1A3 files `deploy/host/cycle.py`, `deploy/host/profile.py` and
+`tests/test_host_cycle.py`, the last for provenance only) and records each SHA-256 and
+`proof_file_count 14` in `summary.json`. It runs `tests/linux/test_host_authority_proof.py` as root
 inside an outer network+mount+PID namespace with only loopback, under
 `HEEL_REQUIRE_HOST_AUTHORITY_PROOF=1`, so every skip is a failure. Probes are H1F's: a datagram every
 10 ms whose admission is the `sendto` verdict inside its own `[t_before, t_after]` bracket; a stale
@@ -118,7 +121,13 @@ the private PID namespace.
 | **T4F** | Injected listen failure with a working endpoint at the path: exception, final inode unchanged, endpoint still accepts, no `*.tmp` |
 | **T4R** | The final path is replaced by another listening socket; `close()` leaves it, and it still accepts |
 | **T4S** | A stale socket file is replaced by a listening inode (the bound inode, not the stale one); after the first connect no `ECONNREFUSED`, `EAGAIN` or other; over the whole run no `EAGAIN`, other or unanswered, totals reconciled; no `*.tmp`; the path is gone after `close()` |
-| **C2** | No gate, child, socket, domain, mount, link or other process survives |
+| **S1** | The H1A3-1 `HostCycle` on this kernel (see below): three ticks 1 s apart against active replies with 60 s of authority each return `serving`/`activated` with `authorized true`; each key delivers (≥ 95 %) over `[t_after_tick, t_before_tick + T − 2·tick)`; `E_upper − D < 0` from the conservative estimates; after the last key's `t_after_tick + T + tick` (+ one tick) no probe is admitted while the activated map still lists exactly mark 3; sequence 3, the first generation of the process (budget delta 1). Records the runner's nine real K9 tokens `k9_<key>`, `k9_satisfied` and `k9_path` |
+| **S2** | The decider answers 1500 ms late (500 ms past the 1000 ms request budget): the client gives up with `cp_timeout`, `last_decision no_reply`, `consecutive_unavailable 1`, the generation stays `serving`, `authorized false`; exactly one process (the prepare) is spawned, no activate, the activated map stays empty and nothing is admitted over the key's whole life `[t_before_tick, t_after_tick + T + tick]`. `late_reply` (a complete reply after the deadline) is proven by `tests/test_host_cycle.py`, not here |
+| **S3** | A reply with 2 s of authority is refused `authority_too_short` (`consecutive_unusable 1`, no activation, lower `E_upper` − upper `D` ≥ 500 ms); the next tick with 10 s activates and delivers (upper `E_upper` − lower `D` ≤ −500 ms); both request gaps < 100 ms; nothing is admitted after that key's bound |
+| **S4** | After one activation that delivers, `inactive key_revoked` closes the generation: phase `closed`, class end `A`, context ended with `key_revoked`, `authorized false`, the activated map read back through the gate's own descriptor is empty and nothing is admitted after the closing tick; a further tick makes no request (the listener saw exactly two). No restart |
+| **S5** | `inactive replayed_sequence` closes the generation after one activation (map flushed); after the real 10 s spacing the same cycle starts a new generation (new `generation_id`, compared in the test, never recorded), whose first request has sequence 1 and activates and delivers on the new namespace. The one positive restart control: budget delta 2 |
+| **S6** | After one activation the decider returns the previous reply verbatim: the real listener's own validation refuses it (`decide_failed 1`, status 500, no body), the client reports `cp_unavailable` (`consecutive_unavailable 1`, sequence 2, no new activation, the first key keeps delivering); the next fresh reply activates (sequence 3, mark 3). The client-side `malformed_reply` checks for a wrong digest or sequence are unit-proven in `tests/test_host_cycle.py` |
+| **C2** | No gate, child, socket, domain, mount, link or other process survives, and the process-wide cleanup registry of `authority.py` is empty; records the cycles and scripted deciders created |
 
 The T4-family connector paces itself by acceptance, not by time. A connect counts as a success only
 once the peer has closed it (EOF) within one absolute 2 s drain deadline, read in bounded chunks that
@@ -142,9 +151,33 @@ Labelled seams, each confined by a static test to its case:
 - `SEAM-COUNTER-START d3 only`: the `_counter` start value, never ownership or reservation;
 - `SEAM-NAMED-NAMESPACE d2 negative only`: a stale writer that resolves a namespace by name;
 - `SEAM-WRONG-ORDER t4n negative only`: the test's own wrong-order publisher;
-- `SEAM-LISTEN-FAILURE t4f only`: an injected `listen` that raises.
+- `SEAM-LISTEN-FAILURE t4f only`: an injected `listen` that raises;
+- `SEAM-SCRIPTED-DECIDER s-cases only`: the listener's `decide` callable returns scripted
+  codec-valid replies, one per request; S6's deliberately stale reply is rejected by the real
+  listener's own validation;
+- `SEAM-CYCLE-SLEEP-REPORT s-cases only`: the fixed all-disabled A-1/A-2 report, substituted only
+  when the recorded real report fails K9; it proves nothing about this host's power policy;
+- `SEAM-CYCLE-DOMAIN-REGISTER s-cases only`: the real `LeaseDomain.create`, wrapped only to register
+  the domain for C2.
 
 No production code sets any of them.
+
+The S cases drive the real `deploy/host/cycle.py` `HostCycle` (admission `NON_CUSTOMER`) through
+`start()`, `install_context()`, `tick()` and `stop()`: its own registry sweep, generation budget,
+signal context, real `LeaseDomain`, real generation self-test and grading, K9 check, clock witness,
+nft children, `connect_cp` and exchange, against the real listener as uid 10001, pid 1 of a child
+PID namespace with production permissions (as T1). The proof module registers its own
+`authority.py`, `profile.py` and listener modules under the names `cycle.py` loads, so the cycle and
+C2 read one cleanup registry (a static test checks the identity). Before the first start the
+fixture installs the signal context once, reads `sleep_capability_report()` once and records it,
+and requires the registry to be `clear` (at most 5 × 200 ms of drain); a refusal records the case as
+failed with a fixed token. The gate table is installed when `start()` returns `ready`, before the
+context. Timing uses one clock (`time.monotonic_ns`) and brackets each tick: a live window ends at
+`t_before_tick + T − 2·tick` (no later than the real `E_lower`), an admission bound is
+`t_after_tick + T + tick` (no earlier than the real `E_upper`), and `D` is estimated from either
+bracket edge, whichever is conservative for the sign asserted. The exact boundaries remain the
+injected-clock unit tests. The budget is the production one and is never reset: the six cases use
+seven real generations of the process's eight, each start at least 10 s after the previous one.
 
 Result rule (as H1F): PASS only if every case ran, every record holds, host fingerprints are
 unchanged and `kernel_profile pinned` (supported tag, nft 1.0.9, known HZ, self-test pass and the
@@ -164,8 +197,15 @@ else is FAIL. The artifact `host-authority-proof` has five bounded files and 3-d
 - Not accepted by H1A-1: the admission contract A-1..A-6, W-1/W-2 enforcement, R-1 closing in a
   cycle, the CP sequence check C-1, the CP snapshot decision (H1A-2), the supervisor cycle (H1A-3),
   H2, H3, the five-second product bound, hosted enablement, launch.
-- The re-add observation is graded by the launcher against the H1F source-tag pin; the production
-  self-test records it without grading.
+- The re-add observation is graded by the launcher against the production profile pin (equal to
+  H1F's source-tag pin); the production self-test records it without grading.
+- The S cases use a scripted decider. The real control-plane decision path is proven by
+  `tests/test_host_cycle.py` on ordinary Linux CI, not here. They record the runner's real nine K9
+  tokens and prove nothing about its power policy; the K9 refusal itself is `STATE-MACHINE ONLY` in
+  `tests/test_host_cycle.py`, and H6/H-B qualify hosts. Because the generation budget is
+  process-wide, one run holds seven real generations with real 10 s spacing. H1A3-A (real control
+  plane, kernel, executor and customer flow, with no seam) is the combined gate; nothing here
+  substitutes for it.
 - The T4 family's pacing holds only for its topology (a refused peer, or an acceptor that closes on
   accept). It is not a client for an admitted peer that waits for a request body. macOS cannot run
   the family: Darwin reports a full accept queue as `ECONNREFUSED`, which looks the same as the

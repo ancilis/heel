@@ -1190,15 +1190,23 @@ def test_profile_grading_matches_h1f_over_the_full_vector_matrix():
 
 
 def test_profile_constants_equal_the_h1f_pin():
-    """The production constants equal the H1F pin (the H1F launcher is not edited). The authority
-    proof launcher still imports H1F's grading in this task; moving it to the production module is
-    H1A3-2 (its static ``is h1f`` assertion stays true here)."""
+    """The production constants equal the H1F pin (the H1F launcher is not edited). Since H1A3-2 the
+    authority proof launcher grades with the production module loaded by path: its grading names are
+    that module's own objects, defined in deploy/host/profile.py, and no longer the H1F launcher's."""
     h1f = _load("heel_h1f_launcher_profile_pin", H1F_FILE)
     assert profile.SUPPORTED_KERNELS == h1f.SUPPORTED_KERNELS == {"6.8": "v6.8", "6.17": "v6.17", "7.0": "v7.0"}
     assert profile.READD_EXPECTED == h1f.READD_EXPECTED and profile.SUPPORTED_NFT == ("1.0.9",)
     assert profile.SUPPORTED_HZ == (100, 250, 1000)
-    launcher = (ROOT / "scripts" / "host_authority_proof.py").read_text(encoding="utf-8")
-    assert "deploy\" / \"host\" / \"profile.py" not in launcher
+    launcher = _load("heel_host_authority_proof_profile_pin", ROOT / "scripts" / "host_authority_proof.py")
+    production = launcher.profile()
+    assert production is launcher.profile() and Path(production.__file__) == PROFILE_FILE
+    for name in ("SUPPORTED_KERNELS", "READD_EXPECTED", "kernel_profile"):
+        assert getattr(launcher, name) is getattr(production, name), name
+        assert getattr(launcher, name) is not getattr(launcher.h1f(), name), name
+    assert Path(launcher.kernel_profile.__code__.co_filename) == PROFILE_FILE
+    fields = {"kernel_major_minor": "6.17", "nft_version": "1.0.9", "config_hz": 1000, "selftest": "pass",
+              "readd_observation": "refresh"}
+    assert launcher.kernel_profile(fields) == profile.kernel_profile(fields) == ("pinned", [])
 
 
 # ---------------------------------------------------------------------------------------------

@@ -69,6 +69,11 @@ def _load(name: str, path: Path):
 LAUNCHER = _load("host_authority_proof", LAUNCHER_FILE)
 AUTHORITY = _load("heel_host_authority_domain", AUTHORITY_FILE)
 LISTENER = _load("heel_host_authority_listener", LISTENER_FILE)
+PROFILE = LAUNCHER.profile()
+sys.modules.setdefault("heel_host_authority_domain", AUTHORITY)
+sys.modules.setdefault("heel_host_profile", PROFILE)
+sys.modules.setdefault("heel_host_authority_codec", LISTENER)
+CYCLE = _load("heel_host_cycle_proof", ROOT / "deploy" / "host" / "cycle.py")
 REQUIRED = os.environ.get(LAUNCHER.REQUIRED_ENV) == "1"
 
 MS = 1_000_000
@@ -342,11 +347,12 @@ def test_static_launcher_requires_every_case_function_and_record_in_this_module(
             recorded[call.args[0].value] = name
     assert recorded == {case: item[0] for case, item in LAUNCHER.RECORD_CASES.items()}
     assert {item[1] for item in LAUNCHER.RECORD_CASES.values()} <= set(LAUNCHER.CONTROLS)
+    assert "cycle" in LAUNCHER.CONTROLS
     assert sorted(case for case, item in LAUNCHER.RECORD_CASES.items() if item[1] == "negative") == ["d2", "t4n"]
     assert {item[2] for item in LAUNCHER.RECORD_CASES.values()} == {"pass"}
     # H1ADR: D1-D6, K8, T1-T3, the five-case T4 family and C2, nothing optional.
     assert set(LAUNCHER.RECORD_CASES) == {"k8", "d1", "d2", "d3", "d4", "d5", "d6", "t1", "t2", "t3", "t4", "t4n", "t4f",
-                                          "t4r", "t4s", "c2"}
+                                          "t4r", "t4s", "s1", "s2", "s3", "s4", "s5", "s6", "c2"}
     # The T4-family connector: a success waits for the peer's EOF under one bounded drain, EAGAIN is
     # named before the catch-all, nothing sleeps, and the fixed workload is unchanged.
     program = ast.parse(CONNECTOR)
@@ -409,9 +415,12 @@ def test_static_launcher_has_one_fixed_profile_fixed_budgets_and_no_inputs(tmp_p
 
 def test_static_profile_pin_and_closure_are_imported_from_h1f_not_copied():
     h1f = LAUNCHER.h1f()
-    for name in ("SUPPORTED_KERNELS", "READD_EXPECTED", "PYTEST_CLOSURE", "PYTHON_VERSION", "PYTEST_VERSION",
-                 "FIXED_PATH", "HOST_TOOLS", "kernel_profile", "ProofFailure"):
+    for name in ("PYTEST_CLOSURE", "PYTHON_VERSION", "PYTEST_VERSION", "FIXED_PATH", "HOST_TOOLS", "ProofFailure"):
         assert getattr(LAUNCHER, name) is getattr(h1f, name), name
+    for name in ("SUPPORTED_KERNELS", "READD_EXPECTED", "kernel_profile"):
+        assert getattr(LAUNCHER, name) is getattr(LAUNCHER.profile(), name), name
+    assert PROFILE.SUPPORTED_KERNELS == h1f.SUPPORTED_KERNELS and PROFILE.READD_EXPECTED == h1f.READD_EXPECTED
+    assert CYCLE.authority is AUTHORITY and CYCLE.profile is PROFILE and CYCLE.codec is LISTENER
     source = LAUNCHER_FILE.read_text(encoding="utf-8")
     for literal in ('"6.17"', '"refresh"', '"noop"', "files.pythonhosted.org", "711ffd45bf766d52"):
         assert literal not in source, literal
@@ -444,7 +453,7 @@ def test_static_launcher_stages_every_path_the_module_reads(tmp_path):
     reads = _root_reads(module) | (_root_reads(LAUNCHER_FILE.read_text(encoding="utf-8")) - {"host-authority-proof"})
     reads.discard(".git")  # only probed below, to tell the checkout from the staged copy
     assert reads <= set(LAUNCHER.STAGE_FILES), sorted(reads - set(LAUNCHER.STAGE_FILES))
-    assert len(LAUNCHER.STAGE_FILES) == len(set(LAUNCHER.STAGE_FILES)) == 11
+    assert len(LAUNCHER.STAGE_FILES) == len(set(LAUNCHER.STAGE_FILES)) == 14
     if not (ROOT / ".git").exists():
         assert [name for name in LAUNCHER.STAGE_FILES if not (ROOT / name).is_file()] == []
         return
@@ -520,6 +529,16 @@ def test_static_seams_are_labelled_and_confined_to_their_cases():
     assert named == {"test_d2_named_namespace_re_resolution_revives_a_key"}
     wrong = {name for name, node in functions.items() if not name.startswith("test_static_") and _calls(node, "_wrong_order_publisher")}
     assert wrong == {"test_t4n_wrong_order_publisher_shows_refused_window"}
+    # The three cycle seams: labelled, passed only by the S-case fixture, which only the six S cases call.
+    for label in ("SEAM-SCRIPTED-DECIDER s-cases only", "SEAM-CYCLE-SLEEP-REPORT s-cases only",
+                  "SEAM-CYCLE-DOMAIN-REGISTER s-cases only"):
+        assert any(label in seam for seam in LAUNCHER.SEAMS) and label in module, label
+    assert _keyword_users(module, "_seams_for_tests") == {"_cycle_fixture"}
+    fixture_users = {name for name, node in functions.items() if _calls(node, "_cycle_fixture")}
+    assert fixture_users == {name for name in LAUNCHER.REQUIRED_CASES if re.match(r"test_s[1-6]_", name)}
+    assert len(fixture_users) == 6
+    for source in (authority, listener, launcher, unit):
+        assert "_seams_for_tests" not in source
 
 
 def test_static_production_has_no_named_namespace_raw_mark_api_or_wrong_publication_order():
@@ -566,7 +585,7 @@ def test_static_doc_names_every_case_and_the_limits():
         assert f"**{case.upper()}**" in doc, case
     for phrase in ("INCOMPLETE", "kernel_profile pinned", "runtime_assumption running-kernel", "NOT RUN", "M3",
                    "python scripts/host_authority_proof.py", "bind, chmod and verify, listen, rename, verify",
-                   "eleven", "t_before", "STATE-MACHINE ONLY", "no allowance", *[seam.split(":")[0] for seam in LAUNCHER.SEAMS]):
+                   "fourteen", "t_before", "STATE-MACHINE ONLY", "no allowance", *[seam.split(":")[0] for seam in LAUNCHER.SEAMS]):
         assert phrase in doc, phrase
 
 
@@ -901,7 +920,7 @@ OPEN_GATES: set = set()
 DOMAINS: list = []
 MOUNTS: list = []
 SOCKETS: list = []
-COUNTERS = {"gates": 0, "children": 0, "sockets": 0, "domains": 0}
+COUNTERS = {"gates": 0, "children": 0, "sockets": 0, "domains": 0, "cycles": 0, "deciders": 0}
 
 
 class Child:
@@ -1969,6 +1988,492 @@ def test_t4s_stale_socket_file_is_replaced_by_a_listening_inode():
     assert ok, "the stale socket file was not replaced by a listening inode in one step"
 
 
+# ---------------------------------------------------------------------------------------------
+# Dynamic cases: the H1A3-1 authorization cycle on this kernel (S1-S6). The real HostCycle with its
+# real LeaseDomain, generation self-test, grading, clock witness, nft children, connect_cp and
+# exchange, against the real listener as uid 10001, pid 1 of a child PID namespace (external-pidns,
+# production permissions, as T1). Three labelled seams, passed only by _cycle_fixture:
+# SEAM-SCRIPTED-DECIDER s-cases only (the listener's decide callable returns scripted replies; the
+# listener still validates each one, so S6's deliberately stale reply never reaches the wire),
+# SEAM-CYCLE-SLEEP-REPORT s-cases only (the fixed all-disabled report, only when the recorded real
+# report fails K9) and SEAM-CYCLE-DOMAIN-REGISTER s-cases only (the real LeaseDomain.create,
+# registered for c2). One coherent clock (time.monotonic_ns), the production budget and spacing.
+
+SCRIPTED_LISTENER_PROGRAM = r'''
+import importlib.util, json, os, sys, threading, time
+listener_file, path, uid, grant = sys.argv[1], sys.argv[2], int(sys.argv[3]), json.loads(sys.argv[4])
+def say(**fields):
+    sys.stdout.write(json.dumps(fields) + "\n")
+    sys.stdout.flush()
+os.unshare(0x20000000)
+child = os.fork()
+if child:
+    say(event="forked", outer_pid=child)
+    _pid, status = os.waitpid(child, 0)
+    os._exit(0 if os.waitstatus_to_exitcode(status) == 0 else 1)
+script = []
+for line in sys.stdin:
+    if line.strip() == "go":
+        break
+    script.append(json.loads(line))
+os.setgroups([])
+os.setresgid(uid, uid, uid)
+os.setresuid(uid, uid, uid)
+spec = importlib.util.spec_from_file_location("listener_under_test", listener_file)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+names = ("workspace_id", "project_id", "environment_id", "verification_record_digest", "runner_id", "runner_key_id",
+         "binding_id", "binding_digest", "run_id", "grant_id", "grant_digest")
+tally = {"requests": 0, "answered_active": 0, "answered_inactive": 0, "stale_attempts": 0}
+previous = []
+def decide(req):
+    # SEAM-SCRIPTED-DECIDER s-cases only: one scripted step per request, in order; past the script
+    # the answer is inactive no_active_run.
+    index = tally["requests"]
+    tally["requests"] += 1
+    step = script[index] if index < len(script) else {"delay_ms": 0, "decision": "inactive", "reason": "no_active_run",
+                                                       "rem_ms": 0, "stale": False}
+    if step["delay_ms"]:
+        time.sleep(step["delay_ms"] / 1000)
+    if step["stale"] and previous:
+        tally["stale_attempts"] += 1
+        return previous[-1]  # the previous request's reply, verbatim
+    now = int(time.time() * 1000)
+    reply = {"schema_version": module.RESPONSE_SCHEMA, "decision": step["decision"], "reason": step["reason"],
+             "sequence": req["sequence"], "request_digest": module.request_digest(req), "server_time_ms": now,
+             "kill_switch_generation": req["kill_switch_generation"]}
+    if step["decision"] == "active":
+        reply.update({name: req[name] for name in names})
+        reply.update(public_key_digest=grant["public_key_digest"], egress_hostname=grant["egress_hostname"],
+                     run_status="running", stop_reason="none", egress_port=443,
+                     proof_expires_at_ms=now + step["rem_ms"], binding_expires_at_ms=now + step["rem_ms"],
+                     grant_expires_at_ms=now + step["rem_ms"])
+        tally["answered_active"] += 1
+    else:
+        tally["answered_inactive"] += 1
+    previous.append(reply)
+    return reply
+config = module.HostAuthorityConfig(path, 0, module.PeerProfile("external-pidns"))
+listener = module.HostAuthorityListener(config, decide)
+try:
+    listener.start()
+except module.HostAuthorityConfigurationError as error:
+    say(event="refused_start", code=error.code)
+    os._exit(1)
+say(event="listening", pid=os.getpid(), uid=os.getuid(), inode=listener.own_inode[1])
+thread = threading.Thread(target=listener.serve_forever, daemon=True)
+thread.start()
+for line in sys.stdin:
+    if line.strip() == "stop":
+        break
+listener.close()
+thread.join(5)
+say(event="stopped", **listener.counters, **tally)
+os._exit(0)
+'''
+
+CYCLE_GRANT = {"public_key_digest": "8" * 64, "egress_hostname": "egress.proof.example"}
+CONTEXT = CYCLE.CycleContext(**{name: REQUEST[name] for name in CYCLE.CONTEXT_STRINGS[:11]}, **CYCLE_GRANT,
+                             kill_switch_generation=0, egress_port=443)
+# SEAM-CYCLE-SLEEP-REPORT s-cases only: the fixed all-disabled A-1/A-2 report (never this host's).
+K9_DISABLED = {**dict.fromkeys(CYCLE._SLEEP_UNITS, "masked"), "sleep_conf": "all_disabled",
+               "hibernation": "disabled_cmdline", "power_state": "none", "enforcement": "none_in_h1a1"}
+_S = {"installed": False, "last_start_ns": None, "k9": None}
+
+
+class _CycleRefused(AssertionError):
+    """The S-case fixture could not reach ``serving``; ``token`` is a fixed refusal token."""
+
+    def __init__(self, token: str):
+        super().__init__(token)
+        self.token = token if LAUNCHER._TOKEN.fullmatch(token) else "other"
+
+
+def _step(decision: str = "active", reason: str = "none", *, rem_ms: int = 60_000, delay_ms: int = 0,
+          stale: bool = False) -> dict:
+    return {"delay_ms": delay_ms, "decision": decision, "reason": reason, "rem_ms": rem_ms, "stale": stale}
+
+
+def _cycle_domain():
+    """SEAM-CYCLE-DOMAIN-REGISTER s-cases only: the real ``LeaseDomain.create``, registered for c2."""
+    domain = AUTHORITY.LeaseDomain.create()
+    DOMAINS.append(domain)
+    COUNTERS["domains"] += 1
+    return domain
+
+
+def _k9_path() -> str:
+    return "real" if _S["k9"] is not None and CYCLE._sleep_disabled(_S["k9"]) else "scripted"
+
+
+def _registry_preflight() -> None:
+    """Fail closed unless the process-wide cleanup registry is clear (at most 5 x 200 ms of drain)."""
+    verdict = CYCLE.classify_children(AUTHORITY.sweep_unresolved_children())
+    for _attempt in range(5):
+        if verdict != "drain":
+            break
+        time.sleep(0.2)
+        verdict = CYCLE.classify_children(AUTHORITY.sweep_unresolved_children())
+    if verdict != "clear":
+        raise _CycleRefused(f"registry_{verdict}")
+
+
+def _scripted_listener(script: list[dict]) -> tuple[Child, Path]:
+    COUNTERS["deciders"] += 1
+    path = _peer_dir(f"cycle{COUNTERS['deciders']}") / "authority.sock"
+    listener = Child(SCRIPTED_LISTENER_PROGRAM, (str(LISTENER_FILE), str(path), str(CP_UID), json.dumps(CYCLE_GRANT)))
+    try:
+        for step in script:
+            listener.send(json.dumps(step))
+        listener.send("go")
+        listener.expect("forked")
+        listening = listener.expect("listening")
+        if not (listening["pid"] == 1 and listening["uid"] == CP_UID and _production_socket(path)):
+            raise _CycleRefused("decider_profile")
+    except BaseException:
+        listener.kill()
+        raise
+    return listener, path
+
+
+def _cycle_start(cycle):
+    """Guard, start, stamp, then require ``ready`` and the one domain this start registered."""
+    status = cycle.status()
+    if status["generations"] >= CYCLE.MAX_GENERATIONS_PER_PROCESS or status["generation_phase"] == "quarantined":
+        raise _CycleRefused("budget_guard")
+    registered = len(DOMAINS)
+    phase = cycle.start()
+    _S["last_start_ns"] = time.monotonic_ns()  # after start() returned: later than the budget's own stamp
+    if phase != "ready":
+        raise _CycleRefused(f"start_{cycle.status()['last_reason']}")
+    if len(DOMAINS) != registered + 1:
+        raise _CycleRefused("domain_unregistered")
+    return DOMAINS[-1]
+
+
+def _refused(case: str, refused: _CycleRefused) -> None:
+    record(case, False, {"generations": CYCLE._BUDGET.generations}, {"setup": refused.token, "k9_path": _k9_path()})
+
+
+def _cycle_fixture(case: str, script: list[dict]):
+    """One scripted listener and one ``HostCycle`` in ``serving`` with a gate on its registered domain:
+    ``(cycle, gate, listener, domain)``. Everything it created is cleaned up if it does not return."""
+    cycle = gate = listener = None
+    first = len(DOMAINS)
+    try:
+        if not _S["installed"]:
+            try:
+                CYCLE.install_signal_context()
+            except CYCLE.SignalContextInvalid as error:
+                raise _CycleRefused(f"signal_{error.code}") from None
+            _S["installed"] = True
+        if _S["k9"] is None:
+            _S["k9"] = AUTHORITY.sleep_capability_report()
+        _registry_preflight()
+        if _S["last_start_ns"] is not None:
+            sleep_until(_S["last_start_ns"] + (CYCLE.MIN_GENERATION_SPACING_MS + 50) * MS)
+        listener, path = _scripted_listener(script)
+        seams = CYCLE.CycleSeams(domain_factory=_cycle_domain,
+                                 sleep_report=None if _k9_path() == "real" else (lambda: dict(K9_DISABLED)))
+        cycle = CYCLE.HostCycle("slot-a", str(path), CP_UID, slot_src=L_ADDR, slot_dst=R_ADDR,
+                                admission=CYCLE.Enablement.NON_CUSTOMER, _seams_for_tests=seams)
+        COUNTERS["cycles"] += 1
+        domain = _cycle_start(cycle)
+        gate = Gate(domain)
+        cycle.install_context(CONTEXT)
+        return cycle, gate, listener, domain
+    except BaseException as error:
+        _finish(cycle, [gate], listener, DOMAINS[first:])
+        if isinstance(error, _CycleRefused):
+            _refused(case, error)
+        raise
+
+
+def _start_again(case: str, cycle):
+    """S5's restart on the same cycle and listener: registry, real spacing, guard, start, gate, context."""
+    gate = None
+    try:
+        _registry_preflight()
+        sleep_until(_S["last_start_ns"] + (CYCLE.MIN_GENERATION_SPACING_MS + 50) * MS)
+        domain = _cycle_start(cycle)
+        gate = Gate(domain)
+        cycle.install_context(CONTEXT)
+    except BaseException as error:
+        if gate is not None:
+            gate.close()
+        if isinstance(error, _CycleRefused):
+            _refused(case, error)
+        raise
+    return gate, domain
+
+
+def _finish(cycle, gates: list, listener, domains: list) -> dict:
+    """Stop an active generation, retire every domain the case registered, close the gates (and their
+    probe sockets), stop the listener and return its final counters ({} if it did not report)."""
+    stopped: dict = {}
+    try:
+        if cycle is not None and cycle.status()["generation_phase"] in ("ready", "serving", "draining"):
+            cycle.stop()
+    finally:
+        for domain in domains:
+            _retire(domain)
+        for gate in gates:
+            if gate is not None:
+                gate.close()
+        if listener is not None:
+            try:
+                listener.send("stop")
+                stopped = listener.expect("stopped", 15)
+            except (AssertionError, OSError, ValueError, queue.Empty):
+                stopped = {}
+            finally:
+                listener.wait()
+    return stopped
+
+
+def _tick(cycle) -> tuple[int, str, int]:
+    t_before = time.monotonic_ns()
+    phase = cycle.tick()
+    return t_before, phase, time.monotonic_ns()
+
+
+def _e_lower_est(t_before: int, tick: int) -> int:
+    """At or before the real E_lower (t_p0 >= t_before): a live window end."""
+    return t_before + CYCLE.LEASE_MS * MS - 2 * tick
+
+
+def _e_upper_est(t_after: int, tick: int) -> int:
+    """At or after the real E_upper (t_p1 <= t_after): an admission bound."""
+    return t_after + CYCLE.LEASE_MS * MS + tick
+
+
+def _probes_after(probes: list[Probe], bound_ns: int) -> list[Probe]:
+    return [probe for probe in probes if probe.t_before > bound_ns]
+
+
+def _common(status: dict, before: int, stopped: dict, spawned: int, admitted: int) -> dict:
+    return {"generations_before": before, "generations_after": status["generations"], "sequence": status["sequence"],
+            "request_gap_ms": status["request_gap_ms"], "nft_spawns": spawned, "admitted_after_bound": admitted,
+            "listener_requests": stopped.get("requests", -1), "listener_decide_failed": stopped.get("decide_failed", -1),
+            "listener_answered": stopped.get("answered", -1), "listener_refused_peer": stopped.get("refused_peer", -1)}
+
+
+def test_s1_positive_renewal_delivers_and_nothing_is_admitted_after_the_bound():
+    _require_runtime()
+    tick = _tick_ns()
+    first, before = len(DOMAINS), CYCLE._BUDGET.generations
+    cycle, gate, listener, _domain_s1 = _cycle_fixture("s1", [_step(), _step(), _step()])
+    ticks, stopped = [], {}
+    try:
+        stream = gate.stream(start_ns=time.monotonic_ns() + 50 * MS, count=700).start()
+        sleep_until(stream.start_ns + 100 * MS)  # probes run before tick 1
+        sentinel_before = _sentinel_pid()
+        for index in range(3):
+            if ticks:
+                sleep_until(ticks[0][0] + index * CYCLE.INTERVAL_MS * MS)
+            t_before, phase, t_after = _tick(cycle)
+            status = cycle.status()
+            ticks.append((t_before, phase, t_after, status["last_reason"], status["authorized"], status["request_gap_ms"]))
+        sentinel_after = _sentinel_pid()
+        bound = _e_upper_est(ticks[-1][2], tick) + tick
+        sleep_until(bound + 500 * MS)
+        status = cycle.status()
+        activated = gate.activated()
+        probes = stream.join()
+    finally:
+        stopped = _finish(cycle, [gate], listener, DOMAINS[first:])
+    deliveries = [live_delivery(probes, t_after, _e_lower_est(t_before, tick), LIVE_PERCENT)
+                  for t_before, _phase, t_after, *_rest in ticks]
+    margins = [(_e_upper_est(t_after, tick) - (t_before + 60_000 * MS)) // MS for t_before, _phase, t_after, *_rest in ticks]
+    after = _probes_after(probes, bound)
+    ok = (all(t[1] == "serving" and t[3] == "activated" and t[4] == "true" for t in ticks) and all(deliveries)
+          and all(margin < 0 for margin in margins) and closed(after) and activated == [3] and status["sequence"] == 3
+          and before == 0 and status["generations"] - before == 1 and stopped.get("requests") == 3)
+    ints = _common(status, before, stopped, sentinel_after - sentinel_before - 1, len(admitted_after(probes, bound)))
+    ints |= {"e_upper_minus_d_ms": margins[-1], "live_windows_held": sum(deliveries), "after_bound_probes": len(after),
+             "activated_entries": len(activated), "max_request_gap_ms": max(t[5] for t in ticks)}
+    k9 = {f"k9_{key}": value if LAUNCHER._TOKEN.fullmatch(value) else "other" for key, value in _S["k9"].items()}
+    record("s1", ok, ints, {"outcome": status["last_reason"], "k9_path": _k9_path(),
+                            "k9_satisfied": "yes" if _k9_path() == "real" else "no", **k9})
+    assert ok, "three real renewals did not deliver, or a packet was admitted after the last key's bound"
+
+
+def test_s2_listener_past_the_deadline_times_out_without_activation():
+    _require_runtime()
+    tick = _tick_ns()
+    first, before = len(DOMAINS), CYCLE._BUDGET.generations
+    cycle, gate, listener, _domain_s2 = _cycle_fixture("s2", [_step(delay_ms=1500)])
+    stopped = {}
+    try:
+        stream = gate.stream(start_ns=time.monotonic_ns() + 50 * MS, count=600).start()
+        sleep_until(stream.start_ns + 100 * MS)
+        sentinel_before = _sentinel_pid()
+        t_before, phase, t_after = _tick(cycle)
+        sentinel_after = _sentinel_pid()
+        status = cycle.status()
+        activated = gate.activated()
+        window_end = _e_upper_est(t_after, tick)
+        sleep_until(window_end + 300 * MS)
+        probes = stream.join()
+    finally:
+        stopped = _finish(cycle, [gate], listener, DOMAINS[first:])
+    spawned = sentinel_after - sentinel_before - 1
+    ok = (phase == "serving" and status["last_reason"] == "cp_timeout" and status["last_decision"] == "no_reply"
+          and status["consecutive_unavailable"] == 1 and status["generation_phase"] == "serving"
+          and status["authorized"] == "false" and spawned == 1 and activated == []
+          and closed(inside(probes, t_before, window_end)) and admitted_after(probes, t_before) == []
+          and status["sequence"] == 1 and status["generations"] - before == 1 and stopped.get("requests") == 1)
+    ints = _common(status, before, stopped, spawned, len(admitted_after(probes, t_before)))
+    ints |= {"reply_delay_ms": 1500, "request_budget_ms": CYCLE.REQUEST_BUDGET_MS, "tick_ms": (t_after - t_before) // MS,
+             "window_probes": len(inside(probes, t_before, window_end)), "activated_entries": len(activated)}
+    record("s2", ok, ints, {"outcome": status["last_reason"], "k9_path": _k9_path(), "last_decision": status["last_decision"]})
+    assert ok, "a reply past the request deadline was not a cp_timeout without activation"
+
+
+def test_s3_short_authority_is_refused_and_a_longer_one_activates():
+    _require_runtime()
+    tick = _tick_ns()
+    first, before = len(DOMAINS), CYCLE._BUDGET.generations
+    cycle, gate, listener, _domain_s3 = _cycle_fixture("s3", [_step(rem_ms=2000), _step(rem_ms=10_000)])
+    stopped = {}
+    try:
+        stream = gate.stream(start_ns=time.monotonic_ns() + 50 * MS, count=600).start()
+        sleep_until(stream.start_ns + 100 * MS)
+        a_before, a_phase, a_after = _tick(cycle)
+        status_a = cycle.status()
+        activated_a = gate.activated()
+        sleep_until(a_before + CYCLE.INTERVAL_MS * MS)
+        b_before, b_phase, b_after = _tick(cycle)
+        status = cycle.status()
+        bound = _e_upper_est(b_after, tick) + tick
+        sleep_until(bound + 500 * MS)
+        probes = stream.join()
+    finally:
+        stopped = _finish(cycle, [gate], listener, DOMAINS[first:])
+    margin_a = ((a_before + CYCLE.LEASE_MS * MS + tick) - (a_after + 2000 * MS)) // MS  # lower E_upper - upper D
+    margin_b = (_e_upper_est(b_after, tick) - (b_before + 10_000 * MS)) // MS  # upper E_upper - lower D
+    after = _probes_after(probes, bound)
+    ok = (a_phase == "serving" and status_a["last_reason"] == "authority_too_short" and status_a["consecutive_unusable"] == 1
+          and activated_a == [] and margin_a >= 500 and b_phase == "serving" and status["last_reason"] == "activated"
+          and live_delivery(probes, b_after, _e_lower_est(b_before, tick), LIVE_PERCENT) and margin_b <= -500
+          and status_a["request_gap_ms"] < 100 and status["request_gap_ms"] < 100 and closed(after)
+          and status["sequence"] == 2 and status["generations"] - before == 1 and stopped.get("requests") == 2)
+    ints = _common(status, before, stopped, -1, len(admitted_after(probes, bound)))
+    ints |= {"e_upper_minus_d_ms_a": margin_a, "e_upper_minus_d_ms_b": margin_b, "request_gap_ms_a": status_a["request_gap_ms"],
+             "consecutive_unusable_a": status_a["consecutive_unusable"], "after_bound_probes": len(after)}
+    record("s3", ok, ints, {"outcome": status["last_reason"], "k9_path": _k9_path(), "outcome_a": status_a["last_reason"]})
+    assert ok, "a reply shorter than the key's bound was activated, or a long enough one was not"
+
+
+def test_s4_revocation_closes_the_generation_and_no_request_follows():
+    _require_runtime()
+    tick = _tick_ns()
+    first, before = len(DOMAINS), CYCLE._BUDGET.generations
+    cycle, gate, listener, _domain_s4 = _cycle_fixture("s4", [_step(), _step("inactive", "key_revoked")])
+    stopped = {}
+    try:
+        stream = gate.stream(start_ns=time.monotonic_ns() + 50 * MS, count=300).start()
+        sleep_until(stream.start_ns + 100 * MS)
+        one_before, one_phase, one_after = _tick(cycle)
+        status_1 = cycle.status()
+        sleep_until(one_before + CYCLE.INTERVAL_MS * MS)
+        two_before, two_phase, two_after = _tick(cycle)
+        status = cycle.status()
+        activated = gate.activated()  # read through the gate's own descriptor after the flush
+        third = cycle.tick()
+        probes = stream.join()
+    finally:
+        stopped = _finish(cycle, [gate], listener, DOMAINS[first:])
+    after = _probes_after(probes, two_after + tick)
+    ok = (one_phase == "serving" and status_1["last_reason"] == "activated"
+          and live_delivery(probes, one_after, min(two_before, _e_lower_est(one_before, tick)), 50)
+          and two_phase == "closed" and status["generation_phase"] == "closed" and status["generation_class_end"] == "A"
+          and status["context_end_reason"] == "key_revoked" and status["context_state"] == "ended"
+          and status["authorized"] == "false" and activated == [] and closed(after) and third == "closed"
+          and status["sequence"] == 2 and stopped.get("requests") == 2 and status["generations"] - before == 1)
+    ints = _common(status, before, stopped, -1, len(admitted_after(probes, two_after + tick)))
+    ints |= {"after_close_probes": len(after), "activated_entries": len(activated)}
+    record("s4", ok, ints, {"outcome": status["last_reason"], "k9_path": _k9_path(), "class_end": status["generation_class_end"],
+                            "context_end": status["context_end_reason"], "third_tick": third})
+    assert ok, "a revocation did not close the generation, flush the key and stop requests"
+
+
+def test_s5_replayed_sequence_closes_and_a_new_generation_restarts_at_sequence_one():
+    _require_runtime()
+    tick = _tick_ns()
+    first, before = len(DOMAINS), CYCLE._BUDGET.generations
+    cycle, gate, listener, _domain_s5 = _cycle_fixture("s5", [_step(), _step("inactive", "replayed_sequence"), _step()])
+    gate_2, stopped = None, {}
+    try:
+        stream = gate.stream(start_ns=time.monotonic_ns() + 50 * MS, count=300).start()
+        sleep_until(stream.start_ns + 100 * MS)
+        one_before, one_phase, one_after = _tick(cycle)
+        status_1 = cycle.status()
+        sleep_until(one_before + CYCLE.INTERVAL_MS * MS)
+        two_before, two_phase, two_after = _tick(cycle)
+        status_2 = cycle.status()
+        activated_2 = gate.activated()
+        probes = stream.join()
+        gate_2, _domain_s5b = _start_again("s5", cycle)
+        stream_2 = gate_2.stream(start_ns=time.monotonic_ns() + 50 * MS, count=250).start()
+        sleep_until(stream_2.start_ns + 100 * MS)
+        three_before, three_phase, three_after = _tick(cycle)
+        status = cycle.status()
+        probes_2 = stream_2.join()
+    finally:
+        stopped = _finish(cycle, [gate, gate_2], listener, DOMAINS[first:])
+    changed = status["generation_id"] != status_1["generation_id"] and status_1["generation_id"] == status_2["generation_id"]
+    ok = (one_phase == "serving" and status_1["last_reason"] == "activated"
+          and live_delivery(probes, one_after, min(two_before, _e_lower_est(one_before, tick)), 50)
+          and two_phase == "closed" and status_2["context_end_reason"] == "replayed_sequence" and activated_2 == []
+          and closed(_probes_after(probes, two_after + tick)) and three_phase == "serving"
+          and status["last_reason"] == "activated" and status["sequence"] == 1 and changed
+          and live_delivery(probes_2, three_after, _e_lower_est(three_before, tick), 50)
+          and status["generations"] - before == 2 and stopped.get("requests") == 3)
+    ints = _common(status, before, stopped, -1, len(admitted_after(probes, two_after + tick)))
+    ints |= {"sequence_before_restart": status_2["sequence"], "restart_delivered": sum(p.delivered for p in probes_2)}
+    record("s5", ok, ints, {"outcome": status["last_reason"], "k9_path": _k9_path(),
+                            "context_end": status_2["context_end_reason"], "generation_changed": "yes" if changed else "no"})
+    assert ok, "a replayed sequence did not close the generation, or the restart did not begin a new one at sequence 1"
+
+
+def test_s6_stale_decision_is_blocked_by_the_listener_and_a_fresh_one_activates():
+    _require_runtime()
+    tick = _tick_ns()
+    first, before = len(DOMAINS), CYCLE._BUDGET.generations
+    cycle, gate, listener, _domain_s6 = _cycle_fixture("s6", [_step(), _step(stale=True), _step()])
+    stopped = {}
+    try:
+        stream = gate.stream(start_ns=time.monotonic_ns() + 50 * MS, count=500).start()
+        sleep_until(stream.start_ns + 100 * MS)
+        one_before, one_phase, one_after = _tick(cycle)
+        status_1 = cycle.status()
+        sleep_until(one_before + CYCLE.INTERVAL_MS * MS)
+        two_before, two_phase, two_after = _tick(cycle)
+        status_2 = cycle.status()
+        activated_2 = gate.activated()
+        sleep_until(one_before + 2 * CYCLE.INTERVAL_MS * MS)
+        three_before, three_phase, three_after = _tick(cycle)
+        status = cycle.status()
+        activated = gate.activated()
+        probes = stream.join()
+    finally:
+        stopped = _finish(cycle, [gate], listener, DOMAINS[first:])
+    ok = (one_phase == "serving" and status_1["last_reason"] == "activated" and two_phase == "serving"
+          and status_2["last_reason"] == "cp_unavailable" and status_2["consecutive_unavailable"] == 1
+          and status_2["sequence"] == 2 and activated_2 == [1]
+          and live_delivery(probes, one_after, _e_lower_est(one_before, tick), LIVE_PERCENT)
+          and three_phase == "serving" and status["last_reason"] == "activated" and status["sequence"] == 3
+          and activated == [3] and live_delivery(probes, three_after, _e_lower_est(three_before, tick), 50)
+          and stopped.get("decide_failed") == 1 and stopped.get("stale_attempts") == 1 and stopped.get("requests") == 3
+          and stopped.get("answered") == 2 and status["generations"] - before == 1)
+    ints = _common(status, before, stopped, -1, -1)
+    ints |= {"consecutive_unavailable_2": status_2["consecutive_unavailable"], "sequence_2": status_2["sequence"],
+             "stale_attempts": stopped.get("stale_attempts", -1), "activated_entries_2": len(activated_2)}
+    record("s6", ok, ints, {"outcome": status["last_reason"], "k9_path": _k9_path(), "outcome_2": status_2["last_reason"]})
+    assert ok, "a stale decision reached the cycle, or the next fresh decision did not activate"
+
+
 def test_c2_no_owned_namespace_process_socket_mount_or_link_survives():
     _require_runtime()
     with contextlib.suppress(ChildProcessError):
@@ -1980,11 +2485,13 @@ def test_c2_no_owned_namespace_process_socket_mount_or_link_survives():
     links = sorted(name for _index, name in socket.if_nameindex())
     others = [entry.name for entry in Path("/proc").iterdir() if entry.name.isdigit()
               and int(entry.name) not in (1, os.getpid())]
+    registry_unresolved = sum(AUTHORITY.unresolved_children().values())
     ok = (not OPEN_GATES and live_children == 0 and open_sockets == 0 and open_domains == 0 and not MOUNTS
-          and links == ["lo"] and not others)
+          and links == ["lo"] and not others and registry_unresolved == 0)
     record("c2", ok, {"open_gates": len(OPEN_GATES), "live_children": live_children, "open_sockets": open_sockets,
                       "open_domains": open_domains, "mounts_left": len(MOUNTS), "outer_links": len(links),
                       "other_processes": len(others), "gates_created": COUNTERS["gates"],
                       "children_spawned": COUNTERS["children"], "sockets_created": COUNTERS["sockets"],
-                      "domains_created": COUNTERS["domains"]}, {})
+                      "domains_created": COUNTERS["domains"], "cycles_created": COUNTERS["cycles"],
+                      "scripted_deciders": COUNTERS["deciders"], "registry_unresolved": registry_unresolved}, {})
     assert ok, "an owned namespace, process, socket, mount or link survived the cases"

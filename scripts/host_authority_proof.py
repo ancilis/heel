@@ -5,8 +5,9 @@ SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
 Run from the repository root as exactly ``python scripts/host_authority_proof.py``: one fixed
 profile, no command, path, ref or test-selector inputs. The structure is H1F's
-(``scripts/host_lease_feasibility.py``), whose reviewed helpers, pytest closure, supported-kernel
-pin and ``READD_EXPECTED`` are imported from it by path and never copied. The unprivileged parent
+(``scripts/host_lease_feasibility.py``), whose reviewed helpers and pytest closure are imported from
+it by path and never copied; the supported-kernel pin, ``READD_EXPECTED`` and ``kernel_profile``
+come from the production ``deploy/host/profile.py``, also by path. The unprivileged parent
 verifies the clean candidate checkout and the pinned Python, confirms the host tools are already
 present, lints the workflow with H0's pinned actionlint and fetches the H0-locked pytest closure.
 One fixed privileged child (``sudo -n``) takes stable host fingerprints, creates an outer
@@ -19,7 +20,8 @@ fingerprints unchanged and the kernel is inside the pinned profile; a clean run 
 profile is INCOMPLETE. The job runs under the running-kernel assumption (no suspend, hibernate,
 pause, restore or clone during the job); it proves the H1A-1 domain and transport unit only and
 says nothing about elapsed authority lifetime under gap modes M3-M6, the CP decision, the cycle,
-H2, H3 or launch.
+H2, H3 or launch. H1A3-2 adds the S1-S6 cases, which drive the H1A3-1 ``HostCycle`` on this kernel
+through the three labelled cycle seams in ``SEAMS``.
 """
 from __future__ import annotations
 
@@ -59,7 +61,8 @@ STAGE_FILES = (
     "deploy/host/authority.py", "heel/saas/host_authority.py", "tests/test_host_authority.py",
     "tests/linux/__init__.py", "tests/linux/test_host_authority_proof.py", "scripts/host_authority_proof.py",
     ".github/workflows/codeql.yml", "docs/saas/HOST_AUTHORITY_PROOF.md", "scripts/host_lease_feasibility.py",
-    "scripts/host_ingress_proof.py", "deploy/host/ingress/runtime-lock.json",
+    "scripts/host_ingress_proof.py", "deploy/host/ingress/runtime-lock.json", "deploy/host/cycle.py",
+    "deploy/host/profile.py", "tests/test_host_cycle.py",
 )
 LAUNCHER_SECONDS = 1200
 TESTS_SECONDS = 600
@@ -92,6 +95,12 @@ REQUIRED_CASES = (
     "test_t4f_listen_failure_leaves_the_working_endpoint",
     "test_t4r_close_leaves_a_replaced_endpoint",
     "test_t4s_stale_socket_file_is_replaced_by_a_listening_inode",
+    "test_s1_positive_renewal_delivers_and_nothing_is_admitted_after_the_bound",
+    "test_s2_listener_past_the_deadline_times_out_without_activation",
+    "test_s3_short_authority_is_refused_and_a_longer_one_activates",
+    "test_s4_revocation_closes_the_generation_and_no_request_follows",
+    "test_s5_replayed_sequence_closes_and_a_new_generation_restarts_at_sequence_one",
+    "test_s6_stale_decision_is_blocked_by_the_listener_and_a_fresh_one_activates",
     "test_c2_no_owned_namespace_process_socket_mount_or_link_survives",
 )
 # Each dynamic case writes exactly one record: id -> (case function, control class, expected verdict).
@@ -111,15 +120,27 @@ RECORD_CASES = {
     "t4f": ("test_t4f_listen_failure_leaves_the_working_endpoint", "listener", "pass"),
     "t4r": ("test_t4r_close_leaves_a_replaced_endpoint", "listener", "pass"),
     "t4s": ("test_t4s_stale_socket_file_is_replaced_by_a_listening_inode", "listener", "pass"),
+    "s1": ("test_s1_positive_renewal_delivers_and_nothing_is_admitted_after_the_bound", "cycle", "pass"),
+    "s2": ("test_s2_listener_past_the_deadline_times_out_without_activation", "cycle", "pass"),
+    "s3": ("test_s3_short_authority_is_refused_and_a_longer_one_activates", "cycle", "pass"),
+    "s4": ("test_s4_revocation_closes_the_generation_and_no_request_follows", "cycle", "pass"),
+    "s5": ("test_s5_replayed_sequence_closes_and_a_new_generation_restarts_at_sequence_one", "cycle", "pass"),
+    "s6": ("test_s6_stale_decision_is_blocked_by_the_listener_and_a_fresh_one_activates", "cycle", "pass"),
     "c2": ("test_c2_no_owned_namespace_process_socket_mount_or_link_survives", "cleanup", "pass"),
 }
-CONTROLS = ("provenance", "domain", "negative", "peer", "listener", "cleanup")
+CONTROLS = ("provenance", "domain", "negative", "peer", "listener", "cleanup", "cycle")
 VERDICTS = ("pass", "fail")
 SETUP_FAILURES = ("wheel_hash_mismatch", "pytest_version_mismatch", "suite_setup_failed")
 SEAMS = ("SEAM-COUNTER-START d3 only: the counter's start value, never ownership or reservation",
          "SEAM-NAMED-NAMESPACE d2 negative only: a stale writer that resolves a namespace by name",
          "SEAM-WRONG-ORDER t4n negative only: the test's own bind-rename-listen publisher",
-         "SEAM-LISTEN-FAILURE t4f only: an injected listen that raises")
+         "SEAM-LISTEN-FAILURE t4f only: an injected listen that raises",
+         "SEAM-SCRIPTED-DECIDER s-cases only: a listener decide callable that returns scripted codec-valid replies"
+         " (S6's deliberately stale reply is rejected by the real listener's own validation)",
+         "SEAM-CYCLE-SLEEP-REPORT s-cases only: the fixed all-disabled A-1/A-2 report, substituted only when the"
+         " recorded real report fails K9; proves nothing about this host's power policy",
+         "SEAM-CYCLE-DOMAIN-REGISTER s-cases only: the real LeaseDomain.create, wrapped only to register the domain"
+         " for c2")
 VERSION_TOKENS = ("kernel_release", "kernel_major_minor", "kernel_source_tag", "proc_version_sha256", "nft_version",
                   "nftables_package", "python", "pytest", "selftest", "readd_observation")
 VERSION_INTS = ("config_hz", "tick_allowance_ms", "overflowuid", "cpu_count")
@@ -139,6 +160,20 @@ def h1f():
     return _H1F
 
 
+_PROFILE = None
+
+
+def profile():
+    """The production runtime-profile module, imported by path (one module object per process)."""
+    global _PROFILE
+    if _PROFILE is None:
+        spec = importlib.util.spec_from_file_location("heel_host_profile", ROOT / "deploy" / "host" / "profile.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _PROFILE = module
+    return _PROFILE
+
+
 def h0():
     return h1f().h0()
 
@@ -149,9 +184,9 @@ HOST_TOOLS = h1f().HOST_TOOLS
 PYTHON_VERSION = h1f().PYTHON_VERSION
 PYTEST_VERSION = h1f().PYTEST_VERSION
 PYTEST_CLOSURE = h1f().PYTEST_CLOSURE
-SUPPORTED_KERNELS = h1f().SUPPORTED_KERNELS
-READD_EXPECTED = h1f().READD_EXPECTED
-kernel_profile = h1f().kernel_profile
+SUPPORTED_KERNELS = profile().SUPPORTED_KERNELS
+READD_EXPECTED = profile().READD_EXPECTED
+kernel_profile = profile().kernel_profile
 artifact_scan = h1f().artifact_scan
 _env = h1f()._env
 _sha256 = h1f()._sha256
