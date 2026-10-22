@@ -19,6 +19,7 @@ import os
 import re
 import signal
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -478,6 +479,417 @@ def test_real_pair_revoke_unpair_and_fresh_invitation_pairs_again_over_tls(tmp_p
     assert _daemon(other_home, harness, other_backend).status()["state"] == "active"
     assert _runner_rows(harness, other_workspace) == [(other_id, "active")]
     assert _revocation_audit(harness, other_workspace, other_id) == []
+
+
+class _HeldCommit:
+    """Human-connection proxy for one owner ``approve``: holds SQLite locks at its commit.
+
+    ``writer`` keeps the approve transaction (RESERVED) open at ``commit()``: the runner
+    activation's ``BEGIN IMMEDIATE`` boundary. ``reader`` opens an unexhausted SELECT, then
+    commits, so the human connection keeps SHARED: the activation's COMMIT boundary. Both set
+    ``held`` and wait, bounded, for ``release``; only the first approve after install is held.
+    """
+
+    def __init__(self, conn, mode):
+        self._conn, self._mode = conn, mode
+        self.held, self.release = threading.Event(), threading.Event()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def commit(self):
+        cursor = None
+        try:
+            if self._mode == "reader":
+                cursor = self._conn.execute("SELECT * FROM workspaces")
+                assert cursor.fetchone() is not None
+                self._conn.commit()
+            self.held.set()
+            self.release.wait(20)
+        finally:
+            if cursor is not None:
+                cursor.close()
+        if self._mode == "writer":
+            self._conn.commit()
+
+    @classmethod
+    def install(cls, monkeypatch, harness, mode):
+        human = harness.control_plane.store.conn
+        hold, used = cls(human, mode), []
+        store_class = type(harness.control_plane.runner_auth)
+        real_approve = store_class.approve
+
+        def approve(self, *args, **kwargs):
+            if used or self.conn is not human:
+                return real_approve(self, *args, **kwargs)
+            used.append(True)
+            self.conn = hold
+            try:
+                return real_approve(self, *args, **kwargs)
+            finally:
+                self.conn = human
+
+        monkeypatch.setattr(store_class, "approve", approve)
+        return hold
+
+    @staticmethod
+    def configure_journal(harness, journal_mode):
+        """Before any pairing traffic: keep the default rollback journal, or set WAL as server.py does."""
+        if journal_mode == "wal":
+            harness.control_plane.store.conn.execute("PRAGMA journal_mode=WAL")
+            harness.control_plane.store.conn.execute("PRAGMA synchronous=FULL")
+        check = sqlite3.connect(str(harness.root / "control-plane.sqlite3"))
+        try:
+            assert check.execute("PRAGMA journal_mode").fetchone()[0] == journal_mode
+        finally:
+            check.close()
+
+
+class _ActivationRecorder:
+    """Wraps ``HTTPSControlTransport.post`` from install on: records ``(path, status, body)`` and
+    sets ``outcome`` for any activation answer outside ``{None, 400}`` or any transport exception."""
+
+    def __init__(self, monkeypatch):
+        self.posts: list[tuple[str, object, bytes]] = []
+        self.outcome = threading.Event()
+        real_post = HTTPSControlTransport.post
+        recorder = self
+
+        def post(transport, path, *, headers=None, body=b""):
+            activation = path.endswith("/activate")
+            try:
+                status, response_headers, payload = real_post(transport, path, headers=headers, body=body)
+            except BaseException:
+                recorder.posts.append((path, "exception", body))
+                if activation:
+                    recorder.outcome.set()
+                raise
+            recorder.posts.append((path, status, body))
+            if activation and status not in {None, 400}:
+                recorder.outcome.set()
+            return status, response_headers, payload
+
+        monkeypatch.setattr(HTTPSControlTransport, "post", post)
+
+    def activations(self):
+        return [(path, status, body) for path, status, body in self.posts if path.endswith("/activate")]
+
+
+def _contended_re_pair_activates_exactly_once(tmp_path, harness, monkeypatch, mode, journal_mode):
+    """The preamble of the re-pair test, then a fresh pairing whose activation meets a held human lock."""
+    _HeldCommit.configure_journal(harness, journal_mode)
+    workspace_id, cookie = harness.signup_owner("owner-repair@example.test")
+    other_workspace, other_cookie = harness.signup_owner("owner-repair-other@example.test")
+    _pair_runner(tmp_path, harness, other_workspace, other_cookie, "other")
+    home, backend, first_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "runner")
+    assert _daemon(home, harness, backend).status()["control_plane"]["state"] == "confirmed"
+    revoke_path = f"/v1/workspaces/{workspace_id}/runners/{first_id}/revoke"
+    assert harness.request("POST", revoke_path, REVOKE_BODY, cookie=cookie)[:2] == (
+        200, {"schema_version": "heel.runner-revoke-result.v1", "revoked": True})
+    assert _daemon(home, harness, backend).status()["state"] == "runner_authentication_rejected"
+    result = _daemon(home, harness, backend).unpair()
+    assert result["state"] == "unpaired" and result["removed"] is True
+    database = str(harness.root / "control-plane.sqlite3")
+
+    def fresh(sql, *params):
+        conn = sqlite3.connect(database)
+        try:
+            return [tuple(row) for row in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+
+    revoked_before = (fresh("SELECT runner_id,status FROM canary_runners WHERE runner_id=?", first_id),
+                      fresh("SELECT key_id,status FROM canary_runner_keys WHERE runner_id=?", first_id))
+    assert revoked_before[0] == [(first_id, "revoked")]
+
+    recorder = _ActivationRecorder(monkeypatch)
+    hold = _HeldCommit.install(monkeypatch, harness, mode)
+    token = _invite(harness, workspace_id, cookie)
+    events: list[dict] = []
+    outcome: dict[str, object] = {}
+    approved: dict[str, int] = {}
+    pending = threading.Event()
+
+    def emit(event):
+        events.append(event)
+        if event["event"] == "pairing_pending":
+            pending.set()
+
+    def run():
+        try:
+            outcome["result"] = _daemon(home, harness, backend).pair(
+                harness.origin, token, display_name="Runner F3", emit=emit)
+        except BaseException as error:  # surfaced to the test thread below
+            outcome["error"] = error
+            pending.set()
+
+    pairing = threading.Thread(target=run, daemon=True)
+    approval = None
+    hold_ms = None
+    pairing.start()
+    try:
+        assert pending.wait(20) and "error" not in outcome, outcome
+        printed = events[0]
+        status, view, _ = harness.request(
+            "GET", f"/v1/workspaces/{workspace_id}/runner-pairings/{printed['pairing_id']}", cookie=cookie)
+        assert status == 200 and view["status"] == "pending"
+        assert view["pairing_phrase"] == printed["pairing_phrase"] and view["fingerprint"] == printed["fingerprint"]
+
+        def approve():
+            approved["status"] = harness.request(
+                "POST", f"/v1/workspaces/{workspace_id}/runner-pairings/{printed['pairing_id']}/approve",
+                {"schema_version": "heel.runner-pairing-approve.v1",
+                 "pairing_phrase": view["pairing_phrase"], "fingerprint": view["fingerprint"]},
+                cookie=cookie)[0]
+
+        approval = threading.Thread(target=approve, daemon=True)
+        approval.start()
+        assert hold.held.wait(20), "the owner approve never reached its commit"
+        held_at = time.monotonic()
+        assert recorder.outcome.wait(20), "the activation poll never answered outside {None, 400}"
+        hold_ms = round((time.monotonic() - held_at) * 1000)
+    finally:
+        hold.release.set()
+        if approval is not None:
+            approval.join(20)
+        pairing.join(20)
+    assert approval is not None and not approval.is_alive()
+    assert not pairing.is_alive()
+    print(f"F3 {mode} hold released after {hold_ms} ms (evidence only)")
+    activations = recorder.activations()
+    statuses = [status for _, status, _ in activations]
+    assert 503 in statuses, statuses
+    assert statuses[-1] == 200 and statuses.count(200) == 1 and statuses.index(503) < len(statuses) - 1, statuses
+    assert set(statuses) <= {400, 503, 200}, statuses
+    assert approved == {"status": 200}
+    assert "error" not in outcome, outcome
+    assert [event["event"] for event in events] == ["pairing_pending", "paired"]
+    pairing_id = printed["pairing_id"]
+    new_id = outcome["result"]["runner_id"]
+    assert outcome["result"]["state"] == "active" and new_id != first_id
+    # Every resend carried the identical sealed bytes of the contended (second) pairing.
+    assert {path for path, _, _ in activations} == {f"/v1/runner-pairings/{pairing_id}/activate"}
+    assert len({body for _, _, body in activations}) == 1
+    assert len(backend.values) == 1
+
+    assert fresh("SELECT status,runner_id FROM canary_runner_pairings WHERE pairing_id=?", pairing_id) == [
+        ("activated", new_id)]
+    assert sorted(fresh("SELECT runner_id,status FROM canary_runners WHERE workspace_id=?", workspace_id)) == sorted(
+        [(first_id, "revoked"), (new_id, "active")])
+    assert fresh("SELECT COUNT(*) FROM canary_runner_keys WHERE runner_id=?", new_id) == [(1,)]
+    assert fresh("SELECT COUNT(*) FROM canary_runner_keys WHERE workspace_id=? AND status='active'",
+                 workspace_id) == [(1,)]
+    assert (fresh("SELECT runner_id,status FROM canary_runners WHERE runner_id=?", first_id),
+            fresh("SELECT key_id,status FROM canary_runner_keys WHERE runner_id=?", first_id)) == revoked_before
+    assert fresh("SELECT COUNT(*) FROM canary_runner_pairing_activation_receipts WHERE pairing_id=?",
+                 pairing_id) == [(1,)]
+    assert fresh("SELECT COUNT(*) FROM canary_runner_audit_records WHERE runner_id=? AND action='runner_activated'",
+                 new_id) == [(1,)]
+
+    # The retry consumed one quota slot only: a further approved pairing in this free workspace is
+    # refused (400) by the active-runner quota, so the daemon polls until its challenge expires.
+    approved_seen: dict[str, bool] = {}
+    skew = {"ms": 0}
+
+    def quota_sleep(seconds):
+        time.sleep(seconds)
+        if approved_seen:
+            skew["ms"] = 11 * 60 * 1000
+        elif fresh("SELECT COUNT(*) FROM canary_runner_pairings WHERE workspace_id=? AND status='approved'",
+                   workspace_id) == [(1,)]:
+            approved_seen["after_approval"] = True  # at least one more poll runs after the approval
+
+    extra_home, extra_backend = _home(tmp_path, "extra"), RecordingSecretBackend()
+    extra_events, extra = _pair_with_owner_approval(
+        harness, _daemon(extra_home, harness, extra_backend,
+                         clock_ms=lambda: int(time.time() * 1000) + skew["ms"], sleep=quota_sleep),
+        workspace_id, cookie, _invite(harness, workspace_id, cookie),
+    )
+    assert isinstance(extra.get("error"), RunnerPairingError) and extra["error"].code == "approval_timeout", extra
+    assert approved_seen == {"after_approval": True}
+    extra_pairing = extra_events[0]["pairing_id"]
+    assert fresh("SELECT status FROM canary_runner_pairings WHERE pairing_id=?", extra_pairing) == [("approved",)]
+    assert fresh("SELECT COUNT(*) FROM canary_runner_pairing_activation_receipts WHERE pairing_id=?",
+                 extra_pairing) == [(0,)]
+    assert fresh("SELECT COUNT(*) FROM canary_runners WHERE workspace_id=? AND status='active'",
+                 workspace_id) == [(1,)]
+
+
+@pytest.mark.parametrize("journal_mode", ["delete", "wal"])
+def test_activation_poll_survives_a_busy_approve_commit_and_activates_exactly_once(
+        tmp_path, harness, monkeypatch, journal_mode):
+    """BEGIN IMMEDIATE boundary: the owner's approve transaction holds the write lock while the runner
+    polls. Writer/writer contention exists in the default rollback journal and in production WAL."""
+    _contended_re_pair_activates_exactly_once(tmp_path, harness, monkeypatch, "writer", journal_mode)
+
+
+def test_activation_commit_survives_a_held_human_reader_and_activates_exactly_once(tmp_path, harness, monkeypatch):
+    """COMMIT boundary: an unexhausted human SELECT under the request lock holds SHARED after approve.
+
+    Rollback journal only: a WAL reader never blocks the activation's commit."""
+    _contended_re_pair_activates_exactly_once(tmp_path, harness, monkeypatch, "reader", "delete")
+
+
+@pytest.mark.parametrize("journal_mode", ["delete", "wal"])
+def test_sustained_busy_activation_terminates_at_the_challenge_deadline(tmp_path, harness, monkeypatch, journal_mode):
+    _HeldCommit.configure_journal(harness, journal_mode)
+    workspace_id, cookie = harness.signup_owner("owner-repair@example.test")
+    other_workspace, other_cookie = harness.signup_owner("owner-repair-other@example.test")
+    _pair_runner(tmp_path, harness, other_workspace, other_cookie, "other")
+    home, backend, first_id = _pair_runner(tmp_path, harness, workspace_id, cookie, "runner")
+    assert _daemon(home, harness, backend).status()["control_plane"]["state"] == "confirmed"
+    revoke_path = f"/v1/workspaces/{workspace_id}/runners/{first_id}/revoke"
+    assert harness.request("POST", revoke_path, REVOKE_BODY, cookie=cookie)[0] == 200
+    assert _daemon(home, harness, backend).status()["state"] == "runner_authentication_rejected"
+    assert _daemon(home, harness, backend).unpair()["removed"] is True
+
+    recorder = _ActivationRecorder(monkeypatch)
+    hold = _HeldCommit.install(monkeypatch, harness, "writer")
+    clock = {"now": int(time.time() * 1000)}
+    slept: list[float] = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        clock["now"] += 11 * 60 * 1000  # past the ten minute challenge
+
+    daemon = _daemon(home, harness, backend, clock_ms=lambda: clock["now"], sleep=sleep)
+    token = _invite(harness, workspace_id, cookie)
+    events: list[dict] = []
+    outcome: dict[str, object] = {}
+    approved: dict[str, int] = {}
+    pending, gate = threading.Event(), threading.Event()
+
+    def emit(event):
+        events.append(event)
+        if event["event"] == "pairing_pending":
+            pending.set()
+            gate.wait(20)  # the first activation poll starts only once the approve holds its commit
+
+    def run():
+        try:
+            outcome["result"] = daemon.pair(harness.origin, token, display_name="Runner F3", emit=emit)
+        except BaseException as error:  # surfaced to the test thread below
+            outcome["error"] = error
+            pending.set()
+
+    pairing = threading.Thread(target=run, daemon=True)
+    approval = None
+    pairing.start()
+    try:
+        assert pending.wait(20) and "error" not in outcome, outcome
+        printed = events[0]
+        status, view, _ = harness.request(
+            "GET", f"/v1/workspaces/{workspace_id}/runner-pairings/{printed['pairing_id']}", cookie=cookie)
+        assert status == 200 and view["status"] == "pending"
+
+        def approve():
+            approved["status"] = harness.request(
+                "POST", f"/v1/workspaces/{workspace_id}/runner-pairings/{printed['pairing_id']}/approve",
+                {"schema_version": "heel.runner-pairing-approve.v1",
+                 "pairing_phrase": view["pairing_phrase"], "fingerprint": view["fingerprint"]},
+                cookie=cookie)[0]
+
+        approval = threading.Thread(target=approve, daemon=True)
+        approval.start()
+        assert hold.held.wait(20), "the owner approve never reached its commit"
+        gate.set()
+        assert recorder.outcome.wait(20), "the activation poll never answered outside {None, 400}"
+        pairing.join(20)
+        assert not pairing.is_alive()
+    finally:
+        gate.set()
+        hold.release.set()
+        if approval is not None:
+            approval.join(20)
+        pairing.join(20)
+    assert approval is not None and not approval.is_alive() and not pairing.is_alive()
+    assert approved == {"status": 200}
+    assert isinstance(outcome.get("error"), RunnerPairingError), outcome
+    assert outcome["error"].code == "approval_timeout"
+    statuses = [status for _, status, _ in recorder.activations()]
+    assert 503 in statuses and statuses[statuses.index(503) + 1:] == [], statuses
+    assert len(slept) == 1 and 0.05 <= slept[0] <= 5.0, slept
+
+    pairing_id = printed["pairing_id"]
+    conn = sqlite3.connect(str(harness.root / "control-plane.sqlite3"))
+    try:
+        (pairing_status, new_id), = conn.execute(
+            "SELECT status,runner_id FROM canary_runner_pairings WHERE pairing_id=?", (pairing_id,)).fetchall()
+        assert pairing_status == "approved"
+        for sql in ("SELECT COUNT(*) FROM canary_runners WHERE runner_id=?",
+                    "SELECT COUNT(*) FROM canary_runner_keys WHERE runner_id=?"):
+            assert conn.execute(sql, (new_id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM canary_runner_pairing_activation_receipts WHERE pairing_id=?",
+                            (pairing_id,)).fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert _daemon(home, harness, backend).status()["state"] == "pairing_incomplete"
+    assert _daemon(home, harness, backend).unpair()["removed"] is True
+
+
+
+def test_await_activation_busy_envelope_is_the_only_retried_503(tmp_path):
+    busy = {"schema_version": "heel.runner-error.v1", "code": "runner_control_busy", "retry_after_ms": 1000}
+    absent = object()
+
+    def run(script, *, poll=0.05, remaining_ms=600_000):
+        """Drive the real ``_await_activation`` against scripted answers with an injected clock."""
+        clock = {"now": 1_000_000}
+        sleeps: list[float] = []
+        bodies: list[bytes] = []
+
+        class Scripted:
+            def post(self, path, *, headers=None, body=b""):
+                assert path == "/v1/runner-pairings/pair_1/activate"
+                assert headers == {"Content-Type": "application/json"}
+                bodies.append(body)
+                answer = script[len(bodies) - 1]
+                if isinstance(answer, ControlTransportError):
+                    raise answer
+                return answer
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock["now"] += round(seconds * 1000)
+
+        daemon = RunnerDaemon(tmp_path / "unit", secret_backend=RecordingSecretBackend(),
+                              clock_ms=lambda: clock["now"], sleep=sleep, poll_interval_seconds=poll)
+        try:
+            result = daemon._await_activation(Scripted(), "pair_1", b"sealed", deadline_ms=clock["now"] + remaining_ms)
+        except RunnerPairingError as error:
+            result = error.code
+        assert set(bodies) <= {b"sealed"}
+        return result, sleeps, len(bodies)
+
+    activated = {"schema_version": "heel.runner-pairing-activated.v4"}
+    ok = (200, {}, activated)
+    # A 503 that is not exactly the named busy envelope stays a final rejection.
+    for payload in ({**busy, "code": "runner_resync_rate_limited"}, {**busy, "schema_version": "heel.runner-error.v2"},
+                    None, [busy], "runner_control_busy", {"error": "internal error"}):
+        assert run([(503, {"Retry-After": "1"}, payload), ok]) == ("response_rejected", [], 1), payload
+    # An absent, non-int or out-of-range hint falls back to the poll interval.
+    for hint in ("1000", 1000.0, True, -5, 0, 5001, 10**9, None, absent):
+        payload = {key: value for key, value in busy.items() if key != "retry_after_ms"}
+        if hint is not absent:
+            payload["retry_after_ms"] = hint
+        assert run([(503, {}, payload), ok]) == (activated, [0.05], 2), hint
+    assert run([(503, {}, busy), ok]) == (activated, [1.0], 2)
+    assert run([(503, {}, busy), ok], poll=2.0) == (activated, [2.0], 2)
+    assert run([(503, {}, {**busy, "retry_after_ms": 5000}), ok]) == (activated, [5.0], 2)
+    assert run([(503, {}, busy), (503, {}, busy), ok]) == (activated, [1.0, 1.0], 3)
+    # Never past the challenge deadline, and no further request once the deadline is known.
+    assert run([(503, {}, busy), ok], remaining_ms=300) == ("approval_timeout", [0.3], 1)
+    assert run([(503, {}, busy), ok], remaining_ms=0) == ("approval_timeout", [], 1)
+    # The body is the only hint; the header is for intermediaries.
+    assert run([(503, {"Retry-After": "60"}, busy), ok]) == (activated, [1.0], 2)
+    # Every other status keeps its existing meaning.
+    assert run([(410, {}, {"code": "runner_activation_receipt_expired"})]) == ("approval_timeout", [], 1)
+    for status in (401, 409, 429, 500, 502):
+        assert run([(status, {}, busy)]) == ("response_rejected", [], 1), status
+    assert run([(200, {}, None)]) == ("response_rejected", [], 1)
+    assert run([(400, {}, {"code": "invalid_runner_pairing"}), ok]) == (activated, [0.05], 2)
+    assert run([ControlTransportError("connection_failed"), ok]) == (activated, [0.05], 2)
+    assert run([ControlTransportError("tls_trust_failed"), ok]) == ("tls_trust_failed", [], 1)
 
 
 def test_runner_pair_cli_refuses_reused_invitation_and_wrong_origin(tmp_path, harness, monkeypatch):

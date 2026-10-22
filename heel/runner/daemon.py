@@ -111,6 +111,8 @@ SERVE_BACKOFF_SECONDS = (2.0, 60.0)
 _SERVE_STATE_REFRESH_SECONDS = 15.0
 # Upper bound for a server-requested recovery delay (the client already bounds the value).
 _MAX_RECOVERY_DEFER_SECONDS = 300.0
+# Upper bound for the control plane's busy hint while the runner resends its sealed activation.
+_ACTIVATION_BUSY_RETRY_MAX_SECONDS = 5.0
 # Turnstile polling: serve and unpair poll faster than status, so a stream of status checks cannot
 # keep a waiting serve out (each check holds the turnstile for one bounded check only).
 _TURNSTILE_POLL_OWNER = 0.005
@@ -903,11 +905,28 @@ class RunnerDaemon:
                 status, payload = None, None
             if status == 200 and isinstance(payload, dict):
                 return payload
-            if status not in {None, 400}:
+            busy = (
+                status == 503 and isinstance(payload, dict)
+                and payload.get("schema_version") == "heel.runner-error.v1"
+                and payload.get("code") == "runner_control_busy"
+            )
+            if status not in {None, 400} and not busy:
                 raise RunnerPairingError("approval_timeout" if status == 410 else "response_rejected")
+            now_ms = self._clock_ms()
+            if now_ms >= deadline_ms:
+                raise RunnerPairingError("approval_timeout")
+            if not busy:
+                self._sleep(self._poll_interval)
+                continue
+            # Busy: resend the same sealed bytes after the server's bounded hint, never past the
+            # challenge deadline, and never start another request once that deadline is known.
+            hint = payload.get("retry_after_ms")
+            delay = self._poll_interval
+            if type(hint) is int and 0 < hint <= 5_000:
+                delay = max(self._poll_interval, min(hint / 1000.0, _ACTIVATION_BUSY_RETRY_MAX_SECONDS))
+            self._sleep(max(0.0, min(delay, (deadline_ms - now_ms) / 1000.0)))
             if self._clock_ms() >= deadline_ms:
                 raise RunnerPairingError("approval_timeout")
-            self._sleep(self._poll_interval)
 
     # ------------------------------------------------------------------ status
     def _active_identity(self, store: RunnerStore, record: Mapping[str, Any]):

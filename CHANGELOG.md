@@ -4,6 +4,7 @@ All notable changes to Heel are documented here. Format loosely follows Keep a C
 
 ## [Unreleased]
 
+- Answer a v3 runner pairing activation that loses its short SQLite busy wait (numeric `SQLITE_BUSY`/`SQLITE_LOCKED`, no open transaction, independent runner connection) with `503 runner_control_busy` (`retry_after_ms: 1000`, `Retry-After: 1`); `heel runner pair` resends the identical sealed activation after that bounded hint and never past the challenge deadline. Every other route and error stays a generic 500, whose log line gains only a typed `sqlite_primary_code` (H1A3-1F3DF).
 - Add the control-plane host-authority snapshot decision and private listener wiring (H1A-2), default off: migration 31 adds a permanent anti-replay generation ledger (no row ever leaves it; 65 536 rows, fail-closed), `HEEL_MANAGED_HOST=1` refuses a missing or unsafe listener configuration before any lock or bind, and a listener thread that outlives its bounded stop keeps database ownership until the process exits. See `docs/saas/HOST_AUTHORITY_SNAPSHOT.md`.
 - Move owner runner revocation to `POST /v1/workspaces/{ws}/runners/{id}/revoke` (same `heel.runner-revoke.v1` body and recent owner/admin same-origin checks) at the control plane and the edge Worker; the old `DELETE …/runners/{id}` could never succeed and is no longer routed.
 - Add a signed-scope, customer-local synthetic export entitlement reference through CLI and MCP, plus app instructions and local report viewing.

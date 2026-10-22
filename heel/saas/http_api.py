@@ -141,6 +141,20 @@ class _NullLock:
     def __exit__(self, *_): return False
 
 
+def _sqlite_primary_code(error: BaseException) -> int | None:
+    """Primary SQLite result code of a real sqlite3 error, or None.
+
+    Typed and range-checked (exact int in 1..0xFFFF; bool, str, float, negative, zero and
+    oversized values are rejected) so a hostile or absent attribute is never classified or logged.
+    """
+    if not isinstance(error, sqlite3.Error):
+        return None
+    code = getattr(error, "sqlite_errorcode", None)
+    if type(code) is not int or not 1 <= code <= 0xFFFF:
+        return None
+    return code & 0xFF
+
+
 def _is_control_generation(value: str) -> bool:
     return (
         value == "0"
@@ -909,12 +923,16 @@ class _Handler(BaseHTTPRequestHandler):
         except ThrottledError as e:
             self._json(429, {"error": str(e)})
         except Exception as error:
-            _LOGGER.error(json.dumps({
+            record = {
                 "event": "control_plane_internal_error",
                 "exception_type": type(error).__name__,
                 "method": getattr(self, "command", "UNKNOWN"),
                 "request_id": getattr(self, "_request_id", "unavailable"),
-            }, sort_keys=True, separators=(",", ":")))
+            }
+            code = _sqlite_primary_code(error)
+            if code is not None:
+                record["sqlite_primary_code"] = code
+            _LOGGER.error(json.dumps(record, sort_keys=True, separators=(",", ":")))
             self._json(500, {"error": "internal error"})
 
     def _match(self, method: str, p: list[str]):
@@ -1157,10 +1175,25 @@ class _Handler(BaseHTTPRequestHandler):
             body = self._body()
             store = self._runner_store()
             if set(body) == {"schema_version", "client_activation_nonce_b64", "signature_b64"} and body["schema_version"] == "heel.runner-pairing-activate.v3":
-                response = store.activate_executable(
-                    pairing_id, body, max_active=self.cp.runner_active_limit(store, pairing_id),
-                    grant_authority=self.cp.grant_authority,
-                )
+                try:
+                    response = store.activate_executable(
+                        pairing_id, body, max_active=self.cp.runner_active_limit(store, pairing_id),
+                        grant_authority=self.cp.grant_authority,
+                    )
+                except sqlite3.OperationalError as error:
+                    # The short runner connection lost its 250 ms busy wait at BEGIN IMMEDIATE or
+                    # COMMIT; activate_executable never opened, or already rolled back, its
+                    # transaction, so the identical sealed activation may be resent. Only this
+                    # executable path was proved side-effect free; every other route stays 500.
+                    if (
+                        not self.cp.runner_connections_are_shared
+                        and _sqlite_primary_code(error) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                        and not store.conn.in_transaction
+                    ):
+                        self._json(503, {"schema_version": "heel.runner-error.v1", "code": "runner_control_busy",
+                                         "retry_after_ms": 1000}, {"Retry-After": "1"})
+                        return
+                    raise
                 self._canonical_json(200, response)
                 return
             if set(body) != {"schema_version", "signature_b64"} or body["schema_version"] != "heel.runner-pairing-activate.v1":

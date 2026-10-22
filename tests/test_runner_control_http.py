@@ -5,6 +5,7 @@ import sqlite3
 import time
 import http.client
 import json
+import logging
 import re
 import socket
 import threading
@@ -2761,5 +2762,325 @@ def test_old_and_new_activation_peers_fail_closed_with_response_rejected(tmp_pat
         assert outcome["error"].code == "response_rejected"
         assert daemon.status()["state"] == "pairing_incomplete"
         assert daemon.unpair()["removed"] is True and backend.values == {}
+    finally:
+        ceremony.close()
+
+
+class _FilePairingCeremony(_PairingCeremony):
+    """``_PairingCeremony`` on a file database, so runner requests own a short independent connection."""
+
+    UNTOUCHED = {"pairing": "approved", "runners": 0, "keys": 0, "receipts": 0, "activated_audits": 0}
+    ACTIVATED_ONCE = {"pairing": "activated", "runners": 1, "keys": 1, "receipts": 1, "activated_audits": 1}
+    BUSY = {"schema_version": "heel.runner-error.v1", "code": "runner_control_busy", "retry_after_ms": 1000}
+
+    def __init__(self, grant_authority, journal_mode="delete"):
+        self._directory = tempfile.TemporaryDirectory()
+        self.database = str(Path(self._directory.name) / "control.sqlite")
+        self.cp = ControlPlane(self.database, device_token_pepper=b"d" * 32, runner_auth_pepper=b"r" * 32,
+                               enable_device_auth=True, public_origin="https://heel.test",
+                               grant_authority=grant_authority)
+        assert self.cp.runner_connections_are_shared is False
+        if journal_mode == "wal":  # before any request, as server.py configures production
+            self.cp.store.conn.execute("PRAGMA journal_mode=WAL")
+            self.cp.store.conn.execute("PRAGMA synchronous=FULL")
+        check = sqlite3.connect(self.database)
+        try:
+            assert check.execute("PRAGMA journal_mode").fetchone()[0] == journal_mode
+        finally:
+            check.close()
+        self.server = serve(self.cp)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            self._directory.cleanup()
+
+    def fresh_state(self, pairing):
+        """Rows for this pairing and its runner, read on a new connection to the database file."""
+        conn = sqlite3.connect(self.database)
+        try:
+            pairing_id, runner_id = pairing["pending"]["pairing_id"], pairing["pending"]["runner_id"]
+            count = lambda sql, value: conn.execute(sql, (value,)).fetchone()[0]  # noqa: E731
+            return {
+                "pairing": conn.execute("SELECT status FROM canary_runner_pairings WHERE pairing_id=?",
+                                        (pairing_id,)).fetchone()[0],
+                "runners": count("SELECT COUNT(*) FROM canary_runners WHERE runner_id=? AND status='active'", runner_id),
+                "keys": count("SELECT COUNT(*) FROM canary_runner_keys WHERE runner_id=?", runner_id),
+                "receipts": count("SELECT COUNT(*) FROM canary_runner_pairing_activation_receipts WHERE pairing_id=?",
+                                  pairing_id),
+                "activated_audits": count("SELECT COUNT(*) FROM canary_runner_audit_records WHERE runner_id=? "
+                                          "AND action='runner_activated'", runner_id),
+            }
+        finally:
+            conn.close()
+
+    def assert_busy_then_activates_once(self, pairing, raw, answer, caplog):
+        """The held request answered the named 503; afterwards the same bytes activate once and replay."""
+        status, headers, body = answer
+        assert status == 503, body
+        assert json.loads(body) == self.BUSY
+        assert [value for name, value in headers if name.lower() == "retry-after"] == ["1"]
+        assert "control_plane_internal_error" not in caplog.text
+        assert self.fresh_state(pairing) == self.UNTOUCHED
+        status, _, first = _raw_post(self, pairing["route"], raw)
+        assert status == 200 and json.loads(first)["schema_version"] == "heel.runner-pairing-activated.v4"
+        assert _raw_post(self, pairing["route"], raw)[::2] == (200, first)
+        assert self.fresh_state(pairing) == self.ACTIVATED_ONCE
+
+
+def _raw_post(ceremony, path, raw):
+    """POST exact bytes; return the status, every response header and the body bytes."""
+    conn = http.client.HTTPConnection("127.0.0.1", ceremony.server.server_address[1], timeout=10)
+    try:
+        conn.request("POST", path, raw, {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        return response.status, response.getheaders(), response.read()
+    finally:
+        conn.close()
+
+
+
+@pytest.mark.parametrize("journal_mode", ["delete", "wal"])
+def test_v3_activation_busy_at_begin_answers_503_then_the_same_bytes_activate_once(caplog, journal_mode):
+    caplog.set_level(logging.ERROR, logger="heel.saas.control_plane")
+    ceremony = _FilePairingCeremony(SigningAuthority.generate(), journal_mode)
+    try:
+        pairing = ceremony.approved_pairing("busy-begin@example.test")
+        raw = canonical_bytes(pairing["activation"])
+        human = ceremony.cp.store.conn
+        human.execute("BEGIN IMMEDIATE")
+        try:
+            human.execute("UPDATE workspaces SET name=name WHERE workspace_id=?", (pairing["workspace_id"],))
+            answer = _raw_post(ceremony, pairing["route"], raw)
+        finally:
+            human.rollback()
+        ceremony.assert_busy_then_activates_once(pairing, raw, answer, caplog)
+    finally:
+        ceremony.close()
+
+
+def test_v3_activation_busy_at_commit_answers_503_then_the_same_bytes_activate_once(caplog):
+    """Rollback journal only: a WAL reader never blocks the activation's commit."""
+    caplog.set_level(logging.ERROR, logger="heel.saas.control_plane")
+    ceremony = _FilePairingCeremony(SigningAuthority.generate())
+    try:
+        pairing = ceremony.approved_pairing("busy-commit@example.test")
+        ceremony.owner("busy-commit-other@example.test")  # two rows, so one fetch leaves the read open
+        raw = canonical_bytes(pairing["activation"])
+        with ceremony.cp.request_lock:
+            cursor = ceremony.cp.store.conn.execute("SELECT * FROM workspaces")
+            try:
+                assert cursor.fetchone() is not None
+                answer = _raw_post(ceremony, pairing["route"], raw)
+            finally:
+                cursor.close()
+        ceremony.assert_busy_then_activates_once(pairing, raw, answer, caplog)
+    finally:
+        ceremony.close()
+
+
+@pytest.mark.parametrize("journal_mode", ["delete", "wal"])
+def test_busy_on_exchange_route_stays_500_with_a_numeric_code_only(caplog, journal_mode):
+    caplog.set_level(logging.ERROR, logger="heel.saas.control_plane")
+    ceremony = _FilePairingCeremony(SigningAuthority.generate(), journal_mode)
+    try:
+        workspace_id, browser = ceremony.owner("busy-exchange@example.test")
+        private = Ed25519PrivateKey.generate()
+        exchange = {
+            "schema_version": "heel.runner-pairing-exchange.v3", "invitation_token": ceremony.invite(workspace_id, browser),
+            "public_key_b64": base64.b64encode(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode(),
+            "pairing_phrase": " ".join(runner_phrase_words()[:6]), "display_name": "Runner F3",
+            "runner_version": "v4", "adapters": {}, "control_protocol": "heel.runner-control.v2",
+        }
+        human = ceremony.cp.store.conn
+        human.execute("BEGIN IMMEDIATE")
+        try:
+            human.execute("UPDATE workspaces SET name=name WHERE workspace_id=?", (workspace_id,))
+            status, headers, body = _raw_post(ceremony, "/v1/runner-pairings/exchange", canonical_bytes(exchange))
+        finally:
+            human.rollback()
+        assert (status, json.loads(body)) == (500, {"error": "internal error"})
+        assert [value for name, value in headers if name.lower() == "retry-after"] == []
+        records = [json.loads(record.getMessage()) for record in caplog.records
+                   if "control_plane_internal_error" in record.getMessage()]
+        assert len(records) == 1
+        assert set(records[0]) == {"event", "exception_type", "method", "request_id", "sqlite_primary_code"}
+        assert records[0]["sqlite_primary_code"] == 5 and records[0]["exception_type"] == "OperationalError"
+        assert records[0]["method"] == "POST"
+    finally:
+        ceremony.close()
+
+
+def test_legacy_v1_activation_busy_stays_500(caplog, monkeypatch):
+    caplog.set_level(logging.ERROR, logger="heel.saas.control_plane")
+    canary = "CANARY-" + secrets_bytes(8).hex()
+
+    def busy(self, *args, **kwargs):
+        error = sqlite3.OperationalError(canary)
+        error.sqlite_errorcode = 5
+        raise error
+
+    ceremony = _FilePairingCeremony(SigningAuthority.generate())
+    try:
+        pairing = ceremony.approved_pairing("busy-legacy@example.test")
+        monkeypatch.setattr(RunnerAuthStore, "activate", busy)
+        legacy = {"schema_version": "heel.runner-pairing-activate.v1", "signature_b64": "A" * 88}
+        status, headers, body = _raw_post(ceremony, pairing["route"], canonical_bytes(legacy))
+        assert (status, json.loads(body)) == (500, {"error": "internal error"})
+        records = [json.loads(record.getMessage()) for record in caplog.records
+                   if "control_plane_internal_error" in record.getMessage()]
+        assert len(records) == 1
+        assert set(records[0]) == {"event", "exception_type", "method", "request_id", "sqlite_primary_code"}
+        assert records[0]["sqlite_primary_code"] == 5 and records[0]["exception_type"] == "OperationalError"
+        assert canary not in caplog.text and canary.encode() not in body and canary not in repr(headers)
+        assert ceremony.fresh_state(pairing) == ceremony.UNTOUCHED
+    finally:
+        ceremony.close()
+
+
+@pytest.mark.parametrize(("code", "expected"), [
+    (..., None), (None, None), ("5", None), (5.0, None), (True, None), (-1, None), (0, None),
+    (5 | (1 << 40), None), (0x10000, None), (1, 1), (11, 11), (0xFFFF, 255),
+], ids=["absent", "none", "str", "float", "bool", "negative", "zero", "huge", "oversized", "error", "corrupt", "max"])
+def test_non_busy_and_hostile_sqlite_errors_stay_500_without_leaking(caplog, monkeypatch, code, expected):
+    caplog.set_level(logging.ERROR, logger="heel.saas.control_plane")
+    canary = "CANARY-" + secrets_bytes(8).hex()
+
+    def failing(self, *args, **kwargs):
+        error = sqlite3.OperationalError(canary)
+        if code is not ...:
+            error.sqlite_errorcode = code
+        raise error
+
+    ceremony = _FilePairingCeremony(SigningAuthority.generate())
+    try:
+        pairing = ceremony.approved_pairing("busy-hostile@example.test")
+        monkeypatch.setattr(RunnerAuthStore, "activate_executable", failing)
+        status, headers, body = _raw_post(ceremony, pairing["route"], canonical_bytes(pairing["activation"]))
+        assert (status, json.loads(body)) == (500, {"error": "internal error"})
+        records = [json.loads(record.getMessage()) for record in caplog.records
+                   if "control_plane_internal_error" in record.getMessage()]
+        assert len(records) == 1
+        keys = {"event", "exception_type", "method", "request_id"}
+        if expected is None:
+            assert set(records[0]) == keys
+        else:
+            assert set(records[0]) == keys | {"sqlite_primary_code"}
+            assert type(records[0]["sqlite_primary_code"]) is int and records[0]["sqlite_primary_code"] == expected
+        assert canary not in caplog.text and canary.encode() not in body and canary not in repr(headers)
+        assert ceremony.fresh_state(pairing) == ceremony.UNTOUCHED
+    finally:
+        ceremony.close()
+
+
+@pytest.mark.parametrize("code", [5, 517])
+def test_busy_with_an_open_transaction_stays_500_and_persists_nothing(caplog, monkeypatch, code):
+    caplog.set_level(logging.ERROR, logger="heel.saas.control_plane")
+    canary = "CANARY-" + secrets_bytes(8).hex()
+
+    def busy_in_transaction(self, *args, **kwargs):
+        self.conn.execute("BEGIN IMMEDIATE")  # left open: the guard, not the code, must refuse the 503
+        error = sqlite3.OperationalError(canary)
+        error.sqlite_errorcode = code
+        raise error
+
+    ceremony = _FilePairingCeremony(SigningAuthority.generate())
+    try:
+        pairing = ceremony.approved_pairing("busy-open@example.test")
+        raw = canonical_bytes(pairing["activation"])
+        monkeypatch.setattr(RunnerAuthStore, "activate_executable", busy_in_transaction)
+        status, headers, body = _raw_post(ceremony, pairing["route"], raw)
+        assert (status, json.loads(body)) == (500, {"error": "internal error"})
+        records = [json.loads(record.getMessage()) for record in caplog.records
+                   if "control_plane_internal_error" in record.getMessage()]
+        assert len(records) == 1
+        assert set(records[0]) == {"event", "exception_type", "method", "request_id", "sqlite_primary_code"}
+        assert records[0]["sqlite_primary_code"] == 5
+        assert canary not in caplog.text and canary.encode() not in body and canary not in repr(headers)
+        assert ceremony.fresh_state(pairing) == ceremony.UNTOUCHED
+        # Closing the short connection discarded the open transaction: the real activation still works.
+        monkeypatch.undo()
+        assert _raw_post(ceremony, pairing["route"], raw)[0] == 200
+        assert ceremony.fresh_state(pairing) == ceremony.ACTIVATED_ONCE
+    finally:
+        ceremony.close()
+
+
+def test_generic_internal_error_log_keeps_its_four_keys(caplog, monkeypatch):
+    caplog.set_level(logging.ERROR, logger="heel.saas.control_plane")
+    canary = "CANARY-" + secrets_bytes(8).hex()
+
+    def failing(self, *args, **kwargs):
+        raise RuntimeError(canary)
+
+    ceremony = _FilePairingCeremony(SigningAuthority.generate())
+    try:
+        pairing = ceremony.approved_pairing("generic-error@example.test")
+        monkeypatch.setattr(RunnerAuthStore, "activate_executable", failing)
+        status, headers, body = _raw_post(ceremony, pairing["route"], canonical_bytes(pairing["activation"]))
+        assert (status, json.loads(body)) == (500, {"error": "internal error"})
+        records = [json.loads(record.getMessage()) for record in caplog.records
+                   if "control_plane_internal_error" in record.getMessage()]
+        assert len(records) == 1
+        assert set(records[0]) == {"event", "exception_type", "method", "request_id"}
+        assert records[0]["exception_type"] == "RuntimeError"
+        assert canary not in caplog.text and canary.encode() not in body and canary not in repr(headers)
+    finally:
+        ceremony.close()
+
+
+@pytest.mark.parametrize("code", [5, 6, 261, 262, 517, 773],
+                         ids=["busy", "locked", "busy_recovery", "locked_sharedcache", "busy_snapshot", "busy_timeout"])
+def test_v3_activation_injected_busy_and_locked_codes_answer_the_named_503(caplog, monkeypatch, code):
+    """Injected errors, classified by primary code on the permitted file-backed v3 route only."""
+    caplog.set_level(logging.ERROR, logger="heel.saas.control_plane")
+    canary = "CANARY-" + secrets_bytes(8).hex()
+
+    def busy(self, *args, **kwargs):
+        error = sqlite3.OperationalError(canary)
+        error.sqlite_errorcode = code
+        raise error
+
+    ceremony = _FilePairingCeremony(SigningAuthority.generate())
+    try:
+        pairing = ceremony.approved_pairing("busy-injected@example.test")
+        monkeypatch.setattr(RunnerAuthStore, "activate_executable", busy)
+        status, headers, body = _raw_post(ceremony, pairing["route"], canonical_bytes(pairing["activation"]))
+        assert status == 503, body
+        assert json.loads(body) == ceremony.BUSY
+        assert [value for name, value in headers if name.lower() == "retry-after"] == ["1"]
+        assert "control_plane_internal_error" not in caplog.text
+        assert canary not in caplog.text and canary.encode() not in body and canary not in repr(headers)
+        assert ceremony.fresh_state(pairing) == ceremony.UNTOUCHED
+    finally:
+        ceremony.close()
+
+
+def test_shared_connection_v3_activation_busy_stays_500(caplog, monkeypatch):
+    caplog.set_level(logging.ERROR, logger="heel.saas.control_plane")
+    canary = "CANARY-" + secrets_bytes(8).hex()
+
+    def busy(self, *args, **kwargs):
+        error = sqlite3.OperationalError(canary)
+        error.sqlite_errorcode = 5
+        raise error
+
+    ceremony = _PairingCeremony(SigningAuthority.generate())
+    try:
+        assert ceremony.cp.runner_connections_are_shared is True
+        pairing = ceremony.approved_pairing("busy-shared@example.test")
+        monkeypatch.setattr(RunnerAuthStore, "activate_executable", busy)
+        status, headers, body = _raw_post(ceremony, pairing["route"], canonical_bytes(pairing["activation"]))
+        assert (status, json.loads(body)) == (500, {"error": "internal error"})
+        assert [value for name, value in headers if name.lower() == "retry-after"] == []
+        records = [json.loads(record.getMessage()) for record in caplog.records
+                   if "control_plane_internal_error" in record.getMessage()]
+        assert len(records) == 1
+        assert set(records[0]) == {"event", "exception_type", "method", "request_id", "sqlite_primary_code"}
+        assert records[0]["sqlite_primary_code"] == 5
+        assert canary not in caplog.text and canary.encode() not in body and canary not in repr(headers)
+        assert ceremony.state(pairing)["receipt"] is None
     finally:
         ceremony.close()
