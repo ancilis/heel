@@ -19,6 +19,9 @@ disables the check. A new generation after a fork needs a fresh interpreter (``e
 This unit installs no production rules or chains (H2), runs no cycle and makes no control-plane
 request (H1A-3). ``ClockWitness``/``detect_gap`` and ``sleep_capability_report`` are diagnostic
 readers only: nothing here enforces them. Missing OS capabilities fail closed.
+H1A3-1 adds readers only, no new kernel write: ``unresolved_children``/``sweep_unresolved_children``
+report the process-global cleanup registry (no pid leaves the module) and ``connect_cp`` returns the
+connection whose control-plane peer it checked, for ``deploy/host/cycle.py`` to write its request on.
 """
 import contextlib
 import dataclasses
@@ -45,8 +48,8 @@ __all__ = (
     "ForeignProcess", "GATE_CHAIN", "HandleState", "HostQuarantined", "IP_PATH", "InstallerFailed", "LeaseDomain",
     "CHILD_REAP_GRACE_MS", "MARK_MAX", "MAX_PREPARE_TIMEOUT_MS", "NAMESPACE_READY_TIMEOUT_MS", "NFT_PATH",
     "PREPARED_SET", "PREPARE_CHILD_TIMEOUT_MS", "PrepareFailed",
-    "PreparedKey", "SelfTestReport", "TABLE", "detect_gap", "generation_self_test", "sleep_capability_report",
-    "verify_cp_socket",
+    "PreparedKey", "SelfTestReport", "TABLE", "connect_cp", "detect_gap", "generation_self_test",
+    "sleep_capability_report", "sweep_unresolved_children", "unresolved_children", "verify_cp_socket",
 )
 
 TABLE, PREPARED_SET, ACTIVATED_MAP, GATE_CHAIN = "heel_lease", "prepared", "activated", "gate"
@@ -381,6 +384,28 @@ def _sweep_unreaped() -> None:
                 child.state = _UNCERTAIN
             if _look(child, _HANDED_OFF):
                 _UNREAPED.discard(child)
+
+
+_CHILD_STATES = (_OWNED, _LOOKING, _REAPED, _HANDED_OFF, _SWEEPING, _UNCERTAIN)
+
+
+def unresolved_children() -> dict[str, int]:
+    """Counts of the whole process's cleanup registry by state, under _REAP_LOCK: the six child
+    states plus ``other`` for anything else, every key always present. A reader only: no waitpid, no
+    signal, and no pid leaves this module. The registry carries no namespace identity, so the counts
+    describe the process, never one domain; a child that never reached the registry is not counted."""
+    counts = dict.fromkeys((*_CHILD_STATES, "other"), 0)
+    with _REAP_LOCK:
+        for child in tuple(_UNREAPED):
+            counts[child.state if child.state in _CHILD_STATES else "other"] += 1
+    return counts
+
+
+def sweep_unresolved_children() -> dict[str, int]:
+    """The drain boundary: one ``_sweep_unreaped`` (non-blocking looks at handed-off entries only,
+    nothing signalled, nothing spawned), then ``unresolved_children``."""
+    _sweep_unreaped()
+    return unresolved_children()
 
 
 def _await(child: _Child, sink_r: int, timeout_ms: int) -> tuple[int | None, bytes]:
@@ -949,6 +974,23 @@ def _selftest_readd_batch(handle: PreparedKey) -> bytes:
 def verify_cp_socket(path: str, cp_uid: int, *, uid_map_path: str = "/proc/self/uid_map") -> None:
     """The supervisor's mutual check before it writes a request. Never creates, unlinks or renames
     anything. Every failure is ``ControlPlaneUnavailable`` with a fixed code."""
+    target = _check_cp_path(path, cp_uid, uid_map_path)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(5)
+        client.connect(str(target))
+        pid, uid, _gid = struct.unpack("3i", client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    except OSError as error:
+        raise ControlPlaneUnavailable("connect_failed") from error
+    finally:
+        client.close()
+    if uid != cp_uid or pid == 0:
+        raise ControlPlaneUnavailable("peer_identity")
+
+
+def _check_cp_path(path: str, cp_uid: int, uid_map_path: str) -> Path:
+    """The static part of the mutual check, in its fixed order: platform, uid, initial user and PID
+    namespaces, absolute path, a 0600 socket and a 0700 directory both owned by ``cp_uid``."""
     if not sys.platform.startswith("linux") or not hasattr(socket, "SO_PEERCRED"):
         raise ControlPlaneUnavailable("platform_unsupported")
     if type(cp_uid) is not int or not 0 <= cp_uid < 2 ** 32 - 1:
@@ -968,17 +1010,35 @@ def verify_cp_socket(path: str, cp_uid: int, *, uid_map_path: str = "/proc/self/
         raise ControlPlaneUnavailable("socket_profile")
     if not (stat.S_ISDIR(parent.st_mode) and parent.st_uid == cp_uid and stat.S_IMODE(parent.st_mode) == 0o700):
         raise ControlPlaneUnavailable("directory_profile")
+    return target
+
+
+def connect_cp(path: str, cp_uid: int, deadline_ns: int, *, uid_map_path: str = "/proc/self/uid_map") -> socket.socket:
+    """The connection the request is written on, after ``_check_cp_path`` and a peer check on this
+    same connection (SO_PEERCRED: uid ``cp_uid``, pid non-zero), all before any byte is written and
+    within the monotonic ``deadline_ns``. Never creates, unlinks or renames anything. Every failure
+    is ``ControlPlaneUnavailable`` with a fixed code (``cp_timeout``, ``connect_failed``,
+    ``peer_identity`` or a ``_check_cp_path`` code); the caller owns and closes the returned socket."""
+    target = _check_cp_path(path, cp_uid, uid_map_path)
+    remaining_ns = deadline_ns - time.monotonic_ns() if type(deadline_ns) is int else 0
+    if remaining_ns <= 0:
+        raise ControlPlaneUnavailable("cp_timeout")
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        client.settimeout(5)
-        client.connect(str(target))
-        pid, uid, _gid = struct.unpack("3i", client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-    except OSError as error:
-        raise ControlPlaneUnavailable("connect_failed") from error
-    finally:
+        client.settimeout(remaining_ns / 1e9)
+        try:
+            client.connect(str(target))
+            pid, uid, _gid = struct.unpack("3i", client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        except TimeoutError as error:
+            raise ControlPlaneUnavailable("cp_timeout") from error
+        except OSError as error:
+            raise ControlPlaneUnavailable("connect_failed") from error
+        if uid != cp_uid or pid == 0:
+            raise ControlPlaneUnavailable("peer_identity")
+    except BaseException:
         client.close()
-    if uid != cp_uid or pid == 0:
-        raise ControlPlaneUnavailable("peer_identity")
+        raise
+    return client
 
 
 # ---------------------------------------------------------------------------------------------

@@ -11,6 +11,7 @@ no clock patches decide an interleaving.
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import dataclasses
 import importlib.util
@@ -23,6 +24,7 @@ import select
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1841,3 +1843,260 @@ def test_new_job_block_is_additive_and_existing_blocks_match_recorded_hashes():
     for name, variant in mutations.items():
         assert variant != text, name
         assert proof.workflow_violations(variant) != [], name
+
+
+# ---------------------------------------------------------------------------------------------
+# H1A3-1 additions (H1A3DR design sections 3.1, 6.1-6.3 and 8.1): the process-global registry
+# reader, the non-mutating sweep wrapper, the request-connection client and the unchanged check.
+
+FAKE_PIDS = {state: 0x7FFF_FF00 + index for index, state in enumerate(
+    ("owned", "looking", "reaped", "handed_off", "sweeping", "uncertain", "other"))}
+REGISTRY_KEYS = ("owned", "looking", "reaped", "handed_off", "sweeping", "uncertain", "other")
+
+
+def _fake_registry(monkeypatch, states, *, handed_off_status=None):
+    """A fresh private registry of fake pids (no real process is forked, waited on or signalled for
+    them) plus waitpid/kill recorders. ``handed_off_status`` is what waitpid reports for the handed-off
+    pid: None = still running, an int = exited with that code."""
+    registry, waits, kills = set(), [], []
+    for state in states:
+        registry.add(authority._Child(FAKE_PIDS[state], "bogus-state" if state == "other" else state))
+    real_waitpid, real_kill = os.waitpid, os.kill
+
+    def waitpid(pid, options):
+        if pid not in FAKE_PIDS.values():
+            return real_waitpid(pid, options)
+        waits.append(pid)
+        if pid != FAKE_PIDS["handed_off"] or handed_off_status is None:
+            return 0, 0
+        return pid, handed_off_status << 8
+
+    def kill(pid, signum):
+        if pid not in FAKE_PIDS.values():
+            return real_kill(pid, signum)
+        kills.append(pid)
+
+    monkeypatch.setattr(authority, "_UNREAPED", registry)
+    monkeypatch.setattr(authority, "_REAP_LOCK", threading.Lock())
+    monkeypatch.setattr(authority.os, "waitpid", waitpid)
+    monkeypatch.setattr(authority.os, "kill", kill)
+    return registry, waits, kills
+
+
+def _states(registry) -> dict[int, str]:
+    return {child.pid: child.state for child in registry}
+
+
+def test_sweep_polls_only_handed_off_entries_never_owned_looking_or_uncertain(monkeypatch):
+    """STATE-MACHINE ONLY (the holder rule, mandatory on this authority.py edit): registry entries in
+    owned, looking, uncertain and sweeping get zero waitpid calls from ``_sweep_unreaped``; a handed_off
+    entry gets exactly one; a sweeping entry is converted to uncertain and kept; nothing is signalled."""
+    registry, waits, kills = _fake_registry(
+        monkeypatch, ("owned", "looking", "uncertain", "sweeping", "handed_off"))
+    authority._sweep_unreaped()
+    assert waits == [FAKE_PIDS["handed_off"]] and kills == []
+    assert _states(registry) == {FAKE_PIDS["owned"]: "owned", FAKE_PIDS["looking"]: "looking",
+                                 FAKE_PIDS["uncertain"]: "uncertain", FAKE_PIDS["sweeping"]: "uncertain",
+                                 FAKE_PIDS["handed_off"]: "handed_off"}
+    assert not authority._REAP_LOCK.locked()
+
+
+def test_unresolved_children_and_sweep_wrapper_report_states_without_touching_pids(monkeypatch):
+    """STATE-MACHINE ONLY: the reader returns the fixed seven keys (the six child states plus other)
+    over the whole process registry under the registry lock, with no waitpid, no kill and no pid in
+    the result. The wrapper is one sweep (one waitpid, for the handed-off entry only) then the reader."""
+    _registry, waits, kills = _fake_registry(monkeypatch, ())
+    assert authority.unresolved_children() == dict.fromkeys(REGISTRY_KEYS, 0)
+    registry, waits, kills = _fake_registry(monkeypatch, REGISTRY_KEYS, handed_off_status=0)
+    counts = authority.unresolved_children()
+    assert tuple(counts) == REGISTRY_KEYS and counts == dict.fromkeys(REGISTRY_KEYS, 1)
+    assert waits == [] and kills == [] and len(registry) == 7
+    assert all(type(value) is int for value in counts.values())
+    counts["owned"] = 99  # a fresh dict each call: the caller cannot reach the registry through it
+    assert authority.unresolved_children()["owned"] == 1
+    swept = authority.sweep_unresolved_children()
+    # handed_off reaped (one look), reaped discarded without a look, sweeping -> uncertain (kept).
+    assert waits == [FAKE_PIDS["handed_off"]] and kills == []
+    assert swept == {"owned": 1, "looking": 1, "reaped": 0, "handed_off": 0, "sweeping": 0, "uncertain": 2, "other": 1}
+    assert not authority._REAP_LOCK.locked()
+    source = AUTHORITY_FILE.read_text(encoding="utf-8")
+    for name in ("unresolved_children", "sweep_unresolved_children"):
+        node = next(node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef) and node.name == name)
+        assert not [item for item in ast.walk(node) if isinstance(item, ast.Attribute) and item.attr in ("pid", "waitpid", "kill")]
+        called = {ast.unparse(item.func) for item in ast.walk(node) if isinstance(item, ast.Call)}
+        assert called <= {"dict.fromkeys", "tuple", "_sweep_unreaped", "unresolved_children"}, (name, called)
+        assert name in authority.__all__
+
+
+def _uid_map(tmp_path: Path, text: str = "0 0 4294967295\n") -> str:
+    path = tmp_path / "uid_map"
+    path.write_text(text, encoding="ascii")
+    return str(path)
+
+
+def _initial_pid_namespace(monkeypatch):
+    """The pid-1 namespace link needs privilege on an ordinary CI runner; the test reads both links as
+    equal (the privileged T1 proof covers the real comparison). Nothing else is patched."""
+    real_readlink = os.readlink
+
+    def readlink(path, *args, **kwargs):
+        if path in ("/proc/self/ns/pid", "/proc/1/ns/pid"):
+            return "pid:[4026531836]"
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(authority.os, "readlink", readlink)
+
+
+class _CpListener:
+    """A real AF_UNIX listener at a 0600 socket in a 0700 directory, owned by this uid; it accepts
+    connections and records the bytes each one sent until EOF."""
+
+    def __init__(self):
+        self.directory = tempfile.mkdtemp(prefix="cpc")
+        self.path = os.path.join(self.directory, "cp.sock")
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(self.path)
+        os.chmod(self.path, 0o600)
+        self.sock.listen(8)
+        self.sock.settimeout(0.2)
+        self.received: list[bytes] = []
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        while not self.done.is_set():
+            try:
+                connection, _address = self.sock.accept()
+            except (TimeoutError, OSError):
+                continue
+            with connection:
+                connection.settimeout(5)
+                data = b""
+                with contextlib.suppress(OSError):
+                    while chunk := connection.recv(4096):
+                        data += chunk
+                self.received.append(data)
+
+    def listing(self):
+        return sorted(os.listdir(self.directory))
+
+    def close(self):
+        self.done.set()
+        self.thread.join(5)
+        self.sock.close()
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+
+class _PeerPidZeroSocket(socket.socket):
+    """A peer-credential double: SO_PEERCRED reads pid 0 (a peer outside this PID namespace)."""
+
+    def getsockopt(self, level, option, *args):
+        if level == socket.SOL_SOCKET and option == getattr(socket, "SO_PEERCRED", None):
+            return struct.pack("3i", 0, os.geteuid(), os.getegid())
+        return super().getsockopt(level, option, *args)
+
+
+def test_connect_cp_verifies_peer_on_the_request_connection_and_never_creates_paths(monkeypatch, tmp_path):
+    """Static on every OS: ``connect_cp`` reads SO_PEERCRED on the very socket it returns and creates,
+    unlinks, renames or binds nothing. Behaviour on Linux (a real AF_UNIX listener owned by this uid;
+    STATE-MACHINE ONLY for the two pid-namespace links and for the pid-0 peer double): the bytes
+    written on the returned socket reach the accepted connection whose peer was checked; a pid-0
+    peer is refused peer_identity with nothing written; an exhausted deadline is cp_timeout; the
+    directory listing never changes. Elsewhere the platform refusal is the only outcome."""
+    source = AUTHORITY_FILE.read_text(encoding="utf-8")
+    node = next(node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef) and node.name == "connect_cp")
+    segment = ast.get_source_segment(source, node)
+    called = {ast.unparse(item.func).split(".")[-1] for item in ast.walk(node) if isinstance(item, ast.Call)}
+    assert not called & {"unlink", "rename", "replace", "mkdir", "bind", "chmod", "symlink", "remove", "verify_cp_socket"}
+    assert "client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED" in segment and "return client" in segment
+    parameters = inspect.signature(authority.connect_cp).parameters
+    assert list(parameters) == ["path", "cp_uid", "deadline_ns", "uid_map_path"]
+    assert parameters["uid_map_path"].kind is inspect.Parameter.KEYWORD_ONLY
+    deadline = time.monotonic_ns() + 2_000_000_000
+    if not sys.platform.startswith("linux"):
+        with pytest.raises(authority.ControlPlaneUnavailable) as raised:
+            authority.connect_cp("/nonexistent/cp.sock", os.geteuid(), deadline)
+        assert raised.value.code == "platform_unsupported"
+        return
+    uid_map = _uid_map(tmp_path)
+    _initial_pid_namespace(monkeypatch)
+    listener = _CpListener()
+    try:
+        before = listener.listing()
+        client = authority.connect_cp(listener.path, os.geteuid(), deadline, uid_map_path=uid_map)
+        try:
+            client.sendall(b"request-on-the-checked-connection")
+        finally:
+            client.close()
+        end = time.monotonic() + 5
+        while not listener.received and time.monotonic() < end:
+            time.sleep(0.01)
+        assert listener.received == [b"request-on-the-checked-connection"]
+        with pytest.raises(authority.ControlPlaneUnavailable) as raised:
+            authority.connect_cp(listener.path, os.geteuid(), time.monotonic_ns() - 1, uid_map_path=uid_map)
+        assert raised.value.code == "cp_timeout"
+        with pytest.raises(authority.ControlPlaneUnavailable) as raised:
+            authority.connect_cp(os.path.join(listener.directory, "absent.sock"), os.geteuid(), deadline,
+                                 uid_map_path=uid_map)
+        assert raised.value.code == "socket_unreadable"
+        monkeypatch.setattr(authority.socket, "socket", _PeerPidZeroSocket)
+        with pytest.raises(authority.ControlPlaneUnavailable) as raised:
+            authority.connect_cp(listener.path, os.geteuid(), deadline, uid_map_path=uid_map)
+        assert raised.value.code == "peer_identity"
+        end = time.monotonic() + 5
+        while len(listener.received) < 2 and time.monotonic() < end:
+            time.sleep(0.01)
+        assert listener.received[1:] == [b""]  # the refused connection carried no byte
+        assert listener.listing() == before == ["cp.sock"]
+    finally:
+        listener.close()
+
+
+def test_verify_cp_socket_behaviour_unchanged(monkeypatch, tmp_path):
+    """``verify_cp_socket`` keeps its signature, codes and order: the platform refusal first, then the
+    uid, namespaces, path, socket and directory profiles, then a separate connection that only reads
+    the peer. On Linux (real listener; STATE-MACHINE ONLY for the pid-namespace links and the pid-0
+    peer double) every code is reached; elsewhere the platform refusal is the outcome."""
+    signature = inspect.signature(authority.verify_cp_socket)
+    assert str(signature) == "(path: str, cp_uid: int, *, uid_map_path: str = '/proc/self/uid_map') -> None"
+    if not sys.platform.startswith("linux"):
+        for cp_uid in (0, -1, True):
+            with pytest.raises(authority.ControlPlaneUnavailable) as raised:
+                authority.verify_cp_socket("/nonexistent/cp.sock", cp_uid)
+            assert raised.value.code == "platform_unsupported"
+        return
+    uid_map = _uid_map(tmp_path)
+    _initial_pid_namespace(monkeypatch)
+    listener = _CpListener()
+
+    def code(path=None, cp_uid=None, uid_map_path=uid_map):
+        try:
+            authority.verify_cp_socket(listener.path if path is None else path,
+                                       os.geteuid() if cp_uid is None else cp_uid, uid_map_path=uid_map_path)
+        except authority.ControlPlaneUnavailable as error:
+            return error.code
+        return "ok"
+
+    try:
+        assert code() == "ok"
+        assert code(cp_uid=-1) == code(cp_uid=True) == code(cp_uid=2 ** 32 - 1) == "cp_uid_invalid"
+        assert code(uid_map_path=_uid_map(tmp_path, "0 1000 1\n")) == "not_initial_user_namespace"
+        assert code(uid_map_path=str(tmp_path / "missing")) == "socket_unreadable"
+        assert code(path="relative/cp.sock") == "path_not_absolute"
+        assert code(path=os.path.join(listener.directory, "absent.sock")) == "socket_unreadable"
+        assert code(cp_uid=os.geteuid() + 1) == "socket_profile"
+        os.chmod(listener.path, 0o660)
+        assert code() == "socket_profile"
+        os.chmod(listener.path, 0o600)
+        os.chmod(listener.directory, 0o750)
+        assert code() == "directory_profile"
+        os.chmod(listener.directory, 0o700)
+        monkeypatch.setattr(authority.socket, "socket", _PeerPidZeroSocket)
+        assert code() == "peer_identity"
+        end = time.monotonic() + 5
+        while len(listener.received) < 2 and time.monotonic() < end:
+            time.sleep(0.01)
+        assert listener.received == [b"", b""]  # the check never writes a byte
+    finally:
+        listener.close()
