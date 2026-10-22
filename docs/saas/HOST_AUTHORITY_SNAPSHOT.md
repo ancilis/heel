@@ -29,7 +29,10 @@ qualification) and H-B (customer enablement) remain mandatory and unchanged.
 
 Every refusal is a `ProductionConfigurationError` from `ProductionConfiguration.from_environment`,
 naming the variable, raised before the process lock is taken or anything binds. A peer uid or
-profile without a socket is refused. The socket path is never logged.
+profile without a socket is refused. The socket path is never logged. `build_server` repeats only
+the managed-host rules for a configuration built in code (`managed_host` set with no listener, a
+peer uid other than the integer `0`, or a profile other than `external-pidns`), with the same
+messages and before the lock or any bind; every other rule stays with `from_environment`.
 
 ## Decision
 
@@ -183,11 +186,19 @@ host-authority stop is not `stopped`, `server_close` raises `HostAuthorityServic
 before the reaper stop and before any release, `closed` stays false, and a repeated `server_close`
 on the same handle is the retry that completes once the thread ended.
 
-On a start failure that leaves the thread lingering, `build_server` raises
-`HostAuthorityServiceError("stop_timeout")` (a reaper that does not stop raises
-`CanaryReaperError`), releases nothing, and logs `control_plane_ownership_retained` with the reason.
-On that start path the reaper is joined before the raise (joining releases nothing; otherwise no
-caller would ever stop it and the process could not end when the listener thread ends). Every
+Start path. Every failure raised once the reaper thread may run (a failed or interrupted reaper
+start, whose own bounded join proves nothing; service construction; listener start and readiness;
+installation of the production close), `KeyboardInterrupt` and `SystemExit` included, goes through
+one unwind: first `draining = True`, `reaper_ready = False` and `host_authority_ready = False`; then
+the host-authority stop (when the service exists) and the reaper stop, both attempted and both
+outcomes recorded; only when both proved a join are the control plane and the lock released. A stop
+that returns not-joined or raises releases nothing. A cancellation is always re-raised unchanged;
+otherwise `build_server` raises `HostAuthorityServiceError("stop_timeout")` for a lingering listener,
+`CanaryReaperError` for a reaper that did not stop, or the stop's own exception when a stop raised,
+and logs `control_plane_ownership_retained` with the reason (`stop_timeout`, `reaper_stop_timeout`,
+`host_authority_stop_failed`, `reaper_stop_failed`). On that start path the reaper is joined before
+the raise even when the listener lingers (joining releases nothing; otherwise no caller would ever
+stop it and the process could not end when the listener thread ends). Every
 retained owner (server, control plane, lock, reaper, service) is kept strongly referenced in a
 process-owned holder in `server.py`; nothing there releases, replaces or restarts it automatically,
 even after its thread ended. A `build_server` that raised never returned a handle, so recovery is the

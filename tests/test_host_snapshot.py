@@ -1688,7 +1688,8 @@ def _accept_one_then_handle(listener, _mark_serving):
         return
 
 
-def test_start_time_trickle_retains_ownership_until_process_exit(short_tmp, fast_bounds, no_host_thread_left, caplog):
+def test_start_time_trickle_retains_ownership_until_process_exit(short_tmp, fast_bounds, no_host_thread_left,
+                                                                  owned_workers, caplog):
     from heel.saas import server as server_module
     from heel.saas.server import ProductionConfiguration, build_server
 
@@ -1732,9 +1733,14 @@ def test_start_time_trickle_retains_ownership_until_process_exit(short_tmp, fast
     assert not lock_is_free(config.database_path)
     release_retained_for_test()
     assert lock_is_free(config.database_path)
+    # The retained record describes the quarantine truthfully, never a healthy node.
+    assert (record.control_plane.draining, record.server.reaper_ready, record.server.host_authority_ready) == (
+        True, False, False)
 
 
-def test_reaper_stop_failure_on_the_start_path_retains_ownership(short_tmp, fast_bounds, no_host_thread_left):
+def test_reaper_stop_failure_on_the_start_path_retains_ownership(short_tmp, fast_bounds, no_host_thread_left,
+                                                                 owned_workers):
+    from heel.saas import server as server_module
     from heel.saas.canary_reaper import CanaryReaper, CanaryReaperError
     from heel.saas.server import ProductionConfiguration, build_server
 
@@ -1750,8 +1756,12 @@ def test_reaper_stop_failure_on_the_start_path_retains_ownership(short_tmp, fast
             mock.patch.object(CanaryReaper, "stop", stop_hangs), pytest.raises(CanaryReaperError):
         build_server(config)
     assert not lock_is_free(config.database_path)
+    record = server_module._RETAINED_OWNERSHIP[-1]
     release_retained_for_test()
     assert lock_is_free(config.database_path)
+    assert record.reason == "reaper_stop_timeout"
+    assert (record.control_plane.draining, record.server.reaper_ready, record.server.host_authority_ready) == (
+        True, False, False)
 
 
 def _record_close_order(server, order: list):
@@ -1780,7 +1790,7 @@ def _record_close_order(server, order: list):
     return mock.patch.object(TCPServer, "server_close", tcp)
 
 
-def test_server_close_order_retry_and_trickle_retention(short_tmp, fast_bounds, no_host_thread_left):
+def test_server_close_order_retry_and_trickle_retention(short_tmp, fast_bounds, no_host_thread_left, owned_workers):
     from heel.saas import server as server_module
     from heel.saas.server import ProductionConfiguration, build_server
 
@@ -1848,7 +1858,7 @@ def _any_request() -> dict:
     }
 
 
-def test_stop_hang_seam_raises_before_release(short_tmp, fast_bounds, no_host_thread_left):
+def test_stop_hang_seam_raises_before_release(short_tmp, fast_bounds, no_host_thread_left, owned_workers):
     from heel.saas.server import ProductionConfiguration, build_server
 
     config = ProductionConfiguration.from_environment(host_environment(short_tmp))
@@ -1966,6 +1976,455 @@ def test_end_to_end_over_real_af_unix_with_peer_credentials(short_tmp, no_host_t
         assert status == 200 and json.loads(body)["reason"] == "replayed_sequence"
     finally:
         server.server_close()
+
+
+# ---------------------------------------------------------------------------------------------
+# H1A2R1: every failure after a reaper thread may run (reaper start, service construction, host
+# start, close-wrapper installation; ``BaseException`` included) goes through one unwind: unhealthy
+# flags first, every stop outcome recorded, release only after proven joins, otherwise retained.
+# Faults are injected in the test (labelled); the workers, flock and SQLite files are real.
+
+class _Owned:
+    def __init__(self):
+        self.reapers: list = []
+        self.services: list = []
+        self.locks: list = []
+
+    def service_factory(self, factory):
+        def make(*args, **kwargs):
+            service = factory(*args, **kwargs)
+            self.services.append(service)
+            return service
+        return make
+
+
+@pytest.fixture
+def owned_workers():
+    """Captures every reaper, host-authority service (built through ``service_factory``) and process
+    lock that ``build_server`` creates, so a test observing the product leaving a worker alive still
+    stops it and frees the descriptor. Teardown: services joined, reapers joined, retained records
+    released (their workers ended), then any lock still open (only reached when the product leaked it)."""
+    from socketserver import TCPServer
+
+    from heel.saas import server as server_module
+    from heel.saas.canary_reaper import CanaryReaper
+
+    owned = _Owned()
+    real_acquire = server_module._SingleProcessDatabaseLock.acquire
+
+    def reaper_factory(*args, **kwargs):
+        reaper = CanaryReaper(*args, **kwargs)
+        owned.reapers.append(reaper)
+        return reaper
+
+    def acquire(database_path):
+        lock = real_acquire(database_path)
+        owned.locks.append(lock)
+        return lock
+
+    try:
+        with mock.patch.object(server_module, "CanaryReaper", reaper_factory), \
+                mock.patch.object(server_module._SingleProcessDatabaseLock, "acquire", acquire):
+            yield owned
+    finally:
+        for service in owned.services:
+            service.stop()
+            if service.thread is not None:
+                service.thread.join(10)
+        for reaper in owned.reapers:
+            assert reaper.stop(timeout=10)
+        with server_module._RETAINED_OWNERSHIP_LOCK:
+            records = list(server_module._RETAINED_OWNERSHIP)
+            server_module._RETAINED_OWNERSHIP.clear()
+        for record in records:
+            with contextlib.suppress(Exception):
+                TCPServer.server_close(record.server)
+            with contextlib.suppress(Exception):
+                record.control_plane.close()
+        for lock in owned.locks:
+            lock.close()
+
+
+@contextlib.contextmanager
+def observe_release(observed: list):
+    """Records, at the moment the process lock is released, how many owned workers still run."""
+    from heel.saas.server import _SingleProcessDatabaseLock
+    real_close = _SingleProcessDatabaseLock.close
+
+    def close(lock):
+        observed.append({
+            "reaper_threads": reaper_threads(),
+            "host_threads": sum(1 for thread in threading.enumerate() if thread.name == HOST_THREAD),
+        })
+        return real_close(lock)
+
+    with mock.patch.object(_SingleProcessDatabaseLock, "close", close):
+        yield
+
+
+def _assert_retained_unhealthy(config, reason: str):
+    from heel.saas import server as server_module
+    from heel.saas.server import ProductionConfigurationError, build_server
+
+    assert len(server_module._RETAINED_OWNERSHIP) == 1
+    record = server_module._RETAINED_OWNERSHIP[-1]
+    assert record.reason == reason
+    assert (record.control_plane.draining, record.server.reaper_ready, record.server.host_authority_ready) == (
+        True, False, False)
+    assert record.control_plane.store.conn.execute("SELECT 1").fetchone()[0] == 1  # CP still open
+    assert not lock_is_free(config.database_path)
+    with pytest.raises(ProductionConfigurationError, match="already has a live process owner"):
+        build_server(config)
+    return record
+
+
+def _constructor_fails(*_args, **_kwargs):  # injected fault: raises after the real reaper started
+    assert reaper_threads() == 1
+    raise ValueError("injected constructor failure")
+
+
+def test_constructor_failure_after_reaper_start_releases_only_after_the_join(short_tmp, owned_workers):
+    from heel.saas import server as server_module
+    from heel.saas.server import ProductionConfiguration, build_server
+
+    config = ProductionConfiguration.from_environment(host_environment(short_tmp))
+    released: list = []
+    with mock.patch("heel.saas.server.HostAuthorityService", _constructor_fails), observe_release(released), \
+            pytest.raises(ValueError, match="injected constructor failure"):
+        build_server(config)
+    assert released == [{"reaper_threads": 0, "host_threads": 0}]
+    (reaper,) = owned_workers.reapers
+    assert not reaper.thread.is_alive()
+    assert server_module._RETAINED_OWNERSHIP == []
+    assert lock_is_free(config.database_path)
+
+
+@pytest.mark.parametrize("stop_fault", ["returns_false", "raises"])
+def test_constructor_failure_with_unproven_reaper_stop_retains_ownership(short_tmp, owned_workers, stop_fault):
+    from heel.saas.canary_reaper import CanaryReaper, CanaryReaperError
+    from heel.saas.server import ProductionConfiguration, build_server
+
+    config = ProductionConfiguration.from_environment(host_environment(short_tmp))
+    real_stop = CanaryReaper.stop
+
+    def unproven(self, *args, **kwargs):  # SEAM-STOP-HANG snapshot tests only (on the reaper; injected)
+        assert real_stop(self, *args, **kwargs)
+        if stop_fault == "raises":
+            raise RuntimeError("injected reaper stop failure")
+        return False
+
+    released: list = []
+    expected = CanaryReaperError if stop_fault == "returns_false" else RuntimeError
+    with mock.patch("heel.saas.server.HostAuthorityService", _constructor_fails), \
+            mock.patch.object(CanaryReaper, "stop", unproven), observe_release(released), \
+            pytest.raises(expected) as raised:
+        build_server(config)
+    assert released == []
+    assert isinstance(raised.value.__cause__ or raised.value.__context__, ValueError)
+    record = _assert_retained_unhealthy(
+        config, {"returns_false": "reaper_stop_timeout", "raises": "reaper_stop_failed"}[stop_fault])
+    assert record.reaper is owned_workers.reapers[0] and record.host_authority is None
+    release_retained_for_test()
+    assert lock_is_free(config.database_path)
+
+
+def _install_fails(server, reaper, database_lock, host_authority=None):  # injected fault
+    assert reaper_threads() == 1 and host_authority.alive and server.host_authority_ready is True
+    raise RuntimeError("injected close-wrapper installation failure")
+
+
+@pytest.mark.parametrize("host_stop", ["joined", "unproven"])
+def test_close_wrapper_installation_failure_unwinds_both_workers(short_tmp, fast_bounds, no_host_thread_left,
+                                                                 owned_workers, host_stop):
+    from heel.saas.server import ProductionConfiguration, build_server
+
+    config = ProductionConfiguration.from_environment(host_environment(short_tmp))
+    seams = {} if host_stop == "joined" else {
+        "_stop_result_for_tests": lambda: False}  # SEAM-STOP-HANG snapshot tests only
+    released: list = []
+    expected = RuntimeError if host_stop == "joined" else HostAuthorityServiceError
+    with mock.patch("heel.saas.server.HostAuthorityService", owned_workers.service_factory(seamed_service(**seams))), \
+            mock.patch("heel.saas.server._install_production_close", _install_fails), observe_release(released), \
+            pytest.raises(expected) as raised:
+        build_server(config)
+    (service,) = owned_workers.services
+    assert not os.path.exists(config.host_authority.socket_path)
+    assert reaper_threads() == 0  # joined on the start path even when the host stop is unproven
+    if host_stop == "joined":
+        assert "injected close-wrapper installation failure" in str(raised.value)
+        assert released == [{"reaper_threads": 0, "host_threads": 0}]
+        assert service.phase == "stopped" and service.decider.quarantined
+        assert lock_is_free(config.database_path)
+        return
+    assert raised.value.code == "stop_timeout" and raised.value.stop_result == StopResult(False, True)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert released == []
+    record = _assert_retained_unhealthy(config, "stop_timeout")
+    assert record.host_authority is service and service.phase == "lingering"
+    release_retained_for_test()
+    assert lock_is_free(config.database_path)
+
+
+@pytest.mark.parametrize("window", ["host_start_failure", "close_wrapper"])
+def test_host_stop_raising_during_start_unwind_retains_ownership(short_tmp, fast_bounds, no_host_thread_left,
+                                                                 owned_workers, window):
+    """Injected fault: ``stop()`` raises without stopping. A host thread that may still run keeps
+    every owned resource; the reaper is still joined and its outcome recorded."""
+    from heel.saas.server import ProductionConfiguration, build_server
+
+    config = ProductionConfiguration.from_environment(host_environment(short_tmp))
+    seams = {"_thread_start_for_tests": _thread_start_fails} if window == "host_start_failure" else {}
+    calls: list = []
+
+    def stop_raises(self, *args, **kwargs):  # injected fault
+        calls.append(self)
+        raise RuntimeError("injected host stop failure")
+
+    released: list = []
+    factory = owned_workers.service_factory(seamed_service(**seams))
+    patches = [mock.patch("heel.saas.server.HostAuthorityService", factory),
+               mock.patch.object(HostAuthorityService, "stop", stop_raises)]
+    if window == "close_wrapper":
+        patches.append(mock.patch("heel.saas.server._install_production_close", _install_fails))
+    with contextlib.ExitStack() as stack:
+        for patch in patches:
+            stack.enter_context(patch)
+        stack.enter_context(observe_release(released))
+        with pytest.raises(RuntimeError, match="injected host stop failure") as raised:
+            build_server(config)
+    (service,) = owned_workers.services
+    assert calls == [service] and released == []
+    assert raised.value.__context__ is not None
+    assert reaper_threads() == 0
+    if window == "close_wrapper":
+        assert service.thread.is_alive()  # the stop never ran: the worker really may still run
+    record = _assert_retained_unhealthy(config, "host_authority_stop_failed")
+    assert record.host_authority is service
+    service.stop()  # test cleanup: the real stop, after the observation
+    if service.thread is not None:
+        service.thread.join(10)
+    release_retained_for_test()
+    assert lock_is_free(config.database_path)
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("reaper_stop", ["joined", "unproven"])
+def test_interrupt_after_reaper_start_is_reraised_and_never_releases_a_live_worker(
+        short_tmp, owned_workers, interrupt, reaper_stop):
+    from heel.saas import server as server_module
+    from heel.saas.canary_reaper import CanaryReaper
+    from heel.saas.server import ProductionConfiguration, build_server
+
+    config = ProductionConfiguration.from_environment(host_environment(short_tmp))
+    real_stop = CanaryReaper.stop
+
+    def constructor_interrupted(*_args, **_kwargs):  # injected cancellation after the reaper started
+        assert reaper_threads() == 1
+        raise interrupt()
+
+    def unproven(self, *args, **kwargs):  # SEAM-STOP-HANG snapshot tests only (on the reaper; injected)
+        assert real_stop(self, *args, **kwargs)
+        return False
+
+    released: list = []
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch("heel.saas.server.HostAuthorityService", constructor_interrupted))
+        if reaper_stop == "unproven":
+            stack.enter_context(mock.patch.object(CanaryReaper, "stop", unproven))
+        stack.enter_context(observe_release(released))
+        with pytest.raises(interrupt) as raised:
+            build_server(config)
+    assert type(raised.value) is interrupt  # the original cancellation, never converted
+    assert reaper_threads() == 0
+    if reaper_stop == "joined":
+        assert released == [{"reaper_threads": 0, "host_threads": 0}]
+        assert server_module._RETAINED_OWNERSHIP == [] and lock_is_free(config.database_path)
+        return
+    assert released == []
+    _assert_retained_unhealthy(config, "reaper_stop_timeout")
+    release_retained_for_test()
+    assert lock_is_free(config.database_path)
+
+
+def test_interrupt_inside_host_start_unpublishes_joins_and_reraises(short_tmp, fast_bounds, no_host_thread_left,
+                                                                   owned_workers):
+    from heel.saas import server as server_module
+    from heel.saas.server import ProductionConfiguration, build_server
+
+    def interrupted(_thread):  # SEAM-THREAD-START snapshot tests only (injected cancellation)
+        assert os.path.exists(config.host_authority.socket_path)  # published, not yet serving
+        raise KeyboardInterrupt
+
+    config = ProductionConfiguration.from_environment(host_environment(short_tmp))
+    released: list = []
+    factory = owned_workers.service_factory(seamed_service(_thread_start_for_tests=interrupted))
+    with mock.patch("heel.saas.server.HostAuthorityService", factory), observe_release(released), \
+            pytest.raises(KeyboardInterrupt):
+        build_server(config)
+    (service,) = owned_workers.services
+    assert released == [{"reaper_threads": 0, "host_threads": 0}]
+    assert service.phase == "stopped" and service.decider.quarantined
+    assert not os.path.exists(config.host_authority.socket_path)
+    assert server_module._RETAINED_OWNERSHIP == [] and lock_is_free(config.database_path)
+
+
+@pytest.mark.parametrize("failure", ["startup_timeout", "interrupt"])
+@pytest.mark.parametrize("reaper_stop", ["joined", "returns_false", "raises"])
+def test_reaper_start_failure_with_a_live_thread_releases_only_after_a_proven_join(
+        short_tmp, owned_workers, failure, reaper_stop):
+    """Default off. The real reaper thread is held inside its first cycle by a bounded barrier
+    (test-only timing wrapper) while ``start()`` times out or is interrupted; CanaryReaper.start's
+    own bounded join proves nothing, so only ``stop()`` returning True may release."""
+    from heel.saas import canary_reaper
+    from heel.saas import server as server_module
+    from heel.saas.canary_reaper import CanaryReaper, CanaryReaperError
+    from heel.saas.server import ProductionConfiguration, ProductionConfigurationError, build_server
+
+    config = ProductionConfiguration.from_environment(valid_environment(short_tmp))
+    barrier, in_cycle = threading.Event(), threading.Event()
+    real_cycle, real_start, real_stop = CanaryReaper._cycle, CanaryReaper.start, CanaryReaper.stop
+
+    def blocked_cycle(self, *args, **kwargs):  # test-only barrier, bounded
+        in_cycle.set()
+        assert barrier.wait(20), "reaper barrier never released"
+        return real_cycle(self, *args, **kwargs)
+
+    class InterruptingStartup(threading.Event):
+        def wait(self, timeout=None):  # injected cancellation of start()'s startup wait
+            assert in_cycle.wait(5)
+            raise KeyboardInterrupt
+
+    def bounded_start(self, **_kwargs):  # test-only timing wrapper (production bound is 5 s)
+        if failure == "interrupt":
+            self._startup = InterruptingStartup()
+        real_start(self, timeout=0.3)
+
+    def stop(self, *args, **kwargs):
+        assert self.thread.is_alive()  # still inside the blocked cycle
+        if reaper_stop == "joined":
+            barrier.set()
+            return real_stop(self, timeout=10)
+        if reaper_stop == "returns_false":
+            return real_stop(self, timeout=0.2)  # the real bounded join, refused by the barrier
+        raise RuntimeError("injected reaper stop failure")  # injected fault
+
+    released: list = []
+    expected = {"joined": ProductionConfigurationError, "returns_false": CanaryReaperError,
+                "raises": RuntimeError}[reaper_stop]
+    if failure == "interrupt":
+        expected = KeyboardInterrupt
+    try:
+        with mock.patch.object(CanaryReaper, "_cycle", blocked_cycle), \
+                mock.patch.object(CanaryReaper, "start", bounded_start), \
+                mock.patch.object(CanaryReaper, "stop", stop), \
+                mock.patch.object(canary_reaper, "STOP_TIMEOUT_SECONDS", 0.2), observe_release(released), \
+                pytest.raises(expected) as raised:
+            build_server(config)
+        (reaper,) = owned_workers.reapers
+        if failure == "startup_timeout" and reaper_stop == "joined":
+            assert "canary lifecycle coordinator failed to start" in str(raised.value)
+            assert "startup timed out" in str(raised.value.__cause__)
+        if reaper_stop == "joined":
+            assert released == [{"reaper_threads": 0, "host_threads": 0}]
+            assert not reaper.thread.is_alive()
+            assert server_module._RETAINED_OWNERSHIP == [] and lock_is_free(config.database_path)
+            return
+        assert released == [] and reaper.thread.is_alive()
+        _assert_retained_unhealthy(
+            config, {"returns_false": "reaper_stop_timeout", "raises": "reaper_stop_failed"}[reaper_stop])
+    finally:
+        barrier.set()
+    reaper.thread.join(10)
+    release_retained_for_test()
+    assert lock_is_free(config.database_path)
+
+
+def test_build_server_refuses_programmatic_managed_config_before_lock_or_bind(short_tmp, owned_workers):
+    """The managed rules hold at the build_server boundary for a configuration that did not come
+    from ``from_environment``; non-managed and default-off configurations stay supported."""
+    import dataclasses
+
+    from heel.saas.server import ProductionConfiguration, ProductionConfigurationError, build_server
+
+    config = ProductionConfiguration.from_environment(valid_environment(short_tmp))
+    socket_path = os.path.join(short_tmp, "h.sock")
+    cases = [
+        ("HEEL_MANAGED_HOST=1 requires HEEL_HOST_AUTHORITY_SOCKET", None),
+        ("HEEL_MANAGED_HOST=1 requires HEEL_HOST_AUTHORITY_PEER_UID=0",
+         HostAuthorityConfig(socket_path, 1000, PeerProfile.EXTERNAL_PIDNS)),
+        ("HEEL_MANAGED_HOST=1 requires HEEL_HOST_AUTHORITY_PEER_UID=0",
+         HostAuthorityConfig(socket_path, False, PeerProfile.EXTERNAL_PIDNS)),
+        ("HEEL_MANAGED_HOST=1 requires HEEL_HOST_AUTHORITY_PEER_PROFILE=external-pidns",
+         HostAuthorityConfig(socket_path, 0, PeerProfile.SHARED_PIDNS)),
+        ("HEEL_MANAGED_HOST=1 requires HEEL_HOST_AUTHORITY_PEER_PROFILE=external-pidns",
+         HostAuthorityConfig(socket_path, 0, "external-pidns")),
+    ]
+    for expected, authority in cases:
+        with pytest.raises(ProductionConfigurationError, match=re.escape(expected)):
+            build_server(dataclasses.replace(config, managed_host=True, host_authority=authority))
+        assert owned_workers.locks == [] and not os.path.exists(config.database_path + ".lock")
+        assert not os.path.exists(config.database_path) and not os.path.exists(socket_path)
+        assert reaper_threads() == 0
+        with pytest.raises(OSError):
+            socket.create_connection(("127.0.0.1", config.port), timeout=1).close()
+    server = build_server(config)  # default off, not managed
+    try:
+        assert server.host_authority is None and server.reaper_ready is True
+    finally:
+        server.server_close()
+
+
+def test_small_monotonic_regression_with_flat_cp_time_closes_the_generation(authority):
+    """A host monotonic regression inside the 500 ms skew tolerance, with the control plane's clock
+    flat, is still a clock gap: the skew clause alone would admit it."""
+    clock = default_clock(authority)
+    decider = make_decider(authority, clock)
+    for slot, back_ms in (("slot-1ms", 1), ("slot-500ms", 500)):
+        g = secrets.token_hex(16)
+        assert decider(authority.request(generation_id=g, slot_id=slot, sequence=1, monotonic_ms=1000))[
+            "reason"] == "none"
+        reply = decider(authority.request(generation_id=g, slot_id=slot, sequence=2, monotonic_ms=1000 - back_ms))
+        assert (reply["decision"], reply["reason"]) == ("inactive", "clock_gap")
+        row = ledger_row(authority.path, g)
+        assert (row["state"], row["close_reason"], row["last_sequence"], row["last_monotonic_ms"]) == (
+            "closed", "clock_gap", 1, 1000)
+
+
+class StopDeclaringLock(RecordingLock):
+    """The recording wrapper with an acquisition hook: runs ``before_acquire`` after the caller's
+    pre-gate checks and before the lock is taken (test attribute only)."""
+
+    def __init__(self, name: str, records: list, before_acquire):
+        super().__init__(name, records)
+        self.before_acquire = before_acquire
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        self.before_acquire()
+        return super().acquire(blocking, timeout)
+
+
+def test_stop_declared_between_the_pre_check_and_the_gate_never_reaches_the_database(authority):
+    cls, connect = recording()
+    decider = make_decider(authority, _connect_for_tests=connect)  # SEAM-RECORDING-CONNECTION snapshot tests only
+    records: list = []
+    # Declares stop exactly as stop() step 1 does, after the pre-check passed (recording wrapper, test attribute).
+    decider._db_gate = StopDeclaringLock("_db_gate", records, decider._stopping.set)
+    reply = decider(authority.request())
+    assert (reply["decision"], reply["reason"]) == ("inactive", "cp_draining")
+    assert records == [("_db_gate", ())]  # the gate was entered: the race window was taken
+    assert cls.log == [] and ledger(authority.path) == []
+    assert not decider.quarantined
+
+
+def test_ordinary_joined_stop_establishes_the_quarantine(live_authority, short_tmp, no_host_thread_left):
+    service = make_service(live_authority.path, short_tmp, live_authority.signing)
+    service.start()
+    assert not service.decider.quarantined and not service.quarantined
+    assert service.stop() == StopResult(True, True)
+    assert service.phase == "stopped" and service.quarantined
+    assert service.decider.quarantined  # the gate is closed, not merely reported closed
+    assert service.decider._db_gate.acquire(timeout=1)  # and free: no decision holds it
+    service.decider._db_gate.release()
 
 
 # ---------------------------------------------------------------------------------------------

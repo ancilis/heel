@@ -9,6 +9,7 @@ checkout explicitly disabled until a verified live billing adapter is configured
 from __future__ import annotations
 
 import base64
+import contextlib
 from dataclasses import dataclass, field
 import errno
 import json
@@ -55,7 +56,8 @@ class _RetainedOwnership:
 
 
 # Database ownership this process could not release safely: a worker thread (host-authority
-# listener or canary reaper) outlived its bounded stop.  Each record keeps strong references to
+# listener or canary reaper) outlived its bounded stop, or its stop raised so the join is
+# unproven.  Each record keeps strong references to
 # the server, control plane, process lock, reaper and host-authority service, so neither garbage
 # collection nor a lost exception frame can close the lock descriptor or the shared connection
 # while that worker may still run.  A record is added when a start or close path retains
@@ -338,8 +340,88 @@ def _host_authority_from_environment(
     return HostAuthorityConfig(socket_value, int(uid_value), profile), managed
 
 
+def _require_managed_host_authority(config: ProductionConfiguration) -> None:
+    """Hold the managed-host rules of ``from_environment`` at the ``build_server`` boundary too, so a
+    configuration built in code cannot reach the lock or a bind without them.  Only the managed
+    rules are repeated here; every other variable keeps its single ``from_environment`` validator."""
+    if not config.managed_host:
+        return
+    authority = config.host_authority
+    if authority is None:
+        raise ProductionConfigurationError("HEEL_MANAGED_HOST=1 requires HEEL_HOST_AUTHORITY_SOCKET")
+    peer_uid = getattr(authority, "peer_uid", None)
+    if type(peer_uid) is not int or peer_uid != 0:
+        raise ProductionConfigurationError("HEEL_MANAGED_HOST=1 requires HEEL_HOST_AUTHORITY_PEER_UID=0")
+    if getattr(authority, "profile", None) is not PeerProfile.EXTERNAL_PIDNS:
+        raise ProductionConfigurationError(
+            "HEEL_MANAGED_HOST=1 requires HEEL_HOST_AUTHORITY_PEER_PROFILE=external-pidns"
+        )
+
+
+def _unwind_failed_start(
+    error: BaseException, *, server, control_plane, database_lock, reaper: CanaryReaper,
+    host_authority: HostAuthorityService | None, host_stop_result,
+) -> BaseException | None:
+    """Unwind a ``build_server`` failure raised after a worker thread may have started.
+
+    Unhealthy state is declared before any cleanup.  The host-authority service (when constructed)
+    and the reaper are both stopped, and every outcome is recorded before the release decision:
+    joining the reaper releases nothing, and it lets the process end once the last worker ends.
+    Ownership (control-plane connection, process lock) is released only when every stop proved a
+    join; a stop that returned False or raised retains every owned resource strongly until the
+    process exits.  Returns ``None`` after a release, otherwise the exception reporting the retention.
+    """
+    control_plane.draining = True
+    ready_lock = getattr(server, "ready_lock", None)
+    with ready_lock if ready_lock is not None else contextlib.nullcontext():
+        server.reaper_ready = False
+        server.host_authority_ready = False
+    stop_errors: list[BaseException] = []
+    host_result = None
+    if host_authority is not None:
+        try:
+            # start() already stopped on its own failures; never stop (or start) twice.
+            host_result = host_stop_result or host_authority.stop()
+        except BaseException as stop_error:
+            stop_errors.append(stop_error)
+    reaper_stopped = False
+    try:
+        # CanaryReaper.start's own bounded join on a failed start proves nothing; only stop() does.
+        reaper_stopped = reaper.stop() is True
+    except BaseException as stop_error:
+        stop_errors.append(stop_error)
+    host_stopped = host_authority is None or (host_result is not None and host_result.stopped is True)
+    if host_stopped and reaper_stopped:
+        # Both workers joined.  The ordinary close owns the control plane here: the production
+        # close is bypassed even if it was already installed on the instance.
+        type(server).server_close(server)
+        database_lock.close()
+        return None
+    if host_result is None and host_authority is not None:
+        reason = "host_authority_stop_failed"
+    elif not host_stopped:
+        reason = "stop_timeout"
+    elif stop_errors:
+        reason = "reaper_stop_failed"
+    else:
+        reason = "reaper_stop_timeout"
+    _retain_ownership(_RetainedOwnership(
+        reason=reason, server=server, control_plane=control_plane, database_lock=database_lock,
+        reaper=reaper, host_authority=host_authority,
+    ))
+    if stop_errors:
+        return stop_errors[0]
+    if not host_stopped:
+        replacement: BaseException = HostAuthorityServiceError("stop_timeout", stop_result=host_result)
+    else:
+        replacement = CanaryReaperError("canary lifecycle coordinator did not stop within the shutdown bound")
+    replacement.__cause__ = error
+    return replacement
+
+
 def build_server(config: ProductionConfiguration):
     """Construct the private listener after every production invariant has passed."""
+    _require_managed_host_authority(config)
     # Resolve the explicitly pinned control-plane dependency before we acquire the durable
     # database process lock or bind a listener. A deployment missing the safe resolver is not a
     # partially usable live-verification deployment.
@@ -356,7 +438,9 @@ def build_server(config: ProductionConfiguration):
     server = None
     reaper = None
     host_authority = None
-    ownership_retained = False
+    workers_may_run = False
+    reaper_start_failure: Exception | None = None
+    host_start_failure: Exception | None = None
     try:
         migration_connection = sqlite3.connect(config.database_path)
         try:
@@ -409,17 +493,14 @@ def build_server(config: ProductionConfiguration):
             on_unexpected_death=reaper_failed,
         )
         server.canary_reaper = reaper
+        # From here until a stop proves its join, a worker thread may run: every failure below,
+        # cancellation included, goes through _unwind_failed_start.
+        workers_may_run = True
         try:
             reaper.start()
         except Exception as error:
-            # The listener has only been bound, never returned as ready.  Its ordinary close path
-            # owns the control plane until the production lifecycle wrapper is installed.
-            server.server_close()
-            server = None
-            control_plane = None
-            raise ProductionConfigurationError(
-                "canary lifecycle coordinator failed to start"
-            ) from error
+            reaper_start_failure = error
+            raise
         server.reaper_ready = True
         server.ready_lock = threading.Lock()
         server.host_authority = None
@@ -452,37 +533,30 @@ def build_server(config: ProductionConfiguration):
                 if not ready:
                     raise HostAuthorityServiceError("startup_failed")
             except Exception as error:
-                # start() already stopped on its own failures; never stop (or start) twice.
-                result = getattr(error, "stop_result", None) or host_authority.stop()
-                # Joining the reaper releases nothing; it lets the process end once the last
-                # worker ends instead of reconciling forever behind a failed start.
-                reaper_stopped = reaper.stop()
-                if not result.stopped:
-                    ownership_retained = True
+                host_start_failure = error
+                with server.ready_lock:
                     server.host_authority_failure = error
-                    raise HostAuthorityServiceError("stop_timeout", stop_result=result) from error
-                if not reaper_stopped:
-                    ownership_retained = True
-                    raise CanaryReaperError(
-                        "canary lifecycle coordinator did not stop within the shutdown bound"
-                    ) from error
-                server.server_close()
-                server = None
-                control_plane = None
-                raise ProductionConfigurationError("host authority listener failed to start") from error
+                raise
             server.host_authority = host_authority
         _install_production_close(server, reaper, database_lock, host_authority)
         return server
-    except Exception as error:
-        if ownership_retained:
-            # A worker outlived its bounded stop: release nothing, keep every owned resource
-            # strongly referenced until the process exits (supervisor recovery).
-            _retain_ownership(_RetainedOwnership(
-                reason=getattr(error, "code", None) or "reaper_stop_timeout",
-                server=server, control_plane=control_plane, database_lock=database_lock,
+    except BaseException as error:
+        if workers_may_run:
+            replacement = _unwind_failed_start(
+                error, server=server, control_plane=control_plane, database_lock=database_lock,
                 reaper=reaper, host_authority=host_authority,
-            ))
+                host_stop_result=getattr(host_start_failure, "stop_result", None),
+            )
+            if not isinstance(error, Exception):
+                raise  # a cancellation is re-raised unchanged, released or retained
+            if replacement is not None:
+                raise replacement
+            if reaper_start_failure is not None:
+                raise ProductionConfigurationError("canary lifecycle coordinator failed to start") from error
+            if host_start_failure is not None:
+                raise ProductionConfigurationError("host authority listener failed to start") from error
             raise
+        # No worker was ever started: the ordinary release.
         if server is not None:
             server.server_close()
         elif control_plane is not None:
