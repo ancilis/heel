@@ -471,7 +471,7 @@ def test_static_launcher_stages_every_path_the_module_reads(tmp_path):
     assert completed.stdout.splitlines()[-1].startswith(expected), completed.stdout[-400:]
 
 
-def test_static_evidence_sanitizer_and_acceptance_rule(tmp_path):
+def test_static_evidence_sanitizer_and_acceptance_rule(tmp_path, monkeypatch):
     good = {"case": "d3", "verdict": "pass", "control": "domain", "ints": {"spawned_during_refusal": 0},
             "tokens": {"refusal": "domain_exhausted"}}
     assert LAUNCHER.sanitize_record(good) == good
@@ -502,6 +502,45 @@ def test_static_evidence_sanitizer_and_acceptance_rule(tmp_path):
     lines = LAUNCHER.version_lines(by, "pinned") + LAUNCHER.report_lines({"result": "PASS", "records": records}, None, cleanup)
     assert "runtime_assumption running-kernel" in lines and "kernel_profile pinned" in lines
     assert all(re.fullmatch(r"[a-z0-9_]+ [A-Za-z0-9_.:/ -]*", line) for line in lines), lines
+    # Every generation class the cycle can end with is recorded as a closed token (H1A3-2R S4: raw "A" was rejected).
+    classes = set()
+    for node in ast.walk(ast.parse((ROOT / "deploy" / "host" / "cycle.py").read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                pairs = (zip(target.elts, node.value.elts) if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple)
+                         else [(target, node.value)])
+                classes |= {value.value for slot, value in pairs if isinstance(slot, ast.Attribute) and slot.attr == "_class_end"
+                            and isinstance(slot.value, ast.Name) and slot.value.id == "self" and isinstance(value, ast.Constant)}
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_close_generation"
+              and node.args and isinstance(node.args[0], ast.Constant)):
+            classes.add(node.args[0].value)
+    assert classes == {"none", "start_refused", "A", "B", "C"}, classes
+    assert all(LAUNCHER._TOKEN.fullmatch(_class_token(value)) for value in classes), {v: _class_token(v) for v in classes}
+    assert _class_token("A") == "a"
+    path = tmp_path / "s4.jsonl"
+    monkeypatch.setenv(LAUNCHER.RECORDS_ENV, str(path))
+    s4_tokens = {"outcome": "key_revoked", "k9_path": "scripted", "context_end": "key_revoked", "third_tick": "closed"}
+    write = record  # the real writer; a direct record("s4") call is the S4 case's own (inventory static)
+    for value in sorted(classes):
+        write("s4", True, {"after_close_probes": 1, "activated_entries": 0}, {**s4_tokens, "class_end": _class_token(value)})
+    kept, dropped = LAUNCHER.sanitize_records(path)
+    assert (len(kept), dropped) == (5, 0) and {r["tokens"]["class_end"] for r in kept} == {"none", "start_refused", "a", "b", "c"}
+    assert LAUNCHER.sanitize_record({**kept[0], "tokens": {**kept[0]["tokens"], "class_end": "A"}}) is None
+    # The real S4 emission goes through the helper; no S case records the raw class.
+    functions = _top_functions(Path(__file__).read_text(encoding="utf-8"))
+    s4 = [call for call in _calls(functions["test_s4_revocation_closes_the_generation_and_no_request_follows"], "record")
+          if call.args and isinstance(call.args[0], ast.Constant) and call.args[0].value == "s4"]
+    assert len(s4) == 1 and isinstance(s4[0].args[3], ast.Dict), s4
+    end = dict(zip([key.value for key in s4[0].args[3].keys], s4[0].args[3].values))["class_end"]
+    assert (isinstance(end, ast.Call) and isinstance(end.func, ast.Name) and end.func.id == "_class_token" and not end.keywords
+            and len(end.args) == 1 and isinstance(end.args[0], ast.Subscript) and isinstance(end.args[0].value, ast.Name)
+            and end.args[0].value.id == "status" and isinstance(end.args[0].slice, ast.Constant)
+            and end.args[0].slice.value == "generation_class_end"), ast.dump(end)
+    raw = [ast.dump(value) for name, node in functions.items() if re.match(r"test_s[1-6]_", name)
+           for call in _calls(node, "record") if len(call.args) > 3 and isinstance(call.args[3], ast.Dict)
+           for value in call.args[3].values if isinstance(value, ast.Subscript) and isinstance(value.slice, ast.Constant)
+           and value.slice.value == "generation_class_end"]
+    assert raw == [], raw
 
 
 def test_static_seams_are_labelled_and_confined_to_their_cases():
@@ -2251,6 +2290,11 @@ def _probes_after(probes: list[Probe], bound_ns: int) -> list[Probe]:
     return [probe for probe in probes if probe.t_before > bound_ns]
 
 
+def _class_token(value: str) -> str:
+    """The generation class end as a closed token: A/B/C are recorded lowercase, the rest verbatim."""
+    return {"A": "a", "B": "b", "C": "c"}.get(value, value)
+
+
 def _common(status: dict, before: int, stopped: dict, spawned: int, admitted: int) -> dict:
     return {"generations_before": before, "generations_after": status["generations"], "sequence": status["sequence"],
             "request_gap_ms": status["request_gap_ms"], "nft_spawns": spawned, "admitted_after_bound": admitted,
@@ -2393,7 +2437,7 @@ def test_s4_revocation_closes_the_generation_and_no_request_follows():
           and status["sequence"] == 2 and stopped.get("requests") == 2 and status["generations"] - before == 1)
     ints = _common(status, before, stopped, -1, len(admitted_after(probes, two_after + tick)))
     ints |= {"after_close_probes": len(after), "activated_entries": len(activated)}
-    record("s4", ok, ints, {"outcome": status["last_reason"], "k9_path": _k9_path(), "class_end": status["generation_class_end"],
+    record("s4", ok, ints, {"outcome": status["last_reason"], "k9_path": _k9_path(), "class_end": _class_token(status["generation_class_end"]),
                             "context_end": status["context_end_reason"], "third_tick": third})
     assert ok, "a revocation did not close the generation, flush the key and stop requests"
 
