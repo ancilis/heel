@@ -149,6 +149,11 @@ npm run test:node
 
 The build verifies the committed Agent downloads without regenerating them.
 
+CI also runs `npm audit --omit=dev --audit-level=high --package-lock-only
+--ignore-scripts --no-fund` after `npm ci`. It covers only lockfile packages npm does not mark
+as dev, so it is not complete Worker-runtime coverage: vinext and other dev-declared
+packages are bundled into the Worker but are outside this check.
+
 ## Deployment
 
 1. Copy `deploy/.env.production.example` to the ignored

@@ -178,6 +178,12 @@ jobs:
       - name: Install pinned browser dependencies without lifecycle scripts
         working-directory: apps/heel-cloud
         run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Declared production dependency advisory check
+        working-directory: apps/heel-cloud
+        # Limited signal: npm advisories for lockfile packages not marked dev.
+        # It is not complete Worker-runtime coverage; bundled dev-declared
+        # packages such as vinext are outside --omit=dev.
+        run: npm audit --omit=dev --audit-level=high --package-lock-only --ignore-scripts --no-fund
       - name: Check deterministic browser wheel and sample artifacts
         run: |
           python scripts/build_browser_engine.py --output apps/heel-cloud/browser-engine --check
