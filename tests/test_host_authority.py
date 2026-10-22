@@ -1928,8 +1928,8 @@ def test_unresolved_children_and_sweep_wrapper_report_states_without_touching_pi
         assert name in authority.__all__
 
 
-def _uid_map(tmp_path: Path, text: str = "0 0 4294967295\n") -> str:
-    path = tmp_path / "uid_map"
+def _uid_map(tmp_path: Path, text: str = "0 0 4294967295\n", *, name: str = "uid_map") -> str:
+    path = tmp_path / name
     path.write_text(text, encoding="ascii")
     return str(path)
 
@@ -1997,7 +1997,7 @@ class _PeerPidZeroSocket(socket.socket):
         return super().getsockopt(level, option, *args)
 
 
-def test_connect_cp_verifies_peer_on_the_request_connection_and_never_creates_paths(monkeypatch, tmp_path):
+def test_connect_cp_verifies_peer_on_the_request_connection_and_never_creates_paths(monkeypatch, tmp_path, capsys):
     """Static on every OS: ``connect_cp`` reads SO_PEERCRED on the very socket it returns and creates,
     unlinks, renames or binds nothing. Behaviour on Linux (a real AF_UNIX listener owned by this uid;
     STATE-MACHINE ONLY for the two pid-namespace links and for the pid-0 peer double): the bytes
@@ -2051,9 +2051,11 @@ def test_connect_cp_verifies_peer_on_the_request_connection_and_never_creates_pa
         assert listener.listing() == before == ["cp.sock"]
     finally:
         listener.close()
+    with capsys.disabled():
+        print("\nH1A3-1L-E2E S24 PASS same_connection=checked pid0=refused deadline=refused paths=unchanged")
 
 
-def test_verify_cp_socket_behaviour_unchanged(monkeypatch, tmp_path):
+def test_verify_cp_socket_behaviour_unchanged(monkeypatch, tmp_path, capsys):
     """``verify_cp_socket`` keeps its signature, codes and order: the platform refusal first, then the
     uid, namespaces, path, socket and directory profiles, then a separate connection that only reads
     the peer. On Linux (real listener; STATE-MACHINE ONLY for the pid-namespace links and the pid-0
@@ -2081,8 +2083,9 @@ def test_verify_cp_socket_behaviour_unchanged(monkeypatch, tmp_path):
     try:
         assert code() == "ok"
         assert code(cp_uid=-1) == code(cp_uid=True) == code(cp_uid=2 ** 32 - 1) == "cp_uid_invalid"
-        assert code(uid_map_path=_uid_map(tmp_path, "0 1000 1\n")) == "not_initial_user_namespace"
+        assert code(uid_map_path=_uid_map(tmp_path, "0 1000 1\n", name="translated_uid_map")) == "not_initial_user_namespace"
         assert code(uid_map_path=str(tmp_path / "missing")) == "socket_unreadable"
+        assert code() == "ok"  # the default map is intact after the two map cases
         assert code(path="relative/cp.sock") == "path_not_absolute"
         assert code(path=os.path.join(listener.directory, "absent.sock")) == "socket_unreadable"
         assert code(cp_uid=os.geteuid() + 1) == "socket_profile"
@@ -2095,8 +2098,10 @@ def test_verify_cp_socket_behaviour_unchanged(monkeypatch, tmp_path):
         monkeypatch.setattr(authority.socket, "socket", _PeerPidZeroSocket)
         assert code() == "peer_identity"
         end = time.monotonic() + 5
-        while len(listener.received) < 2 and time.monotonic() < end:
+        while len(listener.received) < 3 and time.monotonic() < end:
             time.sleep(0.01)
-        assert listener.received == [b"", b""]  # the check never writes a byte
+        assert listener.received == [b"", b"", b""]  # the check never writes a byte
     finally:
         listener.close()
+    with capsys.disabled():
+        print("\nH1A3-1L-E2E S21 PASS codes=13 connections=3")

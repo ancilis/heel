@@ -1587,9 +1587,17 @@ def _real_cp_cycle(monkeypatch, tmp_path, socket_path: str) -> Harness:
     return h
 
 
+def _await_generation_spacing(h: Harness) -> None:
+    """Real monotonic wait until the process budget allows the next start on the cycle's own clock: the real
+    LeaseDomain stamps, connect_cp and exchange_on all measure the host clock, so no offset is applied."""
+    remaining_ns = cycle._BUDGET.last_start_ns + cycle.MIN_GENERATION_SPACING_MS * MS - h.clock()
+    if remaining_ns > 0:
+        time.sleep(remaining_ns / 1e9 + 0.05)
+
+
 @LINUX
 @POSIX_FORK
-def test_cycle_against_real_control_plane_over_af_unix_with_recorded_domain(monkeypatch, tmp_path, signals):
+def test_cycle_against_real_control_plane_over_af_unix_with_recorded_domain(monkeypatch, tmp_path, signals, capsys):
     """The real control plane (``build_server``: listener, peer rule, decider, ledger, reaper) and
     the real client with the peer check on the request connection; the domain is the recorded
     installer (STATE-MACHINE ONLY on the kernel side). Positive: two cycles activate. An operator
@@ -1627,17 +1635,20 @@ def test_cycle_against_real_control_plane_over_af_unix_with_recorded_domain(monk
             server.server_close()
     finally:
         __import__("shutil").rmtree(short, ignore_errors=True)
+    with capsys.disabled():
+        print("\nH1A3-1L-E2E S23 PASS cycles=2 end=no_active_run last_sequence=3")
 
 
 @LINUX
 @POSIX_FORK
-def test_real_cp_clock_gap_and_replayed_sequence_close_the_generation(monkeypatch, tmp_path, signals):
+def test_real_cp_clock_gap_and_replayed_sequence_close_the_generation(monkeypatch, tmp_path, signals, capsys):
     """The real listener, decider and ledger with SEAM-CLOCK on the decider (snapshot tests' seam,
     labelled) and the real client; recorded domain (STATE-MACHINE ONLY on the kernel side). A second
     supervisor enrolling the same (boot, slot) supersedes: the cycle's next request is
     ``replayed_sequence`` and the generation closes; a fresh generation enrols with sequence 1. A CP
     clock jump of 10 s between two requests is ``clock_gap`` and closes that generation too;
-    ``cp_draining`` ends the next context."""
+    ``cp_draining`` ends the next context. The budget spacing between generations is waited in real
+    time: the real domain stamps and the client deadlines are on the host clock, so no offset is applied."""
     from tests import test_host_snapshot as snapshot
     from heel.saas.host_authority import HostAuthorityConfig, HostAuthorityListener, PeerProfile
     from heel.saas.host_snapshot import HostSnapshotDecider
@@ -1669,25 +1680,31 @@ def test_real_cp_clock_gap_and_replayed_sequence_close_the_generation(monkeypatc
             assert h.cycle.start() == "ready"
             h.cycle.install_context(context)
             assert h.cycle.tick() == "serving" and h.domain.calls == ["prepare", "activate"]
+            assert h.status()["authorized"] == "true", h.status()
             # A cloned supervisor enrols the same (boot, slot): the older generation is superseded.
             status, _body = snapshot.post(listener.config.socket_path, snapshot.live_request(
                 fixture, generation_id=secrets.token_hex(16), sequence=1, host_boot_epoch="boot-0001",
                 monotonic_ms=paced() // MS))
             assert status == 200
             assert h.cycle.tick() == "closed" and h.status()["context_end_reason"] == "replayed_sequence"
-            h.clock.advance_ms(cycle.MIN_GENERATION_SPACING_MS)
+            _await_generation_spacing(h)
             assert h.cycle.start() == "ready"
             h.cycle.install_context(context)
-            assert h.cycle.tick() == "serving" and h.status()["authorized"] == "true"
+            assert h.cycle.tick() == "serving" and h.status()["authorized"] == "true", h.status()
+            assert h.domain.calls == ["prepare", "activate"] and h.status()["last_reason"] == "activated"
             skew[0] = 10_000 * MS  # the CP clock jumps 10 s relative to the host
             assert h.cycle.tick() == "closed" and h.status()["context_end_reason"] == "clock_gap"
-            h.clock.advance_ms(cycle.MIN_GENERATION_SPACING_MS)
+            assert h.domain.calls[-1] == "close_generation"
+            _await_generation_spacing(h)
             assert h.cycle.start() == "ready"
             h.cycle.install_context(context)
             draining[0] = True
             assert h.cycle.tick() == "closed" and h.status()["context_end_reason"] == "cp_draining"
+            assert "activate" not in h.domain.calls and h.domain.calls[-1] == "close_generation"
         finally:
             listener.close()
             serving.join(5)
     finally:
         __import__("shutil").rmtree(short, ignore_errors=True)
+    with capsys.disabled():
+        print("\nH1A3-1L-E2E S22 PASS generations=3 ends=replayed_sequence/clock_gap/cp_draining activations=2")
