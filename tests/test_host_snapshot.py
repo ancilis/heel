@@ -1641,9 +1641,7 @@ def test_build_server_listener_failure_points_tear_down(short_tmp, fast_bounds, 
     if case == "check_startup":
         from heel.saas.host_authority import HostAuthorityConfigurationError
         assert isinstance(cause, HostAuthorityConfigurationError)
-        assert cause.code in ({"uid_map_unreadable"} if sys.platform != "linux" else {
-            "socket_directory", "directory_profile", "socket_profile", "uid_map_identity", "uid_map_unreadable",
-            "directory_mode", "overflowuid_unreadable"})
+        assert cause.code == ("socket_directory_profile" if sys.platform == "linux" else "uid_map_unreadable")
     else:
         assert isinstance(cause, HostAuthorityServiceError) and cause.code == expected[case]
     if case in {"immediate_death", "listener_exited"}:
@@ -1954,28 +1952,50 @@ def test_public_tcp_route_and_headers_are_not_an_authority_path(short_tmp):
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="real AF_UNIX peer credentials and check_startup need Linux")
-def test_end_to_end_over_real_af_unix_with_peer_credentials(short_tmp, no_host_thread_left):
+def test_end_to_end_over_real_af_unix_with_peer_credentials(short_tmp, no_host_thread_left, capsys):
     """The real path: check_startup, publication, SO_PEERCRED peer rule, frozen codec, real
-    decision. The refusal half stays with the accepted T1-T3 proof."""
+    decision, then the real reaper's expiry of the unheartbeated claim. The refusal half stays
+    with the accepted T1-T3 proof."""
+    from heel.saas.canary_reaper import HEARTBEAT_STALE_MS
     from heel.saas.server import ProductionConfiguration, build_server
 
     env = host_environment(short_tmp)
     config = ProductionConfiguration.from_environment(env)
-    authority = build_authority(config.database_path, signing=config.grant_authority,
-                                base=math.floor(time.time()) - 60)
+    # A fresh claim: the reaper's startup cycle (proven before readiness) must not find it stale.
+    authority = build_authority(config.database_path, signing=config.grant_authority, base=math.floor(time.time()))
     server = build_server(config)
     try:
         assert server.host_authority_ready is True
         socket_path = config.host_authority.socket_path
         g = secrets.token_hex(16)
+        age_ms = time.time_ns() // 1_000_000 - authority.base_ms
+        if age_ms >= HEARTBEAT_STALE_MS:
+            pytest.fail(f"harness too slow: claim age {age_ms} ms at the first decision")
         status, body = post(socket_path, live_request(authority, generation_id=g, sequence=1))
-        assert status == 200 and json.loads(body)["reason"] == "none"
+        assert status == 200 and json.loads(body)["reason"] == "none", f"claim age {age_ms} ms"
         status, body = post(socket_path, live_request(authority, generation_id=g, sequence=2))
         assert status == 200 and json.loads(body)["decision"] == "active"
         status, body = post(socket_path, live_request(authority, generation_id=g, sequence=2))
         assert status == 200 and json.loads(body)["reason"] == "replayed_sequence"
+        # Negative control: no heartbeat ever arrives, so the real reaper stops the run as disconnected.
+        deadline = time.monotonic() + 15
+        row = run_row(config.database_path, authority.run_id)
+        while row["stop_reason"] == "none" and time.monotonic() < deadline:
+            time.sleep(0.1)
+            row = run_row(config.database_path, authority.run_id)
+        assert (row["status"], row["stop_reason"], row["error_category"]) == (
+            "stop_requested", "cloud_stop", "cloud_disconnected")
+        # The duplicate closed generation g; it stays closed. A fresh generation sees no active run.
+        status, body = post(socket_path, live_request(authority, generation_id=g, sequence=3))
+        assert status == 200 and json.loads(body)["reason"] == "replayed_sequence"
+        status, body = post(socket_path, live_request(authority, generation_id=secrets.token_hex(16), sequence=1))
+        expired = json.loads(body)
+        assert status == 200 and (expired["decision"], expired["reason"]) == ("inactive", "no_active_run")
     finally:
         server.server_close()
+    with capsys.disabled():
+        print(f"\nH1A2LR1-E2E S20 PASS first_age_ms={age_ms} positive=active replay=replayed_sequence"
+              " expiry=cloud_stop/cloud_disconnected expiry_decision=no_active_run")
 
 
 # ---------------------------------------------------------------------------------------------
