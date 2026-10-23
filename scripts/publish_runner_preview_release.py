@@ -880,9 +880,14 @@ def publish(client, root: Path, sha: str, artifacts: dict[str, bytes], reporter:
     reporter.event("published", tag=TAG, acknowledged=acknowledged)
     try:
         if acknowledged:
+            # The acknowledgement must itself be this release, published as the exact prerelease.
             returned = _json(response.body)
-            if not _is_same_release(returned, release_id) or returned.get("target_commitish") != sha:
-                raise VerificationFailed("the publication response names another release or target")
+            try:
+                if check_release(returned, sha=sha, draft=False, notes=notes) != release_id:
+                    raise Refused("it names another release")
+            except Refused as error:
+                raise VerificationFailed(
+                    f"the publication response conflicts with the published prerelease: {error}") from None
         verify_published_release(client, reread, release_id, sha, notes, artifacts, reporter)
     except (Refused, VerificationFailed, TransportError) as error:
         raise _published_unverified(f"post-publication verification failed: {error}", sha, artifacts) from None

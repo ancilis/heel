@@ -227,9 +227,11 @@ python scripts/publish_runner_preview_release.py publish-and-verify \
      (outcome unknown); nothing is retried, and publication is not claimed
    - still a draft: exit `4`; nothing is retried
    - published: it says whether the publish was acknowledged, then continues
-6. After publication is established, before any success, it checks the acknowledged
-   response names the same release and `SHA`; checks the re-read's target, prerelease
-   flag and notes; re-reads the tag; re-lists the assets; and downloads and hashes all
+6. After publication is established, before any success, it checks that an acknowledged
+   response and the re-read each pass the full release check: the same release id, URL,
+   tag, title, upload location and `SHA`, `draft: false`, `prerelease: true` and the
+   exact notes. A conflicting acknowledgement exits `5` even when the re-read is
+   correct. It then re-reads the tag; re-lists the assets; and downloads and hashes all
    three. Any failure or read error here exits `5`.
 7. It never converts a stable release. If the release is already a published matching
    prerelease, the tool sends no publish request and says so, but still re-lists and

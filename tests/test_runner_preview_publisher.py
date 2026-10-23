@@ -286,6 +286,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 record = github.release_record(release)
                 if github.faults.get("patch_response_other_target"):
                     record["target_commitish"] = "main"
+                # The acknowledgement alone conflicts; the stored release a re-read returns does not.
+                record.update(github.faults.get("patch_response_override") or {})
                 return self._send(200, record)
             return self._send(405)
         match = re.fullmatch(rf"{REPO}/releases/(\d+)/assets", path)
@@ -1160,6 +1162,57 @@ class PublishTests(PublisherHarness):
                     self.github.hooks[kind] = action
                 self.assert_published_unverified(release)
                 self.assertIn(reason, self.last_err)
+
+    def test_conflicting_publication_acknowledgement_is_published_unverified(self):
+        other = self.github.next_id + 100
+        cases = {
+            "draft-true": {"draft": True},
+            "prerelease-false": {"prerelease": False},
+            "body-edited": {"body": "edited"},
+            "body-missing": {"body": None},
+            "draft-string": {"draft": "false"},
+            "prerelease-string": {"prerelease": "true"},
+            "upload-url-other": {"upload_url": f"https://uploads.github.com{REPO}/releases/1/assets{{?name,label}}"},
+            # Internally consistent but another release: the expected id stays bound.
+            "other-release-id": {"id": other, "url": f"https://api.github.com{REPO}/releases/{other}",
+                                 "upload_url": f"https://uploads.github.com{REPO}/releases/{other}/assets{{?name,label}}"},
+        }
+        for label, override in cases.items():
+            with self.subTest(label):
+                self.reset()
+                release = self.staged()
+                self.github.faults["patch_response_override"] = override
+                self.assert_published_unverified(release)
+                self.assertIn("publication response conflicts with the published prerelease", self.last_err)
+                self.assertIn("acknowledged=True", self.last_err)
+                # The stored release itself is the correct published prerelease.
+                stored = P.check_release(self.github.release_record(release), sha=self.checkout.sha,
+                                         draft=False, notes=P.render_release_notes(
+                                             self.checkout.sha, CANDIDATE[P.MANIFEST]))
+                self.assertEqual(stored, release["id"])
+                # Read-only recovery establishes the actual published state without any write.
+                self.github.requests.clear()
+                self.github.faults.clear()
+                self.proof_calls.clear()
+                self.assertEqual(self.run_tool("verify-public"), P.EXIT_OK, self.last_err)
+                self.assertEqual(len(self.proof_calls), 1)
+                self.assert_no_mutation()
+                self.assertTrue(all(r["authorization"] is None for r in self.github.requests))
+
+    def test_conflicting_acknowledgement_with_unreliable_reread_stays_unknown(self):
+        for reread in ("500", "other"):
+            with self.subTest(reread):
+                self.reset()
+                release = self.staged()
+                self.github.faults["patch_response_override"] = {"prerelease": False}
+                self.github.faults["reread_after_patch"] = reread
+                self.assertEqual(self.run_tool("publish-and-verify"), P.EXIT_UNKNOWN, self.last_err)
+                self.assertFalse(release["draft"])
+                self.assertNotIn("is published", self.last_err)
+                self.assertEqual(len(self.github.methods("PATCH")), 1)
+                self.assertEqual(self.spawned, [])
+                self.assertEqual(self.last_out, "")
+                self.assert_no_destructive_requests()
 
     def test_post_publication_metadata_or_byte_read_failure_is_published_unverified(self):
         for fault, value in (("asset_list_after_patch", "500"), ("cdn_after_patch", "500"),
