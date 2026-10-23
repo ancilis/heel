@@ -173,7 +173,8 @@ row 20. No state is ever polled or signalled by the cycle.
 
 ## Status keys
 
-`generation_phase` (`created`, `ready`, `serving`, `draining`, `closing`, `closed`, `quarantined`),
+`generation_phase` (`created`, `bootstrapping` (H2-A registered mode only), `ready`, `serving`, `draining`,
+`closing`, `closed`, `quarantined`),
 `generation_id`, `generation_class_end` (`none`, `A`, `B`, `C`, `start_refused`), `context_state`,
 `context_end_reason`, `sequence`, `cycles`, `last_decision`, `last_reason`, `consecutive_unavailable`,
 `consecutive_unusable`, `consecutive_key_failures`, `authorized` (`true`, `false`, `unknown`),
@@ -186,8 +187,15 @@ and booleans; never a request or reply body, nonce, digest, path, pid or excepti
 ## Interfaces and what later gates must do
 
 - **H2 (B1)**: install `heel_lease` with the `prepared`/`activated` lookups and `meta mark set 0` in
-  the generation's namespace at `ready` (`ns_fd`, dup only); never write elements. Until then a bare
-  namespace refuses `prepare` (row 8).
+  the generation's namespace before `ready` (`ns_fd`, dup only); never write elements. Until then a
+  bare namespace refuses `prepare` (row 8). The public pre-ready boundary is H2-A
+  (`docs/saas/H2A_BOOTSTRAP_CONTRACT.md`): `register_bootstrap(BootstrapChannel)` before each
+  `start()` makes `ready` wait for the bootstrap worker's exact receipt (the namespace duplicate goes
+  by `SCM_RIGHTS`, outside the cycle lock, under `BOOTSTRAP_DEADLINE_MS`); any other result revokes
+  through the root controller and ends `start_refused` with reason `h2_bootstrap_failed`, or
+  quarantines `bootstrap_unresolved`. A cycle that never registers keeps the behaviour above
+  (legacy `NON_CUSTOMER` callers); once registered, a start without a new registration raises
+  `bootstrap_unregistered`. H3 must require the registered mode.
 - **H3 (B2)**: deliver the claim-derived `CycleContext` (including the grant's `public_key_digest` and
   `egress_hostname`) and the slot's `slot_src`/`slot_dst` over a root-owned channel; run `tick()` on
   the main thread at 1 Hz; stop/detach the executor on `closing`, `closed`, `quarantined` and every

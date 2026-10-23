@@ -12,18 +12,30 @@ Nothing is learned from a reply, no sequence is ever resent, and every context e
 generation; a new context needs a new domain. The transition table, the residual rule and the
 signal contract are in ``docs/saas/HOST_AUTHORITY_CYCLE.md``.
 
+A caller may register one ``BootstrapChannel`` per generation before ``start()`` (H2-A): the
+generation then reaches ``ready`` only after the cycle armed the root controller, handed the
+worker one namespace descriptor by ``SCM_RIGHTS`` and read the worker's exact receipt, all under
+one monotonic deadline and outside the cycle lock; anything else revokes the operation and refuses
+the start (``docs/saas/H2A_BOOTSTRAP_CONTRACT.md``). A cycle that never registers keeps the H1
+behavior.
+
 The only admission is ``Enablement.NON_CUSTOMER``: this module defines no environment variable,
 flag or entry point, and enables no customer executor. ``authority.py``, ``profile.py`` and the
 codec of ``heel/saas/host_authority.py`` are loaded by file path. Status and logs carry fixed
 tokens and integers only.
 """
+import array
 import dataclasses
 import enum
+import errno
+import hmac
 import importlib.util
 import json
 import logging
+import os
 import secrets
 import signal
+import socket
 import sys
 import threading
 import time
@@ -384,6 +396,272 @@ def classify_children(counts: dict) -> str:
 
 
 # ---------------------------------------------------------------------------------------------
+# The generation bootstrap (H2-A, docs/saas/H2A_BOOTSTRAP_CONTRACT.md). The cycle owns the transport:
+# two connected AF_UNIX datagram sockets, one to the H3 bootstrap worker and one to the H3 root
+# controller. Every message is one canonical JSON datagram of a fixed schema; the only descriptor
+# that ever crosses is the one-use namespace duplicate sent to the worker. No caller code runs.
+
+BOOTSTRAP_DEADLINE_MS = 5000  # arm ack, hand-off and receipt: one absolute monotonic deadline
+REVOKE_DEADLINE_MS = 1000  # the controller's revoke acknowledgement, from the cancellation
+BOOTSTRAP_POLL_MS = 50  # the stop flags are read at least this often while a wait is outside the lock
+MAX_BOOTSTRAP_BYTES = 1024
+BOOTSTRAP_SCHEMA = "heel.h2a.bootstrap.v1"
+RECEIPT_SCHEMA = "heel.h2a.receipt.v1"
+CONTROLLER_SCHEMA = "heel.h2a.controller.v1"
+_MAX_RECEIVED_FDS = 4  # any descriptor sent to the cycle is closed unread and refuses the message
+_CLAIM_LOCK = threading.Lock()
+
+
+class BootstrapChannel:
+    """One generation's transport. The constructor adopts both sockets (the caller's objects are
+    detached, so only this channel can close the descriptors): each must be a connected AF_UNIX
+    ``SOCK_DGRAM`` socket, and they must be distinct sockets. The controller socket never reaches the
+    worker; that the two peers are the H3 worker and root controller is H3's obligation."""
+
+    __slots__ = ("_worker", "_controller", "_claimed")
+
+    def __init__(self, *, worker: socket.socket, controller: socket.socket):
+        for sock in (worker, controller):
+            if not isinstance(sock, socket.socket) or sock.fileno() < 0:
+                raise TypeError("bootstrap_channel_invalid")
+            if sock.family != socket.AF_UNIX or sock.type != socket.SOCK_DGRAM:
+                raise ValueError("bootstrap_channel_invalid")
+            try:
+                sock.getpeername()
+            except OSError:
+                raise ValueError("bootstrap_channel_invalid") from None
+        identities = {(info.st_dev, info.st_ino) for info in map(os.fstat, (worker.fileno(), controller.fileno()))}
+        if worker is controller or len(identities) != 2:
+            raise ValueError("bootstrap_channel_invalid")
+        self._worker = socket.socket(fileno=worker.detach())
+        self._controller = socket.socket(fileno=controller.detach())
+        self._claimed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._worker.fileno() < 0 and self._controller.fileno() < 0
+
+    def close(self) -> None:
+        self._worker.close()
+        self._controller.close()
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class GenerationBootstrap:
+    """What the worker learns about one generation, published as its request: no path, PID, domain,
+    operation nonce or controller capability. ``bootstrap_fence`` is fresh per generation."""
+
+    generation_id: str
+    namespace_identity: tuple[int, int]
+    slot_id: str
+    slot_hop_src: str
+    slot_hop_dst: str
+    bootstrap_fence: str
+
+    def request(self) -> dict:
+        return {"schema": BOOTSTRAP_SCHEMA, "generation_id": self.generation_id,
+                "namespace_dev": self.namespace_identity[0], "namespace_ino": self.namespace_identity[1],
+                "slot_id": self.slot_id, "slot_hop_src": self.slot_hop_src, "slot_hop_dst": self.slot_hop_dst,
+                "bootstrap_fence": self.bootstrap_fence}
+
+    def receipt(self) -> dict:
+        """The only success receipt: exactly these keys and values, as canonical bytes."""
+        return {"schema": RECEIPT_SCHEMA, "generation_id": self.generation_id,
+                "namespace_dev": self.namespace_identity[0], "namespace_ino": self.namespace_identity[1],
+                "bootstrap_fence": self.bootstrap_fence, "installed": True}
+
+
+def _no_duplicates(pairs: list) -> dict:
+    document = dict(pairs)
+    if len(document) != len(pairs):
+        raise ValueError("duplicate key")
+    return document
+
+
+def _close_received(ancdata: list) -> int:
+    """Close every descriptor in ``ancdata``; returns how many control messages there were."""
+    for level, kind, data in ancdata:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            fds = array.array("i")
+            fds.frombytes(data[:len(data) - len(data) % fds.itemsize])
+            for fd in fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    return len(ancdata)
+
+
+def _matches(data: bytes, expected: dict) -> bool:
+    """Exact schema: the canonical bytes of exactly ``expected`` (types included), nothing else.
+    Total: any input is True or False, never an exception (ASCII bytes may still escape non-ASCII
+    or lone-surrogate strings, which no expected value contains)."""
+    try:
+        document = json.loads(data.decode("ascii"), object_pairs_hook=_no_duplicates,
+                              parse_constant=codec._no_constant)
+        if not isinstance(document, dict) or set(document) != set(expected) or codec.canonical(document) != data:
+            return False
+    except (UnicodeError, ValueError, TypeError, RecursionError):
+        return False
+    for key, value in expected.items():
+        if type(document[key]) is not type(value):
+            return False
+        if isinstance(value, str):
+            if not document[key].isascii() or not hmac.compare_digest(document[key].encode("ascii"),
+                                                                       value.encode("ascii")):
+                return False
+        elif document[key] != value:
+            return False
+    return True
+
+
+class _Handoff:
+    """One generation's bootstrap, run by the ``start()`` caller outside the cycle lock. It alone
+    owns the channel and the one namespace duplicate (closed exactly once: right after its one send,
+    or at cancellation). Tokens only: nothing received is logged, kept or raised."""
+
+    def __init__(self, record: GenerationBootstrap, channel: BootstrapChannel, fd: int, deadline_ns: int):
+        self.record, self.deadline_ns = record, deadline_ns
+        self._channel, self._fd = channel, fd
+        self._nonce = secrets.token_hex(16)  # the controller's operation nonce; never sent to the worker
+        self.state, self.root, self.worker = "pending", "not_armed", "not_contacted"
+
+    def _identity(self) -> dict:
+        record = self.record
+        return {"schema": CONTROLLER_SCHEMA, "generation_id": record.generation_id,
+                "bootstrap_fence": record.bootstrap_fence, "operation_nonce": self._nonce}
+
+    def _take_fd(self) -> int:
+        fd, self._fd = self._fd, -1
+        if fd < 0:
+            raise CycleError("bootstrap_capability_spent")
+        return fd
+
+    def _drop_fd(self) -> None:
+        fd, self._fd = self._fd, -1
+        if fd >= 0:
+            os.close(fd)
+
+    @staticmethod
+    def _send(sock: socket.socket, document: dict, deadline_ns: int, clock, stopped, fds=()) -> bool:
+        """One datagram, sent whole or not at all, before ``deadline_ns`` and while no stop is
+        requested. A full peer queue may block the send or refuse it (ENOBUFS, EAGAIN); either way it
+        is retried in ``BOOTSTRAP_POLL_MS`` slices, so the stop flags are read between attempts."""
+        payload = codec.canonical(document)
+        ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))] if fds else []
+        while True:
+            left = deadline_ns - clock()
+            if left <= 0 or stopped():
+                return False
+            slice_s = min(left, BOOTSTRAP_POLL_MS * _MS) / 1e9
+            try:
+                sock.settimeout(slice_s)
+                sock.sendmsg([payload], ancillary)
+            except TimeoutError:
+                continue
+            except OSError as error:
+                if error.errno not in (errno.ENOBUFS, errno.EAGAIN):
+                    return False
+                time.sleep(slice_s)
+                continue
+            return True
+
+    @staticmethod
+    def _receive(sock: socket.socket, expected: tuple, deadline_ns: int, clock, stopped) -> tuple[str, int]:
+        """Exactly one datagram before ``deadline_ns``: (``match``, index into ``expected``), or
+        (``timeout``/``stopped``/``transport``/``late``/``malformed``, -1). Received descriptors are
+        closed before anything else is looked at; nothing after the one datagram is ever read."""
+        space = socket.CMSG_SPACE(_MAX_RECEIVED_FDS * array.array("i").itemsize)
+        while True:
+            left = deadline_ns - clock()
+            if left <= 0:
+                return "timeout", -1
+            if stopped():
+                return "stopped", -1
+            try:
+                sock.settimeout(min(left, BOOTSTRAP_POLL_MS * _MS) / 1e9)
+                data, ancdata, flags, _address = sock.recvmsg(MAX_BOOTSTRAP_BYTES + 1, space)
+            except TimeoutError:
+                continue
+            except OSError:
+                return "transport", -1
+            if _close_received(ancdata) or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+                return "malformed", -1
+            if clock() > deadline_ns:
+                return "late", -1
+            if len(data) <= MAX_BOOTSTRAP_BYTES:
+                for index, document in enumerate(expected):
+                    if _matches(data, document):
+                        return "match", index
+            return "malformed", -1
+
+    def run(self, clock, stopped) -> None:
+        """Arm, hand off, read the receipt; on any other result, cancel. Ends with ``state`` one of
+        ``receipted``, ``cancelled`` (root ``absent`` or ``not_armed``) or ``unresolved``."""
+        channel, record, deadline = self._channel, self.record, self.deadline_ns
+        identity = self._identity()
+        arm = {**identity, "op": "arm", "namespace_dev": record.namespace_identity[0],
+               "namespace_ino": record.namespace_identity[1], "slot_id": record.slot_id,
+               "deadline_monotonic_ns": deadline}
+        outcome = "arm_unsent"
+        if self._send(channel._controller, arm, deadline, clock, stopped):
+            self.root = "armed"
+            outcome, _index = self._receive(channel._controller, ({**identity, "op": "armed"},), deadline, clock,
+                                            stopped)
+        if outcome == "match":
+            fd = self._take_fd()
+            try:
+                info = os.fstat(fd)
+                sent = ((info.st_dev, info.st_ino) == record.namespace_identity
+                        and self._send(channel._worker, record.request(), deadline, clock, stopped, (fd,)))
+            finally:
+                os.close(fd)  # the one close of the duplicate; the kernel holds the in-flight copy
+            self.worker = "contacted" if sent else "unknown"
+            outcome = "unsent"
+            if sent:
+                outcome, _index = self._receive(channel._worker, (record.receipt(),), deadline, clock, stopped)
+        if outcome == "match" and not stopped():
+            self.state = "receipted"
+            channel.close()  # single use: no later message on either socket is ever read
+            return
+        self.cancel(clock)
+
+    def cancel(self, clock) -> None:
+        """Burn the capability, close the worker's socket, then ask the root controller to remove the
+        slot's ``enabled`` marker and end the worker under this nonce. Without the exact ack the
+        outcome stays unresolved; a worker the controller could not reap stays unresolved."""
+        self._drop_fd()
+        channel, self.state = self._channel, "unresolved"
+        channel._worker.close()
+        if self.root == "not_armed":
+            self.state = "cancelled"
+            channel.close()
+            return
+        identity, deadline = self._identity(), clock() + REVOKE_DEADLINE_MS * _MS
+        revoke = {**identity, "op": "revoke", "namespace_dev": self.record.namespace_identity[0],
+                  "namespace_ino": self.record.namespace_identity[1], "slot_id": self.record.slot_id}
+        self.root = "unknown"
+        if self.worker == "not_contacted":
+            self.worker = "unknown"  # an arm the controller saw may have started one
+        workers = ("reaped", "unresolved")
+        acks = tuple({**identity, "op": "revoked", "enabled": "absent", "worker": worker} for worker in workers)
+        result, index = "unsent", -1
+        if self._send(channel._controller, revoke, deadline, clock, lambda: False):
+            result, index = self._receive(channel._controller, acks, deadline, clock, lambda: False)
+        channel.close()
+        self._nonce = "burned"
+        if result == "match":
+            self.root, self.worker = "absent", workers[index]
+            self.state = "cancelled" if self.worker == "reaped" else "unresolved"
+
+    def abandon(self) -> None:
+        """An escaped exception: close everything, claim nothing."""
+        self._drop_fd()
+        self._channel.close()
+        self._nonce, self.state, self.root = "burned", "unresolved", "unknown"
+
+
+# ---------------------------------------------------------------------------------------------
 # Process-wide budget and the cycle.
 
 class _GenerationBudget:
@@ -443,7 +721,11 @@ class HostCycle:
     ``tick()`` runs one cycle on the main thread; ``stop()`` and ``stop_context()`` end the
     generation in order; ``status()`` reads fixed tokens; ``on_transition(callback)`` is called with
     ``(event, status)`` after each transition, outside the cycle lock. One lock, never touched by a
-    signal handler, serializes every method; the domain lock nests inside it."""
+    signal handler, serializes every method; the domain lock nests inside it.
+
+    ``register_bootstrap(channel)`` (H2-A) puts the cycle in bootstrap mode for good: every later
+    ``start()`` needs its own registration, holds the generation in ``bootstrapping`` while the
+    hand-off runs outside the lock, and reaches ``ready`` only on the exact receipt."""
 
     def __init__(self, slot_id: str, cp_socket: str, cp_uid: int, *, slot_src: str, slot_dst: str,
                  admission: Enablement, _seams_for_tests: CycleSeams | None = None):
@@ -469,6 +751,8 @@ class HostCycle:
         self._quarantine_code = "none"
         self._exit_required = False
         self._kernel_profile = "unknown"
+        self._bootstrap_mode = False
+        self._channel: BootstrapChannel | None = None  # registered for the next generation start
         self._reset_generation()
 
     def _reset_generation(self) -> None:
@@ -487,6 +771,8 @@ class HostCycle:
         self._tick_ns: int | None = None
         self._stop_requested = self._replace_requested = False
         self._flush_attempted = self._zero_proven = False
+        self._gen_channel: BootstrapChannel | None = None  # this generation's, until the hand-off owns it
+        self._handoff: _Handoff | None = None
 
     @property
     def _current_bound(self) -> int | None:
@@ -500,8 +786,33 @@ class HostCycle:
         with self._lock:
             self._callbacks.append(callback)
 
+    def register_bootstrap(self, channel: BootstrapChannel) -> None:
+        """One channel for the next generation, only between generations and never after a
+        quarantine. Refused registrations leave the channel with the caller."""
+        if type(channel) is not BootstrapChannel:
+            raise TypeError("channel must be a BootstrapChannel")
+        with self._lock, _CLAIM_LOCK:
+            if (self._phase not in ("created", "closed") or _BUDGET.quarantined or self._channel is not None
+                    or channel._claimed or channel.closed):
+                raise CycleError("bootstrap_registration_refused")
+            channel._claimed = True
+            self._channel, self._bootstrap_mode = channel, True
+
+    def bootstrap_status(self) -> dict:
+        """Fixed tokens: ``mode`` legacy|registered; ``state`` none|pending|receipted|cancelled|
+        unresolved; ``root`` (the controller's word on the slot's ``enabled`` marker) none|not_armed|
+        armed|absent|unknown; ``worker`` none|not_contacted|contacted|reaped|unresolved|unknown."""
+        with self._lock:
+            handoff = self._handoff
+            return {"mode": "registered" if self._bootstrap_mode else "legacy",
+                    "registered": self._channel is not None,
+                    "state": handoff.state if handoff is not None else "none",
+                    "root": handoff.root if handoff is not None else "none",
+                    "worker": handoff.worker if handoff is not None else "none"}
+
     def start(self) -> str:
-        return self._locked(self._start)
+        phase = self._locked(self._start)
+        return self._bootstrap(self._handoff) if phase == "bootstrapping" else phase
 
     def install_context(self, context: CycleContext) -> None:
         def install() -> None:
@@ -571,13 +882,16 @@ class HostCycle:
     # -- generation start (R section 7.3, row 26/27) ----------------------------------------
 
     def _start(self) -> None:
-        if self._phase in ("ready", "serving", "draining", "closing"):
+        if self._phase in ("ready", "serving", "draining", "closing", "bootstrapping"):
             raise CycleError("generation_active")
         if self._phase == "quarantined" or _BUDGET.quarantined:
             self._phase, self._exit_required = "quarantined", True
             if self._quarantine_code == "none":
                 self._quarantine_code = "process_quarantined"
+            self._close_unused_channel()
             return
+        if self._bootstrap_mode and self._channel is None:
+            raise CycleError("bootstrap_unregistered")  # never the legacy path once registered
         children = classify_children(authority.sweep_unresolved_children())
         if children == "uncertain":
             self._quarantine("child_uncertain")
@@ -596,6 +910,7 @@ class HostCycle:
             self._quarantine("generation_budget")
             return
         self._reset_generation()
+        self._gen_channel, self._channel = self._channel, None
         self._boot = self._boot_seam or _read_boot_epoch()
         if self._boot is None:
             return self._refuse_start("boot_epoch_unavailable")
@@ -626,10 +941,63 @@ class HostCycle:
             self._baseline = self._previous = self._witness.sample()
         except authority.ClockUnavailable:
             return self._refuse_start("clock_unavailable")
-        self._phase = "ready"
-        self._event("ready")  # H2's hook: install the gate table in this generation's namespace now
+        if self._gen_channel is None:
+            self._phase = "ready"
+            self._event("ready")  # legacy (no registration): H1 behavior unchanged
+            return
+        return self._open_bootstrap()
+
+    # -- the generation bootstrap (H2-A) --------------------------------------------------------
+
+    def _open_bootstrap(self) -> None:
+        """Under the lock: duplicate the namespace descriptor once and hand it, with the channel, to
+        the generation's ``_Handoff``; ``start()`` then runs it outside the lock."""
+        identity = tuple(self._domain.ns_identity)
+        try:
+            fd = os.dup(self._domain.ns_fd)
+        except OSError:
+            return self._refuse_start("h2_bootstrap_failed")
+        record = GenerationBootstrap(generation_id=self._domain.generation_id, namespace_identity=identity,
+                                     slot_id=self._slot, slot_hop_src=self._src, slot_hop_dst=self._dst,
+                                     bootstrap_fence=secrets.token_hex(16))
+        channel, self._gen_channel = self._gen_channel, None
+        self._handoff = _Handoff(record, channel, fd, self._clock() + BOOTSTRAP_DEADLINE_MS * _MS)
+        self._phase = "bootstrapping"
+
+    def _bootstrap_stopped(self) -> bool:
+        return _STATE.stop_requested or self._stop_requested or self._replace_requested
+
+    def _bootstrap(self, handoff: _Handoff) -> str:
+        try:
+            handoff.run(self._clock, self._bootstrap_stopped)
+        except BaseException:
+            handoff.abandon()
+            self._locked(self._interrupted)
+            raise
+        return self._locked(lambda: self._finish_bootstrap(handoff))
+
+    def _finish_bootstrap(self, handoff: _Handoff) -> None:
+        if self._handoff is not handoff or self._phase != "bootstrapping":
+            return self._quarantine("bootstrap_state")
+        if handoff.state == "receipted":
+            self._phase = "ready"
+            self._event("ready")
+            self._poll_point()  # a stop that arrived after the receipt ends the generation at once
+        elif handoff.state == "cancelled":
+            self._refuse_start("h2_bootstrap_failed")
+        else:  # the root state or the worker is unknown: terminal, no zero claim, no new generation
+            _BUDGET.lost_child = True
+            self._quarantine("bootstrap_unresolved")
+
+    def _close_unused_channel(self) -> None:
+        for name in ("_channel", "_gen_channel"):
+            channel = getattr(self, name)
+            if channel is not None:
+                setattr(self, name, None)
+                channel.close()  # nothing was ever sent on it
 
     def _refuse_start(self, code: str) -> None:
+        self._close_unused_channel()
         if self._domain is not None:
             self._flush_attempted = True
             try:
@@ -826,6 +1194,7 @@ class HostCycle:
         """Class C: at most one best-effort flush, then terminal for the process."""
         if self._phase == "quarantined":
             return
+        self._close_unused_channel()
         if self._domain is not None and not self._flush_attempted:
             self._flush_attempted = True
             try:

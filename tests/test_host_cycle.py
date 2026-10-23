@@ -1563,6 +1563,651 @@ def test_doc_states_the_table_signal_contract_registry_rule_and_limits():
 
 
 # ---------------------------------------------------------------------------------------------
+# H2-A: the pre-ready generation bootstrap (docs/saas/H2A_BOOTSTRAP_CONTRACT.md). The transport is
+# real: unprivileged AF_UNIX datagram socketpairs and real SCM_RIGHTS descriptor passing of the
+# harness's stand-in descriptor (a regular file, never a namespace). The root controller and the
+# bootstrap worker are H3 processes that do not exist yet; ``FakeController`` and ``FakeWorker``
+# are CONTRACT FAKES that only speak the wire schema. Tests prefixed ``CONTRACT:`` prove the cycle's
+# side of the boundary and claim nothing about kernel state, root ``enabled`` markers, namespace
+# destruction or reaping of a real worker.
+
+BOOT_MS = cycle.BOOTSTRAP_DEADLINE_MS
+POSIX_DGRAM = pytest.mark.skipif(not hasattr(socket, "AF_UNIX") or not hasattr(socket.socket, "sendmsg"),
+                                 reason="needs AF_UNIX SCM_RIGHTS")
+
+
+def _holders(identity: tuple[int, int]) -> int:
+    """How many descriptors of this process refer to ``identity`` (dev, ino)."""
+    count = 0
+    for name in os.listdir("/dev/fd"):
+        try:
+            info = os.fstat(int(name))
+        except (OSError, ValueError):
+            continue
+        count += (info.st_dev, info.st_ino) == identity
+    return count
+
+
+def _received_fds(ancdata) -> list[int]:
+    fds = []
+    for level, kind, data in ancdata:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            fds.extend(int.from_bytes(data[i:i + 4], sys.byteorder, signed=True) for i in range(0, len(data) - 3, 4))
+    return fds
+
+
+def _receipt(request: dict, **changes) -> dict:
+    document = {"schema": cycle.RECEIPT_SCHEMA, "generation_id": request["generation_id"],
+                "namespace_dev": request["namespace_dev"], "namespace_ino": request["namespace_ino"],
+                "bootstrap_fence": request["bootstrap_fence"], "installed": True}
+    document.update(changes)
+    return {key: value for key, value in document.items() if value is not _DROP}
+
+
+_DROP = object()
+
+
+class _Peer:
+    """A thread reading one end of a socketpair; ``close()`` stops it and closes the end."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock, self.messages, self.log = sock, [], []
+        self._done = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self._done:
+            try:
+                self.sock.settimeout(0.02)
+                data, ancdata, _flags, _address = self.sock.recvmsg(4096, socket.CMSG_SPACE(64))
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            self.handle(data, _received_fds(ancdata))
+
+    def reply(self, payload: bytes, fds=()) -> bool:
+        try:
+            ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, __import__("array").array("i", fds))] if fds else []
+            self.sock.sendmsg([payload], ancillary)
+        except OSError:
+            return False
+        return True
+
+    def close(self) -> None:
+        self._done = True
+        self.thread.join(5)
+        self.sock.close()
+
+
+class FakeController(_Peer):
+    """CONTRACT FAKE (future H3 root controller): acks ``arm`` and answers ``revoke`` with the
+    scripted worker outcome. It holds no root state; its "absent"/"reaped" words are scripted."""
+
+    def __init__(self, sock, *, arm="ack", revoke="reaped", on_arm=None):
+        self.arm, self.revoke, self.on_arm = arm, revoke, on_arm
+        super().__init__(sock)
+
+    def handle(self, data: bytes, fds: list[int]) -> None:
+        for fd in fds:
+            os.close(fd)
+        message = json.loads(data)
+        self.messages.append(message)
+        self.log.append(message["op"])
+        identity = {key: message[key] for key in ("schema", "generation_id", "bootstrap_fence", "operation_nonce")}
+        if message["op"] == "arm":
+            if self.on_arm is not None:
+                self.on_arm()
+            if self.arm == "ack":
+                self.reply(codec.canonical({**identity, "op": "armed"}))
+        elif message["op"] == "revoke" and self.revoke in ("reaped", "unresolved"):
+            self.reply(codec.canonical({**identity, "op": "revoked", "enabled": "absent", "worker": self.revoke}))
+
+
+class FakeWorker(_Peer):
+    """CONTRACT FAKE (future H3 bootstrap worker): records the request and the identity of the one
+    descriptor it received, closes that descriptor (it owns it), then lets ``respond(request, worker)``
+    return the reply bytes (or ``None`` for no reply)."""
+
+    def __init__(self, sock, respond=None):
+        self.respond = respond or (lambda request, worker: codec.canonical(_receipt(request)))
+        self.fd_identities, self.fd_numbers, self.raw = [], [], []
+        super().__init__(sock)
+
+    def handle(self, data: bytes, fds: list[int]) -> None:
+        self.raw.append(data)
+        for fd in fds:
+            info = os.fstat(fd)
+            self.fd_identities.append((info.st_dev, info.st_ino))
+            self.fd_numbers.append(fd)
+            os.close(fd)
+        request = json.loads(data)
+        self.messages.append(request)
+        reply = self.respond(request, self)
+        if reply is not None:
+            self.log.append("receipt_sent")
+            self.reply(*reply) if isinstance(reply, tuple) else self.reply(reply)
+
+
+class Boot:
+    """One registered generation: a Harness, its channel and the two contract fakes."""
+
+    def __init__(self, h: Harness, *, respond=None, **controller):
+        self.h = h
+        cycle_w, self.worker_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        cycle_c, controller_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.channel = cycle.BootstrapChannel(worker=cycle_w, controller=cycle_c)
+        try:
+            h.cycle.register_bootstrap(self.channel)
+        except BaseException:
+            for sock in (self.channel, self.worker_end, controller_end):
+                sock.close()
+            raise
+        self.controller = FakeController(controller_end, **controller)
+        self.worker = FakeWorker(self.worker_end, respond) if respond != "none" else None
+
+    def close(self) -> None:
+        for peer in (self.worker, self.controller):
+            if peer is not None:
+                peer.close()
+        self.worker_end.close()  # idempotent; the only close when no FakeWorker ever took it
+
+
+@pytest.fixture
+def boots():
+    made: list[Boot] = []
+    yield made
+    for boot in made:
+        boot.close()
+
+
+def _boot(monkeypatch, tmp_path, boots, **kwargs) -> Boot:
+    boot = Boot(Harness(monkeypatch, tmp_path), **kwargs)
+    boots.append(boot)
+    return boot
+
+
+def _subdir(tmp_path, name: str):
+    path = tmp_path / name  # one stand-in file per harness: shared names would share an identity
+    path.mkdir()
+    return path
+
+
+def _events(h: Harness) -> list:
+    events = []
+    h.cycle.on_transition(lambda event, status: events.append(event))
+    return events
+
+
+def _assert_refused(boot: Boot, events: list, phase: str = "closed") -> None:
+    h = boot.h
+    status = h.status()
+    assert "ready" not in events and status["generation_phase"] == phase, (events, status)
+    if phase == "closed":
+        assert (status["generation_class_end"], status["last_reason"]) == ("start_refused", "h2_bootstrap_failed")
+        assert events == ["start_refused"]
+    with pytest.raises(cycle.CycleError, match="context_refused"):
+        h.cycle.install_context(cycle.CycleContext(**CTX))
+    assert h.domain.calls == ["close_generation"]
+    assert _holders(h.domain.ns_identity) == 0  # the domain's own, the cycle's duplicate and the worker's copy
+    assert boot.channel.closed
+    with pytest.raises(cycle.CycleError, match="bootstrap_capability_spent"):
+        h.cycle._handoff._take_fd()
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+def test_bootstrap_ready_only_after_the_exact_receipt_and_the_duplicate_has_one_owner(monkeypatch, tmp_path, signals,
+                                                                                         boots):
+    """CONTRACT: arm ack, one SCM_RIGHTS duplicate matching the published identity, exact receipt,
+    then ``ready``. The cycle's duplicate is closed at its one send; the worker closes its copy; only
+    the domain's own descriptor is left until the generation closes. The worker never sees the
+    controller's operation nonce."""
+    boot = _boot(monkeypatch, tmp_path, boots)
+    h = boot.h
+    order = boot.worker.log
+    h.cycle.on_transition(lambda event, status: order.append(event))
+    assert h.cycle.bootstrap_status() == {"mode": "registered", "registered": True, "state": "none", "root": "none",
+                                          "worker": "none"}
+    assert h.cycle.start() == "ready"
+    identity = tuple(h.domain.ns_identity)
+    [request] = boot.worker.messages
+    assert set(request) == {"schema", "generation_id", "namespace_dev", "namespace_ino", "slot_id", "slot_hop_src",
+                            "slot_hop_dst", "bootstrap_fence"}
+    assert request == {"schema": cycle.BOOTSTRAP_SCHEMA, "generation_id": h.status()["generation_id"],
+                       "namespace_dev": identity[0], "namespace_ino": identity[1], "slot_id": "slot-a",
+                       "slot_hop_src": L, "slot_hop_dst": R, "bootstrap_fence": request["bootstrap_fence"]}
+    assert re.fullmatch(r"[0-9a-f]{32}", request["bootstrap_fence"])
+    assert boot.worker.fd_identities == [identity] and boot.worker.fd_numbers[0] != h.domain.ns_fd
+    [arm] = boot.controller.messages
+    assert arm["op"] == "arm" and (arm["generation_id"], arm["bootstrap_fence"]) == (request["generation_id"],
+                                                                                     request["bootstrap_fence"])
+    assert arm["operation_nonce"] not in boot.worker.raw[0].decode() and "operation_nonce" not in request
+    assert order == ["receipt_sent", "ready"]
+    assert h.cycle.bootstrap_status() == {"mode": "registered", "registered": False, "state": "receipted",
+                                          "root": "armed", "worker": "contacted"}
+    assert _holders(identity) == 1 and boot.channel.closed
+    with pytest.raises(cycle.CycleError, match="bootstrap_capability_spent"):
+        h.cycle._handoff._take_fd()
+    h.cycle.install_context(cycle.CycleContext(**CTX))
+    assert h.cycle.tick() == "serving" and h.domain.calls == ["prepare", "activate"]
+    assert h.cycle.stop() == "closed" and _holders(identity) == 0
+    assert boot.controller.log == ["arm"]  # success sends nothing else; the nonce dies at its deadline
+
+
+MALFORMED = {
+    "installed_false": lambda r: codec.canonical(_receipt(r, installed=False)),
+    "installed_string": lambda r: codec.canonical(_receipt(r, installed="true")),
+    "installed_one": lambda r: codec.canonical(_receipt(r, installed=1)),
+    "missing_key": lambda r: codec.canonical(_receipt(r, namespace_ino=_DROP)),
+    "extra_key": lambda r: codec.canonical({**_receipt(r), "operation_nonce": "0" * 32}),
+    "wrong_generation": lambda r: codec.canonical(_receipt(r, generation_id="0" * 32)),
+    "wrong_namespace": lambda r: codec.canonical(_receipt(r, namespace_ino=r["namespace_ino"] + 1)),
+    "wrong_fence": lambda r: codec.canonical(_receipt(r, bootstrap_fence="f" * 32)),
+    "wrong_schema": lambda r: codec.canonical(_receipt(r, schema=cycle.BOOTSTRAP_SCHEMA)),
+    "not_canonical": lambda r: json.dumps(_receipt(r), sort_keys=True).encode(),
+    "duplicate_key": lambda r: codec.canonical(_receipt(r))[:-1] + b',"installed":true}',
+    "not_json": lambda r: b"\xff\xfe",
+    "nan": lambda r: codec.canonical(_receipt(r)).replace(b'"installed":true', b'"installed":NaN'),
+    "list": lambda r: b"[]",
+    "non_ascii_generation": lambda r: codec.canonical(_receipt(r, generation_id="\u2603" * 32)),
+    "lone_surrogate_fence": lambda r: codec.canonical(_receipt(r, bootstrap_fence="\ud800" * 32)),
+    "empty": lambda r: b"",
+    "oversized": lambda r: codec.canonical({**_receipt(r), "pad": "x" * cycle.MAX_BOOTSTRAP_BYTES}),
+}
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+@pytest.mark.parametrize("variant", sorted(MALFORMED))
+def test_bootstrap_malformed_mismatched_or_false_receipt_refuses_the_start_and_revokes(
+        monkeypatch, tmp_path, signals, boots, variant):
+    """CONTRACT: anything but the exact receipt is a cancellation: the duplicate is burned, the
+    worker's socket closed, the controller asked to revoke under the same nonce it armed, and the
+    H1 generation closed with ``start_refused:h2_bootstrap_failed``; no ``ready``, no context."""
+    boot = _boot(monkeypatch, tmp_path, boots, respond=lambda request, worker: MALFORMED[variant](request))
+    events = _events(boot.h)
+    assert boot.h.cycle.start() == "closed"
+    _assert_refused(boot, events)
+    arm, revoke = boot.controller.messages
+    assert (arm["op"], revoke["op"]) == ("arm", "revoke")
+    assert {key: revoke[key] for key in ("generation_id", "bootstrap_fence", "operation_nonce", "namespace_dev",
+                                          "namespace_ino", "slot_id")} == \
+        {key: arm[key] for key in ("generation_id", "bootstrap_fence", "operation_nonce", "namespace_dev",
+                                   "namespace_ino", "slot_id")}
+    assert boot.h.cycle.bootstrap_status() == {"mode": "registered", "registered": False, "state": "cancelled",
+                                               "root": "absent", "worker": "reaped"}
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+@pytest.mark.parametrize("variant", ["silent", "late", "receipt_with_descriptor", "junk_then_valid"])
+def test_bootstrap_deadline_late_receipt_and_received_descriptors_are_cancellation(
+        monkeypatch, tmp_path, signals, boots, variant):
+    """CONTRACT: a stalled worker ends at the one monotonic deadline (the clock is advanced past it);
+    a receipt read after the deadline is refused; a receipt carrying a descriptor is refused and that
+    descriptor is closed by the cycle; exactly one datagram is read, so a valid receipt queued behind
+    a malformed one is never seen."""
+    sent = tmp_path / "smuggled"
+    sent.write_bytes(b"")
+    smuggled = os.open(sent, os.O_RDONLY | os.O_CLOEXEC)
+    smuggled_identity = (os.fstat(smuggled).st_dev, os.fstat(smuggled).st_ino)
+    holder: list[Boot] = []
+
+    def respond(request, worker):
+        h = holder[0].h
+        if variant == "receipt_with_descriptor":
+            return codec.canonical(_receipt(request)), [smuggled]
+        if variant == "junk_then_valid":
+            worker.reply(b"{}")
+            return codec.canonical(_receipt(request))
+        h.clock.advance_ms(BOOT_MS + 1)
+        return codec.canonical(_receipt(request)) if variant == "late" else None
+
+    boot = _boot(monkeypatch, tmp_path, boots, respond=respond)
+    holder.append(boot)
+    events = _events(boot.h)
+    started = time.monotonic()
+    assert boot.h.cycle.start() == "closed"
+    assert time.monotonic() - started < BOOT_MS / 1000  # bounded by the injected deadline, not the real one
+    _assert_refused(boot, events)
+    assert boot.controller.log == ["arm", "revoke"]
+    try:
+        assert _holders(smuggled_identity) == 1  # only the test's own; the received copy was closed
+    finally:
+        os.close(smuggled)
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+@pytest.mark.parametrize("how", ["stop", "stop_context", "signal_flag"])
+def test_bootstrap_wait_runs_outside_the_lock_and_a_concurrent_stop_cancels_it(monkeypatch, tmp_path, signals, boots,
+                                                                                how):
+    """CONTRACT: while the hand-off waits, ``status()``, ``stop()``, ``install_context()``, ``start()``,
+    ``tick()`` and ``register_bootstrap()`` return at once (the cycle lock is free) and refuse or
+    record; a stop requested then cancels the hand-off even when a valid receipt follows."""
+    seen = {}
+    holder: list[Boot] = []
+
+    def respond(request, worker):
+        c = holder[0].h.cycle
+        results = {}
+
+        def probe():
+            results["status"] = c.status()["generation_phase"]
+            x, y = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+            u, v = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+            fresh = cycle.BootstrapChannel(worker=x, controller=u)
+            for name, call in (("install", lambda: c.install_context(cycle.CycleContext(**CTX))), ("start", c.start),
+                               ("register", lambda: c.register_bootstrap(fresh))):
+                try:
+                    call()
+                except cycle.CycleError as error:
+                    results[name] = error.code
+            for sock in (fresh, y, v):
+                sock.close()
+            results["tick"] = c.tick()
+            if how == "stop":
+                results["stop"] = c.stop()
+            elif how == "stop_context":
+                results["stop"] = c.stop_context()
+            else:
+                cycle._STATE.stop_requested = True
+                results["stop"] = "bootstrapping"
+
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join(2)
+        seen.update(results, joined=not thread.is_alive())
+        return codec.canonical(_receipt(request))
+
+    boot = _boot(monkeypatch, tmp_path, boots, respond=respond)
+    holder.append(boot)
+    events = _events(boot.h)
+    assert boot.h.cycle.start() == "closed"
+    assert seen == {"joined": True, "status": "bootstrapping", "install": "context_refused", "start": "generation_active",
+                    "register": "bootstrap_registration_refused", "tick": "bootstrapping", "stop": "bootstrapping"}
+    _assert_refused(boot, events)
+    assert boot.controller.log == ["arm", "revoke"]
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+def test_bootstrap_arm_without_ack_never_contacts_the_worker_and_still_revokes(monkeypatch, tmp_path, signals, boots):
+    """CONTRACT: no descriptor leaves the cycle before the controller acknowledged the arm; an arm
+    the controller may have seen is revoked anyway."""
+    holder: list[Boot] = []
+    boot = _boot(monkeypatch, tmp_path, boots, arm="silent", on_arm=lambda: holder[0].h.clock.advance_ms(BOOT_MS + 1))
+    holder.append(boot)
+    events = _events(boot.h)
+    assert boot.h.cycle.start() == "closed"
+    _assert_refused(boot, events)
+    assert boot.worker.messages == [] and boot.worker.fd_identities == []
+    assert boot.controller.log == ["arm", "revoke"]
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+@pytest.mark.parametrize("revoke", ["unresolved", "silent"])
+def test_bootstrap_unknown_revocation_or_unreaped_worker_quarantines_and_claims_nothing(
+        monkeypatch, tmp_path, signals, boots, revoke):
+    """CONTRACT: a controller that reports the worker unresolved, or never acknowledges the revoke,
+    leaves the outcome unresolved: terminal quarantine ``bootstrap_unresolved``, no zero residual
+    claim, no new generation. Nothing claims the worker was reaped or its descriptor copy is gone."""
+    boot = _boot(monkeypatch, tmp_path, boots, revoke=revoke,
+                 respond=lambda request, worker: codec.canonical(_receipt(request, installed=False)))
+    events = _events(boot.h)
+    assert boot.h.cycle.start() == "quarantined"
+    status = boot.h.status()
+    assert (status["quarantine_code"], status["exit_required"]) == ("bootstrap_unresolved", True)
+    assert events == ["quarantined"] and cycle._BUDGET.lost_child
+    word = boot.h.cycle.bootstrap_status()
+    assert word["state"] == "unresolved" and word["worker"] != "reaped"
+    assert word["root"] == ("absent" if revoke == "unresolved" else "unknown")
+    assert boot.h.domain.calls == ["close_generation"] and boot.channel.closed
+    boot.h.clock.advance_ms(cycle.MIN_GENERATION_SPACING_MS)
+    assert boot.h.cycle.start() == "quarantined" and len(boot.h.domains) == 1
+    with pytest.raises(cycle.CycleError, match="bootstrap_registration_refused"):
+        Boot(boot.h)
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+def test_bootstrap_late_writer_after_cancellation_and_replayed_receipt_cannot_make_ready(monkeypatch, tmp_path,
+                                                                                          signals, boots):
+    """CONTRACT: after a cancellation the worker's socket is closed (its late receipt is undeliverable)
+    and the controller socket never reached the worker; a receipt of generation 1 replayed on the
+    next generation's channel does not match its fresh fence and refuses that start too."""
+    first = _boot(monkeypatch, tmp_path, boots)
+    h = first.h
+    assert h.cycle.start() == "ready"
+    old_receipt = codec.canonical(_receipt(first.worker.messages[0]))
+    assert h.cycle.stop() == "closed"
+    h.clock.advance_ms(cycle.MIN_GENERATION_SPACING_MS)
+    second = Boot(h, respond=lambda request, worker: old_receipt)
+    boots.append(second)
+    events = _events(h)
+    assert h.cycle.start() == "closed"
+    assert second.worker.messages[0]["bootstrap_fence"] != first.worker.messages[0]["bootstrap_fence"]
+    _assert_refused(second, events)
+    assert not second.worker.reply(codec.canonical(_receipt(second.worker.messages[0])))  # the late writer
+    assert h.status()["generation_phase"] == "closed" and "ready" not in events
+    assert h.cycle.bootstrap_status()["state"] == "cancelled"
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+def test_bootstrap_registration_rules_and_no_fallback_to_the_legacy_path(monkeypatch, tmp_path, signals, boots):
+    """CONTRACT: one registration per generation, only between generations and never after a
+    quarantine; once registered, a start without a fresh registration is refused before any
+    generation is spent (no silent legacy ``ready``); a refused start closes its unused channel."""
+    legacy = Harness(monkeypatch, _subdir(tmp_path, "legacy"))
+    assert legacy.cycle.start() == "ready"
+    assert legacy.cycle.bootstrap_status() == {"mode": "legacy", "registered": False, "state": "none", "root": "none",
+                                               "worker": "none"}
+    with pytest.raises(cycle.CycleError, match="bootstrap_registration_refused"):
+        Boot(legacy)  # after start: refused, the channel stays the caller's
+    assert legacy.cycle.stop() == "closed"
+    with pytest.raises(TypeError):
+        legacy.cycle.register_bootstrap(object())
+
+    boot = _boot(monkeypatch, tmp_path, boots)
+    h = boot.h
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    c, d = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    spare = cycle.BootstrapChannel(worker=a, controller=c)
+    assert a.fileno() == -1 and c.fileno() == -1  # adopted: the caller's objects are detached
+    with pytest.raises(cycle.CycleError, match="bootstrap_registration_refused"):
+        h.cycle.register_bootstrap(spare)  # one per generation
+    with pytest.raises(cycle.CycleError, match="bootstrap_registration_refused"):
+        h.cycle.register_bootstrap(boot.channel)
+    assert not spare.closed
+    h.clock.advance_ms(cycle.MIN_GENERATION_SPACING_MS)  # the legacy harness spent the process budget's slot
+    assert h.cycle.start() == "ready" and h.cycle.stop() == "closed"
+    spent = h.status()["generations"]
+    h.clock.advance_ms(cycle.MIN_GENERATION_SPACING_MS)
+    with pytest.raises(cycle.CycleError, match="bootstrap_unregistered"):
+        h.cycle.start()
+    assert h.status()["generations"] == spent and h.status()["generation_phase"] == "closed"
+    other = Harness(monkeypatch, _subdir(tmp_path, "other"))
+    with pytest.raises(cycle.CycleError, match="bootstrap_registration_refused"):
+        other.cycle.register_bootstrap(boot.channel)  # claimed by the first cycle, and closed
+    spare.close()
+    for sock in (b, d):
+        sock.close()
+
+    unpinned = Harness(monkeypatch, _subdir(tmp_path, "unpinned"),
+                       report=pinned_report(config_hz=999))
+    refused = Boot(unpinned)
+    unpinned.clock.advance_ms(4 * cycle.MIN_GENERATION_SPACING_MS)
+    boots.append(refused)
+    assert unpinned.cycle.start() == "closed" and unpinned.status()["last_reason"] == "profile_unpinned"
+    assert refused.channel.closed and refused.worker.messages == [] and refused.controller.messages == []
+
+
+def test_bootstrap_receipt_matching_is_total_and_refuses_escaped_non_ascii_without_raising():
+    """CONTRACT: ``_matches`` answers True or False for any datagram; escaped non-ASCII and lone
+    surrogates in any string field are refused, never raised (the receipt is attacker input)."""
+    expected = {"schema": cycle.RECEIPT_SCHEMA, "generation_id": "a" * 32, "namespace_dev": 1, "namespace_ino": 2,
+                "bootstrap_fence": "b" * 32, "installed": True}
+    assert cycle._matches(codec.canonical(expected), expected) is True
+    hostile = [codec.canonical({**expected, key: text}) for key in ("schema", "generation_id", "bootstrap_fence")
+               for text in ("\u2603", "\u2603" * 32, "\ud800", "\udfff" * 32, "\x00", "a" * 31 + "\u00e9")]
+    hostile += [b"", b"\xff", b"{", b"[]", b"null", b'"x"', b"1e999", b"[" * 600 + b"]" * 600,
+                b'{"a":' * 400 + b"1" + b"}" * 400, codec.canonical({**expected, "namespace_dev": 10 ** 1000}),
+                codec.canonical({**expected, "installed": 1}), codec.canonical({**expected, "namespace_ino": 2.0}),
+                codec.canonical({**expected, "generation_id": None})]
+    for data in hostile:
+        assert cycle._matches(data, expected) is False, data[:60]
+
+
+def _fill(sock: socket.socket) -> int:
+    """Fill the peer's receive queue from ``sock`` (non-blocking) until the kernel refuses more."""
+    sock.setblocking(False)
+    count = 0
+    try:
+        while count < 100_000:
+            sock.send(b'{"junk":1}')
+            count += 1
+    except OSError:
+        pass
+    sock.setblocking(True)
+    return count
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+@pytest.mark.parametrize("case", ["stop_while_full", "drains_in_time"])
+def test_bootstrap_send_to_a_full_worker_queue_polls_stop_and_retries_within_the_deadline(
+        monkeypatch, tmp_path, signals, boots, case):
+    """CONTRACT: a worker that does not read leaves the cycle's hand-off send facing a full queue
+    (the send may block or be refused with ENOBUFS/EAGAIN). The send is retried in
+    ``BOOTSTRAP_POLL_MS`` slices: a stop cancels it long before the 5 s deadline, and a queue that
+    drains in time still delivers the one descriptor and reaches ``ready``."""
+    h = Harness(monkeypatch, tmp_path)
+    cycle_w, worker_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    cycle_c, controller_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    assert _fill(cycle_w) >= 1
+    channel = cycle.BootstrapChannel(worker=cycle_w, controller=cycle_c)
+    h.cycle.register_bootstrap(channel)
+    boot = Boot.__new__(Boot)
+    boot.h, boot.channel, boot.worker_end, boot.worker = h, channel, worker_end, None
+    boots.append(boot)
+
+    def later():
+        time.sleep(0.3)
+        if case == "stop_while_full":
+            h.cycle.stop()
+        else:
+            boot.worker = FakeWorker(worker_end, lambda request, worker: (
+                codec.canonical(_receipt(request)) if "schema" in request else None))
+
+    boot.controller = FakeController(controller_end, on_arm=lambda: threading.Thread(target=later).start())
+    events = _events(h)
+    started = time.monotonic()
+    phase = h.cycle.start()
+    elapsed = time.monotonic() - started
+    if case == "stop_while_full":
+        assert phase == "closed" and elapsed < 2.0, (phase, elapsed)
+        _assert_refused(boot, events)
+        assert boot.controller.log == ["arm", "revoke"]
+    else:
+        assert phase == "ready" and elapsed < 3.0, (phase, elapsed, h.status())
+        assert boot.worker.fd_identities == [tuple(h.domain.ns_identity)]
+        assert _holders(tuple(h.domain.ns_identity)) == 1
+        assert h.cycle.stop() == "closed"
+
+
+def test_bootstrap_channel_accepts_only_two_distinct_connected_unix_datagram_sockets():
+    """CONTRACT: the transport is typed; nothing else is adopted, and a refusal adopts nothing."""
+    stream_a, stream_b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    dgram_a, dgram_b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    loose = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        for worker, controller in ((stream_a, dgram_a), (dgram_a, stream_a), (loose, dgram_a), (dgram_a, dgram_a)):
+            with pytest.raises(ValueError, match="bootstrap_channel_invalid"):
+                cycle.BootstrapChannel(worker=worker, controller=controller)
+        with pytest.raises(TypeError):
+            cycle.BootstrapChannel(worker=dgram_a.fileno(), controller=dgram_b)
+        assert dgram_a.fileno() >= 0 and stream_a.fileno() >= 0 and loose.fileno() >= 0
+    finally:
+        for sock in (stream_a, stream_b, dgram_a, dgram_b, loose):
+            sock.close()
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+def test_bootstrap_escaped_exception_during_the_wait_quarantines_and_closes_the_duplicate(
+        monkeypatch, tmp_path, signals, boots):
+    """CONTRACT: an exception escaping the out-of-lock hand-off (injected into the receive) closes the
+    duplicate and the channel, quarantines ``operation_interrupted`` and is re-raised."""
+    boot = _boot(monkeypatch, tmp_path, boots)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(cycle._Handoff, "_receive", staticmethod(broken))
+    with pytest.raises(RuntimeError, match="injected"):
+        boot.h.cycle.start()
+    assert boot.h.status()["quarantine_code"] == "operation_interrupted"
+    assert _holders(boot.h.domain.ns_identity) == 0 and boot.channel.closed
+    assert boot.h.cycle.bootstrap_status()["state"] == "unresolved"
+
+
+_CHILD_WORKER = r"""
+import json, os, socket, sys
+sock = socket.socket(fileno=int(sys.argv[1]))
+sock.settimeout(10)
+data, fds, _flags, _address = socket.recv_fds(sock, 4096, 4)
+request = json.loads(data)
+info = os.fstat(fds[0])
+for fd in fds:
+    os.close(fd)
+receipt = {"schema": sys.argv[2], "generation_id": request["generation_id"], "namespace_dev": request["namespace_dev"],
+           "namespace_ino": request["namespace_ino"], "bootstrap_fence": request["bootstrap_fence"], "installed": True}
+sock.send(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode())
+print(len(fds), int((info.st_dev, info.st_ino) == (request["namespace_dev"], request["namespace_ino"])))
+"""
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+def test_bootstrap_descriptor_crosses_to_a_real_worker_process_by_scm_rights(monkeypatch, tmp_path, signals, boots):
+    """CONTRACT: a real unprivileged child process (``python -I``) receives exactly one descriptor of
+    the published identity by SCM_RIGHTS, closes it, and sends the receipt; the cycle reaches
+    ``ready`` with only the domain's own descriptor left. The child is this test's own subprocess,
+    not the H3 worker; the controller is the contract fake."""
+    import subprocess
+
+    boot = _boot(monkeypatch, tmp_path, boots, respond="none")
+    child = subprocess.Popen([sys.executable, "-I", "-c", _CHILD_WORKER, str(boot.worker_end.fileno()),
+                              cycle.RECEIPT_SCHEMA], pass_fds=[boot.worker_end.fileno()], stdout=subprocess.PIPE,
+                             cwd=tmp_path)
+    try:
+        assert boot.h.cycle.start() == "ready", boot.h.status()
+        out, _err = child.communicate(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(5)
+    assert child.returncode == 0 and out.split() == [b"1", b"1"]
+    assert _holders(tuple(boot.h.domain.ns_identity)) == 1
+    boot.worker_end.close()
+    assert boot.h.cycle.stop() == "closed"
+
+
+def test_bootstrap_contract_doc_states_the_boundary_and_the_validation():
+    text = (ROOT / "docs" / "saas" / "H2A_BOOTSTRAP_CONTRACT.md").read_text(encoding="utf-8")
+    for phrase in ("BootstrapChannel", "register_bootstrap", "GenerationBootstrap", "SCM_RIGHTS", "SOCK_DGRAM",
+                   "BOOTSTRAP_DEADLINE_MS", "REVOKE_DEADLINE_MS", "start_refused:h2_bootstrap_failed",
+                   "bootstrap_unresolved", "bootstrap_unregistered", "operation_nonce", "bootstrap_fence",
+                   "CONTRACT FAKE", "not a claim", "H3", "HOLD", "outside the cycle lock", "legacy"):
+        assert phrase in text, phrase
+    assert "register_bootstrap" in DOC_FILE.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------------------------
 # Linux: the real control plane over AF_UNIX (listener, decider, ledger), the real client and peer
 # check. The domain is the recorded installer (STATE-MACHINE ONLY for the kernel side).
 
