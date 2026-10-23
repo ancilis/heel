@@ -31,10 +31,11 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
-## [1.3.0rc1]: unpublished candidate
+## [1.3.0rc1]: 2026-10-23
 
-Runner preview release candidate. It carries the changes listed under Unreleased at its candidate
-commit and is not yet published as a GitHub release or to PyPI.
+Runner preview prerelease, published as a GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. It carries the changes listed under
+Unreleased at its candidate commit. It is not a stable release and is not published to PyPI.
 
 ### Changed
 - Python package, release contract, MCP `serverInfo`, `server.json`, browser engine and newly

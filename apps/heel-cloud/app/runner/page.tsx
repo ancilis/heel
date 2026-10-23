@@ -34,8 +34,9 @@ export default function Runner() {
       <p>Test whether a user can extract paid value through a normal export capability. Validate one protected synthetic row, apply the entitlement fix, and retain the regression.</p></div>
     </section>
     <section className="runner-command">
+      <div className="runner-command-number" aria-hidden="true">01</div>
       <div><h2>1. Review the rule and authorize the reference product</h2>
-      <p>This optional local preview is not a step in the default Heel journey. Heel 1.3.0rc1 is a public preview prerelease at <a href="https://github.com/ancilis/heel/releases/tag/v1.3.0rc1">github.com/ancilis/heel/releases/tag/v1.3.0rc1</a>. It is not a stable release, PyPI publication is not yet available, and it does not indicate live-target support or launch readiness. No source checkout or download is needed.</p>
+      <p>This optional local preview is not a step in the default Heel journey. Heel 1.3.0rc1 is a public preview prerelease at <a href="https://github.com/ancilis/heel/releases/tag/v1.3.0rc1">github.com/ancilis/heel/releases/tag/v1.3.0rc1</a>. It is not a stable release, PyPI publication is not yet available, and it does not indicate live-target support or launch readiness. No source checkout or manual wheel download is needed; pip fetches the pinned wheel directly from the public release.</p>
       <p>In an empty private directory with Python 3.11 or newer, install the hash-pinned public wheel with the local runner extra, inspect the bounded plan, then create a signed scope. pip refuses the wheel unless its SHA-256 matches, and --isolated ignores pip environment variables and user configuration. Installing the extra fetches the pinned cryptography package from your Python package index; these commands contact no product target.</p>
       <pre><code>{`python3 -m venv .venv
 .venv/bin/python -m pip --isolated install \\

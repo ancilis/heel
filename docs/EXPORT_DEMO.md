@@ -45,7 +45,20 @@ Replace SCOPE_ID below with the returned ID. Each attempt ID is consumed once, i
 .venv/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 55555555555555555555555555555555 --stop
 ```
 
-Expected results: verified_violation; invariant_held with regression_passed=true; invariant_held for the HTTP-200 denial envelope; inconclusive; inconclusive with cancellation. `public` and `redacted` are additional supported cases. A missing positive control never passes.
+Results, in order: verified_violation; invariant_held with regression_passed=true; for
+`error_envelope`, 1.3.0rc1 prints invariant_held with regression_passed=true, which is a known
+erratum (see below) and must be read as inconclusive; inconclusive; inconclusive with cancellation.
+`public` and `redacted` are additional supported cases. A missing positive control never passes.
+
+**Erratum for 1.3.0rc1: `error_envelope`.** The published 1.3.0rc1 wheel reports the
+`error_envelope` case as `invariant_held` with `regression_passed=true`. That output is a known
+defect. In this case the reference product answers the lower-plan export with HTTP 200 and a
+`{"error":"license required"}` body. A denial inside a successful response does not establish that
+protected content was withheld, so the correct result is inconclusive. Treat the rc1
+`error_envelope` report as inconclusive: it does not validate the invariant and is not a passing
+regression. The commands and output above are the actual rc1 behavior; the published rc1 artifacts
+are unchanged. A corrected result will ship only in a later candidate, with its evaluator, tests
+and artifacts updated together. The vulnerable and hardened results are not affected.
 
 Every report has `execution_support` set to `reference_only`. Its provenance records
 `network_calls: false`, and `uploaded` is `false`. The runs contact no product target and accept no

@@ -240,6 +240,8 @@ describe("Heel anonymous launch review", () => {
     expect(document.body.textContent).toMatch(/not a stable release/i);
     expect(document.body.textContent).toContain("pwd -P");
     expect(document.body.textContent).not.toMatch(STALE_GITHUB_CLAIMS);
+    expect(document.body.textContent).not.toMatch(/without a download|checkout or download is needed/i);
+    expect(document.body.textContent).toMatch(/directly from the public release/i);
     expect(document.body.textContent).not.toMatch(
       /not yet available as a public download|licensed source checkout|public main branch/i,
     );
@@ -268,6 +270,49 @@ describe("Heel anonymous launch review", () => {
     expect(text).toMatch(/has not expired, or create a fresh scope/i);
     expect(text).toMatch(/a new attempt id is always safe/i);
     expect(text).toMatch(/never raw exceptions, signing keys, scope files, or credentials/i);
+    expect(text).not.toMatch(/without a download|checkout or download is needed/i);
+    expect(text).toMatch(/no source checkout or manual wheel download is needed/i);
+  });
+
+  test("renders reference instructions in the runner body column beside the numbered rail", () => {
+    const { container } = render(<Runner />);
+    const command = container.querySelector("section.runner-command");
+    expect(command).toBeTruthy();
+
+    // globals.css lays .runner-command out as a numbered rail column then a body column and pads
+    // only the last child, so instructions in a sole or first child collapse into the rail.
+    const [rail, body, ...rest] = Array.from(command?.children ?? []);
+    expect(rest).toHaveLength(0);
+    expect(rail.className).toBe("runner-command-number");
+    expect(rail.getAttribute("aria-hidden")).toBe("true");
+    expect(rail.children).toHaveLength(0);
+    expect(rail.textContent).toMatch(/^\d{2}$/);
+    expect(body.tagName).toBe("DIV");
+
+    const steps = within(body as HTMLElement).getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent);
+    expect(steps).toEqual(screen.getAllByRole("heading", { level: 2 })
+      .filter((heading) => command?.contains(heading))
+      .map((heading) => heading.textContent));
+    expect(steps[0]).toMatch(/^1\. Review the rule/);
+    expect(within(body as HTMLElement).getByRole("heading", { level: 3, name: /if the run is rejected/i })).toBeTruthy();
+    expect(within(body as HTMLElement).getByLabelText(/reference report json/i)).toBeTruthy();
+
+    // The page CSP blocks style attributes, so long commands must scroll through the stylesheet
+    // rather than be clipped by the overflow-hidden runner page.
+    const css = readFileSync(resolve(process.cwd(), "app/globals.css"), "utf8");
+    const style = document.createElement("style");
+    style.textContent = (css.match(/^\.runner-command[^{]*\{[^}]*\}/gm) ?? []).join("\n");
+    document.head.append(style);
+    try {
+      const commands = Array.from(body.querySelectorAll("pre"));
+      expect(commands.length).toBeGreaterThan(0);
+      for (const pre of commands) {
+        expect(pre.hasAttribute("style")).toBe(false);
+        expect(getComputedStyle(pre).overflowX).toBe("auto");
+      }
+    } finally {
+      style.remove();
+    }
   });
 
   test("keeps customer docs on the public preview and physical storage path", () => {
@@ -288,6 +333,13 @@ describe("Heel anonymous launch review", () => {
     const demo = documents[2][1].replace(/\s+/g, " ");
     expect(demo).toMatch(/not every rejection is a storage-path problem/i);
     expect(demo).toMatch(/never paste raw exceptions or tracebacks, signing keys, scope files, `\.heel` contents, or credentials/i);
+    // rc1 reports the HTTP-200 denial envelope as invariant_held; the copy must flag that as an
+    // erratum rather than present it as successful validation.
+    expect(demo).not.toMatch(/invariant_held for the HTTP-200 denial envelope/i);
+    expect(demo).toMatch(/erratum/i);
+    expect(demo).toMatch(/`error_envelope`[^.]*inconclusive/i);
+    expect(demo).toMatch(/does not validate the invariant/i);
+    expect(demo).toMatch(/verified_violation; invariant_held with regression_passed=true/i);
   });
 
   test("states the MCP release, platform, privacy, and execution boundaries", () => {

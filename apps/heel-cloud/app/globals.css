@@ -2359,6 +2359,10 @@ fieldset.question {
   font-size: var(--text-sm);
 }
 
+.runner-command > div:last-child pre {
+  overflow-x: auto;
+}
+
 .command-copy {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

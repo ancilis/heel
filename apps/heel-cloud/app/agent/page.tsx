@@ -91,8 +91,9 @@ export default function AgentQuickstart() {
             <h2>Download and install Heel Agent</h2>
             <p>
               Heel&apos;s base MCP core is Apache-2.0 licensed and free to run locally. Install the
-              public preview without a download, or download the exact first-party wheel below; the
-              source archive is provided alongside it for inspection.
+              public preview directly from the public release without a manual wheel download, or
+              download the exact first-party wheel below; the source archive is provided alongside it
+              for inspection.
             </p>
             <p>
               Version 1.3.0rc1 is a public preview prerelease at{" "}
