@@ -232,10 +232,13 @@ class SocketTransport:
 
 class TLSTransport:
     def __init__(self) -> None:
-        self.context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
-        self.context.verify_mode = ssl.CERT_REQUIRED
-        self.context.check_hostname = True
-        self.context.load_default_certs()
+        # TLS 1.2 or newer with certificate and hostname verification; no maximum.
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = True
+        context.load_default_certs()
+        self.context = context
 
     def wrap(self, raw_socket: Any, hostname: str, timeout: float) -> Any:
         raw_socket.settimeout(timeout)

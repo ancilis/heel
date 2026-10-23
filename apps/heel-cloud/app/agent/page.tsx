@@ -6,7 +6,7 @@ import releaseManifest from "../../public/downloads/heel-open-core-manifest.json
 
 
 const WHEEL_SHA256 = releaseManifest.artifacts.find(
-  ({ name }) => name === "heel_sim-1.2.0-py3-none-any.whl",
+  ({ name }) => name === "heel_sim-1.3.0rc1-py3-none-any.whl",
 )?.sha256;
 
 if (WHEEL_SHA256 === undefined) {
@@ -14,7 +14,7 @@ if (WHEEL_SHA256 === undefined) {
 }
 
 const INSTALL_AGENT = `python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.2.0-py3-none-any.whl`;
+.venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl`;
 
 const MCP_CONFIGURATION = `{
   "mcpServers": {
@@ -58,7 +58,7 @@ export default function AgentQuickstart() {
       <article className="mcp-quickstart">
         <header className="quickstart-hero">
           <div>
-            <p className="eyebrow">Heel Agent 1.2.0 · local MCP quickstart</p>
+            <p className="eyebrow">Heel Agent 1.3.0rc1 preview candidate · local MCP quickstart</p>
             <h1>Investigate product abuse from your AI client.</h1>
             <p>
               Bring product rules and abuse hypotheses into your workflow. Download
@@ -91,14 +91,14 @@ export default function AgentQuickstart() {
               <a
                 className="button button-primary"
                 download
-                href="/downloads/heel_sim-1.2.0-py3-none-any.whl"
+                href="/downloads/heel_sim-1.3.0rc1-py3-none-any.whl"
               >
-                Download Heel Agent 1.2.0
+                Download Heel Agent 1.3.0rc1
               </a>
               <a
                 className="button button-secondary"
                 download
-                href="/downloads/heel_sim-1.2.0.tar.gz"
+                href="/downloads/heel_sim-1.3.0rc1.tar.gz"
               >
                 Download source archive
               </a>
@@ -108,6 +108,8 @@ export default function AgentQuickstart() {
               Wheel SHA-256: <code>{WHEEL_SHA256}</code>
             </p>
             <p>
+              Version 1.3.0rc1 is an unreleased preview candidate. It is not yet published as a
+              GitHub release or on PyPI, and the digest above comes from this build&apos;s manifest.
               PyPI publication is not yet available. Python 3.11 or newer is required.
               Secure project storage requires a POSIX filesystem with descriptor-relative operations
               and no-follow support. Windows is not currently supported for MCP local project storage.

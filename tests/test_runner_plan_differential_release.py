@@ -19,8 +19,9 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "release/open-core-v1.json"
 BUILDER = ROOT / "scripts/build_open_core_release.py"
 DOWNLOADS = ROOT / "apps/heel-cloud/public/downloads"
-WHEEL = "heel_sim-1.2.0-py3-none-any.whl"
-SDIST = "heel_sim-1.2.0.tar.gz"
+VERSION = "1.3.0rc1"
+WHEEL = f"heel_sim-{VERSION}-py3-none-any.whl"
+SDIST = f"heel_sim-{VERSION}.tar.gz"
 MANIFEST = "heel-open-core-manifest.json"
 NEW_MODULE = "heel/runner/plan_differential.py"
 EXTENDED = (
@@ -49,7 +50,7 @@ def test_r26_shipped_runner_modules_match_the_checked_in_wheel():
         for path in runner_modules:
             source = (ROOT / path).read_bytes()
             assert wheel.read(path) == source, path
-            member = sdist.extractfile("heel_sim-1.2.0/" + path)
+            member = sdist.extractfile(f"heel_sim-{VERSION}/" + path)
             assert member is not None and member.read() == source, path
 
     # The new module imports only shipped modules and the standard library; cryptography is
@@ -95,7 +96,7 @@ def test_r27_release_artifacts_are_current_and_exactly_three():
         assert built[name] == checked_in[name], f"generated artifact is stale: {name}"
 
     manifest = json.loads(checked_in[MANIFEST])
-    assert manifest["version"] == "1.2.0"
+    assert manifest["version"] == VERSION
     assert {item["name"]: (item["sha256"], item["size"]) for item in manifest["artifacts"]} == {
         name: (hashlib.sha256(checked_in[name]).hexdigest(), len(checked_in[name]))
         for name in (WHEEL, SDIST)

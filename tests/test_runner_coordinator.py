@@ -2034,3 +2034,187 @@ def test_stopped_valid_terminal_projection_is_sent_after_bounded_ack_and_unwind(
     assert len(results) == 1
     assert results[0][0] == lease.run_id
     assert results[0][1]["execution_disposition"] == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# T2b2R1: coordinator startup replay and context acquisition recover lost claim-chain authority
+# through the control client's one resync path (scripted transport; the HTTP gates are in
+# tests/test_runner_daemon.py).
+
+from heel.runner.control_client import RunnerChainRecoveryRequired  # noqa: E402
+
+_AUTH_REFUSED = (401, {}, {"schema_version": "heel.runner-error.v1", "code": "invalid_runner_auth"})
+
+
+class _DownOnce(ConnectionError):
+    pass
+
+
+def _signed_context_binding(identity, authority):
+    unsigned = {
+        "schema_version": "heel.runner-context-binding.v1",
+        "binding_id": "rcb_" + "a" * 32,
+        "workspace_id": identity.workspace_id,
+        "project_id": "prj_123456789",
+        "environment": {
+            "environment_id": "env_123456789", "origin": "https://staging.acme.dev",
+            "environment_class": "staging", "verification_record_digest": "0" * 64,
+        },
+        "runner_binding": {
+            "runner_id": identity.runner_id, "runner_key_id": identity.key_id,
+            "public_key_digest": identity.fingerprint,
+        },
+        "authorization": {"user_id": "owner", "role": "owner"},
+        "issued_at_ms": 1, "expires_at_ms": 60_001,
+    }
+    return {
+        **unsigned, "binding_digest": canonical_digest(unsigned),
+        **authority.sign(b"heel.runner-context-binding.v1\0" + canonical_bytes(unsigned)),
+    }
+
+
+class _RecoveryRoutes:
+    """Route-suffix scripted control plane recording the order of calls."""
+
+    def __init__(self, identity, artifact, *, fail_first=None):
+        self.identity, self.artifact = identity, artifact
+        self.fail_first = fail_first
+        self.calls: list[str] = []
+        self.refuse: list[str] = []
+        self.sequence = 1  # the server's claim-chain next sequence while the staged call is unrecorded
+
+    def post(self, path, *, headers, body):
+        name = path.rsplit("/", 1)[1] if "/resync/" not in path else "resync-" + path.rsplit("/", 1)[1]
+        name = "list" if path.endswith("/contexts/list") else name
+        self.calls.append(name)
+        if self.fail_first == name:
+            self.fail_first = None
+            raise _DownOnce()
+        if self.refuse and self.refuse[0] == name:
+            self.refuse.pop(0)
+            return _AUTH_REFUSED
+        if name == "resync-start":
+            return 200, {}, {
+                "schema_version": "heel.runner-resync-challenge.v2", "challenge_id": "rrs_" + "c" * 32,
+                "chain": {"operation": "claim", "run_id": None}, "server_challenge_b64": _nonce(b"s"),
+                "next_sequence": self.sequence, "expires_at_ms": 65_000, "generation": 0,
+            }
+        if name == "resync-complete":
+            return 200, {}, {
+                "schema_version": "heel.runner-resync-completed.v2", "chain": {"operation": "claim", "run_id": None},
+                "next_sequence": self.sequence, "next_nonce_b64": _nonce(b"r"), "expires_at_ms": 65_000, "generation": 1,
+            }
+        if name == "list":
+            item = self.artifact
+            return 200, {"X-Heel-Runner-Next-Nonce": _nonce(bytes([65 + len(self.calls)]))}, {
+                "schema_version": "heel.runner-context-list-result.v1", "server_time_ms": 2_000,
+                "contexts": [] if item is None else [{
+                    "binding_id": item["binding_id"], "binding_digest": item["binding_digest"],
+                    "project_id": item["project_id"], "environment_id": item["environment"]["environment_id"],
+                    "origin": item["environment"]["origin"], "environment_class": "staging",
+                    "verification_record_digest": "0" * 64, "expires_at_ms": 60_001, "claimed": False,
+                }], "has_more": False,
+            }
+        if path.endswith("/runners/" + self.identity.runner_id + "/claim"):
+            return 204, {"X-Heel-Runner-Next-Nonce": _nonce(b"j")}, None
+        assert path.endswith("/claim")
+        return 200, {"X-Heel-Runner-Next-Nonce": _nonce(bytes([97 + len(self.calls)]))}, {
+            "schema_version": "heel.runner-context-claim-result.v1", "context_binding": self.artifact,
+            "claimed_at_ms": 2_000,
+        }
+
+
+def _recovering_pair(tmp_path, *, with_binding):
+    _bound, identity, signer, _manifest, _projection = compiled_pair(tmp_path / "fixture")
+    store = RunnerStore(tmp_path / "unbound")
+    authority = SigningAuthority.generate()
+    artifact = _signed_context_binding(identity, authority) if with_binding else None
+    runtime = _control_runtime(tmp_path / "recovery-runtime.sqlite3", identity, signer)
+
+    def build(transport):
+        control = RunnerControlClient(
+            origin="https://control.example", workspace_id=identity.workspace_id,
+            runner_id=identity.runner_id, signer=signer, clock=lambda: 2_000,
+            transport=transport, nonce_source=lambda _chain: _nonce(b"c"),
+            resync_random_source=lambda count: b"k" * count,
+            trusted_disclosure_keys={authority.key_id: authority.public_key}, runtime=runtime,
+        )
+        return control, (lambda: RunnerCoordinator(
+            control=control, store=store, identity=identity, signer=signer,
+            trusted_grant_keys={authority.key_id: authority.public_key}, clock_ms=lambda: 2_000,
+        ))
+
+    return identity, store, artifact, runtime, build
+
+
+def test_startup_replay_supersedes_a_stale_staged_list_then_discovers_contexts(tmp_path):
+    identity, store, artifact, runtime, build = _recovering_pair(tmp_path, with_binding=False)
+    first = _RecoveryRoutes(identity, None, fail_first="list")
+    control, _coordinator_factory = build(first)
+    with pytest.raises(_DownOnce):
+        control.list_contexts()
+    assert [item.request_operation for item in runtime.load_pending_calls()] == ["list-contexts"]
+
+    routes = _RecoveryRoutes(identity, None)
+    routes.refuse = ["list"]  # the staged proof is now outside the server's window
+    _control, factory = build(routes)
+    coordinator = factory()  # constructor: replay -> refused -> one resync -> superseded
+    assert routes.calls == ["list", "resync-start", "resync-complete"]
+    assert coordinator.ensure_runner_context() is False
+    assert routes.calls[-1] == "list" and runtime.load_pending_calls() == ()
+    assert [item.request_operation for item in runtime.load_superseded_calls()] == ["list-contexts"]
+
+
+def test_startup_supersedes_a_lost_claim_context_and_reclaims_the_same_binding_once(tmp_path):
+    identity, store, artifact, runtime, build = _recovering_pair(tmp_path, with_binding=True)
+    control, _factory = build(_RecoveryRoutes(identity, artifact, fail_first="claim"))
+    control.list_contexts()
+    with pytest.raises(_DownOnce):
+        control.claim_context(artifact["binding_id"], artifact["binding_digest"])
+    assert [item.request_operation for item in runtime.load_pending_calls()] == ["claim-context"]
+
+    routes = _RecoveryRoutes(identity, artifact)
+    routes.refuse, routes.sequence = ["claim"], 2  # the first list was recorded
+    _control, factory = build(routes)
+    coordinator = factory()
+    assert coordinator.ensure_runner_context() is True
+    assert routes.calls == ["claim", "resync-start", "resync-complete", "list", "claim"]
+    assert store.is_context_bound
+    assert store.verify_cloud_context_binding(
+        identity=identity, trusted_cloud_keys=coordinator.trusted_grant_keys, now_ms=2_000,
+    )["binding_id"] == artifact["binding_id"]
+    assert [item.request_operation for item in runtime.load_superseded_calls()] == ["claim-context"]
+    assert runtime.load_pending_calls() == ()
+
+
+def test_startup_supersedes_a_never_recorded_job_claim_and_the_next_poll_is_fresh(tmp_path):
+    identity, store, artifact, runtime, build = _recovering_pair(tmp_path, with_binding=False)
+    first = _RecoveryRoutes(identity, None, fail_first="claim")
+    control, _factory = build(first)
+    with pytest.raises(_DownOnce):
+        control.claim()
+    (staged,) = runtime.load_pending_calls()
+
+    routes = _RecoveryRoutes(identity, None)
+    routes.refuse = ["claim"]
+    control, factory = build(routes)
+    coordinator = factory()  # replay -> refused -> resync proves N == S -> superseded, not re-issued
+    assert routes.calls == ["claim", "resync-start", "resync-complete"]
+    assert [item.call_id for item in runtime.load_superseded_calls()] == [staged.call_id]
+    assert coordinator.claim() is None  # the loop's next poll: a new signed claim, idle
+    assert routes.calls[-1] == "claim" and runtime.load_pending_calls() == ()
+
+
+def test_startup_keeps_a_job_claim_whose_sequence_the_server_consumed(tmp_path):
+    identity, store, artifact, runtime, build = _recovering_pair(tmp_path, with_binding=False)
+    control, _factory = build(_RecoveryRoutes(identity, None, fail_first="claim"))
+    with pytest.raises(_DownOnce):
+        control.claim()
+    (staged,) = runtime.load_pending_calls()
+    routes = _RecoveryRoutes(identity, None)
+    routes.refuse, routes.sequence = ["claim"], 2  # the server cursor moved past the staged claim
+    _control, factory = build(routes)
+    with pytest.raises(RunnerChainRecoveryRequired) as raised:
+        factory()
+    assert (raised.value.operation, raised.value.reason) == ("claim", "claim_sequence_consumed")
+    assert runtime.load_pending_calls() == (staged,) and runtime.load_superseded_calls() == ()

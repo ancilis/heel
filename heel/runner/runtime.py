@@ -34,7 +34,8 @@ from heel.runner.identity import (
 
 _SCHEMA_V1 = "heel.runner-runtime-state.v1"
 _SCHEMA_V2 = "heel.runner-runtime-state.v2"
-_SCHEMA = "heel.runner-runtime-state.v3"
+_SCHEMA_V3 = "heel.runner-runtime-state.v3"
+_SCHEMA = "heel.runner-runtime-state.v4"
 _SEAL_DOMAIN = b"heel.runner-runtime-state-seal.v1\0"
 _STATE_KEY_WRAP_DOMAIN = b"heel.runner-runtime-state-key-wrap.v1\0"
 _DIGEST_DOMAIN = b"heel.runner-runtime-state-digest.v1\0"
@@ -42,6 +43,15 @@ _ACTIVE_STATE_DIGEST_DOMAIN = b"heel.runner-active-run-state-digest.v1\0"
 _AUTHORITY_IDENTITY_DOMAIN = b"heel.runner-runtime-authority-identity.v1\0"
 _RUNTIME_PRUNED_RECEIPT_DOMAIN = b"heel.local-run-pruned.v2\0"
 _MAX_SAFE_INT = 9_007_199_254_740_991
+# Bounded audit retention: the newest tombstones are kept, the oldest beyond this count are
+# reclaimed when a new one is written (documented in docs/PLAN_DIFFERENTIAL_RUNNER.md).
+_MAX_SUPERSEDED_CALLS = 512
+# Staged claim-chain intents an accepted resync may retire. The context calls are idempotent to
+# re-issue; a job ``claim`` is not, and is retired only on the server's own proof that its sequence
+# was never consumed (T2b2R1D cursor-equality ruling, see ``commit_resync_supersession``).
+_SUPERSEDABLE_OPERATIONS = frozenset({"list-contexts", "claim-context", "claim"})
+_RESYNC_ATTEMPT_SCHEMA = "heel.runner-resync-attempt.v1"
+_SUPERSEDED_CALL_SCHEMA = "heel.runner-superseded-call.v1"
 _DIGEST = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _RUN_ID = re.compile(r"^crun_[0-9a-f]{32}$", re.ASCII)
 _B64_32 = re.compile(r"^[A-Za-z0-9+/]{43}=$", re.ASCII)
@@ -98,10 +108,12 @@ _RUNTIME_INODE_GUARD_BOOTSTRAP = (
 
 _RUNTIME_TABLES = (
     "metadata", "control_chains", "pending_calls", "terminal_disclosures", "active_runs",
+    "chain_recovery",
 )
 _RUNTIME_INDEXES = (
     "idx_pending_calls_created", "idx_terminal_disclosures_state_retention",
     "idx_terminal_disclosures_due_retention", "idx_pending_calls_run_operation",
+    "idx_chain_recovery_attempt", "idx_chain_recovery_kind_created",
 )
 _RUNTIME_OWNED_NAMES = frozenset((*_RUNTIME_TABLES, *_RUNTIME_INDEXES))
 
@@ -155,6 +167,27 @@ _V3_SCHEMA_SQL = (
     "CREATE INDEX idx_terminal_disclosures_due_retention ON terminal_disclosures(retention_expires_at_ms,run_hash) WHERE state IN ('local_terminal','available','consumed')",
 )
 
+# v4 (T2b2R1) = v3 plus the claim-chain recovery records: at most one in-flight resync attempt
+# per chain (its exact signed start/complete bytes, for byte-identical retransmission) and the
+# sealed tombstones of staged calls an accepted resync superseded.  Every v3 table is unchanged.
+_V4_METADATA_SQL = _V3_SCHEMA_SQL[0].replace(
+    "CHECK(schema_version='heel.runner-runtime-state.v3')",
+    "CHECK(schema_version='heel.runner-runtime-state.v4')",
+)
+assert _V4_METADATA_SQL != _V3_SCHEMA_SQL[0]
+_V4_RECOVERY_SQL = (
+    "CREATE TABLE chain_recovery("
+    "record_id TEXT PRIMARY KEY CHECK(length(record_id)=64 AND record_id NOT GLOB '*[^0-9a-f]*'),"
+    "kind TEXT NOT NULL CHECK(kind IN ('resync_attempt','superseded_call')),"
+    "chain TEXT NOT NULL CHECK(length(chain)=64 AND chain NOT GLOB '*[^0-9a-f]*'),"
+    "generation INTEGER NOT NULL CHECK(generation BETWEEN 0 AND 9007199254740991),"
+    "sealed_blob BLOB NOT NULL CHECK(typeof(sealed_blob)='blob' AND length(sealed_blob) BETWEEN 29 AND 16384),"
+    "created_at_ms INTEGER NOT NULL CHECK(created_at_ms BETWEEN 0 AND 9007199254740991))",
+    "CREATE UNIQUE INDEX idx_chain_recovery_attempt ON chain_recovery(chain) WHERE kind='resync_attempt'",
+    "CREATE INDEX idx_chain_recovery_kind_created ON chain_recovery(kind,created_at_ms,record_id)",
+)
+_V4_SCHEMA_SQL = (_V4_METADATA_SQL, *_V3_SCHEMA_SQL[1:], *_V4_RECOVERY_SQL)
+
 _V2_SCHEMA_SQL = (
     "CREATE TABLE metadata("
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
@@ -196,6 +229,10 @@ class RunnerRuntimeUnavailable(RuntimeError):
 
 class RunnerRuntimeConflict(RunnerRuntimeStateError):
     """Retryable compare-and-swap, pending-call, or capacity conflict."""
+
+
+class RuntimeClaimSequenceConsumed(RunnerRuntimeConflict):
+    """The accepted resync shows the staged job claim's sequence was consumed: it is kept."""
 
 
 class RunnerRuntimeCorrupt(RunnerRuntimeStateError):
@@ -331,6 +368,52 @@ class PendingSignedCall:
     def pending_state_digest(self) -> str:
         """The authenticated sealed pending-record digest used by recovery CAS."""
         return self.state_digest
+
+
+@dataclass(frozen=True, slots=True)
+class ChainResyncAttempt:
+    """One in-flight claim-chain resync: its exact signed requests and the server challenge."""
+
+    attempt_id: str
+    operation: str
+    run_id: str | None
+    base_generation: int
+    start_path: str
+    start_headers: Mapping[str, str]
+    start_body: bytes
+    client_nonce_b64: str
+    start_timestamp_ms: int
+    challenge_id: str | None
+    server_challenge_b64: str | None
+    challenge_next_sequence: int | None
+    challenge_generation: int | None
+    challenge_expires_at_ms: int | None
+    complete_path: str | None
+    complete_headers: Mapping[str, str] | None
+    complete_body: bytes | None
+    complete_timestamp_ms: int | None
+    created_at_ms: int
+    state_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class SupersededCallRecord:
+    """The public audit view of a sealed tombstone; the sealed row also keeps the exact request."""
+
+    record_id: str
+    call_id: str
+    request_operation: str
+    path: str
+    body_sha256: str
+    sequence: int
+    generation: int
+    superseded_by_generation: int
+    resync_challenge_id: str
+    challenge_next_sequence: int
+    completed_next_sequence: int
+    created_at_ms: int
+    superseded_at_ms: int
+    state_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1214,6 +1297,8 @@ class RunnerRuntimeState:
             return "v2"
         if self._schema_matches(conn, _V3_SCHEMA_SQL):
             return "v3"
+        if self._schema_matches(conn, _V4_SCHEMA_SQL):
+            return "v4"
         raise RunnerRuntimeCorrupt("runtime state schema is invalid")
 
     @staticmethod
@@ -1265,7 +1350,7 @@ class RunnerRuntimeState:
         conn.execute(
             "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext) "
             "SELECT singleton,?,workspace_id,runner_id,runner_key_id,public_key_digest,1,?,NULL,state_key_ciphertext FROM metadata_v2",
-            (_SCHEMA, self._authority_digest_for(self.identity)),
+            (_SCHEMA_V3, self._authority_digest_for(self.identity)),
         )
         conn.execute(
             "INSERT INTO control_chains(chain,run_hash,operation,next_sequence,generation,sealed_blob,updated_at_ms) "
@@ -1282,6 +1367,25 @@ class RunnerRuntimeState:
         for table in ("metadata_v2", "control_chains_v2", "pending_calls_v2", "terminal_disclosures_v2"):
             conn.execute(f"DROP TABLE {table}")
         self._assert_schema_parity(conn, _V3_SCHEMA_SQL)
+
+    def _upgrade_v3_to_v4(self, conn: sqlite3.Connection) -> None:
+        """Add the recovery-record table; every v3 row (metadata included) is kept byte for byte."""
+        if not self._schema_matches(conn, _V3_SCHEMA_SQL):
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        self._validate_opaque_authority_rows(conn)
+        conn.execute("ALTER TABLE metadata RENAME TO metadata_v3")
+        conn.execute(_V4_METADATA_SQL)
+        changed = conn.execute(
+            "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext) "
+            "SELECT singleton,?,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext FROM metadata_v3 "
+            "WHERE schema_version=?",
+            (_SCHEMA, _SCHEMA_V3),
+        )
+        if changed.rowcount != 1:
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        conn.execute("DROP TABLE metadata_v3")
+        self._execute_schema(conn, _V4_RECOVERY_SQL)
+        self._assert_schema_parity(conn, _V4_SCHEMA_SQL)
 
     def _validate_opaque_authority_rows(self, conn: sqlite3.Connection) -> None:
         """Authenticate the legacy opaque index before a byte-for-byte v3 copy."""
@@ -1327,7 +1431,7 @@ class RunnerRuntimeState:
                 raise RunnerRuntimeCorrupt("runtime terminal disclosure index is invalid")
 
     def _validate_open_runtime(self, conn: sqlite3.Connection, *, allow_rotation_fence: bool = False) -> None:
-        self._assert_schema_parity(conn, _V3_SCHEMA_SQL)
+        self._assert_schema_parity(conn, _V4_SCHEMA_SQL)
         if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal" or conn.execute(
             "PRAGMA secure_delete"
         ).fetchone()[0] != 1 or conn.execute("PRAGMA synchronous").fetchone()[0] != 2:
@@ -1354,7 +1458,10 @@ class RunnerRuntimeState:
         if row["rotation_fence_digest"] is not None and not allow_rotation_fence:
             _digest(row["rotation_fence_digest"], "runtime rotation fence digest")
             raise RunnerRuntimeConflict("runtime rotation is in progress")
-        limits = {"control_chains": 257, "pending_calls": 74, "active_runs": 64}
+        limits = {
+            "control_chains": 257, "pending_calls": 74, "active_runs": 64,
+            "chain_recovery": _MAX_SUPERSEDED_CALLS + 257,
+        }
         for table, limit in limits.items():
             if conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] > limit:
                 raise RunnerRuntimeCorrupt("runtime state capacity is invalid")
@@ -1364,7 +1471,7 @@ class RunnerRuntimeState:
         try:
             state = self._classify_schema(conn)
             if state == "none":
-                self._execute_schema(conn, _V3_SCHEMA_SQL)
+                self._execute_schema(conn, _V4_SCHEMA_SQL)
                 state_key = self._random_source(32)
                 if type(state_key) is not bytes or len(state_key) != 32:
                     raise RunnerRuntimeCorrupt("runtime state random source returned an invalid key")
@@ -1389,13 +1496,16 @@ class RunnerRuntimeState:
                 if not self._key:
                     self._key = self._unwrap_state_key(row["state_key_ciphertext"])
                 self._upgrade_v2_to_v3(conn)
-            elif state == "v3":
+                self._upgrade_v3_to_v4(conn)
+            elif state in {"v3", "v4"}:
                 row = conn.execute("SELECT * FROM metadata WHERE singleton=1").fetchone()
-                if row is None or row["schema_version"] != _SCHEMA or tuple(
+                if row is None or row["schema_version"] != (_SCHEMA_V3 if state == "v3" else _SCHEMA) or tuple(
                     row[key] for key in ("workspace_id", "runner_id", "runner_key_id", "public_key_digest")
                 ) != self._identity_values():
                     raise RunnerRuntimeCorrupt("runtime state belongs to another runner identity")
                 self._key = self._unwrap_state_key(row["state_key_ciphertext"])
+                if state == "v3":
+                    self._upgrade_v3_to_v4(conn)
             self._validate_open_runtime(conn, allow_rotation_fence=allow_rotation_fence)
             conn.execute("COMMIT")
         except BaseException:
@@ -1737,6 +1847,10 @@ class RunnerRuntimeState:
                     raise RunnerRuntimeConflict("runtime rotation is in progress")
                 if conn.execute("SELECT 1 FROM pending_calls LIMIT 1").fetchone() is not None:
                     raise RunnerRuntimeConflict("runtime rotation has pending calls")
+                if conn.execute(
+                    "SELECT 1 FROM chain_recovery WHERE kind='resync_attempt' LIMIT 1"
+                ).fetchone() is not None:
+                    raise RunnerRuntimeConflict("runtime rotation has a pending chain recovery")
                 if conn.execute("SELECT 1 FROM active_runs LIMIT 1").fetchone() is not None:
                     raise RunnerRuntimeConflict("runtime rotation has active runs")
                 if conn.execute("SELECT 1 FROM terminal_disclosures LIMIT 1").fetchone() is not None:
@@ -1784,6 +1898,10 @@ class RunnerRuntimeState:
                     raise RunnerRuntimeConflict("runtime rotation is in progress")
                 if conn.execute("SELECT 1 FROM pending_calls LIMIT 1").fetchone() is not None:
                     raise RunnerRuntimeConflict("runtime rotation has pending calls")
+                if conn.execute(
+                    "SELECT 1 FROM chain_recovery WHERE kind='resync_attempt' LIMIT 1"
+                ).fetchone() is not None:
+                    raise RunnerRuntimeConflict("runtime rotation has a pending chain recovery")
                 if conn.execute("SELECT 1 FROM active_runs LIMIT 1").fetchone() is not None:
                     raise RunnerRuntimeConflict("runtime rotation has active runs")
                 if conn.execute("SELECT 1 FROM terminal_disclosures LIMIT 1").fetchone() is not None:
@@ -1907,6 +2025,10 @@ class RunnerRuntimeState:
                             raise RunnerRuntimeCorrupt("runtime rotation eligibility is invalid")
                         if conn.execute("SELECT 1 FROM pending_calls LIMIT 1").fetchone() is not None:
                             raise RunnerRuntimeConflict("runtime rotation has pending calls")
+                        if conn.execute(
+                            "SELECT 1 FROM chain_recovery WHERE kind='resync_attempt' LIMIT 1"
+                        ).fetchone() is not None:
+                            raise RunnerRuntimeConflict("runtime rotation has a pending chain recovery")
                         rows = conn.execute(
                             "SELECT chain,run_hash,operation,sealed_blob FROM control_chains"
                         ).fetchall()
@@ -2112,6 +2234,694 @@ class RunnerRuntimeState:
     @staticmethod
     def _canonical_b64(value: bytes) -> str:
         return base64.b64encode(value).decode("ascii")
+
+    # ------------------------------------------------------------------ chain recovery (v4)
+    def _seal_stable(self, core: Mapping[str, Any], *, schema: str, record_id: str) -> bytes:
+        """Seal under the stable state key bound only to (schema, record) so audit survives rotation."""
+        nonce = self._random_source(12)
+        if type(nonce) is not bytes or len(nonce) != 12:
+            raise RunnerRuntimeCorrupt("runtime state random source returned an invalid nonce")
+        aad = "\0".join((schema, record_id)).encode("utf-8")
+        return nonce + self._crypto.aead(self._key).encrypt(nonce, canonical_bytes(dict(core)), aad)
+
+    def _open_stable(self, value: object, *, schema: str, record_id: str) -> dict[str, Any]:
+        if type(value) is not bytes or len(value) <= 28:
+            raise RunnerRuntimeCorrupt("runtime state sealed record is invalid")
+        try:
+            plaintext = self._crypto.aead(self._key).decrypt(
+                value[:12], value[12:], "\0".join((schema, record_id)).encode("utf-8"),
+            )
+            decoded = json.loads(plaintext)
+        except Exception as exc:
+            raise RunnerRuntimeCorrupt("runtime state sealed record is invalid") from exc
+        if not isinstance(decoded, dict) or canonical_bytes(decoded) != plaintext:
+            raise RunnerRuntimeCorrupt("runtime state sealed record is invalid")
+        return decoded
+
+    def _resync_path(self, phase: str) -> str:
+        return (
+            f"/v1/workspaces/{self.identity.workspace_id}/runners/{self.identity.runner_id}"
+            f"/resync/{phase}"
+        )
+
+    def _validate_resync_request(
+        self, phase: str, *, path: object, headers: object, body: object, timestamp_ms: object,
+    ) -> tuple[str, dict[str, str], bytes, int, dict[str, Any]]:
+        """Accept only the fixed, correctly self-signed resync request this runner would send."""
+        if path != self._resync_path(phase) or type(body) is not bytes or len(body) > 2048:
+            raise RunnerRuntimeStateError("invalid runtime resync request")
+        timestamp_ms = _safe_int(timestamp_ms, "runtime resync request time")
+        expected = {
+            "Content-Type", "X-Heel-Runner-Id", "X-Heel-Runner-Key-Id",
+            "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Signature",
+        }
+        if not isinstance(headers, Mapping) or set(headers) != expected or any(
+            type(key) is not str or type(value) is not str for key, value in headers.items()
+        ):
+            raise RunnerRuntimeStateError("invalid runtime resync request")
+        values = dict(headers)
+        if (
+            values["Content-Type"] != "application/json"
+            or values["X-Heel-Runner-Id"] != self.identity.runner_id
+            or values["X-Heel-Runner-Key-Id"] != self.identity.key_id
+            or values["X-Heel-Runner-Timestamp-Ms"] != str(timestamp_ms)
+        ):
+            raise RunnerRuntimeStateError("invalid runtime resync request")
+        try:
+            decoded = json.loads(body)
+        except (TypeError, ValueError):
+            raise RunnerRuntimeStateError("invalid runtime resync request") from None
+        if not isinstance(decoded, dict) or canonical_bytes(decoded) != body:
+            raise RunnerRuntimeStateError("invalid runtime resync request")
+        try:
+            signature = base64.b64decode(values["X-Heel-Runner-Signature"], validate=True)
+        except (TypeError, ValueError):
+            raise RunnerRuntimeStateError("invalid runtime resync request") from None
+        if len(signature) != 64 or self._canonical_b64(signature) != values["X-Heel-Runner-Signature"]:
+            raise RunnerRuntimeStateError("invalid runtime resync request")
+        proof = {
+            "schema_version": f"heel.runner-resync-{phase}-proof.v2",
+            "workspace_id": self.identity.workspace_id, "runner_id": self.identity.runner_id,
+            "key_id": self.identity.key_id, "method": "POST", "path": path,
+            "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms,
+        }
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            Ed25519PublicKey.from_public_bytes(self.signer.public_key).verify(
+                signature, f"heel.runner-resync-{phase}-pop.v2".encode("ascii") + b"\0" + canonical_bytes(proof),
+            )
+        except Exception as exc:
+            raise RunnerRuntimeStateError("invalid runtime resync request") from exc
+        return path, values, body, timestamp_ms, decoded
+
+    def _attempt_from_core(self, value: Mapping[str, Any], *, record_id: str) -> ChainResyncAttempt:
+        fields = {
+            "schema_version", "workspace_id", "runner_id", "runner_key_id", "attempt_id",
+            "operation", "run_id", "base_generation", "start", "challenge", "complete",
+            "created_at_ms", "updated_at_ms", "state_digest",
+        }
+        try:
+            if (
+                set(value) != fields or value["schema_version"] != _RESYNC_ATTEMPT_SCHEMA
+                or value["attempt_id"] != record_id
+                or value["workspace_id"] != self.identity.workspace_id
+                or value["runner_id"] != self.identity.runner_id
+                or value["runner_key_id"] != self.identity.key_id
+                or value["operation"] != "claim" or value["run_id"] is not None
+                or value["state_digest"] != _state_digest(
+                    {key: value[key] for key in fields if key != "state_digest"}
+                )
+            ):
+                raise ValueError
+            start = value["start"]
+            if not isinstance(start, dict) or set(start) != {
+                "path", "headers", "body_b64", "client_nonce_b64", "timestamp_ms",
+            }:
+                raise ValueError
+            start_body = base64.b64decode(start["body_b64"], validate=True)
+            path, headers, body, timestamp_ms, decoded = self._validate_resync_request(
+                "start", path=start["path"], headers=start["headers"], body=start_body,
+                timestamp_ms=start["timestamp_ms"],
+            )
+            client_nonce = _nonce(start["client_nonce_b64"], "runtime resync client nonce")
+            if decoded != {
+                "schema_version": "heel.runner-resync-start.v2",
+                "chain": {"operation": "claim", "run_id": None}, "client_nonce_b64": client_nonce,
+            }:
+                raise ValueError
+            challenge = value["challenge"]
+            challenge_values: tuple[Any, ...] = (None,) * 5
+            if challenge is not None:
+                if not isinstance(challenge, dict) or set(challenge) != {
+                    "challenge_id", "server_challenge_b64", "next_sequence", "generation", "expires_at_ms",
+                }:
+                    raise ValueError
+                challenge_id = challenge["challenge_id"]
+                if (
+                    type(challenge_id) is not str or len(challenge_id) != 36
+                    or not challenge_id.startswith("rrs_")
+                    or any(char not in "0123456789abcdef" for char in challenge_id[4:])
+                ):
+                    raise ValueError
+                challenge_values = (
+                    challenge_id, _nonce(challenge["server_challenge_b64"], "runtime resync challenge"),
+                    _safe_int(challenge["next_sequence"], "runtime resync sequence", minimum=1),
+                    _safe_int(challenge["generation"], "runtime resync generation"),
+                    _safe_int(challenge["expires_at_ms"], "runtime resync expiry", minimum=1),
+                )
+                if challenge_values[3] < value["base_generation"]:
+                    raise ValueError
+            complete = value["complete"]
+            complete_values: tuple[Any, ...] = (None,) * 4
+            if complete is not None:
+                if challenge is None or not isinstance(complete, dict) or set(complete) != {
+                    "path", "headers", "body_b64", "timestamp_ms",
+                }:
+                    raise ValueError
+                complete_body = base64.b64decode(complete["body_b64"], validate=True)
+                c_path, c_headers, c_body, c_timestamp, c_decoded = self._validate_resync_request(
+                    "complete", path=complete["path"], headers=complete["headers"], body=complete_body,
+                    timestamp_ms=complete["timestamp_ms"],
+                )
+                if c_decoded != {
+                    "schema_version": "heel.runner-resync-complete.v2",
+                    "challenge_id": challenge_values[0],
+                    "chain": {"operation": "claim", "run_id": None},
+                    "client_nonce_b64": client_nonce, "server_challenge_b64": challenge_values[1],
+                    "generation": challenge_values[3],
+                }:
+                    raise ValueError
+                complete_values = (c_path, MappingProxyType(c_headers), c_body, c_timestamp)
+            return ChainResyncAttempt(
+                attempt_id=_digest(record_id, "runtime resync attempt ID"),
+                operation="claim", run_id=None,
+                base_generation=_safe_int(value["base_generation"], "runtime resync base generation"),
+                start_path=path, start_headers=MappingProxyType(headers), start_body=body,
+                client_nonce_b64=client_nonce, start_timestamp_ms=timestamp_ms,
+                challenge_id=challenge_values[0], server_challenge_b64=challenge_values[1],
+                challenge_next_sequence=challenge_values[2], challenge_generation=challenge_values[3],
+                challenge_expires_at_ms=challenge_values[4],
+                complete_path=complete_values[0], complete_headers=complete_values[1],
+                complete_body=complete_values[2], complete_timestamp_ms=complete_values[3],
+                created_at_ms=_safe_int(value["created_at_ms"], "runtime resync time"),
+                state_digest=_digest(value["state_digest"], "runtime resync attempt digest"),
+            )
+        except (KeyError, TypeError, ValueError, RunnerRuntimeStateError) as exc:
+            if isinstance(exc, RunnerRuntimeCorrupt):
+                raise
+            raise RunnerRuntimeCorrupt("runtime resync attempt is invalid") from None
+
+    def _load_attempt_row_locked(self, conn: sqlite3.Connection) -> tuple[sqlite3.Row, dict[str, Any], ChainResyncAttempt] | None:
+        chain = self._chain_key("claim", None)
+        rows = conn.execute(
+            "SELECT record_id,chain,generation,created_at_ms,sealed_blob FROM chain_recovery "
+            "WHERE kind='resync_attempt' AND chain=?", (chain,),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise RunnerRuntimeCorrupt("runtime resync attempt index is invalid")
+        row = rows[0]
+        core = self._open(row["sealed_blob"], schema=_RESYNC_ATTEMPT_SCHEMA, primary_fields=(row["record_id"],))
+        attempt = self._attempt_from_core(core, record_id=row["record_id"])
+        if row["generation"] != attempt.base_generation or row["created_at_ms"] != attempt.created_at_ms:
+            raise RunnerRuntimeCorrupt("runtime resync attempt index is invalid")
+        return row, core, attempt
+
+    def load_resync_attempt(self, operation: str = "claim", run_id: str | None = None) -> ChainResyncAttempt | None:
+        if operation != "claim" or run_id is not None:
+            raise RunnerRuntimeStateError("runtime resync recovery is claim-chain only")
+        with self._connection() as conn:
+            loaded = self._load_attempt_row_locked(conn)
+        return None if loaded is None else loaded[2]
+
+    def _write_attempt_locked(
+        self, conn: sqlite3.Connection, core_without_digest: dict[str, Any], *, insert: bool,
+    ) -> ChainResyncAttempt:
+        core = {**core_without_digest, "state_digest": _state_digest(core_without_digest)}
+        record_id = core["attempt_id"]
+        attempt = self._attempt_from_core(core, record_id=record_id)
+        blob = self._seal(core, schema=_RESYNC_ATTEMPT_SCHEMA, primary_fields=(record_id,))
+        if len(blob) > 16384:
+            raise RunnerRuntimeStateError("runtime resync attempt exceeds size limit")
+        if insert:
+            conn.execute(
+                "INSERT INTO chain_recovery(record_id,kind,chain,generation,sealed_blob,created_at_ms) "
+                "VALUES(?,'resync_attempt',?,?,?,?)",
+                (record_id, self._chain_key("claim", None), attempt.base_generation, blob, attempt.created_at_ms),
+            )
+        else:
+            changed = conn.execute(
+                "UPDATE chain_recovery SET sealed_blob=? WHERE record_id=? AND kind='resync_attempt'",
+                (blob, record_id),
+            )
+            if changed.rowcount != 1:
+                raise RunnerRuntimeConflict("runtime resync attempt changed")
+        return attempt
+
+    def _current_attempt_locked(
+        self, conn: sqlite3.Connection, attempt: ChainResyncAttempt,
+    ) -> dict[str, Any]:
+        if not isinstance(attempt, ChainResyncAttempt):
+            raise RunnerRuntimeStateError("invalid runtime resync attempt")
+        loaded = self._load_attempt_row_locked(conn)
+        if loaded is None or loaded[2] != attempt:
+            raise RunnerRuntimeConflict("runtime resync attempt changed")
+        return loaded[1]
+
+    def begin_resync_attempt(
+        self, *, operation: str, path: str, headers: Mapping[str, str], body: bytes,
+        client_nonce_b64: str, timestamp_ms: int, now_ms: int, run_id: str | None = None,
+    ) -> ChainResyncAttempt:
+        """Durably record a fresh start request before it is sent.
+
+        Only when no attempt exists: an existing row is opened and validated first, so a corrupt one
+        fails closed with every byte kept, and a valid unfinished one is a conflict (its exact
+        requests may still match a live server challenge). The caller discards that exact attempt
+        first (``discard_resync_attempt``, compare-and-swap) when the server refused it.
+        """
+        if operation != "claim" or run_id is not None:
+            raise RunnerRuntimeStateError("runtime resync recovery is claim-chain only")
+        now_ms = _safe_int(now_ms, "runtime resync time")
+        path, values, body, timestamp_ms, decoded = self._validate_resync_request(
+            "start", path=path, headers=headers, body=body, timestamp_ms=timestamp_ms,
+        )
+        client_nonce_b64 = _nonce(client_nonce_b64, "runtime resync client nonce")
+        if decoded != {
+            "schema_version": "heel.runner-resync-start.v2",
+            "chain": {"operation": "claim", "run_id": None}, "client_nonce_b64": client_nonce_b64,
+        }:
+            raise RunnerRuntimeStateError("invalid runtime resync request")
+        attempt_id = hashlib.sha256(b"heel.runner-resync-attempt-id.v1\0" + canonical_bytes({
+            "workspace_id": self.identity.workspace_id, "runner_id": self.identity.runner_id,
+            "runner_key_id": self.identity.key_id, "operation": "claim",
+            "client_nonce_b64": client_nonce_b64, "timestamp_ms": timestamp_ms,
+        })).hexdigest()
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._load_chain_locked(conn, "claim", None)
+                if cursor is None:
+                    raise RunnerRuntimeConflict("runtime resync chain is unavailable")
+                if self._load_attempt_row_locked(conn) is not None:
+                    raise RunnerRuntimeConflict("runtime resync attempt already exists")
+                attempt = self._write_attempt_locked(conn, {
+                    "schema_version": _RESYNC_ATTEMPT_SCHEMA,
+                    "workspace_id": self.identity.workspace_id, "runner_id": self.identity.runner_id,
+                    "runner_key_id": self.identity.key_id, "attempt_id": attempt_id,
+                    "operation": "claim", "run_id": None, "base_generation": cursor.generation,
+                    "start": {
+                        "path": path, "headers": values, "body_b64": self._canonical_b64(body),
+                        "client_nonce_b64": client_nonce_b64, "timestamp_ms": timestamp_ms,
+                    },
+                    "challenge": None, "complete": None,
+                    "created_at_ms": now_ms, "updated_at_ms": now_ms,
+                }, insert=True)
+                conn.execute("COMMIT")
+                return attempt
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def record_resync_challenge(
+        self, attempt: ChainResyncAttempt, *, challenge_id: str, server_challenge_b64: str,
+        next_sequence: int, generation: int, expires_at_ms: int, now_ms: int,
+    ) -> ChainResyncAttempt:
+        now_ms = _safe_int(now_ms, "runtime resync time")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                core = self._current_attempt_locked(conn, attempt)
+                if core["challenge"] is not None:
+                    raise RunnerRuntimeConflict("runtime resync attempt changed")
+                cursor = self._load_chain_locked(conn, "claim", None)
+                if cursor is None or type(generation) is not int or generation < cursor.generation:
+                    raise RunnerRuntimeCorrupt("runtime resync challenge generation regressed")
+                updated = {key: value for key, value in core.items() if key != "state_digest"}
+                updated.update(challenge={
+                    "challenge_id": challenge_id, "server_challenge_b64": server_challenge_b64,
+                    "next_sequence": next_sequence, "generation": generation,
+                    "expires_at_ms": expires_at_ms,
+                }, updated_at_ms=now_ms)
+                result = self._write_attempt_locked(conn, updated, insert=False)
+                conn.execute("COMMIT")
+                return result
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def record_resync_completion(
+        self, attempt: ChainResyncAttempt, *, path: str, headers: Mapping[str, str], body: bytes,
+        timestamp_ms: int, now_ms: int,
+    ) -> ChainResyncAttempt:
+        """Durably record the exact completion request before it is sent (byte-identical retry)."""
+        now_ms = _safe_int(now_ms, "runtime resync time")
+        path, values, body, timestamp_ms, _decoded = self._validate_resync_request(
+            "complete", path=path, headers=headers, body=body, timestamp_ms=timestamp_ms,
+        )
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                core = self._current_attempt_locked(conn, attempt)
+                if core["challenge"] is None or core["complete"] is not None:
+                    raise RunnerRuntimeConflict("runtime resync attempt changed")
+                updated = {key: value for key, value in core.items() if key != "state_digest"}
+                updated.update(complete={
+                    "path": path, "headers": values, "body_b64": self._canonical_b64(body),
+                    "timestamp_ms": timestamp_ms,
+                }, updated_at_ms=now_ms)
+                result = self._write_attempt_locked(conn, updated, insert=False)
+                conn.execute("COMMIT")
+                return result
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def replace_resync_challenge(
+        self, attempt: ChainResyncAttempt, *, challenge_id: str, server_challenge_b64: str,
+        next_sequence: int, generation: int, expires_at_ms: int, now_ms: int,
+    ) -> ChainResyncAttempt:
+        """Adopt the server's NEW challenge for this attempt's exact start; the old completion goes.
+
+        Only when the recorded challenge was answered (the server holds no pending one for this
+        start any more and answered the byte-identical start with another): leaving that new
+        challenge unanswered would orphan it on the server. Compare-and-swap on the attempt.
+        """
+        now_ms = _safe_int(now_ms, "runtime resync time")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                core = self._current_attempt_locked(conn, attempt)
+                if core["challenge"] is None or core["challenge"]["challenge_id"] == challenge_id:
+                    raise RunnerRuntimeConflict("runtime resync attempt changed")
+                cursor = self._load_chain_locked(conn, "claim", None)
+                if cursor is None or type(generation) is not int or generation < cursor.generation:
+                    raise RunnerRuntimeCorrupt("runtime resync challenge generation regressed")
+                updated = {key: value for key, value in core.items() if key != "state_digest"}
+                updated.update(challenge={
+                    "challenge_id": challenge_id, "server_challenge_b64": server_challenge_b64,
+                    "next_sequence": next_sequence, "generation": generation,
+                    "expires_at_ms": expires_at_ms,
+                }, complete=None, updated_at_ms=now_ms)
+                result = self._write_attempt_locked(conn, updated, insert=False)
+                conn.execute("COMMIT")
+                return result
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def resign_resync_completion(
+        self, attempt: ChainResyncAttempt, *, path: str, headers: Mapping[str, str], body: bytes,
+        timestamp_ms: int, now_ms: int,
+    ) -> ChainResyncAttempt:
+        """Replace the recorded completion's proof with a newer one over the byte-identical body.
+
+        The path and body must equal the recorded completion exactly (same challenge, nonces and
+        generation); only the signed timestamp and signature change. Durable before it is sent.
+        """
+        now_ms = _safe_int(now_ms, "runtime resync time")
+        path, values, body, timestamp_ms, _decoded = self._validate_resync_request(
+            "complete", path=path, headers=headers, body=body, timestamp_ms=timestamp_ms,
+        )
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                core = self._current_attempt_locked(conn, attempt)
+                recorded = core["complete"]
+                if (
+                    recorded is None or recorded["path"] != path
+                    or recorded["body_b64"] != self._canonical_b64(body)
+                ):
+                    raise RunnerRuntimeConflict("runtime resync attempt changed")
+                updated = {key: value for key, value in core.items() if key != "state_digest"}
+                updated.update(complete={
+                    "path": path, "headers": values, "body_b64": self._canonical_b64(body),
+                    "timestamp_ms": timestamp_ms,
+                }, updated_at_ms=now_ms)
+                result = self._write_attempt_locked(conn, updated, insert=False)
+                conn.execute("COMMIT")
+                return result
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def discard_resync_attempt(self, attempt: ChainResyncAttempt) -> None:
+        """Forget one exact attempt the server refused or that can no longer be retransmitted."""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._current_attempt_locked(conn, attempt)
+                conn.execute(
+                    "DELETE FROM chain_recovery WHERE record_id=? AND kind='resync_attempt'",
+                    (attempt.attempt_id,),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def _assert_supersedable_pending(self, pending: PendingSignedCall) -> None:
+        """Structural defence in depth; the control client also checks the exact request semantics."""
+        prefix = f"/v1/workspaces/{self.identity.workspace_id}/runners/{self.identity.runner_id}"
+        if (
+            pending.request_operation not in _SUPERSEDABLE_OPERATIONS
+            or pending.chain_operation != "claim" or pending.run_id is not None
+            or pending.capability != "runner_claim"
+        ):
+            raise RunnerRuntimeConflict("runtime pending call is not supersedable")
+        try:
+            request = json.loads(pending.body)
+        except (TypeError, ValueError):
+            raise RunnerRuntimeConflict("runtime pending call is not supersedable") from None
+        if not isinstance(request, dict) or canonical_bytes(request) != pending.body:
+            raise RunnerRuntimeConflict("runtime pending call is not supersedable")
+        if pending.request_operation == "list-contexts":
+            valid = (
+                request == {"schema_version": "heel.runner-context-list.v1"}
+                and pending.path == f"{prefix}/contexts/list"
+            )
+        elif pending.request_operation == "claim":
+            valid = (
+                request == {"schema_version": "heel.runner-claim-request.v1"}
+                and pending.path == f"{prefix}/claim"
+            )
+        else:
+            binding_id = request.get("binding_id")
+            valid = (
+                set(request) == {"schema_version", "binding_id", "binding_digest"}
+                and request["schema_version"] == "heel.runner-context-claim.v1"
+                and type(binding_id) is str and re.fullmatch(r"rcb_[0-9a-f]{32}", binding_id) is not None
+                and type(request["binding_digest"]) is str and _DIGEST.fullmatch(request["binding_digest"]) is not None
+                and pending.path == f"{prefix}/contexts/{binding_id}/claim"
+            )
+        if not valid:
+            raise RunnerRuntimeConflict("runtime pending call is not supersedable")
+
+    def commit_resync_supersession(
+        self, attempt: ChainResyncAttempt, pending: PendingSignedCall, *,
+        next_nonce_b64: str, next_sequence: int, generation: int, now_ms: int,
+    ) -> RunnerChainCursor:
+        """Atomically install an accepted resync and retire the one staged call it supersedes.
+
+        In one transaction: the claim cursor advances to the server-authoritative generation, the
+        exact pending call (never "every row of a generation") moves into a sealed tombstone that
+        also names the accepted generation and challenge, and the completed attempt is removed.
+        """
+        if not isinstance(pending, PendingSignedCall):
+            raise RunnerRuntimeStateError("invalid runtime pending call")
+        self._assert_supersedable_pending(pending)
+        next_nonce_b64 = _nonce(next_nonce_b64)
+        next_sequence = _safe_int(next_sequence, "runtime resync sequence", minimum=1)
+        generation = _safe_int(generation, "runtime resync generation")
+        now_ms = _safe_int(now_ms, "runtime resync time")
+        chain = self._chain_key("claim", None)
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                core = self._current_attempt_locked(conn, attempt)
+                if core["challenge"] is None or core["complete"] is None:
+                    raise RunnerRuntimeConflict("runtime resync attempt is not complete")
+                current = self._load_chain_locked(conn, "claim", None)
+                if current is None:
+                    raise RunnerRuntimeConflict("runtime resync chain is unavailable")
+                row = conn.execute(
+                    "SELECT call_id,chain,run_hash,operation,sequence,generation,created_at_ms,sealed_blob "
+                    "FROM pending_calls WHERE call_id=?", (pending.call_id,),
+                ).fetchone()
+                if row is None or row["chain"] != chain:
+                    raise RunnerRuntimeConflict("runtime pending call changed")
+                stored = self._pending_from_row_locked(row)
+                if stored != pending:
+                    raise RunnerRuntimeConflict("runtime pending call changed")
+                if (
+                    pending.prior_chain_state_digest != current.state_digest
+                    or pending.generation != current.generation
+                    or pending.sequence != current.next_sequence
+                    or pending.headers.get("X-Heel-Runner-Nonce") != current.next_nonce_b64
+                ):
+                    raise RunnerRuntimeConflict("runtime pending call no longer matches its chain")
+                challenge = attempt.challenge_generation
+                assert challenge is not None and attempt.challenge_next_sequence is not None
+                if (
+                    challenge < current.generation or generation != challenge + 1
+                    or generation <= current.generation or next_sequence < current.next_sequence
+                ):
+                    raise RunnerRuntimeCorrupt("runtime resync generation is invalid")
+                if pending.request_operation == "claim":
+                    # A job claim is not idempotent. The server cursor's next_sequence is monotonic
+                    # and generation-independent and moves only with a committed call, so equality
+                    # at both resync steps proves the staged sequence was never consumed.
+                    if not (
+                        attempt.challenge_next_sequence == next_sequence == pending.sequence
+                        == current.next_sequence
+                    ):
+                        raise RuntimeClaimSequenceConsumed("runtime claim sequence was consumed")
+                    if conn.execute("SELECT 1 FROM active_runs LIMIT 1").fetchone() is not None:
+                        raise RunnerRuntimeConflict("runtime claim supersession with an active run")
+                core_without_digest = {
+                    "schema_version": "heel.runner-control-chain-state.v1",
+                    "workspace_id": self.identity.workspace_id, "runner_id": self.identity.runner_id,
+                    "runner_key_id": self.identity.key_id, "operation": "claim", "run_id": None,
+                    "next_nonce_b64": next_nonce_b64, "next_sequence": next_sequence,
+                    "generation": generation, "updated_at_ms": now_ms,
+                }
+                cursor_core = {**core_without_digest, "state_digest": _state_digest(core_without_digest)}
+                cursor = self._validate_chain_core(cursor_core)
+                pending_core = self._open(
+                    row["sealed_blob"], schema="heel.runner-pending-call.v1", primary_fields=(row["call_id"],),
+                )
+                record_id = hashlib.sha256(b"heel.runner-superseded-call-id.v1\0" + canonical_bytes({
+                    "call_id": pending.call_id, "resync_challenge_id": attempt.challenge_id,
+                    "generation": generation,
+                })).hexdigest()
+                tombstone_without_digest = {
+                    "schema_version": _SUPERSEDED_CALL_SCHEMA, "record_id": record_id,
+                    "workspace_id": self.identity.workspace_id, "runner_id": self.identity.runner_id,
+                    "runner_key_id": self.identity.key_id, "reason": "chain_authority_lost",
+                    "superseded_call": pending_core,
+                    "superseded_by": {
+                        "resync_challenge_id": attempt.challenge_id, "generation": generation,
+                        "next_sequence": next_sequence,
+                    },
+                    # The server evidence that retired the intent (cursor next_sequence at the
+                    # challenge and at the completion).
+                    "proof": {
+                        "challenge_next_sequence": attempt.challenge_next_sequence,
+                        "completed_next_sequence": next_sequence,
+                    },
+                    "superseded_at_ms": now_ms,
+                }
+                tombstone = {**tombstone_without_digest, "state_digest": _state_digest(tombstone_without_digest)}
+                self._superseded_from_core(tombstone, record_id=record_id)
+                blob = self._seal_stable(tombstone, schema=_SUPERSEDED_CALL_SCHEMA, record_id=record_id)
+                if len(blob) > 16384:
+                    raise RunnerRuntimeStateError("runtime superseded call exceeds size limit")
+                conn.execute(
+                    "UPDATE control_chains SET next_sequence=?,generation=?,sealed_blob=?,updated_at_ms=? WHERE chain=?",
+                    (cursor.next_sequence, cursor.generation,
+                     self._seal(cursor_core, schema=cursor_core["schema_version"], primary_fields=(chain,)),
+                     cursor.updated_at_ms, chain),
+                )
+                deleted = conn.execute("DELETE FROM pending_calls WHERE call_id=?", (pending.call_id,))
+                if deleted.rowcount != 1:
+                    raise RunnerRuntimeConflict("runtime pending call changed")
+                conn.execute(
+                    "DELETE FROM chain_recovery WHERE record_id=? AND kind='resync_attempt'",
+                    (attempt.attempt_id,),
+                )
+                conn.execute(
+                    "INSERT INTO chain_recovery(record_id,kind,chain,generation,sealed_blob,created_at_ms) "
+                    "VALUES(?,'superseded_call',?,?,?,?)",
+                    (record_id, chain, generation, blob, now_ms),
+                )
+                excess = conn.execute(
+                    "SELECT COUNT(*) FROM chain_recovery WHERE kind='superseded_call'"
+                ).fetchone()[0] - _MAX_SUPERSEDED_CALLS
+                if excess > 0:
+                    conn.execute(
+                        "DELETE FROM chain_recovery WHERE record_id IN (SELECT record_id FROM chain_recovery "
+                        "WHERE kind='superseded_call' ORDER BY created_at_ms,record_id LIMIT ?)",
+                        (excess,),
+                    )
+                conn.execute("COMMIT")
+                return cursor
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def _superseded_from_core(self, value: Mapping[str, Any], *, record_id: str) -> SupersededCallRecord:
+        fields = {
+            "schema_version", "record_id", "workspace_id", "runner_id", "runner_key_id", "reason",
+            "superseded_call", "superseded_by", "proof", "superseded_at_ms", "state_digest",
+        }
+        pending_fields = {
+            "schema_version", "workspace_id", "runner_id", "runner_key_id", "call_id",
+            "request_operation", "chain_operation", "run_id", "path", "capability", "method",
+            "headers", "body_b64", "body_sha256", "server_nonce_b64", "sequence", "generation",
+            "prior_chain_state_digest", "created_at_ms", "state_digest",
+        }
+        try:
+            call, by, proof = value["superseded_call"], value["superseded_by"], value["proof"]
+            if (
+                set(value) != fields or value["schema_version"] != _SUPERSEDED_CALL_SCHEMA
+                or value["record_id"] != record_id or value["reason"] != "chain_authority_lost"
+                or value["workspace_id"] != self.identity.workspace_id
+                or value["runner_id"] != self.identity.runner_id
+                or value["state_digest"] != _state_digest(
+                    {key: value[key] for key in fields if key != "state_digest"}
+                )
+                or not isinstance(call, dict) or set(call) != pending_fields
+                or call["schema_version"] != "heel.runner-pending-call.v1"
+                or call["state_digest"] != _state_digest(
+                    {key: call[key] for key in pending_fields if key != "state_digest"}
+                )
+                or call["request_operation"] not in _SUPERSEDABLE_OPERATIONS
+                or call["chain_operation"] != "claim" or call["run_id"] is not None
+                or not isinstance(by, dict)
+                or set(by) != {"resync_challenge_id", "generation", "next_sequence"}
+                or type(by["resync_challenge_id"]) is not str
+                or not by["resync_challenge_id"].startswith("rrs_")
+                or not isinstance(proof, dict)
+                or set(proof) != {"challenge_next_sequence", "completed_next_sequence"}
+                or proof["completed_next_sequence"] != by["next_sequence"]
+                or (call["request_operation"] == "claim" and not (
+                    proof["challenge_next_sequence"] == proof["completed_next_sequence"] == call["sequence"]
+                ))
+            ):
+                raise ValueError
+            body = base64.b64decode(call["body_b64"], validate=True)
+            if (
+                hashlib.sha256(body).hexdigest() != call["body_sha256"]
+                or type(call["path"]) is not str or not call["path"].startswith("/v1/")
+                or len(call["path"]) > 512
+            ):
+                raise ValueError
+            record = SupersededCallRecord(
+                record_id=_digest(record_id, "runtime superseded call ID"),
+                call_id=_digest(call["call_id"], "runtime pending call ID"),
+                request_operation=call["request_operation"],
+                path=call["path"],
+                body_sha256=_digest(call["body_sha256"], "runtime superseded body digest"),
+                sequence=_safe_int(call["sequence"], "runtime superseded sequence", minimum=1),
+                generation=_safe_int(call["generation"], "runtime superseded generation"),
+                superseded_by_generation=_safe_int(by["generation"], "runtime superseding generation"),
+                resync_challenge_id=by["resync_challenge_id"],
+                challenge_next_sequence=_safe_int(proof["challenge_next_sequence"], "runtime proof sequence", minimum=1),
+                completed_next_sequence=_safe_int(proof["completed_next_sequence"], "runtime proof sequence", minimum=1),
+                created_at_ms=_safe_int(call["created_at_ms"], "runtime superseded time"),
+                superseded_at_ms=_safe_int(value["superseded_at_ms"], "runtime superseded time"),
+                state_digest=_digest(value["state_digest"], "runtime superseded digest"),
+            )
+        except (KeyError, TypeError, ValueError, RunnerRuntimeStateError) as exc:
+            if isinstance(exc, RunnerRuntimeCorrupt):
+                raise
+            raise RunnerRuntimeCorrupt("runtime superseded call is invalid") from None
+        if record.superseded_by_generation <= record.generation:
+            raise RunnerRuntimeCorrupt("runtime superseded call is invalid")
+        return record
+
+    def load_superseded_calls(self, *, limit: int = 64) -> tuple[SupersededCallRecord, ...]:
+        """The retained tombstones, oldest first; any unreadable row fails closed."""
+        if type(limit) is not int or not 1 <= limit <= _MAX_SUPERSEDED_CALLS:
+            raise RunnerRuntimeStateError("invalid runtime superseded call limit")
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT record_id,chain,generation,created_at_ms,sealed_blob FROM chain_recovery "
+                "WHERE kind='superseded_call' ORDER BY created_at_ms,record_id LIMIT ?", (limit,),
+            ).fetchall()
+        records = []
+        for row in rows:
+            record = self._superseded_from_core(self._open_stable(
+                row["sealed_blob"], schema=_SUPERSEDED_CALL_SCHEMA, record_id=row["record_id"],
+            ), record_id=row["record_id"])
+            if (
+                row["chain"] != self._chain_key("claim", None)
+                or row["generation"] != record.superseded_by_generation
+                or row["created_at_ms"] != record.superseded_at_ms
+            ):
+                raise RunnerRuntimeCorrupt("runtime superseded call index is invalid")
+            records.append(record)
+        return tuple(records)
 
     def _validate_pending_core(self, value: Mapping[str, Any]) -> tuple[PendingSignedCall, dict[str, Any]]:
         fields = {

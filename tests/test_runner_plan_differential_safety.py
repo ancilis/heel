@@ -30,6 +30,7 @@ from heel.runner.compiler import CanaryCompiler, plan_differential_pairs
 from heel.runner.containment import verify_containment_chain
 from heel.runner.execution import LocalCanaryExecutor
 from heel.runner.http_transport import TLSTransport, TransportFailure
+from heel.saas.network_guard import TLSTransport as NetworkTLSTransport
 from heel.runner.redaction import Redactor
 from heel.runner.store import RunnerStore
 from heel.store import Store
@@ -1228,7 +1229,9 @@ def test_r21_production_client_construction_is_unseamed(tmp_path, monkeypatch):
     assert type(client.tls) is TLSTransport
     context = client.tls.context
     assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname is True
-    assert context.protocol == ssl.PROTOCOL_TLSv1_2
+    assert context.protocol == ssl.PROTOCOL_TLS_CLIENT
+    assert context.minimum_version == ssl.TLSVersion.TLSv1_2
+    assert context.maximum_version == ssl.TLSVersion.MAXIMUM_SUPPORTED
     assert client.origin == SYNTHETIC_ORIGIN
 
     # A private or loopback answer is refused at preflight; no client is built.
@@ -1262,8 +1265,9 @@ def test_r21_tls_transport_real_handshake_verifies_chain_and_hostname(tmp_path):
             raw.close()
 
     with TLSLoopbackServer(tmp_path, certificate, key) as server:
-        # A real handshake: matching chain and hostname are accepted over TLS 1.2.
-        assert handshake(server, SYNTHETIC_HOST, ca) == ("TLSv1.2", b"k")
+        # A real handshake: matching chain and hostname are accepted at the highest
+        # common version (TLS 1.2 or newer; see the protocol-bounds test below).
+        assert handshake(server, SYNTHETIC_HOST, ca)[1] == b"k"
         # A wrong hostname is rejected.
         with pytest.raises(ssl.SSLCertVerificationError):
             handshake(server, "wrong-host.heel.dev", ca)
@@ -1276,6 +1280,93 @@ def test_r21_tls_transport_real_handshake_verifies_chain_and_hostname(tmp_path):
         ):
             with pytest.raises(ssl.SSLCertVerificationError):
                 handshake(server, SYNTHETIC_HOST, None)
+
+
+def _default_trust_handshake(transport_class, server, hostname: str):
+    """Connect to the loopback server and wrap with a freshly constructed production transport."""
+    raw = socket.create_connection(("127.0.0.1", server.port), 5)
+    try:
+        wrapped = transport_class().wrap(raw, hostname, 5)
+        try:
+            return wrapped.version(), wrapped.recv(1)
+        finally:
+            wrapped.close()
+    finally:
+        raw.close()
+
+
+@pytest.mark.parametrize("transport_class", [TLSTransport, NetworkTLSTransport])
+def test_r21_tls_transports_negotiate_tls12_and_tls13_through_default_trust(
+    tmp_path, monkeypatch, transport_class,
+):
+    if ssl.get_default_verify_paths().openssl_cafile_env != "SSL_CERT_FILE":
+        pytest.skip("this TLS library does not read SSL_CERT_FILE")
+    ca, certificate, key = make_test_ca(SYNTHETIC_HOST)
+    other_ca, _, _ = make_test_ca("unrelated.heel.dev")
+    ca_file, other_file = tmp_path / "test-ca.pem", tmp_path / "other-ca.pem"
+    ca_file.write_bytes(ca)
+    other_file.write_bytes(other_ca)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_file))
+    v12, v13 = ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3
+    # The availability flags are not consulted: OpenSSL 4 builds report HAS_TLSv1_2 False
+    # yet negotiate TLS 1.2 through the generic client method.
+    for bounds, expected in (((v12, v12), "TLSv1.2"), ((v13, None), "TLSv1.3"), ((None, None), "TLSv1.3")):
+        with TLSLoopbackServer(tmp_path, certificate, key, minimum=bounds[0], maximum=bounds[1]) as server:
+            assert _default_trust_handshake(transport_class, server, SYNTHETIC_HOST) == (expected, b"k")
+            assert server.handshakes == 1
+            # Wrong hostname on the same chain is rejected; no byte is exchanged.
+            with pytest.raises(ssl.SSLCertVerificationError):
+                _default_trust_handshake(transport_class, server, "wrong-host.heel.dev")
+            assert server.handshakes == 1
+    with TLSLoopbackServer(tmp_path, certificate, key) as server:
+        # Another CA in the default location, or no test CA at all, is rejected.
+        monkeypatch.setenv("SSL_CERT_FILE", str(other_file))
+        with pytest.raises(ssl.SSLCertVerificationError):
+            _default_trust_handshake(transport_class, server, SYNTHETIC_HOST)
+        monkeypatch.delenv("SSL_CERT_FILE")
+        with pytest.raises(ssl.SSLCertVerificationError):
+            _default_trust_handshake(transport_class, server, SYNTHETIC_HOST)
+        assert server.handshakes == 0
+
+
+@pytest.mark.parametrize("transport_class", [TLSTransport, NetworkTLSTransport])
+def test_r21_tls_transports_refuse_a_legacy_only_server(tmp_path, monkeypatch, transport_class):
+    if ssl.get_default_verify_paths().openssl_cafile_env != "SSL_CERT_FILE":
+        pytest.skip("this TLS library does not read SSL_CERT_FILE")
+    ca, certificate, key = make_test_ca(SYNTHETIC_HOST)
+    ca_file = tmp_path / "test-ca.pem"
+    ca_file.write_bytes(ca)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_file))
+    legacy = {
+        "minimum": ssl.TLSVersion.TLSv1, "maximum": ssl.TLSVersion.TLSv1_1,
+        "ciphers": "DEFAULT:@SECLEVEL=0",
+    }
+    try:
+        server = TLSLoopbackServer(tmp_path, certificate, key, **legacy)
+    except (ssl.SSLError, ValueError) as exc:
+        pytest.skip(f"this build cannot host a TLS 1.0/1.1 server: {exc!r}")
+    with server:
+        # Control: a deliberately permissive test client proves the fixture really speaks
+        # TLS 1.0/1.1 here; otherwise a refusal would prove nothing about the transport.
+        permissive = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        try:
+            permissive.set_ciphers("DEFAULT:@SECLEVEL=0")
+            permissive.minimum_version = ssl.TLSVersion.TLSv1
+            permissive.load_verify_locations(cadata=ca.decode("ascii"))
+            raw = socket.create_connection(("127.0.0.1", server.port), 5)
+            try:
+                with permissive.wrap_socket(raw, server_hostname=SYNTHETIC_HOST) as control:
+                    control_version = control.version()
+            finally:
+                raw.close()
+        except (ssl.SSLError, ValueError, OSError) as exc:
+            pytest.skip(f"this build cannot complete a TLS 1.0/1.1 handshake: {exc!r}")
+        assert control_version in {"TLSv1", "TLSv1.1"} and server.handshakes == 1
+        with pytest.raises(ssl.SSLError):
+            _default_trust_handshake(transport_class, server, SYNTHETIC_HOST)
+        assert server.handshakes == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -1384,7 +1475,8 @@ def test_r23_ca_trust_follows_openssl_default_locations(tmp_path, monkeypatch):
     def trusted_test_ca() -> bool:
         context = plan_differential._build_client(SYNTHETIC_ORIGIN).tls.context
         assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname is True
-        assert context.protocol == ssl.PROTOCOL_TLSv1_2
+        assert context.protocol == ssl.PROTOCOL_TLS_CLIENT
+        assert context.minimum_version == ssl.TLSVersion.TLSv1_2
         return any(
             (("commonName", "Heel plan-differential test CA"),) in item["subject"]
             for item in context.get_ca_certs()

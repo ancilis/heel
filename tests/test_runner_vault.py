@@ -24,9 +24,11 @@ from heel.runner.store import (
 )
 from heel.runner.vault import (
     MAX_COMMAND_OUTPUT_BYTES,
+    MAX_SECRET_BYTES,
     EphemeralVault,
     KeychainVault,
     SecretServiceVault,
+    SecretTooLargeError,
     VaultUnavailable,
     _run_bounded_process,
     ephemeral_environment_name,
@@ -976,19 +978,16 @@ def verified(path: str, *, allowed_paths, platform_name):
 
 def test_os_vaults_use_verified_absolute_paths_fixed_argv_and_create_only(monkeypatch):
     monkeypatch.setenv("PATH", "/tmp/attacker-controlled")
-    keychain_runner = ScriptedRunner([(44, b""), (0, b"")])
+    keychain_runner = FakeSecurity()
     keychain = KeychainVault(
         runner=keychain_runner, verifier=verified, platform_name="Darwin",
     )
     keychain.store("a" * 32, b"keychain-value")
-    assert keychain_runner.calls[0][0][0] == "/usr/bin/security"
-    assert keychain_runner.calls[1][0] == (
-        "/usr/bin/security", "add-generic-password", "-s", "heel.runner.canary.v1",
-        "-a", "a" * 32, "-w",
-    )
-    assert "-U" not in keychain_runner.calls[1][0]
-    assert keychain_runner.calls[1][1] == b"keychain-value"
-    assert b"keychain-value" not in " ".join(keychain_runner.calls[1][0]).encode()
+    assert all(call[0][0] == "/usr/bin/security" for call in keychain_runner.calls)
+    adds = [call for call in keychain_runner.calls if call[0][1:] == ("-i",)]
+    assert len(adds) == 2
+    assert all(b" -U" not in payload for _, payload, _ in adds)
+    assert all(b"keychain-value" not in " ".join(command).encode() for command, _, _ in keychain_runner.calls)
 
     secret_runner = ScriptedRunner([(1, b""), (0, b"")])
     secret_service = SecretServiceVault(
@@ -1245,3 +1244,472 @@ def test_bearer_api_key_and_cookie_jar_validation_are_closed():
     ):
         with pytest.raises(ValueError, match="cookie"):
             validate_credential_secret("cookie_jar", invalid, "https://staging.acme.dev")
+
+
+# --------------------------------------------------------------------------- macOS Keychain v2 (R23D)
+
+import hashlib as _hashlib
+import platform as _platform
+import secrets as _secrets
+
+from heel.runner import vault as vault_module
+
+
+class FakeSecurity:
+    """In-memory ``/usr/bin/security``: find/delete argv and ``-i`` single-line adds on stdin."""
+
+    def __init__(self, items=None, *, add_codes=None, delete_codes=None, mutate=None):
+        self.items = dict(items or {})
+        self.calls = []
+        self.add_codes = dict(add_codes or {})      # account -> rc returned instead of adding
+        self.delete_codes = dict(delete_codes or {})
+        self.mutate = mutate                        # optional hook(service, account, value) -> stored value
+
+    def __call__(self, command, *, payload, timeout_seconds):
+        self.calls.append((tuple(command), payload, timeout_seconds))
+        verb = command[1]
+        if verb == "-i":
+            assert payload.endswith(b"\n") and payload.count(b"\n") == 1
+            tokens = payload.decode("ascii").split()
+            assert tokens[0] == "add-generic-password" and tokens[1::2][:3] == ["-s", "-a", "-w"]
+            service, account, value = tokens[2], tokens[4], tokens[6].encode()
+            code = self.add_codes.get(account)
+            if code is not None:
+                return self._result(code)
+            if (service, account) in self.items:
+                return self._result(45)
+            if self.mutate is not None:
+                value = self.mutate(service, account, value)
+            self.items[(service, account)] = value
+            return self._result(0)
+        service, account = command[command.index("-s") + 1], command[command.index("-a") + 1]
+        if verb == "find-generic-password":
+            if (service, account) not in self.items:
+                return self._result(44)
+            return self._result(0, self.items[(service, account)] + b"\n" if command[-1] == "-w" else b"attributes")
+        if verb == "delete-generic-password":
+            code = self.delete_codes.get(account)
+            if code is not None:
+                return self._result(code)
+            return self._result(0 if self.items.pop((service, account), None) is not None else 44)
+        raise AssertionError(command)
+
+    @staticmethod
+    def _result(code, stdout=b""):
+        return type("Result", (), {"returncode": code, "stdout": stdout})()
+
+    def accounts(self, service="heel.runner.canary.v2"):
+        return sorted(account for svc, account in self.items if svc == service)
+
+
+def _keychain(fake):
+    return KeychainVault(runner=fake, verifier=verified, platform_name="Darwin")
+
+
+V2, V1 = "heel.runner.canary.v2", "heel.runner.canary.v1"
+H = "c" * 32
+
+
+def _tag(secret):
+    return _hashlib.sha256(secret).hexdigest()[:32]
+
+
+def test_keychain_v2_store_writes_chunks_then_header_last_with_one_command_per_invocation():
+    secret = bytes(range(256)) * 64  # 16384 bytes, every byte value
+    fake = FakeSecurity()
+    _keychain(fake).store(H, secret)
+    adds = [(command, payload) for command, payload, _ in fake.calls if command[1] == "-i"]
+    assert [command for command, _ in adds] == [("/usr/bin/security", "-i")] * 9
+    accounts = [payload.split()[4].decode() for _, payload in adds]
+    assert accounts == [f"{H}.{index}" for index in range(8)] + [H]
+    for command, payload in adds:
+        assert payload.endswith(b"\n") and payload.count(b"\n") == 1
+        assert len(payload) <= 3584 and b" -U " not in payload
+    encoded = base64.b64encode(secret)
+    assert b"".join(fake.items[(V2, f"{H}.{index}")] for index in range(8)) == encoded
+    assert all(len(fake.items[(V2, f"{H}.{index}")]) == 3072 for index in range(7))
+    assert len(fake.items[(V2, f"{H}.7")]) == 344
+    assert fake.items[(V2, H)] == f"v2.16384.8.{_tag(secret)}".encode()
+    for command, _, _ in fake.calls:
+        assert encoded[:64].decode() not in " ".join(command)
+    assert _keychain(fake).load(H) == secret
+
+
+def test_keychain_v2_chunk_count_and_line_length_bounds_hold_at_max_secret():
+    from heel.runner.identity import SECURITY_INTERACTIVE_MAX_LINE_BYTES, security_interactive_add_command
+
+    assert vault_module._KEYCHAIN_MAX_CHUNKS == 8
+    assert vault_module._KEYCHAIN_CHUNK_CHARS == 3072
+    longest = security_interactive_add_command(V2, f"{H}.7", b"A" * 3072)
+    assert len(longest) == 3160 < SECURITY_INTERACTIVE_MAX_LINE_BYTES < 4095
+    fake = FakeSecurity()
+    with pytest.raises(SecretTooLargeError):
+        _keychain(fake).store(H, b"x" * (MAX_SECRET_BYTES + 1))
+    with pytest.raises(ValueError):
+        _keychain(fake).store(H, b"")
+    assert fake.calls == []
+
+
+def test_keychain_v2_store_aborts_on_duplicate_chunk_without_deleting_foreign_items():
+    foreign = {(V2, f"{H}.0"): b"Zm9yZWlnbg=="}
+    fake = FakeSecurity(foreign)
+    with pytest.raises(VaultUnavailable, match="already exists"):
+        _keychain(fake).store(H, b"x" * 9000)
+    assert fake.items == foreign
+    assert not [call for call in fake.calls if call[0][1] == "delete-generic-password"]
+
+    fake = FakeSecurity(add_codes={f"{H}.3": 45})
+    with pytest.raises(VaultUnavailable, match="already exists"):
+        _keychain(fake).store(H, b"y" * 12000)
+    deleted = [call[0][-1] for call in fake.calls if call[0][1] == "delete-generic-password"]
+    assert deleted == [f"{H}.2", f"{H}.1", f"{H}.0"]
+    assert fake.items == {}
+
+    fake = FakeSecurity(add_codes={f"{H}.1": 1})
+    with pytest.raises(VaultUnavailable, match="vault unavailable"):
+        _keychain(fake).store(H, b"z" * 5000)
+    assert fake.items == {}
+
+
+def test_keychain_v2_store_rolls_back_only_created_items_when_readback_mismatches():
+    def truncate(service, account, value):
+        return value[:-4] if account == f"{H}.1" else value
+
+    unrelated = {(V2, "d" * 32): b"v2.1.1." + b"0" * 32}
+    fake = FakeSecurity(unrelated, mutate=truncate)
+    with pytest.raises(VaultUnavailable, match="vault unavailable"):
+        _keychain(fake).store(H, b"q" * 4000)
+    deleted = [call[0][-1] for call in fake.calls if call[0][1] == "delete-generic-password"]
+    assert deleted == [H, f"{H}.1", f"{H}.0"]
+    assert fake.items == unrelated
+
+    fake = FakeSecurity(mutate=truncate, delete_codes={f"{H}.0": 1})
+    with pytest.raises(VaultUnavailable) as caught:
+        _keychain(fake).store(H, b"q" * 4000)
+    assert "cleanup incomplete" in "".join(getattr(caught.value, "__notes__", []))
+    assert (V2, H) not in fake.items
+
+
+def _stored(secret):
+    fake = FakeSecurity()
+    _keychain(fake).store(H, secret)
+    return fake
+
+
+@pytest.mark.parametrize("damage", [
+    "missing-chunk", "short-chunk", "long-chunk", "swapped-chunks", "tag-mismatch",
+    "length-count-mismatch", "zero-length", "count-9", "v3-header", "chunk-not-base64",
+])
+def test_keychain_v2_load_fails_closed_on_missing_short_extra_or_swapped_chunk_and_bad_tag(damage):
+    secret = _secrets.token_bytes(5000)
+    fake = _stored(secret)
+    fake.items[(V1, H)] = b"legacy-must-not-be-used"
+    header = fake.items[(V2, H)].decode()
+    if damage == "missing-chunk":
+        del fake.items[(V2, f"{H}.1")]
+    elif damage == "short-chunk":
+        fake.items[(V2, f"{H}.0")] = fake.items[(V2, f"{H}.0")][:-1]
+    elif damage == "long-chunk":
+        fake.items[(V2, f"{H}.2")] += b"A"
+    elif damage == "swapped-chunks":
+        other = _stored(_secrets.token_bytes(5000))
+        fake.items[(V2, f"{H}.0")] = other.items[(V2, f"{H}.0")]
+    elif damage == "tag-mismatch":
+        fake.items[(V2, H)] = (header[:-32] + "0" * 32).encode()
+    elif damage == "length-count-mismatch":
+        fake.items[(V2, H)] = header.replace(".3.", ".2.", 1).encode()
+    elif damage == "zero-length":
+        fake.items[(V2, H)] = f"v2.0.1.{'0' * 32}".encode()
+    elif damage == "count-9":
+        fake.items[(V2, H)] = header.replace(".3.", ".9.", 1).encode()
+    elif damage == "v3-header":
+        fake.items[(V2, H)] = ("v3" + header[2:]).encode()
+    elif damage == "chunk-not-base64":
+        chunk = fake.items[(V2, f"{H}.0")]
+        fake.items[(V2, f"{H}.0")] = b"!" + chunk[1:]
+    fake.calls.clear()
+    with pytest.raises(VaultUnavailable, match="invalid material") as caught:
+        _keychain(fake).load(H)
+    assert not [call for call in fake.calls if V1 in call[0]]
+    assert "5000" not in str(caught.value)
+
+
+def test_keychain_v2_header_present_never_consults_legacy_service():
+    secret = b"current-v2-secret"
+    fake = _stored(secret)
+    fake.items[(V1, H)] = b"stale-legacy-value"
+    fake.calls.clear()
+    assert _keychain(fake).load(H) == secret
+    assert not [call for call in fake.calls if V1 in call[0]]
+
+
+def test_keychain_legacy_v1_valid_item_is_served_unchanged_and_never_rewritten():
+    legacy = {(V1, H): b"LegacyDummyValue123"}
+    fake = FakeSecurity(legacy)
+    vault = _keychain(fake)
+    assert vault.exists(H) is True
+    assert vault.load(H) == b"LegacyDummyValue123"
+    assert fake.items == legacy
+    assert not [call for call in fake.calls if call[0][1] in {"-i", "delete-generic-password"}]
+
+
+def test_keychain_legacy_v1_empty_item_fails_closed_with_remove_and_readd_message_and_blocks_store():
+    legacy = {(V1, H): b""}
+    fake = FakeSecurity(legacy)
+    vault = _keychain(fake)
+    with pytest.raises(VaultUnavailable, match="empty; remove it and add it again"):
+        vault.load(H)
+    with pytest.raises(VaultUnavailable, match="already exists"):
+        vault.store(H, b"replacement")
+    assert fake.items == legacy
+    vault.delete(H)
+    assert fake.items == {}
+
+
+def test_keychain_exists_is_header_or_legacy_only_not_orphan_chunks():
+    fake = FakeSecurity({(V2, f"{H}.0"): b"QUJD", (V2, f"{H}.1"): b"QUJD"})
+    vault = _keychain(fake)
+    assert vault.exists(H) is False
+    with pytest.raises(VaultUnavailable, match="not found"):
+        vault.load(H)
+    # The orphan prefix blocks a store at its first slot without being deleted by it.
+    with pytest.raises(VaultUnavailable, match="already exists"):
+        vault.store(H, b"new")
+    assert fake.accounts() == [f"{H}.0", f"{H}.1"]
+    assert _keychain(FakeSecurity({(V2, H): b"v2.1.1." + b"0" * 32})).exists(H) is True
+    vault = _keychain(ScriptedRunner([(1, b"")]))
+    with pytest.raises(VaultUnavailable, match="vault unavailable"):
+        vault.exists(H)
+
+
+def test_keychain_delete_sweeps_header_then_eight_slots_then_legacy_and_reports_failure_after_completing():
+    fake = _stored(_secrets.token_bytes(16384))
+    fake.items[(V1, H)] = b"legacy"
+    fake.calls.clear()
+    _keychain(fake).delete(H)
+    order = [(call[0][3], call[0][5]) for call in fake.calls]
+    assert order == [(V2, H)] + [(V2, f"{H}.{index}") for index in range(8)] + [(V1, H)]
+    assert fake.items == {}
+    _keychain(fake).delete(H)  # idempotent
+
+    fake = _stored(b"p" * 9000)
+    fake.delete_codes = {f"{H}.1": 1}
+    with pytest.raises(VaultUnavailable, match="vault unavailable"):
+        _keychain(fake).delete(H)
+    assert len(fake.calls) - fake.calls.index(next(c for c in fake.calls if c[0][1] == "delete-generic-password")) == 10
+    assert fake.accounts() == [f"{H}.1"]
+    assert _keychain(fake).exists(H) is False
+
+
+def test_keychain_vault_errors_never_contain_secret_bytes_or_lengths():
+    secret = b"SECRET-MARKER-" + b"9" * 4321
+    failures = []
+    for options in ({"add_codes": {H: 1}}, {"add_codes": {f"{H}.0": 45}},
+                    {"mutate": lambda service, account, value: value[:-1] if account == f"{H}.0" else value}):
+        with pytest.raises(VaultUnavailable) as caught:
+            _keychain(FakeSecurity(**options)).store(H, secret)
+        failures.append(caught.value)
+    fake = _stored(secret)
+    fake.items[(V2, f"{H}.1")] = fake.items[(V2, f"{H}.1")][:-2]
+    with pytest.raises(VaultUnavailable) as caught:
+        _keychain(fake).load(H)
+    failures.append(caught.value)
+    for error in failures:
+        rendered = f"{error!s} {error!r} {getattr(error, '__notes__', [])!r}"
+        assert "SECRET-MARKER" not in rendered and "4335" not in rendered and "4321" not in rendered
+        assert base64.b64encode(secret)[:16].decode() not in rendered
+
+
+class _SweepVault:
+    backend_id = "macos_keychain"
+    supported = True
+
+    def __init__(self, *, fail_deletes=0):
+        self.deleted, self.fail_deletes = [], fail_deletes
+
+    def exists(self, handle):
+        return False
+
+    def delete(self, handle):
+        self.deleted.append(handle)
+        if self.fail_deletes:
+            self.fail_deletes -= 1
+            raise VaultUnavailable("secure credential vault unavailable")
+
+
+def test_pending_keychain_recovery_sweeps_orphan_slots_and_keeps_the_record_until_deletion_succeeds(tmp_path):
+    store, _, _ = store_and_identity(tmp_path)
+    pending = store.reserve_os_credential(
+        semantic_role="object_owner", auth_profile="bearer", label="owner", backend="macos_keychain",
+    )
+    handle = pending["credential_handle_id"]
+    failing = _SweepVault(fail_deletes=1)
+    store.recover_credentials({"macos_keychain": failing})
+    # Partial delete failure: the pending record and its handle stay for a retry.
+    kept = {item["credential_handle_id"]: item for item in store.list_credentials()}
+    assert failing.deleted == [handle] and kept[handle]["state"] == "pending"
+    store.recover_credentials({"macos_keychain": failing})
+    assert failing.deleted == [handle, handle]
+    assert handle not in {item["credential_handle_id"] for item in store.list_credentials()}
+
+    # A real (fake-backed) orphan prefix is swept by the recovery delete.
+    fake = FakeSecurity()
+    vault = _keychain(fake)
+    pending = store.reserve_os_credential(
+        semantic_role="object_owner", auth_profile="bearer", label="owner", backend="macos_keychain",
+    )
+    handle = pending["credential_handle_id"]
+    fake.items[(V2, f"{handle}.0")] = b"QUJD"
+    fake.items[(V2, f"{handle}.1")] = b"QUJD"
+    store.recover_credentials({"macos_keychain": vault})
+    assert fake.items == {}
+    assert handle not in {item["credential_handle_id"] for item in store.list_credentials()}
+
+
+def test_pending_recovery_for_other_backends_never_deletes_and_drops_the_absent_record(tmp_path):
+    store, _, _ = store_and_identity(tmp_path)
+    pending = store.reserve_os_credential(
+        semantic_role="object_owner", auth_profile="bearer", label="owner", backend="linux_secret_service",
+    )
+
+    class SecretService(_SweepVault):
+        backend_id = "linux_secret_service"
+
+    vault = SecretService(fail_deletes=1)
+    store.recover_credentials({"linux_secret_service": vault})
+    assert vault.deleted == []
+    assert pending["credential_handle_id"] not in {
+        item["credential_handle_id"] for item in store.list_credentials()
+    }
+
+
+_REAL_KEYCHAIN = pytest.mark.skipif(
+    _platform.system() != "Darwin" or not os.path.isfile("/usr/bin/security"),
+    reason="real macOS Keychain only",
+)
+
+
+def _real_find_rc(service, account):
+    return subprocess.run(
+        ["/usr/bin/security", "find-generic-password", "-s", service, "-a", account],
+        capture_output=True, timeout=20, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+    ).returncode
+
+
+def _real_raw_add(service, account, line_value):
+    subprocess.run(
+        ["/usr/bin/security", "-i"], capture_output=True, timeout=20,
+        input=f"add-generic-password -s {service} -a {account} -w {line_value}\n".encode(),
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+    )
+
+
+@_REAL_KEYCHAIN
+@pytest.mark.parametrize("name", [
+    "min-1", "binary-newline-meta", "2303", "2304", "2305", "4607", "4608", "cookie-jar", "max-16384",
+])
+def test_macos_keychain_v2_round_trip_min_max_binary_newline(name):
+    values = {
+        "min-1": b"\x01", "binary-newline-meta": b"\x00\xff\r\n'\"$;|&<>\\ -U -w",
+        "2303": _secrets.token_bytes(2303), "2304": _secrets.token_bytes(2304),
+        "2305": _secrets.token_bytes(2305), "4607": _secrets.token_bytes(4607),
+        "4608": _secrets.token_bytes(4608),
+        "cookie-jar": json.dumps({"cookies": [{"name": "session", "value": "dummy"}]}).encode(),
+        "max-16384": _secrets.token_bytes(MAX_SECRET_BYTES),
+    }
+    vault, handle = KeychainVault(), _secrets.token_hex(16)
+    try:
+        vault.store(handle, values[name])
+        assert vault.exists(handle) is True
+        assert vault.load(handle) == values[name]
+    finally:
+        vault.delete(handle)
+    assert vault.exists(handle) is False
+    assert _real_find_rc(V2, f"{handle}.0") == 44
+
+
+@_REAL_KEYCHAIN
+def test_macos_keychain_v2_duplicate_and_concurrent_store_same_handle_yields_one_owner():
+    vault, handle = KeychainVault(), _secrets.token_hex(16)
+    values = [_secrets.token_bytes(7000), _secrets.token_bytes(7000)]
+    outcomes = [None, None]
+    barrier = threading.Barrier(2)
+
+    def write(index):
+        barrier.wait()
+        try:
+            KeychainVault().store(handle, values[index])
+            outcomes[index] = "stored"
+        except VaultUnavailable as error:
+            outcomes[index] = str(error)
+
+    try:
+        threads = [threading.Thread(target=write, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+        assert sorted(outcomes) == ["secure credential already exists", "stored"]
+        assert vault.load(handle) == values[outcomes.index("stored")]
+        with pytest.raises(VaultUnavailable, match="already exists"):
+            vault.store(handle, b"again")
+    finally:
+        vault.delete(handle)
+    assert vault.exists(handle) is False
+
+
+@_REAL_KEYCHAIN
+def test_macos_keychain_v2_orphan_prefix_blocks_store_and_is_swept_by_delete():
+    vault, handle = KeychainVault(), _secrets.token_hex(16)
+    try:
+        _real_raw_add(V2, f"{handle}.0", "QUJD")
+        _real_raw_add(V2, f"{handle}.1", "QUJD")
+        assert vault.exists(handle) is False
+        with pytest.raises(VaultUnavailable, match="already exists"):
+            vault.store(handle, b"x" * 5000)
+        assert _real_find_rc(V2, f"{handle}.1") == 0
+    finally:
+        vault.delete(handle)
+    assert _real_find_rc(V2, f"{handle}.0") == 44 and _real_find_rc(V2, f"{handle}.1") == 44
+
+
+@_REAL_KEYCHAIN
+def test_macos_keychain_v2_truncated_chunk_fails_closed():
+    vault, handle = KeychainVault(), _secrets.token_hex(16)
+    try:
+        vault.store(handle, _secrets.token_bytes(5000))
+        subprocess.run(
+            ["/usr/bin/security", "delete-generic-password", "-s", V2, "-a", f"{handle}.1"],
+            capture_output=True, timeout=20, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        with pytest.raises(VaultUnavailable, match="invalid material"):
+            vault.load(handle)
+        assert _real_find_rc(V1, handle) == 44
+    finally:
+        vault.delete(handle)
+    assert vault.exists(handle) is False
+
+
+@_REAL_KEYCHAIN
+def test_macos_keychain_legacy_v1_empty_and_valid_items_behave_as_specified():
+    vault = KeychainVault()
+    empty, valid = _secrets.token_hex(16), _secrets.token_hex(16)
+    try:
+        # The pre-R23 prompted protocol with one value stores an empty item (T2aR D2).
+        subprocess.run(
+            ["/usr/bin/security", "add-generic-password", "-s", V1, "-a", empty, "-w"],
+            input=b"legacy", capture_output=True, timeout=20, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        _real_raw_add(V1, valid, "LegacyDummyValue123")
+        assert vault.exists(empty) is True
+        with pytest.raises(VaultUnavailable, match="empty; remove it and add it again"):
+            vault.load(empty)
+        with pytest.raises(VaultUnavailable, match="already exists"):
+            vault.store(empty, b"replacement")
+        assert _real_find_rc(V1, empty) == 0 and _real_find_rc(V2, empty) == 44
+        assert vault.load(valid) == b"LegacyDummyValue123"
+        assert _real_find_rc(V2, valid) == 44
+    finally:
+        vault.delete(empty)
+        vault.delete(valid)
+    assert _real_find_rc(V1, empty) == 44 and _real_find_rc(V1, valid) == 44

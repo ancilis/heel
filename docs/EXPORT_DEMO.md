@@ -1,11 +1,13 @@
 # Export entitlement reference demo
 
-Use the supplied wheel in a private POSIX workspace; no PyPI publication is implied.
+Use the supplied 1.3.0rc1 preview candidate wheel in a private POSIX workspace with Python 3.11 or
+newer. The candidate is unreleased; no GitHub release or PyPI publication is implied. The `runner`
+extra installs the pinned `cryptography` dependency from your package index.
 
 ```sh
 python3 -m venv --copies .venv
 . .venv/bin/activate
-python -m pip install './heel_sim-1.2.0-py3-none-any.whl[runner]'
+python -m pip install './heel_sim-1.3.0rc1-py3-none-any.whl[runner]'
 export HEEL_HOME="$PWD/.heel"
 heel reference prepare
 heel scope create --target reference:export --operator "demo owner" --confirm

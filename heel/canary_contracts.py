@@ -9,6 +9,7 @@ import base64
 import copy
 import hashlib
 import json
+import math
 import re
 import unicodedata
 from collections.abc import Mapping
@@ -18,6 +19,8 @@ TEST_MANIFEST_SCHEMA = "heel.test-manifest.v1"
 APPROVAL_PROJECTION_SCHEMA = "heel.approval-manifest-projection.v1"
 RUNNER_IDENTITY_SCHEMA = "heel.runner-identity.v1"
 EXECUTION_GRANT_SCHEMA = "heel.execution-grant.v1"
+# v1 plus one ``budget_profile`` naming the signed discovery body profile (C2D D4).
+EXECUTION_GRANT_V2_SCHEMA = "heel.execution-grant.v2"
 OPERATIONAL_RUN_SCHEMA = "heel.operational-run-projection.v1"
 RUNNER_CLAIM_REQUEST_SCHEMA = "heel.runner-claim-request.v1"
 RUNNER_HEARTBEAT_REQUEST_SCHEMA = "heel.runner-heartbeat-request.v1"
@@ -32,8 +35,41 @@ RUNNER_CONTEXT_BINDING_REVOKE_SCHEMA = "heel.runner-context-binding-revoke.v1"
 RUNNER_CONTEXT_LIST_SCHEMA = "heel.runner-context-list.v1"
 RUNNER_CONTEXT_CLAIM_SCHEMA = "heel.runner-context-claim.v1"
 RUNNER_APPROVAL_PROJECTION_SUBMIT_SCHEMA = "heel.runner-approval-projection-submit.v1"
+APPROVAL_PROJECTION_V2_SCHEMA = "heel.approval-manifest-projection.v2"
+DISCOVERY_AUTHORIZATION_SCHEMA = "heel.discovery-authorization.v1"
+DISCOVERY_ROUND_REPORT_SCHEMA = "heel.discovery-round-report.v1"
+PLAN_REQUEST_SCHEMA = "heel.plan-request.v1"
+RUNNER_PLAN_REQUEST_CLAIM_SCHEMA = "heel.runner-plan-request-claim.v1"
+RUNNER_PLAN_REQUEST_SCHEMA = "heel.runner-plan-request.v1"
+DISCOVERY_ACKNOWLEDGEMENT = "I authorize Heel to send up to 100 GET/HEAD requests to this origin"
+# The fixed round-1 frontier.  Its digest is bound into every authorization and round-1 plan.
+DISCOVERY_SEED_PATHS = (
+    "/openapi.json", "/openapi.yaml", "/swagger.json", "/swagger/v1/swagger.json", "/v3/api-docs",
+    "/api-docs", "/api/openapi.json", "/api/swagger.json", "/.well-known/openapi", "/robots.txt",
+    "/sitemap.xml", "/",
+)
+# Server constants, never client-settable.  The TTL is the authorization's expires_at_ms.
+DISCOVERY_BOUND = {
+    "max_rounds": 5, "max_actions_per_round": 20, "max_requests": 100,
+    "max_total_execution_ms": 120_000, "max_wall_ms_per_round": 60_000, "max_body_bytes": 2_097_152,
+}
+DISCOVERY_PROVENANCE_KINDS = frozenset({
+    "customer_url", "imported_openapi", "well_known_spec", "robots", "sitemap", "html_link",
+    "script_src", "js_literal", "html_link_auth", "js_literal_auth", "redirect_location",
+    "discovered_openapi",
+})
+# Kinds an executor may report from a round; customer and import sources are not round output.
+_ROUND_PROVENANCE_KINDS = DISCOVERY_PROVENANCE_KINDS - {"customer_url", "imported_openapi"}
+DISCOVERY_EXCLUDED_REASONS = frozenset({
+    "method_not_allowed", "off_origin", "side_effect_risk", "static_asset", "truncated",
+})
 
 _SAFE_INT = (1 << 53) - 1
+# Response-body ceilings by signed profile.  ``scan`` is every v1 record and every scan plan;
+# ``discovery`` is reachable only from a signed discovery plan or a v2 grant that names it.
+SCAN_BODY_BYTES = 256 * 1024
+DISCOVERY_BODY_BYTES = 2 * 1024 * 1024
+_BODY_BYTES = {"scan": SCAN_BODY_BYTES, "discovery": DISCOVERY_BODY_BYTES}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 _EVIDENCE = re.compile(r"^ev1_[0-9a-f]{64}$")
@@ -45,6 +81,10 @@ _FORBIDDEN_APPROVAL_KEYS = frozenset({
     "shell", "model_output", "object_id", "object_ids", "query", "query_values",
     "raw_traffic", "cookies", "tokens", "local_path", "local_paths", "openapi",
     "raw_openapi", "paths", "components",
+})
+# Every C2 discovery/plan schema also refuses value-bearing names (discovery contract preamble).
+_FORBIDDEN_DISCOVERY_KEYS = _FORBIDDEN_APPROVAL_KEYS | frozenset({
+    "password", "secret", "token", "cookie", "authorization", "url", "query", "body",
 })
 _FORBIDDEN_OPERATIONAL_KEYS = _FORBIDDEN_APPROVAL_KEYS | frozenset({
     "assessment", "scenario_results", "findings", "finding", "observations", "private",
@@ -304,14 +344,14 @@ def _statuses(value: Any) -> list[int]:
     return entries
 
 
-def _budgets(value: Any) -> dict[str, Any]:
+def _budgets(value: Any, *, profile: str = "scan") -> dict[str, Any]:
     obj = _object(value, {"maximum_requests", "maximum_concurrency", "action_timeout_ms", "wall_timeout_ms", "maximum_response_bytes"})
     _integer(obj["maximum_requests"], lower=1, upper=20)
     if _integer(obj["maximum_concurrency"], lower=1, upper=1) != 1:
         _fail("concurrency must be one")
     _integer(obj["action_timeout_ms"], lower=1, upper=5000)
     _integer(obj["wall_timeout_ms"], lower=1, upper=60000)
-    _integer(obj["maximum_response_bytes"], lower=1, upper=256 * 1024)
+    _integer(obj["maximum_response_bytes"], lower=1, upper=_BODY_BYTES[profile])
     return obj
 
 
@@ -401,8 +441,11 @@ def validate_test_manifest(value: Any) -> dict[str, Any]:
 
 def validate_approval_projection(value: Any) -> dict[str, Any]:
     obj = _contract(value, 64 * 1024); _reject_keys(obj, _FORBIDDEN_APPROVAL_KEYS)
-    obj = _object(obj, {"schema_version", "projection_id", "workspace_id", "project_id", "environment", "runner", "compiler", "scenarios", "actions", "budgets", "egress", "retry_policy", "compiled_at_ms", "manifest_digest", "projection_digest", "signing_key_id", "signature_b64"})
-    _enum(obj["schema_version"], {APPROVAL_PROJECTION_SCHEMA}); _id_fields(obj, ("projection_id", "workspace_id", "project_id")); env = _environment(obj["environment"])
+    # v2 is v1 plus exactly one closed, signed ``plan`` object; v1 can never carry one.
+    v2 = isinstance(obj, Mapping) and obj.get("schema_version") == APPROVAL_PROJECTION_V2_SCHEMA
+    if v2: _reject_keys(obj, _FORBIDDEN_DISCOVERY_KEYS)
+    obj = _object(obj, {"schema_version", "projection_id", "workspace_id", "project_id", "environment", "runner", "compiler", "scenarios", "actions", "budgets", "egress", "retry_policy", "compiled_at_ms", "manifest_digest", "projection_digest", "signing_key_id", "signature_b64"} | ({"plan"} if v2 else set()))
+    _enum(obj["schema_version"], {APPROVAL_PROJECTION_SCHEMA, APPROVAL_PROJECTION_V2_SCHEMA}); _id_fields(obj, ("projection_id", "workspace_id", "project_id")); env = _environment(obj["environment"])
     runner = _object(obj["runner"], {"runner_id", "runner_key_id", "runner_version", "adapter_versions"}); _id_fields(runner, ("runner_id", "runner_key_id", "runner_version")); _version_list(runner["adapter_versions"])
     compiler = _object(obj["compiler"], {"compiler_version", "engine_version"}); _id_fields(compiler, ("compiler_version", "engine_version"))
     scenarios = _scenarios(obj["scenarios"]); scenario_ids = {(x["scenario_id"], x["adapter_version"]) for x in scenarios}
@@ -413,8 +456,9 @@ def validate_approval_projection(value: Any) -> dict[str, Any]:
         _id_fields(action, ("scenario_id", "adapter_version", "semantic_auth_role"))
         if (action["scenario_id"], action["adapter_version"]) not in scenario_ids: _fail("invalid action ordering")
         _method(action["method"]); _route(action["route_template"]); _enum(action["assertion_class"], {"anonymous_authenticated", "object_ownership", "role_boundary", "plan_entitlement"}); _statuses(action["allowed_status_codes"]); _body_shapes(action["allowed_body_shapes"]); _enum(action["side_effect_class"], {"read_only"})
-    _budgets(obj["budgets"]); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["compiled_at_ms"], lower=0); _hash(obj["manifest_digest"])
+    _budgets(obj["budgets"], profile=approval_body_profile(obj)); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["compiled_at_ms"], lower=0); _hash(obj["manifest_digest"])
     if obj["signing_key_id"] != runner["runner_key_id"]: _fail("approval signing key mismatch")
+    if v2: _plan(obj["plan"], actions, obj["budgets"])
     _signature(obj, "projection_digest")
     return copy.deepcopy(obj)
 
@@ -534,9 +578,11 @@ def validate_runner_identity(value: Any) -> dict[str, Any]:
 
 
 def validate_execution_grant(value: Any) -> dict[str, Any]:
-    obj = _contract(value, 32 * 1024); obj = _object(obj, {"schema_version", "grant_id", "run_id", "workspace_id", "project_id", "approval", "environment", "runner_binding", "approval_actor", "approval_reason", "consented_at_ms", "budgets", "egress", "retry_policy", "grant_nonce", "kill_switch_generation", "operational_receipt_policy", "issued_at_ms", "expires_at_ms", "grant_digest", "signing_key_id", "signature_b64"})
-    _enum(obj["schema_version"], {EXECUTION_GRANT_SCHEMA}); _id_fields(obj, ("grant_id", "run_id", "workspace_id", "project_id", "grant_nonce")); approval = _object(obj["approval"], {"projection_id", "projection_digest", "manifest_digest"}); _id_fields(approval, ("projection_id",)); _hash(approval["projection_digest"]); _hash(approval["manifest_digest"]); env = _environment(obj["environment"])
-    binding = _object(obj["runner_binding"], {"runner_id", "runner_key_id", "public_key_digest"}); _id_fields(binding, ("runner_id", "runner_key_id")); _hash(binding["public_key_digest"]); actor = _object(obj["approval_actor"], {"user_id", "role"}); _id_fields(actor, ("user_id",)); _enum(actor["role"], {"owner", "admin"}); _string(obj["approval_reason"], limit=500); _integer(obj["consented_at_ms"], lower=0); _budgets(obj["budgets"]); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["kill_switch_generation"], lower=0)
+    obj = _contract(value, 32 * 1024)
+    v2 = isinstance(obj, Mapping) and obj.get("schema_version") == EXECUTION_GRANT_V2_SCHEMA
+    obj = _object(obj, {"schema_version", "grant_id", "run_id", "workspace_id", "project_id", "approval", "environment", "runner_binding", "approval_actor", "approval_reason", "consented_at_ms", "budgets", "egress", "retry_policy", "grant_nonce", "kill_switch_generation", "operational_receipt_policy", "issued_at_ms", "expires_at_ms", "grant_digest", "signing_key_id", "signature_b64"} | ({"budget_profile"} if v2 else set()))
+    _enum(obj["schema_version"], {EXECUTION_GRANT_SCHEMA, EXECUTION_GRANT_V2_SCHEMA}); profile = _enum(obj["budget_profile"], {"discovery"}) if v2 else "scan"; _id_fields(obj, ("grant_id", "run_id", "workspace_id", "project_id", "grant_nonce")); approval = _object(obj["approval"], {"projection_id", "projection_digest", "manifest_digest"}); _id_fields(approval, ("projection_id",)); _hash(approval["projection_digest"]); _hash(approval["manifest_digest"]); env = _environment(obj["environment"])
+    binding = _object(obj["runner_binding"], {"runner_id", "runner_key_id", "public_key_digest"}); _id_fields(binding, ("runner_id", "runner_key_id")); _hash(binding["public_key_digest"]); actor = _object(obj["approval_actor"], {"user_id", "role"}); _id_fields(actor, ("user_id",)); _enum(actor["role"], {"owner", "admin"}); _string(obj["approval_reason"], limit=500); _integer(obj["consented_at_ms"], lower=0); _budgets(obj["budgets"], profile=profile); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["kill_switch_generation"], lower=0)
     policy = _object(obj["operational_receipt_policy"], {"schema_version", "maximum_bytes", "allowed_error_categories", "allowed_stop_reasons", "allowed_containment_codes"}); _enum(policy["schema_version"], {OPERATIONAL_RUN_SCHEMA}); _integer(policy["maximum_bytes"], lower=1, upper=32768); _enum_list(policy["allowed_error_categories"], _ERRORS); _enum_list(policy["allowed_stop_reasons"], _STOPS); _enum_list(policy["allowed_containment_codes"], _CONTAINMENT)
     issued = _integer(obj["issued_at_ms"], lower=0); expires = _integer(obj["expires_at_ms"], lower=0)
     if not issued < expires <= issued + 600000: _fail("invalid grant expiry")
@@ -633,6 +679,17 @@ def validate_runner_progress_request(value: Any) -> dict[str, Any]:
 
 
 def validate_runner_result_request(value: Any) -> dict[str, Any]:
+    # A discovery round's signed candidate report rides on its terminal result (contract §2.6).
+    if isinstance(value, Mapping) and "discovery_round_report" in value:
+        report = validate_discovery_round_report(value["discovery_round_report"])
+        request = _runner_operation_request(
+            {key: item for key, item in value.items() if key != "discovery_round_report"},
+            schema=RUNNER_RESULT_REQUEST_SCHEMA, phases={"terminal"},
+        )
+        if report["run_id"] != request["run_id"] or report["grant_id"] != request["operational_projection"]["grant_id"]:
+            _fail("discovery report run mismatch")
+        request["discovery_round_report"] = report
+        return request
     return _runner_operation_request(value, schema=RUNNER_RESULT_REQUEST_SCHEMA,
                                      phases={"terminal"})
 
@@ -675,3 +732,271 @@ def validate_disclosure_permit(value: Any) -> dict[str, Any]:
     _enum(obj["schema_version"], {DISCLOSURE_PERMIT_SCHEMA}); _id_fields(obj, ("permit_id", "workspace_id", "project_id", "run_id", "grant_id", "approved_by", "permit_nonce")); binding = _object(obj["runner_binding"], {"runner_id", "runner_key_id"}); _id_fields(binding, ("runner_id", "runner_key_id")); projection = _object(obj["projection"], {"schema_version", "projection_digest", "maximum_bytes", "scenario_count", "finding_count"}); _enum(projection["schema_version"], {CANARY_FINDINGS_SCHEMA}); _hash(projection["projection_digest"]); _integer(projection["maximum_bytes"], lower=1, upper=262144); _integer(projection["scenario_count"], lower=0, upper=4); _integer(projection["finding_count"], lower=0, upper=4); _integer(obj["approved_at_ms"], lower=0); issued = _integer(obj["issued_at_ms"], lower=0); expires = _integer(obj["expires_at_ms"], lower=0)
     if not issued < expires <= issued + 600000: _fail("invalid permit expiry")
     _signature(obj, "permit_digest"); return copy.deepcopy(obj)
+
+
+# --- discovery authorization, v2 plan object, inventory provenance (C2 contract §2) ---
+
+DISCOVERY_SEED_DIGEST = canonical_digest(list(DISCOVERY_SEED_PATHS))
+_AUTHORIZATION_ID = re.compile(r"^dau_[0-9a-f]{32}$")
+_PLAN_REQUEST_ID = re.compile(r"^cpr_[0-9a-f]{32}$")
+_CONTEXT_BINDING_ID = re.compile(r"^rcb_[0-9a-f]{32}$")
+_NONCE = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
+_SEGMENT = re.compile(r"^[a-z0-9_-]{1,32}$")
+_POSITIONAL = re.compile(r"^\{p([1-9][0-9]?)\}$")
+_VALUE_SEGMENTS = (
+    re.compile(r"^[0-9]+$"), re.compile(r"^[0-9a-f]{12,}$"),
+    re.compile(r"(?:^|[_-])(?:sk|pk|rk)_(?:live|test)_"), re.compile(r"^(?:ghp|gho|ghs|ghu|xox[abpr])[_-]"),
+)
+_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 .-]{0,31}$")
+_PRINTABLE_LABEL = re.compile(r"^[\x21-\x7e](?:[\x20-\x7e]{0,30}[\x21-\x7e])?$")
+_PLAN_ROLES = ("higher_plan", "lower_plan")
+
+
+def _entropy_bits(segment: str) -> float:
+    counts = {character: segment.count(character) for character in set(segment)}
+    total = len(segment)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def _route_template(value: Any) -> str:
+    """A projected template keeps only allowlisted vocabulary segments (launch spec §3.3).
+
+    This is a conservative classifier, not a redactor: anything that could be a value
+    (addresses, numbers, hex, tokens, mixed case, dots, high-entropy text) is refused, and the
+    executor must have replaced it by a positional placeholder before projecting.
+    """
+    route = _route(value)
+    if route in DISCOVERY_SEED_PATHS:
+        return route
+    expected = 1
+    for segment in route[1:].split("/"):
+        positional = _POSITIONAL.fullmatch(segment)
+        if positional:
+            if int(positional.group(1)) != expected:
+                _fail("non-sequential route placeholder")
+            expected += 1
+            continue
+        if not _SEGMENT.fullmatch(segment) or any(pattern.search(segment) for pattern in _VALUE_SEGMENTS):
+            _fail("route segment is not template vocabulary")
+        if len(segment) >= 16 and _entropy_bits(segment) >= 3.5:
+            _fail("route segment is not template vocabulary")
+    return route
+
+
+def _plan_label(value: Any) -> str:
+    label = _string(value, identifier=True)
+    if not _LABEL.fullmatch(label) or re.fullmatch(r"[0-9a-fA-F]{16,}", label.replace("-", "")):
+        _fail("invalid plan label")
+    return label
+
+
+def _plan_labels(value: Any, *, minimum: int) -> list[dict[str, Any]]:
+    entries = _list(value, maximum=2)
+    if len(entries) < minimum:
+        _fail("invalid plan labels")
+    roles = []
+    for entry in entries:
+        entry = _object(entry, {"role", "plan_label"})
+        roles.append(_enum(entry["role"], set(_PLAN_ROLES)))
+        _plan_label(entry["plan_label"])
+    if roles != sorted(set(roles)):
+        _fail("plan labels must be sorted and unique")
+    return entries
+
+
+def approval_body_profile(projection: Mapping[str, Any]) -> str:
+    """The body profile a projection's own signed structure selects; never a caller choice."""
+    plan = projection.get("plan") if projection.get("schema_version") == APPROVAL_PROJECTION_V2_SCHEMA else None
+    if isinstance(plan, Mapping) and plan.get("plan_kind") == "discovery" and plan.get("transport_profile") == "discovery":
+        return "discovery"
+    return "scan"
+
+
+def _plan(value: Any, actions: list[Any], budgets: Mapping[str, Any]) -> dict[str, Any]:
+    kind = value.get("plan_kind") if isinstance(value, Mapping) else None
+    if kind == "discovery":
+        return _discovery_plan(value, actions, budgets)
+    obj = _object(value, {
+        "plan_kind", "plan_request_id", "plan_request_nonce", "inventory_digest", "selection_digest",
+        "selected_count", "plan_labels", "max_ops", "not_executed_count", "not_executed_digest",
+    })
+    _enum(obj["plan_kind"], {"plan_differential", "regression"})
+    if not isinstance(obj["plan_request_id"], str) or not _PLAN_REQUEST_ID.fullmatch(obj["plan_request_id"]):
+        _fail("invalid plan request id")
+    if not isinstance(obj["plan_request_nonce"], str) or not _NONCE.fullmatch(obj["plan_request_nonce"]):
+        _fail("invalid plan request nonce")
+    for field in ("inventory_digest", "selection_digest", "not_executed_digest"):
+        _hash(obj[field])
+    _integer(obj["selected_count"], lower=1, upper=10); _integer(obj["max_ops"], lower=1, upper=20)
+    _integer(obj["not_executed_count"], lower=0, upper=10)
+    _plan_labels(obj["plan_labels"], minimum=2)
+    for action in actions:
+        _route_template(action["route_template"])
+    return obj
+
+
+def _discovery_plan(value: Any, actions: list[Any], budgets: Mapping[str, Any]) -> dict[str, Any]:
+    obj = _object(value, {
+        "plan_kind", "authorization_id", "authorization_digest", "round", "frontier_digest",
+        "cumulative_requests_before", "transport_profile", "action_count", "sources",
+    })
+    if not isinstance(obj["authorization_id"], str) or not _AUTHORIZATION_ID.fullmatch(obj["authorization_id"]):
+        _fail("invalid discovery authorization id")
+    _hash(obj["authorization_digest"]); _hash(obj["frontier_digest"])
+    round_number = _integer(obj["round"], lower=1, upper=DISCOVERY_BOUND["max_rounds"])
+    cumulative = _integer(obj["cumulative_requests_before"], lower=0, upper=DISCOVERY_BOUND["max_requests"] - 1)
+    _enum(obj["transport_profile"], {"discovery"})
+    count = _integer(obj["action_count"], lower=1, upper=DISCOVERY_BOUND["max_actions_per_round"])
+    if count != len(actions) or budgets["maximum_requests"] != count:
+        _fail("discovery action count mismatch")
+    sources = _list(obj["sources"], maximum=DISCOVERY_BOUND["max_actions_per_round"])
+    if len(sources) != count:
+        _fail("discovery source count mismatch")
+    for ordinal, source in enumerate(sources):
+        source = _object(source, {"ordinal", "round", "source_ordinal"})
+        if _integer(source["ordinal"]) != ordinal:
+            _fail("non-contiguous discovery source")
+        source_round = _integer(source["round"], lower=0, upper=round_number - 1)
+        _integer(source["source_ordinal"], lower=0, upper=19)
+        # Round 0 names the fixed seed list, which only round 1 may draw from.
+        if (round_number == 1) != (source_round == 0):
+            _fail("discovery source round mismatch")
+    for action in actions:
+        _route_template(action["route_template"])
+    # Round 1 is the fixed seed frontier.  Exact seed membership of each action is the server's
+    # recorded-relationship check (``seed_mismatch``); the contract binds its digest and shape.
+    if round_number == 1 and (
+        cumulative != 0 or obj["frontier_digest"] != DISCOVERY_SEED_DIGEST or count != len(DISCOVERY_SEED_PATHS)
+    ):
+        _fail("discovery round one is not the seed list")
+    return obj
+
+
+def discovery_frontier_digest(referenced: list[Mapping[str, Any]]) -> str:
+    """Digest of ``[{round, candidate}]`` exactly as stored, in the plan's source order."""
+    return canonical_digest([{"round": item["round"], "candidate": item["candidate"]} for item in referenced])
+
+
+def validate_discovery_authorization_request(value: Any) -> dict[str, Any]:
+    # ``login_exchange_authorized`` is the one JSON boolean in C2; C5 owns ``true``.  It is
+    # stored as integer 0 because canonical contract bytes never encode booleans.
+    if not isinstance(value, Mapping) or value.get("login_exchange_authorized") is not False:
+        _fail("login exchange authorization is not available")
+    obj = _contract({**dict(value), "login_exchange_authorized": 0}, 2 * 1024)
+    _reject_keys(obj, _FORBIDDEN_DISCOVERY_KEYS)
+    obj = _object(obj, {"schema_version", "environment_id", "identities_authorized", "login_exchange_authorized", "acknowledgement"})
+    _enum(obj["schema_version"], {DISCOVERY_AUTHORIZATION_SCHEMA}); _id_fields(obj, ("environment_id",))
+    identities = _list(obj["identities_authorized"], maximum=2)
+    for identity in identities:
+        if not isinstance(identity, str) or not _PRINTABLE_LABEL.fullmatch(identity):
+            _fail("invalid identity label")
+    if len(set(identities)) != len(identities):
+        _fail("duplicate identity label")
+    if obj["acknowledgement"] != DISCOVERY_ACKNOWLEDGEMENT:
+        _fail("discovery acknowledgement mismatch")
+    return copy.deepcopy(obj)
+
+
+def _candidates(value: Any, *, kinds: frozenset[str]) -> list[dict[str, Any]]:
+    entries = _list(value, maximum=200)
+    seen = set()
+    for entry in entries:
+        entry = _object(entry, {"method", "route_template", "provenance_kind", "source_ordinal", "status_code"})
+        key = (_method(entry["method"]), _route_template(entry["route_template"]))
+        if key in seen:
+            _fail("duplicate discovery candidate")
+        seen.add(key)
+        _enum(entry["provenance_kind"], set(kinds)); _integer(entry["source_ordinal"], lower=0, upper=19)
+        _integer(entry["status_code"], lower=100, upper=599)
+    return entries
+
+
+def validate_discovery_round_report(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 64 * 1024); _reject_keys(obj, _FORBIDDEN_DISCOVERY_KEYS)
+    obj = _object(obj, {"schema_version", "authorization_id", "round", "run_id", "grant_id", "candidates", "excluded_count", "truncated_count", "bytes_received", "report_digest", "signing_key_id", "signature_b64"})
+    _enum(obj["schema_version"], {DISCOVERY_ROUND_REPORT_SCHEMA})
+    if not isinstance(obj["authorization_id"], str) or not _AUTHORIZATION_ID.fullmatch(obj["authorization_id"]):
+        _fail("invalid discovery authorization id")
+    _integer(obj["round"], lower=1, upper=DISCOVERY_BOUND["max_rounds"]); _id_fields(obj, ("run_id", "grant_id"))
+    _candidates(obj["candidates"], kinds=_ROUND_PROVENANCE_KINDS)
+    _integer(obj["excluded_count"], lower=0, upper=10_000); _integer(obj["truncated_count"], lower=0, upper=10_000)
+    _integer(obj["bytes_received"], lower=0, upper=DISCOVERY_BOUND["max_actions_per_round"] * DISCOVERY_BOUND["max_body_bytes"])
+    _signature(obj, "report_digest")
+    return copy.deepcopy(obj)
+
+
+def validate_route_inventory_rows(value: Any) -> list[dict[str, Any]]:
+    """Closed inventory rows: templates, provenance and state only, never values (§2.5)."""
+    rows = _contract(value, 256 * 1024); _reject_keys(rows, _FORBIDDEN_DISCOVERY_KEYS)
+    rows = _list(rows, maximum=200)
+    seen = set()
+    for row in rows:
+        excluded = isinstance(row, Mapping) and row.get("state") == "excluded"
+        row = _object(row, {"method", "route_template", "provenance", "first_seen_ms", "state"} | ({"excluded_reason"} if excluded else set()))
+        key = (_method(row["method"]), _route_template(row["route_template"]))
+        if key in seen:
+            _fail("duplicate inventory route")
+        seen.add(key)
+        provenance = _list(row["provenance"], maximum=8)
+        if not provenance:
+            _fail("inventory provenance required")
+        sources = set()
+        for item in provenance:
+            item = _object(item, {"kind", "round", "source_ordinal", "status_code"})
+            _enum(item["kind"], set(DISCOVERY_PROVENANCE_KINDS)); _integer(item["round"], lower=0, upper=DISCOVERY_BOUND["max_rounds"])
+            _integer(item["source_ordinal"], lower=0, upper=19)
+            if item["status_code"] is not None:
+                _integer(item["status_code"], lower=100, upper=599)
+            source = (item["kind"], item["round"], item["source_ordinal"])
+            if source in sources:
+                _fail("duplicate inventory provenance")
+            sources.add(source)
+        _integer(row["first_seen_ms"], lower=0); _enum(row["state"], {"candidate", "selected", "excluded"})
+        if excluded:
+            _enum(row["excluded_reason"], set(DISCOVERY_EXCLUDED_REASONS))
+    return copy.deepcopy(rows)
+
+
+def _route_selection(value: Any, *, maximum: int) -> list[dict[str, Any]]:
+    routes = _list(value, maximum=maximum)
+    if not routes:
+        _fail("route selection required")
+    seen = set()
+    for route in routes:
+        route = _object(route, {"method", "route_template"})
+        key = (_method(route["method"]), _route_template(route["route_template"]))
+        if key in seen:
+            _fail("duplicate selected route")
+        seen.add(key)
+    return routes
+
+
+def validate_plan_request(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 2 * 1024); _reject_keys(obj, _FORBIDDEN_DISCOVERY_KEYS)
+    obj = _object(obj, {"schema_version", "plan_kind", "max_ops", "routes"})
+    _enum(obj["schema_version"], {PLAN_REQUEST_SCHEMA}); _enum(obj["plan_kind"], {"plan_differential"})
+    _integer(obj["max_ops"], lower=1, upper=20); _route_selection(obj["routes"], maximum=10)
+    return copy.deepcopy(obj)
+
+
+def validate_runner_plan_request_claim(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 2 * 1024); _reject_keys(obj, _FORBIDDEN_DISCOVERY_KEYS)
+    obj = _object(obj, {"schema_version", "binding_id", "binding_digest", "credential_roles"})
+    _enum(obj["schema_version"], {RUNNER_PLAN_REQUEST_CLAIM_SCHEMA})
+    if not isinstance(obj["binding_id"], str) or not _CONTEXT_BINDING_ID.fullmatch(obj["binding_id"]):
+        _fail("invalid context binding id")
+    _hash(obj["binding_digest"]); _plan_labels(obj["credential_roles"], minimum=0)
+    return copy.deepcopy(obj)
+
+
+def validate_runner_plan_request(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 64 * 1024); _reject_keys(obj, _FORBIDDEN_DISCOVERY_KEYS)
+    obj = _object(obj, {"schema_version", "plan_request_id", "plan_request_nonce", "plan_kind", "max_ops", "inventory_digest", "selection_digest", "routes", "expires_at_ms"})
+    _enum(obj["schema_version"], {RUNNER_PLAN_REQUEST_SCHEMA}); _enum(obj["plan_kind"], {"plan_differential"})
+    if not isinstance(obj["plan_request_id"], str) or not _PLAN_REQUEST_ID.fullmatch(obj["plan_request_id"]):
+        _fail("invalid plan request id")
+    if not isinstance(obj["plan_request_nonce"], str) or not _NONCE.fullmatch(obj["plan_request_nonce"]):
+        _fail("invalid plan request nonce")
+    _integer(obj["max_ops"], lower=1, upper=20); _hash(obj["inventory_digest"]); _hash(obj["selection_digest"])
+    _route_selection(obj["routes"], maximum=10); _integer(obj["expires_at_ms"], lower=1)
+    return copy.deepcopy(obj)

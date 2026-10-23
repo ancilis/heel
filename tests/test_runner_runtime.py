@@ -634,7 +634,8 @@ def test_runtime_upgrades_v1_metadata_without_rewriting_existing_sealed_rows(tmp
     assert runtime.load_chain("claim", None).state_digest == core["state_digest"]
     assert RunnerRuntimeState(path, identity, signer).load_chain("claim", None).state_digest == core["state_digest"]
     with sqlite3.connect(path) as check:
-        assert check.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v3"
+        # v1 -> v2 -> v3 -> v4 (T2b2R1 recovery records) in one transaction; sealed rows are untouched.
+        assert check.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v4"
         assert check.execute("SELECT sealed_blob FROM control_chains WHERE chain=?", (chain,)).fetchone()[0] == sealed
     check.close()
 
@@ -1248,3 +1249,565 @@ def test_runtime_rejects_each_precreated_noncanonical_schema_object(tmp_path, ob
 
     with pytest.raises(RunnerRuntimeCorrupt, match="runtime state schema is invalid"):
         RunnerRuntimeState(path, identity, signer)
+
+
+# ---------------------------------------------------------------------------
+# T2b2R1: claim-chain authority recovery records (runtime schema v4).
+# A staged claim-chain call the server never recorded can never replay after
+# its proof window; only an accepted resync may retire it, atomically, into a
+# sealed tombstone.  These tests exercise the runtime half of that contract.
+
+_LIST_BODY = canonical_bytes({"schema_version": "heel.runner-context-list.v1"})
+
+
+def _b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _signed_claim_chain_headers(signer, identity, *, path, body, nonce, sequence, timestamp_ms=1):
+    proof = {
+        "schema_version": "heel.runner-request-proof.v1", "workspace_id": identity.workspace_id,
+        "runner_id": identity.runner_id, "key_id": identity.key_id, "capability": "runner_claim",
+        "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(),
+        "timestamp_ms": timestamp_ms, "server_nonce": nonce, "sequence": sequence,
+    }
+    return {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
+        "X-Heel-Runner-Key-Id": identity.key_id, "X-Heel-Runner-Timestamp-Ms": str(timestamp_ms),
+        "X-Heel-Runner-Signature": _b64(signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))),
+        "X-Heel-Runner-Nonce": nonce, "X-Heel-Runner-Sequence": str(sequence),
+    }
+
+
+def _stage_claim_chain(runtime, signer, identity, *, operation="list-contexts", binding_id=None, claim_body=None):
+    cursor = runtime.load_chain("claim", None)
+    prefix = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}"
+    if operation == "list-contexts":
+        path, body = f"{prefix}/contexts/list", _LIST_BODY
+    elif operation == "claim-context":
+        binding_id = binding_id or "rcb_" + "b" * 32
+        path = f"{prefix}/contexts/{binding_id}/claim"
+        body = canonical_bytes({
+            "schema_version": "heel.runner-context-claim.v1", "binding_id": binding_id,
+            "binding_digest": "d" * 64,
+        })
+    elif operation == "submit-context-approval-projection":
+        path = f"{prefix}/contexts/{'rcb_' + 'b' * 32}/approval-projections"
+        body = canonical_bytes({"schema_version": "heel.runner-approval-projection-submit.v1"})
+    else:
+        assert operation == "claim"
+        path = f"{prefix}/claim"
+        body = canonical_bytes(claim_body or {"schema_version": "heel.runner-claim-request.v1"})
+    headers = _signed_claim_chain_headers(
+        signer, identity, path=path, body=body, nonce=cursor.next_nonce_b64, sequence=cursor.next_sequence,
+    )
+    return runtime.stage_call(
+        request_operation=operation, chain_operation="claim", run_id=None, path=path,
+        capability="runner_claim", headers=headers, body=body,
+        expected_state_digest=cursor.state_digest, now_ms=1,
+    )
+
+
+def _resync_start(signer, identity, *, client_nonce, timestamp_ms=2):
+    path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/resync/start"
+    body = canonical_bytes({
+        "schema_version": "heel.runner-resync-start.v2", "chain": {"operation": "claim", "run_id": None},
+        "client_nonce_b64": client_nonce,
+    })
+    proof = {
+        "schema_version": "heel.runner-resync-start-proof.v2", "workspace_id": identity.workspace_id,
+        "runner_id": identity.runner_id, "key_id": identity.key_id, "method": "POST", "path": path,
+        "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms,
+    }
+    headers = {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
+        "X-Heel-Runner-Key-Id": identity.key_id, "X-Heel-Runner-Timestamp-Ms": str(timestamp_ms),
+        "X-Heel-Runner-Signature": _b64(signer.sign(b"heel.runner-resync-start-pop.v2\0" + canonical_bytes(proof))),
+    }
+    return path, headers, body
+
+
+def _resync_complete(signer, identity, *, challenge_id, client_nonce, server_challenge, generation, timestamp_ms=3):
+    path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/resync/complete"
+    body = canonical_bytes({
+        "schema_version": "heel.runner-resync-complete.v2", "challenge_id": challenge_id,
+        "chain": {"operation": "claim", "run_id": None}, "client_nonce_b64": client_nonce,
+        "server_challenge_b64": server_challenge, "generation": generation,
+    })
+    proof = {
+        "schema_version": "heel.runner-resync-complete-proof.v2", "workspace_id": identity.workspace_id,
+        "runner_id": identity.runner_id, "key_id": identity.key_id, "method": "POST", "path": path,
+        "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms,
+    }
+    headers = {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
+        "X-Heel-Runner-Key-Id": identity.key_id, "X-Heel-Runner-Timestamp-Ms": str(timestamp_ms),
+        "X-Heel-Runner-Signature": _b64(signer.sign(b"heel.runner-resync-complete-pop.v2\0" + canonical_bytes(proof))),
+    }
+    return path, headers, body
+
+
+def _completed_attempt(runtime, signer, identity, *, generation=0, challenge_sequence=None):
+    client_nonce, server_challenge = _b64(b"c" * 32), _b64(b"s" * 32)
+    path, headers, body = _resync_start(signer, identity, client_nonce=client_nonce)
+    attempt = runtime.begin_resync_attempt(
+        operation="claim", path=path, headers=headers, body=body, client_nonce_b64=client_nonce,
+        timestamp_ms=2, now_ms=2,
+    )
+    attempt = runtime.record_resync_challenge(
+        attempt, challenge_id="rrs_" + "e" * 32, server_challenge_b64=server_challenge,
+        next_sequence=challenge_sequence or attempt_sequence(runtime), generation=generation,
+        expires_at_ms=60_002, now_ms=2,
+    )
+    path, headers, body = _resync_complete(
+        signer, identity, challenge_id="rrs_" + "e" * 32, client_nonce=client_nonce,
+        server_challenge=server_challenge, generation=generation,
+    )
+    return runtime.record_resync_completion(
+        attempt, path=path, headers=headers, body=body, timestamp_ms=3, now_ms=3,
+    )
+
+
+def _realistic_identity(signer):
+    import dataclasses
+    return dataclasses.replace(
+        _identity(signer), workspace_id="ws_" + "9" * 24, runner_id="runr_" + "a" * 32,
+    )
+
+
+def attempt_sequence(runtime):
+    return runtime.load_chain("claim", None).next_sequence
+
+
+def _claim_runtime(tmp_path, *, name="runtime.sqlite3"):
+    signer = Signer()
+    # Production-length IDs: a claim-context path is then longer than the runtime's 128-byte
+    # short-text fields, which a tombstone must still hold (found by the T2b2R1 HTTP gate).
+    identity = _realistic_identity(signer)
+    runtime = RunnerRuntimeState(tmp_path / name, identity, signer)
+    runtime.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=_b64(b"n" * 32),
+        next_sequence=4, generation=0, now_ms=1,
+    )
+    return runtime, signer, identity
+
+
+@pytest.mark.parametrize("operation", ["list-contexts", "claim-context"])
+def test_accepted_resync_atomically_supersedes_an_eligible_claim_chain_call_into_a_sealed_tombstone(tmp_path, operation):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    pending = _stage_claim_chain(runtime, signer, identity, operation=operation)
+    attempt = _completed_attempt(runtime, signer, identity)
+    recovered_nonce = _b64(b"r" * 32)
+
+    cursor = runtime.commit_resync_supersession(
+        attempt, pending, next_nonce_b64=recovered_nonce, next_sequence=4, generation=1, now_ms=5,
+    )
+
+    assert (cursor.next_nonce_b64, cursor.next_sequence, cursor.generation) == (recovered_nonce, 4, 1)
+    assert runtime.load_pending_calls() == ()
+    assert runtime.load_resync_attempt("claim") is None
+    (tombstone,) = runtime.load_superseded_calls()
+    assert (tombstone.call_id, tombstone.request_operation, tombstone.path, tombstone.sequence,
+            tombstone.generation, tombstone.superseded_by_generation, tombstone.resync_challenge_id,
+            tombstone.superseded_at_ms, tombstone.body_sha256) == (
+        pending.call_id, operation, pending.path, 4, 0, 1, "rrs_" + "e" * 32, 5,
+        hashlib.sha256(pending.body).hexdigest(),
+    )
+    # The audit row is sealed: neither the request body nor its signature is stored in clear.
+    with sqlite3.connect(runtime.path) as conn:
+        rows = conn.execute("SELECT kind,generation,sealed_blob FROM chain_recovery").fetchall()
+    conn.close()
+    assert [(kind, generation) for kind, generation, _blob in rows] == [("superseded_call", 1)]
+    assert pending.body not in rows[0][2] and pending.headers["X-Heel-Runner-Signature"].encode() not in rows[0][2]
+    # Reopening keeps the tombstone and nothing becomes replayable again.
+    reopened = RunnerRuntimeState(runtime.path, identity, signer)
+    assert reopened.load_pending_calls() == ()
+    assert reopened.load_superseded_calls() == (tombstone,)
+
+
+def test_supersession_refuses_ineligible_or_mismatched_intents_without_any_mutation(tmp_path):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    claim = _stage_claim_chain(runtime, signer, identity, operation="submit-context-approval-projection")
+    attempt = _completed_attempt(runtime, signer, identity)
+    before = (runtime.load_chain("claim", None), runtime.load_pending_calls(), runtime.load_resync_attempt("claim"))
+
+    with pytest.raises(RunnerRuntimeConflict, match="not supersedable"):
+        runtime.commit_resync_supersession(
+            attempt, claim, next_nonce_b64=_b64(b"r" * 32), next_sequence=4, generation=1, now_ms=5,
+        )
+    for generation, sequence in ((0, 4), (2, 4), (1, 3)):
+        # No advance, a generation the challenge does not prove, or a regressed sequence.
+        with pytest.raises((RunnerRuntimeConflict, RunnerRuntimeCorrupt)):
+            runtime.commit_resync_supersession(
+                attempt, claim, next_nonce_b64=_b64(b"r" * 32), next_sequence=sequence,
+                generation=generation, now_ms=5,
+            )
+    assert (runtime.load_chain("claim", None), runtime.load_pending_calls(),
+            runtime.load_resync_attempt("claim")) == before
+    assert runtime.load_superseded_calls() == ()
+
+
+def test_supersession_requires_the_pending_call_to_sit_on_the_current_cursor_and_the_exact_attempt(tmp_path):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    pending = _stage_claim_chain(runtime, signer, identity)
+    attempt = _completed_attempt(runtime, signer, identity)
+    other = RunnerRuntimeState(tmp_path / "other.sqlite3", identity, signer)
+    other.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=_b64(b"z" * 32),
+        next_sequence=4, generation=0, now_ms=1,
+    )
+    # Same runner, another chain state: a different call that does not sit on this cursor.
+    foreign = _stage_claim_chain(other, signer, identity)
+    assert foreign.call_id != pending.call_id
+    with pytest.raises((RunnerRuntimeConflict, RunnerRuntimeCorrupt)):
+        runtime.commit_resync_supersession(
+            attempt, foreign, next_nonce_b64=_b64(b"r" * 32), next_sequence=4, generation=1, now_ms=5,
+        )
+    # An attempt without its persisted completion request is not an accepted resync.
+    runtime.discard_resync_attempt(attempt)
+    client_nonce = _b64(b"k" * 32)
+    path, headers, body = _resync_start(signer, identity, client_nonce=client_nonce)
+    started = runtime.begin_resync_attempt(
+        operation="claim", path=path, headers=headers, body=body, client_nonce_b64=client_nonce,
+        timestamp_ms=2, now_ms=2,
+    )
+    with pytest.raises(RunnerRuntimeConflict):
+        runtime.commit_resync_supersession(
+            started, pending, next_nonce_b64=_b64(b"r" * 32), next_sequence=4, generation=1, now_ms=5,
+        )
+    assert runtime.load_pending_calls() == (pending,)
+    assert runtime.load_chain("claim", None).generation == 0
+
+
+def test_resync_attempts_persist_exact_signed_bytes_and_compare_and_swap(tmp_path):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    client_nonce = _b64(b"c" * 32)
+    path, headers, body = _resync_start(signer, identity, client_nonce=client_nonce)
+    attempt = runtime.begin_resync_attempt(
+        operation="claim", path=path, headers=headers, body=body, client_nonce_b64=client_nonce,
+        timestamp_ms=2, now_ms=2,
+    )
+    assert (attempt.start_path, dict(attempt.start_headers), attempt.start_body, attempt.challenge_id) == (
+        path, headers, body, None,
+    )
+    reopened = RunnerRuntimeState(runtime.path, identity, signer)
+    assert reopened.load_resync_attempt("claim") == attempt
+    forged = dict(headers, **{"X-Heel-Runner-Signature": _b64(b"x" * 64)})
+    with pytest.raises(Exception):
+        runtime.begin_resync_attempt(
+            operation="claim", path=path, headers=forged, body=body, client_nonce_b64=client_nonce,
+            timestamp_ms=2, now_ms=2,
+        )
+    with pytest.raises(Exception):
+        runtime.begin_resync_attempt(
+            operation="heartbeat", path=path, headers=headers, body=body, client_nonce_b64=client_nonce,
+            timestamp_ms=2, now_ms=2,
+        )
+    challenged = runtime.record_resync_challenge(
+        attempt, challenge_id="rrs_" + "e" * 32, server_challenge_b64=_b64(b"s" * 32),
+        next_sequence=4, generation=0, expires_at_ms=60_002, now_ms=3,
+    )
+    # A stale snapshot can no longer change the persisted attempt.
+    with pytest.raises(RunnerRuntimeConflict):
+        runtime.record_resync_challenge(
+            attempt, challenge_id="rrs_" + "f" * 32, server_challenge_b64=_b64(b"t" * 32),
+            next_sequence=4, generation=0, expires_at_ms=60_002, now_ms=3,
+        )
+    with pytest.raises(RunnerRuntimeConflict):
+        runtime.discard_resync_attempt(attempt)
+    assert runtime.load_resync_attempt("claim") == challenged
+    # The challenge cannot regress below the local generation.
+    lower, lower_signer, lower_identity = _claim_runtime(tmp_path, name="lower.sqlite3")
+    lower._commit_resync_chain(
+        operation="claim", run_id=None, next_nonce_b64=_b64(b"g" * 32), next_sequence=4,
+        generation=1, now_ms=2,
+    )
+    p, h, b = _resync_start(lower_signer, lower_identity, client_nonce=client_nonce)
+    lower_attempt = lower.begin_resync_attempt(
+        operation="claim", path=p, headers=h, body=b, client_nonce_b64=client_nonce, timestamp_ms=2, now_ms=2,
+    )
+    with pytest.raises(RunnerRuntimeCorrupt):
+        lower.record_resync_challenge(
+            lower_attempt, challenge_id="rrs_" + "e" * 32, server_challenge_b64=_b64(b"s" * 32),
+            next_sequence=4, generation=0, expires_at_ms=60_002, now_ms=3,
+        )
+    runtime.discard_resync_attempt(challenged)
+    assert runtime.load_resync_attempt("claim") is None
+
+
+def test_rotation_refuses_while_a_resync_attempt_is_open(tmp_path):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    client_nonce = _b64(b"c" * 32)
+    path, headers, body = _resync_start(signer, identity, client_nonce=client_nonce)
+    runtime.begin_resync_attempt(
+        operation="claim", path=path, headers=headers, body=body, client_nonce_b64=client_nonce,
+        timestamp_ms=2, now_ms=2,
+    )
+    with pytest.raises(RunnerRuntimeConflict, match="recovery"):
+        runtime.probe_rotation_eligible(old_identity=identity)
+
+
+def test_runtime_v3_to_v4_migration_preserves_every_prior_row_and_rejects_a_tampered_tombstone(tmp_path):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    pending = _stage_claim_chain(runtime, signer, identity)
+    cursor = runtime.load_chain("claim", None)
+    path = runtime.path
+    runtime.close()
+    # Rebuild the exact v3 layout this file had before the T2b2R1 migration existed.
+    with sqlite3.connect(path) as conn:
+        before = {table: conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+                  for table in ("control_chains", "pending_calls", "terminal_disclosures", "active_runs")}
+        metadata = conn.execute("SELECT * FROM metadata").fetchone()
+        conn.execute("DROP TABLE chain_recovery")
+        conn.execute("ALTER TABLE metadata RENAME TO metadata_v4")
+        conn.execute(runtime_module._V3_SCHEMA_SQL[0])
+        conn.execute(
+            "INSERT INTO metadata SELECT singleton,'heel.runner-runtime-state.v3',workspace_id,runner_id,"
+            "runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,"
+            "rotation_fence_digest,state_key_ciphertext FROM metadata_v4"
+        )
+        conn.execute("DROP TABLE metadata_v4")
+        assert RunnerRuntimeState._schema_matches(conn, runtime_module._V3_SCHEMA_SQL)
+    conn.close()
+
+    migrated = RunnerRuntimeState(path, identity, signer)
+    assert migrated.load_chain("claim", None) == cursor
+    assert migrated.load_pending_calls() == (pending,)
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v4"
+        after = {table: conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+                 for table in ("control_chains", "pending_calls", "terminal_disclosures", "active_runs")}
+        assert after == before
+        migrated_metadata = conn.execute("SELECT * FROM metadata").fetchone()
+        assert migrated_metadata[2:] == metadata[2:] and migrated_metadata[1] == "heel.runner-runtime-state.v4"
+        assert conn.execute("SELECT COUNT(*) FROM chain_recovery").fetchone()[0] == 0
+    conn.close()
+
+    attempt = _completed_attempt(migrated, signer, identity)
+    migrated.commit_resync_supersession(
+        attempt, pending, next_nonce_b64=_b64(b"r" * 32), next_sequence=4, generation=1, now_ms=5,
+    )
+    with sqlite3.connect(path) as conn:
+        (blob,) = conn.execute("SELECT sealed_blob FROM chain_recovery").fetchone()
+        conn.execute("UPDATE chain_recovery SET sealed_blob=?", (blob[:-1] + bytes([blob[-1] ^ 1]),))
+    conn.close()
+    with pytest.raises(RunnerRuntimeCorrupt):
+        RunnerRuntimeState(path, identity, signer).load_superseded_calls()
+    # Corruption is never silently repaired: the file still holds the tampered row.
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM chain_recovery").fetchone()[0] == 1
+    conn.close()
+
+
+def test_accepted_resync_supersedes_a_staged_job_claim_only_when_the_server_cursor_equals_its_sequence(tmp_path):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    pending = _stage_claim_chain(runtime, signer, identity, operation="claim")
+    # N == S: the sequence was never consumed at any generation; supersede with the proof recorded.
+    attempt = _completed_attempt(runtime, signer, identity, challenge_sequence=4)
+    cursor = runtime.commit_resync_supersession(
+        attempt, pending, next_nonce_b64=_b64(b"r" * 32), next_sequence=4, generation=1, now_ms=5,
+    )
+    assert (cursor.next_sequence, cursor.generation) == (4, 1)
+    (tombstone,) = runtime.load_superseded_calls()
+    assert (tombstone.request_operation, tombstone.sequence, tombstone.challenge_next_sequence,
+            tombstone.completed_next_sequence) == ("claim", 4, 4, 4)
+
+    # N == S + 1 (from the challenge, the completion, or both): consumed -> refused, nothing changes.
+    for challenge_sequence, completed in ((5, 5), (4, 5), (5, 4)):
+        other, other_signer, other_identity = _claim_runtime(tmp_path, name=f"c{challenge_sequence}{completed}.sqlite3")
+        staged = _stage_claim_chain(other, other_signer, other_identity, operation="claim")
+        kept = _completed_attempt(other, other_signer, other_identity, challenge_sequence=challenge_sequence)
+        before = (other.load_chain("claim", None), other.load_pending_calls(), other.load_resync_attempt("claim"))
+        with pytest.raises(runtime_module.RuntimeClaimSequenceConsumed):
+            other.commit_resync_supersession(
+                kept, staged, next_nonce_b64=_b64(b"r" * 32), next_sequence=completed, generation=1, now_ms=5,
+            )
+        assert (other.load_chain("claim", None), other.load_pending_calls(),
+                other.load_resync_attempt("claim")) == before
+        assert other.load_superseded_calls() == ()
+
+    # Any other claim body is not the fixed poll and is never superseded.
+    odd, odd_signer, odd_identity = _claim_runtime(tmp_path, name="odd.sqlite3")
+    staged = _stage_claim_chain(odd, odd_signer, odd_identity, operation="claim",
+                                claim_body={"schema_version": "heel.runner-claim-request.v1", "x": 1})
+    with pytest.raises(RunnerRuntimeConflict, match="not supersedable"):
+        odd.commit_resync_supersession(
+            _completed_attempt(odd, odd_signer, odd_identity, challenge_sequence=4), staged,
+            next_nonce_b64=_b64(b"r" * 32), next_sequence=4, generation=1, now_ms=5,
+        )
+
+
+def test_job_claim_supersession_refuses_while_a_local_run_is_active(tmp_path):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    pending = _stage_claim_chain(runtime, signer, identity, operation="claim")
+    attempt = _completed_attempt(runtime, signer, identity, challenge_sequence=4)
+    with sqlite3.connect(runtime.path) as conn:
+        conn.execute("INSERT INTO active_runs VALUES(?,?,?)", ("a" * 64, b"x" * 64, 1))
+    conn.close()
+    with pytest.raises(RunnerRuntimeConflict, match="active run"):
+        runtime.commit_resync_supersession(
+            attempt, pending, next_nonce_b64=_b64(b"r" * 32), next_sequence=4, generation=1, now_ms=5,
+        )
+
+
+# --------------------------------------------------------------- T2b2R2: attempt mutations (4.1, 4.3)
+
+
+def _recovery_bytes(path):
+    with sqlite3.connect(path) as conn:
+        rows = {table: conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+                for table in ("metadata", "control_chains", "pending_calls", "chain_recovery")}
+    conn.close()
+    return rows
+
+
+def _fresh_start(runtime, signer, identity, fill=b"k", timestamp_ms=4):
+    client_nonce = _b64(fill * 32)
+    path, headers, body = _resync_start(signer, identity, client_nonce=client_nonce, timestamp_ms=timestamp_ms)
+    return dict(operation="claim", path=path, headers=headers, body=body, client_nonce_b64=client_nonce,
+                timestamp_ms=timestamp_ms, now_ms=timestamp_ms)
+
+
+def test_begin_resync_attempt_fails_closed_on_a_corrupt_existing_attempt_and_changes_no_byte(tmp_path):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    pending = _stage_claim_chain(runtime, signer, identity)
+    _completed_attempt(runtime, signer, identity)
+    with sqlite3.connect(runtime.path) as conn:
+        blob = conn.execute("SELECT sealed_blob FROM chain_recovery WHERE kind='resync_attempt'").fetchone()[0]
+        conn.execute("UPDATE chain_recovery SET sealed_blob=? WHERE kind='resync_attempt'",
+                     (blob[:-1] + bytes([blob[-1] ^ 1]),))
+    conn.close()
+    before = _recovery_bytes(runtime.path)
+
+    with pytest.raises(RunnerRuntimeCorrupt):
+        runtime.begin_resync_attempt(**_fresh_start(runtime, signer, identity))
+
+    assert _recovery_bytes(runtime.path) == before  # never repaired, replaced or deleted
+    with pytest.raises(RunnerRuntimeCorrupt):
+        runtime.load_resync_attempt("claim")
+    reopened = RunnerRuntimeState(runtime.path, identity, signer)
+    with pytest.raises(RunnerRuntimeCorrupt):
+        reopened.begin_resync_attempt(**_fresh_start(reopened, signer, identity, fill=b"j"))
+    assert _recovery_bytes(runtime.path) == before
+    assert reopened.load_pending_calls() == (pending,)
+
+
+@pytest.mark.parametrize("stage", ["started", "challenged", "completed"])
+def test_begin_resync_attempt_refuses_to_replace_a_valid_unfinished_attempt(tmp_path, stage):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    if stage == "completed":
+        existing = _completed_attempt(runtime, signer, identity)
+    else:
+        existing = runtime.begin_resync_attempt(**_fresh_start(runtime, signer, identity, fill=b"c", timestamp_ms=2))
+        if stage == "challenged":
+            existing = runtime.record_resync_challenge(
+                existing, challenge_id="rrs_" + "e" * 32, server_challenge_b64=_b64(b"s" * 32),
+                next_sequence=4, generation=0, expires_at_ms=60_002, now_ms=3,
+            )
+    before = _recovery_bytes(runtime.path)
+
+    with pytest.raises(RunnerRuntimeConflict, match="already exists"):
+        runtime.begin_resync_attempt(**_fresh_start(runtime, signer, identity))
+
+    assert _recovery_bytes(runtime.path) == before
+    reopened = RunnerRuntimeState(runtime.path, identity, signer)
+    assert reopened.load_resync_attempt("claim") == existing
+    # The explicit, validated transition: discard that exact attempt, then a fresh start.
+    reopened.discard_resync_attempt(existing)
+    fresh = reopened.begin_resync_attempt(**_fresh_start(reopened, signer, identity))
+    assert reopened.load_resync_attempt("claim") == fresh != existing
+
+
+def test_a_recorded_completion_is_resigned_only_for_the_identical_body_by_compare_and_swap(tmp_path):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    attempt = _completed_attempt(runtime, signer, identity)
+    args = dict(challenge_id="rrs_" + "e" * 32, client_nonce=_b64(b"c" * 32),
+                server_challenge=_b64(b"s" * 32), generation=0)
+    path, headers, body = _resync_complete(signer, identity, timestamp_ms=40_000, **args)
+    assert body == attempt.complete_body and headers != dict(attempt.complete_headers)
+
+    resigned = runtime.resign_resync_completion(
+        attempt, path=path, headers=headers, body=body, timestamp_ms=40_000, now_ms=40_000,
+    )
+
+    assert (resigned.complete_body, dict(resigned.complete_headers), resigned.complete_timestamp_ms) == (
+        body, headers, 40_000,
+    )
+    assert (resigned.attempt_id, resigned.start_body, resigned.challenge_id) == (
+        attempt.attempt_id, attempt.start_body, attempt.challenge_id,
+    )
+    assert RunnerRuntimeState(runtime.path, identity, signer).load_resync_attempt("claim") == resigned
+    before = _recovery_bytes(runtime.path)
+    # A stale snapshot, another body, or a forged signature never changes the persisted attempt.
+    with pytest.raises(RunnerRuntimeConflict):
+        runtime.resign_resync_completion(
+            attempt, path=path, headers=headers, body=body, timestamp_ms=40_000, now_ms=40_000,
+        )
+    other_path, other_headers, other_body = _resync_complete(
+        signer, identity, timestamp_ms=41_000, **{**args, "generation": 1},
+    )
+    with pytest.raises(RunnerRuntimeConflict):
+        runtime.resign_resync_completion(
+            resigned, path=other_path, headers=other_headers, body=other_body, timestamp_ms=41_000, now_ms=41_000,
+        )
+    forged = dict(headers, **{"X-Heel-Runner-Signature": _b64(b"x" * 64)})
+    with pytest.raises(Exception):
+        runtime.resign_resync_completion(
+            resigned, path=path, headers=forged, body=body, timestamp_ms=40_000, now_ms=40_000,
+        )
+    assert _recovery_bytes(runtime.path) == before
+    # An attempt with no recorded completion has nothing to re-sign.
+    runtime.discard_resync_attempt(resigned)
+    started = runtime.begin_resync_attempt(**_fresh_start(runtime, signer, identity))
+    with pytest.raises(RunnerRuntimeConflict):
+        runtime.resign_resync_completion(
+            started, path=path, headers=headers, body=body, timestamp_ms=40_000, now_ms=40_000,
+        )
+
+
+
+def test_a_new_server_challenge_replaces_the_answered_one_only_by_compare_and_swap(tmp_path):
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    started = runtime.begin_resync_attempt(**_fresh_start(runtime, signer, identity))
+    with pytest.raises(RunnerRuntimeConflict):  # nothing to replace before a challenge exists
+        runtime.replace_resync_challenge(
+            started, challenge_id="rrs_" + "d" * 32, server_challenge_b64=_b64(b"t" * 32),
+            next_sequence=4, generation=0, expires_at_ms=70_000, now_ms=5,
+        )
+    runtime.discard_resync_attempt(started)
+    completed = _completed_attempt(runtime, signer, identity)
+    before = _recovery_bytes(runtime.path)
+    with pytest.raises(RunnerRuntimeConflict):  # the same challenge is not a new one
+        runtime.replace_resync_challenge(
+            completed, challenge_id=completed.challenge_id, server_challenge_b64=_b64(b"t" * 32),
+            next_sequence=4, generation=0, expires_at_ms=70_000, now_ms=5,
+        )
+    runtime._commit_resync_chain(
+        operation="claim", run_id=None, next_nonce_b64=_b64(b"g" * 32), next_sequence=4,
+        generation=1, now_ms=4,
+    )
+    before = _recovery_bytes(runtime.path)
+    with pytest.raises(RunnerRuntimeCorrupt):  # below the local generation
+        runtime.replace_resync_challenge(
+            completed, challenge_id="rrs_" + "d" * 32, server_challenge_b64=_b64(b"t" * 32),
+            next_sequence=4, generation=0, expires_at_ms=70_000, now_ms=5,
+        )
+    assert _recovery_bytes(runtime.path) == before
+
+    replaced = runtime.replace_resync_challenge(
+        completed, challenge_id="rrs_" + "d" * 32, server_challenge_b64=_b64(b"t" * 32),
+        next_sequence=4, generation=1, expires_at_ms=70_000, now_ms=5,
+    )
+
+    assert (replaced.attempt_id, replaced.start_body, dict(replaced.start_headers)) == (
+        completed.attempt_id, completed.start_body, dict(completed.start_headers),
+    )
+    assert (replaced.challenge_id, replaced.challenge_generation, replaced.complete_body) == (
+        "rrs_" + "d" * 32, 1, None,
+    )
+    assert RunnerRuntimeState(runtime.path, identity, signer).load_resync_attempt("claim") == replaced
+    with pytest.raises(RunnerRuntimeConflict):  # a stale snapshot never changes it again
+        runtime.replace_resync_challenge(
+            completed, challenge_id="rrs_" + "f" * 32, server_challenge_b64=_b64(b"u" * 32),
+            next_sequence=4, generation=1, expires_at_ms=70_000, now_ms=6,
+        )

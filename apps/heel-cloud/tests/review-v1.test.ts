@@ -99,7 +99,7 @@ describe("parseReviewEnvelopeV1", () => {
     expect(parsed).not.toBe(source);
     expect(parsed.findings).not.toBe(source.findings);
     expect(parsed.schema_version).toBe("heel.review.v1");
-    expect(parsed.engine_version).toBe("1.2.0");
+    expect(parsed.engine_version).toBe("1.3.0rc1");
     expect(parsed.execution_mode).toBe("browser_local");
     expect(parsed.privacy).toEqual({
       execution: "browser_local",
@@ -166,7 +166,7 @@ describe("parseReviewEnvelopeV1", () => {
     expect(parsed).toEqual(legacy);
     expect(parsed.engine_version).toBe(version);
     expect(() => parseCurrentReviewEnvelopeV1(legacy)).toThrow(/engine_version/i);
-    expect(parseCurrentReviewEnvelopeV1(browserEnvelope()).engine_version).toBe("1.2.0");
+    expect(parseCurrentReviewEnvelopeV1(browserEnvelope()).engine_version).toBe("1.3.0rc1");
   });
 
   test("rejects an unknown next engine version even when its hash is recomputed", () => {

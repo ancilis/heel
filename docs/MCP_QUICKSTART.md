@@ -11,17 +11,20 @@ UTF-8 JSON file no larger than 2 MiB.
 
 ## Install the current Agent
 
-The primary acquisition path is Heel Cloud's `/agent` page. Choose **Download Heel Agent 1.2.0**;
-the same-origin wheel is `/downloads/heel_sim-1.2.0-py3-none-any.whl`. In the directory where you
-saved it, run:
+The current Agent is the unreleased 1.3.0rc1 runner preview candidate. The primary acquisition path
+is Heel Cloud's `/agent` page. Choose **Download Heel Agent 1.3.0rc1**; the same-origin wheel is
+`/downloads/heel_sim-1.3.0rc1-py3-none-any.whl`. Compare it with the wheel SHA-256 that `/agent`
+shows from the build's manifest. In the directory where you saved it, run:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.2.0-py3-none-any.whl
+.venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl
 ```
 
-The wheel, `heel_sim-1.2.0.tar.gz`, and `heel-open-core-manifest.json` are already part of the
+The wheel, `heel_sim-1.3.0rc1.tar.gz`, and `heel-open-core-manifest.json` are already part of the
 deployable Heel Cloud build. Public customer access still depends on the approved deployment.
+A GitHub prerelease `v1.3.0rc1` carrying these exact files is planned but not yet published; no
+release URL or release-asset digest has been publicly verified, so none is given here.
 `heel-sim` is not yet published to PyPI, and the current public repository export is a release-owner
 action that is not complete. Maintainers may install from this private source checkout, but customer
 instructions must not rely on it. Only after an actual PyPI release will this registry command work:

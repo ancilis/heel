@@ -3,6 +3,8 @@
 /** Cloudflare Worker entry point for Heel Cloud. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { canonicalPublicOrigin } from "../build/deployment-config";
+import { dispatchControlPlane } from "./control-plane-dispatch";
 
 interface AssetFetcher {
   fetch(request: Request): Promise<Response>;
@@ -10,10 +12,6 @@ interface AssetFetcher {
 
 interface PrivateControlPlaneFetcher {
   fetch(request: Request): Promise<Response>;
-}
-
-declare class FixedLengthStream extends TransformStream<Uint8Array, Uint8Array> {
-  constructor(expectedLength: number);
 }
 
 interface Env {
@@ -46,7 +44,6 @@ const RESPONSE_HEADERS = Object.freeze({
 });
 
 const CONTROL_PLANE_PREFIX = "/api/control-plane";
-const CONTROL_PLANE_ORIGIN = "https://heel-control-plane.internal";
 const SIGNUP_ROUTE = "/v1/signup";
 const LOGIN_ROUTE = "/v1/login";
 const LOGOUT_ROUTE = "/v1/logout";
@@ -148,7 +145,7 @@ const RUNNER_PAIRING_ACTIVATE = /^\/v1\/runner-pairings\/pending_[0-9a-f]{32}\/(
 const RUNNER_PAIRING_MANAGE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runner-pairings(?:/pending_[0-9a-f]{32}(?:/approve)?)?$`);
 const RUNNER_ROTATION_START = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/rotate$`);
 const RUNNER_ROTATION_APPROVE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/rotations/rotation_[0-9a-f]{32}/approve$`);
-const RUNNER_REVOKE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}$`);
+const RUNNER_REVOKE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/revoke$`);
 const RUNNER_ROTATION_PUBLIC = /^\/v1\/runner-rotations\/rotation_[0-9a-f]{32}\/(?:activate|poll|activation-abort)$/;
 const RUNNER_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}(?:/claim|/runs/[A-Za-z0-9_-]{1,128}/(?:heartbeat|progress|result|stop-ack))$`);
 const RUNNER_CONTEXT_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/contexts(?:/list|/${RUNNER_CONTEXT_REF}/(?:claim|approval-projections))$`);
@@ -478,7 +475,7 @@ function controlPlaneRoute(method: string, pathname: string): string | null {
   if ((upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath) || RUNNER_ROTATION_PUBLIC.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
   if ((RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath)) && method === "POST") return upstreamPath;
-  if (RUNNER_REVOKE.test(upstreamPath) && method === "DELETE") return upstreamPath;
+  if (RUNNER_REVOKE.test(upstreamPath) && method === "POST") return upstreamPath;
   if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (isHumanCanaryRoute(method, upstreamPath) || isHumanEnvironmentRoute(method, upstreamPath)) return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
@@ -498,10 +495,22 @@ async function proxyControlPlane(
   csp: string,
   upstreamPath: string,
 ): Promise<Response> {
-  if (env.CONTROL_PLANE === undefined) {
+  // Configuration outside the declared runtime shapes is unavailable, not an upstream failure. This
+  // guard runs before any request check so a malformed binding always answers the fixed 503; the
+  // dispatch module checks the binding again and re-validates the raw configured origin.
+  if (
+    env.CONTROL_PLANE === undefined
+    || env.CONTROL_PLANE === null
+    || typeof env.CONTROL_PLANE.fetch !== "function"
+  ) {
     return proxyError(503, "control plane unavailable", csp);
   }
-  const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET?.trim() ?? "";
+  const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);
+  if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);
+  if (typeof env.CONTROL_PLANE_EDGE_SECRET !== "string") {
+    return proxyError(503, "control plane unavailable", csp);
+  }
+  const edgeAuthSecret = env.CONTROL_PLANE_EDGE_SECRET.trim();
   if (!/^[A-Za-z0-9_-]{43,86}$/.test(edgeAuthSecret)) {
     return proxyError(503, "control plane unavailable", csp);
   }
@@ -538,7 +547,7 @@ async function proxyControlPlane(
       request.headers,
       request.method,
       upstreamPath,
-      env.PUBLIC_ORIGIN,
+      controlPlaneOrigin,
       edgeClientKey,
       edgeAuthSecret,
     );
@@ -548,30 +557,21 @@ async function proxyControlPlane(
     }
     throw error;
   }
-  const upstreamUrl = new URL(upstreamPath, CONTROL_PLANE_ORIGIN);
-  const init: RequestInit & { duplex?: "half" } = {
-    headers: requestContract.headers,
+  // The only path to the private binding: explicit inputs, one call (H0X).
+  const outcome = await dispatchControlPlane({
+    binding: env.CONTROL_PLANE,
+    publicOrigin: env.PUBLIC_ORIGIN,
+    upstreamPath,
     method: request.method,
-    redirect: "manual",
-  };
-  if (request.method === "POST") {
-    if (requestContract.contentLength !== 0 && request.body === null) {
-      return proxyError(400, "invalid control plane request", csp);
-    }
-    try {
-      init.body = requestContract.contentLength === 0
-        ? new Uint8Array()
-        : request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength));
-      init.duplex = "half";
-    } catch {
-      return proxyError(502, "control plane request failed", csp);
-    }
-  }
+    headers: requestContract.headers,
+    contentLength: requestContract.contentLength,
+    body: request.body,
+  });
+  if (outcome.kind === "unavailable") return proxyError(503, "control plane unavailable", csp);
+  if (outcome.kind === "invalid") return proxyError(400, "invalid control plane request", csp);
+  if (outcome.kind === "failed") return proxyError(502, "control plane request failed", csp);
+  const response = outcome.response;
   try {
-    const response = await env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init));
-    if (response.status >= 300 && response.status <= 399) {
-      return proxyError(502, "control plane request failed", csp);
-    }
     if (CANARY_APPROVAL_REQUESTS_ROUTE.test(upstreamPath) && response.status >= 200 && response.status <= 299) {
       const declared = singletonHeader(response.headers, "Content-Length");
       if (declared === null || !/^(?:0|[1-9][0-9]*)$/.test(declared) || Number(declared) > 69632) {

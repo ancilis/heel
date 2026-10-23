@@ -2,24 +2,29 @@
 
 ## Status
 
-The repository contains a launchable free product and production deployment bundle.
-It has not been publicly deployed.
+The repository contains the free early-access product surface listed below and a
+production deployment bundle. It has not been publicly deployed. The full self-serve
+product is not yet launch-ready: paired runner execution, the cloud route inventory bridge,
+and approval wiring are incomplete, and final launch acceptance has not been given.
 
 Customers can receive immediate anonymous value in the browser, use local CLI/MCP,
 and optionally create an account for exact findings-only continuity. Production
 billing is deliberately disabled: Free is available, Pro and Team are coming soon,
 and Heel accepts no payment in this launch mode.
 
-The remaining launch work requires owner-controlled external systems and decisions,
-not a Stripe or PostgreSQL integration. See `OWNER_ACTIONS.md`.
+The remaining launch work includes that incomplete product work as well as
+owner-controlled external systems and decisions (see `OWNER_ACTIONS.md`). It does not
+include a Stripe or PostgreSQL integration.
 
 ## Implemented launch surface
 
 - Anonymous browser-local OpenAPI review with a committed sample on first visit.
 - Same-origin, pinned Pyodide runtime and Heel wheel; no analyzer network calls.
 - Explicit local browser save/export without retaining the source document.
-- Downloadable Heel 1.2.0 wheel, source archive, manifest, and local stdio MCP
-  quickstart.
+- Checked-in Heel 1.3.0rc1 runner preview candidate wheel, source archive, and manifest
+  under `apps/heel-cloud/public/downloads/`, and the local stdio MCP quickstart. The candidate
+  is unreleased: it is not published as a GitHub release or to PyPI, and it is not publicly
+  deployed. A one-command public install is later work.
 - Local CLI/MCP review without an account.
 - Free account signup/login and private `__Host-heel_session` handling at the edge.
 - Browser-mediated device authorization for CLI/MCP machines.

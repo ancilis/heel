@@ -35,8 +35,8 @@ export default function Runner() {
     </section>
     <section className="runner-command">
       <div><h2>1. Review the rule and authorize the reference product</h2>
-      <p>Download the supplied wheel from /agent and install the local runner extra, inspect the bounded plan, then create a signed scope. These commands contact no product target.</p>
-      <pre><code>{`python -m pip install './heel_sim-1.2.0-py3-none-any.whl[runner]'
+      <p>Download the unreleased 1.3.0rc1 preview candidate wheel from /agent and install the local runner extra, inspect the bounded plan, then create a signed scope. Installing the extra fetches the pinned cryptography package from your Python package index; these commands contact no product target.</p>
+      <pre><code>{`python -m pip install './heel_sim-1.3.0rc1-py3-none-any.whl[runner]'
 heel reference prepare
 heel scope create --target reference:export --operator "your name" --confirm`}</code></pre>
       <p>Copy the returned scope ID into the next commands.</p>

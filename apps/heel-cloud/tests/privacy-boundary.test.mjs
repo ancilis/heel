@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, relative } from "node:path";
@@ -109,6 +110,57 @@ function containsSensitiveInput(node) {
 }
 
 
+// H0X: the private control-plane sink lives only in this module, pinned by bytes (S3) and
+// checked by lexical and token facts (S1, S2). None of these checks claims to model dataflow.
+const CONTROL_PLANE_DISPATCH_PATH = "worker/control-plane-dispatch.ts";
+const CONTROL_PLANE_DISPATCH_SHA256 = "cbebaa836f6ab880ecc5ed93bceb0a8670e72b9bc1aee0983692881b0df711a9";
+const dispatchModuleImport = 'import { canonicalPublicOrigin } from "../build/deployment-config";';
+const dispatchBindingGuard = `if (
+    input.binding === undefined
+    || input.binding === null
+    || typeof input.binding.fetch !== "function"
+  ) {
+    return { kind: "unavailable" };
+  }`;
+const dispatchModuleFragments = [
+  dispatchBindingGuard,
+  "const origin = canonicalPublicOrigin(input.publicOrigin);",
+  'if (origin === null) return { kind: "unavailable" };',
+  "const url = new URL(input.upstreamPath, origin);",
+  'if (input.contentLength !== 0 && input.body === null) return { kind: "invalid" };',
+  "const response = await input.binding.fetch(new Request(url, init));",
+  'if (response.status >= 300 && response.status <= 399) return { kind: "failed" };',
+];
+// Identifiers the module may not name anywhere, including comments and strings. Escaped spellings
+// count: the scanner's normalized token value is compared as well as the raw token text.
+const dispatchForbiddenIdentifiers = [
+  "globalThis", "self", "window", "document", "arguments", "eval", "Function", "Reflect", "Proxy",
+  "defineProperty", "prototype", "ASSETS", "IMAGES", "env", "request", "caches", "process", "require",
+  "fetchLocal",
+];
+const dispatchConstructors = ["URL", "Request", "Uint8Array", "FixedLengthStream"];
+// S4: the Worker refuses a malformed binding with its own guard, the first statement of the proxy and
+// before any 400-producing check, so the fixed 503 ordering is unchanged; the module rechecks it.
+const workerBindingGuard = `if (
+    env.CONTROL_PLANE === undefined
+    || env.CONTROL_PLANE === null
+    || typeof env.CONTROL_PLANE.fetch !== "function"
+  ) {
+    return proxyError(503, "control plane unavailable", csp);
+  }`;
+// S4: the Worker's one reviewed call into the module.
+const dispatchImport = 'import { dispatchControlPlane } from "./control-plane-dispatch";';
+const dispatchCallSite = `const outcome = await dispatchControlPlane({
+    binding: env.CONTROL_PLANE,
+    publicOrigin: env.PUBLIC_ORIGIN,
+    upstreamPath,
+    method: request.method,
+    headers: requestContract.headers,
+    contentLength: requestContract.contentLength,
+    body: request.body,
+  });`;
+
+
 function analyzeSource(fileName, text) {
   const parsed = ts.createSourceFile(
     fileName,
@@ -131,6 +183,7 @@ function analyzeSource(fileName, text) {
   const sinkAliases = new Set();
   const engineWorker = relativeName === "workers/heel-review.worker.ts";
   const serverWorker = relativeName === "worker/index.ts";
+  const dispatchModule = relativeName === CONTROL_PLANE_DISPATCH_PATH;
   const findingsControlPlaneClient = relativeName === "lib/heel-cloud-api.ts";
   const canaryControlPlaneClient = relativeName === "lib/canary-api.ts";
   const controlPlaneClient = findingsControlPlaneClient || canaryControlPlaneClient;
@@ -195,25 +248,16 @@ function analyzeSource(fileName, text) {
     violations.push(`${relativeName}:${location.line + 1}:${location.character + 1}: ${message}`);
   }
 
-  function reviewedControlPlaneFetchCall(call) {
-    if (
-      !serverWorker
-      || !ts.isCallExpression(call)
-      || call.questionDotToken
-      || call.expression.getText(parsed) !== "env.CONTROL_PLANE.fetch"
-      || call.arguments.length !== 1
-      || enclosingFunctionName(call) !== "proxyControlPlane"
-      || !ts.isAwaitExpression(call.parent)
-      || !ts.isVariableDeclaration(call.parent.parent)
-      || !ts.isIdentifier(call.parent.parent.name)
-      || call.parent.parent.name.text !== "response"
-    ) return false;
-    const request = call.arguments[0];
-    return ts.isNewExpression(request)
-      && request.expression.getText(parsed) === "Request"
-      && request.arguments?.length === 2
-      && request.arguments[0].getText(parsed) === "upstreamUrl"
-      && request.arguments[1].getText(parsed) === "init";
+  // The only private control-plane sink: the one awaited binding call in the dispatch module.
+  function reviewedDispatchFetchCall(call) {
+    return dispatchModule
+      && ts.isCallExpression(call)
+      && !call.questionDotToken
+      && call.expression.getText(parsed) === "input.binding.fetch"
+      && call.arguments.length === 1
+      && call.arguments[0].getText(parsed) === "new Request(url, init)"
+      && enclosingFunctionName(call) === "dispatchControlPlane"
+      && ts.isAwaitExpression(call.parent);
   }
 
   function reviewedSameOriginFetchCall(call) {
@@ -244,17 +288,53 @@ function analyzeSource(fileName, text) {
         && ts.isVariableDeclaration(capture.parent)
         && isReviewedBootstrapDeclaration(capture.parent);
     }
+    if (reviewedDispatchCapabilityCheck(node) || reviewedWorkerCapabilityCheck(node)) return true;
+    if (dispatchModule) {
+      return ts.isCallExpression(node.parent) && node.parent.expression === node
+        && reviewedDispatchFetchCall(node.parent);
+    }
     return serverWorker && ts.isCallExpression(node.parent) && node.parent.expression === node
-      && (
-        ["env.ASSETS.fetch", "handler.fetch"].includes(expression)
-        || reviewedControlPlaneFetchCall(node.parent)
-      );
+      && ["env.ASSETS.fetch", "handler.fetch"].includes(expression);
+  }
+
+  // `typeof` inspects the binding capability without calling or capturing it; in the Worker only the
+  // binding-shape guard, the first statement of the proxy, may do so.
+  function reviewedWorkerCapabilityCheck(node) {
+    if (
+      !serverWorker
+      || node.getText(parsed) !== "env.CONTROL_PLANE.fetch"
+      || !ts.isTypeOfExpression(node.parent)
+      || enclosingFunctionName(node) !== "proxyControlPlane"
+    ) return false;
+    const guard = enclosingFunctionDeclaration(node)?.body?.statements[0];
+    return guard !== undefined
+      && ts.isIfStatement(guard)
+      && guard.getText(parsed) === workerBindingGuard
+      && node.getStart(parsed) >= guard.expression.getStart(parsed)
+      && node.getEnd() <= guard.expression.getEnd();
+  }
+
+  // `typeof` inspects the binding capability without calling or capturing it; only the module's
+  // configuration guard, the first statement of the dispatch, may do so.
+  function reviewedDispatchCapabilityCheck(node) {
+    if (
+      !dispatchModule
+      || node.getText(parsed) !== "input.binding.fetch"
+      || !ts.isTypeOfExpression(node.parent)
+      || enclosingFunctionName(node) !== "dispatchControlPlane"
+    ) return false;
+    const guard = enclosingFunctionDeclaration(node)?.body?.statements[0];
+    return guard !== undefined
+      && ts.isIfStatement(guard)
+      && guard.getText(parsed) === dispatchBindingGuard
+      && node.getStart(parsed) >= guard.expression.getStart(parsed)
+      && node.getEnd() <= guard.expression.getEnd();
   }
 
   function allowedFetchCall(node) {
     const expression = node.expression.getText(parsed);
     if (serverWorker && ["env.ASSETS.fetch", "handler.fetch"].includes(expression)) return true;
-    if (reviewedControlPlaneFetchCall(node)) return true;
+    if (reviewedDispatchFetchCall(node)) return true;
     if (reviewedSameOriginFetchCall(node)) return true;
     return engineWorker && expression === "fetcher" && isReviewedFetcherCall(node);
   }
@@ -297,7 +377,7 @@ function analyzeSource(fileName, text) {
   if ((upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath) || RUNNER_ROTATION_PUBLIC.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
   if ((RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath)) && method === "POST") return upstreamPath;
-  if (RUNNER_REVOKE.test(upstreamPath) && method === "DELETE") return upstreamPath;
+  if (RUNNER_REVOKE.test(upstreamPath) && method === "POST") return upstreamPath;
   if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (isHumanCanaryRoute(method, upstreamPath) || isHumanEnvironmentRoute(method, upstreamPath)) return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
@@ -315,7 +395,9 @@ function analyzeSource(fileName, text) {
     }
     for (const fragment of [
       'const CONTROL_PLANE_PREFIX = "/api/control-plane";',
-      'const CONTROL_PLANE_ORIGIN = "https://heel-control-plane.internal";',
+      'import { canonicalPublicOrigin } from "../build/deployment-config";',
+      "const controlPlaneOrigin = canonicalPublicOrigin(env.PUBLIC_ORIGIN);",
+      'if (controlPlaneOrigin === null) return proxyError(503, "control plane unavailable", csp);',
       'const SIGNUP_ROUTE = "/v1/signup";',
       'const LOGIN_ROUTE = "/v1/login";',
       'const LOGOUT_ROUTE = "/v1/logout";',
@@ -341,11 +423,7 @@ function analyzeSource(fileName, text) {
       'const MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES = 272 * 1024;',
       'const MAX_RUNNER_RESYNC_BODY_BYTES = 2 * 1024;',
       'const MAX_RUNNER_PAIRING_BODY_BYTES = 16 * 1024;',
-      "const upstreamUrl = new URL(upstreamPath, CONTROL_PLANE_ORIGIN);",
       "headers: requestContract.headers,",
-      'redirect: "manual",',
-      "request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength))",
-      "if (response.status >= 300 && response.status <= 399)",
       '`__Host-heel_session=${match[1]}; HttpOnly; SameSite=Lax; Path=/; Secure`',
       '"__Host-heel_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure"',
       'if (requestUrl.search !== "") return proxyError(400, "invalid control plane request", csp);',
@@ -369,6 +447,171 @@ function analyzeSource(fileName, text) {
       ).length - 1 !== 1
     ) {
       report(parsed, "control-plane response header allowlist is not the reviewed exact contract");
+    }
+    validateControlPlaneDispatchCallSite();
+  }
+
+  function reportAt(position, message) {
+    const location = parsed.getLineAndCharacterOfPosition(position);
+    violations.push(`${relativeName}:${location.line + 1}:${location.character + 1}: ${message}`);
+  }
+
+  // S4: the Worker reaches the private binding only through the one reviewed module call. These are
+  // exact text and token facts about where the sink is; they do not claim the Worker cannot alias.
+  function validateControlPlaneDispatchCallSite() {
+    const sourceText = parsed.getFullText();
+    if (sourceText.split(dispatchImport).length - 1 !== 1) {
+      report(parsed, `control-plane dispatch call site is missing exact ${dispatchImport}`);
+    }
+    if (sourceText.split("CONTROL_PLANE.fetch").length - 1 !== 1) {
+      report(parsed, "control-plane worker names CONTROL_PLANE.fetch outside its one binding-shape guard");
+    }
+    const proxy = parsed.statements.find((statement) => (
+      ts.isFunctionDeclaration(statement) && statement.name?.text === "proxyControlPlane"
+    ));
+    if (proxy?.body?.statements[0]?.getText(parsed) !== workerBindingGuard) {
+      report(parsed, "control-plane worker binding-shape guard is not the first statement of proxyControlPlane");
+    }
+    for (const forbidden of ['CONTROL_PLANE["fetch"]', ".pipeThrough(", "FixedLengthStream"]) {
+      if (sourceText.includes(forbidden)) {
+        report(parsed, `control-plane worker contains sink text reserved for the dispatch module: ${forbidden}`);
+      }
+    }
+    const calls = [];
+    function inspect(node) {
+      if (
+        (ts.isIdentifier(node) && node.text === "pipeThrough")
+        || (ts.isStringLiteralLike(node) && node.text === "pipeThrough")
+      ) report(node, "control-plane worker names pipeThrough outside the dispatch module");
+      if (ts.isIdentifier(node) && node.text === "dispatchControlPlane" && !ts.isImportSpecifier(node.parent)) {
+        if (ts.isCallExpression(node.parent) && node.parent.expression === node) calls.push(node.parent);
+        else report(node, "control-plane dispatch is referenced outside its one reviewed call");
+      }
+      if (ts.isCallExpression(node)) {
+        const fetchShaped = (ts.isIdentifier(node.expression) && node.expression.text === "fetch")
+          || resolvedMemberNames(node.expression).has("fetch");
+        if (fetchShaped && !["env.ASSETS.fetch", "handler.fetch"].includes(node.expression.getText(parsed))) {
+          report(node, "control-plane worker has an unreviewed fetch-shaped call");
+        }
+      }
+      ts.forEachChild(node, inspect);
+    }
+    inspect(parsed);
+    const statement = calls.length === 1 ? calls[0].parent?.parent?.parent?.parent : undefined;
+    if (
+      calls.length !== 1
+      || enclosingFunctionName(calls[0]) !== "proxyControlPlane"
+      || !ts.isAwaitExpression(calls[0].parent)
+      || statement === undefined
+      || !ts.isVariableStatement(statement)
+      || statement.getText(parsed) !== dispatchCallSite
+    ) report(parsed, "control-plane dispatch is not the one reviewed call in proxyControlPlane");
+  }
+
+  // S1 and S2: lexical and token facts about the dispatch module. They prove where the sink is and
+  // what the module can name, not what any value flows to.
+  function validateControlPlaneDispatchModule() {
+    const sourceText = parsed.getFullText();
+    const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.Standard, sourceText);
+    const unescape = (value) => value.replace(
+      /\\u\{([0-9A-Fa-f]+)\}|\\u([0-9A-Fa-f]{4})/g,
+      (_, braced, plain) => String.fromCodePoint(Number.parseInt(braced ?? plain, 16)),
+    );
+    const forbiddenWords = dispatchForbiddenIdentifiers.map((name) => [
+      name, new RegExp(`(?<![A-Za-z0-9_$])${name}(?![A-Za-z0-9_$])`),
+    ]);
+    for (let kind = scanner.scan(); kind !== ts.SyntaxKind.EndOfFileToken; kind = scanner.scan()) {
+      const raw = scanner.getTokenText();
+      // Compare the scanner's normalized token value as well as the raw token text (H0XA).
+      const spellings = [raw, scanner.getTokenValue() ?? "", unescape(raw)];
+      for (const [name, word] of forbiddenWords) {
+        if (spellings.some((spelling) => word.test(spelling))) {
+          reportAt(scanner.getTokenStart(), `control-plane dispatch module names forbidden identifier ${name}`);
+        }
+      }
+    }
+    const imports = parsed.statements.filter((statement) => ts.isImportDeclaration(statement));
+    if (imports.length !== 1 || imports[0].getText(parsed) !== dispatchModuleImport) {
+      report(parsed, "control-plane dispatch module imports anything but the shared origin validator");
+    }
+    const typeSignatures = new Set([
+      ts.SyntaxKind.MethodSignature, ts.SyntaxKind.CallSignature, ts.SyntaxKind.ConstructSignature,
+      ts.SyntaxKind.IndexSignature, ts.SyntaxKind.FunctionType, ts.SyntaxKind.ConstructorType,
+    ]);
+    const fetchAccesses = [];
+    const pipes = [];
+    const redirects = [];
+    let dispatchDeclarations = 0;
+    function inspect(node) {
+      if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        report(node, "control-plane dispatch module uses dynamic import");
+      }
+      if (
+        ts.isExportAssignment(node)
+        || (ts.canHaveModifiers(node) && ts.getModifiers(node)?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword))
+      ) report(node, "control-plane dispatch module has a default export");
+      if (ts.isExportDeclaration(node) && node.moduleSpecifier) report(node, "control-plane dispatch module re-exports another module");
+      if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) report(node, "control-plane dispatch module declares a class");
+      if (ts.isFunctionLike(node) && !typeSignatures.has(node.kind)) {
+        if (ts.isFunctionDeclaration(node) && node.name?.text === "dispatchControlPlane" && node.parent === parsed) {
+          dispatchDeclarations += 1;
+        } else report(node, "control-plane dispatch module declares a function other than dispatchControlPlane");
+      }
+      if (ts.isNewExpression(node) && !dispatchConstructors.includes(node.expression.getText(parsed))) {
+        report(node, `control-plane dispatch module constructs ${node.expression.getText(parsed)}`);
+      }
+      if (ts.isElementAccessExpression(node)) report(node, "control-plane dispatch module uses a computed member access");
+      if (ts.isStringLiteralLike(node) && ["fetch", "pipeThrough", "redirect"].includes(node.text)) {
+        report(node, `control-plane dispatch module spells ${node.text} as a string`);
+      }
+      if (
+        (ts.isStringLiteralLike(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node))
+        && node.text.includes("://")
+      ) report(node, "control-plane dispatch module names a literal destination");
+      if (ts.isIdentifier(node) && node.text === "fetch") {
+        const parent = node.parent;
+        if (
+          ts.isMethodSignature(parent) && parent.name === node
+          && ts.isInterfaceDeclaration(parent.parent) && parent.parent.name.text === "ControlPlaneBinding"
+        ) {
+          // The binding's declared shape.
+        } else if (ts.isPropertyAccessExpression(parent) && parent.name === node && parent.getText(parsed) === "input.binding.fetch") {
+          fetchAccesses.push(parent);
+        } else report(node, "control-plane dispatch module names fetch outside the binding guard and call");
+      }
+      if (ts.isIdentifier(node) && node.text === "pipeThrough") {
+        if (ts.isPropertyAccessExpression(node.parent) && node.parent.name === node) pipes.push(node.parent);
+        else report(node, "control-plane dispatch module names pipeThrough outside the reviewed framing");
+      }
+      if (ts.isIdentifier(node) && node.text === "redirect") {
+        if (ts.isPropertyAssignment(node.parent) && node.parent.name === node) redirects.push(node.parent);
+        else report(node, "control-plane dispatch module writes the redirect mode outside the request options");
+      }
+      ts.forEachChild(node, inspect);
+    }
+    inspect(parsed);
+    const guardReads = fetchAccesses.filter(reviewedDispatchCapabilityCheck);
+    const sinkCalls = fetchAccesses.filter((access) => (
+      ts.isCallExpression(access.parent) && access.parent.expression === access && reviewedDispatchFetchCall(access.parent)
+    ));
+    if (dispatchDeclarations !== 1) report(parsed, "control-plane dispatch module does not declare exactly one dispatchControlPlane");
+    if (fetchAccesses.length !== 2 || guardReads.length !== 1 || sinkCalls.length !== 1) {
+      report(parsed, "control-plane dispatch module does not have exactly one binding guard read and one binding call");
+    }
+    if (
+      pipes.length !== 1
+      || !ts.isCallExpression(pipes[0].parent)
+      || pipes[0].parent.expression !== pipes[0]
+      || pipes[0].parent.getText(parsed) !== "input.body!.pipeThrough(new FixedLengthStream(input.contentLength))"
+    ) report(parsed, "control-plane dispatch module does not frame the body through exactly one FixedLengthStream pipe");
+    if (redirects.length !== 1 || redirects[0].getText(parsed) !== 'redirect: "manual"') {
+      report(parsed, "control-plane dispatch module redirect mode is not exactly manual");
+    }
+    if (/["'`]https?:\/\//.test(sourceText)) report(parsed, "control-plane dispatch module names a literal destination");
+    for (const fragment of dispatchModuleFragments) {
+      if (sourceText.split(fragment).length - 1 !== 1) {
+        report(parsed, `control-plane dispatch module is missing exact ${fragment}`);
+      }
     }
   }
 
@@ -1476,6 +1719,7 @@ function analyzeSource(fileName, text) {
     validateFindingsProjectionContract();
   }
   if (serverWorker) validateControlPlaneProxyContract();
+  if (dispatchModule) validateControlPlaneDispatchModule();
   if (controlPlaneClient) validateControlPlaneClientContract();
   return violations;
 }
@@ -2249,82 +2493,40 @@ Object.fromEntries([]);
 
 test("the privacy analyzer pins the private control-plane fetch and route allowlist", async () => {
   const worker = await source("worker/index.ts");
-  assert.deepEqual(analyzeSource(join(appRootPath, "worker/index.ts"), worker), []);
+  const dispatch = await source(CONTROL_PLANE_DISPATCH_PATH);
+  const analyzeWorker = (text) => analyzeSource(join(appRootPath, "worker/index.ts"), text);
+  const analyzeDispatch = (text) => analyzeSource(join(appRootPath, CONTROL_PLANE_DISPATCH_PATH), text);
+  assert.deepEqual(analyzeWorker(worker), []);
+  assert.deepEqual(analyzeDispatch(dispatch), []);
+  const call = "  const outcome = await dispatchControlPlane({";
+  const sink = "    const response = await input.binding.fetch(new Request(url, init));";
   const mutations = [
-    {
-      label: "fetch location",
-      source: worker.replace(
-        "async function proxyControlPlane(",
-        "async function movedControlPlane(",
-      ),
-      violation: "network sink",
-    },
-    {
-      label: "fetch callee",
-      source: worker.replace(
-        "env.CONTROL_PLANE.fetch(new Request(upstreamUrl, init))",
-        'env.CONTROL_PLANE["fetch"](new Request(upstreamUrl, init))',
-      ),
-      violation: "network sink",
-    },
-    {
-      label: "route broadening",
-      source: worker.replace('  return "";\n}', "  return upstreamPath;\n}"),
-      violation: "route allowlist is not the reviewed exact contract",
-    },
-    {
-      label: "caller-derived upstream query",
-      source: worker.replace(
-        "const upstreamUrl = new URL(upstreamPath, CONTROL_PLANE_ORIGIN);",
-        "const upstreamUrl = new URL(upstreamPath + new URL(request.url).search, CONTROL_PLANE_ORIGIN);",
-      ),
-      violation: "missing exact const upstreamUrl",
-    },
-    {
-      label: "unbounded request body",
-      source: worker.replace(
-        "request.body!.pipeThrough(new FixedLengthStream(requestContract.contentLength))",
-        "request.body!",
-      ),
-      violation: "FixedLengthStream",
-    },
-    {
-      label: "request header copying",
-      source: worker.replace("const headers = new Headers();", "const headers = new Headers(source);"),
-      violation: "request/response header allowlists",
-    },
-    {
-      label: "response header copying",
-      source: worker.replace(
+    // Retained H0A cases, re-anchored on the Worker call site (S4) or the dispatch module (S1, S2).
+    ["fetch location", analyzeWorker, worker.replace("async function proxyControlPlane(", "async function movedControlPlane("), "not the one reviewed call in proxyControlPlane"],
+    ["fetch callee", analyzeDispatch, dispatch.replace(sink, sink.replace("input.binding.fetch(", 'input.binding["fetch"](')), "network sink"],
+    ["route broadening", analyzeWorker, worker.replace('  return "";\n}', "  return upstreamPath;\n}"), "route allowlist is not the reviewed exact contract"],
+    ["public fetch fallback in the worker", analyzeWorker, worker.replace(call, `  await fetch(new Request(new URL(upstreamPath, controlPlaneOrigin)));\n${call}`), "network sink"],
+    ["public fetch fallback in the dispatch module", analyzeDispatch, dispatch.replace(sink, sink.replace("input.binding.fetch(", "fetch(")), "network sink"],
+    ["legacy fixed destination", analyzeDispatch, dispatch.replace("new URL(input.upstreamPath, origin)", 'new URL(input.upstreamPath, "https://heel-control-plane.internal")'), "literal destination"],
+    ["unbounded request body", analyzeDispatch, dispatch.replace("input.body!.pipeThrough(new FixedLengthStream(input.contentLength))", "input.body!"), "FixedLengthStream pipe"],
+    ["redirect forwarding", analyzeDispatch, dispatch.replace("if (response.status >= 300 && response.status <= 399)", "if (response.status === 399)"), "missing exact if (response.status >= 300"],
+    ["request header copying", analyzeWorker, worker.replace("const headers = new Headers();", "const headers = new Headers(source);"), "request/response header allowlists"],
+    [
+      "response header copying",
+      analyzeWorker,
+      worker.replace(
         'function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""): Response {\n  const headers = new Headers();',
         'function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""): Response {\n  const headers = new Headers(response.headers);',
       ),
-      violation: "request/response header allowlists",
-    },
-    {
-      label: "redirect forwarding",
-      source: worker.replace(
-        "if (response.status >= 300 && response.status <= 399)",
-        "if (response.status === 399)",
-      ),
-      violation: "response.status >= 300",
-    },
-    {
-      label: "query acceptance",
-      source: worker.replace(
-        '      if (requestUrl.search !== "") return proxyError(400, "invalid control plane request", csp);\n',
-        "",
-      ),
-      violation: "requestUrl.search",
-    },
+      "request/response header allowlists",
+    ],
+    ["query acceptance", analyzeWorker, worker.replace('      if (requestUrl.search !== "") return proxyError(400, "invalid control plane request", csp);\n', ""), "requestUrl.search"],
   ];
-  for (const mutation of mutations) {
-    assert.notEqual(mutation.source, worker, `${mutation.label} mutation did not apply`);
-    const violations = analyzeSource(join(appRootPath, "worker/index.ts"), mutation.source);
-    assert.ok(
-      violations.some((violation) => violation.includes(mutation.violation)),
-      `${mutation.label}: ${violations.join("\n")}`,
-    );
+  assert.equal(new Set(mutations.map(([label]) => label)).size, mutations.length);
+  for (const [label, analyze, mutated, violation] of mutations) {
+    assert.notEqual(mutated, analyze === analyzeWorker ? worker : dispatch, `${label} mutation did not apply`);
+    const violations = analyze(mutated);
+    assert.ok(violations.some((found) => found.includes(violation)), `${label}: ${violations.join("\n")}`);
   }
 });
 
@@ -2385,6 +2587,116 @@ test("the privacy analyzer pins the browser client to the same-origin closed con
       violations.some((violation) => violation.includes(mutation.violation)),
       `${mutation.label}: ${violations.join("\n")}`,
     );
+  }
+});
+
+test("S1/S2: the dispatch module is the only private sink and names no ambient authority", async () => {
+  const dispatch = await source(CONTROL_PLANE_DISPATCH_PATH).catch(() => null);
+  assert.notEqual(dispatch, null, `${CONTROL_PLANE_DISPATCH_PATH} is absent`);
+  const analyze = (text) => analyzeSource(join(appRootPath, CONTROL_PLANE_DISPATCH_PATH), text);
+  assert.deepEqual(analyze(dispatch), []);
+  assert.ok(dispatch.split("\n").length <= 121, "the dispatch module exceeds 120 lines");
+  const url = "  const url = new URL(input.upstreamPath, origin);";
+  const sink = "    const response = await input.binding.fetch(new Request(url, init));";
+  const statement = (code) => dispatch.replace(url, `  ${code}\n${url}`);
+  const forbidden = (name) => `forbidden identifier ${name}`;
+  // The Opus assignment red list, plus escaped spellings that only the normalized token value reveals.
+  const red = [
+    ["arguments", statement("const extra = arguments.length;"), forbidden("arguments")],
+    ["escaped arguments", statement("const extra = \\u0061rguments.length;"), forbidden("arguments")],
+    ["braced escaped arguments", statement("const extra = \\u{61}rguments.length;"), forbidden("arguments")],
+    ["globalThis", statement("const extra = globalThis;"), forbidden("globalThis")],
+    ["self", statement("const extra = self;"), forbidden("self")],
+    ["Reflect", statement("const extra = Reflect;"), forbidden("Reflect")],
+    ["Proxy", statement("const extra = Proxy;"), forbidden("Proxy")],
+    ["eval", statement('const extra = eval("1");'), forbidden("eval")],
+    ["Function", statement("const extra = Function;"), forbidden("Function")],
+    ["prototype", statement("const extra = Object.prototype;"), forbidden("prototype")],
+    ["defineProperty", statement('Object.defineProperty(input, "method", { value: "GET" });'), forbidden("defineProperty")],
+    ["env", statement("const env = input;"), forbidden("env")],
+    ["escaped env in a string", statement('const extra = "\\u0065nv";'), forbidden("env")],
+    ["request", statement("const request = input;"), forbidden("request")],
+    ["request in a comment", statement("// forward the caller request"), forbidden("request")],
+    ["ASSETS", statement("const extra = input.binding.ASSETS;"), forbidden("ASSETS")],
+    [
+      "a second import",
+      dispatch.replace(dispatchModuleImport, `${dispatchModuleImport}\nimport { deploymentConfig } from "../build/deployment-config";`),
+      "imports anything but the shared origin validator",
+    ],
+    ["import(", statement('await import("../build/deployment-config");'), "dynamic import"],
+    ["a second .fetch", dispatch.replace(sink, `    await input.binding.fetch(new Request(url, init));\n${sink}`), "exactly one binding guard read and one binding call"],
+    ['a "https:// literal', statement('const extra = "https://heel.example";'), "literal destination"],
+    ['redirect: "follow"', dispatch.replace('redirect: "manual"', 'redirect: "follow"'), "redirect mode is not exactly manual"],
+    ["removal of pipeThrough", dispatch.replace("input.body!.pipeThrough(new FixedLengthStream(input.contentLength))", "input.body!"), "FixedLengthStream pipe"],
+    // Further S1 syntax rules.
+    ["export default", `${dispatch}\nexport default dispatchControlPlane;\n`, "default export"],
+    ["class", statement("class Local {}"), "declares a class"],
+    ["second function", statement("const local = () => input;"), "function other than dispatchControlPlane"],
+    ["unlisted constructor", statement("const extra = new TransformStream();"), "constructs TransformStream"],
+    ["computed member", statement('const extra = input["body"];'), "computed member access"],
+  ];
+  assert.equal(new Set(red.map(([label]) => label)).size, red.length);
+  for (const [label, mutated, violation] of red) {
+    assert.notEqual(mutated, dispatch, `${label} mutation did not apply`);
+    const parsedMutation = ts.createSourceFile("dispatch.ts", mutated, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    assert.equal(parsedMutation.parseDiagnostics.length, 0, `${label} mutation does not parse`);
+    const violations = analyze(mutated);
+    assert.ok(violations.some((found) => found.includes(violation)), `${label}: ${violations.join("\n")}`);
+  }
+  // Controls: a comment and a local read that name nothing forbidden stay accepted.
+  for (const [label, unchanged] of [
+    ["comment", statement("// The destination is now final.")],
+    ["declared length read", dispatch.replace(sink, `    const declaredLength = input.contentLength;\n${sink}`)],
+  ]) {
+    assert.notEqual(unchanged, dispatch, `${label} control did not apply`);
+    assert.deepEqual(analyze(unchanged), [], label);
+  }
+});
+
+
+test("S3: the dispatch module bytes equal the reviewed pinned hash", async () => {
+  const bytes = await readFile(new URL(CONTROL_PLANE_DISPATCH_PATH, appRoot)).catch(() => null);
+  assert.notEqual(bytes, null, `${CONTROL_PLANE_DISPATCH_PATH} is absent`);
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), CONTROL_PLANE_DISPATCH_SHA256);
+});
+
+
+test("S4/S5: the worker reaches the private binding only through the one reviewed dispatch call", async () => {
+  const worker = await source("worker/index.ts");
+  const analyze = (text) => analyzeSource(join(appRootPath, "worker/index.ts"), text);
+  assert.deepEqual(analyze(worker), []);
+  const call = "  const outcome = await dispatchControlPlane({";
+  const before = (code) => worker.replace(call, `  ${code}\n${call}`);
+  const red = [
+    ["binding fetch reinserted", before("await env.CONTROL_PLANE.fetch(new Request(new URL(upstreamPath, controlPlaneOrigin)));"), "names CONTROL_PLANE.fetch outside its one binding-shape guard"],
+    ["binding guard removed", worker.replace(`  ${workerBindingGuard}\n`, ""), "binding-shape guard is not the first statement of proxyControlPlane"],
+    [
+      "binding guard after the request checks",
+      worker.replace(`  ${workerBindingGuard}\n`, "").replace(call, `  ${workerBindingGuard}\n${call}`),
+      "binding-shape guard is not the first statement of proxyControlPlane",
+    ],
+    ["binding guard accepts null", worker.replace("    || env.CONTROL_PLANE === null\n", ""), "binding-shape guard is not the first statement of proxyControlPlane"],
+    ["computed binding fetch", before('await env.CONTROL_PLANE["fetch"](new Request(new URL(upstreamPath, controlPlaneOrigin)));'), 'reserved for the dispatch module: CONTROL_PLANE["fetch"]'],
+    ["body pipe in the worker", before("request.body?.pipeThrough(new TransformStream());"), "reserved for the dispatch module: .pipeThrough("],
+    ["bare fetch", before("await fetch(upstreamPath);"), "unreviewed fetch-shaped call"],
+    ["binding argument substituted", worker.replace("    binding: env.CONTROL_PLANE,\n", "    binding: env.ASSETS,\n"), "not the one reviewed call in proxyControlPlane"],
+    ["second dispatch call", before("await dispatchControlPlane({ binding: env.CONTROL_PLANE, publicOrigin: env.PUBLIC_ORIGIN, upstreamPath, method: request.method, headers: requestContract.headers, contentLength: requestContract.contentLength, body: request.body });"), "not the one reviewed call in proxyControlPlane"],
+    ["dispatch captured", before("const send = dispatchControlPlane;"), "referenced outside its one reviewed call"],
+    ["substitute dispatch module", worker.replace(dispatchImport, dispatchImport.replace("./control-plane-dispatch", "./control-plane-dispatch-copy")), "missing exact import { dispatchControlPlane }"],
+  ];
+  assert.equal(new Set(red.map(([label]) => label)).size, red.length);
+  for (const [label, mutated, violation] of red) {
+    assert.notEqual(mutated, worker, `${label} mutation did not apply`);
+    const violations = analyze(mutated);
+    assert.ok(violations.some((found) => found.includes(violation)), `${label}: ${violations.join("\n")}`);
+  }
+  // S5: the app-wide network-sink rule sees exactly one private sink, in the dispatch module.
+  const files = await discoverOriginalSources(appRootPath);
+  const dispatchPath = join(appRootPath, CONTROL_PLANE_DISPATCH_PATH);
+  assert.ok(files.includes(dispatchPath), "source discovery does not include the dispatch module");
+  for (const file of files) {
+    const text = await readFile(file, "utf8");
+    assert.equal(text.includes("input.binding.fetch("), file === dispatchPath, `${relative(appRootPath, file)} binding call`);
   }
 });
 
