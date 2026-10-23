@@ -1795,12 +1795,15 @@ def test_new_job_block_is_additive_and_existing_blocks_match_recorded_hashes():
     assert proof.workflow_violations(text) == []
     lease = proof._job_block(text, "host-lease-feasibility")
     authority_job = proof._job_block(text, "host-authority-proof")
+    lease_key_job = proof._job_block(text, "host-lease-key-shape")  # H2K1's job, bound by its recorded hash
     head = text[:proof.BASELINE_WORKFLOW_BYTES]
-    assert text == head + "\n" + lease + "\n" + authority_job
+    assert text == head + "\n" + lease + "\n" + authority_job + "\n" + lease_key_job
+    start = len(head) + 1 + len(lease) + 1
+    assert text[start:start + len(authority_job)] == authority_job
 
-    def swap(old: str, new: str) -> str:  # a mutation inside the authority job only
+    def swap(old: str, new: str) -> str:  # a mutation inside the authority job only, in place
         assert authority_job.count(old) == 1, old
-        return text[:-len(authority_job)] + authority_job.replace(old, new)
+        return text[:start] + authority_job.replace(old, new) + text[start + len(authority_job):]
 
     mutations = {
         "base_without_new_job": head + "\n" + lease,
@@ -1839,6 +1842,22 @@ def test_new_job_block_is_additive_and_existing_blocks_match_recorded_hashes():
         "analyze_mutated": text.replace("queries: security-extended", "queries: security-and-quality"),
         "lease_permissions_write": text.replace(lease, lease.replace("contents: read", "contents: write")),
         "lease_run_changed": text.replace(lease, lease.replace("host_lease_feasibility.py", "host_lease_feasibility.py -k x")),
+        # H2K1: the five-job composition is exact; the lease-key job is fixed in content and position.
+        "four_jobs_without_lease_key": head + "\n" + lease + "\n" + authority_job,
+        "extra_artifact_in_authority_job": swap("            host-authority-proof/report.txt\n",
+                                                "            host-authority-proof/report.txt\n"
+                                                "            host-authority-proof/extra.txt\n"),
+        "duplicate_lease_key_job": text + "\n" + lease_key_job,
+        "lease_key_before_authority": head + "\n" + lease + "\n" + lease_key_job + "\n" + authority_job,
+        "lease_key_before_lease": head + "\n" + lease_key_job + "\n" + lease + "\n" + authority_job,
+        "comment_before_lease_key": text.replace("\n  host-lease-key-shape:", "\n# note\n  host-lease-key-shape:"),
+        "sixth_job": text + "\n  extra-job:\n    runs-on: ubuntu-24.04\n",
+        "lease_key_branch": text.replace(lease_key_job, lease_key_job.replace(
+            "refs/heads/codex/self-serve-host-lease-key-shape-proof", "refs/heads/main")),
+        "lease_key_contents_write": text.replace(lease_key_job, lease_key_job.replace("contents: read", "contents: write")),
+        "lease_key_run_changed": text.replace(lease_key_job, lease_key_job.replace("host_lease_key_shape.py",
+                                                                                   "host_lease_key_shape.py -k x")),
+        "lease_key_checkout_tag": text.replace(lease_key_job, lease_key_job.replace(proof.CHECKOUT, "actions/checkout@v4")),
     }
     for name, variant in mutations.items():
         assert variant != text, name
