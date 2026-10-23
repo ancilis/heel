@@ -67,6 +67,14 @@ class FakeGitHub:
         self.next_id = 7000
         self.faults: dict[str, object] = {}
         self.cdn_override: dict[str, bytes] = {}
+        # Provider model: a release create/update recreates a missing tag from target_commitish,
+        # falling back to the default branch when it is omitted (GitHub Releases REST docs).
+        self.default_branch_sha = "d" * 40
+        self.implicit_tags: list[str] = []
+        # Another privileged writer acting between the tool's requests: "before POST",
+        # "before PATCH" and "after PATCH" callbacks, run under the lock.
+        self.hooks: dict[str, object] = {}
+        self.patched = False
 
     # -- state helpers -------------------------------------------------------------------------
     def release_record(self, release: dict) -> dict:
@@ -117,6 +125,25 @@ class FakeGitHub:
 
     def methods(self, method: str, prefix: str = "") -> list[dict]:
         return [r for r in self.requests if r["method"] == method and r["path"].startswith(prefix)]
+
+    def run_hook(self, name: str) -> None:
+        hook = self.hooks.get(name)
+        if hook:
+            hook(self)
+
+    def recreate_missing_tag(self, commitish) -> None:
+        if self.tag_ref is not None:
+            return
+        sha = commitish if isinstance(commitish, str) and re.fullmatch(r"[0-9a-f]{40}", commitish) \
+            else self.default_branch_sha
+        self.tag_ref = {"ref": f"refs/tags/{P.TAG}", "object": {"type": "commit", "sha": sha}}
+        self.implicit_tags.append(sha)
+
+    def replace_asset(self, name: str, payload: bytes, **extra) -> None:
+        """Delete-and-re-upload by another writer: same name, new id, new bytes."""
+        release = self.candidate()
+        self.assets[release["id"]] = [a for a in self.assets[release["id"]] if a["name"] != name]
+        self.add_asset(release["id"], name, payload, **extra)
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -211,8 +238,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if not authorized:
                 return self._send(401)
             document = json.loads(body)
+            github.run_hook("before POST")
             if github.faults.get("drop_create_nocommit"):
                 return self._drop()
+            github.recreate_missing_tag(document.get("target_commitish"))
             release = github.seed_release(draft=document["draft"], prerelease=document["prerelease"],
                                           sha=document["target_commitish"], body=document["body"],
                                           title=document["name"], tag=document["tag_name"])
@@ -228,20 +257,41 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if release is None or (release["draft"] and not authorized):
                 return self._send(404)
             if method == "GET":
+                reread = github.faults.get("reread_after_patch") if github.patched else None
+                if reread == "500":
+                    return self._send(500, {"message": "unavailable"})
+                if reread == "drop":
+                    return self._drop()
+                if reread == "other":
+                    return self._send(200, {**github.release_record(release), "id": release["id"] + 1,
+                                            "url": f"https://api.github.com{REPO}/releases/{release['id'] + 1}"})
+                if reread == "malformed":
+                    return self._send(200, {**github.release_record(release), "draft": "false"})
                 return self._send(200, github.release_record(release))
             if method == "PATCH":
                 if not authorized:
                     return self._send(401)
+                document = json.loads(body)
+                github.run_hook("before PATCH")
                 if github.faults.get("drop_patch_nocommit"):
                     return self._drop()
-                release.update(json.loads(body))
+                github.recreate_missing_tag(document.get("target_commitish"))
+                if not github.faults.get("patch_keeps_draft"):
+                    release.update(document)
                 release.pop("make_latest", None)
+                github.patched = True
+                github.run_hook("after PATCH")
                 if github.faults.get("drop_patch_commit"):
                     return self._drop()
-                return self._send(200, github.release_record(release))
+                record = github.release_record(release)
+                if github.faults.get("patch_response_other_target"):
+                    record["target_commitish"] = "main"
+                return self._send(200, record)
             return self._send(405)
         match = re.fullmatch(rf"{REPO}/releases/(\d+)/assets", path)
         if match and method == "GET":
+            if github.patched and github.faults.get("asset_list_after_patch") == "500":
+                return self._send(500, {"message": "unavailable"})
             release = next(r for r in github.releases if r["id"] == int(match.group(1)))
             return self._page([github.asset_record(release, a) for a in github.assets[release["id"]]], query)
         match = re.fullmatch(rf"{REPO}/releases/assets/(\d+)", path)
@@ -283,6 +333,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _cdn(self, path):
         github = self.server.github
+        failure = github.faults.get("cdn_after_patch") if github.patched else None
+        if failure == "500":
+            return self._send(500)
+        if failure == "drop":
+            return self._drop()
         match = re.fullmatch(r"/blob/(\d+)", path)
         for assets in github.assets.values():
             for asset in assets:
@@ -411,6 +466,15 @@ class PublisherHarness(unittest.TestCase):
     def assert_no_mutation(self):
         self.assertEqual([r for r in self.github.requests if r["method"] != "GET"], [])
 
+    def assert_no_git_ref_request_except_reads(self):
+        git = [r for r in self.github.requests if "/git/" in r["path"]]
+        self.assertTrue(git)
+        self.assertTrue(all(r["method"] == "GET" for r in git), git)
+
+    def requests_after_patch(self) -> list[dict]:
+        index = next(i for i, r in enumerate(self.github.requests) if r["method"] == "PATCH")
+        return self.github.requests[index + 1:]
+
 
 class ImportAndCommandLineTests(unittest.TestCase):
     def test_import_help_and_default_invocation_have_no_side_effects(self):
@@ -461,6 +525,33 @@ class ImportAndCommandLineTests(unittest.TestCase):
             self.assertNotIn(needle, source)
         methods = set(re.findall(r'"(GET|POST|PATCH|PUT|DELETE)"', source))
         self.assertEqual(methods, {"GET", "POST", "PATCH"})
+
+    def test_tag_claims_are_precise_and_no_git_ref_write_is_possible(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        runbook = (ROOT / "docs/RUNNER_PREVIEW_RELEASE.md").read_text(encoding="utf-8")
+        for text in (source, runbook):
+            self.assertNotIn("never creates, moves or pushes a tag", text)
+            self.assertNotIn("never creates, moves, forces or pushes a tag", text)
+            self.assertNotIn("always the exact `SHA`", text)
+        self.assertIn("a release request can recreate it", source)
+        self.assertIn("can recreate the tag", runbook)
+        sent = []
+        transport = mock.Mock(send=lambda *a: sent.append(a) or P.Response(200, [], b"{}"))
+        client = P.GitHubClient(transport, TOKEN, P.Reporter(io.StringIO()))
+        for method, host, path in (
+            ("POST", P.API_HOST, f"{REPO}/git/refs"),
+            ("PATCH", P.API_HOST, f"{REPO}/git/refs/tags/{P.TAG}"),
+            ("PATCH", P.API_HOST, f"{REPO}/git/ref/tags/{P.TAG}"),
+            ("POST", P.API_HOST, f"{REPO}/git/tags"),
+            ("POST", P.API_HOST, f"{REPO}/releases/7000"),
+            ("PATCH", P.API_HOST, f"{REPO}/releases"),
+            ("GET", P.UPLOAD_HOST, f"{REPO}/releases/7000/assets"),
+        ):
+            with self.subTest(method=method, path=path), self.assertRaises(P.VerificationFailed):
+                client._send(host, method, path, body=b"{}")
+        self.assertEqual(sent, [])
+        client.get_json(f"{REPO}/git/ref/tags/{P.TAG}")
+        self.assertEqual(len(sent), 1)
 
     def test_stable_only_pypi_workflow_condition_is_unchanged(self):
         workflow = (ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8")
@@ -753,6 +844,22 @@ class StageDraftTests(PublisherHarness):
                          [P.MANIFEST])
         self.assertEqual(len(self.github.releases), 5)
 
+    def test_tag_deleted_after_final_read_before_create_is_recreated_only_at_the_expected_sha(self):
+        # Another privileged actor deletes the tag after the tool's last tag GET; the provider
+        # then creates it from the POST's target_commitish.  The tool binds it, it cannot stop it.
+        self.github.hooks["before POST"] = lambda github: setattr(github, "tag_ref", None)
+        self.assertEqual(self.run_tool("stage-draft"), P.EXIT_OK, self.last_err)
+        create = json.loads(self.github.methods("POST", f"{REPO}/releases")[0]["body"])
+        self.assertEqual(create["target_commitish"], self.checkout.sha)
+        self.assertEqual(self.github.implicit_tags, [self.checkout.sha])
+        self.assertNotIn(self.github.default_branch_sha, self.github.implicit_tags)
+        self.assert_no_git_ref_request_except_reads()
+        self.assert_no_destructive_requests()
+        # The tag is re-read after staging and resolves to the source.
+        self.assertGreater(self.github.ref_reads, 2)
+        self.assertTrue(self.last_err.rstrip().splitlines()[-1].startswith(
+            "heel-preview-release: draft-staged"))
+
     def test_lost_create_response_after_commit_is_reconciled_without_repeating(self):
         self.github.faults["drop_create_commit"] = True
         self.assertEqual(self.run_tool("stage-draft"), P.EXIT_OK, self.last_err)
@@ -884,10 +991,18 @@ class PublishTests(PublisherHarness):
         patches = self.github.methods("PATCH")
         self.assertEqual(len(patches), 1)
         self.assertEqual(json.loads(patches[0]["body"]),
-                         {"draft": False, "prerelease": True, "make_latest": "false"})
+                         {"draft": False, "prerelease": True, "make_latest": "false",
+                          "target_commitish": self.checkout.sha})
         self.assertEqual((release["draft"], release["prerelease"]), (False, True))
         self.assertEqual(self.spawned, [(self.checkout.sha, MANIFEST_SHA)])
-        self.assertEqual(json.loads(self.last_out)["state"], "published-prerelease")
+        result = json.loads(self.last_out)
+        self.assertEqual(result["state"], "published-prerelease")
+        self.assertEqual(result["post_publication_bytes"], "re-listed and hashed")
+        # After the PATCH: the tag, the asset list and every asset's bytes are read again.
+        after = self.requests_after_patch()
+        self.assertEqual(len([r for r in after if r["host"] == CDN]), 3)
+        self.assertTrue(any(r["path"] == f"{REPO}/git/ref/tags/{P.TAG}" for r in after))
+        self.assertTrue(all(r["method"] == "GET" for r in after))
         self.assertEqual([r for r in self.github.requests if r["method"] == "POST"], [])
         self.assert_no_destructive_requests()
 
@@ -932,6 +1047,8 @@ class PublishTests(PublisherHarness):
         self.assertIn("acknowledged=False", self.last_err)
         self.assertFalse(release["draft"])
         self.assertEqual(len(self.github.methods("PATCH")), 1)
+        self.assertEqual(len([r for r in self.requests_after_patch() if r["host"] == CDN]), 3)
+        self.assertIs(json.loads(self.last_out)["acknowledged"], False)
 
     def test_lost_publish_that_did_not_commit_is_unknown_and_not_retried(self):
         release = self.staged()
@@ -941,6 +1058,176 @@ class PublishTests(PublisherHarness):
         self.assertTrue(release["draft"])
         self.assertIn("no retry", self.last_err)
         self.assertEqual(self.spawned, [])
+
+    def assert_published_unverified(self, release):
+        self.assertEqual(self.run_tool("publish-and-verify"), P.EXIT_PUBLISHED_UNVERIFIED, self.last_err)
+        self.assertFalse(release["draft"])
+        self.assertEqual(len(self.github.methods("PATCH")), 1)
+        self.assertEqual([r for r in self.github.requests if r["method"] == "POST"], [])
+        self.assertTrue(all(r["method"] == "GET" for r in self.requests_after_patch()))
+        self.assert_no_destructive_requests()
+        # Never a success record, never the anonymous install/reference run.
+        self.assertEqual(self.last_out, "")
+        self.assertEqual(self.spawned, [])
+        self.assertIn("is published but post-publication verification failed", self.last_err)
+        self.assertIn("Do not delete, recreate, replace or re-upload anything", self.last_err)
+        self.assertIn(f"Recover read-only with: verify-public --repository ancilis/heel --tag {P.TAG} "
+                      f"--expected-sha {self.checkout.sha} --expected-manifest-sha256 {MANIFEST_SHA}",
+                      self.last_err)
+
+    def reset(self):
+        self.github.releases.clear()
+        self.github.requests.clear()
+        self.github.faults.clear()
+        self.github.hooks.clear()
+        self.github.patched = False
+        self.github.tag_ref = {"ref": f"refs/tags/{P.TAG}", "object": {"type": "commit", "sha": self.checkout.sha}}
+        self.spawned.clear()
+
+    def test_tag_deleted_after_final_read_before_publish_is_bound_to_the_expected_sha(self):
+        release = self.staged()
+        self.github.hooks["before PATCH"] = lambda github: setattr(github, "tag_ref", None)
+        self.assertEqual(self.run_tool("publish-and-verify"), P.EXIT_OK, self.last_err)
+        patch = json.loads(self.github.methods("PATCH")[0]["body"])
+        self.assertEqual(patch["target_commitish"], self.checkout.sha)
+        self.assertEqual(release["target_commitish"], self.checkout.sha)
+        # The provider recreated the tag, and only at the source; no default-branch fallback.
+        self.assertEqual(self.github.implicit_tags, [self.checkout.sha])
+        self.assertEqual(self.github.tag_ref["object"]["sha"], self.checkout.sha)
+        self.assert_no_git_ref_request_except_reads()
+        self.assert_no_destructive_requests()
+
+    def test_fake_provider_falls_back_to_the_default_branch_without_an_explicit_target(self):
+        # The model the previous test relies on: an update that omits target_commitish while the
+        # tag is missing recreates the tag at the default branch.
+        release = self.staged()
+        self.github.tag_ref = None
+        response = self.transport.send(
+            "api.github.com", "PATCH", f"{REPO}/releases/{release['id']}",
+            {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+            json.dumps({"draft": False, "prerelease": True}).encode(), P.MAX_JSON_BYTES,
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.github.implicit_tags, [self.github.default_branch_sha])
+
+    def test_same_name_asset_replaced_after_byte_verification_is_published_unverified(self):
+        changed = bytearray(CANDIDATE[P.WHEEL])
+        changed[-30] ^= 1
+        for label, extra in (("listing-digest", {}), ("no-listing-digest", {"_override": {"digest": None}})):
+            with self.subTest(label):
+                self.reset()
+                release = self.staged()
+                # Another writer deletes and re-uploads the wheel between the tool's last byte
+                # read and its PATCH: same name and size, new id and bytes.
+                self.github.hooks["before PATCH"] = lambda github, extra=extra: github.replace_asset(
+                    P.WHEEL, bytes(changed), **extra)
+                self.assert_published_unverified(release)
+                self.assertIn(f"asset {P.WHEEL} conflicts with the candidate bytes", self.last_err)
+                # Read-only recovery fails before any install or reference execution.
+                self.github.requests.clear()
+                self.github.faults.clear()
+                self.assertEqual(self.run_tool("verify-public"), P.EXIT_FAILED, self.last_err)
+                self.assertEqual(self.proof_calls, [])
+                self.assertEqual(self.last_out, "")
+                self.assert_no_mutation()
+                self.assertTrue(all(r["authorization"] is None for r in self.github.requests))
+
+    def test_post_publication_tag_or_source_change_is_published_unverified(self):
+        def move_tag(github):
+            github.tag_ref = {"ref": f"refs/tags/{P.TAG}", "object": {"type": "commit", "sha": "e" * 40}}
+
+        cases = {
+            "tag-moved": ("after PATCH", move_tag, "does not resolve to the expected source commit"),
+            "tag-deleted": ("after PATCH", lambda github: setattr(github, "tag_ref", None), "does not exist"),
+            # The changed target is caught by whichever of the response or the re-read sees it.
+            "target-changed": ("after PATCH", lambda github: github.candidate().update(target_commitish="f" * 40),
+                               "target"),
+            "made-stable": ("after PATCH", lambda github: github.candidate().update(prerelease=False),
+                            "not a prerelease"),
+            "notes-edited": ("after PATCH", lambda github: github.candidate().update(body="edited"),
+                             "release notes differ"),
+            "asset-added": ("after PATCH", lambda github: github.add_asset(
+                github.candidate()["id"], "notes.txt", b"x"), "unexpected asset"),
+            "response-target": ("fault", "patch_response_other_target", "publication response"),
+        }
+        for label, (kind, action, reason) in cases.items():
+            with self.subTest(label):
+                self.reset()
+                release = self.staged()
+                if kind == "fault":
+                    self.github.faults[action] = True
+                else:
+                    self.github.hooks[kind] = action
+                self.assert_published_unverified(release)
+                self.assertIn(reason, self.last_err)
+
+    def test_post_publication_metadata_or_byte_read_failure_is_published_unverified(self):
+        for fault, value in (("asset_list_after_patch", "500"), ("cdn_after_patch", "500"),
+                             ("cdn_after_patch", "drop")):
+            with self.subTest(fault=fault, value=value):
+                self.reset()
+                release = self.staged()
+                self.github.faults[fault] = value
+                self.assert_published_unverified(release)
+
+    def test_lost_publish_response_with_committed_but_replaced_bytes_is_published_unverified(self):
+        changed = bytearray(CANDIDATE[P.SDIST])
+        changed[-30] ^= 1
+        release = self.staged()
+        self.github.faults["drop_patch_commit"] = True
+        self.github.hooks["after PATCH"] = lambda github: github.replace_asset(
+            P.SDIST, bytes(changed), _override={"digest": None})
+        self.assert_published_unverified(release)
+        self.assertIn("acknowledged=False", self.last_err)
+
+    def test_acknowledged_publish_that_still_reads_as_draft_is_unknown_and_not_retried(self):
+        release = self.staged()
+        self.github.faults["patch_keeps_draft"] = True
+        self.assertEqual(self.run_tool("publish-and-verify"), P.EXIT_UNKNOWN, self.last_err)
+        self.assertIn("acknowledged but the release still reads as a draft", self.last_err)
+        self.assertTrue(release["draft"])
+        self.assertEqual(len(self.github.methods("PATCH")), 1)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.last_out, "")
+
+    def test_failed_or_unreliable_reread_after_publish_is_unknown_not_published(self):
+        for reread in ("500", "drop", "other", "malformed"):
+            with self.subTest(reread):
+                self.reset()
+                release = self.staged()
+                self.github.faults["reread_after_patch"] = reread
+                self.assertEqual(self.run_tool("publish-and-verify"), P.EXIT_UNKNOWN, self.last_err)
+                # The server did commit, but the tool cannot establish it, so it claims neither.
+                self.assertFalse(release["draft"])
+                self.assertNotIn("heel-preview-release: published ", self.last_err)
+                self.assertNotIn("is published", self.last_err)
+                self.assertIn("no retry was sent", self.last_err)
+                self.assertEqual(len(self.github.methods("PATCH")), 1)
+                self.assertEqual(self.spawned, [])
+                self.assertEqual(self.last_out, "")
+                self.assert_no_destructive_requests()
+
+    def test_already_published_release_with_changed_bytes_is_published_unverified_without_writes(self):
+        changed = bytearray(CANDIDATE[P.WHEEL])
+        changed[-30] ^= 1
+        release = self.staged()
+        release["draft"] = False
+        self.github.replace_asset(P.WHEEL, bytes(changed), _override={"digest": None})
+        self.assertEqual(self.run_tool("publish-and-verify"), P.EXIT_PUBLISHED_UNVERIFIED, self.last_err)
+        self.assert_no_mutation()
+        self.assertEqual(self.spawned, [])
+        self.assertIn("Recover read-only with: verify-public", self.last_err)
+
+    def test_verify_process_that_cannot_complete_is_published_unverified(self):
+        self.staged()
+
+        def timed_out(sha, manifest_sha256, reporter):
+            raise subprocess.TimeoutExpired(["verify-public"], 3600)
+
+        self.spawn = timed_out
+        self.assertEqual(self.run_tool("publish-and-verify"), P.EXIT_PUBLISHED_UNVERIFIED, self.last_err)
+        self.assertIn("anonymous verification failed (rc=TimeoutExpired)", self.last_err)
+        self.assertEqual(self.last_out, "")
 
     def test_tag_moved_before_publication_is_refused(self):
         release = self.staged()

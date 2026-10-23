@@ -9,9 +9,11 @@ public URL or release-asset digest has been verified yet. Only the release owner
 the steps below, after an independent review of the tool and green source CI. The tool's
 author does not run them.
 
-What this release proves is limited. Publishing it, and passing `verify-public`, is
-evidence about packaging and the synthetic reference only. It does not establish any of
-these:
+What this release proves is limited. Publication alone proves nothing about the bytes.
+Verified distribution means the trusted expected manifest and artifact digests were
+checked before anything was installed or executed; that is what a passing
+`verify-public` adds. Even then it is evidence about packaging and the synthetic
+reference only, not launch acceptance. It does not establish any of these:
 
 - runner pairing
 - `heel runner serve`
@@ -37,6 +39,33 @@ repository's release paths. Asset bytes come from GitHub's release-asset CDN hos
 must be HTTPS and are always contacted without credentials. There is no option to point
 it at another API host, repository or tag.
 
+The only authenticated writes it can send are `POST .../releases` (create the draft),
+`PATCH .../releases/{id}` (publish it) and `POST` to the upload path (missing assets).
+It has no Git-ref write path, no `DELETE` and no `PUT`.
+
+## What the tool can and cannot guarantee
+
+- **Tag.** The tool issues no Git-ref create, move or push request. Whenever it checks
+  the tag, it requires `v1.3.0rc1` to exist and resolve to `SHA`. But GitHub's create
+  and update release endpoints document that `target_commitish` "determines where the
+  Git tag is created from", is "unused if the Git tag already exists", and defaults to
+  the default branch. So if another privileged actor deletes the tag between two of the
+  tool's requests, a release `POST` or `PATCH` can recreate the tag. Both requests send
+  `target_commitish = SHA` explicitly, so any such implicit creation is bound to `SHA`
+  rather than the default branch. That constrains the effect; it does not make it
+  impossible. The tool re-reads the tag after staging and after publishing.
+- **Bytes.** Reads and writes are separate REST requests. GitHub documents no
+  conditional (`If-Match`/ETag) or compare-and-publish primitive for releases, and the
+  tool sends none. The tool hashes all three draft assets before its one `PATCH`, and
+  re-lists and hashes them again after it. That detects a writer that changed them in
+  between; it cannot prevent one. Keeping other writers out of the window is the
+  operational precondition below, not a technical lock.
+- **Immutable releases.** GitHub's immutable-releases setting locks a release's tag
+  and assets only *after* publication. It does not protect the draft window or the
+  `PATCH`. The last recorded owner read showed it disabled for this repository. Enabling
+  it is a separate hardening decision for the owner; this procedure does not change it
+  or assume it.
+
 ## Preconditions
 
 1. The candidate commit has been independently reviewed and source CI is green. Record
@@ -44,13 +73,69 @@ it at another API host, repository or tag.
 2. A clean checkout of exactly `SHA`, run with Python 3.11 or newer. `git status` must
    show nothing, including untracked files.
 3. `gh auth status` shows the release owner logged in to `github.com` with permission to
-   create releases. The tool reads the credential with `gh auth token`, keeps it in
-   memory only, and never puts it in argv, logs, notes or evidence.
+   create and edit releases (see "Credential permissions" below). The tool reads the
+   credential with `gh auth token`, keeps it in memory only, and never puts it in argv,
+   logs, notes or evidence.
 4. The release owner creates and pushes the tag `v1.3.0rc1` at `SHA` themselves. The
-   tool never creates, moves, forces or pushes a tag. A lightweight tag or an annotated
-   tag is fine. Annotated tags are peeled at most four levels deep. Cycles, and tags
-   that point at a tree or blob, are rejected.
+   tool sends no tag or Git-ref write; see "What the tool can and cannot guarantee" for
+   the implicit-creation case. A lightweight tag or an annotated tag is fine. Annotated
+   tags are peeled at most four levels deep. Cycles, and tags that point at a tree or
+   blob, are rejected.
 5. The package index must be reachable for the `[runner]` extra (`cryptography==45.0.7`).
+6. The release window below is recorded and coordinated.
+
+### Credential permissions
+
+From GitHub's REST documentation (Releases, and "Permissions required for fine-grained
+personal access tokens"):
+
+- Creating and editing a release requires push access. For a fine-grained token, the
+  create (`POST /repos/{owner}/{repo}/releases`) and update
+  (`PATCH /repos/{owner}/{repo}/releases/{release_id}`) endpoints are listed under the
+  **Contents** repository permission (write).
+- If the resolved target commit "adds or modifies any file under .github/workflows/
+  relative to the repository's default branch, the authenticating token must be
+  authorized to modify workflows". Otherwise the endpoint returns `404 Not Found` (some
+  paths return `403 Resource not accessible by integration`). OAuth and classic personal
+  access tokens need the `workflow` scope; fine-grained and GitHub App installation
+  tokens also need the **Workflows** repository permission (write). The Actions
+  `GITHUB_TOKEN` cannot be authorized for this.
+- Check `git diff --stat origin/main "$SHA" -- .github/workflows` after a fresh fetch.
+  If it is not empty, the owner's credential needs the workflow permission. (At the
+  time of writing, the candidate branch changes `ci.yml`, `codeql.yml` and
+  `publish.yml` relative to the last locally fetched `origin/main`.)
+
+Missing access is an operator dependency. A `404`/`403` from the tool is reported, not
+worked around: the tool never refreshes a login, adds scopes or retries with another
+credential, and neither should the owner mid-window without recording it.
+
+### Release window and other writers
+
+GitHub offers no lock that stops another authorized writer from changing the tag,
+release or assets while this procedure runs. Exclusive writing is therefore an explicit
+operational trust assumption. Before `stage-draft`, the designated release owner
+records, in the release evidence:
+
+1. the source `SHA`, the tag `v1.3.0rc1` and (once it exists) the release id;
+2. the release window: it starts before `stage-draft` and ends only after a successful
+   `verify-public`, or after the owner records a published-but-unverified (`5`) or
+   unknown (`4`) outcome and escalates it;
+3. the release, tag and asset writers known to the owner (other administrators and
+   maintainers with release access, and any automation that creates, edits or uploads
+   to releases or tags), and the scope inspected to identify them (for example the
+   repository's collaborator and team access settings and `.github/workflows`);
+4. for each known writer, a written acknowledgement that they will stay inactive for
+   the window. If none were identified, record that fact and the inspection scope. Do
+   not invent acknowledgements, and do not claim every possible credential was
+   enumerated;
+5. the GitHub tag, release, asset and activity evidence the owner can see immediately
+   before `stage-draft` and immediately after `verify-public`. Keep what is available.
+   Snapshots show state at two moments; they do not prove that nothing happened in
+   between, and an organization audit API that is unavailable is not a guarantee.
+
+An identified writer that has not acknowledged the window blocks the procedure. This
+coordination is what "the bytes cannot change during publication" rests on; the tool's
+post-`PATCH` hashing and `verify-public` only detect a breach after the fact.
 
 Compute the external manifest digest from the commit:
 
@@ -96,7 +181,9 @@ python scripts/publish_runner_preview_release.py stage-draft \
    It refuses if there is more than one.
 3. If none exists, it reads the tag again and creates one draft prerelease:
    `target_commitish = SHA`, the fixed title, notes generated from the verified
-   manifest, and `make_latest = "false"`.
+   manifest, and `make_latest = "false"`. If the tag was deleted after that read,
+   GitHub recreates it at `SHA` (not the default branch) as a side effect of this
+   request.
 4. An existing release is reused only if all of these match: draft, prerelease, target,
    title, notes and upload location.
 5. It lists every asset, following pagination. Each existing asset must have a canonical
@@ -105,6 +192,7 @@ python scripts/publish_runner_preview_release.py stage-draft \
    candidate.
 6. Only missing assets are uploaded. Each one is re-listed and downloaded again to
    verify it.
+7. It re-reads the tag; it must still resolve to `SHA`.
 
 The tool refuses rather than repairs. It refuses unknown or duplicate assets,
 conflicting bytes with the same name, a non-draft or non-prerelease release, and any
@@ -128,21 +216,40 @@ python scripts/publish_runner_preview_release.py publish-and-verify \
 2. It requires the matching draft to hold exactly the three verified assets.
 3. Immediately before publishing, it reads `HEAD`, the clean state and the remote tag
    again.
-4. It sends one `PATCH` with `draft: false, prerelease: true, make_latest: "false"`.
-5. It re-reads the release whether or not the response arrived, and reports what it
-   finds:
-   - published: it says whether the publish was acknowledged
-   - still a draft: it exits `4`, and nothing is retried
-6. It never converts a stable release. If the release is already a published matching
-   prerelease, the tool sends no publish request and says so.
-7. It runs `verify-public` in a new process with these properties:
+4. It sends one `PATCH` with `draft: false, prerelease: true, make_latest: "false",
+   target_commitish: SHA`. The explicit target means that, if the tag was deleted after
+   step 3, GitHub's implicit recreation is bound to `SHA` instead of falling back to the
+   default branch. The stored draft target is not relied on for this.
+5. It re-reads the release whether or not the response arrived. Publication counts as
+   established only when that re-read is a well-formed record of the same release id,
+   URL, tag and title with `draft: false`:
+   - the re-read fails, or returns a malformed or different release: exit `4`
+     (outcome unknown); nothing is retried, and publication is not claimed
+   - still a draft: exit `4`; nothing is retried
+   - published: it says whether the publish was acknowledged, then continues
+6. After publication is established, before any success, it checks the acknowledged
+   response names the same release and `SHA`; checks the re-read's target, prerelease
+   flag and notes; re-reads the tag; re-lists the assets; and downloads and hashes all
+   three. Any failure or read error here exits `5`.
+7. It never converts a stable release. If the release is already a published matching
+   prerelease, the tool sends no publish request and says so, but still re-lists and
+   hashes its assets; a mismatch exits `5`.
+8. It runs `verify-public` in a new process with these properties:
    - `python -I`
    - working directory: a new temporary directory outside the checkout
    - `HOME` set to a new empty directory
    - no GitHub token, git configuration, netrc or pip configuration
 
-Exit `5` means the release **is published** but anonymous verification failed. Do not
-delete, recreate or re-upload anything. Recover read-only with step 3.
+Exit `5` means the release **is published** but a later verification failed: the
+post-publication check, the anonymous verification, or the verification process itself.
+It is never a success. Do not delete, recreate, replace or re-upload anything; the tool
+prints the read-only `verify-public` recovery command (step 3). If the bytes really
+changed, `verify-public` fails before installing or running anything, and the owner
+escalates with the recorded window evidence.
+
+Exit `4` after a `PATCH` means the tool could not establish the outcome. Do not repeat
+the `PATCH` blindly. Re-run `publish-and-verify` later; it re-reads first and sends no
+second publish request if the release is already published.
 
 ## 3. Read-only public verification and recovery
 
@@ -188,7 +295,7 @@ printed `work_directory`. A failure exits non-zero and prints no success record.
 | `2` | usage, including running with no mode |
 | `3` | refused: a precondition failed and this run sent no mutation |
 | `4` | outcome unknown: a mutation was sent and could not be confirmed by re-reading; nothing was retried |
-| `5` | published, but anonymous verification failed; recover with `verify-public` |
+| `5` | published, but post-publication or anonymous verification failed; never a success; recover read-only with `verify-public` |
 
 ## After publication
 
@@ -199,12 +306,19 @@ Record the following in the release evidence:
 - the GitHub URL
 - the manifest digest from the notes
 
-Customer copy may cite the public URL and digests only after a successful anonymous
-`verify-public`. Final Fable clean-room launch acceptance repeats anonymous acquisition
-independently. Remaining residual risks:
+- the release-window record and the before/after GitHub evidence
 
-- GitHub could create the tag at `target_commitish` if someone deletes it between the
-  tool's last tag read and its request. The tool reads the tag immediately before both
-  the create and the publish, and `target_commitish` is always the exact `SHA`.
+Customer copy may cite the public URL and digests only after a successful anonymous
+`verify-public`. Any customer-facing install command must itself keep a trusted digest
+check before installation; no verified public URL exists yet. Final Fable clean-room
+launch acceptance repeats anonymous acquisition independently. Remaining trust
+assumptions and limits:
+
+- No other writer acts during the release window. This is coordination, not a lock.
+  An undisclosed or compromised credential could still act; post-publication hashing
+  and `verify-public` would detect changed bytes, but only after exposure.
+- A deleted tag can be recreated by a release request, bound to `SHA`.
+- The loopback tests model GitHub from its documentation; real wire behaviour is
+  confirmed only by the owner run.
 - The tool never asserts anything about the PyPI route beyond the unchanged stable-only
   workflow condition.

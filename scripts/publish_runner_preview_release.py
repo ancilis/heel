@@ -9,16 +9,26 @@ asking for help does nothing.  Each mode must be selected explicitly:
     create or resume only a *draft prerelease* and upload only missing canonical assets.
 ``publish-and-verify``
     Require that draft with exactly the three verified assets, publish it as a prerelease,
-    then run ``verify-public`` in a new credential-free process.
+    re-read and byte-verify the published release, then run ``verify-public`` in a new
+    credential-free process.
 ``verify-public``
     Read-only and anonymous.  Verify the already published prerelease, download its assets
     without GitHub credentials, and install the wheel's ``[runner]`` extra in a new venv to
     run the two synthetic reference outcomes.
 
-The tool never creates, moves or pushes a tag, and never deletes, replaces or overwrites a
-release or asset.  The installed proof is packaging and synthetic-reference evidence only: it
-does not establish pairing, serving, HTTPS target traffic, hosted findings or launch
-readiness.  See docs/RUNNER_PREVIEW_RELEASE.md.
+The tool issues no Git-ref create, move or push request, and never deletes, replaces or
+overwrites a release or asset.  It requires the remote tag to exist at the expected commit
+whenever it checks it, but GitHub's release create and update endpoints create a missing tag
+from ``target_commitish``: if another privileged actor deletes the tag between the tool's
+requests, a release request can recreate it.  Both requests bind ``target_commitish`` to the
+expected commit, which constrains that effect; it does not make it impossible.
+
+Reads and writes are separate requests, not a transaction.  Re-reading and hashing after
+publication detects an intervening writer; it cannot prevent one.  The release window's
+exclusive writer is an operational precondition (docs/RUNNER_PREVIEW_RELEASE.md).
+
+The installed proof is packaging and synthetic-reference evidence only: it does not establish
+pairing, serving, HTTPS target traffic, hosted findings or launch readiness.
 """
 from __future__ import annotations
 
@@ -109,6 +119,11 @@ _API_PATHS = tuple(
     )
 )
 _UPLOAD_PATH = re.compile(rf"\A{_REPO_PATH}/releases/{_ID}/assets\Z")
+# The only authenticated writes: create the release, update the release.  No Git-ref write path.
+_API_WRITES = {
+    "POST": re.compile(rf"\A{_REPO_PATH}/releases\Z"),
+    "PATCH": re.compile(rf"\A{_REPO_PATH}/releases/{_ID}\Z"),
+}
 _REDIRECTS = frozenset({301, 302, 303, 307, 308})
 # Words the closing evidence must never use as an outcome: this proof establishes none of them.
 NOT_PROVEN = ("pairing", "heel runner serve", "HTTPS target traffic", "hosted findings", "launch readiness")
@@ -137,6 +152,8 @@ class VerificationFailed(ReleaseError):
 
 
 class PublishedUnverified(ReleaseError):
+    """A reliable re-read shows the release is published, but a later verification failed."""
+
     exit_code = EXIT_PUBLISHED_UNVERIFIED
 
 
@@ -264,9 +281,12 @@ class GitHubClient:
 
     def _send(self, host, method, path, *, query=None, body=None, content_type=None,
               accept="application/vnd.github+json", limit=MAX_JSON_BYTES) -> Response:
-        allowed = _UPLOAD_PATH.fullmatch(path) if host == UPLOAD_HOST else (
-            host == API_HOST and any(pattern.fullmatch(path) for pattern in _API_PATHS)
-        )
+        if host == UPLOAD_HOST:
+            allowed = method == "POST" and _UPLOAD_PATH.fullmatch(path)
+        elif method == "GET":
+            allowed = host == API_HOST and any(pattern.fullmatch(path) for pattern in _API_PATHS)
+        else:
+            allowed = host == API_HOST and method in _API_WRITES and _API_WRITES[method].fullmatch(path)
         if not allowed:
             raise VerificationFailed("refusing an authenticated request outside the release paths")
         headers = {
@@ -687,6 +707,8 @@ def _uncertain(response) -> bool:
 
 
 def _create_draft(client, sha: str, notes: str, reporter: Reporter) -> dict:
+    # If the tag vanished since the last check, GitHub creates it from target_commitish; the
+    # exact SHA binds that implicit creation instead of the default branch.
     document = {
         "tag_name": TAG, "target_commitish": sha, "name": TITLE, "body": notes,
         "draft": True, "prerelease": True, "generate_release_notes": False, "make_latest": "false",
@@ -750,14 +772,52 @@ def stage_draft(client, sha: str, artifacts: dict[str, bytes], reporter: Reporte
     final = list_assets(client, release_id, artifacts)
     if set(final) != set(ASSET_NAMES):
         raise Refused("draft does not hold exactly the three candidate assets")
+    verify_remote_tag(client, sha, reporter)
     reporter.event("draft-staged", tag=TAG, assets=len(final), state="draft-prerelease")
     return {"mode": "stage-draft", "state": "draft-prerelease", "tag": TAG, "source": sha,
             "assets": sorted(final), "public": False}
 
 
 def _reread(client, release_id: int):
-    status, release, _ = client.get_json(f"{_REPO_PATH}/releases/{release_id}")
+    """The release as GitHub reports it now, or None when it cannot be read reliably."""
+    try:
+        status, release, _ = client.get_json(f"{_REPO_PATH}/releases/{release_id}")
+    except (TransportError, VerificationFailed):
+        return None
     return release if status == 200 else None
+
+
+def _is_same_release(release, release_id: int) -> bool:
+    """Whether a record reliably names the release this run is publishing."""
+    return (
+        isinstance(release, dict) and release.get("id") == release_id
+        and release.get("url") == _expected_release_url(release_id)
+        and release.get("tag_name") == TAG and release.get("name") == TITLE
+    )
+
+
+def recovery_command(sha: str, manifest_sha256: str) -> str:
+    return (f"verify-public --repository {REPOSITORY} --tag {TAG} --expected-sha {sha} "
+            f"--expected-manifest-sha256 {manifest_sha256}")
+
+
+def _published_unverified(reason: str, sha: str, artifacts: dict[str, bytes]) -> PublishedUnverified:
+    manifest_sha256 = hashlib.sha256(artifacts[MANIFEST]).hexdigest()
+    return PublishedUnverified(
+        f"the prerelease is published but {reason}. Do not delete, recreate, replace or re-upload "
+        f"anything. Recover read-only with: {recovery_command(sha, manifest_sha256)}"
+    )
+
+
+def verify_published_release(client, release, release_id: int, sha: str, notes: str,
+                             artifacts: dict[str, bytes], reporter: Reporter) -> None:
+    """Identity, tag, exact asset set and downloaded bytes of a published release."""
+    check_release(release, sha=sha, draft=False, notes=notes)
+    verify_remote_tag(client, sha, reporter)
+    assets = list_assets(client, release_id, artifacts)
+    if set(assets) != set(ASSET_NAMES):
+        raise Refused("published prerelease does not hold exactly the three candidate assets")
+    verify_asset_bytes(client, assets, artifacts, reporter)
 
 
 def publish(client, root: Path, sha: str, artifacts: dict[str, bytes], reporter: Reporter) -> dict:
@@ -768,12 +828,12 @@ def publish(client, root: Path, sha: str, artifacts: dict[str, bytes], reporter:
         raise Refused("no draft prerelease exists; run stage-draft first")
     if isinstance(release, dict) and release.get("draft") is False:
         release_id = check_release(release, sha=sha, draft=False, notes=notes)
-        assets = list_assets(client, release_id, artifacts)
-        if set(assets) != set(ASSET_NAMES):
-            raise Refused("published prerelease does not hold exactly the three candidate assets")
-        verify_asset_bytes(client, assets, artifacts, reporter)
+        try:
+            verify_published_release(client, release, release_id, sha, notes, artifacts, reporter)
+        except (Refused, VerificationFailed, TransportError) as error:
+            raise _published_unverified(f"its verification failed: {error}", sha, artifacts) from None
         reporter.event("already-published", tag=TAG, publish_request_sent=False)
-        return {"published_now": False}
+        return {"published_now": False, "post_publication_bytes": "re-listed and hashed"}
     release_id = check_release(release, sha=sha, draft=True, notes=notes)
     assets = list_assets(client, release_id, artifacts)
     if set(assets) != set(ASSET_NAMES):
@@ -785,32 +845,50 @@ def publish(client, root: Path, sha: str, artifacts: dict[str, bytes], reporter:
     ):
         raise Refused("checkout changed before publication")
     verify_remote_tag(client, sha, reporter)
+    # If the tag vanished since that read, GitHub creates it from target_commitish, defaulting
+    # to the default branch; the exact SHA binds that implicit creation to the source.
     try:
         response = client.patch_json(
             f"{_REPO_PATH}/releases/{release_id}",
-            {"draft": False, "prerelease": True, "make_latest": "false"},
+            {"draft": False, "prerelease": True, "make_latest": "false", "target_commitish": sha},
         )
     except TransportError:
         response = None
-    if response is not None and response.status not in (200,) and not _uncertain(response):
+    if response is not None and response.status != 200 and not _uncertain(response):
         raise Refused(f"publishing returned HTTP {response.status}; re-read the release before any retry")
+    acknowledged = response is not None and response.status == 200
     reread = _reread(client, release_id)
     if reread is None:
-        raise OutcomeUnknown("publication request was sent and the release could not be re-read")
-    if reread.get("draft") is True:
-        if response is not None and response.status == 200:
-            raise OutcomeUnknown("publication was acknowledged but the release still reads as a draft")
+        raise OutcomeUnknown(
+            "publication request was sent and the release could not be re-read; no retry was sent. "
+            "Re-run publish-and-verify later; it re-reads the release first."
+        )
+    if not _is_same_release(reread, release_id) or type(reread.get("draft")) is not bool:
+        raise OutcomeUnknown(
+            "publication request was sent and the re-read returned a malformed or different "
+            "release, so publication is not established; no retry was sent"
+        )
+    if reread["draft"]:
+        if acknowledged:
+            raise OutcomeUnknown("publication was acknowledged but the release still reads as a draft; "
+                                 "no retry was sent")
         raise OutcomeUnknown(
             "publication outcome is unknown and the release still reads as a draft; no retry was "
             "sent. Re-run publish-and-verify later; it re-reads the release first."
         )
-    check_release(reread, sha=sha, draft=False, notes=notes)
-    final = list_assets(client, release_id, artifacts)
-    if set(final) != set(ASSET_NAMES):
-        raise Refused("published prerelease does not hold exactly the three candidate assets")
-    reporter.event("published", tag=TAG, prerelease=True,
-                   acknowledged=response is not None and response.status == 200)
-    return {"published_now": True}
+    # The re-read establishes publication: from here a failure is published-but-unverified.
+    reporter.event("published", tag=TAG, acknowledged=acknowledged)
+    try:
+        if acknowledged:
+            returned = _json(response.body)
+            if not _is_same_release(returned, release_id) or returned.get("target_commitish") != sha:
+                raise VerificationFailed("the publication response names another release or target")
+        verify_published_release(client, reread, release_id, sha, notes, artifacts, reporter)
+    except (Refused, VerificationFailed, TransportError) as error:
+        raise _published_unverified(f"post-publication verification failed: {error}", sha, artifacts) from None
+    reporter.event("published-assets-verified", tag=TAG, assets=len(ASSET_NAMES))
+    return {"published_now": True, "acknowledged": acknowledged,
+            "post_publication_bytes": "re-listed and hashed"}
 
 
 # --------------------------------------------------------------------------- public verification
@@ -1048,14 +1126,12 @@ def main(argv=None, *, transport=None, token_provider=None, gate_runner=None, pr
             else:
                 outcome = publish(client, root, sha, artifacts, reporter)
                 manifest_sha256 = hashlib.sha256(artifacts[MANIFEST]).hexdigest()
-                code = (spawn_verify or spawn_verify_public)(sha, manifest_sha256, reporter)
+                try:
+                    code = (spawn_verify or spawn_verify_public)(sha, manifest_sha256, reporter)
+                except (subprocess.TimeoutExpired, OSError) as error:
+                    code = type(error).__name__
                 if code != EXIT_OK:
-                    raise PublishedUnverified(
-                        f"the prerelease is published but anonymous verification failed (rc={code}). "
-                        "Do not recreate, delete or re-upload. Recover read-only with: "
-                        f"verify-public --repository {REPOSITORY} --tag {TAG} --expected-sha {sha} "
-                        f"--expected-manifest-sha256 {manifest_sha256}"
-                    )
+                    raise _published_unverified(f"anonymous verification failed (rc={code})", sha, artifacts)
                 result = {"mode": "publish-and-verify", "tag": TAG, "source": sha,
                           "state": "published-prerelease", **outcome,
                           "anonymous_verification": "passed in a credential-free process"}
