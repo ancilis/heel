@@ -32,10 +32,18 @@ widen or re-sign a scope.
 
 Run these in order. Replace the values in capitals.
 
+The wheel below is the unreleased 1.3.0rc1 runner preview candidate, which is checked in
+under `apps/heel-cloud/public/downloads/` with its source archive and manifest. It is not yet
+published as a GitHub release or to PyPI, so no public download URL, registry command or
+release-asset digest is given here. A one-command public install is later work. Run the
+command in a directory that holds that local wheel. This journey is the standalone CLI. It
+does not use Heel Cloud pairing, which is still an incomplete public journey (see
+[capabilities](CAPABILITIES.md)).
+
 ```sh
 python3 -m venv --copies .venv
 . .venv/bin/activate
-python -m pip install './heel_sim-1.2.0-py3-none-any.whl[runner]'
+python -m pip install './heel_sim-1.3.0rc1-py3-none-any.whl[runner]'
 export HEEL_HOME="$PWD/.heel"
 ```
 
@@ -322,11 +330,14 @@ pair with a new invitation).
   already activated the pairing, so Heel Cloud lists an **active** runner that no local
   runner can use, and it stays active after the local `unpair`. It counts against the
   workspace's runner quota, so an owner must revoke it in Heel Cloud before a retry can
-  activate; then `unpair` and pair once both sides match. Both that artifact and the current
-  one report version `1.2.0`, so the version string does not tell them apart: the `v3`-only
-  wheel is the one committed before this change (commit `b426fc2`, sha256
+  activate; then `unpair` and pair once both sides match. Historically, that artifact and the
+  `v4` download artifact that replaced it both reported version `1.2.0`, so for those two 1.2.0
+  wheels the version string does not tell them apart: the `v3`-only wheel is the one committed
+  before this change (commit `b426fc2`, sha256
   `4dd9eec27ee57df187ccb5664a816cc3fdc17f6f132c166ab8d27bb1b6c428bf`). Whether anyone
-  installed it is unknown; this path is tested, not assumed unused.
+  installed it is unknown; this path is tested, not assumed unused. The current checked-in
+  artifact is the unreleased 1.3.0rc1 runner preview candidate. It reports `1.3.0rc1` and,
+  like the later 1.2.0 wheel, accepts only a `v4` activation.
 - Control traffic goes only to the `--origin` given at pairing: `https://` only, exact
   pathless lowercase origin, system trust with TLS 1.2 or newer and hostname checks, no
   redirects, no proxies, at most 256 KiB of JSON per response, one 30-second deadline per
