@@ -1,6 +1,6 @@
 # H2-A generation bootstrap contract
 
-Status: source candidate, awaiting independent review. Component evidence only: no runtime verdict,
+Status: source candidate (first review remediation, H2-A1F1), awaiting independent re-review. Component evidence only: no runtime verdict,
 no deployment, no launch claim. **HOLD** remains on H2-0, H2-1, H3 and launch until this change is
 independently reviewed at its commit. It adds no `Enablement` member, no customer mode, no
 environment variable, flag or entry point, and it installs no rules.
@@ -42,7 +42,10 @@ keys and proof behaviour unchanged. H3 must require registered mode; nothing her
 At the old `ready` point (after domain, self-test, profile, K9 and witness), under the cycle lock,
 the cycle takes **one** `os.dup(domain.ns_fd)` and gives it, the channel and a fresh
 `operation_nonce` to the generation's private `_Handoff`, with
-`deadline = now + BOOTSTRAP_DEADLINE_MS` (5000 ms). The phase is `bootstrapping`: `install_context`
+`deadline = now + BOOTSTRAP_DEADLINE_MS` (5000 ms). Ownership moves to the `_Handoff` at one
+assignment, after it is constructed. Before that point, an exception while building the record, its
+`bootstrap_fence`, the deadline or the `_Handoff` closes the duplicate and both sockets exactly once,
+and the exception goes on to the escaped-exception path below. The phase is `bootstrapping`: `install_context`
 is refused, `start` is `generation_active`, `tick` does nothing, `stop()` / `stop_context()` record
 the request, and `status()` reads normally. `start()` then runs the hand-off
 outside the cycle lock:
@@ -58,9 +61,21 @@ outside the cycle lock:
    bootstrap_fence,"installed":true}` as canonical bytes (sorted keys, no whitespace, no
    duplicates, no NaN, ≤ `MAX_BOOTSTRAP_BYTES`, no ancillary data), read before the deadline with
    no stop requested. Exactly one datagram is read. Strings are compared in constant time.
-4. Success: both sockets are closed (single use), the phase becomes `ready`, event `ready`, then the
-   usual poll point (a stop that arrived after the receipt ends the generation at once). The
-   controller is told nothing more; its nonce expires at `deadline_monotonic_ns`.
+4. The receipt does not make `ready` by itself. The hand-off returns with the channel still open
+   and `state` still `pending`. The cycle then takes its lock once and decides there:
+   - no stop recorded: both sockets are closed (single use), `state` becomes `receipted`, the phase
+     becomes `ready`, event `ready`. The controller is told nothing more; its nonce expires at
+     `deadline_monotonic_ns`.
+   - a stop recorded (`stop`, `stop_context`, or the signal flag): the phase stays `bootstrapping`,
+     the lock is released, and the cancellation below runs over the still-open channel. No `ready`
+     event is emitted.
+
+   **Linearization.** That lock-held check is the one decision point. A `stop()` or `stop_context()`
+   that took the cycle lock first is seen there. A stop signal counts once its handler has stored
+   the flag; the handler runs on the main thread between bytecodes, so this is not an exclusion at
+   every instruction boundary. A stop that comes later is an ordinary stop of a `ready` generation
+   and gives `ready` then `closed`. No send, receive or wait is done under the lock: the commit only
+   closes the two sockets.
 
 Receives and sends poll the stop flags (`stop`, `stop_context`, the signal flag) at least
 every `BOOTSTRAP_POLL_MS` (50 ms): each socket operation is given at most one 50 ms slice, and a
@@ -90,8 +105,14 @@ receipt (another generation's fence) is a cancellation, not an after-the-fact ob
    → `lost_child`, quarantine `bootstrap_unresolved`: terminal for the process, no new generation,
    no zero-residual claim.
 
-An exception escaping the hand-off closes the duplicate and channel, quarantines
-`operation_interrupted` and is re-raised. `ready` and `install_context()` are never reachable while
+An exception escaping the hand-off is handled in one of two ways:
+- before the `_Handoff` exists: it closes the duplicate and both sockets, as above;
+- while the `_Handoff` still owns a descriptor or a socket (not committed, or cancellation not yet
+  finished): the `_Handoff` closes them.
+
+Either way it then quarantines `operation_interrupted` and is re-raised. No descriptor sweep is done:
+only the duplicate and the two adopted sockets are closed. A socket close is idempotent, and the
+duplicate's single `os.close` is on exactly one path. `ready` and `install_context()` are never reachable while
 pending, failed or unresolved.
 
 ## Boundary statements (what this is not)
@@ -127,18 +148,26 @@ junk-then-valid replies, a full worker queue (stop cancels within slices; a queu
 in time still succeeds), concurrent `stop`/`stop_context`/signal flag while the lock is free, arm
 without ack (no descriptor sent, revoke still sent), unresolved/silent revoke → quarantine with no
 reaped claim and no new generation, the late writer and cross-generation replay, registration rules
-and no legacy fallback, the typed channel, an escaped exception, and this document.
+and no legacy fallback, the typed channel, an escaped exception, and this document. Added in H2-A1F1:
+- faults injected at each point between `os.dup` and the `_Handoff` construction (the record, the
+  fence, the deadline, the constructor, and a `KeyboardInterrupt`): the duplicate's close is counted
+  exactly once, `/dev/fd` holders are 0, both sockets are closed, and no hand-off is left. The
+  ordinary start keeps only the domain's own descriptor.
+- a `stop`, `stop_context` or real `SIGTERM` flag after a valid receipt but before the lock-held
+  decision, combined with a `reaped`/`unresolved`/silent revoke: no `ready` event, the context is
+  refused during and after the revoke, a late receipt cannot be delivered, the revoke uses the armed
+  nonce, and the outcome is `start_refused:h2_bootstrap_failed` or quarantine `bootstrap_unresolved`.
 
 ## Validation (recorded by the implementing session)
 
 Interpreter `/Users/hellohelloalbus/.cache/heel-h1f-venv/bin/python` (Python 3.13.5, pytest 9.0.2),
 macOS (Darwin 24.1.0), `TMPDIR` a short external directory.
 
-| Command | Before H2-A (63c6096) | After |
-|---|---|---|
-| `python -m pytest tests/test_host_cycle.py -q -p no:cacheprovider -k bootstrap` | none | 38 passed |
-| `python -m pytest tests/test_host_cycle.py -q -p no:cacheprovider` | 131 passed, 2 skipped | 169 passed, 2 skipped |
-| `python -m pytest tests/test_host_*.py -q -p no:cacheprovider` | 296 passed, 197 skipped | 334 passed, 197 skipped |
+| Command | Before H2-A (63c6096) | H2-A1 (5f0a2f0) | H2-A1F1 |
+|---|---|---|---|
+| `python -m pytest tests/test_host_cycle.py -q -p no:cacheprovider -k bootstrap` | none | 38 passed | 53 passed |
+| `python -m pytest tests/test_host_cycle.py -q -p no:cacheprovider` | 131 passed, 2 skipped | 169 passed, 2 skipped | 184 passed, 2 skipped |
+| `python -m pytest tests/test_host_*.py -q -p no:cacheprovider` | 296 passed, 197 skipped | 334 passed, 197 skipped | 349 passed, 197 skipped |
 
 The two skips in `tests/test_host_cycle.py` are the Linux-only real-control-plane tests. The full
 suite result and the Linux CI requirement are in the implementing session's closing report, not

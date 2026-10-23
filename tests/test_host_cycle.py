@@ -1645,8 +1645,8 @@ class FakeController(_Peer):
     """CONTRACT FAKE (future H3 root controller): acks ``arm`` and answers ``revoke`` with the
     scripted worker outcome. It holds no root state; its "absent"/"reaped" words are scripted."""
 
-    def __init__(self, sock, *, arm="ack", revoke="reaped", on_arm=None):
-        self.arm, self.revoke, self.on_arm = arm, revoke, on_arm
+    def __init__(self, sock, *, arm="ack", revoke="reaped", on_arm=None, on_revoke=None):
+        self.arm, self.revoke, self.on_arm, self.on_revoke = arm, revoke, on_arm, on_revoke
         super().__init__(sock)
 
     def handle(self, data: bytes, fds: list[int]) -> None:
@@ -1661,7 +1661,9 @@ class FakeController(_Peer):
                 self.on_arm()
             if self.arm == "ack":
                 self.reply(codec.canonical({**identity, "op": "armed"}))
-        elif message["op"] == "revoke" and self.revoke in ("reaped", "unresolved"):
+        elif message["op"] == "revoke" and self.on_revoke is not None:
+            self.on_revoke()
+        if message["op"] == "revoke" and self.revoke in ("reaped", "unresolved"):
             self.reply(codec.canonical({**identity, "op": "revoked", "enabled": "absent", "worker": self.revoke}))
 
 
@@ -2153,6 +2155,147 @@ def test_bootstrap_escaped_exception_during_the_wait_quarantines_and_closes_the_
     assert boot.h.status()["quarantine_code"] == "operation_interrupted"
     assert _holders(boot.h.domain.ns_identity) == 0 and boot.channel.closed
     assert boot.h.cycle.bootstrap_status()["state"] == "unresolved"
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+@pytest.mark.parametrize("window", ["none", "record", "fence", "deadline", "handoff", "handoff_interrupt"])
+def test_bootstrap_exception_between_dup_and_handoff_closes_the_duplicate_and_the_channel_once(
+        monkeypatch, tmp_path, signals, boots, window):
+    """CONTRACT: until the ``_Handoff`` exists, an exception after the one ``os.dup`` (building the
+    record, its fence, the deadline, or the hand-off itself; ``KeyboardInterrupt`` too) closes that
+    duplicate exactly once and both adopted sockets, quarantines ``operation_interrupted`` and is
+    re-raised, leaving no hand-off. ``none``: the ordinary start closes the duplicate once, at its
+    send, and leaves only the domain's own descriptor."""
+    boot = _boot(monkeypatch, tmp_path, boots)
+    h = boot.h
+    duplicates, closes, faults = [], [], []
+    real_dup, real_close, real_token, real_clock = os.dup, os.close, cycle.secrets.token_hex, h.cycle._clock
+
+    def dup(fd):
+        duplicates.append(real_dup(fd))
+        return duplicates[-1]
+
+    def close(fd):
+        try:  # the cycle's closes only: the fake worker thread closes its received copy too
+            info = os.fstat(fd)
+            if threading.current_thread() is threading.main_thread():
+                closes.append((fd, (info.st_dev, info.st_ino)))
+        except OSError:
+            pass
+        real_close(fd)
+
+    def once(real):
+        def call(*args):
+            if duplicates and not faults:
+                faults.append(window)
+                fault()
+            return real(*args)
+        return call
+
+    def fault(*_args, **_kwargs):
+        raise (KeyboardInterrupt if window == "handoff_interrupt" else RuntimeError)("injected")
+
+    monkeypatch.setattr(cycle.os, "dup", dup)
+    monkeypatch.setattr(cycle.os, "close", close)
+    if window == "record":
+        monkeypatch.setattr(cycle, "GenerationBootstrap", fault)
+    elif window == "fence":
+        monkeypatch.setattr(cycle.secrets, "token_hex", once(real_token))
+    elif window == "deadline":
+        monkeypatch.setattr(h.cycle, "_clock", once(real_clock))
+    elif window.startswith("handoff"):
+        monkeypatch.setattr(cycle._Handoff, "__init__", fault)
+    if window == "none":
+        assert h.cycle.start() == "ready"
+    else:
+        with pytest.raises(KeyboardInterrupt if window == "handoff_interrupt" else RuntimeError, match="injected"):
+            h.cycle.start()
+    identity = tuple(h.domain.ns_identity)
+    [duplicate] = duplicates
+    assert closes.count((duplicate, identity)) == 1  # the duplicate's one close
+    assert boot.channel.closed
+    if window == "none":
+        assert _holders(identity) == 1 and h.cycle._handoff._fd == -1  # only the domain's own owner
+        assert h.cycle.stop() == "closed" and _holders(identity) == 0
+        return
+    status = h.status()
+    assert (status["generation_phase"], status["quarantine_code"]) == ("quarantined", "operation_interrupted")
+    assert _holders(identity) == 0 and h.domain.calls == ["close_generation"]
+    assert h.cycle._handoff is None and h.cycle.bootstrap_status()["state"] == "none"
+    assert boot.controller.log == [] and boot.worker.messages == []
+    assert not boot.worker.reply(b"{}") and not boot.controller.reply(b"{}")  # both adopted sockets closed
+
+
+@POSIX_FORK
+@POSIX_DGRAM
+@pytest.mark.parametrize("revoke", ["reaped", "unresolved", "silent"])
+@pytest.mark.parametrize("how", ["stop", "stop_context", "signal"])
+def test_bootstrap_stop_after_the_receipt_before_the_ready_decision_revokes_and_never_emits_ready(
+        monkeypatch, tmp_path, signals, boots, how, revoke):
+    """CONTRACT: ``ready`` is decided once, under the cycle lock, after the hand-off returns. A stop
+    recorded before that lock is taken (``stop``, ``stop_context`` or the flag of a delivered
+    SIGTERM) wins over a valid receipt: the still-open channel carries the revoke, outside the lock,
+    and the start is refused (``reaped``) or quarantined (``unresolved``/``silent``). No ``ready``
+    event, no context and no revival by a late receipt at any point."""
+    holder: list[Boot] = []
+    seen = {}
+
+    def during_revoke():
+        h = holder[0].h
+        seen["revoke_phase"] = h.status()["generation_phase"]
+        try:
+            h.cycle.install_context(cycle.CycleContext(**CTX))
+        except cycle.CycleError as error:
+            seen["revoke_install"] = error.code
+        seen["late_receipt"] = holder[0].worker.reply(codec.canonical(_receipt(holder[0].worker.messages[0])))
+
+    boot = _boot(monkeypatch, tmp_path, boots, revoke=revoke, on_revoke=during_revoke)
+    holder.append(boot)
+    h = boot.h
+    events = _events(h)
+    real_run = cycle._Handoff.run
+
+    def run_then_stop(handoff, clock, stopped):
+        real_run(handoff, clock, stopped)
+        seen["window"] = (handoff.received, h.cycle.bootstrap_status()["state"], boot.channel.closed)
+        if how == "stop":
+            seen["stop"] = h.cycle.stop()
+        elif how == "stop_context":
+            seen["stop"] = h.cycle.stop_context()
+        else:
+            os.kill(os.getpid(), signal.SIGTERM)
+            waited = time.monotonic() + 2
+            while not cycle._STATE.stop_requested and time.monotonic() < waited:
+                time.sleep(0.001)
+            seen["stop"] = h.status()["generation_phase"]
+        try:
+            h.cycle.install_context(cycle.CycleContext(**CTX))
+        except cycle.CycleError as error:
+            seen["install"] = error.code
+
+    monkeypatch.setattr(cycle._Handoff, "run", run_then_stop)
+    phase = h.cycle.start()
+    assert seen == {"window": (True, "pending", False), "stop": "bootstrapping", "install": "context_refused",
+                    "revoke_phase": "bootstrapping", "revoke_install": "context_refused", "late_receipt": False}
+    assert "ready" not in events
+    arm, revoke_message = boot.controller.messages
+    assert boot.controller.log == ["arm", "revoke"] and revoke_message["operation_nonce"] == arm["operation_nonce"]
+    word = h.cycle.bootstrap_status()
+    if revoke == "reaped":
+        assert phase == "closed"
+        _assert_refused(boot, events)
+        assert word == {"mode": "registered", "registered": False, "state": "cancelled", "root": "absent",
+                        "worker": "reaped"}
+    else:
+        status = h.status()
+        assert phase == "quarantined" and events == ["quarantined"] and cycle._BUDGET.lost_child
+        assert (status["quarantine_code"], status["exit_required"]) == ("bootstrap_unresolved", True)
+        assert word["state"] == "unresolved" and word["worker"] != "reaped"
+        assert word["root"] == ("absent" if revoke == "unresolved" else "unknown")
+        assert boot.channel.closed and _holders(h.domain.ns_identity) == 0
+        with pytest.raises(cycle.CycleError, match="context_refused"):
+            h.cycle.install_context(cycle.CycleContext(**CTX))
 
 
 _CHILD_WORKER = r"""

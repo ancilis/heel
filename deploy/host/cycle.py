@@ -516,15 +516,16 @@ def _matches(data: bytes, expected: dict) -> bool:
 
 
 class _Handoff:
-    """One generation's bootstrap, run by the ``start()`` caller outside the cycle lock. It alone
-    owns the channel and the one namespace duplicate (closed exactly once: right after its one send,
-    or at cancellation). Tokens only: nothing received is logged, kept or raised."""
+    """One generation's bootstrap, run by the ``start()`` caller outside the cycle lock. Once
+    constructed it alone owns the channel and the one namespace duplicate (closed exactly once: right
+    after its one send, or at cancellation). Tokens only: nothing received is logged, kept or raised."""
 
     def __init__(self, record: GenerationBootstrap, channel: BootstrapChannel, fd: int, deadline_ns: int):
         self.record, self.deadline_ns = record, deadline_ns
         self._channel, self._fd = channel, fd
         self._nonce = secrets.token_hex(16)  # the controller's operation nonce; never sent to the worker
         self.state, self.root, self.worker = "pending", "not_armed", "not_contacted"
+        self.received = False  # the exact receipt was read; ``state`` stays pending until the commit
 
     def _identity(self) -> dict:
         record = self.record
@@ -595,9 +596,15 @@ class _Handoff:
                         return "match", index
             return "malformed", -1
 
+    @property
+    def settled(self) -> bool:
+        """Owns nothing any more: committed or cancelled, and both sockets closed."""
+        return self.state != "pending" and self._channel.closed
+
     def run(self, clock, stopped) -> None:
-        """Arm, hand off, read the receipt; on any other result, cancel. Ends with ``state`` one of
-        ``receipted``, ``cancelled`` (root ``absent`` or ``not_armed``) or ``unresolved``."""
+        """Arm, hand off, read the receipt; on any other result, cancel. Ends either ``received``
+        (``state`` still pending, the channel still open for a revoke) or with ``state``
+        ``cancelled`` (root ``absent`` or ``not_armed``) or ``unresolved``."""
         channel, record, deadline = self._channel, self.record, self.deadline_ns
         identity = self._identity()
         arm = {**identity, "op": "arm", "namespace_dev": record.namespace_identity[0],
@@ -621,10 +628,15 @@ class _Handoff:
             if sent:
                 outcome, _index = self._receive(channel._worker, (record.receipt(),), deadline, clock, stopped)
         if outcome == "match" and not stopped():
-            self.state = "receipted"
-            channel.close()  # single use: no later message on either socket is ever read
+            self.received = True  # the cycle decides under its lock: ``commit()`` or ``cancel()``
             return
         self.cancel(clock)
+
+    def commit(self) -> None:
+        """Under the cycle lock, the receipt's one use: both sockets closed (no later message on
+        either is ever read), then ``receipted``. No send, receive or wait."""
+        self._channel.close()
+        self.state = "receipted"
 
     def cancel(self, clock) -> None:
         """Burn the capability, close the worker's socket, then ask the root controller to remove the
@@ -951,38 +963,59 @@ class HostCycle:
 
     def _open_bootstrap(self) -> None:
         """Under the lock: duplicate the namespace descriptor once and hand it, with the channel, to
-        the generation's ``_Handoff``; ``start()`` then runs it outside the lock."""
+        the generation's ``_Handoff``; ``start()`` then runs it outside the lock. Until the hand-off
+        is constructed this frame owns both: an exception building the record, its fence, the deadline
+        or the hand-off closes the duplicate and the channel once here and is re-raised."""
         identity = tuple(self._domain.ns_identity)
         try:
             fd = os.dup(self._domain.ns_fd)
         except OSError:
             return self._refuse_start("h2_bootstrap_failed")
-        record = GenerationBootstrap(generation_id=self._domain.generation_id, namespace_identity=identity,
-                                     slot_id=self._slot, slot_hop_src=self._src, slot_hop_dst=self._dst,
-                                     bootstrap_fence=secrets.token_hex(16))
         channel, self._gen_channel = self._gen_channel, None
-        self._handoff = _Handoff(record, channel, fd, self._clock() + BOOTSTRAP_DEADLINE_MS * _MS)
-        self._phase = "bootstrapping"
+        try:
+            record = GenerationBootstrap(generation_id=self._domain.generation_id, namespace_identity=identity,
+                                         slot_id=self._slot, slot_hop_src=self._src, slot_hop_dst=self._dst,
+                                         bootstrap_fence=secrets.token_hex(16))
+            handoff = _Handoff(record, channel, fd, self._clock() + BOOTSTRAP_DEADLINE_MS * _MS)
+        except BaseException:
+            os.close(fd)
+            channel.close()
+            raise
+        self._handoff, self._phase = handoff, "bootstrapping"  # the ownership transfer
 
     def _bootstrap_stopped(self) -> bool:
         return _STATE.stop_requested or self._stop_requested or self._replace_requested
 
     def _bootstrap(self, handoff: _Handoff) -> str:
+        """The hand-off outside the lock, then the one decision under it (``_finish_bootstrap``). A
+        stop recorded before that decision turns a received receipt into a revoke, run outside the
+        lock over the still-open channel, and then a second decision on its outcome."""
         try:
             handoff.run(self._clock, self._bootstrap_stopped)
+            phase = self._locked(lambda: self._finish_bootstrap(handoff))
+            if phase == "revoke":
+                handoff.cancel(self._clock)
+                phase = self._locked(lambda: self._finish_bootstrap(handoff))
+            return phase
         except BaseException:
-            handoff.abandon()
-            self._locked(self._interrupted)
+            if not handoff.settled:  # it still owns a descriptor or a socket
+                handoff.abandon()
+                self._locked(self._interrupted)
             raise
-        return self._locked(lambda: self._finish_bootstrap(handoff))
 
-    def _finish_bootstrap(self, handoff: _Handoff) -> None:
+    def _finish_bootstrap(self, handoff: _Handoff) -> str | None:
+        """Under the lock. ``ready`` is committed here only if no stop (``stop``, ``stop_context``,
+        the signal flag) is recorded when this lock is held; a stop recorded later is an ordinary stop
+        of a ready generation. Returns ``revoke`` (phase still ``bootstrapping``) to cancel first."""
         if self._handoff is not handoff or self._phase != "bootstrapping":
+            handoff.abandon()
             return self._quarantine("bootstrap_state")
-        if handoff.state == "receipted":
+        if handoff.state == "pending" and handoff.received:
+            if self._bootstrap_stopped():
+                return "revoke"
+            handoff.commit()
             self._phase = "ready"
             self._event("ready")
-            self._poll_point()  # a stop that arrived after the receipt ends the generation at once
         elif handoff.state == "cancelled":
             self._refuse_start("h2_bootstrap_failed")
         else:  # the root state or the worker is unknown: terminal, no zero claim, no new generation
