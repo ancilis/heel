@@ -19,8 +19,9 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "apps/heel-cloud"
 BUILDER = ROOT / "scripts/build_browser_engine.py"
 ARTIFACT_DIR = APP / "browser-engine"
-WHEEL_NAME = "heel_browser-1.2.0-py3-none-any.whl"
-DIST_INFO = "heel_browser-1.2.0.dist-info"
+ENGINE_VERSION = "1.3.0rc1"
+WHEEL_NAME = f"heel_browser-{ENGINE_VERSION}-py3-none-any.whl"
+DIST_INFO = f"heel_browser-{ENGINE_VERSION}.dist-info"
 MODULE_PATHS = (
     "heel/__init__.py",
     "heel/browser_review.py",
@@ -618,7 +619,7 @@ class BrowserEngineBuildTests(unittest.TestCase):
             wheel_metadata = archive.read(WHEEL_PATH).decode("utf-8")
 
         self.assertIn("Name: heel-browser\n", metadata)
-        self.assertIn("Version: 1.2.0\n", metadata)
+        self.assertIn(f"Version: {ENGINE_VERSION}\n", metadata)
         self.assertIn("License-Expression: Apache-2.0\n", metadata)
         self.assertIn("License-File: LICENSE\n", metadata)
         self.assertIn("License-File: NOTICE\n", metadata)
@@ -659,7 +660,7 @@ class BrowserEngineBuildTests(unittest.TestCase):
             json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
         )
         self.assertEqual(manifest, {
-            "engine_version": "1.2.0",
+            "engine_version": ENGINE_VERSION,
             "schema_version": "heel.browser-engine-manifest.v1",
             "wheel": {
                 "filename": WHEEL_NAME,

@@ -31,6 +31,23 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
+## [1.3.0rc1]: unpublished candidate
+
+Runner preview release candidate. It carries the changes listed under Unreleased at its candidate
+commit and is not yet published as a GitHub release or to PyPI.
+
+### Changed
+- Python package, release contract, MCP `serverInfo`, `server.json`, browser engine and newly
+  generated reviews identify `1.3.0rc1` (PEP 440). The Heel Cloud npm package uses the equivalent
+  SemVer spelling `1.3.0-rc.1`.
+- Regenerated `heel_sim-1.3.0rc1` wheel, source archive and manifest, and the
+  `heel_browser-1.3.0rc1` wheel and manifest, through the existing deterministic builders.
+- Saved `1.1.0`, `1.1.1` and `1.2.0` reviews and findings-sync sources remain readable; the
+  `heel.review.v1` and `heel.findings-sync.v1` schemas and all wire protocols are unchanged.
+- The `runner` extra still pins `cryptography==45.0.7`. A source-free test installs the candidate
+  wheel with that extra and runs the synthetic vulnerable and hardened reference cases. This is
+  packaging evidence only, not runner pairing, serving, HTTP or hosted-findings evidence.
+
 ## [1.2.0]: 2026-08-04
 
 Privacy-minimized findings continuity contracts for Heel Cloud. Raw OpenAPI source and guided

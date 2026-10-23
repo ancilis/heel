@@ -538,7 +538,7 @@ class FindingsSyncRequestValidationTests(unittest.TestCase):
             self.sync.validate_findings_sync_request(duplicate, NAMESPACE_KEY)
 
     def test_accepts_only_frozen_source_versions_and_modes(self):
-        for version in ("1.1.0", "1.1.1", "1.2.0"):
+        for version in ("1.1.0", "1.1.1", "1.2.0", "1.3.0rc1"):
             value = copy.deepcopy(self.request)
             value["source"]["engine_version"] = version
             with self.subTest(version=version):
@@ -546,7 +546,7 @@ class FindingsSyncRequestValidationTests(unittest.TestCase):
                     self.sync.validate_findings_sync_request(value, NAMESPACE_KEY),
                     value,
                 )
-        for version in ("1.0.0", "1.2.1", True):
+        for version in ("1.0.0", "1.2.1", "1.3.0", "1.3.0-rc.1", True):
             value = copy.deepcopy(self.request)
             value["source"]["engine_version"] = version
             with self.subTest(version=version):
@@ -697,12 +697,21 @@ class FindingsSyncReceiptTests(unittest.TestCase):
 class FindingsSyncFixtureTests(unittest.TestCase):
     def test_python_goldens_exist_as_exact_canonical_lines(self):
         sync = _sync()
+
+        def frozen_source_review(findings=None):
+            # The committed goldens are frozen 1.2.0-source projections; the source version
+            # stays accepted, so they remain exact without rewriting the legacy fixtures.
+            review = _review(findings)
+            review["engine_version"] = "1.2.0"
+            _rehash_review(review)
+            return review
+
         expected = {
             "request-one-finding.json": sync.project_findings_sync(
-                _review(), PROJECT_REF, NAMESPACE_KEY
+                frozen_source_review(), PROJECT_REF, NAMESPACE_KEY
             ),
             "request-pass.json": sync.project_findings_sync(
-                _review([]), PROJECT_REF, NAMESPACE_KEY
+                frozen_source_review([]), PROJECT_REF, NAMESPACE_KEY
             ),
         }
         expected["receipt-created.json"] = _valid_receipt(

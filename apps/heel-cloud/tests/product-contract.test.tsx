@@ -202,11 +202,11 @@ describe("Heel anonymous launch review", () => {
   test("offers the verified Agent artifacts and exact local install command", () => {
     render(<McpQuickstart />);
 
-    const wheel = screen.getByRole("link", { name: "Download Heel Agent 1.2.0" });
-    expect(wheel.getAttribute("href")).toBe("/downloads/heel_sim-1.2.0-py3-none-any.whl");
+    const wheel = screen.getByRole("link", { name: "Download Heel Agent 1.3.0rc1" });
+    expect(wheel.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc1-py3-none-any.whl");
     expect(wheel.hasAttribute("download")).toBe(true);
     const source = screen.getByRole("link", { name: /download source archive/i });
-    expect(source.getAttribute("href")).toBe("/downloads/heel_sim-1.2.0.tar.gz");
+    expect(source.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc1.tar.gz");
     expect(source.hasAttribute("download")).toBe(true);
 
     const manifest = JSON.parse(readFileSync(
@@ -218,8 +218,10 @@ describe("Heel anonymous launch review", () => {
     expect(document.body.textContent).toContain(wheelArtifact?.sha256);
     expect(document.body.textContent).toContain("python3 -m venv .venv");
     expect(document.body.textContent).toContain(
-      ".venv/bin/python -m pip install ./heel_sim-1.2.0-py3-none-any.whl",
+      ".venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl",
     );
+    expect(document.body.textContent).toContain("unreleased preview candidate");
+    expect(document.body.textContent).toContain("not yet published as a GitHub release or on PyPI");
     expect(document.body.textContent).not.toMatch(
       /not yet available as a public download|licensed source checkout|public main branch/i,
     );

@@ -12,7 +12,7 @@ export const MAX_FINDINGS_SYNC_RECEIPT_BYTES = 8 * 1024;
 export const MAX_FINDINGS = 512;
 export const MAX_JSON_DEPTH = 16;
 
-export type SourceEngineVersion = "1.1.0" | "1.1.1" | "1.2.0";
+export type SourceEngineVersion = "1.1.0" | "1.1.1" | "1.2.0" | "1.3.0rc1";
 export type SourceExecutionMode = "browser_local" | "machine_local" | "cloud_isolated";
 export type FindingsSyncGateStatus = "pass" | "warn" | "block";
 export type FindingsSyncSeverity = "warn" | "block";
@@ -222,7 +222,7 @@ const RECEIPT_FIELDS = [
   "synced_review_id", "disposition", "metered", "accepted_at",
 ] as const;
 const PREPARED_FIELDS = ["request", "requestJson", "requestDigest", "idempotencyKey"] as const;
-const ENGINE_VERSIONS = new Set<SourceEngineVersion>(["1.1.0", "1.1.1", "1.2.0"]);
+const ENGINE_VERSIONS = new Set<SourceEngineVersion>(["1.1.0", "1.1.1", "1.2.0", "1.3.0rc1"]);
 const EXECUTION_MODES = new Set<SourceExecutionMode>(["browser_local", "machine_local", "cloud_isolated"]);
 const SHA256 = /^[0-9a-f]{64}$/;
 const PROJECT_REF = /^prj_[0-9a-f]{32}$/;

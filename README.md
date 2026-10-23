@@ -25,14 +25,17 @@ See the [current capability matrix](docs/CAPABILITIES.md) and [runnable export d
 
 ## Five-minute local launch review
 
-The Heel Cloud app now carries the verified Agent wheel, source archive, and manifest on its own
-origin. Open `/agent`, choose **Download Heel Agent 1.2.0**, and save
-`/downloads/heel_sim-1.2.0-py3-none-any.whl` in an empty working directory. Then install it into an
-isolated environment and review a sanitized OpenAPI document you own:
+The Heel Cloud app build carries the Agent wheel, source archive, and manifest for the 1.3.0rc1
+runner preview candidate on its own origin. This candidate is unreleased: it is not yet published as
+a GitHub release or to PyPI, and a planned `v1.3.0rc1` prerelease URL is not publicly verified. Open
+`/agent`, choose **Download Heel Agent 1.3.0rc1**, and save
+`/downloads/heel_sim-1.3.0rc1-py3-none-any.whl` in an empty working directory. Compare it with the
+wheel SHA-256 that `/agent` shows from the build's manifest. Then install it into an isolated
+environment and review a sanitized OpenAPI document you own:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.2.0-py3-none-any.whl
+.venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl
 export HEEL_HOME="$PWD/.heel-local"
 .venv/bin/heel review openapi ./sanitized-openapi.json
 ```

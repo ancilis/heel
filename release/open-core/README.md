@@ -7,17 +7,20 @@ runtime dependencies and does not require an account or network connection.
 
 ## Install the supplied release artifact
 
-Create an isolated environment, then install the wheel supplied with this release:
+Version 1.3.0rc1 is a runner preview release candidate, not a stable release. Create an
+isolated environment, then install the wheel supplied with this release:
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install ./heel_sim-1.2.0-py3-none-any.whl
+python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl
 heel --version
 ```
 
-Use only release artifacts obtained from your authorized distributor. No public
-package registry or source repository is designated by this release metadata.
+Use only release artifacts obtained from your authorized distributor, and compare the wheel's
+SHA-256 with the digest that distributor publishes outside this package. This file cannot carry
+its own package digest. No public package registry or source repository is designated by this
+release metadata.
 
 ## Start a local review
 
@@ -38,7 +41,7 @@ exposing a local service.
 
 ## Synthetic export entitlement validation
 
-The supplied wheel supports `heel reference prepare` and `heel reference run`. Install the runner extra with `python -m pip install './heel_sim-1.2.0-py3-none-any.whl[runner]'`. Then run `heel scope create --target reference:export --operator "your name" --confirm` outside MCP. Use its returned scope ID:
+The supplied wheel supports `heel reference prepare` and `heel reference run`. Install the runner extra with `python -m pip install './heel_sim-1.3.0rc1-py3-none-any.whl[runner]'` (Python 3.11 or newer; it adds the pinned `cryptography` dependency). Then run `heel scope create --target reference:export --operator "your name" --confirm` outside MCP. Use its returned scope ID:
 
 ```sh
 heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111

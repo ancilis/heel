@@ -11,8 +11,11 @@ from heel.review_contract import ENGINE_VERSION, SUPPORTED_ENGINE_VERSIONS
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.2.0"
-LEGACY_VERSIONS = frozenset({"1.1.0", "1.1.1"})
+# The Python package, release contract, engine and server.json use the PEP 440 spelling.
+VERSION = "1.3.0rc1"
+# npm metadata needs SemVer; this is the single normalization mapping, not a second version.
+NPM_VERSION = "1.3.0-rc.1"
+LEGACY_VERSIONS = frozenset({"1.1.0", "1.1.1", "1.2.0"})
 AGENT_WHEEL = f"heel_sim-{VERSION}-py3-none-any.whl"
 AGENT_SDIST = f"heel_sim-{VERSION}.tar.gz"
 BROWSER_WHEEL = f"heel_browser-{VERSION}-py3-none-any.whl"
@@ -37,11 +40,24 @@ class ReleaseVersionContractTests(unittest.TestCase):
         self.assertEqual(SUPPORTED_ENGINE_VERSIONS, LEGACY_VERSIONS | {VERSION})
         self.assertEqual(pyproject["project"]["version"], VERSION)
         self.assertEqual(descriptor["version"], VERSION)
+        # server.json schema 2025-07-09: the PyPI package version must be the exact published
+        # version (no range); the server version mirrors MCP serverInfo.version.
         self.assertEqual(server["version"], VERSION)
+        self.assertEqual(server["packages"][0]["registry_type"], "pypi")
         self.assertEqual(server["packages"][0]["version"], VERSION)
-        self.assertEqual(app_package["version"], VERSION)
-        self.assertEqual(app_lock["version"], VERSION)
-        self.assertEqual(app_lock["packages"][""]["version"], VERSION)
+        self.assertEqual(app_package["version"], NPM_VERSION)
+        self.assertEqual(app_lock["version"], NPM_VERSION)
+        self.assertEqual(app_lock["packages"][""]["version"], NPM_VERSION)
+
+    def test_pep440_and_semver_spellings_name_one_release(self):
+        self.assertRegex(VERSION, r"\A1\.3\.0rc1\Z")
+        self.assertRegex(NPM_VERSION, r"\A1\.3\.0-rc\.1\Z")
+        major_minor_patch, candidate = VERSION.split("rc")
+        self.assertEqual(NPM_VERSION, f"{major_minor_patch}-rc.{candidate}")
+        self.assertNotEqual(VERSION, NPM_VERSION)
+        from heel.mcp_server import SERVER_INFO
+
+        self.assertEqual(SERVER_INFO["version"], VERSION)
 
     def test_committed_release_directories_contain_only_current_named_artifacts(self):
         downloads = ROOT / "apps/heel-cloud/public/downloads"
@@ -83,6 +99,7 @@ class ReleaseVersionContractTests(unittest.TestCase):
         for legacy_version in LEGACY_VERSIONS:
             self.assertNotIn(f"heel_sim-{legacy_version}", combined)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## [{VERSION}]: unpublished candidate", changelog)
         self.assertIn("## [1.2.0]: 2026-08-04", changelog)
         self.assertIn("## [1.1.1]: 2026-08-04", changelog)
 

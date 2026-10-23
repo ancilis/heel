@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heel-sim"
-version = "1.2.0"
+version = "1.3.0rc1"
 description = "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows."
 readme = "release/open-core/README.md"
 requires-python = ">=3.11"

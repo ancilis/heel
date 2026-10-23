@@ -12,7 +12,7 @@ from .review_contract import stable_json, stable_json_hash, validate_review_enve
 
 FINDINGS_SYNC_SCHEMA_VERSION = "heel.findings-sync.v1"
 FINDINGS_SYNC_RECEIPT_SCHEMA_VERSION = "heel.findings-sync-receipt.v1"
-SUPPORTED_SOURCE_ENGINE_VERSIONS = frozenset({"1.1.0", "1.1.1", "1.2.0"})
+SUPPORTED_SOURCE_ENGINE_VERSIONS = frozenset({"1.1.0", "1.1.1", "1.2.0", "1.3.0rc1"})
 SUPPORTED_SOURCE_EXECUTION_MODES = frozenset({
     "browser_local",
     "machine_local",

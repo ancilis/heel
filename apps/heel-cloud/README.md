@@ -28,10 +28,11 @@ The browser experience works on supported Windows browsers. The machine credenti
 fallback and durable machine sync queue require POSIX descriptor and file-locking
 semantics; Windows CLI/MCP cloud continuity is not launch-supported.
 
-The exact verified Agent files advertised on `/agent` are:
+The exact builder-verified Agent files advertised on `/agent` are the unreleased 1.3.0rc1 runner
+preview candidate (not yet published as a GitHub release or to PyPI):
 
-- `/downloads/heel_sim-1.2.0-py3-none-any.whl`
-- `/downloads/heel_sim-1.2.0.tar.gz`
+- `/downloads/heel_sim-1.3.0rc1-py3-none-any.whl`
+- `/downloads/heel_sim-1.3.0rc1.tar.gz`
 - `/downloads/heel-open-core-manifest.json`
 
 ## Dashboard account onboarding
