@@ -25,19 +25,35 @@ See the [current capability matrix](docs/CAPABILITIES.md) and [runnable export d
 
 ## Five-minute local launch review
 
-The Heel Cloud app build carries the Agent wheel, source archive, and manifest for the 1.3.0rc1
-runner preview candidate on its own origin. This candidate is unreleased: it is not yet published as
-a GitHub release or to PyPI, and a planned `v1.3.0rc1` prerelease URL is not publicly verified. Open
-`/agent`, choose **Download Heel Agent 1.3.0rc1**, and save
-`/downloads/heel_sim-1.3.0rc1-py3-none-any.whl` in an empty working directory. Compare it with the
-wheel SHA-256 that `/agent` shows from the build's manifest. Then install it into an isolated
-environment and review a sanitized OpenAPI document you own:
+This local review is optional. Heel 1.3.0rc1 is a public preview prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. It is not a stable release, its GitHub
+release record is not immutable, and it is not a deployed Heel Cloud URL or evidence of customer
+acceptance. `heel-sim` is not yet published to PyPI. No source checkout or app deployment is needed.
+In an empty private directory, with a POSIX shell and Python 3.11 or newer, install the hash-pinned
+public wheel and review a sanitized OpenAPI document you own:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip --isolated install \
+  'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc1/heel_sim-1.3.0rc1-py3-none-any.whl#sha256=176a17b0d4d7f4ea44420d8099239f32dbb17eeead981e5aa360f0a5bbccb94a'
+export HEEL_HOME="$(pwd -P)/.heel-local"
+.venv/bin/heel review openapi ./sanitized-openapi.json
+```
+
+pip installs the wheel only if it matches that SHA-256. `--isolated` makes pip ignore environment
+variables and user configuration. The `runner` extra downloads the pinned `cryptography` dependency
+from the Python package index; the review itself does not need it. `HEEL_HOME` must be a physical
+path in which no component is a symbolic link. On macOS, `/tmp` and `/var` are symbolic links, so use
+`pwd -P` rather than `$PWD`.
+
+A Heel Cloud deployment also serves the same files on its own origin. From its `/agent` page, choose
+**Download Heel Agent 1.3.0rc1**, save `/downloads/heel_sim-1.3.0rc1-py3-none-any.whl` in an empty
+working directory, compare it with the wheel SHA-256 shown there, and use this install step in place
+of the public one:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl
-export HEEL_HOME="$PWD/.heel-local"
-.venv/bin/heel review openapi ./sanitized-openapi.json
 ```
 
 The default report is validated Markdown. Add `--json` for the canonical `heel.review.v1`
@@ -50,9 +66,8 @@ envelope used by automation and MCP:
 This path needs no account or signing key, makes no analyzer network calls, uploads and syncs
 nothing, and stores the successful review only under `$HEEL_HOME/reviews/`. Inputs must be
 sanitized UTF-8 OpenAPI JSON without credentials or customer data and no larger than 2 MiB.
-The same-origin files exist in the deployable app now; public customer access still requires the
-approved deployment. `heel-sim` is not yet published to PyPI, and a current public repository export
-is a release-owner action that is not complete. See the [MCP quickstart](docs/MCP_QUICKSTART.md) for
+Customer access to the same-origin files still requires the approved deployment. A current
+public repository export is a release-owner action that is not complete. See the [MCP quickstart](docs/MCP_QUICKSTART.md) for
 the exact acquisition matrix and stdio client configuration.
 
 The base local CLI/MCP is Apache-2.0 and has no commercial usage limit. Its safety and 2 MiB input

@@ -28,8 +28,13 @@ The browser experience works on supported Windows browsers. The machine credenti
 fallback and durable machine sync queue require POSIX descriptor and file-locking
 semantics; Windows CLI/MCP cloud continuity is not launch-supported.
 
-The exact builder-verified Agent files advertised on `/agent` are the unreleased 1.3.0rc1 runner
-preview candidate (not yet published as a GitHub release or to PyPI):
+The exact builder-verified Agent files advertised on `/agent` are the 1.3.0rc1 runner preview.
+The same files are published as a public GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. That prerelease is not a stable release,
+its release record is not immutable, it is not a deployed Heel Cloud URL, and it does not indicate
+customer acceptance. `heel-sim` is not yet published to PyPI. `/agent` and `/runner` also show a
+no-download install of the hash-pinned public wheel and require a physical, symlink-free `HEEL_HOME`
+(for example `"$(pwd -P)/.heel"`). The same-origin files are:
 
 - `/downloads/heel_sim-1.3.0rc1-py3-none-any.whl`
 - `/downloads/heel_sim-1.3.0rc1.tar.gz`

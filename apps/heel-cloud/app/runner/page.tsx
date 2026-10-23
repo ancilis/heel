@@ -35,15 +35,23 @@ export default function Runner() {
     </section>
     <section className="runner-command">
       <div><h2>1. Review the rule and authorize the reference product</h2>
-      <p>Download the unreleased 1.3.0rc1 preview candidate wheel from /agent and install the local runner extra, inspect the bounded plan, then create a signed scope. Installing the extra fetches the pinned cryptography package from your Python package index; these commands contact no product target.</p>
-      <pre><code>{`python -m pip install './heel_sim-1.3.0rc1-py3-none-any.whl[runner]'
-heel reference prepare
-heel scope create --target reference:export --operator "your name" --confirm`}</code></pre>
+      <p>This optional local preview is not a step in the default Heel journey. Heel 1.3.0rc1 is a public preview prerelease at <a href="https://github.com/ancilis/heel/releases/tag/v1.3.0rc1">github.com/ancilis/heel/releases/tag/v1.3.0rc1</a>. It is not a stable release, PyPI publication is not yet available, and it does not indicate live-target support or launch readiness. No source checkout or download is needed.</p>
+      <p>In an empty private directory with Python 3.11 or newer, install the hash-pinned public wheel with the local runner extra, inspect the bounded plan, then create a signed scope. pip refuses the wheel unless its SHA-256 matches, and --isolated ignores pip environment variables and user configuration. Installing the extra fetches the pinned cryptography package from your Python package index; these commands contact no product target.</p>
+      <pre><code>{`python3 -m venv .venv
+.venv/bin/python -m pip --isolated install \\
+  'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc1/heel_sim-1.3.0rc1-py3-none-any.whl#sha256=176a17b0d4d7f4ea44420d8099239f32dbb17eeead981e5aa360f0a5bbccb94a'
+export HEEL_HOME="$(pwd -P)/.heel"
+.venv/bin/heel reference prepare
+.venv/bin/heel scope create --target reference:export --operator "your name" --confirm`}</code></pre>
+      <p>HEEL_HOME must be a physical path in which no component is a symbolic link; pwd -P prints one. On macOS, /tmp and /var are symbolic links, so a $PWD below them is refused. Heel refuses symbolic links in private storage on purpose.</p>
       <p>Copy the returned scope ID into the next commands.</p>
       <h2>2. Validate, fix, and repeat</h2>
-      <pre><code>{`heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111
-heel reference run --scope SCOPE_ID --case hardened --attempt 22222222222222222222222222222222`}</code></pre>
-      <p>Each attempt is consumed once. Use a new 32-character hexadecimal attempt ID for a fresh run. Reports and raw synthetic evidence stay under your local .heel/reference directory.</p>
+      <pre><code>{`.venv/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111
+.venv/bin/heel reference run --scope SCOPE_ID --case hardened --attempt 22222222222222222222222222222222`}</code></pre>
+      <p>Expected results: verified_violation for the vulnerable case, then invariant_held with regression_passed=true for the hardened case. Each report records execution_support reference_only, network_calls false, and uploaded false.</p>
+      <p>Each attempt is consumed once. Use a new 32-character lowercase hexadecimal attempt ID for a fresh run. Reports and raw synthetic evidence stay under your local .heel/reference directory.</p>
+      <h3>If the run is rejected</h3>
+      <p>Every refusal prints the same message, “Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage.”, and exits with status 2. Not every rejection is a storage-path problem, so check each of these: HEEL_HOME is a physical private path with no symbolic link in any component; SCOPE_ID came from heel scope create --target reference:export with the same HEEL_HOME and has not expired, or create a fresh scope; the attempt has never been used in this HEEL_HOME, and a new attempt ID is always safe. Do not disable the storage checks or edit the store database or scope files. If you ask for help, share only the command, exit status, and message, never raw exceptions, signing keys, scope files, or credentials.</p>
       <p>The hardened reference checks the account’s current export license before serializing protected fields. HTTP status alone never establishes the result.</p>
       <h2>3. Inspect the local report</h2>
       <label>Reference report JSON <input type="file" accept=".json,application/json" onChange={(event) => void inspect(event.target.files?.[0])} /></label>

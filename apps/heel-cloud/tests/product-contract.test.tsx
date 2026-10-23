@@ -56,6 +56,7 @@ vi.mock("../lib/local-reviews", async (importOriginal) => {
 
 import Home from "../app/page";
 import McpQuickstart from "../app/agent/page";
+import Runner from "../app/runner/page";
 import { OpenApiInput } from "../components/review/OpenApiInput";
 import { ReviewWorkspace } from "../components/review/ReviewWorkspace";
 
@@ -130,6 +131,17 @@ beforeEach(() => {
   clear.mockResolvedValue(true);
 });
 
+
+
+const PUBLIC_RELEASE = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc1";
+const PUBLIC_WHEEL_SHA256 = "176a17b0d4d7f4ea44420d8099239f32dbb17eeead981e5aa360f0a5bbccb94a";
+const PUBLIC_INSTALL = [
+  "python3 -m venv .venv",
+  ".venv/bin/python -m pip --isolated install \\",
+  `  'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc1/heel_sim-1.3.0rc1-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}'`,
+].join("\n");
+const STALE_GITHUB_CLAIMS =
+  /unreleased|not yet published as a GitHub|planned but not yet published|prerelease URL is not publicly verified/i;
 
 describe("Heel anonymous launch review", () => {
   test("renders an abuse hypothesis and immediate actions without a wall", () => {
@@ -220,11 +232,62 @@ describe("Heel anonymous launch review", () => {
     expect(document.body.textContent).toContain(
       ".venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl",
     );
-    expect(document.body.textContent).toContain("unreleased preview candidate");
-    expect(document.body.textContent).toContain("not yet published as a GitHub release or on PyPI");
+    expect(document.body.textContent).toContain(PUBLIC_INSTALL);
+    expect(PUBLIC_WHEEL_SHA256).toBe(wheelArtifact?.sha256);
+    const release = screen.getByRole("link", { name: /github\.com\/ancilis\/heel\/releases\/tag\/v1\.3\.0rc1/i });
+    expect(release.getAttribute("href")).toBe(PUBLIC_RELEASE);
+    expect(document.body.textContent).toMatch(/public preview prerelease/i);
+    expect(document.body.textContent).toMatch(/not a stable release/i);
+    expect(document.body.textContent).toContain("pwd -P");
+    expect(document.body.textContent).not.toMatch(STALE_GITHUB_CLAIMS);
     expect(document.body.textContent).not.toMatch(
       /not yet available as a public download|licensed source checkout|public main branch/i,
     );
+  });
+
+  test("gives the synthetic reference preview a public install, physical storage path, and safe troubleshooting", () => {
+    render(<Runner />);
+    const text = document.body.textContent ?? "";
+
+    expect(text).toContain(PUBLIC_INSTALL);
+    expect(text).toContain('export HEEL_HOME="$(pwd -P)/.heel"');
+    expect(text).not.toContain('"$PWD/.heel"');
+    expect(text).toContain(".venv/bin/heel scope create --target reference:export");
+    expect(text).toContain("--case vulnerable --attempt 11111111111111111111111111111111");
+    expect(text).toContain("--case hardened --attempt 22222222222222222222222222222222");
+    expect(screen.getByRole("link", { name: /releases\/tag\/v1\.3\.0rc1/i }).getAttribute("href"))
+      .toBe(PUBLIC_RELEASE);
+    expect(text).not.toMatch(STALE_GITHUB_CLAIMS);
+    expect(text).toMatch(/pypi publication is not yet available/i);
+    expect(text).toMatch(/not a step in the default heel journey/i);
+    expect(text).toMatch(/does not indicate live-target support or launch readiness/i);
+    expect(text).toMatch(/reference_only, network_calls false, and uploaded false/i);
+    expect(text).toMatch(/contact no product target/i);
+    expect(text).toMatch(/\/tmp and \/var are symbolic links/i);
+    expect(text).toMatch(/not every rejection is a storage-path problem/i);
+    expect(text).toMatch(/has not expired, or create a fresh scope/i);
+    expect(text).toMatch(/a new attempt id is always safe/i);
+    expect(text).toMatch(/never raw exceptions, signing keys, scope files, or credentials/i);
+  });
+
+  test("keeps customer docs on the public preview and physical storage path", () => {
+    const repoRoot = resolve(process.cwd(), "../..");
+    const documents = ["README.md", "docs/MCP_QUICKSTART.md", "docs/EXPORT_DEMO.md", "apps/heel-cloud/README.md"]
+      .map((path) => [path, readFileSync(resolve(repoRoot, path), "utf8")] as const);
+
+    for (const [path, source] of documents) {
+      const unwrapped = source.replace(/\s+/g, " ");
+      expect(unwrapped, path).toContain(PUBLIC_RELEASE);
+      expect(unwrapped, path).not.toMatch(STALE_GITHUB_CLAIMS);
+      expect(source, path).not.toContain('"$PWD/.heel');
+    }
+    for (const [path, source] of documents.slice(0, 3)) {
+      expect(source, path).toContain(PUBLIC_INSTALL);
+      expect(source, path).toContain('"$(pwd -P)/.heel');
+    }
+    const demo = documents[2][1].replace(/\s+/g, " ");
+    expect(demo).toMatch(/not every rejection is a storage-path problem/i);
+    expect(demo).toMatch(/never paste raw exceptions or tracebacks, signing keys, scope files, `\.heel` contents, or credentials/i);
   });
 
   test("states the MCP release, platform, privacy, and execution boundaries", () => {
