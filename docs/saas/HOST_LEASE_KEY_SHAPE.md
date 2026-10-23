@@ -8,10 +8,13 @@ run of the fixed launcher on the literal proof branch. Nothing here is accepted 
 Can the real H1 `LeaseDomain.prepare(SLOT_PEER, SLOT_ADDRESS, ttl)` and `activate(handle)` gate IPv4
 TCP 443 packets whose actual destination is one of two distinct approved targets, neither of which is
 SLOT_ADDRESS, when the activated-map lookup and the prepared-set membership both concatenate the
-immediate constant SLOT_ADDRESS instead of `ip daddr`? This is Option A from FableH2D: a fixed
-logical lease key for arbitrary approved wire addresses. There is **no fallback**. If nft rejects
-the shape, reads it back without a verdict structure the oracle recognises, or the packets disagree,
-the run is FAIL or HOLD. It never switches to a different semantics (no Option B).
+fixed logical gateway SLOT_ADDRESS instead of the packet's destination? This is Option A from
+FableH2D: a fixed logical lease key for arbitrary approved wire addresses. The original revision
+wrote that component as the bare immediate constant; since H2K1F1 it is the typed constant
+`(ip daddr & 0.0.0.0 | 192.0.2.1)`, which has the same value for every packet (see below). There is
+**no fallback**. If nft rejects the shape, reads it back in any form other than the exact one the
+oracle pins, or the packets disagree, the run is FAIL or HOLD. It never switches to a different
+semantics (no Option B).
 
 The owned gate the fixture installs (proof fixture, not a production chain):
 
@@ -22,8 +25,8 @@ table inet heel_lease {
   chain gate {
     type filter hook output priority 0 ; policy drop ;
     meta mark set 0
-    meta mark set ip saddr . 192.0.2.1 map @activated
-    ip saddr . 192.0.2.1 . meta mark @prepared ip daddr { 203.0.113.11, 203.0.113.12 } tcp dport 443 accept
+    meta mark set ip saddr . (ip daddr & 0.0.0.0 | 192.0.2.1) map @activated
+    ip saddr . (ip daddr & 0.0.0.0 | 192.0.2.1) . meta mark @prepared ip daddr { 203.0.113.11, 203.0.113.12 } tcp dport 443 accept
   }
 }
 ```
@@ -150,6 +153,70 @@ Reading the next run: the same parser class and locator in check and install poi
 grammar or evaluator (map it to the pinned source before saying more). `check=accepted` with a netlink
 class at install points to the kernel transaction. `permission`, `tool_missing`, `timeout` and
 `unknown` call for a HOLD and an evidence or fixture repair, not a gate change.
+
+## Typed logical-gateway key (H2K1F1)
+
+Both reviewed runs remain **FAIL** and are not regraded or retried: 39895297766 (12 passed, 5
+failed) and 39901266492 (14 passed, 5 failed, at 2a17b81). In the second run, K1 to K5 recorded
+`parser_other` at line 7 column 30 for both check and install, with the same stderr SHA-256, and an
+empty readback. Line 7 column 30 is the bare `192.0.2.1` in the map key. In nft 1.0.9
+`expr_evaluate_map` evaluates its key with a cleared expression context (`src/evaluate.c:1914-1920`),
+so the second concat component gets no datatype. The literal stays an untyped `SYMBOL_VALUE`, and
+`symbol_parse` fails with "No symbol type information" (`src/datatype.c:126-152`). This is an
+evaluator failure before any kernel transaction. It is not evidence about concatenated map keys.
+
+The correction changes only the second key component, the same way in both uses:
+`(ip daddr & 0.0.0.0 | 192.0.2.1)`. The concat grammar needs the parentheses (a component after
+`.` must be a primary, `src/parser_bison.y:3807-3876`), and `&` binds tighter than `|`. The source
+basis, all in the verified 1.0.9 archive (SHA-256 `a3c304cd…0e14cd`):
+
+- Typing. `ip daddr` is evaluated first and sets the IPv4 context. Both literals are then parsed as
+  `ipv4_addr` big-endian constants. The bitwise ops keep `ip daddr`'s datatype and byte order,
+  because the statement length (cleared to 0 before the map key, `src/evaluate.c:1915`) does not
+  exceed the 32-bit field (`expr_evaluate_binop`/`expr_evaluate_bitwise`,
+  `src/evaluate.c:1338-1442`). The concat
+  component therefore has type `ipv4_addr`, and the key types match the declared
+  `ipv4_addr . ipv4_addr[ . mark]`. No constant folding applies, because the left operand is a
+  payload.
+- Kernel form. `netlink_gen_bitwise` (`src/netlink_linearize.c:657-761`) folds AND 0 then OR G into
+  one bitwise op: mask `0x00000000`, xor `0xc0000201`. The kernel computes
+  `(daddr & 0) ^ 0xc0000201`, which is `192.0.2.1` for every destination. The packet's destination
+  is read, never written. The only statements that write anything are the two `meta mark set`.
+- Readback form. `netlink_parse_bitwise_bool` (`src/netlink_delinearize.c:458-521`) rebuilds mask 0
+  / xor G as `o = G`, `x = 0`, `m = G`. That gives `(ip daddr & 192.0.2.1) | 192.0.2.1`, with no XOR
+  node. The source mask `0.0.0.0` therefore does **not** read back. Inside a concatenation, the AND
+  node returns early (`RULE_PP_REMOVE_OP_AND`; `payload_expr_trim` finds no template for mask
+  `0xc0000201`, `src/payload.c:1073-1121`). The mask takes the completed payload's `ipv4_addr` type,
+  but the OR operand inherits the raw register's `xinteger` type (`payload_init_raw`,
+  `src/payload.c:332-340`; `src/netlink_delinearize.c:2777-2835`). The JSON formatter prints
+  `ipv4_addr` through its printer and `xinteger` as a JSON integer (`src/json.c:953-988,1062-1071`).
+  The one pinned readback component is
+  `{"|": [{"&": [{"payload": {"protocol": "ip", "field": "daddr"}}, "192.0.2.1"]}, 3221225985]}`.
+
+The oracle now requires that exact component, with exact JSON types and no extra keys, in both the
+activated-map key (`activated_key=saddr_gateway`) and the prepared-set membership
+(`prepared_key=saddr_gateway_mark`). The old bare-literal readback is named `saddr_const[_mark]`
+and rejected. Any other mask, constant, byte order, field, operator, string or float form is `other`
+and rejected. There is no equivalence engine and no alternative form. The static tests:
+
+- mirror the linearizer and delinearizer arithmetic and check the identity in network byte order
+  over boundary destinations;
+- pin the 455-byte gate (SHA-256 `8eaa1b2f…ab646e35`) and show that substituting `192.0.2.1` back
+  for both components reproduces the parent's 409-byte gate byte for byte;
+- re-pin only `gate_table` and `readback_shape` (plus the new `_same` helper), and keep
+  `install_error_token`, `gate_ready`, the launcher's `evaluate` and the check/install/readback
+  sequence at their parent hashes.
+
+The target pins, TCP 443, the lease durations, the mark reset, the single accept, the prepared
+membership, K0 to K6, the diagnostics grammar and the launcher are unchanged. No gate is chosen at
+run time. A failed install has no alternative shape.
+
+Limits: everything above is source-supported reasoning and static proof. Whether Ubuntu's
+`1.0.9-1ubuntu0.1` build accepts the text, installs it and reads it back in exactly this form, and
+whether the packets behave, is **UNRUN**. It needs an independently reviewed single Linux run. That
+run needs check and install `accepted`, `readback_ok` with both exact key tokens, and every original
+K0 to K6 behaviour. A different parser error, a check-only success or a readback in another form is
+FAIL, not a reason to widen the oracle.
 
 Workflow: the job `host-lease-key-shape (lease-key-v1)` is appended to `.github/workflows/codeql.yml`
 (5 jobs: analyze plus four proofs). It runs only on manual `workflow_dispatch` at the literal ref

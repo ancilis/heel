@@ -9,8 +9,11 @@ skip, so the ordinary suite never claims the proof.
 The question: can the real H1 ``LeaseDomain.prepare``/``activate`` of (SLOT_PEER, SLOT_ADDRESS) gate
 IPv4 TCP 443 packets whose actual destination is one of two distinct approved targets (neither of
 them SLOT_ADDRESS), when both the activated-map lookup and the prepared-set membership concatenate
-the immediate constant SLOT_ADDRESS (``ip saddr . SLOT_ADDRESS``) instead of ``ip daddr``? There is
-no fallback: a rejected or unrecognized shape is a FAIL, never a different semantics.
+the fixed logical gateway SLOT_ADDRESS instead of the packet's destination? H2K1F1 writes that
+component as the typed constant ``(ip daddr & 0.0.0.0 | SLOT_ADDRESS)``, which equals SLOT_ADDRESS
+for every IPv4 destination; the bare immediate constant had no datatype in nft 1.0.9's map-key
+context. There is no fallback: a rejected or unrecognized shape is a FAIL, never a different
+semantics.
 
 Every key is written by the public domain API (``LeaseDomain.create``, ``prepare``, ``activate``,
 ``close``, ``close_generation``) in the namespace ``create`` made; ``create`` installs nothing there,
@@ -211,9 +214,23 @@ def workflow_violations(text: str) -> list[str]:
 # ---------------------------------------------------------------------------------------------
 # The owned gate (proof fixture; H2 owns any production table) and its readback oracle.
 
+# H2K1F1: the second key component is the typed logical gateway. nft 1.0.9 evaluates a map key
+# with a cleared context, so a bare SLOT_ADDRESS has no datatype there (run 39901266492, line 7
+# column 30). ``ip daddr`` supplies the IPv4 type; the zero mask discards every destination bit and
+# the OR yields SLOT_ADDRESS for every packet. It reads the destination and never writes it.
+GATEWAY_KEY = f"(ip daddr & 0.0.0.0 | {SLOT_ADDRESS})"
+GATEWAY_INT = int.from_bytes(socket.inet_aton(SLOT_ADDRESS), "big")  # 0xc0000201, network byte order
+_DADDR = {"payload": {"protocol": "ip", "field": "daddr"}}
+# The one readback form pinned from the nft 1.0.9 source (docs/saas/HOST_LEASE_KEY_SHAPE.md): the
+# linearizer stores bitwise mask 0 / xor GATEWAY_INT, netlink_parse_bitwise_bool rebuilds that as
+# ``(ip daddr & GATEWAY) | GATEWAY``, the mask takes the payload's ipv4_addr type and the OR operand
+# keeps the raw register's xinteger type, which the JSON formatter prints as an integer.
+GATEWAY_READBACK = {"|": [{"&": [_DADDR, SLOT_ADDRESS]}, GATEWAY_INT]}
+
+
 def gate_table() -> str:
-    """The candidate shape: clear the packet mark, look the mark up by ``ip saddr . SLOT_ADDRESS`` in
-    the activated map, then admit only when ``ip saddr . SLOT_ADDRESS . meta mark`` is a live prepared
+    """The candidate shape: clear the packet mark, look the mark up by ``ip saddr . GATEWAY_KEY`` in
+    the activated map, then admit only when ``ip saddr . GATEWAY_KEY . meta mark`` is a live prepared
     element AND the destination is a fixed approved target AND the protocol is TCP to port 443. The
     only accept is that conjunction; the chain policy drops everything else."""
     t1, t2 = TARGETS
@@ -223,8 +240,8 @@ def gate_table() -> str:
             f"  chain {AUTHORITY.GATE_CHAIN} {{\n"
             "    type filter hook output priority 0 ; policy drop ;\n"
             "    meta mark set 0\n"
-            f"    meta mark set ip saddr . {SLOT_ADDRESS} map @{AUTHORITY.ACTIVATED_MAP}\n"
-            f"    ip saddr . {SLOT_ADDRESS} . meta mark @{AUTHORITY.PREPARED_SET} ip daddr {{ {t1}, {t2} }} tcp dport {PORT} accept\n"
+            f"    meta mark set ip saddr . {GATEWAY_KEY} map @{AUTHORITY.ACTIVATED_MAP}\n"
+            f"    ip saddr . {GATEWAY_KEY} . meta mark @{AUTHORITY.PREPARED_SET} ip daddr {{ {t1}, {t2} }} tcp dport {PORT} accept\n"
             "  }\n"
             "}\n")
 
@@ -359,13 +376,25 @@ def _is_mark_value(value, mark: int) -> bool:
     return value == mark or (isinstance(value, str) and re.fullmatch(r"0x0*" + format(mark, "x"), value) is not None)
 
 
+def _same(value, expected) -> bool:
+    """Exact JSON equality with exact types: no bool for an int, no float for an int, no extra keys."""
+    if type(value) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return value.keys() == expected.keys() and all(_same(value[key], expected[key]) for key in expected)
+    if isinstance(expected, list):
+        return len(value) == len(expected) and all(map(_same, value, expected))
+    return value == expected
+
+
 def readback_shape(document) -> tuple[bool, dict[str, str]]:
     """The structural oracle over ``nft -j list table`` (the kernel's own readback, parsed here; the
     raw listing never leaves the run). Required: the gate chain hooks output with policy drop; its
-    first rule resets the mark to 0; a later rule sets the mark from @activated; exactly one rule
-    carries a verdict, it is accept, and that same rule matches @prepared. Informative tokens say
-    whether each concatenation reads back as ``ip saddr . SLOT_ADDRESS[ . meta mark]`` and whether
-    the target pins and the TCP 443 match read back."""
+    first rule resets the mark to 0; a later rule sets the mark from @activated keyed exactly by
+    ``ip saddr . GATEWAY_READBACK``; exactly one rule carries a verdict, it is accept, and that same
+    rule matches @prepared keyed exactly by ``ip saddr . GATEWAY_READBACK . meta mark``. The old bare
+    constant key is recorded as ``saddr_const[_mark]`` and is not accepted. Informative tokens say
+    whether the target pins and the TCP 443 match read back."""
     tokens = {"chain": "missing", "mark_reset_first": "no", "activated_lookup": "missing", "accept_rules": "0",
               "accept_has_prepared": "no", "activated_key": "other", "prepared_key": "other", "target_pins": "other",
               "tcp_dport": "other", "other_verdicts": "0"}
@@ -391,7 +420,9 @@ def readback_shape(document) -> tuple[bool, dict[str, str]]:
             lookup = value.get("map") if isinstance(value, dict) else None
             if isinstance(lookup, dict) and lookup.get("data") == "@" + AUTHORITY.ACTIVATED_MAP:
                 tokens["activated_lookup"] = "present"
-                if lookup.get("key") == {"concat": [_SADDR, SLOT_ADDRESS]}:
+                if _same(lookup.get("key"), {"concat": [_SADDR, GATEWAY_READBACK]}):
+                    tokens["activated_key"] = "saddr_gateway"
+                elif _same(lookup.get("key"), {"concat": [_SADDR, SLOT_ADDRESS]}):
                     tokens["activated_key"] = "saddr_const"
     verdict_rules = [rule for rule in rules if any(isinstance(expr, dict) and set(expr) & {"accept", "drop", "jump", "goto", "queue",
                                                                                            "return", "continue"} for expr in rule)]
@@ -405,7 +436,9 @@ def readback_shape(document) -> tuple[bool, dict[str, str]]:
                 continue
             if match.get("right") == "@" + AUTHORITY.PREPARED_SET:
                 tokens["accept_has_prepared"] = "yes"
-                if match.get("left") == {"concat": [_SADDR, SLOT_ADDRESS, _META_MARK]}:
+                if _same(match.get("left"), {"concat": [_SADDR, GATEWAY_READBACK, _META_MARK]}):
+                    tokens["prepared_key"] = "saddr_gateway_mark"
+                elif _same(match.get("left"), {"concat": [_SADDR, SLOT_ADDRESS, _META_MARK]}):
                     tokens["prepared_key"] = "saddr_const_mark"
             elif match.get("left") == {"payload": {"protocol": "ip", "field": "daddr"}}:
                 right = match.get("right")
@@ -414,7 +447,8 @@ def readback_shape(document) -> tuple[bool, dict[str, str]]:
             elif match.get("left") == {"payload": {"protocol": "tcp", "field": "dport"}} and match.get("right") == PORT:
                 tokens["tcp_dport"] = "443"
     ok = (tokens["chain"] == "output_drop" and tokens["mark_reset_first"] == "yes" and tokens["activated_lookup"] == "present"
-          and tokens["accept_rules"] == "1" and tokens["other_verdicts"] == "0" and tokens["accept_has_prepared"] == "yes")
+          and tokens["accept_rules"] == "1" and tokens["other_verdicts"] == "0" and tokens["accept_has_prepared"] == "yes"
+          and tokens["activated_key"] == "saddr_gateway" and tokens["prepared_key"] == "saddr_gateway_mark")
     return ok, tokens
 
 
@@ -798,9 +832,9 @@ def _synthetic_readback() -> dict:
                    "hook": "output", "prio": 0, "policy": "drop"}},
         {"rule": {"chain": AUTHORITY.GATE_CHAIN, "expr": [{"mangle": {"key": _META_MARK, "value": 0}}]}},
         {"rule": {"chain": AUTHORITY.GATE_CHAIN, "expr": [{"mangle": {"key": _META_MARK, "value": {"map": {
-            "key": {"concat": [_SADDR, SLOT_ADDRESS]}, "data": "@" + AUTHORITY.ACTIVATED_MAP}}}}]}},
+            "key": {"concat": [_SADDR, GATEWAY_READBACK]}, "data": "@" + AUTHORITY.ACTIVATED_MAP}}}}]}},
         {"rule": {"chain": AUTHORITY.GATE_CHAIN, "expr": [
-            {"match": {"op": "==", "left": {"concat": [_SADDR, SLOT_ADDRESS, _META_MARK]}, "right": "@" + AUTHORITY.PREPARED_SET}},
+            {"match": {"op": "==", "left": {"concat": [_SADDR, GATEWAY_READBACK, _META_MARK]}, "right": "@" + AUTHORITY.PREPARED_SET}},
             {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": {"set": list(TARGETS)}}},
             {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": PORT}},
             {"accept": None}]}},
@@ -812,16 +846,28 @@ def test_static_gate_shape_and_readback_oracle():
     assert SLOT_ADDRESS not in TARGETS and UNAPPROVED not in TARGETS and len(set(TARGETS)) == 2
     assert len({SLOT_PEER, WRONG_SOURCE, SLOT_ADDRESS, UNAPPROVED, *TARGETS}) == 6
     lines = [line.strip() for line in table.splitlines()]
-    reset, lookup = "meta mark set 0", f"meta mark set ip saddr . {SLOT_ADDRESS} map @{AUTHORITY.ACTIVATED_MAP}"
-    admit = (f"ip saddr . {SLOT_ADDRESS} . meta mark @{AUTHORITY.PREPARED_SET} ip daddr {{ {TARGETS[0]}, {TARGETS[1]} }} "
-             f"tcp dport {PORT} accept")
+    assert GATEWAY_KEY == "(ip daddr & 0.0.0.0 | 192.0.2.1)" and GATEWAY_KEY.endswith(f"| {SLOT_ADDRESS})")
+    reset = "meta mark set 0"
+    lookup = f"meta mark set ip saddr . (ip daddr & 0.0.0.0 | {SLOT_ADDRESS}) map @{AUTHORITY.ACTIVATED_MAP}"
+    admit = (f"ip saddr . (ip daddr & 0.0.0.0 | {SLOT_ADDRESS}) . meta mark @{AUTHORITY.PREPARED_SET} "
+             f"ip daddr {{ {TARGETS[0]}, {TARGETS[1]} }} tcp dport {PORT} accept")
     assert lines.index(reset) < lines.index(lookup) < lines.index(admit) == len(lines) - 3
     assert table.count("accept") == 1 and "policy drop" in table and "hook output" in table and "ip daddr ." not in table
     assert f"type ipv4_addr . ipv4_addr . mark ; flags timeout ;" in table and "type ipv4_addr . ipv4_addr : mark ;" in table
+    # Exactly the two typed key uses; the old bare literal key form is gone from both.
+    assert table.count(GATEWAY_KEY) == 2 and table.count(SLOT_ADDRESS) == 2 and table.count("ip daddr") == 3
+    assert re.findall(r"\(ip daddr & (\S+) \| (\S+)\)", table) == [("0.0.0.0", SLOT_ADDRESS)] * 2
+    assert re.findall(r"\(([^()]*)\)", table) == [GATEWAY_KEY[1:-1]] * 2
+    assert f". {SLOT_ADDRESS} map" not in table and f". {SLOT_ADDRESS} . meta" not in table
+    assert f"ip saddr . {SLOT_ADDRESS}" not in table
+    # The gate reads the destination and writes only the packet mark: no payload, NAT or address write.
+    statements = [line for line in lines if re.search(r"\bset\b", line) and not line.startswith("set ")]
+    assert statements == [reset, lookup]
+    assert not re.search(r"\b(?:dnat|snat|masquerade|redirect|tproxy|dup|fwd|notrack|mangle)\b", table)
     assert install_error_token(0, "") == "accepted" and install_error_token(1, "Error: syntax error, unexpected") == "syntax_error"
     assert install_error_token(1, "something new") == "other" and install_error_token(None, "") == "other"
     ok, tokens = readback_shape(_synthetic_readback())
-    assert ok and tokens["prepared_key"] == "saddr_const_mark" and tokens["activated_key"] == "saddr_const", tokens
+    assert ok and tokens["prepared_key"] == "saddr_gateway_mark" and tokens["activated_key"] == "saddr_gateway", tokens
     assert tokens["target_pins"] == "approved_pair" and tokens["tcp_dport"] == "443"
     assert all(LAUNCHER._TOKEN.fullmatch(value) for value in tokens.values())
 
@@ -854,12 +900,88 @@ def test_static_gate_shape_and_readback_oracle():
     for change in (second_accept, accept_without_prepared, policy_accept, no_reset, reset_after_lookup, jump, other_hook):
         assert readback_shape(mutated(change))[0] is False, change.__name__
     assert readback_shape({})[0] is False and readback_shape([])[0] is False
-    # The constant reads back in another form: still structurally gated, recorded as "other".
-    def literal_hex(items):
-        items[5]["rule"]["expr"][0]["match"]["left"]["concat"][1] = "0xc0000201"
 
-    ok, tokens = readback_shape(mutated(literal_hex))
-    assert ok and tokens["prepared_key"] == "other"
+    # The key form is required exactly, in each use independently. The old bare literal is named and
+    # rejected; any other mask, constant, field, operator or JSON type is "other" and rejected.
+    def lookup_key(items):
+        return items[4]["rule"]["expr"][0]["mangle"]["value"]["map"]["key"]["concat"]
+
+    def prepared_key(items):
+        return items[5]["rule"]["expr"][0]["match"]["left"]["concat"]
+
+    def legacy(component):
+        return lambda items: component(items).__setitem__(1, SLOT_ADDRESS)
+
+    for component, token, legacy_token in ((lookup_key, "activated_key", "saddr_const"),
+                                           (prepared_key, "prepared_key", "saddr_const_mark")):
+        ok, tokens = readback_shape(mutated(legacy(component)))
+        assert not ok and tokens[token] == legacy_token, tokens
+        variants = (
+            {"|": [{"&": [_DADDR, "0.0.0.0"]}, GATEWAY_INT]},  # the source text's mask is not what 1.0.9 prints
+            {"|": [{"&": [_DADDR, "0.0.0.0"]}, SLOT_ADDRESS]},
+            {"|": [{"&": [_DADDR, "255.255.255.255"]}, GATEWAY_INT]},
+            {"|": [{"&": [_DADDR, "192.0.2.2"]}, GATEWAY_INT]},
+            {"|": [{"&": [_DADDR, SLOT_ADDRESS]}, GATEWAY_INT + 1]},
+            {"|": [{"&": [_DADDR, SLOT_ADDRESS]}, int.from_bytes(socket.inet_aton(SLOT_ADDRESS), "little")]},
+            {"|": [{"&": [_DADDR, SLOT_ADDRESS]}, SLOT_ADDRESS]},
+            {"|": [{"&": [_DADDR, SLOT_ADDRESS]}, "0xc0000201"]},
+            {"|": [{"&": [_DADDR, SLOT_ADDRESS]}, float(GATEWAY_INT)]},
+            {"|": [{"&": [_SADDR, SLOT_ADDRESS]}, GATEWAY_INT]},
+            {"|": [{"&": [{"payload": {"protocol": "ip6", "field": "daddr"}}, SLOT_ADDRESS]}, GATEWAY_INT]},
+            {"^": [{"&": [_DADDR, SLOT_ADDRESS]}, GATEWAY_INT]},
+            {"|": [{"|": [_DADDR, SLOT_ADDRESS]}, GATEWAY_INT]},
+            {"|": [_DADDR, GATEWAY_INT]},
+            {"&": [_DADDR, SLOT_ADDRESS]},
+            {"|": [{"&": [_DADDR, SLOT_ADDRESS]}, GATEWAY_INT, GATEWAY_INT]},
+            {"|": [{"&": [_DADDR, SLOT_ADDRESS]}, GATEWAY_INT], "&": [_DADDR, SLOT_ADDRESS]},
+            _DADDR, GATEWAY_INT, "0xc0000201", "192.0.2.1/32",
+        )
+        for variant in variants:
+            ok, tokens = readback_shape(mutated(lambda items: component(items).__setitem__(1, variant)))
+            assert not ok and tokens[token] == "other", (token, variant)
+        ok, tokens = readback_shape(mutated(lambda items: component(items).append(GATEWAY_INT)))
+        assert not ok and tokens[token] == "other"
+    assert not readback_shape(mutated(lambda items: (legacy(lookup_key)(items), legacy(prepared_key)(items))))[0]
+    _gateway_key_arithmetic()
+
+
+def _gateway_key_arithmetic() -> None:
+    """The source-mirrored arithmetic of the typed key over boundary IPv4 destinations: the text the
+    gate renders, the kernel bitwise netlink_gen_bitwise emits, and the form netlink_parse_bitwise_bool
+    reads back all equal SLOT_ADDRESS, in network byte order."""
+    full = 0xFFFFFFFF
+    assert socket.inet_aton(SLOT_ADDRESS) == bytes([192, 0, 2, 1]) and GATEWAY_INT == 0xC0000201 == 3221225985
+    assert GATEWAY_INT != int.from_bytes(socket.inet_aton(SLOT_ADDRESS), "little") == 0x010200C0
+    mask_text, value_text = re.fullmatch(r"\(ip daddr & (\S+) \| (\S+)\)", GATEWAY_KEY).groups()
+    mask_in, value_in = (int.from_bytes(socket.inet_aton(text), "big") for text in (mask_text, value_text))
+    assert (mask_in, value_in) == (0, GATEWAY_INT)
+
+    def combine(mask: int, xor: int, m: int, x: int) -> tuple[int, int]:  # netlink_linearize.c combine_binop
+        return mask & m, x ^ (xor & m)
+
+    mask, xor = full, 0  # netlink_gen_bitwise: OP_AND, then OP_OR, innermost first
+    mask, xor = combine(mask, xor, mask_in, 0)
+    mask, xor = combine(mask, xor, ~value_in & full, value_in)
+    assert (mask, xor) == (0, GATEWAY_INT)  # the kernel bitwise: dreg = (sreg & 0) ^ gateway
+
+    m, x = mask, xor  # netlink_parse_bitwise_bool: o = (m & x) ^ x; x &= m; m |= o
+    o = (m & x) ^ x
+    x &= m
+    m |= o
+    assert (m, x, o) == (GATEWAY_INT, 0, GATEWAY_INT)  # AND mask = gateway, no XOR node, OR = gateway
+    assert m != full  # the mask is kept as an AND node (it does not cover the whole field)
+    assert GATEWAY_READBACK == {"|": [{"&": [_DADDR, socket.inet_ntoa(m.to_bytes(4, "big"))]}, o]}
+
+    boundaries = ["0.0.0.0", "255.255.255.255", "0.0.0.1", "128.0.0.0", "127.0.0.1", "192.0.2.0", "192.0.2.2",
+                  SLOT_ADDRESS, "63.255.253.254", SLOT_PEER, WRONG_SOURCE, UNAPPROVED, *TARGETS]
+    for text in boundaries:
+        d = int.from_bytes(socket.inet_aton(text), "big")
+        assert (d & mask_in) | value_in == GATEWAY_INT, text  # the rendered expression
+        assert ((d & mask) ^ xor) == GATEWAY_INT, text  # the kernel bitwise
+        assert (d & m) | o == GATEWAY_INT, text  # the read-back expression
+        assert socket.inet_ntoa(((d & mask) ^ xor).to_bytes(4, "big")) == SLOT_ADDRESS, text
+    # A key without the zero mask would depend on the destination: the mask is load-bearing.
+    assert len({int.from_bytes(socket.inet_aton(text), "big") | GATEWAY_INT for text in TARGETS}) == 2
 
 
 # H2K1D1: the parent c653e6b's gate input and acceptance sources, recorded as fixed values.
@@ -877,6 +999,16 @@ PARENT_LAUNCHER_SHA256 = {
     "summarize_junit": "7619a21e106db305b4e7e6ac78e245cb18a18c8f2c7369b0fe13b13301631f16",
 }
 PARENT_NFT_ERRORS_SHA256 = "80d5a7221191fa3270fd778f06c45e714d1d895218ad8b1cb94ac1e3648a5700"
+# H2K1F1: the typed-gateway candidate. Only gate_table and readback_shape changed deliberately; the
+# gate differs from the parent's only in the two key components.
+CANDIDATE_GATE_BYTES = 455
+CANDIDATE_GATE_SHA256 = "8eaa1b2f2b62c3c1c6302b1883d9415c455bf5e39d370d540c4f8214ab646e35"
+CANDIDATE_SOURCE_SHA256 = {
+    **PARENT_SOURCE_SHA256,
+    "gate_table": "13420fc459f8ce92445e3ac695ed2db0987938221c0dd1e8b265f2c6337cd150",
+    "readback_shape": "a97eae872310434eca2fd47aa9d4fb44f45e29d8224742f6f668975b5eb9983d",
+    "_same": "d92eb6b95fc51c28b29aa6949417e386eab755c37c547a503939ed0c3f9b1538",
+}
 DYNAMIC_CASES = (
     "test_k0_profile_is_captured_and_the_real_h1_self_test_passes",
     "test_k1_live_lease_admits_tcp_443_to_two_distinct_approved_targets",
@@ -896,9 +1028,15 @@ def test_static_gate_bytes_and_the_fixed_check_install_readback_sequence_are_unc
     module = Path(__file__).read_text(encoding="utf-8")
     launcher = LAUNCHER_FILE.read_text(encoding="utf-8")
     gate = gate_table().encode("utf-8")
-    assert (len(gate), hashlib.sha256(gate).hexdigest()) == (PARENT_GATE_BYTES, PARENT_GATE_SHA256)
-    for name, digest in PARENT_SOURCE_SHA256.items():
+    assert (len(gate), hashlib.sha256(gate).hexdigest()) == (CANDIDATE_GATE_BYTES, CANDIDATE_GATE_SHA256)
+    # Undoing the two typed key components reproduces the parent's gate byte for byte.
+    assert gate.count(GATEWAY_KEY.encode()) == 2
+    parent = gate.replace(GATEWAY_KEY.encode(), SLOT_ADDRESS.encode())
+    assert (len(parent), hashlib.sha256(parent).hexdigest()) == (PARENT_GATE_BYTES, PARENT_GATE_SHA256)
+    for name, digest in CANDIDATE_SOURCE_SHA256.items():
         assert _segment_sha256(module, name) == digest, name
+    assert [name for name in PARENT_SOURCE_SHA256 if CANDIDATE_SOURCE_SHA256[name] != PARENT_SOURCE_SHA256[name]] == [
+        "gate_table", "readback_shape"]
     for name, digest in PARENT_LAUNCHER_SHA256.items():
         assert _segment_sha256(launcher, name) == digest, name
     assert hashlib.sha256(json.dumps([list(item) for item in NFT_ERRORS]).encode()).hexdigest() == PARENT_NFT_ERRORS_SHA256
@@ -1033,7 +1171,7 @@ def test_static_installation_diagnostics_are_closed_and_carry_no_raw_text():
     phases = {}
     for name, (check, failure, installed, readback) in variants.items():
         diagnostics = installation_diagnostics(gate, check, failure, installed, readback)
-        assert diagnostics["tokens"]["gate_input_sha256"] == PARENT_GATE_SHA256
+        assert diagnostics["tokens"]["gate_input_sha256"] == CANDIDATE_GATE_SHA256
         entry = _diag_record(diagnostics)
         clean = LAUNCHER.sanitize_record(entry)
         assert clean is not None, name
