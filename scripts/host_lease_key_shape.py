@@ -78,6 +78,8 @@ REQUIRED_CASES = (
     "test_static_evidence_sanitizer_and_acceptance_rule",
     "test_static_fixture_uses_only_the_public_domain_api_and_fd_only_namespaces",
     "test_static_gate_shape_and_readback_oracle",
+    "test_static_gate_bytes_and_the_fixed_check_install_readback_sequence_are_unchanged",
+    "test_static_installation_diagnostics_are_closed_and_carry_no_raw_text",
     "test_static_doc_names_every_case_and_the_limits",
     "test_k0_profile_is_captured_and_the_real_h1_self_test_passes",
     "test_k1_live_lease_admits_tcp_443_to_two_distinct_approved_targets",
@@ -160,6 +162,57 @@ _TOKEN = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,79}")
 INT_LIMIT = 10 ** 12
 RECORD_KEYS = {"case", "verdict", "control", "ints", "tokens"}
 
+# H2K1D1: closed diagnostics of the three fixed nft invocations on the gate text (check ``-c -f -``,
+# install ``-f -``, readback ``-j list table``). Per phase: how the process ended (status), the normal
+# exit code (-1 unless status is exit), the terminating signal (0 unless status is signal), a closed
+# class, nft's own source locator (0/0 when absent) and the SHA-256 of stderr; never stderr itself.
+# ``install_phase`` is the first phase whose class is not accepted (``none`` when all three are).
+DIAG_PHASES = ("check", "install", "readback")
+DIAG_STATUSES = ("exit", "signal", "timeout", "missing", "invalid")
+DIAG_CLASSES = ("accepted", "parser_syntax", "parser_datatype", "parser_other", "netlink_einval", "netlink_eopnotsupp",
+                "permission", "tool_missing", "timeout", "unknown")
+DIAG_LINE_MAX, DIAG_COLUMN_MAX, DIAG_SIGNAL_MAX = 64, 512, 64
+DIAG_TOKEN_KEYS = ("gate_input_sha256", "install_phase",
+                   *(f"{phase}_{field}" for phase in DIAG_PHASES for field in ("status", "class", "stderr_sha256")))
+DIAG_INT_KEYS = tuple(f"{phase}_{field}" for phase in DIAG_PHASES for field in ("exit", "signal", "line", "column"))
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def _phase_valid(phase: str, ints: dict, tokens: dict) -> bool:
+    status, kind = tokens[f"{phase}_status"], tokens[f"{phase}_class"]
+    code, signal = ints[f"{phase}_exit"], ints[f"{phase}_signal"]
+    line, column = ints[f"{phase}_line"], ints[f"{phase}_column"]
+    if status not in DIAG_STATUSES or kind not in DIAG_CLASSES or not _SHA256_HEX.fullmatch(tokens[f"{phase}_stderr_sha256"]):
+        return False
+    if not (0 <= line <= DIAG_LINE_MAX and 0 <= column <= DIAG_COLUMN_MAX and (line == 0) == (column == 0)):
+        return False
+    if line and (status != "exit" or code == 0):  # a locator only ever comes from a rejecting exit
+        return False
+    if status == "exit":
+        return 0 <= code <= 255 and signal == 0 and (code == 0) == (kind == "accepted") and kind not in ("timeout", "tool_missing")
+    if code != -1 or kind == "accepted":
+        return False
+    if status == "signal":
+        return 1 <= signal <= DIAG_SIGNAL_MAX and kind == "unknown"
+    if signal != 0:
+        return False
+    return {"timeout": kind == "timeout", "missing": kind in ("tool_missing", "permission", "unknown"),
+            "invalid": kind == "unknown"}[status]
+
+
+def diagnostics_valid(ints: dict, tokens: dict) -> bool:
+    """The H2K1D1 fields are all absent (a fixture that never reached the gate) or all present, in
+    their own map, inside the closed grammar and mutually consistent."""
+    if not any(key in ints or key in tokens for key in (*DIAG_TOKEN_KEYS, *DIAG_INT_KEYS)):
+        return True
+    if not (all(key in tokens and key not in ints for key in DIAG_TOKEN_KEYS)
+            and all(key in ints and key not in tokens for key in DIAG_INT_KEYS)):
+        return False
+    if not _SHA256_HEX.fullmatch(tokens["gate_input_sha256"]) or not all(_phase_valid(phase, ints, tokens) for phase in DIAG_PHASES):
+        return False
+    first = next((phase for phase in DIAG_PHASES if tokens[f"{phase}_class"] != "accepted"), "none")
+    return tokens["install_phase"] == first
+
 
 def sanitize_record(entry) -> dict | None:
     """All or nothing: one fixed case id, its control class, a verdict, and flat maps of bounded
@@ -177,6 +230,8 @@ def sanitize_record(entry) -> dict | None:
     for key, value in tokens.items():
         if not (isinstance(key, str) and _KEY.fullmatch(key) and isinstance(value, str) and _TOKEN.fullmatch(value)):
             return None
+    if not diagnostics_valid(ints, tokens):
+        return None
     return {"case": entry["case"], "verdict": entry["verdict"], "control": entry["control"],
             "ints": {key: ints[key] for key in sorted(ints)}, "tokens": {key: tokens[key] for key in sorted(tokens)}}
 

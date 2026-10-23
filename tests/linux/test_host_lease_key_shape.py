@@ -244,6 +244,113 @@ def install_error_token(returncode: int | None, stderr: str) -> str:
     return "other"
 
 
+# H2K1D1: closed diagnostics for the fixed check/install/readback invocations (grammar in the
+# launcher's DIAG_*). The class is read only from nft 1.0.9's fixed texts: the located error line
+# "<name>:<line>:<first>-<last>: Error: <msg>" (src/erec.c print_location/erec_print; stdin is named
+# "/dev/stdin" by src/libnftables.c, the command line "<cmdline>"), the bison "syntax error" (parse.error
+# verbose), the evaluator's "datatype mismatch", and the batch path's "Could not process rule: <strerror>"
+# (src/libnftables.c, src/cmd.c). Anything else, including any system error text outside that path, is
+# "unknown", never a parser claim. Only the class, a bounded locator and the stderr SHA-256 leave.
+DIAG_SCAN_CHARS = 65536
+READBACK_COMMAND = "list table inet " + AUTHORITY.TABLE  # the readback argv after "-j", as nft names it <cmdline>
+_LOCATED = re.compile(r"(/dev/stdin|<cmdline>):([0-9]{1,6}):([0-9]{1,6})-[0-9]{1,6}: Error: (.*)")
+_UNLOCATED = re.compile(r"(?:netlink: )?Error: (.*)")
+BATCH_PREFIX = "Could not process rule: "
+BATCH_ERRNO = {"Invalid argument": "netlink_einval", "Operation not supported": "netlink_eopnotsupp",
+               "Operation not permitted": "permission", "Permission denied": "permission"}
+# A kernel EOPNOTSUPP for a base chain is reported without its errno text (src/cmd.c nft_cmd_chain_error).
+CHAIN_EOPNOTSUPP = 'Chain of type "filter" is not supported, perhaps kernel support is missing?'
+# glibc strerror texts: an error line carrying one is a system/kernel error, never a parser one.
+ERRNO_TEXTS = ("Operation not permitted", "No such file or directory", "Invalid argument", "Operation not supported",
+               "File exists", "Device or resource busy", "No buffer space available", "Cannot allocate memory",
+               "Numerical result out of range", "Message too long", "Protocol not supported", "Permission denied",
+               "Address family not supported by protocol", "No space left on device", "Too many links",
+               "Too many levels of symbolic links", "Resource temporarily unavailable", "Bad file descriptor",
+               "Function not implemented", "Value too large for defined data type", "Protocol error",
+               "Interrupted system call", "Too many open files", "Argument list too long", "Connection refused")
+
+
+def nft_error_class(stderr: str, name: str, source: str) -> tuple[str, int, int]:
+    """(class, line, column) of the first nft error line in ``stderr`` for a nonzero exit. The locator
+    counts only when it names ``name`` and lies inside ``source``; otherwise it is (0, 0)."""
+    message, line, column = None, 0, 0
+    for text in stderr[:DIAG_SCAN_CHARS].splitlines():
+        located = _LOCATED.fullmatch(text)
+        if located is not None:
+            message = located.group(4)
+            if located.group(1) == name:
+                rows = source.split("\n")
+                row, col = int(located.group(2)), int(located.group(3))
+                if 1 <= row <= min(len(rows), LAUNCHER.DIAG_LINE_MAX) and 1 <= col <= min(len(rows[row - 1]) + 1,
+                                                                                         LAUNCHER.DIAG_COLUMN_MAX):
+                    line, column = row, col
+            break
+        unlocated = _UNLOCATED.fullmatch(text)
+        if unlocated is not None:
+            message = unlocated.group(1)
+            break
+    if message is None:
+        return "unknown", 0, 0
+    if message.startswith(BATCH_PREFIX):
+        kind = BATCH_ERRNO.get(message[len(BATCH_PREFIX):], "unknown")
+    elif message.startswith("cache initialization failed: "):
+        kind = "permission" if BATCH_ERRNO.get(message.split(": ", 1)[1]) == "permission" else "unknown"
+    elif message == CHAIN_EOPNOTSUPP:
+        kind = "netlink_eopnotsupp"
+    elif any(errno_text in message for errno_text in ERRNO_TEXTS):
+        kind = "unknown"
+    elif message.startswith("syntax error"):
+        kind = "parser_syntax"
+    elif message.startswith("datatype mismatch"):
+        kind = "parser_datatype"
+    elif line:
+        kind = "parser_other"  # a located evaluator/parser message with no system error text
+    else:
+        kind = "unknown"
+    return kind, line, column
+
+
+def phase_diagnostic(completed: subprocess.CompletedProcess | None, failure: BaseException | None, name: str,
+                     source: str) -> dict:
+    """The closed fields of one invocation. A negative return code is a signal (kept as such), never
+    an exit; a missing return code or a raised failure is its own status with exit -1."""
+    returncode = completed.returncode if completed is not None else None
+    stderr = completed.stderr if completed is not None and isinstance(completed.stderr, str) else ""
+    fields = {"status": "missing", "exit": -1, "signal": 0, "class": "unknown", "line": 0, "column": 0,
+              "stderr_sha256": hashlib.sha256(stderr.encode("utf-8", "backslashreplace")).hexdigest()}
+    if isinstance(failure, subprocess.TimeoutExpired):
+        fields["status"], fields["class"] = "timeout", "timeout"
+    elif isinstance(failure, FileNotFoundError):
+        fields["class"] = "tool_missing"
+    elif isinstance(failure, PermissionError):
+        fields["class"] = "permission"
+    elif failure is not None or type(returncode) is not int:
+        pass
+    elif 0 <= returncode <= 255:
+        fields.update(status="exit", exit=returncode)
+        if returncode == 0:
+            fields["class"] = "accepted"
+        else:
+            fields["class"], fields["line"], fields["column"] = nft_error_class(stderr, name, source)
+    elif -LAUNCHER.DIAG_SIGNAL_MAX <= returncode <= -1:
+        fields.update(status="signal", signal=-returncode)
+    else:
+        fields["status"] = "invalid"
+    return fields
+
+
+def installation_diagnostics(gate: str, check, check_failure: BaseException | None, installed, readback) -> dict:
+    """The record fields of the three phases, bound to the SHA-256 of the exact gate input."""
+    phases = {"check": phase_diagnostic(check, check_failure, "/dev/stdin", gate),
+              "install": phase_diagnostic(installed, None, "/dev/stdin", gate),
+              "readback": phase_diagnostic(readback, None, "<cmdline>", READBACK_COMMAND)}
+    ints = {f"{phase}_{key}": fields[key] for phase, fields in phases.items() for key in ("exit", "signal", "line", "column")}
+    tokens = {f"{phase}_{key}": fields[key] for phase, fields in phases.items() for key in ("status", "class", "stderr_sha256")}
+    tokens["gate_input_sha256"] = hashlib.sha256(gate.encode("utf-8")).hexdigest()
+    tokens["install_phase"] = next((phase for phase in LAUNCHER.DIAG_PHASES if phases[phase]["class"] != "accepted"), "none")
+    return {"ints": ints, "tokens": tokens}
+
+
 _META_MARK = {"meta": {"key": "mark"}}
 _SADDR = {"payload": {"protocol": "ip", "field": "saddr"}}
 
@@ -755,6 +862,244 @@ def test_static_gate_shape_and_readback_oracle():
     assert ok and tokens["prepared_key"] == "other"
 
 
+# H2K1D1: the parent c653e6b's gate input and acceptance sources, recorded as fixed values.
+PARENT_GATE_BYTES = 409
+PARENT_GATE_SHA256 = "3e08d90e91d71775a3f16e6a541f67cec356e0f051cf5112114ccdba0f758a48"
+PARENT_SOURCE_SHA256 = {
+    "gate_table": "09e8e8b31af628283e1d2ed2f316b51f22b07f1248b79e7a2451ce88cc79fa73",
+    "install_error_token": "64e70241082c69e43b97079140d71ee6e63845fa6b4f2c82f7c16d53da72bf2b",
+    "readback_shape": "6694f37589b73a0011131daa3be7cde5b8e2938849ca24f3dfb03d463e6c94b2",
+    "gate_ready": "1bec7b8501fe0e0aed2dc9c6003436a43fdee3fb44af9dafa64d84965e341e75",
+}
+PARENT_LAUNCHER_SHA256 = {
+    "evaluate": "d89ecaf1b916be0626e7ec72acfe9237dd4f2982c8adb22a632b2b4be5c108c5",
+    "index_records": "a878323cb93535399f8ef39aaf47332992ba23eb15b2a851a8a31011cf601b27",
+    "summarize_junit": "7619a21e106db305b4e7e6ac78e245cb18a18c8f2c7369b0fe13b13301631f16",
+}
+PARENT_NFT_ERRORS_SHA256 = "80d5a7221191fa3270fd778f06c45e714d1d895218ad8b1cb94ac1e3648a5700"
+DYNAMIC_CASES = (
+    "test_k0_profile_is_captured_and_the_real_h1_self_test_passes",
+    "test_k1_live_lease_admits_tcp_443_to_two_distinct_approved_targets",
+    "test_k2_prepared_only_and_a_caller_supplied_mark_never_admit",
+    "test_k3_no_fresh_connection_is_admitted_after_the_expiry_bound",
+    "test_k4_late_activation_of_an_expired_key_does_not_revive_egress",
+    "test_k5_live_lease_confines_source_target_port_protocol_and_family",
+    "test_k6_every_owned_resource_is_resolved_and_the_outer_namespace_is_unchanged",
+)
+
+
+def _segment_sha256(source: str, name: str) -> str:
+    return hashlib.sha256(ast.get_source_segment(source, _functions(source)[name]).encode()).hexdigest()
+
+
+def test_static_gate_bytes_and_the_fixed_check_install_readback_sequence_are_unchanged():
+    module = Path(__file__).read_text(encoding="utf-8")
+    launcher = LAUNCHER_FILE.read_text(encoding="utf-8")
+    gate = gate_table().encode("utf-8")
+    assert (len(gate), hashlib.sha256(gate).hexdigest()) == (PARENT_GATE_BYTES, PARENT_GATE_SHA256)
+    for name, digest in PARENT_SOURCE_SHA256.items():
+        assert _segment_sha256(module, name) == digest, name
+    for name, digest in PARENT_LAUNCHER_SHA256.items():
+        assert _segment_sha256(launcher, name) == digest, name
+    assert hashlib.sha256(json.dumps([list(item) for item in NFT_ERRORS]).encode()).hexdigest() == PARENT_NFT_ERRORS_SHA256
+    # The fixture runs exactly: fresh listing, one check of the gate, the unchanged install, the readback.
+    init = next(node for node in ast.parse(module).body if isinstance(node, ast.ClassDef) and node.name == "Fixture").body[0]
+    assert init.name == "__init__"
+    runs = [ast.unparse(call) for call in sorted(_calls(init, "_run_in"), key=lambda call: (call.lineno, call.col_offset))]
+    assert runs == ["_run_in(self.l_fd, [AUTHORITY.NFT_PATH, 'list', 'ruleset'])",
+                    "_run_in(self.l_fd, [AUTHORITY.NFT_PATH, '-c', '-f', '-'], gate_table())",
+                    "_run_in(self.l_fd, [AUTHORITY.NFT_PATH, '-f', '-'], gate_table())",
+                    "_run_in(self.l_fd, [AUTHORITY.NFT_PATH, '-j', 'list', 'table', 'inet', AUTHORITY.TABLE])"], runs
+    every = [ast.unparse(call) for call in _calls(ast.parse(module), "_run_in")]
+    assert sum("'-c'" in text for text in every) == 1 and sum("'-f'" in text for text in every) == 2
+    assert READBACK_COMMAND == " ".join(["list", "table", "inet", AUTHORITY.TABLE])
+    # The check is alone inside a try whose handler only records the failure; the install is outside it.
+    tries = [node for node in ast.walk(init) if isinstance(node, ast.Try) and _calls(node, "_run_in")]
+    check_try = [node for node in tries if len(_calls(node, "_run_in")) == 1]
+    assert len(check_try) == 1 and [ast.unparse(call) for call in _calls(check_try[0], "_run_in")] == [runs[1]]
+    handler = check_try[0].handlers[0]
+    assert ast.unparse(handler.type) == "Exception" and ast.unparse(handler.body) == "check_failure = error"
+    init_text = ast.get_source_segment(module, init)
+    assert "self.facts[\"install\"] = install_error_token(installed.returncode, installed.stderr)\n" in init_text
+    assert init_text.index('"-c", "-f", "-"]') < init_text.index('installed = _run_in(self.l_fd, [AUTHORITY.NFT_PATH, "-f", "-"]')
+    assert ("self.facts[\"diagnostics\"] = installation_diagnostics(gate_table(), checked, check_failure, installed, readback)"
+            in init_text)
+    # The required inventory: the dynamic cases and their records are exactly the parent's.
+    assert tuple(name for name in LAUNCHER.REQUIRED_CASES if not name.startswith("test_static_")) == DYNAMIC_CASES
+    assert [item[0] for item in LAUNCHER.RECORD_CASES.values()] == list(DYNAMIC_CASES)
+    assert LAUNCHER.ARTIFACT_FILES == ("summary.json", "cases.jsonl", "versions.txt", "cleanup.json", "report.txt")
+
+
+def _diag_record(diagnostics: dict, case: str = "k1") -> dict:
+    """A K-record carrying the fixture's facts plus the diagnostic fields, as ``record`` would write it."""
+    ints = {"namespaces_distinct": 1, "fresh_ruleset_empty": 1, "peer_link_in_r": 1, "outer_links_after_wire": 1,
+            "ipv6_wired": 1, "baseline_kinds": 7, "baseline_reachable": 7, "baseline_ipv6_reachable": 1, **diagnostics["ints"]}
+    tokens = {"install": "other", "readback_sha256": hashlib.sha256(b"").hexdigest(), **diagnostics["tokens"]}
+    return {"case": case, "verdict": "fail", "control": LAUNCHER.RECORD_CASES[case][1], "ints": ints, "tokens": tokens}
+
+
+def test_static_installation_diagnostics_are_closed_and_carry_no_raw_text():
+    gate = gate_table()
+    done = subprocess.CompletedProcess
+
+    def located(line: int, first: int, message: str, name: str = "/dev/stdin") -> str:
+        return f"{name}:{line}:{first}-{first + 3}: Error: {message}\n    some echoed line\n    ^^^^\n"
+
+    # nft 1.0.9's own forms (src/erec.c, src/libnftables.c, src/cmd.c, src/evaluate.c, src/cache.c).
+    cases = {
+        located(7, 30, "syntax error, unexpected map, expecting end of file or newline or semicolon"): ("parser_syntax", 7, 30),
+        located(8, 5, "datatype mismatch, expected concatenation of (IPv4 address, IPv4 address, packet mark), "
+                      "expression has type IPv4 address"): ("parser_datatype", 8, 5),
+        located(8, 5, "datatype mismatch: expected mark, expression has type integer"): ("parser_datatype", 8, 5),
+        located(7, 5, "Use concatenations with sets and maps, not singleton values"): ("parser_other", 7, 5),
+        located(8, 5, "Could not process rule: Invalid argument"): ("netlink_einval", 8, 5),
+        located(7, 5, "Could not process rule: Operation not supported"): ("netlink_eopnotsupp", 7, 5),
+        located(4, 9, CHAIN_EOPNOTSUPP): ("netlink_eopnotsupp", 4, 9),
+        located(1, 1, "Could not process rule: Operation not permitted"): ("permission", 1, 1),
+        "netlink: Error: cache initialization failed: Operation not permitted\n": ("permission", 0, 0),
+        "netlink: Error: cache initialization failed: Permission denied\n": ("permission", 0, 0),
+        "Error: Could not process rule: Invalid argument\n": ("netlink_einval", 0, 0),
+        # Kernel/system errors that are neither of the two named errnos stay unknown, never parser_*.
+        located(8, 5, "Could not process rule: No buffer space available"): ("unknown", 8, 5),
+        located(8, 5, "Could not process rule: Message too long"): ("unknown", 8, 5),
+        located(7, 43, "No such file or directory; did you mean table ‘x’ in family inet?"): ("unknown", 7, 43),
+        located(2, 3, "Numerical result out of range"): ("unknown", 2, 3),
+        "netlink: Error: cache initialization failed: No such file or directory\n": ("unknown", 0, 0),
+        "netlink: Error: Unknown data type in set key 7\n": ("unknown", 0, 0),
+        "netlink: Error: Cannot parse userdata\n": ("unknown", 0, 0),
+        "": ("unknown", 0, 0), "Segmentation fault\n": ("unknown", 0, 0), "Warning: something\n": ("unknown", 0, 0),
+        # Locators: only the expected name, inside the gate text, ever counts; the class survives without it.
+        located(99, 5, "syntax error, unexpected x"): ("parser_syntax", 0, 0),
+        located(7, 400, "syntax error, unexpected x"): ("parser_syntax", 0, 0),
+        located(0, 5, "syntax error, unexpected x"): ("parser_syntax", 0, 0),
+        located(7, 5, "syntax error, unexpected x", "<cmdline>"): ("parser_syntax", 0, 0),
+        located(7, 5, "Use concatenations with sets and maps, not singleton values", "<cmdline>"): ("unknown", 0, 0),
+        "/tmp/evil:7:30-33: Error: syntax error\n": ("unknown", 0, 0),
+        "/dev/stdin:1234567:1-2: Error: syntax error\n": ("unknown", 0, 0),
+        "/dev/stdin:7:5: Error: syntax error\n": ("unknown", 0, 0),
+        "/dev/stdin:7:5-9: Error: syntax error\r\n": ("parser_syntax", 7, 5),
+        " Error: syntax error\n": ("unknown", 0, 0),
+        "x" * (DIAG_SCAN_CHARS + 10) + "\n" + located(7, 5, "syntax error"): ("unknown", 0, 0),
+        "\n" * (DIAG_SCAN_CHARS + 10) + located(7, 5, "syntax error"): ("unknown", 0, 0),
+    }
+    for stderr, expected in cases.items():
+        assert nft_error_class(stderr, "/dev/stdin", gate) == expected, (stderr[:120], expected)
+    assert nft_error_class("<cmdline>:1:6-10: Error: syntax error, unexpected x\n", "<cmdline>", READBACK_COMMAND) == (
+        "parser_syntax", 1, 6)
+    assert nft_error_class("<cmdline>:2:1-2: Error: syntax error\n", "<cmdline>", READBACK_COMMAND) == ("parser_syntax", 0, 0)
+
+    # Process outcomes: a negative return code stays a signal; nothing becomes a normal exit by default.
+    def diag(returncode, stderr="", failure=None):
+        completed = None if returncode == "absent" else done(["nft"], returncode, "", stderr)
+        fields = phase_diagnostic(completed, failure, "/dev/stdin", gate)
+        return fields["status"], fields["exit"], fields["signal"], fields["class"], fields["line"], fields["column"]
+
+    syntax = located(7, 30, "syntax error, unexpected map")
+    assert diag(0) == ("exit", 0, 0, "accepted", 0, 0)
+    assert diag(0, syntax) == ("exit", 0, 0, "accepted", 0, 0)
+    assert diag(1, syntax) == ("exit", 1, 0, "parser_syntax", 7, 30)
+    assert diag(255) == ("exit", 255, 0, "unknown", 0, 0)
+    assert diag(256) == ("invalid", -1, 0, "unknown", 0, 0)
+    assert diag(-9, syntax) == ("signal", -1, 9, "unknown", 0, 0)
+    assert diag(-1) == ("signal", -1, 1, "unknown", 0, 0)
+    assert diag(-64) == ("signal", -1, 64, "unknown", 0, 0)
+    assert diag(-65) == ("invalid", -1, 0, "unknown", 0, 0)
+    assert diag(None) == ("missing", -1, 0, "unknown", 0, 0) and diag("absent") == diag(None)
+    assert diag(True) == ("missing", -1, 0, "unknown", 0, 0) and diag(1.0) == diag(None)
+    assert diag("absent", failure=subprocess.TimeoutExpired(["nft"], 30)) == ("timeout", -1, 0, "timeout", 0, 0)
+    assert diag("absent", failure=FileNotFoundError(2, "No such file", "/usr/sbin/nft")) == ("missing", -1, 0, "tool_missing", 0, 0)
+    assert diag("absent", failure=PermissionError(13, "denied")) == ("missing", -1, 0, "permission", 0, 0)
+    assert diag("absent", failure=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")) == ("missing", -1, 0, "unknown", 0, 0)
+    assert diag(0, failure=RuntimeError("/root/x 203.0.113.11")) == ("missing", -1, 0, "unknown", 0, 0)
+    assert phase_diagnostic(done(["nft"], 1, "", b"bytes"), None, "/dev/stdin", gate)["stderr_sha256"] == hashlib.sha256(b"").hexdigest()
+    assert phase_diagnostic(done(["nft"], 1, "", syntax), None, "/dev/stdin", gate)["stderr_sha256"] == hashlib.sha256(
+        syntax.encode()).hexdigest()
+
+    # Whole records: hostile stderr reaches only its hash; each record stays inside the closed grammar.
+    hostile = ("/dev/stdin:8:5-9: Error: Could not process rule: Invalid argument\n"
+               "    ip saddr . 192.0.2.1 . meta mark @prepared ip daddr { 203.0.113.11, 203.0.113.12 }\n"
+               "/etc/shadow /proc/self/ns/net net:[4026531840] fd48:4b31::20 ghp_" + "A" * 36 + " AKIA" + "B" * 16
+               + " password=hunter2 ‮\u0000\udcff " + "z" * 100000 + "\n")
+    secrets_found = ("/etc/shadow", "4026531840", "fd48:4b31", "ghp_", "AKIA", "hunter2", "203.0.113", "192.0.2.1", "prepared",
+                     "‮", "zzzz", "Invalid argument", "/dev/stdin")
+    readback_missing = done(["nft"], 1, "", "Error: No such file or directory\nlist table inet " + AUTHORITY.TABLE + "\n")
+    variants = {
+        "install_rejected": (done(["nft"], 0, "", ""), None, done(["nft"], 1, "", hostile), readback_missing),
+        "check_rejected": (done(["nft"], 1, "", hostile), None, done(["nft"], 1, "", hostile), readback_missing),
+        "check_timeout": (None, subprocess.TimeoutExpired(["nft"], 30), done(["nft"], -9, "", hostile), readback_missing),
+        "check_missing": (None, FileNotFoundError(2, "x", "/usr/sbin/nft"), done(["nft"], 0, "", ""), done(["nft"], 0, "{}", "")),
+        "all_accepted": (done(["nft"], 0, "", ""), None, done(["nft"], 0, "", ""), done(["nft"], 0, "{}", "")),
+    }
+    phases = {}
+    for name, (check, failure, installed, readback) in variants.items():
+        diagnostics = installation_diagnostics(gate, check, failure, installed, readback)
+        assert diagnostics["tokens"]["gate_input_sha256"] == PARENT_GATE_SHA256
+        entry = _diag_record(diagnostics)
+        clean = LAUNCHER.sanitize_record(entry)
+        assert clean is not None, name
+        text = json.dumps(clean, ensure_ascii=False)
+        assert len(text) <= 8192 and not [item for item in secrets_found if item in text], name
+        assert set(diagnostics["tokens"]) == set(LAUNCHER.DIAG_TOKEN_KEYS) and set(diagnostics["ints"]) == set(LAUNCHER.DIAG_INT_KEYS)
+        phases[name] = (diagnostics["tokens"]["install_phase"], *(diagnostics["tokens"][f"{phase}_class"] for phase in LAUNCHER.DIAG_PHASES))
+    assert phases == {"install_rejected": ("install", "accepted", "netlink_einval", "unknown"),
+                      "check_rejected": ("check", "netlink_einval", "netlink_einval", "unknown"),
+                      "check_timeout": ("check", "timeout", "unknown", "unknown"),
+                      "check_missing": ("check", "tool_missing", "accepted", "accepted"),
+                      "all_accepted": ("none", "accepted", "accepted", "accepted")}
+    # The largest record any K case writes stays inside the per-record limits.
+    good = _diag_record(installation_diagnostics(gate, *variants["install_rejected"]))
+    worst_ints = {**good["ints"], **{f"x{index}": 10 ** 12 for index in range(64 - len(good["ints"]))}}
+    worst_tokens = {**good["tokens"], **{f"rb_{index}": "z" * 80 for index in range(10)}, "late_activation": "z" * 80,
+                    "error": "z" * 80}
+    assert len(good["ints"]) + 14 <= 64 and len(worst_tokens) <= 32  # K5 adds 14 case ints; K4 adds two tokens
+    worst = {**good, "case": "k4", "control": "negative", "ints": worst_ints, "tokens": worst_tokens}
+    assert LAUNCHER.sanitize_record(worst) is not None and len(json.dumps(worst)) <= 8192
+    # Records from a fixture that never reached the gate (no diagnostic field at all) remain valid.
+    assert LAUNCHER.sanitize_record({**good, "ints": {}, "tokens": {"install": "not_reached", "error": "runtimeerror"}}) is not None
+
+    def drop(change) -> None:
+        entry = json.loads(json.dumps(good))
+        change(entry["ints"], entry["tokens"])
+        assert LAUNCHER.sanitize_record(entry) is None, json.dumps(entry, sort_keys=True)
+
+    hex64 = "ab" * 32
+    for change in (
+            lambda i, t: t.update(install_class="Parser_syntax"), lambda i, t: t.update(install_class="kernel_rejected"),
+            lambda i, t: t.update(install_class="203.0.113.11"), lambda i, t: t.update(check_status="exited"),
+            lambda i, t: t.update(readback_class="other"), lambda i, t: i.update(install_exit=256),
+            lambda i, t: i.update(install_exit=-2), lambda i, t: i.update(install_exit=0),
+            lambda i, t: i.update(install_signal=9), lambda i, t: i.update(install_column=0),
+            lambda i, t: i.update(check_line=1, check_column=1),
+            lambda i, t: i.update(install_line=65, install_column=1), lambda i, t: i.update(install_column=513),
+            lambda i, t: i.update(install_line=0), lambda i, t: i.update(check_exit=1),
+            lambda i, t: t.update(install_stderr_sha256=hex64.upper()), lambda i, t: t.update(install_stderr_sha256=hex64[:63]),
+            lambda i, t: t.update(install_stderr_sha256="invalid_argument"), lambda i, t: t.update(gate_input_sha256="192.0.2.1"),
+            lambda i, t: t.update(install_phase="check"), lambda i, t: t.update(install_phase="none"),
+            lambda i, t: t.pop("readback_status"), lambda i, t: i.pop("check_signal"),
+            lambda i, t: i.update(check_class=1), lambda i, t: t.update(check_exit="0"),
+            lambda i, t: t.update(install_status="signal"), lambda i, t: (i.update(install_exit=-1), t.update(install_status="signal")),
+            lambda i, t: (i.update(install_exit=-1, install_signal=65), t.update(install_status="signal", install_class="unknown")),
+            lambda i, t: (i.update(install_exit=-1, install_signal=9), t.update(install_status="signal")),
+            lambda i, t: (i.update(install_exit=-1), t.update(install_status="timeout")),
+            lambda i, t: (i.update(install_exit=-1, install_line=0, install_column=0), t.update(install_status="missing",
+                                                                                                install_class="accepted")),
+            lambda i, t: (i.update(install_exit=-1, install_line=0, install_column=0), t.update(install_status="invalid",
+                                                                                                install_class="timeout")),
+            lambda i, t: t.update(check_class="tool_missing"), lambda i, t: t.update(check_status="timeout", check_class="timeout"),
+    ):
+        drop(change)
+    # The same fields with consistent signal/timeout/missing values are accepted.
+    for change in (lambda i, t: (i.update(install_exit=-1, install_signal=9, install_line=0, install_column=0),
+                                 t.update(install_status="signal", install_class="unknown")),
+                   lambda i, t: (i.update(install_exit=-1, install_line=0, install_column=0),
+                                 t.update(install_status="timeout", install_class="timeout")),
+                   lambda i, t: (i.update(install_exit=-1, install_line=0, install_column=0),
+                                 t.update(install_status="missing", install_class="tool_missing"))):
+        entry = json.loads(json.dumps(good))
+        change(entry["ints"], entry["tokens"])
+        assert LAUNCHER.sanitize_record(entry) is not None, change
+
+
 def test_static_doc_names_every_case_and_the_limits():
     doc = DOC.read_text(encoding="utf-8")
     for case in LAUNCHER.RECORD_CASES:
@@ -1044,6 +1389,12 @@ class Fixture:
             self._wire()
             self.peer = Peer(self.r_fd, ipv6=bool(self.facts["ipv6_wired"])).start()
             self.facts.update(self._baseline())
+            # H2K1D1: one non-mutating check of the same input first; its outcome never gates the install.
+            checked, check_failure = None, None
+            try:
+                checked = _run_in(self.l_fd, [AUTHORITY.NFT_PATH, "-c", "-f", "-"], gate_table())
+            except Exception as error:  # noqa: BLE001 - a closed status only
+                check_failure = error
             installed = _run_in(self.l_fd, [AUTHORITY.NFT_PATH, "-f", "-"], gate_table())
             self.facts["install"] = install_error_token(installed.returncode, installed.stderr)
             readback = _run_in(self.l_fd, [AUTHORITY.NFT_PATH, "-j", "list", "table", "inet", AUTHORITY.TABLE])
@@ -1053,6 +1404,7 @@ class Fixture:
                 document = None
             self.facts["readback_ok"], self.facts["readback"] = readback_shape(document)
             self.facts["readback_sha256"] = hashlib.sha256(readback.stdout.encode()).hexdigest()
+            self.facts["diagnostics"] = installation_diagnostics(gate_table(), checked, check_failure, installed, readback)
         except BaseException:
             self.close()
             raise
@@ -1191,12 +1543,15 @@ class Fixture:
                 and self.facts.get("fresh_ruleset_empty") == 1 and self.facts.get("namespaces_distinct") == 1)
 
     def facts_ints(self) -> dict:
-        return {key: value for key, value in self.facts.items() if type(value) is int}
+        ints = {key: value for key, value in self.facts.items() if type(value) is int}
+        ints.update((self.facts.get("diagnostics") or {}).get("ints", {}))
+        return ints
 
     def facts_tokens(self) -> dict:
         tokens = {"install": self.facts.get("install", "not_reached"),
                   "readback_sha256": self.facts.get("readback_sha256", "none")}
         tokens.update({f"rb_{key}": value for key, value in (self.facts.get("readback") or {}).items()})
+        tokens.update((self.facts.get("diagnostics") or {}).get("tokens", {}))
         return tokens
 
     def close(self) -> None:
