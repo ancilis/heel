@@ -28,7 +28,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 DOWNLOADS = ROOT / "apps/heel-cloud/public/downloads"
 CONTRACT = ROOT / "release/open-core-v1.json"
-VERSION = "1.3.0rc1"
+VERSION = "1.3.0rc2"
 WHEEL = f"heel_sim-{VERSION}-py3-none-any.whl"
 SDIST = f"heel_sim-{VERSION}.tar.gz"
 MANIFEST = "heel-open-core-manifest.json"
@@ -257,7 +257,7 @@ print(json.dumps({
 
 
 class SourceFreeRunnerExtraInstallTests(unittest.TestCase):
-    def test_candidate_runner_extra_installs_and_runs_both_synthetic_outcomes(self):
+    def test_candidate_runner_extra_installs_and_runs_the_synthetic_outcomes(self):
         self.assertGreaterEqual(sys.version_info[:2], (3, 11))
         with tempfile.TemporaryDirectory(prefix="heel-preview-install-") as temporary:
             temporary_path = Path(temporary).resolve()
@@ -312,21 +312,30 @@ class SourceFreeRunnerExtraInstallTests(unittest.TestCase):
             self.assertEqual(evidence["result"], "verified_violation")
             self.assertIn("heel.runner.identity", evidence["imported_modules"])
 
-            # The documented public CLI journey: human scope, then both synthetic outcomes.
+            # The documented public CLI journey: human scope, then the synthetic outcomes. The
+            # installed wheel, not the checkout, must report the 200 and 403 error envelopes
+            # undecided, and the non-error public read as the passing control.
             heel = str(env.venv / "bin/heel")
             scope = json.loads(env.require(env.run(
                 heel, "scope", "create", "--target", "reference:export",
                 "--operator", "synthetic packaging test", "--confirm",
             )))["created_scope"]
             outcomes = {}
-            for case, attempt in (("vulnerable", "1" * 32), ("hardened", "2" * 32)):
+            for case, attempt in (
+                ("vulnerable", "1" * 32), ("hardened", "2" * 32), ("error_envelope", "5" * 32),
+                ("public", "6" * 32),
+            ):
                 outcomes[case] = json.loads(env.require(env.run(
                     heel, "reference", "run", "--scope", scope, "--case", case, "--attempt", attempt,
                 )))
             self.assertEqual(outcomes["vulnerable"]["result"], "verified_violation")
             self.assertFalse(outcomes["vulnerable"]["regression_passed"])
-            self.assertEqual(outcomes["hardened"]["result"], "invariant_held")
-            self.assertTrue(outcomes["hardened"]["regression_passed"])
+            for case in ("hardened", "error_envelope"):
+                self.assertEqual(outcomes[case]["result"], "inconclusive")
+                self.assertEqual(outcomes[case]["evidence_state"], "unknown")
+                self.assertIs(outcomes[case]["regression_passed"], False)
+            self.assertEqual(outcomes["public"]["result"], "invariant_held")
+            self.assertTrue(outcomes["public"]["regression_passed"])
             for report in outcomes.values():
                 self.assertEqual(report["execution_support"], "reference_only")
                 self.assertEqual(report["provenance"]["kind"], "reference_product_execution")

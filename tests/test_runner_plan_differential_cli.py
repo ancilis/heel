@@ -35,6 +35,10 @@ from plan_differential_support import (
 ROOT = Path(__file__).resolve().parents[1]
 REJECTED = "Heel runner command was rejected.\n"
 EXPORT = ("GET", "/api/export")
+# A structured lower-plan denial: an empty JSON object, without an error or message envelope.
+EMPTY_DENIAL: dict = {}
+# A message-only lower-plan body: undecidable by its shape, never a passing control.
+MESSAGE_ONLY_DENIAL = {"message": "export requires the pro plan"}
 
 
 def finding_for(result: dict, route: tuple[str, str] = EXPORT) -> dict:
@@ -65,6 +69,57 @@ def regress(world: World, *, target: str | None = None, scope: str | None = None
 
 def inventory_file(world: World) -> Path:
     return Path(world.journey.bootstrap["inventory"]["path"])
+
+
+def assert_unstored_with_evidence(
+    world: World, result: dict, reason: str, route: tuple[str, str] = EXPORT,
+) -> None:
+    """An undecided pair stores no finding, yet keeps its report, raw-evidence references
+    and containment entry."""
+    pair = pairs_by_route(result)[route]
+    assert (pair["verdict"], pair["reason"], pair["finding_id"]) == ("inconclusive", reason, None)
+    assert pair["execution_disposition"] == "completed"
+    assert all(
+        (item["method"], item["route_template"]) != route for item in result["findings"]
+    )
+    assert all(
+        item["affordance_id"] != " ".join(route)
+        for item in world.journey.findings(result["run_id"])
+    )
+    # Every stored finding of the run is a completed verified or observed finding.
+    assert all(
+        item["evidence_state"] in {"verified", "observed"} for item in result["findings"]
+    )
+    assert all(
+        item["reproduction"]["evidence_state"] in {"verified", "observed"}
+        for item in world.journey.findings(result["run_id"])
+    )
+    report = json.loads(Path(result["report_path"]).read_text())
+    (observed,) = [
+        item for item in report["observations"]
+        if (item["method"], item["route_template"]) == route
+    ]
+    assert [item["role"] for item in observed["observations"]] == ["lower_plan", "higher_plan"]
+    assert all(item["response_ref"] for item in observed["observations"])
+    # The raw responses stay in the private attempt store.
+    for item in observed["observations"]:
+        assert len(list(world.journey.home.rglob(item["response_ref"] + ".meta"))) == 1
+    assert report["uploaded"] is False
+    code, output, _ = invoke("log", "--run", result["run_id"])
+    log = json.loads(output)
+    assert code == 0 and log["chain_valid"] is True
+    logged = [
+        json.loads(entry["detail"]) for entry in log["entries"]
+        if entry["action"] == "plan_differential_pair"
+    ]
+    assert [
+        item["reason"] for item in logged
+        if (item["method"], item["route_template"]) == route
+    ] == [reason]
+    assert all(
+        json.loads(entry["detail"]).get("evidence_state") in {"verified", "observed"}
+        for entry in log["entries"] if entry["action"] == "finding"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -539,8 +594,14 @@ def test_r20_regression_replay_reuses_saved_predicate_order_scope_origin(tmp_pat
         assert log["chain_valid"] is True
         assert "regression_result" in [entry["action"] for entry in log["entries"]]
 
-        # Hardened target (403 for the lower plan): pass, blocked.
+        # Hardened target (a 403 error envelope for the lower plan): undecided, never a pass.
         world.target.behavior = "hardened"
+        (item,) = regress(world)
+        assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+        assert item["matches_expected"] is False and item["control_likely"] == "unknown"
+        assert journey.findings(item["run_id"]) == []
+        # An empty-object 403 denial for the lower plan: pass, blocked.
+        _override(world, monkeypatch, {("free", EXPORT[1]): _json_response(403, EMPTY_DENIAL)})
         (item,) = regress(world)
         assert (item["result"], item["current_status"]) == ("pass", "blocked")
         assert item["matches_expected"] is True and item["control_likely"] == "present"
@@ -571,7 +632,14 @@ def test_r20_regression_replay_reuses_saved_predicate_order_scope_origin(tmp_pat
         assert world.target.seen()[sent:] == [
             ("GET", "/exports/" + MARKER, "free"), ("GET", "/exports/" + MARKER, "pro"),
         ]
+        # A 403 error envelope without the marker is undecided; an empty-object 403 is held.
         world.target.behavior = "hardened"
+        (item,) = regress(world)
+        assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+        _override(
+            world, monkeypatch,
+            {("free", "/exports/" + MARKER): _json_response(403, EMPTY_DENIAL)},
+        )
         (item,) = regress(world)
         assert (item["result"], item["current_status"]) == ("pass", "blocked")
         sent = len(world.target.seen())
@@ -585,7 +653,10 @@ def test_r20_regression_replay_reuses_saved_predicate_order_scope_origin(tmp_pat
         code, result, error = world.journey.run()
         add_regression(world, result, "export-plan-gate")
         add_regression(world, result, "pricing-plan-gate", ("GET", "/api/pricing"))
-        world.target.behavior = "hardened"
+        _override(world, monkeypatch, {
+            ("free", path): _json_response(403, EMPTY_DENIAL)
+            for path in ("/api/export", "/api/pricing")
+        })
         sent = len(world.target.seen())
         results = regress(world)
         assert sorted((item["result"], item["current_status"]) for item in results) == [
@@ -662,13 +733,18 @@ def test_r24_denial_envelope_is_inconclusive_in_fresh_run_and_regression_replay(
             "inconclusive", "inconclusive", "lower_denial_envelope", False,
         )
         assert pair["execution_disposition"] == "completed"
-        assert finding["evidence_state"] == "inconclusive"
+        assert finding == {}
+        assert_unstored_with_evidence(world, journey.run()[1], "lower_denial_envelope")
         item = replay()
         assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
         assert item["matches_expected"] is False and item["run_id"].startswith("pdrun-")
-        (stored,) = journey.findings(item["run_id"])
-        assert stored["reproduction"]["evidence_state"] == "inconclusive"
-        assert stored["reproduction"]["reason"] == "lower_denial_envelope"
+        # The replay run records the undecided pair but stores no new finding.
+        assert journey.findings(item["run_id"]) == []
+        replayed = [
+            json.loads(entry["detail"]) for entry in journey.containment(item["run_id"])["entries"]
+            if entry["action"] == "plan_differential_pair"
+        ]
+        assert [entry["reason"] for entry in replayed] == ["lower_denial_envelope"]
 
         # 200 with fewer keys: the lower plan still received content.
         world.target.behavior = "subset"
@@ -676,12 +752,26 @@ def test_r24_denial_envelope_is_inconclusive_in_fresh_run_and_regression_replay(
         assert (pair["verdict"], pair["predicate"], pair["reason"], pair["candidate"]) == (
             "inconclusive", "status_parity", "lower_subset", True,
         )
-        assert finding["evidence_state"] == "inconclusive"
+        assert finding == {} and pair["finding_id"] is None
         item = replay()
         assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
 
-        # 403: an affirmative denial with the higher plan still succeeding.
+        # 403 {"error": "upgrade required"}: an error envelope at a denial status is undecided
+        # too, never held and never a pass.
         world.target.behavior = "hardened"
+        code, pair, finding = fresh()
+        assert (pair["verdict"], pair["predicate"], pair["reason"], pair["candidate"]) == (
+            "inconclusive", "inconclusive", "lower_denial_envelope", False,
+        )
+        assert finding == {} and pair["finding_id"] is None
+        assert_unstored_with_evidence(world, journey.run()[1], "lower_denial_envelope")
+        item = replay()
+        assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+        assert item["matches_expected"] is False and journey.findings(item["run_id"]) == []
+
+        # An empty-object 403: an affirmative denial with the higher plan still succeeding.
+        responses = {("free", EXPORT[1]): _json_response(403, EMPTY_DENIAL)}
+        _override(world, monkeypatch, responses)
         code, pair, finding = fresh()
         assert (pair["verdict"], pair["reason"], pair["finding_id"]) == ("held", "lower_denied", None)
         assert finding == {}
@@ -690,9 +780,508 @@ def test_r24_denial_envelope_is_inconclusive_in_fresh_run_and_regression_replay(
         assert item["matches_expected"] is True
 
         # And back: the same regression fails again on the vulnerable target.
+        responses.clear()
         world.target.behavior = "vulnerable"
         item = replay()
         assert (item["result"], item["current_status"]) == ("fail", "still_reachable")
+
+
+# --------------------------------------------------------------------------- #
+# Inconclusive pairs never become local findings
+# --------------------------------------------------------------------------- #
+def _json_response(status: int, value) -> tuple[int, dict[str, str], bytes]:
+    return status, {"Content-Type": "application/json"}, json.dumps(value).encode("utf-8")
+
+
+def _override(world: World, monkeypatch, responses: dict) -> None:
+    """Answer ``(plan, path)`` from ``responses``; every other request is the target's own."""
+    original = world.target.respond
+
+    def respond(method: str, path: str, token: str):
+        answer = responses.get((world.target.sessions.get(token), path))
+        return original(method, path, token) if answer is None else answer
+
+    # The listener looks `respond` up on the instance for every request.
+    monkeypatch.setattr(world.target, "respond", respond)
+
+
+def test_inconclusive_pairs_store_no_finding_and_keep_their_evidence(tmp_path, monkeypatch):
+    export_path = EXPORT[1]
+    marker_route = ("GET", "/exports/{id}")
+    marker_path = "/exports/" + MARKER
+    cases = [
+        # (name, marker world, route, overrides, reason)
+        ("higher_denied", False, EXPORT,
+         {("pro", export_path): _json_response(403, {"error": "upgrade required"})},
+         "no_positive_control"),
+        ("higher_error", False, EXPORT,
+         {("pro", export_path): _json_response(500, {"detail": "boom"})},
+         "no_positive_control"),
+        ("higher_2xx_envelope", False, EXPORT,
+         {("pro", export_path): _json_response(200, {"error": "upgrade required"})},
+         "no_positive_control"),
+        ("lower_error", False, EXPORT,
+         {("free", export_path): _json_response(500, {"detail": "boom"})},
+         "unexpected_status"),
+        ("higher_missing_marker", True, marker_route,
+         {("pro", marker_path): _json_response(200, {"rows": []})},
+         "positive_control_missing_marker"),
+        ("unknown_marker", True, marker_route,
+         {("free", marker_path): _json_response(200, {"rows": [1]})},
+         "marker_undetermined"),
+        ("other_marker", True, marker_route,
+         {("free", marker_path): _json_response(
+             200, {"protected_canary": "heel-canary-export-0009", "rows": [1]})},
+         "marker_undetermined"),
+        ("2xx_error_with_marker", True, marker_route,
+         {("free", marker_path): _json_response(
+             200, {"error": "upgrade required", "protected_canary": MARKER, "rows": []})},
+         "marker_undetermined"),
+    ]
+    for name, marker, route, overrides, reason in cases:
+        keywords = {"marker": MARKER} if marker else {}
+        with World(tmp_path / name, monkeypatch, **keywords) as world:
+            journey = world.journey
+            _override(world, monkeypatch, overrides)
+            code, result, error = journey.run()
+            assert error == "", name
+            pair = pairs_by_route(result)[route]
+            assert (pair["verdict"], pair["reason"]) == ("inconclusive", reason), name
+            assert_unstored_with_evidence(world, result, reason, route)
+            # Nothing undecided is stored, counted or exposed as a finding of the run.
+            assert [
+                item for item in journey.findings(result["run_id"])
+                if item["reproduction"]["evidence_state"] == "inconclusive"
+            ] == [], name
+            code, output, _ = invoke("findings", "--run", result["run_id"])
+            assert code == 0
+            listed = json.loads(output)["findings"]
+            assert len(listed) == len(result["findings"]), name
+            log = journey.containment(result["run_id"])
+            (complete,) = [
+                json.loads(entry["detail"]) for entry in log["entries"]
+                if entry["action"] == "run_complete"
+            ]
+            assert complete["findings"] == len(result["findings"]), name
+            assert complete["pairs"] == len(result["pairs"]), name
+            # A genuine finding elsewhere in the same run is still stored.
+            states = {item["route_template"]: item["evidence_state"] for item in result["findings"]}
+            if route == EXPORT:
+                assert "/api/export" not in states and states.get("/api/pricing") == "observed"
+            else:
+                assert "/exports/{id}" not in states and states["/api/export"] == "observed"
+
+
+# --------------------------------------------------------------------------- #
+# A status-only repair that leaves the paid payload in place never passes
+# --------------------------------------------------------------------------- #
+def test_status_only_repair_with_the_payload_is_never_a_regression_pass(tmp_path, monkeypatch):
+    from plan_differential_support import DENIAL_ENVELOPE, EXPORT as export_body
+
+    export_path = EXPORT[1]
+    with World(tmp_path, monkeypatch) as world:
+        journey = world.journey
+        # The initial 200 read with the same material payload is the observed finding.
+        code, result, error = journey.run()
+        assert (code, error) == (1, "")
+        finding = finding_for(result)
+        assert (finding["predicate"], finding["evidence_state"]) == ("body_superset", "observed")
+        regression = add_regression(world, result, "export-plan-gate")
+        assert regression["scenario_id"] == "plan_differential.body_superset"
+
+        responses: dict = {}
+        _override(world, monkeypatch, responses)
+
+        def fresh_and_replay(reason: str) -> dict:
+            code, result, error = journey.run()
+            assert error == ""
+            pair = pairs_by_route(result)[EXPORT]
+            assert (pair["verdict"], pair["predicate"], pair["reason"], pair["candidate"]) == (
+                "inconclusive", "inconclusive", reason, False,
+            )
+            assert_unstored_with_evidence(world, result, reason)
+            (item,) = regress(world)
+            assert item["run_id"].startswith("pdrun-")
+            assert item["scope_id"] == journey.scope_id and item["target"] == journey.origin
+            assert item["scenario_id"] == "plan_differential.body_superset"
+            assert journey.findings(item["run_id"]) == []
+            replayed = [
+                json.loads(entry["detail"]) for entry in journey.containment(item["run_id"])["entries"]
+                if entry["action"] == "plan_differential_pair"
+            ]
+            assert [entry["reason"] for entry in replayed] == [reason]
+            return item
+
+        # Only the lower status changes to 403 (and 401, 402, 404); the paid body stays.
+        for status in (403, 401, 402, 404):
+            responses[("free", export_path)] = _json_response(status, export_body)
+            item = fresh_and_replay("lower_denied_payload_present")
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive"), status
+            assert item["matches_expected"] is False and item["control_likely"] == "unknown"
+
+        # An error envelope that still carries the same paid fields cannot pass either.
+        responses[("free", export_path)] = _json_response(
+            403, {**DENIAL_ENVELOPE, **export_body},
+        )
+        item = fresh_and_replay("lower_denied_payload_present")
+        assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+
+        # A missing or invalid higher body control is never a pass for a body regression.
+        responses[("free", export_path)] = _json_response(403, DENIAL_ENVELOPE)
+        for higher in (
+            (200, {"Content-Type": "application/json"}, b""),
+            _json_response(200, {}),
+            _json_response(200, {"rows": [], "total": 0}),
+        ):
+            responses[("pro", export_path)] = higher
+            item = fresh_and_replay("higher_control_unassessable")
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+        # An opaque higher body is refused by the transport first: row 1, still no pass.
+        for higher in (
+            (200, {"Content-Type": "text/plain"}, b"plain text"), _json_response(200, [export_body]),
+        ):
+            responses[("pro", export_path)] = higher
+            code, result, error = journey.run()
+            pair = pairs_by_route(result)[EXPORT]
+            assert (pair["verdict"], pair["reason"], pair["finding_id"]) == (
+                "inconclusive", "transport:response_rejected", None,
+            )
+            (item,) = regress(world)
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+        del responses[("pro", export_path)]
+
+        # An unassessable lower body is not proof that the payload disappeared: one beyond
+        # the key-path bounds, or one the transport refuses before any predicate.
+        deep: dict = {"error": "upgrade required"}
+        for _ in range(plan_differential.MAX_KEY_PATH_DEPTH + 2):
+            deep = {"error": deep}
+        wide = {f"k{index}": index for index in range(plan_differential.MAX_KEY_PATH_NODES + 1)}
+        for lower in (deep, wide):
+            responses[("free", export_path)] = _json_response(403, lower)
+            item = fresh_and_replay("lower_denial_unassessable")
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+        responses[("free", export_path)] = (
+            403, {"Content-Type": "text/html"}, b"<html><body>Forbidden</body></html>",
+        )
+        code, result, error = journey.run()
+        assert pairs_by_route(result)[EXPORT]["reason"] == "transport:response_rejected"
+        (item,) = regress(world)
+        assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+
+        # An error envelope without the payload is undecided at a denial status too, and a
+        # message-only body cannot be assessed.
+        for lower, reason in (
+            (_json_response(403, DENIAL_ENVELOPE), "lower_denial_envelope"),
+            (_json_response(404, {"error": "not found"}), "lower_denial_envelope"),
+            (_json_response(403, MESSAGE_ONLY_DENIAL), "lower_denial_unassessable"),
+            (_json_response(404, {"message": "not found"}), "lower_denial_unassessable"),
+        ):
+            responses[("free", export_path)] = lower
+            item = fresh_and_replay(reason)
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+            assert item["matches_expected"] is False and item["control_likely"] == "unknown"
+
+        # A genuine empty or structured denial without the payload still passes against a
+        # valid higher control.
+        for lower in (
+            _json_response(403, EMPTY_DENIAL),
+            (403, {"Content-Type": "application/json"}, b""),
+            _json_response(404, {"account_id": "acct", "total": 0}),
+        ):
+            responses[("free", export_path)] = lower
+            code, result, error = journey.run()
+            pair = pairs_by_route(result)[EXPORT]
+            assert (pair["verdict"], pair["reason"], pair["finding_id"]) == (
+                "held", "lower_denied", None,
+            )
+            (item,) = regress(world)
+            assert (item["result"], item["current_status"]) == ("pass", "blocked")
+            assert item["matches_expected"] is True and item["control_likely"] == "present"
+
+        # And back: the same regression fails again when the payload is served at 200.
+        responses.clear()
+        (item,) = regress(world)
+        assert (item["result"], item["current_status"]) == ("fail", "still_reachable")
+
+
+def test_an_opaque_json_denial_body_is_never_a_regression_pass(tmp_path, monkeypatch):
+    from plan_differential_support import DENIAL_ENVELOPE, EXPORT as export_body
+
+    export_path = EXPORT[1]
+    with World(tmp_path, monkeypatch) as world:
+        journey = world.journey
+        code, result, error = journey.run()
+        assert (code, error) == (1, "")
+        finding = finding_for(result)
+        assert (finding["predicate"], finding["evidence_state"]) == ("body_superset", "observed")
+        add_regression(world, result, "export-plan-gate")
+        first_run = result["run_id"]
+        stored = {item["id"] for item in journey.findings(first_run)}
+
+        responses: dict = {}
+        _override(world, monkeypatch, responses)
+        # A non-empty JSON scalar or array is not a bounded object. The transport refuses it
+        # before any predicate (row 1), so it can never certify the repair; the evaluator's
+        # own refusal is pinned by the predicate tests.
+        opaque = [
+            b'""', b'"denied"', b"0", b"403", b"true", b"false", b"null", b"[]",
+            b'["denied"]', b'[{"error": "upgrade required"}]', json.dumps([export_body]).encode(),
+        ]
+        statuses = sorted(plan_differential._DENIAL_STATUSES)
+        for index, body in enumerate(opaque):
+            status = statuses[index % len(statuses)]
+            responses[("free", export_path)] = (status, {"Content-Type": "application/json"}, body)
+            code, result, error = journey.run()
+            assert error == "", body
+            pair = pairs_by_route(result)[EXPORT]
+            assert (pair["verdict"], pair["reason"], pair["finding_id"], pair["candidate"]) == (
+                "inconclusive", "transport:response_rejected", None, False,
+            ), body
+            assert all(item["route_template"] != export_path for item in result["findings"])
+            report = json.loads(Path(result["report_path"]).read_text())
+            assert report["uploaded"] is False
+            (item,) = regress(world)
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive"), body
+            assert item["matches_expected"] is False and item["control_likely"] == "unknown"
+            assert journey.findings(item["run_id"]) == []
+            code, output, _ = invoke("log", "--run", item["run_id"])
+            log = json.loads(output)
+            assert code == 0 and log["chain_valid"] is True
+            assert [
+                json.loads(entry["detail"])["reason"] for entry in log["entries"]
+                if entry["action"] == "plan_differential_pair"
+            ] == ["transport:response_rejected"], body
+        # No opaque denial added a finding to the original run.
+        assert {item["id"] for item in journey.findings(first_run)} == stored
+
+        # Zero body bytes and a bounded empty-object denial still pass against the valid
+        # control; a bounded error envelope or message-only body does not.
+        for lower in (
+            (403, {"Content-Type": "application/json"}, b""),
+            _json_response(403, EMPTY_DENIAL),
+        ):
+            responses[("free", export_path)] = lower
+            (item,) = regress(world)
+            assert (item["result"], item["current_status"]) == ("pass", "blocked")
+        for lower in (DENIAL_ENVELOPE, MESSAGE_ONLY_DENIAL):
+            responses[("free", export_path)] = _json_response(403, lower)
+            (item,) = regress(world)
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+        # And the 200 observation is still reachable.
+        responses.clear()
+        (item,) = regress(world)
+        assert (item["result"], item["current_status"]) == ("fail", "still_reachable")
+
+
+def test_an_error_envelope_is_never_a_finding_or_a_regression_pass_at_any_status(tmp_path, monkeypatch):
+    from heel.runner.content_assertion import is_ambiguous_message
+    from plan_differential_support import EXPORT as export_body
+
+    envelopes = [
+        {"error": "upgrade required"}, {"errors": ["plan"]}, {"ok": False, "message": "no"},
+        {"forbidden": True}, {"status": "PaymentRequired"}, {"data": {"error": "license required"}},
+        # Message-only bodies are undecidable by shape, whatever they say.
+        MESSAGE_ONLY_DENIAL, {"message": "upgrade required"}, {"message": "not found"},
+        {"Message": "hello"},
+    ]
+    statuses = (200, 201, 401, 402, 403, 404, 500)
+    for marker in (False, True):
+        keywords = {"marker": MARKER} if marker else {}
+        route = ("GET", "/exports/{id}") if marker else EXPORT
+        path = "/exports/" + MARKER if marker else EXPORT[1]
+        # The paid content the lower plan received in the clean initial finding.
+        paid = {"protected_canary": MARKER, "rows": []} if marker else export_body
+        with World(tmp_path / ("marker" if marker else "body"), monkeypatch, **keywords) as world:
+            journey = world.journey
+            code, result, error = journey.run()
+            assert (code, error) == (1, "")
+            assert finding_for(result, route)["evidence_state"] == ("verified" if marker else "observed")
+            add_regression(world, result, "export-plan-gate", route)
+            first_run = result["run_id"]
+            stored = {item["id"] for item in journey.findings(first_run)}
+
+            responses: dict = {}
+            _override(world, monkeypatch, responses)
+            lowers = [
+                (statuses[index % len(statuses)], body)
+                for index, body in enumerate(
+                    [*envelopes, *(
+                        # A message-only body may carry only the exact canary field beside it.
+                        {**envelope, "protected_canary": MARKER} if is_ambiguous_message(envelope)
+                        else {**envelope, **paid}
+                        for envelope in envelopes
+                    )]
+                )
+            ]
+            # The adjudicated counterexample: identical error + paid bytes at 200 and 403.
+            lowers += [(200, {"error": "forbidden", **paid}), (403, {"error": "forbidden", **paid})]
+            for status, body in lowers:
+                responses[("free", path)] = _json_response(status, body)
+                code, result, error = journey.run()
+                assert error == "", (status, body)
+                pair = pairs_by_route(result)[route]
+                # A 2xx message-only body without the paid fields keeps the existing row 8
+                # (status parity candidate), like any lower 2xx body lacking them.
+                row8 = pair["reason"] == "lower_subset"
+                assert (pair["verdict"], pair["predicate"], pair["finding_id"], pair["candidate"]) == (
+                    "inconclusive", "status_parity" if row8 else "inconclusive", None, row8,
+                ), (status, body, pair)
+                assert not row8 or (not marker and 200 <= status <= 299), (status, body, pair)
+                assert pair["reason"] in (
+                    {"marker_undetermined"} if marker else
+                    {"lower_denial_envelope", "lower_denied_payload_present",
+                     "lower_denial_unassessable", "unexpected_status", "lower_subset"}
+                ), (status, body, pair)
+                assert_unstored_with_evidence(world, result, pair["reason"], route)
+                code, output, _ = invoke("findings", "--run", result["run_id"])
+                assert code == 0 and len(json.loads(output)["findings"]) == len(result["findings"])
+                (item,) = regress(world)
+                assert (item["result"], item["current_status"]) == ("fail", "inconclusive"), (
+                    status, body,
+                )
+                assert item["matches_expected"] is False and item["control_likely"] == "unknown"
+                assert journey.findings(item["run_id"]) == []
+                assert [
+                    json.loads(entry["detail"])["reason"]
+                    for entry in journey.containment(item["run_id"])["entries"]
+                    if entry["action"] == "plan_differential_pair"
+                ] == [pair["reason"]], (status, body)
+            # No error envelope added or removed a finding of the original run or a regression.
+            assert {item["id"] for item in journey.findings(first_run)} == stored
+            code, output, _ = invoke("regress", "list")
+            assert code == 0 and len(json.loads(output)["regressions"]) == 1
+
+            # An empty-object denial still passes against the valid control, and the paid read
+            # at 200 still fails the same regression.
+            responses[("free", path)] = _json_response(403, EMPTY_DENIAL)
+            (item,) = regress(world)
+            assert (item["result"], item["current_status"]) == ("pass", "blocked")
+            assert item["matches_expected"] is True and item["control_likely"] == "present"
+            responses.clear()
+            (item,) = regress(world)
+            assert (item["result"], item["current_status"]) == ("fail", "still_reachable")
+
+
+# --------------------------------------------------------------------------- #
+# Records stored by earlier runs: readable, never a new regression, still undecided
+# --------------------------------------------------------------------------- #
+def _legacy_inconclusive_copy(world: World, source: dict, predicate: str, reason: str) -> dict:
+    """Store, as an earlier version did, an undecided pair as a finding (test-only surgery)."""
+    vector = json.loads(json.dumps(source))
+    vector["id"] = "pdv-legacy" + predicate[:2]
+    vector["scenario_id"] = "plan_differential." + predicate
+    vector["plausible"] = False
+    reproduction = vector["reproduction"]
+    reproduction.update({
+        "evidence_state": "inconclusive", "predicate": predicate, "reason": reason,
+        "candidate": predicate == "status_parity",
+    })
+    reproduction["observed"]["predicate"] = predicate
+    connection = sqlite3.connect(world.journey.home / "heel.db")
+    try:
+        (run_id,) = connection.execute(
+            "SELECT run_id FROM findings WHERE vector_id = ?", (source["id"],),
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO findings VALUES (?,?,?,?,?,?)",
+            (run_id, vector["id"], vector["category"], 0.1, 0, json.dumps(vector)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return vector
+
+
+def test_legacy_inconclusive_records_are_readable_rejected_and_replay_undecided(tmp_path, monkeypatch):
+    from heel.store import Store
+
+    with World(tmp_path, monkeypatch) as world:
+        journey = world.journey
+        code, result, error = journey.run()
+        assert (code, error) == (1, "")
+        (observed,) = [
+            item for item in journey.findings(result["run_id"])
+            if item["affordance_id"] == " ".join(EXPORT)
+        ]
+        assert observed["reproduction"]["evidence_state"] == "observed"
+        legacy = {
+            "status_parity": _legacy_inconclusive_copy(world, observed, "status_parity", "lower_subset"),
+            "inconclusive": _legacy_inconclusive_copy(
+                world, observed, "inconclusive", "lower_denial_envelope",
+            ),
+        }
+        before = {item["id"] for item in journey.findings(result["run_id"])}
+
+        # Readable as before, but neither can become a new regression; nothing is deleted.
+        for predicate, vector in legacy.items():
+            assert vector["id"] in before
+            code, output, _ = invoke(
+                "regress", "add", "--run", result["run_id"], "--vector", vector["id"],
+                "--name", "legacy-" + predicate,
+            )
+            assert code == 1
+            assert output == (
+                "REJECTED: an inconclusive plan-differential result cannot become a regression\n"
+            )
+        code, output, _ = invoke("regress", "list")
+        assert code == 0 and json.loads(output)["regressions"] == []
+        assert {item["id"] for item in journey.findings(result["run_id"])} == before
+        # The observed runtime finding of the same run is still admitted.
+        admitted = add_regression(world, result, "export-plan-gate")
+        assert admitted["original_vector_id"] == observed["id"]
+
+        def only_regression(regression: dict) -> None:
+            # Ephemeral credentials serve one replay per process: keep one stored regression.
+            store = Store(str(journey.home / "heel.db"))
+            try:
+                store.conn.execute("DELETE FROM regressions")
+                store.conn.commit()
+                store.add_regression(regression)
+            finally:
+                store.close()
+
+        denial: dict = {}
+        _override(world, monkeypatch, denial)
+
+        def replay(behavior: str) -> tuple[str, str]:
+            denial.clear()
+            if behavior == "empty_denial":
+                denial[("free", EXPORT[1])] = _json_response(403, EMPTY_DENIAL)
+                behavior = "vulnerable"
+            elif behavior == "message_only":
+                denial[("free", EXPORT[1])] = _json_response(403, MESSAGE_ONLY_DENIAL)
+                behavior = "vulnerable"
+            world.target.behavior = behavior
+            (item,) = regress(world)
+            return item["result"], item["current_status"]
+
+        # A regression an earlier version saved from each record still replays. Status
+        # parity alone, a lower denial envelope at any status, or a hollow lower body never
+        # passes and is never still_reachable; only a pair that is itself a finding still
+        # holds, and only an empty or structured denial passes.
+        expected = {
+            "status_parity": {
+                "subset": ("fail", "inconclusive"), "envelope": ("fail", "inconclusive"),
+                "vulnerable": ("fail", "still_reachable"), "hardened": ("fail", "inconclusive"),
+                "empty_denial": ("pass", "blocked"), "message_only": ("fail", "inconclusive"),
+            },
+            "inconclusive": {
+                "subset": ("fail", "inconclusive"), "envelope": ("fail", "inconclusive"),
+                "vulnerable": ("fail", "inconclusive"), "hardened": ("fail", "inconclusive"),
+                "empty_denial": ("pass", "blocked"), "message_only": ("fail", "inconclusive"),
+            },
+        }
+        for predicate, vector in legacy.items():
+            only_regression({
+                **admitted,
+                "regression_id": "reg-legacy-" + predicate[:6],
+                "name": "legacy-" + predicate,
+                "original_vector_id": vector["id"],
+                "scenario_id": vector["scenario_id"],
+                "success_criterion": {"observed": vector["reproduction"]["observed"]},
+            })
+            for behavior, outcome in expected[predicate].items():
+                assert replay(behavior) == outcome, (predicate, behavior)
 
 
 # --------------------------------------------------------------------------- #
@@ -838,19 +1427,16 @@ def test_d5_alias_lower_body_is_hollow_in_fresh_run_and_regression_replay(tmp_pa
             "inconclusive", "inconclusive", "lower_hollow_shape", False,
         )
         assert pair["execution_disposition"] == "completed"
-        assert finding_for(result)["evidence_state"] == "inconclusive"
-        (stored,) = [
+        assert_unstored_with_evidence(world, result, "lower_hollow_shape")
+        assert [
             item for item in journey.findings(result["run_id"])
             if item["reproduction"].get("reason") == "lower_hollow_shape"
-        ]
-        assert stored["reproduction"]["evidence_state"] == "inconclusive"
+        ] == []
 
         (item,) = regress(world)
         assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
         assert item["matches_expected"] is False and item["run_id"].startswith("pdrun-")
-        (stored,) = journey.findings(item["run_id"])
-        assert stored["reproduction"]["evidence_state"] == "inconclusive"
-        assert stored["reproduction"]["reason"] == "lower_hollow_shape"
+        assert journey.findings(item["run_id"]) == []
 
         # Wrapper disabled: the same regression fails again on the vulnerable target.
         alias["enabled"] = False

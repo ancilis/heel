@@ -7,13 +7,13 @@ runtime dependencies and does not require an account or network connection.
 
 ## Install the supplied release artifact
 
-Version 1.3.0rc1 is a runner preview release candidate, not a stable release. Create an
+Version 1.3.0rc2 is a runner preview release candidate, not a stable release. Create an
 isolated environment, then install the wheel supplied with this release:
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl
+python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl
 heel --version
 ```
 
@@ -41,14 +41,16 @@ exposing a local service.
 
 ## Synthetic export entitlement validation
 
-The supplied wheel supports `heel reference prepare` and `heel reference run`. Install the runner extra with `python -m pip install './heel_sim-1.3.0rc1-py3-none-any.whl[runner]'` (Python 3.11 or newer; it adds the pinned `cryptography` dependency). Then run `heel scope create --target reference:export --operator "your name" --confirm` outside MCP. Use its returned scope ID:
+In the same shell, first set `HEEL_HOME` to an absolute physical path in which no component is a symbolic link, for example `export HEEL_HOME="$(pwd -P)/.heel"` from a private working directory; `pwd -P` prints that physical path and plain `$PWD` may not. Use that same physical `HEEL_HOME` from the first command for `heel scope create` and every `heel reference` command. On macOS, `/tmp` and `/var` are symbolic links to `/private/tmp` and `/private/var`. `heel scope create` does not check the storage path and can succeed with a `HEEL_HOME` built from a `$PWD` under `/tmp`, `/var` or `$TMPDIR`; that success does not show the path is safe. `heel reference run` opens the private runner and reference storage without following symbolic links, on purpose, and refuses that `HEEL_HOME` with the generic rejection message. Do not disable or work around that check.
+
+The supplied wheel supports `heel reference prepare` and `heel reference run`. Install the runner extra with `python -m pip install './heel_sim-1.3.0rc2-py3-none-any.whl[runner]'` (Python 3.11 or newer; it adds the pinned `cryptography` dependency). Then run `heel scope create --target reference:export --operator "your name" --confirm` outside MCP. Use its returned scope ID:
 
 ```sh
 heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111
-heel reference run --scope SCOPE_ID --case hardened --attempt 22222222222222222222222222222222
+heel reference run --scope SCOPE_ID --case public --attempt 22222222222222222222222222222222
 ```
 
-Each 32-hex attempt ID is consumed once. The first result is a verified synthetic protected-content violation; the second checks the fix with the same invariant. `error_envelope`, `redacted`, `public`, and `inconclusive` exercise other outcomes. `--stop` checks cancellation. Reports remain under `.heel/reference/ATTEMPT/report.json`.
+Each 32-hex attempt ID is consumed once. The first result is a verified synthetic protected-content violation; the second checks the fix with the same invariant: `public` (like `redacted`) is a successful read that withholds the protected field, `invariant_held` with `regression_passed=true`. `hardened` answers with an HTTP 403 error envelope and `error_envelope` with an HTTP 200 one; an error envelope is inconclusive at any status, so both report `inconclusive` with `regression_passed=false` and neither is a verified repair. (The public 1.3.0rc1 prerelease reported both as `invariant_held`, a known erratum.) `inconclusive` exercises a missing positive control. `--stop` checks cancellation. Reports remain under `$HEEL_HOME/reference/ATTEMPT/report.json`.
 
 MCP exposes `heel_prepare_reference` and `heel_execute_reference` (`scope_id`, `case`, `attempt`); it cannot create the required scope. The app's `/runner` page gives these instructions and reads local reports without uploading. The reference executes an actual in-process product handler through the signed local runner, not an HTTP socket. No external URL or credentials can be supplied. Cloud pairing is incomplete and `heel runner pair` is not supported.
 

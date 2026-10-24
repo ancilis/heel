@@ -30,7 +30,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "release/open-core-v1.json"
 BUILDER = ROOT / "scripts/build_open_core_release.py"
-VERSION = "1.3.0rc1"
+VERSION = "1.3.0rc2"
 WHEEL = f"heel_sim-{VERSION}-py3-none-any.whl"
 SDIST = f"heel_sim-{VERSION}.tar.gz"
 ARTIFACT_MANIFEST = "heel-open-core-manifest.json"

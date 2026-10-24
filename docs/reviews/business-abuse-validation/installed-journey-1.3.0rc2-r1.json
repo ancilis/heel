@@ -1,0 +1,335 @@
+{
+  "attempt_reuse": {
+    "exit": 2,
+    "message": "Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage."
+  },
+  "candidate": {
+    "manifest_sha256": "a46e99c3470d17158cec5e145c68c2ec03dc41240e6592b7c540d92d62589a03",
+    "sdist": {
+      "name": "heel_sim-1.3.0rc2.tar.gz",
+      "sha256": "883af13ef81542aa737edcf3ca1c8a9e278015fb068fcf807ba8067021396427"
+    },
+    "superseded_candidate_wheel_sha256": "ad1aa7ac18e5bd62a90d2e8d5ec74776fd3c6f4d6891b9bba65ba2b5cf2e8cfd",
+    "wheel": {
+      "name": "heel_sim-1.3.0rc2-py3-none-any.whl",
+      "sha256": "7e1050905e12e343a2746c3d83212c0dd8c5e583e4d2610026ce7a27b885f0d5"
+    },
+    "wheel_sha256_matches_manifest": true
+  },
+  "install": {
+    "base_python": "3.13.5",
+    "command": "pip --isolated install --no-index --find-links <copied offline wheelhouse> --no-cache-dir './heel_sim-1.3.0rc2-py3-none-any.whl[runner]'",
+    "environment": "env -i with fresh HOME, PATH=/usr/bin:/bin, private TMPDIR; no HEEL_HOME inherited",
+    "heel_saas": "absent",
+    "installed": {
+      "cffi": "2.1.1",
+      "cryptography": "45.0.7",
+      "heel_sim": "1.3.0rc2",
+      "pycparser": "3.12"
+    },
+    "module_origin": "private venv site-packages (heel, heel.runner.plan_differential, heel.reference_rehearsal, cryptography)",
+    "offline_bundle_note": "Cached public-index provenance from the earlier rc2 proof, re-verified locally; not a fresh remote lookup.",
+    "offline_wheels": [
+      {
+        "cached_index_lists_sha256": true,
+        "filename": "cryptography-45.0.7-cp311-abi3-macosx_10_9_universal2.whl",
+        "record_entries_checked": 103,
+        "record_mismatches": 0,
+        "sha256": "3be4f21c6245930688bd9e162829480de027f8bf962ede33d4f8ba7d67a00cee"
+      },
+      {
+        "cached_index_lists_sha256": true,
+        "filename": "cffi-2.1.1-cp313-cp313-macosx_11_0_arm64.whl",
+        "record_entries_checked": 30,
+        "record_mismatches": 0,
+        "sha256": "19ee6127ee34de7d83ce3d371ebc5ed91addbdcc39f9ab15ce4eb35a4e534971"
+      },
+      {
+        "cached_index_lists_sha256": true,
+        "filename": "pycparser-3.12-py3-none-any.whl",
+        "record_entries_checked": 12,
+        "record_mismatches": 0,
+        "sha256": "a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e"
+      }
+    ],
+    "pip_check": true,
+    "private_directory": "new physical directory outside every checkout, mode 700"
+  },
+  "installed_evaluator_matrix": {
+    "401 same payload": {
+      "reason": "lower_denied_payload_present",
+      "row": 9,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "403 deep lower": {
+      "reason": "lower_denial_unassessable",
+      "row": 9,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "403 empty body": {
+      "reason": "lower_denied",
+      "row": 7,
+      "stores_finding": false,
+      "verdict": "held"
+    },
+    "403 envelope vs higher empty": {
+      "reason": "higher_control_unassessable",
+      "row": 9,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "403 envelope vs higher hollow": {
+      "reason": "higher_control_unassessable",
+      "row": 9,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "403 envelope vs higher text": {
+      "reason": "higher_control_unassessable",
+      "row": 9,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "403 envelope vs higher {}": {
+      "reason": "higher_control_unassessable",
+      "row": 9,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "403 error+same payload": {
+      "reason": "lower_denied_payload_present",
+      "row": 9,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "403 genuine envelope": {
+      "reason": "lower_denied",
+      "row": 7,
+      "stores_finding": false,
+      "verdict": "held"
+    },
+    "403 html lower": {
+      "reason": "lower_denial_unassessable",
+      "row": 9,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "403 partial subset": {
+      "reason": "lower_denied",
+      "row": 7,
+      "stores_finding": false,
+      "verdict": "held"
+    },
+    "403 same payload (status-only)": {
+      "reason": "lower_denied_payload_present",
+      "row": 9,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "HEAD 403 vs 200": {
+      "reason": "lower_denied",
+      "row": 7,
+      "stores_finding": false,
+      "verdict": "held"
+    },
+    "row2 higher 403": {
+      "reason": "no_positive_control",
+      "row": 2,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "row2 higher missing marker": {
+      "reason": "positive_control_missing_marker",
+      "row": 2,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "row3 403 error+marker": {
+      "reason": "marker_present",
+      "row": 3,
+      "stores_finding": true,
+      "verdict": "finding"
+    },
+    "row4 403 marker absent": {
+      "reason": "marker_absent",
+      "row": 4,
+      "stores_finding": false,
+      "verdict": "held"
+    },
+    "row5 2xx error+marker": {
+      "reason": "marker_undetermined",
+      "row": 5,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "row5 unknown marker": {
+      "reason": "marker_undetermined",
+      "row": 5,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    },
+    "row6 original 200 payload": {
+      "reason": "lower_superset",
+      "row": 6,
+      "stores_finding": true,
+      "verdict": "finding"
+    },
+    "row9 lower 500": {
+      "reason": "unexpected_status",
+      "row": 9,
+      "stores_finding": false,
+      "verdict": "inconclusive"
+    }
+  },
+  "installed_evaluator_matrix_equals_source_matrix": true,
+  "kind": "heel.installed-candidate-proof",
+  "label": "1.3.0rc2 F1 remediation candidate, revision r1 (unpublished)",
+  "logical_temporary_cwd": {
+    "HEEL_HOME_from_PWD_message": "Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage.",
+    "HEEL_HOME_from_PWD_reference_run_exit": 2,
+    "HEEL_HOME_from_pwd_P_hardened": "invariant_held",
+    "physical": "/private/tmp/heel-rc2f1-logical.*",
+    "pwd": "/tmp/heel-rc2f1-logical.*"
+  },
+  "network_denial": {
+    "applies_to": "venv creation, pip install/check, every heel CLI call and the acceptance script",
+    "owned_loopback_control_sandboxed": {
+      "connected": false,
+      "elapsed_s": 0.001,
+      "errno": 1,
+      "error": "PermissionError",
+      "timeout": false
+    },
+    "owned_loopback_control_unsandboxed": {
+      "connected": true,
+      "elapsed_s": 0.001,
+      "status_line": "HTTP/1.0 200 OK"
+    },
+    "public_address_contacted": false,
+    "sandbox_profile": "(version 1)(allow default)(deny network*)"
+  },
+  "reference_acceptance": {
+    "cli": [
+      {
+        "case": "vulnerable",
+        "regression_passed": false,
+        "result": "verified_violation"
+      },
+      {
+        "case": "hardened",
+        "regression_passed": true,
+        "result": "invariant_held"
+      },
+      {
+        "case": "error_envelope",
+        "regression_passed": false,
+        "result": "inconclusive"
+      },
+      {
+        "case": "inconclusive",
+        "regression_passed": false,
+        "result": "inconclusive"
+      }
+    ],
+    "mcp": "initialize/list/prepare/execute passed",
+    "replay": "rejected",
+    "unauthorized": "rejected"
+  },
+  "reference_cases": [
+    {
+      "case": "vulnerable",
+      "evidence_state": "verified",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "verified_violation",
+      "run": "vulnerable",
+      "uploaded": false,
+      "viewer": "violation"
+    },
+    {
+      "case": "hardened",
+      "evidence_state": "verified",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": true,
+      "result": "invariant_held",
+      "run": "hardened",
+      "uploaded": false,
+      "viewer": "passed regression"
+    },
+    {
+      "case": "error_envelope",
+      "evidence_state": "unknown",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "inconclusive",
+      "run": "error_envelope",
+      "uploaded": false,
+      "viewer": "not a pass"
+    },
+    {
+      "case": "public",
+      "evidence_state": "verified",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": true,
+      "result": "invariant_held",
+      "run": "public",
+      "uploaded": false,
+      "viewer": "passed regression"
+    },
+    {
+      "case": "redacted",
+      "evidence_state": "verified",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": true,
+      "result": "invariant_held",
+      "run": "redacted",
+      "uploaded": false,
+      "viewer": "passed regression"
+    },
+    {
+      "case": "inconclusive",
+      "evidence_state": "unknown",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "inconclusive",
+      "run": "inconclusive",
+      "uploaded": false,
+      "viewer": "not a pass"
+    },
+    {
+      "case": "hardened",
+      "evidence_state": "unknown",
+      "execution_disposition": "stopped",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "inconclusive",
+      "run": "hardened --stop",
+      "uploaded": false,
+      "viewer": "not a pass"
+    }
+  ],
+  "scope_note": "Packaging/reference evidence only: an offline, source-free install of the regenerated candidate wheel and the synthetic reference product. Not public acquisition, not a real target, not hosted execution, not live-SaaS acceptance.",
+  "viewer_fetch_calls": 0
+}
