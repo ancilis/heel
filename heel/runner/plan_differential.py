@@ -215,6 +215,34 @@ def _is_2xx(status: int) -> bool:
     return 200 <= status <= 299
 
 
+def _denial_undecided(lower: PlanObservation, lower_json: Any, higher_json: Any) -> str | None:
+    """Why a lower 401-404 on a markerless body read cannot be held, or None when it can.
+
+    A denial status proves nothing on its own. It is held only against a higher body that
+    is a bounded JSON object with material content, and only when the lower body is
+    complete and empty, or bounded JSON whose material paths do not cover the higher
+    body's. A lower body that still covers them, with or without an error field, is a
+    status-only change: undecided, never held and never a finding.
+    """
+    try:
+        higher_material = (
+            material_paths(higher_json) if isinstance(higher_json, dict) else frozenset()
+        )
+    except BodyTooComplex:
+        higher_material = frozenset()
+    if not higher_material:
+        return "higher_control_unassessable"
+    if not lower.body:
+        return None
+    if lower_json is None:
+        return "lower_denial_unassessable"
+    try:
+        lower_material = material_paths(lower_json)
+    except BodyTooComplex:
+        return "lower_denial_unassessable"
+    return "lower_denied_payload_present" if lower_material >= higher_material else None
+
+
 def _row_one(reason: str) -> PairVerdict:
     return PairVerdict("inconclusive", None, "inconclusive", reason, False, False, 1)
 
@@ -269,6 +297,10 @@ def _evaluate(
         elif lower.status in _DENIAL_STATUSES:
             status_parity = False
 
+    denial_undecided: str | None = None
+    if status_parity is False and not marker and method != "HEAD":
+        denial_undecided = _denial_undecided(lower, lower_json, higher_json)
+
     marker_leak: bool | None = None
     if marker and method != "HEAD" and positive_control:
         lower_marker = protected_content(
@@ -289,18 +321,23 @@ def _evaluate(
         reason = (
             "positive_control_missing_marker" if marker and higher_ok else "no_positive_control"
         )
-        return PairVerdict("inconclusive", "inconclusive", "inconclusive", reason, False, True, 2, **common)
+        return PairVerdict("inconclusive", "inconclusive", "inconclusive", reason, False, False, 2, **common)
     if marker_leak is True:
         return PairVerdict("finding", "verified", "marker_leak", "marker_present", False, True, 3, **common)
     if marker_leak is False:
         return PairVerdict("held", None, "marker_leak", "marker_absent", False, False, 4, **common)
     if marker:
         return PairVerdict(
-            "inconclusive", "inconclusive", "inconclusive", "marker_undetermined", False, True, 5,
+            "inconclusive", "inconclusive", "inconclusive", "marker_undetermined", False, False, 5,
             **common,
         )
     if body_superset is True:
         return PairVerdict("finding", "observed", "body_superset", "lower_superset", False, True, 6, **common)
+    if status_parity is False and denial_undecided is not None:
+        return PairVerdict(
+            "inconclusive", "inconclusive", "inconclusive", denial_undecided, False, False, 9,
+            **common,
+        )
     if status_parity is False:
         return PairVerdict("held", None, "status_parity", "lower_denied", False, False, 7, **common)
     if status_parity is True:
@@ -1449,7 +1486,13 @@ def _execute(
                 "reason": outcome.verdict.reason,
                 "execution_disposition": outcome.execution_disposition,
             })
-            if outcome.verdict.stores_finding and outcome.execution_disposition == "completed":
+            # Only a completed, verified or observed finding is stored or counted.
+            if (
+                outcome.verdict.stores_finding
+                and outcome.verdict.verdict == "finding"
+                and outcome.verdict.evidence_state in {"verified", "observed"}
+                and outcome.execution_disposition == "completed"
+            ):
                 finding = _finding(plan, outcome, run_id=run_id, attempt_id=attempt_id)
                 db.add_finding(run_id, finding)
                 outcome.finding_id = finding.id
@@ -1764,8 +1807,9 @@ def replay_plan_differential(
             "reproduction details are omitted.",
             run_id,
         )
-    # A pass needs an affirmative denial: the higher plan succeeded and the lower plan was
-    # denied by status, or the supplied marker was absent. A 2xx denial body is not one.
+    # A pass needs an affirmative denial: the higher plan returned a material body and the
+    # lower plan was denied by status without it, or the supplied marker was absent. A 2xx
+    # denial body, or a denial status still carrying the payload, is not one.
     if verdict.verdict == "held":
         return record(
             "pass", "blocked",

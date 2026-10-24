@@ -81,9 +81,13 @@ def test_r11_verdict_table_rows(row, lower, higher, keywords, verdict, state, pr
     assert (result.row, result.verdict, result.evidence_state, result.predicate, result.reason) == (
         row, verdict, state, predicate, reason,
     )
-    # A finding is stored for rows 2, 3, 5 and 6 only; never for row 1, a held pair, status
-    # parity alone (row 8) or an undecided lower response (row 9).
-    assert result.stores_finding is (row in {2, 3, 5, 6})
+    # A finding is stored for rows 3 and 6 only: a completed verified or observed finding.
+    # Never for row 1, a missing positive control (row 2), a held pair, an undetermined
+    # marker (row 5), status parity alone (row 8) or an undecided lower response (row 9).
+    assert result.stores_finding is (row in {3, 6})
+    assert result.stores_finding is (
+        result.verdict == "finding" and result.evidence_state in {"verified", "observed"}
+    )
     # `candidate` is true on row 8 and nowhere else.
     assert result.candidate is (row == 8)
     assert {case[0] for case in ROWS} == set(range(1, 10))
@@ -210,6 +214,7 @@ def test_r11_predicates_fail_closed(monkeypatch):
                                 assert (result.evidence_state == "observed") is (result.row == 6)
                                 assert (result.verdict == "held") is (result.row in {4, 7})
                                 assert result.candidate is (result.row == 8)
+                                assert result.stores_finding is (result.row in {3, 6})
                                 if result.row == 3:
                                     assert marker and method == "GET" and outcome == "observed"
                                 if result.row == 6:
@@ -277,6 +282,127 @@ def test_error_envelope_never_counts_as_parity():
         {"message": "upgrade"}, [], "error", None,
     ):
         assert is_denial_envelope(value) is False
+
+
+# --------------------------------------------------------------------------- #
+# A status-only repair: a lower denial status that still carries the paid payload
+# --------------------------------------------------------------------------- #
+DENIED_UNDECIDED = ("inconclusive", "inconclusive", "inconclusive", 9, False, False)
+
+
+def _denied_columns(result):
+    return (
+        result.verdict, result.evidence_state, result.predicate, result.row,
+        result.stores_finding, result.candidate,
+    )
+
+
+def test_status_only_repair_with_the_same_payload_is_never_held():
+    # The original read: the lower plan receives the higher plan's paid body (row 6).
+    original = evaluate(observation(200, FULL), observation(200, FULL))
+    assert (original.row, original.verdict, original.evidence_state, original.stores_finding) == (
+        6, "finding", "observed", True,
+    )
+    for status in sorted(plan_differential._DENIAL_STATUSES):
+        # Only the status changed, or an error field was added beside the same paid fields,
+        # or more was added: the payload is still there, so this is neither held nor a
+        # finding.
+        for lower in (FULL, {**FULL, "error": "upgrade required"}, {**FULL, "extra": [1]}):
+            result = evaluate(observation(status, lower), observation(200, FULL))
+            assert _denied_columns(result) == DENIED_UNDECIDED, (status, lower)
+            assert result.reason == "lower_denied_payload_present"
+            assert (result.positive_control, result.status_parity) == (True, False)
+            assert result.marker_leak is None
+        # A genuine denial carries none of the paid payload and stays held (row 7).
+        for lower in (ENVELOPE, {"error": {"code": "plan", "message": "upgrade"}}, SUBSET, {}, None):
+            result = evaluate(observation(status, lower), observation(200, FULL))
+            assert (result.row, result.verdict, result.reason, result.stores_finding) == (
+                7, "held", "lower_denied", False,
+            ), (status, lower)
+        # A complete, empty explicit denial is held as well.
+        result = evaluate(observation(status, raw=b""), observation(200, FULL))
+        assert (result.row, result.verdict) == (7, "held")
+
+    # A hollow key-shaped denial body stays non-positive and held.
+    lower, higher = D4_BY_ID["hollow_lower_denial_status_is_held"][:2]
+    result = evaluate(observation(403, lower), observation(200, higher))
+    assert (result.row, result.verdict, result.stores_finding) == (7, "held", False)
+    # The same hollow echo with every populated field filled in is the payload again.
+    result = evaluate(observation(403, higher), observation(200, higher))
+    assert result.reason == "lower_denied_payload_present" and result.verdict != "held"
+
+    # The exact marker contract is unchanged: an error-shaped 403 carrying the supplied
+    # marker is a verified finding; a plain 403 with the marker absent is held.
+    result = evaluate(
+        observation(403, {**protected(), "error": "upgrade required"}),
+        observation(200, protected()), marker=MARKER,
+        outcome=ExecutorOutcome("completed", "observed"),
+    )
+    assert (result.row, result.verdict, result.evidence_state) == (3, "finding", "verified")
+    result = evaluate(
+        observation(403, ENVELOPE), observation(200, protected()), marker=MARKER,
+        outcome=ExecutorOutcome("completed", "blocked"),
+    )
+    assert (result.row, result.verdict) == (4, "held")
+    # A marker pair never reaches the body comparison: the paid body at 403 without the
+    # marker is decided by the marker rows only.
+    result = evaluate(
+        observation(403, {**FULL, "rows": []}), observation(200, {**FULL, **protected()}),
+        marker=MARKER, outcome=ExecutorOutcome("completed", "blocked"),
+    )
+    assert (result.row, result.verdict) == (4, "held")
+
+    # No positive finding arises from any non-2xx lower response without the marker.
+    for status in (*sorted(plan_differential._DENIAL_STATUSES), 302, 500):
+        for lower in (FULL, {**FULL, "error": "x"}, ENVELOPE, None):
+            result = evaluate(observation(status, lower), observation(200, FULL))
+            assert result.verdict != "finding" and result.stores_finding is False
+
+
+def test_a_denial_is_held_only_against_an_assessable_higher_body():
+    deep, wide = _d4_complex_bodies().values()
+    unassessable_higher = {
+        "empty": observation(200, raw=b""),
+        "empty_204": observation(204, raw=b""),
+        "text": observation(200, raw=b"plain text"),
+        "malformed": observation(200, raw=b'{"rows": [1'),
+        "duplicate": observation(200, raw=b'{"a": 1, "a": 2}'),
+        "list": observation(200, [{"id": "r1"}]),
+        "string": observation(200, "export"),
+        "empty_object": observation(200, {}),
+        "hollow_object": observation(200, {"rows": [], "total": 0, "next": None}),
+        "secret_only": observation(200, {"token": "abc"}),
+        "deep": observation(200, deep),
+        "wide": observation(200, wide),
+    }
+    for name, higher in unassessable_higher.items():
+        for lower in (observation(403, ENVELOPE), observation(403, raw=b""), observation(401, FULL)):
+            result = evaluate(lower, higher)
+            assert _denied_columns(result) == DENIED_UNDECIDED, name
+            assert result.reason == "higher_control_unassessable", name
+            assert result.positive_control is True and result.status_parity is False
+
+    # An unassessable non-empty lower body is not proof that the payload disappeared.
+    unassessable_lower = {
+        "html": observation(403, raw=b"<html><body>Forbidden</body></html>"),
+        "malformed": observation(403, raw=b'{"error": '),
+        "nan": observation(403, raw=b'{"error": NaN}'),
+        "duplicate": observation(403, raw=b'{"error": 1, "error": 2}'),
+        "deep": observation(403, deep),
+        "wide": observation(403, wide),
+    }
+    for name, lower in unassessable_lower.items():
+        result = evaluate(lower, observation(200, FULL))
+        assert _denied_columns(result) == DENIED_UNDECIDED, name
+        assert result.reason == "lower_denial_unassessable", name
+
+    # HEAD compares statuses only and keeps its own rows; never a finding.
+    for higher in unassessable_higher.values():
+        result = evaluate(observation(403, raw=b""), higher, method="HEAD")
+        assert (result.row, result.verdict, result.reason) == (7, "held", "lower_denied")
+    for lower_status in (200, 403):
+        result = evaluate(observation(lower_status, FULL), observation(200, FULL), method="HEAD")
+        assert result.verdict != "finding" and result.stores_finding is False
 
 
 def test_key_paths_are_structural_and_skip_secret_named_subtrees():
@@ -556,7 +682,7 @@ def test_d4_verdict_truth_table(lower, higher, expected, statuses, method):
         assert result.evidence_state == (
             "observed" if row == 6 else None if row == 7 else "inconclusive"
         )
-        assert result.stores_finding is (row in {2, 6})
+        assert result.stores_finding is (row == 6)
         assert result.predicate == (
             "body_superset" if row == 6 else "status_parity" if row in {7, 8} else "inconclusive"
         )

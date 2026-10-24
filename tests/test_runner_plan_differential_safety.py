@@ -1372,11 +1372,6 @@ def test_r21_tls_transports_refuse_a_legacy_only_server(tmp_path, monkeypatch, t
 # --------------------------------------------------------------------------- #
 # R22 finding eligibility
 # --------------------------------------------------------------------------- #
-STORED_INCONCLUSIVE_REASONS = frozenset({
-    "no_positive_control", "positive_control_missing_marker", "marker_undetermined",
-})
-
-
 def test_r22_findings_only_for_completed_pairs_and_disposition_is_completed(tmp_path, monkeypatch):
     def check(world: World, result: dict) -> dict:
         journey = world.journey
@@ -1388,17 +1383,15 @@ def test_r22_findings_only_for_completed_pairs_and_disposition_is_completed(tmp_
         for finding in stored.values():
             reproduction = finding["reproduction"]
             assert reproduction["execution_disposition"] == "completed"
+            assert reproduction["evidence_state"] in {"verified", "observed"}
             assert reproduction["candidate"] is (reproduction["predicate"] == "status_parity")
             assert finding["scenario_id"] == "plan_differential." + reproduction["predicate"]
             assert reproduction["operator_declared"] is False
         with_finding = set()
         for pair in result["pairs"]:
             completed = pair["execution_disposition"] == "completed"
-            # Stored: a finding, or a missing positive control or undetermined marker. Held,
-            # status parity alone and an undecided lower response store nothing.
-            eligible = completed and (
-                pair["verdict"] == "finding" or pair["reason"] in STORED_INCONCLUSIVE_REASONS
-            )
+            # Stored: a completed finding only. Held and every inconclusive pair store nothing.
+            eligible = completed and pair["verdict"] == "finding"
             assert (pair["finding_id"] is not None) is eligible, pair
             if eligible:
                 with_finding.add(pair["finding_id"])
