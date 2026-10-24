@@ -12,6 +12,7 @@ import { ActivationCard, type ActivationSnapshot } from "../../components/canary
 import { ApprovalDialog } from "../../components/canary/ApprovalDialog";
 import { DisclosureDialog } from "../../components/canary/DisclosureDialog";
 import { RunProgress, type RunPhase } from "../../components/canary/RunProgress";
+import { TargetRegistrationCard, type OwnershipProofMethod } from "../../components/onboarding/TargetRegistrationCard";
 import {
   CanaryApi, CanaryApiError, type CanaryApprovalSummary, type CanaryDisclosureMetadata, type CanaryPendingApprovalRequest,
   type CanaryRunDashboard, type RunnerContextBindingDashboard, type VerifiedEnvironmentRecord,
@@ -27,8 +28,8 @@ const SIGN_IN_MESSAGE = "Create a free account or sign in to set up your first p
 const SESSION_ENDED_MESSAGE = "Your session ended. Sign in again to continue; nothing from the previous session is shown.";
 const SIGNED_OUT_MESSAGE = "You signed out. Sign in again to continue.";
 const CANARY_LOCKED_MESSAGE = "You are still signed in. Staging verification, runner access and rehearsals stay locked until it loads; nothing has been approved or executed.";
-const PROJECT_CREATED_READY = "Project created. Verify a staging origin next.";
-const PROJECT_CREATED_BLOCKED = "Project created. Canary setup is unavailable right now, so staging verification is blocked; use Try again shortly.";
+const PROJECT_CREATED_READY = "Project created. Add a target next.";
+const PROJECT_CREATED_BLOCKED = "Project created. Canary setup is unavailable right now, so target verification is blocked; use Try again shortly.";
 const cloudApi = new HeelCloudApi();
 const canaryApi = new CanaryApi();
 
@@ -145,7 +146,7 @@ export default function Dashboard() {
   const [busyOperation, setBusyOperation] = useState<number | null>(null);
   const working = busyOperation !== null;
   const [origin, setOrigin] = useState("");
-  const [proofMethod, setProofMethod] = useState<"https-file" | "dns-txt">("https-file");
+  const [proofMethod, setProofMethod] = useState<OwnershipProofMethod>("https-file");
   const [proofChallenge, setProofChallenge] = useState<ProofChallenge | null>(null);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [approvalDialog, setApprovalDialog] = useState<ApprovalDialogState>(null);
@@ -516,7 +517,7 @@ export default function Dashboard() {
     try {
       const verified = await canaryApi.checkEnvironmentProof(context.workspaceRef, context.project.projectRef, proofChallenge.environmentId);
       if (ticket !== generation.current) return;
-      setNotice(verified ? "Staging ownership verified. Pair the local runner next." : "Proof did not match yet. No product route was contacted.");
+      setNotice(verified ? "Target ownership verified. No product route was contacted." : "Proof did not match yet. No product route was contacted.");
       await refreshEnvironments(context, ticket);
       if (ticket !== generation.current) return;
       if (verified) setProofChallenge(null);
@@ -603,6 +604,11 @@ export default function Dashboard() {
     ?? (connection.phase === "select_project" || connection.phase === "forbidden" || connection.phase === "canary_unavailable"
       ? connection.account : null);
   const selectedProject = context?.project ?? (connection.phase === "canary_unavailable" ? connection.project : null);
+  // A paired runner or binding the account already has keeps the private-connector tools; a customer without one
+  // is never sent to runner pairing as the default next step.
+  const privateConnectorInUse = context !== null
+    && (context.contextBindings.runners.length > 0 || context.contextBindings.bindings.length > 0);
+  const showActivation = context === null || privateConnectorInUse || pendingApproval !== null || observedRun !== null;
   const progress = observedRun?.progress;
 
   return (
@@ -632,15 +638,13 @@ export default function Dashboard() {
       {pendingHasMore ? <p className="next-action" role="status">Another pending approval is waiting after this one.</p> : null}
 
       <div className="dashboard-grid"><div>
-        <ActivationCard completedSteps={completedSteps} environmentOrigin={executable?.origin}
+        {context ? <TargetRegistrationCard busy={working} instruction={proofChallenge?.instruction ?? null}
+          onCheckProof={() => void checkProof()} onCreateProof={() => void startProof()} onOriginChange={setOrigin}
+          onProofMethodChange={setProofMethod} origin={origin} proofMethod={proofMethod} verifiedOrigin={executable?.origin ?? null} /> : null}
+        {showActivation ? <ActivationCard completedSteps={completedSteps} environmentOrigin={executable?.origin}
           onReviewApproval={hasPlan && approvalKey ? () => setApprovalDialog({ requestKey: approvalKey, open: true }) : undefined}
-          scenarioCount={pendingApproval?.summary.scenarios.length ?? 0} snapshot={snapshot} />
-        {context && !executable ? <section className="runner-recovery" id="verify-origin" aria-labelledby="verify-origin-title"><p className="canary-kicker">Exact public HTTPS origin</p><h2 id="verify-origin-title">Verify staging now</h2>
-          <label>Staging origin<input autoComplete="url" onChange={(event) => setOrigin(event.target.value)} placeholder="https://staging.yourcompany.com" value={origin} /></label>
-          <label>Proof method<select onChange={(event) => setProofMethod(event.target.value as "https-file" | "dns-txt")} value={proofMethod}><option value="https-file">HTTPS file</option><option value="dns-txt">DNS TXT</option></select></label>
-          {proofChallenge ? <><p><code>{proofChallenge.instruction}</code></p><button className="button button-primary" disabled={working} onClick={() => void checkProof()} type="button">Check exact proof</button></> : <button className="button button-primary" disabled={working || !/^https:\/\/[a-z0-9.-]+$/.test(origin.trim())} onClick={() => void startProof()} type="button">Create proof challenge</button>}
-        </section> : null}
-        {context && executable && !pendingApproval ? <section className="runner-recovery"><p className="canary-kicker">Paired runner authorization</p><h2>Add canary access</h2><p>Authorize one active paired runner for one verified staging or sandbox environment. The runner alone may submit its signed plan; this dashboard never accepts projection file uploads.</p><p>This runner is fixed to its first claimed environment. To move it, stop and re-pair a fresh runner, then authorize access here.</p>
+          scenarioCount={pendingApproval?.summary.scenarios.length ?? 0} snapshot={snapshot} /> : null}
+        {context && executable && !pendingApproval && privateConnectorInUse ? <section className="runner-recovery"><p className="canary-kicker">Paired runner authorization</p><h2>Add canary access</h2><p>Authorize one active paired runner for one verified staging or sandbox environment. The runner alone may submit its signed plan; this dashboard never accepts projection file uploads.</p><p>This runner is fixed to its first claimed environment. To move it, stop and re-pair a fresh runner, then authorize access here.</p>
           <label>Verified environment<select disabled={working} onChange={(event) => setSelectedBindingEnvironment(event.target.value)} value={selectedBindingEnvironment}><option value="">Select environment</option>{context.environments.filter((item) => item.isExecutable && item.verificationRecordDigest !== null).map((item) => <option key={item.environmentId} value={item.environmentId}>{item.origin}</option>)}</select></label>
           <label>Paired runner<select disabled={working} onChange={(event) => setSelectedRunner(event.target.value)} value={selectedRunnerAvailable ? selectedRunner : ""}><option value="">Select runner</option>{context.contextBindings.runners.map((item) => <option key={`${item.runnerId}:${item.runnerKeyId}`} value={item.runnerId}>{item.displayName} · {item.fingerprint.slice(0, 12)}</option>)}</select></label>
           <button className="button button-primary" disabled={working || !selectedBindingEnvironment || !selectedRunnerAvailable} onClick={() => void createContextBinding()} type="button">Authorize paired runner</button>
