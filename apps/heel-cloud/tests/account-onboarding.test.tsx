@@ -40,6 +40,20 @@ function hex(value: number, length: number): string {
 }
 
 
+/** A `VerifiedEnvironment.v1` list entry as the control plane stores it; only verified entries are executable. */
+function environmentWire(environmentId: string, origin: string, proofMethod: string, verified: boolean): Wire {
+  return {
+    schema_version: "VerifiedEnvironment.v1", environment_id: environmentId, origin, environment_class: "staging",
+    status: verified ? "verified" : "pending", attestation: "ownership verified; environment classification supplied by you",
+    attestation_version: "v1", attestation_acknowledgement: "accepted", proof_method: proofMethod,
+    proof_version: proofMethod === "https-file" ? "https-file.v1" : "dns-txt.v1", normalization_version: "exact-origin.v1",
+    challenge_generation: 1, challenge_expires_at: 4_000_000_000_000, last_failure_code: null,
+    verified_at: verified ? 1 : null, proof_expires_at: verified ? 4_000_000_000_000 : null,
+    verification_record_digest: verified ? "a".repeat(64) : null, revoked_at: null, is_executable: verified,
+  };
+}
+
+
 /** In-memory stand-in for the account routes; one "cookie" models the HttpOnly session. */
 class FakeControlPlane {
   readonly accounts = new Map<string, Account>();
@@ -53,6 +67,10 @@ class FakeControlPlane {
   /** Paths whose response waits for `release(path)`. */
   readonly held = new Map<string, { wait: Promise<void>; release: () => void }>();
   overrides = new Map<string, () => Response>();
+  /** Target-proof environments per `workspace/project`, persisted across page loads like the server's. */
+  readonly environments = new Map<string, Wire[]>();
+  /** Whether the customer has published the proof; until then a check answers `verified: false`. */
+  proofPublished = false;
 
   account(email: string, password: string, memberships: { role: Role; projects?: string[] }[]): Account {
     const account: Account = { userId: `usr_${hex(this.next++, 16)}`, email, password, memberships: [] };
@@ -128,8 +146,32 @@ class FakeControlPlane {
     if (this.canaryOutage && /\/projects\/prj_[0-9a-f]{32}\/runner-context-bindings$/.test(route)) {
       return json({ code: "canary_authority_unavailable" }, 503);
     }
-    if (method === "GET" && /\/projects\/prj_[0-9a-f]{32}\/environments$/.test(route)) {
-      return json({ schema_version: "heel.verified-environment-list.v1", environments: [] });
+    const target = route.match(/^\/v1\/workspaces\/(ws_[0-9a-f]{16})\/projects\/(prj_[0-9a-f]{32})\/environments(?:\/(env_[0-9a-f]{32})\/check)?$/);
+    if (target) {
+      if (!this.session.memberships.some((item) => item.workspace_id === target[1])) return json({ error: "not a member" }, 403);
+      const key = `${target[1]}/${target[2]}`;
+      const stored = this.environments.get(key) ?? [];
+      if (method === "GET" && target[3] === undefined) {
+        return json({ schema_version: "heel.verified-environment-list.v1", environments: stored });
+      }
+      if (method === "POST" && target[3] === undefined) {
+        const record = environmentWire(`env_${hex(this.next++, 32)}`, String(data.origin), String(data.proof_method), false);
+        this.environments.set(key, [...stored, record]);
+        const token = `synthetic-proof-token-${this.next++}`;
+        return json({
+          schema_version: "heel.verified-environment-challenge.v1", environment_id: record.environment_id, origin: data.origin,
+          environment_class: data.environment_class, proof_method: data.proof_method, token,
+          http_url: `${String(data.origin)}/.well-known/heel-proof.txt`, dns_record: `_heel-proof TXT ${token}`,
+          challenge_generation: 1, expires_at: 4_000_000_000_000, attestation: data.attestation_text,
+        }, 201);
+      }
+      const index = stored.findIndex((item) => item.environment_id === target[3]);
+      if (method !== "POST" || index < 0) return json({ error: "not found" }, 404);
+      if (this.proofPublished) {
+        const verified = environmentWire(target[3], String(stored[index].origin), String(stored[index].proof_method), true);
+        this.environments.set(key, stored.map((item, position) => position === index ? verified : item));
+      }
+      return json({ schema_version: "heel.verified-environment-check-result.v1", verified: this.proofPublished });
     }
     if (method === "GET" && /\/projects\/prj_[0-9a-f]{32}\/runner-context-bindings$/.test(route)) {
       return json({ schema_version: "heel.runner-context-binding-dashboard.v1", server_time_ms: 1, runners: [], bindings: [] });
@@ -217,7 +259,7 @@ describe("dashboard account onboarding", () => {
     fireEvent.change(within(bar).getByLabelText(/new project/i), { target: { value: "  Billing staging  " } });
     fireEvent.click(within(bar).getByRole("button", { name: "Create project" }));
 
-    await screen.findByText("Project created. Verify a staging origin next.");
+    await screen.findByText("Project created. Add a target next.");
     const created = server.calls.find((call) => call.method === "POST" && call.path.endsWith("/projects"));
     expect(JSON.parse(created?.body ?? "{}")).toEqual({ name: "Billing staging" });
     const project = screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement;
@@ -432,8 +474,8 @@ function navigate(view: ReturnType<typeof render>, search: string): void {
 
 
 function expectCanaryLocked(): void {
-  expect(screen.queryByRole("heading", { name: "Verify staging now" })).toBeNull();
-  expect(screen.queryByRole("button", { name: "Create proof challenge" })).toBeNull();
+  expect(screen.queryByRole("heading", { name: "Add target" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Create ownership proof" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Authorize paired runner" })).toBeNull();
   expect(screen.queryByText("Ready for customer setup")).toBeNull();
 }
@@ -449,7 +491,7 @@ describe("C7AR1 R1: a canary service outage keeps the signed-in account usable",
 
     await screen.findByText("Canary setup could not be loaded.");
     await screen.findByText(/Project created\. Canary setup is unavailable right now/);
-    expect(screen.queryByText(/Verify a staging origin next/)).toBeNull();
+    expect(screen.queryByText(/Add a target next/)).toBeNull();
     const project = screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement;
     expect(project.selectedOptions[0].textContent).toBe("Billing staging");
     expect(nav.search).toMatch(/^workspace=ws_[0-9a-f]{16}&project=prj_[0-9a-f]{32}$/);
@@ -461,7 +503,7 @@ describe("C7AR1 R1: a canary service outage keeps the signed-in account usable",
 
     server.canaryOutage = false;
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
     expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(project.value);
 
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
@@ -477,7 +519,7 @@ describe("C7AR1 R1: a canary service outage keeps the signed-in account usable",
     const ws = account.memberships[0].workspace_id;
     const [alpha, beta] = (server.projects.get(ws) ?? []).map((item) => item.project_ref as string);
     render(<Dashboard />);
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
 
     server.canaryOutage = true;
     fireEvent.change(screen.getByRole("combobox", { name: /project/i }), { target: { value: beta } });
@@ -494,7 +536,7 @@ describe("C7AR1 R1: a canary service outage keeps the signed-in account usable",
 
     server.canaryOutage = false;
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
     expect((screen.getByRole("combobox", { name: /project/i }) as HTMLSelectElement).value).toBe(alpha);
 
     server.canaryOutage = true;
@@ -748,8 +790,8 @@ function challenge(token: string): Record<string, unknown> {
 }
 
 async function requestProof(): Promise<void> {
-  fill(/staging origin/i, "https://synthetic.example.test");
-  fireEvent.click(screen.getByRole("button", { name: "Create proof challenge" }));
+  fill(/target url/i, "https://synthetic.example.test");
+  fireEvent.click(screen.getByRole("button", { name: "Create ownership proof" }));
 }
 
 const BLOCKED_NOTICE = /Project created\. Canary setup is unavailable right now/;
@@ -799,11 +841,11 @@ describe("C7AR2 N3: a successful Retry replaces the outage notice with the curre
     const created = await createDuringOutage();
     server.canaryOutage = false;
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
 
     expect(screen.queryByText(BLOCKED_NOTICE)).toBeNull();
-    expect(screen.queryByText(/staging verification is blocked/)).toBeNull();
-    expect(screen.getByText("Project created. Verify a staging origin next.")).toBeTruthy();
+    expect(screen.queryByText(/target verification is blocked/)).toBeNull();
+    expect(screen.getByText("Project created. Add a target next.")).toBeTruthy();
     expect(screen.getByText("Ready for customer setup")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
     expect(projectSelect().value).toBe(created);
@@ -848,7 +890,7 @@ describe("C7AR2 N2: busy state belongs to the operation and context that started
     const held = deferred<Record<string, unknown>>();
     vi.spyOn(CanaryApi.prototype, "startEnvironmentProof").mockReturnValue(held.promise as never);
     const view = render(<Dashboard />);
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
     await requestProof();
     expect(signOutButton().disabled).toBe(true);
 
@@ -857,8 +899,8 @@ describe("C7AR2 N2: busy state belongs to the operation and context that started
     expect(signOutButton().disabled).toBe(false);
     expect(projectSelect().disabled).toBe(false);
     expect((screen.getByLabelText(/new project/i) as HTMLInputElement).disabled).toBe(false);
-    fill(/staging origin/i, "https://synthetic.example.test");
-    expect((screen.getByRole("button", { name: "Create proof challenge" }) as HTMLButtonElement).disabled).toBe(false);
+    fill(/target url/i, "https://synthetic.example.test");
+    expect((screen.getByRole("button", { name: "Create ownership proof" }) as HTMLButtonElement).disabled).toBe(false);
 
     await act(async () => { held.resolve(challenge("challenge-alpha")); });
     await settle();
@@ -874,7 +916,7 @@ describe("C7AR2 N2: busy state belongs to the operation and context that started
     const start = vi.spyOn(CanaryApi.prototype, "startEnvironmentProof")
       .mockReturnValueOnce(first.promise as never).mockReturnValueOnce(second.promise as never);
     const view = render(<Dashboard />);
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
     await requestProof();
     navigate(view, `workspace=${ws}&project=${beta}`);
     await waitFor(() => expect(projectSelect().value).toBe(beta));
@@ -886,7 +928,7 @@ describe("C7AR2 N2: busy state belongs to the operation and context that started
     await act(async () => { first.resolve(challenge("challenge-alpha")); });
     await settle();
     expect(signOutButton().disabled, "Beta's own pending action must keep its controls disabled").toBe(true);
-    expect((screen.getByRole("button", { name: "Create proof challenge" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Create ownership proof" }) as HTMLButtonElement).disabled).toBe(true);
     expect(document.body.textContent).not.toContain("challenge-alpha");
 
     await act(async () => { second.resolve(challenge("challenge-beta")); });
@@ -901,7 +943,7 @@ describe("C7AR2 N2: busy state belongs to the operation and context that started
     vi.spyOn(CanaryApi.prototype, "startEnvironmentProof")
       .mockReturnValueOnce(first.promise as never).mockReturnValueOnce(second.promise as never);
     const view = render(<Dashboard />);
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
     await requestProof();
     navigate(view, `workspace=${ws}&project=${beta}`);
     await waitFor(() => expect(projectSelect().value).toBe(beta));
@@ -921,9 +963,9 @@ describe("C7AR2 N2: busy state belongs to the operation and context that started
     const held = deferred<Record<string, unknown>>();
     const start = vi.spyOn(CanaryApi.prototype, "startEnvironmentProof").mockReturnValue(held.promise as never);
     render(<Dashboard />);
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
     await requestProof();
-    const button = screen.getByRole("button", { name: "Create proof challenge" }) as HTMLButtonElement;
+    const button = screen.getByRole("button", { name: "Create ownership proof" }) as HTMLButtonElement;
     expect(button.disabled).toBe(true);
     fireEvent.click(button);
     expect(start).toHaveBeenCalledTimes(1);
@@ -945,12 +987,12 @@ describe("C7AR2 N2: busy state belongs to the operation and context that started
       return holdAlpha && projectRef === alpha ? refresh.promise : real.call(this, workspaceRef, projectRef);
     });
     const view = render(<Dashboard />);
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
     await requestProof();
     await screen.findByText(/challenge-alpha/);
     holdAlpha = true;
-    fireEvent.click(screen.getByRole("button", { name: "Check exact proof" }));
-    await screen.findByText("Staging ownership verified. Pair the local runner next.");
+    fireEvent.click(screen.getByRole("button", { name: "Check ownership proof" }));
+    await screen.findByText("Target ownership verified. No product route was contacted.");
 
     navigate(view, `workspace=${ws}&project=${beta}`);
     await waitFor(() => expect(projectSelect().value).toBe(beta));
@@ -959,7 +1001,7 @@ describe("C7AR2 N2: busy state belongs to the operation and context that started
     await act(async () => { refresh.resolve([]); });
     await settle();
     expect(screen.getByText(/challenge-beta/)).toBeTruthy();
-    expect(screen.queryByText("Staging ownership verified. Pair the local runner next.")).toBeNull();
+    expect(screen.queryByText("Target ownership verified. No product route was contacted.")).toBeNull();
   });
 });
 
@@ -1387,14 +1429,14 @@ describe("C7AR3: the proof check's environment refresh keeps the same owner boun
       const { ws, alpha, beta } = alphaBeta();
       const { check, environmentReads } = proofWorld(alpha);
       const view = render(<Dashboard />);
-      await screen.findByRole("heading", { name: "Verify staging now" });
+      await screen.findByRole("heading", { name: "Add target" });
       await requestProof();
       await screen.findByText(/challenge-alpha/);
-      fireEvent.click(screen.getByRole("button", { name: "Check exact proof" }));
+      fireEvent.click(screen.getByRole("button", { name: "Check ownership proof" }));
 
       navigate(view, `workspace=${ws}&project=${beta}`);
       await waitFor(() => expect(projectSelect().value).toBe(beta));
-      await screen.findByRole("heading", { name: "Verify staging now" });
+      await screen.findByRole("heading", { name: "Add target" });
       const before = environmentReads().length;
       if (outcome === "verified") await act(async () => { check.resolve(true); });
       else await act(async () => { check.reject(new CanaryApiError("unavailable", 401)); });
@@ -1402,7 +1444,7 @@ describe("C7AR3: the proof check's environment refresh keeps the same owner boun
       expect(environmentReads().slice(before)).not.toContain(alpha);
       expect(projectSelect().value).toBe(beta);
       expect(nav.search).toBe(`workspace=${ws}&project=${beta}`);
-      expect(screen.queryByText("Staging ownership verified. Pair the local runner next.")).toBeNull();
+      expect(screen.queryByText("Target ownership verified. No product route was contacted.")).toBeNull();
       expect(screen.queryByText(/Your session ended/)).toBeNull();
       expect(document.body.textContent).not.toContain("challenge-alpha");
       expect(signOutButton().disabled).toBe(false);
@@ -1413,13 +1455,13 @@ describe("C7AR3: the proof check's environment refresh keeps the same owner boun
     const { alpha } = alphaBeta();
     const { check, environmentReads } = proofWorld(alpha);
     render(<Dashboard />);
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
     await requestProof();
     await screen.findByText(/challenge-alpha/);
     const before = environmentReads().length;
-    fireEvent.click(screen.getByRole("button", { name: "Check exact proof" }));
+    fireEvent.click(screen.getByRole("button", { name: "Check ownership proof" }));
     await act(async () => { check.resolve(true); });
-    await screen.findByText("Staging ownership verified. Pair the local runner next.");
+    await screen.findByText("Target ownership verified. No product route was contacted.");
     await waitFor(() => expect(environmentReads().slice(before)).toEqual([alpha]));
     await waitFor(() => expect(screen.queryByText(/challenge-alpha/)).toBeNull());
     expect(signOutButton().disabled).toBe(false);
@@ -1429,10 +1471,10 @@ describe("C7AR3: the proof check's environment refresh keeps the same owner boun
     const { alpha } = alphaBeta();
     const { check } = proofWorld(alpha);
     render(<Dashboard />);
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
     await requestProof();
     await screen.findByText(/challenge-alpha/);
-    fireEvent.click(screen.getByRole("button", { name: "Check exact proof" }));
+    fireEvent.click(screen.getByRole("button", { name: "Check ownership proof" }));
     await act(async () => { check.resolve(false); });
     await screen.findByText("Proof did not match yet. No product route was contacted.");
     expect(screen.getByText(/challenge-alpha/)).toBeTruthy();
@@ -1443,13 +1485,165 @@ describe("C7AR3: the proof check's environment refresh keeps the same owner boun
     const { alpha } = alphaBeta();
     const { check } = proofWorld(alpha);
     render(<Dashboard />);
-    await screen.findByRole("heading", { name: "Verify staging now" });
+    await screen.findByRole("heading", { name: "Add target" });
     await requestProof();
     await screen.findByText(/challenge-alpha/);
-    fireEvent.click(screen.getByRole("button", { name: "Check exact proof" }));
+    fireEvent.click(screen.getByRole("button", { name: "Check ownership proof" }));
     await act(async () => { check.reject(new CanaryApiError("unavailable", 401)); });
     await screen.findByText(/Your session ended/);
     expect(document.body.textContent).not.toContain("challenge-alpha");
     expect(nav.search).toBe("");
+  });
+});
+
+
+// SEAM (CUSTOMER-TRACK-UX): the in-memory fake above stands in for the control plane's existing environment-proof
+// routes (start, check and list). This is local synthetic evidence of the UI flow and its requests, not a deployed
+// journey: no target is contacted and no proof is published anywhere.
+describe("CUSTOMER-TRACK-UX: a new customer registers one target through the existing ownership-proof contract", () => {
+  const TARGET = "https://staging.customer.example.test";
+  const BOUNDARY = "Target verified. Managed scanning, credentials, discovery, and scan approval are not available in this build.";
+  const FORBIDDEN = /credential|identit|secret|discover|scan|crawl|pairing|install|openapi|route-inventory|plan|finding/i;
+
+  function selection(): { ws: string; prj: string } {
+    const query = new URLSearchParams(nav.search);
+    return { ws: query.get("workspace") ?? "", prj: query.get("project") ?? "" };
+  }
+
+  function expectNoRunnerDefault(): void {
+    expect(screen.queryByRole("region", { name: /launch activation/i })).toBeNull();
+    expect(screen.queryByRole("link", { name: /open pairing guide/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Authorize paired runner" })).toBeNull();
+    expect(document.body.textContent).not.toMatch(/next action: pair runner|pair the local runner/i);
+  }
+
+  test("sign up, create a project, prove ownership after one honest retry and see the persisted verified target", async () => {
+    await signUp();
+    await screen.findByText("Create a project first.");
+    fill(/new project/i, "Customer staging");
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+    await screen.findByText("Project created. Add a target next.");
+    await screen.findByRole("heading", { name: "Add target" });
+    await waitFor(() => expect(nav.search).toMatch(/^workspace=ws_[0-9a-f]{16}&project=prj_[0-9a-f]{32}$/));
+    const { ws, prj } = selection();
+    // The refs the card acts on are the server-confirmed membership and the project the server created.
+    expect(ws).toBe(server.session?.memberships[0].workspace_id);
+    expect(prj).toBe(server.projects.get(ws)?.[0].project_ref);
+    expect(document.body.textContent).toMatch(/publicly reachable/);
+    expect(document.body.textContent).toMatch(/Ownership proof is required/);
+    expectNoRunnerDefault();
+
+    fill(/target url/i, TARGET);
+    fireEvent.change(screen.getByLabelText("Ownership proof method"), { target: { value: "dns-txt" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create ownership proof" }));
+    await screen.findByText(/^Target verification pending\./);
+    const instruction = screen.getByText(/^Publish this exact record: _heel-proof TXT synthetic-proof-token-[0-9]+$/).textContent ?? "";
+    const token = instruction.split(" ").at(-1) ?? "";
+    expect(screen.queryByLabelText(/target url/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Create ownership proof" })).toBeNull();
+
+    // Not yet published: the challenge stays and the honest retry message is shown.
+    fireEvent.click(screen.getByRole("button", { name: "Check ownership proof" }));
+    await screen.findByText("Proof did not match yet. No product route was contacted.");
+    expect(screen.getByText(instruction)).toBeTruthy();
+    expect(screen.getByText(/^Target verification pending\./)).toBeTruthy();
+    expect(screen.queryByText(BOUNDARY)).toBeNull();
+
+    server.proofPublished = true;
+    fireEvent.click(screen.getByRole("button", { name: "Check ownership proof" }));
+    await screen.findByText("Target ownership verified. No product route was contacted.");
+    const card = screen.getByRole("region", { name: "Your target" });
+    expect(within(card).getByRole("status").textContent).toBe(BOUNDARY);
+    expect(within(card).getByText(TARGET)).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Add target" })).toBeNull();
+    expect(screen.queryByText(instruction)).toBeNull();
+    expectNoRunnerDefault();
+
+    // The only state changes are the account, the project and the existing proof start/check, all in this context.
+    const base = `/api/control-plane/v1/workspaces/${ws}/projects/${prj}`;
+    const environmentId = (server.environments.get(`${ws}/${prj}`) ?? [])[0]?.environment_id as string;
+    expect(environmentId).toMatch(/^env_[0-9a-f]{32}$/);
+    expect(server.calls.filter((call) => call.method !== "GET").map((call) => `${call.method} ${call.path}`)).toEqual([
+      "POST /api/control-plane/v1/signup",
+      `POST /api/control-plane/v1/workspaces/${ws}/projects`,
+      `POST ${base}/environments`,
+      `POST ${base}/environments/${environmentId}/check`,
+      `POST ${base}/environments/${environmentId}/check`,
+    ]);
+    const start = server.calls.find((call) => call.method === "POST" && call.path === `${base}/environments`);
+    expect(JSON.parse(start?.body ?? "{}")).toEqual({
+      schema_version: "heel.verified-environment-start.v1", origin: TARGET, environment_class: "staging", proof_method: "dns-txt",
+      attestation_text: "ownership verified; environment classification supplied by you", attestation_version: "v1",
+      attestation_acknowledgement: "accepted",
+    });
+    for (const call of server.calls.filter((item) => item.path.endsWith("/check"))) {
+      expect(JSON.parse(call.body)).toEqual({ schema_version: "heel.verified-environment-check.v1" });
+    }
+    // Reads are the account context plus the dashboard's existing operational reads for this project only.
+    const reads = new Set(server.calls.filter((call) => call.method === "GET").map((call) => call.path));
+    const allowedReads = new Set([
+      "/api/control-plane/v1/me", `/api/control-plane/v1/workspaces/${ws}/projects`,
+      `${base}/environments`, `${base}/runner-context-bindings`, `${base}/canary-approval-requests`,
+    ]);
+    expect([...reads].filter((path) => !allowedReads.has(path))).toEqual([]);
+    expect(server.calls.every((call) => call.path.startsWith("/api/control-plane/v1/"))).toBe(true);
+    expect(server.calls.filter((call) => FORBIDDEN.test(call.path.slice("/api/control-plane/v1/".length)))).toEqual([]);
+
+    // The target and the proof token are shown on screen only: never in the address, storage or logs.
+    for (const value of [TARGET, token]) {
+      expect(nav.replace.mock.calls.flat().join(" ")).not.toContain(value);
+      expect(nav.search).not.toContain(value);
+      expect(consoleOutput.join("\n")).not.toContain(value);
+    }
+    expectNoSecretLeak();
+
+    // Verified is the server's persisted state: a fresh page load in the same session shows it again.
+    cleanup();
+    render(<Dashboard />);
+    const reloaded = await screen.findByRole("region", { name: "Your target" });
+    expect(within(reloaded).getByRole("status").textContent).toBe(BOUNDARY);
+    expect(within(reloaded).getByText(TARGET)).toBeTruthy();
+    expectNoRunnerDefault();
+  });
+
+  test("a proof start that settles after the session ended elsewhere restores nothing, even after signing in again", async () => {
+    const account = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Customer staging"] }]);
+    server.session = account;
+    const ws = account.memberships[0].workspace_id;
+    const prj = server.projects.get(ws)?.[0].project_ref as string;
+    nav.search = `workspace=${ws}&project=${prj}`;
+    const view = render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Add target" });
+    const release = server.hold(`/api/control-plane/v1/workspaces/${ws}/projects/${prj}/environments`);
+    fill(/target url/i, TARGET);
+    fireEvent.click(screen.getByRole("button", { name: "Create ownership proof" }));
+    // Sign-out is disabled while the start is in flight, so the session ends in another tab and the user navigates.
+    server.session = null;
+    navigate(view, "");
+    await screen.findByRole("heading", { name: "Create your Heel account" });
+    const signedOutStatus = screen.getAllByRole("status").map((item) => item.textContent);
+    release();
+    await settle();
+    // The old session's late 401 is not this view's session loss: the signed-out status is unchanged.
+    expect(screen.getAllByRole("status").map((item) => item.textContent)).toEqual(signedOutStatus);
+    expect(screen.queryByText(/Target verification pending/)).toBeNull();
+    expect(document.body.textContent).not.toMatch(/synthetic-proof-token/);
+    expect(document.body.textContent).not.toContain(TARGET);
+    expect(nav.search).toBe("");
+
+    await signInFromSignedOut(EMAIL, SECRET);
+    await screen.findByRole("heading", { name: "Add target" });
+    expect((screen.getByLabelText(/target url/i) as HTMLInputElement).value).toBe("");
+    expect(screen.queryByRole("button", { name: "Check ownership proof" })).toBeNull();
+    expect(document.body.textContent).not.toMatch(/synthetic-proof-token/);
+    expectNoSecretLeak();
+  });
+
+  test("an account that already operates a private connector keeps its advanced tools beside the verified status", async () => {
+    alphaBetaBindings("create");
+    render(<Dashboard />);
+    await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
+    expect(within(screen.getByRole("region", { name: "Your target" })).getByRole("status").textContent).toBe(BOUNDARY);
+    expect(screen.getByRole("region", { name: /launch activation/i })).toBeTruthy();
   });
 });
