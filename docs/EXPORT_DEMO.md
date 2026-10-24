@@ -93,7 +93,7 @@ scope files, `.heel` contents, or credentials.
 
 The fix is the account export-license check before serialization in `heel/reference_product.py`. Both variants use the same account table, fixture and invariant. The check verifies only read entitlement, not quotas or cumulative extraction. There is one synthetic row and two sequential reads, not bulk extraction.
 
-Reports are saved to `$HEEL_HOME/reference/ATTEMPT/report.json`; raw synthetic evidence remains in that private attempt's runner store. Open `/runner` in the app and select the report to inspect a browser-local summary. The browser does not authenticate imported reports and uploads nothing.
+Reports are saved to `$HEEL_HOME/reference/ATTEMPT/report.json`; raw synthetic evidence remains in that private attempt's runner store. Open `/runner` in the app and select the report to inspect a browser-local summary. The browser does not authenticate imported reports and uploads nothing. It says a regression passed only for the shape a completed held case writes: `hardened`, `public` or `redacted`, `invariant_held`, `regression_passed=true`, `evidence_state` `verified`, `execution_disposition` `completed` and reference-only provenance with no network calls. Any other held report is shown as not a pass.
 
 For MCP, initialize `heel-mcp`, send notifications/initialized, call `heel_prepare_reference` with `{}`, then call `heel_execute_reference` with `{"scope_id":"SCOPE_ID","case":"vulnerable","attempt":"66666666666666666666666666666666"}`. The human-created signed scope must already exist. The MCP server cannot create scopes. It accepts no URL, credentials, or transport override.
 

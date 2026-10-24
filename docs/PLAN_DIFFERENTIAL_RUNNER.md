@@ -259,17 +259,25 @@ request.
 |---|---|---|
 | `finding`, predicate `marker_leak` | `verified` | The lower plan's response contained the protected marker you supplied. |
 | `finding`, predicate `body_superset` | `observed` | The lower plan received every field the higher plan received on this one read. |
-| `held` | none stored | The higher plan succeeded and the lower plan was refused by status (401, 402, 403 or 404), or the marker was absent. |
+| `held` | none stored | The higher plan succeeded and the lower plan was refused by status (401, 402, 403 or 404) without the higher plan's payload, or the marker was absent. |
 | `inconclusive`, predicate `status_parity`, `candidate: true` | none stored | Both plans got a 2xx but the bodies do not show the lower plan received the same content. Status alone is never a finding. |
 | `inconclusive`, reason `lower_denial_envelope`, `lower_hollow_shape`, `unexpected_status`, `body_too_complex` or `predicate_error` | none stored | The lower plan's response could not be decided. |
-| `inconclusive`, reason `no_positive_control`, `positive_control_missing_marker` or `marker_undetermined` | `inconclusive` | The higher-plan positive control or the supplied marker could not be established. The `reason` says why. |
+| `inconclusive`, reason `lower_denied_payload_present`, `lower_denial_unassessable` or `higher_control_unassessable` | none stored | Without a marker, a `GET` denial status could not be shown to withhold the payload: the lower body still covers every populated field of the higher body (with or without an error field), the lower body is beyond the key-path bounds, or the higher body is not a bounded JSON object with a populated field. |
+| `inconclusive`, reason `no_positive_control`, `positive_control_missing_marker` or `marker_undetermined` | none stored | The higher-plan positive control or the supplied marker could not be established. The `reason` says why. |
 
 - `observed` is a hypothesis about a missing plan gate. Heel holds no declaration that a
   route is plan-gated, so a route that is ungated by design is reported too.
 - A 2xx response whose body says no (`error`, `errors`, `ok: false`, `success: false`,
   `upgrade_required`, `payment_required`, `denied`, `forbidden`) is never counted as
   parity, never as `held` without a marker, and never as a regression pass.
+- Without a marker, a `GET` denial status is `held` only when the higher body is a bounded
+  JSON object with at least one populated field, and the lower body is empty or is bounded
+  JSON whose populated paths do not cover the higher body's. A status-only change that
+  leaves the paid fields in place is never `held`, never a finding and never a regression
+  pass. With a marker, the marker rows decide, as before.
 - A `HEAD` pair compares statuses only. It can be `held` or `inconclusive`, nothing else.
+- Only a completed `verified` or `observed` finding is stored, counted or listed. Every
+  `inconclusive` pair stores no finding.
 - A finding is stored only for a pair that completed. A pair that did not complete is in
   the result's `pairs` and in `report.json` as `inconclusive` with its true disposition.
   A pair that stores no finding still keeps its redacted observations in `report.json`,

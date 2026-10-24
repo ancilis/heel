@@ -67,26 +67,39 @@ def inventory_file(world: World) -> Path:
     return Path(world.journey.bootstrap["inventory"]["path"])
 
 
-def assert_unstored_with_evidence(world: World, result: dict, reason: str) -> None:
+def assert_unstored_with_evidence(
+    world: World, result: dict, reason: str, route: tuple[str, str] = EXPORT,
+) -> None:
     """An undecided pair stores no finding, yet keeps its report, raw-evidence references
     and containment entry."""
-    pair = pairs_by_route(result)[EXPORT]
+    pair = pairs_by_route(result)[route]
     assert (pair["verdict"], pair["reason"], pair["finding_id"]) == ("inconclusive", reason, None)
     assert pair["execution_disposition"] == "completed"
     assert all(
-        (item["method"], item["route_template"]) != EXPORT for item in result["findings"]
+        (item["method"], item["route_template"]) != route for item in result["findings"]
     )
     assert all(
-        item["affordance_id"] != " ".join(EXPORT)
+        item["affordance_id"] != " ".join(route)
+        for item in world.journey.findings(result["run_id"])
+    )
+    # Every stored finding of the run is a completed verified or observed finding.
+    assert all(
+        item["evidence_state"] in {"verified", "observed"} for item in result["findings"]
+    )
+    assert all(
+        item["reproduction"]["evidence_state"] in {"verified", "observed"}
         for item in world.journey.findings(result["run_id"])
     )
     report = json.loads(Path(result["report_path"]).read_text())
     (observed,) = [
         item for item in report["observations"]
-        if (item["method"], item["route_template"]) == EXPORT
+        if (item["method"], item["route_template"]) == route
     ]
     assert [item["role"] for item in observed["observations"]] == ["lower_plan", "higher_plan"]
     assert all(item["response_ref"] for item in observed["observations"])
+    # The raw responses stay in the private attempt store.
+    for item in observed["observations"]:
+        assert len(list(world.journey.home.rglob(item["response_ref"] + ".meta"))) == 1
     assert report["uploaded"] is False
     code, output, _ = invoke("log", "--run", result["run_id"])
     log = json.loads(output)
@@ -97,7 +110,7 @@ def assert_unstored_with_evidence(world: World, result: dict, reason: str) -> No
     ]
     assert [
         item["reason"] for item in logged
-        if (item["method"], item["route_template"]) == EXPORT
+        if (item["method"], item["route_template"]) == route
     ] == [reason]
     assert all(
         json.loads(entry["detail"]).get("evidence_state") in {"verified", "observed"}
@@ -735,6 +748,210 @@ def test_r24_denial_envelope_is_inconclusive_in_fresh_run_and_regression_replay(
         # And back: the same regression fails again on the vulnerable target.
         world.target.behavior = "vulnerable"
         item = replay()
+        assert (item["result"], item["current_status"]) == ("fail", "still_reachable")
+
+
+# --------------------------------------------------------------------------- #
+# Inconclusive pairs never become local findings
+# --------------------------------------------------------------------------- #
+def _json_response(status: int, value) -> tuple[int, dict[str, str], bytes]:
+    return status, {"Content-Type": "application/json"}, json.dumps(value).encode("utf-8")
+
+
+def _override(world: World, monkeypatch, responses: dict) -> None:
+    """Answer ``(plan, path)`` from ``responses``; every other request is the target's own."""
+    original = world.target.respond
+
+    def respond(method: str, path: str, token: str):
+        answer = responses.get((world.target.sessions.get(token), path))
+        return original(method, path, token) if answer is None else answer
+
+    # The listener looks `respond` up on the instance for every request.
+    monkeypatch.setattr(world.target, "respond", respond)
+
+
+def test_inconclusive_pairs_store_no_finding_and_keep_their_evidence(tmp_path, monkeypatch):
+    export_path = EXPORT[1]
+    marker_route = ("GET", "/exports/{id}")
+    marker_path = "/exports/" + MARKER
+    cases = [
+        # (name, marker world, route, overrides, reason)
+        ("higher_denied", False, EXPORT,
+         {("pro", export_path): _json_response(403, {"error": "upgrade required"})},
+         "no_positive_control"),
+        ("higher_error", False, EXPORT,
+         {("pro", export_path): _json_response(500, {"detail": "boom"})},
+         "no_positive_control"),
+        ("higher_2xx_envelope", False, EXPORT,
+         {("pro", export_path): _json_response(200, {"error": "upgrade required"})},
+         "no_positive_control"),
+        ("lower_error", False, EXPORT,
+         {("free", export_path): _json_response(500, {"detail": "boom"})},
+         "unexpected_status"),
+        ("higher_missing_marker", True, marker_route,
+         {("pro", marker_path): _json_response(200, {"rows": []})},
+         "positive_control_missing_marker"),
+        ("unknown_marker", True, marker_route,
+         {("free", marker_path): _json_response(200, {"rows": [1]})},
+         "marker_undetermined"),
+        ("other_marker", True, marker_route,
+         {("free", marker_path): _json_response(
+             200, {"protected_canary": "heel-canary-export-0009", "rows": [1]})},
+         "marker_undetermined"),
+        ("2xx_error_with_marker", True, marker_route,
+         {("free", marker_path): _json_response(
+             200, {"error": "upgrade required", "protected_canary": MARKER, "rows": []})},
+         "marker_undetermined"),
+    ]
+    for name, marker, route, overrides, reason in cases:
+        keywords = {"marker": MARKER} if marker else {}
+        with World(tmp_path / name, monkeypatch, **keywords) as world:
+            journey = world.journey
+            _override(world, monkeypatch, overrides)
+            code, result, error = journey.run()
+            assert error == "", name
+            pair = pairs_by_route(result)[route]
+            assert (pair["verdict"], pair["reason"]) == ("inconclusive", reason), name
+            assert_unstored_with_evidence(world, result, reason, route)
+            # Nothing undecided is stored, counted or exposed as a finding of the run.
+            assert [
+                item for item in journey.findings(result["run_id"])
+                if item["reproduction"]["evidence_state"] == "inconclusive"
+            ] == [], name
+            code, output, _ = invoke("findings", "--run", result["run_id"])
+            assert code == 0
+            listed = json.loads(output)["findings"]
+            assert len(listed) == len(result["findings"]), name
+            log = journey.containment(result["run_id"])
+            (complete,) = [
+                json.loads(entry["detail"]) for entry in log["entries"]
+                if entry["action"] == "run_complete"
+            ]
+            assert complete["findings"] == len(result["findings"]), name
+            assert complete["pairs"] == len(result["pairs"]), name
+            # A genuine finding elsewhere in the same run is still stored.
+            states = {item["route_template"]: item["evidence_state"] for item in result["findings"]}
+            if route == EXPORT:
+                assert "/api/export" not in states and states.get("/api/pricing") == "observed"
+            else:
+                assert "/exports/{id}" not in states and states["/api/export"] == "observed"
+
+
+# --------------------------------------------------------------------------- #
+# A status-only repair that leaves the paid payload in place never passes
+# --------------------------------------------------------------------------- #
+def test_status_only_repair_with_the_payload_is_never_a_regression_pass(tmp_path, monkeypatch):
+    from plan_differential_support import DENIAL_ENVELOPE, EXPORT as export_body
+
+    export_path = EXPORT[1]
+    with World(tmp_path, monkeypatch) as world:
+        journey = world.journey
+        # The initial 200 read with the same material payload is the observed finding.
+        code, result, error = journey.run()
+        assert (code, error) == (1, "")
+        finding = finding_for(result)
+        assert (finding["predicate"], finding["evidence_state"]) == ("body_superset", "observed")
+        regression = add_regression(world, result, "export-plan-gate")
+        assert regression["scenario_id"] == "plan_differential.body_superset"
+
+        responses: dict = {}
+        _override(world, monkeypatch, responses)
+
+        def fresh_and_replay(reason: str) -> dict:
+            code, result, error = journey.run()
+            assert error == ""
+            pair = pairs_by_route(result)[EXPORT]
+            assert (pair["verdict"], pair["predicate"], pair["reason"], pair["candidate"]) == (
+                "inconclusive", "inconclusive", reason, False,
+            )
+            assert_unstored_with_evidence(world, result, reason)
+            (item,) = regress(world)
+            assert item["run_id"].startswith("pdrun-")
+            assert item["scope_id"] == journey.scope_id and item["target"] == journey.origin
+            assert item["scenario_id"] == "plan_differential.body_superset"
+            assert journey.findings(item["run_id"]) == []
+            replayed = [
+                json.loads(entry["detail"]) for entry in journey.containment(item["run_id"])["entries"]
+                if entry["action"] == "plan_differential_pair"
+            ]
+            assert [entry["reason"] for entry in replayed] == [reason]
+            return item
+
+        # Only the lower status changes to 403 (and 401, 402, 404); the paid body stays.
+        for status in (403, 401, 402, 404):
+            responses[("free", export_path)] = _json_response(status, export_body)
+            item = fresh_and_replay("lower_denied_payload_present")
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive"), status
+            assert item["matches_expected"] is False and item["control_likely"] == "unknown"
+
+        # An error envelope that still carries the same paid fields cannot pass either.
+        responses[("free", export_path)] = _json_response(
+            403, {**DENIAL_ENVELOPE, **export_body},
+        )
+        item = fresh_and_replay("lower_denied_payload_present")
+        assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+
+        # A missing or invalid higher body control is never a pass for a body regression.
+        responses[("free", export_path)] = _json_response(403, DENIAL_ENVELOPE)
+        for higher in (
+            (200, {"Content-Type": "application/json"}, b""),
+            _json_response(200, {}),
+            _json_response(200, {"rows": [], "total": 0}),
+        ):
+            responses[("pro", export_path)] = higher
+            item = fresh_and_replay("higher_control_unassessable")
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+        # An opaque higher body is refused by the transport first: row 1, still no pass.
+        for higher in (
+            (200, {"Content-Type": "text/plain"}, b"plain text"), _json_response(200, [export_body]),
+        ):
+            responses[("pro", export_path)] = higher
+            code, result, error = journey.run()
+            pair = pairs_by_route(result)[EXPORT]
+            assert (pair["verdict"], pair["reason"], pair["finding_id"]) == (
+                "inconclusive", "transport:response_rejected", None,
+            )
+            (item,) = regress(world)
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+        del responses[("pro", export_path)]
+
+        # An unassessable lower body is not proof that the payload disappeared: one beyond
+        # the key-path bounds, or one the transport refuses before any predicate.
+        deep: dict = {"error": "upgrade required"}
+        for _ in range(plan_differential.MAX_KEY_PATH_DEPTH + 2):
+            deep = {"error": deep}
+        wide = {f"k{index}": index for index in range(plan_differential.MAX_KEY_PATH_NODES + 1)}
+        for lower in (deep, wide):
+            responses[("free", export_path)] = _json_response(403, lower)
+            item = fresh_and_replay("lower_denial_unassessable")
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+        responses[("free", export_path)] = (
+            403, {"Content-Type": "text/html"}, b"<html><body>Forbidden</body></html>",
+        )
+        code, result, error = journey.run()
+        assert pairs_by_route(result)[EXPORT]["reason"] == "transport:response_rejected"
+        (item,) = regress(world)
+        assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
+
+        # A genuine denial without the payload still passes against a valid higher control.
+        for lower in (
+            _json_response(403, DENIAL_ENVELOPE),
+            (403, {"Content-Type": "application/json"}, b""),
+            _json_response(404, {"error": "not found"}),
+        ):
+            responses[("free", export_path)] = lower
+            code, result, error = journey.run()
+            pair = pairs_by_route(result)[EXPORT]
+            assert (pair["verdict"], pair["reason"], pair["finding_id"]) == (
+                "held", "lower_denied", None,
+            )
+            (item,) = regress(world)
+            assert (item["result"], item["current_status"]) == ("pass", "blocked")
+            assert item["matches_expected"] is True and item["control_likely"] == "present"
+
+        # And back: the same regression fails again when the payload is served at 200.
+        responses.clear()
+        (item,) = regress(world)
         assert (item["result"], item["current_status"]) == ("fail", "still_reachable")
 
 

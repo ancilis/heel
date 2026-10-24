@@ -18,16 +18,25 @@ export default function Runner() {
       const r = report as Record<string, unknown>;
       if (r.target !== "reference:export" || r.mechanism_id !== "export-read-entitlement" ||
           r.uploaded !== false || !["verified_violation", "invariant_held", "inconclusive"].includes(String(r.result))) throw new Error();
-      // 1.3.0rc1 reported the HTTP-200 error_envelope case as invariant_held; a held result
-      // counts only with regression_passed true and outside that known-invalid case.
-      const held = r.result === "invariant_held" && r.regression_passed === true && r.case !== "error_envelope";
+      // A pass is only the shape the reference producer writes for a held case: a known
+      // held case, verified evidence, a completed reference-only run, regression_passed
+      // true. This checks shape only; it does not authenticate the file. 1.3.0rc1 wrongly
+      // reported the HTTP-200 error_envelope case as invariant_held.
+      const provenance = typeof r.provenance === "object" && r.provenance !== null ? r.provenance as Record<string, unknown> : null;
+      const held = r.result === "invariant_held" && r.regression_passed === true &&
+        typeof r.case === "string" && ["hardened", "public", "redacted"].includes(r.case) &&
+        r.evidence_state === "verified" && r.execution_disposition === "completed" &&
+        r.execution_support === "reference_only" && provenance !== null &&
+        provenance.kind === "reference_product_execution" && provenance.network_calls === false;
       setSummary(r.result === "verified_violation"
         ? "The local report records protected synthetic export content reaching the lower-plan account. Apply the server-side export entitlement check, then repeat with the hardened product."
         : held
           ? "The local report records a successful entitled positive control and no protected marker in the lower-plan response. This read regression passed."
-          : r.result === "invariant_held"
+          : r.result === "invariant_held" && r.case === "error_envelope"
             ? "This report's held result is not valid evidence: an HTTP 200 error envelope is inconclusive, as Heel 1.3.0rc1 wrongly reported it. Treat it as inconclusive; this is not a pass."
-            : "The local report could not establish the invariant. Check the positive control and response format; this is not a pass.");
+            : r.result === "invariant_held"
+              ? "This report's held result does not match a supported completed reference pass: a known held case, verified evidence, a completed reference-only run and regression_passed true. This is not a pass; rerun the case with a fresh attempt."
+              : "The local report could not establish the invariant. Check the positive control and response format; this is not a pass.");
     } catch {
       setError("Choose a local Heel reference report JSON file under 128 KiB.");
     }

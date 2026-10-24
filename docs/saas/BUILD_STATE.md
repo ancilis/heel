@@ -27,8 +27,9 @@ The implemented launch is **Heel free early access**:
 - Checked-in Heel 1.3.0rc2 runner preview candidate wheel/source/manifest under
   `apps/heel-cloud/public/downloads/`, and local MCP setup. The candidate is unreleased: it is
   not published as a GitHub release or to PyPI, and it is not publicly deployed. It reports the
-  synthetic reference `error_envelope` case as inconclusive, and status-only or undecided
-  plan-differential pairs store no finding. The earlier 1.3.0rc1 preview is a public GitHub
+  synthetic reference `error_envelope` case as inconclusive, no inconclusive plan-differential
+  pair stores a finding, and a denial status that still carries the higher plan's payload is
+  inconclusive, never a regression pass. The earlier 1.3.0rc1 preview is a public GitHub
   prerelease whose `error_envelope` result is a documented erratum; its files are no longer in
   the tree. Earlier versions of this file listed the 1.2.0 files, which are no longer in the
   tree either.
