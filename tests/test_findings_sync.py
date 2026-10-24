@@ -538,7 +538,7 @@ class FindingsSyncRequestValidationTests(unittest.TestCase):
             self.sync.validate_findings_sync_request(duplicate, NAMESPACE_KEY)
 
     def test_accepts_only_frozen_source_versions_and_modes(self):
-        for version in ("1.1.0", "1.1.1", "1.2.0", "1.3.0rc1"):
+        for version in ("1.1.0", "1.1.1", "1.2.0", "1.3.0rc1", "1.3.0rc2"):
             value = copy.deepcopy(self.request)
             value["source"]["engine_version"] = version
             with self.subTest(version=version):
@@ -546,7 +546,7 @@ class FindingsSyncRequestValidationTests(unittest.TestCase):
                     self.sync.validate_findings_sync_request(value, NAMESPACE_KEY),
                     value,
                 )
-        for version in ("1.0.0", "1.2.1", "1.3.0", "1.3.0-rc.1", True):
+        for version in ("1.0.0", "1.2.1", "1.3.0", "1.3.0-rc.1", "1.3.0-rc.2", "1.3.0rc3", True):
             value = copy.deepcopy(self.request)
             value["source"]["engine_version"] = version
             with self.subTest(version=version):

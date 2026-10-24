@@ -37,7 +37,7 @@ from heel.store import Store
 from .catalog import CATALOG_BY_ID, CATALOG_IDS
 from .compiler import CanaryCompiler, plan_differential_pairs
 from .containment import verify_containment_chain
-from .content_assertion import protected_content
+from .content_assertion import is_denial_envelope, protected_content
 from .execution import ExecutionBundle, ExecutionGate, LocalCanaryExecutor
 from .http_transport import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -116,7 +116,7 @@ class ExecutorOutcome:
 @dataclass(frozen=True, slots=True)
 class PairVerdict:
     verdict: str                    # finding | held | inconclusive
-    evidence_state: str | None      # verified | observed | inconclusive; None when not stored
+    evidence_state: str | None      # verified | observed | inconclusive; None when held or row 1
     predicate: str
     reason: str
     candidate: bool
@@ -184,82 +184,6 @@ def material_paths(value: Any) -> frozenset[str]:
                     paths.add(element_path)
                 stack.append((child, element_path, depth + 1))
     return frozenset(paths)
-
-
-_ALLOW_KEYS = frozenset({"ok", "success", "allowed"})
-_DENY_KEYS = frozenset({"upgraderequired", "paymentrequired", "denied", "forbidden"})
-_ERROR_KEYS = frozenset({"error", "errors", "errorcode"})
-_STATUS_KEYS = frozenset({"status", "statuscode", "code"})
-_WRAPPER_KEYS = frozenset({"data", "result", "response"})
-_DENIAL_WORDS = frozenset({
-    "error", "fail", "failed", "failure", "denied", "forbidden", "unauthorized", "required",
-})
-_NO_STRINGS = frozenset({"false", "0", "no"})
-_WORD_BREAK = re.compile(r"[^a-z0-9]+", flags=re.ASCII)
-# Words and digit groups inside one run: ``PaymentRequired``, ``HTTPError``, ``E403``.
-_CAMEL_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", flags=re.ASCII)
-_MAX_ENVELOPE_DEPTH = 2
-
-
-def _says_no(value: Any) -> bool:
-    """An allow flag denies on any JSON-falsy value or a no-word."""
-    if isinstance(value, str):
-        word = value.strip().casefold()
-        return not word or word in _NO_STRINGS
-    return not value
-
-
-def _says_yes(value: Any) -> bool:
-    """A deny flag denies on any JSON-truthy value that is not a no-word."""
-    if isinstance(value, str):
-        word = value.strip().casefold()
-        return bool(word) and word not in _NO_STRINGS
-    return bool(value)
-
-
-def _denial_status(value: Any) -> bool:
-    if type(value) in {int, float}:
-        return 400 <= value <= 599 and value == int(value)
-    if not isinstance(value, str):
-        return False
-    words = {
-        *_WORD_BREAK.split(value.casefold()),
-        *(word.casefold() for word in _CAMEL_WORD.findall(value)),
-    }
-    return any(
-        word in _DENIAL_WORDS or (word.isdigit() and len(word) == 3 and word[0] in "45")
-        for word in words
-    )
-
-
-def _states_denial(value: Any, depth: int) -> bool:
-    if not isinstance(value, dict):
-        return False
-    for key, item in value.items():
-        name = key.casefold().replace("_", "").replace("-", "")
-        if (
-            (name in _ERROR_KEYS and bool(item))
-            or (name in _ALLOW_KEYS and _says_no(item))
-            or (name in _DENY_KEYS and _says_yes(item))
-            or (name in _STATUS_KEYS and _denial_status(item))
-            or (name in _WRAPPER_KEYS and depth < _MAX_ENVELOPE_DEPTH
-                and _states_denial(item, depth + 1))
-        ):
-            return True
-    return False
-
-
-def is_denial_envelope(value: Any) -> bool:
-    """A 2xx body that says no, in any JSON spelling of the small vocabulary above.
-
-    Keys match without case, ``_`` or ``-``. An allow flag denies on any JSON-falsy value
-    or no-word; a deny flag on any JSON-truthy value that is not a no-word. ``status``/
-    ``code`` deny by an integral 4xx/5xx number, or by a denial word or 4xx/5xx digit group
-    found across separators, camel-case and letter/digit boundaries. A ``data``/``result``/
-    ``response`` wrapper is followed to a bounded depth. This only ever
-    withholds parity (for either plan): it never creates a finding or a ``held`` verdict.
-    """
-    return _states_denial(value, 0)
 
 
 def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -385,14 +309,15 @@ def _evaluate(
             else "lower_subset" if body_superset is False
             else "status_only"
         )
-        return PairVerdict("inconclusive", "inconclusive", "status_parity", reason, True, True, 8, **common)
+        # Status parity alone is a candidate, never a stored finding.
+        return PairVerdict("inconclusive", "inconclusive", "status_parity", reason, True, False, 8, **common)
     reason = (
         "lower_denial_envelope" if _is_2xx(lower.status) and lower_denial
         else "lower_hollow_shape" if hollow
         else "unexpected_status" if not _is_2xx(lower.status)
         else "body_too_complex"
     )
-    return PairVerdict("inconclusive", "inconclusive", "inconclusive", reason, False, True, 9, **common)
+    return PairVerdict("inconclusive", "inconclusive", "inconclusive", reason, False, False, 9, **common)
 
 
 def evaluate_plan_pair(
@@ -418,7 +343,7 @@ def evaluate_plan_pair(
             assessment_outcome=executor_outcome.assessment_outcome,
         )
     except Exception:
-        return PairVerdict("inconclusive", "inconclusive", "inconclusive", "predicate_error", False, True, 9)
+        return PairVerdict("inconclusive", "inconclusive", "inconclusive", "predicate_error", False, False, 9)
 
 
 # --------------------------------------------------------------------------- #
@@ -1829,9 +1754,10 @@ def replay_plan_differential(
     run_id = executed["run_id"]
     if outcome.execution_disposition != "completed" or verdict.row == 1:
         return record("fail", "inconclusive", incomplete, run_id)
-    # The saved predicate is re-evaluated; an inconclusive finding saved none.
+    # The saved predicate is re-evaluated; an inconclusive finding saved none. Only a pair
+    # that is itself a finding still holds: status parity alone (row 8) stays undecided.
     value = None if predicate == "inconclusive" else getattr(verdict, predicate)
-    if value is True:
+    if value is True and verdict.verdict == "finding":
         return record(
             "fail", "still_reachable",
             f"The saved predicate {predicate} still holds for the lower plan on this read; "

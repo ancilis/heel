@@ -140,8 +140,12 @@ const PUBLIC_INSTALL = [
   ".venv/bin/python -m pip --isolated install \\",
   `  'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc1/heel_sim-1.3.0rc1-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}'`,
 ].join("\n");
+// Claims that the public 1.3.0rc1 prerelease is unpublished are stale. The corrected 1.3.0rc2
+// candidate is unpublished, must say so, and must never get a public release URL.
 const STALE_GITHUB_CLAIMS =
-  /unreleased|not yet published as a GitHub|planned but not yet published|prerelease URL is not publicly verified/i;
+  /unreleased 1\.3\.0rc1|1\.3\.0rc1[^.]*(unreleased|not yet published)|planned but not yet published|prerelease URL is not publicly verified/i;
+const CANDIDATE_UNPUBLISHED = /1\.3\.0rc2[^.]*(\.[^.]*)?not yet published as a GitHub release/i;
+const CANDIDATE_RELEASE_URL = /releases\/(tag|download)\/v1\.3\.0rc2/i;
 
 describe("Heel anonymous launch review", () => {
   test("renders an abuse hypothesis and immediate actions without a wall", () => {
@@ -214,26 +218,31 @@ describe("Heel anonymous launch review", () => {
   test("offers the verified Agent artifacts and exact local install command", () => {
     render(<McpQuickstart />);
 
-    const wheel = screen.getByRole("link", { name: "Download Heel Agent 1.3.0rc1" });
-    expect(wheel.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc1-py3-none-any.whl");
+    const wheel = screen.getByRole("link", { name: "Download Heel Agent 1.3.0rc2" });
+    expect(wheel.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc2-py3-none-any.whl");
     expect(wheel.hasAttribute("download")).toBe(true);
     const source = screen.getByRole("link", { name: /download source archive/i });
-    expect(source.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc1.tar.gz");
+    expect(source.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc2.tar.gz");
     expect(source.hasAttribute("download")).toBe(true);
 
     const manifest = JSON.parse(readFileSync(
       resolve(process.cwd(), "public/downloads/heel-open-core-manifest.json"),
       "utf8",
-    )) as { artifacts: Array<{ name: string; sha256: string }> };
+    )) as { version: string; artifacts: Array<{ name: string; sha256: string }> };
+    expect(manifest.version).toBe("1.3.0rc2");
     const wheelArtifact = manifest.artifacts.find((artifact) => artifact.name.endsWith(".whl"));
     expect(wheelArtifact).toBeTruthy();
     expect(document.body.textContent).toContain(wheelArtifact?.sha256);
     expect(document.body.textContent).toContain("python3 -m venv .venv");
     expect(document.body.textContent).toContain(
-      ".venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl",
+      ".venv/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl",
     );
     expect(document.body.textContent).toContain(PUBLIC_INSTALL);
-    expect(PUBLIC_WHEEL_SHA256).toBe(wheelArtifact?.sha256);
+    // The same-origin files are the unpublished candidate, not the public rc1 wheel bytes.
+    expect(PUBLIC_WHEEL_SHA256).not.toBe(wheelArtifact?.sha256);
+    expect(document.body.textContent).toMatch(CANDIDATE_UNPUBLISHED);
+    expect(document.body.textContent).not.toMatch(CANDIDATE_RELEASE_URL);
+    expect(document.body.textContent).toMatch(/1\.3\.0rc1 erratum[^.]*`?error_envelope`?[^.]*passed regression; treat that result as inconclusive/i);
     const release = screen.getByRole("link", { name: /github\.com\/ancilis\/heel\/releases\/tag\/v1\.3\.0rc1/i });
     expect(release.getAttribute("href")).toBe(PUBLIC_RELEASE);
     expect(document.body.textContent).toMatch(/public preview prerelease/i);
@@ -272,6 +281,10 @@ describe("Heel anonymous launch review", () => {
     expect(text).toMatch(/never raw exceptions, signing keys, scope files, or credentials/i);
     expect(text).not.toMatch(/without a download|checkout or download is needed/i);
     expect(text).toMatch(/no source checkout or manual wheel download is needed/i);
+    expect(text).toMatch(/1\.3\.0rc1 erratum[^.]*error_envelope[^.]*invariant_held with regression_passed=true/i);
+    expect(text).toMatch(/That result is inconclusive, not a pass/);
+    expect(text).toMatch(/1\.3\.0rc2 candidate reports it as inconclusive with regression_passed=false; 1\.3\.0rc2 is not yet published/);
+    expect(text).not.toMatch(CANDIDATE_RELEASE_URL);
   });
 
   test("renders reference instructions in the runner body column beside the numbered rail", () => {
@@ -324,6 +337,8 @@ describe("Heel anonymous launch review", () => {
       const unwrapped = source.replace(/\s+/g, " ");
       expect(unwrapped, path).toContain(PUBLIC_RELEASE);
       expect(unwrapped, path).not.toMatch(STALE_GITHUB_CLAIMS);
+      expect(unwrapped, path).toMatch(CANDIDATE_UNPUBLISHED);
+      expect(unwrapped, path).not.toMatch(CANDIDATE_RELEASE_URL);
       expect(source, path).not.toContain('"$PWD/.heel');
     }
     for (const [path, source] of documents.slice(0, 3)) {
@@ -340,6 +355,7 @@ describe("Heel anonymous launch review", () => {
     expect(demo).toMatch(/`error_envelope`[^.]*inconclusive/i);
     expect(demo).toMatch(/does not validate the invariant/i);
     expect(demo).toMatch(/verified_violation; invariant_held with regression_passed=true/i);
+    expect(demo).toMatch(/1\.3\.0rc2 candidate[^.]*prints `inconclusive` for `error_envelope`/i);
   });
 
   test("states the MCP release, platform, privacy, and execution boundaries", () => {

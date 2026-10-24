@@ -11,7 +11,7 @@ UTF-8 JSON file no larger than 2 MiB.
 
 ## Install the current Agent
 
-The current Agent is the 1.3.0rc1 runner preview, published as a public GitHub prerelease at
+The current public Agent is the 1.3.0rc1 runner preview, published as a public GitHub prerelease at
 <https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. It is a preview, not a stable release.
 Its GitHub release record is not immutable. It is not a deployed Heel Cloud URL and does not indicate
 customer acceptance. No source checkout or Heel Cloud deployment is needed to install it. In an empty
@@ -26,18 +26,21 @@ python3 -m venv .venv
 pip installs the public wheel only if it matches that SHA-256. `--isolated` makes pip ignore
 environment variables and user configuration. The `runner` extra, which the optional synthetic
 [export reference](EXPORT_DEMO.md) needs, downloads the pinned `cryptography` dependency from the
-Python package index. The local review and MCP tools below do not need it.
+Python package index. The local review and MCP tools below do not need it. Known 1.3.0rc1 erratum:
+its synthetic reference reports the HTTP 200 `error_envelope` case as a passed regression; read that
+result as inconclusive (see the [export reference](EXPORT_DEMO.md)).
 
-The same wheel, `heel_sim-1.3.0rc1.tar.gz`, and `heel-open-core-manifest.json` are also part of the
-deployable Heel Cloud build. Public customer access to those same-origin files still depends on the
-approved deployment. If you use a deployment's `/agent` page, choose
-**Download Heel Agent 1.3.0rc1**; the same-origin wheel is
-`/downloads/heel_sim-1.3.0rc1-py3-none-any.whl`. Compare it with the wheel SHA-256 that `/agent`
+The deployable Heel Cloud build in this repository carries the corrected 1.3.0rc2 candidate instead:
+`heel_sim-1.3.0rc2-py3-none-any.whl`, `heel_sim-1.3.0rc2.tar.gz`, and
+`heel-open-core-manifest.json`. 1.3.0rc2 is not yet published as a GitHub release or to PyPI.
+Public customer access to those same-origin files still depends on the approved deployment. If you
+use a deployment's `/agent` page, choose **Download Heel Agent 1.3.0rc2**; the same-origin wheel is
+`/downloads/heel_sim-1.3.0rc2-py3-none-any.whl`. Compare it with the wheel SHA-256 that `/agent`
 shows from the build's manifest. In the directory where you saved it, run:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl
+.venv/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl
 ```
 
 `heel-sim` is not yet published to PyPI, and the current public repository export is a release-owner

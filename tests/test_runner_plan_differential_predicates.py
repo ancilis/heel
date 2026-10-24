@@ -81,8 +81,9 @@ def test_r11_verdict_table_rows(row, lower, higher, keywords, verdict, state, pr
     assert (result.row, result.verdict, result.evidence_state, result.predicate, result.reason) == (
         row, verdict, state, predicate, reason,
     )
-    # A finding is stored for rows 2, 3, 5, 6, 8 and 9 only; never for row 1 or a held pair.
-    assert result.stores_finding is (row in {2, 3, 5, 6, 8, 9})
+    # A finding is stored for rows 2, 3, 5 and 6 only; never for row 1, a held pair, status
+    # parity alone (row 8) or an undecided lower response (row 9).
+    assert result.stores_finding is (row in {2, 3, 5, 6})
     # `candidate` is true on row 8 and nowhere else.
     assert result.candidate is (row == 8)
     assert {case[0] for case in ROWS} == set(range(1, 10))
@@ -237,18 +238,37 @@ def test_error_envelope_never_counts_as_parity():
             assert (result.verdict, result.evidence_state, result.reason, result.candidate) == (
                 "inconclusive", "inconclusive", "lower_denial_envelope", False,
             )
+            # Undetermined pairs keep their evidence but never become a stored finding.
+            assert result.stores_finding is False
         # The same envelope from the higher plan removes the positive control.
         assert evaluate(observation(200, FULL), observation(200, envelope)).row == 2
 
     # Without a marker an envelope is never held; a 4xx status is.
     assert evaluate(observation(403, ENVELOPE), observation(200, FULL)).verdict == "held"
-    # With a marker, a 2xx envelope that still discloses the marker is a verified leak.
-    leaked = evaluate(
-        observation(200, {**protected(), "error": "upgrade required"}),
+    # With a marker, a 2xx envelope that also carries the marker is still an envelope: the
+    # content predicate is undetermined, so the pair is undecided, never a verified leak,
+    # whatever the executor reported.
+    for envelope in envelopes:
+        for lower_status in (200, 201, 204):
+            for outcome in ("observed", "blocked", "inconclusive"):
+                result = evaluate(
+                    observation(lower_status, {**envelope, **protected()}),
+                    observation(200, protected()), marker=MARKER,
+                    outcome=ExecutorOutcome("completed", outcome),
+                )
+                assert (result.row, result.verdict, result.reason, result.marker_leak) == (
+                    5, "inconclusive", "marker_undetermined", None,
+                ), (envelope, lower_status, outcome)
+    # A marker-bearing 4xx body still discloses the marker; a plain 4xx is held.
+    assert evaluate(
+        observation(403, {**protected(), "error": "upgrade required"}),
         observation(200, protected()), marker=MARKER,
         outcome=ExecutorOutcome("completed", "observed"),
-    )
-    assert leaked.evidence_state == "verified"
+    ).evidence_state == "verified"
+    assert evaluate(
+        observation(403, ENVELOPE), observation(200, protected()), marker=MARKER,
+        outcome=ExecutorOutcome("completed", "blocked"),
+    ).verdict == "held"
 
     # Near-misses are not envelopes. Non-boolean spellings of the vocabulary are envelopes
     # (T3 D1) and are pinned in tests/test_runner_plan_differential_redteam.py.
@@ -536,7 +556,7 @@ def test_d4_verdict_truth_table(lower, higher, expected, statuses, method):
         assert result.evidence_state == (
             "observed" if row == 6 else None if row == 7 else "inconclusive"
         )
-        assert result.stores_finding is (row != 7)
+        assert result.stores_finding is (row in {2, 6})
         assert result.predicate == (
             "body_superset" if row == 6 else "status_parity" if row in {7, 8} else "inconclusive"
         )
@@ -657,7 +677,7 @@ def test_d4_hollow_shape_is_never_observed_candidate_or_held(case_id):
                             assert lower.get("protected_canary") == MARKER
                         if marker is None and method == "GET":
                             assert _d4_columns(result) == D4_HOLLOW
-                            assert (result.verdict, result.stores_finding) == ("inconclusive", True)
+                            assert (result.verdict, result.stores_finding) == ("inconclusive", False)
                         if marker is None and method == "HEAD":
                             assert _d4_columns(result) == (8, "head_status_only", True, None, True)
     assert rows == {2, 3, 4, 5, 8, 9}
@@ -721,8 +741,8 @@ def test_d4_reflexive_bodies_unchanged(case_id):
 # Expected columns: (row, reason, status_parity, body_superset, candidate, evidence_state,
 # stores_finding).
 D5_OBS = (6, "lower_superset", True, True, False, "observed", True)
-D5_SUB = (8, "lower_subset", True, False, True, "inconclusive", True)
-D5_HOL = (9, "lower_hollow_shape", None, None, False, "inconclusive", True)
+D5_SUB = (8, "lower_subset", True, False, True, "inconclusive", False)
+D5_HOL = (9, "lower_hollow_shape", None, None, False, "inconclusive", False)
 D5_ALL = [
     "BodyTooComplex", "ExecutorOutcome", "PairVerdict", "PlanDifferentialRejected",
     "PlanObservation", "evaluate_plan_pair", "is_denial_envelope", "key_paths",
@@ -1022,7 +1042,7 @@ def test_d5_alias_truth_table(lower, higher, expected):
 
 @pytest.mark.parametrize("case_id", ["bounds_wide_alias"])
 def test_d5_bounds_count_alias_keys_as_nodes(case_id):
-    status_only = (8, "status_only", True, None, True, "inconclusive", True)
+    status_only = (8, "status_only", True, None, True, "inconclusive", False)
     limit = plan_differential.MAX_KEY_PATH_NODES
     higher = {f"k{index}": index + 1 for index in range(limit + 1)}
     lower = {**{key: None for key in higher}, "k0.k1": 1}

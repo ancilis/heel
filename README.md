@@ -46,14 +46,21 @@ from the Python package index; the review itself does not need it. `HEEL_HOME` m
 path in which no component is a symbolic link. On macOS, `/tmp` and `/var` are symbolic links, so use
 `pwd -P` rather than `$PWD`.
 
-A Heel Cloud deployment also serves the same files on its own origin. From its `/agent` page, choose
-**Download Heel Agent 1.3.0rc1**, save `/downloads/heel_sim-1.3.0rc1-py3-none-any.whl` in an empty
+Known 1.3.0rc1 erratum: its synthetic reference reports the HTTP 200 `error_envelope` case as
+invariant_held with regression_passed=true. Read that result as inconclusive; see the
+[export demo](docs/EXPORT_DEMO.md). This repository carries a corrected 1.3.0rc2 candidate that
+reports it inconclusive. That candidate is not yet published as a GitHub release or to PyPI, and no
+public 1.3.0rc2 download exists.
+
+A Heel Cloud deployment built from this repository serves that unpublished 1.3.0rc2 candidate on its
+own origin, not the public 1.3.0rc1 files. From its `/agent` page, choose
+**Download Heel Agent 1.3.0rc2**, save `/downloads/heel_sim-1.3.0rc2-py3-none-any.whl` in an empty
 working directory, compare it with the wheel SHA-256 shown there, and use this install step in place
 of the public one:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl
+.venv/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl
 ```
 
 The default report is validated Markdown. Add `--json` for the canonical `heel.review.v1`

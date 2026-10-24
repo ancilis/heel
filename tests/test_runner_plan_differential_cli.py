@@ -67,6 +67,44 @@ def inventory_file(world: World) -> Path:
     return Path(world.journey.bootstrap["inventory"]["path"])
 
 
+def assert_unstored_with_evidence(world: World, result: dict, reason: str) -> None:
+    """An undecided pair stores no finding, yet keeps its report, raw-evidence references
+    and containment entry."""
+    pair = pairs_by_route(result)[EXPORT]
+    assert (pair["verdict"], pair["reason"], pair["finding_id"]) == ("inconclusive", reason, None)
+    assert pair["execution_disposition"] == "completed"
+    assert all(
+        (item["method"], item["route_template"]) != EXPORT for item in result["findings"]
+    )
+    assert all(
+        item["affordance_id"] != " ".join(EXPORT)
+        for item in world.journey.findings(result["run_id"])
+    )
+    report = json.loads(Path(result["report_path"]).read_text())
+    (observed,) = [
+        item for item in report["observations"]
+        if (item["method"], item["route_template"]) == EXPORT
+    ]
+    assert [item["role"] for item in observed["observations"]] == ["lower_plan", "higher_plan"]
+    assert all(item["response_ref"] for item in observed["observations"])
+    assert report["uploaded"] is False
+    code, output, _ = invoke("log", "--run", result["run_id"])
+    log = json.loads(output)
+    assert code == 0 and log["chain_valid"] is True
+    logged = [
+        json.loads(entry["detail"]) for entry in log["entries"]
+        if entry["action"] == "plan_differential_pair"
+    ]
+    assert [
+        item["reason"] for item in logged
+        if (item["method"], item["route_template"]) == EXPORT
+    ] == [reason]
+    assert all(
+        json.loads(entry["detail"]).get("evidence_state") in {"verified", "observed"}
+        for entry in log["entries"] if entry["action"] == "finding"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # R14 no transport selection from the CLI
 # --------------------------------------------------------------------------- #
@@ -662,13 +700,18 @@ def test_r24_denial_envelope_is_inconclusive_in_fresh_run_and_regression_replay(
             "inconclusive", "inconclusive", "lower_denial_envelope", False,
         )
         assert pair["execution_disposition"] == "completed"
-        assert finding["evidence_state"] == "inconclusive"
+        assert finding == {}
+        assert_unstored_with_evidence(world, journey.run()[1], "lower_denial_envelope")
         item = replay()
         assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
         assert item["matches_expected"] is False and item["run_id"].startswith("pdrun-")
-        (stored,) = journey.findings(item["run_id"])
-        assert stored["reproduction"]["evidence_state"] == "inconclusive"
-        assert stored["reproduction"]["reason"] == "lower_denial_envelope"
+        # The replay run records the undecided pair but stores no new finding.
+        assert journey.findings(item["run_id"]) == []
+        replayed = [
+            json.loads(entry["detail"]) for entry in journey.containment(item["run_id"])["entries"]
+            if entry["action"] == "plan_differential_pair"
+        ]
+        assert [entry["reason"] for entry in replayed] == ["lower_denial_envelope"]
 
         # 200 with fewer keys: the lower plan still received content.
         world.target.behavior = "subset"
@@ -676,7 +719,7 @@ def test_r24_denial_envelope_is_inconclusive_in_fresh_run_and_regression_replay(
         assert (pair["verdict"], pair["predicate"], pair["reason"], pair["candidate"]) == (
             "inconclusive", "status_parity", "lower_subset", True,
         )
-        assert finding["evidence_state"] == "inconclusive"
+        assert finding == {} and pair["finding_id"] is None
         item = replay()
         assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
 
@@ -693,6 +736,115 @@ def test_r24_denial_envelope_is_inconclusive_in_fresh_run_and_regression_replay(
         world.target.behavior = "vulnerable"
         item = replay()
         assert (item["result"], item["current_status"]) == ("fail", "still_reachable")
+
+
+# --------------------------------------------------------------------------- #
+# Records stored by earlier runs: readable, never a new regression, still undecided
+# --------------------------------------------------------------------------- #
+def _legacy_inconclusive_copy(world: World, source: dict, predicate: str, reason: str) -> dict:
+    """Store, as an earlier version did, an undecided pair as a finding (test-only surgery)."""
+    vector = json.loads(json.dumps(source))
+    vector["id"] = "pdv-legacy" + predicate[:2]
+    vector["scenario_id"] = "plan_differential." + predicate
+    vector["plausible"] = False
+    reproduction = vector["reproduction"]
+    reproduction.update({
+        "evidence_state": "inconclusive", "predicate": predicate, "reason": reason,
+        "candidate": predicate == "status_parity",
+    })
+    reproduction["observed"]["predicate"] = predicate
+    connection = sqlite3.connect(world.journey.home / "heel.db")
+    try:
+        (run_id,) = connection.execute(
+            "SELECT run_id FROM findings WHERE vector_id = ?", (source["id"],),
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO findings VALUES (?,?,?,?,?,?)",
+            (run_id, vector["id"], vector["category"], 0.1, 0, json.dumps(vector)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return vector
+
+
+def test_legacy_inconclusive_records_are_readable_rejected_and_replay_undecided(tmp_path, monkeypatch):
+    from heel.store import Store
+
+    with World(tmp_path, monkeypatch) as world:
+        journey = world.journey
+        code, result, error = journey.run()
+        assert (code, error) == (1, "")
+        (observed,) = [
+            item for item in journey.findings(result["run_id"])
+            if item["affordance_id"] == " ".join(EXPORT)
+        ]
+        assert observed["reproduction"]["evidence_state"] == "observed"
+        legacy = {
+            "status_parity": _legacy_inconclusive_copy(world, observed, "status_parity", "lower_subset"),
+            "inconclusive": _legacy_inconclusive_copy(
+                world, observed, "inconclusive", "lower_denial_envelope",
+            ),
+        }
+        before = {item["id"] for item in journey.findings(result["run_id"])}
+
+        # Readable as before, but neither can become a new regression; nothing is deleted.
+        for predicate, vector in legacy.items():
+            assert vector["id"] in before
+            code, output, _ = invoke(
+                "regress", "add", "--run", result["run_id"], "--vector", vector["id"],
+                "--name", "legacy-" + predicate,
+            )
+            assert code == 1
+            assert output == (
+                "REJECTED: an inconclusive plan-differential result cannot become a regression\n"
+            )
+        code, output, _ = invoke("regress", "list")
+        assert code == 0 and json.loads(output)["regressions"] == []
+        assert {item["id"] for item in journey.findings(result["run_id"])} == before
+        # The observed runtime finding of the same run is still admitted.
+        admitted = add_regression(world, result, "export-plan-gate")
+        assert admitted["original_vector_id"] == observed["id"]
+
+        def only_regression(regression: dict) -> None:
+            # Ephemeral credentials serve one replay per process: keep one stored regression.
+            store = Store(str(journey.home / "heel.db"))
+            try:
+                store.conn.execute("DELETE FROM regressions")
+                store.conn.commit()
+                store.add_regression(regression)
+            finally:
+                store.close()
+
+        def replay(behavior: str) -> tuple[str, str]:
+            world.target.behavior = behavior
+            (item,) = regress(world)
+            return item["result"], item["current_status"]
+
+        # A regression an earlier version saved from each record still replays. Status
+        # parity alone, a lower denial envelope, or a hollow lower body never passes and is
+        # never still_reachable; only a pair that is itself a finding still holds.
+        expected = {
+            "status_parity": {
+                "subset": ("fail", "inconclusive"), "envelope": ("fail", "inconclusive"),
+                "vulnerable": ("fail", "still_reachable"), "hardened": ("pass", "blocked"),
+            },
+            "inconclusive": {
+                "subset": ("fail", "inconclusive"), "envelope": ("fail", "inconclusive"),
+                "vulnerable": ("fail", "inconclusive"), "hardened": ("pass", "blocked"),
+            },
+        }
+        for predicate, vector in legacy.items():
+            only_regression({
+                **admitted,
+                "regression_id": "reg-legacy-" + predicate[:6],
+                "name": "legacy-" + predicate,
+                "original_vector_id": vector["id"],
+                "scenario_id": vector["scenario_id"],
+                "success_criterion": {"observed": vector["reproduction"]["observed"]},
+            })
+            for behavior, outcome in expected[predicate].items():
+                assert replay(behavior) == outcome, (predicate, behavior)
 
 
 # --------------------------------------------------------------------------- #
@@ -838,19 +990,16 @@ def test_d5_alias_lower_body_is_hollow_in_fresh_run_and_regression_replay(tmp_pa
             "inconclusive", "inconclusive", "lower_hollow_shape", False,
         )
         assert pair["execution_disposition"] == "completed"
-        assert finding_for(result)["evidence_state"] == "inconclusive"
-        (stored,) = [
+        assert_unstored_with_evidence(world, result, "lower_hollow_shape")
+        assert [
             item for item in journey.findings(result["run_id"])
             if item["reproduction"].get("reason") == "lower_hollow_shape"
-        ]
-        assert stored["reproduction"]["evidence_state"] == "inconclusive"
+        ] == []
 
         (item,) = regress(world)
         assert (item["result"], item["current_status"]) == ("fail", "inconclusive")
         assert item["matches_expected"] is False and item["run_id"].startswith("pdrun-")
-        (stored,) = journey.findings(item["run_id"])
-        assert stored["reproduction"]["evidence_state"] == "inconclusive"
-        assert stored["reproduction"]["reason"] == "lower_hollow_shape"
+        assert journey.findings(item["run_id"]) == []
 
         # Wrapper disabled: the same regression fails again on the vulnerable target.
         alias["enabled"] = False

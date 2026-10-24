@@ -21,10 +21,11 @@ include a Stripe or PostgreSQL integration.
 - Anonymous browser-local OpenAPI review with a committed sample on first visit.
 - Same-origin, pinned Pyodide runtime and Heel wheel; no analyzer network calls.
 - Explicit local browser save/export without retaining the source document.
-- Checked-in Heel 1.3.0rc1 runner preview candidate wheel, source archive, and manifest
+- Checked-in Heel 1.3.0rc2 runner preview candidate wheel, source archive, and manifest
   under `apps/heel-cloud/public/downloads/`, and the local stdio MCP quickstart. The candidate
   is unreleased: it is not published as a GitHub release or to PyPI, and it is not publicly
-  deployed. A one-command public install is later work.
+  deployed. It corrects the public 1.3.0rc1 prerelease's `error_envelope` erratum. A
+  one-command public install of a corrected release is later work.
 - Local CLI/MCP review without an account.
 - Free account signup/login and private `__Host-heel_session` handling at the edge.
 - Browser-mediated device authorization for CLI/MCP machines.

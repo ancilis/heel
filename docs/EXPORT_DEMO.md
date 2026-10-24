@@ -31,9 +31,10 @@ prints that physical path; plain `$PWD` may not. On macOS, `/tmp` and `/var` are
 disable or work around that check. Run the commands below in the same shell so that `HEEL_HOME` stays
 set.
 
-If you downloaded `heel_sim-1.3.0rc1-py3-none-any.whl` from a Heel Cloud deployment's `/agent`
-page, you can install that file instead with
-`.venv/bin/python -m pip --isolated install './heel_sim-1.3.0rc1-py3-none-any.whl[runner]'`.
+A Heel Cloud deployment built from the current repository serves the unpublished 1.3.0rc2 candidate
+on its `/agent` page instead of the public 1.3.0rc1 wheel. If you downloaded
+`heel_sim-1.3.0rc2-py3-none-any.whl` there, you can install that file instead with
+`.venv/bin/python -m pip --isolated install './heel_sim-1.3.0rc2-py3-none-any.whl[runner]'`.
 
 Replace SCOPE_ID below with the returned ID. Each attempt ID is consumed once, including cancelled or interrupted attempts; choose fresh 32-character lowercase hexadecimal IDs on repetition.
 
@@ -57,8 +58,10 @@ defect. In this case the reference product answers the lower-plan export with HT
 protected content was withheld, so the correct result is inconclusive. Treat the rc1
 `error_envelope` report as inconclusive: it does not validate the invariant and is not a passing
 regression. The commands and output above are the actual rc1 behavior; the published rc1 artifacts
-are unchanged. A corrected result will ship only in a later candidate, with its evaluator, tests
-and artifacts updated together. The vulnerable and hardened results are not affected.
+are unchanged. The corrected 1.3.0rc2 candidate, whose evaluator, tests and artifacts changed
+together, prints `inconclusive` for `error_envelope`, with `evidence_state` `unknown` and
+`regression_passed=false`. 1.3.0rc2 is not yet published as a GitHub release or to PyPI, and no
+public 1.3.0rc2 download exists. The vulnerable and hardened results are not affected.
 
 Every report has `execution_support` set to `reference_only`. Its provenance records
 `network_calls: false`, and `uploaded` is `false`. The runs contact no product target and accept no

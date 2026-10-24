@@ -6,7 +6,7 @@ import releaseManifest from "../../public/downloads/heel-open-core-manifest.json
 
 
 const WHEEL_SHA256 = releaseManifest.artifacts.find(
-  ({ name }) => name === "heel_sim-1.3.0rc1-py3-none-any.whl",
+  ({ name }) => name === "heel_sim-1.3.0rc2-py3-none-any.whl",
 )?.sha256;
 
 if (WHEEL_SHA256 === undefined) {
@@ -14,7 +14,7 @@ if (WHEEL_SHA256 === undefined) {
 }
 
 const INSTALL_AGENT = `python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl`;
+.venv/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl`;
 
 const PUBLIC_WHEEL_SHA256 = "176a17b0d4d7f4ea44420d8099239f32dbb17eeead981e5aa360f0a5bbccb94a";
 
@@ -64,7 +64,7 @@ export default function AgentQuickstart() {
       <article className="mcp-quickstart">
         <header className="quickstart-hero">
           <div>
-            <p className="eyebrow">Heel Agent 1.3.0rc1 preview candidate · local MCP quickstart</p>
+            <p className="eyebrow">Heel Agent 1.3.0rc2 preview candidate · local MCP quickstart</p>
             <h1>Investigate product abuse from your AI client.</h1>
             <p>
               Bring product rules and abuse hypotheses into your workflow. Download
@@ -105,21 +105,27 @@ export default function AgentQuickstart() {
               hash-pinned public wheel. pip refuses the wheel unless its SHA-256 matches;{" "}
               <code>--isolated</code> ignores pip environment variables and user configuration, and
               the <code>runner</code> extra downloads the pinned <code>cryptography</code> package
-              from your Python package index.
+              from your Python package index. Known 1.3.0rc1 erratum: its synthetic reference reports
+              the HTTP 200 <code>error_envelope</code> case as a passed regression; treat that result
+              as inconclusive.
             </p>
             <pre><code>{INSTALL_PUBLIC_AGENT}</code></pre>
+            <p>
+              The downloads below are this build&apos;s 1.3.0rc2 candidate, which reports that case as
+              inconclusive. Version 1.3.0rc2 is not yet published as a GitHub release or to PyPI.
+            </p>
             <div className="hero-actions" aria-label="Heel Agent downloads">
               <a
                 className="button button-primary"
                 download
-                href="/downloads/heel_sim-1.3.0rc1-py3-none-any.whl"
+                href="/downloads/heel_sim-1.3.0rc2-py3-none-any.whl"
               >
-                Download Heel Agent 1.3.0rc1
+                Download Heel Agent 1.3.0rc2
               </a>
               <a
                 className="button button-secondary"
                 download
-                href="/downloads/heel_sim-1.3.0rc1.tar.gz"
+                href="/downloads/heel_sim-1.3.0rc2.tar.gz"
               >
                 Download source archive
               </a>
