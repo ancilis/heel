@@ -220,9 +220,10 @@ def _denial_undecided(lower: PlanObservation, lower_json: Any, higher_json: Any)
 
     A denial status proves nothing on its own. It is held only against a higher body that
     is a bounded JSON object with material content, and only when the lower body is
-    complete and empty, or bounded JSON whose material paths do not cover the higher
-    body's. A lower body that still covers them, with or without an error field, is a
-    status-only change: undecided, never held and never a finding.
+    complete and empty, or a bounded JSON object whose material paths do not cover the
+    higher body's. A lower body that still covers them, with or without an error field, is
+    a status-only change: undecided, never held and never a finding. A non-empty lower body
+    that is not a JSON object, a scalar or array included, cannot be compared at all.
     """
     try:
         higher_material = (
@@ -234,7 +235,7 @@ def _denial_undecided(lower: PlanObservation, lower_json: Any, higher_json: Any)
         return "higher_control_unassessable"
     if not lower.body:
         return None
-    if lower_json is None:
+    if not isinstance(lower_json, dict):
         return "lower_denial_unassessable"
     try:
         lower_material = material_paths(lower_json)

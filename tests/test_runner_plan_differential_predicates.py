@@ -396,6 +396,45 @@ def test_a_denial_is_held_only_against_an_assessable_higher_body():
         assert _denied_columns(result) == DENIED_UNDECIDED, name
         assert result.reason == "lower_denial_unassessable", name
 
+    # A non-empty lower body is assessable only as a bounded JSON object. A JSON scalar or
+    # array has no root key paths to compare with the higher object, so finding none of the
+    # higher body's material there is not proof that the payload disappeared. A JSON empty
+    # string or empty array is a non-empty body, unlike zero body bytes.
+    opaque_lower = {
+        "empty_string": b'""', "string": b'"denied"', "zero": b"0", "number": b"403",
+        "float": b"12.5", "true": b"true", "false": b"false", "null": b"null",
+        "empty_array": b"[]", "empty_arrays": b"[[]]", "scalar_array": b'["denied"]',
+        "falsy_array": b"[0, false, null]", "object_array": b'[{"error": "denied"}]',
+        "payload_array": json.dumps([FULL]).encode(), "spaced_string": b' "denied" ',
+    }
+    for status in sorted(plan_differential._DENIAL_STATUSES):
+        for name, raw in opaque_lower.items():
+            result = evaluate(observation(status, raw=raw), observation(200, FULL))
+            assert _denied_columns(result) == DENIED_UNDECIDED, (status, name)
+            assert result.reason == "lower_denial_unassessable", (status, name)
+            assert (result.positive_control, result.status_parity) == (True, False)
+            assert result.body_superset is not True and result.marker_leak is None
+        # Zero body bytes and a bounded JSON object without the payload stay held.
+        for lower in (observation(status, raw=b""), observation(status, ENVELOPE),
+                      observation(status, {}), observation(status, SUBSET)):
+            result = evaluate(lower, observation(200, FULL))
+            assert (result.row, result.verdict, result.reason) == (7, "held", "lower_denied")
+        # The higher control is still checked first.
+        result = evaluate(observation(status, raw=b'"denied"'), observation(200, {}))
+        assert result.reason == "higher_control_unassessable"
+    # An opaque lower body at 2xx or another status keeps its existing rows.
+    assert evaluate(observation(200, raw=b'"x"'), observation(200, FULL)).row == 8
+    assert evaluate(observation(500, raw=b"[]"), observation(200, FULL)).reason == (
+        "unexpected_status"
+    )
+    # The exact marker policy is unchanged: an opaque denial body leaves the marker
+    # undetermined (row 5), never held.
+    result = evaluate(
+        observation(403, raw=b'"denied"'), observation(200, protected()), marker=MARKER,
+        outcome=ExecutorOutcome("completed", "blocked"),
+    )
+    assert (result.row, result.verdict, result.reason) == (5, "inconclusive", "marker_undetermined")
+
     # HEAD compares statuses only and keeps its own rows; never a finding.
     for higher in unassessable_higher.values():
         result = evaluate(observation(403, raw=b""), higher, method="HEAD")
