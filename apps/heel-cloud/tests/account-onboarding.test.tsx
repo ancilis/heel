@@ -282,7 +282,8 @@ describe("dashboard account onboarding", () => {
     expect(project.selectedOptions[0].textContent).toBe("Mine");
     expect(document.body.textContent).not.toContain("Theirs");
     expect(server.calls.some((call) => call.path.includes(other.memberships[0].workspace_id))).toBe(false);
-    expect(nav.search).toContain(mine.memberships[0].workspace_id);
+    // The URL-sync effect replaces the address after the commit that shows this account's project, so wait for it.
+    await waitFor(() => expect(nav.search).toContain(mine.memberships[0].workspace_id));
   });
 
   test("switching workspace re-reads the server identity and role before showing projects", async () => {
@@ -361,7 +362,9 @@ describe("dashboard account onboarding", () => {
     const project = await screen.findByRole("combobox", { name: /project/i }) as HTMLSelectElement;
     expect(project.selectedOptions[0].textContent).toBe("Second project");
     expect(document.body.textContent).not.toContain("First private");
-    expect(nav.search).toContain(second.memberships[0].workspace_id);
+    expectNoSecretLeak();
+    // The URL-sync effect writes the second account's address after the commit that shows its project, so wait for it.
+    await waitFor(() => expect(nav.search).toContain(second.memberships[0].workspace_id));
     expectNoSecretLeak();
   });
 
@@ -376,7 +379,8 @@ describe("dashboard account onboarding", () => {
     await screen.findByText(/Your session ended\. Sign in again to continue/);
     expect(document.body.textContent).not.toContain("Expiring");
     expect(screen.getByRole("heading", { name: "Create your Heel account" })).toBeTruthy();
-    expect(nav.search).toBe("");
+    // The URL-sync effect clears the address after the commit that shows sign-in, so wait for it.
+    await waitFor(() => expect(nav.search).toBe(""));
   });
 
   test("an unavailable service is a retryable error, not a signed-out state", async () => {
@@ -462,8 +466,9 @@ describe("C7AR1 R1: a canary service outage keeps the signed-in account usable",
 
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
     await screen.findByText("You signed out. Sign in again to continue.");
-    expect(nav.search).toBe("");
     expect(document.body.textContent).not.toContain("Billing staging");
+    // The URL-sync effect clears the address after the commit that shows the sign-out notice, so wait for it.
+    await waitFor(() => expect(nav.search).toBe(""));
   });
 
   test("a ready account that loses the canary service keeps project switching and sign-out, then recovers", async () => {
@@ -498,7 +503,8 @@ describe("C7AR1 R1: a canary service outage keeps the signed-in account usable",
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
     await screen.findByText("You signed out. Sign in again to continue.");
     expect(server.session).toBeNull();
-    expect(nav.search).toBe("");
+    // The URL-sync effect clears the address after the commit that shows the sign-out notice, so wait for it.
+    await waitFor(() => expect(nav.search).toBe(""));
   });
 
   test("a canary 401 is still session loss, not an outage", async () => {
