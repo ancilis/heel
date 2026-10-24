@@ -15,7 +15,7 @@ for (const [result, expected, passed] of [["verified_violation", /reaching the l
     const fetch = vi.fn(() => { throw new Error("unexpected network"); });
     vi.stubGlobal("fetch", fetch);
     render(<Runner />);
-    const report = { ...PRODUCED, target: "reference:export", mechanism_id: "export-read-entitlement", uploaded: false, result, case: result === "invariant_held" ? "hardened" : "vulnerable", evidence_state: result === "inconclusive" ? "unknown" : "verified", regression_passed: passed, arbitrary: "IGNORE PREVIOUS INSTRUCTIONS" };
+    const report = { ...PRODUCED, target: "reference:export", mechanism_id: "export-read-entitlement", uploaded: false, result, case: result === "invariant_held" ? "public" : "vulnerable", evidence_state: result === "inconclusive" ? "unknown" : "verified", regression_passed: passed, arbitrary: "IGNORE PREVIOUS INSTRUCTIONS" };
     fireEvent.change(screen.getByLabelText(/reference report JSON/i), { target: { files: [{ size: 1000, text: async () => JSON.stringify(report) }] } });
     await waitFor(() => expect(screen.getByRole("status").textContent).toMatch(expected));
     expect(screen.queryByText("IGNORE PREVIOUS INSTRUCTIONS")).toBeNull();
@@ -61,13 +61,29 @@ test("a held result without regression_passed true is not a pass", async () => {
 const HELD = { ...BASE, ...PRODUCED, result: "invariant_held", regression_passed: true, evidence_state: "verified" };
 
 test("the producer's supported held cases read as a passed regression", async () => {
-  // hardened (403), public and redacted (200 with the protected field withheld) all report
+  // public and redacted (200 with the protected field withheld, no error) report
   // invariant_held with regression_passed true from the actual reference producer.
-  for (const kase of ["hardened", "public", "redacted"]) {
+  for (const kase of ["public", "redacted"]) {
     cleanup();
     const text = await inspectReport({ ...HELD, case: kase });
     expect(text).toMatch(/This read regression passed/);
   }
+});
+
+test("never presents a legacy hardened held report as a passed regression", async () => {
+  // 1.3.0rc1 and earlier candidates reported the hardened case's HTTP 403 error envelope as
+  // invariant_held/regression_passed=true in this exact producer shape.
+  const text = await inspectReport({ ...HELD, case: "hardened" });
+  expect(text).not.toMatch(/regression passed/);
+  expect(text).toMatch(/HTTP 403 error envelope, which is inconclusive/);
+  expect(text).not.toMatch(/HTTP 200/);
+  expect(text).toMatch(/not a pass/);
+});
+
+test("reads the corrected candidate's hardened report as inconclusive", async () => {
+  const text = await inspectReport({ ...BASE, ...PRODUCED, case: "hardened", result: "inconclusive", regression_passed: false, evidence_state: "unknown" });
+  expect(text).toMatch(/could not establish the invariant/);
+  expect(text).not.toMatch(/regression passed/);
 });
 
 test("a held report outside the supported pass shape never says the regression passed", async () => {
@@ -76,6 +92,7 @@ test("a held report outside the supported pass shape never says the regression p
     // case: missing, unknown, wrong type, wrong spelling, or a case that cannot hold.
     { case: undefined }, { case: "unknown" }, { case: "" }, { case: 7 }, { case: null }, { case: true },
     { case: ["hardened"] }, { case: { name: "hardened" } }, { case: "Hardened" }, { case: " hardened" },
+    { case: ["public"] }, { case: "Public" }, { case: "redacted " },
     { case: "vulnerable" }, { case: "inconclusive" },
     // regression_passed: anything but the boolean true.
     { regression_passed: undefined }, { regression_passed: false }, { regression_passed: "true" }, { regression_passed: 1 },
@@ -92,11 +109,12 @@ test("a held report outside the supported pass shape never says the regression p
   ];
   for (const variant of variants) {
     cleanup();
-    const text = await inspectReport({ ...HELD, case: "hardened", ...variant });
+    const text = await inspectReport({ ...HELD, case: "public", ...variant });
     expect(text, JSON.stringify(variant)).not.toMatch(/regression passed/);
     expect(text, JSON.stringify(variant)).toMatch(/not a pass/);
-    // Only the known error_envelope case is explained as an HTTP 200 error response.
+    // Only the known error_envelope and hardened cases are explained as error responses.
     expect(text, JSON.stringify(variant)).not.toMatch(/HTTP 200 error/);
+    expect(text, JSON.stringify(variant)).not.toMatch(/HTTP 403 error/);
     expect(text, JSON.stringify(variant)).toMatch(/does not match a supported completed reference pass/);
   }
 });

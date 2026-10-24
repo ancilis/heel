@@ -25,9 +25,12 @@ def main():
     scope = cli('scope', 'create', '--target', 'reference:export', '--operator', 'installed acceptance', '--confirm')
     scope_id = scope['created_scope']
     reports = []
-    # A 2xx error envelope says it refused the read: inconclusive, never a passed regression.
-    for number, case, expected in [(1,'vulnerable','verified_violation'),(2,'hardened','invariant_held'),
-                                   (3,'error_envelope','inconclusive'),(4,'inconclusive','inconclusive')]:
+    # An error envelope (the 403 hardened and 200 error_envelope cases) says it refused the
+    # read: inconclusive, never a passed regression. The public and redacted reads withhold the
+    # protected field without an error: the passing controls.
+    for number, case, expected in [(1,'vulnerable','verified_violation'),(2,'hardened','inconclusive'),
+                                   (3,'error_envelope','inconclusive'),(4,'inconclusive','inconclusive'),
+                                   (5,'public','invariant_held'),(6,'redacted','invariant_held')]:
         attempt = f'{number:032x}'
         report = cli('reference','run','--scope',scope_id,'--case',case,'--attempt',attempt)
         assert report['result'] == expected
@@ -43,12 +46,14 @@ def main():
         {'jsonrpc':'2.0','id':2,'method':'tools/list','params':{}},
         {'jsonrpc':'2.0','id':3,'method':'tools/call','params':{'name':'heel_prepare_reference','arguments':{}}},
         {'jsonrpc':'2.0','id':4,'method':'tools/call','params':{'name':'heel_execute_reference','arguments':{'scope_id':scope_id,'case':'hardened','attempt':'8'*32}}},
+        {'jsonrpc':'2.0','id':5,'method':'tools/call','params':{'name':'heel_execute_reference','arguments':{'scope_id':scope_id,'case':'public','attempt':'7'*32}}},
     ]
     response = subprocess.run([sys.executable,'-I','-m','heel.mcp_server'],
         input='\n'.join(json.dumps(m) for m in messages)+'\n', text=True, capture_output=True, timeout=30)
     assert response.returncode == 0, response.stderr
     values = [json.loads(line) for line in response.stdout.splitlines()]
     assert 'heel_execute_reference' in {t['name'] for t in values[1]['result']['tools']}
+    assert values[-2]['result']['structuredContent']['regression_passed'] is False
     assert values[-1]['result']['structuredContent']['regression_passed'] is True
     print(json.dumps({'cli':reports,'mcp':'initialize/list/prepare/execute passed','replay':'rejected','unauthorized':'rejected'},indent=2))
 
