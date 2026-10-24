@@ -23,6 +23,7 @@ from heel.runner.control_client import RunnerControlClient
 from heel.runner.execution import (
     ExecutionBundle,
     ExecutionGate,
+    ValidatedExecutionBundle,
     validate_execution_bundle,
 )
 from heel.runner.identity import RunnerIdentity, SecureSigner
@@ -844,18 +845,54 @@ class RunnerCoordinator:
 
 
 class RunnerExecutionAdapter:
-    """Bind Task 6 execution to one coordinator gate source and one local target transport."""
+    """Bind Task 6 execution to one coordinator gate source and one local target transport.
 
-    def __init__(self, *, coordinator: RunnerCoordinator, executor: object, transport: object):
+    The transport is either one fixed object or ``transport_factory``, which builds a transport
+    for one lease. The factory runs only after the coordinator's fresh gate and the exact claimed
+    bundle have been revalidated, and it receives only that validated bundle, so no transport can
+    be built for an unvalidated, stale, revoked or mismatched lease.
+    """
+
+    def __init__(
+        self,
+        *,
+        coordinator: RunnerCoordinator,
+        executor: object,
+        transport: object = None,
+        transport_factory: Callable[[ValidatedExecutionBundle], object] | None = None,
+    ):
         if not isinstance(coordinator, RunnerCoordinator):
             raise TypeError("runner coordinator is required")
         if not callable(getattr(executor, "execute", None)):
             raise TypeError("local canary executor is required")
-        if transport is None:
+        if (transport is None) == (transport_factory is None) or (
+            transport_factory is not None and not callable(transport_factory)
+        ):
             raise TypeError("bounded local target transport is required")
         self.coordinator = coordinator
         self.executor = executor
         self.transport = transport
+        self.transport_factory = transport_factory
+
+    def _validated_lease(self, lease: ClaimLease) -> ValidatedExecutionBundle:
+        coordinator = self.coordinator
+        gate = coordinator.execution_gate(lease.run_id)
+        validated = validate_execution_bundle(
+            lease.bundle,
+            store=coordinator.store,
+            identity=coordinator.identity,
+            trusted_grant_keys=coordinator.trusted_grant_keys,
+            now_ms=coordinator._now_ms(),
+            gate=gate,
+        )
+        with coordinator._lock:
+            binding = coordinator._bindings.get(lease.run_id)
+        if binding is None or validated.grant["run_id"] != lease.run_id or binding != (
+            validated.grant["grant_id"], validated.projection["projection_id"],
+            validated.projection["projection_digest"],
+        ):
+            raise ValueError("runner claim lease differs from the active claim")
+        return validated
 
     def execute(
         self,
@@ -866,9 +903,14 @@ class RunnerExecutionAdapter:
     ) -> object:
         if not isinstance(lease, ClaimLease):
             raise ValueError("runner claim lease is required")
+        transport = self.transport
+        if self.transport_factory is not None:
+            transport = self.transport_factory(self._validated_lease(lease))
+            if transport is None:
+                raise TypeError("bounded local target transport is required")
         return self.executor.execute(
             lease.bundle,
-            transport=self.transport,
+            transport=transport,
             gate_source=lambda: self.coordinator.execution_gate(lease.run_id),
             cancellation=cancellation,
             on_progress=on_progress,
