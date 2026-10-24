@@ -930,9 +930,11 @@ class LocalCanaryExecutor:
         stop_requested_at_ms,
         stop_acknowledged_at_ms,
     ) -> ExecutionResult:
-        state = self.store.load_run(grant["run_id"])["state"]
-        if state in {"verified", "running", "stop_requested"}:
-            self.store.transition_run(grant["run_id"], "finalizing", now_ms=self.clock_ms())
+        state = self.store.load_run(grant["run_id"])
+        if state["state"] in {"verified", "running", "stop_requested"}:
+            state = self.store.transition_run(
+                grant["run_id"], "finalizing", now_ms=self.clock_ms(),
+            )
         existing_events = log.load()
         if not existing_events or existing_events[-1]["event_code"] != "run_finalized":
             log.append("run_finalized", detail_code=disposition, counters=counters)
@@ -999,8 +1001,11 @@ class LocalCanaryExecutor:
             else "blocked" if outcomes and all(item == "blocked" for item in outcomes)
             else "inconclusive"
         )
+        # The one terminal instant: signed into the projections below and used, unchanged, for
+        # the terminal transition, so the stored terminal record and the signed result agree.
+        # It is never earlier than the run's current local time, which the store requires.
         finished_at = max(
-            self.clock_ms(), started_at,
+            self.clock_ms(), started_at, state["updated_at_ms"],
             stop_requested_at_ms or 0, stop_acknowledged_at_ms or 0,
         )
         findings_unsigned = {
@@ -1088,7 +1093,7 @@ class LocalCanaryExecutor:
         self.store.save_final_projections(
             grant["run_id"], operational, findings, local_view, disclosure,
         )
-        self.store.transition_run(grant["run_id"], "terminal", now_ms=self.clock_ms())
+        self.store.transition_run(grant["run_id"], "terminal", now_ms=finished_at)
         return ExecutionResult(
             aggregate, disposition, operational, findings, local_view, disclosure,
         )
@@ -1107,9 +1112,22 @@ class LocalCanaryExecutor:
         if stored is not None:
             state = self.store.load_run(run_id)["state"]
             if state != "terminal":
+                # Verified finals persisted before the terminal transition: finish at the instant
+                # they sign. A store time later than that instant is refused by the store.
+                operational = stored["operational_projection"]
+                terminal_at = operational["timestamps"]["terminal_at_ms"]
+                if (
+                    operational["run_id"] != run_id
+                    or operational["grant_id"] != self.store.load_run_grant(run_id)["grant_id"]
+                    or operational["lifecycle_phase"] != "terminal"
+                    or isinstance(terminal_at, bool)
+                    or not isinstance(terminal_at, int)
+                    or operational["timestamps"]["updated_at_ms"] != terminal_at
+                ):
+                    raise RunnerStoreError("local final projections are invalid")
                 if state in {"verified", "running", "stop_requested"}:
-                    self.store.transition_run(run_id, "finalizing", now_ms=self.clock_ms())
-                self.store.transition_run(run_id, "terminal", now_ms=self.clock_ms())
+                    self.store.transition_run(run_id, "finalizing", now_ms=terminal_at)
+                self.store.transition_run(run_id, "terminal", now_ms=terminal_at)
             return ExecutionResult(
                 stored["findings_projection"]["assessment_outcome"],
                 stored["operational_projection"]["execution_disposition"],

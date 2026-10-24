@@ -18,7 +18,7 @@ from heel.canary_contracts import (
 from heel.runner.control_client import _RunGuard, RunnerControlClient
 from heel.runner.coordinator import RunnerCoordinator, RunnerExecutionAdapter
 from heel.runner.http_transport import CancellationToken
-from heel.runner.execution import ExecutionBundle, ExecutionGate
+from heel.runner.execution import ExecutionBundle, ExecutionGate, ValidatedExecutionBundle
 from heel.runner.service import ClaimLease, RunnerService
 from heel.runner.store import RunnerStore, RunnerStoreError
 from heel.runner.runtime import (
@@ -1875,6 +1875,121 @@ def test_delayed_execution_rejects_stale_authenticated_claim_gate_before_executo
             lease, cancellation=CancellationToken(), on_progress=lambda _: None,
         )
     assert entered == [True]
+
+
+def test_execution_adapter_builds_a_lease_transport_only_from_the_revalidated_claim(tmp_path):
+    """Unit (scripted control transport, recording executor): the lazy factory runs after the
+    fresh coordinator gate and the exact bundle check, sees only the validated bundle, and its
+    transport is the one the executor receives."""
+    coordinator, _, _, manifest, projection, grant, _ = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+        ],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    order: list[str] = []
+    built = object()
+    real_gate = coordinator.execution_gate
+
+    def gate(run_id):
+        order.append("gate")
+        return real_gate(run_id)
+
+    coordinator.execution_gate = gate
+
+    def factory(validated):
+        order.append("factory")
+        assert isinstance(validated, ValidatedExecutionBundle)
+        assert validated.manifest == manifest and validated.projection == projection
+        assert validated.grant == grant
+        return built
+
+    class LocalExecutor:
+        def execute(self, bundle, *, transport, gate_source, cancellation, on_progress):
+            order.append("execute")
+            assert bundle is lease.bundle and transport is built
+            assert gate_source() == ExecutionGate(**_gate())
+            return {"operational_projection": lease.operational_projection}
+
+    adapter = RunnerExecutionAdapter(
+        coordinator=coordinator, executor=LocalExecutor(), transport_factory=factory,
+    )
+    adapter.execute(lease, cancellation=CancellationToken(), on_progress=lambda _: None)
+    assert order == ["gate", "factory", "execute", "gate"]
+    for arguments in ({}, {"transport": object(), "transport_factory": factory},
+                      {"transport_factory": "not callable"}):
+        with pytest.raises(TypeError, match="target transport is required"):
+            RunnerExecutionAdapter(coordinator=coordinator, executor=LocalExecutor(), **arguments)
+
+
+_REFUSALS = {
+    "stale": "gate is stale",
+    "revoked": "gate denies execution",
+    "unknown-run": "active runner claim is required",
+    "mismatched-bundle": "lease differs from the active claim",
+    "expired": "grant is expired",
+}
+
+
+@pytest.mark.parametrize("case", ["stale", "revoked", "unknown-run", "mismatched-bundle", "expired"])
+def test_execution_adapter_never_builds_transport_for_a_stale_revoked_or_mismatched_lease(
+    tmp_path, case,
+):
+    """Unit (scripted control transport): every refused authority fails before the factory, so
+    no resolver, socket or executor is reached."""
+    now = [1.0]
+    clock = [2_000]
+
+    def responses(manifest, projection, grant):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"a")},
+             _gate(server_time_ms=2_001, stop_reason="runner_revoked", active=False)),
+        ]
+
+    coordinator, _, _, manifest, projection, grant, authority = _coordinator(
+        tmp_path, responses, monotonic=lambda: now[0],
+    )
+    coordinator.clock_ms = lambda: clock[0]
+    lease = coordinator.claim()
+    assert lease is not None
+    if case == "stale":
+        now[0] = 1.501
+    elif case == "revoked":
+        coordinator.heartbeat(lease.run_id, lease.operational_projection)
+    elif case == "unknown-run":
+        lease = ClaimLease("crun_" + "f" * 32, lease.bundle, lease.operational_projection)
+    elif case == "mismatched-bundle":
+        other = copy.deepcopy(dict(grant))
+        other["grant_id"] = "grant_987654321"
+        unsigned = {
+            key: value for key, value in other.items()
+            if key not in {"grant_digest", "signing_key_id", "signature_b64"}
+        }
+        other = {**unsigned, "grant_digest": canonical_digest(unsigned),
+                 **authority.sign(canonical_bytes(unsigned))}
+        lease = ClaimLease(
+            lease.run_id, ExecutionBundle(manifest, projection, other),
+            lease.operational_projection,
+        )
+    else:
+        clock[0] = grant["expires_at_ms"]
+    reached: list[str] = []
+
+    class Executor:
+        def execute(self, *_args, **_kwargs):
+            reached.append("execute")
+
+    adapter = RunnerExecutionAdapter(
+        coordinator=coordinator, executor=Executor(),
+        transport_factory=lambda validated: reached.append("factory"),
+    )
+    with pytest.raises(ValueError, match=_REFUSALS[case]):
+        adapter.execute(lease, cancellation=CancellationToken(), on_progress=lambda _: None)
+    assert reached == []
 
 
 def test_authenticated_gate_cannot_outlive_proof_horizon_by_local_elapsed_time(tmp_path):

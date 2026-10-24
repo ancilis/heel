@@ -2461,3 +2461,173 @@ def test_service_maintenance_failure_stops_claiming_and_raises_closed():
     assert len(seen) == 1
     assert isinstance(seen[0], RuntimeError)
     assert str(seen[0]) == "runner maintenance failed closed"
+
+
+# ---------------------------------------------------------------------------
+# One terminal instant under an advancing wall clock: the signed final projections and the stored
+# terminal record carry the same ``terminal_at_ms``, which ``RunnerCoordinator.result`` requires.
+
+class _AdvancingClock:
+    """A wall clock that moves forward on every read, like a real one."""
+
+    def __init__(self, start=50_000_000, step=3):
+        self.value, self.step = start, step
+
+    def __call__(self):
+        self.value += self.step
+        return self.value
+
+
+def _advancing_executor(tmp_path):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    clock = _AdvancingClock()
+    grant = signed_grant(manifest, projection, identity, authority,
+                         issued=clock.value - 1_000, expires=clock.value + 300_000)
+
+    def executor(selected_clock=clock):
+        return LocalCanaryExecutor(
+            store=store, identity=identity, signer=signer,
+            trusted_grant_keys={authority.key_id: authority.public_key},
+            vaults={"ephemeral_env": StaticVault()}, clock_ms=selected_clock,
+            monotonic=lambda: 1.0,
+        )
+
+    return store, signer, manifest, projection, grant, clock, executor
+
+
+def _assert_one_terminal_instant(store, run_id):
+    operational = store.load_final_projections(run_id)["operational_projection"]
+    instant = operational["timestamps"]["terminal_at_ms"]
+    assert operational["timestamps"]["updated_at_ms"] == instant
+    assert store.load_run(run_id)["updated_at_ms"] == instant
+    assert store._runtime_terminal_anchor(run_id)["terminal_at_ms"] == instant
+    return instant
+
+
+def test_advancing_clock_finalization_signs_and_stores_one_terminal_instant(tmp_path):
+    store, _signer, manifest, projection, grant, clock, executor = _advancing_executor(tmp_path)
+    result = executor().execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    instant = _assert_one_terminal_instant(store, grant["run_id"])
+    assert result.operational_projection["timestamps"]["terminal_at_ms"] == instant
+    assert clock.value > instant  # the clock kept moving after the instant was chosen
+
+
+def test_stopped_run_with_a_later_stop_acknowledgement_terminates_at_that_instant(tmp_path):
+    store, _signer, manifest, projection, grant, clock, executor = _advancing_executor(tmp_path)
+    acknowledged_at = clock.value + 90_000  # the ack clock is ahead of the executor clock
+
+    class StoppingTransport(ScriptedTransport):
+        def request(self, action, *, cancellation, before_attempt, **kwargs):
+            del kwargs
+            before_attempt(1, None)
+            self.calls.append((action, None))
+            cancellation.stop_reason = "cloud_stop"
+            cancellation.stop_requested_at_ms = clock.value + 60_000
+            cancellation.stop_acknowledged_at_ms = acknowledged_at
+            cancellation.stop_ack_event = threading.Event()
+            cancellation.stop_ack_event.set()
+            cancellation.cancel()
+            raise TransportFailure("cancelled", requests_made=1)
+
+    transport = StoppingTransport([])
+    result = executor().execute(
+        ExecutionBundle(manifest, projection, grant), transport=transport, gate_source=active_gate,
+    )
+    assert len(transport.calls) == 1 and result.execution_disposition == "stopped"
+    assert _assert_one_terminal_instant(store, grant["run_id"]) == acknowledged_at
+
+
+def _crash_before_terminal_transition(store, monkeypatch):
+    real = store.transition_run
+
+    def crash(run_id, next_state, *, now_ms):
+        if next_state == "terminal":
+            raise RunnerStoreError("simulated crash before the terminal transition")
+        return real(run_id, next_state, now_ms=now_ms)
+
+    monkeypatch.setattr(store, "transition_run", crash)
+    return lambda: monkeypatch.setattr(store, "transition_run", real)
+
+
+def test_recovery_after_finals_persist_terminates_at_the_signed_instant_not_the_recovery_clock(
+    tmp_path, monkeypatch,
+):
+    store, _signer, manifest, projection, grant, clock, executor = _advancing_executor(tmp_path)
+    restore = _crash_before_terminal_transition(store, monkeypatch)
+    with pytest.raises(RunnerStoreError, match="simulated crash"):
+        executor().execute(
+            ExecutionBundle(manifest, projection, grant),
+            transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+        )
+    restore()
+    assert store.load_run(grant["run_id"])["state"] == "finalizing"
+    signed = store.load_final_projections(grant["run_id"])["operational_projection"]
+    later = _AdvancingClock(start=clock.value + 3_600_000)
+    transport = ScriptedTransport([200])
+    recovered = executor(later).recover(grant["run_id"], transport=transport)
+    assert transport.calls == []
+    assert recovered.operational_projection == signed
+    assert _assert_one_terminal_instant(store, grant["run_id"]) == signed["timestamps"]["terminal_at_ms"]
+
+
+@pytest.mark.parametrize("defect", ["not-terminal", "split-instant", "other-run", "before-store-time"])
+def test_recovery_refuses_malformed_or_backward_stored_final_authority(tmp_path, monkeypatch, defect):
+    store, signer, manifest, projection, grant, _clock, executor = _advancing_executor(tmp_path)
+    restore = _crash_before_terminal_transition(store, monkeypatch)
+    with pytest.raises(RunnerStoreError, match="simulated crash"):
+        executor().execute(
+            ExecutionBundle(manifest, projection, grant),
+            transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+        )
+    restore()
+    stored = copy.deepcopy(store.load_final_projections(grant["run_id"]))
+    operational = stored["operational_projection"]
+    state_time = store.load_run(grant["run_id"])["updated_at_ms"]
+    if defect == "not-terminal":
+        operational["lifecycle_phase"] = "finalizing"
+    elif defect == "split-instant":
+        operational["timestamps"]["updated_at_ms"] = operational["timestamps"]["terminal_at_ms"] - 1
+    elif defect == "other-run":
+        operational["run_id"] = "crun_" + "b" * 32
+    else:
+        # A verified authority whose signed instant precedes the run's stored local time.
+        operational["timestamps"]["terminal_at_ms"] = state_time - 1
+        operational["timestamps"]["updated_at_ms"] = state_time - 1
+    monkeypatch.setattr(store, "load_final_projections", lambda run_id: stored)
+    expected = "moved backward" if defect == "before-store-time" else "final projections are invalid"
+    with pytest.raises(RunnerStoreError, match=expected):
+        executor().recover(grant["run_id"], transport=ScriptedTransport([200]))
+    assert store.load_run(grant["run_id"])["state"] == "finalizing"
+
+
+def test_recovery_never_terminalizes_a_tampered_persisted_final_envelope(tmp_path, monkeypatch):
+    store, _signer, manifest, projection, grant, _clock, executor = _advancing_executor(tmp_path)
+    restore = _crash_before_terminal_transition(store, monkeypatch)
+    with pytest.raises(RunnerStoreError, match="simulated crash"):
+        executor().execute(
+            ExecutionBundle(manifest, projection, grant),
+            transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+        )
+    restore()
+    path = store.run_path(grant["run_id"]) / "finals.json"
+    envelope = json.loads(path.read_text())
+    envelope["operational_projection"]["timestamps"]["terminal_at_ms"] += 1
+    envelope["operational_projection"]["timestamps"]["updated_at_ms"] += 1
+    operational = envelope["operational_projection"]
+    operational["projection_digest"] = canonical_digest({
+        key: value for key, value in operational.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    })
+    core = {key: value for key, value in envelope.items() if key != "finals_digest"}
+    envelope["finals_digest"] = canonical_digest(core)  # only the runner signature can catch it
+    path.write_text(json.dumps(envelope, sort_keys=True, separators=(",", ":")))
+    transport = ScriptedTransport([200])
+    # The signature check rejects the stored finals; re-finalizing cannot replace them either.
+    with pytest.raises(RunnerStoreError, match="immutable final projection collision"):
+        executor().recover(grant["run_id"], transport=transport)
+    assert transport.calls == []
+    assert store.load_run(grant["run_id"])["state"] == "finalizing"

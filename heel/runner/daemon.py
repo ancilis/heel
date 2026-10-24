@@ -13,11 +13,14 @@ account, and the IDs the cloud assigned. It never holds key material, tokens or 
 ``serve`` keeps the paired runner online over the existing ``RunnerService`` /
 ``RunnerCoordinator`` / ``RunnerControlClient`` composition. One serve per ``HEEL_HOME`` holds a
 non-blocking kernel lock on ``.serve.lock``; its visible state is ``serve-state.json`` (public
-coordinates only). There is no target execution bridge yet: any claimed lease ends the serve with
-the closed ``execution_unavailable`` code and no target traffic.
+coordinates only). A claimed lease runs through the optional local execution bridge: the existing
+``RunnerExecutionAdapter`` revalidates the fresh gate and the exact approved bundle, then the
+existing ``LocalCanaryExecutor`` runs over a direct ``TargetHTTPSClient`` pinned to the signed
+manifest origin, with credentials only from OS secret stores. A lease that cannot be decoded
+locally still ends the serve with ``execution_unavailable`` and no target traffic.
 
-Test code may inject a secret backend or an explicit CA bundle through the constructor; the CLI
-never passes either.
+Test code may inject a secret backend, an explicit CA bundle, a credential vault factory or target
+network collaborators through the constructor; the CLI never passes any of them.
 """
 from __future__ import annotations
 
@@ -48,13 +51,19 @@ from .identity import (
     LinuxSecretServiceBackend, MacOSKeychainSecretBackend, OSSecretBackend, SystemSecureSigner,
     create_runner_pairing_material, runner_pairing_signer_label,
 )
-from .coordinator import RunnerCoordinator
+from .coordinator import RunnerCoordinator, RunnerExecutionAdapter
+from .execution import LocalCanaryExecutor, ValidatedExecutionBundle
+from .http_transport import (
+    DEFAULT_TIMEOUT_SECONDS, BoundedResolver, TargetHTTPSClient, TransportFailure,
+    normalize_target_origin,
+)
 from .runtime import RunnerRuntimeState, RunnerRuntimeStateError, RunnerRuntimeUnavailable
 from .service import RunnerService
 from .store import (
     _LOCK_FLAGS, PLAN_LABEL_ROLES, RunnerStore, RunnerStoreError, _flock, _open_child, _read_json,
     _secure_directory, _secure_regular, _write_json,
 )
+from .vault import VaultUnavailable, select_vault
 
 try:
     import fcntl
@@ -86,6 +95,9 @@ _RECORD_FIELDS = frozenset({
 _AUTHORITY_FIELDS = frozenset({"grant_authority_key_id", "grant_authority_public_key_b64"})
 _REPAIR_STEPS = ["heel runner unpair", "heel runner pair --origin <origin> --invite <new token>"]
 _PLAN_ROLES = ("lower_plan", "higher_plan")
+# The only credential backends a serve execution may use; env/fd handles are never resolved here.
+_OS_CREDENTIAL_BACKENDS = ("macos_keychain", "linux_secret_service")
+_TARGET_NETWORK_SEAMS = frozenset({"resolver", "sockets", "tls"})
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 NO_SECRET_SERVICE = "no supported runner OS secret service"
 _SERVE_LOCK = ".serve.lock"
@@ -331,11 +343,107 @@ def self_serve_access(store: RunnerStore) -> dict[str, Any]:
     }
 
 
-class _ExecutionUnavailable:
-    """The ``serve`` executor until the plan-differential bridge exists: never executes."""
+def _require_os_credentials(
+    store: RunnerStore, manifest: Mapping[str, Any], vaults: Mapping[str, object],
+) -> None:
+    """Every signed credential binding names an active local record kept in an OS secret store.
+
+    Checked from metadata only, before any DNS, socket or secret load: an env/fd (ephemeral)
+    handle is refused here, so the executor's ephemeral fallback can never run under ``serve``.
+    Handles are random and their backend never changes, so the executor resolves the same records.
+    """
+    records = {item["credential_handle_id"]: item for item in store.list_credentials()}
+    for binding in manifest["credential_bindings"]:
+        record = records.get(binding["credential_handle_id"])
+        vault = None if record is None else vaults.get(record["backend"])
+        if (
+            record is None
+            or record["state"] != "active"
+            or record["semantic_role"] != binding["semantic_role"]
+            or record["auth_profile"] != binding["auth_profile"]
+            or record["backend"] not in _OS_CREDENTIAL_BACKENDS
+            or vault is None
+            or getattr(vault, "supported", False) is not True
+            or getattr(vault, "backend_id", None) != record["backend"]
+        ):
+            raise RunnerServeError("credential_unavailable")
+
+
+class _ServeExecution:
+    """The ``serve`` executor: one fresh ``LocalCanaryExecutor`` and adapter per claimed lease.
+
+    The adapter builds the target transport only after the coordinator's fresh gate and the exact
+    claimed bundle are revalidated. The transport factory then checks credential metadata, resolves
+    the full public address set of the validated manifest origin once and pins a direct
+    ``TargetHTTPSClient`` to it; nothing else can choose the origin, resolver, port or TLS. OS vaults
+    are constructed through ``select_vault`` for the OS backends present locally; no secret is
+    loaded here, only inside the executor's own preflight.
+    """
+
+    def __init__(
+        self, coordinator: RunnerCoordinator, *, clock_ms: Callable[[], int],
+        vault_factory: Callable[[str], object] | None = None,
+        target_network: Mapping[str, Any] | None = None,
+    ):
+        network = dict(target_network or {})
+        if set(network) - _TARGET_NETWORK_SEAMS:
+            raise ValueError("unsupported target network seam")
+        self._coordinator = coordinator
+        self._clock_ms = clock_ms
+        self._vault_factory = select_vault if vault_factory is None else vault_factory
+        self._network = network
+        self._lock = threading.Lock()
+        self._adapter: RunnerExecutionAdapter | None = None
+
+    def _vaults(self) -> dict[str, object]:
+        present = {item["backend"] for item in self._coordinator.store.list_credentials()}
+        vaults: dict[str, object] = {}
+        for backend in _OS_CREDENTIAL_BACKENDS:
+            if backend in present:
+                try:
+                    vaults[backend] = self._vault_factory(backend)
+                except (VaultUnavailable, ValueError):
+                    continue  # refused per binding by ``_require_os_credentials``
+        return vaults
+
+    def _target(self, vaults: Mapping[str, object], validated: ValidatedExecutionBundle):
+        coordinator = self._coordinator
+        _require_os_credentials(coordinator.store, validated.manifest, vaults)
+        origin = normalize_target_origin(validated.manifest["environment"]["origin"])
+        resolver = self._network.get("resolver") or BoundedResolver()
+        try:
+            preflight = resolver(
+                origin[len("https://"):], deadline=time.monotonic() + DEFAULT_TIMEOUT_SECONDS,
+            )
+            return TargetHTTPSClient(
+                origin=origin, preflight_addresses=preflight, resolver=resolver,
+                sockets=self._network.get("sockets"), tls=self._network.get("tls"),
+            )
+        except TransportFailure:
+            raise RunnerServeError("target_unavailable") from None
 
     def execute(self, lease, *, cancellation, on_progress):
-        raise RunnerServeError("execution_unavailable")
+        coordinator = self._coordinator
+        vaults = self._vaults()
+        executor = LocalCanaryExecutor(
+            store=coordinator.store, identity=coordinator.identity, signer=coordinator.signer,
+            trusted_grant_keys=coordinator.trusted_grant_keys, vaults=vaults,
+            clock_ms=self._clock_ms,
+        )
+        adapter = RunnerExecutionAdapter(
+            coordinator=coordinator, executor=executor,
+            transport_factory=lambda validated: self._target(vaults, validated),
+        )
+        with self._lock:
+            self._adapter = adapter
+        return adapter.execute(lease, cancellation=cancellation, on_progress=on_progress)
+
+    def prepare_stop_ack(self, lease, projection, stop_reason, proposed_at_ms):
+        with self._lock:
+            adapter = self._adapter
+        if adapter is None:
+            raise RunnerServeError("execution_unavailable")
+        return adapter.prepare_stop_ack(lease, projection, stop_reason, proposed_at_ms)
 
 
 class _ServeCoordinator:
@@ -344,9 +452,10 @@ class _ServeCoordinator:
     Every service worker (idle loop, maintenance, heartbeat, stop control) reaches the runner only
     through this object, so it is the cycle's explicit ownership gate: ``close`` refuses any later
     call and waits for calls in flight, before the runtime closes and the instance lock is
-    released. It also reports each authenticated poll and refuses every lease before the service
-    starts its heartbeat worker, so nothing is acknowledged, heartbeated as running or
-    terminalized; the server's reaper ends the claimed run.
+    released. It reports each authenticated poll and forwards the lease lifecycle (heartbeat,
+    progress, result, stop acknowledgement) to the coordinator. A claim that was recorded but
+    cannot be decoded locally is refused before the heartbeat worker starts; the server's reaper
+    ends that run.
     """
 
     def __init__(self, coordinator: RunnerCoordinator, on_contact: Callable[[], None]):
@@ -396,10 +505,8 @@ class _ServeCoordinator:
                 if {item.run_id for item in runtime.load_active_run_controls(limit=64)} - before:
                     raise RunnerServeError("execution_unavailable") from None
                 raise
-            if lease is None:
-                self._on_contact()
-                return None
-            raise RunnerServeError("execution_unavailable")
+            self._on_contact()
+            return lease
         finally:
             self._leave()
 
@@ -411,12 +518,32 @@ class _ServeCoordinator:
             self._leave()
 
     def heartbeat(self, run_id, operational_projection):
-        raise RunnerServeError("execution_unavailable")
+        self._enter()
+        try:
+            return self._coordinator.heartbeat(run_id, operational_projection)
+        finally:
+            self._leave()
 
-    progress = result = heartbeat
+    def progress(self, run_id, operational_projection):
+        self._enter()
+        try:
+            return self._coordinator.progress(run_id, operational_projection)
+        finally:
+            self._leave()
+
+    def result(self, run_id, operational_projection):
+        self._enter()
+        try:
+            return self._coordinator.result(run_id, operational_projection)
+        finally:
+            self._leave()
 
     def stop_ack(self, run_id, operational_projection, *, deadline):
-        raise RunnerServeError("execution_unavailable")
+        self._enter()
+        try:
+            return self._coordinator.stop_ack(run_id, operational_projection, deadline=deadline)
+        finally:
+            self._leave()
 
 
 class RunnerDaemon:
@@ -432,10 +559,14 @@ class RunnerDaemon:
         transport_timeout_seconds: float | None = None,
         serve_idle_poll_seconds: float = SERVE_IDLE_POLL_SECONDS,
         serve_backoff_seconds: tuple[float, float] = SERVE_BACKOFF_SECONDS,
+        vault_factory: Callable[[str], object] | None = None,
+        target_network: Mapping[str, Any] | None = None,
     ):
         self.root = Path(heel_home()) if root is None else Path(root)
         self._secret_backend = secret_backend
         self._ca_bundle = ca_bundle
+        self._vault_factory = vault_factory
+        self._target_network = target_network
         self._clock_ms = clock_ms
         self._sleep = sleep
         self._poll_interval = poll_interval_seconds
@@ -1323,8 +1454,11 @@ class _ServeSession:
             owner = _ServeCoordinator(coordinator, lambda: self._contact(coordinator))
             service = RunnerService(
                 coordinator=owner,
-                executor=_ExecutionUnavailable(), idle_poll_interval=daemon._serve_idle_poll,
-                clock_ms=daemon._clock_ms,
+                executor=_ServeExecution(
+                    coordinator, clock_ms=daemon._clock_ms, vault_factory=daemon._vault_factory,
+                    target_network=daemon._target_network,
+                ),
+                idle_poll_interval=daemon._serve_idle_poll, clock_ms=daemon._clock_ms,
             )
             cycle = threading.Event()
             daemon._service, daemon._cycle_stop = service, cycle
