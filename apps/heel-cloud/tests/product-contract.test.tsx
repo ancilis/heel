@@ -265,7 +265,9 @@ describe("Heel anonymous launch review", () => {
     expect(text).not.toContain('"$PWD/.heel"');
     expect(text).toContain(".venv/bin/heel scope create --target reference:export");
     expect(text).toContain("--case vulnerable --attempt 11111111111111111111111111111111");
-    expect(text).toContain("--case hardened --attempt 22222222222222222222222222222222");
+    expect(text).toContain("--case public --attempt 22222222222222222222222222222222");
+    expect(text).not.toContain("--case hardened");
+    expect(text).toMatch(/invariant_held with regression_passed=true for the public case/);
     expect(screen.getByRole("link", { name: /releases\/tag\/v1\.3\.0rc1/i }).getAttribute("href"))
       .toBe(PUBLIC_RELEASE);
     expect(text).not.toMatch(STALE_GITHUB_CLAIMS);
@@ -275,6 +277,11 @@ describe("Heel anonymous launch review", () => {
     expect(text).toMatch(/reference_only, network_calls false, and uploaded false/i);
     expect(text).toMatch(/contact no product target/i);
     expect(text).toMatch(/\/tmp and \/var are symbolic links/i);
+    // Scope creation does not check the storage path; opening the reference store does.
+    expect(text).toMatch(/scope creation can still succeed under a symbolic-link path/i);
+    expect(text).toMatch(/opening the private reference storage checks every component and refuses a symbolic link/i);
+    expect(text).toMatch(/one physical private HEEL_HOME[^.]*from the first command onward/i);
+    expect(text).not.toMatch(/a \$PWD below them is refused/i);
     expect(text).toMatch(/not every rejection is a storage-path problem/i);
     expect(text).toMatch(/has not expired, or create a fresh scope/i);
     expect(text).toMatch(/a new attempt id is always safe/i);
@@ -284,6 +291,11 @@ describe("Heel anonymous launch review", () => {
     expect(text).toMatch(/1\.3\.0rc1 erratum[^.]*error_envelope[^.]*invariant_held with regression_passed=true/i);
     expect(text).toMatch(/That result is inconclusive, not a pass/);
     expect(text).toMatch(/1\.3\.0rc2 candidate reports it as inconclusive with regression_passed=false; 1\.3\.0rc2 is not yet published/);
+    // The hardened case answers with an HTTP 403 error envelope: an rc1 erratum, never a repair.
+    expect(text).toMatch(/1\.3\.0rc1 erratum[^.]*hardened case, an HTTP 403 error response, as invariant_held with regression_passed=true/i);
+    expect(text).toMatch(/unpublished 1\.3\.0rc2 candidate reports the hardened case as inconclusive with regression_passed=false/);
+    expect(text).not.toMatch(/hardened case[^.]*HTTP 200/i);
+    expect(text).not.toMatch(/repeat with the hardened/i);
     expect(text).not.toMatch(CANDIDATE_RELEASE_URL);
   });
 

@@ -37,7 +37,7 @@ from heel.store import Store
 from .catalog import CATALOG_BY_ID, CATALOG_IDS
 from .compiler import CanaryCompiler, plan_differential_pairs
 from .containment import verify_containment_chain
-from .content_assertion import is_denial_envelope, protected_content
+from .content_assertion import is_ambiguous_message, is_denial_envelope, protected_content
 from .execution import ExecutionBundle, ExecutionGate, LocalCanaryExecutor
 from .http_transport import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -223,7 +223,9 @@ def _denial_undecided(lower: PlanObservation, lower_json: Any, higher_json: Any)
     complete and empty, or a bounded JSON object whose material paths do not cover the
     higher body's. A lower body that still covers them, with or without an error field, is
     a status-only change: undecided, never held and never a finding. A non-empty lower body
-    that is not a JSON object, a scalar or array included, cannot be compared at all.
+    that is not a JSON object, a scalar or array included, cannot be compared at all. A
+    lower body that is a recognized error or denial envelope is undecided at any status, and
+    a message-only object cannot be assessed.
     """
     try:
         higher_material = (
@@ -241,7 +243,11 @@ def _denial_undecided(lower: PlanObservation, lower_json: Any, higher_json: Any)
         lower_material = material_paths(lower_json)
     except BodyTooComplex:
         return "lower_denial_unassessable"
-    return "lower_denied_payload_present" if lower_material >= higher_material else None
+    if lower_material >= higher_material:
+        return "lower_denied_payload_present"
+    if is_denial_envelope(lower_json):
+        return "lower_denial_envelope"
+    return "lower_denial_unassessable" if is_ambiguous_message(lower_json) else None
 
 
 def _row_one(reason: str) -> PairVerdict:
@@ -262,7 +268,11 @@ def _evaluate(
         protected_content(higher.body, marker=marker, status=higher.status, method=method)
         if marker else None
     )
-    higher_ok = _is_2xx(higher.status) and not is_denial_envelope(higher_json)
+    higher_ok = (
+        _is_2xx(higher.status)
+        and not is_denial_envelope(higher_json)
+        and not is_ambiguous_message(higher_json)
+    )
     positive_control = higher_ok and (
         not marker or (higher.status == 200 and higher_marker is True)
     )
@@ -299,8 +309,13 @@ def _evaluate(
             status_parity = False
 
     denial_undecided: str | None = None
-    if status_parity is False and not marker and method != "HEAD":
-        denial_undecided = _denial_undecided(lower, lower_json, higher_json)
+    if status_parity is False and not marker:
+        if method != "HEAD":
+            denial_undecided = _denial_undecided(lower, lower_json, higher_json)
+        elif lower_denial:
+            denial_undecided = "lower_denial_envelope"
+        elif is_ambiguous_message(lower_json):
+            denial_undecided = "lower_denial_unassessable"
 
     marker_leak: bool | None = None
     if marker and method != "HEAD" and positive_control:

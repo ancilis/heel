@@ -36,7 +36,7 @@ The wheel below is the unreleased 1.3.0rc2 runner preview candidate, which is ch
 under `apps/heel-cloud/public/downloads/` with its source archive and manifest. It is not yet
 published as a GitHub release or to PyPI, so no public download URL, registry command or
 release-asset digest is given here. (The earlier 1.3.0rc1 preview is a public GitHub prerelease;
-see [the export demo](EXPORT_DEMO.md) for its `error_envelope` erratum.) A one-command public install is later work. Run the
+see [the export demo](EXPORT_DEMO.md) for its `error_envelope` and `hardened` errata.) A one-command public install is later work. Run the
 command in a directory that holds that local wheel. This journey is the standalone CLI. It
 does not use Heel Cloud pairing, which is still an incomplete public journey (see
 [capabilities](CAPABILITIES.md)).
@@ -207,8 +207,8 @@ $HARNESS runner run --scope SCOPE_ID --base-url $ORIGIN \
 ```
 
 Expected: exit code `1`; `GET /api/export` has verdict `finding`, predicate
-`body_superset`; `GET /api/reports` is `held`; `GET /api/billing` is `inconclusive`
-(`lower_denial_envelope`); `HEAD /api/export` is `inconclusive` (`head_status_only`);
+`body_superset`; `GET /api/reports` (a `403 {"error": ...}`) and `GET /api/billing` (a
+`200 {"error": ...}`) are `inconclusive` (`lower_denial_envelope`); `HEAD /api/export` is `inconclusive` (`head_status_only`);
 `GET /api/redirect` and `GET /api/text` are `inconclusive`
 (`transport:response_rejected`). Only the `GET /api/export` finding is stored; the others
 are pairs in the result and report, not findings. The OpenAPI fixture carries no plan
@@ -231,9 +231,14 @@ command:
 .venv-synthetic/bin/python tests/plan_differential_harness.py serve --behavior hardened
 ```
 
-The replay now reports `"result": "pass"`, `"current_status": "blocked"`. The other
-behaviors are `envelope` (the lower plan gets `200 {"error": ...}`) and `subset` (a `200`
-with fewer fields); both replay as `fail` / `inconclusive`.
+The `hardened` behavior denies the lower plan with `403 {"error": "upgrade required"}`. An
+error envelope is inconclusive at any status, so the replay now reports `"result": "fail"`,
+`"current_status": "inconclusive"`, never a pass. The other behaviors are `envelope` (the
+lower plan gets `200 {"error": ...}`) and `subset` (a `200` with fewer fields); both replay as
+`fail` / `inconclusive` too. A replay passes (`"result": "pass"`, `"current_status":
+"blocked"`) only when the lower plan is refused with zero body bytes, an empty JSON object, or
+other structured JSON data without the higher plan's payload, and without an error envelope or a
+message-only body. The synthetic harness has no such behavior; the CLI tests exercise it.
 
 ### The one test seam
 
@@ -259,26 +264,39 @@ request.
 |---|---|---|
 | `finding`, predicate `marker_leak` | `verified` | The lower plan's response contained the protected marker you supplied. |
 | `finding`, predicate `body_superset` | `observed` | The lower plan received every field the higher plan received on this one read. |
-| `held` | none stored | The higher plan succeeded and the lower plan was refused by status (401, 402, 403 or 404) without the higher plan's payload, or the marker was absent. |
+| `held` | none stored | The higher plan succeeded and the lower plan was refused by status (401, 402, 403 or 404) without the higher plan's payload and without an error envelope, or the marker was absent from a body that is not an error envelope. |
 | `inconclusive`, predicate `status_parity`, `candidate: true` | none stored | Both plans got a 2xx but the bodies do not show the lower plan received the same content. Status alone is never a finding. |
-| `inconclusive`, reason `lower_denial_envelope`, `lower_hollow_shape`, `unexpected_status`, `body_too_complex` or `predicate_error` | none stored | The lower plan's response could not be decided. |
-| `inconclusive`, reason `lower_denied_payload_present`, `lower_denial_unassessable` or `higher_control_unassessable` | none stored | Without a marker, a `GET` denial status could not be shown to withhold the payload: the lower body still covers every populated field of the higher body (with or without an error field), the lower body is not a bounded JSON object (a JSON string, number, boolean, `null` or array, malformed, or beyond the key-path bounds), or the higher body is not a bounded JSON object with a populated field. |
+| `inconclusive`, reason `lower_denial_envelope`, `lower_hollow_shape`, `unexpected_status`, `body_too_complex` or `predicate_error` | none stored | The lower plan's response could not be decided; `lower_denial_envelope` means it is an error or denial envelope, at a 2xx or a denial status. |
+| `inconclusive`, reason `lower_denied_payload_present`, `lower_denial_unassessable` or `higher_control_unassessable` | none stored | Without a marker, a denial status could not be shown to withhold the payload: the lower body still covers every populated field of the higher body (with or without an error field), the lower body is not a bounded JSON object (a JSON string, number, boolean, `null` or array, malformed, or beyond the key-path bounds) or is a message-only object, or the higher body is not a bounded JSON object with a populated field. |
 | `inconclusive`, reason `no_positive_control`, `positive_control_missing_marker` or `marker_undetermined` | none stored | The higher-plan positive control or the supplied marker could not be established. The `reason` says why. |
 
 - `observed` is a hypothesis about a missing plan gate. Heel holds no declaration that a
   route is plan-gated, so a route that is ungated by design is reported too.
-- A 2xx response whose body says no (`error`, `errors`, `ok: false`, `success: false`,
-  `upgrade_required`, `payment_required`, `denied`, `forbidden`) is never counted as
-  parity, never as `held` without a marker, and never as a regression pass.
+- A response whose body says no (`error`, `errors`, `ok: false`, `success: false`,
+  `upgrade_required`, `payment_required`, `denied`, `forbidden`, or a denial `status` or
+  `code`) is an error envelope at every HTTP status, 2xx, 4xx or 5xx alike. It is never
+  counted as parity, never `held`, never a finding even when it carries the supplied marker,
+  and never a regression pass. The status alone never decides it. The same envelope from the
+  higher plan removes the positive control.
+- A message-only object, whose keys all normalize to `message` (at least one non-empty)
+  beside at most the exact `protected_canary` field, is undecidable by its shape, whatever the
+  message says. Heel does not read the text. It is never a positive control, a finding (even
+  with the marker), `held` or a regression pass, for either plan and at any status; at a
+  denial status its reason is `lower_denial_unassessable`. A message beside other data is
+  ordinary structured content. This is a check of that one shape, not a classification of
+  arbitrary response text.
 - Without a marker, a `GET` denial status is `held` only when the higher body is a bounded
   JSON object with at least one populated field, and the lower body is empty (zero bytes)
   or is a bounded JSON object whose populated paths do not cover the higher body's. A
   non-empty lower body that is a JSON scalar or array, even `""` or `[]`, cannot be
   compared and is `inconclusive`; the HTTPS transport already refuses such bodies before
   any predicate. A status-only change that leaves the paid fields in place is never
-  `held`, never a finding and never a regression pass. With a marker, the marker rows
-  decide, as before.
+  `held`, never a finding and never a regression pass, and neither is an error envelope
+  without them. With a marker, the marker rows decide: a body that is an error envelope
+  leaves the marker undetermined (`marker_undetermined`) at any status.
 - A `HEAD` pair compares statuses only. It can be `held` or `inconclusive`, nothing else.
+  The transport refuses any `HEAD` response body, and the evaluator never holds a `HEAD`
+  pair whose lower body is an error envelope.
 - Only a completed `verified` or `observed` finding is stored, counted or listed. Every
   `inconclusive` pair stores no finding.
 - A finding is stored only for a pair that completed. A pair that did not complete is in

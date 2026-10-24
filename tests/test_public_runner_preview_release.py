@@ -313,7 +313,8 @@ class SourceFreeRunnerExtraInstallTests(unittest.TestCase):
             self.assertIn("heel.runner.identity", evidence["imported_modules"])
 
             # The documented public CLI journey: human scope, then the synthetic outcomes. The
-            # installed wheel, not the checkout, must report the 2xx error envelope undecided.
+            # installed wheel, not the checkout, must report the 200 and 403 error envelopes
+            # undecided, and the non-error public read as the passing control.
             heel = str(env.venv / "bin/heel")
             scope = json.loads(env.require(env.run(
                 heel, "scope", "create", "--target", "reference:export",
@@ -322,17 +323,19 @@ class SourceFreeRunnerExtraInstallTests(unittest.TestCase):
             outcomes = {}
             for case, attempt in (
                 ("vulnerable", "1" * 32), ("hardened", "2" * 32), ("error_envelope", "5" * 32),
+                ("public", "6" * 32),
             ):
                 outcomes[case] = json.loads(env.require(env.run(
                     heel, "reference", "run", "--scope", scope, "--case", case, "--attempt", attempt,
                 )))
             self.assertEqual(outcomes["vulnerable"]["result"], "verified_violation")
             self.assertFalse(outcomes["vulnerable"]["regression_passed"])
-            self.assertEqual(outcomes["hardened"]["result"], "invariant_held")
-            self.assertTrue(outcomes["hardened"]["regression_passed"])
-            self.assertEqual(outcomes["error_envelope"]["result"], "inconclusive")
-            self.assertEqual(outcomes["error_envelope"]["evidence_state"], "unknown")
-            self.assertIs(outcomes["error_envelope"]["regression_passed"], False)
+            for case in ("hardened", "error_envelope"):
+                self.assertEqual(outcomes[case]["result"], "inconclusive")
+                self.assertEqual(outcomes[case]["evidence_state"], "unknown")
+                self.assertIs(outcomes[case]["regression_passed"], False)
+            self.assertEqual(outcomes["public"]["result"], "invariant_held")
+            self.assertTrue(outcomes["public"]["regression_passed"])
             for report in outcomes.values():
                 self.assertEqual(report["execution_support"], "reference_only")
                 self.assertEqual(report["provenance"]["kind"], "reference_product_execution")
