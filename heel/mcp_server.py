@@ -46,7 +46,7 @@ from .review_service import review_openapi
 from .scenarios import list_scenarios
 from .store import Store
 
-SERVER_INFO = {"name": "heel", "version": "1.3.0rc1"}
+SERVER_INFO = {"name": "heel", "version": "1.3.0rc2"}
 MCP_SCHEMA_VERSION = "heel.mcp.v1"
 MAX_OPENAPI_PAYLOAD_BYTES = 2 * 1024 * 1024
 MAX_FRAME_BYTES = 4 * 1024 * 1024

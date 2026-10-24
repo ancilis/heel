@@ -89,7 +89,7 @@ See [security boundaries](SECURITY.md) before using non-synthetic input.
 
 ## Synthetic export entitlement validation
 
-The supplied wheel supports `heel reference prepare` and `heel reference run`. Install the runner extra with `python -m pip install './heel_sim-1.3.0rc1-py3-none-any.whl[runner]'` (Python 3.11 or newer; it adds the pinned `cryptography` dependency). Then run `heel scope create --target reference:export --operator "your name" --confirm` outside MCP. Use its returned scope ID:
+The supplied wheel supports `heel reference prepare` and `heel reference run`. Install the runner extra with `python -m pip install './heel_sim-1.3.0rc2-py3-none-any.whl[runner]'` (Python 3.11 or newer; it adds the pinned `cryptography` dependency). Then run `heel scope create --target reference:export --operator "your name" --confirm` outside MCP. Use its returned scope ID:
 
 ```sh
 heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111

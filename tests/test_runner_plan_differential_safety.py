@@ -1372,6 +1372,11 @@ def test_r21_tls_transports_refuse_a_legacy_only_server(tmp_path, monkeypatch, t
 # --------------------------------------------------------------------------- #
 # R22 finding eligibility
 # --------------------------------------------------------------------------- #
+STORED_INCONCLUSIVE_REASONS = frozenset({
+    "no_positive_control", "positive_control_missing_marker", "marker_undetermined",
+})
+
+
 def test_r22_findings_only_for_completed_pairs_and_disposition_is_completed(tmp_path, monkeypatch):
     def check(world: World, result: dict) -> dict:
         journey = world.journey
@@ -1389,7 +1394,11 @@ def test_r22_findings_only_for_completed_pairs_and_disposition_is_completed(tmp_
         with_finding = set()
         for pair in result["pairs"]:
             completed = pair["execution_disposition"] == "completed"
-            eligible = completed and pair["verdict"] != "held"
+            # Stored: a finding, or a missing positive control or undetermined marker. Held,
+            # status parity alone and an undecided lower response store nothing.
+            eligible = completed and (
+                pair["verdict"] == "finding" or pair["reason"] in STORED_INCONCLUSIVE_REASONS
+            )
             assert (pair["finding_id"] is not None) is eligible, pair
             if eligible:
                 with_finding.add(pair["finding_id"])
@@ -1425,8 +1434,12 @@ def test_r22_findings_only_for_completed_pairs_and_disposition_is_completed(tmp_
                   for item in result["findings"]}
         assert states["/api/export GET"] == "observed"
         assert states["/exports/{id} GET"] == "verified"
-        assert states["/api/export HEAD"] == "inconclusive"
-        assert states["/api/billing GET"] == "inconclusive"
+        # Status parity alone (HEAD) and a 2xx lower denial envelope keep their pair but no
+        # finding.
+        assert "/api/export HEAD" not in states and "/api/billing GET" not in states
+        assert (by_route[("HEAD", "/api/export")]["predicate"],
+                by_route[("HEAD", "/api/export")]["reason"]) == ("status_parity", "head_status_only")
+        assert by_route[("GET", "/api/billing")]["reason"] == "lower_denial_envelope"
 
     # A scope-tamper stop: the later pairs are inconclusive, not started, and unstored.
     with World(tmp_path / "tamper", monkeypatch) as world:

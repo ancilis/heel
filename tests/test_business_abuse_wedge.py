@@ -28,7 +28,19 @@ def test_intentional_coupon_stacking_and_permitted_bulk_are_not_abuse():
 
 @pytest.mark.parametrize('body,status,expected', [
     (b'{"protected_canary":"heel-canary-row"}',200,True),
-    (b'{"error":"forbidden"}',200,False),
+    # A recognized 2xx error/denial envelope is undetermined, never a held boundary, even
+    # when it also carries the marker; a 4xx denial is still absence.
+    (b'{"error":"forbidden"}',200,None),
+    (b'{"error":"forbidden","protected_canary":"heel-canary-row"}',200,None),
+    (b'{"ok":false,"protected_canary":"heel-canary-row"}',204,None),
+    (b'{"data":{"status":"PaymentRequired"},"protected_canary":"heel-canary-row"}',200,None),
+    (b'{"error":"forbidden"}',403,False),
+    (b'{"error":"forbidden","protected_canary":"heel-canary-row"}',403,True),
+    (b'{"error":null,"protected_canary":"heel-canary-row"}',200,True),
+    (b'{"protected_canary":"heel-canary-row","protected_canary":"heel-canary-row"}',200,None),
+    (b'{"protected_canary":"heel-canary-row"' + b' ' * (256 * 1024) + b'}',200,None),
+    (b'{"protected_canary":',200,None),
+    (b'["heel-canary-row"]',200,None),
     (b'{"visibility":"redacted"}',200,False),
     (b'{"visibility":"public","id":"heel-canary-row"}',200,False),
     (b'{"message":"retry"}',200,None),
@@ -45,7 +57,19 @@ def test_positive_control_and_fix_regression():
     assert evaluate_pair('plan_entitlement_read',200,200,first_protected=False,second_protected=True).outcome == 'blocked'
     assert evaluate_pair('plan_entitlement_read',403,200,first_protected=False,second_protected=None).outcome == 'inconclusive'
 
-@pytest.mark.parametrize('variant,expected', [('vulnerable','verified_violation'),('hardened','invariant_held'),('error_envelope','invariant_held'),('redacted','invariant_held'),('public','invariant_held'),('inconclusive','inconclusive')])
+def test_error_envelope_for_either_identity_is_inconclusive():
+    from heel.runner.content_assertion import protected_content
+    marker = 'heel-canary-row'
+    envelope = protected_content(b'{"error":"license required","protected_canary":"heel-canary-row"}', marker=marker, status=200)
+    disclosed = protected_content(b'{"protected_canary":"heel-canary-row"}', marker=marker, status=200)
+    denied = protected_content(b'{"error":"license required"}', marker=marker, status=403)
+    assert (envelope, disclosed, denied) == (None, True, False)
+    for lower, higher in ((envelope, disclosed), (disclosed, envelope), (envelope, envelope)):
+        assert evaluate_pair('plan_entitlement_read',200,200,first_protected=lower,second_protected=higher).outcome == 'inconclusive'
+    assert evaluate_pair('plan_entitlement_read',403,200,first_protected=denied,second_protected=disclosed).outcome == 'blocked'
+    assert evaluate_pair('plan_entitlement_read',200,200,first_protected=disclosed,second_protected=disclosed).outcome == 'observed'
+
+@pytest.mark.parametrize('variant,expected', [('vulnerable','verified_violation'),('hardened','invariant_held'),('error_envelope','inconclusive'),('redacted','invariant_held'),('public','invariant_held'),('inconclusive','inconclusive')])
 def test_real_reference_product_through_signed_executor(tmp_path,monkeypatch,variant,expected):
     from heel.scope import create_scope
     from heel.reference_rehearsal import run_reference, TARGET
@@ -53,7 +77,13 @@ def test_real_reference_product_through_signed_executor(tmp_path,monkeypatch,var
     scope = create_scope([TARGET],'test operator')
     result = run_reference(scope.scope_id,variant,'a'*32)
     assert result['result'] == expected
+    assert result['regression_passed'] is (expected == 'invariant_held')
+    assert result['evidence_state'] == ('unknown' if expected == 'inconclusive' else 'verified')
     assert result['uploaded'] is False
+    if variant == 'error_envelope':
+        # The signed executor itself is undecided; the private evidence is still recorded.
+        assert result['execution_disposition'] == 'completed'
+        assert {o['actor']:o['protected_content'] for o in result['invariant_observations']} == {'lower_plan':None,'higher_plan':True}
     with pytest.raises((ValueError,FileExistsError)):
         run_reference(scope.scope_id,variant,'a'*32)
 

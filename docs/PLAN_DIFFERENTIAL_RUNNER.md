@@ -32,10 +32,11 @@ widen or re-sign a scope.
 
 Run these in order. Replace the values in capitals.
 
-The wheel below is the unreleased 1.3.0rc1 runner preview candidate, which is checked in
+The wheel below is the unreleased 1.3.0rc2 runner preview candidate, which is checked in
 under `apps/heel-cloud/public/downloads/` with its source archive and manifest. It is not yet
 published as a GitHub release or to PyPI, so no public download URL, registry command or
-release-asset digest is given here. A one-command public install is later work. Run the
+release-asset digest is given here. (The earlier 1.3.0rc1 preview is a public GitHub prerelease;
+see [the export demo](EXPORT_DEMO.md) for its `error_envelope` erratum.) A one-command public install is later work. Run the
 command in a directory that holds that local wheel. This journey is the standalone CLI. It
 does not use Heel Cloud pairing, which is still an incomplete public journey (see
 [capabilities](CAPABILITIES.md)).
@@ -43,7 +44,7 @@ does not use Heel Cloud pairing, which is still an incomplete public journey (se
 ```sh
 python3 -m venv --copies .venv
 . .venv/bin/activate
-python -m pip install './heel_sim-1.3.0rc1-py3-none-any.whl[runner]'
+python -m pip install './heel_sim-1.3.0rc2-py3-none-any.whl[runner]'
 export HEEL_HOME="$PWD/.heel"
 ```
 
@@ -209,7 +210,9 @@ Expected: exit code `1`; `GET /api/export` has verdict `finding`, predicate
 `body_superset`; `GET /api/reports` is `held`; `GET /api/billing` is `inconclusive`
 (`lower_denial_envelope`); `HEAD /api/export` is `inconclusive` (`head_status_only`);
 `GET /api/redirect` and `GET /api/text` are `inconclusive`
-(`transport:response_rejected`). The OpenAPI fixture carries no plan metadata.
+(`transport:response_rejected`). Only the `GET /api/export` finding is stored; the others
+are pairs in the result and report, not findings. The OpenAPI fixture carries no plan
+metadata.
 
 ```sh
 .venv-synthetic/bin/heel findings --run RUN_ID
@@ -257,8 +260,9 @@ request.
 | `finding`, predicate `marker_leak` | `verified` | The lower plan's response contained the protected marker you supplied. |
 | `finding`, predicate `body_superset` | `observed` | The lower plan received every field the higher plan received on this one read. |
 | `held` | none stored | The higher plan succeeded and the lower plan was refused by status (401, 402, 403 or 404), or the marker was absent. |
-| `inconclusive`, predicate `status_parity`, `candidate: true` | `inconclusive` | Both plans got a 2xx but the bodies do not show the lower plan received the same content. |
-| `inconclusive` | `inconclusive`, or none stored | Anything else. The `reason` says why. |
+| `inconclusive`, predicate `status_parity`, `candidate: true` | none stored | Both plans got a 2xx but the bodies do not show the lower plan received the same content. Status alone is never a finding. |
+| `inconclusive`, reason `lower_denial_envelope`, `lower_hollow_shape`, `unexpected_status`, `body_too_complex` or `predicate_error` | none stored | The lower plan's response could not be decided. |
+| `inconclusive`, reason `no_positive_control`, `positive_control_missing_marker` or `marker_undetermined` | `inconclusive` | The higher-plan positive control or the supplied marker could not be established. The `reason` says why. |
 
 - `observed` is a hypothesis about a missing plan gate. Heel holds no declaration that a
   route is plan-gated, so a route that is ungated by design is reported too.
@@ -268,6 +272,13 @@ request.
 - A `HEAD` pair compares statuses only. It can be `held` or `inconclusive`, nothing else.
 - A finding is stored only for a pair that completed. A pair that did not complete is in
   the result's `pairs` and in `report.json` as `inconclusive` with its true disposition.
+  A pair that stores no finding still keeps its redacted observations in `report.json`,
+  its raw responses in the attempt store and its containment-log entry.
+- Earlier versions stored status-only and undecided pairs as `inconclusive` findings. Those
+  records stay readable, but `heel regress add` refuses to turn any `inconclusive`
+  plan-differential result into a regression. A regression saved earlier from one still
+  replays, and reports `fail` / `inconclusive` unless the replayed pair is itself a finding
+  (`still_reachable`) or a status denial with a valid positive control (`pass`).
 - A regression passes only when the lower plan is denied by status (or the marker is
   absent) while the higher plan still succeeds. It replays only under the same,
   still-valid scope, against the same origin, with the same two handles in the same order.
@@ -336,7 +347,7 @@ pair with a new invitation).
   before this change (commit `b426fc2`, sha256
   `4dd9eec27ee57df187ccb5664a816cc3fdc17f6f132c166ab8d27bb1b6c428bf`). Whether anyone
   installed it is unknown; this path is tested, not assumed unused. The current checked-in
-  artifact is the unreleased 1.3.0rc1 runner preview candidate. It reports `1.3.0rc1` and,
+  artifact is the unreleased 1.3.0rc2 runner preview candidate. It reports `1.3.0rc2` and,
   like the later 1.2.0 wheel, accepts only a `v4` activation.
 - Control traffic goes only to the `--origin` given at pairing: `https://` only, exact
   pathless lowercase origin, system trust with TLS 1.2 or newer and hostname checks, no

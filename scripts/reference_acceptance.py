@@ -25,11 +25,13 @@ def main():
     scope = cli('scope', 'create', '--target', 'reference:export', '--operator', 'installed acceptance', '--confirm')
     scope_id = scope['created_scope']
     reports = []
+    # A 2xx error envelope says it refused the read: inconclusive, never a passed regression.
     for number, case, expected in [(1,'vulnerable','verified_violation'),(2,'hardened','invariant_held'),
-                                   (3,'error_envelope','invariant_held'),(4,'inconclusive','inconclusive')]:
+                                   (3,'error_envelope','inconclusive'),(4,'inconclusive','inconclusive')]:
         attempt = f'{number:032x}'
         report = cli('reference','run','--scope',scope_id,'--case',case,'--attempt',attempt)
         assert report['result'] == expected
+        assert report['regression_passed'] is (expected == 'invariant_held')
         assert report['uploaded'] is False
         assert Path(os.environ['HEEL_HOME'], 'reference', attempt, 'report.json').is_file()
         cli('reference','run','--scope',scope_id,'--case',case,'--attempt',attempt,expect=2)
