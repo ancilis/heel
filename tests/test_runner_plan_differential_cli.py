@@ -955,6 +955,70 @@ def test_status_only_repair_with_the_payload_is_never_a_regression_pass(tmp_path
         assert (item["result"], item["current_status"]) == ("fail", "still_reachable")
 
 
+def test_an_opaque_json_denial_body_is_never_a_regression_pass(tmp_path, monkeypatch):
+    from plan_differential_support import DENIAL_ENVELOPE, EXPORT as export_body
+
+    export_path = EXPORT[1]
+    with World(tmp_path, monkeypatch) as world:
+        journey = world.journey
+        code, result, error = journey.run()
+        assert (code, error) == (1, "")
+        finding = finding_for(result)
+        assert (finding["predicate"], finding["evidence_state"]) == ("body_superset", "observed")
+        add_regression(world, result, "export-plan-gate")
+        first_run = result["run_id"]
+        stored = {item["id"] for item in journey.findings(first_run)}
+
+        responses: dict = {}
+        _override(world, monkeypatch, responses)
+        # A non-empty JSON scalar or array is not a bounded object. The transport refuses it
+        # before any predicate (row 1), so it can never certify the repair; the evaluator's
+        # own refusal is pinned by the predicate tests.
+        opaque = [
+            b'""', b'"denied"', b"0", b"403", b"true", b"false", b"null", b"[]",
+            b'["denied"]', b'[{"error": "upgrade required"}]', json.dumps([export_body]).encode(),
+        ]
+        statuses = sorted(plan_differential._DENIAL_STATUSES)
+        for index, body in enumerate(opaque):
+            status = statuses[index % len(statuses)]
+            responses[("free", export_path)] = (status, {"Content-Type": "application/json"}, body)
+            code, result, error = journey.run()
+            assert error == "", body
+            pair = pairs_by_route(result)[EXPORT]
+            assert (pair["verdict"], pair["reason"], pair["finding_id"], pair["candidate"]) == (
+                "inconclusive", "transport:response_rejected", None, False,
+            ), body
+            assert all(item["route_template"] != export_path for item in result["findings"])
+            report = json.loads(Path(result["report_path"]).read_text())
+            assert report["uploaded"] is False
+            (item,) = regress(world)
+            assert (item["result"], item["current_status"]) == ("fail", "inconclusive"), body
+            assert item["matches_expected"] is False and item["control_likely"] == "unknown"
+            assert journey.findings(item["run_id"]) == []
+            code, output, _ = invoke("log", "--run", item["run_id"])
+            log = json.loads(output)
+            assert code == 0 and log["chain_valid"] is True
+            assert [
+                json.loads(entry["detail"])["reason"] for entry in log["entries"]
+                if entry["action"] == "plan_differential_pair"
+            ] == ["transport:response_rejected"], body
+        # No opaque denial added a finding to the original run.
+        assert {item["id"] for item in journey.findings(first_run)} == stored
+
+        # Zero body bytes and a bounded object denial still pass against the valid control.
+        for lower in (
+            (403, {"Content-Type": "application/json"}, b""),
+            _json_response(403, DENIAL_ENVELOPE),
+        ):
+            responses[("free", export_path)] = lower
+            (item,) = regress(world)
+            assert (item["result"], item["current_status"]) == ("pass", "blocked")
+        # And the 200 observation is still reachable.
+        responses.clear()
+        (item,) = regress(world)
+        assert (item["result"], item["current_status"]) == ("fail", "still_reachable")
+
+
 # --------------------------------------------------------------------------- #
 # Records stored by earlier runs: readable, never a new regression, still undecided
 # --------------------------------------------------------------------------- #
