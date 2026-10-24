@@ -105,13 +105,14 @@ export default function AgentQuickstart() {
               hash-pinned public wheel. pip refuses the wheel unless its SHA-256 matches;{" "}
               <code>--isolated</code> ignores pip environment variables and user configuration, and
               the <code>runner</code> extra downloads the pinned <code>cryptography</code> package
-              from your Python package index. Known 1.3.0rc1 erratum: its synthetic reference reports
-              the HTTP 200 <code>error_envelope</code> case as a passed regression; treat that result
-              as inconclusive.
+              from your Python package index. Known 1.3.0rc1 errata: its synthetic reference reports
+              the HTTP 200 <code>error_envelope</code> case as a passed regression, and also the{" "}
+              <code>hardened</code> case, an HTTP 403 error envelope. An error envelope is
+              inconclusive at any status; treat each result as inconclusive, not a pass.
             </p>
             <pre><code>{INSTALL_PUBLIC_AGENT}</code></pre>
             <p>
-              The downloads below are this build&apos;s 1.3.0rc2 candidate, which reports that case as
+              The downloads below are this build&apos;s 1.3.0rc2 candidate, which reports both cases as
               inconclusive. Version 1.3.0rc2 is not yet published as a GitHub release or to PyPI.
             </p>
             <div className="hero-actions" aria-label="Heel Agent downloads">

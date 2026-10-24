@@ -242,7 +242,12 @@ describe("Heel anonymous launch review", () => {
     expect(PUBLIC_WHEEL_SHA256).not.toBe(wheelArtifact?.sha256);
     expect(document.body.textContent).toMatch(CANDIDATE_UNPUBLISHED);
     expect(document.body.textContent).not.toMatch(CANDIDATE_RELEASE_URL);
-    expect(document.body.textContent).toMatch(/1\.3\.0rc1 erratum[^.]*`?error_envelope`?[^.]*passed regression; treat that result as inconclusive/i);
+    expect(document.body.textContent).toMatch(/1\.3\.0rc1 errata[^.]*HTTP 200 error_envelope case as a passed regression/i);
+    // The hardened case answers with an HTTP 403 error envelope: a second rc1 erratum, never a pass.
+    expect(document.body.textContent).toMatch(/and also the hardened case, an HTTP 403 error envelope\./i);
+    expect(document.body.textContent).toMatch(/An error envelope is inconclusive at any status; treat each result as inconclusive, not a pass\./);
+    expect(document.body.textContent).toMatch(/1\.3\.0rc2 candidate, which reports both cases as inconclusive\./);
+    expect(document.body.textContent).not.toMatch(/hardened[^.]*HTTP 200/i);
     const release = screen.getByRole("link", { name: /github\.com\/ancilis\/heel\/releases\/tag\/v1\.3\.0rc1/i });
     expect(release.getAttribute("href")).toBe(PUBLIC_RELEASE);
     expect(document.body.textContent).toMatch(/public preview prerelease/i);

@@ -46,10 +46,12 @@ from the Python package index; the review itself does not need it. `HEEL_HOME` m
 path in which no component is a symbolic link. On macOS, `/tmp` and `/var` are symbolic links, so use
 `pwd -P` rather than `$PWD`.
 
-Known 1.3.0rc1 erratum: its synthetic reference reports the HTTP 200 `error_envelope` case as
-invariant_held with regression_passed=true. Read that result as inconclusive; see the
-[export demo](docs/EXPORT_DEMO.md). This repository carries a corrected 1.3.0rc2 candidate that
-reports it inconclusive. That candidate is not yet published as a GitHub release or to PyPI, and no
+Known 1.3.0rc1 errata: its synthetic reference reports the HTTP 200 `error_envelope` case as
+invariant_held with regression_passed=true. It also reports the `hardened` case, an HTTP 403 error
+envelope, as invariant_held with regression_passed=true. An error envelope is inconclusive at any
+status, so read each result as inconclusive, not a pass; see the [export demo](docs/EXPORT_DEMO.md).
+This repository carries a corrected 1.3.0rc2 candidate that reports each case inconclusive with
+regression_passed=false. That candidate is not yet published as a GitHub release or to PyPI, and no
 public 1.3.0rc2 download exists.
 
 A Heel Cloud deployment built from this repository serves that unpublished 1.3.0rc2 candidate on its

@@ -37,11 +37,13 @@ Corrected runner preview release candidate. It carries the changes listed under 
 candidate commit and is not yet published as a GitHub release or to PyPI.
 
 ### Fixed
-- A 2xx response that is a recognized error or denial envelope is inconclusive for either plan,
-  even when it also carries the protected marker. The synthetic reference `error_envelope` case
-  now reports `inconclusive` with `regression_passed=false`, correcting the 1.3.0rc1 erratum;
-  the vulnerable and hardened results are unchanged. The shared content predicate and the
-  plan-differential evaluator read one denial vocabulary.
+- A response that is a recognized error or denial envelope is inconclusive for either plan at
+  every HTTP status, even when it also carries the protected marker. 1.3.0rc1 has two synthetic
+  reference errata, neither of which is a pass: the HTTP 200 `error_envelope` case and the HTTP 403
+  `hardened` case each report `invariant_held` with `regression_passed=true`. This candidate
+  reports each as `inconclusive` with `regression_passed=false`; the vulnerable result is
+  unchanged. The shared content predicate and the plan-differential evaluator read one denial
+  vocabulary.
 - Plan-differential status parity alone and undecided lower responses no longer store a finding
   or add to local finding counts. Their pairs, redacted observations, raw attempt evidence and
   containment entries are kept.
@@ -49,8 +51,11 @@ candidate commit and is not yet published as a GitHub release or to PyPI.
   earlier version, identified by its runtime provenance; such records remain readable. A saved
   regression whose replayed pair is status parity alone reports `inconclusive`, not
   `still_reachable`.
-- The local `/runner` report viewer no longer presents a 1.3.0rc1 `error_envelope` report, or
-  any held report without `regression_passed=true`, as a passed regression.
+- The local `/runner` report viewer no longer presents a 1.3.0rc1 held `error_envelope` (HTTP 200)
+  or `hardened` (HTTP 403) report as a passed regression; it names each as an inconclusive error
+  envelope, not a pass. It presents a pass only for a held `public` or `redacted` report with
+  `regression_passed=true`, verified evidence and a completed reference-only run without network
+  calls. It checks the report's shape and does not authenticate the file.
 
 ### Changed
 - Python package, release contract, MCP `serverInfo`, `server.json`, browser engine and newly

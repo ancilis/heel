@@ -29,8 +29,9 @@ fallback and durable machine sync queue require POSIX descriptor and file-lockin
 semantics; Windows CLI/MCP cloud continuity is not launch-supported.
 
 The exact builder-verified Agent files advertised on `/agent` are the 1.3.0rc2 runner preview
-candidate. It corrects the 1.3.0rc1 reference erratum: the HTTP 200 `error_envelope` case is
-inconclusive, not a passed regression. The 1.3.0rc2 candidate is not yet published as a GitHub
+candidate. It corrects both 1.3.0rc1 reference errata: the HTTP 200 `error_envelope` case and the
+HTTP 403 `hardened` error-envelope case are each inconclusive, not a passed regression. The 1.3.0rc2
+candidate is not yet published as a GitHub
 release or to PyPI. The earlier 1.3.0rc1 runner preview is the public GitHub prerelease at
 <https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. That prerelease is not a stable release,
 its release record is not immutable, it is not a deployed Heel Cloud URL, and it does not indicate

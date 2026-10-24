@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,20 @@ from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/publish_runner_preview_release.py"
-DOWNLOADS = ROOT / "apps/heel-cloud/public/downloads"
+# The fixed publisher names the public 1.3.0rc1 release, whatever candidate this checkout carries,
+# so its input is the historical rc1 bytes: exported from the immutable rc1 commit, committed here
+# and bound by git blob id, so a shallow or source-only checkout loads them without history or git.
+HISTORICAL_FIXTURE = ROOT / "tests/fixtures/runner_preview_rc1"
+HISTORICAL_COMMIT = "d3a5b61e6ced65f0edc5a95c128d5527d2e7222e"
+HISTORICAL_BLOBS = {
+    "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc1-py3-none-any.whl": "6be8b96d444a8ef3ceadfd1004d354b9e7c75e24",
+    "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc1.tar.gz": "1d93115c17bed290f469f576900993176f5edcf7",
+    "apps/heel-cloud/public/downloads/heel-open-core-manifest.json": "61691e27cadc8608c5f0e3b73e75902ca278b06b",
+    "pyproject.toml": "7ce20c920e70617a7836a37794c27141b5fb4da5",
+    "release/open-core-v1.json": "a6810fcac95714bf196ba58e9ba08461d4037fa5",
+    "heel/__init__.py": "33d834d4701d715bc4bdc987ce389cc85cdf3dee",
+    "scripts/build_open_core_release.py": "d74f7f6bf5b6dbd07aa2f0b5f12fdfe8116bf9d3",
+}
 INSTALL_REQUIRED = os.environ.get("HEEL_REQUIRE_RUNNER_EXTRA_INSTALL") == "1"
 # A synthetic credential: it has no real-token prefix and only proves non-reflection.
 TOKEN = "heelfaketoken_" + "Q7" * 15
@@ -46,7 +60,49 @@ def _load():
 P = _load()
 _real_git = P._git
 NAMES = P.ASSET_NAMES
-CANDIDATE = {name: (DOWNLOADS / name).read_bytes() for name in NAMES}
+
+
+class HistoricalFixtureError(Exception):
+    pass
+
+
+def _git_blob_id(payload: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(payload) + payload).hexdigest()
+
+
+def load_historical_rc1(directory: Path = HISTORICAL_FIXTURE) -> tuple[dict[str, bytes], dict[str, bytes]]:
+    """The rc1 artifacts by asset name and version sources by path, each verified by blob id."""
+    layout = {f"{P.DOWNLOADS}/{name}": f"artifacts/{name}" for name in P.ASSET_NAMES}
+    layout.update({source: f"version_sources/{Path(source).name}.txt" for source in P.VERSION_SOURCES})
+    try:
+        present = sorted(path.relative_to(directory).as_posix()
+                         for path in directory.rglob("*") if not path.is_dir())
+        if present != sorted([*layout.values(), "provenance.json"]):
+            raise HistoricalFixtureError("fixture is not exactly the rc1 artifacts, sources and provenance")
+        provenance = json.loads((directory / "provenance.json").read_text(encoding="utf-8"))
+        entries = [*provenance["artifacts"], *provenance["version_sources"]]
+        if (provenance["source_commit"] != HISTORICAL_COMMIT or provenance["version"] != P.VERSION
+                or [entry["source_path"] for entry in entries] != list(layout)):
+            raise HistoricalFixtureError("provenance does not name the rc1 commit, version and layout")
+        loaded = {}
+        for entry in entries:
+            source = entry["source_path"]
+            path = directory / layout[source]
+            if path.is_symlink() or not path.is_file():
+                raise HistoricalFixtureError(f"{layout[source]} is not a regular file")
+            payload = path.read_bytes()
+            if not (_git_blob_id(payload) == entry["git_blob"] == HISTORICAL_BLOBS[source]
+                    and len(payload) == entry["size"]
+                    and hashlib.sha256(payload).hexdigest() == entry["sha256"]):
+                raise HistoricalFixtureError(f"{layout[source]} is not the historical rc1 blob")
+            loaded[source] = payload
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise HistoricalFixtureError(f"malformed historical fixture ({type(error).__name__})") from None
+    artifacts = {name: loaded[f"{P.DOWNLOADS}/{name}"] for name in P.ASSET_NAMES}
+    return artifacts, {source: loaded[source] for source in P.VERSION_SOURCES}
+
+
+CANDIDATE, HISTORICAL_SOURCES = load_historical_rc1()
 MANIFEST_SHA = hashlib.sha256(CANDIDATE[P.MANIFEST]).hexdigest()
 
 
@@ -379,14 +435,14 @@ def _git(cwd: Path, *arguments: str) -> str:
 
 
 class FixtureCheckout:
-    """A temporary git checkout holding only the version sources and the candidate artifacts."""
+    """A temporary git checkout holding only the historical rc1 version sources and artifacts."""
 
     def __init__(self, temporary: Path, *, artifacts=None, pyproject_version=None):
         self.root = temporary / "checkout"
-        for relative in P.VERSION_SOURCES:
+        for relative, payload in HISTORICAL_SOURCES.items():
             target = self.root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(ROOT / relative, target)
+            target.write_bytes(payload)
         if pyproject_version:
             path = self.root / "pyproject.toml"
             path.write_text(path.read_text().replace(f'version = "{P.VERSION}"',
@@ -403,6 +459,95 @@ class FixtureCheckout:
         _git(self.root, "commit", "-q", "--no-verify", "-m", "fixture")
         self.sha = _git(self.root, "rev-parse", "HEAD").strip()
         return self.sha
+
+
+class HistoricalFixtureTests(unittest.TestCase):
+    """The fixture is deliberately the existing public rc1 identity, loaded offline and verified."""
+
+    def setUp(self):
+        self.temporary = Path(tempfile.mkdtemp(prefix="heel-publisher-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, self.temporary, ignore_errors=True)
+
+    def copy(self, name="fixture") -> Path:
+        target = self.temporary / name
+        shutil.copytree(HISTORICAL_FIXTURE, target)
+        return target
+
+    def test_fixture_is_the_public_rc1_identity_the_fixed_publisher_names(self):
+        self.assertEqual(P.VERSION, "1.3.0rc1")
+        self.assertEqual(tuple(CANDIDATE), P.ASSET_NAMES)
+        self.assertEqual(tuple(HISTORICAL_SOURCES), P.VERSION_SOURCES)
+        checkout = FixtureCheckout(self.temporary)
+        self.assertEqual(P._committed_versions(checkout.root, checkout.sha),
+                         dict.fromkeys(P.VERSION_SOURCES, P.VERSION))
+        for relative, payload in HISTORICAL_SOURCES.items():
+            self.assertEqual((checkout.root / relative).read_bytes(), payload)
+        manifest = P.verify_artifact_set(CANDIDATE)
+        self.assertEqual(manifest["version"], P.VERSION)
+
+    def test_loader_needs_no_git_history_network_or_checkout(self):
+        copied = self.copy()
+        self.assertFalse(copied.is_relative_to(ROOT))
+
+        def refused(*arguments, **keywords):
+            raise AssertionError("the historical fixture loader must not spawn or connect")
+
+        with mock.patch.object(subprocess, "run", refused), \
+                mock.patch.object(subprocess, "Popen", refused), \
+                mock.patch.object(socket, "socket", refused):
+            self.assertEqual(load_historical_rc1(copied), (CANDIDATE, HISTORICAL_SOURCES))
+
+    def test_loader_rejects_missing_altered_relabelled_or_extra_bytes(self):
+        def provenance(directory, change):
+            path = directory / "provenance.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            change(document)
+            path.write_text(json.dumps(document), encoding="utf-8")
+
+        def relabel_pyproject(directory):
+            # New bytes with a self-consistent provenance entry still differ from the pinned blob.
+            path = directory / "version_sources/pyproject.toml.txt"
+            payload = path.read_bytes().replace(b'version = "1.3.0rc1"', b'version = "1.3.0rc2"', 1)
+            path.write_bytes(payload)
+
+            def change(document):
+                entry = document["version_sources"][0]
+                entry.update(size=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+                             git_blob=_git_blob_id(payload))
+            provenance(directory, change)
+
+        def flip_sdist_byte(directory):
+            path = directory / "artifacts" / P.SDIST
+            payload = bytearray(path.read_bytes())
+            payload[100] ^= 1
+            path.write_bytes(bytes(payload))
+
+        def symlink_manifest(directory):
+            path = directory / "artifacts" / P.MANIFEST
+            outside = self.temporary / "outside.json"
+            outside.write_bytes(path.read_bytes())
+            path.unlink()
+            path.symlink_to(outside)
+
+        mutations = {
+            "missing wheel": lambda d: (d / "artifacts" / P.WHEEL).unlink(),
+            "altered sdist": flip_sdist_byte,
+            "truncated version source": lambda d: (d / "version_sources/__init__.py.txt").write_bytes(b""),
+            "relabelled version source": relabel_pyproject,
+            "extra file": lambda d: (d / "artifacts/notes.txt").write_bytes(b"x"),
+            "symlinked manifest": symlink_manifest,
+            "movable reference": lambda d: provenance(d, lambda doc: doc.update(source_commit="main")),
+            "other version": lambda d: provenance(d, lambda doc: doc.update(version="1.3.0rc2")),
+            "reordered sources": lambda d: provenance(d, lambda doc: doc["version_sources"].reverse()),
+            "malformed provenance": lambda d: (d / "provenance.json").write_bytes(b"{not json"),
+            "missing provenance field": lambda d: provenance(d, lambda doc: doc.pop("artifacts")),
+        }
+        for index, (label, mutate) in enumerate(mutations.items()):
+            with self.subTest(label):
+                copied = self.copy(f"fixture-{index}")
+                mutate(copied)
+                with self.assertRaises(HistoricalFixtureError):
+                    load_historical_rc1(copied)
 
 
 class PublisherHarness(unittest.TestCase):
@@ -578,7 +723,7 @@ class ImportAndCommandLineTests(unittest.TestCase):
         self.assertNotIn("http", notes.replace("HTTPS target traffic", ""))
         self.assertNotIn(TOKEN, notes)
         # The manifest is the artifact; rendering external metadata leaves its bytes unchanged.
-        self.assertEqual((DOWNLOADS / P.MANIFEST).read_bytes(), CANDIDATE[P.MANIFEST])
+        self.assertEqual((HISTORICAL_FIXTURE / "artifacts" / P.MANIFEST).read_bytes(), CANDIDATE[P.MANIFEST])
 
     def test_default_credential_source_is_gh_without_token_in_argv(self):
         completed = subprocess.CompletedProcess([], 0, stdout=TOKEN + "\n", stderr="")
