@@ -11,8 +11,27 @@ UTF-8 JSON file no larger than 2 MiB.
 
 ## Install the current Agent
 
-The current Agent is the unreleased 1.3.0rc1 runner preview candidate. The primary acquisition path
-is Heel Cloud's `/agent` page. Choose **Download Heel Agent 1.3.0rc1**; the same-origin wheel is
+The current Agent is the 1.3.0rc1 runner preview, published as a public GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. It is a preview, not a stable release.
+Its GitHub release record is not immutable. It is not a deployed Heel Cloud URL and does not indicate
+customer acceptance. No source checkout or Heel Cloud deployment is needed to install it. In an empty
+private directory, with a POSIX shell and Python 3.11 or newer, run:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip --isolated install \
+  'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc1/heel_sim-1.3.0rc1-py3-none-any.whl#sha256=176a17b0d4d7f4ea44420d8099239f32dbb17eeead981e5aa360f0a5bbccb94a'
+```
+
+pip installs the public wheel only if it matches that SHA-256. `--isolated` makes pip ignore
+environment variables and user configuration. The `runner` extra, which the optional synthetic
+[export reference](EXPORT_DEMO.md) needs, downloads the pinned `cryptography` dependency from the
+Python package index. The local review and MCP tools below do not need it.
+
+The same wheel, `heel_sim-1.3.0rc1.tar.gz`, and `heel-open-core-manifest.json` are also part of the
+deployable Heel Cloud build. Public customer access to those same-origin files still depends on the
+approved deployment. If you use a deployment's `/agent` page, choose
+**Download Heel Agent 1.3.0rc1**; the same-origin wheel is
 `/downloads/heel_sim-1.3.0rc1-py3-none-any.whl`. Compare it with the wheel SHA-256 that `/agent`
 shows from the build's manifest. In the directory where you saved it, run:
 
@@ -21,10 +40,6 @@ python3 -m venv .venv
 .venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl
 ```
 
-The wheel, `heel_sim-1.3.0rc1.tar.gz`, and `heel-open-core-manifest.json` are already part of the
-deployable Heel Cloud build. Public customer access still depends on the approved deployment.
-A GitHub prerelease `v1.3.0rc1` carrying these exact files is planned but not yet published; no
-release URL or release-asset digest has been publicly verified, so none is given here.
 `heel-sim` is not yet published to PyPI, and the current public repository export is a release-owner
 action that is not complete. Maintainers may install from this private source checkout, but customer
 instructions must not rely on it. Only after an actual PyPI release will this registry command work:
@@ -44,11 +59,11 @@ are not part of the local Apache package.
 
 ## Review from the CLI
 
-Set `HEEL_HOME` to a private absolute path whose parent directories are not symbolic links,
-then review a sanitized OpenAPI JSON file:
+Set `HEEL_HOME` to a private absolute physical path in which no component is a symbolic link,
+then review a sanitized OpenAPI JSON file. `pwd -P` prints the physical working directory:
 
 ```bash
-export HEEL_HOME="$PWD/.heel-local"
+export HEEL_HOME="$(pwd -P)/.heel-local"
 .venv/bin/heel review openapi ./sanitized-openapi.json
 ```
 
@@ -106,8 +121,13 @@ The MCP tool and `heel review openapi ... --json` return the same deterministic
 configured `HEEL_HOME`. The MCP server exposes review-consumption tools but no scope creation,
 widening, or relaxation tool.
 
-On macOS, use the resolved absolute path (for example `/private/var/...`, not the `/var` symlink)
-when placing `HEEL_HOME` outside the current directory.
+On macOS, `/tmp` and `/var` are symbolic links to `/private/tmp` and `/private/var`, and `$TMPDIR`
+is below `/var`. A `HEEL_HOME` that passes through them is refused. Use the resolved physical path,
+for example `$(pwd -P)/.heel-local` or `/private/var/...`. Heel refuses symbolic links in private
+storage on purpose; do not disable or work around that check. For a generic
+`Reference rehearsal rejected` message from the optional export reference, follow the
+[troubleshooting steps](EXPORT_DEMO.md#if-the-reference-run-is-rejected). That message does not
+always mean a storage-path problem.
 
 ## Verify the release as a maintainer
 

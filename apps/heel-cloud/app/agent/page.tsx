@@ -16,6 +16,12 @@ if (WHEEL_SHA256 === undefined) {
 const INSTALL_AGENT = `python3 -m venv .venv
 .venv/bin/python -m pip install ./heel_sim-1.3.0rc1-py3-none-any.whl`;
 
+const PUBLIC_WHEEL_SHA256 = "176a17b0d4d7f4ea44420d8099239f32dbb17eeead981e5aa360f0a5bbccb94a";
+
+const INSTALL_PUBLIC_AGENT = `python3 -m venv .venv
+.venv/bin/python -m pip --isolated install \\
+  'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc1/heel_sim-1.3.0rc1-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}'`;
+
 const MCP_CONFIGURATION = `{
   "mcpServers": {
     "heel": {
@@ -84,9 +90,24 @@ export default function AgentQuickstart() {
             <p className="step-number">01 · Install</p>
             <h2>Download and install Heel Agent</h2>
             <p>
-              Heel&apos;s base MCP core is Apache-2.0 licensed and free to run locally. Download the
-              exact first-party wheel below; the source archive is provided alongside it for inspection.
+              Heel&apos;s base MCP core is Apache-2.0 licensed and free to run locally. Install the
+              public preview directly from the public release without a manual wheel download, or
+              download the exact first-party wheel below; the source archive is provided alongside it
+              for inspection.
             </p>
+            <p>
+              Version 1.3.0rc1 is a public preview prerelease at{" "}
+              <a href="https://github.com/ancilis/heel/releases/tag/v1.3.0rc1">
+                github.com/ancilis/heel/releases/tag/v1.3.0rc1
+              </a>
+              . It is not a stable release, its GitHub release record is not immutable, and it does
+              not indicate customer acceptance. In an empty private directory, install the
+              hash-pinned public wheel. pip refuses the wheel unless its SHA-256 matches;{" "}
+              <code>--isolated</code> ignores pip environment variables and user configuration, and
+              the <code>runner</code> extra downloads the pinned <code>cryptography</code> package
+              from your Python package index.
+            </p>
+            <pre><code>{INSTALL_PUBLIC_AGENT}</code></pre>
             <div className="hero-actions" aria-label="Heel Agent downloads">
               <a
                 className="button button-primary"
@@ -108,8 +129,8 @@ export default function AgentQuickstart() {
               Wheel SHA-256: <code>{WHEEL_SHA256}</code>
             </p>
             <p>
-              Version 1.3.0rc1 is an unreleased preview candidate. It is not yet published as a
-              GitHub release or on PyPI, and the digest above comes from this build&apos;s manifest.
+              The digest above comes from this build&apos;s manifest. To use the downloaded file,
+              install it from the folder where you saved it with the command below.
               PyPI publication is not yet available. Python 3.11 or newer is required.
               Secure project storage requires a POSIX filesystem with descriptor-relative operations
               and no-follow support. Windows is not currently supported for MCP local project storage.
@@ -122,7 +143,12 @@ export default function AgentQuickstart() {
             <h2>Add the local stdio server</h2>
             <p>
               Replace both absolute paths. <code>HEEL_HOME</code> must be a private local directory;
-              reviewed results are saved below it only after a successful MCP review.
+              reviewed results are saved below it only after a successful MCP review. Use a physical
+              path in which no component is a symbolic link, such as the output of{" "}
+              <code>pwd -P</code> followed by <code>/.heel</code>. On macOS, <code>/tmp</code> and{" "}
+              <code>/var</code> are symbolic links, so use <code>/private/tmp</code> or{" "}
+              <code>/private/var</code> paths instead. Heel refuses symbolic links in private storage
+              on purpose.
             </p>
             <pre><code>{MCP_CONFIGURATION}</code></pre>
           </article>

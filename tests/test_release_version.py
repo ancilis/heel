@@ -99,7 +99,9 @@ class ReleaseVersionContractTests(unittest.TestCase):
         for legacy_version in LEGACY_VERSIONS:
             self.assertNotIn(f"heel_sim-{legacy_version}", combined)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn(f"## [{VERSION}]: unpublished candidate", changelog)
+        self.assertIn(f"## [{VERSION}]: 2026-10-23", changelog)
+        self.assertIn(f"https://github.com/ancilis/heel/releases/tag/v{VERSION}", changelog)
+        self.assertNotIn("unpublished candidate", changelog)
         self.assertIn("## [1.2.0]: 2026-08-04", changelog)
         self.assertIn("## [1.1.1]: 2026-08-04", changelog)
 

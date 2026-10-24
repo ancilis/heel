@@ -1,29 +1,92 @@
 # Export entitlement reference demo
 
-Use the supplied 1.3.0rc1 preview candidate wheel in a private POSIX workspace with Python 3.11 or
-newer. The candidate is unreleased; no GitHub release or PyPI publication is implied. The `runner`
-extra installs the pinned `cryptography` dependency from your package index.
+This optional local preview runs a synthetic reference product on your machine. It is not a step in
+the default Heel journey (signup, product URL and credentials, explicit authorization, then discovery
+and scanning), which needs no OpenAPI document or manual runner setup.
+
+Heel 1.3.0rc1 is a public preview prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. It is not a stable release, its GitHub
+release record is not immutable, and it is not published to PyPI. The release is not a deployed Heel
+Cloud URL and does not indicate customer acceptance.
+
+You need a POSIX shell and Python 3.11 or newer (`python3 --version`). No source checkout or Heel
+Cloud deployment is needed. Work in an empty private directory you own. pip installs the public wheel
+only if it matches the pinned SHA-256. `--isolated` makes pip ignore environment variables and user
+configuration. The `runner` extra then downloads the pinned `cryptography` dependency and its
+dependencies from the Python package index (PyPI by default).
 
 ```sh
-python3 -m venv --copies .venv
-. .venv/bin/activate
-python -m pip install './heel_sim-1.3.0rc1-py3-none-any.whl[runner]'
-export HEEL_HOME="$PWD/.heel"
-heel reference prepare
-heel scope create --target reference:export --operator "demo owner" --confirm
+python3 -m venv .venv
+.venv/bin/python -m pip --isolated install \
+  'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc1/heel_sim-1.3.0rc1-py3-none-any.whl#sha256=176a17b0d4d7f4ea44420d8099239f32dbb17eeead981e5aa360f0a5bbccb94a'
+export HEEL_HOME="$(pwd -P)/.heel"
+.venv/bin/heel reference prepare
+.venv/bin/heel scope create --target reference:export --operator "demo owner" --confirm
 ```
+
+`HEEL_HOME` must be an absolute physical path in which no component is a symbolic link. `pwd -P`
+prints that physical path; plain `$PWD` may not. On macOS, `/tmp` and `/var` are symbolic links to
+`/private/tmp` and `/private/var`, so a `HEEL_HOME` built from a `$PWD` under `/tmp`, `/var` or
+`$TMPDIR` is refused. Heel opens private storage without following symbolic links on purpose. Do not
+disable or work around that check. Run the commands below in the same shell so that `HEEL_HOME` stays
+set.
+
+If you downloaded `heel_sim-1.3.0rc1-py3-none-any.whl` from a Heel Cloud deployment's `/agent`
+page, you can install that file instead with
+`.venv/bin/python -m pip --isolated install './heel_sim-1.3.0rc1-py3-none-any.whl[runner]'`.
 
 Replace SCOPE_ID below with the returned ID. Each attempt ID is consumed once, including cancelled or interrupted attempts; choose fresh 32-character lowercase hexadecimal IDs on repetition.
 
 ```sh
-heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111
-heel reference run --scope SCOPE_ID --case hardened --attempt 22222222222222222222222222222222
-heel reference run --scope SCOPE_ID --case error_envelope --attempt 33333333333333333333333333333333
-heel reference run --scope SCOPE_ID --case inconclusive --attempt 44444444444444444444444444444444
-heel reference run --scope SCOPE_ID --case vulnerable --attempt 55555555555555555555555555555555 --stop
+.venv/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111
+.venv/bin/heel reference run --scope SCOPE_ID --case hardened --attempt 22222222222222222222222222222222
+.venv/bin/heel reference run --scope SCOPE_ID --case error_envelope --attempt 33333333333333333333333333333333
+.venv/bin/heel reference run --scope SCOPE_ID --case inconclusive --attempt 44444444444444444444444444444444
+.venv/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 55555555555555555555555555555555 --stop
 ```
 
-Expected results: verified_violation; invariant_held with regression_passed=true; invariant_held for the HTTP-200 denial envelope; inconclusive; inconclusive with cancellation. `public` and `redacted` are additional supported cases. A missing positive control never passes.
+Results, in order: verified_violation; invariant_held with regression_passed=true; for
+`error_envelope`, 1.3.0rc1 prints invariant_held with regression_passed=true, which is a known
+erratum (see below) and must be read as inconclusive; inconclusive; inconclusive with cancellation.
+`public` and `redacted` are additional supported cases. A missing positive control never passes.
+
+**Erratum for 1.3.0rc1: `error_envelope`.** The published 1.3.0rc1 wheel reports the
+`error_envelope` case as `invariant_held` with `regression_passed=true`. That output is a known
+defect. In this case the reference product answers the lower-plan export with HTTP 200 and a
+`{"error":"license required"}` body. A denial inside a successful response does not establish that
+protected content was withheld, so the correct result is inconclusive. Treat the rc1
+`error_envelope` report as inconclusive: it does not validate the invariant and is not a passing
+regression. The commands and output above are the actual rc1 behavior; the published rc1 artifacts
+are unchanged. A corrected result will ship only in a later candidate, with its evaluator, tests
+and artifacts updated together. The vulnerable and hardened results are not affected.
+
+Every report has `execution_support` set to `reference_only`. Its provenance records
+`network_calls: false`, and `uploaded` is `false`. The runs contact no product target and accept no
+URL, credentials, or transport override. A passing synthetic reference shows only that this local
+preview works. It does not show that Heel supports live targets or is ready for launch.
+
+## If the reference run is rejected
+
+The CLI prints the same message for every refusal:
+`Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage.`
+It exits with status 2. The message does not say which check failed, so check each of these. Not
+every rejection is a storage-path problem.
+
+1. **Private storage path.** From your workspace, run `export HEEL_HOME="$(pwd -P)/.heel"` again.
+   Every component of `HEEL_HOME` must be a real directory, not a symbolic link. Check this
+   especially under macOS `/tmp`, `/var` or `$TMPDIR`. Do not replace directories with links,
+   relax permissions, or edit the store database or scope files.
+2. **Signed synthetic scope.** `SCOPE_ID` must come from
+   `heel scope create --target reference:export ... --confirm`, run with the same `HEEL_HOME`. The
+   scope must not have expired (the default lifetime is seven days). If you are unsure, create a
+   fresh scope and use its ID.
+3. **Unused attempt.** The attempt must be 32 lowercase hexadecimal characters that this
+   `HEEL_HOME` has never used before. Cancelled or interrupted runs count as used. Retrying with a
+   new attempt ID is always safe.
+
+If you ask for help, share only the command (with `SCOPE_ID`), the exit status, the one-line
+message, your OS, and your Python version. Never paste raw exceptions or tracebacks, signing keys,
+scope files, `.heel` contents, or credentials.
 
 The fix is the account export-license check before serialization in `heel/reference_product.py`. Both variants use the same account table, fixture and invariant. The check verifies only read entitlement, not quotas or cumulative extraction. There is one synthetic row and two sequential reads, not bulk extraction.
 
