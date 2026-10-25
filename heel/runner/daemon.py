@@ -52,10 +52,9 @@ from .identity import (
     create_runner_pairing_material, runner_pairing_signer_label,
 )
 from .coordinator import RunnerCoordinator, RunnerExecutionAdapter
-from .execution import LocalCanaryExecutor, ValidatedExecutionBundle
+from .execution import LocalCanaryExecutor, LocalRunNotActive, ValidatedExecutionBundle
 from .http_transport import (
-    DEFAULT_TIMEOUT_SECONDS, BoundedResolver, TargetHTTPSClient, TransportFailure,
-    normalize_target_origin,
+    DEFAULT_TIMEOUT_SECONDS, BoundedResolver, TargetHTTPSClient, normalize_target_origin,
 )
 from .runtime import RunnerRuntimeState, RunnerRuntimeStateError, RunnerRuntimeUnavailable
 from .service import RunnerService
@@ -372,12 +371,14 @@ def _require_os_credentials(
 class _ServeExecution:
     """The ``serve`` executor: one fresh ``LocalCanaryExecutor`` and adapter per claimed lease.
 
-    The adapter builds the target transport only after the coordinator's fresh gate and the exact
-    claimed bundle are revalidated. The transport factory then checks credential metadata, resolves
-    the full public address set of the validated manifest origin once and pins a direct
-    ``TargetHTTPSClient`` to it; nothing else can choose the origin, resolver, port or TLS. OS vaults
-    are constructed through ``select_vault`` for the OS backends present locally; no secret is
-    loaded here, only inside the executor's own preflight.
+    The adapter checks credential metadata only after the coordinator's fresh gate and the exact
+    claimed bundle are revalidated, before the executor reserves the run. The executor calls the
+    transport factory only after durable local activation: it resolves the full public address set
+    of the validated manifest origin once and pins a direct ``TargetHTTPSClient`` to it; nothing
+    else can choose the origin, resolver, port or TLS. A resolution failure is finalized as that
+    activated run's zero-request outcome. OS vaults are constructed through ``select_vault`` for
+    the OS backends present locally; no secret is loaded here, only inside the executor after the
+    factory returns and no stop is known.
     """
 
     def __init__(
@@ -406,21 +407,17 @@ class _ServeExecution:
                     continue  # refused per binding by ``_require_os_credentials``
         return vaults
 
-    def _target(self, vaults: Mapping[str, object], validated: ValidatedExecutionBundle):
-        coordinator = self._coordinator
-        _require_os_credentials(coordinator.store, validated.manifest, vaults)
+    def _target(self, validated: ValidatedExecutionBundle):
+        # A ``TransportFailure`` here reaches the executor's finalizer as ``target_unavailable``.
         origin = normalize_target_origin(validated.manifest["environment"]["origin"])
         resolver = self._network.get("resolver") or BoundedResolver()
-        try:
-            preflight = resolver(
-                origin[len("https://"):], deadline=time.monotonic() + DEFAULT_TIMEOUT_SECONDS,
-            )
-            return TargetHTTPSClient(
-                origin=origin, preflight_addresses=preflight, resolver=resolver,
-                sockets=self._network.get("sockets"), tls=self._network.get("tls"),
-            )
-        except TransportFailure:
-            raise RunnerServeError("target_unavailable") from None
+        preflight = resolver(
+            origin[len("https://"):], deadline=time.monotonic() + DEFAULT_TIMEOUT_SECONDS,
+        )
+        return TargetHTTPSClient(
+            origin=origin, preflight_addresses=preflight, resolver=resolver,
+            sockets=self._network.get("sockets"), tls=self._network.get("tls"),
+        )
 
     def execute(self, lease, *, cancellation, on_progress):
         coordinator = self._coordinator
@@ -432,7 +429,10 @@ class _ServeExecution:
         )
         adapter = RunnerExecutionAdapter(
             coordinator=coordinator, executor=executor,
-            transport_factory=lambda validated: self._target(vaults, validated),
+            transport_precheck=lambda validated: _require_os_credentials(
+                coordinator.store, validated.manifest, vaults,
+            ),
+            transport_factory=self._target,
         )
         with self._lock:
             self._adapter = adapter
@@ -442,7 +442,7 @@ class _ServeExecution:
         with self._lock:
             adapter = self._adapter
         if adapter is None:
-            raise RunnerServeError("execution_unavailable")
+            raise LocalRunNotActive("no locally activated run matches the stop")
         return adapter.prepare_stop_ack(lease, projection, stop_reason, proposed_at_ms)
 
 
