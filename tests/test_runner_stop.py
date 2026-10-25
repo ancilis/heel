@@ -8,6 +8,7 @@ import os
 import shutil
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,6 +29,7 @@ from heel.runner.execution import (
     validate_execution_bundle,
 )
 from heel.runner.http_transport import BoundedResponseEvidence, TargetResponse, TransportFailure
+import heel.runner.service as service_module
 from heel.runner.service import ClaimLease, RunnerService
 from heel.runner.runtime import ActiveRunInstall, RunnerRuntimeState, RuntimePruneCompletion
 from heel.runner.store import RunnerStoreError
@@ -2631,3 +2633,448 @@ def test_recovery_never_terminalizes_a_tampered_persisted_final_envelope(tmp_pat
         executor().recover(grant["run_id"], transport=transport)
     assert transport.calls == []
     assert store.load_run(grant["run_id"])["state"] == "finalizing"
+
+
+# --- Stop before, during and after local activation, ahead of a lazy transport factory --------
+
+
+class _CountingVault(StaticVault):
+    def __init__(self):
+        self.loads = []
+
+    def load(self, handle_id):
+        self.loads.append(handle_id)
+        return super().load(handle_id)
+
+
+def _stopping(cancellation, reason="cloud_stop", at_ms=None):
+    """What ``_StopController.request`` records before the token is cancelled."""
+    cancellation.stop_reason = reason
+    cancellation.stop_requested_at_ms = at_ms if at_ms is not None else int(time.time() * 1000)
+    cancellation.cancel()
+
+
+def _lazy_executor(tmp_path):
+    store, signer, manifest, projection, grant, clock, executor = _advancing_executor(tmp_path)
+    vault = _CountingVault()
+    local = executor()
+    local.vaults = {"ephemeral_env": vault}
+    return SimpleNamespace(
+        store=store, manifest=manifest, projection=projection, grant=grant, clock=clock,
+        local=local, vault=vault, bundle=ExecutionBundle(manifest, projection, grant),
+    )
+
+
+def test_stop_before_local_activation_has_no_reservation_or_unanchored_ack(tmp_path):
+    from heel.runner.execution import LocalRunNotActive, UnactivatedExecution
+    from heel.runner.http_transport import CancellationToken
+
+    run = _lazy_executor(tmp_path)
+    built = []
+    cancellation = CancellationToken()
+    _stopping(cancellation)
+    outcome = run.local.execute(
+        run.bundle, transport_factory=lambda: built.append("factory"), gate_source=active_gate,
+        cancellation=cancellation,
+    )
+    assert isinstance(outcome, UnactivatedExecution) and outcome.stop_reason == "cloud_stop"
+    assert outcome.operational_projection is None
+    assert built == [] and run.vault.loads == []
+    with pytest.raises(RunnerStoreError):
+        run.store.load_run(run.grant["run_id"])  # the grant is not consumed locally
+    with pytest.raises(LocalRunNotActive):
+        run.local.prepare_stop_ack(
+            run.grant["run_id"], stop_reason="cloud_stop", proposed_at_ms=run.clock.value,
+        )
+    # Exactly one of transport or factory; never both, never neither.
+    for arguments in ({}, {"transport": object(), "transport_factory": lambda: object()},
+                      {"transport_factory": "not callable"}):
+        with pytest.raises(TypeError, match="target transport is required"):
+            run.local.execute(run.bundle, gate_source=active_gate, **arguments)
+
+
+def test_stop_during_local_activation_is_acknowledged_once_against_the_running_run(tmp_path, monkeypatch):
+    """The stop is chosen while activation holds its lock (inside ``reserve_run``). Preparation
+    waits for that lock and then finds the durable running run: one ``running -> stop_requested``
+    transition and one ``stop_observed``, never a bare-reservation acknowledgement."""
+    from heel.runner.http_transport import CancellationToken
+
+    run = _lazy_executor(tmp_path)
+    in_reserve, release = threading.Event(), threading.Event()
+    real_reserve = run.store.reserve_run
+    transitions = []
+    real_transition = run.store.transition_run
+
+    def held_reserve(*args, **kwargs):
+        in_reserve.set()
+        assert release.wait(5)
+        return real_reserve(*args, **kwargs)
+
+    def recording_transition(run_id, next_state, *, now_ms):
+        transitions.append((run.store.load_run(run_id)["state"], next_state))
+        return real_transition(run_id, next_state, now_ms=now_ms)
+
+    monkeypatch.setattr(run.store, "reserve_run", held_reserve)
+    monkeypatch.setattr(run.store, "transition_run", recording_transition)
+    cancellation = CancellationToken()
+    built, results, acks = [], [], []
+    worker = threading.Thread(target=lambda: results.append(run.local.execute(
+        run.bundle, transport_factory=lambda: built.append("factory"), gate_source=active_gate,
+        cancellation=cancellation,
+    )))
+    worker.start()
+    assert in_reserve.wait(5)
+    _stopping(cancellation, at_ms=run.clock.value)
+    preparer = threading.Thread(target=lambda: acks.append(run.local.prepare_stop_ack(
+        run.grant["run_id"], stop_reason="cloud_stop", proposed_at_ms=run.clock.value,
+    )))
+    preparer.start()
+    time.sleep(0.05)
+    assert acks == []  # preparation waits for the activation lock, it does not see `verified`
+    release.set()
+    preparer.join(5)
+    worker.join(5)
+    (ack,) = acks
+    assert (ack["lifecycle_phase"], ack["stop_reason"]) == ("stop_requested", "cloud_stop")
+    assert ack["counters"]["requests_started"] == 0
+    assert transitions[:2] == [("verified", "running"), ("running", "stop_requested")]
+    assert ("verified", "stop_requested") not in transitions
+    assert built == [] and run.vault.loads == []  # the factory never ran after the known stop
+    (result,) = results
+    assert result.execution_disposition == "stopped"
+    operational = result.operational_projection
+    assert operational["stop_reason"] == "cloud_stop"
+    assert operational["containment_codes"].count("stop_observed") == 1
+    _assert_one_terminal_instant(run.store, run.grant["run_id"])
+
+
+def test_factory_return_after_stop_never_loads_credentials_or_executes(tmp_path):
+    from heel.runner.http_transport import CancellationToken
+
+    run = _lazy_executor(tmp_path)
+    cancellation = CancellationToken()
+    transport = ScriptedTransport([200, 200, 200, 200])
+
+    def factory():
+        # The stop arrives while the factory is still resolving; it then returns normally.
+        assert run.store.load_run(run.grant["run_id"])["state"] == "running"
+        _stopping(cancellation, at_ms=run.clock.value)
+        return transport
+
+    result = run.local.execute(
+        run.bundle, transport_factory=factory, gate_source=active_gate, cancellation=cancellation,
+    )
+    assert transport.calls == [] and run.vault.loads == []
+    assert result.execution_disposition == "stopped"
+    assert result.operational_projection["stop_reason"] == "cloud_stop"
+    assert result.operational_projection["counters"]["requests_started"] == 0
+    _assert_one_terminal_instant(run.store, run.grant["run_id"])
+
+
+@pytest.mark.parametrize("failure, expected", [
+    (lambda: TransportFailure("connect_error"), ("incomplete", "target_unavailable", "none")),
+    (lambda: TransportFailure("unsafe_dns"), ("incomplete", "target_unavailable", "none")),
+    (lambda: RuntimeError("synthetic factory fault"), ("failed", "runner_fault", "none")),
+    ("stop-wins", ("stopped", "none", "target_revoked")),
+])
+def test_factory_exception_finalizes_activated_run_without_target_replay(tmp_path, failure, expected):
+    from heel.runner.http_transport import CancellationToken
+
+    run = _lazy_executor(tmp_path)
+    cancellation = CancellationToken()
+    calls = []
+
+    def factory():
+        calls.append("factory")
+        if failure == "stop-wins":
+            _stopping(cancellation, reason="target_revoked", at_ms=run.clock.value)
+            raise TransportFailure("unsafe_dns")  # cancellation won the race: stopped, not DNS
+        raise failure()
+
+    result = run.local.execute(
+        run.bundle, transport_factory=factory, gate_source=active_gate, cancellation=cancellation,
+    )
+    operational = result.operational_projection
+    assert calls == ["factory"] and run.vault.loads == []
+    assert (
+        operational["execution_disposition"], operational["error_category"], operational["stop_reason"],
+    ) == expected
+    assert operational["counters"]["requests_started"] == 0
+    assert result.assessment_outcome == "inconclusive"
+    _assert_one_terminal_instant(run.store, run.grant["run_id"])
+    transport = ScriptedTransport([200])
+    recovered = run.local.recover(run.grant["run_id"], transport=transport)  # stored finals only
+    assert transport.calls == [] and calls == ["factory"] and run.vault.loads == []
+    assert recovered.operational_projection == operational
+
+
+def test_duplicate_ack_and_close_after_pre_factory_stop_are_idempotent(tmp_path):
+    from heel.runner.execution import LocalRunNotActive
+    from heel.runner.http_transport import CancellationToken
+
+    run = _lazy_executor(tmp_path)
+    cancellation = CancellationToken()
+    entered, release = threading.Event(), threading.Event()
+    results = []
+
+    def factory():
+        entered.set()
+        assert release.wait(5)
+        return ScriptedTransport([200])
+
+    worker = threading.Thread(target=lambda: results.append(run.local.execute(
+        run.bundle, transport_factory=factory, gate_source=active_gate, cancellation=cancellation,
+    )))
+    worker.start()
+    assert entered.wait(5)
+    _stopping(cancellation, at_ms=run.clock.value)
+    first = run.local.prepare_stop_ack(
+        run.grant["run_id"], stop_reason="cloud_stop", proposed_at_ms=run.clock.value,
+    )
+    second = run.local.prepare_stop_ack(
+        run.grant["run_id"], stop_reason="cloud_stop", proposed_at_ms=run.clock.value,
+    )
+    assert run.store.load_run(run.grant["run_id"])["state"] == "stop_requested"
+    assert first["event_sequence"] == second["event_sequence"]  # one stop_observed, not two
+    release.set()
+    worker.join(5)
+    (result,) = results
+    assert result.execution_disposition == "stopped" and run.vault.loads == []
+    assert result.operational_projection["containment_codes"].count("stop_observed") == 1
+    with pytest.raises(LocalRunNotActive):  # after finalization nothing can be acknowledged
+        run.local.prepare_stop_ack(
+            run.grant["run_id"], stop_reason="cloud_stop", proposed_at_ms=run.clock.value,
+        )
+
+
+def test_recovery_of_activated_pre_factory_run_finalizes_without_factory_or_target_replay(tmp_path):
+    """A crash after local activation and before the factory: recovery finalizes the one
+    reservation with zero requests, never builds a transport, loads a secret or reuses the grant."""
+    run = _lazy_executor(tmp_path)
+    run.store.reserve_run(run.grant, retention_expires_at_ms=run.clock.value + 86_400_000)
+    log = ContainmentLog(
+        store=run.store, signer=run.local.signer, run_id=run.grant["run_id"],
+        grant_id=run.grant["grant_id"], manifest_digest=run.manifest["manifest_digest"],
+        clock_ms=run.clock,
+    )
+    log.append("grant_verified", detail_code="grant_exact")
+    run.store.transition_run(run.grant["run_id"], "running", now_ms=run.clock())
+    log.append("run_started", detail_code="locally_activated")
+    transport = ScriptedTransport([200])
+    recovered = run.local.recover(run.grant["run_id"], transport=transport)
+    assert transport.calls == [] and run.vault.loads == []
+    operational = recovered.operational_projection
+    assert (operational["execution_disposition"], operational["error_category"]) == ("incomplete", "runner_fault")
+    assert operational["counters"]["requests_started"] == 0
+    _assert_one_terminal_instant(run.store, run.grant["run_id"])
+    built = []
+    with pytest.raises((ValueError, RunnerStoreError), match="already consumed|reservation is unavailable"):
+        run.local.execute(run.bundle, transport_factory=lambda: built.append("factory"), gate_source=active_gate)
+    assert built == []
+
+
+class _RecordingStopCoordinator(StopCoordinator):
+    def __init__(self, lease, *, stop_reason="cloud_stop", ack=None, stop_when=lambda: True):
+        super().__init__(lease)
+        self.results = []
+        self._stop_reason, self._ack, self._stop_when = stop_reason, ack, stop_when
+
+    def heartbeat(self, run_id, operational_projection):
+        self.heartbeats.append(time.monotonic())
+        reason = self._stop_reason if self._stop_when() else "none"
+        return ExecutionGate(True, "active", "valid", 20_000, 7, reason, 2_000)
+
+    def result(self, run_id, operational_projection):
+        self.results.append(operational_projection)
+
+    def stop_ack(self, run_id, operational_projection, *, deadline):
+        super().stop_ack(run_id, operational_projection, deadline=deadline)
+        if self._ack is not None:
+            return self._ack()
+        return None
+
+
+def _real_stop_service(tmp_path, coordinator_factory, *, prepare=None):
+    """A real executor whose first target request blocks until cancelled, behind RunnerService."""
+    run = _lazy_executor(tmp_path)
+
+    class BlockingTransport:
+        def __init__(self):
+            self.calls, self.started = [], threading.Event()
+
+        def request(self, action, *, cancellation, before_attempt, **kwargs):
+            del kwargs
+            before_attempt(1, None)
+            self.calls.append(action)
+            self.started.set()
+            while not cancellation.cancelled:
+                time.sleep(0.005)
+            raise TransportFailure("cancelled", requests_made=1)
+
+    transport = BlockingTransport()
+
+    class Adapter:
+        def execute(self, lease, *, cancellation, on_progress):
+            return run.local.execute(
+                lease.bundle, transport_factory=lambda: transport, gate_source=active_gate,
+                cancellation=cancellation, on_progress=on_progress,
+            )
+
+        def prepare_stop_ack(self, lease, projection, stop_reason, proposed_at_ms):
+            if prepare is not None:
+                return prepare()
+            return run.local.prepare_stop_ack(
+                lease.run_id, stop_reason=stop_reason, proposed_at_ms=proposed_at_ms,
+            )
+
+    lease = ClaimLease(run.grant["run_id"], run.bundle, {
+        "run_id": run.grant["run_id"], "lifecycle_phase": "claimed",
+    })
+    coordinator = coordinator_factory(lease, transport.started.is_set)
+    service = RunnerService(
+        coordinator=coordinator, executor=Adapter(), heartbeat_interval=0.05, idle_poll_interval=2.0,
+    )
+    return run, transport, coordinator, service
+
+
+@pytest.mark.parametrize("failure", ["prepare-raises", "ack-raises", "ack-not-accepted"])
+def test_unacknowledged_stop_of_an_activated_run_sends_one_null_ack_stopped_terminal(
+    tmp_path, monkeypatch, failure,
+):
+    """No uncaught worker exception and no completed fallback: the activated run is finalized as
+    stopped and reports exactly that signed terminal, with the chosen reason and a null
+    acknowledgement timestamp ("acknowledgement not established"), never an invented one."""
+    errors = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: errors.append(args.exc_value))
+
+    def failing_prepare():
+        raise RuntimeError("synthetic stop preparation fault")
+
+    def failing_ack():
+        raise TimeoutError("synthetic control plane timeout")
+
+    ack = {
+        "prepare-raises": None, "ack-raises": failing_ack,
+        "ack-not-accepted": lambda: SimpleNamespace(accepted=False, acknowledged_at_ms=2_500),
+    }[failure]
+    run, transport, coordinator, service = _real_stop_service(
+        tmp_path, lambda lease, started: _RecordingStopCoordinator(lease, ack=ack, stop_when=started),
+        prepare=failing_prepare if failure == "prepare-raises" else None,
+    )
+    controllers = []
+    real_request = service_module._StopController.request
+
+    def recording_request(self, reason, *, deadline=None):
+        controllers.append(self)
+        return real_request(self, reason, deadline=deadline)
+
+    monkeypatch.setattr(service_module._StopController, "request", recording_request)
+    assert service.run_once() is True
+    assert errors == []
+    assert controllers and controllers[0].completed.is_set()
+    assert controllers[0].outcome == "unacknowledged"
+    assert len(coordinator.acks) == (0 if failure == "prepare-raises" else 1)
+    assert len(transport.calls) == 1  # the one in-flight request; nothing after the stop
+    operational = run.store.load_final_projections(run.grant["run_id"])["operational_projection"]
+    assert operational["execution_disposition"] == "stopped"
+    assert operational["stop_reason"] == "cloud_stop"
+    assert operational["timestamps"]["stop_acknowledged_at_ms"] is None
+    assert coordinator.results == [operational]  # the exact signed local terminal, once
+
+
+def test_not_active_preparation_is_its_own_outcome_with_no_ack_or_result(monkeypatch):
+    from heel.runner.execution import LocalRunNotActive
+
+    errors = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: errors.append(args.exc_value))
+    lease = ClaimLease("run_123456789", object(), {
+        "run_id": "run_123456789", "lifecycle_phase": "claimed",
+    })
+    controllers = []
+
+    class NeverActivated(BlockingExecutor):
+        def execute(self, lease, *, cancellation, on_progress):
+            del on_progress
+            while not cancellation.cancelled:
+                time.sleep(0.005)
+            assert cancellation.stop_ack_event.wait(1)
+            controllers.append(cancellation.stop_ack_event)
+            return SimpleNamespace(operational_projection=None)
+
+        def prepare_stop_ack(self, lease, projection, stop_reason, proposed_at_ms):
+            raise LocalRunNotActive("no locally activated run matches the stop")
+
+    coordinator = _RecordingStopCoordinator(lease)
+    service = RunnerService(
+        coordinator=coordinator, executor=NeverActivated(), heartbeat_interval=0.05,
+        idle_poll_interval=2.0,
+    )
+    seen = []
+    real_request = service_module._StopController.request
+
+    def recording_request(self, reason, *, deadline=None):
+        seen.append(self)
+        return real_request(self, reason, deadline=deadline)
+
+    monkeypatch.setattr(service_module._StopController, "request", recording_request)
+    assert service.run_once() is True
+    assert errors == [] and controllers
+    assert seen[0].outcome == "not_active"
+    assert coordinator.acks == [] and coordinator.results == []
+
+
+def test_concurrent_local_and_cloud_stop_pre_factory_uses_one_ack_and_one_reason(tmp_path, monkeypatch):
+    errors = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: errors.append(args.exc_value))
+    run = _lazy_executor(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    transport = ScriptedTransport([200, 200, 200, 200])
+
+    def factory():
+        entered.set()
+        assert release.wait(5)
+        return transport
+
+    class Adapter:
+        def execute(self, lease, *, cancellation, on_progress):
+            return run.local.execute(
+                lease.bundle, transport_factory=factory, gate_source=active_gate,
+                cancellation=cancellation, on_progress=on_progress,
+            )
+
+        def prepare_stop_ack(self, lease, projection, stop_reason, proposed_at_ms):
+            return run.local.prepare_stop_ack(
+                lease.run_id, stop_reason=stop_reason, proposed_at_ms=proposed_at_ms,
+            )
+
+    class RaceCoordinator(_RecordingStopCoordinator):
+        def heartbeat(self, run_id, operational_projection):
+            self.heartbeats.append(time.monotonic())
+            reason = "cloud_stop" if entered.is_set() else "none"
+            return ExecutionGate(True, "active", "valid", 20_000, 7, reason, 2_000)
+
+    lease = ClaimLease(run.grant["run_id"], run.bundle, {
+        "run_id": run.grant["run_id"], "lifecycle_phase": "claimed",
+    })
+    coordinator = RaceCoordinator(lease)
+    service = RunnerService(
+        coordinator=coordinator, executor=Adapter(), heartbeat_interval=0.01, idle_poll_interval=2.0,
+    )
+    worker = threading.Thread(target=service.run_once)
+    worker.start()
+    assert entered.wait(5)
+    local = service.request_local_stop()
+    deadline = time.monotonic() + 5
+    while len(coordinator.acks) < 1:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert service.request_local_stop() is True  # duplicate stops are absorbed
+    release.set()
+    worker.join(5)
+    assert not worker.is_alive() and errors == [] and local is True
+    assert len(coordinator.acks) == 1 and transport.calls == [] and run.vault.loads == []
+    (ack,) = coordinator.ack_projections
+    (terminal,) = coordinator.results
+    assert terminal["lifecycle_phase"] == "terminal" and terminal["execution_disposition"] == "stopped"
+    assert terminal["stop_reason"] == ack["stop_reason"] in {"local_emergency_stop", "cloud_stop"}
+    assert terminal["timestamps"]["stop_acknowledged_at_ms"] is not None

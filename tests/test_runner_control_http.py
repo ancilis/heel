@@ -2369,6 +2369,181 @@ def test_real_http_heartbeat_bypasses_held_human_request_lock():
             server.shutdown(); server.server_close(); cp.close()
 
 
+
+class _LiveHttpRun:
+    """A real in-process control-plane HTTP server holding one approved, claimed canary run."""
+
+    def __init__(self, directory):
+        from canary_test_support import approval_projection
+        from heel.saas.canary_runs import CanaryRunService
+
+        self.cp = cp = ControlPlane(
+            str(Path(directory) / "control.sqlite"), runner_auth_pepper=b"r" * 32,
+            grant_authority=SigningAuthority.generate(),
+        )
+        self.server = serve(cp)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        org = cp.store.create_org("org")
+        self.workspace = workspace = cp.store.create_workspace(org, "ws", "free", CATALOG_VERSION)
+        self.private = private = Ed25519PrivateKey.generate()
+        public = base64.b64encode(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+        raw = base64.b64decode(public)
+        self.key_id = key_id = ed25519_key_id(raw)
+        cp.store.conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner", workspace, "runner", "active", time.time()))
+        cp.store.conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (key_id, workspace, "runner", public, "active", time.time()))
+        stamp, self.stamp_ms, digest = time.time(), int(time.time() * 1000), "a" * 64
+        cp.store.conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", (workspace, "prj", "project", "owner", stamp))
+        cp.store.conn.execute("INSERT INTO users VALUES(?,?,?)", ("owner", "owner@example.test", stamp))
+        cp.store.conn.execute("INSERT INTO memberships VALUES(?,?,?,?)", (workspace, "owner", "owner", stamp))
+        cp.store.conn.execute(
+            "INSERT INTO canary_environments("
+            "environment_id,workspace_id,project_ref,origin,environment_class,status,created_at,"
+            "attestation_text,attestation_version,attestation_acknowledgement,attested_by,attested_at,"
+            "proof_method,proof_version,normalization_version,challenge_generation,last_check_at,"
+            "verified_at,proof_expires_at,verification_record_digest) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "env", workspace, "prj", "https://canary.acme.dev", "staging", "verified",
+                stamp, "ownership verified; environment classification supplied by you", "v1",
+                "accepted", "owner", stamp, "https-file", "https-file.v1", "exact-origin.v1",
+                1, stamp, stamp, stamp + 3600, digest,
+            ),
+        )
+        identity = cp.runner_auth._identity_record(workspace_id=workspace, runner_id="runner", public_key=public, fingerprint=hashlib.sha256(raw).hexdigest(), key_id=key_id, runner_version="1.0.0", adapters_json=json.dumps({"canary":"1.0.0"}), paired_by="owner", paired_at=time.time(), heartbeat_at=time.time())
+        cp.runner_auth._save_identity(identity, instant=time.time())
+        _enable_executable_protocol(cp.store.conn, workspace, "runner")
+        cp.store.conn.commit()
+        self.signer = SigningAuthority.from_private_key(private, key_id)
+        self.runs = runs = CanaryRunService(
+            cp.store.conn, signing=cp.grant_authority, runner_auth=cp.runner_auth, initialize_schema=False,
+        )
+        approval = approval_projection(
+            self.signer, workspace_id=workspace, project_ref="prj",
+            environment_id="env", runner_id="runner", verification_digest=digest,
+        )
+        submitted = runs.submit_projection(approval, uploaded_by="owner")
+        self.grant = runs.approve(
+            workspace, "prj", submitted["run_id"],
+            projection_digest=approval["projection_digest"], actor="owner", role="owner",
+            reason="Exercise the stop acknowledgement and result HTTP boundary",
+            exact_hostname="canary.acme.dev", recent_auth_at_ms=self.stamp_ms,
+            idempotency_key="ca1-" + "d" * 64, expected_kill_switch_generation=0,
+        )["grant"]
+        self.run_id = submitted["run_id"]
+        self.chains = {
+            name: dict(state) for name, state in runs.claim(workspace, "runner", key_id)["chain_states"].items()
+        }
+
+    def post(self, operation, projection):
+        """One authenticated POST on the run's own nonce-sequenced chain, exactly as a runner signs it."""
+        schema = {"stop-ack": "heel.runner-stop-ack-request.v1", "result": "heel.runner-result-request.v1"}[operation]
+        capability = {"stop-ack": "runner_heartbeat", "result": "runner_result"}[operation]
+        body = canonical_bytes({"schema_version": schema, "run_id": self.run_id, "operational_projection": projection})
+        route = f"/v1/workspaces/{self.workspace}/runners/runner/runs/{self.run_id}/{operation}"
+        chain = self.chains[operation]
+        timestamp = int(time.time() * 1000)
+        proof = {"schema_version": "heel.runner-request-proof.v1", "workspace_id": self.workspace, "runner_id": "runner", "key_id": self.key_id, "capability": capability, "method": "POST", "path": route, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp, "server_nonce": chain["next_nonce_b64"], "sequence": chain["next_sequence"]}
+        headers = {"Content-Type": "application/json", "X-Heel-Runner-Id": "runner", "X-Heel-Runner-Key-Id": self.key_id, "X-Heel-Runner-Timestamp-Ms": str(timestamp), "X-Heel-Runner-Nonce": chain["next_nonce_b64"], "X-Heel-Runner-Sequence": str(chain["next_sequence"]), "X-Heel-Runner-Signature": base64.b64encode(self.private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))).decode()}
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        try:
+            conn.request("POST", route, body, headers)
+            response = conn.getresponse()
+            payload = json.loads(response.read() or b"null")
+            next_nonce = response.getheader("X-Heel-Runner-Next-Nonce")
+        finally:
+            conn.close()
+        if next_nonce:
+            chain["next_nonce_b64"], chain["next_sequence"] = next_nonce, chain["next_sequence"] + 1
+        return response.status, payload
+
+    def row(self):
+        return self.cp.store.conn.execute(
+            "SELECT status,execution_disposition,stop_reason,stop_acknowledged_at_ms,quota_state "
+            "FROM canary_runs WHERE run_id=?", (self.run_id,),
+        ).fetchone()
+
+    def close(self):
+        self.server.shutdown(); self.server.server_close(); self.cp.close()
+
+
+# The public envelope for the server's internal ``stop_conflict`` refusal.
+_STATE_CONFLICT = {"schema_version": "heel.canary-error.v1", "code": "canary_state_conflict"}
+
+
+def _stop_instants():
+    """Runner-local signed (requested, acknowledged) instants on the shared projection timeline
+    (claimed ``NOW_MS + 100``, started ``NOW_MS + 200``). Cloud receipt time decides lateness."""
+    from canary_test_support import NOW_MS
+
+    return NOW_MS + 300, NOW_MS + 400
+
+
+def _stopped_terminal(live, *, acknowledged_at_ms, sequence=2):
+    from canary_test_support import NOW_MS, operational_projection
+
+    return operational_projection(
+        live.signer, live.grant, sequence=sequence, phase="terminal", disposition="stopped",
+        stop_reason="cloud_stop", stop_requested_at_ms=_stop_instants()[0],
+        stop_acknowledged_at_ms=acknowledged_at_ms, updated_at_ms=NOW_MS + 1_000,
+    )
+
+
+def test_real_http_null_ack_stopped_terminal_after_an_ack_lost_before_the_cloud_accepted_it():
+    """Reject-before-accept: the stop acknowledgement never reached the Cloud. Over the real HTTP
+    boundary an invented acknowledgement timestamp is refused, and the activated run's stopped
+    terminal with a null acknowledgement is accepted once without any acknowledgement claim."""
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            live.runs.request_stop(
+                live.workspace, "prj", live.run_id, actor="owner", reason="cloud_stop",
+                expected_kill_switch_generation=0,
+            )
+            invented = _stopped_terminal(live, acknowledged_at_ms=_stop_instants()[1])
+            status, payload = live.post("result", invented)
+            assert (status, payload) == (409, _STATE_CONFLICT)
+            assert live.row()["status"] == "stop_requested"
+            status, payload = live.post("result", _stopped_terminal(live, acknowledged_at_ms=None))
+            assert status == 200 and payload["status"] == "terminal"
+            row = live.row()
+            assert (row["status"], row["execution_disposition"], row["stop_reason"]) == ("terminal", "stopped", "cloud_stop")
+            assert row["stop_acknowledged_at_ms"] is None  # never an acknowledgement claim
+            assert row["quota_state"] == "refunded"  # zero requests started
+        finally:
+            live.close()
+
+
+def test_real_http_null_ack_stopped_terminal_is_refused_after_an_accepted_ack_whose_response_was_lost():
+    """Accepted-remote, lost-response: the Cloud accepted the acknowledgement but the runner never
+    learned it, so the runner sends the null-ack stopped terminal. The server's existing conflict
+    check (``stop_conflict``, public ``canary_state_conflict``) refuses that terminal and keeps its acknowledged stop state; the
+    client cannot force acceptance or invent the timestamp it never received."""
+    from canary_test_support import operational_projection
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            live.runs.request_stop(
+                live.workspace, "prj", live.run_id, actor="owner", reason="cloud_stop",
+                expected_kill_switch_generation=0,
+            )
+            ack = operational_projection(
+                live.signer, live.grant, sequence=1, phase="stop_requested", stop_reason="cloud_stop",
+                stop_requested_at_ms=_stop_instants()[0], stop_acknowledged_at_ms=_stop_instants()[1],
+                updated_at_ms=_stop_instants()[1],
+            )
+            status, payload = live.post("stop-ack", ack)
+            assert status == 200 and payload["accepted"] is True  # this answer is what gets lost
+            acknowledged = live.row()["stop_acknowledged_at_ms"]
+            assert live.row()["status"] == "stop_requested" and acknowledged is not None
+            status, payload = live.post("result", _stopped_terminal(live, acknowledged_at_ms=None))
+            assert (status, payload) == (409, _STATE_CONFLICT)
+            row = live.row()
+            assert row["status"] == "stop_requested" and row["stop_acknowledged_at_ms"] == acknowledged
+            assert row["execution_disposition"] is None
+        finally:
+            live.close()
+
 # --- T2b-1: grant-authority bootstrap in the v4 activation response -------------------------
 
 V3_ACTIVATED_FIELDS = {

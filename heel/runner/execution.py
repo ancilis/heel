@@ -109,6 +109,21 @@ class ExecutionResult:
     disclosure_preview: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class UnactivatedExecution:
+    """A stop was known before local activation: nothing was reserved, loaded or dialed.
+
+    There is no local receipt to acknowledge or report; the Cloud stop lifecycle owns the run.
+    """
+
+    stop_reason: str
+    operational_projection: None = None
+
+
+class LocalRunNotActive(RunnerStoreError):
+    """No locally activated run matches a stop acknowledgement request."""
+
+
 _MAX_GATE_STALE_SECONDS = 0.5
 
 
@@ -367,8 +382,8 @@ class LocalCanaryExecutor:
         self.clock_ms = clock_ms
         self.monotonic = monotonic
         self._active_lock = threading.Lock()
+        # Serializes local activation with stop preparation: the activation linearization point.
         self._stop_lock = threading.Lock()
-        self._active_ready = threading.Event()
         self._active_context: dict[str, Any] | None = None
 
     def _gate(self, source: Callable[[], ExecutionGate], generation: int) -> ExecutionGate:
@@ -432,10 +447,6 @@ class LocalCanaryExecutor:
     def _set_active_context(self, value: dict[str, Any] | None) -> None:
         with self._active_lock:
             self._active_context = value
-            if value is None:
-                self._active_ready.clear()
-            else:
-                self._active_ready.set()
 
     def prepare_stop_ack(
         self, run_id: str, *, stop_reason: str, proposed_at_ms: int,
@@ -450,24 +461,24 @@ class LocalCanaryExecutor:
             raise ValueError("stop acknowledgement reason is invalid")
         if isinstance(proposed_at_ms, bool) or not isinstance(proposed_at_ms, int) or proposed_at_ms < 0:
             raise ValueError("stop acknowledgement timestamp is invalid")
-        if not self._active_ready.wait(1.0):
-            raise RunnerStoreError("active run is unavailable for stop acknowledgement")
-        with self._active_lock:
-            context = self._active_context
+        with self._stop_lock:
+            # The caller chose this stop before calling.  An activation that has not yet taken
+            # this lock will observe it and refuse, so a missing context is final: there is no
+            # local receipt to anchor an acknowledgement.
+            with self._active_lock:
+                context = self._active_context
             if context is None or context["grant"]["run_id"] != run_id:
-                raise RunnerStoreError("active run does not match stop acknowledgement")
+                raise LocalRunNotActive("no locally activated run matches the stop")
             manifest = context["manifest"]
             projection = context["projection"]
             grant = context["grant"]
             started_at = context["started_at"]
             started_monotonic = context["started_monotonic"]
-            counter_state = context["counters"]
             budget_lock = context["budget_lock"]
-            redaction_count = context["redaction_state"]["count"]
             log = context["log"]
-        with budget_lock:
-            counters = dict(counter_state)
-        with self._stop_lock:
+            with budget_lock:
+                counters = dict(context["counters"])
+            redaction_count = context["redaction_state"]["count"]
             state = self.store.load_run(run_id)
             if state["state"] == "running":
                 self.store.transition_run(
@@ -556,11 +567,22 @@ class LocalCanaryExecutor:
         self,
         bundle: ExecutionBundle,
         *,
-        transport: Any,
+        transport: Any = None,
+        transport_factory: Callable[[], Any] | None = None,
         gate_source: Callable[[], ExecutionGate],
         cancellation: CancellationToken | None = None,
         on_progress: Callable[[dict[str, Any]], None] | None = None,
-    ) -> ExecutionResult:
+    ) -> ExecutionResult | UnactivatedExecution:
+        """Run one exact grant against ``transport``, or the one ``transport_factory`` builds.
+
+        The factory runs only after local activation, so a stop that arrives while it blocks (for
+        example in DNS) finds a durable running run to acknowledge; its failure is finalized as
+        this run's outcome, never retried.
+        """
+        if (transport is None) == (transport_factory is None) or (
+            transport_factory is not None and not callable(transport_factory)
+        ):
+            raise TypeError("bounded local target transport is required")
         initial_gate = gate_source()
         initial_gate_monotonic = self.monotonic()
         validated = validate_execution_bundle(
@@ -576,18 +598,7 @@ class LocalCanaryExecutor:
         retention_expires = (
             self.clock_ms() + manifest["local_evidence_policy"]["retention_seconds"] * 1000
         )
-        self.store.reserve_run(grant, retention_expires_at_ms=retention_expires)
-        log = _SerializedContainmentLog(
-            ContainmentLog(
-                store=self.store, signer=self.signer, run_id=grant["run_id"],
-                grant_id=grant["grant_id"], manifest_digest=manifest["manifest_digest"],
-                clock_ms=self.clock_ms,
-            )
-        )
-        log.append("grant_verified", detail_code="grant_exact")
         cancellation = cancellation or CancellationToken()
-        started_at = self.clock_ms()
-        started_monotonic = self.monotonic()
         counters = {
             "requests_started": 0,
             "requests_completed": 0,
@@ -615,18 +626,50 @@ class LocalCanaryExecutor:
         systemic_failure = False
         stop_requested_at_ms = None
         stop_acknowledged_at_ms = None
-        self._set_active_context({
-            "manifest": manifest,
-            "projection": projection,
-            "grant": grant,
-            "started_at": started_at,
-            "started_monotonic": started_monotonic,
-            "counters": counters,
-            "budget_lock": budget_lock,
-            "redaction_state": redaction_state,
-            "log": log,
-        })
+        with self._stop_lock:
+            # Activation linearization point.  A stop chosen before it consumes no reservation
+            # and has nothing to acknowledge; one chosen after it finds a durable running run.
+            known_stop = getattr(cancellation, "stop_reason", None)
+            if known_stop is not None:
+                return UnactivatedExecution(known_stop)
+            self.store.reserve_run(grant, retention_expires_at_ms=retention_expires)
+            log = _SerializedContainmentLog(
+                ContainmentLog(
+                    store=self.store, signer=self.signer, run_id=grant["run_id"],
+                    grant_id=grant["grant_id"], manifest_digest=manifest["manifest_digest"],
+                    clock_ms=self.clock_ms,
+                )
+            )
+            log.append("grant_verified", detail_code="grant_exact")
+            started_at = self.clock_ms()
+            started_monotonic = self.monotonic()
+            # ``run_started`` records local activation under the exact grant, before any secret
+            # load or DNS; target activity is only ``action_started`` and the request counters.
+            self.store.transition_run(grant["run_id"], "running", now_ms=started_at)
+            log.append("run_started", detail_code="locally_activated", counters=counters)
+            self._set_active_context({
+                "manifest": manifest,
+                "projection": projection,
+                "grant": grant,
+                "started_at": started_at,
+                "started_monotonic": started_monotonic,
+                "counters": counters,
+                "budget_lock": budget_lock,
+                "redaction_state": redaction_state,
+                "log": log,
+            })
         try:
+            cancellation.raise_if_cancelled()
+            if transport_factory is not None:
+                try:
+                    transport = transport_factory()
+                except BaseException:
+                    # A stop that won the race decides the outcome, not the factory failure.
+                    cancellation.raise_if_cancelled()
+                    raise
+                if transport is None:
+                    raise TypeError("bounded local target transport is required")
+                cancellation.raise_if_cancelled()
             credentials, configured_secrets = self._resolve_credentials(manifest)
             redactor = Redactor(configured_secrets)
             retry_policy = RetryPolicy.from_mapping(manifest["retry_policy"])
@@ -634,8 +677,6 @@ class LocalCanaryExecutor:
                 gate_source, generation=grant["kill_switch_generation"],
                 monotonic=self.monotonic,
             )
-            self.store.transition_run(grant["run_id"], "running", now_ms=self.clock_ms())
-            log.append("run_started", detail_code="all_preflight_valid", counters=counters)
             for source, action in zip(manifest["actions"], prepared, strict=True):
                 cancellation.raise_if_cancelled()
                 action_binding = {
@@ -1177,5 +1218,6 @@ class LocalCanaryExecutor:
 
 __all__ = [
     "ExecutionBundle", "ExecutionGate", "ExecutionResult", "LocalCanaryExecutor",
-    "ValidatedExecutionBundle", "validate_execution_bundle",
+    "LocalRunNotActive", "UnactivatedExecution", "ValidatedExecutionBundle",
+    "validate_execution_bundle",
 ]
