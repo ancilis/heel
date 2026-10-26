@@ -2422,6 +2422,7 @@ class _LiveHttpRun:
             environment_id="env", runner_id="runner", verification_digest=digest,
         )
         submitted = runs.submit_projection(approval, uploaded_by="owner")
+        self.approval = approval
         self.grant = runs.approve(
             workspace, "prj", submitted["run_id"],
             projection_digest=approval["projection_digest"], actor="owner", role="owner",
@@ -2434,27 +2435,57 @@ class _LiveHttpRun:
             name: dict(state) for name, state in runs.claim(workspace, "runner", key_id)["chain_states"].items()
         }
 
-    def post(self, operation, projection):
-        """One authenticated POST on the run's own nonce-sequenced chain, exactly as a runner signs it."""
+    def signed(self, operation, projection, *, nonce=None):
+        """One request on the run's own nonce-sequenced chain, exactly as a runner signs it."""
         schema = {"stop-ack": "heel.runner-stop-ack-request.v1", "result": "heel.runner-result-request.v1"}[operation]
         capability = {"stop-ack": "runner_heartbeat", "result": "runner_result"}[operation]
         body = canonical_bytes({"schema_version": schema, "run_id": self.run_id, "operational_projection": projection})
         route = f"/v1/workspaces/{self.workspace}/runners/runner/runs/{self.run_id}/{operation}"
         chain = self.chains[operation]
+        nonce = chain["next_nonce_b64"] if nonce is None else nonce
         timestamp = int(time.time() * 1000)
-        proof = {"schema_version": "heel.runner-request-proof.v1", "workspace_id": self.workspace, "runner_id": "runner", "key_id": self.key_id, "capability": capability, "method": "POST", "path": route, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp, "server_nonce": chain["next_nonce_b64"], "sequence": chain["next_sequence"]}
-        headers = {"Content-Type": "application/json", "X-Heel-Runner-Id": "runner", "X-Heel-Runner-Key-Id": self.key_id, "X-Heel-Runner-Timestamp-Ms": str(timestamp), "X-Heel-Runner-Nonce": chain["next_nonce_b64"], "X-Heel-Runner-Sequence": str(chain["next_sequence"]), "X-Heel-Runner-Signature": base64.b64encode(self.private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))).decode()}
+        proof = {"schema_version": "heel.runner-request-proof.v1", "workspace_id": self.workspace, "runner_id": "runner", "key_id": self.key_id, "capability": capability, "method": "POST", "path": route, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp, "server_nonce": nonce, "sequence": chain["next_sequence"]}
+        headers = {"Content-Type": "application/json", "X-Heel-Runner-Id": "runner", "X-Heel-Runner-Key-Id": self.key_id, "X-Heel-Runner-Timestamp-Ms": str(timestamp), "X-Heel-Runner-Nonce": nonce, "X-Heel-Runner-Sequence": str(chain["next_sequence"]), "X-Heel-Runner-Signature": base64.b64encode(self.private.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))).decode()}
+        return route, body, headers
+
+    def send(self, route, body, headers):
+        """POST exact bytes; returns status, raw response body and its runner response headers."""
         conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
         try:
             conn.request("POST", route, body, headers)
             response = conn.getresponse()
-            payload = json.loads(response.read() or b"null")
-            next_nonce = response.getheader("X-Heel-Runner-Next-Nonce")
+            raw = response.read()
+            runner_headers = {key: value for key, value in response.getheaders() if key.startswith("X-Heel-")}
         finally:
             conn.close()
+        return response.status, raw, runner_headers
+
+    def post(self, operation, projection, *, nonce=None):
+        """One authenticated POST on the run's own nonce-sequenced chain, exactly as a runner signs it."""
+        chain = self.chains[operation]
+        status, raw, headers = self.send(*self.signed(operation, projection, nonce=nonce))
+        next_nonce = headers.get("X-Heel-Runner-Next-Nonce")
         if next_nonce:
             chain["next_nonce_b64"], chain["next_sequence"] = next_nonce, chain["next_sequence"] + 1
-        return response.status, payload
+        return status, json.loads(raw or b"null")
+
+    def witness(self):
+        return tuple(self.cp.store.conn.execute(
+            "SELECT stop_ack_source_event_sequence,stop_ack_projection_digest,stop_ack_runner_local_at_ms "
+            "FROM canary_runs WHERE run_id=?", (self.run_id,),
+        ).fetchone())
+
+    def finalized_digests(self):
+        return [row[0] for row in self.cp.store.conn.execute(
+            "SELECT payload_digest FROM canary_audit_records WHERE run_id=? AND action='finalized'",
+            (self.run_id,),
+        )]
+
+    def cursors(self):
+        return [tuple(row) for row in self.cp.store.conn.execute(
+            "SELECT chain_name,next_sequence,generation FROM canary_runner_chain_cursors "
+            "WHERE runner_id='runner' ORDER BY chain_name",
+        )]
 
     def row(self):
         return self.cp.store.conn.execute(
@@ -2488,10 +2519,12 @@ def _stopped_terminal(live, *, acknowledged_at_ms, sequence=2):
     )
 
 
-def test_real_http_null_ack_stopped_terminal_after_an_ack_lost_before_the_cloud_accepted_it():
+def test_real_http_no_server_ack_null_terminal_remains_accepted():
     """Reject-before-accept: the stop acknowledgement never reached the Cloud. Over the real HTTP
     boundary an invented acknowledgement timestamp is refused, and the activated run's stopped
-    terminal with a null acknowledgement is accepted once without any acknowledgement claim."""
+    terminal with a null acknowledgement is accepted once without any acknowledgement claim.
+    (Formerly ``test_real_http_null_ack_stopped_terminal_after_an_ack_lost_before_the_cloud_accepted_it``;
+    the scenario is unchanged.)"""
     with tempfile.TemporaryDirectory() as directory:
         live = _LiveHttpRun(directory)
         try:
@@ -2509,38 +2542,390 @@ def test_real_http_null_ack_stopped_terminal_after_an_ack_lost_before_the_cloud_
             assert (row["status"], row["execution_disposition"], row["stop_reason"]) == ("terminal", "stopped", "cloud_stop")
             assert row["stop_acknowledged_at_ms"] is None  # never an acknowledgement claim
             assert row["quota_state"] == "refunded"  # zero requests started
+            assert live.witness() == (None, None, None)
+            assert live.finalized_digests() == [canonical_digest(_finalized_payload("none", (None, None, None), None))]
         finally:
             live.close()
 
 
-def test_real_http_null_ack_stopped_terminal_is_refused_after_an_accepted_ack_whose_response_was_lost():
-    """Accepted-remote, lost-response: the Cloud accepted the acknowledgement but the runner never
-    learned it, so the runner sends the null-ack stopped terminal. The server's existing conflict
-    check (``stop_conflict``, public ``canary_state_conflict``) refuses that terminal and keeps its acknowledged stop state; the
-    client cannot force acceptance or invent the timestamp it never received."""
+def _finalized_payload(reconciliation, witness, server_acknowledged_at_ms, *, late=False):
+    sequence, digest, local = witness
+    return {
+        "execution_disposition": "stopped", "ack_reconciliation": reconciliation,
+        "stop_ack_source_event_sequence": sequence, "stop_ack_projection_digest": digest,
+        "stop_ack_runner_local_at_ms": local,
+        "server_acknowledged_at_ms": server_acknowledged_at_ms, "stop_ack_late": int(late),
+    }
+
+
+def _accepted_ack(live, *, times=None):
+    """The Cloud accepts the signed acknowledgement; the caller decides whether its answer is lost."""
     from canary_test_support import operational_projection
+
+    live.runs.request_stop(
+        live.workspace, "prj", live.run_id, actor="owner", reason="cloud_stop",
+        expected_kill_switch_generation=0,
+    )
+    if times is None:
+        ack = operational_projection(
+            live.signer, live.grant, sequence=1, phase="stop_requested", stop_reason="cloud_stop",
+            stop_requested_at_ms=_stop_instants()[0], stop_acknowledged_at_ms=_stop_instants()[1],
+            updated_at_ms=_stop_instants()[1],
+        )
+    else:
+        ack = _live_projection(live, times, sequence=1, phase="stop_requested", acknowledged=times["acknowledged"])
+    status, payload = live.post("stop-ack", ack)
+    assert status == 200 and payload["accepted"] is True
+    return ack
+
+
+def test_real_http_matching_non_null_ack_terminal_remains_accepted():
+    """The runner learned the accepted ACK: its terminal carries the same signed local ACK time
+    and is accepted through the ordinary path, not through the NULL-ACK reconciliation."""
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            ack = _accepted_ack(live)
+            acknowledged = live.row()["stop_acknowledged_at_ms"]
+            witness = (1, ack["projection_digest"], _stop_instants()[1])
+            assert live.witness() == witness
+            status, payload = live.post("result", _stopped_terminal(live, acknowledged_at_ms=_stop_instants()[1]))
+            assert status == 200 and payload["status"] == "terminal"
+            row = live.row()
+            assert (row["status"], row["execution_disposition"], row["stop_acknowledged_at_ms"]) == ("terminal", "stopped", acknowledged)
+            assert live.witness() == witness
+            assert live.finalized_digests() == [canonical_digest(_finalized_payload("none", witness, acknowledged))]
+        finally:
+            live.close()
+
+
+def test_real_http_accepted_ack_lost_response_null_terminal_reconciles():
+    """Accepted-remote, lost-response (D): the Cloud accepted the acknowledgement but the runner
+    never learned it, so the runner sends the null-ack stopped terminal. With the complete,
+    write-once signed ACK witness the Cloud accepts that truthful terminal unchanged, keeps its
+    own receipt time, and records ``cloud_recorded_client_unknown`` in the hashed terminal audit.
+    (This was ``test_real_http_null_ack_stopped_terminal_is_refused_after_an_accepted_ack_whose_response_was_lost``,
+    which recorded the former 409.)"""
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            ack = _accepted_ack(live)  # this answer is what gets lost
+            acknowledged = live.row()["stop_acknowledged_at_ms"]
+            assert live.row()["status"] == "stop_requested" and acknowledged is not None
+            witness = (1, ack["projection_digest"], _stop_instants()[1])
+            assert live.witness() == witness
+            terminal = _stopped_terminal(live, acknowledged_at_ms=None)
+            status, payload = live.post("result", terminal)
+            assert status == 200 and payload["status"] == "terminal"
+            assert payload["stop_acknowledged_at_ms"] == acknowledged
+            row = live.row()
+            assert (row["status"], row["execution_disposition"], row["stop_reason"]) == ("terminal", "stopped", "cloud_stop")
+            assert row["stop_acknowledged_at_ms"] == acknowledged  # Cloud receipt time, never rewritten
+            assert row["quota_state"] == "refunded"
+            assert live.witness() == witness
+            receipt = live.cp.store.conn.execute(
+                "SELECT receipt_digest,receipt_json FROM canary_operational_receipts WHERE run_id=?", (live.run_id,),
+            ).fetchone()
+            # The signed terminal is stored exactly as sent: its ACK stays NULL.
+            assert receipt["receipt_digest"] == terminal["projection_digest"]
+            assert receipt["receipt_json"] == canonical_bytes(terminal).decode()
+            assert live.finalized_digests() == [canonical_digest(
+                _finalized_payload("cloud_recorded_client_unknown", witness, acknowledged),
+            )]
+        finally:
+            live.close()
+
+
+class _LiveRunnerSigner(SecureSigner):
+    def __init__(self, private):
+        self.private = private
+        self.public_key = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        self.key_id = ed25519_key_id(self.public_key)
+
+    def sign(self, payload):
+        return self.private.sign(payload)
+
+
+class _LiveRunnerTransport:
+    """Real loopback HTTP for a runner control client; it can drop one answer or one send."""
+
+    def __init__(self, live):
+        self.live, self.sent, self.answers = live, [], []
+        self.lose_answers = 0
+        self.refuse_sends = 0
+
+    def post(self, path, *, headers=None, body=b""):
+        self.sent.append((path, dict(headers or {}), body))
+        if self.refuse_sends:
+            self.refuse_sends -= 1
+            raise ConnectionError("runner process stopped before the request left")
+        answer = self.live.send(path, body, dict(headers or {}))
+        self.answers.append(answer)
+        if self.lose_answers:
+            self.lose_answers -= 1
+            raise ConnectionError("accepted result response was lost")
+        status, raw, response_headers = answer
+        return status, response_headers, (json.loads(raw) if raw else None)
+
+
+class _RecordingResultVerifier:
+    """Stand-in for the coordinator's Store anchor bridge; it authorizes only the exact pending call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def authorize_pending_result_replay(self, pending, *, now_ms):
+        self.calls.append(("authorize", pending.call_id))
+        return object()
+
+    def consume(self, authority, *, pending, now_ms):
+        self.calls.append(("consume", pending.call_id))
+
+
+def _live_timeline():
+    """Runner-local instants a few seconds in the past, so local terminal authority is valid now."""
+    base = int(time.time() * 1000) - 5_000
+    return {"claimed": base + 100, "started": base + 200, "requested": base + 300, "acknowledged": base + 400, "terminal": base + 1_000}
+
+
+def _live_projection(live, times, *, sequence, phase, acknowledged):
+    from canary_test_support import operational_projection
+    from test_canary_lifecycle import resign_operational
+
+    value = operational_projection(
+        live.signer, live.grant, sequence=sequence, phase=phase, stop_reason="cloud_stop",
+        disposition="stopped" if phase == "terminal" else None,
+    )
+    updated = times["terminal"] if phase == "terminal" else times["acknowledged"]
+    value["timestamps"] = {
+        "claimed_at_ms": times["claimed"], "started_at_ms": times["started"], "updated_at_ms": updated,
+        "stop_requested_at_ms": times["requested"], "stop_acknowledged_at_ms": acknowledged,
+        "terminal_at_ms": times["terminal"] if phase == "terminal" else None,
+    }
+    return resign_operational(value, live.signer)
+
+
+def _live_runtime(live, root):
+    signer = _LiveRunnerSigner(live.private)
+    identity = RunnerIdentity(
+        runner_id="runner", workspace_id=live.workspace, runner_version="test", adapter_versions={},
+        public_key_b64=base64.b64encode(signer.public_key).decode("ascii"),
+        fingerprint=hashlib.sha256(signer.public_key).hexdigest(), key_id=signer.key_id, pairing_phrase=(),
+    )
+    return RunnerRuntimeState(root / "runtime.sqlite3", identity, signer), signer
+
+
+def _live_runner(live, root, transport, terminal, *, times):
+    """Install the Cloud-issued run chains and authority in a durable runner runtime, then register
+    the runner's local terminal: the state a runner holds right before it sends its result."""
+    root.mkdir(mode=0o700, exist_ok=True)
+    runtime, signer = _live_runtime(live, root)
+    now = int(time.time() * 1000)
+    runtime.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=base64.b64encode(b"p" * 32).decode(),
+        next_sequence=1, generation=0, now_ms=now,
+    )
+    claim = runtime.load_chain("claim", None)
+    path = f"/v1/workspaces/{live.workspace}/runners/runner/claim"
+    body = canonical_bytes({"schema_version": "heel.runner-claim-request.v1"})
+    proof = {
+        "schema_version": "heel.runner-request-proof.v1", "workspace_id": live.workspace,
+        "runner_id": "runner", "key_id": signer.key_id, "capability": "runner_claim", "method": "POST",
+        "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": now,
+        "server_nonce": claim.next_nonce_b64, "sequence": claim.next_sequence,
+    }
+    headers = {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": "runner", "X-Heel-Runner-Key-Id": signer.key_id,
+        "X-Heel-Runner-Timestamp-Ms": str(now),
+        "X-Heel-Runner-Signature": base64.b64encode(signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))).decode("ascii"),
+        "X-Heel-Runner-Nonce": claim.next_nonce_b64, "X-Heel-Runner-Sequence": str(claim.next_sequence),
+    }
+    pending = runtime.stage_call(
+        request_operation="claim", chain_operation="claim", run_id=None, path=path, capability="runner_claim",
+        headers=headers, body=body, expected_state_digest=claim.state_digest, now_ms=now,
+    )
+    runtime.commit_call(
+        pending.call_id, next_nonce_b64=base64.b64encode(b"n" * 32).decode(), now_ms=now,
+        installed_chains=tuple(
+            (operation, live.run_id, live.chains[operation]["next_nonce_b64"],
+             live.chains[operation]["next_sequence"], live.chains[operation]["generation"])
+            for operation in ("heartbeat", "progress", "result", "stop-ack")
+        ),
+        active_run=ActiveRunInstall(
+            run_id=live.run_id, approval_projection=live.approval, grant=live.grant,
+            gate={
+                "active": True, "runner_state": "active", "proof_state": "valid",
+                "proof_expires_at_ms": now + 3_600_000, "kill_switch_generation": 0,
+                "stop_reason": "none", "server_time_ms": now,
+            },
+            claim_response_digest="a" * 64, gate_response_digest="b" * 64,
+            claimed_at_ms=now, gate_received_at_ms=now,
+        ),
+    )
+    control = _live_client(live, runtime, signer, transport)
+    control._register_runtime_local_terminal({
+        "run_id": live.run_id, "project_id": "prj", "grant_id": live.grant["grant_id"],
+        "approval_projection_digest": live.approval["projection_digest"],
+        "terminal_projection_digest": terminal["projection_digest"], "terminal_record_digest": "c" * 64,
+        "terminal_at_ms": times["terminal"], "retention_expires_at_ms": times["terminal"] + 86_400_000,
+    })
+    return runtime, signer, control
+
+
+def _live_client(live, runtime, signer, transport):
+    return RunnerControlClient(
+        origin="http://127.0.0.1", workspace_id=live.workspace, runner_id="runner", signer=signer,
+        clock=lambda: int(time.time() * 1000), transport=transport,
+        nonce_source=lambda chain: (_ for _ in ()).throw(AssertionError("run chains are Cloud-issued")),
+        runtime=runtime,
+    )
+
+
+def _runtime_retired(runtime, run_id):
+    return (
+        runtime.load_pending_calls() == () and runtime.load_active_run_controls() == ()
+        and all(runtime.load_chain(name, run_id) is None for name in ("heartbeat", "progress", "result", "stop-ack"))
+        and runtime.load_terminal_state(run_id).state == "available"
+    )
+
+
+def test_d_reconciliation_keeps_expired_revoked_and_wrong_nonce_result_rejected_with_pending_evidence(tmp_path):
+    """Authentication and the exact receipt ledger run before reconciliation. A wrong nonce, a revoked
+    key and an expired replay receipt are refused; the Cloud witness and the runner's staged result
+    stay intact, and none of these rejections becomes reconciliation authority."""
+    from heel.runner.control_client import RunnerChainRecoveryRequired
 
     with tempfile.TemporaryDirectory() as directory:
         live = _LiveHttpRun(directory)
         try:
-            live.runs.request_stop(
-                live.workspace, "prj", live.run_id, actor="owner", reason="cloud_stop",
-                expected_kill_switch_generation=0,
+            times = _live_timeline()
+            ack = _accepted_ack(live, times=times)
+            witness = (1, ack["projection_digest"], times["acknowledged"])
+            before = (tuple(live.row()), live.witness(), live.cursors())
+            terminal = _live_projection(live, times, sequence=2, phase="terminal", acknowledged=None)
+            status, payload = live.post("result", terminal, nonce=base64.b64encode(b"w" * 32).decode())
+            assert status == 401 and payload["code"] == "invalid_runner_auth"
+            assert (tuple(live.row()), live.witness(), live.cursors()) == before
+            transport = _LiveRunnerTransport(live)
+            runtime, _, control = _live_runner(live, tmp_path / "revoked", transport, terminal, times=times)
+            live.cp.store.conn.execute(
+                "UPDATE canary_runner_keys SET status='revoked',revoked_at=? WHERE key_id=?",
+                (time.time(), live.key_id),
             )
-            ack = operational_projection(
-                live.signer, live.grant, sequence=1, phase="stop_requested", stop_reason="cloud_stop",
-                stop_requested_at_ms=_stop_instants()[0], stop_acknowledged_at_ms=_stop_instants()[1],
-                updated_at_ms=_stop_instants()[1],
+            live.cp.store.conn.commit()
+            with pytest.raises(RunnerChainRecoveryRequired):
+                control.result(run_id=live.run_id, operational_projection=terminal)
+            assert transport.answers[-1][0] == 401
+            assert (tuple(live.row()), live.witness(), live.cursors()) == before
+            assert live.witness() == witness
+            (pending,) = runtime.load_pending_calls()  # the exact staged result remains as evidence
+            assert (pending.request_operation, pending.body) == ("result", transport.sent[-1][2])
+            assert runtime.load_terminal_state(live.run_id).state == "local_terminal"
+        finally:
+            live.close()
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            times = _live_timeline()
+            _accepted_ack(live, times=times)
+            terminal = _live_projection(live, times, sequence=2, phase="terminal", acknowledged=None)
+            transport = _LiveRunnerTransport(live)
+            runtime, _, control = _live_runner(live, tmp_path / "expired", transport, terminal, times=times)
+            transport.lose_answers = 1
+            with pytest.raises(ConnectionError):
+                control.result(run_id=live.run_id, operational_projection=terminal)
+            assert transport.answers[0][0] == 200 and live.row()["status"] == "terminal"
+            settled = (tuple(live.row()), live.witness(), live.cursors())
+            live.cp.store.conn.execute(
+                "UPDATE canary_runner_request_ledger SET retention_expires_at=created_at WHERE chain_name=?",
+                (f"result:{live.run_id}",),
             )
-            status, payload = live.post("stop-ack", ack)
-            assert status == 200 and payload["accepted"] is True  # this answer is what gets lost
-            acknowledged = live.row()["stop_acknowledged_at_ms"]
-            assert live.row()["status"] == "stop_requested" and acknowledged is not None
-            status, payload = live.post("result", _stopped_terminal(live, acknowledged_at_ms=None))
-            assert (status, payload) == (409, _STATE_CONFLICT)
+            live.cp.store.conn.commit()
+            (pending,) = runtime.load_pending_calls()
+            with pytest.raises(RunnerChainRecoveryRequired):
+                control.replay_pending_call(
+                    pending, now_ms=int(time.time() * 1000), result_verifier=_RecordingResultVerifier(),
+                )
+            assert transport.sent[1] == transport.sent[0] and transport.answers[1][0] == 401
+            assert (tuple(live.row()), live.witness(), live.cursors()) == settled
+            assert runtime.load_pending_calls() == (pending,)
+            assert runtime.load_terminal_state(live.run_id).state == "local_terminal"
+        finally:
+            live.close()
+
+
+def test_d_result_response_loss_replays_exactly_then_normal_result_commit_retires_runtime(tmp_path):
+    """The reconciled D result's own answer is lost: the runner replays its exact sealed request, the
+    Cloud returns the exact retained answer, and the ordinary terminal commit retires the run."""
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            times = _live_timeline()
+            _accepted_ack(live, times=times)
+            terminal = _live_projection(live, times, sequence=2, phase="terminal", acknowledged=None)
+            transport = _LiveRunnerTransport(live)
+            runtime, _, control = _live_runner(live, tmp_path / "runner", transport, terminal, times=times)
+            transport.lose_answers = 1
+            with pytest.raises(ConnectionError):
+                control.result(run_id=live.run_id, operational_projection=terminal)
+            first_status, first_raw, _ = transport.answers[0]
+            assert first_status == 200 and json.loads(first_raw)["status"] == "terminal"
+            settled = (tuple(live.row()), live.witness(), live.cursors(), live.finalized_digests())
+            (pending,) = runtime.load_pending_calls()
+            assert pending.body == transport.sent[0][2] and runtime.load_active_run_controls() != ()
+            verifier = _RecordingResultVerifier()
+            outcome = control.replay_pending_call(pending, now_ms=int(time.time() * 1000), result_verifier=verifier)
+            assert transport.sent[1] == transport.sent[0]  # exact sealed bytes and headers
+            # The exact retained answer: status, body bytes and next nonce (request IDs are per request).
+            assert transport.answers[1][:2] == transport.answers[0][:2]
+            assert transport.answers[1][2]["X-Heel-Runner-Next-Nonce"] == transport.answers[0][2]["X-Heel-Runner-Next-Nonce"]
+            assert outcome.status == 200 and outcome.body["status"] == "terminal"
+            assert verifier.calls == [("authorize", pending.call_id), ("consume", pending.call_id)]
+            assert (tuple(live.row()), live.witness(), live.cursors(), live.finalized_digests()) == settled
+            assert _runtime_retired(runtime, live.run_id)
+        finally:
+            live.close()
+
+
+def test_d_restart_drains_already_staged_result_without_new_cursor_or_pending_deletion(tmp_path):
+    """The D result was staged but the process stopped before sending it. A fresh client on the same
+    durable runtime refuses new control work, drains the exact staged result first, and the Cloud
+    reconciles it on its existing result chain; no cursor is added and nothing staged is dropped."""
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            times = _live_timeline()
+            ack = _accepted_ack(live, times=times)
+            terminal = _live_projection(live, times, sequence=2, phase="terminal", acknowledged=None)
+            transport = _LiveRunnerTransport(live)
+            runtime, signer, control = _live_runner(live, tmp_path / "runner", transport, terminal, times=times)
+            transport.refuse_sends = 1
+            with pytest.raises(ConnectionError):
+                control.result(run_id=live.run_id, operational_projection=terminal)
+            assert transport.answers == [] and live.row()["status"] == "stop_requested"
+            cursors = live.cursors()
+            (pending,) = runtime.load_pending_calls()
+
+            restarted = RunnerRuntimeState(runtime.path, runtime.identity, signer)
+            fresh_transport = _LiveRunnerTransport(live)
+            fresh = _live_client(live, restarted, signer, fresh_transport)
+            with pytest.raises(ValueError, match="pending replay is required"):
+                fresh.result(run_id=live.run_id, operational_projection=terminal)
+            assert fresh_transport.sent == [] and restarted.load_pending_calls() == (pending,)
+            outcomes = fresh.replay_all_pending(now_ms=int(time.time() * 1000), result_verifier=_RecordingResultVerifier())
+            assert [(item.request_operation, item.status) for item in outcomes] == [("result", 200)]
+            assert fresh_transport.sent == [(pending.path, dict(pending.headers), pending.body)]
             row = live.row()
-            assert row["status"] == "stop_requested" and row["stop_acknowledged_at_ms"] == acknowledged
-            assert row["execution_disposition"] is None
+            assert (row["status"], row["execution_disposition"]) == ("terminal", "stopped")
+            assert live.witness() == (1, ack["projection_digest"], times["acknowledged"])
+            result_chain = f"result:{live.run_id}"
+            assert [name for name, *_ in live.cursors()] == [name for name, *_ in cursors]
+            assert [item for item in live.cursors() if item[0] != result_chain] == [item for item in cursors if item[0] != result_chain]
+            (before_result,) = [item for item in cursors if item[0] == result_chain]
+            (after_result,) = [item for item in live.cursors() if item[0] == result_chain]
+            assert after_result == (result_chain, before_result[1] + 1, before_result[2])
+            assert _runtime_retired(restarted, live.run_id)
         finally:
             live.close()
 
