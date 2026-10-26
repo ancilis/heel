@@ -6,11 +6,14 @@ produce is ``local-synthetic-test`` evidence, never acceptance evidence.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import itertools
 import json
 import os
 from pathlib import Path
+import socket
 import ssl
 import sys
 import tempfile
@@ -117,6 +120,57 @@ class SyntheticTLS:
         if self.error is not None:
             raise self.error
         return connected_socket
+
+
+class CoalescingSocket(SyntheticSocket):
+    """LOCAL/SYNTHETIC TLS socket whose records coalesce the header block with the body.
+
+    ``recv`` honors the requested byte count, as ``ssl.SSLSocket.recv`` does, and records every
+    request and how many body bytes (bytes after the first ``\\r\\n\\r\\n``) it handed back.
+    """
+
+    def __init__(self, peer, response):
+        super().__init__(peer, response)
+        terminator = bytes(response).find(b"\r\n\r\n")
+        self.header_length = len(response) if terminator < 0 else terminator + 4
+        self.requested = []
+        self.returned = 0
+
+    def recv(self, size):
+        self.requested.append(size)
+        chunk = super().recv(size)
+        self.returned += len(chunk)
+        return chunk
+
+    @property
+    def body_bytes_returned(self):
+        return max(0, self.returned - self.header_length)
+
+
+class CoalescingSockets(SyntheticSockets):
+    def connect(self, address, timeout):
+        self.connects.append(address)
+        self.socket = CoalescingSocket(address[0], self.response)
+        return self.socket
+
+
+class NoRealNetwork:
+    """Fails the test if anything reaches the real socket layer instead of the injected seams."""
+
+    def __enter__(self):
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("real network access attempted")
+
+        self._saved = {name: getattr(socket, name)
+                       for name in ("socket", "create_connection", "getaddrinfo")}
+        for name in self._saved:
+            setattr(socket, name, refuse)
+        return self
+
+    def __exit__(self, *_exc):
+        for name, value in self._saved.items():
+            setattr(socket, name, value)
+        return False
 
 
 def http_response(status_line, headers=(), body=b""):
@@ -284,6 +338,117 @@ class ProbeTests(unittest.TestCase):
         self.assertLessEqual(preflight.PROBE_TIMEOUT_SECONDS, 10)
 
 
+MARKER = b"SYNTHETIC-COALESCED-BODY"
+HEADER_LIMIT = preflight.MAX_CHALLENGE_HEADER_BYTES + 4
+
+
+def coalesced_body(length=9000):
+    """A body built to change the outcome if any of it were parsed: a status line, redirect,
+    cookie, readiness JSON and non-ASCII bytes, with the marker throughout."""
+    lure = (MARKER + b" HTTP/1.1 302 Found\r\nLocation: https://elsewhere-redirect.com/" + MARKER
+            + b"\r\nSet-Cookie: s=" + MARKER + b"\r\n\r\n" + b'{"ready":true,"heel":"' + MARKER
+            + b'"}\x00\xff\xfe')
+    return (lure * (length // len(lure) + 1))[:length]
+
+
+def padded_headers(status_line, total_length):
+    """A header block, terminator included, of exactly ``total_length`` bytes."""
+    head, tail = f"{status_line}\r\nX-Pad: ".encode("latin-1"), b"\r\n\r\n"
+    return head + b"a" * (total_length - len(head) - len(tail)) + tail
+
+
+class CoalescedResponseTests(unittest.TestCase):
+    """TLS/TCP has no header/body boundary: a receive can return body bytes with the headers.
+
+    The guarantee under test is the bounded one: a body prefix may reach the probe's receive
+    buffer, at most ``MAX_CHALLENGE_HEADER_BYTES + 4`` bytes are ever requested in total, and the
+    body is never parsed nor written to stdout, stderr, error text, the report or the output tree.
+    """
+
+    def run_cli(self, response):
+        sockets = CoalescingSockets(response)
+        seams = synthetic_network(sockets=sockets)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, NoRealNetwork(), \
+                self.assertNoLogs(level="DEBUG"), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            output = Path(tmp).resolve(strict=True) / "evidence"
+            code = preflight.main(["--public-origin", ORIGIN, "--output", str(output)], seams=seams)
+            written = {path.relative_to(output).as_posix(): path.read_bytes()
+                       for path in sorted(output.rglob("*")) if path.is_file()}
+        self.assertEqual(list(written), ["customer-acceptance-preflight.json"])
+        report = json.loads(written["customer-acceptance-preflight.json"])
+        persisted = b"".join(written.values())
+        emitted = (stdout.getvalue() + stderr.getvalue()).encode("utf-8")
+        for needle in (MARKER, MARKER.decode("ascii").encode("utf-8"), b"elsewhere-redirect",
+                       b'"ready"'):
+            self.assertNotIn(needle, persisted)
+            self.assertNotIn(needle, emitted)
+        self.assertNotIn(MARKER.decode("ascii"), report["stages"][0]["evidence"])
+        socket_ = sockets.socket
+        self.assertTrue(socket_.closed)
+        self.assertTrue(socket_.requested)
+        self.assertLessEqual(max(socket_.requested), 4096)
+        self.assertLessEqual(sum(socket_.requested), HEADER_LIMIT)
+        self.assertLessEqual(socket_.returned, HEADER_LIMIT)
+        return code, report, socket_
+
+    def test_a_coalesced_body_prefix_is_received_but_never_parsed_or_emitted(self):
+        headers = http_response("HTTP/1.1 200 OK", ["Content-Type: text/html"])
+        body = coalesced_body()
+        code, report, socket_ = self.run_cli(headers + body)
+
+        self.assertEqual(code, preflight.EXIT_BLOCKED)
+        public = report["stages"][0]
+        self.assertEqual((public["state"], public["reason_code"]), ("blocked", "heel_identity_unproven"))
+        self.assertIn("HTTP 200", public["evidence"])
+        self.assertNotIn("302", public["evidence"])
+        # Bounded body-prefix receipt is real, not denied: it came in the same receive as the
+        # headers, stayed inside the bound, and reading stopped at the header terminator.
+        self.assertGreater(socket_.body_bytes_returned, 0)
+        self.assertIn(MARKER, bytes(body[:socket_.body_bytes_returned]))
+        self.assertLessEqual(socket_.body_bytes_returned, HEADER_LIMIT - socket_.header_length)
+        self.assertEqual(len(socket_.requested), 1)
+        self.assertEqual(len(socket_.response), len(headers) + len(body) - socket_.returned)
+        self.assertGreater(len(socket_.response), 0)
+
+    def test_coalesced_bodies_never_reach_failure_evidence(self):
+        cases = [
+            ("non_2xx_status", http_response("HTTP/1.1 404 Not Found") + coalesced_body()),
+            ("non_2xx_status", http_response("HTTP/1.1 500 Internal Server Error") + coalesced_body()),
+            ("redirect_refused", http_response("HTTP/1.1 302 Found", ["Location: /x"]) + coalesced_body()),
+            ("malformed_response", b"HTTP/2 200\r\n\r\n" + coalesced_body()),
+            ("malformed_response", b"HTTP/1.1 2OO OK\r\n" + MARKER + b"\r\n\r\n" + coalesced_body()),
+            ("malformed_response", padded_headers("HTTP/1.1 200 OK", HEADER_LIMIT + 1) + coalesced_body()),
+        ]
+        for reason, response in cases:
+            with self.subTest(reason=reason, head=response[:20]):
+                code, report, _ = self.run_cli(response)
+                self.assertEqual(code, preflight.EXIT_FAIL)
+                self.assertEqual(report["classification"], "FAIL")
+                self.assertEqual(report["stages"][0]["reason_code"], reason)
+
+    def test_the_header_bound_is_exact_and_bounds_every_receive(self):
+        at_limit = padded_headers("HTTP/1.1 200 OK", HEADER_LIMIT)
+        code, report, socket_ = self.run_cli(at_limit + coalesced_body())
+        self.assertEqual(report["stages"][0]["reason_code"], "heel_identity_unproven")
+        self.assertEqual(code, preflight.EXIT_BLOCKED)
+        self.assertEqual(socket_.returned, HEADER_LIMIT)
+        self.assertEqual(socket_.body_bytes_returned, 0)
+
+        oversized = [
+            padded_headers("HTTP/1.1 200 OK", HEADER_LIMIT + 1),
+            padded_headers("HTTP/1.1 200 OK", 18000),
+            b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 40000,
+        ]
+        for response in oversized:
+            with self.subTest(length=len(response)):
+                code, report, socket_ = self.run_cli(response + coalesced_body())
+                self.assertEqual(code, preflight.EXIT_FAIL)
+                self.assertEqual(report["stages"][0]["reason_code"], "malformed_response")
+                self.assertEqual(socket_.body_bytes_returned, 0)
+
+
 class OriginPolicyTests(unittest.TestCase):
     REJECTED = [
         "", "heel.com", "http://acceptance-customer.com", "HTTPS://acceptance-customer.com",
@@ -397,6 +562,35 @@ class ReadinessDocumentTests(unittest.TestCase):
             self.assertIn(f"`{stage}`", text)
         self.assertNotRegex(text, r"heel_(?:at|rt|ses|sk)_[A-Za-z0-9_-]+")
         self.assertNotIn("zonal-acceptance", text)
+
+    def test_every_claim_surface_states_the_bounded_guarantee_and_operator_environment(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+            preflight.main(["--help"])
+        self.assertEqual(raised.exception.code, 0)
+        surfaces = {
+            "help": " ".join(stdout.getvalue().split()),
+            "docstring": " ".join(preflight.__doc__.split()),
+            "document": " ".join((ROOT / "docs/saas/CUSTOMER_ACCEPTANCE_READINESS.md")
+                                 .read_text(encoding="utf-8").split()),
+        }
+        for name, text in surfaces.items():
+            lowered = text.lower()
+            for required in ("header-oriented", "body prefix", "not parsed", "source checkout",
+                             "dnspython==2.8.0", "not part of the public runner install",
+                             "no-checkout customer command"):
+                self.assertIn(required, lowered, (name, required))
+            for false_claim in ("only the status line and header framing are read",
+                                "no body is read", "never receives", "standard-library-only",
+                                "standard library only", "standalone"):
+                self.assertNotIn(false_claim, lowered, (name, false_claim))
+        for name in ("docstring", "document"):
+            for reference in (".github/workflows/ci.yml", "deploy/Dockerfile.control-plane",
+                              "pyproject.toml"):
+                self.assertIn(reference, surfaces[name], (name, reference))
+        for reference in (".github/workflows/ci.yml", "deploy/Dockerfile.control-plane"):
+            self.assertIn("dnspython==2.8.0", (ROOT / reference).read_text(encoding="utf-8"))
+        self.assertNotIn("dnspython", (ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

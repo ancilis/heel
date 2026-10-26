@@ -29,10 +29,25 @@ runner never produces deployed acceptance evidence.
 ## Preflight
 
 ```bash
-python3 scripts/customer_acceptance_preflight.py \
+# From the root of a Heel source checkout, with an interpreter that has dnspython==2.8.0
+python scripts/customer_acceptance_preflight.py \
   --public-origin https://YOUR_CANONICAL_HOST \
   --output /absolute/path/to/redacted-evidence
 ```
+
+Supported environment: this is an operator command. It runs from the root of a Heel source
+checkout, because it imports the reviewed guards in `heel/saas/network_guard.py` from that checkout,
+using Python 3.11+ (`pyproject.toml` `requires-python`) with the pinned control-plane DNS
+dependency `dnspython==2.8.0`. `pyproject.toml` declares no extra for that dependency
+(`dependencies = []`; the only extra is `runner`). Install the same wheel, verified by the same
+sha256, as the "Install pinned runner/control-plane wheels" step in `.github/workflows/ci.yml` or
+the `deploy/Dockerfile.control-plane` image. Without it the report is `FAIL` with
+`dns_resolution_failed`. It is not part of the public runner install: the `heel_sim` wheel and its
+`runner` extra ship only the `heel` and `heel.runner` packages (`pyproject.toml`
+`[tool.setuptools]`), not `heel.saas`. It is not a no-checkout customer command.
+
+This is an unauthenticated operator check of the Heel public origin. It is not a customer-target
+scanner and does not change customer-evidence custody.
 
 Run it only after the release owner has established the public origin; do not run it against a
 placeholder to manufacture a negative result. It takes no other input and reads no environment
@@ -46,11 +61,20 @@ reserved name (`.example`, `.test`, `.localhost`, `.local`, `.internal`, `exampl
 like), and not the owner-private local-review origin in `docs/saas/OPERATIONS.md`. A rejected
 origin makes no network request.
 
-The single network action is one unauthenticated `GET /` using the verifier's guards: a bounded
-DNS answer in which every address must be public, a connection to the selected address, TLS 1.2+
-with certificate and hostname verification, a 5-second deadline for the whole probe, and no
-redirect following. Only the status line and header framing are read; no body, header value,
-cookie or redirect location is recorded.
+The single network action is one unauthenticated, bounded, header-oriented `GET /` using the
+verifier's guards: a bounded DNS answer in which every address must be public, a connection to
+the selected address, TLS 1.2+ with certificate and hostname verification, a 5-second deadline
+for the whole probe, and no redirect following.
+
+Receives stop once the header block ends. In total they never exceed 16,388 bytes
+(`MAX_CHALLENGE_HEADER_BYTES` + 4), and a longer header block fails as `malformed_response`.
+TLS/TCP has no boundary between headers and body, so a receive can also deliver a bounded body
+prefix coalesced with the headers. That prefix lands in a transient in-memory receive buffer, and
+the TLS library and kernel may buffer more until the connection closes. The probe does not claim
+that no response-body bytes are received or held briefly in memory. Only the status line is
+parsed. Header values and any body prefix are not parsed, and they are never persisted, reported
+or logged. No body bytes, header values, cookies or redirect locations appear in the report,
+stdout, stderr or error text.
 
 A 2xx answer proves reachability only. `GET /` cannot bind Heel identity, release revision or
 readiness (the Worker exposes no public health route and the readiness probe is private), so
