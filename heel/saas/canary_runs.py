@@ -39,7 +39,7 @@ from heel.canary_contracts import (
 )
 from heel.crypto import load_public_key_base64, verify_envelope
 
-from .canary_store import CanaryStore
+from .canary_store import STOP_ACK_WITNESS_COLUMNS, CanaryStore
 from .catalog import Meter, get_plan
 from .ledger import QuotaExceeded, UsageLedger
 
@@ -1738,6 +1738,46 @@ class CanaryRunService:
             raise CanaryRunError("invalid_operational_projection")
         return value
 
+    @staticmethod
+    def _stop_ack_witness(row: sqlite3.Row) -> tuple[int, str, int] | None:
+        """The first accepted ACK's signed (sequence, digest, runner-local time), or None.
+
+        None means no Cloud-accepted ACK since v32 (or a pre-v32 one).  A partial or malformed
+        tuple is never repaired: it is unprovable and fails closed.
+        """
+        witness = tuple(row[name] for name in STOP_ACK_WITNESS_COLUMNS)
+        if witness == (None, None, None):
+            return None
+        sequence, digest, acknowledged = witness
+        if (
+            type(sequence) is not int or sequence < 0
+            or type(acknowledged) is not int or acknowledged < 0
+            or type(digest) is not str or len(digest) != 64
+            or digest.strip("0123456789abcdef")
+        ):
+            raise CanaryRunError("stop_conflict")
+        return sequence, digest, acknowledged
+
+    @staticmethod
+    def _require_lost_ack_reconciliation(
+        row: sqlite3.Row, projection: dict, witness: tuple[int, str, int] | None,
+    ) -> None:
+        """D: a truthful NULL-ACK stopped terminal after the Cloud accepted the runner's ACK.
+
+        Only the complete signed witness admits it, compared in the runner-local clock domain.
+        The terminal itself is never rewritten; Cloud receipt time is never compared here.
+        """
+        if (
+            witness is None or row["stop_acknowledged_at_ms"] is None
+            or projection["timestamps"]["stop_acknowledged_at_ms"] is not None
+            or projection["lifecycle_phase"] != "terminal"
+            or projection["execution_disposition"] != "stopped"
+            or row["stop_reason"] == "none" or projection["stop_reason"] != row["stop_reason"]
+            or projection["event_sequence"] <= witness[0]
+            or projection["timestamps"]["terminal_at_ms"] < witness[2]
+        ):
+            raise CanaryRunError("stop_conflict")
+
     def _source_state(self, row: sqlite3.Row, projection: dict) -> str:
         sequence = projection["event_sequence"]
         digest = projection["projection_digest"]
@@ -2161,6 +2201,12 @@ class CanaryRunService:
             value = self._validate_operational(row, projection)
             source = self._source_state(row, value)
             if source == "replay" and row["stop_acknowledged_at_ms"] is not None:
+                witness = self._stop_ack_witness(row)
+                if witness is not None and witness != (
+                    value["event_sequence"], value["projection_digest"],
+                    value["timestamps"]["stop_acknowledged_at_ms"],
+                ):
+                    raise CanaryRunError("stop_conflict")
                 late = bool(row["stop_ack_late"])
                 if owns_transaction:
                     self.conn.commit()
@@ -2201,7 +2247,7 @@ class CanaryRunService:
                 raise CanaryRunError("stop_conflict")
             if value["lifecycle_phase"] not in {"stop_requested", "finalizing"}:
                 raise CanaryRunError("invalid_stop_ack")
-            if row["stop_acknowledged_at_ms"] is not None:
+            if row["stop_acknowledged_at_ms"] is not None or self._stop_ack_witness(row) is not None:
                 raise CanaryRunError("stop_conflict")
             acknowledged = value["timestamps"]["stop_acknowledged_at_ms"]
             if acknowledged is None or row["stop_deadline_ms"] is None:
@@ -2227,26 +2273,43 @@ class CanaryRunService:
                 "terminal" if terminal_ack else
                 "finalizing" if value["lifecycle_phase"] == "finalizing" else row["status"]
             )
-            self.conn.execute(
+            # Server receipt time/late status and the signed runner-local witness are written in
+            # one write-once update; a later receipt UPSERT never touches the witness columns.
+            witnessed = self.conn.execute(
                 "UPDATE canary_runs SET status=?,source_event_sequence=?,source_projection_digest=?,"
-                "stop_acknowledged_at_ms=?,stop_ack_late=?,updated_at=? "
-                "WHERE workspace_id=? AND project_ref=? AND run_id=?",
+                "stop_acknowledged_at_ms=?,stop_ack_late=?,stop_ack_source_event_sequence=?,"
+                "stop_ack_projection_digest=?,stop_ack_runner_local_at_ms=?,updated_at=? "
+                "WHERE workspace_id=? AND project_ref=? AND run_id=? "
+                "AND stop_acknowledged_at_ms IS NULL AND stop_ack_source_event_sequence IS NULL "
+                "AND stop_ack_projection_digest IS NULL AND stop_ack_runner_local_at_ms IS NULL",
                 (
                     next_status, value["event_sequence"], value["projection_digest"], arrival,
-                    int(late), arrival,
-                    workspace_id, project_ref, run_id,
+                    int(late), value["event_sequence"], value["projection_digest"], acknowledged,
+                    arrival, workspace_id, project_ref, run_id,
                 ),
             )
+            if witnessed.rowcount != 1:
+                raise CanaryRunError("stop_conflict")
             row = self._run(workspace_id, project_ref, run_id)
             self._append_event(
                 row, "stop_acknowledged", actor_class="runner", actor_id=runner_id,
                 reason_code="late" if late else "deadline_met",
                 source_event_sequence=value["event_sequence"],
             )
+            action = "stop_ack_late" if late else "stop_acknowledged"
             self._audit(
-                row, "stop_ack_late" if late else "stop_acknowledged", subject_ref=run_id,
+                row, action, subject_ref=run_id,
                 actor_class="runner", actor_id=runner_id,
                 reason_code="late" if late else "deadline_met",
+                payload={
+                    "action": action,
+                    "stop_ack_source_event_sequence": value["event_sequence"],
+                    "stop_ack_projection_digest": value["projection_digest"],
+                    "stop_ack_runner_local_at_ms": acknowledged,
+                    "server_acknowledged_at_ms": arrival,
+                    "stop_deadline_ms": row["stop_deadline_ms"],
+                    "stop_ack_late": int(late),
+                },
             )
             if owns_transaction:
                 self.conn.commit()
@@ -2329,6 +2392,13 @@ class CanaryRunService:
                 or value["execution_disposition"] != "stopped"
             ):
                 raise CanaryRunError("stop_conflict")
+            witness = self._stop_ack_witness(row)
+            if (
+                witness is not None and timestamps["stop_acknowledged_at_ms"] is not None
+                and timestamps["stop_acknowledged_at_ms"] != witness[2]
+            ):
+                raise CanaryRunError("stop_conflict")
+            ack_reconciliation = "none"
             prior_receipt = self.conn.execute(
                 "SELECT receipt_json FROM canary_operational_receipts WHERE workspace_id=? "
                 "AND project_ref=? AND run_id=?",
@@ -2346,7 +2416,16 @@ class CanaryRunService:
                     prior_ack_evidence is not None
                     and timestamps["stop_acknowledged_at_ms"] != prior_ack_evidence
                 ):
-                    raise CanaryRunError("stop_conflict")
+                    # The ACK was accepted but its answer was lost (D), or this is a conflict.
+                    self._require_lost_ack_reconciliation(row, value, witness)
+                    ack_reconciliation = "cloud_recorded_client_unknown"
+            if (
+                ack_reconciliation == "none" and row["stop_acknowledged_at_ms"] is not None
+                and timestamps["stop_acknowledged_at_ms"] is None
+            ):
+                # A pruned or superseded receipt never stands in for the durable ACK witness.
+                self._require_lost_ack_reconciliation(row, value, witness)
+                ack_reconciliation = "cloud_recorded_client_unknown"
             if (
                 row["stop_requested_at_ms"] is not None
                 and row["stop_acknowledged_at_ms"] is None
@@ -2400,10 +2479,19 @@ class CanaryRunService:
                 row, "terminal", actor_class="runner", actor_id=runner_id,
                 source_event_sequence=value["event_sequence"], status="terminal",
             )
+            sequence, digest, acknowledged = witness or (None, None, None)
             self._audit(
                 row, "finalized", subject_ref=run_id, actor_class="runner", actor_id=runner_id,
                 reason_code=value["error_category"],
-                payload={"execution_disposition": value["execution_disposition"]},
+                payload={
+                    "execution_disposition": value["execution_disposition"],
+                    "ack_reconciliation": ack_reconciliation,
+                    "stop_ack_source_event_sequence": sequence,
+                    "stop_ack_projection_digest": digest,
+                    "stop_ack_runner_local_at_ms": acknowledged,
+                    "server_acknowledged_at_ms": row["stop_acknowledged_at_ms"],
+                    "stop_ack_late": int(row["stop_ack_late"]),
+                },
             )
             result = self._discovery_result_in_transaction(
                 self._context(workspace_id, project_ref, run_id, runner_id), value, discovery_report,

@@ -24,6 +24,7 @@ from .canary_store import (
     RUNNER_CONTEXT_REAPER_INDEXES_MIGRATION, RUNNER_CONTEXT_AFFINITIES_MIGRATION,
     RUNNER_CONTEXT_BOUNDED_PURGE_MIGRATION, RUNNER_CONTEXT_AFFINITY_GUARDS_MIGRATION,
     PENDING_APPROVAL_LIVE_SEEK_MIGRATION, RUNNER_CONTEXT_PURGE_READINESS_MIGRATION,
+    STOP_ACK_WITNESS_MIGRATION,
 )
 from .canary_runs import DISCOVERY_PLAN_MIGRATION
 from .runner_auth import (
@@ -398,6 +399,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_canary_fault_refund
     Migration(29, "runner_auth_bounded_retention", RUNNER_AUTH_BOUNDED_RETENTION_MIGRATION),
     Migration(30, "self_serve_discovery_and_plan_requests", DISCOVERY_PLAN_MIGRATION),
     Migration(31, "host_authority_generations", HOST_AUTHORITY_GENERATIONS_MIGRATION),
+    Migration(32, "stop_ack_signed_witness", STOP_ACK_WITNESS_MIGRATION),
 ]
 
 
