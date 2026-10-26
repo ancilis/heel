@@ -49,6 +49,8 @@ const ROUTES: Array<{ method: "GET" | "POST"; path: string }> = [
   { method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/runner-context-bindings` },
   { method: "GET", path: `/v1/workspaces/${workspace}/projects/${project}/environments` },
   { method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/environments/${environment}/check` },
+  { method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/environments/${environment}/challenge` },
+  { method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/environments/${environment}/challenge/rotate` },
 ];
 
 const REFUSED_ORIGINS: unknown[] = [

@@ -117,7 +117,7 @@ from .tenancy import (
     ControlPlaneStore, IntegrationLimitExceeded, Role, SeatLimitExceeded, hash_api_key, require,
 )
 from .verification import (
-    ATTESTATION_ACKNOWLEDGEMENT, ATTESTATION_VERSION, EnvironmentCooldown, EnvironmentNotFound,
+    ATTESTATION_ACKNOWLEDGEMENT, ATTESTATION_VERSION, EnvironmentChallengeClosed, EnvironmentCooldown, EnvironmentNotFound,
     HostnameReuseExceeded, OWNERSHIP_ATTESTATION, TargetLimitExceeded, TargetVerifier,
     VerifiedEnvironmentService,
 )
@@ -185,6 +185,20 @@ def _reject_json_constant(_value):
 
 def current_period() -> str:
     return time.strftime("%Y-%m", time.gmtime())
+
+
+def _environment_dns_record(challenge) -> str:
+    return "_heel." + challenge.origin[len("https://"):] + " TXT heel-verify=" + challenge.token
+
+
+# Closed, token-free public states for a pending proof that cannot be recovered or rotated.
+_CLOSED_CHALLENGE_ERRORS = {
+    "expired": ("pending proof expired", "environment_challenge_expired"),
+    "missing": ("pending proof is unavailable", "environment_challenge_missing"),
+    "verified": ("proof is not pending", "environment_challenge_closed"),
+    "revoked": ("proof is not pending", "environment_challenge_closed"),
+    "live": ("pending proof is still current", "environment_challenge_live"),
+}
 
 
 class ApiError(Exception):
@@ -1055,6 +1069,10 @@ class _Handler(BaseHTTPRequestHandler):
                     return lambda: self._ws_environment_check(wid, project_ref, tail[3])
                 if len(tail) == 5 and method == "POST" and tail[4] == "revoke":
                     return lambda: self._ws_environment_revoke(wid, project_ref, tail[3])
+                if len(tail) == 5 and method == "POST" and tail[4] == "challenge":
+                    return lambda: self._ws_environment_challenge(wid, project_ref, tail[3], rotate=False)
+                if len(tail) == 6 and method == "POST" and tail[4] == "challenge" and tail[5] == "rotate":
+                    return lambda: self._ws_environment_challenge(wid, project_ref, tail[3], rotate=True)
                 if len(tail) == 5 and tail[4] == "discovery-authorizations" and method == "POST":
                     return lambda: self._ws_discovery_authorization_create(wid, project_ref, tail[3])
                 if len(tail) == 6 and tail[4] == "discovery-authorizations" and method == "GET":
@@ -2891,9 +2909,41 @@ class _Handler(BaseHTTPRequestHandler):
             "environment_id": challenge.environment_id, "origin": challenge.origin,
             "environment_class": challenge.environment_class, "proof_method": body["proof_method"],
             "token": challenge.token, "http_url": challenge.http_url,
-            "dns_record": "_heel." + challenge.origin[len("https://"):] + " TXT heel-verify=" + challenge.token,
+            "dns_record": _environment_dns_record(challenge),
             "challenge_generation": challenge.generation, "expires_at": challenge.expires_at,
             "attestation": challenge.attestation,
+        })
+
+    def _ws_environment_challenge(self, wid: str, project_ref: str, environment_id: str, *, rotate: bool):
+        """Explicit pending-proof recovery (read-only) or same-record rotation, under the proof-start ceremony."""
+        self._recent_owner_admin(wid)
+        body = self._body()
+        schema = ("heel.verified-environment-challenge-rotate.v1" if rotate
+                  else "heel.verified-environment-challenge-recover.v1")
+        if set(body) != {"schema_version"} or body.get("schema_version") != schema:
+            raise ApiError(400, "invalid environment challenge request", code="invalid_environment_challenge")
+        try:
+            self.cp.projects.get(wid, project_ref)
+        except ProjectNotFound:
+            raise ApiError(404, "project not found", code="project_not_found") from None
+        action = (self.cp.environments.rotate_unrecoverable_challenge if rotate
+                  else self.cp.environments.recover_pending_challenge)
+        try:
+            challenge = action(wid, project_ref, environment_id)
+        except EnvironmentNotFound:
+            raise ApiError(404, "environment not found", code="environment_not_found") from None
+        except EnvironmentChallengeClosed as closed:
+            message, code = _CLOSED_CHALLENGE_ERRORS[closed.reason]
+            raise ApiError(409, message, code=code) from None
+        self._json(201 if rotate else 200, {
+            "schema_version": "heel.verified-environment-challenge-recovery.v1",
+            "environment_id": challenge.environment_id, "origin": challenge.origin,
+            "environment_class": challenge.environment_class, "proof_method": challenge.proof_method,
+            "token": challenge.token, "http_url": challenge.http_url,
+            "dns_record": _environment_dns_record(challenge),
+            "challenge_generation": challenge.generation, "expires_at": challenge.expires_at,
+            "attestation": challenge.attestation, "attestation_version": ATTESTATION_VERSION,
+            "attestation_acknowledgement": ATTESTATION_ACKNOWLEDGEMENT,
         })
 
     def _ws_environment_check(self, wid: str, project_ref: str, environment_id: str):

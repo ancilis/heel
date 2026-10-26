@@ -99,6 +99,8 @@ function routeCases(origin: string): RouteCase[] {
     { label: "runner context bindings", method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/runner-context-bindings`, headers: browser, body: "{}", human: true },
     { label: "environments list", method: "GET", path: `/v1/workspaces/${workspace}/projects/${project}/environments`, headers: session },
     { label: "environment check", method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/environments/${environment}/check`, headers: browser, body: "{}", human: true },
+    { label: "environment proof recovery", method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/environments/${environment}/challenge`, headers: browser, body: "{}", human: true },
+    { label: "environment proof rotation", method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/environments/${environment}/challenge/rotate`, headers: browser, body: "{}", human: true },
   ];
 }
 
@@ -426,6 +428,54 @@ describe("canonical control-plane binding destination", () => {
         expect(fetcher.mock.calls[0][0].url, route.label).toBe(`${origin}${route.path}`);
         expect(reads, route.label).toEqual(["TypeError"]);
       }
+    }
+    expectNoFallback();
+  });
+
+  it("admits pending-proof recovery and rotation only as exact same-origin browser POSTs", async () => {
+    const origin = CONFIGURED_ORIGINS[0];
+    const fetcher = bindingSpy();
+    const base = `/v1/workspaces/${workspace}/projects/${project}/environments`;
+    const browser = { ...session, Origin: origin, "Sec-Fetch-Site": "same-origin" };
+    const notFound: RouteCase[] = [
+      { label: "recovery GET", method: "GET", path: `${base}/${environment}/challenge`, headers: browser },
+      { label: "rotation GET", method: "GET", path: `${base}/${environment}/challenge/rotate`, headers: browser },
+      ...[
+        `${base}/${environment}/challenge/`, `${base}/${environment}/challenge/rotate/`, `${base}/${environment}/challenges`,
+        `${base}/${environment}/challenge/rotated`, `${base}/${environment}/challenge/rotate/now`, `${base}/${environment}/x/challenge`,
+        `${base}/env_${"d".repeat(31)}/challenge`, `${base}/ENV_${"d".repeat(32)}/challenge`, `${base}/${environment}/check/challenge`,
+        `${base}/challenge`, `/v1/workspaces/${workspace}/projects/${project}/environment/${environment}/challenge`,
+        `/v1/workspaces/${workspace}/environments/${environment}/challenge`,
+      ].map((path): RouteCase => ({ label: path, method: "POST", path, headers: browser, body: "{}" })),
+    ];
+    for (const route of notFound) {
+      const response = await worker.fetch(incoming(origin, route), workerEnv(origin, fetcher), context);
+      expect(response.status, route.label).toBe(404);
+    }
+    for (const path of [`${base}/${environment}/challenge`, `${base}/${environment}/challenge/rotate`]) {
+      for (const [label, headers] of [
+        ["bearer key beside the session", { ...browser, Authorization: "Bearer heel_sk_private" }],
+        ["bearer key without a session", { Origin: origin, "Sec-Fetch-Site": "same-origin", Authorization: "Bearer heel_sk_private" }],
+        ["no session", { Origin: origin, "Sec-Fetch-Site": "same-origin" }],
+        ["no Origin", { ...session, "Sec-Fetch-Site": "same-origin" }],
+        ["no fetch metadata", { ...session, Origin: origin }],
+        ["same-site", { ...browser, "Sec-Fetch-Site": "same-site" }],
+        ["foreign Origin", { ...browser, Origin: "https://attacker.invalid" }],
+      ] as Array<[string, Record<string, string>]>) {
+        const response = await worker.fetch(incoming(origin, { label, method: "POST", path, headers, body: "{}" }), workerEnv(origin, fetcher), context);
+        expect(response.status, `${path} ${label}`).toBe(400);
+      }
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+    // A forged internal-origin header is replaced by the Worker's own, never forwarded as given.
+    for (const path of [`${base}/${environment}/challenge`, `${base}/${environment}/challenge/rotate`]) {
+      const forged = { ...browser, "X-Heel-Internal-Origin": "forged", "X-Heel-Edge-Auth": "forged" };
+      const response = await worker.fetch(incoming(origin, { label: path, method: "POST", path, headers: forged, body: "{}" }), workerEnv(origin, fetcher), context);
+      expect(response.status, path).toBe(200);
+      const upstream = fetcher.mock.calls.at(-1)![0];
+      expect(upstream.headers.get("x-heel-internal-origin")).toBe("same-origin");
+      expect(upstream.headers.get("x-heel-edge-auth")).toBe(edge);
+      expect(upstream.headers.get("origin")).toBe(origin);
     }
     expectNoFallback();
   });
