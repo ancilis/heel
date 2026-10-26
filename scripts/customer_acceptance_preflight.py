@@ -3,11 +3,18 @@
 
 SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
+An unauthenticated operator check of the Heel public origin; it is not a customer-target scanner.
 Writes one closed ``heel.customer-acceptance-preflight.v1`` report for a canonical public HTTPS
-origin. The only network action is one unauthenticated ``GET /`` through the ownership verifier's
-guards in ``heel.saas.network_guard``: exact public origin policy, a bounded DNS answer whose every
-address is public, a connection to that pinned address, TLS 1.2+ with certificate and hostname
-verification, and no redirect following. Only the status line and header framing are read.
+origin. The only network action is one bounded, header-oriented ``GET /`` through the ownership
+verifier's guards in ``heel.saas.network_guard``: exact public origin policy, a bounded DNS answer
+whose every address is public, a connection to that pinned address, TLS 1.2+ with certificate and
+hostname verification, one 5-second deadline, and no redirect following.
+
+Receives stop at the end of the header block and never exceed ``MAX_CHALLENGE_HEADER_BYTES + 4``
+bytes in total. TLS/TCP has no boundary between headers and body, so a receive can also deliver a
+bounded body prefix coalesced with the headers into a transient in-memory receive buffer (the TLS
+library and kernel may buffer more until close). Only the status line is parsed; header values and
+any body prefix are not parsed, and are never persisted, reported or logged.
 
 A 2xx answer shows reachability, not that the origin is Heel, which release it runs, or that it is
 ready: ``GET /`` cannot bind any of those, so ``public_https`` stays ``blocked`` with
@@ -15,7 +22,13 @@ ready: ``GET /`` cannot bind any of those, so ``public_https`` stays ``blocked``
 normally ``BLOCKED`` (or ``FAIL``) and is never acceptance. No credential, token, target URL,
 target body, provider or account input is accepted from the command line or the environment.
 
-Run: python3 scripts/customer_acceptance_preflight.py --public-origin https://HOST --output DIR
+Supported environment: run from the root of a Heel source checkout with Python 3.11+ and the
+pinned control-plane ``dnspython==2.8.0`` wheel (installed by hash in ``.github/workflows/ci.yml``
+and ``deploy/Dockerfile.control-plane``; ``pyproject.toml`` declares no extra for it). It imports
+``heel.saas.network_guard`` from that checkout. It is not part of the public runner install and is
+not a no-checkout customer command.
+
+Run: python scripts/customer_acceptance_preflight.py --public-origin https://HOST --output DIR
 """
 from __future__ import annotations
 
@@ -162,12 +175,14 @@ def _remaining(deadline: float, clock: Callable[[], float]) -> float:
 
 
 def _read_status(connection: Any, deadline: float, clock: Callable[[], float]) -> int:
+    # Receives stop at the header terminator, but TLS/TCP has no header/body boundary, so a
+    # receive can also return a body prefix; that prefix is never parsed and is dropped on return.
     response = bytearray()
     while response.find(b"\r\n\r\n") < 0:
         if len(response) > MAX_CHALLENGE_HEADER_BYTES:
             raise ProbeFailure("malformed_response", "Response headers exceed the bound.")
         connection.settimeout(_remaining(deadline, clock))
-        chunk = connection.recv(4096)
+        chunk = connection.recv(min(4096, MAX_CHALLENGE_HEADER_BYTES + 4 - len(response)))
         if not chunk:
             raise ProbeFailure("malformed_response", "Response headers are incomplete.")
         response.extend(chunk)
@@ -311,7 +326,13 @@ def _write_report(directory: Path, report: dict) -> Path:
 
 def main(argv: list[str] | None = None, *, seams: ProbeSeams | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Fail-closed deployed customer-acceptance preflight (never acceptance by itself).",
+        description="Fail-closed deployed customer-acceptance preflight (never acceptance by itself): "
+                    "one unauthenticated, bounded, header-oriented GET / of the Heel public origin.",
+        epilog="A bounded body prefix coalesced with the headers may be received into a transient "
+               "buffer; it is not parsed, persisted, reported or logged. Operator command: run from "
+               "a Heel source checkout with Python 3.11+ and the pinned dnspython==2.8.0 wheel "
+               "(see docs/saas/CUSTOMER_ACCEPTANCE_READINESS.md); not part of the public runner "
+               "install and not a no-checkout customer command.",
         allow_abbrev=False,
     )
     parser.add_argument("--public-origin", required=True, help="canonical https://HOST origin")
