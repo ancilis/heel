@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import Dashboard from "../app/dashboard/page";
 import Runner from "../app/runner/page";
+import { ActivationCard, type ActivationSnapshot } from "../components/canary/ActivationCard";
 import { ApprovalDialog } from "../components/canary/ApprovalDialog";
 import { DisclosureDialog } from "../components/canary/DisclosureDialog";
 import { RunProgress } from "../components/canary/RunProgress";
@@ -21,6 +22,9 @@ vi.mock("next/navigation", () => ({
 }));
 
 afterEach(cleanup);
+
+// The dashboard's initial (session-checking) state, i.e. a private connector is not yet known.
+const LOCKED: ActivationSnapshot = { environment: "unverified", runner: "locked", canaryAccess: "locked", rehearsal: "locked" };
 
 
 describe("canary activation dashboard", () => {
@@ -64,8 +68,15 @@ describe("canary activation dashboard", () => {
     expect(source).toContain("error.status === 401 || error.status === 403");
     expect(source).toContain("const hasPlan = pendingApproval !== null && pendingApproval.run.run.status === \"awaiting_execution_approval\"");
   });
-  test("leads with four ordered steps and one unambiguous next action", () => {
+  test("does not lead a visitor without a private connector into the runner activation funnel", () => {
     render(<Dashboard />);
+
+    expect(screen.queryByRole("region", { name: /launch activation/i })).toBeNull();
+    expect(document.body.textContent).not.toMatch(/next action: verify staging|pair runner/i);
+  });
+
+  test("keeps the private-connector activation card's four ordered steps and one unambiguous next action", () => {
+    render(<ActivationCard completedSteps={0} snapshot={LOCKED} />);
 
     const activation = screen.getByRole("region", { name: /launch activation/i });
     const steps = within(activation).getAllByRole("listitem");
@@ -93,7 +104,7 @@ describe("canary activation dashboard", () => {
   });
 
   test("offers precise recovery for interrupted setup and a usable local runner route", () => {
-    render(<Dashboard />);
+    render(<ActivationCard completedSteps={0} snapshot={LOCKED} />);
     expect(screen.getByText(/proof has not been checked yet/i)).toBeTruthy();
     expect(screen.getByText(/runner pairing starts after verification/i)).toBeTruthy();
     expect(screen.getByText(/add two isolated test identities on this machine/i)).toBeTruthy();

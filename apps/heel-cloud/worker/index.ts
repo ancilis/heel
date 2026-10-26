@@ -121,6 +121,12 @@ const ENVIRONMENT_CHECK_ROUTE = new RegExp(
 const ENVIRONMENT_REVOKE_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/environments/${ENVIRONMENT_REF}/revoke$`,
 );
+const ENVIRONMENT_CHALLENGE_RECOVER_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/environments/${ENVIRONMENT_REF}/challenge$`,
+);
+const ENVIRONMENT_CHALLENGE_ROTATE_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/environments/${ENVIRONMENT_REF}/challenge/rotate$`,
+);
 const MAX_CONTROL_PLANE_BODY_BYTES = 256 * 1024;
 const MAX_DEVICE_BODY_BYTES = 8 * 1024;
 const MAX_CANARY_PROJECTION_BODY_BYTES = 64 * 1024;
@@ -170,8 +176,10 @@ function isHumanCanaryRoute(method: string, upstreamPath: string): boolean {
 
 function isHumanEnvironmentRoute(method: string, upstreamPath: string): boolean {
   if (ENVIRONMENTS_ROUTE.test(upstreamPath)) return method === "GET" || method === "POST";
+  // Proof recovery is a token-bearing read, so it is a POST: it keeps the same-origin ceremony of every proof action.
   return method === "POST"
-    && (ENVIRONMENT_CHECK_ROUTE.test(upstreamPath) || ENVIRONMENT_REVOKE_ROUTE.test(upstreamPath));
+    && (ENVIRONMENT_CHECK_ROUTE.test(upstreamPath) || ENVIRONMENT_REVOKE_ROUTE.test(upstreamPath)
+      || ENVIRONMENT_CHALLENGE_RECOVER_ROUTE.test(upstreamPath) || ENVIRONMENT_CHALLENGE_ROTATE_ROUTE.test(upstreamPath));
 }
 
 function contentSecurityPolicy(nonce: string): string {

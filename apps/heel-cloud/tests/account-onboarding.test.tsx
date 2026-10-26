@@ -41,13 +41,13 @@ function hex(value: number, length: number): string {
 
 
 /** A `VerifiedEnvironment.v1` list entry as the control plane stores it; only verified entries are executable. */
-function environmentWire(environmentId: string, origin: string, proofMethod: string, verified: boolean): Wire {
+function environmentWire(environmentId: string, origin: string, proofMethod: string, verified: boolean, generation = 1): Wire {
   return {
     schema_version: "VerifiedEnvironment.v1", environment_id: environmentId, origin, environment_class: "staging",
     status: verified ? "verified" : "pending", attestation: "ownership verified; environment classification supplied by you",
     attestation_version: "v1", attestation_acknowledgement: "accepted", proof_method: proofMethod,
     proof_version: proofMethod === "https-file" ? "https-file.v1" : "dns-txt.v1", normalization_version: "exact-origin.v1",
-    challenge_generation: 1, challenge_expires_at: 4_000_000_000_000, last_failure_code: null,
+    challenge_generation: generation, challenge_expires_at: 4_000_000_000_000, last_failure_code: null,
     verified_at: verified ? 1 : null, proof_expires_at: verified ? 4_000_000_000_000 : null,
     verification_record_digest: verified ? "a".repeat(64) : null, revoked_at: null, is_executable: verified,
   };
@@ -71,6 +71,10 @@ class FakeControlPlane {
   readonly environments = new Map<string, Wire[]>();
   /** Whether the customer has published the proof; until then a check answers `verified: false`. */
   proofPublished = false;
+  /** Server-side pending challenge per environment, like the real row's `challenge_token`; never in the list. */
+  readonly challenges = new Map<string, { token: string; generation: number; expired: boolean }>();
+  /** Models the control plane's 15-minute owner/admin ceremony; a real login makes the session recent again. */
+  recentAuth = true;
 
   account(email: string, password: string, memberships: { role: Role; projects?: string[] }[]): Account {
     const account: Account = { userId: `usr_${hex(this.next++, 16)}`, email, password, memberships: [] };
@@ -88,6 +92,15 @@ class FakeControlPlane {
     const project = { workspace_id: workspaceRef, project_ref: `prj_${hex(this.next++, 32)}`, name, created_by: `membership:${userId}`, created_at: this.next };
     this.projects.get(workspaceRef)?.push(project);
     return project;
+  }
+
+  /** A pending record left by an earlier page load; its challenge exists only server-side. */
+  seedPending(workspaceRef: string, projectRef: string, origin: string, proofMethod = "dns-txt"): string {
+    const environmentId = `env_${hex(this.next++, 32)}`;
+    const key = `${workspaceRef}/${projectRef}`;
+    this.environments.set(key, [...(this.environments.get(key) ?? []), environmentWire(environmentId, origin, proofMethod, false)]);
+    this.challenges.set(environmentId, { token: `synthetic-proof-token-${this.next++}`, generation: 1, expired: false });
+    return environmentId;
   }
 
   hold(path: string): () => void {
@@ -122,6 +135,7 @@ class FakeControlPlane {
       const account = this.accounts.get(String(data.email ?? "").trim());
       if (account === undefined || account.password !== data.password) return json({ error: "invalid email or password" }, 403);
       this.session = account;
+      this.recentAuth = true;
       return json({ user_id: account.userId });
     }
     if (method === "POST" && route === "/v1/logout") {
@@ -146,7 +160,7 @@ class FakeControlPlane {
     if (this.canaryOutage && /\/projects\/prj_[0-9a-f]{32}\/runner-context-bindings$/.test(route)) {
       return json({ code: "canary_authority_unavailable" }, 503);
     }
-    const target = route.match(/^\/v1\/workspaces\/(ws_[0-9a-f]{16})\/projects\/(prj_[0-9a-f]{32})\/environments(?:\/(env_[0-9a-f]{32})\/check)?$/);
+    const target = route.match(/^\/v1\/workspaces\/(ws_[0-9a-f]{16})\/projects\/(prj_[0-9a-f]{32})\/environments(?:\/(env_[0-9a-f]{32})\/(check|challenge|challenge\/rotate))?$/);
     if (target) {
       if (!this.session.memberships.some((item) => item.workspace_id === target[1])) return json({ error: "not a member" }, 403);
       const key = `${target[1]}/${target[2]}`;
@@ -154,24 +168,59 @@ class FakeControlPlane {
       if (method === "GET" && target[3] === undefined) {
         return json({ schema_version: "heel.verified-environment-list.v1", environments: stored });
       }
-      if (method === "POST" && target[3] === undefined) {
-        const record = environmentWire(`env_${hex(this.next++, 32)}`, String(data.origin), String(data.proof_method), false);
-        this.environments.set(key, [...stored, record]);
+      if (method !== "POST") return json({ error: "not found" }, 404);
+      if (!this.recentAuth) return json({ error: "a recent owner or admin browser session is required", code: "recent_auth_required" }, 403);
+      const instructions = (origin: string, token: string) => ({
+        http_url: `${origin}/.well-known/heel-verify.txt`, dns_record: `_heel.${origin.slice("https://".length)} TXT heel-verify=${token}`,
+      });
+      if (target[3] === undefined) {
+        // Like the real service, a start for an origin this project already has replaces that record's challenge.
+        const origin = String(data.origin);
+        const existing = stored.find((item) => item.origin === origin);
+        const environmentId = (existing?.environment_id as string | undefined) ?? `env_${hex(this.next++, 32)}`;
+        const generation = (this.challenges.get(environmentId)?.generation ?? 0) + 1;
+        const record = environmentWire(environmentId, origin, String(data.proof_method), false, generation);
+        this.environments.set(key, existing ? stored.map((item) => item === existing ? record : item) : [...stored, record]);
         const token = `synthetic-proof-token-${this.next++}`;
+        this.challenges.set(environmentId, { token, generation, expired: false });
         return json({
-          schema_version: "heel.verified-environment-challenge.v1", environment_id: record.environment_id, origin: data.origin,
-          environment_class: data.environment_class, proof_method: data.proof_method, token,
-          http_url: `${String(data.origin)}/.well-known/heel-proof.txt`, dns_record: `_heel-proof TXT ${token}`,
-          challenge_generation: 1, expires_at: 4_000_000_000_000, attestation: data.attestation_text,
+          schema_version: "heel.verified-environment-challenge.v1", environment_id: environmentId, origin,
+          environment_class: data.environment_class, proof_method: data.proof_method, token, ...instructions(origin, token),
+          challenge_generation: generation, expires_at: 4_000_000_000_000, attestation: data.attestation_text,
         }, 201);
       }
       const index = stored.findIndex((item) => item.environment_id === target[3]);
-      if (method !== "POST" || index < 0) return json({ error: "not found" }, 404);
-      if (this.proofPublished) {
-        const verified = environmentWire(target[3], String(stored[index].origin), String(stored[index].proof_method), true);
-        this.environments.set(key, stored.map((item, position) => position === index ? verified : item));
+      if (index < 0) return json({ error: "environment not found", code: "environment_not_found" }, 404);
+      const record = stored[index];
+      const current = this.challenges.get(target[3]);
+      if (target[4] !== "check") {
+        const rotate = target[4] === "challenge/rotate";
+        const schema = `heel.verified-environment-challenge-${rotate ? "rotate" : "recover"}.v1`;
+        if (Object.keys(data).join() !== "schema_version" || data.schema_version !== schema) return json({ error: "invalid", code: "invalid_environment_challenge" }, 400);
+        if (record.status !== "pending") return json({ error: "proof is not pending", code: "environment_challenge_closed" }, 409);
+        if (!rotate && (current === undefined || current.expired)) return json({ error: "pending proof expired", code: "environment_challenge_expired" }, 409);
+        if (rotate && current !== undefined && !current.expired) return json({ error: "pending proof is still current", code: "environment_challenge_live" }, 409);
+        let challenge = current as { token: string; generation: number; expired: boolean };
+        if (rotate) {
+          challenge = { token: `synthetic-proof-token-${this.next++}`, generation: (current?.generation ?? 0) + 1, expired: false };
+          this.challenges.set(target[3], challenge);
+          this.environments.set(key, stored.map((item, position) => position === index
+            ? environmentWire(target[3], String(record.origin), String(record.proof_method), false, challenge.generation) : item));
+        }
+        return json({
+          schema_version: "heel.verified-environment-challenge-recovery.v1", environment_id: target[3], origin: record.origin,
+          environment_class: record.environment_class, proof_method: record.proof_method, token: challenge.token,
+          ...instructions(String(record.origin), challenge.token), challenge_generation: challenge.generation,
+          expires_at: 4_000_000_000_000, attestation: record.attestation, attestation_version: "v1", attestation_acknowledgement: "accepted",
+        }, rotate ? 201 : 200);
       }
-      return json({ schema_version: "heel.verified-environment-check-result.v1", verified: this.proofPublished });
+      const verified = this.proofPublished && current !== undefined && !current.expired;
+      if (verified) {
+        const verifiedRecord = environmentWire(target[3], String(record.origin), String(record.proof_method), true, current.generation);
+        this.environments.set(key, stored.map((item, position) => position === index ? verifiedRecord : item));
+        this.challenges.delete(target[3]);
+      }
+      return json({ schema_version: "heel.verified-environment-check-result.v1", verified });
     }
     if (method === "GET" && /\/projects\/prj_[0-9a-f]{32}\/runner-context-bindings$/.test(route)) {
       return json({ schema_version: "heel.runner-context-binding-dashboard.v1", server_time_ms: 1, runners: [], bindings: [] });
@@ -1537,8 +1586,8 @@ describe("CUSTOMER-TRACK-UX: a new customer registers one target through the exi
     fireEvent.change(screen.getByLabelText("Ownership proof method"), { target: { value: "dns-txt" } });
     fireEvent.click(screen.getByRole("button", { name: "Create ownership proof" }));
     await screen.findByText(/^Target verification pending\./);
-    const instruction = screen.getByText(/^Publish this exact record: _heel-proof TXT synthetic-proof-token-[0-9]+$/).textContent ?? "";
-    const token = instruction.split(" ").at(-1) ?? "";
+    const instruction = screen.getByText(/^Publish this exact record: _heel\.staging\.customer\.example\.test TXT heel-verify=synthetic-proof-token-[0-9]+$/).textContent ?? "";
+    const token = instruction.split("=").at(-1) ?? "";
     expect(screen.queryByLabelText(/target url/i)).toBeNull();
     expect(screen.queryByRole("button", { name: "Create ownership proof" })).toBeNull();
 
@@ -1644,6 +1693,363 @@ describe("CUSTOMER-TRACK-UX: a new customer registers one target through the exi
     render(<Dashboard />);
     await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
     expect(within(screen.getByRole("region", { name: "Your target" })).getByRole("status").textContent).toBe(BOUNDARY);
-    expect(screen.getByRole("region", { name: /launch activation/i })).toBeTruthy();
+    const activation = screen.getByRole("region", { name: /launch activation/i });
+    expect(within(activation).getAllByRole("listitem").map((step) => step.querySelector("h2")?.textContent))
+      .toEqual(["Verify staging", "Pair runner", "Add canary access", "Run first rehearsal"]);
+    expect(screen.getByRole("button", { name: "Authorize paired runner" })).toBeTruthy();
+    expect(screen.getByRole("complementary", { name: "Safety boundaries" }).textContent)
+      .toMatch(/The paired runner owns target traffic\..*GET \+ HEAD.*Staging :443 only/);
   });
+});
+
+
+// SEAM (CUSTOMER-TRACK-UX-F1): the same in-memory control plane; `/v1/me` is held to observe the loading state.
+describe("CUSTOMER-TRACK-UX-F1: no visitor is sent into runner onboarding before a private connector exists", () => {
+  const INTRO = "Add one publicly reachable staging or sandbox HTTPS target and prove you own it. Managed scanning is not available in this build.";
+
+  function expectNoRunnerFunnel(): void {
+    expect(screen.queryByRole("region", { name: /launch activation/i })).toBeNull();
+    expect(screen.queryByRole("heading", { name: /^(Verify staging|Pair runner|Add canary access|Run first rehearsal)$/ })).toBeNull();
+    expect(screen.queryByRole("link", { name: /verify staging now|open pairing guide/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Authorize paired runner" })).toBeNull();
+    expect(document.body.textContent).not.toMatch(/next action: (verify staging|pair runner)|runner pairing starts after|first useful run/i);
+  }
+
+  function expectTruthfulDefaultCopy(): void {
+    const intro = screen.getByRole("heading", { level: 1 }).closest("section");
+    expect(intro?.textContent).toContain(INTRO);
+    expect(intro?.textContent).not.toMatch(/runner onboarding|canary rehearsal/i);
+    const rail = screen.getByRole("complementary", { name: "Safety boundaries" });
+    expect(rail.textContent).toMatch(/No scan traffic is sent in this build\./);
+    expect(rail.textContent).toMatch(/Ownership check.*One proof file or DNS record/);
+    expect(rail.textContent).toMatch(/Operational status only/);
+    expect(rail.textContent).not.toMatch(/runner owns target traffic|GET \+ HEAD|:443/i);
+  }
+
+  test("while the session is still loading, no runner step or prerequisite is shown", async () => {
+    const release = server.hold("/api/control-plane/v1/me");
+    render(<Dashboard />);
+    await screen.findByText("Checking your session.");
+    expectNoRunnerFunnel();
+    expectTruthfulDefaultCopy();
+    release();
+    await screen.findByRole("heading", { name: "Create your Heel account" });
+  });
+
+  test("a signed-out visitor sees account access and the target-first copy, never a runner funnel", async () => {
+    render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Create your Heel account" });
+    expectNoRunnerFunnel();
+    expectTruthfulDefaultCopy();
+  });
+
+  test("an unavailable service is retryable without advertising runner onboarding", async () => {
+    server.offline = true;
+    render(<Dashboard />);
+    await screen.findByRole("button", { name: "Try again" });
+    expectNoRunnerFunnel();
+    expectTruthfulDefaultCopy();
+  });
+
+  test("a new account without a project, without a workspace, with a refused role or during a canary outage sees no runner funnel", async () => {
+    const cases: { name: string; arrange: () => void; shown: () => Promise<unknown> }[] = [
+      { name: "no project", arrange: () => { server.session = server.account(EMAIL, SECRET, [{ role: "owner" }]); },
+        shown: () => screen.findByText("Create a project first.") },
+      { name: "no workspace", arrange: () => { server.session = server.account("lone@example.test", SECRET, []); },
+        shown: () => screen.findByText(/not a member of any workspace/) },
+      { name: "refused role", arrange: () => { server.session = server.account("billing@example.test", SECRET, [{ role: "billing" }]); },
+        shown: () => screen.findByText(/role cannot open projects/) },
+      { name: "canary outage", arrange: () => {
+        server.session = server.account("outage@example.test", SECRET, [{ role: "owner", projects: ["Customer staging"] }]);
+        server.canaryOutage = true;
+      }, shown: () => screen.findByText(/stay locked until it loads/) },
+    ];
+    for (const item of cases) {
+      cleanup();
+      server.canaryOutage = false;
+      item.arrange();
+      render(<Dashboard />);
+      await item.shown();
+      expectNoRunnerFunnel();
+      expectTruthfulDefaultCopy();
+    }
+  });
+
+  test("a new account's ready project offers Add target with the same truthful copy and no runner funnel", async () => {
+    server.session = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Customer staging"] }]);
+    render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Add target" });
+    expectNoRunnerFunnel();
+    expectTruthfulDefaultCopy();
+  });
+});
+
+
+// SEAM (CUSTOMER-TRACK-UX-F1): the in-memory control plane keeps each pending challenge server-side, like the real
+// row, and models the recovery/rotation routes, the 15-minute ceremony and same-origin upsert. Local synthetic
+// evidence of the UI state machine only; `tests/test_verified_environments.py` proves the real routes over HTTP.
+describe("CUSTOMER-TRACK-UX-F1: a pending ownership proof survives a reload and is resumed explicitly", () => {
+  const TARGET = "https://staging.customer.example.test";
+  const OTHER = "https://sandbox.customer.example.test";
+  const BOUNDARY = "Target verified. Managed scanning, credentials, discovery, and scan approval are not available in this build.";
+  const EXPIRED = "This pending proof expired. Issue a replacement proof for the same target.";
+  const RECENT_AUTH = "For your security, showing or replacing a pending proof needs a sign-in from the last 15 minutes. The proof is kept on the server: sign out, sign in again, then resume it.";
+
+  function ownerWith(projects: string[] = ["Customer staging"], second?: string[]): { ws: string; prj: string; ws2: string; prj2: string } {
+    const memberships = [{ role: "owner" as const, projects }, ...(second ? [{ role: "owner" as const, projects: second }] : [])];
+    const account = server.account(EMAIL, SECRET, memberships);
+    server.session = account;
+    const ws = account.memberships[0].workspace_id;
+    const ws2 = account.memberships[1]?.workspace_id ?? "";
+    const prj = server.projects.get(ws)?.[0].project_ref as string;
+    nav.search = `workspace=${ws}&project=${prj}`;
+    return { ws, prj, ws2, prj2: (server.projects.get(ws2)?.[0]?.project_ref as string | undefined) ?? "" };
+  }
+
+  function base(ws: string, prj: string): string {
+    return `/api/control-plane/v1/workspaces/${ws}/projects/${prj}`;
+  }
+
+  function postsSince(mark: number): string[] {
+    return server.calls.slice(mark).filter((call) => call.method === "POST").map((call) => call.path.replace(/^.*\/environments/, "/environments"));
+  }
+
+  function tokenOf(environmentId: string): string {
+    return server.challenges.get(environmentId)?.token ?? "";
+  }
+
+  function expectProofOnlyOnScreen(token: string): void {
+    expect(globalThis.localStorage.length).toBe(0);
+    expect(globalThis.sessionStorage.length).toBe(0);
+    expect(nav.search).not.toContain(token);
+    expect(nav.replace.mock.calls.flat().join(" ")).not.toContain(token);
+    expect(consoleOutput.join("\n")).not.toContain(token);
+  }
+
+  async function pendingGroup(): Promise<HTMLElement> {
+    return screen.findByRole("group", { name: "Pending ownership proof" });
+  }
+
+  test("a reload after starting a proof shows the pending target and resumes the same proof through the existing check", async () => {
+    const { ws, prj } = ownerWith();
+    render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Add target" });
+    fill(/target url/i, TARGET);
+    fireEvent.change(screen.getByLabelText("Ownership proof method"), { target: { value: "dns-txt" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create ownership proof" }));
+    await screen.findByText(/^Target verification pending\./);
+    const environmentId = server.environments.get(`${ws}/${prj}`)?.[0].environment_id as string;
+    const token = tokenOf(environmentId);
+    const instruction = `Publish this exact record: _heel.staging.customer.example.test TXT heel-verify=${token}`;
+    expect(screen.getByText(instruction)).toBeTruthy();
+
+    const mark = server.calls.length;
+    cleanup();
+    render(<Dashboard />);
+    const pending = await pendingGroup();
+    expect(within(pending).getByText(TARGET)).toBeTruthy();
+    expect(screen.queryByText(instruction)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Check ownership proof" })).toBeNull();
+    expect(document.body.textContent).not.toContain(token);
+    // Loading the page recovers nothing, registers nothing and checks nothing on its own.
+    await settle();
+    expect(postsSince(mark)).toEqual([]);
+
+    fireEvent.click(within(pending).getByRole("button", { name: "Resume ownership proof" }));
+    await screen.findByText(instruction);
+    expect(postsSince(mark)).toEqual([`/environments/${environmentId}/challenge`]);
+    expect(server.environments.get(`${ws}/${prj}`)).toHaveLength(1);
+    expect(server.challenges.get(environmentId)).toEqual({ token, generation: 1, expired: false });
+
+    fireEvent.click(screen.getByRole("button", { name: "Check ownership proof" }));
+    await screen.findByText("Proof did not match yet. No product route was contacted.");
+    expect(screen.getByText(instruction)).toBeTruthy();
+    server.proofPublished = true;
+    fireEvent.click(screen.getByRole("button", { name: "Check ownership proof" }));
+    const card = await screen.findByRole("region", { name: "Your target" });
+    expect(within(card).getByRole("status").textContent).toBe(BOUNDARY);
+    expect(postsSince(mark)).toEqual([
+      `/environments/${environmentId}/challenge`, `/environments/${environmentId}/check`, `/environments/${environmentId}/check`,
+    ]);
+    expect(server.calls.slice(mark).every((call) => call.path.startsWith(`${base(ws, prj)}/`) || call.path.endsWith("/v1/me") || call.path.endsWith("/projects"))).toBe(true);
+    expectProofOnlyOnScreen(token);
+    expectNoSecretLeak();
+  });
+
+  test("an expired pending proof is replaced in the same record only when the user asks", async () => {
+    const { ws, prj } = ownerWith();
+    const environmentId = server.seedPending(ws, prj, TARGET, "https-file");
+    const oldToken = tokenOf(environmentId);
+    server.challenges.get(environmentId)!.expired = true;
+    const mark = server.calls.length;
+    render(<Dashboard />);
+    fireEvent.click(within(await pendingGroup()).getByRole("button", { name: "Resume ownership proof" }));
+    await screen.findByText(EXPIRED);
+    const pending = screen.getByRole("group", { name: "Pending ownership proof" });
+    expect(within(pending).queryByRole("button", { name: "Resume ownership proof" })).toBeNull();
+    expect(document.body.textContent).not.toContain(oldToken);
+    expect(postsSince(mark)).toEqual([`/environments/${environmentId}/challenge`]);
+    expect(server.challenges.get(environmentId)?.generation).toBe(1);
+
+    fireEvent.click(within(pending).getByRole("button", { name: "Issue replacement proof" }));
+    const newToken = await waitFor(() => {
+      const current = tokenOf(environmentId);
+      expect(current).not.toBe(oldToken);
+      return current;
+    });
+    await screen.findByText(`Place the one-time token at ${TARGET}/.well-known/heel-verify.txt: ${newToken}`);
+    expect(postsSince(mark)).toEqual([`/environments/${environmentId}/challenge`, `/environments/${environmentId}/challenge/rotate`]);
+    expect(server.environments.get(`${ws}/${prj}`)).toHaveLength(1);
+    expect(server.environments.get(`${ws}/${prj}`)?.[0].environment_id).toBe(environmentId);
+    expect(server.challenges.get(environmentId)?.generation).toBe(2);
+    expect(document.body.textContent).not.toContain(oldToken);
+
+    server.proofPublished = true;
+    fireEvent.click(screen.getByRole("button", { name: "Check ownership proof" }));
+    await screen.findByRole("region", { name: "Your target" });
+    expectProofOnlyOnScreen(newToken);
+  });
+
+  test("with several pending targets the user chooses which one to resume; none is picked silently", async () => {
+    const { ws, prj } = ownerWith();
+    const first = server.seedPending(ws, prj, TARGET);
+    const second = server.seedPending(ws, prj, OTHER);
+    const mark = server.calls.length;
+    render(<Dashboard />);
+    const pending = await pendingGroup();
+    const select = within(pending).getByRole("combobox", { name: "Pending target" }) as HTMLSelectElement;
+    expect(select.value).toBe("");
+    expect((within(pending).getByRole("button", { name: "Resume ownership proof" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(within(pending).getByRole("button", { name: "Resume ownership proof" }));
+    await settle();
+    expect(postsSince(mark)).toEqual([]);
+
+    fireEvent.change(select, { target: { value: second } });
+    fireEvent.click(within(pending).getByRole("button", { name: "Resume ownership proof" }));
+    await screen.findByText(`Publish this exact record: _heel.sandbox.customer.example.test TXT heel-verify=${tokenOf(second)}`);
+    expect(postsSince(mark)).toEqual([`/environments/${second}/challenge`]);
+    expect(document.body.textContent).not.toContain(tokenOf(first));
+  });
+
+  test("a malformed or foreign recovery response shows no proof and re-reads the listed state", async () => {
+    const { ws, prj } = ownerWith();
+    const environmentId = server.seedPending(ws, prj, TARGET);
+    const token = tokenOf(environmentId);
+    const valid = {
+      schema_version: "heel.verified-environment-challenge-recovery.v1", environment_id: environmentId, origin: TARGET,
+      environment_class: "staging", proof_method: "dns-txt", token, http_url: `${TARGET}/.well-known/heel-verify.txt`,
+      dns_record: `_heel.staging.customer.example.test TXT heel-verify=${token}`, challenge_generation: 1, expires_at: 4_000_000_000_000,
+      attestation: "ownership verified; environment classification supplied by you", attestation_version: "v1", attestation_acknowledgement: "accepted",
+    };
+    for (const body of [
+      { ...valid, environment_id: `env_${"f".repeat(32)}` },
+      { ...valid, origin: OTHER },
+      { ...valid, challenge_generation: 7 },
+      { ...valid, raw_proof_body: "x" },
+    ]) {
+      cleanup();
+      server.overrides.set(`POST ${base(ws, prj)}/environments/${environmentId}/challenge`, () => json(body));
+      render(<Dashboard />);
+      const resume = within(await pendingGroup()).getByRole("button", { name: "Resume ownership proof" });
+      const listReads = () => server.calls.filter((call) => call.method === "GET" && call.path === `${base(ws, prj)}/environments`).length;
+      const before = listReads();
+      fireEvent.click(resume);
+      await screen.findByText("Heel Cloud returned an invalid canary response.");
+      expect(screen.queryByRole("button", { name: "Check ownership proof" })).toBeNull();
+      expect(document.body.textContent).not.toContain(token);
+      await waitFor(() => expect(listReads()).toBe(before + 1));
+    }
+  });
+
+  for (const action of ["resume", "replace"] as const) {
+    for (const transition of ["project switch", "workspace switch", "session ended elsewhere"] as const) {
+      test(`a ${action} that settles after a ${transition} shows nothing in the new context`, async () => {
+        const { ws, prj, ws2, prj2 } = ownerWith(["Alpha", "Beta"], ["Gamma"]);
+        const beta = server.projects.get(ws)?.[1].project_ref as string;
+        const environmentId = server.seedPending(ws, prj, TARGET);
+        if (action === "replace") server.challenges.get(environmentId)!.expired = true;
+        const view = render(<Dashboard />);
+        const pending = await pendingGroup();
+        if (action === "replace") {
+          fireEvent.click(within(pending).getByRole("button", { name: "Resume ownership proof" }));
+          await screen.findByText(EXPIRED);
+        }
+        const path = `${base(ws, prj)}/environments/${environmentId}/challenge${action === "replace" ? "/rotate" : ""}`;
+        const release = server.hold(path);
+        fireEvent.click(within(screen.getByRole("group", { name: "Pending ownership proof" }))
+          .getByRole("button", { name: action === "resume" ? "Resume ownership proof" : "Issue replacement proof" }));
+        await waitFor(() => expect(server.calls.some((call) => call.path === path)).toBe(true));
+        if (transition === "project switch") {
+          navigate(view, `workspace=${ws}&project=${beta}`);
+          await waitFor(() => expect(projectSelect().value).toBe(beta));
+          await screen.findByRole("heading", { name: "Add target" });
+        } else if (transition === "workspace switch") {
+          navigate(view, `workspace=${ws2}&project=${prj2}`);
+          await waitFor(() => expect(projectSelect().value).toBe(prj2));
+          await screen.findByRole("heading", { name: "Add target" });
+        } else {
+          server.session = null;
+          navigate(view, "");
+          await screen.findByRole("heading", { name: "Create your Heel account" });
+        }
+        const statuses = screen.queryAllByRole("status").map((item) => item.textContent);
+        release();
+        await settle();
+        expect(screen.queryAllByRole("status").map((item) => item.textContent)).toEqual(statuses);
+        expect(screen.queryByRole("button", { name: "Check ownership proof" })).toBeNull();
+        expect(screen.queryByRole("group", { name: "Pending ownership proof" })).toBeNull();
+        expect(document.body.textContent).not.toMatch(/synthetic-proof-token|heel-verify/);
+        expect(document.body.textContent).not.toContain(TARGET);
+        expectProofOnlyOnScreen(tokenOf(environmentId));
+      });
+    }
+  }
+
+  test("a recovery 401 in the current session ends it without showing the proof", async () => {
+    const { ws, prj } = ownerWith();
+    const environmentId = server.seedPending(ws, prj, TARGET);
+    server.overrides.set(`POST ${base(ws, prj)}/environments/${environmentId}/challenge`, () => json({ error: "authentication required" }, 401));
+    render(<Dashboard />);
+    fireEvent.click(within(await pendingGroup()).getByRole("button", { name: "Resume ownership proof" }));
+    await screen.findByText(/Your session ended/);
+    expect(document.body.textContent).not.toContain(tokenOf(environmentId));
+    expect(nav.search).toBe("");
+  });
+
+  for (const afterLogin of ["live", "expired"] as const) {
+    test(`after the fresh-sign-in window lapses, a real sign-in shows the kept proof again (${afterLogin})`, async () => {
+      const { ws, prj } = ownerWith();
+      const environmentId = server.seedPending(ws, prj, TARGET);
+      const token = tokenOf(environmentId);
+      server.recentAuth = false;
+      render(<Dashboard />);
+      fireEvent.click(within(await pendingGroup()).getByRole("button", { name: "Resume ownership proof" }));
+      await screen.findByText(RECENT_AUTH);
+      expect(screen.queryByRole("button", { name: "Check ownership proof" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Issue replacement proof" })).toBeNull();
+      expect(document.body.textContent).not.toContain(token);
+      // Nothing was cleared or rotated server-side, and the session age was not refreshed silently.
+      expect(server.challenges.get(environmentId)).toEqual({ token, generation: 1, expired: false });
+      expect(server.recentAuth).toBe(false);
+
+      fireEvent.click(signOutButton());
+      await signInFromSignedOut(EMAIL, SECRET);
+      if (afterLogin === "expired") server.challenges.get(environmentId)!.expired = true;
+      const mark = server.calls.length;
+      fireEvent.click(within(await pendingGroup()).getByRole("button", { name: "Resume ownership proof" }));
+      if (afterLogin === "live") {
+        await screen.findByText(`Publish this exact record: _heel.staging.customer.example.test TXT heel-verify=${token}`);
+        expect(postsSince(mark)).toEqual([`/environments/${environmentId}/challenge`]);
+      } else {
+        await screen.findByText(EXPIRED);
+        fireEvent.click(screen.getByRole("button", { name: "Issue replacement proof" }));
+        await screen.findByText(/heel-verify=synthetic-proof-token-/);
+        expect(postsSince(mark)).toEqual([`/environments/${environmentId}/challenge`, `/environments/${environmentId}/challenge/rotate`]);
+        expect(server.challenges.get(environmentId)?.generation).toBe(2);
+      }
+      expect(server.environments.get(`${ws}/${prj}`)).toHaveLength(1);
+      expectProofOnlyOnScreen(token);
+      expectNoSecretLeak();
+    });
+  }
 });
