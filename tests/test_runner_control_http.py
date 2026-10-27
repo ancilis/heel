@@ -1,6 +1,8 @@
 import base64
+import copy
 import hashlib
 import inspect
+import os
 import sqlite3
 import time
 import http.client
@@ -4296,5 +4298,292 @@ def test_public_findings_upload_over_3072_bytes_round_trips_the_control_plane_ov
             assert stored == 1
             with capsys.disabled():
                 print(f"\n[T-P8 measured] findings upload body {len(sent)} B over loopback HTTP -> synchronized")
+        finally:
+            live.close()
+
+
+# --- R2: client acceptance of an inactive-claim attestation (POSTRESET §7.2) ---
+
+def _loopback_bounded(port, path, *, headers=None, body=b"", max_response_bytes):
+    """LOOPBACK DECODER ADAPTER (labelled): plain HTTP to the in-process control plane, answered and
+    then read by the production ``HTTPSControlTransport._decode`` with the caller's limit, so the
+    returned body is the exact octets read off the socket, capped before the strict parser."""
+    from heel.runner.control_transport import HTTPSControlTransport
+
+    decoder = HTTPSControlTransport("https://localhost")
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        conn.request("POST", path, body, dict(headers or {}))
+        response = conn.getresponse()
+        try:
+            return decoder._decode(response, conn, time.monotonic() + 10, max_response_bytes)
+        finally:
+            response.close()
+    finally:
+        conn.close()
+
+
+def _stuck_live_client(live, root, transport):
+    """A runtime holding the Cloud-claimed run as an active group that never activated, and a
+    client whose pinned grant trust set is the control plane's grant authority."""
+    root.mkdir(mode=0o700, exist_ok=True)
+    runtime, signer = _live_runtime(live, root)
+    now = int(time.time() * 1000)
+    runtime.install_chain(
+        operation="claim", run_id=None, next_nonce_b64=base64.b64encode(b"p" * 32).decode(),
+        next_sequence=1, generation=0, now_ms=now,
+    )
+    claim = runtime.load_chain("claim", None)
+    path = f"/v1/workspaces/{live.workspace}/runners/runner/claim"
+    body = canonical_bytes({"schema_version": "heel.runner-claim-request.v1"})
+    proof = {
+        "schema_version": "heel.runner-request-proof.v1", "workspace_id": live.workspace,
+        "runner_id": "runner", "key_id": signer.key_id, "capability": "runner_claim", "method": "POST",
+        "path": path, "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": now,
+        "server_nonce": claim.next_nonce_b64, "sequence": claim.next_sequence,
+    }
+    pending = runtime.stage_call(
+        request_operation="claim", chain_operation="claim", run_id=None, path=path, capability="runner_claim",
+        headers={"Content-Type": "application/json", "X-Heel-Runner-Id": "runner", "X-Heel-Runner-Key-Id": signer.key_id,
+                 "X-Heel-Runner-Timestamp-Ms": str(now),
+                 "X-Heel-Runner-Signature": base64.b64encode(signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))).decode(),
+                 "X-Heel-Runner-Nonce": claim.next_nonce_b64, "X-Heel-Runner-Sequence": "1"},
+        body=body, expected_state_digest=claim.state_digest, now_ms=now,
+    )
+    runtime.commit_call(
+        pending.call_id, next_nonce_b64=base64.b64encode(b"n" * 32).decode(), now_ms=now,
+        installed_chains=tuple(
+            (operation, live.run_id, live.chains[operation]["next_nonce_b64"],
+             live.chains[operation]["next_sequence"], live.chains[operation]["generation"])
+            for operation in ("heartbeat", "progress", "result", "stop-ack")
+        ),
+        active_run=ActiveRunInstall(
+            run_id=live.run_id, approval_projection=live.approval, grant=live.grant,
+            gate={"active": True, "runner_state": "active", "proof_state": "valid",
+                  "proof_expires_at_ms": now + 3_600_000, "kill_switch_generation": 0,
+                  "stop_reason": "none", "server_time_ms": now},
+            claim_response_digest="a" * 64, gate_response_digest="b" * 64,
+            claimed_at_ms=now, gate_received_at_ms=now,
+        ),
+    )
+    authority = live.cp.grant_authority
+    challenges = []
+
+    def random_source(size):
+        challenges.append(os.urandom(size))
+        return challenges[-1]
+
+    control = RunnerControlClient(
+        origin="http://127.0.0.1", workspace_id=live.workspace, runner_id="runner", signer=signer,
+        clock=lambda: int(time.time() * 1000), transport=transport,
+        nonce_source=lambda chain: (_ for _ in ()).throw(AssertionError("run chains are Cloud-issued")),
+        resync_random_source=random_source, trusted_disclosure_keys={authority.key_id: authority.public_key},
+        runtime=runtime,
+    )
+    return runtime, control, challenges
+
+
+def _runtime_tables(runtime):
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(runtime.path)) as conn:
+        return {table: sorted(map(tuple, conn.execute(f"SELECT * FROM {table}"))) for table in (
+            "active_runs", "control_chains", "pending_calls", "terminal_disclosures", "chain_recovery", "retired_claims",
+        )}
+
+
+def _resigned_attestation(payload, authority, **changes):
+    """FAULTY SERVER: the (possibly compromised) grant authority signs a changed attestation."""
+    from heel.canary_contracts import canonical_digest, inactive_claim_attestation_signing_payload
+
+    record = {key: copy.deepcopy(value) for key, value in payload.items()
+              if key not in {"attestation_digest", "signing_key_id", "signature_b64"}}
+    for key, value in changes.items():
+        if key.startswith("cloud."):
+            record["cloud"][key[6:]] = value
+        else:
+            record[key] = value
+    record["attestation_digest"] = canonical_digest(record)
+    record.update(authority.sign(inactive_claim_attestation_signing_payload(record)))
+    return record
+
+
+def test_attestation_acceptance_requires_matching_challenge_pinned_signer_and_exact_active_row_bindings(tmp_path):
+    from heel.runner.control_client import (
+        RunnerInactiveClaimAttestationUntrusted, RunnerInactiveClaimRecoveryBlocked, VerifiedInactiveClaimAttestation,
+    )
+    from heel.runner.daemon import _serve_failure as daemon_serve_failure
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            from heel.runner.control_transport import BoundedControlResponse
+
+            transport = _LiveRunnerTransport(live)
+            rewrite, wire = {}, []
+
+            def post_bounded(path, *, headers=None, body=b"", max_response_bytes):
+                transport.sent.append((path, dict(headers or {}), body))
+                bounded = _loopback_bounded(live.server.server_address[1], path, headers=headers, body=body,
+                                            max_response_bytes=max_response_bytes)
+                wire.append(bounded.body)
+                change = rewrite.pop("next", None)
+                if change is None:
+                    return bounded
+                # FAULTY SERVER: the rewritten answer is serialized the way the server writes JSON.
+                status, response_headers, payload = change(bounded.status, bounded.headers, bounded.payload)
+                raw = b"" if payload is None else json.dumps(payload).encode()
+                return BoundedControlResponse(status, response_headers, raw, payload)
+
+            transport.post_bounded = post_bounded
+            runtime, control, challenges = _stuck_live_client(live, tmp_path / "runner", transport)
+            _cloud_stop(live)
+            before = _runtime_tables(runtime)
+            authority = live.cp.grant_authority
+
+            honest = control._attest_inactive_claim(live.run_id)
+
+            assert isinstance(honest, VerifiedInactiveClaimAttestation)
+            path, headers, body = transport.sent[-1]
+            assert path == f"/v1/workspaces/{live.workspace}/runners/runner/runs/{live.run_id}/inactive-claim-attestation"
+            assert set(headers) == {"Content-Type", "X-Heel-Runner-Id", "X-Heel-Runner-Key-Id",
+                                    "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Signature"}
+            request = json.loads(body)
+            assert canonical_bytes(request) == body
+            assert request["client_challenge_b64"] == base64.b64encode(challenges[-1]).decode()
+            evidence = honest.evidence
+            assert (evidence.request_method, evidence.request_path, evidence.request_body) == ("POST", path, body)
+            assert dict(evidence.request_headers) == {k: v for k, v in headers.items() if k != "Content-Type"}
+            assert evidence.request_timestamp_ms == int(headers["X-Heel-Runner-Timestamp-Ms"])
+            assert evidence.response_status == 200
+            # The archive holds the exact octets read off the wire, not a re-encoding.
+            assert evidence.response_body == wire[-1] and len(evidence.response_body) <= 8192
+            assert evidence.response_body != canonical_bytes(honest.attestation)
+            assert json.loads(evidence.response_body) == honest.attestation
+            _verify_attestation(live, honest.attestation, challenges[-1])
+            assert honest.expected_state_digest == runtime.load_active_run_controls()[0].state_digest
+            assert _runtime_tables(runtime) == before  # attestation alone changes nothing locally
+
+            untrusted = SigningAuthority.generate()
+            faulty = {
+                # name: (rewrite of the real 200 answer, expected exception)
+                "replayed-earlier-attestation": (lambda s, h, p: (s, h, copy.deepcopy(honest.attestation)), RunnerInactiveClaimRecoveryBlocked),
+                "other-challenge": (lambda s, h, p: (s, h, _resigned_attestation(p, authority, client_challenge_b64=base64.b64encode(b"x" * 32).decode())), RunnerInactiveClaimRecoveryBlocked),
+                "untrusted-signer": (lambda s, h, p: (s, h, _resigned_attestation(p, untrusted)), RunnerInactiveClaimAttestationUntrusted),
+                "unsigned-change": (lambda s, h, p: (s, h, {**p, "attested_at_ms": p["attested_at_ms"] + 1}), RunnerInactiveClaimAttestationUntrusted),
+                "started-at-reported": (lambda s, h, p: (s, h, _resigned_attestation(p, authority, **{"cloud.started_at_ms": 1})), RunnerInactiveClaimRecoveryBlocked),
+                "oversized": (lambda s, h, p: (s, h, {**p, "padding": "x" * 9000}), RunnerInactiveClaimRecoveryBlocked),
+                "status-only": (lambda s, h, p: (200, h, {"status": "terminal"}), RunnerInactiveClaimRecoveryBlocked),
+                "empty-200": (lambda s, h, p: (200, h, None), RunnerInactiveClaimRecoveryBlocked),
+            }
+            for field, value in (
+                ("run_id", "crun_" + "f" * 32), ("project_id", "prj_other"), ("grant_id", "grant_other"),
+                ("grant_digest", "f" * 64), ("approval_id", "approval_other"), ("approval_projection_digest", "e" * 64),
+                ("workspace_id", "ws_other"), ("runner_id", "runner_other"),
+            ):
+                faulty[f"binding-{field}"] = (
+                    lambda s, h, p, field=field, value=value: (s, h, _resigned_attestation(p, authority, **{field: value})),
+                    RunnerInactiveClaimRecoveryBlocked,
+                )
+            faulty["binding-runner-keys"] = (
+                lambda s, h, p: (s, h, _resigned_attestation(p, authority, bound_runner_key_id="key_other", authenticated_runner_key_id="key_other")),
+                RunnerInactiveClaimRecoveryBlocked,
+            )
+            for name, (change, expected) in faulty.items():
+                # RATE-WINDOW SEAM: every case is a real signed request; reset the 3/min audit window.
+                live.cp.store.conn.execute("DELETE FROM canary_inactive_claim_attestations")
+                live.cp.store.conn.commit()
+                rewrite["next"] = change
+                with pytest.raises(expected) as refused:
+                    control._attest_inactive_claim(live.run_id)
+                assert daemon_serve_failure(refused.value) == (
+                    ("rejected", "inactive_claim_attestation_untrusted")
+                    if expected is RunnerInactiveClaimAttestationUntrusted else ("failed", "recovery_required")
+                ), name
+                assert "next" not in rewrite, name
+                assert _runtime_tables(runtime) == before, name
+            # Every refused answer was a fresh signed request with its own fresh challenge.
+            sent = [json.loads(body)["client_challenge_b64"] for path, _h, body in transport.sent if path.endswith("/inactive-claim-attestation")]
+            assert len(sent) == len(set(sent)) == 1 + len(faulty)
+            # A verified attestation is bound to this client and its exact active-row snapshot.
+            other_runtime, other, _ = _stuck_live_client(live, tmp_path / "other", _LiveRunnerTransport(live))
+            with pytest.raises(ValueError):
+                other._retire_inactive_claim(honest, reservation_probe="absent", now_ms=int(time.time() * 1000))
+            assert other_runtime.load_retired_claim(live.run_id) is None
+            record = control._retire_inactive_claim(honest, reservation_probe="absent", now_ms=int(time.time() * 1000))
+            assert record.run_id == live.run_id and runtime.load_active_run_controls() == ()
+            assert live.run_id not in control._tracked_runs and live.run_id not in control._run_guards
+            assert not any(name.endswith(live.run_id) for name in control._chains)
+            with pytest.raises(ValueError):
+                control._attest_inactive_claim(live.run_id)  # no active claim is left to attest
+        finally:
+            live.close()
+
+
+class _LoopbackBoundedTransport:
+    """Plain loopback to the in-process control plane: ``post`` as the R2 harnesses do, and
+    ``post_bounded`` through the LOOPBACK DECODER ADAPTER (production ``_decode``)."""
+
+    def __init__(self, live):
+        self.live, self.sent, self.bodies = live, [], []
+
+    def post(self, path, *, headers=None, body=b""):
+        self.sent.append((path, dict(headers or {}), body))
+        status, raw, response_headers = self.live.send(path, body, dict(headers or {}))
+        return status, response_headers, (json.loads(raw) if raw else None)
+
+    def post_bounded(self, path, *, headers=None, body=b"", max_response_bytes):
+        self.sent.append((path, dict(headers or {}), body))
+        bounded = _loopback_bounded(self.live.server.server_address[1], path, headers=headers, body=body,
+                                    max_response_bytes=max_response_bytes)
+        self.bodies.append(bounded.body)
+        return bounded
+
+
+def test_attestation_archives_the_servers_wire_bytes_and_refuses_oversize_raw_before_parse(tmp_path, monkeypatch):
+    import heel.runner.control_client as control_module
+    import heel.saas.http_api as http_api
+    from heel.runner.control_transport import ControlTransportError
+    from heel.runner.daemon import _AttributedTransport
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            loopback = _LoopbackBoundedTransport(live)
+            runtime, control, _challenges = _stuck_live_client(live, tmp_path / "runner", _AttributedTransport(loopback))
+            _cloud_stop(live)
+            before = _runtime_tables(runtime)
+            parses = []
+            real_parse = control_module.parse_json
+            monkeypatch.setattr(control_module, "parse_json", lambda raw, **kw: (parses.append(len(raw)), real_parse(raw, **kw))[1])
+
+            # FAULTY SERVER: a validly signed attestation padded with JSON whitespace to over 9 000 bytes.
+            real_json = http_api._Handler._json
+
+            def padded(self, status, obj, headers=None):
+                if self.path.endswith("/inactive-claim-attestation") and status == 200:
+                    body = json.dumps(obj).encode() + b" " * 9_000
+                    self._write_json(status, body, dict(headers or {}))
+                    return
+                return real_json(self, status, obj, headers)
+
+            monkeypatch.setattr(http_api._Handler, "_json", padded)
+            with pytest.raises(ControlTransportError) as refused:
+                control._attest_inactive_claim(live.run_id)
+            assert refused.value.code == "response_too_large"
+            assert parses == [] and loopback.bodies == [] and _runtime_tables(runtime) == before
+            monkeypatch.setattr(http_api._Handler, "_json", real_json)
+
+            # Honest server: the archived body is exactly the octets read, i.e. the server's json.dumps bytes.
+            verified = control._attest_inactive_claim(live.run_id)
+            (wire,) = loopback.bodies
+            assert verified.evidence.response_body == wire == json.dumps(verified.attestation).encode()
+            assert wire != canonical_bytes(verified.attestation) and parses == [len(wire)]
+            record = control._retire_inactive_claim(verified, reservation_probe="absent", now_ms=int(time.time() * 1000))
+            archived = runtime.load_retired_claim(live.run_id, authenticate_components=True)
+            assert base64.b64decode(archived.attestation["response"]["body_b64"]) == wire
+            assert record.run_id == live.run_id
+            _verify_attestation(live, json.loads(wire), base64.b64decode(json.loads(wire)["client_challenge_b64"]))
         finally:
             live.close()

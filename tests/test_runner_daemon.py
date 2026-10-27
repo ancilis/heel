@@ -4579,3 +4579,227 @@ def test_edge_harness_default_route_refuses_a_malformed_bearer_like_the_worker(t
     forwarded = len(harness.forwarded)
     harness.request("GET", path, headers={"Authorization": "Bearer heel_sk_" + "a" * 32})
     assert len(harness.forwarded) == forwarded + 1
+
+
+# ---------------------------------------------------------------------------
+# R2 raw attestation transport (R2-RAW-ATTESTATION-TRANSPORT-DESIGN rev 2 §2/§6, tests 1-4).
+# ScriptedTLSServer answers are labelled FAULT FIXTURES where they are not a server's own bytes.
+
+_BOUNDED_PATH = "/v1/runner-pairings/exchange"
+
+
+def _bounded(transport, limit=8_192):
+    return transport.post_bounded(
+        _BOUNDED_PATH, headers={"Content-Type": "application/json"}, body=b"{}", max_response_bytes=limit,
+    )
+
+
+def _raw(status_line, headers, body):
+    return (status_line + "\r\n" + "".join(f"{name}: {value}\r\n" for name, value in headers)
+            + "\r\n").encode("latin-1") + body
+
+
+def _chunked(body, size):
+    return b"".join(b"%x\r\n" % len(body[i:i + size]) + body[i:i + size] + b"\r\n" for i in range(0, len(body), size))
+
+
+class _TransportSpies:
+    """Count strict-JSON parses and record every ``read1(n)`` request and its returned length."""
+
+    def __init__(self, monkeypatch):
+        self.parses = 0
+        self.reads: list[tuple[int, int]] = []
+        real_parse, real_read1 = control_transport._strict_json, http.client.HTTPResponse.read1
+        spies = self
+
+        def parse(raw):
+            spies.parses += 1
+            return real_parse(raw)
+
+        def read1(response, n=-1):
+            chunk = real_read1(response, n)
+            spies.reads.append((n, len(chunk)))
+            return chunk
+
+        monkeypatch.setattr(control_transport, "_strict_json", parse)
+        monkeypatch.setattr(http.client.HTTPResponse, "read1", read1)
+
+    def returned(self):
+        return sum(length for _n, length in self.reads)
+
+
+def test_transport_post_bounded_returns_verbatim_body_and_the_same_headers_as_post(ca):
+    from heel.runner.control_transport import BoundedControlResponse
+
+    nonce = base64.b64encode(b"n" * 32).decode()
+    wire = b'{"ok": true, "n": [1, 2]}'  # generic transport fixture; the Boolean keeps post's {"ok": True} shape
+    response = raw_json_response(200, wire, extra=(("x-heel-runner-next-nonce", nonce), ("X-Other", "1")))
+    with scripted(ca, lambda _path: response) as server:
+        transport = HTTPSControlTransport(server.origin, ca_bundle=ca.ca_path)
+        bounded = _bounded(transport)
+        assert type(bounded) is BoundedControlResponse
+        assert bounded.body == wire and bounded.body != json.dumps(bounded.payload, separators=(",", ":")).encode()
+        assert bounded.payload == {"ok": True, "n": [1, 2]}
+        assert bounded.status == 200 and transport.last_status == 200
+        assert (bounded.status, bounded.headers, bounded.payload) == _post(transport)
+        assert bounded.headers == {"X-Heel-Runner-Next-Nonce": nonce}
+        assert [request[2] for request in server.requests] == [b"{}", b"{}"]
+    with scripted(ca, lambda _path: b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n") as server:
+        bounded = _bounded(HTTPSControlTransport(server.origin, ca_bundle=ca.ca_path))
+        assert (bounded.status, bounded.headers, bounded.body, bounded.payload) == (204, {}, b"", None)
+    with scripted(ca, lambda _path: raw_json_response(409, b'{"code": "x_y"}')) as server:
+        transport = HTTPSControlTransport(server.origin, ca_bundle=ca.ca_path)
+        assert _bounded(transport).body == b'{"code": "x_y"}' and transport.last_error_code == "x_y"
+
+
+_PADDED_9000 = b'{"pad": "x"}' + b" " * (9_000 - 12)
+_CHUNKED_HEAD = (("Content-Type", "application/json"), ("Transfer-Encoding", "chunked"), ("Connection", "close"))
+
+
+@pytest.mark.parametrize("case", [
+    "a-declared-length-over-cap", "b-chunked-short-reads-over-cap", "c-exact-cap", "c-cap-plus-one",
+    "d-short-length-complete-prefix", "d-short-length-incomplete-prefix",
+    "e-long-length-complete-json", "e-long-length-incomplete-json", "h-chunked-truncated",
+    "f-invalid-utf8", "f-duplicate-key", "f-nan", "g-indented",
+])
+def test_transport_post_bounded_rejects_oversize_raw_before_parse_by_declared_length_and_by_stream(
+    ca, monkeypatch, case,
+):
+    """Raw octets are capped before the strict parser; Content-Length disagreements keep post's probed behavior."""
+    ok = b'{"a": 1}'
+    exact = b'{"a": "' + b"x" * (8_192 - 9) + b'"}'
+    expected_body = None
+    if case == "a-declared-length-over-cap":
+        raw, code = raw_json_response(200, _PADDED_9000), "response_too_large"
+    elif case == "b-chunked-short-reads-over-cap":
+        body = b'{"a": 1}' + b" " * (64 * 1024)
+        raw, code = _raw("HTTP/1.1 200 OK", _CHUNKED_HEAD, _chunked(body, 16) + b"0\r\n\r\n"), "response_too_large"
+    elif case == "c-exact-cap":
+        assert len(exact) == 8_192
+        raw, code, expected_body = raw_json_response(200, exact), None, exact
+    elif case == "c-cap-plus-one":
+        raw, code = raw_json_response(200, exact + b" "), "response_too_large"
+    elif case.startswith("d-"):
+        sent, declared = (b'{"a": 1}   {"b":2}', 8) if "complete" in case and "incomplete" not in case else (b'{"a":1}', 5)
+        raw = _raw("HTTP/1.1 200 OK", (("Content-Type", "application/json"), ("Content-Length", str(declared)),
+                                         ("Connection", "close")), sent)
+        code, expected_body = (None, ok) if "incomplete" not in case else ("malformed_response", None)
+    elif case.startswith("e-"):
+        sent = ok if "incomplete" not in case else b'{"a": '
+        raw = _raw("HTTP/1.1 200 OK", (("Content-Type", "application/json"), ("Content-Length", "100"),
+                                         ("Connection", "close")), sent)
+        code, expected_body = (None, ok) if "incomplete" not in case else ("malformed_response", None)
+    elif case == "h-chunked-truncated":
+        raw, code = _raw("HTTP/1.1 200 OK", _CHUNKED_HEAD, _chunked(ok, 4)), "malformed_response"
+    elif case.startswith("f-"):
+        raw = raw_json_response(200, {"f-invalid-utf8": b'{"a": "\xff"}', "f-duplicate-key": b'{"a":1,"a":2}',
+                                      "f-nan": b'{"a": NaN}'}[case])
+        code = "malformed_response"
+    else:
+        indented = json.dumps({"a": [1, 2], "b": "c"}, indent=2).encode()
+        raw, code, expected_body = raw_json_response(200, indented), None, indented
+
+    spies = _TransportSpies(monkeypatch)
+    with scripted(ca, lambda _path: raw) as server:
+        transport = HTTPSControlTransport(server.origin, ca_bundle=ca.ca_path)
+        if code is None:
+            bounded = _bounded(transport)
+            assert bounded.body == expected_body and bounded.payload == json.loads(expected_body)
+        else:
+            with pytest.raises(ControlTransportError) as refused:
+                _bounded(transport)
+            assert refused.value.code == code
+        bounded_spies = (spies.parses, list(spies.reads))
+        if case.startswith(("d-", "e-")):
+            # Old-path compatibility pin: post decides both sub-cases exactly the same way.
+            if code is None:
+                assert _post(transport)[2] == json.loads(expected_body)
+            else:
+                with pytest.raises(ControlTransportError) as old:
+                    _post(transport)
+                assert old.value.code == code
+    parses, reads = bounded_spies
+    if case == "a-declared-length-over-cap":
+        assert parses == 0 and reads == []  # refused on the declared length, nothing read
+    if case == "b-chunked-short-reads-over-cap":
+        assert parses == 0
+        returned = 0
+        for requested, length in reads:
+            assert requested <= 8_193 - returned
+            returned += length
+        assert returned == 8_193 and max(length for _n, length in reads) <= 16  # short reads exercised
+        print(f"\n[2b] read1 calls {len(reads)}, returned {returned}, requested sum {sum(n for n, _ in reads)}")
+    if case == "c-cap-plus-one":
+        assert parses == 0
+    if case.startswith("f-"):
+        assert parses == 1
+
+
+def test_transport_post_bounded_cannot_widen_the_budget_or_bypass_request_redirect_or_tls_rules(ca, tmp_path):
+    from tests.support.edge_tls_harness import free_loopback_port
+
+    response = raw_json_response(200, b'{"ok": true}')
+    with scripted(ca, lambda _path: response) as server:
+        transport = HTTPSControlTransport(server.origin, ca_bundle=ca.ca_path)
+        for limit in (0, -1, True, 1.5, MAX_CONTROL_RESPONSE_BYTES + 1, "8192", None):
+            with pytest.raises(ControlTransportError) as refused:
+                _bounded(transport, limit)
+            assert refused.value.code == "invalid_request", limit
+        with pytest.raises(TypeError):
+            transport.post_bounded(_BOUNDED_PATH, headers={}, body=b"{}")  # the limit is required
+        for path in ("/v1/x?y=1", "https://evil.example/v1/x", "/v1/../admin"):
+            with pytest.raises(ControlTransportError) as refused:
+                transport.post_bounded(path, headers={}, body=b"{}", max_response_bytes=8_192)
+            assert refused.value.code == "invalid_request"
+        for headers in ({"Cookie": "a=b"}, {"Authorization": "x"}, {"X-Test": "a\r\nb"}):
+            with pytest.raises(ControlTransportError) as refused:
+                transport.post_bounded(_BOUNDED_PATH, headers=headers, body=b"{}", max_response_bytes=8_192)
+            assert refused.value.code == "invalid_request"
+        assert server.requests == []
+        assert _bounded(transport, MAX_CONTROL_RESPONSE_BYTES).payload == {"ok": True}
+        other = EphemeralCA(tmp_path / "other-ca")
+        with pytest.raises(ControlTransportError) as foreign:
+            _bounded(HTTPSControlTransport(server.origin, ca_bundle=other.ca_path))
+        assert foreign.value.code == "tls_trust_failed"
+    redirect = b"HTTP/1.1 302 Found\r\nLocation: https://evil.example/v1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    with scripted(ca, lambda _path: redirect) as server:
+        with pytest.raises(ControlTransportError) as refused:
+            _bounded(HTTPSControlTransport(server.origin, ca_bundle=ca.ca_path))
+        assert refused.value.code == "redirect_refused" and len(server.requests) == 1
+    with pytest.raises(ControlTransportError):
+        HTTPSControlTransport(f"http://localhost:{free_loopback_port()}")  # plain HTTP is never an origin
+    slow = raw_json_response(200, b'{"slow":"' + b"x" * 64 + b'"}')
+    with scripted(ca, lambda _path: slow, delay_seconds=0.05) as server:
+        transport = HTTPSControlTransport(server.origin, ca_bundle=ca.ca_path, timeout_seconds=0.5)
+        started = time.monotonic()
+        with pytest.raises(ControlTransportError) as refused:
+            _bounded(transport)
+        assert refused.value.code == "timeout" and time.monotonic() - started < 3
+
+
+def test_attributed_transport_post_bounded_classifies_exactly_like_post(ca):
+    answers = {
+        "503": raw_json_response(503, b'{"code": "upstream"}', reason="Service Unavailable"),
+        "403": raw_json_response(403, b'{"code": "runner_protocol_upgrade_required"}', reason="Forbidden"),
+        "401": raw_json_response(401, b'{"code": "invalid_runner_auth"}', reason="Unauthorized"),
+        "200": raw_json_response(200, b'{"a":  1}'),
+    }
+    for status, raw in answers.items():
+        with scripted(ca, lambda _path, raw=raw: raw) as server:
+            attributed = daemon_module._AttributedTransport(HTTPSControlTransport(server.origin, ca_bundle=ca.ca_path))
+            outcomes = []
+            for call in (lambda: attributed.post(_BOUNDED_PATH, headers={}, body=b"{}"), lambda: _bounded(attributed)):
+                try:
+                    outcomes.append(call())
+                except daemon_module._ControlCallRejected as rejected:
+                    outcomes.append(("rejected", rejected.code))
+            if status in {"503", "403"}:
+                expected = ("rejected", "upstream_unavailable" if status == "503" else "protocol_upgrade_required")
+                assert outcomes == [expected, expected]
+            else:
+                plain, bounded = outcomes
+                assert (bounded.status, bounded.headers, bounded.payload) == plain
+                assert bounded.body == raw.split(b"\r\n\r\n", 1)[1]
+    assert set(vars(daemon_module._AttributedTransport)) - {"__module__", "__doc__", "__dict__", "__weakref__", "__qualname__", "__firstlineno__", "__static_attributes__"} == {
+        "__init__", "post", "post_bounded", "_classify",
+    }

@@ -1796,8 +1796,9 @@ def test_new_job_block_is_additive_and_existing_blocks_match_recorded_hashes():
     lease = proof._job_block(text, "host-lease-feasibility")
     authority_job = proof._job_block(text, "host-authority-proof")
     lease_key_job = proof._job_block(text, "host-lease-key-shape")  # H2K1's job, bound by its recorded hash
+    h2_policy_job = proof._job_block(text, "host-h2-policy-proof")  # H2-2's job, bound by its recorded hash
     head = text[:proof.BASELINE_WORKFLOW_BYTES]
-    assert text == head + "\n" + lease + "\n" + authority_job + "\n" + lease_key_job
+    assert text == head + "\n" + lease + "\n" + authority_job + "\n" + lease_key_job + "\n" + h2_policy_job
     start = len(head) + 1 + len(lease) + 1
     assert text[start:start + len(authority_job)] == authority_job
 
@@ -1858,6 +1859,22 @@ def test_new_job_block_is_additive_and_existing_blocks_match_recorded_hashes():
         "lease_key_run_changed": text.replace(lease_key_job, lease_key_job.replace("host_lease_key_shape.py",
                                                                                    "host_lease_key_shape.py -k x")),
         "lease_key_checkout_tag": text.replace(lease_key_job, lease_key_job.replace(proof.CHECKOUT, "actions/checkout@v4")),
+        # H2-2: the six-job composition is exact; the h2-policy job is fixed in content and position.
+        "five_jobs_without_h2_policy": head + "\n" + lease + "\n" + authority_job + "\n" + lease_key_job,
+        "duplicate_h2_policy_job": text + "\n" + h2_policy_job,
+        "h2_policy_before_lease_key": (head + "\n" + lease + "\n" + authority_job + "\n" + h2_policy_job + "\n"
+                                       + lease_key_job),
+        "comment_before_h2_policy": text.replace("\n  host-h2-policy-proof:", "\n# note\n  host-h2-policy-proof:"),
+        "h2_policy_branch": text.replace(h2_policy_job, h2_policy_job.replace(
+            "refs/heads/codex/self-serve-host-h2-policy-proof", "refs/heads/main")),
+        "h2_policy_contents_write": text.replace(h2_policy_job, h2_policy_job.replace("contents: read", "contents: write")),
+        "h2_policy_run_changed": text.replace(h2_policy_job, h2_policy_job.replace("host_h2_policy_proof.py",
+                                                                                   "host_h2_policy_proof.py -k x")),
+        "h2_policy_cache_step": text.replace(h2_policy_job, h2_policy_job.replace(
+            "      - name: Upload allowlisted safe evidence\n",
+            "      - uses: actions/cache@" + "2" * 40 + "\n      - name: Upload allowlisted safe evidence\n")),
+        "h2_policy_dispatch_only_removed": text.replace(h2_policy_job, h2_policy_job.replace(
+            "github.event_name == 'workflow_dispatch' && ", "")),
     }
     for name, variant in mutations.items():
         assert variant != text, name

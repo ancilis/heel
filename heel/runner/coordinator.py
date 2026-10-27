@@ -25,11 +25,12 @@ from heel.runner.execution import (
     ExecutionGate,
     UnactivatedExecution,
     ValidatedExecutionBundle,
+    _gate_failure,
     validate_execution_bundle,
 )
 from heel.runner.identity import RunnerIdentity, SecureSigner
 from heel.runner.service import ClaimLease
-from heel.runner.store import RunnerContext, RunnerStore, RunnerStoreError
+from heel.runner.store import RunReservationProbe, RunnerContext, RunnerStore, RunnerStoreError
 
 
 _MAX_AUTHENTICATED_GATE_AGE_SECONDS = 0.5
@@ -122,6 +123,9 @@ class RunnerCoordinator:
         self._pending_result_replay_verifier = store.pending_result_replay_verifier(control.runtime)
         try:
             self._recover_terminal_runtime_state()
+            # A claim the Cloud already stopped before it ever activated can never hydrate;
+            # retire it first, from a Cloud-signed attestation, or keep it and fail closed.
+            self._reconcile_inactive_claims()
             self._recover_active_runtime_state()
             self._stage_unstaged_terminal_results()
             self._replay_pending_calls()
@@ -186,6 +190,56 @@ class RunnerCoordinator:
                     self._bindings.pop(run_id, None)
                     self._heartbeat_guards.pop(run_id, None)
             self._terminal_runs.intersection_update(active_ids)
+
+    def _inactive_claim_eligible(self, active: object, pending: tuple[object, ...], now_ms: int) -> bool:
+        """POSTRESET §7.1 L2-L5 for one loaded (L1-valid) active row; L6 is construction order.
+
+        L2 is exactly the hydration failure C exists for: a failed persisted gate or an expired
+        grant.  Every other row keeps its existing restart path.  The coordinator is built before
+        any executor exists and ``serve`` holds the exclusive instance lock, so no reservation can
+        appear between the Store probe and the retirement.
+        """
+        try:
+            gate = ExecutionGate(**dict(active.gate))
+        except (TypeError, ValueError):
+            return False
+        if (
+            _gate_failure(gate, active.grant["kill_switch_generation"]) is None
+            and now_ms < active.grant["expires_at_ms"]
+        ):
+            return False
+        if self.control.runtime.load_terminal_state(active.run_id) is not None:
+            return False
+        if any(
+            item.run_id == active.run_id
+            and (item.chain_operation != "heartbeat" or item.request_operation != "heartbeat")
+            for item in pending
+        ):
+            return False
+        return self.store.probe_run_reservation(active.run_id) is RunReservationProbe.ABSENT
+
+    def _reconcile_inactive_claims(self) -> None:
+        """Retire every eligible pre-activation claim before any active authority is hydrated.
+
+        Only a pinned grant-authority attestation of this exact claim retires it, through the control
+        client's per-run guard.  Any refusal, unusable answer or transport failure is raised with the
+        sealed group intact; the next construction asks again with a new challenge.
+        """
+        pending = self.control.runtime.load_pending_calls(limit=74)
+        now_ms = self._now_ms()
+        for active in self.control.runtime.load_active_run_controls(limit=64):
+            if not self._inactive_claim_eligible(active, pending, now_ms):
+                continue
+            verified = self.control._attest_inactive_claim(active.run_id)
+            self.control._retire_inactive_claim(
+                verified, reservation_probe=RunReservationProbe.ABSENT.value, now_ms=self._now_ms(),
+            )
+            with self._lock:
+                if (
+                    active.run_id in self._gates or active.run_id in self._gate_receipts
+                    or active.run_id in self._bindings
+                ):
+                    raise RunnerStoreError("runtime retired claim authority is invalid")
 
     def _recover_active_runtime_state(self) -> None:
         """Rebuild live coordinator authority from sealed runtime controls.

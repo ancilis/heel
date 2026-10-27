@@ -104,7 +104,11 @@ LEASE_BLOCK_BYTES = 1649
 # own module, outside this closure, constrains every line of it).
 LEASE_KEY_JOB_BYTES = 1650
 LEASE_KEY_JOB_SHA256 = "d03011b2222f34fb18cf60d2c65ece7f7815e435a90b9ed4b8d51d605acf1888"
-EXPECTED_JOBS = ["analyze", "host-ingress-proof", "host-lease-feasibility", "host-authority-proof", "host-lease-key-shape"]
+# H2-2 appends one job after H2K1's, bound the same way (tests/linux/test_host_h2_policy.py constrains it).
+H2_POLICY_JOB_BYTES = 1652
+H2_POLICY_JOB_SHA256 = "6f67a0bd0f9396339950ac14373fc059c70f3436ad6b819d88ee74d96886fa36"
+EXPECTED_JOBS = ["analyze", "host-ingress-proof", "host-lease-feasibility", "host-authority-proof", "host-lease-key-shape",
+                 "host-h2-policy-proof"]
 AUTHORITY_GATE = ("if: github.event_name == 'workflow_dispatch' && "
                   "github.ref == 'refs/heads/codex/self-serve-host-authority-proof'")
 CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
@@ -200,7 +204,8 @@ def authority_job_violations(job: str, allowed_uses: set[str]) -> list[str]:
 
 def workflow_violations(text: str) -> list[str]:
     """Empty iff codeql.yml is exactly the recorded base, then the unchanged lease block, then the
-    one fully constrained authority job, then the recorded H2K1 lease-key job, with no other byte."""
+    one fully constrained authority job, then the recorded H2K1 lease-key job and the recorded H2-2
+    h2-policy job, with no other byte."""
     found = []
     data = text.encode("utf-8")
     if not data.isascii() or hashlib.sha256(data[:BASELINE_WORKFLOW_BYTES]).hexdigest() != BASELINE_WORKFLOW_SHA256:
@@ -218,8 +223,11 @@ def workflow_violations(text: str) -> list[str]:
     lease_key = blocks["host-lease-key-shape"].encode()
     if len(lease_key) != LEASE_KEY_JOB_BYTES or hashlib.sha256(lease_key).hexdigest() != LEASE_KEY_JOB_SHA256:
         found.append("block_host-lease-key-shape")
+    h2_policy = blocks["host-h2-policy-proof"].encode()
+    if len(h2_policy) != H2_POLICY_JOB_BYTES or hashlib.sha256(h2_policy).hexdigest() != H2_POLICY_JOB_SHA256:
+        found.append("block_host-h2-policy-proof")
     if text != (text[:BASELINE_WORKFLOW_BYTES] + "\n" + blocks["host-lease-feasibility"] + "\n" + blocks["host-authority-proof"]
-                + "\n" + blocks["host-lease-key-shape"]):
+                + "\n" + blocks["host-lease-key-shape"] + "\n" + blocks["host-h2-policy-proof"]):
         found.append("composition")
     if ("\npermissions: {}\n" not in text or "pull_request_target" in text or "secrets." in text or "inputs:" in text
             or "workflow_dispatch: {}" not in text):
@@ -449,10 +457,11 @@ def test_static_workflow_keeps_existing_blocks_and_fully_constrains_the_authorit
     assert workflow_violations(text + "# trailing\n") != []
     assert workflow_violations(text.replace("\n  host-authority-proof:", "\n# between\n  host-authority-proof:")) != []
     lease_key = _job_block(text, "host-lease-key-shape")
-    four = text[:-len(lease_key) - 1]
-    assert text == four + "\n" + lease_key and "job_names" in workflow_violations(four)
+    h2_policy = _job_block(text, "host-h2-policy-proof")
+    four = text[:-len(lease_key) - len(h2_policy) - 2]
+    assert text == four + "\n" + lease_key + "\n" + h2_policy and "job_names" in workflow_violations(four)
     assert "block_host-lease-key-shape" in workflow_violations(four + "\n" + lease_key.replace("retention-days: 3",
-                                                                                              "retention-days: 4"))
+                                                                                              "retention-days: 4") + "\n" + h2_policy)
     assert workflow_violations(text + "\n" + lease_key) != [] and workflow_violations(text + "\n  extra-job:\n    x: y\n") != []
 
 

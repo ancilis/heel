@@ -2559,3 +2559,1003 @@ def test_coordinator_startup_replays_a_representative_findings_upload_over_3072_
     assert recovered._bindings == {}
     with capsys.disabled():
         print(f"\n[T-P7 {shape}] findings upload body {len(sealed_body)} B replayed once after restart")
+
+
+# ---------------------------------------------------------------------------
+# R2 inactive-claim recovery (POSTRESET §5-§11, LOAD-GUARD T-W3, PRUNING C3/C4) over the REAL
+# in-process control plane: real HTTP server, ControlPlane, CanaryRunService approval and grant
+# signing, RunnerAuthStore PoP, and the real RunnerRuntimeState, RunnerStore, RunnerControlClient
+# and RunnerCoordinator.  Labelled seams only:
+#   PAIRING SEED   the runner identity, key and claim-chain cursor are inserted exactly as pairing
+#                  activation stores them (no pairing ceremony runs here);
+#   CLOCK SEAM     the runner's local clock (coordinator, executor, Store) may run ahead of the
+#                  server; PoP timestamps always use the real wall clock; the monotonic gate clock
+#                  is a constant so an execution gate is fresh;
+#   FAULTY SERVER  a named test rewrites one real answer (status, headers, body) after the real
+#                  server produced it;
+#   TARGET SEAM    honest execution talks to the stop-test ScriptedTransport, never the network.
+
+import http.client
+import json
+import socket
+import sqlite3
+import time
+from contextlib import closing
+from pathlib import Path
+
+import heel.runner.daemon as daemon_module
+from heel.canary_contracts import (
+    INACTIVE_CLAIM_ATTESTATION_SCHEMA, inactive_claim_attestation_signing_payload,
+    validate_inactive_claim_attestation,
+)
+from heel.crypto import verify_envelope
+import heel.runner.control_client as control_module
+from heel.runner.control_client import RunnerAuthenticationRejected, RunnerChainRecoveryDeferred
+from heel.runner.control_transport import ControlTransportError
+from heel.runner.coordinator import _signed_projection
+from tests.test_runner_stop import resign_grant
+
+_R2_GUARDED_TABLES = (
+    "canary_runs", "canary_execution_grants", "canary_approval_projections", "canary_operational_receipts",
+    "usage_ledger", "canary_runner_nonce_chains", "canary_runner_chain_cursors", "canary_runner_request_ledger",
+    "canary_run_events", "canary_audit_records", "canary_runner_keys", "canary_runner_resync_challenges",
+)
+_R2_RUNTIME_TABLES = (
+    "active_runs", "control_chains", "pending_calls", "terminal_disclosures", "chain_recovery", "retired_claims",
+)
+
+
+class _R2Http:
+    """Real loopback HTTP to the in-process control plane; it records every exchange it carries.
+
+    ``refuse`` fails one operation before it leaves (``ControlTransportError('connection_failed')``,
+    as the production transport reports it); ``lose`` drops one answer after the server committed
+    it; ``rewrite`` is the FAULTY SERVER hook and is set only by tests that say so.
+    """
+
+    def __init__(self, port):
+        self.port = port
+        self.sent: list[tuple[str, dict, bytes]] = []
+        self.answers: list[tuple[str, int, bytes]] = []
+        self.refuse: list[str] = []
+        self.lose: list[str] = []
+        self.rewrite: dict[str, object] = {}
+
+    @staticmethod
+    def operation(path):
+        return path.rsplit("/", 1)[1]
+
+    def post(self, path, *, headers=None, body=b""):
+        operation = self.operation(path)
+        self.sent.append((path, dict(headers or {}), body))
+        if operation in self.refuse:
+            self.refuse.remove(operation)
+            raise ControlTransportError("connection_failed")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("POST", path, body, dict(headers or {}))
+            response = conn.getresponse()
+            raw = response.read()
+            selected = {
+                key: value for key, value in response.getheaders()
+                if key in {"X-Heel-Runner-Next-Nonce", "Retry-After"}
+            }
+        finally:
+            conn.close()
+        self.answers.append((operation, response.status, raw))
+        if operation in self.lose:
+            self.lose.remove(operation)
+            raise ControlTransportError("timeout")
+        answer = (response.status, selected, json.loads(raw) if raw else None)
+        rewrite = self.rewrite.pop(operation, None)
+        return answer if rewrite is None else rewrite(*answer)
+
+    def post_bounded(self, path, *, headers=None, body=b"", max_response_bytes):
+        """The bounded read through the LOOPBACK DECODER ADAPTER (production ``_decode``): genuine wire bytes."""
+        from tests.test_runner_control_http import _loopback_bounded
+
+        operation = self.operation(path)
+        assert operation not in self.rewrite  # no FAULTY SERVER rewrite of a bounded read here
+        self.sent.append((path, dict(headers or {}), body))
+        if operation in self.refuse:
+            self.refuse.remove(operation)
+            raise ControlTransportError("connection_failed")
+        bounded = _loopback_bounded(self.port, path, headers=headers, body=body, max_response_bytes=max_response_bytes)
+        self.answers.append((operation, bounded.status, bounded.body))
+        if operation in self.lose:
+            self.lose.remove(operation)
+            raise ControlTransportError("timeout")
+        return bounded
+
+    def operations(self, since=0):
+        return [self.operation(path) for path, _headers, _body in self.sent[since:]]
+
+
+class _R2ProductionTransport:
+    """The production pair: ``_AttributedTransport(HTTPSControlTransport)`` to the TLS edge harness.
+
+    It only records what it carried (``answers`` hold the bounded reads' exact bodies)."""
+
+    def __init__(self, edge):
+        from heel.runner.control_transport import HTTPSControlTransport
+
+        self.transport = daemon_module._AttributedTransport(HTTPSControlTransport(edge.origin, ca_bundle=edge.ca.ca_path))
+        self.sent, self.answers = [], []
+
+    def post(self, path, *, headers=None, body=b""):
+        self.sent.append((path, dict(headers or {}), body))
+        return self.transport.post(path, headers=headers, body=body)
+
+    def post_bounded(self, path, *, headers=None, body=b"", max_response_bytes):
+        self.sent.append((path, dict(headers or {}), body))
+        bounded = self.transport.post_bounded(path, headers=headers, body=body, max_response_bytes=max_response_bytes)
+        self.answers.append((_R2Http.operation(path), bounded.status, bounded.body))
+        return bounded
+
+    def operations(self, since=0):
+        return [_R2Http.operation(path) for path, _headers, _body in self.sent[since:]]
+
+
+class _R2Cloud:
+    """One locally compiled approval pair, approved and granted by the real control plane.
+
+    ``edge=True`` serves the same control plane behind the Python TLS edge harness and talks to it
+    with the production transport pair; the workspace ID then has the edge's ``ws_`` + 16 hex shape.
+    """
+
+    def __init__(self, tmp_path, *, edge=False):
+        import dataclasses
+
+        from heel.saas.canary_runs import CanaryRunService
+        from heel.saas.catalog import CATALOG_VERSION
+        from heel.saas.runner_auth import NONCE_TTL
+        from heel.saas.server import ControlPlane, serve
+        from tests.test_runner_compiler import CanaryCompiler, add_roles, bound_store, context, map_scenarios
+        from tests.test_runner_control_http import _enable_executable_protocol
+
+        self.tmp = tmp_path
+        self.edge = None
+        if edge:
+            from tests.support.edge_tls_harness import EdgeTLSHarness
+
+            self.store, self.identity, self.signer = bound_store(
+                tmp_path, selected_context=dataclasses.replace(context(), workspace_id="ws_0123456789abcdef"),
+            )
+            map_scenarios(self.store)
+            add_roles(self.store)
+            compiled = CanaryCompiler(
+                store=self.store, identity=self.identity, signer=self.signer, now_ms=1_000,
+            ).compile(["anonymous_authenticated_read", "object_ownership_read"])
+            self.manifest, self.projection = compiled.manifest, compiled.projection
+            authority = SigningAuthority.generate()
+            self.edge = EdgeTLSHarness(
+                tmp_path / "edge", grant_authority=authority,
+                grant_trusted_keys={authority.key_id: authority.public_key},
+            )
+            self.cp = cp = self.edge.control_plane
+            self.server = None
+            self.http = _R2ProductionTransport(self.edge)
+        else:
+            self.store, self.identity, self.signer, self.manifest, self.projection = compiled_pair(tmp_path)
+            self.cp = cp = ControlPlane(
+                str(tmp_path / "control.sqlite"), runner_auth_pepper=b"r" * 32,
+                grant_authority=SigningAuthority.generate(),
+            )
+            self.server = serve(cp)
+            threading.Thread(target=self.server.serve_forever, daemon=True).start()
+            self.http = _R2Http(self.server.server_address[1])
+        self.home = self.store.root
+        self.runtime_path = self.home / "runner" / daemon_module._RUNTIME_FILENAME
+        conn, now = cp.store.conn, time.time()
+        self.workspace, self.runner_id = self.manifest["workspace_id"], self.identity.runner_id
+        self.project = self.manifest["project_id"]
+        conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org_canary", "org", now))
+        conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)",
+                     (self.workspace, "org_canary", "Executor", "free", CATALOG_VERSION, now))
+        conn.execute("INSERT INTO users VALUES(?,?,?)", ("user_owner", "owner@example.test", now))
+        conn.execute("INSERT INTO memberships VALUES(?,?,?,?)", (self.workspace, "user_owner", "owner", now))
+        conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", (self.workspace, self.project, "Executor", "user_owner", now))
+        environment = self.manifest["environment"]
+        conn.execute(
+            "INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,"
+            "status,created_at,attestation_text,attestation_version,attestation_acknowledgement,attested_by,"
+            "attested_at,proof_method,proof_version,normalization_version,challenge_generation,last_check_at,"
+            "verified_at,proof_expires_at,verification_record_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (environment["environment_id"], self.workspace, self.project, environment["origin"],
+             environment["environment_class"], "verified", now,
+             "ownership verified; environment classification supplied by you", "v1", "accepted", "user_owner",
+             now, "https-file", "https-file.v1", "exact-origin.v1", 1, now, now, now + 86_400,
+             environment["verification_record_digest"]),
+        )
+        # PAIRING SEED: the rows and claim cursor pairing activation stores (runner_auth.py activate).
+        public_key = base64.b64encode(self.signer.public_key).decode("ascii")
+        conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", (self.runner_id, self.workspace, "Executor", "active", now))
+        conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)",
+                     (self.identity.key_id, self.workspace, self.runner_id, public_key, "active", now))
+        auth = cp.runner_auth
+        auth._save_identity(auth._identity_record(
+            workspace_id=self.workspace, runner_id=self.runner_id, public_key=public_key,
+            fingerprint=self.identity.fingerprint, key_id=self.identity.key_id,
+            runner_version=self.identity.runner_version, adapters_json=json.dumps(self.identity.adapter_versions),
+            paired_by="user_owner", paired_at=now, heartbeat_at=now,
+        ), instant=now)
+        _enable_executable_protocol(conn, self.workspace, self.runner_id)
+        self.claim_nonce = base64.b64encode(os.urandom(32)).decode("ascii")
+        conn.execute("INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)",
+                     (self.workspace, self.runner_id, "claim", auth._hash("nonce", self.claim_nonce), 1, now + NONCE_TTL))
+        conn.execute("INSERT INTO canary_runner_chain_cursors VALUES(?,?,?,?,?,?)",
+                     (self.workspace, self.runner_id, "claim", 1, 0, now))
+        conn.commit()
+        self.runs = CanaryRunService(conn, signing=cp.grant_authority, runner_auth=auth, initialize_schema=False)
+        self.trusted = {cp.grant_authority.key_id: cp.grant_authority.public_key}
+        self.offset_ms = 0
+        self.runtime = None
+        self.client = None
+        self.coordinator = None
+        self.challenges: list[bytes] = []
+
+    # -- runner side ---------------------------------------------------------------------------
+    def now_ms(self):
+        """CLOCK SEAM: the runner's local clock; PoP timestamps use the real clock below."""
+        return int(time.time() * 1000) + self.offset_ms
+
+    def _random(self, size):
+        value = os.urandom(size)
+        self.challenges.append(value)
+        return value
+
+    def start(self, *, transport=None):
+        """One runner process start: open the runtime by path, then the client, then the coordinator."""
+        if self.runtime is not None:
+            self.runtime.close()
+        self.runtime = RunnerRuntimeState(self.runtime_path, self.identity, self.signer)
+        if self.runtime.load_chain("claim", None) is None:
+            self.runtime.install_chain(
+                operation="claim", run_id=None, next_nonce_b64=self.claim_nonce,
+                next_sequence=1, generation=0, now_ms=self.now_ms(),
+            )
+        self.store = RunnerStore(self.home)
+        self.client = RunnerControlClient(
+            origin="http://127.0.0.1", workspace_id=self.workspace, runner_id=self.runner_id,
+            signer=self.signer, clock=lambda: int(time.time() * 1000),
+            transport=self.http if transport is None else transport,
+            nonce_source=lambda _key: (_ for _ in ()).throw(AssertionError("claim chains are Cloud-issued")),
+            resync_random_source=self._random, trusted_disclosure_keys=self.trusted, runtime=self.runtime,
+        )
+        self.coordinator = None
+        self.coordinator = RunnerCoordinator(
+            control=self.client, store=self.store, identity=self.identity, signer=self.signer,
+            trusted_grant_keys=self.trusted, clock_ms=self.now_ms, monotonic=lambda: 1.0,
+        )
+        return self.client, self.coordinator
+
+    def runtime_rows(self):
+        with closing(sqlite3.connect(self.runtime_path)) as conn:
+            return {
+                table: sorted(map(tuple, conn.execute(f"SELECT * FROM {table}"))) for table in _R2_RUNTIME_TABLES
+            }
+
+    def raw_group(self, run_id):
+        """The exact sealed bytes of one run's active row, four chains and pending calls."""
+        run_hash = hashlib.sha256(run_id.encode()).hexdigest()
+        with closing(sqlite3.connect(self.runtime_path)) as conn:
+            active = conn.execute("SELECT sealed_blob FROM active_runs WHERE run_hash=?", (run_hash,)).fetchall()
+            chains = conn.execute(
+                "SELECT operation,sealed_blob FROM control_chains WHERE run_hash=? ORDER BY operation", (run_hash,),
+            ).fetchall()
+            pending = conn.execute(
+                "SELECT call_id,sealed_blob FROM pending_calls WHERE run_hash=? ORDER BY call_id", (run_hash,),
+            ).fetchall()
+        return [bytes(row[0]) for row in active], {row[0]: bytes(row[1]) for row in chains}, [
+            (row[0], bytes(row[1])) for row in pending
+        ]
+
+    def store_tree(self):
+        from tests.test_runner_store_probe import _context_path, _tree
+
+        return _tree(_context_path(self.store))
+
+    # -- cloud side ----------------------------------------------------------------------------
+    def approve(self, *, projection=None):
+        projection = self.projection if projection is None else projection
+        submitted = self.runs.submit_projection(projection, uploaded_by="user_owner")
+        return self.runs.approve(
+            self.workspace, self.project, submitted["run_id"],
+            projection_digest=projection["projection_digest"], actor="user_owner", role="owner",
+            reason="Exercise inactive claim recovery over the real control plane",
+            exact_hostname=self.manifest["egress"]["hostname"], recent_auth_at_ms=int(time.time() * 1000),
+            idempotency_key="ca1-" + hashlib.sha256(projection["projection_digest"].encode()).hexdigest(),
+            expected_kill_switch_generation=0,
+        )["grant"]
+
+    def request_stop(self, run_id):
+        self.runs.request_stop(
+            self.workspace, self.project, run_id, actor="user_owner", reason="cloud_stop",
+            expected_kill_switch_generation=0,
+        )
+
+    def reap(self, seconds):
+        """The reaper's orphan path at a later server instant (missing ACK -> terminal/stopped)."""
+        from canary_test_support import Clock
+        from heel.saas.canary_runs import CanaryRunService
+
+        clock = Clock(time.time() + seconds)
+        CanaryRunService(
+            self.cp.store.conn, signing=self.cp.grant_authority, clock=clock, initialize_schema=False,
+        ).expire_and_reconcile()
+
+    def row(self, run_id):
+        return tuple(self.cp.store.conn.execute(
+            "SELECT status,execution_disposition,stop_reason,started_at_ms,stop_acknowledged_at_ms "
+            "FROM canary_runs WHERE run_id=?", (run_id,),
+        ).fetchone())
+
+    def guarded(self):
+        conn = self.cp.store.conn
+        return {table: sorted(map(tuple, conn.execute(f"SELECT * FROM {table}"))) for table in _R2_GUARDED_TABLES}
+
+    def audit(self):
+        return [tuple(row) for row in self.cp.store.conn.execute(
+            "SELECT run_id,authenticated_key_id,cloud_status FROM canary_inactive_claim_attestations "
+            "ORDER BY created_at_ms,attestation_id",
+        )]
+
+    def close(self):
+        if self.runtime is not None:
+            self.runtime.close()
+        if self.edge is not None:
+            self.edge.close()
+            return
+        self.server.shutdown()
+        self.server.server_close()
+        self.cp.close()
+
+
+@pytest.fixture
+def r2_cloud(tmp_path):
+    cloud = _R2Cloud(tmp_path)
+    try:
+        yield cloud
+    finally:
+        cloud.close()
+
+
+def _r2_running(lease, signer, at_ms):
+    """The runner's own signed running projection after ``lease``'s claimed projection."""
+    unsigned = {
+        key: copy.deepcopy(value) for key, value in lease.operational_projection.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    unsigned["event_sequence"] += 1
+    unsigned["lifecycle_phase"] = "running"
+    unsigned["timestamps"]["started_at_ms"] = at_ms
+    unsigned["timestamps"]["updated_at_ms"] = at_ms
+    return _signed_projection(unsigned, signer)
+
+
+def _r2_activity_guards(monkeypatch, cloud):
+    """Record every name resolution and refuse every vault, factory, DNS, reservation or executor use."""
+    from heel.runner.execution import LocalCanaryExecutor as Executor
+
+    seen = {"hosts": [], "forbidden": []}
+    real_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo(host, *args, **kwargs):
+        seen["hosts"].append(host)
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    def forbidden(name):
+        def refuse(*_args, **_kwargs):
+            seen["forbidden"].append(name)
+            raise AssertionError(f"{name} must not run during inactive-claim recovery")
+        return refuse
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    for name in ("select_vault", "BoundedResolver", "TargetHTTPSClient"):
+        monkeypatch.setattr(daemon_module, name, forbidden(name))
+    monkeypatch.setattr(RunnerStore, "reserve_run", forbidden("reserve_run"))
+    monkeypatch.setattr(RunnerStore, "recover_run_reservation", forbidden("recover_run_reservation"))
+    monkeypatch.setattr(Executor, "execute", forbidden("LocalCanaryExecutor.execute"))
+    return seen
+
+
+def _r2_stuck_preactivation(cloud, *, stop=True, heartbeat_stop=True):
+    """A real claim that never activated; the Cloud then stops it and the stopped gate is durable."""
+    cloud.approve()
+    cloud.start()
+    lease = cloud.coordinator.claim()
+    assert lease is not None
+    if stop:
+        cloud.request_stop(lease.run_id)
+    if stop and heartbeat_stop:
+        gate = cloud.coordinator.heartbeat(lease.run_id, lease.operational_projection)
+        assert (gate.active, gate.stop_reason) == (False, "cloud_stop")
+    return lease
+
+
+def _r2_assert_retired_verbatim(cloud, run_id, before_group, *, pending_uncertain=0):
+    record = cloud.runtime.load_retired_claim(run_id, authenticate_components=True)
+    assert record is not None and record.reason == "cloud_inactive_attested"
+    assert record.local_observations == {"reservation": "absent", "terminal": "absent"}
+    active, chains, pending = before_group
+    assert [base64.b64decode(record.active["sealed_blob_b64"])] == active
+    assert {item["index"]["operation"]: base64.b64decode(item["sealed_blob_b64"]) for item in record.chains} == chains
+    assert [(item["index"]["call_id"], base64.b64decode(item["sealed_blob_b64"])) for item in record.pending] == pending
+    assert [item["delivery"] for item in record.pending] == ["uncertain"] * pending_uncertain
+    # The archived response is the exact wire answer: a pinned-grant-authority signed attestation.
+    archived = base64.b64decode(record.attestation["response"]["body_b64"])
+    wire = [raw for operation, status, raw in cloud.http.answers if operation == "inactive-claim-attestation" and status == 200]
+    assert wire and archived == wire[-1] and archived == json.dumps(json.loads(archived)).encode()
+    response = json.loads(archived)
+    request = json.loads(base64.b64decode(record.attestation["request"]["body_b64"]))
+    assert validate_inactive_claim_attestation(response) == response
+    verify_envelope(
+        dict(cloud.trusted), {"signing_key_id": response["signing_key_id"], "signature_b64": response["signature_b64"]},
+        inactive_claim_attestation_signing_payload(response),
+    )
+    assert response["schema_version"] == INACTIVE_CLAIM_ATTESTATION_SCHEMA
+    assert response["run_id"] == request["run_id"] == run_id
+    assert response["client_challenge_b64"] == request["client_challenge_b64"]
+    assert record.attestation["request"]["path"].endswith(f"/runs/{run_id}/inactive-claim-attestation")
+    return record, response
+
+
+def test_fresh_coordinator_reconciles_preactivation_stop_then_claims_with_zero_vault_factory_dns_socket_or_target_activity(
+    r2_cloud, monkeypatch,
+):
+    cloud = r2_cloud
+    lease = _r2_stuck_preactivation(cloud)
+    run_id = lease.run_id
+    assert cloud.row(run_id)[:3] == ("stop_requested", None, "cloud_stop")
+    group = cloud.raw_group(run_id)
+    tree, guarded, sent = cloud.store_tree(), cloud.guarded(), len(cloud.http.sent)
+    assert cloud.store.probe_run_reservation(run_id).value == "absent"
+    seen = _r2_activity_guards(monkeypatch, cloud)
+
+    client, coordinator = cloud.start()
+
+    # Exactly one network exchange, the attestation, before any hydration or replay.
+    assert cloud.http.operations(sent) == ["inactive-claim-attestation"]
+    path, headers, body = cloud.http.sent[sent]
+    assert set(headers) == {
+        "Content-Type", "X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
+        "X-Heel-Runner-Signature",
+    }
+    request = json.loads(body)
+    assert canonical_bytes(request) == body and len(body) <= 2048
+    assert request["client_challenge_b64"] == base64.b64encode(cloud.challenges[-1]).decode("ascii")
+    record, response = _r2_assert_retired_verbatim(cloud, run_id, group)
+    assert response["cloud"]["status"] == "stop_requested" and response["cloud"]["stop_reason"] == "cloud_stop"
+    # Nothing else: no runtime group, no tracking, no gate, no reservation, Store files unchanged.
+    assert cloud.runtime.load_active_run_controls() == () and cloud.runtime.load_pending_calls() == ()
+    assert all(cloud.runtime.load_chain(op, run_id) is None for op in ("heartbeat", "progress", "result", "stop-ack"))
+    assert run_id not in client._tracked_runs and run_id not in client._run_guards
+    assert not any(name.endswith(run_id) for name in client._chains)
+    assert run_id not in coordinator._gates and run_id not in coordinator._bindings
+    assert run_id not in coordinator._gate_receipts
+    assert cloud.store_tree() == tree
+    assert cloud.store.probe_run_reservation(run_id).value == "absent"
+    # The Cloud wrote only its audit row; its stop actor and reason are preserved.
+    assert cloud.guarded() == guarded and cloud.audit() == [(run_id, cloud.identity.key_id, "stop_requested")]
+    with pytest.raises(ValueError, match="active runner claim is required"):
+        coordinator.execution_gate(run_id)
+    # Normal claiming continues: the idle poll is the next and only other request.
+    assert coordinator.claim() is None
+    assert cloud.http.operations(sent) == ["inactive-claim-attestation", "claim"]
+    assert set(seen["hosts"]) == {"127.0.0.1"} and seen["forbidden"] == []
+    assert record.created_at_ms <= cloud.now_ms()
+
+
+def test_fresh_coordinator_crash_before_retirement_commit_reattests_with_a_new_challenge_and_changes_nothing_else(
+    r2_cloud, monkeypatch,
+):
+    cloud = r2_cloud
+    run_id = _r2_stuck_preactivation(cloud).run_id
+    group, rows, tree = cloud.raw_group(run_id), cloud.runtime_rows(), cloud.store_tree()
+    sent = len(cloud.http.sent)
+    real_retire = RunnerRuntimeState.retire_inactive_claim
+
+    def crash_before_commit(self, *args, **kwargs):
+        raise KeyboardInterrupt("synthetic process death before the retirement transaction")
+
+    monkeypatch.setattr(RunnerRuntimeState, "retire_inactive_claim", crash_before_commit)
+    with pytest.raises(KeyboardInterrupt):
+        cloud.start()
+    first = json.loads(cloud.http.sent[sent][2])["client_challenge_b64"]
+    assert cloud.http.operations(sent) == ["inactive-claim-attestation"]
+    assert cloud.runtime_rows() == rows and cloud.store_tree() == tree
+
+    monkeypatch.setattr(RunnerRuntimeState, "retire_inactive_claim", real_retire)
+    cloud.start()
+    second = json.loads(cloud.http.sent[sent + 1][2])["client_challenge_b64"]
+    assert cloud.http.operations(sent) == ["inactive-claim-attestation"] * 2 and second != first
+    _r2_assert_retired_verbatim(cloud, run_id, group)
+    assert len(cloud.audit()) == 2 and cloud.store_tree() == tree
+
+
+def test_fresh_coordinator_crash_after_retirement_commit_before_the_cache_drop_restarts_clean(r2_cloud, monkeypatch):
+    cloud = r2_cloud
+    run_id = _r2_stuck_preactivation(cloud).run_id
+    group = cloud.raw_group(run_id)
+    real_retire = RunnerRuntimeState.retire_inactive_claim
+
+    def crash_after_commit(self, *args, **kwargs):
+        real_retire(self, *args, **kwargs)
+        raise KeyboardInterrupt("synthetic process death after commit, before the client cache drop")
+
+    monkeypatch.setattr(RunnerRuntimeState, "retire_inactive_claim", crash_after_commit)
+    with pytest.raises(KeyboardInterrupt):
+        cloud.start()
+    monkeypatch.setattr(RunnerRuntimeState, "retire_inactive_claim", real_retire)
+    sent = len(cloud.http.sent)
+    client, coordinator = cloud.start()
+    assert cloud.http.operations(sent) == []  # nothing left to attest, nothing replayed
+    _r2_assert_retired_verbatim(cloud, run_id, group)
+    assert client._tracked_runs == set() and coordinator._gates == {}
+    assert coordinator.claim() is None
+
+
+_R2_BLOCKED = {
+    # case: (stop the run first, expected daemon (state, code), exception type)
+    "401-revoked": (True, ("rejected", "runner_authentication_rejected"), "RunnerAuthenticationRejected"),
+    "401-rotated": (True, ("rejected", "runner_authentication_rejected"), "RunnerAuthenticationRejected"),
+    "403-legacy-protocol": (True, ("failed", "protocol_upgrade_required"), "_ControlCallRejected"),
+    "409-run-live": (False, ("offline", "inactive_claim_waiting_for_cloud"), "RunnerInactiveClaimRecoveryWaiting"),
+    "409-binding-mismatch": (True, ("failed", "recovery_required"), "RunnerInactiveClaimRecoveryBlocked"),
+    "409-cloud-observed-execution": (True, ("failed", "recovery_required"), "RunnerInactiveClaimRecoveryBlocked"),
+    "429-rate-limited": (True, ("offline", "recovery_rate_limited"), "RunnerChainRecoveryDeferred"),
+    "transport-failure": (True, ("offline", "connection_failed"), "ControlTransportError"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_R2_BLOCKED))
+def test_fresh_coordinator_recovery_blocked_states_keep_the_active_group_for_401_403_409_429_and_transport_failure(
+    r2_cloud, case,
+):
+    cloud = r2_cloud
+    stop, expected, error_name = _R2_BLOCKED[case]
+    error_type = {"_ControlCallRejected": daemon_module._ControlCallRejected,
+                  "ControlTransportError": ControlTransportError}.get(error_name) or getattr(control_module, error_name)
+    lease = _r2_stuck_preactivation(cloud, stop=False)
+    run_id = lease.run_id
+    conn = cloud.cp.store.conn
+    if case == "409-cloud-observed-execution":
+        cloud.coordinator.heartbeat(run_id, _r2_running(lease, cloud.signer, lease.operational_projection["timestamps"]["claimed_at_ms"] + 1))
+        assert cloud.row(run_id)[3] is not None
+    if stop:
+        cloud.request_stop(run_id)
+    cloud.offset_ms = 601_000  # CLOCK SEAM: the local grant has expired (L2) without a local stop gate
+    if case == "401-revoked":
+        conn.execute("UPDATE canary_runner_keys SET status='revoked',revoked_at=? WHERE key_id=?", (time.time(), cloud.identity.key_id))
+    elif case == "401-rotated":
+        conn.execute("UPDATE canary_runner_keys SET status='verification_only' WHERE key_id=?", (cloud.identity.key_id,))
+    elif case == "403-legacy-protocol":
+        conn.execute("DELETE FROM canary_runner_execution_protocols WHERE workspace_id=? AND runner_id=?",
+                     (cloud.workspace, cloud.runner_id))
+    elif case == "409-binding-mismatch":
+        conn.execute("UPDATE canary_execution_grants SET grant_digest=? WHERE run_id=?", ("f" * 64, run_id))
+    elif case == "429-rate-limited":
+        for index in range(3):
+            conn.execute(
+                "INSERT INTO canary_inactive_claim_attestations VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("ica_" + f"{index:032x}", cloud.workspace, cloud.runner_id, run_id, "grant_seed",
+                 cloud.identity.key_id, "a" * 64, "b" * 64, "stop_requested", int(time.time() * 1000),
+                 int(time.time() * 1000) + 1),
+            )
+    elif case == "transport-failure":
+        cloud.http.refuse.append("inactive-claim-attestation")
+    conn.commit()
+    rows, tree, sent = cloud.runtime_rows(), cloud.store_tree(), len(cloud.http.sent)
+    audit = cloud.audit()
+
+    with pytest.raises(error_type) as blocked:
+        cloud.start(transport=daemon_module._AttributedTransport(cloud.http))
+
+    assert daemon_module._serve_failure(blocked.value) == expected
+    if case == "409-run-live":
+        assert blocked.value.retry_after_ms >= 1_000
+    if case in {"409-binding-mismatch", "409-cloud-observed-execution"}:
+        assert blocked.value.reason == case.split("-", 1)[1].replace("-", "_")
+    assert cloud.http.operations(sent) == ["inactive-claim-attestation"]
+    assert cloud.runtime_rows() == rows and cloud.store_tree() == tree
+    assert cloud.runtime.load_retired_claim(run_id) is None
+    assert cloud.audit() == audit
+
+
+def test_grant_expired_unstopped_claim_waits_for_cloud_then_recovers_without_new_target_traffic(r2_cloud, monkeypatch):
+    from heel.saas.canary_reaper import CanaryReaper
+
+    cloud = r2_cloud
+    run_id = _r2_stuck_preactivation(cloud, stop=False).run_id
+    group = cloud.raw_group(run_id)
+    cloud.offset_ms = 601_000  # CLOCK SEAM: the local grant expired; the Cloud has not reaped yet
+    seen = _r2_activity_guards(monkeypatch, cloud)
+    with pytest.raises(control_module.RunnerInactiveClaimRecoveryWaiting):
+        cloud.start(transport=daemon_module._AttributedTransport(cloud.http))
+    assert cloud.runtime.load_active_run_controls()[0].run_id == run_id
+    # One reaper cycle persists the stop for the expired grant; no runner action is involved.
+    reaper = CanaryReaper(
+        str(cloud.tmp / "control.sqlite"), signing=cloud.cp.grant_authority,
+        runner_auth_pepper=b"r" * 32, clock=lambda: time.time() + 700,
+    )
+    assert reaper.run_once()["authority_stops"] == 1
+    assert cloud.row(run_id)[:4] == ("stop_requested", None, "cloud_stop", None)
+    sent = len(cloud.http.sent)
+    cloud.start(transport=daemon_module._AttributedTransport(cloud.http))
+    _r2_assert_retired_verbatim(cloud, run_id, group)
+    assert cloud.coordinator.claim() is None
+    assert cloud.http.operations(sent) == ["inactive-claim-attestation", "claim"]
+    assert set(seen["hosts"]) == {"127.0.0.1"} and seen["forbidden"] == []
+
+
+@pytest.mark.parametrize("loss", ["lost-response", "ledger-expired"])
+def test_fresh_coordinator_recovery_seals_lost_response_and_ledger_expired_pending_heartbeats_as_uncertain(
+    r2_cloud, monkeypatch, loss,
+):
+    from canary_test_support import Clock
+    from heel.saas.runner_auth import RunnerAuthStore
+
+    cloud = r2_cloud
+    lease = _r2_stuck_preactivation(cloud, stop=False)
+    run_id = lease.run_id
+    # The pre-activation heartbeat is accepted by the Cloud, but its answer never arrives.
+    cloud.http.lose.append("heartbeat")
+    with pytest.raises(ControlTransportError):
+        cloud.coordinator.heartbeat(run_id, lease.operational_projection)
+    (pending,) = cloud.runtime.load_pending_calls()
+    assert (pending.request_operation, pending.run_id) == ("heartbeat", run_id)
+    assert cloud.http.answers[-1][:2] == ("heartbeat", 200)  # the Cloud accepted it; the answer was lost
+    cloud.request_stop(run_id)
+    if loss == "ledger-expired":
+        auth = RunnerAuthStore(cloud.cp.store.conn, pepper=b"r" * 32, now=Clock(time.time() + 31 * 86_400))
+        while auth.purge_runner_request_receipts(time.time() + 31 * 86_400)[1]:
+            pass
+        assert cloud.cp.store.conn.execute("SELECT COUNT(*) FROM canary_runner_request_ledger").fetchone()[0] == 0
+    cloud.offset_ms = 601_000  # CLOCK SEAM: L2 by local expiry; the durable gate is still the claim gate
+    group = cloud.raw_group(run_id)
+    ledger = cloud.guarded()["canary_runner_request_ledger"]
+    sent = len(cloud.http.sent)
+    seen = _r2_activity_guards(monkeypatch, cloud)
+
+    cloud.start()
+
+    # The old heartbeat is never resent: the pending bytes are archived as delivery-uncertain.
+    assert cloud.http.operations(sent) == ["inactive-claim-attestation"]
+    record, _response = _r2_assert_retired_verbatim(cloud, run_id, group, pending_uncertain=1)
+    assert record.pending[0]["index"]["operation"] == "heartbeat"
+    assert cloud.runtime.load_pending_calls() == ()
+    assert cloud.guarded()["canary_runner_request_ledger"] == ledger
+    assert cloud.coordinator.claim() is None
+    assert seen["forbidden"] == []
+
+
+def _r2_old_claim_body(cloud):
+    (raw,) = [raw for operation, status, raw in cloud.http.answers if operation == "claim" and status == 200]
+    return json.loads(raw)
+
+
+def _r2_faulty_claim_replay(body):
+    """FAULTY SERVER: answer a fresh, really consumed claim poll with an OLD, already-signed claim body."""
+    def rewrite(status, headers, payload):
+        assert status in {200, 204}  # the real server answered (and advanced the claim chain)
+        return 200, headers, copy.deepcopy(body)
+    return rewrite
+
+
+def test_fresh_coordinator_rejects_a_claim_response_naming_the_retired_run_and_exposes_no_gate(r2_cloud):
+    """LOAD-GUARD T-W3 over real HTTP; the replayed body is a FAULTY SERVER fixture."""
+    cloud = r2_cloud
+    run_id = _r2_stuck_preactivation(cloud).run_id
+    old = _r2_old_claim_body(cloud)
+    client, coordinator = cloud.start()
+    assert cloud.runtime.load_retired_claim(run_id) is not None
+    tree = cloud.store_tree()
+    cloud.http.rewrite["claim"] = _r2_faulty_claim_replay(old)
+
+    with pytest.raises(ValueError):
+        coordinator.claim()
+
+    with pytest.raises(ValueError, match="active runner claim is required"):
+        coordinator.execution_gate(run_id)
+    assert run_id not in coordinator._gates and run_id not in client._tracked_runs
+    assert cloud.runtime.load_active_run_controls() == ()
+    assert [(item.request_operation, item.run_id) for item in cloud.runtime.load_pending_calls()] == [("claim", None)]
+    assert cloud.store_tree() == tree and cloud.store.probe_run_reservation(run_id).value == "absent"
+
+
+def _r2_honest_execution(cloud, lease, *, observed):
+    """The run executes honestly against the TARGET SEAM; ``observed`` sends one running heartbeat."""
+    executor = LocalCanaryExecutor(
+        store=cloud.store, identity=cloud.identity, signer=cloud.signer, trusted_grant_keys=cloud.trusted,
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=cloud.now_ms, monotonic=lambda: 1.0,
+    )
+    progress = []
+    target = ScriptedTransport([401, 200, 200, 403])
+    outcome = RunnerExecutionAdapter(coordinator=cloud.coordinator, executor=executor, transport=target).execute(
+        lease, cancellation=CancellationToken(), on_progress=progress.append,
+    )
+    assert outcome.operational_projection["execution_disposition"] == "completed"
+    assert len(target.calls) == 4
+    if observed:
+        running = next(item for item in progress if item["lifecycle_phase"] == "running")
+        cloud.coordinator.heartbeat(lease.run_id, running)
+        assert cloud.row(lease.run_id)[3] is not None  # the Cloud observed the start
+    return target
+
+
+def _r2_prune(cloud, run_id):
+    """Real local terminal -> detach -> due prune -> Store prune -> finish -> compaction."""
+    runtime, store = cloud.runtime, cloud.store
+    local = runtime.register_local_terminal(**store._runtime_terminal_anchor(run_id))
+    store.detach_terminal(run_id, runtime=runtime, expected_local_state_digest=local.state_digest, now_ms=cloud.now_ms())
+    retention = store.load_run(run_id)["retention_expires_at_ms"]
+    cloud.offset_ms = retention - int(time.time() * 1000)  # CLOCK SEAM: the local clock reaches retention
+    pending = runtime.claim_due_prune(now_ms=retention)[0]
+    receipt = store.prune_runtime_terminal(
+        run_id, runtime=runtime, expected_runtime_state_digest=pending.state_digest, now_ms=retention,
+    )
+    completion = runtime.finish_prune(receipt=receipt, expected_prune_pending_state_digest=pending.state_digest)
+    store.finish_pruned_compaction(completion, runtime=runtime)
+    assert store.probe_run_reservation(run_id).value == "absent"
+    return retention
+
+
+def _r2_resurrect(cloud, old):
+    """Restart, then a FAULTY SERVER answers the fresh claim with the pruned run's old signed body."""
+    cloud.offset_ms += 1_000
+    client, coordinator = cloud.start()
+    assert cloud.runtime.load_active_run_controls() == ()
+    cloud.http.rewrite["claim"] = _r2_faulty_claim_replay(old)
+    with pytest.raises(ValueError, match="execution grant is expired or not yet valid"):
+        coordinator.claim()
+    return client, coordinator
+
+
+@pytest.mark.parametrize("observed", [True, False], ids=["cloud-observed-execution", "cloud-saw-no-execution"])
+def test_coordinator_fails_closed_when_a_claim_response_resurrects_a_pruned_run(r2_cloud, observed):
+    """PRUNING C3 over real HTTP: the replayed claim body is a FAULTY SERVER fixture."""
+    cloud = r2_cloud
+    cloud.approve()
+    cloud.start()
+    lease = cloud.coordinator.claim()
+    run_id = lease.run_id
+    old = _r2_old_claim_body(cloud)
+    target = _r2_honest_execution(cloud, lease, observed=observed)
+    _r2_prune(cloud, run_id)
+    tree = cloud.store_tree()
+
+    client, coordinator = _r2_resurrect(cloud, old)
+
+    # commit_call installed the group before bundle validation refused it; nothing else happened.
+    assert [item.run_id for item in cloud.runtime.load_active_run_controls()] == [run_id]
+    assert run_id not in coordinator._gates
+    with pytest.raises(ValueError, match="active runner claim is required"):
+        coordinator.execution_gate(run_id)
+    assert cloud.store_tree() == tree and cloud.store.probe_run_reservation(run_id).value == "absent"
+    assert len(target.calls) == 4
+    group = cloud.raw_group(run_id)
+
+    # Reconstruction: the real Cloud decides.  Observed execution keeps the row; otherwise retire.
+    cloud.request_stop(run_id)
+    if observed:
+        rows = cloud.runtime_rows()
+        with pytest.raises(control_module.RunnerInactiveClaimRecoveryBlocked) as blocked:
+            cloud.start()
+        assert blocked.value.reason == "cloud_observed_execution"
+        assert cloud.runtime_rows() == rows and cloud.runtime.load_retired_claim(run_id) is None
+    else:
+        cloud.reap(3_600)
+        assert cloud.row(run_id)[:3] == ("terminal", "stopped", "cloud_stop")
+        cloud.start()
+        _r2_assert_retired_verbatim(cloud, run_id, group)
+        assert cloud.runtime.load_active_run_controls() == ()
+    assert cloud.store_tree() == tree and len(target.calls) == 4
+
+
+def test_fresh_claim_replaying_a_pruned_runs_signed_body_cannot_lease_reserve_or_execute(r2_cloud, monkeypatch):
+    """PRUNING C4 over real HTTP: compiler pair, 600 s Cloud grant, honest execution, real prune and
+    compaction, restart, then a FAULTY SERVER replays the old signed claim body on a fresh claim."""
+    cloud = r2_cloud
+    cloud.approve()
+    cloud.start()
+    lease = cloud.coordinator.claim()
+    run_id = lease.run_id
+    assert lease.bundle.grant["expires_at_ms"] - lease.bundle.grant["issued_at_ms"] == 600_000
+    assert cloud.manifest["local_evidence_policy"]["retention_seconds"] == 86_400
+    old = _r2_old_claim_body(cloud)
+    target = _r2_honest_execution(cloud, lease, observed=False)
+    retention = _r2_prune(cloud, run_id)
+    runs = cloud.store.run_path(run_id).parent
+    assert {path.name for path in runs.iterdir()} == {"run-authority-checkpoint.json", "run-authority-index.json"}
+    floor = json.loads((runs / "run-authority-checkpoint.json").read_bytes())
+    floor = floor.get("time_floor_ms", floor.get("core", {}).get("time_floor_ms"))
+    assert floor >= lease.bundle.grant["expires_at_ms"]
+
+    client, coordinator = _r2_resurrect(cloud, old)
+
+    # No lease, gate, reservation or target request; tracking staleness carries no authority.
+    assert run_id in client._tracked_runs and run_id not in coordinator._gates
+    with pytest.raises(ValueError, match="active runner claim is required"):
+        coordinator.execution_gate(run_id)
+    with pytest.raises(ValueError, match="active runner claim is required"):
+        coordinator.heartbeat(run_id, lease.operational_projection)
+    with pytest.raises(ValueError):
+        cloud.store.reserve_run(lease.bundle.grant, retention_expires_at_ms=retention + 86_400_000)
+    assert {path.name for path in runs.iterdir()} == {"run-authority-checkpoint.json", "run-authority-index.json"}
+    assert len(target.calls) == 4
+    # The stuck row is exactly C's eligible state (L2 expiry, L3 absent, L4, L5): a restart asks the
+    # Cloud for an attestation and changes nothing locally when the request cannot leave.
+    rows = cloud.runtime_rows()
+    sent = len(cloud.http.sent)
+    cloud.http.refuse.append("inactive-claim-attestation")
+    with pytest.raises(ControlTransportError):
+        cloud.start()
+    assert cloud.http.operations(sent) == ["inactive-claim-attestation"]
+    assert cloud.runtime_rows() == rows
+
+
+def test_short_retention_prune_refusal_keeps_its_roots_and_a_second_honest_run_and_maintenance_proceed(tmp_path):
+    """PRUNING INFERRED gate (TAMPERED, NON-COMPILER pair, labelled): after the refused compaction the
+    first restart fails closed once; later restarts, a second honest run and maintenance proceed."""
+    from heel.canary_contracts import validate_approval_projection, validate_test_manifest
+    from tests.test_runner_stop import _install_runtime_active_claim
+
+    store, identity, signer, compiled_manifest, compiled_projection = compiled_pair(tmp_path)
+    tampered = copy.deepcopy(compiled_manifest)
+    tampered.pop("manifest_digest")
+    tampered["local_evidence_policy"]["retention_seconds"] = 60
+    tampered["manifest_digest"] = canonical_digest(tampered)
+    manifest = validate_test_manifest(tampered)
+    unsigned = {
+        key: copy.deepcopy(value) for key, value in compiled_projection.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    unsigned["manifest_digest"] = manifest["manifest_digest"]
+    unsigned["projection_id"] = f"projection_{manifest['manifest_digest'][:24]}"
+    projection = validate_approval_projection({
+        **unsigned, "projection_digest": canonical_digest(unsigned), "signing_key_id": identity.key_id,
+        "signature_b64": base64.b64encode(signer.sign(canonical_bytes(unsigned))).decode("ascii"),
+    })
+    store.save_approved_pair(manifest, projection)
+    authority = SigningAuthority.generate()
+    trusted = {authority.key_id: authority.public_key}
+    grant = signed_grant(manifest, projection, identity, authority, expires=601_000)
+    run_id = grant["run_id"]
+
+    def executor(clock):
+        return LocalCanaryExecutor(
+            store=store, identity=identity, signer=signer, trusted_grant_keys=trusted,
+            vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: clock, monotonic=lambda: 1.0,
+        )
+
+    executor(2_000).execute(ExecutionBundle(manifest, projection, grant), transport=ScriptedTransport([401, 200, 200, 403]),
+                            gate_source=active_gate)
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    _install_runtime_active_claim(runtime, identity, signer, projection, grant)
+    local = runtime.register_local_terminal(**store._runtime_terminal_anchor(run_id))
+    store.detach_terminal(run_id, runtime=runtime, expected_local_state_digest=local.state_digest, now_ms=2_000)
+    retention = store.load_run(run_id)["retention_expires_at_ms"]
+    pending = runtime.claim_due_prune(now_ms=retention)[0]
+    with pytest.raises(RunnerStoreError, match="local run authority compaction entry is invalid"):
+        store.prune_runtime_terminal(run_id, runtime=runtime, expected_runtime_state_digest=pending.state_digest, now_ms=retention)
+    roots = {
+        f"grant-{grant['grant_digest']}.json",
+        store._run_authority_record_filename("reserve", run_hash := store._run_hash(run_id)),
+        store._run_authority_record_filename("terminal", run_hash),
+        store._run_authority_record_filename("detach_terminal", run_hash),
+        store._run_authority_record_filename("prune", run_hash),
+    }
+    runs = store.run_path(run_id).parent
+
+    def restart(clock, responses=()):
+        transport = ScriptedControlTransport(list(responses))
+        client = RunnerControlClient(
+            origin="https://control.example", workspace_id=identity.workspace_id, runner_id=identity.runner_id,
+            signer=signer, clock=lambda: clock, transport=transport, nonce_source=lambda _key: _nonce(b"c"),
+            trusted_disclosure_keys=trusted, runtime=runtime,
+        )
+        return RunnerCoordinator(
+            control=client, store=store, identity=identity, signer=signer, trusted_grant_keys=trusted,
+            clock_ms=lambda: clock, monotonic=lambda: 1.0,
+        ), transport
+
+    # Observed (pre-existing, tampered state only): the first restart finishes the runtime prune
+    # and then fails closed on the invalid compaction entry; nothing of the roots is removed.
+    with pytest.raises(RunnerStoreError, match="local run authority compaction completion is unavailable"):
+        restart(retention + 10)
+    assert roots <= {path.name for path in runs.iterdir()}
+    coordinator, _transport = restart(retention + 20)
+    assert coordinator.maintenance_once(now_ms=retention + 30).processed == 0
+    assert store.probe_run_reservation(run_id).value == "reserved"
+    # A second honest run (distinct grant, real claim decode, real executor) and maintenance proceed.
+    second = dict(signed_grant(compiled_manifest, compiled_projection, identity, authority,
+                               issued=retention + 40, expires=retention + 600_040))
+    second.update(run_id="crun_" + "b" * 32, grant_id="grant_987654321")
+    second = resign_grant(second, authority)
+    claim = _claim(compiled_manifest, compiled_projection, second)
+    claim["gate"] = _gate(server_time_ms=retention + 50, generation=7, proof_expires_at_ms=retention + 100_000)
+    coordinator, _transport = restart(retention + 50, [(200, {"X-Heel-Runner-Next-Nonce": _nonce(b"m")}, claim)])
+    lease = coordinator.claim()
+    target = ScriptedTransport([401, 200, 200, 403])
+    outcome = RunnerExecutionAdapter(coordinator=coordinator, executor=executor(retention + 50), transport=target).execute(
+        lease, cancellation=CancellationToken(), on_progress=lambda _projection: None,
+    )
+    assert outcome.operational_projection["execution_disposition"] == "completed" and len(target.calls) == 4
+    assert coordinator.maintenance_once(now_ms=retention + 60).processed == 0
+    assert roots <= {path.name for path in runs.iterdir()}
+    assert store.probe_run_reservation(run_id).value == "reserved"
+
+
+def test_serve_cycle_composition_reconciles_before_hydration_then_polls(r2_cloud, monkeypatch):
+    """The daemon's own serve cycle (runtime by path -> client -> coordinator -> RunnerService) over
+    loopback, so the recovery runs in the production startup order, not a hand-ordered fixture."""
+    cloud = r2_cloud
+    run_id = _r2_stuck_preactivation(cloud).run_id
+    group = cloud.raw_group(run_id)
+    cloud.runtime.close()
+    cloud.runtime = None
+    seen = _r2_activity_guards(monkeypatch, cloud)
+    sent = len(cloud.http.sent)
+    record = {"origin": "http://127.0.0.1", "runner_id": cloud.runner_id}
+
+    class LoopbackDaemon(daemon_module.RunnerDaemon):
+        def _transport(self, origin):
+            assert origin == record["origin"]
+            return cloud.http
+
+        def _load_record(self, store):
+            return record
+
+    daemon = LoopbackDaemon(cloud.home, clock_ms=cloud.now_ms)
+    directory = os.open(cloud.tmp, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        session = daemon_module._ServeSession(daemon, directory, record, once=True, emit=lambda _event: None)
+        session.identity, session.signer, session.trusted = cloud.identity, cloud.signer, dict(cloud.trusted)
+        session._cycle()
+    finally:
+        os.close(directory)
+    assert cloud.http.operations(sent) == ["inactive-claim-attestation", "claim"]
+    cloud.runtime = RunnerRuntimeState(cloud.runtime_path, cloud.identity, cloud.signer)
+    _r2_assert_retired_verbatim(cloud, run_id, group)
+    assert set(seen["hosts"]) == {"127.0.0.1"} and seen["forbidden"] == []
+
+
+def test_attestation_without_a_bounded_transport_fails_closed_and_keeps_the_claim(r2_cloud):
+    """Design test 6: a post-only adapter never falls back to ``post``; the sealed group is kept."""
+    cloud = r2_cloud
+    run_id = _r2_stuck_preactivation(cloud).run_id
+    rows, tree, sent = cloud.runtime_rows(), cloud.store_tree(), len(cloud.http.sent)
+
+    class PostOnly:
+        def post(self, path, *, headers=None, body=b""):
+            return cloud.http.post(path, headers=headers, body=body)
+
+    with pytest.raises(control_module.RunnerInactiveClaimRecoveryBlocked) as blocked:
+        cloud.start(transport=PostOnly())
+    assert blocked.value.reason == "transport_capability_missing"
+    assert daemon_module._serve_failure(blocked.value) == ("failed", "recovery_required")
+    assert cloud.http.operations(sent) == [] and cloud.audit() == []
+    assert cloud.runtime_rows() == rows and cloud.store_tree() == tree
+    assert cloud.runtime.load_retired_claim(run_id) is None
+
+
+def test_tls_edge_recovery_uses_the_production_transport_and_archives_the_edge_wire_bytes(tmp_path, monkeypatch):
+    """One real recovery exchange: HTTPSControlTransport + _AttributedTransport -> Python TLS edge
+    harness -> real control plane.  The Cloudflare Worker itself is not exercised here."""
+    cloud = _R2Cloud(tmp_path, edge=True)
+    try:
+        run_id = _r2_stuck_preactivation(cloud).run_id
+        group = cloud.raw_group(run_id)
+        seen = _r2_activity_guards(monkeypatch, cloud)
+        sent = len(cloud.http.sent)
+        cloud.start()
+        assert cloud.http.operations(sent) == ["inactive-claim-attestation"]
+        record, response = _r2_assert_retired_verbatim(cloud, run_id, group)
+        archived = base64.b64decode(record.attestation["response"]["body_b64"])
+        assert archived != canonical_bytes(response)
+        assert ("POST", f"/v1/workspaces/{cloud.workspace}/runners/{cloud.runner_id}/runs/{run_id}/inactive-claim-attestation") \
+            in cloud.edge.forwarded
+        assert cloud.coordinator.claim() is None
+        assert set(seen["hosts"]) <= {"localhost", "127.0.0.1"} and seen["forbidden"] == []  # client and edge hop
+    finally:
+        cloud.close()

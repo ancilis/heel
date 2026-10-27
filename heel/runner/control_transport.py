@@ -20,6 +20,7 @@ import re
 import socket
 import ssl
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -60,6 +61,20 @@ class ControlTransportError(RuntimeError):
             code = "malformed_response"
         super().__init__(f"runner control transport failed: {code}")
         self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedControlResponse:
+    """One bounded control answer: the selected headers, the exact entity octets and their parse.
+
+    ``body`` is the octets read after transfer decoding (no content decoding); ``payload`` is the
+    strict JSON object parsed from exactly those octets, or ``None`` for 204.
+    """
+
+    status: int
+    headers: dict[str, str]
+    body: bytes
+    payload: dict[str, Any] | None
 
 
 def validate_control_origin(origin: object) -> tuple[str, str, int]:
@@ -280,6 +295,28 @@ class HTTPSControlTransport:
         return context
 
     def post(self, path: str, *, headers: Mapping[str, str] | None = None, body: bytes = b"") -> tuple[int, dict[str, str], dict[str, Any] | None]:
+        response = self._exchange(path, headers=headers, body=body, limit=MAX_CONTROL_RESPONSE_BYTES)
+        return response.status, response.headers, response.payload
+
+    def post_bounded(
+        self, path: str, *, headers: Mapping[str, str] | None = None, body: bytes = b"",
+        max_response_bytes: int,
+    ) -> BoundedControlResponse:
+        """``post`` with a narrower response budget, returning the exact entity octets as well.
+
+        ``max_response_bytes`` can only narrow ``MAX_CONTROL_RESPONSE_BYTES``; it is checked before
+        any connection, and the raw body is capped before the strict parser runs.
+        """
+        if (
+            type(max_response_bytes) is not int
+            or not 1 <= max_response_bytes <= MAX_CONTROL_RESPONSE_BYTES
+        ):
+            raise ControlTransportError("invalid_request")
+        return self._exchange(path, headers=headers, body=body, limit=max_response_bytes)
+
+    def _exchange(
+        self, path: str, *, headers: Mapping[str, str] | None, body: bytes, limit: int,
+    ) -> BoundedControlResponse:
         path = _validate_path(path)
         request_headers = _validate_headers(headers)
         if type(body) is not bytes or len(body) > MAX_CONTROL_REQUEST_BYTES:
@@ -309,7 +346,7 @@ class HTTPSControlTransport:
                 raise ControlTransportError("timeout") from None
             except (http.client.HTTPException, OSError):
                 raise ControlTransportError("connection_failed") from None
-            return self._decode(response, connection, deadline)
+            return self._decode(response, connection, deadline, limit)
         finally:
             # The response owns the socket after a ``Connection: close`` header; close both.
             try:
@@ -320,8 +357,8 @@ class HTTPSControlTransport:
 
     def _decode(
         self, response: http.client.HTTPResponse, connection: http.client.HTTPSConnection,
-        deadline: float,
-    ) -> tuple[int, dict[str, str], dict[str, Any] | None]:
+        deadline: float, limit: int,
+    ) -> BoundedControlResponse:
         status = response.status
         if 300 <= status <= 399:
             # Never follow: a redirect could move signed runner proofs to another origin.
@@ -347,17 +384,17 @@ class HTTPSControlTransport:
         if length:
             if re.fullmatch(r"[0-9]{1,12}", length[0]) is None:
                 raise ControlTransportError("malformed_response")
-            if int(length[0]) > MAX_CONTROL_RESPONSE_BYTES:
+            if int(length[0]) > limit:
                 raise ControlTransportError("response_too_large")
             if status == 204 and int(length[0]) != 0:
                 # http.client discards a 204 body silently; a framing contradiction is malformed.
                 raise ControlTransportError("malformed_response")
-        raw = self._read_bounded(response, connection, deadline)
+        raw = self._read_bounded(response, connection, deadline, limit)
         self.last_status = status
         if status == 204:
             if raw:
                 raise ControlTransportError("malformed_response")
-            return status, selected, None
+            return BoundedControlResponse(status, selected, raw, None)
         media = content_type[0].split(";", 1)[0].strip().lower() if content_type else ""
         if media != "application/json":
             raise ControlTransportError("malformed_response")
@@ -365,12 +402,12 @@ class HTTPSControlTransport:
         code = payload.get("code")
         if status >= 400 and type(code) is str and re.fullmatch(r"[a-z0-9_]{1,64}", code):
             self.last_error_code = code
-        return status, selected, payload
+        return BoundedControlResponse(status, selected, raw, payload)
 
     @staticmethod
     def _read_bounded(
         response: http.client.HTTPResponse, connection: http.client.HTTPSConnection,
-        deadline: float,
+        deadline: float, limit: int,
     ) -> bytes:
         chunks: list[bytes] = []
         total = 0
@@ -379,12 +416,12 @@ class HTTPSControlTransport:
                 if deadline - time.monotonic() <= 0:
                     raise ControlTransportError("timeout")
                 # Every socket read below waits only for the time left (``_DeadlineSocket``).
-                chunk = response.read1(min(_READ_CHUNK, MAX_CONTROL_RESPONSE_BYTES + 1 - total))
+                chunk = response.read1(min(_READ_CHUNK, limit + 1 - total))
                 if not chunk:
                     break
                 chunks.append(chunk)
                 total += len(chunk)
-                if total > MAX_CONTROL_RESPONSE_BYTES:
+                if total > limit:
                     raise ControlTransportError("response_too_large")
         except ControlTransportError:
             raise
@@ -396,6 +433,6 @@ class HTTPSControlTransport:
 
 
 __all__ = [
-    "CONTROL_TIMEOUT_SECONDS", "ControlTransportError", "HTTPSControlTransport",
+    "BoundedControlResponse", "CONTROL_TIMEOUT_SECONDS", "ControlTransportError", "HTTPSControlTransport",
     "MAX_CONTROL_RESPONSE_BYTES", "validate_control_origin",
 ]
