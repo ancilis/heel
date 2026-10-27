@@ -7,6 +7,14 @@ CONFIRMED `git rev-parse HEAD^ HEAD^^{tree}` from the candidate). **No product, 
 deployment, provider, namespace or customer state was changed.** This file is the only tracked write
 of the session. Evidence folder: `.worktrees/heel-task-evidence/H3-COMPOSITION-DESIGN/`.
 
+> **Revision 3 (2026-10-27, after independent review round 3, `H3-COMPOSITION-SPEC-REVIEW-R3/REPORT.md`,
+> and Astra's `ASTRA-TEXT-CONSISTENCY-GRANT.md`).** Text-consistency correction only, B-R3: §4.9
+> obligation 3, T5, T10's executor clause and L6 (d) now agree with the S order revision 2 already
+> selected (flush in the deciding tick before the executor stop request; no `cleanup()` after
+> attachment; executor timing measured from the stop request, or from the decision including the
+> ≤ 1250 ms flush). No protocol, constant, deadline, test name or architecture change; the nine
+> round-3 advisories are not folded in. Commits `c502e1ca`, `2e68c571`, `3f837be4` preserved.
+>
 > **Revision 2 (2026-10-27, after independent review round 2, `H3-COMPOSITION-SPEC-REVIEW-R2/REPORT.md`,
 > and Astra's `ASTRA-REVISION-2-GRANT.md`).** Commits `c502e1ca` and `2e68c571` are preserved and not
 > accepted. **B-R1:** the 1000 ms `REVOKE_DEADLINE_MS` is unchanged; revoke now runs a release-before-kill
@@ -569,7 +577,8 @@ the status and, for the worker, its process group is empty):
 3. Call `cleanup()` after a successful generation only in the order H3's lifecycle contract fixes
    against `LeaseDomain.close_generation` (H1 flush + owner-fd close; the table survives until the
    namespace dies). → the contracted order is S (§4.7): no `cleanup()` after success, ever; the flush
-   precedes every holder release; the executor is reaped before the flush.
+   runs in the deciding tick and precedes every holder release and the executor stop; the executor
+   is stopped and reaped after the flush, never before; no `cleanup()` after attachment.
 4. Run the worker as a dedicated process (**carried with item 4 made mandatory**: the H2 design says
    "recommended, not a precondition since revision 4"; H3 requires it), hand it the borrowed fd, and
    supervise it under the cycle's deadline/revoke; the installer itself inherits no descriptor into its
@@ -587,12 +596,12 @@ the status and, for the worker, its process group is empty):
 | T2 | Executor asserts a false claim (`claimed` with ids it does not hold) | CP `tuple_mismatch`/`context_mismatch` ends the context before any key; registry run record is a narrowing filter, PoP is the authority | H1A-2 / H3 refuses on mismatch |
 | T3 | Executor asserts a false origin (`bound`/`claim_request`) | the generation is pinned to the reported origin only after the supervisor's own preflight; a claim whose grant environment differs from the pin is `origin_mismatch`; the CP's `egress_hostname` must equal the context | H3 |
 | T4 | Late worker/helper writes after cancellation | H2-1 single-use input, no negative receipt; H2-A burned nonce and closed worker socket; worker killed under the nonce; the controller never re-enables | H2-A / H2-1 / H3 |
-| T5 | Deleting the table with a live executor | invariant T; no `cleanup()` after success; executor reaped before flush | H3 (tests §6.1 3, L5) |
+| T5 | Deleting the table with a live executor | invariant T; no `cleanup()` after success or attachment; the table is never deleted on S; the executor is stopped only after the flush; holders released only under the contracted conditions of §4.7 | H3 (tests §6.1 3, L5) |
 | T6 | Descriptor leak into the executor or nft | `close_fds=True` everywhere; the executor helper closes `ns_fd` before the privilege drop; `/dev/fd` assertions in tests | H3 |
 | T7 | Secret or raw body in supervisor logs/status/registry | links carry ids/digests only (grammar-checked); executor stdio is `/dev/null`; registry fields are the closed H0 schema; no credential path exists in H3 (anonymous-only) | H3 (static tests), C5 for the vault |
 | T8 | Privilege escalation from the executor | unprivileged uid, no supplementary groups, `no_new_privs` inherited from the unit, no capability, read-only prefix, `-I -S -B` | H3 helper + H6 unit |
 | T9 | Supervisor becomes an SSRF proxy | the supervisor opens no socket on the executor's behalf and forwards nothing; its only outbound connections are the CP Unix socket (`connect_cp`) and the preflight DNS query | H3 (static: no TCP connect in `supervisor.py`) |
-| T10 | Revocation latency (restated from budgets, no blanket bound) | From the tick that decides a context end (a CP `inactive` reply, `stop()`, the signal flag, `kill_switch_active`, …): target traffic — new connections dropped as soon as `close_generation`'s flush child commits (≤ `PREPARE_CHILD_TIMEOUT_MS` 1000 + `CHILD_REAP_GRACE_MS` 250 after the decision; established flows lose their key no later than the prepared element's timeout, `LEASE_MS` 3000 after the last `prepare`); control access — refused at the next ingress request after the registry write (≤ 100 ms after the decision, plus the next controller slice); executor process — `SIGTERM` within one controller slice, `SIGKILL` at +2000 ms, reaped ≤ +250 ms, so ≤ ~2.3 s after the decision in the ordinary case; the CP's own decision latency (reaper, heartbeat deadline) is upstream of H3 and not claimed here. Revoke during bootstrap: `revoked` within 800 ms of the `revoke` datagram (§4.6) | H3 (test §6.1 4 and the revoke-budget static test; L6 records each of these against its budget) |
+| T10 | Revocation latency (restated from budgets, no blanket bound) | From the tick that decides a context end (a CP `inactive` reply, `stop()`, the signal flag, `kill_switch_active`, …): target traffic — new connections dropped as soon as `close_generation`'s flush child commits (≤ `PREPARE_CHILD_TIMEOUT_MS` 1000 + `CHILD_REAP_GRACE_MS` 250 after the decision; established flows lose their key no later than the prepared element's timeout, `LEASE_MS` 3000 after the last `prepare`); control access — refused at the next ingress request after the registry write (≤ 100 ms after the decision, plus the next controller slice); executor process — the stop request is set when `close_generation` returns (≤ 1250 ms after the decision); `SIGTERM` within one controller slice after that, `SIGKILL` at +2000 ms, reaped ≤ +250 ms: ≤ ~2.3 s from the stop request, ≤ ~3.55 s from the decision in the worst contracted case; the CP's own decision latency (reaper, heartbeat deadline) is upstream of H3 and not claimed here. Revoke during bootstrap: `revoked` within 800 ms of the `revoke` datagram (§4.6) | H3 (test §6.1 4 and the revoke-budget static test; L6 records each of these against its budget) |
 | T11 | Malformed/hostile link or channel input | exact matching, fixed refusal tokens, generation ends; nothing raised or logged | H3 |
 | T12 | Supervisor budget exhaustion / restart loop | `generation_budget` quarantine; ≥ 10 s spacing; H6 restart delay; ledger capacity 65 536 | cycle / H6 |
 | T13 | DNS change or rebinding during a run | the unchanged client re-resolves before every attempt through the constrained channel and refuses `dns_changed`/`unsafe_dns` (P4 behaviour kept); the kernel set is fixed at install, so a new address is unreachable even if a stale answer named it; a target whose old address stopped serving is `connect_error`/`timeout` → `target_unavailable`; an address reassigned to a stranger cannot present a certificate for the origin name (TLS `check_hostname`/`CERT_REQUIRED`, `http_transport.py:237-245`) | H2 / H3 (L1 adversarial case) |
@@ -792,8 +801,10 @@ plane here — stated in every record and in the doc. Cases:
 - **L6** revocation latency, restated from budgets (B-R2): `inactive stop_requested` from the real CP
   in tick *t*: records (a) decision instant → flush committed (budget 1250 ms), (b) → first dropped
   target connection from the still-running executor probe (≤ (a) + one probe interval), (c) →
-  registry write visible (budget 100 ms + one slice), (d) → executor reaped (budget 2000 + 250 ms
-  + one slice), (e) → worker reaped (budget 250 + 50 ms + one slice after (d)). Each value is
+  registry write visible (budget 100 ms + one slice), (d) stop request instant (set when
+  `close_generation` returns, i.e. at or after (a)) → executor reaped (budget 2000 + 250 ms + one
+  slice from the stop request; equivalently ≤ 1250 + 50 + 2000 + 250 ms from the decision), (e) →
+  worker reaped (budget 250 + 50 ms + one slice after (d)). Each value is
   compared to its budget; a value over budget FAILS the case; no aggregate "≤ 5 s" is asserted or
   claimed. Also recorded: the resolver thread's state at the decision (idle or in flight) and that
   the controller answered a concurrent `resolve_refused` within one slice.
