@@ -358,17 +358,23 @@ def test_linux_module_guards_reject_seam_assignment_fakes_skips_and_missing_case
     _require_runtime()
 '''
     fixture = {
-        "platform_forced": source + "\nH2._PLATFORM_OK = True\n",
+        # Any assignment or deletion of an H2 name is refused, private or public (H2-1's own guard keeps
+        # its two private seam names out of every other tracked module, so they are not spelled here).
+        "private_assigned": source + "\nH2._LOCK = None\n",
         "nft_redirected": source + "\nH2.NFT_PATH = '/bin/true'\n",
-        "helper_replaced": source + "\nH2._HELPER_SOURCE = H2._HELPER_SOURCE.replace('setns', 'getpid')\n",
-        "helper_deleted": source + "\ndel H2._HELPER_SOURCE\n",
+        "installer_replaced": source + "\nH2.install = lambda *arguments, **keywords: None\n",
+        "public_deleted": source + "\ndel H2.render_table\n",
+        "augmented": source + "\nH2.STATES += ('forged',)\n",
+        "private_read": source + "\ndef _x():\n    return H2._INPUTS\n",
+        "delattr_used": source + "\ndelattr(H2, 'NFT_PATH')\n",
         "authority_patched": source + "\nAUTHORITY.NFT_PATH = None\n",
         "setattr_used": source + "\nsetattr(H2, 'NFT_PATH', '/bin/true')\n",
         "monkeypatch_used": source + "\ndef _x(monkeypatch):\n    monkeypatch.undo()\n",
         "fake_nft": source + "\ndef fake_nft_script():\n    return None\n",
         "private_render": source + "\ndef _x():\n    return H2._receipt_document(None)\n",
         "client_socket_seam": _replace(source, "resolver=resolver,\n", "resolver=resolver, sockets=None,\n"),
-        "client_clock_seam": _replace(source, "timeout_seconds=3.0)", "timeout_seconds=3.0, clock=time.monotonic)"),
+        "client_clock_seam": _replace(source, "timeout_seconds=CLIENT_TIMEOUT_S)",
+                                      "timeout_seconds=CLIENT_TIMEOUT_S, clock=time.monotonic)"),
         "netns_path": source + '\nNS = "/run/' + 'netns/x"\n',
         "other_key": _replace(source, "late = fx.domain.prepare(SLOT_SRC, SLOT_DST, LATE_MS)",
                               "late = fx.domain.prepare(SLOT_SRC, TARGETS[0], LATE_MS)"),

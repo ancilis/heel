@@ -92,9 +92,13 @@ allow-listed artifacts only (`summary.json`, `cases.jsonl`, `versions.txt`, `cle
 ## Cases (one record each, no skip under the required switch)
 
 - **P0** profile captured through the real H1 self-test, fresh `create()` namespace with an empty
-  ruleset; provenance: the staged H2-1 source and helper hash, `_PLATFORM_OK is True` (read only),
-  the system nft, the client and harness imported from the staged root, cryptography outside it, no
-  `.git` in the staged root.
+  ruleset; provenance: the staged H2-1 source hash and its helper constant's hash (located in the
+  pinned file's AST), the computed platform guard passing by behaviour (a cleanup of a never-installed
+  input returns `refused_input`/`not_installed`, not `refused_platform`), the system nft, the client
+  and harness imported from the staged root, cryptography outside it, no `.git` in the staged root.
+  No H2-2 module names H2-1's two private seams: H2-1's accepted guard
+  (`tests/test_host_h2_policy.py`, the tracked-file scan) admits no other tracked module that does,
+  and H2-2 forbids itself any assignment, deletion or private read of an H2 name instead.
 - **P1** real install → exact receipt (the H2-A canonical document), whole ruleset exactly one table,
   product readback exact; then H1 `prepare`/`activate` admits only the two pinned targets on TCP 443
   while live, nothing after the bound, and interleaved unapproved/8443 probes stay closed.
@@ -104,11 +108,12 @@ allow-listed artifacts only (`summary.json`, `cases.jsonl`, `versions.txt`, `cle
 - **P3** a short key admits while live and no fresh connection after the conservative bound; an
   expired key activated late revives nothing; a fresh key admits and closing it denies again.
 - **P4** (mandatory) the unchanged client: succeeds before any table (topology control); with the
-  table, fails with `connect_error` without a key and with a prepared-only key; with the live key
-  succeeds for a reordered and the canonical answer, dialing the IPv4 selection `8.8.4.4` of the
+  table, is denied without a key and with a prepared-only key (`connect_error`, or `timeout` because
+  TCP retries a dropped SYN to the client deadline) while no listener sees a connection; with a fresh
+  live key succeeds for a reordered and the canonical answer, dialing the IPv4 selection `8.8.4.4` of the
   dual-stack tuple (the AAAA listener sees nothing); refuses a dropped AAAA, an added or replaced
   member (`dns_changed`) and a private or loopback member (`unsafe_dns`) without connecting; resolves
-  once per attempt; fails again after the key is closed.
+  once per attempt; is denied again after the key is closed.
 - **P5** an IPv6-only tuple returns `unsupported_ipv6_only` with no receipt and no helper, the ruleset
   stays empty, and the H1 `prepare` is refused without a table.
 - **P6** faults never receipt. **FAULT-INJECTION** (the one labelled seam, `LAUNCHER.SEAMS`): (a) an

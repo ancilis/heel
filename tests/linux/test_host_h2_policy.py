@@ -102,6 +102,8 @@ SHORT_MS, LATE_MS = 1000, 300
 PROBE_INTERVAL_NS = 100 * MS
 CONNECT_TIMEOUT_S = 0.15
 LIVE_PERCENT = 95
+CLIENT_TIMEOUT_S = 1.0  # P4: a dropped SYN is retried by TCP until this deadline (tcp_connect drops the NF_DROP error)
+DENIED = ("connect_error", "timeout")  # the unchanged client's two codes for a connection the policy dropped
 NONCE_BYTES = 32
 CLONE_NEWNET = 0x40000000
 RECEIPT_SCHEMA = "heel.h2a.receipt.v1"
@@ -111,7 +113,11 @@ H2_SOURCE_SHA256 = "0bd7d171fdb69e10d58d4422ef45ee16e57ad7319e77b90e518a70a2a38f
 H2_HELPER_SHA256 = "c261a67fee245d58bbf59adcd8203f959209c6210f1c16b452315044a5a53866"
 HARNESS_SHA256 = "779d21299de454ccae41674f7f9f1afb3853007ad870c50a7de1718ee156378f"
 H2_PUBLIC = ("build_input", "cleanup", "install", "readback_matches", "render_table", "unresolved_helpers")
-H2_SEAMS_READ = ("_HELPER_SOURCE", "_PLATFORM_OK", "NFT_PATH")  # read only; never assigned here
+# The only non-function H2 names this module reads (public constants); it never reads or assigns a
+# private H2 name. H2-1's own guard (tests/test_host_h2_policy.py) admits no other tracked module that
+# names its two private seams, so the helper is pinned through the pinned file's AST (helper_sha256)
+# and the platform guard through behaviour (P0's cleanup probe; every P1-P4/P7 receipt).
+H2_READ = ("NFT_PATH", "STATES", "RECEIPT_SCHEMA")
 FAULT_TRIGGERS = ("_install", "_drive")  # the H2-1 functions whose clock() calls P6's fault clock counts
 
 # ---------------------------------------------------------------------------------------------
@@ -446,7 +452,7 @@ def fixture_violations(source: str) -> list[str]:
         found.append("authority_private")
     h2_used = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
                and isinstance(node.value, ast.Name) and node.value.id == "H2" and not node.attr.startswith("__")}
-    if not h2_used <= set(H2_PUBLIC) | set(H2_SEAMS_READ) | {"STATES", "RECEIPT_SCHEMA"}:
+    if not h2_used <= set(H2_PUBLIC) | set(H2_READ):
         found.append("h2_private")
     # No assignment, deletion or setattr of anything on H2/AUTHORITY/LAUNCHER, and no patching library.
     for node in ast.walk(tree):
@@ -464,18 +470,15 @@ def fixture_violations(source: str) -> list[str]:
              | {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
              | {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
              | {node.arg for node in ast.walk(tree) if isinstance(node, ast.arg)})
-    for forbidden in ("setattr", "monkeypatch", "mock", "Mock", "MagicMock", "patch", "_PLATFORM_OK_OVERRIDE"):
+    for forbidden in ("setattr", "delattr", "monkeypatch", "mock", "Mock", "MagicMock", "patch", "vars"):
         if forbidden in names:
             found.append("forbidden_name_" + forbidden)
     if [name for name in names if "fake" in name.lower() or "stub" in name.lower()]:
         found.append("fake_name")
-    # No private attribute of anything but this module's own objects, the launcher's grammar and the
-    # three H2 seams (read).
-    allowed_private = {("H2", seam) for seam in H2_SEAMS_READ}
+    # No private attribute of anything but this module's own objects and the launcher's helpers.
     private = sorted({ast.unparse(node) for node in ast.walk(tree) if isinstance(node, ast.Attribute)
                       and node.attr.startswith("_") and not node.attr.startswith("__")
-                      and not (isinstance(node.value, ast.Name) and node.value.id in ("self", "os", "LAUNCHER"))
-                      and not (isinstance(node.value, ast.Name) and (node.value.id, node.attr) in allowed_private)})
+                      and not (isinstance(node.value, ast.Name) and node.value.id in ("self", "os", "LAUNCHER"))})
     if private:
         found.append("private_attribute")
     for forbidden in ("/run/" + "net" + "ns", "ns" + "enter", "ip " + "net" + "ns", "multi" + "processing", "_gate_table" + "_fixture",
@@ -501,7 +504,8 @@ def fixture_violations(source: str) -> list[str]:
     cleanups = [call for call in _calls(tree, "cleanup") if ast.unparse(call.func) == "H2.cleanup"]
     install_arguments = [ast.unparse(arg) for call in installs for arg in call.args]
     if (not installs or not cleanups or install_arguments != ["self.l_fd", "self.policy"] * len(installs)
-            or not all(len(call.args) == 2 and ast.unparse(call.args[0]).endswith(".l_fd") for call in cleanups)):
+            or not all(len(call.args) == 2 and (ast.unparse(call.args[0]).endswith(".l_fd") or ast.unparse(call.args[0]) == "probe_fd")
+                       for call in cleanups)):
         found.append("installer_entry")
     if {name for name, node in functions.items() if '"-f"' in ast.get_source_segment(source, node)} - {"fixture_violations"} != {"_p6"}:
         found.append("fixture_nft_input")
@@ -544,6 +548,15 @@ def fixture_violations(source: str) -> list[str]:
     if not clock_keywords or not all(value in ("clock", "FaultClock(*fault)") for value in clock_keywords):
         found.append("clock_keyword")
     return found
+
+
+def helper_sha256(source: str) -> str | None:
+    """SHA-256 of the one module-level string constant of ``h2_policy.py`` holding the helper's
+    ``os.setns`` -> ``os.execve`` sequence, located structurally (see H2_READ)."""
+    found = [node.value.value for node in ast.parse(source).body if isinstance(node, ast.Assign) and len(node.targets) == 1
+             and isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Constant)
+             and isinstance(node.value.value, str) and "os.setns(" in node.value.value and "os.execve(" in node.value.value]
+    return hashlib.sha256(found[0].encode()).hexdigest() if len(found) == 1 else None
 
 
 def test_static_required_profile_cannot_skip():
@@ -730,7 +743,8 @@ def test_static_fixture_uses_only_public_apis_fd_only_namespaces_and_never_assig
     # The staged H2-1 source is the accepted one, its production helper is the pinned one, and the
     # P6 fault clock's triggers are functions of that source that call ``clock()``.
     assert hashlib.sha256(H2_FILE.read_bytes()).hexdigest() == H2_SOURCE_SHA256
-    assert hashlib.sha256(H2._HELPER_SOURCE.encode()).hexdigest() == H2_HELPER_SHA256
+    assert helper_sha256(H2_FILE.read_text(encoding="utf-8")) == H2_HELPER_SHA256
+    assert helper_sha256("X = 'os.setns( os.execve('\nY = 'os.setns( os.execve('\n") is None  # exactly one constant
     assert hashlib.sha256(HARNESS_FILE.read_bytes()).hexdigest() == HARNESS_SHA256
     h2_functions = _functions(H2_FILE.read_text(encoding="utf-8"))
     for name in FAULT_TRIGGERS:
@@ -1496,15 +1510,14 @@ def _p0(ints: dict, tokens: dict) -> bool:
     STATE["namespace_fds_baseline"] = len(_namespace_fds())
     STATE["outer_fingerprint"] = _outer_fingerprint()
     STATE["outer_links_baseline"] = len(socket.if_nameindex())
-    # Provenance: the staged, unmodified H2-1 source and helper, the computed platform guard, the
-    # system nft, and the unchanged client and harness imported from the staged root only.
+    # Provenance: the staged, unmodified H2-1 source and helper, the system nft, and the unchanged
+    # client and harness imported from the staged root only.
     transport, harness = _transport(), _harness()
     cryptography = importlib.import_module("cryptography")
     heel = importlib.import_module("heel")
     ints.update(h2_staged=int(_under_root(H2.__file__) and Path(H2.__file__).resolve() == H2_FILE.resolve()),
                 h2_source_pinned=int(hashlib.sha256(H2_FILE.read_bytes()).hexdigest() == H2_SOURCE_SHA256),
-                h2_helper_pinned=int(hashlib.sha256(H2._HELPER_SOURCE.encode()).hexdigest() == H2_HELPER_SHA256),
-                h2_platform_ok=int(H2._PLATFORM_OK is True),
+                h2_helper_pinned=int(helper_sha256(H2_FILE.read_text(encoding="utf-8")) == H2_HELPER_SHA256),
                 nft_is_system=int(H2.NFT_PATH is AUTHORITY.NFT_PATH and H2.NFT_PATH in ("/usr/sbin/nft", "/sbin/nft")),
                 client_staged=int(_under_root(transport.__file__) and _under_root(heel.__file__)),
                 harness_staged=int(_under_root(harness.__file__)),
@@ -1520,6 +1533,10 @@ def _p0(ints: dict, tokens: dict) -> bool:
             outer = os.stat("/proc/self/ns/net")
             ints["create_namespace_fresh"] = int(_identity(probe_fd) != (outer.st_dev, outer.st_ino))
             ints["create_ruleset_empty"] = int(_empty_ruleset(probe_fd))
+            # The computed platform guard, by behaviour: a cleanup of a never-installed input passes the
+            # guard (else ``refused_platform``) and stops at the empty record without any child.
+            guard = H2.cleanup(probe_fd, policy_input(probe_fd, OBSERVED_LITERALS))
+            ints["h2_platform_ok"] = int(guard.state == "refused_input" and guard.tokens.get("cleanup") == "not_installed")
             try:
                 report = AUTHORITY.generation_self_test(domain)
             except AUTHORITY.HostQuarantined as error:
@@ -1552,9 +1569,9 @@ def _p0(ints: dict, tokens: dict) -> bool:
         tick = PROFILE.tick_ns(report)
     except KeyError:
         tick = None
-    provenance = all(ints[key] == 1 for key in ("h2_staged", "h2_source_pinned", "h2_helper_pinned", "h2_platform_ok",
-                                                "nft_is_system", "client_staged", "harness_staged", "harness_pinned",
-                                                "cryptography_outside_root", "staged_without_git"))
+    provenance = all(ints.get(key) == 1 for key in ("h2_staged", "h2_source_pinned", "h2_helper_pinned", "h2_platform_ok",
+                                                    "nft_is_system", "client_staged", "harness_staged", "harness_pinned",
+                                                    "cryptography_outside_root", "staged_without_git"))
     if grade == "pinned" and tick is not None and provenance:
         STATE["tick_ns"] = tick
         ints["tick_ns"] = tick
@@ -1779,7 +1796,7 @@ def _p4(ints: dict, tokens: dict) -> bool:
     with _fixture("p4", peer="tls") as fx:
         resolver = Resolver(canonical)
         client = transport.TargetHTTPSClient(origin="https://" + HOSTNAME, preflight_addresses=canonical, resolver=resolver,
-                                             tls=_tls_transport(transport, fx.ca), timeout_seconds=3.0)
+                                             tls=_tls_transport(transport, fx.ca), timeout_seconds=CLIENT_TIMEOUT_S)
         # Positive reachability control before any table: the full client stack works in this topology,
         # and the AAAA listener accepts a plain IPv6 connection.
         results = {"baseline": _request(fx, client)}
@@ -1794,13 +1811,10 @@ def _p4(ints: dict, tokens: dict) -> bool:
         if not ready:
             return False
         results["no_key"] = _request(fx, client)
-        before = time.monotonic_ns()
-        handle = fx.domain.prepare(SLOT_SRC, SLOT_DST, LEASE_MS)
-        after_prepare = time.monotonic_ns()
-        live_to, _bound = _bounds(before, after_prepare, LEASE_MS)
+        fx.domain.prepare(SLOT_SRC, SLOT_DST, LEASE_MS)  # prepared only, never activated
         results["prepared_only"] = _request(fx, client)
         denied_counts, denied_served = fx.peer.counts()
-        fx.domain.activate(handle)
+        handle, live_to, _bound, _active = _lease(fx)  # a fresh key: the denials above may take the whole client timeout
         resolver.answer = list(reversed(canonical))  # order-only change: canonicalises equal
         results["reordered"] = _request(fx, client)
         resolver.answer = canonical
@@ -1830,13 +1844,14 @@ def _p4(ints: dict, tokens: dict) -> bool:
                 served_admitted=len(admitted),
                 served_ipv4_selection=sum(label == "t1" and local == TARGETS[0] for label, _line, _host, local in admitted),
                 served_exact_request=sum(line == "GET /health HTTP/1.1" and host == HOSTNAME for _l, line, host, _local in admitted))
-    expected = {"baseline": "ok", "no_key": "connect_error", "prepared_only": "connect_error", "reordered": "ok",
-                "canonical": "ok", "drop_aaaa": "dns_changed", "add_member": "dns_changed", "replace_member": "dns_changed",
-                "unsafe_private": "unsafe_dns", "unsafe_loopback": "unsafe_dns", "after_close": "connect_error"}
-    ints["results_expected"] = sum(results.get(name) == value for name, value in expected.items())
+    expected = {"baseline": ("ok",), "no_key": DENIED, "prepared_only": DENIED, "reordered": ("ok",), "canonical": ("ok",),
+                "drop_aaaa": ("dns_changed",), "add_member": ("dns_changed",), "replace_member": ("dns_changed",),
+                "unsafe_private": ("unsafe_dns",), "unsafe_loopback": ("unsafe_dns",), "after_close": DENIED}
+    ints["results_expected"] = sum(results.get(name) in codes for name, codes in expected.items())
     # Every attempt resolved the full set again (one resolver call per request after the guard).
-    return (results == expected and ints["baseline_ipv6_admitted"] == 1 and ints["preflight_full_tuple"] == 1
-            and ints["ipv4_targets"] == 2 and resolver.calls == len(results) and ints["within_live"] == 1
+    return (set(results) == set(expected) and ints["results_expected"] == len(expected)
+            and ints["baseline_ipv6_admitted"] == 1 and ints["preflight_full_tuple"] == 1 and ints["ipv4_targets"] == 2
+            and resolver.calls == len(results) and ints["within_live"] == 1
             and ints["denied_new_connections"] == 0 and ints["admitted_t1"] == 2 and ints["admitted_t2"] == 0
             and ints["admitted_t6"] == 0 and ints["changed_new_connections"] == 0 and ints["closed_new_connections"] == 0
             and ints["served_admitted"] == 2 and ints["served_ipv4_selection"] == 2 and ints["served_exact_request"] == 2)
