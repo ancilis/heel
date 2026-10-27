@@ -8,6 +8,7 @@ import os
 import shutil
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -2017,6 +2018,63 @@ def test_prepare_stop_ack_snapshots_budget_counters_under_the_execution_lock(tmp
     ) is True
 
 
+class _RespondingCloudGate:
+    """Fixture gate whose authenticated server time advances like a Cloud that keeps answering.
+
+    ``stall()`` freezes the server time so the unchanged 0.5 s staleness bound still fires.
+    """
+
+    def __init__(self, gate, *, monotonic):
+        self._gate = gate
+        self._monotonic = monotonic
+        self._epoch = monotonic()
+        self._server_time_ms = gate.server_time_ms
+        self._stalled = False
+        self._lock = threading.Lock()
+
+    def stall(self):
+        with self._lock:
+            self._stalled = True
+
+    def __call__(self):
+        with self._lock:
+            if not self._stalled:
+                self._server_time_ms = max(
+                    self._server_time_ms,
+                    self._gate.server_time_ms + int((self._monotonic() - self._epoch) * 1000),
+                )
+            return replace(self._gate, server_time_ms=self._server_time_ms)
+
+
+class _FixtureWatchdog:
+    """One test-harness synchronisation budget; never a product bound.
+
+    An expired wait records the named point and sets ``abort`` instead of raising, so a fixture
+    shim cannot kill the runner's heartbeat supervisor; the test thread reports ``failures``.
+    """
+
+    BUDGET_SECONDS = 30.0
+
+    def __init__(self):
+        self.deadline = time.monotonic() + self.BUDGET_SECONDS
+        self.abort = threading.Event()
+        self.failures: list[tuple[str, str]] = []
+        self._lock = threading.Lock()
+
+    def wait(self, event, point):
+        while not event.is_set():
+            remaining = self.deadline - time.monotonic()
+            if self.abort.is_set() or remaining <= 0:
+                with self._lock:
+                    self.failures.append((
+                        point, "aborted" if self.abort.is_set() else "budget expired",
+                    ))
+                self.abort.set()
+                return False
+            event.wait(min(remaining, 0.05))
+        return True
+
+
 @pytest.mark.parametrize(
     "stop_after_completed,overtake_progress,expected_sequences",
     [
@@ -2118,6 +2176,7 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
     )
     heartbeat_released = threading.Event()
     acknowledgement_committed = threading.Event()
+    watchdog = _FixtureWatchdog()
     observed_progress: list[dict] = []
     observed_acknowledgements: list[dict] = []
     observed_results: list[dict] = []
@@ -2160,7 +2219,7 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
                 # The independent heartbeat/ack chain commits a newer containment position
                 # while this already-produced progress snapshot is still in flight.
                 heartbeat_released.set()
-                assert acknowledgement_committed.wait(1)
+                watchdog.wait(acknowledgement_committed, "overtaking progress awaits stop ack")
                 with cloud_request_lock:
                     status = coordinator.progress(
                         manifest["workspace_id"], manifest["project_id"], run_id,
@@ -2185,11 +2244,11 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
                         identity.runner_id, value,
                     )
                 heartbeat_released.set()
-                assert acknowledgement_committed.wait(1)
+                watchdog.wait(acknowledgement_committed, "committed progress awaits stop ack")
             return status
 
         def heartbeat(self, run_id, value):
-            assert heartbeat_released.wait(1)
+            watchdog.wait(heartbeat_released, "heartbeat awaits stop progress")
             try:
                 with cloud_request_lock:
                     gate = coordinator.heartbeat(
@@ -2255,8 +2314,9 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
         def execute(self, lease, *, cancellation, on_progress):
             return executor.execute(
                 lease.bundle, transport=ScriptedTransport([401, 200, 200, 403]),
-                gate_source=lambda: ExecutionGate(
-                    True, "active", "valid", NOW_MS + 60_000, 0, "none", NOW_MS,
+                gate_source=_RespondingCloudGate(
+                    ExecutionGate(True, "active", "valid", NOW_MS + 60_000, 0, "none", NOW_MS),
+                    monotonic=time.monotonic,
                 ),
                 cancellation=cancellation, on_progress=on_progress,
             )
@@ -2274,20 +2334,27 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
             threading.current_thread().name == "heel-runner-heartbeat"
             and not heartbeat_released.is_set()
         ):
-            assert heartbeat_released.wait(1)
+            watchdog.wait(heartbeat_released, "service monotonic holds heartbeat snapshot")
         return time.monotonic()
 
     bridge = CloudBridge()
-    assert RunnerService(
+    ran = RunnerService(
         coordinator=bridge, executor=ExecutorAdapter(), heartbeat_interval=0.01,
         idle_poll_interval=2.0, clock_ms=lambda: NOW_MS + 200,
         monotonic=service_monotonic,
-    ).run_once() is True
+    ).run_once()
+    completed_counts = [value["counters"]["requests_completed"] for value in observed_progress]
+    assert watchdog.failures == [] and not watchdog.abort.is_set(), (
+        watchdog.failures, completed_counts, heartbeat_failures,
+    )
+    assert ran is True
 
-    stopped_progress = next(
+    stopped = [
         value for value in observed_progress
         if value["counters"]["requests_completed"] == stop_after_completed
-    )
+    ]
+    assert stopped, (stop_after_completed, completed_counts, heartbeat_failures)
+    stopped_progress = stopped[0]
     assert (
         stopped_progress["event_sequence"],
         observed_acknowledgements[0]["event_sequence"],
@@ -2307,6 +2374,52 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
     assert status["status"] == "terminal"
     assert status["execution_disposition"] == "stopped"
     assert status["error_category"] == "none", heartbeat_failures
+
+
+@pytest.mark.parametrize("stall_after_request", [None, 1])
+def test_responding_fixture_gate_keeps_the_half_second_staleness_bound(
+    tmp_path, stall_after_request,
+):
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+
+    class Clock:
+        value = 0.0
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+    gate = _RespondingCloudGate(active_gate(), monotonic=clock)
+
+    class SlowTransport(ScriptedTransport):
+        # Each request spends 0.3 s, so four requests outlive one 0.5 s staleness window.
+        def request(self, action, **kwargs):
+            response = super().request(action, **kwargs)
+            clock.value += 0.3
+            if len(self.calls) == stall_after_request:
+                gate.stall()
+            return response
+
+    result = LocalCanaryExecutor(
+        store=store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=clock,
+    ).execute(
+        ExecutionBundle(manifest, projection, grant),
+        transport=SlowTransport([401, 200, 200, 403]), gate_source=gate,
+    )
+    counters = result.operational_projection["counters"]
+    if stall_after_request is None:
+        assert result.execution_disposition == "completed"
+        assert counters["requests_started"] == 4
+    else:
+        # Server time last advanced at 0.0 s; the third request's 0.6 s check exceeds 0.5 s.
+        assert result.execution_disposition == "incomplete"
+        assert result.operational_projection["error_category"] == "cloud_disconnected"
+        assert counters["requests_started"] == 2
 
 
 def test_real_executor_local_emergency_stop_transitions_and_allocates_ack_sequence(tmp_path):
