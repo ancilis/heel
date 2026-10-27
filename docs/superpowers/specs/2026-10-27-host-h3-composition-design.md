@@ -7,6 +7,24 @@ CONFIRMED `git rev-parse HEAD^ HEAD^^{tree}` from the candidate). **No product, 
 deployment, provider, namespace or customer state was changed.** This file is the only tracked write
 of the session. Evidence folder: `.worktrees/heel-task-evidence/H3-COMPOSITION-DESIGN/`.
 
+> **Revision 2 (2026-10-27, after independent review round 2, `H3-COMPOSITION-SPEC-REVIEW-R2/REPORT.md`,
+> and Astra's `ASTRA-REVISION-2-GRANT.md`).** Commits `c502e1ca` and `2e68c571` are preserved and not
+> accepted. **B-R1:** the 1000 ms `REVOKE_DEADLINE_MS` is unchanged; revoke now runs a release-before-kill
+> protocol with explicit budgets (registry ≤ 100 ms, release wait ≤ 400 ms, `CHILD_REAP_GRACE_MS` = 250
+> ms from `authority.py:59`, group scan ≤ 50 ms, total ≤ 800 ms, §4.6); ending F (the worker's own
+> `sendmsg` raised) and the new outcome **P⁰ — preempted worker** (killed before reaching its send; not
+> a failed-send observation, no delete/state required) are distinct, each with its own deterministic
+> offline test and Linux case (§4.7, §6.1, §6.3 L3). **B-R2:** executor stop and worker release have
+> exactly one owner, the controller thread; the main thread requests and polls at tick granularity and
+> never waits; the orderly end flushes first and stops the executor second, so target traffic is cut
+> within the tick that decided the end (§4.2, §4.6, §4.7 S); blocking DNS resolution runs on a
+> per-generation resolver thread with one pending request, cancellation, timeout, residual-thread
+> accounting and a bounded count (§4.5 item 3); T10/L6 are restated from the budgets, the blanket
+> "≤ 5 s" claim is withdrawn (§5, §6.3 L6). Advisories A-R1 (claim gate at `_ServeCoordinator.claim`),
+> A-R2 (no caching; residual `heel-bounded-dns` threads), A-R3 (obligation 4 "made mandatory"), A-R4
+> (cites), A-R5 (previous-generation registry window), A-R6 (fork sentence) are applied. No product
+> code; no implementation grant; CodeQL candidate `d24501ae` is a separate prerequisite (§11).
+>
 > **Revision 1 (2026-10-27, after independent review round 1, `H3-COMPOSITION-SPEC-REVIEW/REPORT.md`,
 > and Astra's `ASTRA-REVISION-1-GRANT.md`).** The original candidate `c502e1ca` is preserved and is not
 > accepted. This revision resolves blockers B-1…B-6 and the safety-relevant advisories A-1…A-12 as
@@ -245,8 +263,8 @@ names which component owns each).
   40564023989). The child between `fork` and `execve` executes only `os.setns`, `os.dup2`,
   `os.execve`, `os._exit` under CPython's post-fork child state; it takes no lock the controller
   thread can hold (the controller thread never calls into `authority`/`cycle`). `authority._FORKED`
-  stays `False` in the supervisor because every H3 child is a `Popen` without `preexec_fn` (no
-  `register_at_fork` hook fires; H2 design §4.3 probe), and the static test in §6.1 pins "no
+  stays `False` in the supervisor: it flips only in a forked child (`register_at_fork` `after_in_child`,
+  `authority.py:154-155`), and every H3 child is a `Popen` that execs; the static test in §6.1 pins "no
   `os.fork`, no `preexec_fn`" in the three H3 modules. H3-2 L1 re-exercises the real cycle ticks with
   the controller thread alive. No H1 change is proposed.
 - The executor's control transport resolves the control name with the system resolver
@@ -308,16 +326,18 @@ and the pin).
 
 | Thread | Does | Never does |
 |---|---|---|
-| main | `install_signal_context()` once; per generation: build channel and link sockets, spawn the worker (own process group), `register_bootstrap`, `start()` (the hand-off runs outside the cycle lock), executor attach after `ready`, `tick()` at 1 Hz, `stop()`/`stop_context()` at context ends, executor detach, worker release, `status()` → tokens | blocks on a child; reads a cycle private; forks; holds the supervisor lock while inside `start()`, `tick()`, `stop()`, `stop_context()` or any blocking wait |
-| controller | serves the controller end of the H2-A channel (`arm` → `pin` to the worker → `armed`; `revoke` → §4.6 → `revoked`), the worker link (`fd_forward`, `state`, `release`), the executor link (`bound`/`claim_request`/`claimed`/`resolve`/`released`), the registry writer, the link writer, the constrained resolver, and child reaping on request from main | calls any `HostCycle` method; sends a receipt; runs nft; waits on the main thread |
+| main | `install_signal_context()` once; per generation: build channel and link sockets, spawn the worker (own process group), `register_bootstrap`, `start()` (the hand-off runs outside the cycle lock), executor attach after `ready` (the launch `Popen` itself; the helper execs within milliseconds), `tick()` at 1 Hz, `stop()`/`stop_context()` at context ends, **requests** executor stop and worker release by setting record flags, polls their outcome at tick granularity, `status()` → tokens, exits on `exit_required`/budget | blocks on any child (`waitpid`, `killpg` waits, link reads); reads a cycle private; forks; holds the supervisor lock while inside `start()`, `tick()`, `stop()`, `stop_context()` or any blocking call |
+| controller | one `select.poll` loop (50 ms slices) over the H2-A controller end, the worker link, the executor link and the resolver result pipe: `arm` → `pin` → `armed`; `revoke` → §4.6 → `revoked`; `fd_forward`/`state`; `bound`/`claim_request`/`claimed`/`released`; `resolve` → enqueue to the resolver thread, answer when its result arrives; registry writes; link (veth) creation at attach; **the only owner of executor stop and worker release** (B-R2), run as non-blocking state machines advanced each slice (`SIGTERM` at t0, `SIGKILL` at t0 + 2000 ms, `waitpid(WNOHANG)` until `CHILD_REAP_GRACE_MS`, `/proc` group scan) | calls any `HostCycle` method; sends a receipt; runs nft; resolves DNS inline; blocks longer than one slice on anything but its sockets (the registry `fsync` + `os.replace` and `killpg`/`waitpid(WNOHANG)` are the only non-socket syscalls, each bounded, I-Q2) |
+| resolver (per generation, `heel-h3-resolver-<n>`) | takes at most one pending `resolve` at a time from the controller, runs the unchanged `BoundedResolver()(pinned_hostname, deadline)` (which itself blocks ≤ the deadline on its own `heel-bounded-dns` daemon thread, `http_transport.py:188-205`), writes the result token + answers (or `timeout`/`unsafe_dns`) to the result pipe; exits when the generation ends and no request is in flight | touches sockets, the registry, children or the cycle; caches anything |
 
 **Lock discipline (B-6).** The per-generation record is protected by one supervisor lock used only
 for short, non-blocking critical sections (read or write a field, swap a descriptor). The main thread
 takes it before and after a cycle call, never across one; the controller thread takes it to read the
-current operation and to record `armed`/`revoked`, never while sending, receiving, resolving or
-writing the registry. Every controller reply is therefore bounded by its own socket deadline, not by
-the main thread's progress, and the cycle's `BOOTSTRAP_POLL_MS` slices (`cycle.py:_send/_receive`)
-see an answer within one slice or cancel by their own deadline.
+current operation and to record `armed`/`revoked`/`reaped`, never while sending, receiving or writing
+the registry; the resolver thread takes it only to hand over a result. Every controller reply is
+therefore bounded by its own socket deadline and the 50 ms slice, not by the main thread's progress or
+by any DNS call, and the cycle's `BOOTSTRAP_POLL_MS` slices (`cycle.py:_send/_receive`) see an answer
+within one slice or cancel by their own deadline.
 
 ### 4.3 Trusted constructor (validated inputs → `CycleContext`, `H2PolicyInput`, resolver channel)
 
@@ -386,40 +406,59 @@ refuse the message, as the cycle does (`cycle.py:_close_received`).
    prefix_python, ["python", "-I", "-S", "-B", entry_path, home, input_path, link_fd], {PATH, LC_ALL})`.
    The namespace descriptor is closed before the privilege drop and never reaches the executor; the
    link fd is the only inherited descriptor besides stdio (`/dev/null`).
-3. **Constrained resolution channel (B-3).** `deploy/host/executor.py` builds
+3. **Constrained resolution channel (B-3, B-R2).** `deploy/host/executor.py` builds
    `LinkResolver(link, pinned_hostname)` and passes it as `target_network={"resolver": …}`
    (`daemon.py:100,578`). The unchanged client calls it before every attempt and once for the preflight
    (`daemon.py:429`, `http_transport.py:706`). `LinkResolver.__call__(hostname, *, deadline)`: if
    `hostname != pinned_hostname` → `TransportFailure("unsafe_dns")` without any message; otherwise one
    `resolve {hostname, deadline_ms}` datagram, one reply before the caller's deadline; `resolved` →
    return `answers` as a list of strings (the client then runs `select_public_addresses` and its
-   equality check itself, `http_transport.py:699-720`); `resolve_refused unsafe_dns|not_pinned` →
-   `TransportFailure("unsafe_dns")`; `timeout`/no reply → `TransportFailure("timeout")`. The supervisor
-   side answers only when `hostname == pinned_hostname` of the live generation, runs the unchanged
-   `BoundedResolver()(hostname, deadline=min(requested, now + 5 s))` in the host namespace (which
-   itself refuses non-public answers, `http_transport.py:209`), returns the raw strings, and bounds
-   the channel: one outstanding request per executor, at most 64 requests per generation (the client
-   needs ≤ 1 + `maximum_requests` 20 + retries), `budget` refusal beyond. Properties kept: real
-   per-attempt resolution, full A+AAAA set, `dns_changed` on membership change, `unsafe_dns` on an
-   unsafe member, `resolver_calls == attempts + 1`; properties added: the supervisor resolves no name
-   other than the authorized origin, so the channel is not a DNS oracle for the executor. The kernel
-   set stays the install-time IPv4 members: a membership change makes the attempt `dns_changed`
-   (refused before any socket), never a reach to a new address. This is the P4 configuration with the
-   mutable answer supplied by a real resolver instead of a scripted one; it is not a constant.
-4. `daemon.py` changes are exactly: a `managed_link` constructor seam (like `target_network`, never
-   passed by the CLI); in `_ServeSession.run`, after the context is ensured and before
-   `service.run_once()`, `link.claim_request(origin)` → `defer` returns the loop to its offline path
-   (no claim); on `allow` the supervisor has re-resolved the pinned origin and found the canonical set
-   equal to the install-time tuple (otherwise it answers `defer`, ends the generation `pin_stale` and
-   the next generation pins the current set — the staleness bound); `_ServeExecution.execute`
-   composes `transport_precheck = chain(link.await_authorized, _require_os_credentials)` and emits
-   `claimed` before waiting; on terminal result or stop it emits `released`. No other runner module
-   changes. `_require_os_credentials` passes with zero credential bindings (CONFIRMED by round 1,
+   equality check itself, `http_transport.py:699-720`); `resolve_refused unsafe_dns|not_pinned|budget`
+   → `TransportFailure("unsafe_dns")`; `timeout`/no reply → `TransportFailure("timeout")`.
+   **Supervisor side, off the controller thread:** the controller validates the datagram (`hostname ==
+   pinned_hostname` of the live generation, budget ≤ 64 per generation, no request pending, else an
+   immediate `resolve_refused`) and hands it to the generation's resolver thread; that thread runs the
+   unchanged `BoundedResolver()(hostname, deadline=min(requested, now + 5 s))` in the host namespace
+   (which refuses non-public answers, `http_transport.py:209`) and returns the raw strings through the
+   result pipe; the controller answers on the link in its next slice. **No caching (A-R2):** every
+   `resolve` is a fresh `getaddrinfo`; the supervisor stores no answer beyond the one in flight and
+   never serves a previous answer. **Pending-resolution ownership:** the resolver thread owns the one
+   pending request; the controller records `(request_id, deadline)` and a `cancelled` flag.
+   Cancellation (executor link closed, generation ending, `stop`) sets the flag; the in-flight
+   `getaddrinfo` cannot be interrupted, so the resolver thread runs it to its deadline (≤ 5 s), then
+   discards the result if cancelled and exits. Timeout: the result token is `timeout` and
+   `BoundedResolver` leaves its `heel-bounded-dns` daemon thread running until libc returns
+   (`http_transport.py:203-205`); that thread is counted, never joined, and bounded: at most one per
+   generation (one pending request at a time), so ≤ 8 per supervisor process; `status()` reports
+   `resolver_residual` (count of such threads still alive, by name) and `resolver_pending` (0 or 1);
+   a new `resolve` is refused `budget` while a residual thread of the **same** generation is alive.
+   Residual duration is libc's (INFERRED I-13); it is reported, never relabelled as reaped, and it
+   does not block generation end (the thread holds no namespace reference and no socket). Properties
+   kept: real per-attempt resolution, full A+AAAA set, `dns_changed` on membership change,
+   `unsafe_dns` on an unsafe member, `resolver_calls == attempts + 1`; properties added: the
+   supervisor resolves no name other than the authorized origin, so the channel is not a DNS oracle
+   for the executor. The kernel set stays the install-time IPv4 members: a membership change makes the
+   attempt `dns_changed` (refused before any socket), never a reach to a new address. This is the P4
+   configuration with the mutable answer supplied by a real resolver instead of a scripted one; it is
+   not a constant and not a cache.
+4. `daemon.py` changes are exactly (A-R1): a `managed_link` constructor seam (like `target_network`,
+   never passed by the CLI); the claim gate in **`_ServeCoordinator.claim`** (`daemon.py:510`, the
+   daemon-owned wrapper the service calls on every cycle of `service.serve(cycle)`, `daemon.py:1485`):
+   before delegating to `RunnerCoordinator.claim`, `link.claim_request(origin)`; `defer` returns
+   `None` (no lease, the service's ordinary offline path); the `bound` emission in the
+   `ensure_runner_context` wrapper (`daemon.py:501-508`); on `allow` the supervisor has re-resolved the
+   pinned origin (through the resolver thread, same rules) and found the canonical set equal to the
+   install-time tuple (otherwise it answers `defer`, ends the generation `pin_stale` and the next
+   generation pins the current set — the staleness bound); `_ServeExecution.execute` composes
+   `transport_precheck = chain(link.await_authorized, _require_os_credentials)` and emits `claimed`
+   before waiting; on terminal result or stop it emits `released`. No other runner module changes.
+   `_require_os_credentials` passes with zero credential bindings (CONFIRMED by round 1,
    `daemon.py:360-383`), so H3 adds no credential path. The `run`-phase daemon is built with
    `secret_backend=<managed backend>` (the `RunnerDaemon` constructor seam, `daemon.py:569`): on a
    headless host the default is the `secret-tool` adapter with no fallback (`identity.py:336-355`),
    so the managed identity backend is an explicit **C4 input** of H3-3 (§9.1); H3-1's real-daemon case
    passes a test backend through the same seam and says so.
+
 5. **Registry record sources (B-5).** The slot's `runner` record (`runner_id`, `runner_key_id`,
    `public_key_digest`; `policy.js:793-798`) is load-bearing for the ingress (every proof route needs
    it, 1098-1101; the CP's grant `runner_binding` is compared to it, 1582-1584) and must exist before
@@ -446,10 +485,10 @@ refuse the message, as the cycle does (`cycle.py:_close_received`).
 | worker spawn | `Popen(..., start_new_session=True)` so the worker and every H2-1 helper it starts share one process group (H2-1 helpers keep `start_new_session=False`, `h2_policy.py:383-385`, so they inherit it) | — |
 | slot veth | **after `ready`** (A-5), at attach, from the forwarded dup: `RTM_NEWLINK` veth from a `NETLINK_ROUTE` socket opened in the host namespace with peer `IFLA_NET_NS_FD = <dup>`; host side `slot_hop_dst/32`, `slot_hop_src/32` plus routes/neighbours inside the generation through `ip` entered by `setns` on the dup (the H2-2 fixture pattern by descriptor, `tests/linux/test_host_h2_policy.py:1267-1300`); the dup is closed after the netlink ack, the `ip` steps and the executor helper's `Popen` | any step failing → `link_failed`: `stop()` before any executor exists; no table is deleted |
 | registry | render `heel.ingress-registry.v1` from the root-owned slot configuration + the per-slot dynamic record; write temp file + fsync + chmod 0644 + `os.replace`, `config_generation` strictly increasing, `expires_at_ms` bounded (`tests/support/host_ingress_harness.py:339-367` pattern; production code in `supervisor.py`; validated with the harness's `validate_registry`, 241) | a write failure refuses attach (`registry_failed`) |
-| `revoke` (B-1) | (1) registry: the slot record becomes **`phase: stopping`, `projects: []`, `contexts: []`, `runs: []`** under a new `config_generation` (`runner`/`pairing` kept, as the grammar requires for a paired slot, `policy.js:897-903`); (2) close the forwarded dup if held; (3) `killpg(SIGKILL)` on the worker's group, `waitpid(worker)` within `CHILD_REAP_GRACE_MS`, then (Linux) scan `/proc/*/stat` for the group id within the same grace; (4) answer `revoked {enabled: absent, worker: reaped|unresolved}` under the armed nonce only; (5) burn the nonce. `reaped` means: worker status collected **and** no process of its group remains; otherwise `unresolved` (A-3) | **a failed registry write sends no ack**: the cycle's `REVOKE_DEADLINE_MS` passes, it quarantines `bootstrap_unresolved`, the process exits; an unreaped worker or a surviving helper is `unresolved`, never `reaped` |
+| `revoke` (B-1, B-R1: release-before-kill, all budgets monotonic from the `revoke` datagram; `REVOKE_DEADLINE_MS` 1000 unchanged, `cycle.py:405`) | (1) registry write ≤ `REVOKE_REGISTRY_BUDGET_MS` 100: the slot record becomes **`phase: stopping`, `projects: []`, `contexts: []`, `runs: []`** under a new `config_generation` (`runner`/`pairing` kept, `policy.js:897-903`); (2) `revoke {generation_id, bootstrap_fence}` on the worker link (non-blocking send); (3) wait ≤ `REVOKE_RELEASE_WAIT_MS` 400 for the worker's `state` datagram or link EOF (50 ms slices; an idle R′ worker exits 0 at once on `revoke`; an F worker finishes its failed send, `cleanup()` and `state` inside this window if its remaining install work fits — see §4.7); (4) `killpg(SIGKILL)` on the worker's group (a no-op for an exited worker), `waitpid(worker)` with `WNOHANG` polls ≤ `CHILD_REAP_GRACE_MS` 250 (`authority.CHILD_REAP_GRACE_MS`, `authority.py:59`), then (Linux) one `/proc/*/stat` scan for the group id ≤ `REVOKE_SCAN_MS` 50; (5) close the forwarded dup if held; (6) answer `revoked {enabled: absent, worker: reaped|unresolved}` under the armed nonce only; (7) burn the nonce. Budget: 100 + 400 + 250 + 50 = `REVOKE_CONTROLLER_BUDGET_MS` 800 ≤ 1000 − `BOOTSTRAP_POLL_MS` 50 − 150 ms scheduling margin; the static test pins the constants and the inequality. `reaped` means: worker status collected **and** no process of its group remains; otherwise `unresolved` (A-3) | **a failed or over-budget registry write sends no ack**: the cycle's `REVOKE_DEADLINE_MS` passes, it quarantines `bootstrap_unresolved`, the process exits; an unreaped worker or a surviving group member is `unresolved`, never `reaped`; a worker killed in step (4) before it reached its send is outcome **P⁰** (§4.7): no delete, no `state`, and none is required |
 | what "absent" admits afterwards (B-1, truthful) | with empty `runs`/`contexts`, every `run_operation`, `result_projection`, `context_claim` and `context_submit` is refused `identity` (1103-1113) and `claim` is refused `phase` (1144); still admitted for the paired identity: `context_list` (proof route without id lookup), `resync` (1085, `PROOF4`) and the retained pairing receipt routes (1154-1159). They reach the CP, which authenticates proof-of-possession, holds no active run for this slot after the cycle's end, and answers from its own state. This is the strongest meaning the H0 grammar offers; a non-admitting paired phase would be an H0 grammar change (own task, not proposed) | — |
-| executor stop | `stop` on the link, SIGTERM, 2000 ms, SIGKILL, `waitpid` within `CHILD_REAP_GRACE_MS` | unreaped executor → `executor_unresolved`: the flush of S still runs (A-4), no further generation in this process, `exit_required` |
-| worker release | `release` on the link after the executor is reaped and `close_generation` returned; the worker closes its dup and exits 0; `waitpid`; group scan as above | unreaped worker or surviving helper → `worker_unresolved`, same policy |
+| executor stop (sole owner: controller thread, B-R2) | triggered by the record flag the main thread sets (`executor_stop_requested`, with the reason) or by link EOF/`released`; non-blocking state machine: `stop` on the link and `SIGTERM` at t0; `SIGKILL` at t0 + `EXECUTOR_TERM_GRACE_MS` 2000; `waitpid(WNOHANG)` each slice until t0 + 2000 + `CHILD_REAP_GRACE_MS` 250; result `reaped`/`unresolved` written to the record; the main thread reads it at its next tick | unreaped executor → `executor_unresolved`: recorded, no further generation in this process, `exit_required`; the flush of S has already run (A-4), so nothing waits on this outcome except the next generation |
+| worker release (sole owner: controller thread) | triggered by the record flag the main thread sets after `close_generation` returned (S step 4): `release` on the link; the worker closes its dup and exits 0; `waitpid(WNOHANG)` ≤ `CHILD_REAP_GRACE_MS` 250 then `killpg(SIGKILL)` + one more grace + group scan; result to the record | unreaped worker or surviving group member → `worker_unresolved`, same policy |
 
 ### 4.7 Teardown: why no path creates default-allow while anything can still use the namespace
 
@@ -488,14 +527,15 @@ the status and, for the worker, its process group is empty):
 
 | Ending | Order | Why no default-allow and no stale authority |
 |---|---|---|
-| **S — success, orderly end** (`stop_context`/`stop` after `released`, or any class-A/B reason) | 1 `stop` on the link, SIGTERM → SIGKILL, executor **reaped** (or `executor_unresolved` after the grace, A-4: continue); 2 registry non-admitting shape (new generation); 3 cycle ends the context: `close(current)` then `close_generation` (flush, owner fd closed) — **always**, also after `executor_unresolved`; 4 `release` to the worker → worker closes its dup, exits, **reaped**; 5 the supervisor holds no namespace fd after the attach step | the table is intact while the executor exists (1 before 3); the flush (3) removes every live key before any holder is released (4), so a socket that outlived the executor (TIME_WAIT) can only retransmit into a dropped chain; no `cleanup()`; the namespace and its veth die at 4 |
-| **F — failed send** (the worker's own `sendmsg` of the receipt raised; reachable only when the cycle closed the worker socket before the send: deadline during a slow `install()`, or an earlier cancel) | worker: 1 no retry, no second `install()`; 2 `cleanup(fd, input)` once (best effort); 3 `state {send: failed}` on the link; 4 close its dup; 5 exit 0. Cycle: `cancel()` already ran → `revoke` → controller §4.6 (the worker may already have exited; `reaped` then needs only `waitpid`) | no executor exists (`ready` never happened); T(a)-(c) hold; the H2 single-use rule refuses a second install (`refused_reused_input`) |
-| **R′ — receipt read or queued, then revoked** (stop before the lock-held decision; a late receipt after the deadline; a malformed-after-valid sequence) | cycle: `_finish_bootstrap` → `revoke` → `cancel()` closes the worker socket with the datagram read or unread, sends `revoke`; controller §4.6: registry non-admitting, forwarded dup closed, `killpg(SIGKILL)`, `reaped|unresolved`; `_refuse_start` → `close_generation` | **no `cleanup()`**: the worker's send succeeded, so it waits for `release`/`fd_forward` acknowledgement and is killed under the burned nonce; the table dies with the namespace; the forwarded dup (if sent) is closed at revoke step (2); no executor was ever attached; `_INPUTS` records `receipt_ready` and nothing ever acts on it |
+| **S — success, orderly end** (`stop_context`/`stop` after `released`, or any class-A/B reason decided in a tick) | 1 main (same tick): registry non-admitting shape under a new `config_generation` (controller performs the write on request within its next slice; main does not wait for it before step 2); 2 main (same tick): the cycle ends the context: `close(current)` then `close_generation` (flush ≤ `PREPARE_CHILD_TIMEOUT_MS` 1000 + `CHILD_REAP_GRACE_MS` 250, owner fd closed) — **always**, whatever the executor's later state; 3 controller: executor stop state machine (`stop`, SIGTERM, SIGKILL at +2000 ms, reap ≤ +250 ms) → `reaped`/`unresolved`; 4 controller, after 3 settled: `release` to the worker → worker closes its dup, exits, **reaped** (or group-killed after the grace); 5 main polls 3-4 at tick cadence; the next generation starts only after both are `reaped`; the supervisor holds no namespace fd after attach | the table is never deleted (no `cleanup()` on this path), so an executor outliving step 2 sees a `policy drop` chain with no live key: every new target packet is dropped from step 2 on, and established connections lose their key within the prepared element's own timeout (≤ `LEASE_MS` 3000 after the last `prepare`); control access ends at the next ingress request after step 1; the namespace and its veth die at 4 |
+| **F — failed send** (the worker's own `sendmsg` of the receipt raised; reachable only when the cycle closed the worker socket before the send: deadline during a slow `install()`, or an earlier cancel; **observed** only when the worker's remaining install + cleanup work fits inside the controller's `REVOKE_RELEASE_WAIT_MS` window, otherwise the outcome is P⁰) | worker: 1 no retry, no second `install()`; 2 `cleanup(fd, input)` once (best effort); 3 `state {send: failed}` on the link; 4 close its dup; 5 exit 0. Cycle: `cancel()` already ran → `revoke` → controller §4.6 steps (1)-(7): the `state` datagram or EOF ends the release wait early | no executor exists (`ready` never happened); T(a)-(c) hold; the H2 single-use rule refuses a second install (`refused_reused_input`) |
+| **P⁰ — preempted worker** (the cycle cancelled while the worker was inside `install()`, and the worker did not reach its `sendmsg` before the controller's `killpg` in revoke step (4), i.e. its remaining install work exceeded the 400 ms release window) | controller §4.6: the release wait expires with no `state`, `killpg(SIGKILL)` kills the worker and every helper in its group, `waitpid` + group scan → `reaped` (or `unresolved`); the table may or may not have been installed | **not a failed-send observation**: no `cleanup()`, no `state` and no `delete table` are required or possible (obligation 2 binds only a worker whose own send failed); no `ready`, no executor, the registry never admitted; a partially or fully installed table is `policy drop` with no key and dies with the namespace when the worker's dup closes at its death; `_INPUTS` is lost with the process. Distinct test and Linux case from F (§6.1 item 2b, §6.3 L3) |
+| **R′ — receipt read or queued, then revoked** (stop before the lock-held decision; a late receipt after the deadline; a malformed-after-valid sequence) | cycle: `_finish_bootstrap` → `revoke` → `cancel()` closes the worker socket with the datagram read or unread, sends `revoke`; controller §4.6: registry non-admitting, `revoke` on the link → the idle worker closes its dup and exits 0 within the release window, `waitpid` → `reaped` (group kill is a no-op), forwarded dup closed; `_refuse_start` → `close_generation` | **no `cleanup()`**: the worker's send succeeded, so it waits for `release`/`revoke` and exits on it; the table dies with the namespace; the forwarded dup (if sent) is closed at revoke step (5); no executor was ever attached; `_INPUTS` records `receipt_ready` and nothing ever acts on it |
 | **C — cancel before any send** (arm unacked, `pin` send failed, request send failed, stop before the request) | cycle: burn dup, close worker socket, `revoke`; controller §4.6; worker: its `recvmsg` returns EOF (no request) → it exits 0 without installing, `state {send: not_attempted}` | nothing was installed; no `cleanup()` (nothing to clean; `cleanup()` would be a no-op by H2-1's rule) |
-| **X — executor crash** (exit without `released`) | link EOF → supervisor `stop_context` (`context_replaced`) → S from step 2 | the executor is reaped (crash = exit) before the flush; the run's CP state ends through the existing reaper (`HOST_AUTHORITY_CYCLE.md` "A stopped executor's heartbeats stop") |
+| **X — executor crash** (exit without `released`) | controller reaps it (link EOF → stop state machine finds it already exited) and sets the record; main sees it at the next tick → `stop_context` (`context_replaced`) → S from step 1 | the run's CP state ends through the existing reaper (`HOST_AUTHORITY_CYCLE.md` "A stopped executor's heartbeats stop"); the table was never deleted |
 | **W — worker crash after receipt** | `state`/EOF on the worker link; if the forwarded dup never arrived → `link_failed` → S without an executor; if it did → S | the table stays; nothing deletes it; helpers in the dead worker's group are killed by the group kill at release |
 | **Q — cycle quarantine** (`child_uncertain`, `bootstrap_unresolved`, `flush_failed`, `operation_interrupted`, …) | executor stop as S step 1 (best effort, bounded), registry non-admitting, worker group kill, `exit_required` → the supervisor exits (H6 restarts it ≥ 10 s later) | the namespace is abandoned, never deleted-from; residual admission is bounded by `R_bound` and the prepared timeout; the executor is dead |
-| **P — supervisor crash/restart** | all children die with the control group (H6 `KillMode=control-group`, INFERRED I-1); the new supervisor starts a new generation; the old namespace dies with its last holder | the registry's `host_boot_epoch`/`config_generation` rules make the new supervisor's first write supersede the old record; no path revives an old namespace (I2 no naming) |
+| **P — supervisor crash/restart** | all children die with the control group (H6 `KillMode=control-group`, INFERRED I-1); the new supervisor starts a new generation; the old namespace dies with its last holder | the registry's `host_boot_epoch`/`config_generation` rules make the new supervisor's first write supersede the old record; no path revives an old namespace (I2 no naming); until the new supervisor's first registry write (after its restart delay ≥ 10 s, I-1) the old slot record may still admit a run route for a process that no longer exists — harmless, and part of the revocation bound H6's delay sets (A-R5) |
 
 ### 4.8 Lifecycle and ownership table (per resource, per phase)
 
@@ -509,10 +549,11 @@ the status and, for the worker, its process group is empty):
 | H2-A channel sockets | supervisor (`socketpair` ×2) | adopted by `BootstrapChannel`; worker end passed to the worker; controller end served by the controller thread | — | — | closed by `commit`/`cancel` | — | — |
 | worker link | supervisor | passed at worker spawn | `pin`, `fd_forward`, `state` | — | `release` | worker reaped | both ends closed |
 | executor link | supervisor | passed at executor launch | — | `bound`/`claim_request`/`claimed`/`authorized` | `released`/`stop` | executor reaped | both ends closed |
-| worker process | supervisor (`Popen`, own process group) | before `register_bootstrap`; receives `pin` on `arm` | runs `install`, sends receipt once | idle, holds its dup | — | `killpg(SIGKILL)` at revoke; `waitpid` + group scan after `release` | `unresolved` if the worker is not reaped or any group member survives the grace |
-| executor process | supervisor via execed helper | after `ready` | — | claims, waits for `authorized`, executes | `stop`/SIGTERM/SIGKILL | `waitpid` within grace | `executor_unresolved` → `exit_required` |
+| worker process | supervisor (`Popen`, own process group) | before `register_bootstrap`; receives `pin` on `arm` | runs `install`, sends receipt once | idle, holds its dup | — | controller only: `revoke`/`release` on the link, release wait, `killpg(SIGKILL)`, `waitpid` ≤ 250 ms, group scan | `unresolved` if the worker is not reaped or any group member survives the grace; P⁰ if killed before its send |
+| executor process | supervisor via execed helper (main thread launches) | after `ready` | — | claims, waits for `authorized`, executes | main requests; controller runs `stop`/SIGTERM/SIGKILL (+2000 ms) | controller: `waitpid` ≤ 250 ms grace | `executor_unresolved` → `exit_required` |
 | registry slot record | supervisor | `pending` → `active` at attach | — | run record `admitted` at `claimed` | `stopping` before the flush | — | `retained`/empty between generations |
 | slot veth | supervisor (netlink by fd) | — | — | created at attach, after `ready`; carries control and pinned target traffic | — | — | dies with the namespace (I-4) |
+| resolver thread + `heel-bounded-dns` residual | supervisor (per generation) | — | — | one pending `resolve` at a time; result by pipe | cancelled flag set; in-flight call runs to its ≤ 5 s deadline | thread exits when idle after the end | residual libc thread counted in `status()`, never joined, ≤ 1 per generation |
 | CP authority socket | cycle (`connect_cp` per request) | — | — | one connection per tick | — | — | — |
 
 ### 4.9 Mandatory obligations (H2 design §4.8, carried verbatim) and where each lives
@@ -529,9 +570,10 @@ the status and, for the worker, its process group is empty):
    against `LeaseDomain.close_generation` (H1 flush + owner-fd close; the table survives until the
    namespace dies). → the contracted order is S (§4.7): no `cleanup()` after success, ever; the flush
    precedes every holder release; the executor is reaped before the flush.
-4. Run the worker as a dedicated process, hand it the borrowed fd, and supervise it under the cycle's
-   deadline/revoke; the installer itself inherits no descriptor into its helpers (`close_fds=True`).
-   → §4.1, §4.6; the worker's helpers keep H2-1's `close_fds=True`/`pass_fds`.
+4. Run the worker as a dedicated process (**carried with item 4 made mandatory**: the H2 design says
+   "recommended, not a precondition since revision 4"; H3 requires it), hand it the borrowed fd, and
+   supervise it under the cycle's deadline/revoke; the installer itself inherits no descriptor into its
+   helpers (`close_fds=True`). → §4.1, §4.6; the worker's helpers keep H2-1's `close_fds=True`/`pass_fds`.
 5. Treat `unresolved_helpers()` non-zero as a reason to report `unresolved` to the controller, never
    "reaped". → the worker's `state` message carries `unresolved = unresolved_helpers()["unreaped"]`;
    a non-zero value makes the controller answer `worker: unresolved` on revoke and makes the supervisor
@@ -550,7 +592,7 @@ the status and, for the worker, its process group is empty):
 | T7 | Secret or raw body in supervisor logs/status/registry | links carry ids/digests only (grammar-checked); executor stdio is `/dev/null`; registry fields are the closed H0 schema; no credential path exists in H3 (anonymous-only) | H3 (static tests), C5 for the vault |
 | T8 | Privilege escalation from the executor | unprivileged uid, no supplementary groups, `no_new_privs` inherited from the unit, no capability, read-only prefix, `-I -S -B` | H3 helper + H6 unit |
 | T9 | Supervisor becomes an SSRF proxy | the supervisor opens no socket on the executor's behalf and forwards nothing; its only outbound connections are the CP Unix socket (`connect_cp`) and the preflight DNS query | H3 (static: no TCP connect in `supervisor.py`) |
-| T10 | Revocation latency | registry non-admitting shape (empty `runs`/`contexts`, `stopping`) refuses every run/context route at the next request and `claim` by phase; `resync`/`context_list`/retained pairing routes reach a CP with no active run; executor SIGTERM→SIGKILL ≤ 2 s + grace; `close_generation` flush cuts targets; the cycle's own ends (`stop_requested`, `kill_switch_active`, …) drive S within one tick | H3 (test §6.1 4, L6 ≤ 5 s) |
+| T10 | Revocation latency (restated from budgets, no blanket bound) | From the tick that decides a context end (a CP `inactive` reply, `stop()`, the signal flag, `kill_switch_active`, …): target traffic — new connections dropped as soon as `close_generation`'s flush child commits (≤ `PREPARE_CHILD_TIMEOUT_MS` 1000 + `CHILD_REAP_GRACE_MS` 250 after the decision; established flows lose their key no later than the prepared element's timeout, `LEASE_MS` 3000 after the last `prepare`); control access — refused at the next ingress request after the registry write (≤ 100 ms after the decision, plus the next controller slice); executor process — `SIGTERM` within one controller slice, `SIGKILL` at +2000 ms, reaped ≤ +250 ms, so ≤ ~2.3 s after the decision in the ordinary case; the CP's own decision latency (reaper, heartbeat deadline) is upstream of H3 and not claimed here. Revoke during bootstrap: `revoked` within 800 ms of the `revoke` datagram (§4.6) | H3 (test §6.1 4 and the revoke-budget static test; L6 records each of these against its budget) |
 | T11 | Malformed/hostile link or channel input | exact matching, fixed refusal tokens, generation ends; nothing raised or logged | H3 |
 | T12 | Supervisor budget exhaustion / restart loop | `generation_budget` quarantine; ≥ 10 s spacing; H6 restart delay; ledger capacity 65 536 | cycle / H6 |
 | T13 | DNS change or rebinding during a run | the unchanged client re-resolves before every attempt through the constrained channel and refuses `dns_changed`/`unsafe_dns` (P4 behaviour kept); the kernel set is fixed at install, so a new address is unreachable even if a stale answer named it; a target whose old address stopped serving is `connect_error`/`timeout` → `target_unavailable`; an address reassigned to a stranger cannot present a certificate for the origin name (TLS `check_hostname`/`CERT_REQUIRED`, `http_transport.py:237-245`) | H2 / H3 (L1 adversarial case) |
@@ -580,23 +622,40 @@ Mandatory (H2 design §4.8, names fixed):
    `receipt_ready`, `readback_mismatch`→`cleaned`, `timeout`→`quarantined`, `identity_mismatch`: exactly
    one datagram is ever sent and only in the first case; its bytes equal `GenerationBootstrap.receipt()`
    canonical; the cycle reaches `ready` only in that case; AST: one `sendmsg` site, guarded by the state.
-2. `test_worker_failed_send_is_final_cleanup_once_no_reinstall` — the **F** scenario (B-2): the fake
-   `nft` sleeps through the install step while the test advances the cycle's offset clock past
-   `BOOTSTRAP_DEADLINE_MS`, so `_receive` times out and `cancel()` closes the worker socket **before**
-   the worker's `sendmsg`; the worker's send raises (I-9), the fake-nft call log shows exactly one
-   `delete table` and no second check/install, `state {send: failed}` is sent, the worker exits 0,
-   the controller's `revoked` carries `reaped`, `_INPUTS` records `cleaned`, no `ready` event.
+2. `test_worker_failed_send_is_final_cleanup_once_no_reinstall` — the **F** scenario, deterministic
+   (B-2, B-R1): the fake `nft` answers every step at once (no sleep), the test advances the cycle's
+   offset clock past `BOOTSTRAP_DEADLINE_MS` right after the request is sent, so `_receive` returns
+   `timeout` and `cancel()` closes the worker socket microseconds later, while the worker still has
+   three fake-nft launches ahead of it (milliseconds); the controller then waits ≤ 400 ms for the
+   worker (release-before-kill), which is ample for the fast fake nft: the worker's `sendmsg` raises
+   (I-9), the fake-nft call log shows exactly one `delete table` and no second check/install,
+   `state {send: failed}` arrives inside the release window, the worker exits 0 before any `killpg`,
+   `revoked` carries `reaped`, `_INPUTS` records `cleaned`, no `ready` event. The test records the
+   socket-close instant and the send-attempt instant and asserts close < send.
+   2b. `test_worker_preempted_before_its_send_is_killed_without_cleanup_or_state_and_is_still_reaped`
+   — the **P⁰** scenario, deterministic: the fake `nft` sleeps 2 s on the install step; the same
+   clock jump cancels the cycle; the controller's release window (400 ms) expires with no `state`,
+   `killpg(SIGKILL)` kills the worker and the sleeping fake nft, `waitpid` + group scan → `revoked`
+   carries `reaped`; the fake-nft log has **no** `delete table`; no `state` datagram; no `ready`; the
+   stand-in namespace descriptor has zero holders afterwards. Also asserted: `REVOKE_REGISTRY_BUDGET_MS
+   + REVOKE_RELEASE_WAIT_MS + CHILD_REAP_GRACE_MS + REVOKE_SCAN_MS ≤ REVOKE_DEADLINE_MS − BOOTSTRAP_POLL_MS
+   − 150` (static), and the ack arrived before the cycle's revoke deadline (offset clock).
 3. `test_worker_cleanup_order_against_close_generation_is_the_contracted_one` — recorded order of
-   events on the success path is exactly S of §4.7: executor reaped < registry non-admitting <
-   `close_generation` < `release` < worker reaped; the fake-nft log contains **no** `delete table`; the
-   same with an unresolved executor stand-in (SIGSTOP) still shows the flush (A-4); on ending F the log
-   contains exactly one `delete table`, before the worker exits and never while an executor record
-   exists.
-4. `test_worker_is_supervised_under_the_cycle_deadline_and_revoke` — a worker that never answers:
-   the cycle times out at 5000 ms (offset clock), the controller thread answers `revoked` within
-   `REVOKE_DEADLINE_MS` after a `killpg`, the worker is reaped; a worker that cannot be reaped (SIGSTOP
-   stand-in) yields `unresolved` and the cycle quarantines `bootstrap_unresolved` with no `ready`; a
-   surviving fake helper in the worker's group also yields `unresolved` (A-3).
+   events on the success path is exactly S of §4.7: registry non-admitting requested <
+   `close_generation` (flush) < controller `stop` to the executor < executor reaped < `release` <
+   worker reaped, with the main thread never blocked (its tick cadence is asserted under the offset
+   clock); the fake-nft log contains **no** `delete table`; the same with an unresolved executor
+   stand-in (SIGSTOP) still shows the flush before the stop machine starts (A-4) and ends in
+   `executor_unresolved` + `exit_required`; on ending F the log contains exactly one `delete table`,
+   before the worker exits and never while an executor record exists.
+4. `test_worker_is_supervised_under_the_cycle_deadline_and_revoke` — a worker that never answers
+   (fake nft sleeps 10 s): the cycle times out at 5000 ms (offset clock), the controller thread
+   answers `revoked` within `REVOKE_DEADLINE_MS` after the release window and `killpg`, the worker is
+   reaped; a worker that cannot be reaped (SIGSTOP stand-in) yields `unresolved` and the cycle
+   quarantines `bootstrap_unresolved` with no `ready`; a surviving fake helper in the worker's group
+   also yields `unresolved` (A-3); in every case the controller loop kept answering a concurrent
+   `resolve` and a concurrent executor-link message within one slice (B-R2 liveness).
+
 5. `test_worker_reports_unresolved_when_unresolved_helpers_is_nonzero` — the fake nft hangs through
    the reap grace: `unresolved_helpers()["unreaped"] == 1` in the worker; the `state` message carries
    it; the revoke ack says `worker: unresolved`; the supervisor records `worker_unresolved` and refuses a
@@ -623,7 +682,15 @@ Additional named tests:
   TLS target and `sockets` seam; the supervisor's `BoundedResolver` is the test seam returning a
   mutable answer: reorder → success, drop/add/replace member → `dns_changed`, private member →
   `unsafe_dns`, other hostname → `unsafe_dns` with no datagram, 65th request → `budget`, no reply →
-  `timeout`; `resolver_calls == attempts + 1`.
+  `timeout`; `resolver_calls == attempts + 1`; two consecutive identical requests produce two seam
+  calls (no caching, A-R2).
+- `test_resolution_runs_off_the_controller_thread_with_one_pending_request_cancellation_and_residual_accounting`
+  (B-R2): a seam resolver that blocks 3 s: a concurrent `revoke` is acknowledged within its budget and
+  a concurrent executor `released` is handled within one slice while the resolve is in flight; a
+  second `resolve` during the first is `resolve_refused budget`; link closure sets `cancelled` and the
+  late result is discarded; a seam that never returns (daemon-thread stand-in) leaves
+  `resolver_residual == 1` in `status()`, refuses further `resolve` for that generation, does not block
+  the generation end, and is never reported as reaped.
 - `test_claim_request_re_resolves_and_defers_on_a_stale_pin` (§4.5 item 4).
 - `test_executor_helper_sets_namespace_then_drops_privileges_closes_the_namespace_fd_and_execs_fixed_argv`
   (real helper source with a labelled test helper that skips `setns`/`setresuid` only; `/dev/fd`
@@ -692,33 +759,50 @@ plane here — stated in every record and in the doc. Cases:
 - **L2** binding generation: control-only table (no target accept), `claim_request` → `defer`,
   executor exits, origin pinned for the next generation; ≥ 10 s spacing observed from the cycle's
   budget.
-- **L3** failed send (F) and receipt-then-revoke (R′), real nft, real worker, no fake installer or
-  nft: the one labelled seam is the cycle's public `CycleSeams.clock` (**FAULT-INJECTION**, the
-  precedent of H1A3-2's `_cycle_fixture` seam, `tests/linux/test_host_authority_proof.py:598,2238`,
-  and of H2-2 P6(c)). F: the clock reads past `BOOTSTRAP_DEADLINE_MS` at the first receive poll, so
-  `_receive` returns `timeout` and `cancel()` closes the worker socket microseconds after the request
-  was sent, while the worker still needs three real nft children (milliseconds); the worker's later
-  `sendmsg` raises → exactly one `delete table`, ruleset empty, `state {send: failed}`, worker reaped,
-  `revoked`/`absent`/`reaped`, no `ready`, no executor process ever existed. The record carries the
-  cycle's socket-close instant and the worker's send-attempt instant (from `state`); the case FAILS if
-  the margin is below 10 ms or if `send` is not `failed` (it proves the fail-closed state machine on a
-  real kernel, not kernel timing). R′: a real `stop()` from the fixture after the receipt was read and
-  before the lock-held decision (`tests/test_host_cycle.py:2234` pattern, observed through
-  `bootstrap_status()`): no `delete table`, table present until the namespace dies, worker group
-  killed, `reaped`, `_INPUTS` stays `receipt_ready` (read through the worker's `state`).
+- **L3** failed send (F), preempted worker (P⁰) and receipt-then-revoke (R′), real nft, real worker,
+  no fake installer or nft: the one labelled seam is the cycle's public `CycleSeams.clock`
+  (**FAULT-INJECTION**, the precedent of H1A3-2's `_cycle_fixture` seam,
+  `tests/linux/test_host_authority_proof.py:598,2238`, and of H2-2 P6(c)). **F:** the clock reads past
+  `BOOTSTRAP_DEADLINE_MS` at the first receive poll, so `cancel()` closes the worker socket
+  microseconds after the request was sent; the controller's release window (400 ms) lets the worker
+  finish its three real nft children, fail its send, run `cleanup()` and send `state`; record:
+  `send == failed`, exactly one `delete table`, ruleset empty, worker exited 0 before any `killpg`,
+  `revoked`/`absent`/`reaped`, no `ready`, no executor process ever existed, close instant < send
+  instant. If the real nft steps did not fit the window the record is `preempted` and **this sub-case
+  FAILS** (the runner is too slow for the contract; never a silent pass): the deterministic F proof is
+  the offline test 2. **P⁰:** no fake nft is permitted, so P⁰ is driven by the clock seam
+  **and** a `revoke` whose release window the fixture shortens to 0 through the labelled
+  `REVOKE_RELEASE_WAIT_MS` constant seam (`SEAM-REVOKE-WINDOW`, test-only, pinned by the static
+  oracle to be assigned only in this case): the worker is killed mid-install, `reaped` by group kill
+  and scan, no `state`, no `delete table`, the ruleset is whatever the kill left (recorded, not
+  asserted), the namespace dies with the worker's dup, no `ready`, no executor. **R′:** a real
+  `stop()` from the fixture after the receipt was read and before the lock-held decision
+  (`tests/test_host_cycle.py:2234` pattern, observed through `bootstrap_status()`): no `delete table`,
+  table present until the namespace dies, the idle worker exits 0 on `revoke`, `reaped`, `_INPUTS`
+  stays `receipt_ready` (read through the worker's `state`).
+
 - **L4** revoke with forwarded dup: the controller's dup is closed before the ack (`/proc/self/fd`
   count by identity); `unresolved` when the worker is SIGSTOPped or a helper of its group survives:
   quarantine, `exit_required`, no new generation; a registry write failure injected at revoke: no
   `revoked` datagram, `bootstrap_unresolved`.
 
-- **L5** teardown order S with a live executor and an established connection: the table is present
-  until the executor is reaped; the flush precedes `release`; after the last holder closes, the
+- **L5** teardown order S with a live executor and an established connection: the flush runs in the
+  deciding tick and precedes the executor stop; the table is present until the namespace dies (never deleted); the executor is reaped by the controller; `release` follows; after the last holder closes, the
   namespace identity is gone from every `/proc/*/ns/net` and the host-side veth is gone (I-4).
-- **L6** revocation latency: `inactive stop_requested` from the real CP → executor reaped and target
-  denied within 5 s wall (recorded, single-run fact).
-- **L7** residue: no fixture, domain, namespace descriptor, veth, socket, thread, helper, worker,
-  executor or outer-namespace change remains; `unresolved_children()` all zero; `unresolved_helpers()`
-  zero; outer fingerprints unchanged.
+- **L6** revocation latency, restated from budgets (B-R2): `inactive stop_requested` from the real CP
+  in tick *t*: records (a) decision instant → flush committed (budget 1250 ms), (b) → first dropped
+  target connection from the still-running executor probe (≤ (a) + one probe interval), (c) →
+  registry write visible (budget 100 ms + one slice), (d) → executor reaped (budget 2000 + 250 ms
+  + one slice), (e) → worker reaped (budget 250 + 50 ms + one slice after (d)). Each value is
+  compared to its budget; a value over budget FAILS the case; no aggregate "≤ 5 s" is asserted or
+  claimed. Also recorded: the resolver thread's state at the decision (idle or in flight) and that
+  the controller answered a concurrent `resolve_refused` within one slice.
+
+- **L7** residue: no fixture, domain, namespace descriptor, veth, socket, helper, worker,
+  executor or outer-namespace change remains; no thread remains except `heel-bounded-dns` residuals,
+  which are waited for ≤ 30 s and must be zero afterwards (A-R2, I-13; the isolated namespace has no
+  resolver, so `getaddrinfo` fails fast there); `unresolved_children()` all zero; `unresolved_helpers()`
+  zero; `resolver_residual` zero; outer fingerprints unchanged.
 
 Gates: statics + H3-1 green locally → small DCO commit → fresh Fable source review → Astra-only
 dispatch → independent runtime review. A missing capability, an unsupported profile, any skip or any
@@ -740,7 +824,7 @@ on the H0 launcher's build budget. It is the H1A3-A-class combined gate the cycl
 |---|---|---|
 | `deploy/host/h2_policy.py` (H2-3) | control accept rule; `control_only` keyword and the empty-tuple shape; `install` entry refusal and `_readback` empty-set precondition under `control_only`; readback oracle (`_READBACK_PARTS` gains `control_rule`); doc | ~60 lines |
 | `deploy/host/supervisor.py`, `worker.py`, `executor.py`, `executor_link.py` (new) | the contract above; load `authority.py`, `cycle.py`, `h2_policy.py` and the codec by path like `cycle.py:44-61` (one module object per file per process) | new |
-| `heel/runner/daemon.py` | `managed_link` constructor seam; claim gate in `_ServeSession.run`; precheck chain and `claimed`/`released` emission in `_ServeExecution.execute`; `target_network`/`secret_backend` seams unchanged and used by the managed entry | ≤ 40 lines; regenerates the three download artifacts |
+| `heel/runner/daemon.py` | `managed_link` constructor seam; claim gate in `_ServeCoordinator.claim` (`daemon.py:510`) and `bound` in the `ensure_runner_context` wrapper (501-508); precheck chain and `claimed`/`released` emission in `_ServeExecution.execute`; `target_network`/`secret_backend` seams unchanged and used by the managed entry | ≤ 40 lines; regenerates the three download artifacts |
 | CP (`heel/saas/*`) | none | — |
 | Persistence | none in the CP; root-owned per-slot configuration (`/etc/heel/slots/<slot>.json`: listener, peer, hop addresses, uid/gid, volume, prefix pin, **runner record written by C4's pairing ceremony**, later the CP-bound environment origin) and the registry file are inputs the supervisor reads; the supervisor persists nothing else | — |
 | Packaging | nothing ships in the open-core wheel from `deploy/host/`; the executor prefix is the existing wheel + `runner` extra | — |
@@ -769,9 +853,9 @@ keyword-only `control_only: bool = False`; `observed_public_addresses == ()` is 
 `observed_public_addresses_invalid`; an IPv6-only tuple stays `unsupported_ipv6_only`), then
 `ipv4_egress_targets == ()`; (2) `render_table` (`h2_policy.py:179-202`) emits, immediately before
 the target accept, `ip saddr <slot_hop_src> ip daddr <slot_hop_dst> tcp dport 443 accept`, and omits
-the target accept iff `control_only` (its `unsupported_ipv6_only` raise at 182-183 becomes
-"empty targets and not control_only"); (3) `install()` entry (521-522) refuses an empty IPv4 set
-only when not `control_only`; (4) `_readback` (261-264) accepts an empty target set only under
+the target accept iff `control_only` (its `unsupported_ipv6_only` raise at 183-184 becomes
+"empty targets and not control_only"); (3) `install()` entry (522-523) refuses an empty IPv4 set
+only when not `control_only`; (4) `_readback` (260-261) accepts an empty target set only under
 `control_only`, and `_READBACK_PARTS` gains `control_rule` between `lookup_rule` and `admit_rule`.
 Readback invariants (A-1): rule order `reset`, `lookup`, `control`, `admit` (the last absent iff
 `control_only`); the control rule's `expr` is exactly `[match ==/in ip saddr <slot_hop_src>,
@@ -804,8 +888,8 @@ generation runs against the accepted H2-1 API, and the one test that needs the H
 `control_only` pin field are an **H3-1b hunk** committed only after H2-3's source review passes. H3-1
 is independent of DO access, C3, C4 and H6; its real-daemon case passes a test `secret_backend` (A-8).
 Allowed files (exhaustive):
-- new `deploy/host/supervisor.py` (cycle owner, controller thread, registry writer, link writer by raw
-  rtnetlink, trusted constructor, preflight, constrained resolver, executor helper constant with
+- new `deploy/host/supervisor.py` (cycle owner, controller thread with the executor-stop and worker-release state machines, per-generation resolver thread, registry writer, link writer by raw
+  rtnetlink, trusted constructor, preflight, revoke budget constants (`REVOKE_REGISTRY_BUDGET_MS` 100, `REVOKE_RELEASE_WAIT_MS` 400, `REVOKE_SCAN_MS` 50, `EXECUTOR_TERM_GRACE_MS` 2000, reusing `authority.CHILD_REAP_GRACE_MS` 250), executor helper constant with
   pinned hash, lock discipline, budget/exit),
 - new `deploy/host/worker.py` (receive `pin` then request + fd, `build_input`, `install`, one send,
   `fd_forward`, `state`, ending F only on its own `sendmsg` error, `release`),
@@ -851,7 +935,8 @@ by module import, never copied), new `tests/linux/h3_probe.py`, new `scripts/hos
 `host-h2-policy-proof`, same three pinned actions, `contents: read`, no inputs/secrets/cache/services,
 literal ref, five artifacts, three-day retention; the 216 existing lines byte-identical), new
 `tests/test_host_h3_lifecycle_proof.py` (static oracle: launcher, stage list, seven-job composition,
-required cases, sanitizer, literals), minimal oracle hunks in `tests/linux/test_host_h2_policy.py:129,222`,
+required cases, sanitizer, literals, and the rule that `SEAM-REVOKE-WINDOW` and `CycleSeams.clock` are
+assigned only inside the L3 case function), minimal oracle hunks in `tests/linux/test_host_h2_policy.py:129,222`,
 `tests/linux/test_host_lease_key_shape.py:100,193`, `tests/linux/test_host_authority_proof.py:110,205`
 and the composition assertion in `tests/test_host_h2_policy_proof.py:239` and `tests/test_host_authority.py`
 (the mutation matrix around 1792-1815, per the H2 design §3 C precedent), new `docs/saas/H3_LIFECYCLE_PROOF.md`.
@@ -894,7 +979,7 @@ doc, the oracle hunks). Not scheduled by this design.
 | 7 | workspace/project isolation | owner's existing suite: `test_cross_tenant_objects_unreachable`, `test_tenant_isolation`; H3-2 L1/L7 (namespace per generation, one slot = one workspace executor) |
 | 8 | pairing/verification non-replayable | owner's existing suite, unchanged by H3: `test_exchange_is_one_time_and_access_is_workspace_bound`, `test_http_v3_pairing_activation_replays_one_sealed_executable_cursor`; C4's proposed managed-pairing test |
 | 9 | quotas idempotent | owner's existing suite, unchanged by H3: `test_duplicate_idempotent_run_charged_once`, `test_concurrent_reservations_never_exceed_quota` |
-| 10 | prompt revocation | owner's existing suite: `test_canary_stop.py`, `test_revoked_runner_zero_request_claim_is_stopped_and_refunded_after_deadline`; H3-1 test 4 and `test_revoke_writes_the_non_admitting_shape_before_the_ack_and_a_failed_write_sends_no_ack`; H3-2 L6 (≤ 5 s) |
+| 10 | prompt revocation | owner's existing suite: `test_canary_stop.py`, `test_revoked_runner_zero_request_claim_is_stopped_and_refunded_after_deadline`; H3-1 test 4 and `test_revoke_writes_the_non_admitting_shape_before_the_ack_and_a_failed_write_sends_no_ack`; H3-2 L6 (per-budget records, §5 T10) |
 | 11 | sessions/CSRF/rate limits/audit | owner's existing suite, unchanged by H3: `test_lockout_after_failures`, `test_verify_requires_browser_session_same_origin_and_live_sync_role` |
 | 12 | offline/lost authorization/malformed input fail closed visibly | owner's existing suite: `test_restart_coordinator_rehydrates_active_binding_but_requires_fresh_heartbeat`, `test_malformed_and_oversized_bodies`; H3-1 `test_executor_link_and_worker_link_match_exactly_and_refuse_descriptors_and_oversize`, `test_executor_crash_ends_the_context_and_reaps_before_the_flush` |
 
@@ -920,11 +1005,13 @@ multi-slot supervisor; no credential path; no model-API use.
 | I-10 | The slot runner listener serves a certificate valid for the control name to a `check_hostname` client | H3-3 with the real ingress; read the H0 nginx server block when H3-3 is planned |
 | I-11 | No wildcard `:443` listener other than the slot listeners exists on the host; public HTTPS enters through cloudflared only | H6 qualification; H3-3 G9-style probe from the slot |
 | I-12 | `killpg` on the worker's session reaches every H2-1 helper (they inherit the group because H2-1 passes `start_new_session=False`) and a `/proc` group scan within the grace is a sufficient "no survivor" check | H3-1 test 4 (fake helper survivor case) on Linux CI; H3-2 L4 |
+| I-13 | A `heel-bounded-dns` daemon thread left by a timed-out `BoundedResolver` call ends when libc's resolver returns (glibc default: 5 s × attempts × nameservers, typically ≤ 30 s); it holds no namespace reference or socket of the generation | H3-1 residual test (seam stand-in); H3-2 L7 waits ≤ 30 s; reported in `status()` as `resolver_residual`, never as reaped |
+| I-14 | The registry temp-file write + `fsync` + `os.replace` completes within `REVOKE_REGISTRY_BUDGET_MS` 100 on the target host (round-2 I-Q2) | H3-2 L4/L6 timing records; an over-budget write sends no ack by rule |
 
 ## 11. Next action
 
 Astra: (1) launch the fresh independent spec review round 2 of this revision; (2) on acceptance, and
-only after the CodeQL alerts 98/99 on `scripts/host_h2_policy_proof.py` are dispositioned, grant
+only after the CodeQL alerts 98/99 on `scripts/host_h2_policy_proof.py` are dispositioned (permissions candidate `d24501ae` is under exact-tree CI/GHAS review, separately), grant
 **H2-3** (§8.1) and **H3-1** (§8.2) to fresh Opus sessions (coding may overlap; H3-1's integration gate
 and its H3-1b hunk wait for H2-3's accepted interface); (3) after both pass source review and H2-3
 passes its runtime review, grant **H3-2** (§8.3); (4) record the C4 dependency (slot runner record,
