@@ -86,8 +86,10 @@ REQUIRED = os.environ.get(LAUNCHER.REQUIRED_ENV) == "1"
 
 MS = 1_000_000
 # The H1 slot hop (the H2 lease key src/dst): fixed documentation addresses, as in H2K1. SLOT_DST is
-# the logical gateway constant: assigned to no interface and never a destination.
+# the slot gateway: the typed key constant and (H2-3) the one control destination, held by R on the
+# veth so the fixed control accept can be probed; GATEWAY6 is R's IPv6 gateway address (ULA), never admitted.
 SLOT_SRC, SLOT_DST = "198.51.100.20", "192.0.2.1"
+GATEWAY6 = "fd48:4b31::1"
 # Astra's recorded pick (FIXTURE-LITERALS.json, validator-approved, no network operation used to choose
 # them): assigned only inside the disposable namespaces, never contacted outside them.
 TARGETS = ("8.8.4.4", "8.8.8.8")  # canonical (version, packed) order
@@ -107,9 +109,10 @@ DENIED = ("connect_error", "timeout")  # the unchanged client's two codes for a 
 NONCE_BYTES = 32
 CLONE_NEWNET = 0x40000000
 RECEIPT_SCHEMA = "heel.h2a.receipt.v1"
-# The accepted H2-1 source (7dcad343 + 4bce9513) this proof runs unmodified, its production helper,
-# and the unmodified TLS harness: a static test and P0 compare the staged bytes with these.
-H2_SOURCE_SHA256 = "0bd7d171fdb69e10d58d4422ef45ee16e57ad7319e77b90e518a70a2a38f0a8a"
+# The H2 source this proof runs unmodified (accepted H2-1 7dcad343 + 4bce9513 plus the H2-3 control
+# accept candidate), its production helper (unchanged by H2-3), and the unmodified TLS harness: a
+# static test and P0 compare the staged bytes with these.
+H2_SOURCE_SHA256 = "2511dae4352bbf2006fb638164375da1d80a097a4bb6117dc7ea96328b5b4af6"
 H2_HELPER_SHA256 = "c261a67fee245d58bbf59adcd8203f959209c6210f1c16b452315044a5a53866"
 HARNESS_SHA256 = "779d21299de454ccae41674f7f9f1afb3853007ad870c50a7de1718ee156378f"
 H2_PUBLIC = ("build_input", "cleanup", "install", "readback_matches", "render_table", "unresolved_helpers")
@@ -249,9 +252,10 @@ def workflow_violations(text: str) -> list[str]:
 # The whole-namespace ruleset check (a fixture assertion; the product readback judges the named
 # table only and is checked separately with ``H2.readback_matches``).
 
-def ruleset_shape(document) -> tuple[bool, str]:
+def ruleset_shape(document, rules: int = 4) -> tuple[bool, str]:
     """``nft -j list ruleset`` holds exactly the metainfo and one ``inet heel_lease`` table with one
-    set, one map, one chain and three rules, all inside that table, and nothing else."""
+    set, one map, one chain and ``rules`` rules (four; three for H2-3's control-only shape), all
+    inside that table, and nothing else."""
     if not isinstance(document, dict) or list(document) != ["nftables"] or not isinstance(document["nftables"], list):
         return False, "document"
     items = document["nftables"]
@@ -267,7 +271,7 @@ def ruleset_shape(document) -> tuple[bool, str]:
         if (body.get("name") if kind == "table" else body.get("table")) != AUTHORITY.TABLE:
             return False, "foreign_table"
         kinds[kind] = kinds.get(kind, 0) + 1
-    if kinds != {"table": 1, "set": 1, "map": 1, "chain": 1, "rule": 3}:
+    if kinds != {"table": 1, "set": 1, "map": 1, "chain": 1, "rule": rules}:
         return False, "object_count"
     return True, "exact"
 
@@ -730,12 +734,16 @@ def test_static_evidence_sanitizer_and_acceptance_rule(tmp_path):
     assert all(re.fullmatch(r"[a-z0-9_]+ [A-Za-z0-9_.:/ -]*", line) for line in lines), lines
     assert all(LAUNCHER._TOKEN.fullmatch(error_token(error)) for error in (ValueError(), AUTHORITY.PrepareFailed("installer_refused")))
     assert error_token(AUTHORITY.PrepareFailed("installer_refused")) == "preparefailed_installer_refused"
-    # The fixture's whole-ruleset oracle: exactly one heel_lease table of seven objects, else a named part.
+    # The fixture's whole-ruleset oracle: exactly one heel_lease table of eight objects (seven for the
+    # H2-3 control-only shape), else a named part.
     table = {"family": "inet", "name": AUTHORITY.TABLE}
     owned = {"family": "inet", "table": AUTHORITY.TABLE}
-    inner_objects = [{"set": owned}, {"map": owned}, {"chain": owned}] + [{"rule": owned}] * 3
+    inner_objects = [{"set": owned}, {"map": owned}, {"chain": owned}] + [{"rule": owned}] * 4
     exact = {"nftables": [{"metainfo": {}}, {"table": table}, *inner_objects]}
     assert ruleset_shape(exact) == (True, "exact") and not ruleset_is_empty(exact)
+    control_only = {"nftables": exact["nftables"][:-1]}
+    assert ruleset_shape(control_only, 3) == (True, "exact") and ruleset_shape(control_only)[1] == "object_count"
+    assert ruleset_shape(exact, 3)[1] == "object_count"
     assert ruleset_is_empty({"nftables": [{"metainfo": {}}]})
     for extra, part in (({"table": {"family": "ip", "name": "x"}}, "foreign_object"),
                         ({"table": {"family": "inet", "name": "x"}}, "foreign_table")):
@@ -781,7 +789,7 @@ def test_static_fixture_literals_are_the_recorded_public_pick():
     assert policy.observed_public_addresses == observed and len(observed) == 3  # the AAAA stays in the tuple
     assert tuple(map(str, policy.ipv4_egress_targets)) == TARGETS and str(observed[0]) == TARGETS[0]
     assert transport.normalize_target_origin("https://" + HOSTNAME) == "https://" + HOSTNAME
-    for local in (SLOT_SRC, SLOT_DST, PEER6):  # documentation/ULA, never a target
+    for local in (SLOT_SRC, SLOT_DST, PEER6, GATEWAY6):  # documentation/ULA, never a target
         assert not ipaddress.ip_address(local).is_global, local
 
 
@@ -991,13 +999,15 @@ def _observed(addresses) -> tuple:
 OBSERVED_LITERALS = (*TARGETS, TARGET6)  # the dual-stack A+AAAA answer every admitting case installs
 
 
-def policy_input(fd: int, addresses, *, identity: tuple[int, int] | None = None):
+def policy_input(fd: int, addresses, *, identity: tuple[int, int] | None = None, control_only: bool = False):
     """A fresh H2PolicyInput for the namespace of ``fd``: a new generation id and fence, the slot hop,
-    the validated hostname and port, and the canonical full tuple."""
+    the validated hostname and port, and the canonical full tuple (H2-3: the empty tuple and
+    ``control_only`` for a binding generation)."""
+    options = {"observed_public_addresses": (), "control_only": True} if control_only else {
+        "observed_public_addresses": _observed(addresses)}
     return H2.build_input(generation_id=secrets.token_hex(16), namespace_identity=identity or _identity(fd),
                           slot_id=SLOT_ID, slot_hop_src=SLOT_SRC, slot_hop_dst=SLOT_DST,
-                          bootstrap_fence=secrets.token_hex(16), egress_hostname=HOSTNAME, egress_port=PORT,
-                          observed_public_addresses=_observed(addresses))
+                          bootstrap_fence=secrets.token_hex(16), egress_hostname=HOSTNAME, egress_port=PORT, **options)
 
 
 def receipt_exact(outcome, policy) -> bool:
@@ -1049,7 +1059,12 @@ LISTENERS = (("t1", socket.AF_INET, socket.SOCK_STREAM, (TARGETS[0], PORT)),
              ("t3", socket.AF_INET, socket.SOCK_STREAM, (UNAPPROVED, PORT)),
              ("t1_wrong_port", socket.AF_INET, socket.SOCK_STREAM, (TARGETS[0], WRONG_PORT)),
              ("t1_udp", socket.AF_INET, socket.SOCK_DGRAM, (TARGETS[0], PORT)),
-             ("t6", socket.AF_INET6, socket.SOCK_STREAM, (TARGET6, PORT)))
+             ("t6", socket.AF_INET6, socket.SOCK_STREAM, (TARGET6, PORT)),
+             # H2-3: the slot gateway's control listener and its negative twins.
+             ("gw", socket.AF_INET, socket.SOCK_STREAM, (SLOT_DST, PORT)),
+             ("gw_wrong_port", socket.AF_INET, socket.SOCK_STREAM, (SLOT_DST, WRONG_PORT)),
+             ("gw_udp", socket.AF_INET, socket.SOCK_DGRAM, (SLOT_DST, PORT)),
+             ("gw6", socket.AF_INET6, socket.SOCK_STREAM, (GATEWAY6, PORT)))
 # The fixed probe kinds: kind -> (source, target, port, transport, listener label).
 PLAN = {
     "t1": (SLOT_SRC, TARGETS[0], PORT, "tcp", "t1"),
@@ -1059,8 +1074,14 @@ PLAN = {
     "wrong_port": (SLOT_SRC, TARGETS[0], WRONG_PORT, "tcp", "t1_wrong_port"),
     "udp": (SLOT_SRC, TARGETS[0], PORT, "udp", "t1_udp"),
     "ipv6": (PEER6, TARGET6, PORT, "tcp6", "t6"),
+    "gateway": (SLOT_SRC, SLOT_DST, PORT, "tcp", "gw"),
+    "gateway_wrong_source": (WRONG_SOURCE, SLOT_DST, PORT, "tcp", "gw"),
+    "gateway_wrong_port": (SLOT_SRC, SLOT_DST, WRONG_PORT, "tcp", "gw_wrong_port"),
+    "gateway_udp": (SLOT_SRC, SLOT_DST, PORT, "udp", "gw_udp"),
+    "gateway_ipv6": (PEER6, GATEWAY6, PORT, "tcp6", "gw6"),
 }
 NEGATIVES = ("wrong_source", "unapproved_target", "wrong_port", "udp", "ipv6")
+GATEWAY_NEGATIVES = ("gateway_wrong_source", "gateway_wrong_port", "gateway_udp", "gateway_ipv6")
 
 
 def _listener(r_fd: int, family: int, kind: int, address: tuple) -> socket.socket:
@@ -1300,20 +1321,22 @@ class Fixture:
         self.facts["peer_link_in_r"] = int(self.ip(self.r_fd, "link", "show", "dev", b))
         steps = [(self.l_fd, "link", "set", "lo", "up"), (self.r_fd, "link", "set", "lo", "up"),
                  (self.l_fd, "addr", "add", f"{SLOT_SRC}/32", "dev", a), (self.l_fd, "addr", "add", f"{WRONG_SOURCE}/32", "dev", a),
-                 *[(self.r_fd, "addr", "add", f"{target}/32", "dev", b) for target in (*TARGETS, UNAPPROVED)],
+                 *[(self.r_fd, "addr", "add", f"{target}/32", "dev", b) for target in (*TARGETS, UNAPPROVED, SLOT_DST)],
                  (self.l_fd, "link", "set", a, "up"), (self.r_fd, "link", "set", b, "up"),
-                 *[(self.l_fd, "route", "add", f"{target}/32", "dev", a, "src", SLOT_SRC) for target in (*TARGETS, UNAPPROVED)],
+                 *[(self.l_fd, "route", "add", f"{target}/32", "dev", a, "src", SLOT_SRC)
+                   for target in (*TARGETS, UNAPPROVED, SLOT_DST)],
                  *[(self.l_fd, "neigh", "replace", target, "lladdr", text_r, "dev", a, "nud", "permanent")
-                   for target in (*TARGETS, UNAPPROVED)],
+                   for target in (*TARGETS, UNAPPROVED, SLOT_DST)],
                  *[(self.r_fd, "route", "add", f"{source}/32", "dev", b) for source in (SLOT_SRC, WRONG_SOURCE)],
                  *[(self.r_fd, "neigh", "replace", source, "lladdr", text_l, "dev", b, "nud", "permanent")
                    for source in (SLOT_SRC, WRONG_SOURCE)],
                  # IPv6 is mandatory here: the dual-stack target and the IPv6 denial need it.
                  (self.l_fd, "-6", "addr", "add", f"{PEER6}/128", "dev", a, "nodad"),
-                 (self.r_fd, "-6", "addr", "add", f"{TARGET6}/128", "dev", b, "nodad"),
-                 (self.l_fd, "-6", "route", "add", f"{TARGET6}/128", "dev", a),
+                 *[(self.r_fd, "-6", "addr", "add", f"{target}/128", "dev", b, "nodad") for target in (TARGET6, GATEWAY6)],
+                 *[(self.l_fd, "-6", "route", "add", f"{target}/128", "dev", a) for target in (TARGET6, GATEWAY6)],
                  (self.r_fd, "-6", "route", "add", f"{PEER6}/128", "dev", b),
-                 (self.l_fd, "-6", "neigh", "replace", TARGET6, "lladdr", text_r, "dev", a, "nud", "permanent"),
+                 *[(self.l_fd, "-6", "neigh", "replace", target, "lladdr", text_r, "dev", a, "nud", "permanent")
+                   for target in (TARGET6, GATEWAY6)],
                  (self.r_fd, "-6", "neigh", "replace", PEER6, "lladdr", text_l, "dev", b, "nud", "permanent")]
         for fd, *arguments in steps:
             if not self.ip(fd, *arguments):
@@ -1329,9 +1352,11 @@ class Fixture:
         probes = self.settle([self.probe(kind) for kind in PLAN])
         return {"baseline_kinds": len(PLAN), "baseline_reachable": len(reachable(probes))}
 
-    def install(self, addresses=OBSERVED_LITERALS, *, identity: tuple[int, int] | None = None, fault=None):
-        """The real installer on the fixture's descriptor (P6 alone passes its labelled fault clock)."""
-        self.policy = policy_input(self.l_fd, addresses, identity=identity)
+    def install(self, addresses=OBSERVED_LITERALS, *, identity: tuple[int, int] | None = None, fault=None,
+                control_only: bool = False):
+        """The real installer on the fixture's descriptor (P6 alone passes its labelled fault clock;
+        P5 alone the H2-3 control-only shape)."""
+        self.policy = policy_input(self.l_fd, addresses, identity=identity, control_only=control_only)
         COUNTERS["installs"] += 1
         if fault is None:
             self.outcome = H2.install(self.l_fd, self.policy)
@@ -1343,7 +1368,7 @@ class Fixture:
         """The whole-namespace check and the product's own readback of the named table, separately."""
         whole, whole_sha = _ruleset(self.l_fd)
         named, named_sha = _named_table(self.l_fd)
-        whole_ok, whole_part = ruleset_shape(whole)
+        whole_ok, whole_part = ruleset_shape(whole, 3 if self.policy.control_only else 4)
         named_ok, named_tokens = H2.readback_matches(named, self.policy)
         return {"whole_ok": whole_ok, "named_ok": named_ok,
                 "tokens": {"ruleset": whole_part, "readback": named_tokens["readback"], "readback_part": named_tokens["part"],
@@ -1612,17 +1637,27 @@ def _p1(ints: dict, tokens: dict) -> bool:
         ints["observed_addresses"] = len(fx.policy.observed_public_addresses)
         if not ready:
             return False
+        # H2-3: the fixed control accept admits the slot source to the gateway on TCP 443 with no key.
+        no_key_gateway = fx.settle([fx.probe("gateway") for _ in range(4)])
         _handle, live_to, bound, active = _lease(fx)
-        rounds = ["t1", "unapproved_target", "t2", "wrong_port"]
-        probes = fx.settle(fx.series(rounds, active, bound + 800 * MS))
+        rounds = ["t1", "unapproved_target", "t2", "wrong_port", "gateway"]
+        probes = fx.settle(fx.series(rounds, active, bound + 1000 * MS))  # five kinds: keep >= 4 target probes past the bound
     window, late = inside(probes, active, live_to), after(probes, bound)
     per_target = {kind: [p for p in window if p.kind == kind] for kind in ("t1", "t2")}
-    others = [p for p in probes if p.kind not in ("t1", "t2")]
+    others = [p for p in probes if p.kind not in ("t1", "t2", "gateway")]
+    late_targets = [p for p in late if p.kind != "gateway"]
+    gateway = no_key_gateway + [p for p in probes if p.kind == "gateway"]
     ints.update(live_probes=len(window), live_admitted_t1=sum(p.admitted and p.delivered for p in per_target["t1"]),
                 live_admitted_t2=sum(p.admitted and p.delivered for p in per_target["t2"]),
                 other_probes=len(others), other_accepted=sum(p.accepted for p in others),
-                after_bound_probes=len(late), after_bound_accepted=sum(p.accepted for p in late), anomalies=anomalies(probes))
-    return (all(live(per_target[kind], 4) for kind in per_target) and closed(others, 8) and closed(late, 4)
+                after_bound_probes=len(late_targets), after_bound_accepted=sum(p.accepted for p in late_targets),
+                gateway_no_key_probes=len(no_key_gateway),
+                gateway_no_key_admitted=sum(p.admitted and p.delivered for p in no_key_gateway),
+                gateway_probes=len(gateway), gateway_admitted=sum(p.admitted and p.delivered for p in gateway),
+                gateway_after_bound_probes=sum(p.kind == "gateway" for p in late),
+                anomalies=anomalies(no_key_gateway + probes))
+    return (all(live(per_target[kind], 4) for kind in per_target) and closed(others, 8) and closed(late_targets, 4)
+            and len(gateway) >= 8 and ints["gateway_admitted"] == len(gateway) and ints["gateway_no_key_admitted"] == 4
             and ints["ipv4_targets"] == 2 and ints["observed_addresses"] == 3)
 
 
@@ -1649,7 +1684,7 @@ def _p2(ints: dict, tokens: dict) -> bool:
         tokens.update(fx.facts_tokens())
         if not ready:
             return False
-        # Phase A: the table alone (no key) admits nothing, for every kind.
+        # Phase A: the table alone (no key) admits nothing but the H2-3 control accept, for every kind.
         no_key = fx.settle([fx.probe(kind) for kind in [*PLAN, *PLAN]])
         # Phase B: a prepared-only key admits nothing.
         before = time.monotonic_ns()
@@ -1657,10 +1692,11 @@ def _p2(ints: dict, tokens: dict) -> bool:
         after_prepare = time.monotonic_ns()
         live_to, _bound = _bounds(before, after_prepare, LEASE_MS)
         prepared_only = fx.series(["t1", "t2"], after_prepare, min(after_prepare + 300 * MS, live_to - 2000 * MS))
-        # Phase C: activated; the controls admit while every other kind stays denied.
+        # Phase C: activated; the controls admit while every other kind stays denied (the gateway
+        # negatives once more under the live key).
         fx.domain.activate(handle)
         active = time.monotonic_ns()
-        mixed = [fx.probe(kind) for kind in ["t1", *NEGATIVES, "t2"] * 2]
+        mixed = [fx.probe(kind) for kind in [*["t1", *NEGATIVES, "gateway", "t2"] * 2, "gateway", *GATEWAY_NEGATIVES]]
         fx.settle(prepared_only + mixed)
         # Phase D: the product removes its table; every kind reaches its listener again (the listeners
         # never died, so the denials above were the policy's).
@@ -1670,17 +1706,23 @@ def _p2(ints: dict, tokens: dict) -> bool:
         restored = fx.settle([fx.probe(kind) for kind in PLAN])
     window = inside(mixed, active, live_to)
     controls = [p for p in window if p.kind in ("t1", "t2")]
-    for kind in NEGATIVES:
+    gateway = [p for p in no_key + mixed if p.kind == "gateway"]
+    no_key_denied = [p for p in no_key if p.kind != "gateway"]
+    for kind in (*NEGATIVES, *GATEWAY_NEGATIVES):
         ints[f"{kind}_probes"] = sum(p.kind == kind for p in window)
         ints[f"{kind}_accepted"] = sum(p.accepted for p in mixed if p.kind == kind)
-    ints.update(no_key_probes=len(no_key), no_key_accepted=sum(p.accepted for p in no_key),
+    ints.update(gateway_probes=len(gateway), gateway_admitted=sum(p.admitted and p.delivered for p in gateway),
+                no_key_gateway_negative_accepted=sum(p.accepted for p in no_key if p.kind in GATEWAY_NEGATIVES))
+    ints.update(no_key_probes=len(no_key_denied), no_key_accepted=sum(p.accepted for p in no_key_denied),
                 prepared_only_probes=len(inside(prepared_only, after_prepare, live_to)),
                 prepared_only_accepted=sum(p.accepted for p in prepared_only), control_probes=len(controls),
                 control_admitted=sum(p.admitted and p.delivered for p in controls), mixed_outside_live=len(mixed) - len(window),
                 restored_reachable=len(reachable(restored)), anomalies=anomalies(no_key + prepared_only + mixed + restored))
-    return (closed(no_key, 2 * len(PLAN)) and closed(inside(prepared_only, after_prepare, live_to), 3)
+    return (closed(no_key_denied, 2 * (len(PLAN) - 1)) and closed(inside(prepared_only, after_prepare, live_to), 3)
             and len(window) == len(mixed) and live(controls, 4)
             and all(closed([p for p in window if p.kind == kind], 2) for kind in NEGATIVES)
+            and all(closed([p for p in window if p.kind == kind], 1) for kind in GATEWAY_NEGATIVES)
+            and len(gateway) == 5 and ints["gateway_admitted"] == 5
             and removed.state == "cleaned" and ints["after_cleanup_empty"] == 1 and ints["restored_reachable"] == len(PLAN))
 
 
@@ -1877,7 +1919,10 @@ def test_p4_unchanged_client_resolves_full_set_each_attempt_accepts_reorder_refu
 
 def _p5(ints: dict, tokens: dict) -> bool:
     _tick_ns()
-    with _fixture("p5", peer=None) as fx:
+    with _fixture("p5") as fx:
+        if fx.facts["baseline_reachable"] != len(PLAN):
+            ints.update(fx.facts_ints())
+            return False
         outcome = fx.install((TARGET6,))
         tokens.update(outcome_tokens("h2", outcome))
         ints.update(fx.facts_ints(), observed_addresses=len(fx.policy.observed_public_addresses),
@@ -1889,9 +1934,41 @@ def _p5(ints: dict, tokens: dict) -> bool:
             tokens["prepare_without_table"] = "accepted"
         except AUTHORITY.InstallerFailed as error:
             tokens["prepare_without_table"] = error_token(error)
+        # H2-3 binding generation in the same namespace: control_only with the empty tuple. The whole
+        # ruleset is one table of seven objects with no target accept; the gateway is admitted and the
+        # targets stay denied, with no key and under a live key.
+        shape = fx.install(control_only=True)
+        ready = fx.gate_ready()
+        whole, _sha = _ruleset(fx.l_fd)
+        objects = whole["nftables"][1:] if isinstance(whole, dict) and isinstance(whole.get("nftables"), list) else []
+        tokens.update(outcome_tokens("shape", shape))
+        tokens.update({f"shape_{key}": value for key, value in fx.facts["table_tokens"].items()})
+        ints.update(shape_ready=int(ready), shape_receipt_exact=fx.facts["receipt_exact"],
+                    shape_ruleset_exact=fx.facts["ruleset_exact"], shape_readback_exact=fx.facts["readback_exact"],
+                    shape_items=len(objects), shape_ipv4_targets=len(fx.policy.ipv4_egress_targets),
+                    shape_target_rules=sum("@" + AUTHORITY.PREPARED_SET in json.dumps(item) for item in objects
+                                           if isinstance(item, dict) and "rule" in item))
+        if not ready:
+            return False
+        no_key = fx.settle([fx.probe(kind) for kind in ["gateway", "t1", "t2"] * 2])
+        _handle, live_to, _bound, active = _lease(fx)
+        keyed = [fx.probe(kind) for kind in ["gateway", "t1", "t2"] * 2]
+        fx.settle(keyed)
+        removed = H2.cleanup(fx.l_fd, fx.policy)
+        tokens.update(outcome_tokens("cleanup", removed))
+        ints["after_cleanup_empty"] = int(_empty_ruleset(fx.l_fd))
+    gateway = [p for p in no_key + keyed if p.kind == "gateway"]
+    targets = [p for p in no_key + keyed if p.kind != "gateway"]
+    ints.update(control_probes=len(gateway), control_admitted=sum(p.admitted and p.delivered for p in gateway),
+                target_probes=len(targets), target_accepted=sum(p.accepted for p in targets),
+                keyed_inside_live=len(inside(keyed, active, live_to)), anomalies=anomalies(no_key + keyed))
     return (outcome.state == "unsupported_ipv6_only" and outcome.receipt is None and ints["observed_addresses"] == 1
             and ints["ipv4_targets"] == 0 and ints["ruleset_empty_after"] == 1 and ints["fresh_ruleset_empty"] == 1
-            and ints["unreaped_helpers"] == 0 and tokens["prepare_without_table"].startswith("preparefailed_"))
+            and ints["unreaped_helpers"] == 0 and tokens["prepare_without_table"].startswith("preparefailed_")
+            and shape.state == "receipt_ready" and ints["shape_items"] == 7 and ints["shape_target_rules"] == 0
+            and ints["shape_ipv4_targets"] == 0 and ints["control_probes"] == 4 and ints["control_admitted"] == 4
+            and closed(targets, 8) and ints["keyed_inside_live"] == len(keyed)
+            and removed.state == "cleaned" and ints["after_cleanup_empty"] == 1)
 
 
 def test_p5_ipv6_only_input_refuses_before_any_table_exists():
@@ -1902,7 +1979,8 @@ def test_p5_ipv6_only_input_refuses_before_any_table_exists():
     except Exception as error:  # noqa: BLE001 - a fixed token only
         tokens["error"] = error_token(error)
     record("p5", ok, ints, tokens)
-    assert ok, "an IPv6-only input was not refused before any table existed"
+    assert ok, ("an IPv6-only input was not refused before any table existed, or the H2-3 control-only table was not "
+                "exactly seven objects admitting the gateway and denying the targets")
 
 
 def _p6(ints: dict, tokens: dict) -> bool:
