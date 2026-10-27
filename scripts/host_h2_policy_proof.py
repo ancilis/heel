@@ -605,9 +605,9 @@ def stage_tree(destination: Path, root: Path = ROOT) -> Path:
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)
         for parent in target.relative_to(destination).parents:
-            os.chmod(destination / parent, 0o755)
+            os.chmod(destination / parent, 0o700)
         shutil.copyfile(root / name, target)
-        os.chmod(target, 0o644)
+        os.chmod(target, 0o600)
     return destination
 
 
