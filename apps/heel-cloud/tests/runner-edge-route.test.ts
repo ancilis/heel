@@ -179,3 +179,71 @@ describe("runner edge routes", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 });
+
+describe("runner inactive-claim attestation edge route", () => {
+  const run = `crun_${"c".repeat(32)}`;
+  const path = `/api/control-plane/v1/workspaces/${workspace}/runners/${runner}/runs/${run}/inactive-claim-attestation`;
+  const proof = { "X-Heel-Runner-Id": runner, "X-Heel-Runner-Key-Id": "key", "X-Heel-Runner-Timestamp-Ms": "1", "X-Heel-Runner-Signature": "sig" };
+  const context = { waitUntil() {}, passThroughOnException() {} };
+
+  it("inactive-claim-attestation admits only POST with the resync header family and the 2 KiB cap", async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response("{}", { headers: { "Content-Type": "application/json" } }));
+    const body = "x".repeat(2048);
+    const accepted = await worker.fetch(request(path, proof, body), env(fetcher), context);
+    expect(accepted.status).toBe(200);
+    expect(accepted.headers.get("Cache-Control")).toBe("no-store");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const upstream = fetcher.mock.calls[0][0] as Request;
+    expect(upstream.method).toBe("POST");
+    expect(upstream.url).toBe(`https://heel.example${path.replace("/api/control-plane", "")}`);
+    expect([...upstream.headers.keys()].sort()).toEqual([
+      "content-encoding", "content-length", "content-type", "x-heel-edge-auth",
+      "x-heel-runner-id", "x-heel-runner-key-id", "x-heel-runner-signature", "x-heel-runner-timestamp-ms",
+    ]);
+    expect(await upstream.text()).toBe(body);
+
+    const rejected = vi.fn();
+    expect((await worker.fetch(request(path, proof, "x".repeat(2049)), env(rejected), context)).status).toBe(400);
+    for (const missing of Object.keys(proof)) {
+      const headers: Record<string, string> = { ...proof };
+      delete headers[missing];
+      expect((await worker.fetch(request(path, headers), env(rejected), context)).status).toBe(400);
+    }
+    for (const method of ["GET", "PUT", "DELETE", "PATCH"]) {
+      const init: RequestInit = { method, headers: { ...proof } };
+      if (method !== "GET" && method !== "DELETE") {
+        init.body = "{}";
+        init.headers = { ...proof, "Content-Type": "application/json", "Content-Length": "2" };
+      }
+      expect((await worker.fetch(new Request(`https://heel.example${path}`, init), env(rejected), context)).status).toBe(404);
+    }
+    for (const near of [
+      `${path}/extra`, path.replace("inactive-claim-attestation", "inactive-claim-attestations"),
+      path.replace(`/runs/${run}`, `/runs/run`), path.replace(`/runs/${run}`, ""),
+    ]) {
+      expect((await worker.fetch(request(near, proof), env(rejected), context)).status).toBe(404);
+    }
+    expect(rejected).not.toHaveBeenCalled();
+  });
+
+  it("inactive-claim-attestation forwards no next-nonce header and rejects nonce/sequence/authorization/cookie", async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response("{}", {
+      headers: { "Content-Type": "application/json", "X-Heel-Runner-Next-Nonce": `${"A".repeat(43)}=` },
+    }));
+    const response = await worker.fetch(request(path, proof), env(fetcher), context);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Heel-Runner-Next-Nonce")).toBeNull();
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+
+    const rejected = vi.fn();
+    const forbiddenHeaders: Array<Record<string, string>> = [
+      { "X-Heel-Runner-Nonce": "nonce" }, { "X-Heel-Runner-Sequence": "1" },
+      { Authorization: "Bearer heel_sk_abc" }, { Cookie: "__Host-heel_session=abc" },
+    ];
+    for (const forbidden of forbiddenHeaders) {
+      expect((await worker.fetch(request(path, { ...proof, ...forbidden }), env(rejected), context)).status).toBe(400);
+    }
+    expect((await worker.fetch(request(path, { ...proof, "X-Heel-Runner-Id": `${runner}, ${runner}` }), env(rejected), context)).status).toBe(400);
+    expect(rejected).not.toHaveBeenCalled();
+  });
+});

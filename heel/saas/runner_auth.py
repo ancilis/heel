@@ -23,10 +23,15 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from heel.canary_contracts import (
+    RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN, RUNNER_INACTIVE_CLAIM_ATTESTATION_PROOF_SCHEMA,
+    RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_MAX_BYTES, INACTIVE_CLAIM_ATTESTATION_SCHEMA,
     canonical_bytes, canonical_digest, parse_json, validate_runner_identity,
+    validate_runner_inactive_claim_attestation_request,
 )
 from heel.crypto import ed25519_key_id, load_public_key_base64
 from heel.runner.identity import runner_phrase_words, validate_pairing_phrase
+
+from .canary_runs import AUDIT_RETENTION_MS
 
 
 PAIRING_TTL = 10 * 60
@@ -973,6 +978,28 @@ END;
 RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_BOUNDED_RETENTION_MIGRATION
 
 
+# Migration 33 (C design §6.6, ADDENDUM A1, clarification §1): the only table written by
+# inactive-claim attestation issuance.  Times are integer milliseconds from one explicit
+# seconds-to-milliseconds conversion; the CHECKs are portable range/ordering guards, not unit proofs.
+RUNNER_AUTH_INACTIVE_CLAIM_ATTESTATION_MIGRATION = r"""
+CREATE TABLE canary_inactive_claim_attestations(
+ attestation_id TEXT PRIMARY KEY CHECK(length(attestation_id)=36 AND substr(attestation_id,1,4)='ica_'
+  AND substr(attestation_id,5) NOT GLOB '*[^0-9a-f]*'),
+ workspace_id TEXT NOT NULL, runner_id TEXT NOT NULL, run_id TEXT NOT NULL, grant_id TEXT NOT NULL,
+ authenticated_key_id TEXT NOT NULL,
+ request_signed_digest TEXT NOT NULL CHECK(length(request_signed_digest)=64),
+ attestation_digest TEXT NOT NULL CHECK(length(attestation_digest)=64),
+ cloud_status TEXT NOT NULL CHECK(cloud_status IN ('stop_requested','finalizing','terminal')),
+ created_at_ms INTEGER NOT NULL CHECK(typeof(created_at_ms)='integer' AND created_at_ms BETWEEN 0 AND 9007199254740991),
+ purge_at INTEGER NOT NULL CHECK(typeof(purge_at)='integer' AND purge_at>created_at_ms));
+CREATE INDEX idx_canary_inactive_claim_attestations_rate
+ ON canary_inactive_claim_attestations(workspace_id,runner_id,created_at_ms);
+"""
+RUNNER_AUTH_RUNTIME_SCHEMA += RUNNER_AUTH_INACTIVE_CLAIM_ATTESTATION_MIGRATION
+INACTIVE_CLAIM_ATTESTATION_RATE_WINDOW_MS = 60_000
+INACTIVE_CLAIM_ATTESTATION_RATE_LIMIT = 3
+
+
 class RunnerAuthError(PermissionError):
     """Uniform external runner-auth failure."""
 
@@ -1122,7 +1149,7 @@ def _ensure_lifecycle_tables(conn: sqlite3.Connection) -> None:
     """)
 
 
-_RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_request_ledger_archive", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records", "canary_runner_chain_cursors", "canary_runner_resync_challenges", "canary_runner_pairing_protocols", "canary_runner_execution_protocols", "canary_runner_pairing_activation_receipts", "canary_runner_rotation_activation_receipts", "canary_runner_pairing_activation_abort_receipts", "canary_runner_rotation_activation_abort_receipts", "canary_runner_key_retirement_queue")
+_RUNNER_AUTH_TABLES = ("canary_runner_pairings", "canary_runner_nonce_chains", "canary_runner_request_ledger", "canary_runner_request_ledger_archive", "canary_runner_rotations", "canary_runner_identity_records", "canary_runner_audit_records", "canary_runner_chain_cursors", "canary_runner_resync_challenges", "canary_runner_pairing_protocols", "canary_runner_execution_protocols", "canary_runner_pairing_activation_receipts", "canary_runner_rotation_activation_receipts", "canary_runner_pairing_activation_abort_receipts", "canary_runner_rotation_activation_abort_receipts", "canary_runner_key_retirement_queue", "canary_inactive_claim_attestations")
 _RUNNER_AUTH_EXACT_INDEX_NAMES = (
     "idx_canary_runner_key_history_expiry",
     "idx_canary_runner_ledger_retention",
@@ -1142,6 +1169,7 @@ _RUNNER_AUTH_EXACT_INDEX_NAMES = (
     "idx_canary_runner_rotation_old_key_history",
     "idx_canary_runner_key_retirement_due",
     "idx_canary_runner_one_open_rotation",
+    "idx_canary_inactive_claim_attestations_rate",
 )
 
 
@@ -2850,6 +2878,85 @@ class RunnerAuthStore:
                 raise RunnerAuthError("invalid runner authentication")
             self.conn.commit()
             return response
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def attest_inactive_claim(self, *, workspace_id: str, runner_id: str, run_id: str, path: str,
+                              raw_body: bytes, headers: Mapping[str, list[str]], runs) -> dict:
+        """Issue a signed inactive-claim attestation in one side-effect-free transaction.
+
+        Order (C design §6.6): protocol gate, resync-family PoP (its own schema/domain, never
+        stale), closed canonical body, the read-only retained-column predicate, the rate check,
+        signing, then the single audit INSERT.  No nonce, cursor, ledger, lifecycle or quota row
+        is read for update or written.  ``runs`` must share this connection so the predicate
+        reads inside the PoP transaction; a zero-argument factory is called only after the
+        protocol gate and PoP, so an unauthenticated caller never reaches service setup.
+        """
+        if not callable(runs) and getattr(runs, "conn", None) is not self.conn:
+            raise TypeError("inactive-claim attestation requires the runner store connection")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self._require_executable_protocol_in_transaction(workspace_id, runner_id)
+            key, signed_digest, _ = self._resync_proof(
+                workspace_id=workspace_id, runner_id=runner_id, path=path, raw_body=raw_body,
+                headers=headers, proof_schema=RUNNER_INACTIVE_CLAIM_ATTESTATION_PROOF_SCHEMA,
+                domain=RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN, allow_stale=False,
+            )
+            try:
+                body = validate_runner_inactive_claim_attestation_request(
+                    parse_json(raw_body, max_bytes=RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_MAX_BYTES),
+                )
+            except ValueError:
+                raise RunnerAuthError("invalid runner authentication") from None
+            if canonical_bytes(body) != raw_body or body["run_id"] != run_id:
+                raise RunnerAuthError("invalid runner authentication")
+            if callable(runs):
+                runs = runs()
+                if getattr(runs, "conn", None) is not self.conn:
+                    raise TypeError("inactive-claim attestation requires the runner store connection")
+            cloud = runs.inactive_claim_cloud_state_in_transaction(
+                workspace_id, runner_id, body, authenticated_key_id=key["key_id"],
+            )
+            if cloud is None:  # not this (workspace, runner)'s run: an authentication failure
+                raise RunnerAuthError("invalid runner authentication")
+            created_at_ms = self._milliseconds(self._now())
+            # Open lower boundary: a row exactly 60 s old no longer counts (clarification §1).
+            recent = self.conn.execute(
+                "SELECT COUNT(*) FROM canary_inactive_claim_attestations "
+                "INDEXED BY idx_canary_inactive_claim_attestations_rate "
+                "WHERE workspace_id=? AND runner_id=? AND created_at_ms>?",
+                (workspace_id, runner_id, created_at_ms - INACTIVE_CLAIM_ATTESTATION_RATE_WINDOW_MS),
+            ).fetchone()[0]
+            if recent >= INACTIVE_CLAIM_ATTESTATION_RATE_LIMIT:
+                raise RunnerAuthRateLimited("runner recovery rate limited")
+            attestation = runs.sign_inactive_claim_attestation({
+                "schema_version": INACTIVE_CLAIM_ATTESTATION_SCHEMA,
+                "attestation_id": "ica_" + secrets.token_hex(16),
+                "workspace_id": workspace_id, "runner_id": runner_id,
+                "project_id": body["project_id"], "run_id": body["run_id"],
+                "grant_id": body["grant_id"], "grant_digest": body["grant_digest"],
+                "approval_id": body["approval_id"],
+                "approval_projection_digest": body["approval_projection_digest"],
+                "bound_runner_key_id": body["bound_runner_key_id"],
+                "authenticated_runner_key_id": key["key_id"],
+                "client_challenge_b64": body["client_challenge_b64"],
+                "cloud": cloud,
+                "attested_at_ms": created_at_ms,
+            })
+            self.conn.execute(
+                "INSERT INTO canary_inactive_claim_attestations(attestation_id,workspace_id,runner_id,"
+                "run_id,grant_id,authenticated_key_id,request_signed_digest,attestation_digest,"
+                "cloud_status,created_at_ms,purge_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    attestation["attestation_id"], workspace_id, runner_id, body["run_id"],
+                    body["grant_id"], key["key_id"], signed_digest, attestation["attestation_digest"],
+                    cloud["status"], created_at_ms, created_at_ms + AUDIT_RETENTION_MS,
+                ),
+            )
+            self.conn.commit()
+            return attestation
         except Exception:
             if self.conn.in_transaction:
                 self.conn.rollback()

@@ -157,6 +157,8 @@ const RUNNER_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Z
 const RUNNER_CONTEXT_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/contexts(?:/list|/${RUNNER_CONTEXT_REF}/(?:claim|approval-projections))$`);
 const RUNNER_RESULT_PROJECTION = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/runs/${CANARY_RUN_REF}/result-projection$`);
 const RUNNER_RESYNC = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/resync/(?:start|complete)$`);
+// Side-effect-free and nonce-free: rides the resync proof header family, never a nonce chain.
+const RUNNER_INACTIVE_CLAIM_ATTESTATION = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/runs/${CANARY_RUN_REF}/inactive-claim-attestation$`);
 const RUNNER_HEADERS = ["X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature"];
 const RUNNER_RESYNC_HEADERS = ["X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Signature"];
 
@@ -268,7 +270,7 @@ function controlPlaneRequestHeaders(
   const runnerResultProjection = RUNNER_RESULT_PROJECTION.test(upstreamPath);
   const runnerContextControl = RUNNER_CONTEXT_CONTROL.test(upstreamPath);
   const runnerControl = RUNNER_CONTROL.test(upstreamPath) || runnerContextControl || runnerResultProjection;
-  const runnerResync = RUNNER_RESYNC.test(upstreamPath);
+  const runnerResync = RUNNER_RESYNC.test(upstreamPath) || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath);
   const humanCanary = isHumanCanaryRoute(method, upstreamPath);
   const humanEnvironment = isHumanEnvironmentRoute(method, upstreamPath);
   const runnerPairingPublic = upstreamPath === RUNNER_PAIRING_EXCHANGE || RUNNER_PAIRING_ACTIVATE.test(upstreamPath) || RUNNER_ROTATION_PUBLIC.test(upstreamPath);
@@ -484,7 +486,7 @@ function controlPlaneRoute(method: string, pathname: string): string | null {
   if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
   if ((RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (RUNNER_REVOKE.test(upstreamPath) && method === "POST") return upstreamPath;
-  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath)) && method === "POST") return upstreamPath;
+  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath) || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (isHumanCanaryRoute(method, upstreamPath) || isHumanEnvironmentRoute(method, upstreamPath)) return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;

@@ -25,16 +25,19 @@ from heel.canary_contracts import (
     DISCOVERY_SEED_PATHS,
     EXECUTION_GRANT_SCHEMA,
     EXECUTION_GRANT_V2_SCHEMA,
+    INACTIVE_CLAIM_OBSERVATION,
     ContractError,
     approval_body_profile,
     discovery_frontier_digest,
     validate_discovery_round_report,
     canonical_bytes,
     canonical_digest,
+    inactive_claim_attestation_signing_payload,
     validate_discovery_authorization_request,
     validate_route_inventory_rows,
     validate_approval_projection,
     validate_execution_grant,
+    validate_inactive_claim_attestation,
     validate_operational_run,
 )
 from heel.crypto import load_public_key_base64, verify_envelope
@@ -268,6 +271,18 @@ class DiscoveryError(ValueError):
 # A round grant names its parent authorization's single ledger reservation in a namespace the
 # ledger cannot resolve (C2D D3).  Round runs are unreserved, so no per-run quota path reads it.
 DISCOVERY_GRANT_RESERVATION_REF = re.compile(r"^dauth:dau_[0-9a-f]{32}:r[1-5]$")
+
+
+class InactiveClaimAttestationRefused(Exception):
+    """An authenticated runner asked about a claim the Cloud cannot attest as inactive."""
+
+    REASONS = frozenset({"run_live", "lifecycle_mismatch", "cloud_observed_execution", "binding_mismatch"})
+
+    def __init__(self, reason: str):
+        if reason not in self.REASONS:
+            raise ValueError("unknown inactive-claim refusal reason")
+        super().__init__(reason)
+        self.reason = reason
 
 
 def discovery_round_grant_reference(authorization_id: str, round_number: int) -> str:
@@ -1619,6 +1634,84 @@ class CanaryRunService:
         if row is None:
             raise LookupError("canary run not found")
         return row
+
+    def inactive_claim_cloud_state_in_transaction(
+        self, workspace_id: str, runner_id: str, request: dict, *, authenticated_key_id: str,
+    ) -> dict | None:
+        """Read-only C predicate on retained columns; None when the path runner does not own the run.
+
+        Never ``_gate``/``_context``: those can persist stops or need rows outside this proof.
+        Only the run, its grant and approval digests and the receipt's phase columns are read, so
+        the answer survives the payload, receipt-JSON, audit and request-ledger purges.  It states
+        exactly what the Cloud knows: no start, no acknowledgement, no execution-phase projection.
+        """
+        row = self.conn.execute(
+            "SELECT r.project_ref,r.grant_id,r.approval_id,r.runner_key_id,r.status,r.stop_reason,"
+            "r.execution_disposition,r.started_at_ms,r.stop_acknowledged_at_ms,"
+            + ",".join(f"r.{name}" for name in STOP_ACK_WITNESS_COLUMNS) + ","
+            "r.stop_generation,r.stop_requested_at_ms,r.stop_deadline_ms,r.terminal_at_ms,"
+            "g.grant_digest,g.status AS grant_status,a.projection_digest AS approval_projection_digest,"
+            "o.run_id AS receipt_run_id,o.lifecycle_phase AS receipt_phase,"
+            "o.execution_disposition AS receipt_disposition "
+            "FROM canary_runs r JOIN canary_execution_grants g ON g.workspace_id=r.workspace_id "
+            "AND g.project_ref=r.project_ref AND g.grant_id=r.grant_id "
+            "JOIN canary_approval_projections a ON a.workspace_id=r.workspace_id "
+            "AND a.project_ref=r.project_ref AND a.approval_id=r.approval_id "
+            "LEFT JOIN canary_operational_receipts o ON o.workspace_id=r.workspace_id "
+            "AND o.project_ref=r.project_ref AND o.run_id=r.run_id "
+            "WHERE r.workspace_id=? AND r.runner_id=? AND r.run_id=?",
+            (workspace_id, runner_id, request["run_id"]),
+        ).fetchone()
+        if row is None:
+            return None
+        if (
+            row["project_ref"] != request["project_id"]
+            or row["grant_id"] != request["grant_id"]
+            or row["grant_digest"] != request["grant_digest"]
+            or row["approval_id"] != request["approval_id"]
+            or row["approval_projection_digest"] != request["approval_projection_digest"]
+            or row["runner_key_id"] != request["bound_runner_key_id"]
+            or row["runner_key_id"] != authenticated_key_id
+        ):
+            raise InactiveClaimAttestationRefused("binding_mismatch")
+        stopped = row["stop_reason"] != "none"
+        inactive = stopped and (
+            row["status"] in {"stop_requested", "finalizing"}  # I1
+            or (row["status"] == "terminal" and row["execution_disposition"] == "stopped")  # I2
+        )
+        if not inactive:
+            if row["status"] in {"claimed", "running"} and not stopped:
+                raise InactiveClaimAttestationRefused("run_live")
+            raise InactiveClaimAttestationRefused("lifecycle_mismatch")
+        if (
+            row["started_at_ms"] is not None  # E1
+            or row["stop_acknowledged_at_ms"] is not None  # E2
+            or any(row[name] is not None for name in STOP_ACK_WITNESS_COLUMNS)  # E2'
+            or (row["receipt_run_id"] is not None and (  # E3
+                row["receipt_phase"] != "claimed" or row["receipt_disposition"] is not None
+            ))
+        ):
+            raise InactiveClaimAttestationRefused("cloud_observed_execution")
+        return {
+            "status": row["status"], "stop_reason": row["stop_reason"],
+            "stop_generation": row["stop_generation"],
+            "stop_requested_at_ms": row["stop_requested_at_ms"],
+            "stop_deadline_ms": row["stop_deadline_ms"], "terminal_at_ms": row["terminal_at_ms"],
+            "execution_disposition": row["execution_disposition"], "grant_status": row["grant_status"],
+            "started_at_ms": None, "stop_acknowledged_at_ms": None,
+            "observation": INACTIVE_CLAIM_OBSERVATION,
+        }
+
+    def sign_inactive_claim_attestation(self, unsigned: dict) -> dict:
+        """Digest and grant-authority-sign one attestation with the shared C1 payload helper."""
+        record = dict(unsigned)
+        record["attestation_digest"] = canonical_digest(unsigned)
+        record.update(self.signing.sign(inactive_claim_attestation_signing_payload(record)))
+        try:
+            return validate_inactive_claim_attestation(record)
+        except ContractError as error:
+            # Server state that the closed contract cannot carry is never attested.
+            raise RuntimeError("inactive-claim attestation is not representable") from error
 
     def _stored_operational_authority(self, row: sqlite3.Row) -> tuple[dict, dict]:
         """Verify and return the immutable runner approval and Cloud execution grant."""
@@ -3333,6 +3426,10 @@ class CanaryRunService:
             counts["purged_receipts"] = cursor.rowcount
             cursor = self.conn.execute("DELETE FROM canary_audit_records WHERE purge_at<=?", (now,))
             counts["purged_audit"] = cursor.rowcount
+            cursor = self.conn.execute(
+                "DELETE FROM canary_inactive_claim_attestations WHERE purge_at<=?", (now,),
+            )
+            counts["purged_inactive_claim_attestations"] = cursor.rowcount
             self.conn.commit()
             return counts
         except Exception:

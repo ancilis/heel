@@ -2437,8 +2437,8 @@ class _LiveHttpRun:
 
     def signed(self, operation, projection, *, nonce=None):
         """One request on the run's own nonce-sequenced chain, exactly as a runner signs it."""
-        schema = {"stop-ack": "heel.runner-stop-ack-request.v1", "result": "heel.runner-result-request.v1"}[operation]
-        capability = {"stop-ack": "runner_heartbeat", "result": "runner_result"}[operation]
+        schema = {"heartbeat": "heel.runner-heartbeat-request.v1", "progress": "heel.runner-progress-request.v1", "stop-ack": "heel.runner-stop-ack-request.v1", "result": "heel.runner-result-request.v1"}[operation]
+        capability = {"heartbeat": "runner_heartbeat", "progress": "runner_progress", "stop-ack": "runner_heartbeat", "result": "runner_result"}[operation]
         body = canonical_bytes({"schema_version": schema, "run_id": self.run_id, "operational_projection": projection})
         route = f"/v1/workspaces/{self.workspace}/runners/runner/runs/{self.run_id}/{operation}"
         chain = self.chains[operation]
@@ -3644,3 +3644,453 @@ def test_shared_connection_v3_activation_busy_stays_500(caplog, monkeypatch):
         assert ceremony.state(pairing)["receipt"] is None
     finally:
         ceremony.close()
+
+
+# --- C2: inactive-claim attestation over the real in-process HTTP boundary (C design §6, §11) ---
+
+_INVALID_RUNNER_AUTH = (401, {"schema_version": "heel.runner-error.v1", "code": "invalid_runner_auth"})
+_ATTESTATION_GUARDED_TABLES = (
+    "canary_runs", "canary_execution_grants", "canary_approval_projections", "canary_operational_receipts",
+    "usage_ledger", "canary_runner_nonce_chains", "canary_runner_chain_cursors", "canary_runner_request_ledger",
+    "canary_run_events", "canary_audit_records", "canary_runner_keys", "canary_runner_resync_challenges",
+)
+
+
+def _attestation_refused(reason):
+    return (409, {"schema_version": "heel.runner-error.v1", "code": "inactive_claim_attestation_refused", "reason": reason})
+
+
+def _attestation_body(live, *, challenge=b"c" * 32, **overrides):
+    from heel.canary_contracts import RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_SCHEMA
+
+    approval_id = live.cp.store.conn.execute(
+        "SELECT approval_id FROM canary_runs WHERE run_id=?", (live.run_id,),
+    ).fetchone()[0]
+    return canonical_bytes({
+        "schema_version": RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_SCHEMA,
+        "run_id": live.run_id, "project_id": "prj", "grant_id": live.grant["grant_id"],
+        "grant_digest": live.grant["grant_digest"], "approval_id": approval_id,
+        "approval_projection_digest": live.grant["approval"]["projection_digest"],
+        "bound_runner_key_id": live.key_id,
+        "client_challenge_b64": base64.b64encode(challenge).decode(),
+        **overrides,
+    })
+
+
+def _attest(live, body=None, *, workspace=None, runner_id="runner", run_id=None, path=None, private=None,
+            key_id=None, timestamp_ms=None, extra_headers=None, method="POST", sign_path=None, sign_body=None,
+            domain=None):
+    """POST exact bytes with only the resync proof header family; returns status, JSON, X-Heel headers."""
+    from heel.canary_contracts import (
+        RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN, RUNNER_INACTIVE_CLAIM_ATTESTATION_PROOF_SCHEMA,
+    )
+
+    workspace = live.workspace if workspace is None else workspace
+    run_id = live.run_id if run_id is None else run_id
+    path = f"/v1/workspaces/{workspace}/runners/{runner_id}/runs/{run_id}/inactive-claim-attestation" if path is None else path
+    body = _attestation_body(live) if body is None else body
+    private = live.private if private is None else private
+    key_id = live.key_id if key_id is None else key_id
+    timestamp_ms = int(time.time() * 1000) if timestamp_ms is None else timestamp_ms
+    proof = {
+        "schema_version": RUNNER_INACTIVE_CLAIM_ATTESTATION_PROOF_SCHEMA, "workspace_id": workspace,
+        "runner_id": runner_id, "key_id": key_id, "method": "POST", "path": path if sign_path is None else sign_path,
+        "body_sha256": hashlib.sha256(body if sign_body is None else sign_body).hexdigest(), "timestamp_ms": timestamp_ms,
+    }
+    signature = private.sign((RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN if domain is None else domain) + canonical_bytes(proof))
+    headers = {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": runner_id, "X-Heel-Runner-Key-Id": key_id,
+        "X-Heel-Runner-Timestamp-Ms": str(timestamp_ms), "X-Heel-Runner-Signature": base64.b64encode(signature).decode(),
+        **(extra_headers or {}),
+    }
+    conn = http.client.HTTPConnection("127.0.0.1", live.server.server_address[1], timeout=5)
+    try:
+        conn.request(method, path, body, headers)
+        response = conn.getresponse()
+        raw = response.read()
+        runner_headers = {key: value for key, value in response.getheaders() if key.startswith("X-Heel-")}
+    finally:
+        conn.close()
+    try:
+        payload = json.loads(raw) if raw else None
+    except ValueError:
+        payload = raw
+    return response.status, payload, runner_headers
+
+
+def _guarded_state(live):
+    conn = live.cp.store.conn
+    return {table: sorted(map(tuple, conn.execute(f"SELECT * FROM {table}"))) for table in _ATTESTATION_GUARDED_TABLES}
+
+
+def _attestation_audit(live):
+    return [dict(row) for row in live.cp.store.conn.execute(
+        "SELECT * FROM canary_inactive_claim_attestations ORDER BY created_at_ms,attestation_id"
+    )]
+
+
+def _cloud_stop(live):
+    live.runs.request_stop(
+        live.workspace, "prj", live.run_id, actor="owner", reason="cloud_stop",
+        expected_kill_switch_generation=0,
+    )
+
+
+def _verify_attestation(live, payload, challenge):
+    from heel.canary_contracts import inactive_claim_attestation_signing_payload, validate_inactive_claim_attestation
+    from heel.crypto import verify_envelope
+
+    assert validate_inactive_claim_attestation(payload) == payload
+    authority = live.cp.grant_authority
+    envelope = {"signing_key_id": payload["signing_key_id"], "signature_b64": payload["signature_b64"]}
+    verify_envelope({authority.key_id: authority.public_key}, envelope, inactive_claim_attestation_signing_payload(payload))
+    stranger = SigningAuthority.generate()
+    with pytest.raises(ValueError):
+        verify_envelope({stranger.key_id: stranger.public_key}, envelope, inactive_claim_attestation_signing_payload(payload))
+    assert payload["client_challenge_b64"] == base64.b64encode(challenge).decode()
+    approval_id = live.cp.store.conn.execute("SELECT approval_id FROM canary_runs WHERE run_id=?", (live.run_id,)).fetchone()[0]
+    assert {key: payload[key] for key in (
+        "workspace_id", "runner_id", "project_id", "run_id", "grant_id", "grant_digest", "approval_id",
+        "approval_projection_digest", "bound_runner_key_id", "authenticated_runner_key_id",
+    )} == {
+        "workspace_id": live.workspace, "runner_id": "runner", "project_id": "prj", "run_id": live.run_id,
+        "grant_id": live.grant["grant_id"], "grant_digest": live.grant["grant_digest"], "approval_id": approval_id,
+        "approval_projection_digest": live.grant["approval"]["projection_digest"],
+        "bound_runner_key_id": live.key_id, "authenticated_runner_key_id": live.key_id,
+    }
+
+
+def _expected_cloud(live):
+    row = live.cp.store.conn.execute(
+        "SELECT r.status,r.stop_reason,r.stop_generation,r.stop_requested_at_ms,r.stop_deadline_ms,r.terminal_at_ms,"
+        "r.execution_disposition,g.status AS grant_status FROM canary_runs r JOIN canary_execution_grants g "
+        "ON g.grant_id=r.grant_id WHERE r.run_id=?", (live.run_id,),
+    ).fetchone()
+    return {**dict(row), "started_at_ms": None, "stop_acknowledged_at_ms": None,
+            "observation": "no_start_no_ack_no_execution_projection"}
+
+
+def test_real_http_inactive_claim_attestation_roundtrip_uses_resync_header_family_and_pinned_signature():
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            _cloud_stop(live)
+            before = _guarded_state(live)
+            challenge = bytes(range(32))
+            status, payload, headers = _attest(live, _attestation_body(live, challenge=challenge))
+            assert status == 200, payload
+            assert "X-Heel-Runner-Next-Nonce" not in headers  # no nonce is consumed or issued
+            _verify_attestation(live, payload, challenge)
+            assert payload["cloud"] == _expected_cloud(live)
+            assert payload["cloud"]["status"] == "stop_requested" and payload["cloud"]["stop_reason"] == "cloud_stop"
+            assert _guarded_state(live) == before
+            [audit] = _attestation_audit(live)
+            assert audit == {
+                "attestation_id": payload["attestation_id"], "workspace_id": live.workspace, "runner_id": "runner",
+                "run_id": live.run_id, "grant_id": live.grant["grant_id"], "authenticated_key_id": live.key_id,
+                "request_signed_digest": audit["request_signed_digest"],
+                "attestation_digest": payload["attestation_digest"], "cloud_status": "stop_requested",
+                "created_at_ms": payload["attested_at_ms"], "purge_at": payload["attested_at_ms"] + 30 * 24 * 60 * 60 * 1000,
+            }
+            assert len(audit["request_signed_digest"]) == 64
+        finally:
+            live.close()
+
+
+def test_real_http_inactive_claim_attestation_rejects_nonce_sequence_headers_query_fragment_and_non_post():
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            _cloud_stop(live)
+            before = _guarded_state(live)
+            route = f"/v1/workspaces/{live.workspace}/runners/runner/runs/{live.run_id}/inactive-claim-attestation"
+            body = _attestation_body(live)
+            for extra in (
+                {"X-Heel-Runner-Nonce": base64.b64encode(b"n" * 32).decode()}, {"X-Heel-Runner-Sequence": "1"},
+                {"Authorization": "Bearer heel_sk_abc"}, {"Cookie": "heel_session=abc"},
+            ):
+                assert _attest(live, body, extra_headers=extra)[:2] == _INVALID_RUNNER_AUTH, extra
+            for path in (route + "?x=1", route + "#fragment", route.replace("/runs/", "/r%75ns/"),
+                         route.replace("inactive-claim-attestation", "inactive-claim-attestatio%6E")):
+                assert _attest(live, body, path=path)[0] in {400, 401, 404}, path  # never routed to issuance
+                assert _attestation_audit(live) == []
+            assert _attest(live, body, path=route + "?x=1")[:2] == _INVALID_RUNNER_AUTH
+            assert _attest(live, body, path=route + "#fragment")[0] == 404  # a fragment never routes
+            for method in ("GET", "PUT", "DELETE", "PATCH"):
+                assert _attest(live, body, method=method)[0] in {400, 404, 405, 501}, method  # never issuance
+            other = Ed25519PrivateKey.generate()
+            for kwargs in (
+                {"body": body + b" "},                                            # not canonical
+                {"body": body.replace(b"{", b"{ ", 1)},                          # not canonical
+                {"body": b"{" + b" " * 2048 + b"}"},                               # above the 2048-byte cap
+                {"body": _attestation_body(live, run_id="crun_" + "f" * 32)},     # body run differs from path
+                {"body": body, "sign_body": _attestation_body(live, challenge=b"x" * 32)},  # tampered body
+                {"body": body, "sign_path": route.replace(live.run_id, "crun_" + "f" * 32)},  # tampered path
+                {"body": body, "private": other},                                 # tampered PoP
+                {"body": body, "domain": b"heel.runner-resync-start-pop.v2\0"},   # another PoP domain
+                {"body": body, "timestamp_ms": int(time.time() * 1000) - 31_000},  # stale (allow_stale=False)
+                {"body": body, "timestamp_ms": int(time.time() * 1000) + 31_000},
+                {"body": body, "key_id": ed25519_key_id(other.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)), "private": other},
+                {"body": body, "extra_headers": {"X-Heel-Runner-Signature": ""}},
+            ):
+                assert _attest(live, **kwargs)[:2] == _INVALID_RUNNER_AUTH, kwargs.keys()
+            assert _attestation_audit(live) == []
+            assert _guarded_state(live) == before
+            status, _, headers = _attest(live, body)
+            assert status == 200 and "X-Heel-Runner-Next-Nonce" not in headers
+        finally:
+            live.close()
+
+
+def test_real_http_inactive_claim_attestation_is_issued_after_reaper_missing_ack_terminal_and_all_purges():
+    from canary_test_support import Clock, operational_projection
+    from heel.saas.canary_runs import CanaryRunService
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            # A pre-activation heartbeat leaves a 'claimed' receipt and no start.
+            status, _ = live.post("heartbeat", operational_projection(live.signer, live.grant, sequence=0, phase="claimed"))
+            assert status == 200
+            _cloud_stop(live)
+            clock = Clock(time.time() + 10)
+            reaper = CanaryRunService(live.cp.store.conn, signing=live.cp.grant_authority, clock=clock, initialize_schema=False)
+            assert reaper.expire_and_reconcile()["finalized_orphans"] == 1
+            assert live.cp.store.conn.execute(
+                "SELECT COUNT(*) FROM canary_audit_records WHERE run_id=? AND action='stop_ack_late' AND reason_code='missing_ack'",
+                (live.run_id,),
+            ).fetchone()[0] == 1
+            start = clock.value
+            for elapsed in (25 * 3600, 8 * 86400, 31 * 86400):  # 24 h payload, 7 d receipt, 30 d audit purges
+                clock.value = start + elapsed
+                reaper.expire_and_reconcile()
+            auth = RunnerAuthStore(live.cp.store.conn, pepper=b"r" * 32, now=clock)
+            while auth.purge_runner_request_receipts(clock.value)[1]:
+                pass
+            conn = live.cp.store.conn
+            assert conn.execute("SELECT grant_json FROM canary_execution_grants").fetchone()[0] is None
+            assert conn.execute("SELECT projection_json FROM canary_approval_projections").fetchone()[0] is None
+            assert tuple(conn.execute(
+                "SELECT receipt_json,lifecycle_phase,execution_disposition FROM canary_operational_receipts",
+            ).fetchone()) == (None, "claimed", None)
+            assert conn.execute("SELECT COUNT(*) FROM canary_runner_request_ledger").fetchone()[0] == 0
+            row = live.row()
+            assert (row["status"], row["execution_disposition"], row["stop_reason"]) == ("terminal", "stopped", "cloud_stop")
+            before = _guarded_state(live)
+            challenge = b"\x01" * 32
+            status, payload, _ = _attest(live, _attestation_body(live, challenge=challenge))
+            assert status == 200, payload
+            _verify_attestation(live, payload, challenge)
+            assert payload["cloud"] == _expected_cloud(live)
+            assert (payload["cloud"]["status"], payload["cloud"]["execution_disposition"], payload["cloud"]["grant_status"]) == (
+                "terminal", "stopped", "terminal")
+            assert type(payload["cloud"]["terminal_at_ms"]) is int
+            assert _guarded_state(live) == before
+        finally:
+            live.close()
+
+
+def test_real_http_inactive_claim_attestation_refuses_live_claimed_run_then_succeeds_after_reaper_persists_stop():
+    from heel.saas.canary_reaper import CanaryReaper
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            before = _guarded_state(live)
+            assert _attest(live)[:2] == _attestation_refused("run_live")
+            conn = live.cp.store.conn
+            for status in ("expired", "cancelled"):
+                conn.execute("UPDATE canary_runs SET status=? WHERE run_id=?", (status, live.run_id)); conn.commit()
+                assert _attest(live)[:2] == _attestation_refused("lifecycle_mismatch"), status
+            conn.execute("UPDATE canary_runs SET status='claimed' WHERE run_id=?", (live.run_id,)); conn.commit()
+            assert _guarded_state(live) == before and _attestation_audit(live) == []
+            # The grant expires without any runner action; one reaper cycle persists the stop.
+            reaper = CanaryReaper(
+                str(Path(directory) / "control.sqlite"), signing=live.cp.grant_authority,
+                runner_auth_pepper=b"r" * 32, clock=lambda: time.time() + 700,
+            )
+            assert reaper.run_once()["authority_stops"] == 1
+            row = conn.execute("SELECT status,stop_reason,started_at_ms FROM canary_runs WHERE run_id=?", (live.run_id,)).fetchone()
+            assert tuple(row) == ("stop_requested", "cloud_stop", None)
+            challenge = b"\x02" * 32
+            status, payload, _ = _attest(live, _attestation_body(live, challenge=challenge))
+            assert status == 200, payload
+            _verify_attestation(live, payload, challenge)
+            assert payload["cloud"] == _expected_cloud(live)
+        finally:
+            live.close()
+
+
+def test_real_http_inactive_claim_attestation_refuses_started_acknowledged_d_witness_and_queued_terminal_rows():
+    from canary_test_support import operational_projection
+
+    observed = _attestation_refused("cloud_observed_execution")
+    with tempfile.TemporaryDirectory() as directory:
+        # Started, then the D-family queued NULL-ACK stopped terminal accepted by the Cloud.
+        live = _LiveHttpRun(directory)
+        try:
+            status, _ = live.post("progress", operational_projection(
+                live.signer, live.grant, sequence=0, phase="running", requests_started=1,
+            ))
+            assert status == 200
+            _cloud_stop(live)
+            assert _attest(live)[:2] == observed
+            from canary_test_support import NOW_MS
+            status, payload = live.post("result", operational_projection(
+                live.signer, live.grant, sequence=1, phase="terminal", disposition="stopped",
+                stop_reason="cloud_stop", requests_started=1, stop_requested_at_ms=_stop_instants()[0],
+                stop_acknowledged_at_ms=None, updated_at_ms=NOW_MS + 1_000,
+            ))
+            assert status == 200 and payload["status"] == "terminal"
+            assert live.row()["execution_disposition"] == "stopped"
+            assert _attest(live)[:2] == observed
+            assert _attestation_audit(live) == []
+        finally:
+            live.close()
+    with tempfile.TemporaryDirectory() as directory:
+        # Accepted stop acknowledgement (D witness written once with the Cloud receipt time).
+        live = _LiveHttpRun(directory)
+        try:
+            _accepted_ack(live)
+            assert live.witness() != (None, None, None)
+            assert _attest(live)[:2] == observed
+            assert _attestation_audit(live) == []
+        finally:
+            live.close()
+    with tempfile.TemporaryDirectory() as directory:
+        # Each predicate column alone refuses, on an otherwise attestable pre-activation stop.
+        live = _LiveHttpRun(directory)
+        try:
+            status, _ = live.post("heartbeat", operational_projection(live.signer, live.grant, sequence=0, phase="claimed"))
+            assert status == 200
+            _cloud_stop(live)
+            conn = live.cp.store.conn
+            for table, assignment, restore in (
+                ("canary_runs", "started_at_ms=1", "started_at_ms=NULL"),
+                ("canary_runs", "stop_acknowledged_at_ms=1", "stop_acknowledged_at_ms=NULL"),
+                ("canary_runs", "stop_ack_source_event_sequence=0", "stop_ack_source_event_sequence=NULL"),
+                ("canary_runs", f"stop_ack_projection_digest='{'a' * 64}'", "stop_ack_projection_digest=NULL"),
+                ("canary_runs", "stop_ack_runner_local_at_ms=1", "stop_ack_runner_local_at_ms=NULL"),
+                ("canary_operational_receipts", "lifecycle_phase='running'", "lifecycle_phase='claimed'"),
+                ("canary_operational_receipts", "lifecycle_phase='terminal'", "lifecycle_phase='claimed'"),
+                ("canary_operational_receipts", "execution_disposition='stopped'", "execution_disposition=NULL"),
+            ):
+                conn.execute(f"UPDATE {table} SET {assignment} WHERE run_id=?", (live.run_id,)); conn.commit()
+                assert _attest(live)[:2] == observed, assignment
+                conn.execute(f"UPDATE {table} SET {restore} WHERE run_id=?", (live.run_id,)); conn.commit()
+            assert _attestation_audit(live) == []
+            status, payload, _ = _attest(live)
+            assert status == 200, payload
+        finally:
+            live.close()
+
+
+def test_real_http_inactive_claim_attestation_refuses_binding_mismatch_and_401s_foreign_runner():
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            _cloud_stop(live)
+            conn = live.cp.store.conn
+            before = _guarded_state(live)
+            for field, value in (
+                ("project_id", "prj_other"), ("grant_id", "grant_other"), ("grant_digest", "f" * 64),
+                ("approval_id", "ap_other"), ("approval_projection_digest", "e" * 64),
+                ("bound_runner_key_id", "key_other"),
+            ):
+                assert _attest(live, _attestation_body(live, **{field: value}))[:2] == _attestation_refused("binding_mismatch"), field
+            # A decomposed identifier is not the canonical NFC request the runner signed.
+            raw = json.dumps(json.loads(_attestation_body(live)) | {"project_id": "préj"},
+                             sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+            assert _attest(live, raw)[:2] == _INVALID_RUNNER_AUTH
+            # Not owned by the path (workspace, runner) or not present: authentication failure, not 409.
+            assert _attest(live, run_id="crun_" + "f" * 32, body=_attestation_body(live, run_id="crun_" + "f" * 32))[:2] == _INVALID_RUNNER_AUTH
+            foreign = Ed25519PrivateKey.generate()
+            foreign_raw = foreign.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            foreign_key = ed25519_key_id(foreign_raw)
+            conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner2", live.workspace, "runner2", "active", time.time()))
+            conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (foreign_key, live.workspace, "runner2", base64.b64encode(foreign_raw).decode(), "active", time.time()))
+            _enable_executable_protocol(conn, live.workspace, "runner2")
+            other_workspace = live.cp.store.create_workspace(live.cp.store.create_org("org2"), "ws2", "free", CATALOG_VERSION)
+            other_key_private = Ed25519PrivateKey.generate()
+            other_raw = other_key_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            conn.execute("INSERT INTO canary_runners VALUES(?,?,?,?,?)", ("runner3", other_workspace, "runner3", "active", time.time()))
+            conn.execute("INSERT INTO canary_runner_keys VALUES(?,?,?,?,?,?,NULL)", (ed25519_key_id(other_raw), other_workspace, "runner3", base64.b64encode(other_raw).decode(), "active", time.time()))
+            _enable_executable_protocol(conn, other_workspace, "runner3")
+            conn.commit()
+            before = _guarded_state(live)
+            for body in (_attestation_body(live), _attestation_body(live, bound_runner_key_id=foreign_key)):
+                assert _attest(live, body, runner_id="runner2", private=foreign, key_id=foreign_key)[:2] == _INVALID_RUNNER_AUTH
+            assert _attest(live, workspace=other_workspace, runner_id="runner3", private=other_key_private, key_id=ed25519_key_id(other_raw))[:2] == _INVALID_RUNNER_AUTH
+            # The live runner's key cannot authenticate for another runner or workspace path.
+            assert _attest(live, runner_id="runner2")[:2] == _INVALID_RUNNER_AUTH
+            # The protocol gate precedes PoP exactly as in start_resync (design §10.4): this pair has none.
+            assert _attest(live, workspace=other_workspace)[:2] == (
+                403, {"schema_version": "heel.runner-error.v1", "code": "runner_protocol_upgrade_required"})
+            assert _guarded_state(live) == before and _attestation_audit(live) == []
+            assert _attest(live)[0] == 200
+        finally:
+            live.close()
+
+
+def test_real_http_inactive_claim_attestation_fails_closed_for_revoked_rotated_and_legacy_protocol_keys():
+    upgrade = (403, {"schema_version": "heel.runner-error.v1", "code": "runner_protocol_upgrade_required"})
+    for case in ("legacy", "rotated", "revoked"):
+        with tempfile.TemporaryDirectory() as directory:
+            live = _LiveHttpRun(directory)
+            try:
+                _cloud_stop(live)
+                conn = live.cp.store.conn
+                if case == "legacy":
+                    conn.execute("DELETE FROM canary_runner_execution_protocols WHERE workspace_id=?", (live.workspace,))
+                    conn.commit()
+                elif case == "rotated":
+                    # Rotation leaves the old key verification-only; no successor key may attest for it.
+                    conn.execute("UPDATE canary_runner_keys SET status='verification_only' WHERE key_id=?", (live.key_id,))
+                    conn.commit()
+                else:
+                    assert live.cp.runner_auth.revoke(live.workspace, "runner", actor="owner") is True
+                before = _guarded_state(live)
+                expected = upgrade if case == "legacy" else _INVALID_RUNNER_AUTH
+                assert _attest(live)[:2] == expected, case
+                assert _guarded_state(live) == before and _attestation_audit(live) == []
+            finally:
+                live.close()
+
+
+def test_real_http_inactive_claim_attestation_leaves_expired_pending_heartbeat_chain_and_ledger_untouched():
+    from canary_test_support import operational_projection
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            status, _ = live.post("heartbeat", operational_projection(live.signer, live.grant, sequence=0, phase="claimed"))
+            assert status == 200
+            # The next heartbeat was staged locally but its nonce has since expired on the Cloud.
+            pending = live.signed("heartbeat", operational_projection(live.signer, live.grant, sequence=1, phase="claimed"))
+            conn = live.cp.store.conn
+            conn.execute(
+                "UPDATE canary_runner_nonce_chains SET expires_at=0 WHERE workspace_id=? AND chain_name=?",
+                (live.workspace, f"heartbeat:{live.run_id}"),
+            )
+            conn.commit()
+            _cloud_stop(live)
+            chain_tables = ("canary_runner_nonce_chains", "canary_runner_chain_cursors", "canary_runner_request_ledger")
+            before = _guarded_state(live)
+            assert before["canary_runner_request_ledger"]
+            replay = _attestation_body(live, challenge=b"\x03" * 32)
+            first = _attest(live, replay)
+            second = _attest(live, replay)  # side-effect free: a replay is answered again, never interpreted
+            for status, payload, headers in (first, second):
+                assert status == 200, payload
+                assert "X-Heel-Runner-Next-Nonce" not in headers
+                _verify_attestation(live, payload, b"\x03" * 32)
+            assert first[1]["attestation_id"] != second[1]["attestation_id"]
+            after = _guarded_state(live)
+            assert {table: after[table] for table in chain_tables} == {table: before[table] for table in chain_tables}
+            assert after == before
+            assert len(_attestation_audit(live)) == 2
+            # The expired pending heartbeat is still exactly as it was: never resent, never consumed.
+            assert live.send(*pending)[0] == 401
+            assert _guarded_state(live) == before
+        finally:
+            live.close()

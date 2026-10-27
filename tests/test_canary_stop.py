@@ -917,3 +917,205 @@ def test_due_prune_never_substitutes_for_cloud_ack_and_c_pre_activation_remains_
     assert len(_audit_digests(c_conn, "stop_ack_late")) == 1
     _refused(c_coordinator, c_grant, _terminal(c_runner, c_grant, acknowledged=None), "illegal_run_transition")
     assert _state(c_conn) == c_state
+
+
+# --- C2: server issuance of the inactive-claim attestation (C design §6, A1, clarification §1) ---
+
+_ATTESTATION_WRITES = {
+    18: "insert", 23: "update", 9: "delete",  # sqlite3.SQLITE_INSERT / _UPDATE / _DELETE
+}
+
+
+def _attestation_setup():
+    """A claimed, never-started run whose Cloud stop is persisted (I1), on one shared Clock."""
+    from canary_test_support import NOW
+
+    conn, clock, runner, coordinator, approved, _ = running_setup()
+    conn.execute(
+        "INSERT INTO canary_runner_execution_protocols("
+        "workspace_id,runner_id,protocol_version,control_protocol,exchange_digest,activated_at"
+        ") VALUES(?,?,?,?,?,?)",
+        (WORKSPACE, RUNNER, 3, "heel.runner-control.v2", "a" * 64, NOW),
+    )
+    conn.commit()
+    grant = approved["grant"]
+    coordinator.request_stop(
+        WORKSPACE, PROJECT, grant["run_id"], actor="user_owner",
+        reason="cloud_stop", expected_kill_switch_generation=0,
+    )
+    # Fractional seconds: a seconds/milliseconds mix cannot satisfy the exact equalities below.
+    clock.value = NOW + 0.25
+    return conn, clock, runner, coordinator, grant
+
+
+def _attestation_call(conn, clock, runner, coordinator, grant, *, challenge=b"c" * 32, **overrides):
+    import base64
+    import hashlib
+
+    from heel.canary_contracts import (
+        RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN,
+        RUNNER_INACTIVE_CLAIM_ATTESTATION_PROOF_SCHEMA,
+        RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_SCHEMA,
+    )
+
+    approval_id = conn.execute(
+        "SELECT approval_id FROM canary_runs WHERE run_id=?", (grant["run_id"],),
+    ).fetchone()[0]
+    body = canonical_bytes({
+        "schema_version": RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_SCHEMA,
+        "run_id": grant["run_id"], "project_id": grant["project_id"],
+        "grant_id": grant["grant_id"], "grant_digest": grant["grant_digest"],
+        "approval_id": approval_id,
+        "approval_projection_digest": grant["approval"]["projection_digest"],
+        "bound_runner_key_id": runner.key_id,
+        "client_challenge_b64": base64.b64encode(challenge).decode(),
+        **overrides,
+    })
+    path = f"/v1/workspaces/{WORKSPACE}/runners/{RUNNER}/runs/{grant['run_id']}/inactive-claim-attestation"
+    timestamp_ms = int(clock.value * 1000)
+    proof = {
+        "schema_version": RUNNER_INACTIVE_CLAIM_ATTESTATION_PROOF_SCHEMA, "workspace_id": WORKSPACE,
+        "runner_id": RUNNER, "key_id": runner.key_id, "method": "POST", "path": path,
+        "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms,
+    }
+    signature = runner.private_key.sign(RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN + canonical_bytes(proof))
+    headers = {
+        "X-Heel-Runner-Id": [RUNNER], "X-Heel-Runner-Key-Id": [runner.key_id],
+        "X-Heel-Runner-Timestamp-Ms": [str(timestamp_ms)],
+        "X-Heel-Runner-Signature": [base64.b64encode(signature).decode()],
+        "X-Heel-Runner-Nonce": [], "X-Heel-Runner-Sequence": [], "Authorization": [], "Cookie": [],
+    }
+    return coordinator.runner_auth.attest_inactive_claim(
+        workspace_id=WORKSPACE, runner_id=RUNNER, run_id=grant["run_id"], path=path,
+        raw_body=body, headers=headers, runs=coordinator,
+    )
+
+
+def _all_rows(conn):
+    tables = [row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    )]
+    return {table: sorted(map(tuple, conn.execute(f"SELECT * FROM {table}"))) for table in tables}
+
+
+def test_inactive_claim_attestation_transaction_mutates_only_its_audit_table():
+    from heel.canary_contracts import (
+        inactive_claim_attestation_signing_payload, validate_inactive_claim_attestation,
+    )
+    from heel.crypto import verify_envelope
+    from heel.saas.canary_runs import CanaryRunService, InactiveClaimAttestationRefused
+
+    conn, clock, runner, coordinator, grant = _attestation_setup()
+    before = _all_rows(conn)
+    writes = []
+
+    def authorizer(action, table, *_):
+        if action in _ATTESTATION_WRITES:
+            writes.append((_ATTESTATION_WRITES[action], table))
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(authorizer)
+    try:
+        record = _attestation_call(conn, clock, runner, coordinator, grant)
+    finally:
+        conn.set_authorizer(None)
+    # Exactly one write, to the append-only audit table; nothing else (runs, grants, approvals,
+    # receipts, quota ledger, nonce chains, cursors, request ledger, events, audit) is touched.
+    assert writes == [("insert", "canary_inactive_claim_attestations")]
+    after = _all_rows(conn)
+    audit = after.pop("canary_inactive_claim_attestations")
+    assert before.pop("canary_inactive_claim_attestations") == []
+    assert after == before
+    assert len(audit) == 1
+
+    assert validate_inactive_claim_attestation(record) == record
+    verify_envelope(
+        {coordinator.signing.key_id: coordinator.signing.public_key},
+        {"signing_key_id": record["signing_key_id"], "signature_b64": record["signature_b64"]},
+        inactive_claim_attestation_signing_payload(record),
+    )
+    assert record["signing_key_id"] == coordinator.signing.key_id
+    assert (record["workspace_id"], record["runner_id"], record["run_id"]) == (WORKSPACE, RUNNER, grant["run_id"])
+    assert record["bound_runner_key_id"] == record["authenticated_runner_key_id"] == runner.key_id
+    assert record["cloud"]["status"] == "stop_requested" and record["cloud"]["stop_reason"] == "cloud_stop"
+    assert record["cloud"]["started_at_ms"] is None and record["cloud"]["stop_acknowledged_at_ms"] is None
+
+    # A refusal rolls back and writes nothing at all.
+    writes.clear()
+    conn.set_authorizer(authorizer)
+    try:
+        with pytest.raises(InactiveClaimAttestationRefused) as refused:
+            _attestation_call(conn, clock, runner, coordinator, grant, challenge=b"d" * 32, grant_digest="f" * 64)
+    finally:
+        conn.set_authorizer(None)
+    assert refused.value.reason == "binding_mismatch"
+    assert writes == []
+    assert _all_rows(conn) == {**before, "canary_inactive_claim_attestations": audit}
+
+    # The predicate must read inside the PoP transaction: a service on another connection is refused.
+    other = sqlite3.connect(":memory:")
+    try:
+        foreign = CanaryRunService(other, signing=coordinator.signing, initialize_schema=False)
+        with pytest.raises(TypeError):
+            coordinator.runner_auth.attest_inactive_claim(
+                workspace_id=WORKSPACE, runner_id=RUNNER, run_id=grant["run_id"], path="/",
+                raw_body=b"{}", headers={}, runs=foreign,
+            )
+    finally:
+        other.close()
+    assert _all_rows(conn) == {**before, "canary_inactive_claim_attestations": audit}
+
+
+def test_inactive_claim_attestation_rate_limits_at_three_per_minute_and_purges_with_audit_retention():
+    from heel.saas.canary_runs import AUDIT_RETENTION_MS
+    from heel.saas.runner_auth import RunnerAuthRateLimited
+
+    conn, clock, runner, coordinator, grant = _attestation_setup()
+    t0 = clock.value
+    t0_ms = int(t0 * 1000)
+
+    def rows():
+        return [tuple(row) for row in conn.execute(
+            "SELECT attestation_id,created_at_ms,purge_at FROM canary_inactive_claim_attestations "
+            "ORDER BY created_at_ms,attestation_id"
+        )]
+
+    first = _attestation_call(conn, clock, runner, coordinator, grant, challenge=b"1" * 32)
+    stored = rows()
+    assert [(created, purge) for _, created, purge in stored] == [(t0_ms, t0_ms + AUDIT_RETENTION_MS)]
+    assert all(type(created) is int and type(purge) is int for _, created, purge in stored)
+    assert first["attested_at_ms"] == t0_ms == stored[0][1]
+    assert stored[0][0] == first["attestation_id"]
+    _attestation_call(conn, clock, runner, coordinator, grant, challenge=b"2" * 32)
+    _attestation_call(conn, clock, runner, coordinator, grant, challenge=b"3" * 32)
+    assert len(rows()) == 3
+
+    # The window is open at its lower boundary: three at t0 refuse a fourth at t0+59 s and admit
+    # the first one at exactly t0+60 s (created_at_ms > now_ms - 60000).
+    clock.value = t0 + 59
+    with pytest.raises(RunnerAuthRateLimited):
+        _attestation_call(conn, clock, runner, coordinator, grant, challenge=b"4" * 32)
+    assert len(rows()) == 3
+    clock.value = t0 + 60
+    late = _attestation_call(conn, clock, runner, coordinator, grant, challenge=b"5" * 32)
+    assert late["attested_at_ms"] == t0_ms + 60_000
+    assert len(rows()) == 4
+
+    # Retention runs on the service's clock, which is the same Clock object.
+    clock.value = t0 + 29 * 86400
+    coordinator.expire_and_reconcile()
+    assert len(rows()) == 4
+    clock.value = t0 + 30 * 86400
+    coordinator.expire_and_reconcile()
+    assert [created for _, created, _ in rows()] == [t0_ms + 60_000]
+    clock.value = t0 + 30 * 86400 + 60
+    coordinator.expire_and_reconcile()
+    assert rows() == []
+
+    # The persisted columns hold portable integers only; a fractional seconds value is refused.
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO canary_inactive_claim_attestations VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("ica_" + "0" * 32, WORKSPACE, RUNNER, grant["run_id"], grant["grant_id"], runner.key_id,
+             "a" * 64, "b" * 64, "terminal", t0, t0 + 1),
+        )

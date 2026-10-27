@@ -74,7 +74,10 @@ from .canary_disclosure import (
     CanaryDisclosureError,
     CanaryDisclosureService,
 )
-from .canary_runs import CanaryRunError, CanaryRunService, DiscoveryError, ensure_discovery_plan_schema
+from .canary_runs import (
+    CanaryRunError, CanaryRunService, DiscoveryError, InactiveClaimAttestationRefused,
+    ensure_discovery_plan_schema,
+)
 from .runner_contexts import RunnerContextBindingService, RunnerContextError
 from .runner_auth import (
     RunnerActivationAbortConflict,
@@ -889,6 +892,7 @@ class _Handler(BaseHTTPRequestHandler):
             (len(p) == 7 and p[5] == "resync" and p[6] in {"start", "complete"}) or
             (len(p) == 8 and p[5] == "runs" and p[7] in {
                 "heartbeat", "progress", "result", "stop-ack", "result-projection",
+                "inactive-claim-attestation",
             })
         ))
 
@@ -1026,6 +1030,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return lambda: self._runner_request(wid, tail[1], "runner_claim", tail[3], "context-plan-request-claim")
             if method == "POST" and len(tail) == 4 and tail[0] == "runners" and tail[2] == "resync" and tail[3] in {"start", "complete"}:
                 return lambda: self._runner_resync(wid, tail[1], tail[3])
+            if (method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "runs"
+                    and tail[4] == "inactive-claim-attestation"):
+                return lambda: self._runner_inactive_claim_attestation(wid, tail[1], tail[3])
             if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "runs" and tail[4] in {"heartbeat", "progress", "result", "stop-ack"}:
                 capability = "runner_heartbeat" if tail[4] in {"heartbeat", "stop-ack"} else "runner_" + tail[4]
                 return lambda: self._runner_request(wid, tail[1], capability, tail[3], tail[4])
@@ -1615,6 +1622,35 @@ class _Handler(BaseHTTPRequestHandler):
         except (RunnerAuthRateLimited, RunnerProtocolUpgradeRequired):
             raise
         except (ValueError, RunnerAuthError):
+            raise RunnerAuthError("invalid runner authentication") from None
+        self._json(200, response)
+
+    def _runner_inactive_claim_attestation(self, wid: str, runner_id: str, run_id: str) -> None:
+        """Side-effect-free C attestation on the resync proof family; never forwards a next nonce."""
+        if "?" in self.path or "#" in self.path or "%" in self.path or self.command != "POST":
+            raise RunnerAuthError("invalid runner authentication")
+        headers = {name: self._header_values(name) for name in (
+            "X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
+            "X-Heel-Runner-Signature", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence",
+            "Authorization", "Cookie")}
+        store = self._runner_store()
+        try:
+            # The service is set up only after the protocol gate and PoP, on the same connection,
+            # so the predicate reads inside the RunnerAuthStore transaction.
+            response = store.attest_inactive_claim(
+                workspace_id=wid, runner_id=runner_id, run_id=run_id, path=self.path,
+                raw_body=self._raw_body(), headers=headers,
+                runs=lambda: self._runner_canary_services(store)[0],
+            )
+        except InactiveClaimAttestationRefused as refused:
+            self._json(409, {
+                "schema_version": "heel.runner-error.v1",
+                "code": "inactive_claim_attestation_refused", "reason": refused.reason,
+            })
+            return
+        except (RunnerAuthRateLimited, RunnerProtocolUpgradeRequired, CanaryRunError):
+            raise
+        except (ValueError, LookupError, RunnerAuthError):
             raise RunnerAuthError("invalid runner authentication") from None
         self._json(200, response)
 
