@@ -93,7 +93,12 @@ SO_MARK = getattr(socket, "SO_MARK", 36)
 
 PRIOR_WORKFLOW_BYTES = 5598
 PRIOR_WORKFLOW_SHA256 = "f30734710ad81081cd45bf428f85a263c88bd1c3fe5e598491a0b1534318964f"
-EXPECTED_JOBS = ["analyze", "host-ingress-proof", "host-lease-feasibility", "host-authority-proof", "host-lease-key-shape"]
+# H2-2 appends one later job after this unit's; it is bound here by its fixed bytes and hash only (its
+# own module, tests/linux/test_host_h2_policy.py, constrains every line of it).
+H2_POLICY_JOB_BYTES = 1652
+H2_POLICY_JOB_SHA256 = "6f67a0bd0f9396339950ac14373fc059c70f3436ad6b819d88ee74d96886fa36"
+EXPECTED_JOBS = ["analyze", "host-ingress-proof", "host-lease-feasibility", "host-authority-proof", "host-lease-key-shape",
+                 "host-h2-policy-proof"]
 KEY_SHAPE_GATE = ("if: github.event_name == 'workflow_dispatch' && "
                   "github.ref == 'refs/heads/codex/self-serve-host-lease-key-shape-proof'")
 CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
@@ -186,8 +191,8 @@ def key_shape_job_violations(job: str) -> list[str]:
 
 
 def workflow_violations(text: str) -> list[str]:
-    """Empty iff codeql.yml is exactly the recorded four-job parent, one newline, and the one fully
-    constrained lease-key job, with no other byte anywhere."""
+    """Empty iff codeql.yml is exactly the recorded four-job parent, one newline, the one fully
+    constrained lease-key job, one newline and the recorded H2-2 h2-policy job, with no other byte."""
     found = []
     data = text.encode("utf-8")
     if not data.isascii() or hashlib.sha256(data[:PRIOR_WORKFLOW_BYTES]).hexdigest() != PRIOR_WORKFLOW_SHA256:
@@ -198,7 +203,10 @@ def workflow_violations(text: str) -> list[str]:
     if names != EXPECTED_JOBS:
         return found + ["job_names"]
     job = _job_block(text, "host-lease-key-shape")
-    if text != text[:PRIOR_WORKFLOW_BYTES] + "\n" + job:
+    h2_policy = _job_block(text, "host-h2-policy-proof")
+    if len(h2_policy.encode()) != H2_POLICY_JOB_BYTES or hashlib.sha256(h2_policy.encode()).hexdigest() != H2_POLICY_JOB_SHA256:
+        found.append("block_host-h2-policy-proof")
+    if text != text[:PRIOR_WORKFLOW_BYTES] + "\n" + job + "\n" + h2_policy:
         found.append("composition")
     if ("\npermissions: {}\n" not in text or "pull_request_target" in text or "secrets." in text or "inputs:" in text
             or "workflow_dispatch: {}" not in text):
@@ -658,11 +666,12 @@ def test_static_workflow_is_the_recorded_four_jobs_plus_one_fully_constrained_jo
     text = WORKFLOW.read_text(encoding="utf-8")
     assert workflow_violations(text) == []
     prior, job = text[:PRIOR_WORKFLOW_BYTES], _job_block(text, "host-lease-key-shape")
-    assert text == prior + "\n" + job and job == KEY_SHAPE_JOB
+    suffix = "\n" + _job_block(text, "host-h2-policy-proof")  # H2-2's job, bound by its recorded hash
+    assert text == prior + "\n" + job + suffix and job == KEY_SHAPE_JOB
 
-    def swap(old: str, new: str) -> str:  # a mutation inside the appended job only
+    def swap(old: str, new: str) -> str:  # a mutation inside the appended job only, in place
         assert job.count(old) == 1, old
-        return prior + "\n" + job.replace(old, new)
+        return prior + "\n" + job.replace(old, new) + suffix
 
     mutations = {
         "prior_only": prior, "trailing_bytes": text + "\n", "trailing_comment": text + "# trailing\n",
