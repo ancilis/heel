@@ -8,7 +8,8 @@ production helper with only its ``setns`` line replaced; ``_PLATFORM_OK = True``
 ``clock``; and test-process wrappers around ``subprocess.Popen``/``os.dup``/``Popen.kill``. The
 real launch, pipe, deadline, kill and reap paths run. Nothing here enters a namespace, runs a real
 nft, touches the kernel's packet path or claims anything about it: H2-2 owns that proof. Ordinary
-Linux CI runs the unmodified production helper to its ``setns`` failure.
+Linux CI runs the unmodified production helper to its ``setns`` failure (Python 3.12+; an interpreter
+without ``os.setns`` asserts the platform refusal and the helper's 125 on the missing attribute).
 """
 from __future__ import annotations
 
@@ -736,11 +737,16 @@ def test_unavailable_platform_refuses_before_any_launch_and_no_public_input_can_
 def test_linux_real_helper_setns_on_a_regular_file_exits_125_and_launches_no_nft(monkeypatch, stand_in, launches, tmp_path):
     fd, identity = stand_in
     nft = FakeNft(tmp_path / "fake")
-    monkeypatch.setattr(h2, "_PLATFORM_OK", True)
     monkeypatch.setattr(h2, "NFT_PATH", str(nft.path))
     monkeypatch.setattr(h2, "_INPUTS", {})
-    assert hasattr(os, "setns") and h2._HELPER_SOURCE.count(SETNS_LINE) == 1
+    assert h2._HELPER_SOURCE.count(SETNS_LINE) == 1
     assert hashlib.sha256(h2._HELPER_SOURCE.encode()).hexdigest() == PRODUCTION_HELPER_SHA256
+    if not hasattr(os, "setns"):  # a Linux interpreter without os.setns (3.11): the unpatched guard refuses first
+        assert h2._PLATFORM_OK is False
+        assert h2.install(fd, h2.build_input(**fields(identity=identity))).state == "refused_platform"
+        assert launches.calls == [] and nft.calls() == []
+    # Forced past the guard: setns(2) on a regular file fails with EINVAL, or the attribute is missing. Both 125.
+    monkeypatch.setattr(h2, "_PLATFORM_OK", True)
     outcome = h2.install(fd, h2.build_input(**fields(identity=identity)))
     assert outcome.state == "setns_failed" and outcome.receipt is None
     assert len(launches.calls) == 1 and nft.calls() == []
