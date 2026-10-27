@@ -2363,6 +2363,10 @@ fieldset.question {
   overflow-x: auto;
 }
 
+.runner-command > div:last-child p a {
+  overflow-wrap: anywhere;
+}
+
 .command-copy {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
