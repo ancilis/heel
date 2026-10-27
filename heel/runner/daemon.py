@@ -45,7 +45,8 @@ from .control_client import (
     RunnerControlClient,
 )
 from .control_transport import (
-    CONTROL_TIMEOUT_SECONDS, ControlTransportError, HTTPSControlTransport, validate_control_origin,
+    CONTROL_TIMEOUT_SECONDS, BoundedControlResponse, ControlTransportError, HTTPSControlTransport,
+    validate_control_origin,
 )
 from .identity import (
     LinuxSecretServiceBackend, MacOSKeychainSecretBackend, OSSecretBackend, SystemSecureSigner,
@@ -187,6 +188,21 @@ class _AttributedTransport:
 
     def post(self, path: str, *, headers: Mapping[str, str] | None = None, body: bytes = b""):
         status, response_headers, payload = self._transport.post(path, headers=headers, body=body)
+        self._classify(status, payload)
+        return status, response_headers, payload
+
+    def post_bounded(
+        self, path: str, *, headers: Mapping[str, str] | None = None, body: bytes = b"",
+        max_response_bytes: int,
+    ) -> BoundedControlResponse:
+        response = self._transport.post_bounded(
+            path, headers=headers, body=body, max_response_bytes=max_response_bytes,
+        )
+        self._classify(response.status, response.payload)
+        return response
+
+    @staticmethod
+    def _classify(status: int, payload: object) -> None:
         code = payload.get("code") if isinstance(payload, dict) else None
         if status in _UPSTREAM_UNAVAILABLE:
             raise _ControlCallRejected("upstream_unavailable")
@@ -194,7 +210,6 @@ class _AttributedTransport:
         # authority first, recovered through the resync protocol, and final only if refused.
         if status == 403 and code == "runner_protocol_upgrade_required":
             raise _ControlCallRejected("protocol_upgrade_required")
-        return status, response_headers, payload
 
 
 def _serve_failure(error: BaseException) -> tuple[str, str]:

@@ -4304,6 +4304,25 @@ def test_public_findings_upload_over_3072_bytes_round_trips_the_control_plane_ov
 
 # --- R2: client acceptance of an inactive-claim attestation (POSTRESET §7.2) ---
 
+def _loopback_bounded(port, path, *, headers=None, body=b"", max_response_bytes):
+    """LOOPBACK DECODER ADAPTER (labelled): plain HTTP to the in-process control plane, answered and
+    then read by the production ``HTTPSControlTransport._decode`` with the caller's limit, so the
+    returned body is the exact octets read off the socket, capped before the strict parser."""
+    from heel.runner.control_transport import HTTPSControlTransport
+
+    decoder = HTTPSControlTransport("https://localhost")
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        conn.request("POST", path, body, dict(headers or {}))
+        response = conn.getresponse()
+        try:
+            return decoder._decode(response, conn, time.monotonic() + 10, max_response_bytes)
+        finally:
+            response.close()
+    finally:
+        conn.close()
+
+
 def _stuck_live_client(live, root, transport):
     """A runtime holding the Cloud-claimed run as an active group that never activated, and a
     client whose pinned grant trust set is the control plane's grant authority."""
@@ -4399,16 +4418,25 @@ def test_attestation_acceptance_requires_matching_challenge_pinned_signer_and_ex
     with tempfile.TemporaryDirectory() as directory:
         live = _LiveHttpRun(directory)
         try:
+            from heel.runner.control_transport import BoundedControlResponse
+
             transport = _LiveRunnerTransport(live)
-            rewrite = {}
-            real_post = transport.post
+            rewrite, wire = {}, []
 
-            def post(path, *, headers=None, body=b""):
-                status, response_headers, payload = real_post(path, headers=headers, body=body)
+            def post_bounded(path, *, headers=None, body=b"", max_response_bytes):
+                transport.sent.append((path, dict(headers or {}), body))
+                bounded = _loopback_bounded(live.server.server_address[1], path, headers=headers, body=body,
+                                            max_response_bytes=max_response_bytes)
+                wire.append(bounded.body)
                 change = rewrite.pop("next", None)
-                return (status, response_headers, payload) if change is None else change(status, response_headers, payload)
+                if change is None:
+                    return bounded
+                # FAULTY SERVER: the rewritten answer is serialized the way the server writes JSON.
+                status, response_headers, payload = change(bounded.status, bounded.headers, bounded.payload)
+                raw = b"" if payload is None else json.dumps(payload).encode()
+                return BoundedControlResponse(status, response_headers, raw, payload)
 
-            transport.post = post
+            transport.post_bounded = post_bounded
             runtime, control, challenges = _stuck_live_client(live, tmp_path / "runner", transport)
             _cloud_stop(live)
             before = _runtime_tables(runtime)
@@ -4429,7 +4457,10 @@ def test_attestation_acceptance_requires_matching_challenge_pinned_signer_and_ex
             assert dict(evidence.request_headers) == {k: v for k, v in headers.items() if k != "Content-Type"}
             assert evidence.request_timestamp_ms == int(headers["X-Heel-Runner-Timestamp-Ms"])
             assert evidence.response_status == 200
-            assert evidence.response_body == canonical_bytes(honest.attestation) and len(evidence.response_body) <= 8192
+            # The archive holds the exact octets read off the wire, not a re-encoding.
+            assert evidence.response_body == wire[-1] and len(evidence.response_body) <= 8192
+            assert evidence.response_body != canonical_bytes(honest.attestation)
+            assert json.loads(evidence.response_body) == honest.attestation
             _verify_attestation(live, honest.attestation, challenges[-1])
             assert honest.expected_state_digest == runtime.load_active_run_controls()[0].state_digest
             assert _runtime_tables(runtime) == before  # attestation alone changes nothing locally
@@ -4486,5 +4517,73 @@ def test_attestation_acceptance_requires_matching_challenge_pinned_signer_and_ex
             assert not any(name.endswith(live.run_id) for name in control._chains)
             with pytest.raises(ValueError):
                 control._attest_inactive_claim(live.run_id)  # no active claim is left to attest
+        finally:
+            live.close()
+
+
+class _LoopbackBoundedTransport:
+    """Plain loopback to the in-process control plane: ``post`` as the R2 harnesses do, and
+    ``post_bounded`` through the LOOPBACK DECODER ADAPTER (production ``_decode``)."""
+
+    def __init__(self, live):
+        self.live, self.sent, self.bodies = live, [], []
+
+    def post(self, path, *, headers=None, body=b""):
+        self.sent.append((path, dict(headers or {}), body))
+        status, raw, response_headers = self.live.send(path, body, dict(headers or {}))
+        return status, response_headers, (json.loads(raw) if raw else None)
+
+    def post_bounded(self, path, *, headers=None, body=b"", max_response_bytes):
+        self.sent.append((path, dict(headers or {}), body))
+        bounded = _loopback_bounded(self.live.server.server_address[1], path, headers=headers, body=body,
+                                    max_response_bytes=max_response_bytes)
+        self.bodies.append(bounded.body)
+        return bounded
+
+
+def test_attestation_archives_the_servers_wire_bytes_and_refuses_oversize_raw_before_parse(tmp_path, monkeypatch):
+    import heel.runner.control_client as control_module
+    import heel.saas.http_api as http_api
+    from heel.runner.control_transport import ControlTransportError
+    from heel.runner.daemon import _AttributedTransport
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            loopback = _LoopbackBoundedTransport(live)
+            runtime, control, _challenges = _stuck_live_client(live, tmp_path / "runner", _AttributedTransport(loopback))
+            _cloud_stop(live)
+            before = _runtime_tables(runtime)
+            parses = []
+            real_parse = control_module.parse_json
+            monkeypatch.setattr(control_module, "parse_json", lambda raw, **kw: (parses.append(len(raw)), real_parse(raw, **kw))[1])
+
+            # FAULTY SERVER: a validly signed attestation padded with JSON whitespace to over 9 000 bytes.
+            real_json = http_api._Handler._json
+
+            def padded(self, status, obj, headers=None):
+                if self.path.endswith("/inactive-claim-attestation") and status == 200:
+                    body = json.dumps(obj).encode() + b" " * 9_000
+                    self._write_json(status, body, dict(headers or {}))
+                    return
+                return real_json(self, status, obj, headers)
+
+            monkeypatch.setattr(http_api._Handler, "_json", padded)
+            with pytest.raises(ControlTransportError) as refused:
+                control._attest_inactive_claim(live.run_id)
+            assert refused.value.code == "response_too_large"
+            assert parses == [] and loopback.bodies == [] and _runtime_tables(runtime) == before
+            monkeypatch.setattr(http_api._Handler, "_json", real_json)
+
+            # Honest server: the archived body is exactly the octets read, i.e. the server's json.dumps bytes.
+            verified = control._attest_inactive_claim(live.run_id)
+            (wire,) = loopback.bodies
+            assert verified.evidence.response_body == wire == json.dumps(verified.attestation).encode()
+            assert wire != canonical_bytes(verified.attestation) and parses == [len(wire)]
+            record = control._retire_inactive_claim(verified, reservation_probe="absent", now_ms=int(time.time() * 1000))
+            archived = runtime.load_retired_claim(live.run_id, authenticate_components=True)
+            assert base64.b64decode(archived.attestation["response"]["body_b64"]) == wire
+            assert record.run_id == live.run_id
+            _verify_attestation(live, json.loads(wire), base64.b64decode(json.loads(wire)["client_challenge_b64"]))
         finally:
             live.close()

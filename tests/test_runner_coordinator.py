@@ -2650,31 +2650,102 @@ class _R2Http:
         rewrite = self.rewrite.pop(operation, None)
         return answer if rewrite is None else rewrite(*answer)
 
+    def post_bounded(self, path, *, headers=None, body=b"", max_response_bytes):
+        """The bounded read through the LOOPBACK DECODER ADAPTER (production ``_decode``): genuine wire bytes."""
+        from tests.test_runner_control_http import _loopback_bounded
+
+        operation = self.operation(path)
+        assert operation not in self.rewrite  # no FAULTY SERVER rewrite of a bounded read here
+        self.sent.append((path, dict(headers or {}), body))
+        if operation in self.refuse:
+            self.refuse.remove(operation)
+            raise ControlTransportError("connection_failed")
+        bounded = _loopback_bounded(self.port, path, headers=headers, body=body, max_response_bytes=max_response_bytes)
+        self.answers.append((operation, bounded.status, bounded.body))
+        if operation in self.lose:
+            self.lose.remove(operation)
+            raise ControlTransportError("timeout")
+        return bounded
+
     def operations(self, since=0):
         return [self.operation(path) for path, _headers, _body in self.sent[since:]]
 
 
-class _R2Cloud:
-    """One locally compiled approval pair, approved and granted by the real control plane."""
+class _R2ProductionTransport:
+    """The production pair: ``_AttributedTransport(HTTPSControlTransport)`` to the TLS edge harness.
 
-    def __init__(self, tmp_path):
+    It only records what it carried (``answers`` hold the bounded reads' exact bodies)."""
+
+    def __init__(self, edge):
+        from heel.runner.control_transport import HTTPSControlTransport
+
+        self.transport = daemon_module._AttributedTransport(HTTPSControlTransport(edge.origin, ca_bundle=edge.ca.ca_path))
+        self.sent, self.answers = [], []
+
+    def post(self, path, *, headers=None, body=b""):
+        self.sent.append((path, dict(headers or {}), body))
+        return self.transport.post(path, headers=headers, body=body)
+
+    def post_bounded(self, path, *, headers=None, body=b"", max_response_bytes):
+        self.sent.append((path, dict(headers or {}), body))
+        bounded = self.transport.post_bounded(path, headers=headers, body=body, max_response_bytes=max_response_bytes)
+        self.answers.append((_R2Http.operation(path), bounded.status, bounded.body))
+        return bounded
+
+    def operations(self, since=0):
+        return [_R2Http.operation(path) for path, _headers, _body in self.sent[since:]]
+
+
+class _R2Cloud:
+    """One locally compiled approval pair, approved and granted by the real control plane.
+
+    ``edge=True`` serves the same control plane behind the Python TLS edge harness and talks to it
+    with the production transport pair; the workspace ID then has the edge's ``ws_`` + 16 hex shape.
+    """
+
+    def __init__(self, tmp_path, *, edge=False):
+        import dataclasses
+
         from heel.saas.canary_runs import CanaryRunService
         from heel.saas.catalog import CATALOG_VERSION
         from heel.saas.runner_auth import NONCE_TTL
         from heel.saas.server import ControlPlane, serve
+        from tests.test_runner_compiler import CanaryCompiler, add_roles, bound_store, context, map_scenarios
         from tests.test_runner_control_http import _enable_executable_protocol
 
         self.tmp = tmp_path
-        self.store, self.identity, self.signer, self.manifest, self.projection = compiled_pair(tmp_path)
+        self.edge = None
+        if edge:
+            from tests.support.edge_tls_harness import EdgeTLSHarness
+
+            self.store, self.identity, self.signer = bound_store(
+                tmp_path, selected_context=dataclasses.replace(context(), workspace_id="ws_0123456789abcdef"),
+            )
+            map_scenarios(self.store)
+            add_roles(self.store)
+            compiled = CanaryCompiler(
+                store=self.store, identity=self.identity, signer=self.signer, now_ms=1_000,
+            ).compile(["anonymous_authenticated_read", "object_ownership_read"])
+            self.manifest, self.projection = compiled.manifest, compiled.projection
+            authority = SigningAuthority.generate()
+            self.edge = EdgeTLSHarness(
+                tmp_path / "edge", grant_authority=authority,
+                grant_trusted_keys={authority.key_id: authority.public_key},
+            )
+            self.cp = cp = self.edge.control_plane
+            self.server = None
+            self.http = _R2ProductionTransport(self.edge)
+        else:
+            self.store, self.identity, self.signer, self.manifest, self.projection = compiled_pair(tmp_path)
+            self.cp = cp = ControlPlane(
+                str(tmp_path / "control.sqlite"), runner_auth_pepper=b"r" * 32,
+                grant_authority=SigningAuthority.generate(),
+            )
+            self.server = serve(cp)
+            threading.Thread(target=self.server.serve_forever, daemon=True).start()
+            self.http = _R2Http(self.server.server_address[1])
         self.home = self.store.root
         self.runtime_path = self.home / "runner" / daemon_module._RUNTIME_FILENAME
-        self.cp = cp = ControlPlane(
-            str(tmp_path / "control.sqlite"), runner_auth_pepper=b"r" * 32,
-            grant_authority=SigningAuthority.generate(),
-        )
-        self.server = serve(cp)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.http = _R2Http(self.server.server_address[1])
         conn, now = cp.store.conn, time.time()
         self.workspace, self.runner_id = self.manifest["workspace_id"], self.identity.runner_id
         self.project = self.manifest["project_id"]
@@ -2832,6 +2903,9 @@ class _R2Cloud:
     def close(self):
         if self.runtime is not None:
             self.runtime.close()
+        if self.edge is not None:
+            self.edge.close()
+            return
         self.server.shutdown()
         self.server.server_close()
         self.cp.close()
@@ -2908,8 +2982,11 @@ def _r2_assert_retired_verbatim(cloud, run_id, before_group, *, pending_uncertai
     assert {item["index"]["operation"]: base64.b64decode(item["sealed_blob_b64"]) for item in record.chains} == chains
     assert [(item["index"]["call_id"], base64.b64decode(item["sealed_blob_b64"])) for item in record.pending] == pending
     assert [item["delivery"] for item in record.pending] == ["uncertain"] * pending_uncertain
-    # The archived response is a pinned-grant-authority signed attestation for this exact run.
-    response = json.loads(base64.b64decode(record.attestation["response"]["body_b64"]))
+    # The archived response is the exact wire answer: a pinned-grant-authority signed attestation.
+    archived = base64.b64decode(record.attestation["response"]["body_b64"])
+    wire = [raw for operation, status, raw in cloud.http.answers if operation == "inactive-claim-attestation" and status == 200]
+    assert wire and archived == wire[-1] and archived == json.dumps(json.loads(archived)).encode()
+    response = json.loads(archived)
     request = json.loads(base64.b64decode(record.attestation["request"]["body_b64"]))
     assert validate_inactive_claim_attestation(response) == response
     verify_envelope(
@@ -3441,3 +3518,44 @@ def test_serve_cycle_composition_reconciles_before_hydration_then_polls(r2_cloud
     cloud.runtime = RunnerRuntimeState(cloud.runtime_path, cloud.identity, cloud.signer)
     _r2_assert_retired_verbatim(cloud, run_id, group)
     assert set(seen["hosts"]) == {"127.0.0.1"} and seen["forbidden"] == []
+
+
+def test_attestation_without_a_bounded_transport_fails_closed_and_keeps_the_claim(r2_cloud):
+    """Design test 6: a post-only adapter never falls back to ``post``; the sealed group is kept."""
+    cloud = r2_cloud
+    run_id = _r2_stuck_preactivation(cloud).run_id
+    rows, tree, sent = cloud.runtime_rows(), cloud.store_tree(), len(cloud.http.sent)
+
+    class PostOnly:
+        def post(self, path, *, headers=None, body=b""):
+            return cloud.http.post(path, headers=headers, body=body)
+
+    with pytest.raises(control_module.RunnerInactiveClaimRecoveryBlocked) as blocked:
+        cloud.start(transport=PostOnly())
+    assert blocked.value.reason == "transport_capability_missing"
+    assert daemon_module._serve_failure(blocked.value) == ("failed", "recovery_required")
+    assert cloud.http.operations(sent) == [] and cloud.audit() == []
+    assert cloud.runtime_rows() == rows and cloud.store_tree() == tree
+    assert cloud.runtime.load_retired_claim(run_id) is None
+
+
+def test_tls_edge_recovery_uses_the_production_transport_and_archives_the_edge_wire_bytes(tmp_path, monkeypatch):
+    """One real recovery exchange: HTTPSControlTransport + _AttributedTransport -> Python TLS edge
+    harness -> real control plane.  The Cloudflare Worker itself is not exercised here."""
+    cloud = _R2Cloud(tmp_path, edge=True)
+    try:
+        run_id = _r2_stuck_preactivation(cloud).run_id
+        group = cloud.raw_group(run_id)
+        seen = _r2_activity_guards(monkeypatch, cloud)
+        sent = len(cloud.http.sent)
+        cloud.start()
+        assert cloud.http.operations(sent) == ["inactive-claim-attestation"]
+        record, response = _r2_assert_retired_verbatim(cloud, run_id, group)
+        archived = base64.b64decode(record.attestation["response"]["body_b64"])
+        assert archived != canonical_bytes(response)
+        assert ("POST", f"/v1/workspaces/{cloud.workspace}/runners/{cloud.runner_id}/runs/{run_id}/inactive-claim-attestation") \
+            in cloud.edge.forwarded
+        assert cloud.coordinator.claim() is None
+        assert set(seen["hosts"]) <= {"localhost", "127.0.0.1"} and seen["forbidden"] == []  # client and edge hop
+    finally:
+        cloud.close()

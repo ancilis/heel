@@ -560,13 +560,15 @@ Exit codes: `0` stopped (SIGINT, SIGTERM or `--once` done), `1` offline (`--once
      proof-of-possession headers only (no nonce, no sequence, nothing staged, no cursor or
      attempt change) and a closed body naming the exact project, grant, approval digests, the
      runner key and a fresh random 32-byte challenge.
-  2. It accepts only a 200 answer whose canonical JSON is at most 8 192 bytes, whose signature
-     verifies under the grant authority pinned at pairing, which passes the closed validator,
+  2. The answer is read with the transport's bounded call: a body over 8 192 bytes (declared by
+     `Content-Length` or streamed) ends `response_too_large` before anything is parsed. It accepts
+     only a 200 answer whose signature verifies under the grant authority pinned at pairing, which passes the closed validator,
      echoes the challenge and every binding of the local claim, and reports a stopped run with no
      start and no stop acknowledgement. The local clock is never compared with the attestation.
   3. In one runtime transaction the active row, its four run chains and any staged heartbeat are
      archived verbatim in `retired_claims` (the heartbeat marked delivery `uncertain`; it is
-     never resent) together with the request and the attestation, and removed. No reservation,
+     never resent) together with the request body, its four signed proof headers and the exact
+     response octets the transport read, and removed. No reservation,
      terminal, acknowledgement, result, quota or target activity is created. A crash before that
      commit leaves everything unchanged and the next start asks again with a new challenge; a
      crash after it leaves nothing to redo.
@@ -587,11 +589,16 @@ Exit codes: `0` stopped (SIGINT, SIGTERM or `--once` done), `1` offline (`--once
     be unpaired (`context_bound`, below); re-provision with a new, empty `HEEL_HOME` and a new
     invitation, and keep the old directory as evidence.
   - `429` (three attestations per runner per minute): `offline`, `recovery_rate_limited`.
-  - A transport failure: classified as for every control call (`offline` for a connection
-    failure or timeout).
-  The transport hands the client strictly parsed JSON (bounded at 256 KiB like every control
-  answer), so the archived response bytes are the canonical encoding of that JSON, not the wire
-  bytes, and the 8 192-byte budget applies to that encoding.
+  - A transport failure, including `response_too_large`: classified as for every control call
+    (`offline` for a connection failure or timeout).
+  - A transport without the bounded raw-body call: `failed`, `recovery_required`
+    (`transport_capability_missing`); nothing is sent.
+  The archived response is the entity body exactly as received (after HTTP transfer decoding;
+  the runner asks for no content encoding), so the server's own JSON spacing survives. The fixed
+  `Content-Type` request header, the response headers and chunk framing are not archived; the
+  archive is not a full wire capture. As for every control answer, a `Content-Length` that
+  disagrees with the bytes sent is not an error by itself: the bytes received decide, and an
+  incomplete JSON object is `malformed_response`.
 - **Unpair after a binding: open gap, no recovery path yet.** Once a context binding is
   installed, `unpair` refuses `context_bound` (unchanged) and `pair` refuses the same
   `HEEL_HOME`. There is no product command that retires the bound context, its credential

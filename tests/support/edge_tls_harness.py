@@ -59,6 +59,13 @@ _RUNNER_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}(?:/claim
 _RUNNER_CONTEXT_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/contexts(?:/list|/rcb_[0-9a-f]{{32}}/(?:claim|approval-projections))$")
 _RUNNER_RESULT_PROJECTION = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/runs/crun_[0-9a-f]{{32}}/result-projection$")
 _RUNNER_RESYNC = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/resync/(?:start|complete)$")
+# ``index.ts`` ``RUNNER_INACTIVE_CLAIM_ATTESTATION``: classified exactly like the resync family.
+_RUNNER_INACTIVE_CLAIM_ATTESTATION = re.compile(
+    rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/runs/crun_[0-9a-f]{{32}}/inactive-claim-attestation$")
+
+
+def _resync_family(path: str) -> bool:
+    return bool(_RUNNER_RESYNC.match(path) or _RUNNER_INACTIVE_CLAIM_ATTESTATION.match(path))
 # ``index.ts`` ``API_KEY_AUTHORIZATION`` / ``DEVICE_AUTHORIZATION``: the only Authorization values
 # ``controlPlaneCredentials`` forwards (trimmed); any other non-empty value refuses the request.
 _API_KEY_AUTHORIZATION = re.compile(r"Bearer heel_sk_[A-Za-z0-9_-]+")
@@ -116,7 +123,7 @@ def _edge_route(method: str, path: str) -> bool:
     if _RUNNER_ROTATION_START.match(path) or _RUNNER_ROTATION_APPROVE.match(path) or _RUNNER_REVOKE.match(path):
         return method == "POST"
     if (_RUNNER_CONTROL.match(path) or _RUNNER_CONTEXT_CONTROL.match(path)
-            or _RUNNER_RESULT_PROJECTION.match(path) or _RUNNER_RESYNC.match(path)):
+            or _RUNNER_RESULT_PROJECTION.match(path) or _resync_family(path)):
         return method == "POST"
     return False
 
@@ -137,7 +144,7 @@ def _body_cap(path: str) -> int:
         return 256 if path.endswith("/claim") else 69632
     if _RUNNER_CONTROL.match(path):
         return 256 if path.endswith("/claim") else 36 * 1024
-    if _RUNNER_RESYNC.match(path):
+    if _resync_family(path):
         return 2 * 1024
     if (path == _RUNNER_PAIRING_EXCHANGE or _RUNNER_PAIRING_ACTIVATE.match(path)
             or _RUNNER_ROTATION_PUBLIC.match(path) or _RUNNER_PAIRING_MANAGE.match(path)
@@ -292,7 +299,7 @@ class EdgeTLSHarness:
                 human = bool(_RUNNER_PAIRING_MANAGE.match(path) or _RUNNER_ROTATION_START.match(path)
                              or _RUNNER_ROTATION_APPROVE.match(path) or _RUNNER_REVOKE.match(path))
                 owner = _human_owner_route(method, path)
-                if runner_control or _RUNNER_RESYNC.match(path):
+                if runner_control or _resync_family(path):
                     names = _RUNNER_HEADERS if runner_control else _RUNNER_RESYNC_HEADERS
                     forbidden = ("Authorization", "Cookie", "X-Heel-Internal-Origin", "Content-Encoding") if runner_control \
                         else ("Authorization", "Cookie", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence")

@@ -154,7 +154,8 @@ class RunnerInactiveClaimRecoveryBlocked(RunnerChainRecoveryRequired):
 
     ``reason`` is the Cloud's closed refusal (``cloud_observed_execution``, ``binding_mismatch``,
     ``lifecycle_mismatch``), ``protocol_upgrade_required``, ``unexpected_response`` (any other
-    non-200 status) or ``invalid_attestation`` (an unusable 200).
+    non-200 status), ``invalid_attestation`` (an unusable 200) or ``transport_capability_missing``
+    (the transport has no bounded raw-body call; nothing was sent).
     """
 
     def __init__(self, reason: str):
@@ -2268,15 +2269,20 @@ class RunnerControlClient:
 
         Nonce-free: one fixed path, a closed canonical body with a fresh 32-byte challenge, and the
         resync proof-of-possession header family.  Nothing is staged and no chain, cursor, attempt or
-        execution authority changes.  A 200 counts only after it fits the 8 KiB attestation budget,
+        execution authority changes.  The answer is read through the transport's bounded call, so the
+        raw body is capped at 8 KiB before any parse and archived verbatim.  A 200 counts only after it
         verifies under the pairing-pinned grant authority, passes the closed validator and echoes the
         challenge and every binding of the exact active row; a status alone never proves inactivity.
+        A transport without the bounded call is refused before anything is sent.
         """
         if type(run_id) is not str or not run_id:
             raise ValueError("active runner claim is required")
         trusted = dict(self._trusted_disclosure_keys)
         if not trusted:
             raise ValueError("trusted grant authority is required")
+        post_bounded = getattr(self.transport, "post_bounded", None)
+        if not callable(post_bounded):
+            raise RunnerInactiveClaimRecoveryBlocked("transport_capability_missing")
         with self._run_guard(run_id):
             active = next((
                 item for item in self.runtime.load_active_run_controls(limit=64) if item.run_id == run_id
@@ -2308,13 +2314,13 @@ class RunnerControlClient:
             headers = self._headers(
                 self._signature(RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN + canonical_bytes(proof)), timestamp_ms,
             )
-            status, _response_headers, payload = self._closed_transport_response(
-                self.transport.post(path, headers=headers, body=body),
-                error="invalid runner inactive claim response",
-            )
+            status, payload, response_body = self._closed_bounded_response(post_bounded(
+                path, headers=headers, body=body,
+                max_response_bytes=INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES,
+            ))
             if status != 200:
                 self._raise_inactive_claim_refusal(status, payload)
-            attestation, response_body = self._verified_inactive_claim(payload, trusted, challenge, active)
+            attestation = self._verified_inactive_claim(response_body, trusted, challenge, active)
             # The runtime archives the authenticated proof headers; Content-Type is fixed framing.
             evidence = InactiveClaimAttestationEvidence(
                 request_method="POST", request_path=path,
@@ -2349,17 +2355,26 @@ class RunnerControlClient:
             raise RunnerInactiveClaimRecoveryBlocked("protocol_upgrade_required")
         raise RunnerInactiveClaimRecoveryBlocked("unexpected_response")
 
+    @staticmethod
+    def _closed_bounded_response(response: object) -> tuple[int, object, bytes]:
+        """``(status, payload, raw body)`` of one bounded answer; any other shape is unusable."""
+        if (
+            isinstance(getattr(response, "status", None), bool)
+            or type(getattr(response, "status", None)) is not int
+            or not isinstance(getattr(response, "headers", None), dict)
+            or any(type(key) is not str or type(value) is not str for key, value in response.headers.items())
+            or type(getattr(response, "body", None)) is not bytes
+            or len(response.body) > INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES
+            or not (response.payload is None or isinstance(response.payload, dict))
+        ):
+            raise RunnerInactiveClaimRecoveryBlocked("invalid_attestation")
+        return response.status, response.payload, response.body
+
     def _verified_inactive_claim(
-        self, payload: object, trusted: dict[str, object], challenge: str, active: object,
-    ) -> tuple[dict[str, Any], bytes]:
+        self, response_body: bytes, trusted: dict[str, object], challenge: str, active: object,
+    ) -> dict[str, Any]:
         try:
-            if not isinstance(payload, dict):
-                raise ValueError
-            # The transport hands over strictly parsed JSON; the archived bytes are its canonical
-            # encoding, bounded before the closed parse.
-            response_body = canonical_bytes(payload)
-            if len(response_body) > INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES:
-                raise ValueError
+            # The exact octets the transport read (already capped before its own parse).
             value = parse_json(response_body, max_bytes=INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES)
             if (
                 not isinstance(value, dict) or type(value.get("signing_key_id")) is not str
@@ -2394,7 +2409,7 @@ class RunnerControlClient:
             or cloud["started_at_ms"] is not None or cloud["stop_acknowledged_at_ms"] is not None
         ):
             raise RunnerInactiveClaimRecoveryBlocked("invalid_attestation")
-        return checked, response_body
+        return checked
 
     def _retire_inactive_claim(
         self, verified: VerifiedInactiveClaimAttestation, *, reservation_probe: str, now_ms: int,
