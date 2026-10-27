@@ -24,10 +24,17 @@ The implemented launch is **Heel free early access**:
   result on first use.
 - Pinned same-origin browser runtime and dedicated Python Web Worker.
 - Optional local browser save, delete, clear, JSON export, and Markdown export.
-- Checked-in Heel 1.3.0rc1 runner preview candidate wheel/source/manifest under
+- Checked-in Heel 1.3.0rc2 runner preview candidate wheel/source/manifest under
   `apps/heel-cloud/public/downloads/`, and local MCP setup. The candidate is unreleased: it is
-  not published as a GitHub release or to PyPI, and it is not publicly deployed. Earlier
-  versions of this file listed the 1.2.0 files, which are no longer in the tree.
+  not published as a GitHub release or to PyPI, and it is not publicly deployed. It treats a
+  recognized error envelope as inconclusive at every HTTP status, so the synthetic reference
+  `error_envelope` (HTTP 200) and `hardened` (HTTP 403) cases are inconclusive and only the
+  non-error `public` and `redacted` cases pass; no inconclusive plan-differential pair stores a
+  finding, and a denial status that still carries the higher plan's payload is inconclusive,
+  never a regression pass. The earlier 1.3.0rc1 preview is a public GitHub prerelease whose
+  `error_envelope` and `hardened` results are documented errata; its files are no longer in the
+  tree. Earlier versions of this file listed the 1.2.0 files, which are no longer in the
+  tree either.
 - Local CLI and MCP review without an account.
 - Free signup/login/logout at the website.
 - Browser-mediated device authorization for a local machine.
@@ -140,8 +147,8 @@ docker compose --env-file deploy/.env.production \
 - The full self-serve product is not launch-ready. Paired runner execution, the cloud route
   inventory bridge, and approval wiring are incomplete, and final launch acceptance has not
   been given. Owner actions alone do not close these gaps.
-- The 1.3.0rc1 candidate files are not yet published, and a one-command public install is later
-  work.
+- The 1.3.0rc2 candidate files are not yet published, and a one-command public install of a
+  corrected release is later work.
 
 ## Exact next action
 

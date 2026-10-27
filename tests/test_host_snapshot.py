@@ -1072,9 +1072,10 @@ def test_migration_31_and_direct_construction_parity(short_tmp):
 
     full = sqlite3.connect(os.path.join(short_tmp, "full.db"))
     try:
-        assert Migrator(full, CONTROL_PLANE_MIGRATIONS).apply_all() == list(range(1, 32))
-        assert CONTROL_PLANE_MIGRATIONS[-1].version == 31
-        assert CONTROL_PLANE_MIGRATIONS[-1].name == "host_authority_generations"
+        assert Migrator(full, CONTROL_PLANE_MIGRATIONS).apply_all() == list(range(1, 34))
+        assert (CONTROL_PLANE_MIGRATIONS[-3].version, CONTROL_PLANE_MIGRATIONS[-3].name) == (31, "host_authority_generations")
+        assert (CONTROL_PLANE_MIGRATIONS[-2].version, CONTROL_PLANE_MIGRATIONS[-2].name) == (32, "stop_ack_signed_witness")
+        assert (CONTROL_PLANE_MIGRATIONS[-1].version, CONTROL_PLANE_MIGRATIONS[-1].name) == (33, "inactive_claim_attestation_audit")
     finally:
         full.close()
     conn = sqlite3.connect(os.path.join(short_tmp, "older.db"))
@@ -1083,8 +1084,11 @@ def test_migration_31_and_direct_construction_parity(short_tmp):
         assert Migrator(conn, CONTROL_PLANE_MIGRATIONS[:30]).apply_all() == list(range(1, 31))
         CanaryStore(conn)  # direct construction creates the ledger (IF NOT EXISTS)
         conn.commit()
-        assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [31]
-        assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version() == 31
+        assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [31, 32, 33]
+        assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version() == 33
+        assert {
+            "stop_ack_source_event_sequence", "stop_ack_projection_digest", "stop_ack_runner_local_at_ms",
+        } <= {row[1] for row in conn.execute("PRAGMA table_info(canary_runs)")}
         objects = conn.execute(
             "SELECT type,name FROM sqlite_master WHERE tbl_name='host_authority_generations' ORDER BY type,name",
         ).fetchall()

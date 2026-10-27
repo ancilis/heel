@@ -215,10 +215,10 @@ class ReviewContractTests(unittest.TestCase):
             validate_review_envelope(tampered)
 
     def test_envelope_validator_rejects_other_engine_even_when_rehashed(self):
-        self.assertEqual(ENGINE_VERSION, "1.3.0rc1")
+        self.assertEqual(ENGINE_VERSION, "1.3.0rc2")
         self.assertEqual(
             SUPPORTED_ENGINE_VERSIONS,
-            frozenset({"1.1.0", "1.1.1", "1.2.0", "1.3.0rc1"}),
+            frozenset({"1.1.0", "1.1.1", "1.2.0", "1.3.0rc1", "1.3.0rc2"}),
         )
         envelope = self._build()
         envelope["engine_version"] = "1.2.1"

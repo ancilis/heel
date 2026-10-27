@@ -35,11 +35,13 @@ from heel.runner.identity import (
 _SCHEMA_V1 = "heel.runner-runtime-state.v1"
 _SCHEMA_V2 = "heel.runner-runtime-state.v2"
 _SCHEMA_V3 = "heel.runner-runtime-state.v3"
-_SCHEMA = "heel.runner-runtime-state.v4"
+_SCHEMA_V4 = "heel.runner-runtime-state.v4"
+_SCHEMA = "heel.runner-runtime-state.v5"
 _SEAL_DOMAIN = b"heel.runner-runtime-state-seal.v1\0"
 _STATE_KEY_WRAP_DOMAIN = b"heel.runner-runtime-state-key-wrap.v1\0"
 _DIGEST_DOMAIN = b"heel.runner-runtime-state-digest.v1\0"
 _ACTIVE_STATE_DIGEST_DOMAIN = b"heel.runner-active-run-state-digest.v1\0"
+_RETIRED_STATE_DIGEST_DOMAIN = b"heel.runner-retired-claim-digest.v1\0"
 _AUTHORITY_IDENTITY_DOMAIN = b"heel.runner-runtime-authority-identity.v1\0"
 _RUNTIME_PRUNED_RECEIPT_DOMAIN = b"heel.local-run-pruned.v2\0"
 _MAX_SAFE_INT = 9_007_199_254_740_991
@@ -52,6 +54,50 @@ _MAX_SUPERSEDED_CALLS = 512
 _SUPERSEDABLE_OPERATIONS = frozenset({"list-contexts", "claim-context", "claim"})
 _RESYNC_ATTEMPT_SCHEMA = "heel.runner-resync-attempt.v1"
 _SUPERSEDED_CALL_SCHEMA = "heel.runner-superseded-call.v1"
+# C recovery: a cloud-attested inactive, unexecuted claim is retired into one sealed archive row.
+_RETIRED_CLAIM_SCHEMA = "heel.runner-retired-claim.v1"
+_RUN_CHAIN_OPERATIONS = ("heartbeat", "progress", "result", "stop-ack")
+_RETIRED_ATTESTATION_HEADERS = frozenset({
+    "X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Signature",
+})
+# Metadata is the archive's canonical bytes minus its sealed_blob_b64 texts (RETIREMENT-RESYNC §4).
+_RETIRED_CLAIM_METADATA_CAP = 24_576
+_RETIRED_CLAIM_BOUND = (
+    4 * -(-393_216 // 3)        # active component text: active_runs CHECK 393 216 B
+    + 4 * 4 * -(-4_096 // 3)    # four chain component texts: control_chains CHECK 4 096 B
+    + 4 * -(-393_216 // 3)      # at most one pending component text: pending_calls CHECK 393 216 B
+    + _RETIRED_CLAIM_METADATA_CAP
+    + 28                        # outer AEAD nonce and tag
+)
+assert _RETIRED_CLAIM_BOUND == 1_095_036 and _RETIRED_CLAIM_BOUND <= 2_097_152
+# The archive grammar lifts the public 4 096-byte string ceiling only for these base64 texts, each
+# capped at 4 * ceil(byte cap / 3); the exact byte cap is re-checked after strict decoding.
+_RETIRED_B64_TEXT = re.compile(r"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$", re.ASCII)
+_RETIRED_LONG_TEXT_PATHS = MappingProxyType({
+    ("active", "sealed_blob_b64"): 524_288,
+    ("chains", "*", "sealed_blob_b64"): 5_464,
+    ("pending", "*", "sealed_blob_b64"): 524_288,
+    ("attestation", "request", "body_b64"): 2_732,
+    ("attestation", "response", "body_b64"): 10_924,
+})
+_PENDING_CALL_SCHEMA = "heel.runner-pending-call.v1"
+# PENDING-BODY-CAP: new pending bodies are capped per operation at the server's runner route budget
+# (http_api ``_runner_request``), before any signature check, encoding or transaction.  The caps
+# bind staging only: the reader keeps the historical 272 KiB bound, so every record the runtime
+# accepted before this table still opens (docs/PLAN_DIFFERENTIAL_RUNNER.md, "Runtime state").
+_PENDING_BODY_CAPS = MappingProxyType({
+    "claim": 256, "list-contexts": 128, "claim-context": 256,
+    "heartbeat": 36_864, "progress": 36_864, "stop-ack": 36_864,
+    "result": 103_424, "submit-context-approval-projection": 69_632,
+    "upload-findings": 278_528,
+})
+_PENDING_BODY_MAX = 278_528
+_PENDING_BODY_B64_TEXT_CAP = 4 * -(-_PENDING_BODY_MAX // 3)
+_PENDING_BLOB_BOUND = 393_216   # pending_calls CHECK, nonce and tag included
+assert max(_PENDING_BODY_CAPS.values()) == _PENDING_BODY_MAX and _PENDING_BODY_B64_TEXT_CAP == 371_372
+# Only the top-level body_b64 may exceed the public 4 096-byte string ceiling; its exact decoded
+# length is re-checked after strict decoding.
+_PENDING_B64_TEXT = re.compile(r"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$", re.ASCII)
 _DIGEST = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _RUN_ID = re.compile(r"^crun_[0-9a-f]{32}$", re.ASCII)
 _B64_32 = re.compile(r"^[A-Za-z0-9+/]{43}=$", re.ASCII)
@@ -108,12 +154,12 @@ _RUNTIME_INODE_GUARD_BOOTSTRAP = (
 
 _RUNTIME_TABLES = (
     "metadata", "control_chains", "pending_calls", "terminal_disclosures", "active_runs",
-    "chain_recovery",
+    "chain_recovery", "retired_claims",
 )
 _RUNTIME_INDEXES = (
     "idx_pending_calls_created", "idx_terminal_disclosures_state_retention",
     "idx_terminal_disclosures_due_retention", "idx_pending_calls_run_operation",
-    "idx_chain_recovery_attempt", "idx_chain_recovery_kind_created",
+    "idx_chain_recovery_attempt", "idx_chain_recovery_kind_created", "idx_retired_claims_created",
 )
 _RUNTIME_OWNED_NAMES = frozenset((*_RUNTIME_TABLES, *_RUNTIME_INDEXES))
 
@@ -187,6 +233,33 @@ _V4_RECOVERY_SQL = (
     "CREATE INDEX idx_chain_recovery_kind_created ON chain_recovery(kind,created_at_ms,record_id)",
 )
 _V4_SCHEMA_SQL = (_V4_METADATA_SQL, *_V3_SCHEMA_SQL[1:], *_V4_RECOVERY_SQL)
+
+# v5 (C recovery) = v4 plus the never-deleted retired-claim archive.  Every v4 table is unchanged.
+_V5_METADATA_SQL = _V4_METADATA_SQL.replace(
+    "CHECK(schema_version='heel.runner-runtime-state.v4')",
+    "CHECK(schema_version='heel.runner-runtime-state.v5')",
+)
+assert _V5_METADATA_SQL != _V4_METADATA_SQL
+_V5_RETIRED_SQL = (
+    "CREATE TABLE retired_claims("
+    "run_hash TEXT PRIMARY KEY CHECK(length(run_hash)=64 AND run_hash NOT GLOB '*[^0-9a-f]*'),"
+    "sealed_blob BLOB NOT NULL CHECK(typeof(sealed_blob)='blob' AND length(sealed_blob) BETWEEN 29 AND 2097152),"
+    "created_at_ms INTEGER NOT NULL CHECK(created_at_ms BETWEEN 0 AND 9007199254740991))",
+    "CREATE INDEX idx_retired_claims_created ON retired_claims(created_at_ms,run_hash)",
+)
+_V5_SCHEMA_SQL = (_V5_METADATA_SQL, *_V4_SCHEMA_SQL[1:], *_V5_RETIRED_SQL)
+
+# Tier A load guards: index columns only, never an archive blob.  CROSS JOIN fixes the bounded live
+# table as the outer loop, so retired_claims is reached only by primary-key search.
+_RETIRED_CLAIM_GUARD_SQL = (
+    "SELECT 1 FROM active_runs a CROSS JOIN retired_claims r ON r.run_hash=a.run_hash LIMIT 1",
+    "SELECT 1 FROM control_chains c CROSS JOIN retired_claims r ON r.run_hash=c.run_hash "
+    "WHERE c.run_hash IS NOT NULL LIMIT 1",
+    "SELECT 1 FROM pending_calls p CROSS JOIN retired_claims r ON r.run_hash=p.run_hash "
+    "WHERE p.run_hash IS NOT NULL LIMIT 1",
+    "SELECT 1 FROM terminal_disclosures t CROSS JOIN retired_claims r ON r.run_hash=t.run_hash LIMIT 1",
+    "SELECT 1 FROM chain_recovery WHERE chain != ? LIMIT 1",
+)
 
 _V2_SCHEMA_SQL = (
     "CREATE TABLE metadata("
@@ -470,6 +543,41 @@ class PendingResultReplayVerifier(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class InactiveClaimAttestationEvidence:
+    """The exact inactive-claim attestation exchange, archived verbatim.
+
+    Opaque to the runtime, which enforces bounds only: the control client verifies the
+    grant-authority signature, the echoed challenge and every binding before retirement.
+    """
+
+    request_method: str
+    request_path: str
+    request_headers: Mapping[str, str]
+    request_body: bytes
+    request_timestamp_ms: int
+    response_status: int
+    response_body: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class RetiredClaimRecord:
+    """One authenticated retired-claim archive; it grants nothing and is never deleted."""
+
+    run_id: str
+    run_hash: str
+    created_at_ms: int
+    reason: str
+    sealing_identity: Mapping[str, Any]
+    local_observations: Mapping[str, str]
+    chain_recovery: Mapping[str, Any]
+    active: Mapping[str, Any]
+    chains: tuple[Mapping[str, Any], ...]
+    pending: tuple[Mapping[str, Any], ...]
+    attestation: Mapping[str, Any]
+    state_digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveRunInstall:
     """Authenticated claim-200 authority to be committed with its four cursors."""
 
@@ -708,6 +816,168 @@ def _active_json_parse(plaintext: bytes) -> dict[str, Any]:
     if not isinstance(decoded, dict) or _active_json_bytes(decoded) != plaintext:
         raise ValueError("runtime active JSON is not canonical")
     return decoded
+
+
+def _retired_json_value(value: Any, *, path: tuple[str, ...] = (), depth: int = 0) -> Any:
+    """The public canonical grammar, except that the five archive base64 paths may exceed 4 096."""
+    if depth > 16:
+        raise ValueError("runtime retired value nesting is invalid")
+    if value is None:
+        return None
+    if type(value) is int:
+        if not 0 <= value <= _MAX_SAFE_INT:
+            raise ValueError("runtime retired integer is invalid")
+        return value
+    if type(value) is str:
+        cap = _RETIRED_LONG_TEXT_PATHS.get(path)
+        if cap is not None:
+            # ASCII base64 only, so the NFC and control-character rules hold by construction.
+            if len(value) > cap or _RETIRED_B64_TEXT.fullmatch(value) is None:
+                raise ValueError("runtime retired base64 text is invalid")
+            return value
+        if (
+            any(unicodedata.category(char) == "Cc" or 0xD800 <= ord(char) <= 0xDFFF for char in value)
+            or unicodedata.normalize("NFC", value) != value
+            or len(value.encode("utf-8")) > 4096
+        ):
+            raise ValueError("runtime retired text is invalid")
+        return value
+    if type(value) is list:
+        return [_retired_json_value(item, path=(*path, "*"), depth=depth + 1) for item in value]
+    if isinstance(value, Mapping):
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str or key in output:
+                raise ValueError("runtime retired mapping is invalid")
+            _retired_json_value(key, path=("",), depth=depth + 1)
+            output[key] = _retired_json_value(item, path=(*path, key), depth=depth + 1)
+        return output
+    raise ValueError("runtime retired value is invalid")
+
+
+def _retired_json_bytes(core: Mapping[str, Any]) -> bytes:
+    """Encode the archive with the public canonical form without widening the public canonicalizer."""
+    if not isinstance(core, Mapping):
+        raise ValueError("runtime retired core is invalid")
+    encoded = json.dumps(
+        _retired_json_value(core), ensure_ascii=False, allow_nan=False,
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) + 28 > _RETIRED_CLAIM_BOUND:
+        raise ValueError("runtime retired claim exceeds its size limit")
+    return encoded
+
+
+def _retired_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("runtime retired JSON has duplicate keys")
+        result[key] = value
+    return result
+
+
+def _retired_json_parse(plaintext: bytes) -> dict[str, Any]:
+    try:
+        decoded = json.loads(
+            plaintext.decode("utf-8"), object_pairs_hook=_retired_json_pairs,
+            parse_float=lambda _value: (_ for _ in ()).throw(ValueError("runtime retired float is invalid")),
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("runtime retired constant is invalid")),
+        )
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("runtime retired JSON is invalid") from exc
+    if not isinstance(decoded, dict) or _retired_json_bytes(decoded) != plaintext:
+        raise ValueError("runtime retired JSON is not canonical")
+    return decoded
+
+
+def _retired_state_digest(core: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_RETIRED_STATE_DIGEST_DOMAIN + _retired_json_bytes(core)).hexdigest()
+
+
+def _retired_metadata_size(core: Mapping[str, Any]) -> int:
+    """Archive bytes excluding the sealed component texts (RETIREMENT-RESYNC §4.1)."""
+    texts = [core["active"]["sealed_blob_b64"], *(
+        item["sealed_blob_b64"] for section in ("chains", "pending") for item in core[section]
+    )]
+    return len(_retired_json_bytes(core)) - sum(len(text) for text in texts)
+
+
+def _pending_json_value(value: Any, *, path: tuple[str, ...] = (), depth: int = 0) -> Any:
+    """The public canonical grammar with strict NFC, except that the top-level body_b64 may exceed 4 096."""
+    if depth > 16:
+        raise ValueError("runtime pending value nesting is invalid")
+    if value is None:
+        return None
+    if type(value) is int:
+        if not 0 <= value <= _MAX_SAFE_INT:
+            raise ValueError("runtime pending integer is invalid")
+        return value
+    if type(value) is str:
+        if path == ("body_b64",):
+            # ASCII base64 only, so the NFC and control-character rules hold by construction.
+            if len(value) > _PENDING_BODY_B64_TEXT_CAP or _PENDING_B64_TEXT.fullmatch(value) is None:
+                raise ValueError("runtime pending body text is invalid")
+            return value
+        if (
+            any(unicodedata.category(char) == "Cc" or 0xD800 <= ord(char) <= 0xDFFF for char in value)
+            or unicodedata.normalize("NFC", value) != value
+            or len(value.encode("utf-8")) > 4096
+        ):
+            raise ValueError("runtime pending text is invalid")
+        return value
+    if type(value) is list:
+        return [_pending_json_value(item, path=(*path, "*"), depth=depth + 1) for item in value]
+    if isinstance(value, Mapping):
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str or key in output:
+                raise ValueError("runtime pending mapping is invalid")
+            _pending_json_value(key, path=("",), depth=depth + 1)
+            output[key] = _pending_json_value(item, path=(*path, key), depth=depth + 1)
+        return output
+    raise ValueError("runtime pending value is invalid")
+
+
+def _pending_json_bytes(core: Mapping[str, Any]) -> bytes:
+    """Encode a pending call; equal to ``canonical_bytes`` on every core both grammars accept."""
+    if not isinstance(core, Mapping):
+        raise ValueError("runtime pending core is invalid")
+    encoded = json.dumps(
+        _pending_json_value(core), ensure_ascii=False, allow_nan=False,
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) + 28 > _PENDING_BLOB_BOUND:
+        raise ValueError("runtime pending call exceeds its size limit")
+    return encoded
+
+
+def _pending_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("runtime pending JSON has duplicate keys")
+        result[key] = value
+    return result
+
+
+def _pending_json_parse(plaintext: bytes) -> dict[str, Any]:
+    try:
+        decoded = json.loads(
+            plaintext.decode("utf-8"), object_pairs_hook=_pending_json_pairs,
+            parse_float=lambda _value: (_ for _ in ()).throw(ValueError("runtime pending float is invalid")),
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("runtime pending constant is invalid")),
+        )
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("runtime pending JSON is invalid") from exc
+    if not isinstance(decoded, dict) or _pending_json_bytes(decoded) != plaintext:
+        raise ValueError("runtime pending JSON is not canonical")
+    return decoded
+
+
+def _pending_state_digest(core: Mapping[str, Any]) -> str:
+    """The pending digest keeps ``_DIGEST_DOMAIN``: equal to ``_state_digest`` on every legacy core."""
+    return hashlib.sha256(_DIGEST_DOMAIN + _pending_json_bytes(core)).hexdigest()
 
 
 class RunnerRuntimeState:
@@ -1299,6 +1569,8 @@ class RunnerRuntimeState:
             return "v3"
         if self._schema_matches(conn, _V4_SCHEMA_SQL):
             return "v4"
+        if self._schema_matches(conn, _V5_SCHEMA_SQL):
+            return "v5"
         raise RunnerRuntimeCorrupt("runtime state schema is invalid")
 
     @staticmethod
@@ -1379,13 +1651,32 @@ class RunnerRuntimeState:
             "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext) "
             "SELECT singleton,?,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext FROM metadata_v3 "
             "WHERE schema_version=?",
-            (_SCHEMA, _SCHEMA_V3),
+            (_SCHEMA_V4, _SCHEMA_V3),
         )
         if changed.rowcount != 1:
             raise RunnerRuntimeCorrupt("runtime state schema is invalid")
         conn.execute("DROP TABLE metadata_v3")
         self._execute_schema(conn, _V4_RECOVERY_SQL)
         self._assert_schema_parity(conn, _V4_SCHEMA_SQL)
+
+    def _upgrade_v4_to_v5(self, conn: sqlite3.Connection) -> None:
+        """Add the retired-claim archive; every v4 row (metadata included) is kept byte for byte."""
+        if not self._schema_matches(conn, _V4_SCHEMA_SQL):
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        self._validate_opaque_authority_rows(conn)
+        conn.execute("ALTER TABLE metadata RENAME TO metadata_v4")
+        conn.execute(_V5_METADATA_SQL)
+        changed = conn.execute(
+            "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext) "
+            "SELECT singleton,?,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext FROM metadata_v4 "
+            "WHERE schema_version=?",
+            (_SCHEMA, _SCHEMA_V4),
+        )
+        if changed.rowcount != 1:
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        conn.execute("DROP TABLE metadata_v4")
+        self._execute_schema(conn, _V5_RETIRED_SQL)
+        self._assert_schema_parity(conn, _V5_SCHEMA_SQL)
 
     def _validate_opaque_authority_rows(self, conn: sqlite3.Connection) -> None:
         """Authenticate the legacy opaque index before a byte-for-byte v3 copy."""
@@ -1431,7 +1722,7 @@ class RunnerRuntimeState:
                 raise RunnerRuntimeCorrupt("runtime terminal disclosure index is invalid")
 
     def _validate_open_runtime(self, conn: sqlite3.Connection, *, allow_rotation_fence: bool = False) -> None:
-        self._assert_schema_parity(conn, _V4_SCHEMA_SQL)
+        self._assert_schema_parity(conn, _V5_SCHEMA_SQL)
         if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal" or conn.execute(
             "PRAGMA secure_delete"
         ).fetchone()[0] != 1 or conn.execute("PRAGMA synchronous").fetchone()[0] != 2:
@@ -1465,13 +1756,31 @@ class RunnerRuntimeState:
         for table, limit in limits.items():
             if conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] > limit:
                 raise RunnerRuntimeCorrupt("runtime state capacity is invalid")
+        # retired_claims is deliberately outside the limits: never deleted, PK-bounded, and each row
+        # costs a cloud-signed attestation.  Its rows are compared by index column only, never opened.
+        self._assert_retired_index_disjoint_locked(conn)
+        self._assert_claim_only_recovery_locked(conn)
+
+    def _assert_retired_index_disjoint_locked(self, conn: sqlite3.Connection) -> None:
+        for statement in _RETIRED_CLAIM_GUARD_SQL[:4]:
+            if conn.execute(statement).fetchone() is not None:
+                raise RunnerRuntimeCorrupt("runtime retired claim index is invalid")
+
+    def _assert_claim_only_recovery_locked(self, conn: sqlite3.Connection) -> None:
+        # Every chain_recovery writer uses the claim key, so any other chain is corruption.
+        if conn.execute(_RETIRED_CLAIM_GUARD_SQL[4], (self._chain_key("claim", None),)).fetchone() is not None:
+            raise RunnerRuntimeCorrupt("runtime chain recovery index is invalid")
+
+    def _assert_run_not_retired_locked(self, conn: sqlite3.Connection, run_hash: str) -> None:
+        if conn.execute("SELECT 1 FROM retired_claims WHERE run_hash=?", (run_hash,)).fetchone() is not None:
+            raise RunnerRuntimeConflict("runtime active run was retired")
 
     def _initialize(self, conn: sqlite3.Connection, *, allow_rotation_fence: bool = False) -> None:
         conn.execute("BEGIN IMMEDIATE")
         try:
             state = self._classify_schema(conn)
             if state == "none":
-                self._execute_schema(conn, _V4_SCHEMA_SQL)
+                self._execute_schema(conn, _V5_SCHEMA_SQL)
                 state_key = self._random_source(32)
                 if type(state_key) is not bytes or len(state_key) != 32:
                     raise RunnerRuntimeCorrupt("runtime state random source returned an invalid key")
@@ -1497,15 +1806,19 @@ class RunnerRuntimeState:
                     self._key = self._unwrap_state_key(row["state_key_ciphertext"])
                 self._upgrade_v2_to_v3(conn)
                 self._upgrade_v3_to_v4(conn)
-            elif state in {"v3", "v4"}:
+                self._upgrade_v4_to_v5(conn)
+            elif state in {"v3", "v4", "v5"}:
                 row = conn.execute("SELECT * FROM metadata WHERE singleton=1").fetchone()
-                if row is None or row["schema_version"] != (_SCHEMA_V3 if state == "v3" else _SCHEMA) or tuple(
+                expected_version = {"v3": _SCHEMA_V3, "v4": _SCHEMA_V4, "v5": _SCHEMA}[state]
+                if row is None or row["schema_version"] != expected_version or tuple(
                     row[key] for key in ("workspace_id", "runner_id", "runner_key_id", "public_key_digest")
                 ) != self._identity_values():
                     raise RunnerRuntimeCorrupt("runtime state belongs to another runner identity")
                 self._key = self._unwrap_state_key(row["state_key_ciphertext"])
                 if state == "v3":
                     self._upgrade_v3_to_v4(conn)
+                if state in {"v3", "v4"}:
+                    self._upgrade_v4_to_v5(conn)
             self._validate_open_runtime(conn, allow_rotation_fence=allow_rotation_fence)
             conn.execute("COMMIT")
         except BaseException:
@@ -1514,8 +1827,13 @@ class RunnerRuntimeState:
 
     @staticmethod
     def _aad_for(identity: RunnerIdentity, schema: str, *primary_fields: str) -> bytes:
-        return "\0".join((schema, identity.workspace_id, identity.runner_id,
-                           identity.key_id, *primary_fields)).encode("utf-8")
+        return RunnerRuntimeState._aad_values(
+            schema, identity.workspace_id, identity.runner_id, identity.key_id, *primary_fields,
+        )
+
+    @staticmethod
+    def _aad_values(schema: str, workspace_id: str, runner_id: str, key_id: str, *primary_fields: str) -> bytes:
+        return "\0".join((schema, workspace_id, runner_id, key_id, *primary_fields)).encode("utf-8")
 
     def _aad(self, schema: str, *primary_fields: str) -> bytes:
         return self._aad_for(self.identity, schema, *primary_fields)
@@ -1534,6 +1852,7 @@ class RunnerRuntimeState:
             raise RunnerRuntimeCorrupt("runtime state random source returned an invalid nonce")
         plaintext = (
             _active_json_bytes(core) if schema == "heel.runner-active-run-state.v1"
+            else _pending_json_bytes(core) if schema == _PENDING_CALL_SCHEMA
             else canonical_bytes(dict(core))
         )
         return nonce + self._crypto.aead(key).encrypt(
@@ -1543,6 +1862,9 @@ class RunnerRuntimeState:
     def _open(self, value: object, *, schema: str, primary_fields: tuple[str, ...]) -> dict[str, Any]:
         if type(value) is not bytes or len(value) <= 28:
             raise RunnerRuntimeCorrupt("runtime state sealed record is invalid")
+        if schema == _PENDING_CALL_SCHEMA and len(value) > _PENDING_BLOB_BOUND:
+            # The pending bound is enforced before any decryption or parsing work.
+            raise RunnerRuntimeCorrupt("runtime state sealed record is invalid")
         try:
             plaintext = self._crypto.aead(self._key).decrypt(
                 value[:12], value[12:], self._aad(schema, *primary_fields),
@@ -1550,6 +1872,7 @@ class RunnerRuntimeState:
             decoded = (
                 _active_json_parse(plaintext)
                 if schema == "heel.runner-active-run-state.v1"
+                else _pending_json_parse(plaintext) if schema == _PENDING_CALL_SCHEMA
                 else json.loads(plaintext)
             )
         except Exception as exc:
@@ -1559,6 +1882,7 @@ class RunnerRuntimeState:
         try:
             expected_plaintext = (
                 _active_json_bytes(decoded) if schema == "heel.runner-active-run-state.v1"
+                else _pending_json_bytes(decoded) if schema == _PENDING_CALL_SCHEMA
                 else canonical_bytes(decoded)
             )
         except (TypeError, ValueError) as exc:
@@ -1656,6 +1980,8 @@ class RunnerRuntimeState:
                 existing = conn.execute(
                     "SELECT run_hash,operation,sealed_blob FROM control_chains WHERE chain=?", (chain,),
                 ).fetchone()
+                if run_hash is not None:
+                    self._assert_run_not_retired_locked(conn, run_hash)
                 if existing is not None:
                     if existing["run_hash"] != run_hash or existing["operation"] != operation:
                         raise RunnerRuntimeCorrupt("runtime chain index is invalid")
@@ -2242,11 +2568,25 @@ class RunnerRuntimeState:
         if type(nonce) is not bytes or len(nonce) != 12:
             raise RunnerRuntimeCorrupt("runtime state random source returned an invalid nonce")
         aad = "\0".join((schema, record_id)).encode("utf-8")
-        return nonce + self._crypto.aead(self._key).encrypt(nonce, canonical_bytes(dict(core)), aad)
+        plaintext = (
+            _retired_json_bytes(dict(core)) if schema == _RETIRED_CLAIM_SCHEMA
+            else canonical_bytes(dict(core))
+        )
+        return nonce + self._crypto.aead(self._key).encrypt(nonce, plaintext, aad)
 
     def _open_stable(self, value: object, *, schema: str, record_id: str) -> dict[str, Any]:
         if type(value) is not bytes or len(value) <= 28:
             raise RunnerRuntimeCorrupt("runtime state sealed record is invalid")
+        if schema == _RETIRED_CLAIM_SCHEMA:
+            # The derived bound is enforced before any decryption or parsing work.
+            if len(value) > _RETIRED_CLAIM_BOUND:
+                raise RunnerRuntimeCorrupt("runtime state sealed record is invalid")
+            try:
+                return _retired_json_parse(self._crypto.aead(self._key).decrypt(
+                    value[:12], value[12:], "\0".join((schema, record_id)).encode("utf-8"),
+                ))
+            except Exception as exc:
+                raise RunnerRuntimeCorrupt("runtime state sealed record is invalid") from exc
         try:
             plaintext = self._crypto.aead(self._key).decrypt(
                 value[:12], value[12:], "\0".join((schema, record_id)).encode("utf-8"),
@@ -2962,7 +3302,8 @@ class RunnerRuntimeState:
             body = base64.b64decode(value["body_b64"], validate=True)
         except (TypeError, ValueError):
             raise RunnerRuntimeCorrupt("runtime pending call is invalid") from None
-        if self._canonical_b64(body) != value["body_b64"] or len(body) > 272 * 1024:
+        # The reader keeps the historical bound for every operation (never the staging caps).
+        if self._canonical_b64(body) != value["body_b64"] or len(body) > _PENDING_BODY_MAX:
             raise RunnerRuntimeCorrupt("runtime pending call is invalid")
         if hashlib.sha256(body).hexdigest() != _digest(value["body_sha256"], "runtime pending body digest"):
             raise RunnerRuntimeCorrupt("runtime pending call is invalid")
@@ -2977,7 +3318,11 @@ class RunnerRuntimeState:
         elif not (request_operation == "claim" and chain_operation == "claim"):
             raise RunnerRuntimeCorrupt("runtime pending call is invalid")
         core_without_digest = {key: value[key] for key in fields if key != "state_digest"}
-        if value["state_digest"] != _state_digest(core_without_digest):
+        try:
+            expected_digest = _pending_state_digest(core_without_digest)
+        except (TypeError, ValueError):
+            raise RunnerRuntimeCorrupt("runtime pending call digest is invalid") from None
+        if value["state_digest"] != expected_digest:
             raise RunnerRuntimeCorrupt("runtime pending call digest is invalid")
         call_id = _digest(value["call_id"], "runtime pending call ID")
         pending = PendingSignedCall(
@@ -3061,6 +3406,29 @@ class RunnerRuntimeState:
             return path.startswith(f"{prefix}/contexts/rcb_") and path.endswith("/approval-projections")
         return False
 
+    def _seal_pending_core(
+        self, core_without_digest: Mapping[str, Any], *, call_id: str,
+    ) -> tuple[dict[str, Any], bytes, PendingSignedCall]:
+        """Digest, validate and seal a new pending core under the pending grammar.
+
+        A grammar failure (non-NFC or over-bound input) at digest construction or inside the sealer
+        fails closed with one fixed message; the input is never normalized and no byte of it is echoed.
+        """
+        try:
+            core = {**core_without_digest, "state_digest": _pending_state_digest(core_without_digest)}
+        except (TypeError, ValueError):
+            raise RunnerRuntimeStateError("invalid runtime pending call") from None
+        pending, _ = self._validate_pending_core(core)
+        try:
+            blob = self._seal(core, schema=_PENDING_CALL_SCHEMA, primary_fields=(call_id,))
+        except RunnerRuntimeStateError:
+            raise
+        except (TypeError, ValueError):
+            raise RunnerRuntimeStateError("invalid runtime pending call") from None
+        if len(blob) > 384 * 1024:
+            raise RunnerRuntimeStateError("runtime pending call exceeds size limit")
+        return core, blob, pending
+
     def stage_call(
         self, *, request_operation: str, chain_operation: str, run_id: str | None,
         path: str, capability: str, headers: Mapping[str, str], body: bytes,
@@ -3080,6 +3448,8 @@ class RunnerRuntimeState:
         )
         if chain_operation != expected_chain or ((chain_operation == "claim") != (run_id is None)):
             raise RunnerRuntimeStateError("invalid runtime pending call")
+        if len(body) > _PENDING_BODY_CAPS[request_operation]:
+            raise RunnerRuntimeStateError("invalid runtime pending body")
         if run_id is not None:
             _run_id(run_id)
         _digest(expected_state_digest, "runtime expected state digest")
@@ -3124,11 +3494,7 @@ class RunnerRuntimeState:
                     "sequence": sequence, "generation": generation,
                     "prior_chain_state_digest": prior_state_digest, "created_at_ms": now_ms,
                 }
-                core = {**core_without_digest, "state_digest": _state_digest(core_without_digest)}
-                pending, _ = self._validate_pending_core(core)
-                blob = self._seal(core, schema=core["schema_version"], primary_fields=(call_id,))
-                if len(blob) > 384 * 1024:
-                    raise RunnerRuntimeStateError("runtime pending call exceeds size limit")
+                core, blob, pending = self._seal_pending_core(core_without_digest, call_id=call_id)
                 conn.execute(
                     "INSERT INTO pending_calls(call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms) "
                     "VALUES(?,?,?,?,?,?,?,?)",
@@ -3255,6 +3621,9 @@ class RunnerRuntimeState:
                     pending.request_operation == "heartbeat" and pending.run_id is not None
                 ):
                     raise RunnerRuntimeCorrupt("runtime active gate update does not match pending heartbeat")
+                if parsed_installed:
+                    # A retired run is never reinstalled, whatever claim response names it.
+                    self._assert_run_not_retired_locked(conn, _run_hash(parsed_installed[0][1]))
                 chain = self._chain_key(pending.chain_operation, pending.run_id)
                 if row["chain"] != chain:
                     raise RunnerRuntimeCorrupt("runtime pending call index is invalid")
@@ -3891,6 +4260,452 @@ class RunnerRuntimeState:
                 conn.execute("ROLLBACK")
                 raise
 
+    # ------------------------------------------------------------------ C recovery: retired claims (v5)
+    def _retirement_attestation(self, evidence: object) -> dict[str, Any]:
+        if not isinstance(evidence, InactiveClaimAttestationEvidence):
+            raise RunnerRuntimeStateError("invalid runtime retirement evidence")
+        try:
+            if (
+                type(evidence.request_body) is not bytes or type(evidence.response_body) is not bytes
+                or not isinstance(evidence.request_headers, Mapping)
+            ):
+                raise ValueError("runtime retirement evidence is invalid")
+            attestation = {
+                "request": {
+                    "method": evidence.request_method, "path": evidence.request_path,
+                    "headers": dict(evidence.request_headers),
+                    "body_b64": self._canonical_b64(evidence.request_body),
+                    "timestamp_ms": evidence.request_timestamp_ms,
+                },
+                "response": {
+                    "status": evidence.response_status,
+                    "body_b64": self._canonical_b64(evidence.response_body),
+                },
+            }
+            _retired_json_value(attestation, path=("attestation",))
+            self._check_retired_attestation(attestation)
+        except (TypeError, ValueError) as exc:
+            raise RunnerRuntimeStateError("invalid runtime retirement evidence") from exc
+        return attestation
+
+    def _strict_b64(self, text: object, *, minimum: int, maximum: int) -> bytes:
+        if type(text) is not str:
+            raise ValueError("runtime retired base64 is invalid")
+        raw = base64.b64decode(text, validate=True)
+        if self._canonical_b64(raw) != text or not minimum <= len(raw) <= maximum:
+            raise ValueError("runtime retired base64 is invalid")
+        return raw
+
+    def _check_retired_attestation(self, value: object) -> None:
+        """Bounds of the opaque attestation exchange; never a signature or binding check."""
+        if not isinstance(value, Mapping) or set(value) != {"request", "response"}:
+            raise ValueError("runtime retired attestation is invalid")
+        request, response = value["request"], value["response"]
+        if (
+            not isinstance(request, Mapping)
+            or set(request) != {"method", "path", "headers", "body_b64", "timestamp_ms"}
+            or not isinstance(response, Mapping) or set(response) != {"status", "body_b64"}
+        ):
+            raise ValueError("runtime retired attestation is invalid")
+        headers = request["headers"]
+        path = request["path"]
+        timestamp_ms = _safe_int(request["timestamp_ms"], "runtime retired attestation time")
+        if (
+            request["method"] != "POST"
+            or type(path) is not str or not path.startswith("/v1/workspaces/")
+            or not path.endswith("/inactive-claim-attestation")
+            or not isinstance(headers, Mapping) or set(headers) != _RETIRED_ATTESTATION_HEADERS
+            or any(type(item) is not str or not item for item in headers.values())
+            or len(headers["X-Heel-Runner-Id"].encode("utf-8")) > 128
+            or len(headers["X-Heel-Runner-Key-Id"].encode("utf-8")) > 128
+            or headers["X-Heel-Runner-Timestamp-Ms"] != str(timestamp_ms)
+            or type(response["status"]) is not int or response["status"] != 200
+        ):
+            raise ValueError("runtime retired attestation is invalid")
+        self._strict_b64(headers["X-Heel-Runner-Signature"], minimum=64, maximum=64)
+        self._strict_b64(request["body_b64"], minimum=1, maximum=2048)
+        self._strict_b64(response["body_b64"], minimum=1, maximum=8192)
+
+    def _retired_component(
+        self, item: object, *, table: str, schema: str, primary_fields: list[str], index_fields: set[str],
+        maximum: int, extra: Mapping[str, str] | None = None,
+    ) -> Mapping[str, Any]:
+        expected = {"table", "schema", "primary_fields", "index", "sealed_blob_b64", *(extra or {})}
+        if (
+            not isinstance(item, Mapping) or set(item) != expected
+            or item["table"] != table or item["schema"] != schema
+            or item["primary_fields"] != primary_fields
+            or not isinstance(item["index"], Mapping) or set(item["index"]) != index_fields
+            or any(item[key] != value for key, value in (extra or {}).items())
+        ):
+            raise ValueError("runtime retired component is invalid")
+        self._strict_b64(item["sealed_blob_b64"], minimum=29, maximum=maximum)
+        return item["index"]
+
+    def _retired_core(
+        self, *, run_id: str, created_at_ms: int, sealing_identity: Mapping[str, Any],
+        active: Mapping[str, Any], chains: list[Mapping[str, Any]], pending: list[Mapping[str, Any]],
+        attestation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Assemble the closed archive shape (RETIREMENT-RESYNC §4.1) and its retired digest."""
+        core = {
+            "schema_version": _RETIRED_CLAIM_SCHEMA, "reason": "cloud_inactive_attested",
+            "run_id": run_id, "run_hash": _run_hash(run_id), "created_at_ms": created_at_ms,
+            "sealing_identity": dict(sealing_identity),
+            "local_observations": {"reservation": "absent", "terminal": "absent"},
+            "chain_recovery": {
+                "run_chain_rows": 0,
+                "run_chains": {operation: self._chain_key(operation, run_id) for operation in _RUN_CHAIN_OPERATIONS},
+            },
+            "active": dict(active), "chains": [dict(item) for item in chains],
+            "pending": [dict(item) for item in pending], "attestation": dict(attestation),
+        }
+        return {**core, "state_digest": _retired_state_digest(core)}
+
+    def _validate_retired_core(self, value: Mapping[str, Any], *, run_id: str) -> RetiredClaimRecord:
+        try:
+            return self._retired_record(value, run_id=run_id)
+        except RunnerRuntimeCorrupt:
+            raise
+        except (TypeError, ValueError, KeyError, AttributeError) as exc:
+            raise RunnerRuntimeCorrupt("runtime retired claim is invalid") from exc
+
+    def _retired_record(self, value: Mapping[str, Any], *, run_id: str) -> RetiredClaimRecord:
+        run_id = _run_id(run_id)
+        assert run_id is not None
+        run_hash = _run_hash(run_id)
+        fields = {
+            "schema_version", "reason", "run_id", "run_hash", "created_at_ms", "sealing_identity",
+            "local_observations", "chain_recovery", "active", "chains", "pending", "attestation",
+            "state_digest",
+        }
+        if (
+            not isinstance(value, Mapping) or set(value) != fields
+            or value["schema_version"] != _RETIRED_CLAIM_SCHEMA or value["reason"] != "cloud_inactive_attested"
+            or value["run_id"] != run_id or value["run_hash"] != run_hash
+        ):
+            raise ValueError("runtime retired claim is invalid")
+        created_at_ms = _safe_int(value["created_at_ms"], "runtime retired time")
+        identity = value["sealing_identity"]
+        if not isinstance(identity, Mapping) or set(identity) != {
+            "workspace_id", "runner_id", "runner_key_id", "public_key_digest", "authority_epoch",
+        }:
+            raise ValueError("runtime retired sealing identity is invalid")
+        for key in ("workspace_id", "runner_id", "runner_key_id"):
+            _text(identity[key], "runtime retired sealing identity")
+        _digest(identity["public_key_digest"], "runtime retired sealing identity")
+        _safe_int(identity["authority_epoch"], "runtime retired sealing identity", minimum=1)
+        keys = {operation: self._chain_key(operation, run_id) for operation in _RUN_CHAIN_OPERATIONS}
+        if (
+            value["local_observations"] != {"reservation": "absent", "terminal": "absent"}
+            or not isinstance(value["chain_recovery"], Mapping)
+            or set(value["chain_recovery"]) != {"run_chain_rows", "run_chains"}
+            or type(value["chain_recovery"]["run_chain_rows"]) is not int
+            or value["chain_recovery"]["run_chain_rows"] != 0
+            or value["chain_recovery"]["run_chains"] != keys
+        ):
+            raise ValueError("runtime retired chain recovery observation is invalid")
+        index = self._retired_component(
+            value["active"], table="active_runs", schema="heel.runner-active-run-state.v1",
+            primary_fields=[run_hash], index_fields={"run_hash", "updated_at_ms"}, maximum=393_216,
+        )
+        if index["run_hash"] != run_hash:
+            raise ValueError("runtime retired component is invalid")
+        _safe_int(index["updated_at_ms"], "runtime retired component index")
+        chains = value["chains"]
+        if type(chains) is not list or len(chains) != 4:
+            raise ValueError("runtime retired component is invalid")
+        for operation, item in zip(_RUN_CHAIN_OPERATIONS, chains, strict=True):
+            index = self._retired_component(
+                item, table="control_chains", schema="heel.runner-control-chain-state.v1",
+                primary_fields=[keys[operation]],
+                index_fields={"chain", "run_hash", "operation", "next_sequence", "generation", "updated_at_ms"},
+                maximum=4_096,
+            )
+            if (index["chain"], index["run_hash"], index["operation"]) != (keys[operation], run_hash, operation):
+                raise ValueError("runtime retired component is invalid")
+            _safe_int(index["next_sequence"], "runtime retired component index", minimum=1)
+            _safe_int(index["generation"], "runtime retired component index")
+            _safe_int(index["updated_at_ms"], "runtime retired component index")
+        pending = value["pending"]
+        if type(pending) is not list or len(pending) > 1:
+            raise ValueError("runtime retired component is invalid")
+        for item in pending:
+            if not isinstance(item, Mapping) or type(item.get("primary_fields")) is not list or len(item["primary_fields"]) != 1:
+                raise ValueError("runtime retired component is invalid")
+            call_id = _digest(item["primary_fields"][0], "runtime retired component index")
+            index = self._retired_component(
+                item, table="pending_calls", schema="heel.runner-pending-call.v1", primary_fields=[call_id],
+                index_fields={"call_id", "chain", "run_hash", "operation", "sequence", "generation", "created_at_ms"},
+                maximum=393_216, extra={"delivery": "uncertain"},
+            )
+            if (index["call_id"], index["chain"], index["run_hash"], index["operation"]) != (
+                call_id, keys["heartbeat"], run_hash, "heartbeat",
+            ):
+                raise ValueError("runtime retired component is invalid")
+            _safe_int(index["sequence"], "runtime retired component index", minimum=1)
+            _safe_int(index["generation"], "runtime retired component index")
+            _safe_int(index["created_at_ms"], "runtime retired component index")
+        self._check_retired_attestation(value["attestation"])
+        body = {key: item for key, item in value.items() if key != "state_digest"}
+        if value["state_digest"] != _retired_state_digest(body):
+            raise ValueError("runtime retired claim digest is invalid")
+        copied = json.loads(json.dumps(dict(value)))
+        return RetiredClaimRecord(
+            run_id=run_id, run_hash=run_hash, created_at_ms=created_at_ms, reason=copied["reason"],
+            sealing_identity=copied["sealing_identity"], local_observations=copied["local_observations"],
+            chain_recovery=copied["chain_recovery"], active=copied["active"],
+            chains=tuple(copied["chains"]), pending=tuple(copied["pending"]),
+            attestation=copied["attestation"], state_digest=copied["state_digest"],
+        )
+
+    def _authenticate_retired_components(self, record: RetiredClaimRecord) -> None:
+        """Open each archived original under the historical sealing identity's AAD (never self.identity)."""
+        identity = record.sealing_identity
+        owner = (identity["workspace_id"], identity["runner_id"], identity["runner_key_id"])
+
+        def opened(item: Mapping[str, Any]) -> tuple[bytes, dict[str, Any]]:
+            raw = base64.b64decode(item["sealed_blob_b64"], validate=True)
+            plaintext = self._crypto.aead(self._key).decrypt(
+                raw[:12], raw[12:], self._aad_values(item["schema"], *owner, *item["primary_fields"]),
+            )
+            if item["schema"] == "heel.runner-active-run-state.v1":
+                return plaintext, _active_json_parse(plaintext)
+            if item["schema"] == _PENDING_CALL_SCHEMA:
+                return plaintext, _pending_json_parse(plaintext)
+            decoded = json.loads(plaintext)
+            if not isinstance(decoded, dict) or canonical_bytes(decoded) != plaintext:
+                raise ValueError("runtime retired component is not canonical")
+            return plaintext, decoded
+
+        def owned(core: Mapping[str, Any]) -> bool:
+            return (core.get("workspace_id"), core.get("runner_id"), core.get("runner_key_id")) == owner
+
+        try:
+            _plaintext, active = opened(record.active)
+            active_fields = {
+                "schema_version", "state", "workspace_id", "runner_id", "runner_key_id", "run_id", "run_hash",
+                "project_id", "approval_id", "grant_id", "grant_digest", "approval_projection_digest",
+                "approval_projection", "grant", "gate", "claim_response_digest", "latest_gate_response_digest",
+                "claimed_at_ms", "gate_received_at_ms", "revision", "prior_state_digest", "state_digest",
+            }
+            if (
+                set(active) != active_fields or active["schema_version"] != "heel.runner-active-run-state.v1"
+                or active["state"] != "active" or not owned(active)
+                or active["run_id"] != record.run_id or active["run_hash"] != record.run_hash
+                or record.active["index"] != {"run_hash": record.run_hash, "updated_at_ms": active["gate_received_at_ms"]}
+                or active["state_digest"] != _active_state_digest(
+                    {key: item for key, item in active.items() if key != "state_digest"}
+                )
+            ):
+                raise ValueError("runtime retired active component is invalid")
+            chain_fields = {
+                "schema_version", "workspace_id", "runner_id", "runner_key_id", "operation", "run_id",
+                "next_nonce_b64", "next_sequence", "generation", "updated_at_ms", "state_digest",
+            }
+            for item in record.chains:
+                _plaintext, chain = opened(item)
+                index = item["index"]
+                if (
+                    set(chain) != chain_fields or chain["schema_version"] != "heel.runner-control-chain-state.v1"
+                    or not owned(chain) or chain["operation"] != index["operation"] or chain["run_id"] != record.run_id
+                    or (chain["next_sequence"], chain["generation"], chain["updated_at_ms"])
+                    != (index["next_sequence"], index["generation"], index["updated_at_ms"])
+                    or chain["state_digest"] != _state_digest(
+                        {key: value for key, value in chain.items() if key != "state_digest"}
+                    )
+                ):
+                    raise ValueError("runtime retired chain component is invalid")
+            pending_fields = {
+                "schema_version", "workspace_id", "runner_id", "runner_key_id", "call_id",
+                "request_operation", "chain_operation", "run_id", "path", "capability", "method",
+                "headers", "body_b64", "body_sha256", "server_nonce_b64", "sequence", "generation",
+                "prior_chain_state_digest", "created_at_ms", "state_digest",
+            }
+            for item in record.pending:
+                _plaintext, call = opened(item)
+                index = item["index"]
+                if (
+                    set(call) != pending_fields or call["schema_version"] != "heel.runner-pending-call.v1"
+                    or not owned(call) or call["call_id"] != index["call_id"]
+                    or call["request_operation"] != "heartbeat" or call["chain_operation"] != "heartbeat"
+                    or call["run_id"] != record.run_id
+                    or (call["sequence"], call["generation"], call["created_at_ms"])
+                    != (index["sequence"], index["generation"], index["created_at_ms"])
+                    or call["state_digest"] != _pending_state_digest(
+                        {key: value for key, value in call.items() if key != "state_digest"}
+                    )
+                ):
+                    raise ValueError("runtime retired pending component is invalid")
+        except Exception as exc:
+            raise RunnerRuntimeCorrupt("runtime retired claim component is invalid") from exc
+
+    def load_retired_claim(
+        self, run_id: str, *, authenticate_components: bool = False,
+    ) -> RetiredClaimRecord | None:
+        """Tier B: open one named archive on demand; never called on any load or claim path.
+
+        Default: one outer decryption, then shape, bindings, the four recomputed chain keys, the
+        retired digest and every component's index and length.  ``authenticate_components=True``
+        additionally decrypts each archived original under its historical sealing identity.
+        """
+        run_id = _run_id(run_id)
+        assert run_id is not None
+        if type(authenticate_components) is not bool:
+            raise RunnerRuntimeStateError("invalid runtime retired claim authentication flag")
+        run_hash = _run_hash(run_id)
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT run_hash,sealed_blob,created_at_ms FROM retired_claims WHERE run_hash=?", (run_hash,),
+            ).fetchone()
+        if row is None:
+            return None
+        record = self._validate_retired_core(
+            self._open_stable(row["sealed_blob"], schema=_RETIRED_CLAIM_SCHEMA, record_id=run_hash),
+            run_id=run_id,
+        )
+        if row["run_hash"] != run_hash or row["created_at_ms"] != record.created_at_ms:
+            raise RunnerRuntimeCorrupt("runtime retired claim index is invalid")
+        if authenticate_components:
+            self._authenticate_retired_components(record)
+        return record
+
+    def retire_inactive_claim(
+        self, run_id: str, *, expected_state_digest: str, evidence: InactiveClaimAttestationEvidence,
+        reservation_probe: str, now_ms: int,
+    ) -> RetiredClaimRecord:
+        """Seal one cloud-attested inactive claim and remove exactly its active group, atomically.
+
+        The caller, not this method, guarantees that no ``reserve_run`` caller exists in any process:
+        it holds the exclusive serve lock for this HEEL_HOME and retires before hydration.  The
+        snapshot digest proves only that the runtime row is unchanged; ``reservation_probe`` must be
+        the Store's ``RunReservationProbe.ABSENT`` observed under that ownership.  Pending delivery
+        stays uncertain, nothing in ``chain_recovery`` is written, and nothing grants execution.
+
+        The archived ``local_observations.reservation`` is that ``RunReservationProbe`` value observed
+        under the serve lock at retirement: ``absent`` means no reservation record exists now (never
+        reserved, or reserved, terminal, pruned and compacted).  It is not a statement that the run
+        never executed.
+        """
+        run_id = _run_id(run_id)
+        assert run_id is not None
+        run_hash = _run_hash(run_id)
+        expected_state_digest = _digest(expected_state_digest, "runtime retirement state digest")
+        now_ms = _safe_int(now_ms, "runtime retirement time")
+        if not isinstance(reservation_probe, str) or reservation_probe != "absent":
+            raise RunnerRuntimeConflict("runtime retirement requires an absent local reservation")
+        attestation = self._retirement_attestation(evidence)
+        keys = {operation: self._chain_key(operation, run_id) for operation in _RUN_CHAIN_OPERATIONS}
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                active_row = conn.execute(
+                    "SELECT run_hash,sealed_blob,updated_at_ms FROM active_runs WHERE run_hash=?", (run_hash,),
+                ).fetchone()
+                if active_row is None:
+                    raise RunnerRuntimeConflict("runtime active run is unavailable")
+                active = self._load_active_locked(conn, run_id)
+                if active is None or active["state_digest"] != expected_state_digest:
+                    raise RunnerRuntimeConflict("runtime active run state changed")
+                if conn.execute("SELECT 1 FROM terminal_disclosures WHERE run_hash=?", (run_hash,)).fetchone() is not None:
+                    raise RunnerRuntimeConflict("runtime retirement requires no local terminal")
+                pending_rows = conn.execute(
+                    "SELECT call_id,chain,run_hash,operation,sequence,generation,created_at_ms,sealed_blob "
+                    "FROM pending_calls WHERE run_hash=? ORDER BY call_id", (run_hash,),
+                ).fetchall()
+                if len(pending_rows) > 1 or any(row["operation"] != "heartbeat" for row in pending_rows):
+                    raise RunnerRuntimeConflict("runtime retirement requires only a heartbeat pending call")
+                for row in pending_rows:
+                    call = self._pending_from_row_locked(row)
+                    if call.chain_operation != "heartbeat" or call.run_id != run_id or row["chain"] != keys["heartbeat"]:
+                        raise RunnerRuntimeCorrupt("runtime pending call index is invalid")
+                chain_rows = {
+                    row["operation"]: row for row in conn.execute(
+                        "SELECT chain,run_hash,operation,next_sequence,generation,sealed_blob,updated_at_ms "
+                        "FROM control_chains WHERE run_hash=?", (run_hash,),
+                    ).fetchall()
+                }
+                if (
+                    set(chain_rows) != set(_RUN_CHAIN_OPERATIONS)
+                    or conn.execute("SELECT COUNT(*) FROM control_chains WHERE run_hash=?", (run_hash,)).fetchone()[0] != 4
+                    or any(chain_rows[operation]["chain"] != keys[operation] for operation in _RUN_CHAIN_OPERATIONS)
+                ):
+                    raise RunnerRuntimeCorrupt("runtime active run cursor group is invalid")
+                for operation in _RUN_CHAIN_OPERATIONS:
+                    cursor = self._load_chain_locked(conn, operation, run_id)
+                    row = chain_rows[operation]
+                    if cursor is None or (cursor.next_sequence, cursor.generation, cursor.updated_at_ms) != (
+                        row["next_sequence"], row["generation"], row["updated_at_ms"],
+                    ):
+                        raise RunnerRuntimeCorrupt("runtime active run cursor group is invalid")
+                # R0: assert empty, record, never touch.  No writer produces such a row (claim-key only).
+                if conn.execute(
+                    "SELECT COUNT(*) FROM chain_recovery WHERE chain IN (?,?,?,?)",
+                    tuple(keys[operation] for operation in _RUN_CHAIN_OPERATIONS),
+                ).fetchone()[0] != 0:
+                    raise RunnerRuntimeCorrupt("runtime retired claim has chain recovery rows")
+                core = self._retired_core(
+                    run_id=run_id, created_at_ms=now_ms,
+                    sealing_identity={
+                        "workspace_id": self.identity.workspace_id, "runner_id": self.identity.runner_id,
+                        "runner_key_id": self.identity.key_id, "public_key_digest": self.identity.fingerprint,
+                        "authority_epoch": self._authority_epoch,
+                    },
+                    active={
+                        "table": "active_runs", "schema": "heel.runner-active-run-state.v1",
+                        "primary_fields": [run_hash],
+                        "index": {"run_hash": run_hash, "updated_at_ms": active_row["updated_at_ms"]},
+                        "sealed_blob_b64": self._canonical_b64(active_row["sealed_blob"]),
+                    },
+                    chains=[{
+                        "table": "control_chains", "schema": "heel.runner-control-chain-state.v1",
+                        "primary_fields": [keys[operation]],
+                        "index": {
+                            "chain": keys[operation], "run_hash": run_hash, "operation": operation,
+                            "next_sequence": chain_rows[operation]["next_sequence"],
+                            "generation": chain_rows[operation]["generation"],
+                            "updated_at_ms": chain_rows[operation]["updated_at_ms"],
+                        },
+                        "sealed_blob_b64": self._canonical_b64(chain_rows[operation]["sealed_blob"]),
+                    } for operation in _RUN_CHAIN_OPERATIONS],
+                    pending=[{
+                        "table": "pending_calls", "schema": "heel.runner-pending-call.v1",
+                        "primary_fields": [row["call_id"]],
+                        "index": {
+                            "call_id": row["call_id"], "chain": row["chain"], "run_hash": run_hash,
+                            "operation": row["operation"], "sequence": row["sequence"],
+                            "generation": row["generation"], "created_at_ms": row["created_at_ms"],
+                        },
+                        "delivery": "uncertain",
+                        "sealed_blob_b64": self._canonical_b64(row["sealed_blob"]),
+                    } for row in pending_rows],
+                    attestation=attestation,
+                )
+                try:
+                    metadata = _retired_metadata_size(core)
+                    blob = self._seal_stable(core, schema=_RETIRED_CLAIM_SCHEMA, record_id=run_hash)
+                except ValueError as exc:
+                    raise RunnerRuntimeStateError("runtime retired claim exceeds its size limit") from exc
+                if metadata > _RETIRED_CLAIM_METADATA_CAP or len(blob) > _RETIRED_CLAIM_BOUND:
+                    raise RunnerRuntimeStateError("runtime retired claim exceeds its size limit")
+                record = self._validate_retired_core(core, run_id=run_id)
+                conn.execute(
+                    "INSERT INTO retired_claims(run_hash,sealed_blob,created_at_ms) VALUES(?,?,?)",
+                    (run_hash, blob, now_ms),
+                )
+                removed = (
+                    conn.execute("DELETE FROM active_runs WHERE run_hash=?", (run_hash,)).rowcount,
+                    conn.execute("DELETE FROM control_chains WHERE run_hash=?", (run_hash,)).rowcount,
+                    conn.execute("DELETE FROM pending_calls WHERE run_hash=?", (run_hash,)).rowcount,
+                )
+                if removed != (1, 4, len(pending_rows)):
+                    raise RunnerRuntimeCorrupt("runtime retired claim does not own an exact run")
+                conn.execute("COMMIT")
+                return record
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
     def lease_terminal_disclosure(
         self, run_id: str, *, expected_project_id: str, expected_grant_id: str,
         expected_approval_projection_digest: str, now_ms: int,
@@ -3959,7 +4774,7 @@ class RunnerRuntimeState:
         body: bytes, now_ms: int,
     ) -> PendingSignedCall:
         lease = self._require_lease(lease, require_unused=True)
-        if type(body) is not bytes or len(body) > 272 * 1024:
+        if type(body) is not bytes or len(body) > _PENDING_BODY_CAPS["upload-findings"]:
             raise RunnerRuntimeStateError("invalid runtime pending body")
         now_ms = _safe_int(now_ms, "runtime disclosure time")
         with self._connection() as conn:
@@ -4014,11 +4829,7 @@ class RunnerRuntimeState:
                     "sequence": sequence, "generation": generation,
                     "prior_chain_state_digest": state.state_digest, "created_at_ms": now_ms,
                 }
-                core = {**core_without_digest, "state_digest": _state_digest(core_without_digest)}
-                pending, _ = self._validate_pending_core(core)
-                blob = self._seal(core, schema=core["schema_version"], primary_fields=(call_id,))
-                if len(blob) > 384 * 1024:
-                    raise RunnerRuntimeStateError("runtime pending call exceeds size limit")
+                core, blob, pending = self._seal_pending_core(core_without_digest, call_id=call_id)
                 conn.execute(
                     "INSERT INTO pending_calls(call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms) "
                     "VALUES(?,?,?,?,?,?,?,?)",

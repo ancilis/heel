@@ -155,7 +155,7 @@ describe("LocalReviewStore", () => {
     const current = envelope("current-after-upgrade");
     await expect(store.save(current)).resolves.toBe(true);
     await expect(store.list()).resolves.toMatchObject([
-      { envelope: { engine_version: "1.3.0rc1", review_id: current.review_id } },
+      { envelope: { engine_version: "1.3.0rc2", review_id: current.review_id } },
       { envelope: { engine_version: "1.1.1", review_id: legacyEnvelope111.review_id } },
       { envelope: { engine_version: "1.1.0", review_id: legacyEnvelope110.review_id } },
     ]);

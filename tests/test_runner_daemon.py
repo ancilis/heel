@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1249,8 +1250,10 @@ def test_cli_paths_cannot_select_an_in_memory_backend_or_a_ca_bundle():
         source = inspect.getsource(function)
         assert "RunnerDaemon()" in source
         assert "ca_bundle" not in source and "secret_backend" not in source
+        assert "vault_factory" not in source and "target_network" not in source
     default = RunnerDaemon()
     assert default._secret_backend is None and default._ca_bundle is None
+    assert default._vault_factory is None and default._target_network is None
     for module in (daemon_module, control_transport):
         source = inspect.getsource(module)
         assert "os.environ" not in source and "getenv" not in source
@@ -1911,10 +1914,11 @@ def test_serve_keeps_the_instance_lock_until_its_own_cycle_workers_have_ended(tm
     assert outcome_b["result"]["state"] == "stopped", outcome_b
 
 
-def test_serve_exits_execution_unavailable_closed_without_traffic_or_traceback(monkeypatch):
-    """Unit (mock coordinator): any lease is refused before the heartbeat worker starts. A real
-    legacy catalog lease over HTTP is T4a's ``test_serve_refuses_a_catalog_projection_lease_…``."""
-    from heel.runner.service import ClaimLease, RunnerService
+def test_serve_exits_execution_unavailable_for_an_undecodable_claim_without_traffic_or_traceback(monkeypatch):
+    """Unit (mock coordinator): a claim that was recorded but cannot be decoded locally is refused
+    before the heartbeat worker starts and before the executor. A real legacy catalog lease over
+    HTTP is ``test_a_superseded_job_claim_then_claims_an_existing_grant_exactly_once``."""
+    from heel.runner.service import RunnerService
 
     calls: list[str] = []
 
@@ -1926,9 +1930,8 @@ def test_serve_exits_execution_unavailable_closed_without_traffic_or_traceback(m
             return list(self.active)
 
     class Coordinator:
-        def __init__(self, lease=None, record_then_fail=False):
+        def __init__(self):
             self.control = type("Control", (), {"runtime": Runtime()})()
-            self.lease, self.record_then_fail = lease, record_then_fail
 
         def ensure_runner_context(self):
             calls.append("ensure")
@@ -1936,10 +1939,8 @@ def test_serve_exits_execution_unavailable_closed_without_traffic_or_traceback(m
 
         def claim(self):
             calls.append("claim")
-            if self.record_then_fail:
-                self.control.runtime.active.append(type("Active", (), {"run_id": "crun_" + "a" * 32})())
-                raise RunnerStoreError("local approved pair is unavailable")
-            return self.lease
+            self.control.runtime.active.append(type("Active", (), {"run_id": "crun_" + "a" * 32})())
+            raise RunnerStoreError("local approved pair is unavailable")
 
         def __getattr__(self, name):
             def forbidden(*_args, **_kwargs):
@@ -1947,19 +1948,20 @@ def test_serve_exits_execution_unavailable_closed_without_traffic_or_traceback(m
                 raise AssertionError(f"{name} must not be called")
             return forbidden
 
-    lease = ClaimLease("crun_" + "b" * 32, object(), {"schema_version": "x"})
-    for coordinator in (Coordinator(lease=lease), Coordinator(record_then_fail=True)):
-        calls.clear()
-        contacts: list[int] = []
-        service = RunnerService(
-            coordinator=daemon_module._ServeCoordinator(coordinator, lambda: contacts.append(1)),
-            executor=daemon_module._ExecutionUnavailable(),
-        )
-        with pytest.raises(daemon_module.RunnerServeError) as refused:
-            service.run_once()
-        assert refused.value.code == "execution_unavailable"
-        assert calls == ["ensure", "claim"]  # no heartbeat, progress, result or stop-ack
-        assert daemon_module._serve_failure(refused.value) == ("failed", "execution_unavailable")
+    class ForbiddenExecutor:
+        def execute(self, *_args, **_kwargs):
+            raise AssertionError("an undecodable claim never reaches execution")
+
+    contacts: list[int] = []
+    service = RunnerService(
+        coordinator=daemon_module._ServeCoordinator(Coordinator(), lambda: contacts.append(1)),
+        executor=ForbiddenExecutor(),
+    )
+    with pytest.raises(daemon_module.RunnerServeError) as refused:
+        service.run_once()
+    assert refused.value.code == "execution_unavailable"
+    assert calls == ["ensure", "claim"]  # no heartbeat, progress, result or stop-ack
+    assert daemon_module._serve_failure(refused.value) == ("failed", "execution_unavailable")
     # A claim that fails without recording a run keeps its own failure.
     plain = Coordinator()
     plain.claim = lambda: (_ for _ in ()).throw(ValueError("invalid runner claim response"))
@@ -1970,6 +1972,710 @@ def test_serve_exits_execution_unavailable_closed_without_traffic_or_traceback(m
         raise daemon_module.RunnerServeError("execution_unavailable")
     monkeypatch.setattr(daemon_module.RunnerDaemon, "serve", refuse)
     assert _invoke("runner", "serve") == (2, "", "Heel runner serve stopped: execution_unavailable.\n")
+
+
+# ---------------------------------------------------------------------------
+# Optional local execution bridge (synthetic/local evidence only). Real: RunnerStore, compiled
+# approved pair, RunnerControlClient + RunnerRuntimeState, RunnerCoordinator, the serve owner and
+# executor composition, RunnerService, LocalCanaryExecutor and TargetHTTPSClient. Seams (labelled):
+# BRIDGE-CONTROL (a scripted control transport answering the closed control routes), BRIDGE-VAULT
+# (an OS-backend-shaped vault double returned through the vault factory), BRIDGE-NETWORK (the
+# resolver/socket/TLS collaborators of TargetHTTPSClient). Every clock is the real, advancing wall
+# clock. No deployed or customer target is used.
+
+_BRIDGE_TOKENS = {
+    "authenticated": "synthetic-bridge-token-authenticated",
+    "object_owner": "synthetic-bridge-token-object-owner",
+    "non_owner": "synthetic-bridge-token-non-owner",
+}
+
+
+class _BridgeVault:
+    """BRIDGE-VAULT: an OS-backend-shaped vault double holding repository-owned synthetic tokens."""
+
+    supported = True
+
+    def __init__(self, backend_id, tokens):
+        self.backend_id, self.tokens, self.loads = backend_id, tokens, []
+
+    def load(self, handle_id):
+        self.loads.append(handle_id)
+        return self.tokens[handle_id].encode("ascii")
+
+
+class _BridgeControl:
+    """BRIDGE-CONTROL: answers the closed claim/heartbeat/progress/result/stop-ack routes."""
+
+    def __init__(self, manifest, projection, grant, *, stop_gate=None, stop_when=None, claim_gate=None):
+        from tests.test_runner_coordinator import _claim
+
+        self.claim = _claim(manifest, projection, grant)
+        server_ms = int(time.time() * 1000)
+        self.claim["gate"] = claim_gate or self._gate(server_ms)
+        self.server_ms = server_ms
+        self.projection, self.grant = projection, grant
+        self.stop_gate, self.stop_when = stop_gate, stop_when
+        self.requests: list[tuple[str, bytes]] = []
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _gate(server_ms, **changes):
+        return {
+            "active": True, "runner_state": "active", "proof_state": "valid",
+            "proof_expires_at_ms": server_ms + 60_000, "kill_switch_generation": 7,
+            "stop_reason": "none", "server_time_ms": server_ms, **changes,
+        }
+
+    def _status(self, status):
+        from tests.test_runner_coordinator import _status
+
+        return _status(self.grant["run_id"], approval_id=self.projection["projection_id"],
+                       grant_id=self.grant["grant_id"], status=status)
+
+    def operations(self):
+        with self._lock:
+            return [path.rsplit("/", 1)[1] for path, _ in self.requests]
+
+    def bodies(self, operation):
+        with self._lock:
+            return [json.loads(body)["operational_projection"] for path, body in self.requests
+                    if path.endswith("/" + operation)]
+
+    def post(self, path, *, headers, body):
+        del headers
+        with self._lock:
+            self.requests.append((path, body))
+            self.server_ms += 1
+            server_ms = self.server_ms
+        nonce = {"X-Heel-Runner-Next-Nonce": base64.b64encode(os.urandom(32)).decode("ascii")}
+        operation = path.rsplit("/", 1)[1]
+        if operation == "claim":
+            return 200, nonce, self.claim
+        if operation == "heartbeat":
+            if self.stop_gate is not None and (self.stop_when is None or self.stop_when()):
+                return 200, nonce, self._gate(server_ms, **self.stop_gate)
+            return 200, nonce, self._gate(server_ms)
+        if operation == "progress":
+            return 200, nonce, self._status("running")
+        if operation == "result":
+            return 200, nonce, self._status("terminal")
+        if operation == "stop-ack":
+            return 200, nonce, {"accepted": True, "deadline_met": True, "late": False}
+        raise AssertionError(path)
+
+
+def _bridge(tmp_path, *, backend="macos_keychain", ephemeral=False, monotonic=time.monotonic, **control):
+    """A context-bound store with an approved pair whose three credentials live in ``backend``."""
+    from heel.crypto import SigningAuthority as Authority
+    from heel.runner.control_client import RunnerControlClient
+    from heel.runner.coordinator import RunnerCoordinator
+    from heel.runner.runtime import RunnerRuntimeState
+    from tests.test_runner_compiler import CanaryCompiler, bound_store, map_scenarios
+    from tests.test_runner_stop import signed_grant
+
+    store, identity, signer = bound_store(tmp_path)
+    map_scenarios(store)
+    now = int(time.time() * 1000)
+    clock = lambda: int(time.time() * 1000)  # the real wall clock
+    tokens = {}
+    for role, token in _BRIDGE_TOKENS.items():
+        if ephemeral:
+            record = store.register_ephemeral_credential(
+                semantic_role=role, auth_profile="bearer", source_kind="environment", label=f"local {role}",
+            )
+        else:
+            record = store.reserve_os_credential(
+                semantic_role=role, auth_profile="bearer", label=f"local {role}", backend=backend,
+            )
+            store.activate_credential(record["credential_handle_id"])
+        tokens[record["credential_handle_id"]] = token
+    compiled = CanaryCompiler(store=store, identity=identity, signer=signer, now_ms=1_000).compile(
+        ["anonymous_authenticated_read", "object_ownership_read"],
+    )
+    authority = Authority.generate()
+    grant = signed_grant(compiled.manifest, compiled.projection, identity, authority,
+                         issued=now - 1_000, expires=now + 300_000)
+    scripted = _BridgeControl(compiled.manifest, compiled.projection, grant, **control)
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    runtime.install_chain(operation="claim", run_id=None,
+                          next_nonce_b64=base64.b64encode(b"c" * 32).decode("ascii"),
+                          next_sequence=1, generation=0, now_ms=0)
+    trusted = {authority.key_id: authority.public_key}
+    client = RunnerControlClient(
+        origin="https://control.example", workspace_id=identity.workspace_id,
+        runner_id=identity.runner_id, signer=signer, clock=clock,
+        transport=scripted, nonce_source=lambda _key: base64.b64encode(os.urandom(32)).decode("ascii"),
+        trusted_disclosure_keys=trusted, runtime=runtime,
+    )
+    coordinator = RunnerCoordinator(
+        control=client, store=store, identity=identity, signer=signer, trusted_grant_keys=trusted,
+        clock_ms=clock, monotonic=monotonic,
+    )
+    vault = _BridgeVault(backend, tokens)
+    factory_calls: list[str] = []
+
+    def vault_factory(kind):
+        factory_calls.append(kind)
+        return vault
+
+    return SimpleNamespace(
+        store=store, coordinator=coordinator, control=scripted, grant=grant, vault=vault,
+        vault_factory=vault_factory, factory_calls=factory_calls, runtime=runtime,
+        manifest=compiled.manifest, clock=clock,
+    )
+
+
+def _bridge_service(bridge, network):
+    from heel.runner.service import RunnerService
+
+    owner = daemon_module._ServeCoordinator(bridge.coordinator, lambda: None)
+    execution = daemon_module._ServeExecution(
+        bridge.coordinator, clock_ms=bridge.clock,
+        vault_factory=bridge.vault_factory, target_network=network,
+    )
+    return owner, RunnerService(
+        coordinator=owner, executor=execution, heartbeat_interval=0.05, clock_ms=bridge.clock,
+    )
+
+
+def _target_answers():
+    from tests.test_runner_http_transport import response
+
+    head = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Type: application/json\r\n\r\n"
+    return [head, head, response(200, b'{"id":"canary-a-item-0137"}'), response(403, b'{"error":"forbidden"}')]
+
+
+def _assert_terminal_evidence(bridge, disposition, *, error_category="none", evidence_count=0):
+    run_id = bridge.grant["run_id"]
+    assert bridge.store.load_run(run_id)["state"] == "terminal"  # real local reservation, finalized
+    finals = bridge.store.load_final_projections(run_id)
+    operational = finals["operational_projection"]
+    assert (operational["execution_disposition"], operational["error_category"]) == (disposition, error_category)
+    refs = [ref for item in finals["findings_projection"]["scenario_results"] for ref in item["local_evidence_refs"]]
+    assert len(refs) == evidence_count
+    (result,) = bridge.control.bodies("result")
+    assert result["projection_digest"] == operational["projection_digest"]
+    assert result["lifecycle_phase"] == "terminal"
+    return finals, refs
+
+
+def _assert_no_secret_left_the_target(bridge):
+    sent = b"".join(body for _path, body in bridge.control.requests)
+    finals = canonical_bytes(bridge.store.load_final_projections(bridge.grant["run_id"]))
+    for token in _BRIDGE_TOKENS.values():
+        assert token.encode() not in sent and token.encode() not in finals
+
+
+def test_serve_execution_bridge_runs_a_signed_lease_through_the_real_target_client(tmp_path):
+    from tests.test_runner_http_transport import PUBLIC, TLS, Resolver, Sockets, TLSSocket
+
+    bridge = _bridge(tmp_path)
+    resolver = Resolver([[PUBLIC]])
+    tls_sockets = [TLSSocket(answer) for answer in _target_answers()]
+    sockets = Sockets(tls_sockets)
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    assert service.run_once() is True
+    owner.close()
+    # One preflight plus one recheck per attempt, all for the signed manifest origin's host only.
+    assert [call[0] for call in resolver.calls] == ["staging.acme.dev"] * 5
+    assert [call[0] for call in sockets.calls] == [(PUBLIC, 443)] * 4
+    requests = [b"".join(item.sent) for item in tls_sockets]
+    assert [line.split(b"\r\n", 1)[0] for line in requests] == [
+        b"HEAD /health HTTP/1.1", b"HEAD /health HTTP/1.1",
+        b"GET /items/canary-a-item-0137 HTTP/1.1", b"GET /items/canary-a-item-0137 HTTP/1.1",
+    ]
+    assert b"Authorization" not in requests[0]
+    assert b"Bearer synthetic-bridge-token-authenticated" in requests[1]
+    assert b"Bearer synthetic-bridge-token-object-owner" in requests[2]
+    assert b"Bearer synthetic-bridge-token-non-owner" in requests[3]
+    assert sorted(bridge.vault.loads) == sorted(bridge.vault.tokens)
+    assert bridge.factory_calls == ["macos_keychain"]
+    _, refs = _assert_terminal_evidence(bridge, "completed", evidence_count=4)
+    stored = [bridge.store.load_response_evidence(bridge.grant["run_id"], ref, now_ms=bridge.clock())
+              for ref in refs]  # random references: compare as a multiset, not by position
+    assert sorted(body for _headers, body in stored) == [
+        b"", b"", b'{"error":"forbidden"}', b'{"id":"canary-a-item-0137"}',
+    ]
+    assert all(b"Content-Length" in headers for headers, _body in stored)
+    operations = bridge.control.operations()
+    assert operations[0] == "claim" and operations[-1] == "result" and operations.count("result") == 1
+    assert "progress" in operations and "stop-ack" not in operations
+    _assert_no_secret_left_the_target(bridge)
+    with pytest.raises(daemon_module.RunnerServeError):
+        owner.heartbeat(bridge.grant["run_id"], {})  # the closed owner refuses every later call
+
+
+def test_serve_execution_bridge_reaches_an_owned_loopback_https_target(tmp_path):
+    """BRIDGE-NETWORK with real bytes: a real TLS listener on 127.0.0.1 holding a certificate for
+    the manifest host. The seam maps the pinned public address to that listener and reports the
+    pinned address as the peer; TLS verification of the manifest host name is real."""
+    from tests.test_runner_http_transport import PUBLIC
+
+    ca = EphemeralCA(tmp_path / "target-ca", names=("staging.acme.dev",))
+    context = ca.server_context()
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    port = listener.getsockname()[1]
+    received: list[bytes] = []
+    answers = list(_target_answers())
+
+    def serve_target():
+        for answer in answers:
+            raw, _ = listener.accept()
+            with context.wrap_socket(raw, server_side=True) as connection:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                received.append(data)
+                connection.sendall(answer)
+
+    target = threading.Thread(target=serve_target, daemon=True)
+    target.start()
+
+    class LoopbackDial:
+        def connect(self, address, timeout, cancellation):
+            assert address == (PUBLIC, 443)
+            raw = socket.create_connection(("127.0.0.1", port), timeout)
+            cancellation.register(raw)
+            return raw
+
+    class PinnedPeer:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def getpeername(self):
+            return (PUBLIC, 443)
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+    class VerifyingTLS:
+        def __init__(self):
+            self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            self.context.minimum_version = ssl.TLSVersion.TLSv1_2
+            self.context.load_verify_locations(ca.ca_path)
+
+        def wrap(self, raw, hostname, timeout):
+            raw.settimeout(timeout)
+            wrapped = self.context.wrap_socket(raw, server_hostname=hostname)
+            wrapped.settimeout(timeout)
+            return PinnedPeer(wrapped)
+
+    bridge = _bridge(tmp_path)
+    owner, service = _bridge_service(bridge, {
+        "resolver": lambda hostname, *, deadline: [PUBLIC], "sockets": LoopbackDial(), "tls": VerifyingTLS(),
+    })
+    try:
+        assert service.run_once() is True
+    finally:
+        owner.close()
+        listener.close()
+    target.join(5)
+    assert [item.split(b"\r\n", 1)[0] for item in received] == [
+        b"HEAD /health HTTP/1.1", b"HEAD /health HTTP/1.1",
+        b"GET /items/canary-a-item-0137 HTTP/1.1", b"GET /items/canary-a-item-0137 HTTP/1.1",
+    ]
+    assert all(b"\r\nHost: staging.acme.dev\r\n" in item for item in received)
+    assert b"Bearer synthetic-bridge-token-non-owner" in received[3]
+    _assert_terminal_evidence(bridge, "completed", evidence_count=4)
+    _assert_no_secret_left_the_target(bridge)
+
+
+def test_serve_execution_bridge_refuses_a_changed_dns_set_before_any_target_socket(tmp_path):
+    from tests.test_runner_http_transport import PUBLIC, TLS, Resolver, Sockets
+
+    bridge = _bridge(tmp_path)
+    resolver = Resolver([[PUBLIC], ["93.184.216.35"]])
+    sockets = Sockets([])
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    assert service.run_once() is True
+    owner.close()
+    assert len(resolver.calls) >= 2 and sockets.calls == []
+    finals, _ = _assert_terminal_evidence(bridge, "incomplete", error_category="dns_changed")
+    assert "dns_changed" in finals["operational_projection"]["containment_codes"]
+
+
+@pytest.mark.parametrize("stop_gate, reason", [
+    ({"stop_reason": "cloud_stop"}, "cloud_stop"),
+    ({"runner_state": "revoked"}, "runner_revoked"),
+])
+def test_serve_execution_bridge_stop_or_revocation_cancels_the_target_and_acknowledges(tmp_path, stop_gate, reason):
+    from tests.test_runner_http_transport import PUBLIC, TLS, Resolver, Sockets, TLSSocket
+
+    class HeldSocket(TLSSocket):
+        """The first target read blocks until cancellation closes the socket."""
+
+        def close(self):
+            super().close()
+            self.block.set()
+
+    held = HeldSocket(_target_answers()[0], block=threading.Event())
+    sockets = Sockets([held])
+    bridge = _bridge(tmp_path, stop_gate=stop_gate, stop_when=held.sent_event.is_set)
+    owner, service = _bridge_service(bridge, {
+        "resolver": Resolver([[PUBLIC]]), "sockets": sockets, "tls": TLS(sockets),
+    })
+    started = time.monotonic()
+    assert service.run_once() is True
+    owner.close()
+    assert time.monotonic() - started < 5.0
+    assert len(sockets.calls) == 1 and held.closed  # the in-flight socket was cancelled, no other
+    (ack,) = bridge.control.bodies("stop-ack")
+    assert (ack["lifecycle_phase"], ack["stop_reason"]) == ("stop_requested", reason)
+    assert ack["timestamps"]["stop_acknowledged_at_ms"] is not None
+    finals, _ = _assert_terminal_evidence(
+        bridge, "stopped", error_category="runner_fault" if reason == "runner_revoked" else "none",
+    )
+    assert finals["operational_projection"]["stop_reason"] == reason
+
+
+@pytest.mark.parametrize("case", ["stale-gate", "revoked-gate", "ephemeral-credential", "vault-unavailable"])
+def test_serve_execution_bridge_refuses_before_transport_secrets_or_reservation(tmp_path, case):
+    from heel.runner.http_transport import CancellationToken
+    from heel.runner.vault import VaultUnavailable
+    from tests.test_runner_http_transport import PUBLIC, TLS, Resolver, Sockets
+
+    now = [time.monotonic()]
+    bridge = _bridge(
+        tmp_path, ephemeral=case == "ephemeral-credential", monotonic=lambda: now[0],
+        claim_gate=_BridgeControl._gate(int(time.time() * 1000), runner_state="revoked") if case == "revoked-gate" else None,
+    )
+    resolver = Resolver([[PUBLIC]])
+    sockets = Sockets([])
+    if case == "vault-unavailable":
+        def unavailable(kind):
+            bridge.factory_calls.append(kind)
+            raise VaultUnavailable("secure credential vault unavailable on this platform")
+        bridge.vault_factory = unavailable
+    try:
+        lease = bridge.coordinator.claim()
+    except ValueError:
+        assert case == "revoked-gate"  # the claim itself refuses a gate that denies execution
+        lease = None
+    execution = daemon_module._ServeExecution(
+        bridge.coordinator, clock_ms=bridge.clock,
+        vault_factory=bridge.vault_factory, target_network={"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)},
+    )
+    if lease is not None:
+        if case == "stale-gate":
+            now[0] += 0.501
+        with pytest.raises(Exception) as refused:
+            execution.execute(lease, cancellation=CancellationToken(), on_progress=lambda _value: None)
+        expected = {
+            "stale-gate": ("failed", "response_rejected"),
+            "ephemeral-credential": ("failed", "credential_unavailable"),
+            "vault-unavailable": ("failed", "credential_unavailable"),
+        }[case]
+        assert daemon_module._serve_failure(refused.value) == expected
+    assert sockets.calls == [] and bridge.vault.loads == [] and resolver.calls == []
+    # Constructing an OS vault object loads nothing; no vault is built for env/fd handles.
+    assert bridge.factory_calls == ([] if lease is None or case == "ephemeral-credential" else ["macos_keychain"])
+    with pytest.raises(RunnerStoreError):
+        bridge.store.load_run(bridge.grant["run_id"])  # no local reservation: the grant is unconsumed
+    assert [op for op in bridge.control.operations() if op != "claim"] == []
+
+
+def test_serve_execution_bridge_dns_preflight_failure_finalizes_the_activated_run_with_zero_requests(tmp_path):
+    """DNS runs only after durable local activation, so a preflight resolution failure is this
+    run's outcome: reserved once, finalized ``incomplete``/``target_unavailable`` with zero
+    requests and no secret load, and reported by one terminal result. The Cloud refunds a
+    zero-request terminal (``test_canary_quota.py::test_zero_request_terminal_refunds_reserved_unit``)."""
+    from heel.runner.http_transport import TransportFailure
+    from tests.test_runner_http_transport import TLS, Resolver, Sockets
+
+    bridge = _bridge(tmp_path)
+    resolver = Resolver([TransportFailure("unsafe_dns")])
+    sockets = Sockets([])
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    assert service.run_once() is True
+    owner.close()
+    assert [call[0] for call in resolver.calls] == ["staging.acme.dev"]
+    assert sockets.calls == [] and bridge.vault.loads == []
+    finals, _ = _assert_terminal_evidence(bridge, "incomplete", error_category="target_unavailable")
+    operational = finals["operational_projection"]
+    assert operational["counters"]["requests_started"] == 0
+    assert operational["stop_reason"] == "none"
+    assert "stop-ack" not in bridge.control.operations()
+    with pytest.raises((ValueError, RunnerStoreError), match="already consumed|reservation is unavailable"):
+        bridge.store.reserve_run(bridge.grant, retention_expires_at_ms=bridge.clock() + 60_000)  # one-shot
+
+
+class _HeldResolver:
+    """The transport factory's DNS preflight blocks until released; it reports its entry."""
+
+    def __init__(self):
+        from tests.test_runner_http_transport import PUBLIC
+
+        self.public = PUBLIC
+        self.entered, self.release, self.calls = threading.Event(), threading.Event(), []
+
+    def __call__(self, hostname, *, deadline):
+        self.calls.append(hostname)
+        self.entered.set()
+        assert self.release.wait(10), "held resolver was never released"
+        return [self.public]
+
+
+def _record_thread_errors(monkeypatch):
+    errors = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: errors.append(args.exc_value))
+    return errors
+
+
+def _held_factory_run(tmp_path, monkeypatch, *, stop, stop_gate=None, **control):
+    """Run one bridge lease whose factory is held in DNS until the stop controller settles."""
+    from tests.test_runner_http_transport import TLS, Sockets, TLSSocket
+
+    errors = _record_thread_errors(monkeypatch)
+    resolver = _HeldResolver()
+    tls_sockets = [TLSSocket(answer) for answer in _target_answers()]
+    sockets = Sockets(tls_sockets)
+    bridge = _bridge(tmp_path, stop_gate=stop_gate, stop_when=resolver.entered.is_set, **control)
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    outcome = {}
+
+    def run():
+        try:
+            outcome["claimed"] = service.run_once()
+        except BaseException as exc:  # recorded, asserted below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert resolver.entered.wait(10)
+    if stop == "local":
+        assert service.request_local_stop() is True
+    deadline = time.monotonic() + 10
+    while service._active_stop_controller is None or not service._active_stop_controller.completed.is_set():
+        assert time.monotonic() < deadline, "stop controller did not settle while DNS was held"
+        time.sleep(0.01)
+    controller = service._active_stop_controller
+    operations_while_held = bridge.control.operations()
+    resolver.release.set()
+    worker.join(10)
+    owner.close()
+    assert not worker.is_alive()
+    return SimpleNamespace(
+        bridge=bridge, resolver=resolver, sockets=sockets, outcome=outcome, errors=errors,
+        controller=controller, operations_while_held=operations_while_held,
+    )
+
+
+@pytest.mark.parametrize("stop, stop_gate, reason, error_category", [
+    ("cloud", {"stop_reason": "cloud_stop"}, "cloud_stop", "none"),
+    ("cloud", {"runner_state": "revoked"}, "runner_revoked", "runner_fault"),
+    ("cloud", {"proof_state": "revoked"}, "target_revoked", "proof_expired"),
+    ("cloud", {"active": False}, "kill_switch", "none"),
+    ("local", None, "local_emergency_stop", "none"),
+])
+def test_stop_while_lazy_factory_blocks_acknowledges_before_credentials_or_target(
+    tmp_path, monkeypatch, stop, stop_gate, reason, error_category,
+):
+    """The original race: a stop while the factory is held in DNS. The run is already locally
+    activated, so exactly one signed acknowledgement goes out while DNS is still blocked; after
+    release no secret is loaded and no target socket opens, no worker raises, and the only result
+    is the stopped terminal that the accepted acknowledgement anchors."""
+    held = _held_factory_run(tmp_path, monkeypatch, stop=stop, stop_gate=stop_gate)
+    bridge = held.bridge
+    assert held.outcome == {"claimed": True} and held.errors == []
+    assert held.controller.outcome == "acknowledged"
+    assert "stop-ack" in held.operations_while_held and "result" not in held.operations_while_held
+    assert bridge.vault.loads == [] and held.sockets.calls == []
+    assert held.resolver.calls == ["staging.acme.dev"]  # the one preflight; no attempt re-resolve
+    (ack,) = bridge.control.bodies("stop-ack")
+    assert (ack["lifecycle_phase"], ack["stop_reason"]) == ("stop_requested", reason)
+    assert ack["counters"]["requests_started"] == 0
+    assert ack["timestamps"]["stop_acknowledged_at_ms"] is not None
+    finals, _ = _assert_terminal_evidence(bridge, "stopped", error_category=error_category)
+    operational = finals["operational_projection"]
+    assert operational["stop_reason"] == reason and operational["counters"]["requests_started"] == 0
+    assert operational["timestamps"]["stop_acknowledged_at_ms"] == ack["timestamps"]["stop_acknowledged_at_ms"]
+    assert bridge.control.operations().count("stop-ack") == 1
+    _assert_no_secret_left_the_target(bridge)
+
+
+def _fresh_coordinator(bridge):
+    """What the next serve cycle builds: a new client and coordinator over the same store/runtime."""
+    from heel.runner.control_client import RunnerControlClient
+    from heel.runner.coordinator import RunnerCoordinator
+
+    old = bridge.coordinator
+    client = RunnerControlClient(
+        origin="https://control.example", workspace_id=old.identity.workspace_id,
+        runner_id=old.identity.runner_id, signer=old.signer, clock=bridge.clock,
+        transport=bridge.control, nonce_source=lambda _key: base64.b64encode(os.urandom(32)).decode("ascii"),
+        trusted_disclosure_keys=dict(old.trusted_grant_keys), runtime=bridge.runtime,
+    )
+    return RunnerCoordinator(
+        control=client, store=old.store, identity=old.identity, signer=old.signer,
+        trusted_grant_keys=dict(old.trusted_grant_keys), clock_ms=bridge.clock,
+    )
+
+
+@pytest.mark.parametrize("failure", ["rejected", "late"])
+def test_failed_or_late_ack_during_held_factory_sends_one_null_ack_stopped_result(tmp_path, monkeypatch, failure):
+    """An unestablished acknowledgement (reset before the Cloud saw it, or an answer after the
+    deadline) is followed by exactly one stopped terminal with a null acknowledgement timestamp,
+    never a completed result. A fresh coordinator over the same store/runtime then rehydrates with
+    no factory, DNS, vault load or target socket. This scripted control does not model Cloud ack
+    acceptance; the accepted-remote conflict is proven over real HTTP in test_runner_control_http."""
+    jump = [0.0]
+
+    class FailingAckControl(_BridgeControl):
+        def post(self, path, *, headers, body):
+            if path.endswith("/stop-ack"):
+                if failure == "rejected":
+                    with self._lock:
+                        self.requests.append((path, body))
+                    raise ConnectionResetError("synthetic control plane reset")
+                jump[0] = 30.0  # the answer arrives after the bounded deadline
+            return super().post(path, headers=headers, body=body)
+
+    monkeypatch.setattr(sys.modules[__name__], "_BridgeControl", FailingAckControl)
+    held = _held_factory_run(
+        tmp_path, monkeypatch, stop="cloud", stop_gate={"stop_reason": "cloud_stop"},
+        monotonic=lambda: time.monotonic() + jump[0],
+    )
+    bridge = held.bridge
+    assert held.errors == [] and held.controller.outcome == "unacknowledged"
+    assert "error" not in held.outcome
+    assert bridge.vault.loads == [] and held.sockets.calls == []
+    operations = bridge.control.operations()
+    assert operations.count("stop-ack") == 1 and operations.count("result") == 1
+    assert operations.index("stop-ack") < operations.index("result")
+    run_id = bridge.grant["run_id"]
+    finals, _ = _assert_terminal_evidence(bridge, "stopped")
+    operational = finals["operational_projection"]
+    assert operational["stop_reason"] == "cloud_stop"
+    assert operational["timestamps"]["stop_acknowledged_at_ms"] is None
+    assert operational["counters"]["requests_started"] == 0
+    jump[0] = 0.0
+    before = list(operations)
+    fresh = _fresh_coordinator(bridge)
+    assert bridge.runtime.load_active_run_controls(limit=64) == ()  # the runtime row is retired
+    assert run_id not in fresh._bindings
+    assert bridge.store.load_run(run_id)["state"] == "terminal"
+    assert bridge.vault.loads == [] and held.sockets.calls == [] and held.resolver.calls == ["staging.acme.dev"]
+    assert bridge.control.operations() == before  # restart replays nothing to the control plane
+
+
+def test_accepted_remote_ack_with_a_lost_answer_fails_closed_on_the_null_ack_result_without_replay(
+    tmp_path, monkeypatch,
+):
+    """Accepted-remote, lost-response: the Cloud accepted the acknowledgement, but its answer came
+    after the deadline, so acceptance was never established and the runner sends the null-ack
+    stopped terminal. The Cloud refuses it as it does over real HTTP (409 ``canary_state_conflict``,
+    no next nonce; test_runner_control_http). This records the actual state rather than forcing
+    acceptance: the result call fails closed, its exact request stays staged behind the registered
+    local terminal, and a fresh coordinator refuses to rehydrate the stop-gated run. Nothing
+    replays the factory, DNS, a vault load or a target socket. Reconciling it is separate work."""
+    jump = [0.0]
+
+    class LateAckConflictControl(_BridgeControl):
+        def post(self, path, *, headers, body):
+            if path.endswith("/stop-ack"):
+                jump[0] = 30.0  # accepted by the Cloud; the answer lands after the deadline
+            if path.endswith("/result"):
+                with self._lock:
+                    self.requests.append((path, body))
+                return 409, {}, {"schema_version": "heel.canary-error.v1", "code": "canary_state_conflict"}
+            return super().post(path, headers=headers, body=body)
+
+    monkeypatch.setattr(sys.modules[__name__], "_BridgeControl", LateAckConflictControl)
+    held = _held_factory_run(
+        tmp_path, monkeypatch, stop="cloud", stop_gate={"stop_reason": "cloud_stop"},
+        monotonic=lambda: time.monotonic() + jump[0],
+    )
+    bridge, run_id = held.bridge, held.bridge.grant["run_id"]
+    assert held.errors == [] and held.controller.outcome == "unacknowledged"
+    assert isinstance(held.outcome.get("error"), ValueError)  # the refused result, not swallowed
+    operations = bridge.control.operations()
+    assert operations.count("stop-ack") == 1 and operations.count("result") == 1
+    (sent,) = bridge.control.bodies("result")
+    assert (sent["execution_disposition"], sent["stop_reason"]) == ("stopped", "cloud_stop")
+    assert sent["timestamps"]["stop_acknowledged_at_ms"] is None  # never the unseen Cloud timestamp
+    assert bridge.store.load_run(run_id)["state"] == "terminal"
+    assert bridge.runtime.load_terminal_state(run_id).state == "local_terminal"
+    assert [(item.request_operation, item.run_id) for item in bridge.runtime.load_pending_calls(limit=74)] == [
+        ("result", run_id),
+    ]
+    jump[0] = 0.0
+    with pytest.raises(RunnerStoreError, match="runtime active grant authority is unavailable"):
+        _fresh_coordinator(bridge)
+    assert bridge.control.operations() == operations
+    assert bridge.vault.loads == [] and held.sockets.calls == [] and held.resolver.calls == ["staging.acme.dev"]
+
+
+def test_stop_known_before_local_activation_reserves_loads_and_dials_nothing(tmp_path, monkeypatch):
+    """A stop chosen before activation: no reservation, factory, DNS, vault load, socket,
+    acknowledgement or result, and no worker exception. The grant stays unconsumed locally."""
+    from tests.test_runner_http_transport import TLS, Resolver, Sockets
+
+    errors = _record_thread_errors(monkeypatch)
+    bridge = _bridge(tmp_path, stop_gate={"stop_reason": "cloud_stop"})
+    resolver = Resolver([])
+    sockets = Sockets([])
+    vault_factory, services = bridge.vault_factory, []
+
+    def held_vault_factory(kind):
+        # ``_ServeExecution.execute`` builds vault objects before the adapter; hold it there until
+        # the heartbeat's stop has been chosen and its controller has settled.
+        deadline = time.monotonic() + 10
+        while not services[0]._active_stop_controller.completed.is_set():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        services.append(services[0]._active_stop_controller.outcome)
+        return vault_factory(kind)
+
+    bridge.vault_factory = held_vault_factory
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    services.append(service)
+    assert service.run_once() is True
+    assert bridge.factory_calls == ["macos_keychain"]  # held there, before the adapter
+    owner.close()
+    assert errors == [] and services[1:] == ["not_active"]
+    assert resolver.calls == [] and sockets.calls == [] and bridge.vault.loads == []
+    with pytest.raises(RunnerStoreError):
+        bridge.store.load_run(bridge.grant["run_id"])
+    operations = bridge.control.operations()
+    assert "heartbeat" in operations and "stop-ack" not in operations and "result" not in operations
+
+
+def test_daemon_request_stop_during_held_factory_uses_the_local_stop_path(tmp_path, monkeypatch):
+    """SIGTERM and ``request_stop`` reach the active service through ``request_local_stop``: the
+    same activated-run acknowledgement, no secret load or socket after release."""
+    from tests.test_runner_http_transport import TLS, Sockets
+
+    errors = _record_thread_errors(monkeypatch)
+    resolver = _HeldResolver()
+    sockets = Sockets([])
+    bridge = _bridge(tmp_path)
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    daemon = RunnerDaemon(tmp_path / "home")
+    daemon._service = service
+    worker = threading.Thread(target=service.run_once)
+    worker.start()
+    assert resolver.entered.wait(10)
+    daemon.request_stop()
+    assert daemon._shutdown.is_set()
+    deadline = time.monotonic() + 10
+    while not service._active_stop_controller.completed.is_set():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert service._active_stop_controller.outcome == "acknowledged"
+    assert service.request_local_stop() is True  # a duplicate stop is absorbed, no second ack
+    resolver.release.set()
+    worker.join(10)
+    owner.close()
+    assert not worker.is_alive() and errors == []
+    assert bridge.vault.loads == [] and sockets.calls == []
+    (ack,) = bridge.control.bodies("stop-ack")
+    assert ack["stop_reason"] == "local_emergency_stop"
+    _assert_terminal_evidence(bridge, "stopped")
 
 
 def test_serve_failure_classification_is_attributed_to_the_failing_call(ca):

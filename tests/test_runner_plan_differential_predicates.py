@@ -20,6 +20,10 @@ MARKER = "heel-canary-export-0001"
 FULL = {"account_id": "acct", "rows": [{"id": "r1", "amount": 12.5}], "total": 1}
 SUBSET = {"account_id": "acct", "total": 0}
 ENVELOPE = {"error": "upgrade required"}
+# A message-only body: undecidable by its shape, never a non-error control.
+MESSAGE_ONLY = {"message": "upgrade required"}
+# A structured lower denial without the paid payload or any error/message envelope.
+EMPTY_DENIAL: dict = {}
 COMPLETED = ExecutorOutcome("completed", "inconclusive")
 
 
@@ -49,15 +53,20 @@ ROWS = [
     (3, observation(200, protected()), observation(200, protected()),
      {"marker": MARKER, "outcome": ExecutorOutcome("completed", "observed")},
      "finding", "verified", "marker_leak", "marker_present"),
-    (4, observation(403, ENVELOPE), observation(200, protected()),
+    (4, observation(403, EMPTY_DENIAL), observation(200, protected()),
      {"marker": MARKER, "outcome": ExecutorOutcome("completed", "blocked")},
      "held", None, "marker_leak", "marker_absent"),
     (5, observation(200, {"rows": [1]}), observation(200, protected()),
      {"marker": MARKER, "outcome": ExecutorOutcome("completed", "inconclusive")},
      "inconclusive", "inconclusive", "inconclusive", "marker_undetermined"),
+    (5, observation(403, ENVELOPE), observation(200, protected()),
+     {"marker": MARKER, "outcome": ExecutorOutcome("completed", "blocked")},
+     "inconclusive", "inconclusive", "inconclusive", "marker_undetermined"),
     (6, observation(200, FULL), observation(200, FULL), {},
      "finding", "observed", "body_superset", "lower_superset"),
-    (7, observation(403, ENVELOPE), observation(200, FULL), {},
+    (7, observation(403, EMPTY_DENIAL), observation(200, FULL), {},
+     "held", None, "status_parity", "lower_denied"),
+    (7, observation(403), observation(200, FULL), {},
      "held", None, "status_parity", "lower_denied"),
     (8, observation(200, SUBSET), observation(200, FULL), {},
      "inconclusive", "inconclusive", "status_parity", "lower_subset"),
@@ -66,6 +75,8 @@ ROWS = [
     (8, observation(200), observation(200), {"method": "HEAD"},
      "inconclusive", "inconclusive", "status_parity", "head_status_only"),
     (9, observation(200, ENVELOPE), observation(200, FULL), {},
+     "inconclusive", "inconclusive", "inconclusive", "lower_denial_envelope"),
+    (9, observation(403, ENVELOPE), observation(200, FULL), {},
      "inconclusive", "inconclusive", "inconclusive", "lower_denial_envelope"),
     (9, observation(500, {"detail": "boom"}), observation(200, FULL), {},
      "inconclusive", "inconclusive", "inconclusive", "unexpected_status"),
@@ -81,8 +92,13 @@ def test_r11_verdict_table_rows(row, lower, higher, keywords, verdict, state, pr
     assert (result.row, result.verdict, result.evidence_state, result.predicate, result.reason) == (
         row, verdict, state, predicate, reason,
     )
-    # A finding is stored for rows 2, 3, 5, 6, 8 and 9 only; never for row 1 or a held pair.
-    assert result.stores_finding is (row in {2, 3, 5, 6, 8, 9})
+    # A finding is stored for rows 3 and 6 only: a completed verified or observed finding.
+    # Never for row 1, a missing positive control (row 2), a held pair, an undetermined
+    # marker (row 5), status parity alone (row 8) or an undecided lower response (row 9).
+    assert result.stores_finding is (row in {3, 6})
+    assert result.stores_finding is (
+        result.verdict == "finding" and result.evidence_state in {"verified", "observed"}
+    )
     # `candidate` is true on row 8 and nowhere else.
     assert result.candidate is (row == 8)
     assert {case[0] for case in ROWS} == set(range(1, 10))
@@ -209,6 +225,7 @@ def test_r11_predicates_fail_closed(monkeypatch):
                                 assert (result.evidence_state == "observed") is (result.row == 6)
                                 assert (result.verdict == "held") is (result.row in {4, 7})
                                 assert result.candidate is (result.row == 8)
+                                assert result.stores_finding is (result.row in {3, 6})
                                 if result.row == 3:
                                     assert marker and method == "GET" and outcome == "observed"
                                 if result.row == 6:
@@ -237,18 +254,60 @@ def test_error_envelope_never_counts_as_parity():
             assert (result.verdict, result.evidence_state, result.reason, result.candidate) == (
                 "inconclusive", "inconclusive", "lower_denial_envelope", False,
             )
+            # Undetermined pairs keep their evidence but never become a stored finding.
+            assert result.stores_finding is False
         # The same envelope from the higher plan removes the positive control.
         assert evaluate(observation(200, FULL), observation(200, envelope)).row == 2
 
-    # Without a marker an envelope is never held; a 4xx status is.
-    assert evaluate(observation(403, ENVELOPE), observation(200, FULL)).verdict == "held"
-    # With a marker, a 2xx envelope that still discloses the marker is a verified leak.
-    leaked = evaluate(
-        observation(200, {**protected(), "error": "upgrade required"}),
-        observation(200, protected()), marker=MARKER,
-        outcome=ExecutorOutcome("completed", "observed"),
-    )
-    assert leaked.evidence_state == "verified"
+    # Without a marker an envelope is never held, at a 4xx status either; an empty 4xx
+    # object denial is.
+    for envelope in envelopes[:-1]:
+        for lower_status in sorted(plan_differential._DENIAL_STATUSES):
+            result = evaluate(observation(lower_status, envelope), observation(200, FULL))
+            assert (result.row, result.verdict, result.reason, result.stores_finding) == (
+                9, "inconclusive", "lower_denial_envelope", False,
+            ), (envelope, lower_status)
+            assert (result.status_parity, result.body_superset) == (False, None)
+    assert evaluate(observation(403, EMPTY_DENIAL), observation(200, FULL)).verdict == "held"
+    # With a marker, a 2xx envelope that also carries the marker is still an envelope: the
+    # content predicate is undetermined, so the pair is undecided, never a verified leak,
+    # whatever the executor reported.
+    for envelope in envelopes:
+        for lower_status in (200, 201, 204):
+            for outcome in ("observed", "blocked", "inconclusive"):
+                result = evaluate(
+                    observation(lower_status, {**envelope, **protected()}),
+                    observation(200, protected()), marker=MARKER,
+                    outcome=ExecutorOutcome("completed", outcome),
+                )
+                assert (result.row, result.verdict, result.reason, result.marker_leak) == (
+                    5, "inconclusive", "marker_undetermined", None,
+                ), (envelope, lower_status, outcome)
+    # The same at a non-2xx status: a marker-bearing error envelope is undecided, never a
+    # verified leak, and an error envelope without the marker is never held.
+    for envelope in envelopes:
+        for lower_status in (*sorted(plan_differential._DENIAL_STATUSES), 302, 500, 503):
+            for outcome in ("observed", "blocked", "inconclusive"):
+                for lower in ({**envelope, **protected()}, envelope):
+                    result = evaluate(
+                        observation(lower_status, lower), observation(200, protected()),
+                        marker=MARKER, outcome=ExecutorOutcome("completed", outcome),
+                    )
+                    assert (result.row, result.verdict, result.reason, result.marker_leak) == (
+                        5, "inconclusive", "marker_undetermined", None,
+                    ), (lower, lower_status, outcome)
+                    assert result.stores_finding is False
+    # A marker-bearing non-error 4xx body still discloses the marker; a non-error 4xx
+    # without it is held.
+    for lower in (protected(), {**protected(), "error": None}):
+        assert evaluate(
+            observation(403, lower), observation(200, protected()), marker=MARKER,
+            outcome=ExecutorOutcome("completed", "observed"),
+        ).evidence_state == "verified"
+    assert evaluate(
+        observation(403, EMPTY_DENIAL), observation(200, protected()), marker=MARKER,
+        outcome=ExecutorOutcome("completed", "blocked"),
+    ).verdict == "held"
 
     # Near-misses are not envelopes. Non-boolean spellings of the vocabulary are envelopes
     # (T3 D1) and are pinned in tests/test_runner_plan_differential_redteam.py.
@@ -257,6 +316,313 @@ def test_error_envelope_never_counts_as_parity():
         {"message": "upgrade"}, [], "error", None,
     ):
         assert is_denial_envelope(value) is False
+
+
+def test_identical_error_envelope_bytes_are_undecided_at_every_status_on_either_side():
+    # The adjudicated counterexample: the same recognized error bytes with the exact marker
+    # were undecided at 200 and a stored verified finding at 403. No status promotes them.
+    statuses = (200, 201, 204, 401, 402, 403, 404, 409, 429, 500, 503)
+    marked = (
+        {"error": "forbidden", **protected()},
+        {"data": {"forbidden": True}, **protected()},
+        {"errors": ["plan"], "ok": False, **protected()},
+        {"status": "PaymentRequired", **protected(), **FULL},
+    )
+    for body in marked:
+        raw = json.dumps(body).encode()
+        rows = set()
+        for status in statuses:
+            for outcome in ("observed", "blocked", "inconclusive"):
+                result = evaluate(
+                    observation(status, raw=raw), observation(200, protected()), marker=MARKER,
+                    outcome=ExecutorOutcome("completed", outcome),
+                )
+                rows.add((result.row, result.verdict, result.evidence_state, result.reason))
+                assert result.stores_finding is False and result.candidate is False
+                assert result.marker_leak is None
+        assert rows == {(5, "inconclusive", "inconclusive", "marker_undetermined")}, body
+
+    # The higher plan's error envelope removes the positive control at any status, with or
+    # without the marker or paid fields, and so does an envelope on both sides.
+    for body in marked + (ENVELOPE, {**ENVELOPE, **FULL}):
+        for status in statuses:
+            for marker in (None, MARKER):
+                for lower in (observation(200, {**FULL, **protected()}), observation(status, body)):
+                    result = evaluate(
+                        lower, observation(status, body), marker=marker,
+                        outcome=ExecutorOutcome("completed", "observed"),
+                    )
+                    assert (result.row, result.verdict, result.stores_finding) == (
+                        2, "inconclusive", False,
+                    ), (body, status, marker)
+                    assert result.positive_control is False
+
+    # Markerless: an error envelope beside the paid fields is never held or a finding.
+    for status in statuses:
+        result = evaluate(observation(status, {**ENVELOPE, **FULL}), observation(200, FULL))
+        assert result.verdict == "inconclusive" and result.stores_finding is False, status
+        assert result.reason in {
+            "lower_denial_envelope", "lower_denied_payload_present", "unexpected_status",
+        }
+
+    # Genuine non-error controls are unchanged: a clean marker disclosure is verified at 200
+    # and at a non-2xx status, and an incidental null error field is not an envelope.
+    for status in (200, 403, 500):
+        for lower in (protected(), {**protected(), "error": None}):
+            result = evaluate(
+                observation(status, lower), observation(200, protected()), marker=MARKER,
+                outcome=ExecutorOutcome("completed", "observed"),
+            )
+            assert (result.row, result.verdict, result.evidence_state, result.stores_finding) == (
+                3, "finding", "verified", True,
+            ), (status, lower)
+    assert evaluate(observation(200, FULL), observation(200, FULL)).row == 6
+
+
+def test_a_message_only_body_is_never_a_control_finding_held_or_pass_on_either_side():
+    from heel.runner.content_assertion import is_ambiguous_message
+
+    messages = (
+        MESSAGE_ONLY, {"message": "export requires the pro plan"}, {"message": "not found"},
+        {"message": "hello"}, {"Message": "hello"}, {"MESSAGE": "x"}, {"mes-sage": "x"},
+    )
+    statuses = (200, 401, 402, 403, 404, 500)
+    for body in messages:
+        assert is_ambiguous_message(body) and not is_denial_envelope(body)
+        # The shape allows only the exact protected_canary field beside the message.
+        for lower in (body, {**body, "protected_canary": MARKER}):
+            for status in statuses:
+                # Configured marker: undetermined, whatever the executor reported.
+                for outcome in ("observed", "blocked", "inconclusive"):
+                    result = evaluate(
+                        observation(status, lower), observation(200, protected()), marker=MARKER,
+                        outcome=ExecutorOutcome("completed", outcome),
+                    )
+                    assert (result.row, result.verdict, result.reason, result.marker_leak) == (
+                        5, "inconclusive", "marker_undetermined", None,
+                    ), (lower, status, outcome)
+                # No marker: never held, never a finding, never stored.
+                result = evaluate(observation(status, lower), observation(200, FULL))
+                assert result.verdict == "inconclusive" and result.stores_finding is False, (lower, status)
+                if status in plan_differential._DENIAL_STATUSES:
+                    assert (result.row, result.reason) == (9, "lower_denial_unassessable"), (lower, status)
+                # HEAD at the pure boundary is not held either.
+                if status in plan_differential._DENIAL_STATUSES:
+                    head = evaluate(observation(status, lower), observation(200, FULL), method="HEAD")
+                    assert (head.row, head.verdict, head.reason) == (9, "inconclusive", "lower_denial_unassessable")
+            # Higher plan, and both sides: no positive control at any status or marker path.
+            for status in statuses:
+                for marker in (None, MARKER):
+                    for other in (observation(200, {**FULL, **protected()}), observation(status, lower)):
+                        result = evaluate(
+                            other, observation(200, lower), marker=marker,
+                            outcome=ExecutorOutcome("completed", "observed"),
+                        )
+                        assert (result.row, result.verdict, result.positive_control) == (
+                            2, "inconclusive", False,
+                        ), (lower, status, marker)
+    # Outside the shape the content contract is unchanged: a message beside the marker and
+    # other protected output still discloses it.
+    result = evaluate(
+        observation(403, {**MESSAGE_ONLY, **protected()}), observation(200, protected()),
+        marker=MARKER, outcome=ExecutorOutcome("completed", "observed"),
+    )
+    assert (result.row, result.evidence_state) == (3, "verified")
+    # Genuine controls keep their outcomes: empty and structured denials are held, and a
+    # message beside other data is ordinary structured content.
+    for lower in (observation(403, raw=b""), observation(403, {}), observation(403, SUBSET),
+                  observation(403, {"message": "x", "total": 0})):
+        result = evaluate(lower, observation(200, FULL))
+        assert (result.row, result.verdict) == (7, "held"), lower
+    result = evaluate(
+        observation(403, {}), observation(200, protected()), marker=MARKER,
+        outcome=ExecutorOutcome("completed", "blocked"),
+    )
+    assert (result.row, result.verdict) == (4, "held")
+
+
+# --------------------------------------------------------------------------- #
+# A status-only repair: a lower denial status that still carries the paid payload
+# --------------------------------------------------------------------------- #
+DENIED_UNDECIDED = ("inconclusive", "inconclusive", "inconclusive", 9, False, False)
+
+
+def _denied_columns(result):
+    return (
+        result.verdict, result.evidence_state, result.predicate, result.row,
+        result.stores_finding, result.candidate,
+    )
+
+
+def test_status_only_repair_with_the_same_payload_is_never_held():
+    # The original read: the lower plan receives the higher plan's paid body (row 6).
+    original = evaluate(observation(200, FULL), observation(200, FULL))
+    assert (original.row, original.verdict, original.evidence_state, original.stores_finding) == (
+        6, "finding", "observed", True,
+    )
+    for status in sorted(plan_differential._DENIAL_STATUSES):
+        # Only the status changed, or an error field was added beside the same paid fields,
+        # or more was added: the payload is still there, so this is neither held nor a
+        # finding.
+        for lower in (FULL, {**FULL, "error": "upgrade required"}, {**FULL, "extra": [1]}):
+            result = evaluate(observation(status, lower), observation(200, FULL))
+            assert _denied_columns(result) == DENIED_UNDECIDED, (status, lower)
+            assert result.reason == "lower_denied_payload_present"
+            assert (result.positive_control, result.status_parity) == (True, False)
+            assert result.marker_leak is None
+        # An error envelope without the paid payload is undecided, never held.
+        for lower in (ENVELOPE, {"error": {"code": "plan", "message": "upgrade"}}, {"ok": False}):
+            result = evaluate(observation(status, lower), observation(200, FULL))
+            assert _denied_columns(result) == DENIED_UNDECIDED, (status, lower)
+            assert result.reason == "lower_denial_envelope"
+        # A genuine non-error denial carries none of the paid payload and stays held (row 7).
+        for lower in (EMPTY_DENIAL, SUBSET, {}, None):
+            result = evaluate(observation(status, lower), observation(200, FULL))
+            assert (result.row, result.verdict, result.reason, result.stores_finding) == (
+                7, "held", "lower_denied", False,
+            ), (status, lower)
+        # A complete, empty explicit denial is held as well.
+        result = evaluate(observation(status, raw=b""), observation(200, FULL))
+        assert (result.row, result.verdict) == (7, "held")
+
+    # A hollow key-shaped denial body stays non-positive and held.
+    lower, higher = D4_BY_ID["hollow_lower_denial_status_is_held"][:2]
+    result = evaluate(observation(403, lower), observation(200, higher))
+    assert (result.row, result.verdict, result.stores_finding) == (7, "held", False)
+    # The same hollow echo with every populated field filled in is the payload again.
+    result = evaluate(observation(403, higher), observation(200, higher))
+    assert result.reason == "lower_denied_payload_present" and result.verdict != "held"
+
+    # The exact marker contract: an error-shaped 403 carrying the supplied marker is
+    # undecided, a non-error 403 carrying it is a verified finding, and a non-error 403
+    # with the marker absent is held.
+    result = evaluate(
+        observation(403, {**protected(), "error": "upgrade required"}),
+        observation(200, protected()), marker=MARKER,
+        outcome=ExecutorOutcome("completed", "observed"),
+    )
+    assert (result.row, result.verdict, result.evidence_state) == (5, "inconclusive", "inconclusive")
+    result = evaluate(
+        observation(403, protected()), observation(200, protected()), marker=MARKER,
+        outcome=ExecutorOutcome("completed", "observed"),
+    )
+    assert (result.row, result.verdict, result.evidence_state) == (3, "finding", "verified")
+    result = evaluate(
+        observation(403, EMPTY_DENIAL), observation(200, protected()), marker=MARKER,
+        outcome=ExecutorOutcome("completed", "blocked"),
+    )
+    assert (result.row, result.verdict) == (4, "held")
+    # A marker pair never reaches the body comparison: the paid body at 403 without the
+    # marker is decided by the marker rows only.
+    result = evaluate(
+        observation(403, {**FULL, "rows": []}), observation(200, {**FULL, **protected()}),
+        marker=MARKER, outcome=ExecutorOutcome("completed", "blocked"),
+    )
+    assert (result.row, result.verdict) == (4, "held")
+
+    # No positive finding arises from any non-2xx lower response without the marker.
+    for status in (*sorted(plan_differential._DENIAL_STATUSES), 302, 500):
+        for lower in (FULL, {**FULL, "error": "x"}, ENVELOPE, None):
+            result = evaluate(observation(status, lower), observation(200, FULL))
+            assert result.verdict != "finding" and result.stores_finding is False
+
+
+def test_a_denial_is_held_only_against_an_assessable_higher_body():
+    deep, wide = _d4_complex_bodies().values()
+    unassessable_higher = {
+        "empty": observation(200, raw=b""),
+        "empty_204": observation(204, raw=b""),
+        "text": observation(200, raw=b"plain text"),
+        "malformed": observation(200, raw=b'{"rows": [1'),
+        "duplicate": observation(200, raw=b'{"a": 1, "a": 2}'),
+        "list": observation(200, [{"id": "r1"}]),
+        "string": observation(200, "export"),
+        "empty_object": observation(200, {}),
+        "hollow_object": observation(200, {"rows": [], "total": 0, "next": None}),
+        "secret_only": observation(200, {"token": "abc"}),
+        "deep": observation(200, deep),
+        "wide": observation(200, wide),
+    }
+    for name, higher in unassessable_higher.items():
+        for lower in (observation(403, ENVELOPE), observation(403, raw=b""), observation(401, FULL)):
+            result = evaluate(lower, higher)
+            assert _denied_columns(result) == DENIED_UNDECIDED, name
+            assert result.reason == "higher_control_unassessable", name
+            assert result.positive_control is True and result.status_parity is False
+
+    # An unassessable non-empty lower body is not proof that the payload disappeared.
+    unassessable_lower = {
+        "html": observation(403, raw=b"<html><body>Forbidden</body></html>"),
+        "malformed": observation(403, raw=b'{"error": '),
+        "nan": observation(403, raw=b'{"error": NaN}'),
+        "duplicate": observation(403, raw=b'{"error": 1, "error": 2}'),
+        "deep": observation(403, deep),
+        "wide": observation(403, wide),
+    }
+    for name, lower in unassessable_lower.items():
+        result = evaluate(lower, observation(200, FULL))
+        assert _denied_columns(result) == DENIED_UNDECIDED, name
+        assert result.reason == "lower_denial_unassessable", name
+
+    # A non-empty lower body is assessable only as a bounded JSON object. A JSON scalar or
+    # array has no root key paths to compare with the higher object, so finding none of the
+    # higher body's material there is not proof that the payload disappeared. A JSON empty
+    # string or empty array is a non-empty body, unlike zero body bytes.
+    opaque_lower = {
+        "empty_string": b'""', "string": b'"denied"', "zero": b"0", "number": b"403",
+        "float": b"12.5", "true": b"true", "false": b"false", "null": b"null",
+        "empty_array": b"[]", "empty_arrays": b"[[]]", "scalar_array": b'["denied"]',
+        "falsy_array": b"[0, false, null]", "object_array": b'[{"error": "denied"}]',
+        "payload_array": json.dumps([FULL]).encode(), "spaced_string": b' "denied" ',
+    }
+    for status in sorted(plan_differential._DENIAL_STATUSES):
+        for name, raw in opaque_lower.items():
+            result = evaluate(observation(status, raw=raw), observation(200, FULL))
+            assert _denied_columns(result) == DENIED_UNDECIDED, (status, name)
+            assert result.reason == "lower_denial_unassessable", (status, name)
+            assert (result.positive_control, result.status_parity) == (True, False)
+            assert result.body_superset is not True and result.marker_leak is None
+        # Zero body bytes and a bounded non-error JSON object without the payload stay held;
+        # a bounded error envelope is undecided.
+        for lower in (observation(status, raw=b""), observation(status, EMPTY_DENIAL),
+                      observation(status, {}), observation(status, SUBSET)):
+            result = evaluate(lower, observation(200, FULL))
+            assert (result.row, result.verdict, result.reason) == (7, "held", "lower_denied")
+        result = evaluate(observation(status, ENVELOPE), observation(200, FULL))
+        assert (result.row, result.verdict, result.reason) == (9, "inconclusive", "lower_denial_envelope")
+        # The higher control is still checked first.
+        result = evaluate(observation(status, raw=b'"denied"'), observation(200, {}))
+        assert result.reason == "higher_control_unassessable"
+    # An opaque lower body at 2xx or another status keeps its existing rows.
+    assert evaluate(observation(200, raw=b'"x"'), observation(200, FULL)).row == 8
+    assert evaluate(observation(500, raw=b"[]"), observation(200, FULL)).reason == (
+        "unexpected_status"
+    )
+    # The exact marker policy is unchanged: an opaque denial body leaves the marker
+    # undetermined (row 5), never held.
+    result = evaluate(
+        observation(403, raw=b'"denied"'), observation(200, protected()), marker=MARKER,
+        outcome=ExecutorOutcome("completed", "blocked"),
+    )
+    assert (result.row, result.verdict, result.reason) == (5, "inconclusive", "marker_undetermined")
+
+    # HEAD compares statuses only and keeps its own rows; never a finding.
+    for higher in unassessable_higher.values():
+        result = evaluate(observation(403, raw=b""), higher, method="HEAD")
+        assert (result.row, result.verdict, result.reason) == (7, "held", "lower_denied")
+    for lower_status in (200, 403):
+        result = evaluate(observation(lower_status, FULL), observation(200, FULL), method="HEAD")
+        assert result.verdict != "finding" and result.stores_finding is False
+    # The transport refuses every non-empty HEAD body; at this pure boundary recognized error
+    # data is still never held, and an empty HEAD denial keeps its status-only row.
+    for lower_status in sorted(plan_differential._DENIAL_STATUSES):
+        for envelope in (ENVELOPE, {"ok": False}, {"data": {"forbidden": True}}):
+            result = evaluate(observation(lower_status, envelope), observation(200, FULL), method="HEAD")
+            assert (result.row, result.verdict, result.reason, result.stores_finding) == (
+                9, "inconclusive", "lower_denial_envelope", False,
+            ), (lower_status, envelope)
+        result = evaluate(observation(lower_status, raw=b""), observation(200, FULL), method="HEAD")
+        assert (result.row, result.verdict, result.reason) == (7, "held", "lower_denied")
 
 
 def test_key_paths_are_structural_and_skip_secret_named_subtrees():
@@ -536,7 +902,7 @@ def test_d4_verdict_truth_table(lower, higher, expected, statuses, method):
         assert result.evidence_state == (
             "observed" if row == 6 else None if row == 7 else "inconclusive"
         )
-        assert result.stores_finding is (row != 7)
+        assert result.stores_finding is (row == 6)
         assert result.predicate == (
             "body_superset" if row == 6 else "status_parity" if row in {7, 8} else "inconclusive"
         )
@@ -657,7 +1023,7 @@ def test_d4_hollow_shape_is_never_observed_candidate_or_held(case_id):
                             assert lower.get("protected_canary") == MARKER
                         if marker is None and method == "GET":
                             assert _d4_columns(result) == D4_HOLLOW
-                            assert (result.verdict, result.stores_finding) == ("inconclusive", True)
+                            assert (result.verdict, result.stores_finding) == ("inconclusive", False)
                         if marker is None and method == "HEAD":
                             assert _d4_columns(result) == (8, "head_status_only", True, None, True)
     assert rows == {2, 3, 4, 5, 8, 9}
@@ -721,8 +1087,8 @@ def test_d4_reflexive_bodies_unchanged(case_id):
 # Expected columns: (row, reason, status_parity, body_superset, candidate, evidence_state,
 # stores_finding).
 D5_OBS = (6, "lower_superset", True, True, False, "observed", True)
-D5_SUB = (8, "lower_subset", True, False, True, "inconclusive", True)
-D5_HOL = (9, "lower_hollow_shape", None, None, False, "inconclusive", True)
+D5_SUB = (8, "lower_subset", True, False, True, "inconclusive", False)
+D5_HOL = (9, "lower_hollow_shape", None, None, False, "inconclusive", False)
 D5_ALL = [
     "BodyTooComplex", "ExecutorOutcome", "PairVerdict", "PlanDifferentialRejected",
     "PlanObservation", "evaluate_plan_pair", "is_denial_envelope", "key_paths",
@@ -1022,7 +1388,7 @@ def test_d5_alias_truth_table(lower, higher, expected):
 
 @pytest.mark.parametrize("case_id", ["bounds_wide_alias"])
 def test_d5_bounds_count_alias_keys_as_nodes(case_id):
-    status_only = (8, "status_only", True, None, True, "inconclusive", True)
+    status_only = (8, "status_only", True, None, True, "inconclusive", False)
     limit = plan_differential.MAX_KEY_PATH_NODES
     higher = {f"k{index}": index + 1 for index in range(limit + 1)}
     lower = {**{key: None for key in higher}, "k0.k1": 1}

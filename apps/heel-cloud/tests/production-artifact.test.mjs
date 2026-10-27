@@ -2,8 +2,11 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { closeSync, constants as fsConstants, fstatSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
 import { cp, lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, extname, join, relative } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
@@ -18,9 +21,9 @@ const clientRoot = join(distRoot, "client");
 const runtimeRoot = join(clientRoot, "heel-runtime");
 const downloadsRoot = join(clientRoot, "downloads");
 const serverRoot = join(distRoot, "server");
-const wheelName = "heel_browser-1.3.0rc1-py3-none-any.whl";
-const agentWheelName = "heel_sim-1.3.0rc1-py3-none-any.whl";
-const agentSourceName = "heel_sim-1.3.0rc1.tar.gz";
+const wheelName = "heel_browser-1.3.0rc2-py3-none-any.whl";
+const agentWheelName = "heel_sim-1.3.0rc2-py3-none-any.whl";
+const agentSourceName = "heel_sim-1.3.0rc2.tar.gz";
 const agentManifestName = "heel-open-core-manifest.json";
 const edgeAuthSecret = "E".repeat(43);
 const expectedDownloadNames = [agentManifestName, agentWheelName, agentSourceName];
@@ -247,17 +250,76 @@ function swapFirstTwoCentralEntries(archive) {
 
 
 function canonicalGzip(payload) {
+  assert.ok(payload.byteLength <= maxReleaseArchiveBytes, "canonical gzip input exceeds the release archive bound");
   const header = Buffer.from("1f8b08000000000002ff", "hex");
   const trailer = Buffer.alloc(8);
   trailer.writeUInt32LE(crc32(payload), 0);
   trailer.writeUInt32LE(payload.byteLength >>> 0, 4);
-  // Match the Python release builder, not Node's independently changing zlib
-  // implementation. Keep exact canonical-byte validation on Node 26 as well.
-  const compressed = spawnSync("python3", ["-I", "-c",
-    "import sys,zlib; c=zlib.compressobj(9,zlib.DEFLATED,-15); sys.stdout.buffer.write(c.compress(sys.stdin.buffer.read())+c.flush())"],
-    { input: payload, timeout: 10_000, maxBuffer: maxReleaseArchiveBytes });
-  assert.equal(compressed.status, 0, "Python canonical release compressor failed");
-  return Buffer.concat([header, compressed.stdout, trailer]);
+  // Feed stdin from a private regular file, not spawnSync's input option. On
+  // macOS that option streams through a Unix socket, and the child's read has
+  // been observed to block until the timeout.
+  const directory = mkdtempSync(join(tmpdir(), "heel-canonical-gzip-"));
+  const inputPath = join(directory, "input");
+  let stdinFd = null;
+  try {
+    const writeFd = openSync(inputPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    let written;
+    try {
+      for (let offset = 0; offset < payload.byteLength;) {
+        offset += writeSync(writeFd, payload, offset, payload.byteLength - offset, offset);
+      }
+      written = fstatSync(writeFd);
+    } finally {
+      closeSync(writeFd);
+    }
+    // The child inherits this read-only descriptor as fd 0 at offset 0, reads
+    // it to end of file, and shares the offset, so each call opens its own.
+    stdinFd = openSync(inputPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const stdin = fstatSync(stdinFd);
+    assert.ok(stdin.isFile() && stdin.dev === written.dev && stdin.ino === written.ino
+      && stdin.size === payload.byteLength && (stdin.mode & 0o777) === 0o600 && stdin.uid === process.getuid(),
+    "canonical gzip input is not the private regular file that was written");
+    // Match the Python release builder, not Node's independently changing zlib
+    // implementation. Keep exact canonical-byte validation on Node 26 as well.
+    const options = { stdio: [stdinFd, "pipe", "pipe"], timeout: 10_000, maxBuffer: maxReleaseArchiveBytes };
+    const startedAt = performance.now();
+    const compressed = spawnSync("python3", ["-I", "-c",
+      "import sys,zlib; c=zlib.compressobj(9,zlib.DEFLATED,-15); sys.stdout.buffer.write(c.compress(sys.stdin.buffer.read())+c.flush())"],
+      options);
+    const elapsedMs = performance.now() - startedAt;
+    // Build the failure detail only on failure, so passing calls keep their timing.
+    if (compressed.status !== 0) {
+      assert.equal(compressed.status, 0,
+        `Python canonical release compressor failed ${compressorFailureDetail(compressed, payload, options, elapsedMs)}`);
+    }
+    return Buffer.concat([header, compressed.stdout, trailer]);
+  } finally {
+    if (stdinFd !== null) closeSync(stdinFd);
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+
+// Report how the child ended without its environment or stderr text.
+function compressorFailureDetail(result, payload, options, elapsedMs) {
+  const bounded = (value) => value === undefined || value === null
+    ? null
+    : String(value).replace(/[^\x20-\x7e]/g, "?").slice(0, 160);
+  return JSON.stringify({
+    status: result.status,
+    signal: result.signal,
+    error_code: bounded(result.error?.code),
+    error_message: bounded(result.error?.message),
+    stderr_bytes: result.stderr?.byteLength ?? null,
+    stdout_bytes: result.stdout?.byteLength ?? null,
+    elapsed_ms: Number(elapsedMs.toFixed(1)),
+    stdin: "private regular file",
+    input_bytes: payload.byteLength,
+    input_sha256: sha256(payload),
+    timeout_ms: options.timeout,
+    max_buffer: options.maxBuffer,
+  });
 }
 
 
@@ -939,7 +1001,7 @@ test("TAR scanner rejects noncanonical and nonempty unused header metadata", asy
 
 
 test("TAR scanner rejects corrupt checksums, padding, termination, and private members", () => {
-  const valid = syntheticTar([{ name: "heel_sim-1.3.0rc1/heel/model.py", payload: Buffer.from("VALUE = 1\n") }]);
+  const valid = syntheticTar([{ name: "heel_sim-1.3.0rc2/heel/model.py", payload: Buffer.from("VALUE = 1\n") }]);
   const raw = gunzipSync(valid);
 
   const badChecksum = Buffer.from(raw);
@@ -960,13 +1022,13 @@ test("TAR scanner rejects corrupt checksums, padding, termination, and private m
   assert.throws(() => tarMembers(canonicalGzip(trailingPayload), "trailing-data source"), /trailing|termination/i);
 
   const privateSource = syntheticTar([
-    { name: "heel_sim-1.3.0rc1/docs/saas/PRODUCT.md", payload: Buffer.from("private\n") },
-    { name: "heel_sim-1.3.0rc1/heel/model.py", payload: Buffer.from("VALUE = 1\n") },
+    { name: "heel_sim-1.3.0rc2/docs/saas/PRODUCT.md", payload: Buffer.from("private\n") },
+    { name: "heel_sim-1.3.0rc2/heel/model.py", payload: Buffer.from("VALUE = 1\n") },
   ]);
   assert.throws(
     () => classifyReleaseMembers(tarMembers(privateSource), {
       label: "mutated source",
-      rootPrefix: "heel_sim-1.3.0rc1/",
+      rootPrefix: "heel_sim-1.3.0rc2/",
     }),
     /commercial boundary/,
   );
@@ -975,7 +1037,7 @@ test("TAR scanner rejects corrupt checksums, padding, termination, and private m
 
 test("TAR decompression budget includes bounded headers and padding", () => {
   const records = Array.from({ length: 6 }, (_, index) => ({
-    name: `heel_sim-1.3.0rc1/heel/payload_${index}.py`,
+    name: `heel_sim-1.3.0rc2/heel/payload_${index}.py`,
     payload: Buffer.alloc(maxReleaseMemberBytes),
   }));
   assert.equal(tarMembers(syntheticTar(records), "limit source").length, records.length);
@@ -1069,7 +1131,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
   const manifest = JSON.parse(decodeUtf8(manifestPayload, `downloads/${agentManifestName}`));
   assert.deepEqual(Object.keys(manifest).sort(), ["artifacts", "schema_version", "version"]);
   assert.equal(manifest.schema_version, "heel.open-core-artifacts.v1");
-  assert.equal(manifest.version, "1.3.0rc1");
+  assert.equal(manifest.version, "1.3.0rc2");
   assert.deepEqual(manifest.artifacts.map(({ name }) => name), [agentWheelName, agentSourceName]);
   await validateReleaseDownloads(downloadsRoot);
 
@@ -1090,7 +1152,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
   const sourceRecords = tarMembers(artifacts.get(agentSourceName), "Heel Agent source archive");
   classifyReleaseMembers(sourceRecords, {
     label: "Heel Agent source archive",
-    rootPrefix: "heel_sim-1.3.0rc1/",
+    rootPrefix: "heel_sim-1.3.0rc2/",
   });
 });
 
@@ -1098,7 +1160,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
 test("release member classification rejects private paths and hostile archive shapes", () => {
   const safeWheel = { name: "heel/model.py", payload: Buffer.from("VALUE = 1\n"), type: "0" };
   const safeSource = {
-    name: "heel_sim-1.3.0rc1/heel/model.py",
+    name: "heel_sim-1.3.0rc2/heel/model.py",
     payload: Buffer.from("VALUE = 1\n"),
     type: "0",
   };
@@ -1111,8 +1173,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "source private documentation",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc1/docs/saas/PRODUCT.md" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc1/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc2/docs/saas/PRODUCT.md" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc2/" },
       message: /commercial boundary/,
     },
     {
@@ -1135,8 +1197,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "device",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc1/heel/device.py", type: "3" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc1/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc2/heel/device.py", type: "3" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc2/" },
       message: /not a regular file/,
     },
     {
@@ -1165,8 +1227,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "unexpected extension",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc1/private.pem" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc1/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc2/private.pem" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc2/" },
       message: /unexpected extension/,
     },
   ];
@@ -1396,8 +1458,8 @@ test("serves the Agent acquisition page only from the canonical route", async ()
   assert.equal(agent.status, 200, "/agent must serve the customer acquisition page");
   const agentBody = await agent.text();
   assert.match(agentBody, /<h1>Investigate product abuse from your AI client\.<\/h1>/);
-  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.3\.0rc1-py3-none-any\.whl"/);
-  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.3\.0rc1\.tar\.gz"/);
+  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.3\.0rc2-py3-none-any\.whl"/);
+  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.3\.0rc2\.tar\.gz"/);
   assert.match(agentBody, /href="\/downloads\/heel-open-core-manifest\.json"/);
   const agentManifest = JSON.parse(
     await readFile(join(downloadsRoot, agentManifestName), "utf8"),

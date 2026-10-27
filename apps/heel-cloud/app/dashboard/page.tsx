@@ -12,9 +12,10 @@ import { ActivationCard, type ActivationSnapshot } from "../../components/canary
 import { ApprovalDialog } from "../../components/canary/ApprovalDialog";
 import { DisclosureDialog } from "../../components/canary/DisclosureDialog";
 import { RunProgress, type RunPhase } from "../../components/canary/RunProgress";
+import { TargetRegistrationCard, type OwnershipProofMethod, type PendingTarget } from "../../components/onboarding/TargetRegistrationCard";
 import {
   CanaryApi, CanaryApiError, type CanaryApprovalSummary, type CanaryDisclosureMetadata, type CanaryPendingApprovalRequest,
-  type CanaryRunDashboard, type RunnerContextBindingDashboard, type VerifiedEnvironmentRecord,
+  type CanaryRunDashboard, type PendingEnvironmentProof, type RunnerContextBindingDashboard, type VerifiedEnvironmentRecord,
 } from "../../lib/canary-api";
 import {
   canCreateProject, resolveAccount, selectionFromParams, selectionQuery, type AccountSelection, type AccountWorkspaceView,
@@ -27,8 +28,9 @@ const SIGN_IN_MESSAGE = "Create a free account or sign in to set up your first p
 const SESSION_ENDED_MESSAGE = "Your session ended. Sign in again to continue; nothing from the previous session is shown.";
 const SIGNED_OUT_MESSAGE = "You signed out. Sign in again to continue.";
 const CANARY_LOCKED_MESSAGE = "You are still signed in. Staging verification, runner access and rehearsals stay locked until it loads; nothing has been approved or executed.";
-const PROJECT_CREATED_READY = "Project created. Verify a staging origin next.";
-const PROJECT_CREATED_BLOCKED = "Project created. Canary setup is unavailable right now, so staging verification is blocked; use Try again shortly.";
+const PROJECT_CREATED_READY = "Project created. Add a target next.";
+const PROOF_RECENT_AUTH_MESSAGE = "For your security, showing or replacing a pending proof needs a sign-in from the last 15 minutes. The proof is kept on the server: sign out, sign in again, then resume it.";
+const PROJECT_CREATED_BLOCKED = "Project created. Canary setup is unavailable right now, so target verification is blocked; use Try again shortly.";
 const cloudApi = new HeelCloudApi();
 const canaryApi = new CanaryApi();
 
@@ -76,6 +78,11 @@ function messageOf(error: unknown): string {
 function isSessionLoss(error: unknown): boolean {
   return (error instanceof HeelCloudApiError && error.code === "auth_required")
     || (error instanceof CanaryApiError && error.status === 401);
+}
+
+/** The one place a proof instruction is worded; it is shown on screen only and never stored. */
+function proofInstruction(method: OwnershipProofMethod, httpUrl: string, token: string, dnsRecord: string): string {
+  return method === "https-file" ? `Place the one-time token at ${httpUrl}: ${token}` : `Publish this exact record: ${dnsRecord}`;
 }
 
 function idempotencyKey(): `ca1-${string}` {
@@ -145,8 +152,11 @@ export default function Dashboard() {
   const [busyOperation, setBusyOperation] = useState<number | null>(null);
   const working = busyOperation !== null;
   const [origin, setOrigin] = useState("");
-  const [proofMethod, setProofMethod] = useState<"https-file" | "dns-txt">("https-file");
+  const [proofMethod, setProofMethod] = useState<OwnershipProofMethod>("https-file");
   const [proofChallenge, setProofChallenge] = useState<ProofChallenge | null>(null);
+  // Which listed pending record the user chose, and which one the server said can only be replaced.
+  const [selectedPendingId, setSelectedPendingId] = useState<string | null>(null);
+  const [replacementPendingId, setReplacementPendingId] = useState<string | null>(null);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [approvalDialog, setApprovalDialog] = useState<ApprovalDialogState>(null);
   const [observedRun, setObservedRun] = useState<CanaryRunDashboard | null>(null);
@@ -201,6 +211,7 @@ export default function Dashboard() {
   const resetProjectState = useCallback((): void => {
     setSelectedRunner(""); setSelectedBindingEnvironment("");
     setProofChallenge(null);
+    setSelectedPendingId(null); setReplacementPendingId(null);
     setOrigin("");
   }, []);
 
@@ -361,6 +372,12 @@ export default function Dashboard() {
 
   const executable = connection.phase === "ready"
     ? connection.context.environments.find((item) => item.isExecutable) : undefined;
+  const pendingRecords = connection.phase === "ready"
+    ? connection.context.environments.filter((item) => item.status === "pending" && item.environmentClass !== "production") : [];
+  // Only the user's explicit choice, or the single pending record, is ever acted on.
+  const chosenPending = pendingRecords.find((item) => item.environmentId === selectedPendingId)
+    ?? (pendingRecords.length === 1 ? pendingRecords[0] : undefined);
+  const pendingTargets: PendingTarget[] = pendingRecords.map((item) => ({ environmentId: item.environmentId, origin: item.origin, proofMethod: item.proofMethod }));
   const selectedRunnerAvailable = connection.phase === "ready"
     && connection.context.contextBindings.runners.some((runner) => runner.runnerId === selectedRunner);
   const approvalKey = connection.phase === "ready" && pendingApproval !== null
@@ -499,13 +516,45 @@ export default function Dashboard() {
         attestationText: OWNERSHIP_ATTESTATION, attestationVersion: "v1", attestationAcknowledgement: "accepted",
       });
       if (ticket !== generation.current) return;
+      setReplacementPendingId(null);
       setProofChallenge({
         environmentId: value.environment_id as string,
-        instruction: proofMethod === "https-file"
-          ? `Place the one-time token at ${value.http_url as string}: ${value.token as string}`
-          : `Publish this exact record: ${value.dns_record as string}`,
+        instruction: proofInstruction(proofMethod, value.http_url as string, value.token as string, value.dns_record as string),
       });
     } catch (error) { recover(error, ticket); } finally { endWork(operation); }
+  }
+
+  /**
+   * Shows a listed pending record's proof again (resume) or replaces it in the same record (replace). Neither
+   * registers a target or checks the proof; the instruction is kept only in this page's memory.
+   */
+  async function pendingProofAction(replace: boolean): Promise<void> {
+    if (connection.phase !== "ready" || chosenPending === undefined) return;
+    const { context } = connection;
+    const record = chosenPending;
+    const ticket = generation.current;
+    const operation = beginWork(); setNotice(null);
+    try {
+      const proof: PendingEnvironmentProof = replace
+        ? await canaryApi.rotateEnvironmentProof(context.workspaceRef, context.project.projectRef, record)
+        : await canaryApi.recoverEnvironmentProof(context.workspaceRef, context.project.projectRef, record);
+      if (ticket !== generation.current) return;
+      setReplacementPendingId(null);
+      setProofChallenge({ environmentId: proof.environmentId, instruction: proofInstruction(proof.proofMethod, proof.httpUrl, proof.token, proof.dnsRecord) });
+    } catch (error) {
+      if (ticket !== generation.current) return;
+      if (error instanceof CanaryApiError && (error.code === "environment_challenge_expired" || error.code === "environment_challenge_missing")) {
+        setReplacementPendingId(record.environmentId);
+        setNotice(error.message);
+      } else if (error instanceof CanaryApiError && error.code === "recent_auth_required") {
+        setNotice(PROOF_RECENT_AUTH_MESSAGE);
+      } else if (error instanceof CanaryApiError && ["environment_challenge_closed", "environment_challenge_live", "invalid_response"].includes(error.code)) {
+        // The listed record is out of date (verified, revoked or replaced elsewhere): show its current state.
+        setReplacementPendingId(null);
+        setNotice(error.message);
+        try { await refreshEnvironments(context, ticket); } catch (refreshError) { recover(refreshError, ticket); }
+      } else recover(error, ticket);
+    } finally { endWork(operation); }
   }
 
   async function checkProof(): Promise<void> {
@@ -516,7 +565,7 @@ export default function Dashboard() {
     try {
       const verified = await canaryApi.checkEnvironmentProof(context.workspaceRef, context.project.projectRef, proofChallenge.environmentId);
       if (ticket !== generation.current) return;
-      setNotice(verified ? "Staging ownership verified. Pair the local runner next." : "Proof did not match yet. No product route was contacted.");
+      setNotice(verified ? "Target ownership verified. No product route was contacted." : "Proof did not match yet. No product route was contacted.");
       await refreshEnvironments(context, ticket);
       if (ticket !== generation.current) return;
       if (verified) setProofChallenge(null);
@@ -603,6 +652,11 @@ export default function Dashboard() {
     ?? (connection.phase === "select_project" || connection.phase === "forbidden" || connection.phase === "canary_unavailable"
       ? connection.account : null);
   const selectedProject = context?.project ?? (connection.phase === "canary_unavailable" ? connection.project : null);
+  // A paired runner or binding the account already has keeps the private-connector tools; a customer without one,
+  // and any visitor whose account is still loading, signed out or unresolved, is never sent to runner pairing.
+  const privateConnectorInUse = context !== null
+    && (context.contextBindings.runners.length > 0 || context.contextBindings.bindings.length > 0);
+  const showActivation = context !== null && (privateConnectorInUse || pendingApproval !== null || observedRun !== null);
   const progress = observedRun?.progress;
 
   return (
@@ -611,7 +665,7 @@ export default function Dashboard() {
         <div className="dashboard-context"><span className="dashboard-workspace">{selectedProject ? selectedProject.name : "Workspace not connected"}</span><span className="dashboard-presence"><i aria-hidden="true" /> {context ? "Cloud connected" : "Local-first"}</span></div></header>
 
       <p className="runner-recovery">Supported validation: <Link href="/runner">export entitlement reference and local report viewer</Link>. No customer-target pairing command is available in this release.</p>
-      <section className="dashboard-intro" aria-labelledby="dashboard-title"><div><p className="canary-kicker">Verified canary rehearsal</p><h1 id="dashboard-title">Cross the boundary <em>before</em> your customers do.</h1><p>Cloud runner onboarding is an incomplete preview. Use the local export reference to validate a supported synthetic workflow.</p></div>
+      <section className="dashboard-intro" aria-labelledby="dashboard-title"><div><p className="canary-kicker">Verified target setup</p><h1 id="dashboard-title">Cross the boundary <em>before</em> your customers do.</h1><p>Add one publicly reachable staging or sandbox HTTPS target and prove you own it. Managed scanning is not available in this build.</p></div>
         <aside className="preview-notice" aria-label="Connection status"><span className="preview-pulse" aria-hidden="true" /><div><strong>{connection.phase === "ready" ? "Ready for customer setup" : "Connect to begin"}</strong><p>{connection.phase === "checking" ? "Checking signed-in context · no request sent" : connection.phase === "ready" ? "Live account state · operational metadata only" : "No sample data is shown"}</p></div></aside></section>
 
       {connection.phase !== "ready" ? <section className="next-action" role="status"><span aria-hidden="true">↳</span><p><strong>{STATUS_TITLES[connection.phase]}</strong> {"message" in connection ? connection.message
@@ -632,15 +686,16 @@ export default function Dashboard() {
       {pendingHasMore ? <p className="next-action" role="status">Another pending approval is waiting after this one.</p> : null}
 
       <div className="dashboard-grid"><div>
-        <ActivationCard completedSteps={completedSteps} environmentOrigin={executable?.origin}
+        {context ? <TargetRegistrationCard busy={working} instruction={proofChallenge?.instruction ?? null}
+          onCheckProof={() => void checkProof()} onCreateProof={() => void startProof()} onOriginChange={setOrigin}
+          onProofMethodChange={setProofMethod} origin={origin} proofMethod={proofMethod} verifiedOrigin={executable?.origin ?? null}
+          pendingTargets={pendingTargets} selectedPendingId={chosenPending?.environmentId ?? null} replacementPendingId={replacementPendingId}
+          onSelectPendingTarget={(environmentId) => { setSelectedPendingId(environmentId || null); setNotice(null); }}
+          onResumeProof={() => void pendingProofAction(false)} onReplaceProof={() => void pendingProofAction(true)} /> : null}
+        {showActivation ? <ActivationCard completedSteps={completedSteps} environmentOrigin={executable?.origin}
           onReviewApproval={hasPlan && approvalKey ? () => setApprovalDialog({ requestKey: approvalKey, open: true }) : undefined}
-          scenarioCount={pendingApproval?.summary.scenarios.length ?? 0} snapshot={snapshot} />
-        {context && !executable ? <section className="runner-recovery" id="verify-origin" aria-labelledby="verify-origin-title"><p className="canary-kicker">Exact public HTTPS origin</p><h2 id="verify-origin-title">Verify staging now</h2>
-          <label>Staging origin<input autoComplete="url" onChange={(event) => setOrigin(event.target.value)} placeholder="https://staging.yourcompany.com" value={origin} /></label>
-          <label>Proof method<select onChange={(event) => setProofMethod(event.target.value as "https-file" | "dns-txt")} value={proofMethod}><option value="https-file">HTTPS file</option><option value="dns-txt">DNS TXT</option></select></label>
-          {proofChallenge ? <><p><code>{proofChallenge.instruction}</code></p><button className="button button-primary" disabled={working} onClick={() => void checkProof()} type="button">Check exact proof</button></> : <button className="button button-primary" disabled={working || !/^https:\/\/[a-z0-9.-]+$/.test(origin.trim())} onClick={() => void startProof()} type="button">Create proof challenge</button>}
-        </section> : null}
-        {context && executable && !pendingApproval ? <section className="runner-recovery"><p className="canary-kicker">Paired runner authorization</p><h2>Add canary access</h2><p>Authorize one active paired runner for one verified staging or sandbox environment. The runner alone may submit its signed plan; this dashboard never accepts projection file uploads.</p><p>This runner is fixed to its first claimed environment. To move it, stop and re-pair a fresh runner, then authorize access here.</p>
+          scenarioCount={pendingApproval?.summary.scenarios.length ?? 0} snapshot={snapshot} /> : null}
+        {context && executable && !pendingApproval && privateConnectorInUse ? <section className="runner-recovery"><p className="canary-kicker">Paired runner authorization</p><h2>Add canary access</h2><p>Authorize one active paired runner for one verified staging or sandbox environment. The runner alone may submit its signed plan; this dashboard never accepts projection file uploads.</p><p>This runner is fixed to its first claimed environment. To move it, stop and re-pair a fresh runner, then authorize access here.</p>
           <label>Verified environment<select disabled={working} onChange={(event) => setSelectedBindingEnvironment(event.target.value)} value={selectedBindingEnvironment}><option value="">Select environment</option>{context.environments.filter((item) => item.isExecutable && item.verificationRecordDigest !== null).map((item) => <option key={item.environmentId} value={item.environmentId}>{item.origin}</option>)}</select></label>
           <label>Paired runner<select disabled={working} onChange={(event) => setSelectedRunner(event.target.value)} value={selectedRunnerAvailable ? selectedRunner : ""}><option value="">Select runner</option>{context.contextBindings.runners.map((item) => <option key={`${item.runnerId}:${item.runnerKeyId}`} value={item.runnerId}>{item.displayName} · {item.fingerprint.slice(0, 12)}</option>)}</select></label>
           <button className="button button-primary" disabled={working || !selectedBindingEnvironment || !selectedRunnerAvailable} onClick={() => void createContextBinding()} type="button">Authorize paired runner</button>
@@ -648,7 +703,9 @@ export default function Dashboard() {
         </section> : null}
       </div>
 
-      <aside className="dashboard-rail" aria-label="Rehearsal safety boundaries"><section className="boundary-ledger"><p className="canary-kicker">Always enforced</p><h2>The runner owns target traffic.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Methods</dt><dd>GET + HEAD</dd></div><div><dt>Egress</dt><dd>Staging :443 only</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></section>
+      <aside className="dashboard-rail" aria-label="Safety boundaries"><section className="boundary-ledger"><p className="canary-kicker">Always enforced</p>
+        {showActivation ? <><h2>The paired runner owns target traffic.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Methods</dt><dd>GET + HEAD</dd></div><div><dt>Egress</dt><dd>Staging :443 only</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></>
+          : <><h2>No scan traffic is sent in this build.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Ownership check</dt><dd>One proof file or DNS record</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></>}</section>
          {runPhase && progress?.available ? <RunProgress phase={runPhase} completedScenarios={progress.scenariosCompleted ?? 0} totalScenarios={progress.scenariosTotal ?? 0} requestsUsed={progress.requestsStarted ?? 0} requestBudget={(progress.requestsStarted ?? 0) + (progress.remainingRequests ?? 0)} secondsRemaining={Math.ceil((progress.remainingWallMs ?? 0) / 1000)} onStop={runPhase === "running" ? () => void stopRun() : undefined} localResultUrl={progress.localResultReady && observedRun ? `http://127.0.0.1:7331/runs/${observedRun.run.runId}` : undefined} /> : null}
          {observedRun && !observedRun.progress.available ? <p className="run-recovery" role="alert">Signed progress is unavailable. The cloud will not invent metrics; inspect the local runner and retry status.</p> : null}
         {progress?.localResultReady ? <label className="disclosure-entry"><span>Optional history</span><strong>Load local summary to review separate sharing →</strong><input accept="application/json,.json" hidden onChange={(event) => void loadDisclosurePreview(event.target.files?.[0])} type="file" /></label> : null}

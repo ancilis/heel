@@ -37,7 +37,7 @@ from heel.store import Store
 from .catalog import CATALOG_BY_ID, CATALOG_IDS
 from .compiler import CanaryCompiler, plan_differential_pairs
 from .containment import verify_containment_chain
-from .content_assertion import protected_content
+from .content_assertion import is_ambiguous_message, is_denial_envelope, protected_content
 from .execution import ExecutionBundle, ExecutionGate, LocalCanaryExecutor
 from .http_transport import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -116,7 +116,7 @@ class ExecutorOutcome:
 @dataclass(frozen=True, slots=True)
 class PairVerdict:
     verdict: str                    # finding | held | inconclusive
-    evidence_state: str | None      # verified | observed | inconclusive; None when not stored
+    evidence_state: str | None      # verified | observed | inconclusive; None when held or row 1
     predicate: str
     reason: str
     candidate: bool
@@ -186,82 +186,6 @@ def material_paths(value: Any) -> frozenset[str]:
     return frozenset(paths)
 
 
-_ALLOW_KEYS = frozenset({"ok", "success", "allowed"})
-_DENY_KEYS = frozenset({"upgraderequired", "paymentrequired", "denied", "forbidden"})
-_ERROR_KEYS = frozenset({"error", "errors", "errorcode"})
-_STATUS_KEYS = frozenset({"status", "statuscode", "code"})
-_WRAPPER_KEYS = frozenset({"data", "result", "response"})
-_DENIAL_WORDS = frozenset({
-    "error", "fail", "failed", "failure", "denied", "forbidden", "unauthorized", "required",
-})
-_NO_STRINGS = frozenset({"false", "0", "no"})
-_WORD_BREAK = re.compile(r"[^a-z0-9]+", flags=re.ASCII)
-# Words and digit groups inside one run: ``PaymentRequired``, ``HTTPError``, ``E403``.
-_CAMEL_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", flags=re.ASCII)
-_MAX_ENVELOPE_DEPTH = 2
-
-
-def _says_no(value: Any) -> bool:
-    """An allow flag denies on any JSON-falsy value or a no-word."""
-    if isinstance(value, str):
-        word = value.strip().casefold()
-        return not word or word in _NO_STRINGS
-    return not value
-
-
-def _says_yes(value: Any) -> bool:
-    """A deny flag denies on any JSON-truthy value that is not a no-word."""
-    if isinstance(value, str):
-        word = value.strip().casefold()
-        return bool(word) and word not in _NO_STRINGS
-    return bool(value)
-
-
-def _denial_status(value: Any) -> bool:
-    if type(value) in {int, float}:
-        return 400 <= value <= 599 and value == int(value)
-    if not isinstance(value, str):
-        return False
-    words = {
-        *_WORD_BREAK.split(value.casefold()),
-        *(word.casefold() for word in _CAMEL_WORD.findall(value)),
-    }
-    return any(
-        word in _DENIAL_WORDS or (word.isdigit() and len(word) == 3 and word[0] in "45")
-        for word in words
-    )
-
-
-def _states_denial(value: Any, depth: int) -> bool:
-    if not isinstance(value, dict):
-        return False
-    for key, item in value.items():
-        name = key.casefold().replace("_", "").replace("-", "")
-        if (
-            (name in _ERROR_KEYS and bool(item))
-            or (name in _ALLOW_KEYS and _says_no(item))
-            or (name in _DENY_KEYS and _says_yes(item))
-            or (name in _STATUS_KEYS and _denial_status(item))
-            or (name in _WRAPPER_KEYS and depth < _MAX_ENVELOPE_DEPTH
-                and _states_denial(item, depth + 1))
-        ):
-            return True
-    return False
-
-
-def is_denial_envelope(value: Any) -> bool:
-    """A 2xx body that says no, in any JSON spelling of the small vocabulary above.
-
-    Keys match without case, ``_`` or ``-``. An allow flag denies on any JSON-falsy value
-    or no-word; a deny flag on any JSON-truthy value that is not a no-word. ``status``/
-    ``code`` deny by an integral 4xx/5xx number, or by a denial word or 4xx/5xx digit group
-    found across separators, camel-case and letter/digit boundaries. A ``data``/``result``/
-    ``response`` wrapper is followed to a bounded depth. This only ever
-    withholds parity (for either plan): it never creates a finding or a ``held`` verdict.
-    """
-    return _states_denial(value, 0)
-
-
 def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -291,6 +215,41 @@ def _is_2xx(status: int) -> bool:
     return 200 <= status <= 299
 
 
+def _denial_undecided(lower: PlanObservation, lower_json: Any, higher_json: Any) -> str | None:
+    """Why a lower 401-404 on a markerless body read cannot be held, or None when it can.
+
+    A denial status proves nothing on its own. It is held only against a higher body that
+    is a bounded JSON object with material content, and only when the lower body is
+    complete and empty, or a bounded JSON object whose material paths do not cover the
+    higher body's. A lower body that still covers them, with or without an error field, is
+    a status-only change: undecided, never held and never a finding. A non-empty lower body
+    that is not a JSON object, a scalar or array included, cannot be compared at all. A
+    lower body that is a recognized error or denial envelope is undecided at any status, and
+    a message-only object cannot be assessed.
+    """
+    try:
+        higher_material = (
+            material_paths(higher_json) if isinstance(higher_json, dict) else frozenset()
+        )
+    except BodyTooComplex:
+        higher_material = frozenset()
+    if not higher_material:
+        return "higher_control_unassessable"
+    if not lower.body:
+        return None
+    if not isinstance(lower_json, dict):
+        return "lower_denial_unassessable"
+    try:
+        lower_material = material_paths(lower_json)
+    except BodyTooComplex:
+        return "lower_denial_unassessable"
+    if lower_material >= higher_material:
+        return "lower_denied_payload_present"
+    if is_denial_envelope(lower_json):
+        return "lower_denial_envelope"
+    return "lower_denial_unassessable" if is_ambiguous_message(lower_json) else None
+
+
 def _row_one(reason: str) -> PairVerdict:
     return PairVerdict("inconclusive", None, "inconclusive", reason, False, False, 1)
 
@@ -309,7 +268,11 @@ def _evaluate(
         protected_content(higher.body, marker=marker, status=higher.status, method=method)
         if marker else None
     )
-    higher_ok = _is_2xx(higher.status) and not is_denial_envelope(higher_json)
+    higher_ok = (
+        _is_2xx(higher.status)
+        and not is_denial_envelope(higher_json)
+        and not is_ambiguous_message(higher_json)
+    )
     positive_control = higher_ok and (
         not marker or (higher.status == 200 and higher_marker is True)
     )
@@ -345,6 +308,15 @@ def _evaluate(
         elif lower.status in _DENIAL_STATUSES:
             status_parity = False
 
+    denial_undecided: str | None = None
+    if status_parity is False and not marker:
+        if method != "HEAD":
+            denial_undecided = _denial_undecided(lower, lower_json, higher_json)
+        elif lower_denial:
+            denial_undecided = "lower_denial_envelope"
+        elif is_ambiguous_message(lower_json):
+            denial_undecided = "lower_denial_unassessable"
+
     marker_leak: bool | None = None
     if marker and method != "HEAD" and positive_control:
         lower_marker = protected_content(
@@ -365,18 +337,23 @@ def _evaluate(
         reason = (
             "positive_control_missing_marker" if marker and higher_ok else "no_positive_control"
         )
-        return PairVerdict("inconclusive", "inconclusive", "inconclusive", reason, False, True, 2, **common)
+        return PairVerdict("inconclusive", "inconclusive", "inconclusive", reason, False, False, 2, **common)
     if marker_leak is True:
         return PairVerdict("finding", "verified", "marker_leak", "marker_present", False, True, 3, **common)
     if marker_leak is False:
         return PairVerdict("held", None, "marker_leak", "marker_absent", False, False, 4, **common)
     if marker:
         return PairVerdict(
-            "inconclusive", "inconclusive", "inconclusive", "marker_undetermined", False, True, 5,
+            "inconclusive", "inconclusive", "inconclusive", "marker_undetermined", False, False, 5,
             **common,
         )
     if body_superset is True:
         return PairVerdict("finding", "observed", "body_superset", "lower_superset", False, True, 6, **common)
+    if status_parity is False and denial_undecided is not None:
+        return PairVerdict(
+            "inconclusive", "inconclusive", "inconclusive", denial_undecided, False, False, 9,
+            **common,
+        )
     if status_parity is False:
         return PairVerdict("held", None, "status_parity", "lower_denied", False, False, 7, **common)
     if status_parity is True:
@@ -385,14 +362,15 @@ def _evaluate(
             else "lower_subset" if body_superset is False
             else "status_only"
         )
-        return PairVerdict("inconclusive", "inconclusive", "status_parity", reason, True, True, 8, **common)
+        # Status parity alone is a candidate, never a stored finding.
+        return PairVerdict("inconclusive", "inconclusive", "status_parity", reason, True, False, 8, **common)
     reason = (
         "lower_denial_envelope" if _is_2xx(lower.status) and lower_denial
         else "lower_hollow_shape" if hollow
         else "unexpected_status" if not _is_2xx(lower.status)
         else "body_too_complex"
     )
-    return PairVerdict("inconclusive", "inconclusive", "inconclusive", reason, False, True, 9, **common)
+    return PairVerdict("inconclusive", "inconclusive", "inconclusive", reason, False, False, 9, **common)
 
 
 def evaluate_plan_pair(
@@ -418,7 +396,7 @@ def evaluate_plan_pair(
             assessment_outcome=executor_outcome.assessment_outcome,
         )
     except Exception:
-        return PairVerdict("inconclusive", "inconclusive", "inconclusive", "predicate_error", False, True, 9)
+        return PairVerdict("inconclusive", "inconclusive", "inconclusive", "predicate_error", False, False, 9)
 
 
 # --------------------------------------------------------------------------- #
@@ -1524,7 +1502,13 @@ def _execute(
                 "reason": outcome.verdict.reason,
                 "execution_disposition": outcome.execution_disposition,
             })
-            if outcome.verdict.stores_finding and outcome.execution_disposition == "completed":
+            # Only a completed, verified or observed finding is stored or counted.
+            if (
+                outcome.verdict.stores_finding
+                and outcome.verdict.verdict == "finding"
+                and outcome.verdict.evidence_state in {"verified", "observed"}
+                and outcome.execution_disposition == "completed"
+            ):
                 finding = _finding(plan, outcome, run_id=run_id, attempt_id=attempt_id)
                 db.add_finding(run_id, finding)
                 outcome.finding_id = finding.id
@@ -1829,17 +1813,19 @@ def replay_plan_differential(
     run_id = executed["run_id"]
     if outcome.execution_disposition != "completed" or verdict.row == 1:
         return record("fail", "inconclusive", incomplete, run_id)
-    # The saved predicate is re-evaluated; an inconclusive finding saved none.
+    # The saved predicate is re-evaluated; an inconclusive finding saved none. Only a pair
+    # that is itself a finding still holds: status parity alone (row 8) stays undecided.
     value = None if predicate == "inconclusive" else getattr(verdict, predicate)
-    if value is True:
+    if value is True and verdict.verdict == "finding":
         return record(
             "fail", "still_reachable",
             f"The saved predicate {predicate} still holds for the lower plan on this read; "
             "reproduction details are omitted.",
             run_id,
         )
-    # A pass needs an affirmative denial: the higher plan succeeded and the lower plan was
-    # denied by status, or the supplied marker was absent. A 2xx denial body is not one.
+    # A pass needs an affirmative denial: the higher plan returned a material body and the
+    # lower plan was denied by status without it, or the supplied marker was absent. A 2xx
+    # denial body, or a denial status still carrying the payload, is not one.
     if verdict.verdict == "held":
         return record(
             "pass", "blocked",

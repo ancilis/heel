@@ -1016,7 +1016,10 @@ def test_r9_max_ops_hard_caps_total_requests(tmp_path, monkeypatch):
         assert result["requests_sent"] == 100 == len(world.target.seen())
         assert len(result["pairs"]) == 50
         assert {pair["execution_disposition"] for pair in result["pairs"]} == {"completed"}
-        assert {pair["verdict"] for pair in result["pairs"]} == {"held"}
+        # Each lower read is a 403 error envelope: undecided, never held.
+        assert {(pair["verdict"], pair["reason"]) for pair in result["pairs"]} == {
+            ("inconclusive", "lower_denial_envelope"),
+        }
         assert [item["reason"] for item in result["not_executed"]] == ["over_budget"] * 10
         assert result["chain_valid"] is True
 
@@ -1383,13 +1386,15 @@ def test_r22_findings_only_for_completed_pairs_and_disposition_is_completed(tmp_
         for finding in stored.values():
             reproduction = finding["reproduction"]
             assert reproduction["execution_disposition"] == "completed"
+            assert reproduction["evidence_state"] in {"verified", "observed"}
             assert reproduction["candidate"] is (reproduction["predicate"] == "status_parity")
             assert finding["scenario_id"] == "plan_differential." + reproduction["predicate"]
             assert reproduction["operator_declared"] is False
         with_finding = set()
         for pair in result["pairs"]:
             completed = pair["execution_disposition"] == "completed"
-            eligible = completed and pair["verdict"] != "held"
+            # Stored: a completed finding only. Held and every inconclusive pair store nothing.
+            eligible = completed and pair["verdict"] == "finding"
             assert (pair["finding_id"] is not None) is eligible, pair
             if eligible:
                 with_finding.add(pair["finding_id"])
@@ -1419,14 +1424,21 @@ def test_r22_findings_only_for_completed_pairs_and_disposition_is_completed(tmp_
             assert (by_route[route]["execution_disposition"], by_route[route]["reason"]) == (
                 "failed", "transport:response_rejected",
             )
-        held = by_route[("GET", "/api/reports")]
-        assert (held["verdict"], held["finding_id"], held["reason"]) == ("held", None, "lower_denied")
+        # A 403 error envelope keeps its pair but is undecided and stores no finding.
+        denied = by_route[("GET", "/api/reports")]
+        assert (denied["verdict"], denied["finding_id"], denied["reason"]) == (
+            "inconclusive", None, "lower_denial_envelope",
+        )
         states = {item["route_template"] + " " + item["method"]: item["evidence_state"]
                   for item in result["findings"]}
         assert states["/api/export GET"] == "observed"
         assert states["/exports/{id} GET"] == "verified"
-        assert states["/api/export HEAD"] == "inconclusive"
-        assert states["/api/billing GET"] == "inconclusive"
+        # Status parity alone (HEAD) and a 2xx lower denial envelope keep their pair but no
+        # finding.
+        assert "/api/export HEAD" not in states and "/api/billing GET" not in states
+        assert (by_route[("HEAD", "/api/export")]["predicate"],
+                by_route[("HEAD", "/api/export")]["reason"]) == ("status_parity", "head_status_only")
+        assert by_route[("GET", "/api/billing")]["reason"] == "lower_denial_envelope"
 
     # A scope-tamper stop: the later pairs are inconclusive, not started, and unstored.
     with World(tmp_path / "tamper", monkeypatch) as world:
@@ -1532,7 +1544,7 @@ def test_r25_numeric_json_bodies_complete_and_do_not_end_the_run(tmp_path, monke
         after = result["pairs"][routes.index(("GET", "/api/pricing")) + 1:]
         assert len(after) == 4
         assert all(pair["execution_disposition"] in {"completed", "failed"} for pair in after)
-        assert by_route[("GET", "/api/reports")]["verdict"] == "held"
+        assert by_route[("GET", "/api/reports")]["verdict"] == "inconclusive"
         assert ("GET", "/api/summary", "pro") in world.target.seen()
         assert_no_credentials(world, json.dumps(result))
         # The stored evidence is the numeric body, with the echoed credential replaced.

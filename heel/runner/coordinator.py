@@ -23,6 +23,8 @@ from heel.runner.control_client import RunnerControlClient
 from heel.runner.execution import (
     ExecutionBundle,
     ExecutionGate,
+    UnactivatedExecution,
+    ValidatedExecutionBundle,
     validate_execution_bundle,
 )
 from heel.runner.identity import RunnerIdentity, SecureSigner
@@ -844,18 +846,63 @@ class RunnerCoordinator:
 
 
 class RunnerExecutionAdapter:
-    """Bind Task 6 execution to one coordinator gate source and one local target transport."""
+    """Bind Task 6 execution to one coordinator gate source and one local target transport.
 
-    def __init__(self, *, coordinator: RunnerCoordinator, executor: object, transport: object):
+    The transport is either one fixed object or ``transport_factory``, which builds a transport
+    for one lease. The factory runs only after the coordinator's fresh gate and the exact claimed
+    bundle have been revalidated, and it receives only that validated bundle, so no transport can
+    be built for an unvalidated, stale, revoked or mismatched lease. ``transport_precheck`` (pure
+    metadata, no network or secret) refuses before any local reservation. The executor then calls
+    the factory only after it has durably activated the run, so a stop during a blocking factory
+    is acknowledged against that run instead of racing it.
+    """
+
+    def __init__(
+        self,
+        *,
+        coordinator: RunnerCoordinator,
+        executor: object,
+        transport: object = None,
+        transport_factory: Callable[[ValidatedExecutionBundle], object] | None = None,
+        transport_precheck: Callable[[ValidatedExecutionBundle], None] | None = None,
+    ):
         if not isinstance(coordinator, RunnerCoordinator):
             raise TypeError("runner coordinator is required")
         if not callable(getattr(executor, "execute", None)):
             raise TypeError("local canary executor is required")
-        if transport is None:
+        if (transport is None) == (transport_factory is None) or (
+            transport_factory is not None and not callable(transport_factory)
+        ):
             raise TypeError("bounded local target transport is required")
+        if transport_precheck is not None and (
+            transport_factory is None or not callable(transport_precheck)
+        ):
+            raise TypeError("transport precheck requires a lazy target transport")
         self.coordinator = coordinator
         self.executor = executor
         self.transport = transport
+        self.transport_factory = transport_factory
+        self.transport_precheck = transport_precheck
+
+    def _validated_lease(self, lease: ClaimLease) -> ValidatedExecutionBundle:
+        coordinator = self.coordinator
+        gate = coordinator.execution_gate(lease.run_id)
+        validated = validate_execution_bundle(
+            lease.bundle,
+            store=coordinator.store,
+            identity=coordinator.identity,
+            trusted_grant_keys=coordinator.trusted_grant_keys,
+            now_ms=coordinator._now_ms(),
+            gate=gate,
+        )
+        with coordinator._lock:
+            binding = coordinator._bindings.get(lease.run_id)
+        if binding is None or validated.grant["run_id"] != lease.run_id or binding != (
+            validated.grant["grant_id"], validated.projection["projection_id"],
+            validated.projection["projection_digest"],
+        ):
+            raise ValueError("runner claim lease differs from the active claim")
+        return validated
 
     def execute(
         self,
@@ -866,12 +913,33 @@ class RunnerExecutionAdapter:
     ) -> object:
         if not isinstance(lease, ClaimLease):
             raise ValueError("runner claim lease is required")
+        # An authenticated stop already chosen for this lease ends it before any local work;
+        # the executor repeats this check at its activation linearization point.
+        if getattr(cancellation, "stop_reason", None) is not None:
+            return UnactivatedExecution(cancellation.stop_reason)
+
+        def gate_source() -> ExecutionGate:
+            return self.coordinator.execution_gate(lease.run_id)
+
+        if self.transport_factory is None:
+            return self.executor.execute(
+                lease.bundle, transport=self.transport, gate_source=gate_source,
+                cancellation=cancellation, on_progress=on_progress,
+            )
+        try:
+            validated = self._validated_lease(lease)
+        except ValueError:
+            # The gate that refused may be the stop itself, recorded just before the heartbeat
+            # worker chose it; a known stop is then the outcome, not a validation failure.
+            if getattr(cancellation, "stop_reason", None) is not None:
+                return UnactivatedExecution(cancellation.stop_reason)
+            raise
+        if self.transport_precheck is not None:
+            self.transport_precheck(validated)
+        factory = self.transport_factory
         return self.executor.execute(
-            lease.bundle,
-            transport=self.transport,
-            gate_source=lambda: self.coordinator.execution_gate(lease.run_id),
-            cancellation=cancellation,
-            on_progress=on_progress,
+            lease.bundle, transport_factory=lambda: factory(validated), gate_source=gate_source,
+            cancellation=cancellation, on_progress=on_progress,
         )
 
     def prepare_stop_ack(

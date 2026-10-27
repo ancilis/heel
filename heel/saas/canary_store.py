@@ -1055,6 +1055,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_host_authority_generation_one_open
  ON host_authority_generations(host_boot_epoch,slot_id) WHERE state='open';
 """
 
+# Migration 32 (D): the first Cloud-accepted stop acknowledgement's signed runner facts, kept on the
+# run row because the receipt row is replaced by every later UPSERT.  The server receipt time and
+# late status stay in stop_acknowledged_at_ms/stop_ack_late; these three are runner-local signed
+# evidence only.  All three are set together exactly once; NULL means no witness (or pre-v32).
+STOP_ACK_WITNESS_MIGRATION = r"""
+ALTER TABLE canary_runs ADD COLUMN stop_ack_source_event_sequence INTEGER
+  CHECK(stop_ack_source_event_sequence IS NULL OR stop_ack_source_event_sequence >= 0);
+ALTER TABLE canary_runs ADD COLUMN stop_ack_projection_digest TEXT
+  CHECK(stop_ack_projection_digest IS NULL OR
+        (length(stop_ack_projection_digest)=64 AND
+         stop_ack_projection_digest NOT GLOB '*[^0-9a-f]*'));
+ALTER TABLE canary_runs ADD COLUMN stop_ack_runner_local_at_ms INTEGER
+  CHECK(stop_ack_runner_local_at_ms IS NULL OR stop_ack_runner_local_at_ms >= 0);
+"""
+STOP_ACK_WITNESS_COLUMNS = (
+    "stop_ack_source_event_sequence", "stop_ack_projection_digest", "stop_ack_runner_local_at_ms",
+)
+
 _ENVIRONMENT_COLUMNS = (
     "attestation_text", "attestation_version", "attested_by", "attested_at", "proof_method",
     "proof_version", "normalization_version", "challenge_generation", "challenge_digest",
@@ -1576,6 +1594,38 @@ def ensure_host_authority_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"RELEASE SAVEPOINT {savepoint}")
 
 
+def ensure_stop_ack_witness_schema(conn: sqlite3.Connection) -> None:
+    """Bring direct construction to migration-32 parity, never half of it.
+
+    A migration-tracked database below v32 is left to ``Migrator`` so its ALTERs still apply.
+    """
+    present = {row[1] for row in conn.execute("PRAGMA table_info(canary_runs)")}
+    found = set(STOP_ACK_WITNESS_COLUMNS) & present
+    if found == set(STOP_ACK_WITNESS_COLUMNS):
+        return
+    if found:
+        raise RuntimeError("canary stop acknowledgement witness schema is partially initialized")
+    tracked = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone() is not None
+    if tracked:
+        current = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        if int(current or 0) >= 32:
+            raise RuntimeError("canary stop acknowledgement witness schema does not match migration 32")
+        return
+    savepoint = "stop_ack_witness_schema_apply"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for statement in _sqlite_schema_statements(STOP_ACK_WITNESS_MIGRATION):
+            if statement:
+                conn.execute(statement)
+    except Exception as error:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise RuntimeError("canary stop acknowledgement witness schema initialization failed") from error
+    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+
 class CanaryStore:
     """Typed schema owner. Higher canary services are added in later packets."""
 
@@ -1617,3 +1667,4 @@ class CanaryStore:
             raise RuntimeError("canary coordination schema is partially initialized")
         ensure_runner_context_schema(self.conn)
         ensure_host_authority_schema(self.conn)
+        ensure_stop_ack_witness_schema(self.conn)

@@ -18,11 +18,28 @@ export default function Runner() {
       const r = report as Record<string, unknown>;
       if (r.target !== "reference:export" || r.mechanism_id !== "export-read-entitlement" ||
           r.uploaded !== false || !["verified_violation", "invariant_held", "inconclusive"].includes(String(r.result))) throw new Error();
+      // A pass is only the shape the reference producer writes for a held case: a known
+      // held case, verified evidence, a completed reference-only run, regression_passed
+      // true. This checks shape only; it does not authenticate the file. 1.3.0rc1 wrongly
+      // reported the HTTP-200 error_envelope and HTTP-403 hardened error envelopes as
+      // invariant_held; only the non-error public and redacted reads can hold.
+      const provenance = typeof r.provenance === "object" && r.provenance !== null ? r.provenance as Record<string, unknown> : null;
+      const held = r.result === "invariant_held" && r.regression_passed === true &&
+        typeof r.case === "string" && ["public", "redacted"].includes(r.case) &&
+        r.evidence_state === "verified" && r.execution_disposition === "completed" &&
+        r.execution_support === "reference_only" && provenance !== null &&
+        provenance.kind === "reference_product_execution" && provenance.network_calls === false;
       setSummary(r.result === "verified_violation"
-        ? "The local report records protected synthetic export content reaching the lower-plan account. Apply the server-side export entitlement check, then repeat with the hardened product."
-        : r.result === "invariant_held"
+        ? "The local report records protected synthetic export content reaching the lower-plan account. Apply the server-side export entitlement check so the lower-plan read withholds the protected field without an error response, then repeat with a fresh attempt."
+        : held
           ? "The local report records a successful entitled positive control and no protected marker in the lower-plan response. This read regression passed."
-          : "The local report could not establish the invariant. Check the positive control and response format; this is not a pass.");
+          : r.result === "invariant_held" && r.case === "error_envelope"
+            ? "This report's held result is not valid evidence: an HTTP 200 error envelope is inconclusive, as Heel 1.3.0rc1 wrongly reported it. Treat it as inconclusive; this is not a pass."
+            : r.result === "invariant_held" && r.case === "hardened"
+              ? "This report's held result is not valid evidence: the hardened case answers with an HTTP 403 error envelope, which is inconclusive, as Heel 1.3.0rc1 wrongly reported it. Treat it as inconclusive; this is not a pass."
+              : r.result === "invariant_held"
+                ? "This report's held result does not match a supported completed reference pass: a known held case, verified evidence, a completed reference-only run and regression_passed true. This is not a pass; rerun the case with a fresh attempt."
+                : "The local report could not establish the invariant. Check the positive control and response format; this is not a pass.");
     } catch {
       setError("Choose a local Heel reference report JSON file under 128 KiB.");
     }
@@ -44,16 +61,18 @@ export default function Runner() {
 export HEEL_HOME="$(pwd -P)/.heel"
 .venv/bin/heel reference prepare
 .venv/bin/heel scope create --target reference:export --operator "your name" --confirm`}</code></pre>
-      <p>HEEL_HOME must be a physical path in which no component is a symbolic link; pwd -P prints one. On macOS, /tmp and /var are symbolic links, so a $PWD below them is refused. Heel refuses symbolic links in private storage on purpose.</p>
+      <p>Use one physical private HEEL_HOME, in which no component is a symbolic link, from the first command onward; pwd -P prints one. On macOS, /tmp and /var are symbolic links. Scope creation can still succeed under a symbolic-link path, and that success does not show the path is safe: opening the private reference storage checks every component and refuses a symbolic link on purpose, so a later reference run with the same HEEL_HOME is rejected.</p>
       <p>Copy the returned scope ID into the next commands.</p>
       <h2>2. Validate, fix, and repeat</h2>
       <pre><code>{`.venv/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111
-.venv/bin/heel reference run --scope SCOPE_ID --case hardened --attempt 22222222222222222222222222222222`}</code></pre>
-      <p>Expected results: verified_violation for the vulnerable case, then invariant_held with regression_passed=true for the hardened case. Each report records execution_support reference_only, network_calls false, and uploaded false.</p>
+.venv/bin/heel reference run --scope SCOPE_ID --case public --attempt 22222222222222222222222222222222`}</code></pre>
+      <p>Expected results: verified_violation for the vulnerable case, then invariant_held with regression_passed=true for the public case, a successful read that withholds the protected field. The redacted case is the other passing control. Each report records execution_support reference_only, network_calls false, and uploaded false.</p>
+      <p>Known 1.3.0rc1 erratum: it reports the error_envelope case, an HTTP 200 error response, as invariant_held with regression_passed=true. That result is inconclusive, not a pass. The corrected 1.3.0rc2 candidate reports it as inconclusive with regression_passed=false; 1.3.0rc2 is not yet published.</p>
+      <p>Known 1.3.0rc1 erratum: it also reports the hardened case, an HTTP 403 error response, as invariant_held with regression_passed=true. An error response is inconclusive at any status, so that result is not a pass either. The unpublished 1.3.0rc2 candidate reports the hardened case as inconclusive with regression_passed=false.</p>
       <p>Each attempt is consumed once. Use a new 32-character lowercase hexadecimal attempt ID for a fresh run. Reports and raw synthetic evidence stay under your local .heel/reference directory.</p>
       <h3>If the run is rejected</h3>
       <p>Every refusal prints the same message, “Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage.”, and exits with status 2. Not every rejection is a storage-path problem, so check each of these: HEEL_HOME is a physical private path with no symbolic link in any component; SCOPE_ID came from heel scope create --target reference:export with the same HEEL_HOME and has not expired, or create a fresh scope; the attempt has never been used in this HEEL_HOME, and a new attempt ID is always safe. Do not disable the storage checks or edit the store database or scope files. If you ask for help, share only the command, exit status, and message, never raw exceptions, signing keys, scope files, or credentials.</p>
-      <p>The hardened reference checks the account’s current export license before serializing protected fields. HTTP status alone never establishes the result.</p>
+      <p>The hardened, public and redacted reference cases check the account’s current export license before serializing protected fields. The hardened case refuses with an error response, which neither proves a disclosure nor a denial; the public and redacted cases answer successfully without the protected field. HTTP status alone never establishes the result.</p>
       <h2>3. Inspect the local report</h2>
       <label>Reference report JSON <input type="file" accept=".json,application/json" onChange={(event) => void inspect(event.target.files?.[0])} /></label>
       {summary && <p role="status">{summary}</p>}{error && <p role="alert">{error}</p>}

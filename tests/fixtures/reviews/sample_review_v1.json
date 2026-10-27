@@ -1,6 +1,6 @@
 {
   "baseline_hash": "4d86c01f77bd7f5c005cfd5acfc90d86b53a003e727c72537d891324304071c0",
-  "engine_version": "1.3.0rc1",
+  "engine_version": "1.3.0rc2",
   "execution_mode": "machine_local",
   "findings": [
     {
@@ -167,8 +167,8 @@
       "surface_type": "integration_oauth_apps"
     }
   ],
-  "result_hash": "c29eb2a9adfad4ca581d80542ba77807696b39d373cbdd93921fbacb6ba25ec7",
-  "review_id": "review_c29eb2a9adfad4ca581d",
+  "result_hash": "cb98b62f167aae30ef36e741052272b3301e2760cf52f7e3283b5f25b641fdbe",
+  "review_id": "review_cb98b62f167aae30ef36",
   "safety": {
     "canary_only": true,
     "live_probing": false,

@@ -18,7 +18,9 @@ from heel.canary_contracts import (
 from heel.runner.control_client import _RunGuard, RunnerControlClient
 from heel.runner.coordinator import RunnerCoordinator, RunnerExecutionAdapter
 from heel.runner.http_transport import CancellationToken
-from heel.runner.execution import ExecutionBundle, ExecutionGate
+from heel.runner.execution import (
+    ExecutionBundle, ExecutionGate, UnactivatedExecution, ValidatedExecutionBundle,
+)
 from heel.runner.service import ClaimLease, RunnerService
 from heel.runner.store import RunnerStore, RunnerStoreError
 from heel.runner.runtime import (
@@ -191,7 +193,7 @@ def _findings_projection(coordinator, manifest, projection, grant):
 
 def _permit(
     authority, coordinator, grant, findings, *, issued_at_ms=2_000,
-    expires_at_ms=602_000,
+    expires_at_ms=602_000, scenario_count=0, finding_count=0,
 ):
     projection_bytes = len(canonical_bytes(findings))
     unsigned = {
@@ -207,7 +209,7 @@ def _permit(
             "schema_version": findings["schema_version"],
             "projection_digest": findings["projection_digest"],
             "maximum_bytes": projection_bytes,
-            "scenario_count": 0, "finding_count": 0,
+            "scenario_count": scenario_count, "finding_count": finding_count,
         },
         "approved_by": "user_owner_123", "approved_at_ms": 2_000,
         "issued_at_ms": issued_at_ms, "expires_at_ms": expires_at_ms,
@@ -1877,6 +1879,154 @@ def test_delayed_execution_rejects_stale_authenticated_claim_gate_before_executo
     assert entered == [True]
 
 
+def test_execution_adapter_builds_a_lease_transport_only_from_the_revalidated_claim(tmp_path):
+    """Unit (scripted control transport, recording executor): the metadata precheck runs after the
+    fresh coordinator gate and the exact bundle check, before the executor; the lazy factory is
+    handed to the executor, which calls it only after its own local activation. Both see only the
+    validated bundle, and the factory's transport is the one the executor uses."""
+    coordinator, _, _, manifest, projection, grant, _ = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+        ],
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    order: list[str] = []
+    built = object()
+    real_gate = coordinator.execution_gate
+
+    def gate(run_id):
+        order.append("gate")
+        return real_gate(run_id)
+
+    coordinator.execution_gate = gate
+
+    def factory(validated):
+        order.append("factory")
+        assert isinstance(validated, ValidatedExecutionBundle)
+        assert validated.manifest == manifest and validated.projection == projection
+        assert validated.grant == grant
+        return built
+
+    def precheck(validated):
+        order.append("precheck")
+        assert isinstance(validated, ValidatedExecutionBundle) and validated.grant == grant
+
+    class LocalExecutor:
+        def execute(self, bundle, *, transport_factory, gate_source, cancellation, on_progress):
+            order.append("execute")
+            assert bundle is lease.bundle
+            assert gate_source() == ExecutionGate(**_gate())
+            assert transport_factory() is built  # after the executor's own activation
+            return {"operational_projection": lease.operational_projection}
+
+    adapter = RunnerExecutionAdapter(
+        coordinator=coordinator, executor=LocalExecutor(), transport_factory=factory,
+        transport_precheck=precheck,
+    )
+    adapter.execute(lease, cancellation=CancellationToken(), on_progress=lambda _: None)
+    assert order == ["gate", "precheck", "execute", "gate", "factory"]
+    for arguments in ({}, {"transport": object(), "transport_factory": factory},
+                      {"transport_factory": "not callable"}):
+        with pytest.raises(TypeError, match="target transport is required"):
+            RunnerExecutionAdapter(coordinator=coordinator, executor=LocalExecutor(), **arguments)
+    for arguments in ({"transport": object(), "transport_precheck": precheck},
+                      {"transport_factory": factory, "transport_precheck": "not callable"}):
+        with pytest.raises(TypeError, match="precheck requires a lazy target transport"):
+            RunnerExecutionAdapter(coordinator=coordinator, executor=LocalExecutor(), **arguments)
+
+    # A metadata refusal is final before the executor: nothing is reserved or built.
+    order.clear()
+
+    def refusing(validated):
+        order.append("precheck")
+        raise ValueError("credential metadata refused")
+
+    with pytest.raises(ValueError, match="credential metadata refused"):
+        RunnerExecutionAdapter(
+            coordinator=coordinator, executor=LocalExecutor(), transport_factory=factory,
+            transport_precheck=refusing,
+        ).execute(lease, cancellation=CancellationToken(), on_progress=lambda _: None)
+    assert order == ["gate", "precheck"]
+
+    # An authenticated stop already chosen for the lease ends it before any gate or executor.
+    order.clear()
+    stopped = CancellationToken()
+    stopped.stop_reason = "cloud_stop"
+    outcome = adapter.execute(lease, cancellation=stopped, on_progress=lambda _: None)
+    assert isinstance(outcome, UnactivatedExecution) and outcome.stop_reason == "cloud_stop"
+    assert outcome.operational_projection is None and order == []
+
+
+_REFUSALS = {
+    "stale": "gate is stale",
+    "revoked": "gate denies execution",
+    "unknown-run": "active runner claim is required",
+    "mismatched-bundle": "lease differs from the active claim",
+    "expired": "grant is expired",
+}
+
+
+@pytest.mark.parametrize("case", ["stale", "revoked", "unknown-run", "mismatched-bundle", "expired"])
+def test_execution_adapter_never_builds_transport_for_a_stale_revoked_or_mismatched_lease(
+    tmp_path, case,
+):
+    """Unit (scripted control transport): every refused authority fails before the factory, so
+    no resolver, socket or executor is reached."""
+    now = [1.0]
+    clock = [2_000]
+
+    def responses(manifest, projection, grant):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"a")},
+             _gate(server_time_ms=2_001, stop_reason="runner_revoked", active=False)),
+        ]
+
+    coordinator, _, _, manifest, projection, grant, authority = _coordinator(
+        tmp_path, responses, monotonic=lambda: now[0],
+    )
+    coordinator.clock_ms = lambda: clock[0]
+    lease = coordinator.claim()
+    assert lease is not None
+    if case == "stale":
+        now[0] = 1.501
+    elif case == "revoked":
+        coordinator.heartbeat(lease.run_id, lease.operational_projection)
+    elif case == "unknown-run":
+        lease = ClaimLease("crun_" + "f" * 32, lease.bundle, lease.operational_projection)
+    elif case == "mismatched-bundle":
+        other = copy.deepcopy(dict(grant))
+        other["grant_id"] = "grant_987654321"
+        unsigned = {
+            key: value for key, value in other.items()
+            if key not in {"grant_digest", "signing_key_id", "signature_b64"}
+        }
+        other = {**unsigned, "grant_digest": canonical_digest(unsigned),
+                 **authority.sign(canonical_bytes(unsigned))}
+        lease = ClaimLease(
+            lease.run_id, ExecutionBundle(manifest, projection, other),
+            lease.operational_projection,
+        )
+    else:
+        clock[0] = grant["expires_at_ms"]
+    reached: list[str] = []
+
+    class Executor:
+        def execute(self, *_args, **_kwargs):
+            reached.append("execute")
+
+    adapter = RunnerExecutionAdapter(
+        coordinator=coordinator, executor=Executor(),
+        transport_factory=lambda validated: reached.append("factory"),
+    )
+    with pytest.raises(ValueError, match=_REFUSALS[case]):
+        adapter.execute(lease, cancellation=CancellationToken(), on_progress=lambda _: None)
+    assert reached == []
+
+
 def test_authenticated_gate_cannot_outlive_proof_horizon_by_local_elapsed_time(tmp_path):
     now = [1.0]
 
@@ -2034,6 +2184,69 @@ def test_stopped_valid_terminal_projection_is_sent_after_bounded_ack_and_unwind(
     assert len(results) == 1
     assert results[0][0] == lease.run_id
     assert results[0][1]["execution_disposition"] == "stopped"
+
+
+@pytest.mark.parametrize("variant", ["completed", "other-reason", "missing-ack"])
+def test_no_non_stopped_or_mismatched_terminal_is_sent_after_an_acknowledged_stop(tmp_path, variant):
+    """After an accepted cloud_stop acknowledgement the only permitted result is the stopped
+    terminal for that exact reason carrying an acknowledgement timestamp; a completed terminal, a
+    different stop reason or a missing timestamp is never sent."""
+    coordinator, _, _, _, _, _, _ = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+        ],
+    )
+    lease = coordinator.claim()
+    results = []
+
+    class StoppingCoordinator:
+        def claim(self):
+            return lease
+
+        def heartbeat(self, run_id, projection):
+            return ExecutionGate(True, "active", "valid", 20_000, 7, "cloud_stop", 2_001)
+
+        def progress(self, run_id, projection):
+            return None
+
+        def stop_ack(self, run_id, projection, *, deadline):
+            return SimpleNamespace(accepted=True, acknowledged_at_ms=2_000)
+
+        def result(self, run_id, projection):
+            results.append(projection)
+
+    class Executor:
+        def execute(self, claimed, *, cancellation, on_progress):
+            while not cancellation.cancelled:
+                time.sleep(0.005)
+            assert cancellation.stop_ack_event.wait(1)
+            unsigned = {
+                key: copy.deepcopy(value)
+                for key, value in _phase(lease.operational_projection, coordinator.signer, "terminal").items()
+                if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+            }
+            if variant != "completed":
+                unsigned["execution_disposition"] = "stopped"
+                unsigned["stop_reason"] = "kill_switch" if variant == "other-reason" else "cloud_stop"
+                unsigned["timestamps"]["stop_requested_at_ms"] = 2_000
+                unsigned["timestamps"]["stop_acknowledged_at_ms"] = None if variant == "missing-ack" else 2_000
+            signature = coordinator.signer.sign(canonical_bytes(unsigned))
+            return {"operational_projection": validate_operational_run({
+                **unsigned, "projection_digest": canonical_digest(unsigned),
+                "signing_key_id": coordinator.signer.key_id,
+                "signature_b64": base64.b64encode(signature).decode("ascii"),
+            })}
+
+        def prepare_stop_ack(self, claimed, projection, stop_reason, proposed_at_ms):
+            return _phase(lease.operational_projection, coordinator.signer, "stop_requested")
+
+    RunnerService(
+        coordinator=StoppingCoordinator(), executor=Executor(),
+        heartbeat_interval=0.05, idle_poll_interval=2.0,
+    ).run_once()
+    assert results == []
 
 
 # ---------------------------------------------------------------------------
@@ -2218,3 +2431,131 @@ def test_startup_keeps_a_job_claim_whose_sequence_the_server_consumed(tmp_path):
         factory()
     assert (raised.value.operation, raised.value.reason) == ("claim", "claim_sequence_consumed")
     assert runtime.load_pending_calls() == (staged,) and runtime.load_superseded_calls() == ()
+
+
+# --- PENDING-BODY-CAP T-P7: coordinator startup replay of a findings upload over 3 072 B ---------------
+
+_FINDINGS_SHAPES = {
+    "representative": {"scenarios": 2, "observations": 2, "text": 200, "title": 60},
+    "maximal": {"scenarios": 4, "observations": 5, "text": 2000, "title": 160},
+}
+
+
+def _findings_projection_with_scenarios(coordinator, manifest, projection, grant, *, scenarios, observations,
+                                        text, title):
+    base = _findings_projection(coordinator, manifest, projection, grant)
+    unsigned = {
+        key: value for key, value in base.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    unsigned["assessment_outcome"] = "observed"
+    unsigned["scenario_results"] = [
+        {
+            "ordinal": index, "scenario_id": f"scenario_{index}", "adapter_version": unsigned["adapter_versions"][0],
+            "assessment_outcome": "observed",
+            "route": {"method": "GET", "route_template": f"/api/canary/{index}"},
+            "observations": [
+                {"semantic_role": f"role{item:02d}", "status_code": 200, "body_shape": "json_object",
+                 "truncation_state": "complete"}
+                for item in range(observations)
+            ],
+            "finding": {
+                "title": "T" * title, "reachability_rationale": "r" * text, "confidence": "high",
+                "recommended_control": "c" * text, "regression_suggestion": "s" * text,
+            },
+            "containment_codes": [], "redaction_count": 0, "local_evidence_refs": ["ev1_" + "a" * 64],
+        }
+        for index in range(scenarios)
+    ]
+    return {
+        **unsigned,
+        "projection_digest": canonical_digest(unsigned),
+        "signing_key_id": coordinator.signer.key_id,
+        "signature_b64": base64.b64encode(coordinator.signer.sign(canonical_bytes(unsigned))).decode("ascii"),
+    }
+
+
+@pytest.mark.parametrize("shape", sorted(_FINDINGS_SHAPES))
+def test_coordinator_startup_replays_a_representative_findings_upload_over_3072_bytes_byte_identically(
+    tmp_path, capsys, shape,
+):
+    """T-P7: the coordinator path with a scripted transport (labelled as such, not HTTP): a findings
+    upload over 3 072 B whose answer was malformed is sealed, survives a client restart and is sent
+    again byte-identically exactly once by coordinator startup."""
+    receipt_holder = {}
+
+    def responses(manifest, projection, grant):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, _status(
+                grant["run_id"], approval_id=projection["projection_id"], status="terminal",
+            )),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, {"malformed": True}),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, receipt_holder),
+        ]
+
+    coordinator, client, transport, manifest, projection, grant, authority = _coordinator(
+        tmp_path, responses,
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    completed = LocalCanaryExecutor(
+        store=coordinator.store, identity=coordinator.identity, signer=coordinator.signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        lease.bundle, transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    coordinator.result(grant["run_id"], completed.operational_projection)
+    findings = _findings_projection_with_scenarios(
+        coordinator, manifest, projection, grant, **_FINDINGS_SHAPES[shape],
+    )
+    count = _FINDINGS_SHAPES[shape]["scenarios"]
+    permit = _permit(authority, coordinator, grant, findings, scenario_count=count, finding_count=count)
+    receipt_holder.update({
+        "schema_version": "heel.canary-findings-receipt.v1",
+        "receipt_id": "cfr_runner_recovered_upload",
+        "workspace_id": grant["workspace_id"], "project_id": grant["project_id"],
+        "run_id": grant["run_id"], "grant_id": grant["grant_id"],
+        "permit_id": permit["permit_id"], "projection_id": findings["projection_id"],
+        "projection_digest": findings["projection_digest"],
+        "byte_count": len(canonical_bytes(findings)), "scenario_count": count,
+        "finding_count": count, "accepted_at_ms": 2_001, "status": "synchronized",
+    })
+    with pytest.raises(ValueError, match="invalid runner findings receipt"):
+        coordinator.upload_findings(
+            grant["run_id"], permit=permit, findings_projection=findings,
+        )
+    (pending,) = client.runtime.load_pending_calls()
+    assert pending.request_operation == "upload-findings"
+    sealed_body = pending.body
+    assert len(sealed_body) > 3072 and sealed_body == transport.requests[-1][2]
+    assert sealed_body == canonical_bytes({
+        "schema_version": "heel.runner-findings-upload.v1", "run_id": grant["run_id"], "permit": permit,
+        "findings_projection": findings,
+    })
+    sends_before_restart = len(transport.requests)
+
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=client.signer, clock=client.clock, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    recovered = RunnerCoordinator(
+        control=restarted, store=coordinator.store, identity=coordinator.identity,
+        signer=coordinator.signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        clock_ms=lambda: 2_000, monotonic=lambda: 1.0,
+    )
+
+    assert len(transport.requests) == sends_before_restart + 1
+    assert transport.requests[-1] == transport.requests[-2]
+    assert transport.requests[-1][2] == sealed_body
+    assert restarted.runtime.load_pending_calls() == ()
+    assert restarted.runtime.load_terminal_state(grant["run_id"]).state == "consumed"
+    assert recovered._bindings == {}
+    with capsys.disabled():
+        print(f"\n[T-P7 {shape}] findings upload body {len(sealed_body)} B replayed once after restart")

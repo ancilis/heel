@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from enum import Enum
 try:
     import fcntl
 except ImportError:  # pragma: no cover - POSIX capability gate rejects first
@@ -55,6 +56,15 @@ class UnsupportedSecureStorageError(RuntimeError):
 
 class RunnerStoreError(ValueError):
     """Runner state is corrupt, unsafe, or belongs to another target context."""
+
+
+class RunReservationProbe(str, Enum):
+    """Read-only local reservation fact for one run; only ``ABSENT`` proves no reservation exists."""
+
+    ABSENT = "absent"
+    RESERVED = "reserved"
+    JOURNAL_PENDING = "journal_pending"
+    UNRESOLVED = "unresolved"
 
 
 _DIRECTORY_FLAGS = (
@@ -7603,6 +7613,45 @@ class RunnerStore:
             finally:
                 os.close(runs_fd)
         return state
+
+    def probe_run_reservation(self, run_id: str) -> RunReservationProbe:
+        """Classify one run's local reservation without writing run authority.
+
+        Unlike ``recover_run_reservation`` this never rolls a run-authority or compaction journal
+        forward and never creates ``runs/``; the shared lock excludes every writer.  A pending
+        journal, for any run, is ``JOURNAL_PENDING`` when its signed form validates and
+        ``UNRESOLVED`` otherwise.  Every store or filesystem error is ``UNRESOLVED``: malformed
+        state is never reported as ``ABSENT``.
+        """
+        identity, _signer = self._require_runtime_authority()
+        run_hash = self._run_hash(run_id)
+        try:
+            with self._transaction(exclusive=False) as context_fd:
+                runs_fd = _open_child(context_fd, "runs", create=False)
+                if runs_fd is None:
+                    return RunReservationProbe.ABSENT
+                try:
+                    _secure_directory(runs_fd, "Heel runner runs directory")
+                    journal = _read_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, None)
+                    compaction = _read_json(runs_fd, _RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME, None)
+                    if journal is not None or compaction is not None:
+                        if journal is not None:
+                            self._validate_run_authority_journal(journal, identity=identity)
+                        if compaction is not None:
+                            self._validate_run_authority_compaction_journal(compaction, identity=identity)
+                        return RunReservationProbe.JOURNAL_PENDING
+                    self._run_authority_index_locked(runs_fd, identity=identity)
+                    reservation = _read_json(
+                        runs_fd, self._run_authority_record_filename("reserve", run_hash), None,
+                    )
+                    if reservation is not None:
+                        return RunReservationProbe.RESERVED
+                    return RunReservationProbe.ABSENT
+                finally:
+                    os.close(runs_fd)
+        except (OSError, ValueError, TypeError):
+            # RunnerStoreError and canonical ContractError are ValueErrors.
+            return RunReservationProbe.UNRESOLVED
 
     def recover_run_reservation(self, run_id: str) -> dict[str, Any]:
         """Read committed run authority; only a still-present reserve journal may repair files."""

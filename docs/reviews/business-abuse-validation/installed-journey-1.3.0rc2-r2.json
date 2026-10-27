@@ -1,0 +1,471 @@
+{
+  "attempt_reuse": {
+    "exit": 2,
+    "message": "Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage."
+  },
+  "candidate": {
+    "manifest_sha256": "233bf7d1dd19360e552397e1010108b3349ecf66aa62394d38346c03288d5ed8",
+    "sdist": {
+      "name": "heel_sim-1.3.0rc2.tar.gz",
+      "sha256": "d4b49a68b042ea0eef7d8c65c13f5f0de6d1ffe910f4628eed7f672f9074d820"
+    },
+    "superseded_candidate_wheel_sha256": "7e1050905e12e343a2746c3d83212c0dd8c5e583e4d2610026ce7a27b885f0d5",
+    "wheel": {
+      "name": "heel_sim-1.3.0rc2-py3-none-any.whl",
+      "sha256": "4af09c4cc431dd0fe3cb5b45fd1712e199c274832c7e71adefe57314eb41e801"
+    },
+    "wheel_sha256_matches_manifest": true
+  },
+  "install": {
+    "base_python": "3.13.5",
+    "command": "pip --isolated install --no-index --find-links <copied offline wheelhouse> --no-cache-dir './heel_sim-1.3.0rc2-py3-none-any.whl[runner]'",
+    "environment": "env -i with fresh HOME, PATH=/usr/bin:/bin, private TMPDIR; no HEEL_HOME inherited",
+    "heel_saas": "absent",
+    "installed": {
+      "cffi": "2.1.1",
+      "cryptography": "45.0.7",
+      "heel_sim": "1.3.0rc2",
+      "pycparser": "3.12"
+    },
+    "module_origin": "private venv site-packages (heel, heel.runner.plan_differential, heel.reference_rehearsal, cryptography)",
+    "offline_bundle_note": "Cached public-index provenance, re-verified locally (PROVENANCE sha256/size, wheel RECORD); not a fresh remote lookup.",
+    "offline_wheels": [
+      {
+        "cached_index_lists_sha256": true,
+        "filename": "cryptography-45.0.7-cp311-abi3-macosx_10_9_universal2.whl",
+        "record_entries_checked": 103,
+        "record_mismatches": 0,
+        "sha256": "3be4f21c6245930688bd9e162829480de027f8bf962ede33d4f8ba7d67a00cee"
+      },
+      {
+        "cached_index_lists_sha256": true,
+        "filename": "cffi-2.1.1-cp313-cp313-macosx_11_0_arm64.whl",
+        "record_entries_checked": 30,
+        "record_mismatches": 0,
+        "sha256": "19ee6127ee34de7d83ce3d371ebc5ed91addbdcc39f9ab15ce4eb35a4e534971"
+      },
+      {
+        "cached_index_lists_sha256": true,
+        "filename": "pycparser-3.12-py3-none-any.whl",
+        "record_entries_checked": 12,
+        "record_mismatches": 0,
+        "sha256": "a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e"
+      }
+    ],
+    "pip_check": true,
+    "private_directory": "new physical directory outside every checkout, mode 700"
+  },
+  "installed_evaluator_matrix_equals_source_matrix": true,
+  "kind": "heel.installed-candidate-proof",
+  "label": "1.3.0rc2 F2 remediation candidate, revision r2 (unpublished)",
+  "logical_cwd": {
+    "HEEL_HOME_from_PWD_message": "Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage.",
+    "HEEL_HOME_from_PWD_reference_run_exit": 2,
+    "HEEL_HOME_from_pwd_P_hardened": "invariant_held",
+    "physical": "<private>/physical-target",
+    "pwd": "<private>/logical",
+    "setup": "a symlink owned by the proof inside the private directory (no system /tmp)"
+  },
+  "network_denial": {
+    "applies_to": "venv creation, pip install/check, both evaluator matrices, every heel CLI call and the acceptance script",
+    "owned_loopback_control_sandboxed": {
+      "connected": false,
+      "elapsed_s": 0.001,
+      "errno": 1,
+      "error": "PermissionError",
+      "timeout": false
+    },
+    "owned_loopback_control_unsandboxed": {
+      "connected": true,
+      "elapsed_s": 0.001,
+      "status_line": "HTTP/1.0 200 OK"
+    },
+    "public_address_contacted": false,
+    "sandbox_profile": "(version 1)(allow default)(deny network*)"
+  },
+  "opaque_lower_denial": {
+    "cases_changed_from_parent": 44,
+    "evidence_kinds": {
+      "installed_pure_evaluator": "evaluate_plan_pair from the installed wheel, no I/O (this matrix).",
+      "installed_reference_cli": "The reference cases below exercise the installed heel CLI against the synthetic reference product, not the plan-differential evaluator.",
+      "source_cli_replay": "tests/test_runner_plan_differential_cli.py::test_an_opaque_json_denial_body_is_never_a_regression_pass runs the real runner and regress CLI from source against the loopback synthetic target; the HTTPS transport refuses every non-empty non-object body first (row 1 transport:response_rejected), so replay is fail/inconclusive and no finding is stored. It is not an installed run."
+    },
+    "head_note": "HEAD compares statuses only and is unchanged (retained narrow semantics); the transport refuses any non-empty HEAD body (http_transport._body_shape), so HEAD rows with a body are evaluator-only.",
+    "installed_matrix": {
+      "GET json_empty_array": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET json_empty_string": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET json_false": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET json_float": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET json_null": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET json_number": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET json_object_array": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET json_payload_array": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET json_scalar_array": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET json_string": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET json_true": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET json_zero": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET malformed": {
+        "reason": "lower_denial_unassessable",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET object_empty": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "GET object_envelope": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "GET object_payload": {
+        "reason": "lower_denied_payload_present",
+        "replay": "not pass",
+        "row": 9,
+        "stores_finding": false,
+        "verdict": "inconclusive"
+      },
+      "GET zero_bytes": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_empty_array": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_empty_string": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_false": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_float": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_null": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_number": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_object_array": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_payload_array": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_scalar_array": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_string": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_true": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD json_zero": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD malformed": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD object_empty": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD object_envelope": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD object_payload": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      },
+      "HEAD zero_bytes": {
+        "reason": "lower_denied",
+        "replay": "pass/blocked",
+        "row": 7,
+        "stores_finding": false,
+        "verdict": "held"
+      }
+    },
+    "installed_matrix_equals_source_matrix": true,
+    "parent_6c5b105_held_now_unassessable": [
+      "json_empty_array",
+      "json_empty_string",
+      "json_false",
+      "json_float",
+      "json_number",
+      "json_object_array",
+      "json_payload_array",
+      "json_scalar_array",
+      "json_string",
+      "json_true",
+      "json_zero"
+    ],
+    "what": "Markerless lower 401/402/403/404 against a valid higher 200 JSON object. Each cell is identical for all four statuses."
+  },
+  "reference_acceptance": {
+    "cli": [
+      {
+        "case": "vulnerable",
+        "regression_passed": false,
+        "result": "verified_violation"
+      },
+      {
+        "case": "hardened",
+        "regression_passed": true,
+        "result": "invariant_held"
+      },
+      {
+        "case": "error_envelope",
+        "regression_passed": false,
+        "result": "inconclusive"
+      },
+      {
+        "case": "inconclusive",
+        "regression_passed": false,
+        "result": "inconclusive"
+      }
+    ],
+    "mcp": "initialize/list/prepare/execute passed",
+    "replay": "rejected",
+    "unauthorized": "rejected"
+  },
+  "reference_cases": [
+    {
+      "case": "vulnerable",
+      "evidence_state": "verified",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "verified_violation",
+      "run": "vulnerable",
+      "signed_attempt_run_id": "crun_a0000000000000000000000000000001",
+      "uploaded": false
+    },
+    {
+      "case": "hardened",
+      "evidence_state": "verified",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": true,
+      "result": "invariant_held",
+      "run": "hardened",
+      "signed_attempt_run_id": "crun_a0000000000000000000000000000002",
+      "uploaded": false
+    },
+    {
+      "case": "error_envelope",
+      "evidence_state": "unknown",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "inconclusive",
+      "run": "error_envelope",
+      "signed_attempt_run_id": "crun_a0000000000000000000000000000003",
+      "uploaded": false
+    },
+    {
+      "case": "public",
+      "evidence_state": "verified",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": true,
+      "result": "invariant_held",
+      "run": "public",
+      "signed_attempt_run_id": "crun_a0000000000000000000000000000004",
+      "uploaded": false
+    },
+    {
+      "case": "redacted",
+      "evidence_state": "verified",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": true,
+      "result": "invariant_held",
+      "run": "redacted",
+      "signed_attempt_run_id": "crun_a0000000000000000000000000000005",
+      "uploaded": false
+    },
+    {
+      "case": "inconclusive",
+      "evidence_state": "unknown",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "inconclusive",
+      "run": "inconclusive",
+      "signed_attempt_run_id": "crun_a0000000000000000000000000000006",
+      "uploaded": false
+    },
+    {
+      "case": "hardened",
+      "evidence_state": "unknown",
+      "execution_disposition": "stopped",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "inconclusive",
+      "run": "hardened --stop",
+      "signed_attempt_run_id": "crun_a0000000000000000000000000000007",
+      "uploaded": false
+    }
+  ],
+  "scope_note": "Packaging/reference evidence only: an offline, source-free install of the regenerated candidate wheel, its pure evaluator and the synthetic reference product. Not public acquisition, not a real target, not hosted execution, not live-SaaS or customer acceptance."
+}
