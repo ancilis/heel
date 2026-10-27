@@ -18,7 +18,9 @@ from heel.canary_contracts import (
 from heel.runner.control_client import _RunGuard, RunnerControlClient
 from heel.runner.coordinator import RunnerCoordinator, RunnerExecutionAdapter
 from heel.runner.http_transport import CancellationToken
-from heel.runner.execution import ExecutionBundle, ExecutionGate, ValidatedExecutionBundle
+from heel.runner.execution import (
+    ExecutionBundle, ExecutionGate, UnactivatedExecution, ValidatedExecutionBundle,
+)
 from heel.runner.service import ClaimLease, RunnerService
 from heel.runner.store import RunnerStore, RunnerStoreError
 from heel.runner.runtime import (
@@ -1878,9 +1880,10 @@ def test_delayed_execution_rejects_stale_authenticated_claim_gate_before_executo
 
 
 def test_execution_adapter_builds_a_lease_transport_only_from_the_revalidated_claim(tmp_path):
-    """Unit (scripted control transport, recording executor): the lazy factory runs after the
-    fresh coordinator gate and the exact bundle check, sees only the validated bundle, and its
-    transport is the one the executor receives."""
+    """Unit (scripted control transport, recording executor): the metadata precheck runs after the
+    fresh coordinator gate and the exact bundle check, before the executor; the lazy factory is
+    handed to the executor, which calls it only after its own local activation. Both see only the
+    validated bundle, and the factory's transport is the one the executor uses."""
     coordinator, _, _, manifest, projection, grant, _ = _coordinator(
         tmp_path,
         lambda manifest, projection, grant: [
@@ -1907,22 +1910,54 @@ def test_execution_adapter_builds_a_lease_transport_only_from_the_revalidated_cl
         assert validated.grant == grant
         return built
 
+    def precheck(validated):
+        order.append("precheck")
+        assert isinstance(validated, ValidatedExecutionBundle) and validated.grant == grant
+
     class LocalExecutor:
-        def execute(self, bundle, *, transport, gate_source, cancellation, on_progress):
+        def execute(self, bundle, *, transport_factory, gate_source, cancellation, on_progress):
             order.append("execute")
-            assert bundle is lease.bundle and transport is built
+            assert bundle is lease.bundle
             assert gate_source() == ExecutionGate(**_gate())
+            assert transport_factory() is built  # after the executor's own activation
             return {"operational_projection": lease.operational_projection}
 
     adapter = RunnerExecutionAdapter(
         coordinator=coordinator, executor=LocalExecutor(), transport_factory=factory,
+        transport_precheck=precheck,
     )
     adapter.execute(lease, cancellation=CancellationToken(), on_progress=lambda _: None)
-    assert order == ["gate", "factory", "execute", "gate"]
+    assert order == ["gate", "precheck", "execute", "gate", "factory"]
     for arguments in ({}, {"transport": object(), "transport_factory": factory},
                       {"transport_factory": "not callable"}):
         with pytest.raises(TypeError, match="target transport is required"):
             RunnerExecutionAdapter(coordinator=coordinator, executor=LocalExecutor(), **arguments)
+    for arguments in ({"transport": object(), "transport_precheck": precheck},
+                      {"transport_factory": factory, "transport_precheck": "not callable"}):
+        with pytest.raises(TypeError, match="precheck requires a lazy target transport"):
+            RunnerExecutionAdapter(coordinator=coordinator, executor=LocalExecutor(), **arguments)
+
+    # A metadata refusal is final before the executor: nothing is reserved or built.
+    order.clear()
+
+    def refusing(validated):
+        order.append("precheck")
+        raise ValueError("credential metadata refused")
+
+    with pytest.raises(ValueError, match="credential metadata refused"):
+        RunnerExecutionAdapter(
+            coordinator=coordinator, executor=LocalExecutor(), transport_factory=factory,
+            transport_precheck=refusing,
+        ).execute(lease, cancellation=CancellationToken(), on_progress=lambda _: None)
+    assert order == ["gate", "precheck"]
+
+    # An authenticated stop already chosen for the lease ends it before any gate or executor.
+    order.clear()
+    stopped = CancellationToken()
+    stopped.stop_reason = "cloud_stop"
+    outcome = adapter.execute(lease, cancellation=stopped, on_progress=lambda _: None)
+    assert isinstance(outcome, UnactivatedExecution) and outcome.stop_reason == "cloud_stop"
+    assert outcome.operational_projection is None and order == []
 
 
 _REFUSALS = {
@@ -2149,6 +2184,69 @@ def test_stopped_valid_terminal_projection_is_sent_after_bounded_ack_and_unwind(
     assert len(results) == 1
     assert results[0][0] == lease.run_id
     assert results[0][1]["execution_disposition"] == "stopped"
+
+
+@pytest.mark.parametrize("variant", ["completed", "other-reason", "missing-ack"])
+def test_no_non_stopped_or_mismatched_terminal_is_sent_after_an_acknowledged_stop(tmp_path, variant):
+    """After an accepted cloud_stop acknowledgement the only permitted result is the stopped
+    terminal for that exact reason carrying an acknowledgement timestamp; a completed terminal, a
+    different stop reason or a missing timestamp is never sent."""
+    coordinator, _, _, _, _, _, _ = _coordinator(
+        tmp_path,
+        lambda manifest, projection, grant: [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+        ],
+    )
+    lease = coordinator.claim()
+    results = []
+
+    class StoppingCoordinator:
+        def claim(self):
+            return lease
+
+        def heartbeat(self, run_id, projection):
+            return ExecutionGate(True, "active", "valid", 20_000, 7, "cloud_stop", 2_001)
+
+        def progress(self, run_id, projection):
+            return None
+
+        def stop_ack(self, run_id, projection, *, deadline):
+            return SimpleNamespace(accepted=True, acknowledged_at_ms=2_000)
+
+        def result(self, run_id, projection):
+            results.append(projection)
+
+    class Executor:
+        def execute(self, claimed, *, cancellation, on_progress):
+            while not cancellation.cancelled:
+                time.sleep(0.005)
+            assert cancellation.stop_ack_event.wait(1)
+            unsigned = {
+                key: copy.deepcopy(value)
+                for key, value in _phase(lease.operational_projection, coordinator.signer, "terminal").items()
+                if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+            }
+            if variant != "completed":
+                unsigned["execution_disposition"] = "stopped"
+                unsigned["stop_reason"] = "kill_switch" if variant == "other-reason" else "cloud_stop"
+                unsigned["timestamps"]["stop_requested_at_ms"] = 2_000
+                unsigned["timestamps"]["stop_acknowledged_at_ms"] = None if variant == "missing-ack" else 2_000
+            signature = coordinator.signer.sign(canonical_bytes(unsigned))
+            return {"operational_projection": validate_operational_run({
+                **unsigned, "projection_digest": canonical_digest(unsigned),
+                "signing_key_id": coordinator.signer.key_id,
+                "signature_b64": base64.b64encode(signature).decode("ascii"),
+            })}
+
+        def prepare_stop_ack(self, claimed, projection, stop_reason, proposed_at_ms):
+            return _phase(lease.operational_projection, coordinator.signer, "stop_requested")
+
+    RunnerService(
+        coordinator=StoppingCoordinator(), executor=Executor(),
+        heartbeat_interval=0.05, idle_poll_interval=2.0,
+    ).run_once()
+    assert results == []
 
 
 # ---------------------------------------------------------------------------

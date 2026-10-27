@@ -7,7 +7,7 @@ import time
 from typing import Any, Callable, Protocol, runtime_checkable
 
 from heel.canary_contracts import validate_operational_run
-from heel.runner.execution import ExecutionGate
+from heel.runner.execution import ExecutionGate, LocalRunNotActive
 from heel.runner.http_transport import CancellationToken
 
 
@@ -53,7 +53,14 @@ class LeaseExecutor(Protocol):
 
 
 class _StopController:
-    """Choose one stop reason, cancel immediately, and acknowledge on a bounded worker."""
+    """Choose one stop reason, cancel immediately, and acknowledge on a bounded worker.
+
+    ``outcome`` settles before ``completed`` is set: ``"acknowledged"`` only for an accepted
+    acknowledgement inside the deadline; ``"not_active"`` when no locally activated run exists to
+    anchor one (the Cloud stop lifecycle owns that run); ``"unacknowledged"`` for every
+    preparation or call failure, rejection or timeout. A timeout never proves the Cloud did not
+    accept the acknowledgement; it only means acceptance was not established locally.
+    """
 
     def __init__(
         self,
@@ -77,6 +84,7 @@ class _StopController:
         self.clock_ms = clock_ms
         self.initiated = threading.Event()
         self.completed = threading.Event()
+        self.outcome: str | None = None
         self._lock = threading.Lock()
         self._worker: threading.Thread | None = None
 
@@ -104,13 +112,18 @@ class _StopController:
             return True
 
     def _acknowledge(self, reason: str, proposed_at_ms: int, deadline: float) -> None:
+        outcome = "unacknowledged"
         try:
             prepare = getattr(self.executor, "prepare_stop_ack", None)
-            acknowledgement = (
-                self.snapshot()
-                if prepare is None
-                else prepare(self.lease, self.snapshot(), reason, proposed_at_ms)
-            )
+            try:
+                acknowledgement = (
+                    self.snapshot()
+                    if prepare is None
+                    else prepare(self.lease, self.snapshot(), reason, proposed_at_ms)
+                )
+            except LocalRunNotActive:
+                outcome = "not_active"
+                return
             if not isinstance(acknowledgement, dict):
                 return
             if self.monotonic() >= deadline:
@@ -125,6 +138,8 @@ class _StopController:
                     response = self.coordinator.stop_ack(
                         self.lease.run_id, acknowledgement, deadline=deadline,
                     )
+                    if getattr(response, "accepted", True) is not True:
+                        raise ValueError("stop acknowledgement was not accepted")
                     exact_timestamp = getattr(response, "acknowledged_at_ms", None)
                     if exact_timestamp is None:
                         exact_timestamp = self.clock_ms()
@@ -154,7 +169,12 @@ class _StopController:
             ):
                 self.cancellation.stop_acknowledged_at_ms = acknowledged_at_ms[0]
                 self.accept_projection(acknowledgement)
+                outcome = "acknowledged"
+        except BaseException:
+            # A failed preparation is never an acknowledgement and never escapes this worker.
+            outcome = "unacknowledged"
         finally:
+            self.outcome = outcome
             self.completed.set()
 
     def join(self, timeout: float = 5.1) -> None:
@@ -345,7 +365,15 @@ class RunnerService:
             raise RuntimeError("runner heartbeat failed closed") from heartbeat_failure[0]
         if not stopped:
             self.coordinator.result(lease.run_id, snapshot())
-        else:
+        elif stop_controller.completed.is_set() and stop_controller.outcome in {
+            "acknowledged", "unacknowledged",
+        }:
+            # A locally activated run reports one stopped terminal for the chosen reason.  It
+            # carries the acknowledgement timestamp only when the bounded acknowledgement was
+            # accepted, and null otherwise: "stopped, acknowledgement not established", never an
+            # acknowledgement claim and never a completed result.  A stop with no active local
+            # run (``not_active``) has no local terminal anchor and sends nothing further.
+            acknowledged = stop_controller.outcome == "acknowledged"
             try:
                 terminal = validate_operational_run(snapshot())
             except (TypeError, ValueError):
@@ -354,6 +382,9 @@ class RunnerService:
                 terminal is not None
                 and terminal["run_id"] == lease.run_id
                 and terminal["lifecycle_phase"] == "terminal"
+                and terminal["execution_disposition"] == "stopped"
+                and terminal["stop_reason"] == getattr(cancellation, "stop_reason", None)
+                and (terminal["timestamps"]["stop_acknowledged_at_ms"] is not None) == acknowledged
             ):
                 self.coordinator.result(lease.run_id, terminal)
         return True
