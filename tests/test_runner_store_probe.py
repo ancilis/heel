@@ -198,6 +198,8 @@ def test_probe_reports_a_valid_compaction_journal_as_pending_without_completing_
 @pytest.mark.parametrize("damage", (
     "tampered-reserve-journal", "invalid-compaction-journal", "missing-index", "tampered-index",
     "symlinked-reservation", "malformed-reservation", "context-rollover-journal",
+    # R1 independent review O1: the validated signed index names the run, its record is missing.
+    "index-lists-nonterminal-run-record-missing", "index-lists-terminal-queue-run-record-missing",
 ))
 def test_probe_reports_unresolved_for_malformed_state_and_changes_nothing(tmp_path, monkeypatch, damage):
     store, identity, signer, manifest, projection = compiled_pair(tmp_path)
@@ -228,6 +230,24 @@ def test_probe_reports_unresolved_for_malformed_state_and_changes_nothing(tmp_pa
         os.symlink(target, reservation)
     elif damage == "malformed-reservation":
         reservation.write_bytes(b"{not json")
+    elif damage == "index-lists-nonterminal-run-record-missing":
+        store.reserve_run(grant, retention_expires_at_ms=2_000 + 86_400_000)
+        listed = json.loads(index.read_text())
+        assert [item["run_hash"] for item in listed["nonterminal_runs"]] == [run_hash]
+        reservation.unlink()
+    elif damage == "index-lists-terminal-queue-run-record-missing":
+        authority = SigningAuthority.generate()
+        grant = signed_grant(manifest, projection, identity, authority)
+        LocalCanaryExecutor(
+            store=store, identity=identity, signer=signer,
+            trusted_grant_keys={authority.key_id: authority.public_key},
+            vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000, monotonic=lambda: 1.0,
+        ).execute(ExecutionBundle(manifest, projection, grant), transport=ScriptedTransport([401, 200, 200, 403]),
+                  gate_source=active_gate)
+        listed = json.loads(index.read_text())
+        assert listed["nonterminal_runs"] == []
+        assert [item["run_hash"] for item in listed["terminal_queue"]] == [run_hash]
+        reservation.unlink()
     else:
         (_context_path(store) / "context-rollover.json").write_bytes(b"{}")
     before = _tree(_context_path(store))

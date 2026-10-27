@@ -7620,8 +7620,9 @@ class RunnerStore:
         Unlike ``recover_run_reservation`` this never rolls a run-authority or compaction journal
         forward and never creates ``runs/``; the shared lock excludes every writer.  A pending
         journal, for any run, is ``JOURNAL_PENDING`` when its signed form validates and
-        ``UNRESOLVED`` otherwise.  Every store or filesystem error is ``UNRESOLVED``: malformed
-        state is never reported as ``ABSENT``.
+        ``UNRESOLVED`` otherwise.  Every store or filesystem error is ``UNRESOLVED``, and so is a
+        run the validated index lists without its reservation record: malformed state is never
+        reported as ``ABSENT``.
         """
         identity, _signer = self._require_runtime_authority()
         run_hash = self._run_hash(run_id)
@@ -7640,12 +7641,19 @@ class RunnerStore:
                         if compaction is not None:
                             self._validate_run_authority_compaction_journal(compaction, identity=identity)
                         return RunReservationProbe.JOURNAL_PENDING
-                    self._run_authority_index_locked(runs_fd, identity=identity)
+                    index = self._run_authority_index_locked(runs_fd, identity=identity)
                     reservation = _read_json(
                         runs_fd, self._run_authority_record_filename("reserve", run_hash), None,
                     )
                     if reservation is not None:
                         return RunReservationProbe.RESERVED
+                    # The signed index still names this run, so its missing record is contradictory
+                    # current state, never proof of absence.
+                    if any(
+                        item["run_hash"] == run_hash
+                        for item in (*index["nonterminal_runs"], *index["terminal_queue"])
+                    ):
+                        return RunReservationProbe.UNRESOLVED
                     return RunReservationProbe.ABSENT
                 finally:
                     os.close(runs_fd)

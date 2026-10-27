@@ -15,7 +15,15 @@ from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
 from heel.canary_contracts import (
+    INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES,
+    RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN,
+    RUNNER_INACTIVE_CLAIM_ATTESTATION_PROOF_SCHEMA,
+    RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_SCHEMA,
     canonical_bytes,
+    inactive_claim_attestation_signing_payload,
+    parse_json,
+    validate_inactive_claim_attestation,
+    validate_runner_inactive_claim_attestation_request,
     validate_approval_projection,
     validate_canary_findings,
     validate_disclosure_permit,
@@ -32,9 +40,10 @@ from heel.canary_contracts import (
 )
 from heel.crypto import ed25519_key_id, verify_envelope
 from heel.runner.runtime import (
-    ActiveGateUpdate, ActiveRunInstall, ChainResyncAttempt, PendingResultReplayVerifier, PendingSignedCall,
-    RunnerRuntimeConflict, RunnerRuntimeCorrupt, RunnerRuntimeState, RuntimeClaimSequenceConsumed,
-    TerminalResultStageEvidence, _active_json_bytes,
+    ActiveGateUpdate, ActiveRunInstall, ChainResyncAttempt, InactiveClaimAttestationEvidence,
+    PendingResultReplayVerifier, PendingSignedCall, RetiredClaimRecord, RunnerRuntimeConflict,
+    RunnerRuntimeCorrupt, RunnerRuntimeState, RuntimeClaimSequenceConsumed, TerminalResultStageEvidence,
+    _active_json_bytes,
 )
 
 
@@ -122,6 +131,47 @@ class RunnerChainRecoveryDeferred(RunnerControlRecoveryError):
     def __init__(self, retry_after_ms: int):
         super().__init__("runner chain recovery is rate limited")
         self.retry_after_ms = retry_after_ms
+
+
+class RunnerInactiveClaimAttestationUntrusted(RunnerAuthenticationRejected):
+    """A 200 inactive-claim answer did not verify under the pairing-pinned grant authority."""
+
+    code = "inactive_claim_attestation_untrusted"
+
+
+class RunnerInactiveClaimRecoveryWaiting(RunnerChainRecoveryDeferred):
+    """The Cloud still holds the claim live (``run_live``); its reaper persists the stop. Retry later."""
+
+    code = "inactive_claim_waiting_for_cloud"
+
+    def __init__(self, retry_after_ms: int):
+        super().__init__(retry_after_ms)
+        self.args = ("runner inactive claim is still live in the cloud",)
+
+
+class RunnerInactiveClaimRecoveryBlocked(RunnerChainRecoveryRequired):
+    """The Cloud refused, or answered with an unusable, inactive-claim attestation; the claim is kept.
+
+    ``reason`` is the Cloud's closed refusal (``cloud_observed_execution``, ``binding_mismatch``,
+    ``lifecycle_mismatch``), ``protocol_upgrade_required``, ``unexpected_response`` (any other
+    non-200 status) or ``invalid_attestation`` (an unusable 200).
+    """
+
+    def __init__(self, reason: str):
+        RunnerControlRecoveryError.__init__(self, f"runner inactive claim recovery is blocked: {reason}")
+        self.operation = "inactive-claim-attestation"
+        self.reason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedInactiveClaimAttestation:
+    """One verified attestation exchange, bound to the client and active-row snapshot it was made for."""
+
+    run_id: str
+    expected_state_digest: str
+    attestation: Mapping[str, Any]
+    evidence: InactiveClaimAttestationEvidence
+    _client: object
 
 
 class _ClaimChainAuthorityLost(Exception):
@@ -2212,6 +2262,169 @@ class RunnerControlClient:
                 raise ValueError("active runner claim is required")
             self._stage_chain(staged, chain_name, state)
             self._chains = staged
+
+    def _attest_inactive_claim(self, run_id: str) -> VerifiedInactiveClaimAttestation:
+        """Ask the Cloud to attest one sealed active claim as irreversibly inactive (POSTRESET §7.2).
+
+        Nonce-free: one fixed path, a closed canonical body with a fresh 32-byte challenge, and the
+        resync proof-of-possession header family.  Nothing is staged and no chain, cursor, attempt or
+        execution authority changes.  A 200 counts only after it fits the 8 KiB attestation budget,
+        verifies under the pairing-pinned grant authority, passes the closed validator and echoes the
+        challenge and every binding of the exact active row; a status alone never proves inactivity.
+        """
+        if type(run_id) is not str or not run_id:
+            raise ValueError("active runner claim is required")
+        trusted = dict(self._trusted_disclosure_keys)
+        if not trusted:
+            raise ValueError("trusted grant authority is required")
+        with self._run_guard(run_id):
+            active = next((
+                item for item in self.runtime.load_active_run_controls(limit=64) if item.run_id == run_id
+            ), None)
+            if active is None:
+                raise ValueError("active runner claim is required")
+            challenge = self._random_b64()
+            request = {
+                "schema_version": RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_SCHEMA, "run_id": run_id,
+                "project_id": active.project_id, "grant_id": active.grant_id, "grant_digest": active.grant_digest,
+                "approval_id": active.approval_id,
+                "approval_projection_digest": active.approval_projection_digest,
+                "bound_runner_key_id": self.signer.key_id, "client_challenge_b64": challenge,
+            }
+            if validate_runner_inactive_claim_attestation_request(request) != request:
+                raise ValueError("invalid runner inactive claim request")
+            body = canonical_bytes(request)
+            path = (
+                f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}"
+                f"/runs/{run_id}/inactive-claim-attestation"
+            )
+            timestamp_ms = self._timestamp()
+            proof = {
+                "schema_version": RUNNER_INACTIVE_CLAIM_ATTESTATION_PROOF_SCHEMA,
+                "workspace_id": self.workspace_id, "runner_id": self.runner_id, "key_id": self.signer.key_id,
+                "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(),
+                "timestamp_ms": timestamp_ms,
+            }
+            headers = self._headers(
+                self._signature(RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN + canonical_bytes(proof)), timestamp_ms,
+            )
+            status, _response_headers, payload = self._closed_transport_response(
+                self.transport.post(path, headers=headers, body=body),
+                error="invalid runner inactive claim response",
+            )
+            if status != 200:
+                self._raise_inactive_claim_refusal(status, payload)
+            attestation, response_body = self._verified_inactive_claim(payload, trusted, challenge, active)
+            # The runtime archives the authenticated proof headers; Content-Type is fixed framing.
+            evidence = InactiveClaimAttestationEvidence(
+                request_method="POST", request_path=path,
+                request_headers={name: headers[name] for name in (
+                    "X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
+                    "X-Heel-Runner-Signature",
+                )},
+                request_body=body, request_timestamp_ms=timestamp_ms,
+                response_status=200, response_body=response_body,
+            )
+            return VerifiedInactiveClaimAttestation(run_id, active.state_digest, attestation, evidence, self)
+
+    def _raise_inactive_claim_refusal(self, status: int, payload: object) -> None:
+        if status == 401:
+            raise RunnerAuthenticationRejected()
+        if status == 429:
+            raise RunnerChainRecoveryDeferred(self._retry_after_ms(payload))
+        if (
+            status == 409 and isinstance(payload, dict)
+            and set(payload) == {"schema_version", "code", "reason"}
+            and payload["schema_version"] == "heel.runner-error.v1"
+            and payload["code"] == "inactive_claim_attestation_refused"
+        ):
+            if payload["reason"] == "run_live":
+                raise RunnerInactiveClaimRecoveryWaiting(_DEFAULT_RETRY_AFTER_MS)
+            if payload["reason"] in {"cloud_observed_execution", "binding_mismatch", "lifecycle_mismatch"}:
+                raise RunnerInactiveClaimRecoveryBlocked(payload["reason"])
+        if (
+            status == 403 and isinstance(payload, dict)
+            and payload.get("code") == "runner_protocol_upgrade_required"
+        ):
+            raise RunnerInactiveClaimRecoveryBlocked("protocol_upgrade_required")
+        raise RunnerInactiveClaimRecoveryBlocked("unexpected_response")
+
+    def _verified_inactive_claim(
+        self, payload: object, trusted: dict[str, object], challenge: str, active: object,
+    ) -> tuple[dict[str, Any], bytes]:
+        try:
+            if not isinstance(payload, dict):
+                raise ValueError
+            # The transport hands over strictly parsed JSON; the archived bytes are its canonical
+            # encoding, bounded before the closed parse.
+            response_body = canonical_bytes(payload)
+            if len(response_body) > INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES:
+                raise ValueError
+            value = parse_json(response_body, max_bytes=INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES)
+            if (
+                not isinstance(value, dict) or type(value.get("signing_key_id")) is not str
+                or type(value.get("signature_b64")) is not str
+            ):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise RunnerInactiveClaimRecoveryBlocked("invalid_attestation") from None
+        try:
+            verify_envelope(
+                trusted, {"signing_key_id": value["signing_key_id"], "signature_b64": value["signature_b64"]},
+                inactive_claim_attestation_signing_payload(value),
+            )
+        except (TypeError, ValueError):
+            raise RunnerInactiveClaimAttestationUntrusted() from None
+        try:
+            checked = validate_inactive_claim_attestation(value)
+        except (TypeError, ValueError):
+            raise RunnerInactiveClaimRecoveryBlocked("invalid_attestation") from None
+        expected = {
+            "workspace_id": self.workspace_id, "runner_id": self.runner_id, "project_id": active.project_id,
+            "run_id": active.run_id, "grant_id": active.grant_id, "grant_digest": active.grant_digest,
+            "approval_id": active.approval_id, "approval_projection_digest": active.approval_projection_digest,
+            "bound_runner_key_id": self.signer.key_id, "authenticated_runner_key_id": self.signer.key_id,
+            "client_challenge_b64": challenge,
+        }
+        cloud = checked["cloud"]
+        if (
+            checked != value or any(checked[key] != item for key, item in expected.items())
+            or cloud["status"] not in {"stop_requested", "finalizing", "terminal"}
+            or cloud["stop_reason"] == "none"
+            or cloud["started_at_ms"] is not None or cloud["stop_acknowledged_at_ms"] is not None
+        ):
+            raise RunnerInactiveClaimRecoveryBlocked("invalid_attestation")
+        return checked, response_body
+
+    def _retire_inactive_claim(
+        self, verified: VerifiedInactiveClaimAttestation, *, reservation_probe: str, now_ms: int,
+    ) -> RetiredClaimRecord:
+        """Durably retire one verified inactive claim, then drop its in-memory tracking (LOAD-GUARD §3.4).
+
+        The run guard is held across the runtime commit and the cache drop; ``_state_lock`` covers
+        only the dictionary mutation and is never held across the runtime transaction.  A crash
+        between the two leaves nothing to drop: the next client rebuilds tracking from the runtime.
+        """
+        if not isinstance(verified, VerifiedInactiveClaimAttestation) or verified._client is not self:
+            raise ValueError("verified inactive claim attestation is required")
+        run_id = verified.run_id
+        with self._run_guard(run_id) as guard_token:
+            record = self.runtime.retire_inactive_claim(
+                run_id, expected_state_digest=verified.expected_state_digest, evidence=verified.evidence,
+                reservation_probe=reservation_probe, now_ms=now_ms,
+            )
+            with self._state_lock:
+                staged = dict(self._chains)
+                for operation in _RUN_OPERATIONS:
+                    staged.pop(self._chain(operation, run_id), None)
+                self._tracked_runs.discard(run_id)
+                self._terminal_runs.discard(run_id)
+                self._terminal_bindings.pop(run_id, None)
+                guard = self._run_guards.get(run_id)
+                if guard is not None and guard.token is guard_token:
+                    self._run_guards.pop(run_id, None)
+                self._chains = staged
+        return record
 
     def _random_b64(self) -> str:
         raw = self.resync_random_source(32)

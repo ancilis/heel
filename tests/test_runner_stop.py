@@ -3078,3 +3078,91 @@ def test_concurrent_local_and_cloud_stop_pre_factory_uses_one_ack_and_one_reason
     assert terminal["lifecycle_phase"] == "terminal" and terminal["execution_disposition"] == "stopped"
     assert terminal["stop_reason"] == ack["stop_reason"] in {"local_emergency_stop", "cloud_stop"}
     assert terminal["timestamps"]["stop_acknowledged_at_ms"] is not None
+
+
+class _NoControlTransport:
+    """Any control request is a test failure: these runs must never reach inactive-claim recovery."""
+
+    def __init__(self, *, lose=()):
+        self.sent, self.lose = [], set(lose)
+
+    def post(self, path, *, headers=None, body=b""):
+        operation = path.rsplit("/", 1)[1]
+        self.sent.append(operation)
+        if operation in self.lose:
+            raise ConnectionError("synthetic: the answer was lost")
+        raise AssertionError(f"unexpected control request {operation}")
+
+
+@pytest.mark.parametrize("case", ["activated-pre-factory", "local-terminal", "pending-progress", "pending-stop-ack"])
+def test_activated_pre_factory_and_terminal_local_runs_never_enter_preactivation_recovery(tmp_path, case):
+    """L3/L4/L5 (POSTRESET §7.1): an expired claim that reserved locally, holds a local terminal or has
+    a non-heartbeat request staged keeps its existing fail-closed restart path and evidence."""
+    import sqlite3
+    from contextlib import closing
+
+    from heel.runner.control_client import RunnerControlClient
+    from heel.runner.coordinator import RunnerCoordinator, _signed_projection
+
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    trusted = {authority.key_id: authority.public_key}
+    grant = signed_grant(manifest, projection, identity, authority)
+    run_id = grant["run_id"]
+    runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+    _install_runtime_active_claim(runtime, identity, signer, projection, grant)
+    transport = _NoControlTransport(lose={"progress", "stop-ack"})
+
+    def client():
+        return RunnerControlClient(
+            origin="https://control.example", workspace_id=identity.workspace_id, runner_id=identity.runner_id,
+            signer=signer, clock=lambda: 2_000, transport=transport,
+            nonce_source=lambda _key: base64.b64encode(b"c" * 32).decode("ascii"),
+            trusted_disclosure_keys=trusted, runtime=runtime,
+        )
+
+    claim_builder = object.__new__(RunnerCoordinator)
+    claim_builder.identity, claim_builder.signer = identity, signer
+    claimed = claim_builder._claimed_projection(manifest, projection, grant, claimed_at_ms=2_000)
+    if case == "activated-pre-factory":
+        # The executor's activation reserves before any factory or target transport exists.
+        store.reserve_run(grant, retention_expires_at_ms=2_000 + 86_400_000)
+    elif case == "local-terminal":
+        LocalCanaryExecutor(
+            store=store, identity=identity, signer=signer, trusted_grant_keys=trusted,
+            vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000, monotonic=lambda: 1.0,
+        ).execute(ExecutionBundle(manifest, projection, grant), transport=ScriptedTransport([401, 200, 200, 403]),
+                  gate_source=active_gate)
+        runtime.register_local_terminal(**store._runtime_terminal_anchor(run_id))
+    else:
+        unsigned = {key: copy.deepcopy(value) for key, value in claimed.items()
+                    if key not in {"projection_digest", "signing_key_id", "signature_b64"}}
+        unsigned.update(event_sequence=1, lifecycle_phase="running")
+        unsigned["timestamps"].update(started_at_ms=2_000, updated_at_ms=2_000)
+        if case == "pending-stop-ack":
+            unsigned.update(event_sequence=2, lifecycle_phase="stop_requested", stop_reason="cloud_stop")
+            unsigned["timestamps"].update(stop_requested_at_ms=2_000, stop_acknowledged_at_ms=2_000)
+        staged = client()
+        with pytest.raises(ConnectionError):
+            getattr(staged, "progress" if case == "pending-progress" else "stop_ack")(
+                run_id=run_id, operational_projection=_signed_projection(unsigned, signer),
+            )
+        assert [item.request_operation for item in runtime.load_pending_calls()] == [case.split("-", 1)[1]]
+    probe = store.probe_run_reservation(run_id).value
+    assert probe == ("absent" if case.startswith("pending") else "reserved")
+
+    def rows():
+        with closing(sqlite3.connect(runtime.path)) as conn:
+            return {table: sorted(map(tuple, conn.execute(f"SELECT * FROM {table}"))) for table in (
+                "active_runs", "control_chains", "pending_calls", "terminal_disclosures", "retired_claims")}
+
+    before, sent = rows(), list(transport.sent)
+    # The grant (issued 1 000, expires 10 000) is expired for the restarted runner: L2 holds.
+    with pytest.raises(RunnerStoreError, match="runtime active grant authority is unavailable"):
+        RunnerCoordinator(
+            control=client(), store=store, identity=identity, signer=signer, trusted_grant_keys=trusted,
+            clock_ms=lambda: 20_000, monotonic=lambda: 1.0,
+        )
+    assert transport.sent == sent  # never an attestation, never a replay
+    assert rows() == before and runtime.load_retired_claim(run_id) is None
+    assert store.probe_run_reservation(run_id).value == probe

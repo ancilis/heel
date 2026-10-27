@@ -3686,7 +3686,8 @@ def test_stage_call_refuses_a_non_nfc_path_and_an_out_of_grammar_capability_with
         assert probe.seals == probe.encryptions == 0
     assert str(refused.value) == "invalid runtime pending headers"
     assert _semantic_rows(runtime.path) == before
-    # A failure inside the sealer itself (here: the whole-record bound) is wrapped the same way.
+    # An artificial 64-byte whole-record bound makes digest construction fail (``_pending_json_bytes``
+    # inside ``_pending_state_digest``) before any seal; that failure is wrapped the same way.
     monkeypatch.setattr(runtime_module, "_PENDING_BLOB_BOUND", 64)
     with pytest.raises(runtime_module.RunnerRuntimeStateError) as refused:
         _stage_on_claim_chain(runtime, signer, identity, "list-contexts", _LIST_BODY)

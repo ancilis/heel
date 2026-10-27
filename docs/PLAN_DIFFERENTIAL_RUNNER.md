@@ -546,23 +546,71 @@ Exit codes: `0` stopped (SIGINT, SIGTERM or `--once` done), `1` offline (`--once
   runner must be re-provisioned (separate `HEEL_HOME`, re-pair).
   Revocation therefore cannot yet be shown to
   stop target traffic; that is proven when execution exists.
+- **Pre-activation claim recovery.** <a id="pre-activation-claim-recovery"></a>A claimed run that
+  never activated locally can be left behind when Heel Cloud stops it (owner stop, kill switch,
+  proof or grant expiry, missing heartbeat) before the runner hears about it. Its sealed claim
+  can never hydrate again, so before restoring any claimed run the serve cycle's coordinator
+  retires such a claim, and only such a claim, when all of these hold: the persisted gate denies
+  execution or the grant has expired; the Store probe finds no local reservation now
+  (`absent`; a run the signed run-authority index still lists without its record is
+  `unresolved` and does not qualify); there is no local terminal; and every staged request of
+  the run is a heartbeat. This runs while `serve` holds the instance lock and before any
+  executor exists. Any other claimed run keeps the restart behavior described above.
+  1. The runner asks `POST …/runs/{run_id}/inactive-claim-attestation` with the resync
+     proof-of-possession headers only (no nonce, no sequence, nothing staged, no cursor or
+     attempt change) and a closed body naming the exact project, grant, approval digests, the
+     runner key and a fresh random 32-byte challenge.
+  2. It accepts only a 200 answer whose canonical JSON is at most 8 192 bytes, whose signature
+     verifies under the grant authority pinned at pairing, which passes the closed validator,
+     echoes the challenge and every binding of the local claim, and reports a stopped run with no
+     start and no stop acknowledgement. The local clock is never compared with the attestation.
+  3. In one runtime transaction the active row, its four run chains and any staged heartbeat are
+     archived verbatim in `retired_claims` (the heartbeat marked delivery `uncertain`; it is
+     never resent) together with the request and the attestation, and removed. No reservation,
+     terminal, acknowledgement, result, quota or target activity is created. A crash before that
+     commit leaves everything unchanged and the next start asks again with a new challenge; a
+     crash after it leaves nothing to redo.
+  The archived `reservation: "absent"` means only that no reservation record exists now (never
+  reserved, or reserved, finished, pruned and compacted); it is not a statement that the run never
+  executed. Outcomes that keep the claim unchanged:
+  - `409 run_live` (the Cloud still holds it live; its reaper persists the stop): `offline`,
+    `inactive_claim_waiting_for_cloud`, retried after 60 s.
+  - `409 cloud_observed_execution`, `binding_mismatch` or `lifecycle_mismatch`, an unusable 200,
+    or `403 runner_protocol_upgrade_required` from a direct client: `failed`,
+    `recovery_required` (contact Heel support; nothing is deleted). Behind the production
+    transport the 403 ends `failed`, `protocol_upgrade_required`, as for every control call.
+  - A 200 whose signature does not verify under the pinned authority: `rejected`,
+    `inactive_claim_attestation_untrusted`.
+  - `401` (revoked key, key rotated in Heel Cloud, clock outside the server window, or a run not
+    owned by this runner): `rejected`, `runner_authentication_rejected`. No successor key can
+    retire an old key's claim. After a revocation or rotation, a context-bound `HEEL_HOME` cannot
+    be unpaired (`context_bound`, below); re-provision with a new, empty `HEEL_HOME` and a new
+    invitation, and keep the old directory as evidence.
+  - `429` (three attestations per runner per minute): `offline`, `recovery_rate_limited`.
+  - A transport failure: classified as for every control call (`offline` for a connection
+    failure or timeout).
+  The transport hands the client strictly parsed JSON (bounded at 256 KiB like every control
+  answer), so the archived response bytes are the canonical encoding of that JSON, not the wire
+  bytes, and the 8 192-byte budget applies to that encoding.
 - **Unpair after a binding: open gap, no recovery path yet.** Once a context binding is
   installed, `unpair` refuses `context_bound` (unchanged) and `pair` refuses the same
   `HEEL_HOME`. There is no product command that retires the bound context, its credential
   items in the OS secret store or the pairing seed; a new `HEEL_HOME` leaves all of them
   behind. Retirement is being designed separately and is not part of this release.
 
-### Runtime state `heel.runner-runtime-state.v4` (for later retirement work)
+### Runtime state `heel.runner-runtime-state.v5` (for later retirement work)
 
-`$HEEL_HOME/runner/runtime.sqlite3` is migrated in place to `v4` the first time this version
-opens it (`v1`/`v2`/`v3` → `v4` in one transaction). Every `v3` table and row, including the
-metadata identity, authority epoch, rotation fence and wrapped state key, is copied unchanged;
-`v4` only adds one table. A file that matches no known schema is refused
-(`RunnerRuntimeCorrupt`), never recreated. An earlier Heel version refuses a `v4` file.
+`$HEEL_HOME/runner/runtime.sqlite3` is migrated in place to `v5` the first time this version
+opens it (`v1`/`v2`/`v3`/`v4` → `v5` in one transaction). Every earlier table and row, including
+the metadata identity, authority epoch, rotation fence and wrapped state key, is copied
+unchanged; `v4` added `chain_recovery` and `v5` adds only `retired_claims` (see
+[Pre-activation claim recovery](#pre-activation-claim-recovery)). A file that matches no known
+schema is refused (`RunnerRuntimeCorrupt`), never recreated.
 
 Tables: `metadata`, `control_chains`, `pending_calls`, `terminal_disclosures`, `active_runs`
-(all as in `v3`) and `chain_recovery(record_id, kind, chain, generation, sealed_blob,
-created_at_ms)` with two kinds:
+(all as in `v3`), `retired_claims(run_hash, sealed_blob, created_at_ms)` (one sealed archive per
+retired claim; never deleted, never opened at startup) and `chain_recovery(record_id, kind,
+chain, generation, sealed_blob, created_at_ms)` with two kinds:
 
 | `kind` | Meaning | Lifecycle state |
 |---|---|---|
