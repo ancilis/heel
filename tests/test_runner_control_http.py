@@ -4094,3 +4094,207 @@ def test_real_http_inactive_claim_attestation_leaves_expired_pending_heartbeat_c
             assert _guarded_state(live) == before
         finally:
             live.close()
+
+
+# --- PENDING-BODY-CAP: bodies over 3 072 B through the public client over real loopback HTTP ---------
+
+def _wide_running_projection(live, times, *, sequence):
+    """A wire-valid running heartbeat projection whose version fields are at their validator maxima."""
+    from canary_test_support import operational_projection
+    from test_canary_lifecycle import resign_operational
+
+    value = operational_projection(
+        live.signer, live.grant, sequence=sequence, phase="running", requests_started=1, requests_completed=1,
+    )
+    value["timestamps"] = {
+        "claimed_at_ms": times["claimed"], "started_at_ms": times["started"],
+        "updated_at_ms": times["started"] + sequence, "stop_requested_at_ms": None,
+        "stop_acknowledged_at_ms": None, "terminal_at_ms": None,
+    }
+    value["versions"] = {
+        "runner_version": "v" * 128, "engine_version": "e" * 128,
+        "adapter_versions": sorted(f"{index:02d}" + "a" * 126 for index in range(20)),
+    }
+    return resign_operational(value, live.signer)
+
+
+def _heartbeat_cursor(live):
+    (cursor,) = [item for item in live.cursors() if item[0] == f"heartbeat:{live.run_id}"]
+    return cursor
+
+
+def test_public_heartbeat_over_3072_bytes_stages_sends_commits_over_real_loopback_http_and_replays_byte_identically_after_restart(
+    tmp_path, capsys,
+):
+    """T-P6: the public ``heartbeat`` API stages, sends and commits a wire-valid heartbeat over 3 072 B;
+    a second one whose send never left survives a restart and is replayed byte-identically once."""
+    from heel.canary_contracts import validate_runner_heartbeat_request
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            times = _live_timeline()
+            terminal = _live_projection(live, times, sequence=9, phase="terminal", acknowledged=None)
+            transport = _LiveRunnerTransport(live)
+            runtime, signer, control = _live_runner(live, tmp_path / "runner", transport, terminal, times=times)
+            initial = _heartbeat_cursor(live)
+
+            first = _wide_running_projection(live, times, sequence=1)
+            status, headers = control.heartbeat(run_id=live.run_id, operational_projection=first)
+            ((_path, _headers, sent),) = transport.sent
+            assert status == 200 and "X-Heel-Runner-Next-Nonce" in headers and transport.answers[0][0] == 200
+            assert len(sent) > 3072 and sent == canonical_bytes(validate_runner_heartbeat_request({
+                "schema_version": "heel.runner-heartbeat-request.v1", "run_id": live.run_id,
+                "operational_projection": first,
+            }))
+            assert runtime.load_pending_calls() == ()
+            after_first = _heartbeat_cursor(live)
+            assert after_first[1] == initial[1] + 1
+
+            second = _wide_running_projection(live, times, sequence=2)
+            transport.refuse_sends = 1
+            with pytest.raises(ConnectionError):
+                control.heartbeat(run_id=live.run_id, operational_projection=second)
+            assert len(transport.answers) == 1 and _heartbeat_cursor(live) == after_first
+            (pending,) = runtime.load_pending_calls()
+            assert pending.request_operation == "heartbeat" and pending.body == transport.sent[1][2]
+            assert len(pending.body) > 3072
+
+            restarted = RunnerRuntimeState(runtime.path, runtime.identity, signer)
+            assert restarted.load_pending_calls() == (pending,)
+            fresh_transport = _LiveRunnerTransport(live)
+            fresh = _live_client(live, restarted, signer, fresh_transport)
+            with pytest.raises(ValueError, match="pending replay is required"):
+                fresh.heartbeat(run_id=live.run_id, operational_projection=second)
+            assert fresh_transport.sent == []
+            outcomes = fresh.replay_all_pending(now_ms=int(time.time() * 1000))
+            assert [(item.request_operation, item.status) for item in outcomes] == [("heartbeat", 200)]
+            assert fresh_transport.sent == [(pending.path, dict(pending.headers), pending.body)]
+            assert restarted.load_pending_calls() == ()
+            assert _heartbeat_cursor(live) == (after_first[0], after_first[1] + 1, after_first[2])
+            assert fresh.replay_all_pending(now_ms=int(time.time() * 1000)) == ()
+            assert len(fresh_transport.sent) == 1 and _heartbeat_cursor(live)[1] == after_first[1] + 1
+
+            # Over the heartbeat route budget: a projection cannot be wire-valid at 36 865 B (its fields are
+            # bounded), so an oversized one is refused by the client's own validation before staging or send.
+            oversized = dict(_wide_running_projection(live, times, sequence=3))
+            oversized["versions"] = {**oversized["versions"], "adapter_versions": ["a" * 2048] * 18}
+            body_size = len(canonical_bytes({
+                "schema_version": "heel.runner-heartbeat-request.v1", "run_id": live.run_id,
+                "operational_projection": oversized,
+            }))
+            assert body_size > 36_864
+            cursor = _heartbeat_cursor(live)
+            with pytest.raises(ValueError):
+                fresh.heartbeat(run_id=live.run_id, operational_projection=oversized)
+            assert len(fresh_transport.sent) == 1 and restarted.load_pending_calls() == ()
+            assert _heartbeat_cursor(live) == cursor
+            with capsys.disabled():
+                print(
+                    f"\n[T-P6 measured] heartbeat bodies {len(sent)} B and {len(pending.body)} B over loopback HTTP; "
+                    f"oversized projection body {body_size} B refused before send",
+                )
+        finally:
+            live.close()
+
+
+def _representative_findings(live, terminal, *, observations=2, text=800, title=120):
+    """The live run's findings projection widened past 3 072 B. The control plane binds the scenario
+    results to the approval's scenarios and action routes, so the single approved scenario is kept and
+    only its observations and finding texts grow."""
+    from test_canary_disclosure import _findings
+
+    value = _findings(live.signer, live.grant, terminal)
+    (scenario,) = value["scenario_results"]
+    scenario["observations"] = [
+        {**scenario["observations"][0], "semantic_role": f"role{item:02d}"} for item in range(observations)
+    ]
+    scenario["finding"] = {
+        **scenario["finding"], "title": "T" * title, "reachability_rationale": "r" * text,
+        "recommended_control": "c" * text, "regression_suggestion": "s" * text,
+    }
+    value["workspace_id"], value["project_id"], value["environment_id"] = live.workspace, "prj", "env"
+    unsigned = {
+        key: item for key, item in value.items() if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    value["projection_digest"] = canonical_digest(unsigned)
+    value.update(live.signer.sign(canonical_bytes(unsigned)))
+    return value
+
+
+def _live_permit(live, findings):
+    from heel.canary_contracts import CANARY_FINDINGS_SCHEMA
+
+    metadata = {
+        "projection_schema_version": CANARY_FINDINGS_SCHEMA, "projection_digest": findings["projection_digest"],
+        "byte_count": len(canonical_bytes(findings)), "scenario_count": len(findings["scenario_results"]),
+        "finding_count": sum(item["finding"] is not None for item in findings["scenario_results"]),
+    }
+    disclosure = live.cp.canary_disclosure
+    preview = disclosure.preview(
+        live.workspace, "prj", live.run_id, runner_id="runner", runner_key_id=live.key_id, **metadata,
+    )
+    return disclosure.permit(
+        live.workspace, "prj", live.run_id, request_id=preview["request_id"], actor="owner", role="owner",
+        recent_auth_at_ms=int(time.time() * 1000), **metadata,
+    )
+
+
+def test_public_findings_upload_over_3072_bytes_round_trips_the_control_plane_over_loopback_http(tmp_path, capsys):
+    """T-P8: after a real terminal result, the public ``upload_findings`` API stages and sends a findings
+    upload over 3 072 B over loopback HTTP; the control plane answers ``synchronized`` and the runtime
+    drains. (The two-scenario 4 569 B vector is staged by T-P3/T-P7; this run approves one scenario.) The permit is minted by the control plane's own
+    disclosure service (the HTTP permit route needs a browser session this harness does not have)."""
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            times = _live_timeline()
+            _accepted_ack(live, times=times)
+            terminal = _live_projection(live, times, sequence=2, phase="terminal", acknowledged=None)
+            transport = _LiveRunnerTransport(live)
+            runtime, signer, control = _live_runner(live, tmp_path / "runner", transport, terminal, times=times)
+            control.result(run_id=live.run_id, operational_projection=terminal)
+            assert transport.answers[-1][0] == 200 and _runtime_retired(runtime, live.run_id)
+            authority = live.cp.grant_authority
+            uploader = RunnerControlClient(
+                origin="http://127.0.0.1", workspace_id=live.workspace, runner_id="runner", signer=signer,
+                clock=lambda: int(time.time() * 1000), transport=transport,
+                nonce_source=lambda chain: (_ for _ in ()).throw(AssertionError("run chains are Cloud-issued")),
+                trusted_disclosure_keys={authority.key_id: authority.public_key}, runtime=runtime,
+            )
+
+            # Over the findings budget: a projection cannot be wire-valid at 278 529 B (≤ 4 scenarios, ≤ 20
+            # observations, 4 096-byte strings), so an oversized one (an extra padded key) is refused by the
+            # client's own validation before staging or sending.
+            oversized = {**_representative_findings(live, terminal), "padding": ["x" * 4000] * 70}
+            assert len(canonical_bytes(oversized)) > 278_528
+            sends = len(transport.sent)
+            with pytest.raises(ValueError):
+                uploader.upload_findings(
+                    run_id=live.run_id, permit=_live_permit(live, _representative_findings(live, terminal)),
+                    findings_projection=oversized,
+                )
+            assert len(transport.sent) == sends and runtime.load_pending_calls() == ()
+            assert runtime.load_terminal_state(live.run_id).state == "available"
+
+            findings = _representative_findings(live, terminal)
+            permit = _live_permit(live, findings)
+            receipt = uploader.upload_findings(run_id=live.run_id, permit=permit, findings_projection=findings)
+            path, _headers, sent = transport.sent[-1]
+            assert path.endswith(f"/runs/{live.run_id}/result-projection") and transport.answers[-1][0] == 200
+            assert sent == canonical_bytes({
+                "schema_version": "heel.runner-findings-upload.v1", "run_id": live.run_id, "permit": permit,
+                "findings_projection": findings,
+            })
+            assert len(sent) > 3072
+            assert receipt["status"] == "synchronized" and receipt["projection_digest"] == findings["projection_digest"]
+            assert runtime.load_pending_calls() == ()
+            assert runtime.load_terminal_state(live.run_id).state == "consumed"
+            stored = live.cp.store.conn.execute(
+                "SELECT COUNT(*) FROM canary_findings_projections WHERE run_id=?", (live.run_id,),
+            ).fetchone()[0]
+            assert stored == 1
+            with capsys.disabled():
+                print(f"\n[T-P8 measured] findings upload body {len(sent)} B over loopback HTTP -> synchronized")
+        finally:
+            live.close()

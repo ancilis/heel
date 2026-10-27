@@ -193,7 +193,7 @@ def _findings_projection(coordinator, manifest, projection, grant):
 
 def _permit(
     authority, coordinator, grant, findings, *, issued_at_ms=2_000,
-    expires_at_ms=602_000,
+    expires_at_ms=602_000, scenario_count=0, finding_count=0,
 ):
     projection_bytes = len(canonical_bytes(findings))
     unsigned = {
@@ -209,7 +209,7 @@ def _permit(
             "schema_version": findings["schema_version"],
             "projection_digest": findings["projection_digest"],
             "maximum_bytes": projection_bytes,
-            "scenario_count": 0, "finding_count": 0,
+            "scenario_count": scenario_count, "finding_count": finding_count,
         },
         "approved_by": "user_owner_123", "approved_at_ms": 2_000,
         "issued_at_ms": issued_at_ms, "expires_at_ms": expires_at_ms,
@@ -2431,3 +2431,131 @@ def test_startup_keeps_a_job_claim_whose_sequence_the_server_consumed(tmp_path):
         factory()
     assert (raised.value.operation, raised.value.reason) == ("claim", "claim_sequence_consumed")
     assert runtime.load_pending_calls() == (staged,) and runtime.load_superseded_calls() == ()
+
+
+# --- PENDING-BODY-CAP T-P7: coordinator startup replay of a findings upload over 3 072 B ---------------
+
+_FINDINGS_SHAPES = {
+    "representative": {"scenarios": 2, "observations": 2, "text": 200, "title": 60},
+    "maximal": {"scenarios": 4, "observations": 5, "text": 2000, "title": 160},
+}
+
+
+def _findings_projection_with_scenarios(coordinator, manifest, projection, grant, *, scenarios, observations,
+                                        text, title):
+    base = _findings_projection(coordinator, manifest, projection, grant)
+    unsigned = {
+        key: value for key, value in base.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    unsigned["assessment_outcome"] = "observed"
+    unsigned["scenario_results"] = [
+        {
+            "ordinal": index, "scenario_id": f"scenario_{index}", "adapter_version": unsigned["adapter_versions"][0],
+            "assessment_outcome": "observed",
+            "route": {"method": "GET", "route_template": f"/api/canary/{index}"},
+            "observations": [
+                {"semantic_role": f"role{item:02d}", "status_code": 200, "body_shape": "json_object",
+                 "truncation_state": "complete"}
+                for item in range(observations)
+            ],
+            "finding": {
+                "title": "T" * title, "reachability_rationale": "r" * text, "confidence": "high",
+                "recommended_control": "c" * text, "regression_suggestion": "s" * text,
+            },
+            "containment_codes": [], "redaction_count": 0, "local_evidence_refs": ["ev1_" + "a" * 64],
+        }
+        for index in range(scenarios)
+    ]
+    return {
+        **unsigned,
+        "projection_digest": canonical_digest(unsigned),
+        "signing_key_id": coordinator.signer.key_id,
+        "signature_b64": base64.b64encode(coordinator.signer.sign(canonical_bytes(unsigned))).decode("ascii"),
+    }
+
+
+@pytest.mark.parametrize("shape", sorted(_FINDINGS_SHAPES))
+def test_coordinator_startup_replays_a_representative_findings_upload_over_3072_bytes_byte_identically(
+    tmp_path, capsys, shape,
+):
+    """T-P7: the coordinator path with a scripted transport (labelled as such, not HTTP): a findings
+    upload over 3 072 B whose answer was malformed is sealed, survives a client restart and is sent
+    again byte-identically exactly once by coordinator startup."""
+    receipt_holder = {}
+
+    def responses(manifest, projection, grant):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")},
+             _claim(manifest, projection, grant)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, _status(
+                grant["run_id"], approval_id=projection["projection_id"], status="terminal",
+            )),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, {"malformed": True}),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, receipt_holder),
+        ]
+
+    coordinator, client, transport, manifest, projection, grant, authority = _coordinator(
+        tmp_path, responses,
+    )
+    lease = coordinator.claim()
+    assert lease is not None
+    completed = LocalCanaryExecutor(
+        store=coordinator.store, identity=coordinator.identity, signer=coordinator.signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(
+        lease.bundle, transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate,
+    )
+    coordinator.result(grant["run_id"], completed.operational_projection)
+    findings = _findings_projection_with_scenarios(
+        coordinator, manifest, projection, grant, **_FINDINGS_SHAPES[shape],
+    )
+    count = _FINDINGS_SHAPES[shape]["scenarios"]
+    permit = _permit(authority, coordinator, grant, findings, scenario_count=count, finding_count=count)
+    receipt_holder.update({
+        "schema_version": "heel.canary-findings-receipt.v1",
+        "receipt_id": "cfr_runner_recovered_upload",
+        "workspace_id": grant["workspace_id"], "project_id": grant["project_id"],
+        "run_id": grant["run_id"], "grant_id": grant["grant_id"],
+        "permit_id": permit["permit_id"], "projection_id": findings["projection_id"],
+        "projection_digest": findings["projection_digest"],
+        "byte_count": len(canonical_bytes(findings)), "scenario_count": count,
+        "finding_count": count, "accepted_at_ms": 2_001, "status": "synchronized",
+    })
+    with pytest.raises(ValueError, match="invalid runner findings receipt"):
+        coordinator.upload_findings(
+            grant["run_id"], permit=permit, findings_projection=findings,
+        )
+    (pending,) = client.runtime.load_pending_calls()
+    assert pending.request_operation == "upload-findings"
+    sealed_body = pending.body
+    assert len(sealed_body) > 3072 and sealed_body == transport.requests[-1][2]
+    assert sealed_body == canonical_bytes({
+        "schema_version": "heel.runner-findings-upload.v1", "run_id": grant["run_id"], "permit": permit,
+        "findings_projection": findings,
+    })
+    sends_before_restart = len(transport.requests)
+
+    restarted = RunnerControlClient(
+        origin=client.origin, workspace_id=client.workspace_id, runner_id=client.runner_id,
+        signer=client.signer, clock=client.clock, transport=transport,
+        nonce_source=client.nonce_source, trusted_disclosure_keys=client._trusted_disclosure_keys,
+        runtime=client.runtime,
+    )
+    recovered = RunnerCoordinator(
+        control=restarted, store=coordinator.store, identity=coordinator.identity,
+        signer=coordinator.signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        clock_ms=lambda: 2_000, monotonic=lambda: 1.0,
+    )
+
+    assert len(transport.requests) == sends_before_restart + 1
+    assert transport.requests[-1] == transport.requests[-2]
+    assert transport.requests[-1][2] == sealed_body
+    assert restarted.runtime.load_pending_calls() == ()
+    assert restarted.runtime.load_terminal_state(grant["run_id"]).state == "consumed"
+    assert recovered._bindings == {}
+    with capsys.disabled():
+        print(f"\n[T-P7 {shape}] findings upload body {len(sealed_body)} B replayed once after restart")

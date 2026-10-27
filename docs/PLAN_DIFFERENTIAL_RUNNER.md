@@ -583,6 +583,47 @@ local control evidence only: it is not functional execution recovery; restart af
 run (today `local_state_invalid`) and reconciliation of a `claim_sequence_consumed` call remain
 T4a work.
 
+#### Pending-call request bodies
+
+A staged control request is sealed whole, so its body is part of the `pending_calls` record.
+`stage_call` and `stage_disclosure_call` refuse a **new** body over the server's route budget for
+its operation with `invalid runtime pending body`. The check runs on the raw bytes, before any
+signature check, encoding or transaction:
+
+| Operation | Staging cap (bytes) |
+|---|---|
+| `list-contexts` | 128 |
+| `claim`, `claim-context` | 256 |
+| `heartbeat`, `progress`, `stop-ack` | 36 864 |
+| `submit-context-approval-projection` | 69 632 |
+| `result` | 103 424 |
+| `upload-findings` | 278 528 |
+
+Earlier versions stored only bodies up to 3 072 bytes, because the record used the public
+4 096-byte string ceiling. The pending record now has its own JSON grammar. Only the top-level
+`body_b64` may be longer, as strict base64 of at most 371 372 characters. The whole sealed
+record must fit 393 216 bytes, and that bound is checked before decryption. The schema string,
+digest domain, AEAD key and associated data are unchanged, and every record an earlier version
+wrote opens byte-identically. The reader never applies the staging caps. It keeps the historical
+272 KiB decoded bound for every operation, so an older record staged directly through the runtime
+API over today's cap (for example a 3 000-byte `claim`) still loads, commits and replays; the server
+answers it under its own budget.
+
+One narrowing is deliberate. A non-NFC string in a new record, such as a path, is refused with
+`invalid runtime pending call` and nothing is written. Earlier versions silently normalized it,
+so the durable record differed from the request that was returned. No product client can send
+one: binding IDs are `rcb_` hex, and control paths are ASCII.
+
+A retired-claim archive authenticates its pending component under the same pending grammar and
+digest, with the historical sealing identity's associated data (`load_retired_claim(...,
+authenticate_components=True)`). A retired heartbeat over 3 072 bytes opens before and after key
+rotation. The archive grammar and caps are unchanged.
+
+Rollback: an older Heel version cannot read a pending record whose body is over 3 072 bytes. It
+fails closed with `RunnerRuntimeCorrupt` on that row, and nothing is deleted. Downgrade only after
+replay has emptied `pending_calls`. Otherwise, upgrade again; the row is still there and replays.
+There is no schema version change.
+
 ## Trust boundary
 
 The operator's process environment and `HEEL_HOME` are inside the trust boundary. The

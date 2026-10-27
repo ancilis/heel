@@ -80,6 +80,24 @@ _RETIRED_LONG_TEXT_PATHS = MappingProxyType({
     ("attestation", "request", "body_b64"): 2_732,
     ("attestation", "response", "body_b64"): 10_924,
 })
+_PENDING_CALL_SCHEMA = "heel.runner-pending-call.v1"
+# PENDING-BODY-CAP: new pending bodies are capped per operation at the server's runner route budget
+# (http_api ``_runner_request``), before any signature check, encoding or transaction.  The caps
+# bind staging only: the reader keeps the historical 272 KiB bound, so every record the runtime
+# accepted before this table still opens (docs/PLAN_DIFFERENTIAL_RUNNER.md, "Runtime state").
+_PENDING_BODY_CAPS = MappingProxyType({
+    "claim": 256, "list-contexts": 128, "claim-context": 256,
+    "heartbeat": 36_864, "progress": 36_864, "stop-ack": 36_864,
+    "result": 103_424, "submit-context-approval-projection": 69_632,
+    "upload-findings": 278_528,
+})
+_PENDING_BODY_MAX = 278_528
+_PENDING_BODY_B64_TEXT_CAP = 4 * -(-_PENDING_BODY_MAX // 3)
+_PENDING_BLOB_BOUND = 393_216   # pending_calls CHECK, nonce and tag included
+assert max(_PENDING_BODY_CAPS.values()) == _PENDING_BODY_MAX and _PENDING_BODY_B64_TEXT_CAP == 371_372
+# Only the top-level body_b64 may exceed the public 4 096-byte string ceiling; its exact decoded
+# length is re-checked after strict decoding.
+_PENDING_B64_TEXT = re.compile(r"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$", re.ASCII)
 _DIGEST = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _RUN_ID = re.compile(r"^crun_[0-9a-f]{32}$", re.ASCII)
 _B64_32 = re.compile(r"^[A-Za-z0-9+/]{43}=$", re.ASCII)
@@ -883,6 +901,83 @@ def _retired_metadata_size(core: Mapping[str, Any]) -> int:
         item["sealed_blob_b64"] for section in ("chains", "pending") for item in core[section]
     )]
     return len(_retired_json_bytes(core)) - sum(len(text) for text in texts)
+
+
+def _pending_json_value(value: Any, *, path: tuple[str, ...] = (), depth: int = 0) -> Any:
+    """The public canonical grammar with strict NFC, except that the top-level body_b64 may exceed 4 096."""
+    if depth > 16:
+        raise ValueError("runtime pending value nesting is invalid")
+    if value is None:
+        return None
+    if type(value) is int:
+        if not 0 <= value <= _MAX_SAFE_INT:
+            raise ValueError("runtime pending integer is invalid")
+        return value
+    if type(value) is str:
+        if path == ("body_b64",):
+            # ASCII base64 only, so the NFC and control-character rules hold by construction.
+            if len(value) > _PENDING_BODY_B64_TEXT_CAP or _PENDING_B64_TEXT.fullmatch(value) is None:
+                raise ValueError("runtime pending body text is invalid")
+            return value
+        if (
+            any(unicodedata.category(char) == "Cc" or 0xD800 <= ord(char) <= 0xDFFF for char in value)
+            or unicodedata.normalize("NFC", value) != value
+            or len(value.encode("utf-8")) > 4096
+        ):
+            raise ValueError("runtime pending text is invalid")
+        return value
+    if type(value) is list:
+        return [_pending_json_value(item, path=(*path, "*"), depth=depth + 1) for item in value]
+    if isinstance(value, Mapping):
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str or key in output:
+                raise ValueError("runtime pending mapping is invalid")
+            _pending_json_value(key, path=("",), depth=depth + 1)
+            output[key] = _pending_json_value(item, path=(*path, key), depth=depth + 1)
+        return output
+    raise ValueError("runtime pending value is invalid")
+
+
+def _pending_json_bytes(core: Mapping[str, Any]) -> bytes:
+    """Encode a pending call; equal to ``canonical_bytes`` on every core both grammars accept."""
+    if not isinstance(core, Mapping):
+        raise ValueError("runtime pending core is invalid")
+    encoded = json.dumps(
+        _pending_json_value(core), ensure_ascii=False, allow_nan=False,
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) + 28 > _PENDING_BLOB_BOUND:
+        raise ValueError("runtime pending call exceeds its size limit")
+    return encoded
+
+
+def _pending_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("runtime pending JSON has duplicate keys")
+        result[key] = value
+    return result
+
+
+def _pending_json_parse(plaintext: bytes) -> dict[str, Any]:
+    try:
+        decoded = json.loads(
+            plaintext.decode("utf-8"), object_pairs_hook=_pending_json_pairs,
+            parse_float=lambda _value: (_ for _ in ()).throw(ValueError("runtime pending float is invalid")),
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("runtime pending constant is invalid")),
+        )
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("runtime pending JSON is invalid") from exc
+    if not isinstance(decoded, dict) or _pending_json_bytes(decoded) != plaintext:
+        raise ValueError("runtime pending JSON is not canonical")
+    return decoded
+
+
+def _pending_state_digest(core: Mapping[str, Any]) -> str:
+    """The pending digest keeps ``_DIGEST_DOMAIN``: equal to ``_state_digest`` on every legacy core."""
+    return hashlib.sha256(_DIGEST_DOMAIN + _pending_json_bytes(core)).hexdigest()
 
 
 class RunnerRuntimeState:
@@ -1757,6 +1852,7 @@ class RunnerRuntimeState:
             raise RunnerRuntimeCorrupt("runtime state random source returned an invalid nonce")
         plaintext = (
             _active_json_bytes(core) if schema == "heel.runner-active-run-state.v1"
+            else _pending_json_bytes(core) if schema == _PENDING_CALL_SCHEMA
             else canonical_bytes(dict(core))
         )
         return nonce + self._crypto.aead(key).encrypt(
@@ -1766,6 +1862,9 @@ class RunnerRuntimeState:
     def _open(self, value: object, *, schema: str, primary_fields: tuple[str, ...]) -> dict[str, Any]:
         if type(value) is not bytes or len(value) <= 28:
             raise RunnerRuntimeCorrupt("runtime state sealed record is invalid")
+        if schema == _PENDING_CALL_SCHEMA and len(value) > _PENDING_BLOB_BOUND:
+            # The pending bound is enforced before any decryption or parsing work.
+            raise RunnerRuntimeCorrupt("runtime state sealed record is invalid")
         try:
             plaintext = self._crypto.aead(self._key).decrypt(
                 value[:12], value[12:], self._aad(schema, *primary_fields),
@@ -1773,6 +1872,7 @@ class RunnerRuntimeState:
             decoded = (
                 _active_json_parse(plaintext)
                 if schema == "heel.runner-active-run-state.v1"
+                else _pending_json_parse(plaintext) if schema == _PENDING_CALL_SCHEMA
                 else json.loads(plaintext)
             )
         except Exception as exc:
@@ -1782,6 +1882,7 @@ class RunnerRuntimeState:
         try:
             expected_plaintext = (
                 _active_json_bytes(decoded) if schema == "heel.runner-active-run-state.v1"
+                else _pending_json_bytes(decoded) if schema == _PENDING_CALL_SCHEMA
                 else canonical_bytes(decoded)
             )
         except (TypeError, ValueError) as exc:
@@ -3201,7 +3302,8 @@ class RunnerRuntimeState:
             body = base64.b64decode(value["body_b64"], validate=True)
         except (TypeError, ValueError):
             raise RunnerRuntimeCorrupt("runtime pending call is invalid") from None
-        if self._canonical_b64(body) != value["body_b64"] or len(body) > 272 * 1024:
+        # The reader keeps the historical bound for every operation (never the staging caps).
+        if self._canonical_b64(body) != value["body_b64"] or len(body) > _PENDING_BODY_MAX:
             raise RunnerRuntimeCorrupt("runtime pending call is invalid")
         if hashlib.sha256(body).hexdigest() != _digest(value["body_sha256"], "runtime pending body digest"):
             raise RunnerRuntimeCorrupt("runtime pending call is invalid")
@@ -3216,7 +3318,11 @@ class RunnerRuntimeState:
         elif not (request_operation == "claim" and chain_operation == "claim"):
             raise RunnerRuntimeCorrupt("runtime pending call is invalid")
         core_without_digest = {key: value[key] for key in fields if key != "state_digest"}
-        if value["state_digest"] != _state_digest(core_without_digest):
+        try:
+            expected_digest = _pending_state_digest(core_without_digest)
+        except (TypeError, ValueError):
+            raise RunnerRuntimeCorrupt("runtime pending call digest is invalid") from None
+        if value["state_digest"] != expected_digest:
             raise RunnerRuntimeCorrupt("runtime pending call digest is invalid")
         call_id = _digest(value["call_id"], "runtime pending call ID")
         pending = PendingSignedCall(
@@ -3300,6 +3406,29 @@ class RunnerRuntimeState:
             return path.startswith(f"{prefix}/contexts/rcb_") and path.endswith("/approval-projections")
         return False
 
+    def _seal_pending_core(
+        self, core_without_digest: Mapping[str, Any], *, call_id: str,
+    ) -> tuple[dict[str, Any], bytes, PendingSignedCall]:
+        """Digest, validate and seal a new pending core under the pending grammar.
+
+        A grammar failure (non-NFC or over-bound input) at digest construction or inside the sealer
+        fails closed with one fixed message; the input is never normalized and no byte of it is echoed.
+        """
+        try:
+            core = {**core_without_digest, "state_digest": _pending_state_digest(core_without_digest)}
+        except (TypeError, ValueError):
+            raise RunnerRuntimeStateError("invalid runtime pending call") from None
+        pending, _ = self._validate_pending_core(core)
+        try:
+            blob = self._seal(core, schema=_PENDING_CALL_SCHEMA, primary_fields=(call_id,))
+        except RunnerRuntimeStateError:
+            raise
+        except (TypeError, ValueError):
+            raise RunnerRuntimeStateError("invalid runtime pending call") from None
+        if len(blob) > 384 * 1024:
+            raise RunnerRuntimeStateError("runtime pending call exceeds size limit")
+        return core, blob, pending
+
     def stage_call(
         self, *, request_operation: str, chain_operation: str, run_id: str | None,
         path: str, capability: str, headers: Mapping[str, str], body: bytes,
@@ -3319,6 +3448,8 @@ class RunnerRuntimeState:
         )
         if chain_operation != expected_chain or ((chain_operation == "claim") != (run_id is None)):
             raise RunnerRuntimeStateError("invalid runtime pending call")
+        if len(body) > _PENDING_BODY_CAPS[request_operation]:
+            raise RunnerRuntimeStateError("invalid runtime pending body")
         if run_id is not None:
             _run_id(run_id)
         _digest(expected_state_digest, "runtime expected state digest")
@@ -3363,11 +3494,7 @@ class RunnerRuntimeState:
                     "sequence": sequence, "generation": generation,
                     "prior_chain_state_digest": prior_state_digest, "created_at_ms": now_ms,
                 }
-                core = {**core_without_digest, "state_digest": _state_digest(core_without_digest)}
-                pending, _ = self._validate_pending_core(core)
-                blob = self._seal(core, schema=core["schema_version"], primary_fields=(call_id,))
-                if len(blob) > 384 * 1024:
-                    raise RunnerRuntimeStateError("runtime pending call exceeds size limit")
+                core, blob, pending = self._seal_pending_core(core_without_digest, call_id=call_id)
                 conn.execute(
                     "INSERT INTO pending_calls(call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms) "
                     "VALUES(?,?,?,?,?,?,?,?)",
@@ -4344,6 +4471,8 @@ class RunnerRuntimeState:
             )
             if item["schema"] == "heel.runner-active-run-state.v1":
                 return plaintext, _active_json_parse(plaintext)
+            if item["schema"] == _PENDING_CALL_SCHEMA:
+                return plaintext, _pending_json_parse(plaintext)
             decoded = json.loads(plaintext)
             if not isinstance(decoded, dict) or canonical_bytes(decoded) != plaintext:
                 raise ValueError("runtime retired component is not canonical")
@@ -4403,7 +4532,7 @@ class RunnerRuntimeState:
                     or call["run_id"] != record.run_id
                     or (call["sequence"], call["generation"], call["created_at_ms"])
                     != (index["sequence"], index["generation"], index["created_at_ms"])
-                    or call["state_digest"] != _state_digest(
+                    or call["state_digest"] != _pending_state_digest(
                         {key: value for key, value in call.items() if key != "state_digest"}
                     )
                 ):
@@ -4645,7 +4774,7 @@ class RunnerRuntimeState:
         body: bytes, now_ms: int,
     ) -> PendingSignedCall:
         lease = self._require_lease(lease, require_unused=True)
-        if type(body) is not bytes or len(body) > 272 * 1024:
+        if type(body) is not bytes or len(body) > _PENDING_BODY_CAPS["upload-findings"]:
             raise RunnerRuntimeStateError("invalid runtime pending body")
         now_ms = _safe_int(now_ms, "runtime disclosure time")
         with self._connection() as conn:
@@ -4700,11 +4829,7 @@ class RunnerRuntimeState:
                     "sequence": sequence, "generation": generation,
                     "prior_chain_state_digest": state.state_digest, "created_at_ms": now_ms,
                 }
-                core = {**core_without_digest, "state_digest": _state_digest(core_without_digest)}
-                pending, _ = self._validate_pending_core(core)
-                blob = self._seal(core, schema=core["schema_version"], primary_fields=(call_id,))
-                if len(blob) > 384 * 1024:
-                    raise RunnerRuntimeStateError("runtime pending call exceeds size limit")
+                core, blob, pending = self._seal_pending_core(core_without_digest, call_id=call_id)
                 conn.execute(
                     "INSERT INTO pending_calls(call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms) "
                     "VALUES(?,?,?,?,?,?,?,?)",

@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import unicodedata
 
 import pytest
 
@@ -445,6 +446,11 @@ def _runtime_with_active_run(tmp_path):
 
 def _runtime_with_available_disclosure(tmp_path, *, suffix: str = "d"):
     del suffix
+    runtime, signer, identity, run_id, available, _grant = _available_disclosure_with_grant(tmp_path)
+    return runtime, signer, identity, run_id, available
+
+
+def _available_disclosure_with_grant(tmp_path):
     runtime, signer, identity, grant = _runtime_with_active_run(tmp_path)
     run_id = grant["run_id"]
     cursor = runtime.load_chain("result", run_id)
@@ -478,7 +484,7 @@ def _runtime_with_available_disclosure(tmp_path, *, suffix: str = "d"):
     available = runtime.commit_terminal_response(
         staged.call_id, next_nonce_b64=base64.b64encode(b"x" * 32).decode("ascii"), now_ms=12,
     )
-    return runtime, signer, identity, run_id, available
+    return runtime, signer, identity, run_id, available, grant
 
 
 @pytest.mark.parametrize("tamper", ("remove-active", "insert-extra-cursor"))
@@ -1403,7 +1409,7 @@ def _claim_runtime(tmp_path, *, name="runtime.sqlite3"):
     return runtime, signer, identity
 
 
-@pytest.mark.parametrize("operation", ["list-contexts", "claim-context"])
+@pytest.mark.parametrize("operation", ["list-contexts", "claim-context", "claim"])
 def test_accepted_resync_atomically_supersedes_an_eligible_claim_chain_call_into_a_sealed_tombstone(tmp_path, operation):
     runtime, signer, identity = _claim_runtime(tmp_path)
     pending = _stage_claim_chain(runtime, signer, identity, operation=operation)
@@ -3006,24 +3012,6 @@ def _real_attestation_evidence(live, *, challenge=b"C" * 32):
     ), attestation
 
 
-def _largest_admitted_versions(build_body, *, limit):
-    """Largest-first reduction: keep 128-byte versions, then fill adapter versions up to ``limit``."""
-    versions = []
-    for index in range(20):
-        candidate = versions + [chr(ord("a") + index) * 128]
-        if len(build_body(candidate)) > limit:
-            break
-        versions = candidate
-    if len(versions) < 20:
-        tail_prefix = chr(ord("a") + len(versions))
-        for length in range(128, 0, -1):
-            candidate = versions + [tail_prefix * length]
-            if len(build_body(candidate)) <= limit:
-                versions = candidate
-                break
-    return versions
-
-
 def test_retired_claim_largest_state_the_existing_runtime_admits_fits_the_metadata_cap_and_the_derived_bound(
     tmp_path, capsys,
 ):
@@ -3031,89 +3019,16 @@ def test_retired_claim_largest_state_the_existing_runtime_admits_fits_the_metada
 
     The runtime adopts the in-process control plane's runner identity and installs that plane's own
     signed grant and approval, so the archived attestation is the genuine one for the archived run.
-    Every heartbeat field is at its validator maximum except ``adapter_versions``, reduced largest
-    first until the canonical body is the largest ``stage_call`` admits (PENDING-BODY-CAP, ≤ 3 072 B).
+    Every heartbeat field is at its validator maximum, including all 20 ``adapter_versions`` at 128 B:
+    the wire-valid maximal heartbeat, with no reduction (PENDING-BODY-CAP lifted the 3 072 B ceiling;
+    RETIREMENT-RESYNC §5 test 4 restored, R1 §4 item 5 superseded sentence).
     """
-    from heel.runner.control_client import RunnerControlClient
-    from tests.test_runner_control_http import _LiveHttpRun
-
-    with tempfile.TemporaryDirectory() as directory:
-        live = _LiveHttpRun(directory)
-        try:
-            signer = _LiveSigner(live.private, live.key_id)
-            identity = RunnerIdentity(
-                runner_id="runner", workspace_id=live.workspace, runner_version="1.0.0",
-                adapter_versions={"canary": "1.0.0"},
-                public_key_b64=base64.b64encode(signer.public_key).decode("ascii"),
-                fingerprint=hashlib.sha256(signer.public_key).hexdigest(), key_id=live.key_id,
-                pairing_phrase=runner_phrase_words()[:6],
-            )
-            runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
-            runtime.install_chain(
-                operation="claim", run_id=None, next_nonce_b64=_b64(b"c" * 32),
-                next_sequence=1, generation=0, now_ms=1,
-            )
-            staged_claim = _stage_claim(runtime, signer, identity, timestamp_ms=2)
-            runtime.commit_call(
-                staged_claim.call_id, next_nonce_b64=_b64(b"n" * 32), now_ms=2,
-                installed_chains=tuple(
-                    (op, live.run_id, live.chains[op]["next_nonce_b64"], live.chains[op]["next_sequence"],
-                     live.chains[op]["generation"])
-                    for op in _RUN_OPERATIONS
-                ),
-                active_run=ActiveRunInstall(
-                    run_id=live.run_id, approval_projection=live.approval, grant=live.grant,
-                    gate={
-                        "active": True, "runner_state": "active", "proof_state": "valid",
-                        "proof_expires_at_ms": 2_000_000_000_000,
-                        "kill_switch_generation": live.grant["kill_switch_generation"],
-                        "stop_reason": "none", "server_time_ms": 2,
-                    },
-                    claim_response_digest="a" * 64, gate_response_digest="b" * 64,
-                    claimed_at_ms=2, gate_received_at_ms=2,
-                ),
-            )
-            ids = {"grant_id": live.grant["grant_id"], "workspace_id": live.workspace, "project_id": "prj"}
-
-            def projection(versions):
-                return _projection_for(
-                    signer, live.grant, live.approval, adapter_versions=versions,
-                    runner_version="r" * 128, engine_version="e" * 128, identifiers=ids,
-                    maximal_numbers=True,
-                )
-
-            def body_of(versions):
-                return _heartbeat_body(projection(versions), live.run_id)
-
-            versions = _largest_admitted_versions(body_of, limit=3072)
-            body = body_of(versions)
-            assert len(body) <= 3072 and len(body_of(versions + ["z" * 128])) > 3072
-            transport = _LostResponseTransport()
-            client = RunnerControlClient(
-                origin="https://control.example", workspace_id=live.workspace, runner_id="runner",
-                signer=signer, clock=lambda: 3, transport=transport,
-                nonce_source=lambda _key: _b64(b"x" * 32), runtime=runtime,
-            )
-            with pytest.raises(OSError, match="response lost"):
-                client.heartbeat(run_id=live.run_id, operational_projection=projection(versions))
-            ((_path, _headers, sent_body),) = transport.requests
-            assert sent_body == body
-            (staged,) = runtime.load_pending_calls()
-            assert staged.request_operation == "heartbeat" and staged.body == body
-            run_hash = _run_hash_of(live.run_id)
-            sources = {
-                table: _rows_for(runtime.path, table, run_hash)
-                for table in ("active_runs", "control_chains", "pending_calls")
-            }
-            evidence, _attestation = _real_attestation_evidence(live)
-        finally:
-            live.close()
-
-    record = runtime.retire_inactive_claim(
-        live.run_id, expected_state_digest=_active_digest(runtime, live.run_id), evidence=evidence,
-        reservation_probe="absent", now_ms=int(time.time() * 1000),
+    runtime, _signer, _identity, run_id, body, versions, sources, evidence, record = _live_retired_heartbeat_run(
+        tmp_path, _WIRE_MAXIMAL_VERSIONS,
     )
-    core = _open_retired_core(runtime, live.run_id)
+    validate_runner_heartbeat_request(json.loads(body))
+    assert len(body) > 3072 and len(versions) == 20 and {len(item) for item in versions} == {128}
+    core = _open_retired_core(runtime, run_id)
     metadata = runtime_module._retired_metadata_size(core)
     with contextlib.closing(sqlite3.connect(runtime.path)) as conn:
         blob_length = conn.execute("SELECT length(sealed_blob) FROM retired_claims").fetchone()[0]
@@ -3126,7 +3041,7 @@ def test_retired_claim_largest_state_the_existing_runtime_admits_fits_the_metada
     assert _component_bytes(record.pending[0]) == sources["pending_calls"][0][6]
     assert base64.b64decode(record.attestation["request"]["body_b64"]) == evidence.request_body
     assert base64.b64decode(record.attestation["response"]["body_b64"]) == evidence.response_body
-    assert runtime.load_retired_claim(live.run_id, authenticate_components=True) == record
+    assert runtime.load_retired_claim(run_id, authenticate_components=True) == record
     with capsys.disabled():
         print(
             "\n[R1 test 4a measured] heartbeat body", len(body), "B; adapter_versions", len(versions),
@@ -3242,16 +3157,22 @@ class SimpleSigned:
         self.signer = signer
 
 
-def test_stage_call_refuses_a_wire_valid_heartbeat_body_over_3072_bytes_pending_body_cap_backlog(tmp_path):
-    """Test 4c pins PENDING-BODY-CAP (launch backlog): flip this assertion when the cap is fixed."""
+def test_stage_call_accepts_a_wire_valid_heartbeat_body_over_3072_bytes_up_to_the_heartbeat_cap(tmp_path):
+    """Test 4c (flipped by PENDING-BODY-CAP): the wire-valid maximal heartbeat stages and reloads exactly;
+    the heartbeat staging cap (36 864 B, the server's route budget) is still a boundary."""
     fixture = _retirable(tmp_path)
     _projection_value, body = _maximal_wire_heartbeat(fixture.signer, fixture.grant, fixture.projection)
     assert len(body) > 3072
     validate_runner_heartbeat_request(json.loads(body))
-    before = _semantic_rows(fixture.runtime.path)
-    with pytest.raises(ContractError):
-        _stage_run_call(fixture.runtime, fixture.signer, fixture.identity, fixture.run_id, "heartbeat", body)
-    assert _semantic_rows(fixture.runtime.path) == before
+    staged = _stage_run_call(fixture.runtime, fixture.signer, fixture.identity, fixture.run_id, "heartbeat", body)
+    reopened = RunnerRuntimeState(fixture.runtime.path, fixture.identity, fixture.signer)
+    assert reopened.load_pending_calls() == (staged,) and reopened.get_pending_call(staged.call_id).body == body
+
+    other = _retirable(tmp_path / "over")
+    before = _semantic_rows(other.runtime.path)
+    with pytest.raises(runtime_module.RunnerRuntimeStateError, match="invalid runtime pending body"):
+        _stage_run_call(other.runtime, other.signer, other.identity, other.run_id, "heartbeat", b"{" + b" " * 36_863 + b"}")
+    assert _semantic_rows(other.runtime.path) == before
 
 
 # --------------------------------------------------------------------- Tier A query plan and timing (T-P1)
@@ -3457,3 +3378,882 @@ def test_retire_inactive_claim_archives_a_resurrected_pruned_group_verbatim_and_
         )
     assert runtime.load_active_run_controls() == ()
     assert len(target.calls) == target_requests
+
+
+# --------------------------------------------------------------------- PENDING-BODY-CAP (T-P1..T-P5, T-P9)
+
+
+_PENDING_SCHEMA = "heel.runner-pending-call.v1"
+# The server's per-operation runner parse budgets (http_api ``_runner_request``) by staging operation.
+_SERVER_BODY_CAPS = {
+    "claim": 256, "list-contexts": 128, "claim-context": 256,
+    "heartbeat": 36 * 1024, "progress": 36 * 1024, "stop-ack": 36 * 1024,
+    "result": 36 * 1024 + 64 * 1024 + 1024, "submit-context-approval-projection": 69_632,
+    "upload-findings": 272 * 1024,
+}
+
+
+def _canonical_body_of(size):
+    """A canonical JSON object of exactly ``size`` bytes whose strings stay under the 4 096 ceiling."""
+    room = size - len(b'{"p":[]}')
+    count = max(1, -(-(room + 1) // 4003))
+    letters = room - 3 * count + 1
+    lengths = [letters // count + (index < letters % count) for index in range(count)]
+    body = canonical_bytes({"p": ["x" * length for length in lengths]})
+    assert len(body) == size
+    return body
+
+
+def _pending_core(**changes):
+    core = {
+        "schema_version": _PENDING_SCHEMA, "workspace_id": "ws", "runner_id": "runner",
+        "runner_key_id": "rk", "call_id": "0" * 64, "request_operation": "heartbeat",
+        "chain_operation": "heartbeat", "run_id": "crun_" + "a" * 32, "path": "/p",
+        "capability": "runner_heartbeat", "method": "POST", "headers": {"Content-Type": "application/json"},
+        "body_b64": _b64(b"{}"), "body_sha256": "0" * 64, "server_nonce_b64": _b64(b"n" * 32),
+        "sequence": 1, "generation": 0, "prior_chain_state_digest": "0" * 64, "created_at_ms": 1,
+    }
+    core.update(changes)
+    return core
+
+
+def test_pending_call_grammar_allows_only_body_b64_beyond_4096_and_keeps_every_other_closed_rule():
+    """T-P1: the pending grammar is the public grammar with strict NFC and one long top-level path."""
+    encode = runtime_module._pending_json_bytes
+    parse = runtime_module._pending_json_parse
+    core = _pending_core(body_b64=_b64(_canonical_body_of(36 * 1024)))
+    assert parse(encode(core)) == core
+    with pytest.raises(ContractError):
+        canonical_bytes(core)
+    text_cap = runtime_module._PENDING_BODY_B64_TEXT_CAP
+    assert text_cap == 371_372 == 4 * -(-278_528 // 3)
+    assert parse(encode(_pending_core(body_b64="A" * text_cap)))["body_b64"] == "A" * text_cap
+    for value in (
+        "A" * (text_cap + 4), "A" * 5, "A" * 6, "AA=A", "AB!=", "A\nAA", "é" * 4, "AAAA" * 1100 + "\x00AAA",
+        "AAA-", "AAA_",
+    ):
+        with pytest.raises(ValueError):
+            encode(_pending_core(body_b64=value))
+    # Every other string keeps the public 4 096-byte ceiling, at the top level and nested.
+    for field, ok, bad in (
+        ("path", "/" + "p" * 4095, "/" + "p" * 4096),
+        ("capability", "c" * 4096, "c" * 4097),
+        ("headers", {"X-Heel-Runner-Signature": "h" * 4096}, {"X-Heel-Runner-Signature": "h" * 4097}),
+        ("headers", {"body_b64": "A" * 4096}, {"body_b64": "A" * 4100}),
+    ):
+        assert parse(encode(_pending_core(**{field: ok})))[field] == ok
+        with pytest.raises(ValueError):
+            encode(_pending_core(**{field: bad}))
+    with pytest.raises(ValueError):
+        encode(_pending_core(headers={"x": [{"body_b64": "A" * 4100}]}))
+    with pytest.raises(ValueError):
+        encode({"embedded": _pending_core(body_b64="A" * 4100)})
+    with pytest.raises(ContractError):
+        canonical_bytes({"path": "p" * 4097})
+    deep: object = "leaf"
+    for _ in range(17):
+        deep = [deep]
+    for bad in (
+        _pending_core(sequence=True), _pending_core(sequence=-1), _pending_core(sequence=_MAX_SAFE + 1),
+        _pending_core(sequence=1.0), _pending_core(capability="a\x07"), _pending_core(capability="\ud800"),
+        _pending_core(headers={1: "x"}), _pending_core(headers={"x": deep}), _pending_core(headers=("x",)),
+        "not-a-mapping",
+    ):
+        with pytest.raises(ValueError):
+            encode(bad)
+    plain = encode(_pending_core())
+    for raw in (
+        plain.replace(b'"sequence":1', b'"sequence":1.0'),
+        plain.replace(b'"sequence":1', b'"sequence":NaN'),
+        plain[:-1] + b',"sequence":1}',
+        plain.replace(b'{"body_b64"', b'{ "body_b64"'),
+        b"[]", b"\xff",
+    ):
+        with pytest.raises(ValueError):
+            parse(raw)
+    # Strict NFC: a non-NFC input is refused, where the public canonicalizer normalizes it.
+    decomposed = "/v1/contexts/rcb_é" + "0" * 30
+    composed = unicodedata.normalize("NFC", decomposed)
+    assert decomposed != composed
+    assert canonical_bytes({"path": decomposed}) == canonical_bytes({"path": composed})
+    with pytest.raises(ValueError):
+        encode(_pending_core(path=decomposed))
+    with pytest.raises(ValueError):
+        runtime_module._pending_state_digest(_pending_core(path=decomposed))
+    assert parse(encode(_pending_core(path=composed)))["path"] == composed
+    # Byte identity and the same digest domain on every core both grammars accept.
+    for candidate in (_pending_core(), _pending_core(path=composed), _pending_core(body_b64="A" * 4096)):
+        assert encode(candidate) == canonical_bytes(candidate)
+        assert runtime_module._pending_state_digest(candidate) == _state_digest(candidate)
+
+
+def _claim_chain_path(identity, operation):
+    prefix = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}"
+    return {
+        "claim": f"{prefix}/claim", "list-contexts": f"{prefix}/contexts/list",
+        "claim-context": f"{prefix}/contexts/rcb_{'b' * 32}/claim",
+        "submit-context-approval-projection": f"{prefix}/contexts/rcb_{'b' * 32}/approval-projections",
+    }[operation]
+
+
+def _stage_on_claim_chain(runtime, signer, identity, operation, body, *, path=None, capability="runner_claim"):
+    cursor = runtime.load_chain("claim", None)
+    path = path or _claim_chain_path(identity, operation)
+    headers = _signed_claim_chain_headers(
+        signer, identity, path=path, body=body, nonce=cursor.next_nonce_b64, sequence=cursor.next_sequence,
+    )
+    return runtime.stage_call(
+        request_operation=operation, chain_operation="claim", run_id=None, path=path,
+        capability=capability, headers=headers, body=body,
+        expected_state_digest=cursor.state_digest, now_ms=1,
+    )
+
+
+def _signed_disclosure(runtime, signer, identity, run_id, available, body, *, timestamp_ms=13, lease=None):
+    lease = lease or runtime.lease_terminal_disclosure(
+        run_id, expected_project_id=available.project_id, expected_grant_id=available.grant_id,
+        expected_approval_projection_digest=available.approval_projection_digest, now_ms=12,
+    )
+    nonce, sequence = available.result_chain["next_nonce_b64"], available.result_chain["next_sequence"]
+    path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/runs/{run_id}/result-projection"
+    proof = {
+        "schema_version": "heel.runner-request-proof.v1", "workspace_id": identity.workspace_id,
+        "runner_id": identity.runner_id, "key_id": identity.key_id, "capability": "runner_result",
+        "method": "POST", "path": path, "body_sha256": hashlib.sha256(body).hexdigest(),
+        "timestamp_ms": timestamp_ms, "server_nonce": nonce, "sequence": sequence,
+    }
+    headers = {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
+        "X-Heel-Runner-Key-Id": identity.key_id, "X-Heel-Runner-Timestamp-Ms": str(timestamp_ms),
+        "X-Heel-Runner-Signature": _b64(signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))),
+        "X-Heel-Runner-Nonce": nonce, "X-Heel-Runner-Sequence": str(sequence),
+    }
+    return lease, path, headers
+
+
+class _StagingProbe:
+    """Count seals, AEAD encryptions and signature verifications made by one runtime."""
+
+    def __init__(self, runtime, monkeypatch):
+        self.seals = self.encryptions = self.verifications = 0
+        real_seal, real_verify, real_crypto = runtime._seal, runtime._validate_signed_headers, runtime._crypto
+        probe = self
+
+        def seal(*args, **kwargs):
+            probe.seals += 1
+            return real_seal(*args, **kwargs)
+
+        def verify(*args, **kwargs):
+            probe.verifications += 1
+            return real_verify(*args, **kwargs)
+
+        class CountingAead:
+            def __init__(self, key):
+                self._inner = real_crypto.aead(key)
+
+            def encrypt(self, nonce, data, aad):
+                probe.encryptions += 1
+                return self._inner.encrypt(nonce, data, aad)
+
+            def decrypt(self, nonce, data, aad):
+                return self._inner.decrypt(nonce, data, aad)
+
+        monkeypatch.setattr(runtime, "_seal", seal)
+        monkeypatch.setattr(runtime, "_validate_signed_headers", verify)
+        monkeypatch.setattr(runtime, "_crypto", runtime_module._RuntimeCrypto(
+            aead=CountingAead, hashes=real_crypto.hashes, hkdf=real_crypto.hkdf,
+        ))
+
+    @property
+    def counts(self):
+        return self.seals, self.encryptions, self.verifications
+
+
+def test_pending_body_cap_table_is_the_server_route_budget_and_the_reader_keeps_the_historical_bound():
+    """T-P2 (table): staging caps equal the server's runner parse budgets; the reader bound is 272 KiB."""
+    import inspect
+
+    import heel.saas.canary_disclosure as canary_disclosure
+    import heel.saas.http_api as http_api
+
+    assert dict(runtime_module._PENDING_BODY_CAPS) == _SERVER_BODY_CAPS
+    assert _SERVER_BODY_CAPS["result"] == http_api.DISCOVERY_RESULT_MAX_BYTES
+    assert _SERVER_BODY_CAPS["upload-findings"] == canary_disclosure.MAX_UPLOAD_BYTES == http_api.MAX_UPLOAD_BYTES
+    source = inspect.getsource(http_api._Handler._runner_request)
+    for literal in (
+        '128 if operation == "context-list"', '256 if operation in {"claim", "context-claim"}',
+        '69632 if operation == "context-approval-projections"',
+        'MAX_UPLOAD_BYTES if operation == "result-projection"',
+        'DISCOVERY_RESULT_MAX_BYTES if operation == "result"', "else 36 * 1024",
+    ):
+        assert literal in source
+    assert runtime_module._PENDING_BODY_MAX == max(_SERVER_BODY_CAPS.values()) == 272 * 1024
+    assert runtime_module._PENDING_BLOB_BOUND == 393_216 == 384 * 1024
+
+
+@pytest.mark.parametrize("operation", sorted(_SERVER_BODY_CAPS))
+def test_stage_call_and_stage_disclosure_call_enforce_exact_per_operation_body_caps_before_any_persistence(
+    tmp_path, monkeypatch, capsys, operation,
+):
+    """T-P2: a direct ``stage_call``/``stage_disclosure_call`` boundary probe, not a wire-valid message.
+
+    The cap + 1 body is refused before any transaction, seal, AEAD use or signature verification; the
+    cap body stages, reloads byte-identically after reopening and keeps its exact body digest.
+    """
+    cap = _SERVER_BODY_CAPS[operation]
+    over, exact = _canonical_body_of(cap + 1), _canonical_body_of(cap)
+    if operation == "upload-findings":
+        runtime, signer, identity, run_id, available = _runtime_with_available_disclosure(tmp_path)
+        lease, _path, _headers = _signed_disclosure(runtime, signer, identity, run_id, available, b"")
+
+        def stage(body):
+            _lease, path, headers = _signed_disclosure(runtime, signer, identity, run_id, available, body, lease=lease)
+            return runtime.stage_disclosure_call(lease, path=path, headers=headers, body=body, now_ms=13)
+    elif operation in _RUN_OPERATIONS:
+        fixture = _retirable(tmp_path)
+        runtime, signer, identity = fixture.runtime, fixture.signer, fixture.identity
+
+        def stage(body):
+            return _stage_run_call(runtime, signer, identity, fixture.run_id, operation, body)
+    else:
+        runtime, signer, identity = _claim_runtime(tmp_path)
+
+        def stage(body):
+            return _stage_on_claim_chain(runtime, signer, identity, operation, body)
+
+    before = _semantic_rows(runtime.path)
+    with monkeypatch.context() as patch:
+        probe = _StagingProbe(runtime, patch)
+        with pytest.raises(runtime_module.RunnerRuntimeStateError) as refused:
+            stage(over)
+        assert probe.counts == (0, 0, 0)
+    assert type(refused.value) is runtime_module.RunnerRuntimeStateError
+    assert str(refused.value) == "invalid runtime pending body" and refused.value.__cause__ is None
+    assert _semantic_rows(runtime.path) == before
+
+    started = time.perf_counter()
+    staged = stage(exact)
+    staged_at = time.perf_counter()
+    reopened = RunnerRuntimeState(runtime.path, identity, signer)
+    (reloaded,) = reopened.load_pending_calls()
+    reloaded_at = time.perf_counter()
+    assert reloaded == staged == reopened.get_pending_call(staged.call_id)
+    assert reloaded.body == exact and reloaded.request_operation == operation
+    with contextlib.closing(sqlite3.connect(runtime.path)) as conn:
+        (blob,) = conn.execute("SELECT sealed_blob FROM pending_calls").fetchone()
+    core = runtime_module._pending_json_parse(runtime._crypto.aead(runtime._key).decrypt(
+        blob[:12], blob[12:], runtime._aad(_PENDING_SCHEMA, staged.call_id),
+    ))
+    assert core["body_sha256"] == hashlib.sha256(exact).hexdigest() and base64.b64decode(core["body_b64"]) == exact
+    assert core["state_digest"] == staged.state_digest == runtime_module._pending_state_digest(
+        {key: value for key, value in core.items() if key != "state_digest"}
+    )
+    with capsys.disabled():
+        print(
+            f"\n[T-P2 {operation}] cap {cap} B (base64 {len(core['body_b64'])} chars) staged in "
+            f"{staged_at - started:.4f} s, reopened+reloaded in {reloaded_at - staged_at:.4f} s; "
+            f"sealed blob {len(blob)} B",
+        )
+
+
+def test_stage_call_refuses_a_non_nfc_path_and_an_out_of_grammar_capability_with_a_fixed_error_and_no_row(
+    tmp_path, monkeypatch,
+):
+    """T-P2 (strict NFC, the one explicit narrowing): grammar failures at digest construction and at
+    sealing both surface as the fixed ``invalid runtime pending call``; nothing is written. A non-NFC
+    capability never reaches the grammar: the existing signed-header check refuses it first."""
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    prefix = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}"
+    decomposed = f"{prefix}/contexts/rcb_é{'0' * 30}/claim"
+    body = canonical_bytes({"schema_version": "heel.runner-context-claim.v1"})
+    before = _semantic_rows(runtime.path)
+    with monkeypatch.context() as patch:
+        probe = _StagingProbe(runtime, patch)
+        with pytest.raises(runtime_module.RunnerRuntimeStateError) as refused:
+            _stage_on_claim_chain(runtime, signer, identity, "claim-context", body, path=decomposed)
+        assert probe.seals == probe.encryptions == 0
+    assert type(refused.value) is runtime_module.RunnerRuntimeStateError
+    assert str(refused.value) == "invalid runtime pending call"
+    assert refused.value.__cause__ is None and refused.value.__suppress_context__
+    assert _semantic_rows(runtime.path) == before
+    with monkeypatch.context() as patch:
+        probe = _StagingProbe(runtime, patch)
+        with pytest.raises(runtime_module.RunnerRuntimeStateError) as refused:
+            _stage_on_claim_chain(
+                runtime, signer, identity, "claim", canonical_bytes({"schema_version": "heel.runner-claim-request.v1"}),
+                capability="runner_claiḿ",
+            )
+        assert probe.seals == probe.encryptions == 0
+    assert str(refused.value) == "invalid runtime pending headers"
+    assert _semantic_rows(runtime.path) == before
+    # A failure inside the sealer itself (here: the whole-record bound) is wrapped the same way.
+    monkeypatch.setattr(runtime_module, "_PENDING_BLOB_BOUND", 64)
+    with pytest.raises(runtime_module.RunnerRuntimeStateError) as refused:
+        _stage_on_claim_chain(runtime, signer, identity, "list-contexts", _LIST_BODY)
+    assert str(refused.value) == "invalid runtime pending call" and refused.value.__cause__ is None
+    assert _semantic_rows(runtime.path) == before
+
+
+def _findings_upload_body(signer, identity, grant, *, scenarios, observations, text, title):
+    from heel.canary_contracts import (
+        CANARY_FINDINGS_SCHEMA, DISCLOSURE_PERMIT_SCHEMA, validate_canary_findings, validate_disclosure_permit,
+    )
+
+    run_id = grant["run_id"]
+    unsigned = {
+        "schema_version": CANARY_FINDINGS_SCHEMA, "projection_id": "cfp_canary", "run_id": run_id,
+        "grant_id": grant["grant_id"], "workspace_id": grant["workspace_id"], "project_id": grant["project_id"],
+        "environment_id": grant["environment"]["environment_id"],
+        "manifest_digest": grant["approval"]["manifest_digest"],
+        "approval_projection_digest": grant["approval"]["projection_digest"], "grant_digest": grant["grant_digest"],
+        "engine_version": "1", "adapter_versions": ["1.0.0"], "started_at_ms": 1, "finished_at_ms": 2,
+        "assessment_outcome": "observed", "scenario_results": [
+            {
+                "ordinal": index, "scenario_id": f"scenario_{index}", "adapter_version": "1.0.0",
+                "assessment_outcome": "observed",
+                "route": {"method": "GET", "route_template": f"/api/canary/{index}"},
+                "observations": [
+                    {"semantic_role": f"role{item:02d}", "status_code": 200, "body_shape": "json_object",
+                     "truncation_state": "complete"}
+                    for item in range(observations)
+                ],
+                "finding": {
+                    "title": "T" * title, "reachability_rationale": "r" * text, "confidence": "high",
+                    "recommended_control": "c" * text, "regression_suggestion": "s" * text,
+                },
+                "containment_codes": ["admitted"], "redaction_count": 0,
+                "local_evidence_refs": ["ev1_" + "a" * 64],
+            }
+            for index in range(scenarios)
+        ],
+        "containment_codes": ["admitted"], "redaction_count": 0,
+    }
+    findings = validate_canary_findings({
+        **unsigned, "projection_digest": canonical_digest(unsigned), "signing_key_id": signer.key_id,
+        "signature_b64": _b64(signer.sign(canonical_bytes(unsigned))),
+    })
+    permit_unsigned = {
+        "schema_version": DISCLOSURE_PERMIT_SCHEMA, "permit_id": "cdp_canary", "workspace_id": grant["workspace_id"],
+        "project_id": grant["project_id"], "run_id": run_id, "grant_id": grant["grant_id"],
+        "runner_binding": {"runner_id": identity.runner_id, "runner_key_id": identity.key_id},
+        "projection": {
+            "schema_version": CANARY_FINDINGS_SCHEMA, "projection_digest": findings["projection_digest"],
+            "maximum_bytes": len(canonical_bytes(findings)), "scenario_count": scenarios,
+            "finding_count": scenarios,
+        },
+        "approved_by": "user_owner", "permit_nonce": "pn_" + "0" * 32, "approved_at_ms": 1, "issued_at_ms": 1,
+        "expires_at_ms": 600_001,
+    }
+    permit = validate_disclosure_permit({
+        **permit_unsigned, "permit_digest": canonical_digest(permit_unsigned),
+        **SigningAuthority.generate().sign(canonical_bytes(permit_unsigned)),
+    })
+    return canonical_bytes({
+        "schema_version": "heel.runner-findings-upload.v1", "run_id": run_id, "permit": permit,
+        "findings_projection": findings,
+    })
+
+
+_FINDINGS_SHAPES = {
+    "realistic": {"scenarios": 1, "observations": 1, "text": 60, "title": 30},
+    "representative": {"scenarios": 2, "observations": 2, "text": 200, "title": 60},
+    "maximal": {"scenarios": 4, "observations": 5, "text": 2000, "title": 160},
+}
+
+
+def _discovery_result_body(fixture, *, candidates):
+    """A wire-valid terminal result carrying one discovery round report (existing report contract only)."""
+    from heel.canary_contracts import validate_runner_result_request
+    from tests.test_canary_contracts import _digest as contract_digest, _report, operational
+
+    projection = operational()
+    projection.update({
+        "run_id": fixture.run_id, "grant_id": fixture.grant["grant_id"], "lifecycle_phase": "terminal",
+        "execution_disposition": "completed",
+    })
+    projection["timestamps"].update({"claimed_at_ms": 1, "started_at_ms": 1, "terminal_at_ms": 1})
+    projection = contract_digest(projection, "projection_digest")
+    report = _report(run_id=fixture.run_id, grant_id=fixture.grant["grant_id"], candidates=[
+        {"method": "GET", "route_template": f"/api/v1/resource{index:03d}/items", "provenance_kind": "html_link",
+         "source_ordinal": 11, "status_code": 200}
+        for index in range(candidates)
+    ])
+    return canonical_bytes(validate_runner_result_request({
+        "schema_version": "heel.runner-result-request.v1", "run_id": fixture.run_id,
+        "operational_projection": projection, "discovery_round_report": report,
+    }))
+
+
+def test_stage_call_persists_wire_valid_heartbeat_and_findings_upload_bodies_over_3072_bytes_byte_identical(
+    tmp_path, capsys,
+):
+    """T-P3: real wire-valid bodies over 3 072 B stage, reload byte-identically and commit."""
+    from canary_test_support import approval_projection
+    from heel.canary_contracts import validate_canary_findings, validate_runner_approval_projection_submit
+
+    sizes = {}
+    fixture = _retirable(tmp_path / "heartbeat")
+    _value, heartbeat = _maximal_wire_heartbeat(fixture.signer, fixture.grant, fixture.projection)
+    validate_runner_heartbeat_request(json.loads(heartbeat))
+    staged = _stage_run_call(fixture.runtime, fixture.signer, fixture.identity, fixture.run_id, "heartbeat", heartbeat)
+    reopened = RunnerRuntimeState(fixture.runtime.path, fixture.identity, fixture.signer)
+    assert reopened.load_pending_calls() == (staged,) and reopened.get_pending_call(staged.call_id).body == heartbeat
+    committed = reopened.commit_call(staged.call_id, next_nonce_b64=_b64(b"q" * 32), now_ms=6)
+    assert committed.next_sequence == 2 and reopened.load_pending_calls() == ()
+    sizes["heartbeat-maximal"] = len(heartbeat)
+
+    # DECISION §7.1: a discovery-report terminal result at a realistic candidate count, staged as a
+    # storage regression case through the existing report contract (no parser, no execution).
+    result = _discovery_result_body(fixture, candidates=40)
+    staged = _stage_run_call(fixture.runtime, fixture.signer, fixture.identity, fixture.run_id, "result", result)
+    assert RunnerRuntimeState(fixture.runtime.path, fixture.identity, fixture.signer).get_pending_call(
+        staged.call_id,
+    ).body == result
+    sizes["discovery-result-40-candidates"] = len(result)
+
+    for label, shape in _FINDINGS_SHAPES.items():
+        runtime, signer, identity, run_id, available, grant = _available_disclosure_with_grant(tmp_path / label)
+        body = _findings_upload_body(signer, identity, grant, **shape)
+        findings = validate_canary_findings(json.loads(body)["findings_projection"])
+        lease, path, headers = _signed_disclosure(runtime, signer, identity, run_id, available, body)
+        staged = runtime.stage_disclosure_call(lease, path=path, headers=headers, body=body, now_ms=13)
+        reopened = RunnerRuntimeState(runtime.path, identity, signer)
+        assert reopened.load_pending_calls() == (staged,) and staged.body == body
+        consumed = runtime.commit_disclosure(
+            staged.call_id, lease, next_nonce_b64=_b64(b"z" * 32), permit_id="cdp_canary",
+            findings_projection_digest=findings["projection_digest"], receipt_digest="e" * 64, disclosed_at_ms=14,
+        )
+        assert consumed.state == "consumed" and runtime.load_pending_calls() == ()
+        sizes[f"findings-{label}"] = len(body)
+    assert sizes["findings-representative"] > 3072 and sizes["findings-maximal"] > 3072
+    assert sizes["heartbeat-maximal"] > 3072 and sizes["discovery-result-40-candidates"] > 3072
+
+    runtime, signer, identity = _claim_runtime(tmp_path / "submit")
+
+    class _ProjectionSigner:
+        key_id = signer.key_id
+
+        def sign(self, payload):
+            return {"signing_key_id": signer.key_id, "signature_b64": _b64(signer.sign(payload))}
+
+    submit = canonical_bytes(validate_runner_approval_projection_submit({
+        "schema_version": "heel.runner-approval-projection-submit.v1", "context_binding_id": "rcb_" + "b" * 32,
+        "context_binding_digest": "0" * 64, "approval_projection": approval_projection(
+            _ProjectionSigner(), workspace_id=identity.workspace_id, runner_id=identity.runner_id,
+        ),
+    }))
+    staged = _stage_on_claim_chain(runtime, signer, identity, "submit-context-approval-projection", submit)
+    assert RunnerRuntimeState(runtime.path, identity, signer).get_pending_call(staged.call_id).body == submit
+    sizes["approval-projection-submit-fixture"] = len(submit)
+    with capsys.disabled():
+        print("\n[T-P3 measured wire-valid bodies, B]", sizes)
+
+
+def _legacy_seal_pending(runtime, *, request_operation, chain_operation, run_id, path, capability, headers, body,
+                         now_ms, position=None):
+    """The pre-repair sealer (``canonical_bytes`` core, ``_state_digest``, no cap table), written verbatim.
+
+    ``position`` is (nonce, sequence, generation, prior state digest); by default the chain's cursor.
+    """
+    if position is None:
+        cursor = runtime.load_chain(chain_operation, run_id)
+        position = (cursor.next_nonce_b64, cursor.next_sequence, cursor.generation, cursor.state_digest)
+    nonce, sequence, generation, prior_chain_state_digest = position
+    body_digest = hashlib.sha256(body).hexdigest()
+    call_id = hashlib.sha256(b"heel.runner-pending-call-id.v1\0" + canonical_bytes({
+        "workspace_id": runtime.identity.workspace_id, "runner_id": runtime.identity.runner_id,
+        "runner_key_id": runtime.identity.key_id, "request_operation": request_operation,
+        "chain_operation": chain_operation, "run_id": run_id, "path": path, "body_sha256": body_digest,
+        "server_nonce_b64": nonce, "sequence": sequence, "generation": generation,
+    })).hexdigest()
+    core_without_digest = {
+        "schema_version": _PENDING_SCHEMA, "workspace_id": runtime.identity.workspace_id,
+        "runner_id": runtime.identity.runner_id, "runner_key_id": runtime.identity.key_id, "call_id": call_id,
+        "request_operation": request_operation, "chain_operation": chain_operation, "run_id": run_id, "path": path,
+        "capability": capability, "method": "POST", "headers": dict(headers), "body_b64": _b64(body),
+        "body_sha256": body_digest, "server_nonce_b64": nonce, "sequence": sequence, "generation": generation,
+        "prior_chain_state_digest": prior_chain_state_digest, "created_at_ms": now_ms,
+    }
+    core = {**core_without_digest, "state_digest": _state_digest(core_without_digest)}
+    seal_nonce = os.urandom(12)
+    blob = seal_nonce + runtime._crypto.aead(runtime._key).encrypt(
+        seal_nonce, canonical_bytes(core), runtime._aad(_PENDING_SCHEMA, call_id),
+    )
+    _raw(
+        runtime.path,
+        "INSERT INTO pending_calls(call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (call_id, _chain_key(chain_operation, run_id), None if run_id is None else _run_hash_of(run_id),
+         request_operation, sequence, generation, blob, now_ms),
+    )
+    return call_id, canonical_bytes(core), blob
+
+
+def _legacy_claim_chain_row(runtime, signer, identity, operation, body, *, path=None):
+    cursor = runtime.load_chain("claim", None)
+    path = path or _claim_chain_path(identity, operation)
+    headers = _signed_claim_chain_headers(
+        signer, identity, path=path, body=body, nonce=cursor.next_nonce_b64, sequence=cursor.next_sequence,
+    )
+    return _legacy_seal_pending(
+        runtime, request_operation=operation, chain_operation="claim", run_id=None, path=path,
+        capability="runner_claim", headers=headers, body=body, now_ms=1,
+    )
+
+
+def _assert_legacy_row_opens_unchanged(runtime, call_id, plaintext, blob, body):
+    reopened = RunnerRuntimeState(runtime.path, runtime.identity, runtime.signer)
+    pending = reopened.get_pending_call(call_id)
+    assert pending.body == body and call_id in {item.call_id for item in reopened.load_pending_calls()}
+    opened = reopened._open(blob, schema=_PENDING_SCHEMA, primary_fields=(call_id,))
+    assert runtime_module._pending_json_bytes(opened) == canonical_bytes(opened) == plaintext
+    without = {key: value for key, value in opened.items() if key != "state_digest"}
+    assert runtime_module._pending_state_digest(without) == _state_digest(without) == opened["state_digest"]
+    assert runtime_module._pending_json_parse(plaintext) == opened
+    return reopened, pending
+
+
+def _rebuild_v3(path):
+    """The exact v3 layout of ``test_runtime_v3_to_v4_migration_preserves_every_prior_row_...``."""
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        conn.execute("DROP TABLE retired_claims")
+        conn.execute("DROP TABLE chain_recovery")
+        conn.execute("ALTER TABLE metadata RENAME TO metadata_v4")
+        conn.execute(runtime_module._V3_SCHEMA_SQL[0])
+        conn.execute(
+            "INSERT INTO metadata SELECT singleton,'heel.runner-runtime-state.v3',workspace_id,runner_id,"
+            "runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,"
+            "rotation_fence_digest,state_key_ciphertext FROM metadata_v4"
+        )
+        conn.execute("DROP TABLE metadata_v4")
+        conn.commit()
+        assert RunnerRuntimeState._schema_matches(conn, runtime_module._V3_SCHEMA_SQL)
+
+
+def test_legacy_pending_rows_sealed_by_the_public_canonicalizer_open_unchanged_under_the_pending_grammar(tmp_path):
+    """T-P4: rows written by the pre-repair sealer open, commit and supersede exactly as before."""
+    # (a) one wire-valid record per operation.
+    for operation, body in (
+        ("claim", canonical_bytes({"schema_version": "heel.runner-claim-request.v1"})),
+        ("list-contexts", _LIST_BODY),
+        ("claim-context", canonical_bytes({
+            "schema_version": "heel.runner-context-claim.v1", "binding_id": "rcb_" + "b" * 32,
+            "binding_digest": "d" * 64,
+        })),
+        ("submit-context-approval-projection",
+         canonical_bytes({"schema_version": "heel.runner-approval-projection-submit.v1"})),
+    ):
+        runtime, signer, identity = _claim_runtime(tmp_path, name=f"legacy-{operation}.sqlite3")
+        call_id, plaintext, blob = _legacy_claim_chain_row(runtime, signer, identity, operation, body)
+        reopened, pending = _assert_legacy_row_opens_unchanged(runtime, call_id, plaintext, blob, body)
+        if operation in {"claim", "list-contexts", "claim-context"}:
+            attempt = _completed_attempt(reopened, signer, identity)
+            reopened.commit_resync_supersession(
+                attempt, pending, next_nonce_b64=_b64(b"r" * 32), next_sequence=4, generation=1, now_ms=5,
+            )
+            (tombstone,) = reopened.load_superseded_calls()
+            assert (tombstone.call_id, tombstone.body_sha256) == (call_id, hashlib.sha256(body).hexdigest())
+        else:
+            assert reopened.commit_call(call_id, next_nonce_b64=_b64(b"x" * 32), now_ms=2).next_sequence == 5
+    # Run chains: the real heartbeat body; progress, stop-ack and result use the fixture-shaped bodies the
+    # runtime tests stage elsewhere (the runtime stores bytes; the wire validators are not its contract).
+    fixture = _retirable(tmp_path / "run")
+    run_bodies = {
+        "heartbeat": _heartbeat_body(_projection_for(fixture.signer, fixture.grant, fixture.projection), fixture.run_id),
+        "progress": canonical_bytes({"schema_version": "heel.runner-progress-request.v1"}),
+        "stop-ack": canonical_bytes({"schema_version": "heel.runner-stop-ack-request.v1"}),
+        "result": canonical_bytes({"schema_version": "heel.runner-result-request.v1"}),
+    }
+    legacy_calls = {}
+    for operation, body in run_bodies.items():
+        cursor = fixture.runtime.load_chain(operation, fixture.run_id)
+        path = (
+            f"/v1/workspaces/{fixture.identity.workspace_id}/runners/{fixture.identity.runner_id}"
+            f"/runs/{fixture.run_id}/{operation}"
+        )
+        proof = {
+            "schema_version": "heel.runner-request-proof.v1", "workspace_id": fixture.identity.workspace_id,
+            "runner_id": fixture.identity.runner_id, "key_id": fixture.identity.key_id,
+            "capability": _CAPABILITY[operation], "method": "POST", "path": path,
+            "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": 5,
+            "server_nonce": cursor.next_nonce_b64, "sequence": cursor.next_sequence,
+        }
+        headers = {
+            "Content-Type": "application/json", "X-Heel-Runner-Id": fixture.identity.runner_id,
+            "X-Heel-Runner-Key-Id": fixture.identity.key_id, "X-Heel-Runner-Timestamp-Ms": "5",
+            "X-Heel-Runner-Signature": _b64(fixture.signer.sign(b"heel.runner-pop.v1\0" + canonical_bytes(proof))),
+            "X-Heel-Runner-Nonce": cursor.next_nonce_b64, "X-Heel-Runner-Sequence": str(cursor.next_sequence),
+        }
+        call_id, plaintext, blob = _legacy_seal_pending(
+            fixture.runtime, request_operation=operation, chain_operation=operation, run_id=fixture.run_id,
+            path=path, capability=_CAPABILITY[operation], headers=headers, body=body, now_ms=5,
+        )
+        _assert_legacy_row_opens_unchanged(fixture.runtime, call_id, plaintext, blob, body)
+        legacy_calls[operation] = call_id
+    reopened = RunnerRuntimeState(fixture.runtime.path, fixture.identity, fixture.signer)
+    assert len(reopened.load_pending_calls()) == 4
+    assert reopened.commit_call(legacy_calls["heartbeat"], next_nonce_b64=_b64(b"q" * 32), now_ms=6).next_sequence == 2
+    runtime, signer, identity, run_id, available, grant = _available_disclosure_with_grant(tmp_path / "disclosure")
+    findings = _findings_upload_body(signer, identity, grant, **_FINDINGS_SHAPES["realistic"])
+    assert len(findings) <= 3072
+    lease, path, headers = _signed_disclosure(runtime, signer, identity, run_id, available, findings)
+    call_id, plaintext, blob = _legacy_seal_pending(
+        runtime, request_operation="upload-findings", chain_operation="result", run_id=run_id, path=path,
+        capability="runner_result", headers=headers, body=findings, now_ms=13,
+        position=(
+            available.result_chain["next_nonce_b64"], available.result_chain["next_sequence"],
+            available.result_chain["generation"], available.state_digest,
+        ),
+    )
+    _assert_legacy_row_opens_unchanged(runtime, call_id, plaintext, blob, findings)
+    consumed = runtime.commit_disclosure(
+        call_id, lease, next_nonce_b64=_b64(b"z" * 32), permit_id="cdp_canary",
+        findings_projection_digest=json.loads(findings)["findings_projection"]["projection_digest"],
+        receipt_digest="e" * 64, disclosed_at_ms=14,
+    )
+    assert consumed.state == "consumed"
+
+    # (b) old-sealed records over the NEW staging caps (claim 3 000 B > 256; list-contexts 3 000 B > 128):
+    # previously accepted by the runtime API, they still open, reload and commit; the reader keeps 272 KiB.
+    claim_body = canonical_bytes({"schema_version": "heel.runner-claim-request.v1", "pad": "x" * 2942})
+    list_body = canonical_bytes({"schema_version": "heel.runner-context-list.v1", "pad": "x" * 2943})
+    assert (len(claim_body), len(list_body)) == (3000, 3000)
+    runtime, signer, identity = _claim_runtime(tmp_path, name="legacy-over-cap.sqlite3")
+    with pytest.raises(runtime_module.RunnerRuntimeStateError, match="invalid runtime pending body"):
+        _stage_on_claim_chain(runtime, signer, identity, "claim", claim_body)
+    call_id, plaintext, blob = _legacy_claim_chain_row(runtime, signer, identity, "claim", claim_body)
+    reopened, pending = _assert_legacy_row_opens_unchanged(runtime, call_id, plaintext, blob, claim_body)
+    assert reopened.commit_call(call_id, next_nonce_b64=_b64(b"x" * 32), now_ms=2).next_sequence == 5
+    assert reopened.load_pending_calls() == ()
+    # Supersession treats it exactly as before the repair: it is never the fixed poll, so it is refused
+    # as not supersedable (a conflict, not corruption) and nothing changes.
+    runtime, signer, identity = _claim_runtime(tmp_path, name="legacy-over-cap-resync.sqlite3")
+    call_id, plaintext, blob = _legacy_claim_chain_row(runtime, signer, identity, "claim", claim_body)
+    reopened, pending = _assert_legacy_row_opens_unchanged(runtime, call_id, plaintext, blob, claim_body)
+    attempt = _completed_attempt(reopened, signer, identity)
+    before = _semantic_rows(runtime.path)
+    with pytest.raises(RunnerRuntimeConflict, match="not supersedable"):
+        reopened.commit_resync_supersession(
+            attempt, pending, next_nonce_b64=_b64(b"r" * 32), next_sequence=4, generation=1, now_ms=5,
+        )
+    assert _semantic_rows(runtime.path) == before and reopened.get_pending_call(call_id) == pending
+    runtime, signer, identity = _claim_runtime(tmp_path, name="legacy-over-cap-list.sqlite3")
+    call_id, plaintext, blob = _legacy_claim_chain_row(runtime, signer, identity, "list-contexts", list_body)
+    _assert_legacy_row_opens_unchanged(runtime, call_id, plaintext, blob, list_body)
+    # The same file rebuilt as v3 migrates with the over-cap row byte-identical.
+    runtime.close()
+    _rebuild_v3(runtime.path)
+    migrated = RunnerRuntimeState(runtime.path, identity, signer)
+    assert [item.body for item in migrated.load_pending_calls()] == [list_body]
+    with contextlib.closing(sqlite3.connect(runtime.path)) as conn:
+        assert conn.execute("SELECT sealed_blob FROM pending_calls").fetchone()[0] == blob
+
+    # (c) a row whose path was NFC-normalized at seal time opens unchanged (persisted plaintext is NFC).
+    runtime, signer, identity = _claim_runtime(tmp_path, name="legacy-nfc.sqlite3")
+    prefix = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}"
+    decomposed = f"{prefix}/contexts/rcb_é{'0' * 30}/claim"
+    body = canonical_bytes({"schema_version": "heel.runner-context-claim.v1"})
+    call_id, plaintext, blob = _legacy_claim_chain_row(runtime, signer, identity, "claim-context", body, path=decomposed)
+    _reopened, pending = _assert_legacy_row_opens_unchanged(runtime, call_id, plaintext, blob, body)
+    assert pending.path == unicodedata.normalize("NFC", decomposed) != decomposed
+
+
+def test_open_refuses_an_over_bound_pending_blob_before_decryption_and_tombstones_keep_the_public_canonicalizer(
+    tmp_path, monkeypatch,
+):
+    """T-P5: the pending pre-decrypt bound is exact; tombstones are unchanged."""
+    runtime, signer, identity = _claim_runtime(tmp_path)
+    decrypts = _count_stable_key_decrypts(runtime, monkeypatch)
+    for size in (393_217, 393_216 * 2):
+        with pytest.raises(RunnerRuntimeCorrupt, match="runtime state sealed record is invalid"):
+            runtime._open(b"\0" * size, schema=_PENDING_SCHEMA, primary_fields=("0" * 64,))
+    assert decrypts == []
+    with pytest.raises(RunnerRuntimeCorrupt, match="runtime state sealed record is invalid"):
+        runtime._open(b"\0" * 393_216, schema=_PENDING_SCHEMA, primary_fields=("0" * 64,))
+    assert len(decrypts) == 1  # at the bound: one (failing) decryption, then corrupt
+    # Another schema keeps its own rules: the pending bound is not a global cap.
+    with pytest.raises(RunnerRuntimeCorrupt):
+        runtime._open(b"\0" * 393_217, schema="heel.runner-control-chain-state.v1", primary_fields=("0" * 64,))
+    assert len(decrypts) == 2
+    monkeypatch.undo()
+    # A tombstone still embeds and seals through the public canonicalizer: a 4 097-byte string is refused.
+    pending = _stage_claim_chain(runtime, signer, identity)
+    with contextlib.closing(sqlite3.connect(runtime.path)) as conn:
+        (blob,) = conn.execute("SELECT sealed_blob FROM pending_calls").fetchone()
+    core = runtime._open(blob, schema=_PENDING_SCHEMA, primary_fields=(pending.call_id,))
+    with pytest.raises(ContractError):
+        runtime._seal_stable(
+            {"schema_version": runtime_module._SUPERSEDED_CALL_SCHEMA, "superseded_call": {**core, "path": "p" * 4097}},
+            schema=runtime_module._SUPERSEDED_CALL_SCHEMA, record_id="0" * 64,
+        )
+    attempt = _completed_attempt(runtime, signer, identity)
+    runtime.commit_resync_supersession(
+        attempt, pending, next_nonce_b64=_b64(b"r" * 32), next_sequence=4, generation=1, now_ms=5,
+    )
+    (tombstone,) = RunnerRuntimeState(runtime.path, identity, signer).load_superseded_calls()
+    assert tombstone.call_id == pending.call_id
+
+
+# --------------------------------------------------------------------- PENDING-BODY-CAP T-P9 (R1 inner pending)
+
+def _live_retired_heartbeat_run(tmp_path, versions):
+    """Stage one heartbeat through the real client path against the in-process control plane's run,
+    lose its answer, then retire the run with the genuine attestation (R1 tests 4a and T-P9)."""
+    from heel.runner.control_client import RunnerControlClient
+    from tests.test_runner_control_http import _LiveHttpRun
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            signer = _LiveSigner(live.private, live.key_id)
+            identity = RunnerIdentity(
+                runner_id="runner", workspace_id=live.workspace, runner_version="1.0.0",
+                adapter_versions={"canary": "1.0.0"},
+                public_key_b64=base64.b64encode(signer.public_key).decode("ascii"),
+                fingerprint=hashlib.sha256(signer.public_key).hexdigest(), key_id=live.key_id,
+                pairing_phrase=runner_phrase_words()[:6],
+            )
+            runtime = RunnerRuntimeState(tmp_path / "runtime.sqlite3", identity, signer)
+            runtime.install_chain(
+                operation="claim", run_id=None, next_nonce_b64=_b64(b"c" * 32),
+                next_sequence=1, generation=0, now_ms=1,
+            )
+            staged_claim = _stage_claim(runtime, signer, identity, timestamp_ms=2)
+            runtime.commit_call(
+                staged_claim.call_id, next_nonce_b64=_b64(b"n" * 32), now_ms=2,
+                installed_chains=tuple(
+                    (op, live.run_id, live.chains[op]["next_nonce_b64"], live.chains[op]["next_sequence"],
+                     live.chains[op]["generation"])
+                    for op in _RUN_OPERATIONS
+                ),
+                active_run=ActiveRunInstall(
+                    run_id=live.run_id, approval_projection=live.approval, grant=live.grant,
+                    gate={
+                        "active": True, "runner_state": "active", "proof_state": "valid",
+                        "proof_expires_at_ms": 2_000_000_000_000,
+                        "kill_switch_generation": live.grant["kill_switch_generation"],
+                        "stop_reason": "none", "server_time_ms": 2,
+                    },
+                    claim_response_digest="a" * 64, gate_response_digest="b" * 64,
+                    claimed_at_ms=2, gate_received_at_ms=2,
+                ),
+            )
+            ids = {"grant_id": live.grant["grant_id"], "workspace_id": live.workspace, "project_id": "prj"}
+
+            def projection(versions):
+                return _projection_for(
+                    signer, live.grant, live.approval, adapter_versions=versions,
+                    runner_version="r" * 128, engine_version="e" * 128, identifiers=ids,
+                    maximal_numbers=True,
+                )
+
+            versions = list(versions)
+            body = _heartbeat_body(projection(versions), live.run_id)
+            transport = _LostResponseTransport()
+            client = RunnerControlClient(
+                origin="https://control.example", workspace_id=live.workspace, runner_id="runner",
+                signer=signer, clock=lambda: 3, transport=transport,
+                nonce_source=lambda _key: _b64(b"x" * 32), runtime=runtime,
+            )
+            with pytest.raises(OSError, match="response lost"):
+                client.heartbeat(run_id=live.run_id, operational_projection=projection(versions))
+            ((_path, _headers, sent_body),) = transport.requests
+            assert sent_body == body
+            (staged,) = runtime.load_pending_calls()
+            assert staged.request_operation == "heartbeat" and staged.body == body
+            run_hash = _run_hash_of(live.run_id)
+            sources = {
+                table: _rows_for(runtime.path, table, run_hash)
+                for table in ("active_runs", "control_chains", "pending_calls")
+            }
+            evidence, _attestation = _real_attestation_evidence(live)
+        finally:
+            live.close()
+
+    record = runtime.retire_inactive_claim(
+        live.run_id, expected_state_digest=_active_digest(runtime, live.run_id), evidence=evidence,
+        reservation_probe="absent", now_ms=int(time.time() * 1000),
+    )
+    return runtime, signer, identity, live.run_id, body, versions, sources, evidence, record
+
+
+_WIRE_MAXIMAL_VERSIONS = [chr(ord("a") + index) * 128 for index in range(20)]
+
+
+def test_load_retired_claim_authenticates_a_real_pending_component_over_4096_base64_before_and_after_rotation(
+    tmp_path, monkeypatch, capsys,
+):
+    """T-P9: R1 inner pending authentication uses the pending grammar and digest under the historical AAD."""
+    runtime, signer, identity, run_id, body, versions, sources, _evidence, record = _live_retired_heartbeat_run(
+        tmp_path, _WIRE_MAXIMAL_VERSIONS,
+    )
+    validate_runner_heartbeat_request(json.loads(body))
+    assert len(body) > 3072 and versions == _WIRE_MAXIMAL_VERSIONS
+    source_row = sources["pending_calls"][0]
+    source_blob, call_id = source_row[6], source_row[0]
+    (pending,) = record.pending
+    pending_text = pending["sealed_blob_b64"]
+    assert 4096 < len(pending_text) < 524_288 and _component_bytes(pending) == source_blob
+    historical_aad = runtime._aad(_PENDING_SCHEMA, call_id)
+    original_plaintext = runtime._crypto.aead(runtime._key).decrypt(source_blob[:12], source_blob[12:], historical_aad)
+    core = runtime_module._pending_json_parse(original_plaintext)
+    assert len(core["body_b64"]) > 4096 and base64.b64decode(core["body_b64"]) == body
+    assert core["state_digest"] == runtime_module._pending_state_digest(
+        {key: value for key, value in core.items() if key != "state_digest"}
+    )
+    with pytest.raises(ContractError):
+        canonical_bytes(core)
+    assert pending["index"] == {
+        "call_id": source_row[0], "chain": source_row[1], "run_hash": source_row[2], "operation": source_row[3],
+        "sequence": source_row[4], "generation": source_row[5], "created_at_ms": source_row[7],
+    }
+
+    def opened_counts(state):
+        with monkeypatch.context() as patch:
+            decrypts = _count_stable_key_decrypts(state, patch)
+            assert state.load_retired_claim(run_id) == record
+            shallow = list(decrypts)
+            assert state.load_retired_claim(run_id, authenticate_components=True) == record
+            return shallow, decrypts[len(shallow):]
+
+    shallow, deep = opened_counts(runtime)
+    assert len(shallow) == 1 and len(deep) == 7
+    assert deep[-1] == historical_aad  # the pending component opens under the sealing identity's AAD
+
+    old_identity = identity
+    new_signer = Signer(b"y" * 32)
+    new_identity = dataclasses.replace(
+        old_identity, public_key_b64=base64.b64encode(new_signer.public_key).decode("ascii"),
+        fingerprint=hashlib.sha256(new_signer.public_key).hexdigest(), key_id=new_signer.key_id,
+    )
+    journal = _rotation_journal_after(runtime, old_identity, new_identity, nonce=_b64(b"w" * 32))
+    probe = runtime.probe_rotation_eligible(old_identity=old_identity)
+    eligibility = runtime.assert_rotation_eligible(
+        old_identity=old_identity, prepared_journal_digest="d" * 64,
+        runtime_rotation_intent_digest="e" * 64, probe=probe, now_ms=60,
+    )
+    runtime.finish_rotation(journal, eligibility=eligibility, new_identity=new_identity, new_signer=new_signer)
+    reopened = RunnerRuntimeState(runtime.path, new_identity, new_signer)
+    shallow, deep = opened_counts(reopened)
+    assert len(shallow) == 1 and len(deep) == 7 and deep[-1] == historical_aad
+    assert reopened._crypto.aead(reopened._key).decrypt(source_blob[:12], source_blob[12:], historical_aad) == original_plaintext
+    with pytest.raises(RunnerRuntimeCorrupt):
+        reopened._open(source_blob, schema=_PENDING_SCHEMA, primary_fields=(call_id,))  # never the new identity
+
+    original = _open_retired_core(reopened, run_id)
+    for position in (0, 12, len(source_blob) // 2, len(source_blob) - 1):
+        tampered = json.loads(json.dumps(original))
+        blob = bytearray(source_blob)
+        blob[position] ^= 1
+        tampered["pending"][0]["sealed_blob_b64"] = _b64(bytes(blob))
+        _reseal_retired_core(reopened, run_id, tampered)
+        assert reopened.load_retired_claim(run_id).run_id == run_id
+        with pytest.raises(RunnerRuntimeCorrupt, match="runtime retired claim component is invalid"):
+            reopened.load_retired_claim(run_id, authenticate_components=True)
+    _reseal_retired_core(reopened, run_id, original)
+    assert reopened.load_retired_claim(run_id, authenticate_components=True) == record
+    with capsys.disabled():
+        print(
+            f"\n[T-P9 measured] heartbeat body {len(body)} B; pending blob {len(source_blob)} B; archived pending "
+            f"text {len(pending_text)} chars; decryptions shallow 1 / authenticated 7, before and after rotation",
+        )
