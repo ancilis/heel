@@ -673,7 +673,14 @@ def test_static_launcher_stages_every_path_the_module_reads(tmp_path):
     staged = sorted(str(path.relative_to(source)) for path in source.rglob("*") if path.is_file())
     assert staged == sorted(LAUNCHER.staged_files())
     assert all((source / name).read_bytes() == (ROOT / name).read_bytes() for name in LAUNCHER.staged_files())
-    statics = [name for name in LAUNCHER.REQUIRED_CASES if name.startswith("test_static_")]
+    # The launcher's own isolated smoke on this copy first, as the child runs it before pytest: it must
+    # pass and leave the copy exactly as staged (no __pycache__ or any other entry, the same bytes).
+    entries = sorted(str(path.relative_to(source)) for path in source.rglob("*"))
+    assert LAUNCHER.import_smoke(Path(sys.executable), source, Path(sys.prefix))
+    assert sorted(str(path.relative_to(source)) for path in source.rglob("*")) == entries
+    assert sorted(str(path.relative_to(source)) for path in source.rglob("*") if path.is_file()) == staged
+    assert all((source / name).read_bytes() == (ROOT / name).read_bytes() for name in LAUNCHER.staged_files())
+    statics =[name for name in LAUNCHER.REQUIRED_CASES if name.startswith("test_static_")]
     completed = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-k", "static", LAUNCHER.TEST_MODULE],
         cwd=source, capture_output=True, text=True, timeout=600,
@@ -1907,9 +1914,13 @@ def _p6(ints: dict, tokens: dict) -> bool:
         outcome = fx.install(identity=(outer.st_dev, outer.st_ino))
         results["identity"] = (outcome, int(_empty_ruleset(fx.l_fd)))
     # (b) readback fault: a pre-seeded conflicting chain in the named table makes the real readback
-    # differ; the product cleans its own table and nothing remains.
+    # differ; the product cleans its own table and nothing remains. The seed uses the product's script
+    # grammar (each nested block newline-terminated); its exit code is recorded so a failed seed is a
+    # clearly attributed FAIL, never a vacuous pass.
     with _fixture("p6_readback", peer=None) as fx:
-        seeded = _run_in(fx.l_fd, [AUTHORITY.NFT_PATH, "-f", "-"], f"table inet {AUTHORITY.TABLE} {{ chain conflict {{ }} }}\n")
+        seed = f"table inet {AUTHORITY.TABLE} {{\n  chain conflict {{\n  }}\n}}\n"
+        seeded = _run_in(fx.l_fd, [AUTHORITY.NFT_PATH, "-f", "-"], seed)
+        ints["seed_exit"] = seeded.returncode
         ints["seeded"] = int(seeded.returncode == 0)
         outcome = fx.install()
         results["readback"] = (outcome, int(_empty_ruleset(fx.l_fd)))

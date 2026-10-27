@@ -641,8 +641,9 @@ def install_closure(wheel_bytes: dict[str, bytes], root: Path) -> Path:
 
 
 def import_smoke(python: Path, source: Path, env: Path) -> bool:
-    """IMPORT_SMOKE with ``-I`` from ``/``: only the staged root and the closed environment."""
-    completed = subprocess.run([str(python), "-I", "-c", IMPORT_SMOKE, str(source), str(env), CRYPTOGRAPHY_VERSION],
+    """IMPORT_SMOKE with ``-I`` from ``/``: only the staged root and the closed environment. ``-B``
+    because ``-I`` ignores PYTHONDONTWRITEBYTECODE: no bytecode may be written into the staged tree."""
+    completed = subprocess.run([str(python), "-I", "-B", "-c", IMPORT_SMOKE, str(source), str(env), CRYPTOGRAPHY_VERSION],
                                cwd="/", capture_output=True, text=True, timeout=120, env={"PATH": FIXED_PATH, "LC_ALL": "C"})
     return completed.returncode == 0 and completed.stdout.startswith("import_smoke ok ")
 
