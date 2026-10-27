@@ -806,3 +806,267 @@ def test_execution_grant_v2_budget_profile_is_finite_and_v1_grants_stay_256kib()
         validate_execution_grant(_digest(missing, "grant_digest"))
     with pytest.raises(ContractError):
         validate_execution_grant(_digest({**grant(), "budget_profile": "discovery"}, "grant_digest"))
+
+
+# --- inactive-claim attestation wire contracts (C design §6.2/§6.5, ADDENDUM A5.2) ---
+# The new names are read through the module so that, before they exist, only these tests fail.
+import heel.canary_contracts as contracts
+
+CHALLENGE = base64.b64encode(bytes(range(32, 64))).decode("ascii")
+_ID128 = "i" * 128
+
+
+def _inactive_request(**overrides) -> dict:
+    value = {
+        "schema_version": "heel.runner-inactive-claim-attestation-request.v1",
+        "run_id": "run_1", "project_id": "prj", "grant_id": "grant_1", "grant_digest": HASH,
+        "approval_id": "apr_1", "approval_projection_digest": "b" * 64,
+        "bound_runner_key_id": "rk_1", "client_challenge_b64": CHALLENGE,
+    }
+    value.update(overrides)
+    return value
+
+
+def _cloud(status: str = "stop_requested", **overrides) -> dict:
+    terminal = status == "terminal"
+    value = {
+        "status": status, "stop_reason": "cloud_stop", "stop_generation": 1,
+        "stop_requested_at_ms": 10, "stop_deadline_ms": 20,
+        "terminal_at_ms": 30 if terminal else None,
+        "execution_disposition": "stopped" if terminal else None,
+        "grant_status": "terminal" if terminal else "claimed",
+        "started_at_ms": None, "stop_acknowledged_at_ms": None,
+        "observation": "no_start_no_ack_no_execution_projection",
+    }
+    value.update(overrides)
+    return value
+
+
+_DEFAULT_CLOUD = object()
+
+
+def _attestation(cloud: object = _DEFAULT_CLOUD, **overrides) -> dict:
+    value = {
+        "schema_version": "heel.inactive-claim-attestation.v1",
+        "attestation_id": "ica_" + "0123456789abcdef" * 2,
+        "workspace_id": "ws", "runner_id": "rnr", "project_id": "prj", "run_id": "run_1",
+        "grant_id": "grant_1", "grant_digest": HASH, "approval_id": "apr_1",
+        "approval_projection_digest": "b" * 64, "bound_runner_key_id": "rk_1",
+        "authenticated_runner_key_id": "rk_1", "client_challenge_b64": CHALLENGE,
+        "cloud": _cloud() if cloud is _DEFAULT_CLOUD else cloud, "attested_at_ms": 40,
+        "attestation_digest": HASH, "signing_key_id": "grant-authority", "signature_b64": SIG,
+    }
+    value.update(overrides)
+    try:
+        return _digest(value, "attestation_digest")
+    except ContractError:
+        # A non-portable mutation has no canonical digest; the validator must reject it as given.
+        return value
+
+
+def _rejects(validator, record) -> None:
+    with pytest.raises(ContractError):
+        validator(record)
+
+
+def test_inactive_claim_attestation_request_and_response_are_closed_canonical_and_domain_separated():
+    assert contracts.RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_SCHEMA == "heel.runner-inactive-claim-attestation-request.v1"
+    assert contracts.RUNNER_INACTIVE_CLAIM_ATTESTATION_PROOF_SCHEMA == "heel.runner-inactive-claim-attestation-proof.v1"
+    assert contracts.RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN == b"heel.runner-inactive-claim-attestation-pop.v1\0"
+    assert contracts.INACTIVE_CLAIM_ATTESTATION_SCHEMA == "heel.inactive-claim-attestation.v1"
+    assert contracts.INACTIVE_CLAIM_ATTESTATION_DOMAIN == b"heel.inactive-claim-attestation.v1\0"
+    assert contracts.INACTIVE_CLAIM_OBSERVATION == "no_start_no_ack_no_execution_projection"
+    assert contracts.RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_MAX_BYTES == 2048
+    assert contracts.INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES == 8192
+    # The two new separators differ from each other and from every existing runner/resync PoP domain.
+    domains = {contracts.RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN, contracts.INACTIVE_CLAIM_ATTESTATION_DOMAIN,
+               b"heel.runner-pop.v1\0", b"heel.runner-resync-start-pop.v2\0", b"heel.runner-resync-complete-pop.v2\0"}
+    assert len(domains) == 5
+
+    request = _inactive_request()
+    accepted = contracts.validate_runner_inactive_claim_attestation_request(request)
+    assert accepted == request and accepted is not request
+    raw = canonical_bytes(request)
+    assert contracts.validate_runner_inactive_claim_attestation_request(
+        parse_json(raw, max_bytes=contracts.RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_MAX_BYTES)) == request
+
+    # I1 (stop_requested/finalizing, no terminal fields) and I2 (terminal/stopped) are both valid.
+    for cloud in (_cloud("stop_requested"), _cloud("finalizing"), _cloud("terminal")):
+        record = _attestation(cloud)
+        result = contracts.validate_inactive_claim_attestation(record)
+        assert result == record and result["cloud"] is not record["cloud"]
+        raw = canonical_bytes(record)
+        assert contracts.validate_inactive_claim_attestation(
+            parse_json(raw, max_bytes=contracts.INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES)) == record
+
+    # The signed payload is the domain plus the canonical record without digest and envelope fields.
+    record = _attestation()
+    unsigned = {k: v for k, v in record.items() if k not in {"attestation_digest", "signing_key_id", "signature_b64"}}
+    payload = contracts.inactive_claim_attestation_signing_payload(record)
+    assert payload == b"heel.inactive-claim-attestation.v1\0" + canonical_bytes(unsigned)
+    assert contracts.inactive_claim_attestation_signing_payload(unsigned) == payload
+    assert record["attestation_digest"] == canonical_digest(unsigned)
+
+
+def test_inactive_claim_attestation_request_rejects_unknown_fields_types_and_encodings():
+    missing = _inactive_request(); missing.pop("client_challenge_b64")
+    for bad in (
+        _inactive_request(unexpected=1),
+        _inactive_request(workspace_id="ws"),
+        missing,
+        _inactive_request(schema_version="heel.runner-inactive-claim-attestation-request.v2"),
+        _inactive_request(schema_version="heel.runner-resync-start.v2"),
+        _inactive_request(run_id=""), _inactive_request(run_id=1), _inactive_request(run_id=True),
+        _inactive_request(run_id=None), _inactive_request(run_id=["run_1"]),
+        _inactive_request(project_id=_ID128 + "x"), _inactive_request(grant_id=False),
+        _inactive_request(approval_id={"id": "apr_1"}), _inactive_request(bound_runner_key_id=0),
+        _inactive_request(grant_digest="A" * 64), _inactive_request(grant_digest="a" * 63),
+        _inactive_request(grant_digest=True), _inactive_request(approval_projection_digest="g" * 64),
+        _inactive_request(client_challenge_b64=base64.b64encode(bytes(31)).decode()),
+        _inactive_request(client_challenge_b64=base64.b64encode(bytes(33)).decode()),
+        _inactive_request(client_challenge_b64=CHALLENGE.rstrip("=")),
+        _inactive_request(client_challenge_b64=base64.urlsafe_b64encode(bytes([0xfb] * 32)).decode()),
+        _inactive_request(client_challenge_b64=CHALLENGE + "\n"),
+        _inactive_request(client_challenge_b64=" " + CHALLENGE),
+        _inactive_request(client_challenge_b64=True),
+        _inactive_request(client_challenge_b64=list(range(32))),
+        "not an object", [], None,
+    ):
+        _rejects(contracts.validate_runner_inactive_claim_attestation_request, bad)
+    # Boundary identifiers are accepted; a standard-alphabet challenge with '+' and '/' is canonical.
+    contracts.validate_runner_inactive_claim_attestation_request(_inactive_request(
+        run_id=_ID128, client_challenge_b64=base64.b64encode(bytes([0xfb, 0xff] * 16)).decode()))
+
+
+def test_inactive_claim_attestation_wire_budgets_use_the_bounded_parser():
+    request_max = contracts.RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_MAX_BYTES
+    response_max = contracts.INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES
+    # The largest valid records (every identifier at its 128-byte ceiling) fit their budgets.
+    request = _inactive_request(**{f: _ID128 for f in ("run_id", "project_id", "grant_id", "approval_id", "bound_runner_key_id")})
+    assert len(canonical_bytes(contracts.validate_runner_inactive_claim_attestation_request(request))) < request_max
+    ids = {f: _ID128 for f in ("workspace_id", "runner_id", "project_id", "run_id", "grant_id", "approval_id",
+                                "bound_runner_key_id", "authenticated_runner_key_id", "signing_key_id")}
+    response = _attestation(_cloud("terminal", stop_generation=(1 << 53) - 1, stop_requested_at_ms=(1 << 53) - 1,
+                                   stop_deadline_ms=(1 << 53) - 1, terminal_at_ms=(1 << 53) - 1,
+                                   stop_reason="local_emergency_stop", grant_status="terminal"),
+                            attested_at_ms=(1 << 53) - 1, **ids)
+    assert len(canonical_bytes(contracts.validate_inactive_claim_attestation(response))) < response_max
+    # The byte budget is enforced by parse_json on the raw wire bytes, exactly at the ceiling.
+    for record, maximum, validator in (
+        (_inactive_request(), request_max, contracts.validate_runner_inactive_claim_attestation_request),
+        (_attestation(), response_max, contracts.validate_inactive_claim_attestation),
+    ):
+        raw = canonical_bytes(record)
+        at_limit = raw + b" " * (maximum - len(raw))
+        assert validator(parse_json(at_limit, max_bytes=maximum)) == record
+        with pytest.raises(ContractError, match="input exceeds size limit"):
+            parse_json(at_limit + b" ", max_bytes=maximum)
+
+
+def test_inactive_claim_attestation_timestamps_are_nonnegative_integers_without_unit_inference():
+    # Seconds-looking and millisecond-looking integers, zero and the portable ceiling are all accepted
+    # unchanged; the contract has no epoch floor and never rescales a bare integer.
+    for moment in (0, 1, 1_800_000_000, 1_800_000_000_000, (1 << 53) - 1):
+        record = _attestation(_cloud("terminal", stop_requested_at_ms=moment, stop_deadline_ms=moment,
+                                     terminal_at_ms=moment), attested_at_ms=moment)
+        assert contracts.validate_inactive_claim_attestation(record) == record
+    for field in ("stop_requested_at_ms", "stop_deadline_ms", "terminal_at_ms", "stop_generation"):
+        for bad in (-1, 1 << 53, True, False, "1", None if field != "terminal_at_ms" else "x", [1], {"ms": 1}):
+            _rejects(contracts.validate_inactive_claim_attestation, _attestation(_cloud("terminal", **{field: bad})))
+    for bad in (-1, 1 << 53, True, "40", None, [40]):
+        _rejects(contracts.validate_inactive_claim_attestation, _attestation(attested_at_ms=bad))
+
+
+def test_inactive_claim_attestation_rejects_incoherent_cloud_state_and_observation():
+    cases = [
+        _cloud("terminal", execution_disposition=None),
+        _cloud("terminal", execution_disposition="completed"),
+        _cloud("terminal", execution_disposition="failed"),
+        _cloud("terminal", terminal_at_ms=None),
+        _cloud("stop_requested", execution_disposition="stopped"),
+        _cloud("finalizing", terminal_at_ms=30),
+        _cloud("finalizing", execution_disposition="stopped", terminal_at_ms=30),
+        _cloud("running"), _cloud("claimed"), _cloud("cancelled"), _cloud("expired"), _cloud("TERMINAL"),
+        _cloud(stop_reason="none"), _cloud(stop_reason="cloud_disconnected"), _cloud(stop_reason=None),
+        _cloud(grant_status="active"), _cloud(grant_status=None),
+        _cloud(started_at_ms=0), _cloud(started_at_ms=11), _cloud(started_at_ms=False),
+        _cloud(stop_acknowledged_at_ms=0), _cloud(stop_acknowledged_at_ms=12),
+        _cloud(observation="no_start_no_ack_no_execution_projection "),
+        _cloud(observation="NO_START_NO_ACK_NO_EXECUTION_PROJECTION"),
+        _cloud(observation="not_executed"), _cloud(observation=None),
+        {**_cloud(), "unexpected": None},
+        {k: v for k, v in _cloud().items() if k != "started_at_ms"},
+        {k: v for k, v in _cloud().items() if k != "observation"},
+        "terminal", None, [],
+    ]
+    for cloud in cases:
+        _rejects(contracts.validate_inactive_claim_attestation, _attestation(cloud))
+    for reason in ("local_emergency_stop", "cloud_stop", "runner_revoked", "target_revoked", "kill_switch"):
+        contracts.validate_inactive_claim_attestation(_attestation(_cloud("terminal", stop_reason=reason)))
+    for status in ("prepared", "approved", "issued", "claimed", "expired", "revoked", "terminal"):
+        contracts.validate_inactive_claim_attestation(_attestation(_cloud(grant_status=status)))
+
+
+def test_inactive_claim_attestation_rejects_fields_ids_keys_challenge_and_digest_mutations():
+    missing = _attestation(); missing.pop("authenticated_runner_key_id")
+    cases = [
+        _attestation(unexpected=1), _attestation(nonce="x"), _digest(missing, "attestation_digest"),
+        _attestation(schema_version="heel.inactive-claim-attestation.v2"),
+        _attestation(schema_version="heel.runner-inactive-claim-attestation-request.v1"),
+        _attestation(attestation_id="ica_" + "0" * 31), _attestation(attestation_id="ica_" + "0" * 33),
+        _attestation(attestation_id="ICA_" + "0" * 32), _attestation(attestation_id="ica_" + "A" * 32),
+        _attestation(attestation_id="ica_" + "0" * 31 + "\n"), _attestation(attestation_id="rcb_" + "0" * 32),
+        _attestation(attestation_id=None), _attestation(attestation_id=True),
+        _attestation(authenticated_runner_key_id="rk_2"), _attestation(bound_runner_key_id="rk_2"),
+        _attestation(workspace_id=""), _attestation(runner_id=_ID128 + "x"), _attestation(run_id=1),
+        _attestation(project_id=True), _attestation(grant_id=None), _attestation(approval_id=["apr_1"]),
+        _attestation(grant_digest="A" * 64), _attestation(approval_projection_digest="b" * 65),
+        _attestation(client_challenge_b64=CHALLENGE.rstrip("=")),
+        _attestation(client_challenge_b64=base64.b64encode(bytes(16)).decode()),
+        _attestation(client_challenge_b64=base64.urlsafe_b64encode(bytes([0xfb] * 32)).decode()),
+        _attestation(signing_key_id=""), _attestation(signing_key_id=True),
+        _attestation(signature_b64=base64.b64encode(bytes(63)).decode()),
+        _attestation(signature_b64=SIG.rstrip("=")),
+        "attestation", None, [],
+    ]
+    # A field changed after the digest was computed, and a digest over the wrong field set.
+    changed = _attestation(); changed["run_id"] = "run_2"; cases.append(changed)
+    changed = _attestation(); changed["cloud"] = dict(changed["cloud"], stop_generation=2); cases.append(changed)
+    wrong_set = _attestation(); wrong_set["attestation_digest"] = canonical_digest(
+        {k: v for k, v in wrong_set.items() if k != "attestation_digest"}); cases.append(wrong_set)
+    missing_digest = _attestation(); missing_digest.pop("attestation_digest"); cases.append(missing_digest)
+    for bad_digest in ("A" * 64, "a" * 63, True, None):
+        changed = _attestation(); changed["attestation_digest"] = bad_digest; cases.append(changed)
+    for record in cases:
+        _rejects(contracts.validate_inactive_claim_attestation, record)
+
+
+def test_inactive_claim_attestation_validator_does_not_prove_authenticity_signature_is_caller_checked():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from heel.crypto import ed25519_key_id, sign_envelope, verify_envelope
+
+    # A structurally valid record with an arbitrary well-formed signature passes the validator: the
+    # contract is structural only and callers must verify the pinned grant-authority signature.
+    assert contracts.validate_inactive_claim_attestation(_attestation())["signature_b64"] == SIG
+
+    private = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    public = private.public_key()
+    key_id = ed25519_key_id(public.public_bytes(Encoding.Raw, PublicFormat.Raw))
+    record = _attestation(signing_key_id=key_id)
+    record.update(sign_envelope(private, key_id, contracts.inactive_claim_attestation_signing_payload(record)))
+    accepted = contracts.validate_inactive_claim_attestation(record)
+    envelope = {"signing_key_id": accepted["signing_key_id"], "signature_b64": accepted["signature_b64"]}
+    verify_envelope({key_id: public}, envelope, contracts.inactive_claim_attestation_signing_payload(accepted))
+    # Domain separation: the same unsigned bytes without the separator, or under another domain, fail.
+    unsigned_bytes = contracts.inactive_claim_attestation_signing_payload(accepted)[len(contracts.INACTIVE_CLAIM_ATTESTATION_DOMAIN):]
+    for payload in (unsigned_bytes, b"heel.runner-pop.v1\0" + unsigned_bytes,
+                    contracts.RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN + unsigned_bytes):
+        with pytest.raises(ValueError):
+            verify_envelope({key_id: public}, envelope, payload)
+    # A re-digested mutation is structurally valid again but no longer verifies.
+    forged = _attestation(signing_key_id=key_id, run_id="run_2")
+    forged.update(envelope)
+    contracts.validate_inactive_claim_attestation(forged)
+    with pytest.raises(ValueError):
+        verify_envelope({key_id: public}, envelope, contracts.inactive_claim_attestation_signing_payload(forged))

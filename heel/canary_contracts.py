@@ -41,6 +41,19 @@ DISCOVERY_ROUND_REPORT_SCHEMA = "heel.discovery-round-report.v1"
 PLAN_REQUEST_SCHEMA = "heel.plan-request.v1"
 RUNNER_PLAN_REQUEST_CLAIM_SCHEMA = "heel.runner-plan-request-claim.v1"
 RUNNER_PLAN_REQUEST_SCHEMA = "heel.runner-plan-request.v1"
+# Inactive-claim attestation (pre-activation recovery, C design §6).  The request rides the resync
+# proof-of-possession family: the runner signs POP_DOMAIN + canonical proof (PROOF_SCHEMA).  The
+# cloud answer is signed by the grant authority over ATTESTATION_DOMAIN + canonical unsigned record.
+# Neither separator is shared with any other runner, resync, or grant protocol.
+RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_SCHEMA = "heel.runner-inactive-claim-attestation-request.v1"
+RUNNER_INACTIVE_CLAIM_ATTESTATION_PROOF_SCHEMA = "heel.runner-inactive-claim-attestation-proof.v1"
+RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN = b"heel.runner-inactive-claim-attestation-pop.v1\0"
+INACTIVE_CLAIM_ATTESTATION_SCHEMA = "heel.inactive-claim-attestation.v1"
+INACTIVE_CLAIM_ATTESTATION_DOMAIN = b"heel.inactive-claim-attestation.v1\0"
+INACTIVE_CLAIM_OBSERVATION = "no_start_no_ack_no_execution_projection"
+# Raw wire budgets for parse_json; the transport and edge caps are wired separately.
+RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_MAX_BYTES = 2048
+INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES = 8192
 DISCOVERY_ACKNOWLEDGEMENT = "I authorize Heel to send up to 100 GET/HEAD requests to this origin"
 # The fixed round-1 frontier.  Its digest is bound into every authorization and round-1 plan.
 DISCOVERY_SEED_PATHS = (
@@ -999,4 +1012,83 @@ def validate_runner_plan_request(value: Any) -> dict[str, Any]:
         _fail("invalid plan request nonce")
     _integer(obj["max_ops"], lower=1, upper=20); _hash(obj["inventory_digest"]); _hash(obj["selection_digest"])
     _route_selection(obj["routes"], maximum=10); _integer(obj["expires_at_ms"], lower=1)
+    return copy.deepcopy(obj)
+
+
+# --- inactive-claim attestation (C design §6.2/§6.5, ADDENDUM A5.2) ---
+
+_ATTESTATION_ID = re.compile(r"^ica_[0-9a-f]{32}$")
+_INACTIVE_CLOUD_STATUSES = {"stop_requested", "finalizing", "terminal"}
+_GRANT_STATUSES = {"prepared", "approved", "issued", "claimed", "expired", "revoked", "terminal"}
+_ATTESTATION_ENVELOPE_FIELDS = frozenset({"attestation_digest", "signing_key_id", "signature_b64"})
+
+
+def validate_runner_inactive_claim_attestation_request(value: Any) -> dict[str, Any]:
+    """Validate the closed runner request; raw bytes go through parse_json with the request budget.
+
+    The path run ID, the header key and the PoP proof are checked by the server, not here.
+    """
+    obj = _contract(value, RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_MAX_BYTES)
+    obj = _object(obj, {
+        "schema_version", "run_id", "project_id", "grant_id", "grant_digest", "approval_id",
+        "approval_projection_digest", "bound_runner_key_id", "client_challenge_b64",
+    })
+    _enum(obj["schema_version"], {RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_SCHEMA})
+    _id_fields(obj, ("run_id", "project_id", "grant_id", "approval_id", "bound_runner_key_id"))
+    _hash(obj["grant_digest"]); _hash(obj["approval_projection_digest"])
+    _base64(obj["client_challenge_b64"], 32)
+    return copy.deepcopy(obj)
+
+
+def inactive_claim_attestation_signing_payload(value: Mapping[str, Any]) -> bytes:
+    """Return the domain-separated bytes the grant authority signs for an attestation."""
+    if not isinstance(value, Mapping):
+        _fail("object required")
+    return INACTIVE_CLAIM_ATTESTATION_DOMAIN + canonical_bytes(
+        {key: item for key, item in value.items() if key not in _ATTESTATION_ENVELOPE_FIELDS})
+
+
+def validate_inactive_claim_attestation(value: Any) -> dict[str, Any]:
+    """Validate the closed cloud attestation structurally; this never proves authenticity.
+
+    Callers must verify the envelope against the pinned grant-authority trust set over
+    inactive_claim_attestation_signing_payload, and compare the echoed challenge and every
+    binding with their own state.  attested_at_ms is informational and never a freshness input.
+    """
+    obj = _contract(value, INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES)
+    obj = _object(obj, {
+        "schema_version", "attestation_id", "workspace_id", "runner_id", "project_id", "run_id",
+        "grant_id", "grant_digest", "approval_id", "approval_projection_digest", "bound_runner_key_id",
+        "authenticated_runner_key_id", "client_challenge_b64", "cloud", "attested_at_ms",
+        "attestation_digest", "signing_key_id", "signature_b64",
+    })
+    _enum(obj["schema_version"], {INACTIVE_CLAIM_ATTESTATION_SCHEMA})
+    if not isinstance(obj["attestation_id"], str) or not _ATTESTATION_ID.fullmatch(obj["attestation_id"]):
+        _fail("invalid attestation id")
+    _id_fields(obj, ("workspace_id", "runner_id", "project_id", "run_id", "grant_id", "approval_id",
+                     "bound_runner_key_id", "authenticated_runner_key_id"))
+    _hash(obj["grant_digest"]); _hash(obj["approval_projection_digest"])
+    _base64(obj["client_challenge_b64"], 32)
+    if obj["bound_runner_key_id"] != obj["authenticated_runner_key_id"]:
+        _fail("runner key mismatch")
+    cloud = _object(obj["cloud"], {
+        "status", "stop_reason", "stop_generation", "stop_requested_at_ms", "stop_deadline_ms",
+        "terminal_at_ms", "execution_disposition", "grant_status", "started_at_ms",
+        "stop_acknowledged_at_ms", "observation",
+    })
+    status = _enum(cloud["status"], _INACTIVE_CLOUD_STATUSES)
+    _enum(cloud["stop_reason"], _STOPS - {"none"})
+    for field in ("stop_generation", "stop_requested_at_ms", "stop_deadline_ms"):
+        _integer(cloud[field], lower=0)
+    _enum(cloud["grant_status"], _GRANT_STATUSES)
+    if status == "terminal":
+        _enum(cloud["execution_disposition"], {"stopped"}); _integer(cloud["terminal_at_ms"], lower=0)
+    elif cloud["execution_disposition"] is not None or cloud["terminal_at_ms"] is not None:
+        _fail("preterminal disposition")
+    if cloud["started_at_ms"] is not None or cloud["stop_acknowledged_at_ms"] is not None:
+        _fail("cloud observed execution")
+    if cloud["observation"] != INACTIVE_CLAIM_OBSERVATION:
+        _fail("invalid observation")
+    _integer(obj["attested_at_ms"], lower=0)
+    _signature(obj, "attestation_digest")
     return copy.deepcopy(obj)
