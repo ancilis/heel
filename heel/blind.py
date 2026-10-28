@@ -1,5 +1,5 @@
 """
-HEEL — blind-target generator (red-team-driven; closes the circularity, EVAL §7).
+Heel — blind-target generator (red-team-driven; closes the circularity, EVAL §7).
 
 The synthetic-target coverage backtest is a SELF-CONSISTENCY check: the seed probes and the
 planted weaknesses were authored together. The red-team's prescription for a REAL detection-

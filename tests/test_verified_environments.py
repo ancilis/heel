@@ -1,0 +1,1396 @@
+import hashlib
+import ipaddress
+import os
+import socket
+import sqlite3
+import http.client
+import json
+import ssl
+import threading
+import time
+from dataclasses import dataclass
+
+import pytest
+
+from heel.canary_contracts import canonical_digest
+
+from heel.saas import network_guard
+from heel.saas.network_guard import (
+    AddressSetValidationError,
+    BoundedDNSResolver,
+    CHALLENGE_PATH,
+    OriginValidationError,
+    PeerMismatch,
+    PinnedHTTPSVerifier,
+    VerificationError,
+    VerificationTimeout,
+    VerificationTimeout,
+    normalize_verified_origin,
+    select_safe_addresses,
+)
+from heel.saas.iana_root_tlds import (
+    IANA_ROOT_TLDS,
+    IANA_TLD_LINE_COUNT,
+    IANA_TLD_SHA256,
+    IANA_TLD_VERSION,
+)
+from heel.saas.catalog import CATALOG_VERSION
+from heel.saas.verification import (
+    EnvironmentCooldown, HostnameReuseExceeded, OWNERSHIP_ATTESTATION, TargetLimitExceeded,
+    VerifiedEnvironmentService,
+)
+from heel.saas.http_api import ControlPlane, serve
+from heel.saas.tenancy import Role
+
+from plan_differential_support import make_test_ca
+
+
+PIN = hashlib.sha256(b"certificate").hexdigest()
+TOKEN = "staging-token-123"
+RESPONSE = (
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/plain\r\n"
+    f'Content-Length: {len(TOKEN) + 1}\r\n'
+    "\r\n"
+    f"{TOKEN}\n"
+).encode("ascii")
+
+
+def verifier(**changes):
+    tls_socket = changes.pop("tls_socket", None)
+    sockets_response = changes.pop("sockets_response", None)
+    values = {
+        "pin_sha256_hex": PIN,
+        "clock": lambda: 100.0,
+        "resolver": lambda hostname, *, timeout_seconds=None: ["93.184.216.34"],
+        "sockets": FakeSockets(tls_socket or FakeTLSSocket(sockets_response or RESPONSE, PIN)),
+        "tls": None,
+    }
+    values.update(changes)
+    guard = PinnedHTTPSVerifier(**values)
+    if values["tls"] is None:
+        guard = PinnedHTTPSVerifier(
+            **{**values, "tls": FakeTLS(values["sockets"].tls_socket)}
+        )
+    return guard
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        ("https://Staging.Example.COM", "https://staging.example.com"),
+    ],
+)
+def test_normalize_exact_https_origin(origin, expected):
+    assert normalize_verified_origin(origin) == expected
+
+
+def test_normalize_requires_frozen_iana_public_root_zone_tld():
+    assert IANA_TLD_VERSION == "2026082301"
+    assert IANA_TLD_SHA256 == "1e296954a3bbe1525756893e68e3b5917604c299a696b2e59390a8a2e99289ef"
+    assert IANA_TLD_LINE_COUNT == 1439
+    assert {"com", "zip"} <= IANA_ROOT_TLDS
+    assert normalize_verified_origin("https://staging.example.com") == "https://staging.example.com"
+    assert normalize_verified_origin("https://launch.zip") == "https://launch.zip"
+    for origin in ("https://staging.private", "https://staging.intranet", "https://staging.acmeinternal", "https://service.arpa"):
+        with pytest.raises(OriginValidationError):
+            normalize_verified_origin(origin)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "",
+        " http://example.com",
+        "https://example.com ",
+        "http://example.com",
+        "HTTPS://example.com",
+        "example.com",
+        "https://example.com/",
+        "https://user@example.com",
+        "https://:pass@example.com",
+        "https://example.com:443",
+        "https://example.com:",
+        "https://192.0.2.1",
+        "https://[2001:db8::1]",
+        "https://example.com/path",
+        "https://example.com?query",
+        "https://example.com#fragment",
+        "https://ex%41mple.com",
+        "https://ex ample.com",
+        "https://例え.com",
+        "https://xn--r8jz45g.com",
+        "https://example.com.",
+        "https://localhost",
+        "https://foo.localhost",
+        "https://metadata.google.internal",
+        "https://printer",
+        "https://svc.corp",
+        "https://x.example",
+        "https://x.onion",
+        "https://x.home.arpa",
+        "https://-.example.com",
+        "https://example..com",
+    ],
+)
+def test_normalize_rejects_disallowed_origins(origin):
+    with pytest.raises(OriginValidationError):
+        normalize_verified_origin(origin)
+
+
+def test_select_addresses_sorts_and_deduplicates():
+    addresses = select_safe_addresses(
+        [
+            "2606:4700::6810:85e5",
+            "104.16.133.229",
+            "104.16.133.229",
+            "104.16.132.229",
+        ]
+    )
+    assert [address.compressed for address in addresses] == [
+        "104.16.132.229",
+        "104.16.133.229",
+        "2606:4700::6810:85e5",
+    ]
+
+
+@pytest.mark.parametrize("text", ["10.0.0.1", "fe80::1"])
+def test_select_addresses_poisons_mixed_answer(text):
+    with pytest.raises(AddressSetValidationError):
+        select_safe_addresses(["93.184.216.34", text])
+
+
+def test_bounded_dns_txt_uses_absolute_names_and_rejects_private_answers():
+    class TXT:
+        strings = (b"heel-verify=token",)
+    class Resolver:
+        def __init__(self): self.calls = []
+        def resolve(self, name, kind, **kwargs):
+            self.calls.append((name, kind, kwargs))
+            return {"A": ["93.184.216.34"], "AAAA": [], "TXT": [TXT()]}[kind]
+    fake = Resolver()
+    resolver = BoundedDNSResolver(resolver=fake)
+    assert resolver.txt("staging.example.com") == ["heel-verify=token"]
+    assert [call[0] for call in fake.calls] == ["staging.example.com.", "staging.example.com.", "_heel.staging.example.com."]
+    assert all(call[2]["search"] is False for call in fake.calls)
+    class PrivateResolver(Resolver):
+        def resolve(self, name, kind, **kwargs):
+            return ["10.0.0.1"] if kind == "A" else []
+    with pytest.raises(AddressSetValidationError):
+        BoundedDNSResolver(resolver=PrivateResolver()).txt("staging.example.com")
+
+
+def test_bounded_dns_consumes_verifier_deadline_for_each_query():
+    class Resolver:
+        def __init__(self): self.calls = []
+        def resolve(self, name, kind, **kwargs):
+            self.calls.append(kwargs)
+            return ["93.184.216.34"] if kind == "A" else []
+    fake = Resolver()
+    bounded = BoundedDNSResolver(resolver=fake, lifetime=1, clock=lambda: 100)
+    bounded("staging.example.com", deadline=100.05)
+    assert [call["lifetime"] for call in fake.calls] == [pytest.approx(0.05), pytest.approx(0.05)]
+
+
+def test_bounded_dns_deadline_between_a_and_aaaa_is_typed_timeout_for_service():
+    class Resolver:
+        def resolve(self, name, kind, **kwargs):
+            return ["93.184.216.34"] if kind == "A" else []
+    clock_values = iter((0.0, 0.0, 6.0))
+    bounded = BoundedDNSResolver(resolver=Resolver(), lifetime=5, clock=lambda: next(clock_values))
+    guard = PinnedHTTPSVerifier(resolver=bounded)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    service = VerifiedEnvironmentService(conn, https_verifier=guard)
+    challenge = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                              attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                              attestation_acknowledgement="accepted")
+    assert not service.check("ws", "prj", challenge.environment_id)
+    assert conn.execute("SELECT last_failure_code FROM canary_environments WHERE environment_id=?", (challenge.environment_id,)).fetchone()[0] == "network_timeout"
+    conn.close()
+
+
+def test_pinned_verifier_passes_remaining_time_to_bounded_dns_contract():
+    class Resolver:
+        def __init__(self): self.calls = []
+        def resolve(self, name, kind, **kwargs):
+            self.calls.append(kwargs)
+            return ["93.184.216.34"] if kind == "A" else []
+    dns = Resolver()
+    bounded = BoundedDNSResolver(resolver=dns, lifetime=1, clock=lambda: 100)
+    tls_socket = FakeTLSSocket(RESPONSE, PIN)
+    guard = PinnedHTTPSVerifier(
+        pin_sha256_hex=PIN, timeout_seconds=0.05, clock=lambda: 0,
+        resolver=bounded, sockets=FakeSockets(tls_socket), tls=FakeTLS(tls_socket),
+    )
+    assert guard.verify("https://example.com") == TOKEN
+    assert [call["lifetime"] for call in dns.calls] == [pytest.approx(0.05), pytest.approx(0.05)]
+
+
+class FakeSocket:
+    def __init__(self):
+        self.timeout = None
+        self.closed = False
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def close(self):
+        self.closed = True
+
+
+class FakeConnectedSocket(FakeSocket):
+    pass
+
+
+class FakeTLSSocket(FakeSocket):
+    def __init__(self, response, pin):
+        super().__init__()
+        self.response = response
+        self.pin = pin
+        self.requests = []
+        self.offset = 0
+        self.delay_reads_until = None
+
+    def getpeercert(self, binary_form=False):
+        return b"certificate"
+
+    def getpeername(self):
+        return ("93.184.216.34", 443)
+
+    def sendall(self, request):
+        self.requests.append(request)
+
+    def recv(self, size):
+        if self.delay_reads_until is not None and self.offset < len(self.response):
+            raise socket.timeout()
+        chunk = self.response[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return bytes(chunk)
+
+
+class FakeSockets:
+    def __init__(self, tls_socket):
+        self.connected_to = None
+        self.tls_socket = tls_socket
+        self.configured_timeout = None
+
+    def connect(self, address, timeout):
+        self.connected_to = address
+        self.connect_timeout = timeout
+        return FakeConnectedSocket()
+
+    def configure(self, connected_socket, timeout):
+        connected_socket.settimeout(timeout)
+        self.configured_timeout = timeout
+
+
+class FakeTLS:
+    def __init__(self, tls_socket):
+        self.tls_socket = tls_socket
+        self.hostname = None
+        self.context_checks_hostname = True
+
+    def wrap(self, connected_socket, hostname, timeout):
+        self.hostname = hostname
+        self.wrap_timeout = timeout
+        return self.tls_socket
+
+
+def test_verify_selects_stable_ip_and_accepts_exact_token():
+    fake_tls_socket = FakeTLSSocket(RESPONSE, PIN)
+    fake_sockets = FakeSockets(fake_tls_socket)
+    result = verifier(resolver=lambda hostname, *, timeout_seconds=None: ["2606:4700::20", "93.184.216.34", "93.184.216.34"], sockets=fake_sockets).verify(
+        "https://Example.COM"
+    )
+    assert result == TOKEN
+    assert fake_sockets.connected_to == ("93.184.216.34", 443)
+    assert fake_sockets.configured_timeout == 5.0
+    assert fake_tls_socket.requests[0].startswith(f"GET {CHALLENGE_PATH} HTTP/1.1\r\n".encode())
+    assert b"\r\nHost: example.com\r\n" in fake_tls_socket.requests[0]
+    assert b"Accept-Encoding: identity\r\n" in fake_tls_socket.requests[0]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        RESPONSE.replace(b"HTTP/1.1 200 OK", b"HTTP/1.1 302 Found"),
+        RESPONSE.replace(b"Content-Type", b"Content-Encoding"),
+    ],
+)
+def test_verify_rejects_redirect_and_compression(response):
+    with pytest.raises(VerificationError):
+        verifier(sockets_response=response).verify("https://example.com")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        RESPONSE.replace(b"Content-Type: text/plain", b"Transfer-Encoding : chunked"),
+        RESPONSE.replace(b"Content-Type: text/plain", b"Transfer-Encoding: identity\r\nContent-Type: text/plain"),
+        RESPONSE.replace(b"Content-Type: text/plain", b"Bad Header: text/plain"),
+        RESPONSE.replace(b"Content-Type: text/plain", b"Bad-\x01: text/plain"),
+        RESPONSE.replace(b"Content-Type: text/plain", b"Content-Type: text/plain\x01"),
+        RESPONSE.replace(b"Content-Type: text/plain", b"Content-Type:  text/plain"),
+    ],
+)
+def test_verify_rejects_ambiguous_or_invalid_response_headers(response):
+    with pytest.raises(VerificationError):
+        verifier(sockets_response=response).verify("https://example.com")
+
+
+def test_verify_rejects_resolver_without_deadline_contract():
+    with pytest.raises(ValueError, match="deadline-aware"):
+        PinnedHTTPSVerifier(resolver=lambda hostname: ["93.184.216.34"])
+
+
+def test_verify_rejects_oversize():
+    body = b"x" * (4097 + 1)
+    response = (
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4098\r\n\r\n" + body
+    )
+    with pytest.raises(VerificationError, match="streaming bound"):
+        verifier(sockets_response=response).verify("https://example.com")
+
+
+def test_verify_maps_deadline_to_timeout():
+    fake_tls_socket = FakeTLSSocket(RESPONSE, PIN)
+    fake_tls_socket.delay_reads_until = True
+    with pytest.raises(VerificationTimeout):
+        verifier(sockets=FakeSockets(fake_tls_socket), tls=FakeTLS(fake_tls_socket)).verify(
+            "https://example.com"
+        )
+
+
+def test_verify_rejects_peer_mismatch():
+    fake_tls_socket = FakeTLSSocket(RESPONSE, PIN)
+    with pytest.raises(PeerMismatch):
+        PinnedHTTPSVerifier(
+            pin_sha256_hex=hashlib.sha256(b"other").hexdigest(),
+            resolver=lambda hostname, *, timeout_seconds=None: ["93.184.216.34"],
+            sockets=FakeSockets(fake_tls_socket),
+            tls=FakeTLS(fake_tls_socket),
+        ).verify("https://example.com")
+
+
+def test_verify_ignores_proxy_environment():
+    old_environment = os.environ.copy()
+    os.environ.update(
+        HTTPS_PROXY="http://proxy.example.net:3128",
+        https_proxy="http://proxy.example.net:3128",
+        ALL_PROXY="socks5://proxy.example.net:1080",
+        NO_PROXY="example.com",
+    )
+    try:
+        result = verifier().verify("https://Example.COM")
+    finally:
+        os.environ.clear()
+        os.environ.update(old_environment)
+    assert result == TOKEN
+
+
+def test_verify_uses_fixed_challenge_path_and_rejects_extra_lf():
+    response = RESPONSE[:-1] + b"\n\n"
+    with pytest.raises(VerificationError):
+        verifier(sockets_response=response).verify("https://example.com")
+    guard = verifier()
+    assert guard.verify("https://example.com") == TOKEN
+    assert CHALLENGE_PATH == "/.well-known/heel-verify.txt"
+
+
+# --------------------------------------------------------------------------- #
+# Default production TLS path over a real loopback handshake. The resolver and the
+# socket connector are explicit seams (a public answer routed to a loopback server);
+# the TLS transport is the default one the verifier constructs itself.
+# --------------------------------------------------------------------------- #
+LOOPBACK_HOST = "ownership-proof-synthetic.heel.dev"
+LOOPBACK_ORIGIN = "https://" + LOOPBACK_HOST
+LOOPBACK_PUBLIC = "93.184.216.34"
+PRODUCTION_TLS_TRANSPORT = network_guard.TLSTransport
+
+
+class OwnershipLoopbackServer:
+    """A real TLS server on loopback answering one HTTP request per connection."""
+
+    def __init__(self, tmp_path, certificate, key, response=RESPONSE):
+        (tmp_path / "server.pem").write_bytes(certificate)
+        (tmp_path / "server.key").write_bytes(key)
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.load_cert_chain(tmp_path / "server.pem", tmp_path / "server.key")
+        self.response = response
+        self.requests = []
+        self.connections = 0
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.port = self.listener.getsockname()[1]
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+
+    def serve(self):
+        self.listener.settimeout(0.1)
+        while not self.stopped.is_set():
+            try:
+                raw, _ = self.listener.accept()
+            except OSError:
+                continue
+            try:
+                raw.settimeout(5)
+                with self.context.wrap_socket(raw, server_side=True) as wrapped:
+                    request = b""
+                    while b"\r\n\r\n" not in request:
+                        chunk = wrapped.recv(4096)
+                        if not chunk:
+                            break
+                        request += chunk
+                    if request:
+                        self.requests.append(request)
+                        wrapped.sendall(self.response)
+                        wrapped.unwrap()
+            except (OSError, ssl.SSLError):
+                pass
+            finally:
+                raw.close()
+                self.connections += 1
+
+    def settled(self, connections):
+        """Wait until the server has finished handling this many connections."""
+        deadline = time.monotonic() + 5
+        while self.connections < connections and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self.connections == connections
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self.stopped.set()
+        self.thread.join(5)
+        self.listener.close()
+
+
+class LoopbackRoutedSockets(network_guard.SocketTransport):
+    """Connect the selected public address to the loopback server instead."""
+
+    def __init__(self, port):
+        self.port = port
+        self.connected_to = []
+
+    def connect(self, address, timeout):
+        self.connected_to.append(address)
+        return socket.create_connection(("127.0.0.1", self.port), timeout=timeout)
+
+
+class PeerAsRouted:
+    """Report the routed public peer for a real loopback TLS socket; delegate everything else."""
+
+    def __init__(self, inner, peer):
+        self.inner = inner
+        self.peer = peer
+
+    def getpeername(self):
+        assert self.inner.getpeername()[0] == "127.0.0.1"
+        return self.peer
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def default_tls_routed_to(peer):
+    """The production TLS transport (inherited constructor and wrap) with routed peer naming."""
+    class RoutedTLSTransport(PRODUCTION_TLS_TRANSPORT):
+        constructed = []
+
+        def __init__(self):
+            super().__init__()
+            RoutedTLSTransport.constructed.append(self)
+
+        def wrap(self, connected_socket, hostname, timeout):
+            return PeerAsRouted(super().wrap(connected_socket, hostname, timeout), peer)
+
+    return RoutedTLSTransport
+
+
+def loopback_verifier(server, **changes):
+    values = {
+        "resolver": lambda hostname, *, timeout_seconds=None: [LOOPBACK_PUBLIC],
+        "sockets": LoopbackRoutedSockets(server.port),
+    }
+    values.update(changes)
+    return PinnedHTTPSVerifier(**values)
+
+
+@pytest.fixture
+def ownership_ca(tmp_path, monkeypatch):
+    if ssl.get_default_verify_paths().openssl_cafile_env != "SSL_CERT_FILE":
+        pytest.skip("this TLS library does not read SSL_CERT_FILE")
+    ca, certificate, key = make_test_ca(LOOPBACK_HOST)
+    ca_file = tmp_path / "test-ca.pem"
+    ca_file.write_bytes(ca)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_file))
+    return ca_file, certificate, key
+
+
+def test_default_tls_verifier_completes_real_handshake_through_default_trust(
+    tmp_path, monkeypatch, ownership_ca,
+):
+    _, certificate, key = ownership_ca
+    routed = default_tls_routed_to((LOOPBACK_PUBLIC, 443))
+    monkeypatch.setattr(network_guard, "TLSTransport", routed)
+    pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(certificate.decode("ascii"))).hexdigest()
+    with OwnershipLoopbackServer(tmp_path, certificate, key) as server:
+        guard = loopback_verifier(server)
+        assert guard.tls is None
+        assert guard.verify(LOOPBACK_ORIGIN) == TOKEN
+        # The verifier built the production context itself; nothing was injected into it.
+        (transport,) = routed.constructed
+        assert transport.context.protocol == ssl.PROTOCOL_TLS_CLIENT
+        assert transport.context.minimum_version == ssl.TLSVersion.TLSv1_2
+        assert transport.context.verify_mode == ssl.CERT_REQUIRED
+        assert transport.context.check_hostname is True
+        assert guard.sockets.connected_to == [(LOOPBACK_PUBLIC, 443)]
+        assert server.requests[0].startswith(f"GET {CHALLENGE_PATH} HTTP/1.1\r\n".encode())
+        assert f"\r\nHost: {LOOPBACK_HOST}\r\n".encode() in server.requests[0]
+        # The SHA-256 pin of the real leaf is accepted; any other pin is refused.
+        assert loopback_verifier(server, pin_sha256_hex=pin).verify(LOOPBACK_ORIGIN) == TOKEN
+        with pytest.raises(PeerMismatch):
+            loopback_verifier(
+                server, pin_sha256_hex=hashlib.sha256(b"other").hexdigest(),
+            ).verify(LOOPBACK_ORIGIN)
+        assert server.settled(3) and len(server.requests) == 2
+
+
+def test_default_tls_verifier_rejects_untrusted_chain_and_wrong_hostname(
+    tmp_path, monkeypatch, ownership_ca,
+):
+    _, certificate, key = ownership_ca
+    monkeypatch.setattr(network_guard, "TLSTransport", default_tls_routed_to((LOOPBACK_PUBLIC, 443)))
+    other_ca, other_certificate, other_key = make_test_ca("other-host.heel.dev")
+    with OwnershipLoopbackServer(tmp_path, certificate, key) as server:
+        # Default trust unset: the system store does not contain the test CA.
+        monkeypatch.delenv("SSL_CERT_FILE")
+        with pytest.raises(ssl.SSLCertVerificationError):
+            loopback_verifier(server).verify(LOOPBACK_ORIGIN)
+        # Another CA in the default location.
+        other_file = tmp_path / "other-ca.pem"
+        other_file.write_bytes(other_ca)
+        monkeypatch.setenv("SSL_CERT_FILE", str(other_file))
+        with pytest.raises(ssl.SSLCertVerificationError):
+            loopback_verifier(server).verify(LOOPBACK_ORIGIN)
+        assert server.settled(2) and server.requests == []
+    # A chain trusted through other_ca but naming another host.
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    monkeypatch.setenv("SSL_CERT_FILE", str(other_file))
+    with OwnershipLoopbackServer(other_dir, other_certificate, other_key) as server:
+        with pytest.raises(ssl.SSLCertVerificationError):
+            loopback_verifier(server).verify(LOOPBACK_ORIGIN)
+        assert server.settled(1) and server.requests == []
+
+
+def test_default_tls_verifier_keeps_address_peer_and_redirect_guards(
+    tmp_path, monkeypatch, ownership_ca,
+):
+    _, certificate, key = ownership_ca
+    redirect = RESPONSE.replace(b"HTTP/1.1 200 OK", b"HTTP/1.1 302 Found")
+    monkeypatch.setattr(network_guard, "TLSTransport", default_tls_routed_to((LOOPBACK_PUBLIC, 443)))
+    with OwnershipLoopbackServer(tmp_path, certificate, key, response=redirect) as server:
+        # A private answer is refused before any connection.
+        for address in ("127.0.0.1", "10.0.0.5", "169.254.169.254"):
+            guard = loopback_verifier(
+                server, resolver=lambda hostname, *, timeout_seconds=None, _a=address: [_a],
+            )
+            with pytest.raises(AddressSetValidationError):
+                guard.verify(LOOPBACK_ORIGIN)
+            assert guard.sockets.connected_to == []
+        # A redirect over the real channel is not followed.
+        with pytest.raises(VerificationError):
+            loopback_verifier(server).verify(LOOPBACK_ORIGIN)
+        assert server.settled(1) and len(server.requests) == 1
+        # A peer other than the selected address is refused before any request.
+        monkeypatch.setattr(network_guard, "TLSTransport", default_tls_routed_to(("93.184.216.35", 443)))
+        with pytest.raises(PeerMismatch):
+            loopback_verifier(server).verify(LOOPBACK_ORIGIN)
+        assert server.settled(2) and len(server.requests) == 1
+
+
+def test_environment_proof_is_project_bound_and_clears_pending_token():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    seen = []
+    class Proof:
+        def verify(self, origin):
+            seen.append(origin)
+            return token[0]
+    token = [""]
+    service = VerifiedEnvironmentService(conn, https_verifier=Proof())
+    challenge = service.start("ws", "prj", "https://Staging.Example.COM", "staging", actor="owner",
+                              attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                              attestation_acknowledgement="accepted")
+    token[0] = challenge.token
+    assert service.check("ws", "prj", challenge.environment_id, max_verified=1)
+    row = conn.execute("SELECT * FROM canary_environments WHERE environment_id=?", (challenge.environment_id,)).fetchone()
+    assert seen == ["https://staging.example.com"]
+    assert row["challenge_token"] is None
+    assert row["attestation_text"] == OWNERSHIP_ATTESTATION
+    expected_verification_record = {
+        "schema_version": "heel.environment-verification-record.v1",
+        "workspace_id": "ws",
+        "project_id": "prj",
+        "environment_id": challenge.environment_id,
+        "origin": "https://staging.example.com",
+        "environment_class": "staging",
+        "attestation_text": OWNERSHIP_ATTESTATION,
+        "attestation_version": "v1",
+        "attestation_acknowledgement": "accepted",
+        "proof_method": "https-file",
+        "proof_version": "https-file.v1",
+        "normalization_version": "exact-origin.v1",
+        "challenge_generation": 1,
+        "verified_at_ms": int(row["verified_at"] * 1000),
+        "proof_expires_at_ms": int(row["proof_expires_at"] * 1000),
+    }
+    assert row["verification_record_digest"] == canonical_digest(expected_verification_record)
+    assert service.public_record(row)["verification_record_digest"] == row["verification_record_digest"]
+    assert service.is_executable("ws", "prj", challenge.environment_id)
+    replacement = service.start("ws", "prj", "https://staging.example.com", "production", actor="owner",
+                                attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                                attestation_acknowledgement="accepted")
+    assert replacement.environment_id == challenge.environment_id
+    assert not service.is_executable("ws", "prj", challenge.environment_id)
+    conn.close()
+
+
+def test_pre_migration_verified_row_without_record_digest_is_never_executable():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    service = VerifiedEnvironmentService(conn, clock=lambda: 100.0)
+    conn.execute(
+        "INSERT INTO canary_environments(environment_id,workspace_id,project_ref,origin,environment_class,status,created_at,"
+        "attestation_text,attestation_version,attestation_acknowledgement,proof_method,proof_version,normalization_version,"
+        "challenge_generation,verified_at,proof_expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("env_legacy", "ws", "prj", "https://legacy.example.com", "staging", "verified", 1,
+         OWNERSHIP_ATTESTATION, "v1", "accepted", "https-file", "https-file.v1", "exact-origin.v1", 1, 1, 200),
+    )
+    conn.commit()
+    assert not service.is_executable("ws", "prj", "env_legacy")
+    assert service.list("ws", "prj")[0]["verification_record_digest"] is None
+    conn.close()
+
+
+def test_environment_check_claims_cooldown_before_a_failed_network_call():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    class FailingProof:
+        def verify(self, origin):
+            raise TimeoutError
+    service = VerifiedEnvironmentService(conn, https_verifier=FailingProof())
+    challenge = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                              attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                              attestation_acknowledgement="accepted")
+    assert not service.check("ws", "prj", challenge.environment_id)
+    with pytest.raises(EnvironmentCooldown):
+        service.check("ws", "prj", challenge.environment_id)
+    conn.close()
+
+
+def test_environment_records_typed_network_timeout_code():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    class TimedOut:
+        def verify(self, origin): raise VerificationTimeout("late")
+    service = VerifiedEnvironmentService(conn, https_verifier=TimedOut())
+    challenge = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                              attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                              attestation_acknowledgement="accepted")
+    assert not service.check("ws", "prj", challenge.environment_id)
+    assert conn.execute("SELECT last_failure_code FROM canary_environments WHERE environment_id=?", (challenge.environment_id,)).fetchone()[0] == "network_timeout"
+    conn.close()
+
+
+def test_environment_quota_counts_the_whole_workspace_not_one_project():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.executemany("INSERT INTO projects VALUES(?,?,?,?,?)", [("ws", "one", "one", "owner", 1), ("ws", "two", "two", "owner", 1)])
+    token = [""]
+    class Proof:
+        def verify(self, origin): return token[0]
+    service = VerifiedEnvironmentService(conn, https_verifier=Proof())
+    fields = {"attestation_text": OWNERSHIP_ATTESTATION, "attestation_version": "v1", "attestation_acknowledgement": "accepted"}
+    first = service.start("ws", "one", "https://one.example.com", "staging", actor="owner", **fields)
+    token[0] = first.token
+    assert service.check("ws", "one", first.environment_id, max_verified=1)
+    second = service.start("ws", "two", "https://two.example.com", "staging", actor="owner", **fields)
+    token[0] = second.token
+    with pytest.raises(TargetLimitExceeded):
+        service.check("ws", "two", second.environment_id, max_verified=1)
+    assert conn.execute("SELECT last_failure_code FROM canary_environments WHERE environment_id=?", (second.environment_id,)).fetchone()[0] == "quota_exceeded"
+    conn.close()
+
+
+def test_environment_hostname_reuse_finalization_is_persisted():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.executemany("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", [("one", "org", "one", "free", CATALOG_VERSION, 1), ("two", "org", "two", "free", CATALOG_VERSION, 1)])
+    conn.executemany("INSERT INTO projects VALUES(?,?,?,?,?)", [("one", "prj", "project", "owner", 1), ("two", "prj", "project", "owner", 1)])
+    token = [""]
+    class Proof:
+        def verify(self, origin): return token[0]
+    service = VerifiedEnvironmentService(conn, https_verifier=Proof(), max_workspaces_per_hostname=0)
+    fields = {"attestation_text": OWNERSHIP_ATTESTATION, "attestation_version": "v1", "attestation_acknowledgement": "accepted"}
+    first = service.start("one", "prj", "https://shared.example.com", "staging", actor="owner", **fields)
+    token[0] = first.token
+    # Seed an active other-workspace proof without relaxing the target service's enforcement.
+    conn.execute("UPDATE canary_environments SET status='verified',verified_at=1,proof_expires_at=? WHERE environment_id=?", (time.time() + 3600, first.environment_id))
+    conn.commit()
+    second = service.start("two", "prj", "https://shared.example.com", "staging", actor="owner", **fields)
+    token[0] = second.token
+    with pytest.raises(HostnameReuseExceeded):
+        service.check("two", "prj", second.environment_id)
+    assert conn.execute("SELECT last_failure_code FROM canary_environments WHERE environment_id=?", (second.environment_id,)).fetchone()[0] == "hostname_reuse_exceeded"
+    conn.close()
+
+
+def test_replaced_environment_challenge_is_auditable_without_touching_new_token():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    fields = {"attestation_text": OWNERSHIP_ATTESTATION, "attestation_version": "v1", "attestation_acknowledgement": "accepted"}
+    replacement = [None]
+    class ReplacingProof:
+        def verify(self, origin):
+            replacement[0] = service.start("ws", "prj", origin, "staging", actor="owner", **fields)
+            return original.token
+    service = VerifiedEnvironmentService(conn, https_verifier=ReplacingProof())
+    original = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner", **fields)
+    assert not service.check("ws", "prj", original.environment_id)
+    current = conn.execute("SELECT * FROM canary_environments WHERE environment_id=?", (original.environment_id,)).fetchone()
+    assert current["challenge_generation"] == replacement[0].generation
+    assert current["challenge_token"] == replacement[0].token
+    assert current["last_failure_code"] == "challenge_replaced"
+    public = service.public_record(current)
+    assert public["status"] == "pending"
+    assert "challenge_token" not in public
+    assert replacement[0].token not in json.dumps(public)
+    conn.close()
+
+
+def test_finalization_expiry_is_recorded_as_expired_not_replaced():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    now = [100.0]
+    class ExpiringProof:
+        token = ""
+        def verify(self, origin):
+            now[0] += 24 * 3600 + 1
+            return self.token
+    proof = ExpiringProof()
+    service = VerifiedEnvironmentService(conn, https_verifier=proof, clock=lambda: now[0])
+    challenge = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                              attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                              attestation_acknowledgement="accepted")
+    proof.token = challenge.token
+    assert not service.check("ws", "prj", challenge.environment_id)
+    row = conn.execute("SELECT * FROM canary_environments WHERE environment_id=?", (challenge.environment_id,)).fetchone()
+    assert row["last_failure_code"] == "challenge_expired"
+    assert row["challenge_token"] == challenge.token
+    assert row["status"] == "pending"
+    conn.close()
+
+
+def test_finalization_revocation_preserves_proof_revoked_closed_state():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    challenge = [None]
+    class RevokingProof:
+        def verify(self, origin):
+            assert service.revoke("ws", "prj", challenge[0].environment_id, actor="owner", reason="changed")
+            return challenge[0].token
+    service = VerifiedEnvironmentService(conn, https_verifier=RevokingProof())
+    challenge[0] = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                                 attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                                 attestation_acknowledgement="accepted")
+    assert not service.check("ws", "prj", challenge[0].environment_id)
+    row = conn.execute("SELECT * FROM canary_environments WHERE environment_id=?", (challenge[0].environment_id,)).fetchone()
+    assert row["status"] == "revoked"
+    assert row["last_failure_code"] == "proof_revoked"
+    assert row["challenge_token"] is None
+    conn.close()
+
+
+def test_environment_start_requires_exact_user_attestation_fields():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+    service = VerifiedEnvironmentService(conn)
+    with pytest.raises(ValueError):
+        service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                      attestation_text="forged", attestation_version="v1", attestation_acknowledgement="accepted")
+    challenge = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                              attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+                              attestation_acknowledgement="accepted")
+    row = conn.execute("SELECT * FROM canary_environments WHERE environment_id=?", (challenge.environment_id,)).fetchone()
+    assert row["attestation_text"] == OWNERSHIP_ATTESTATION
+    assert row["attestation_version"] == "v1"
+    assert row["attestation_acknowledgement"] == "accepted"
+    conn.close()
+
+
+def test_dns_txt_cannot_verify_nonpublic_root_zone_origin():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", ("ws", "org", "ws", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", ("ws", "prj", "project", "owner", 1))
+
+    class FakePublicDNS:
+        calls = []
+        def __call__(self, hostname):
+            self.calls.append(("address", hostname))
+            return ["93.184.216.34"]
+        def txt(self, hostname):
+            self.calls.append(("txt", hostname))
+            return ["heel-verify=would-be-exact-token"]
+
+    dns = FakePublicDNS()
+    service = VerifiedEnvironmentService(conn, dns_txt=dns)
+    with pytest.raises(ValueError, match="exact public https origin"):
+        service.start(
+            "ws", "prj", "https://staging.private", "staging", actor="owner", proof_method="dns-txt",
+            attestation_text=OWNERSHIP_ATTESTATION, attestation_version="v1",
+            attestation_acknowledgement="accepted",
+        )
+    assert dns.calls == []
+    assert conn.execute("SELECT count(*) FROM canary_environments").fetchone()[0] == 0
+    assert not service.is_executable("ws", "prj", "env_private")
+    conn.close()
+
+
+def test_environment_http_ceremony_is_closed_and_token_is_pending_only():
+    class Proof:
+        token = ""
+        def verify(self, origin):
+            return self.token
+    proof = Proof()
+    cp = ControlPlane(device_token_pepper=b"p" * 32, enable_device_auth=True,
+                      public_origin="https://heel.example", environment_https_verifier=proof)
+    oid = cp.store.create_org("org")
+    owner = cp.store.create_user("owner@example.com")
+    wid = cp.store.create_workspace(oid, "ws", "free", CATALOG_VERSION)
+    cp.store.add_member(wid, owner, Role.OWNER)
+    project = cp.projects.create(wid, "project", created_by=owner)
+    session = cp.auth.create_session(owner)
+    server = serve(cp)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        def request(method, path, body=None, headers=None):
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            wire = None if body is None else json.dumps(body)
+            connection.request(method, path, body=wire, headers=headers or {})
+            response = connection.getresponse()
+            result = json.loads(response.read())
+            connection.close()
+            return response.status, result
+        base = {"Cookie": f"heel_session={session.token}", "Origin": "https://heel.example",
+                "X-Heel-Internal-Origin": "same-origin", "Content-Type": "application/json"}
+        start_body = {"schema_version": "heel.verified-environment-start.v1", "origin": "https://staging.example.com",
+                      "environment_class": "staging", "proof_method": "https-file",
+                      "attestation_text": OWNERSHIP_ATTESTATION, "attestation_version": "v1",
+                      "attestation_acknowledgement": "accepted"}
+        path = f"/v1/workspaces/{wid}/projects/{project.project_ref}/environments"
+        status, failed = request("POST", path, start_body, {k: v for k, v in base.items() if k != "Origin"})
+        assert status == 403 and failed["code"] == "same_origin_required"
+        status, failed = request("POST", path, start_body, {**base, "Origin": "https://evil.example"})
+        assert status == 403 and failed["code"] == "same_origin_required"
+        member = cp.store.create_user("member@example.com")
+        cp.store.add_member(wid, member, Role.MEMBER)
+        member_session = cp.auth.create_session(member)
+        status, failed = request("POST", path, start_body, {**base, "Cookie": f"heel_session={member_session.token}"})
+        assert status == 403 and failed["code"] == "recent_auth_required"
+        bad = dict(start_body, attestation_text="forged")
+        status, failed = request("POST", path, bad, base)
+        assert status == 400 and failed["code"] == "invalid_environment_request"
+        status, challenge = request("POST", path, start_body, base)
+        assert status == 201 and challenge["token"]
+        proof.token = challenge["token"]
+        eid = challenge["environment_id"]
+        check_path = path + f"/{eid}/check"
+        status, checked = request("POST", check_path, {"schema_version": "heel.verified-environment-check.v1"}, base)
+        assert status == 200 and checked["verified"] is True
+        status, listed = request("GET", path, headers={"Cookie": f"heel_session={session.token}"})
+        assert status == 200 and listed["environments"][0]["is_executable"] is True
+        assert "token" not in listed["environments"][0]
+        revoke_path = path + f"/{eid}/revoke"
+        status, revoked = request("POST", revoke_path, {"schema_version": "heel.verified-environment-revoke.v1", "reason": "done"}, base)
+        assert status == 200 and revoked["revoked"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# CUSTOMER-TRACK-UX-F1: a pending ownership proof is recoverable after a reload by an explicit,
+# read-only recovery and, only once it can no longer be checked, an explicit same-record rotation.
+_PROOF_FIELDS = {"attestation_text": OWNERSHIP_ATTESTATION, "attestation_version": "v1", "attestation_acknowledgement": "accepted"}
+
+
+def _environment_db():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY,org_id TEXT,name TEXT,plan_id TEXT,catalog_version TEXT,created_at REAL);"
+        "CREATE TABLE projects(workspace_id TEXT,project_ref TEXT,name TEXT,created_by TEXT,created_at REAL,PRIMARY KEY(workspace_id,project_ref));"
+    )
+    for workspace in ("ws", "ws2"):
+        conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", (workspace, "org", workspace, "free", CATALOG_VERSION, 1))
+    for workspace, project in (("ws", "prj"), ("ws", "prj2"), ("ws2", "prj")):
+        conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", (workspace, project, "project", "owner", 1))
+    return conn
+
+
+def _environment_rows(conn):
+    return [dict(row) for row in conn.execute("SELECT * FROM canary_environments ORDER BY environment_id")]
+
+
+def test_recover_pending_environment_challenge_returns_exact_current_token_only_for_live_scoped_row():
+    conn = _environment_db()
+    service = VerifiedEnvironmentService(conn, clock=lambda: 100.0)
+    started = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner",
+                            proof_method="dns-txt", **_PROOF_FIELDS)
+    before = _environment_rows(conn)
+    recovered = service.recover_pending_challenge("ws", "prj", started.environment_id)
+    assert recovered == started
+    assert recovered.proof_method == "dns-txt"
+    # Recovery is a read: no rotation, no failure code, no check claim and no new record.
+    assert _environment_rows(conn) == before
+    assert len(before) == 1 and before[0]["last_check_at"] is None and before[0]["last_failure_code"] is None
+    conn.close()
+
+
+def test_recover_pending_environment_challenge_rejects_project_or_workspace_cross_scope():
+    from heel.saas.verification import EnvironmentNotFound
+    conn = _environment_db()
+    service = VerifiedEnvironmentService(conn)
+    started = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner", **_PROOF_FIELDS)
+    before = _environment_rows(conn)
+    for workspace, project in (("ws", "prj2"), ("ws2", "prj"), ("ws2", "prj2")):
+        with pytest.raises(EnvironmentNotFound):
+            service.recover_pending_challenge(workspace, project, started.environment_id)
+        with pytest.raises(EnvironmentNotFound):
+            service.rotate_unrecoverable_challenge(workspace, project, started.environment_id)
+    assert _environment_rows(conn) == before
+    conn.close()
+
+
+def test_recovery_public_list_never_contains_challenge_token():
+    conn = _environment_db()
+    now = [100.0]
+    service = VerifiedEnvironmentService(conn, clock=lambda: now[0])
+    started = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner", **_PROOF_FIELDS)
+    recovered = service.recover_pending_challenge("ws", "prj", started.environment_id)
+    now[0] += 24 * 3600 + 1
+    rotated = service.rotate_unrecoverable_challenge("ws", "prj", started.environment_id)
+    listed = json.dumps(service.list("ws", "prj"))
+    for token in (started.token, recovered.token, rotated.token):
+        assert token not in listed
+    assert "challenge_token" not in listed and "challenge_digest" not in listed
+    conn.close()
+
+
+def test_rotate_expired_pending_environment_preserves_identity_and_invalidates_old_token():
+    from heel.saas.verification import EnvironmentChallengeClosed
+    now = [100.0]
+    class Proof:
+        token = ""
+        def verify(self, origin):
+            return self.token
+    proof = Proof()
+    conn = _environment_db()
+    service = VerifiedEnvironmentService(conn, https_verifier=proof, clock=lambda: now[0])
+    started = service.start("ws", "prj", "https://staging.example.com", "sandbox", actor="owner", **_PROOF_FIELDS)
+    with pytest.raises(EnvironmentChallengeClosed) as live:
+        service.rotate_unrecoverable_challenge("ws", "prj", started.environment_id)
+    assert live.value.reason == "live"
+    now[0] += 24 * 3600
+    with pytest.raises(EnvironmentChallengeClosed) as expired:
+        service.recover_pending_challenge("ws", "prj", started.environment_id)
+    assert expired.value.reason == "expired" and started.token not in str(expired.value)
+    before = _environment_rows(conn)[0]
+    rotated = service.rotate_unrecoverable_challenge("ws", "prj", started.environment_id)
+    after = _environment_rows(conn)
+    assert len(after) == 1
+    row = after[0]
+    assert rotated.environment_id == started.environment_id
+    assert rotated.generation == started.generation + 1 == row["challenge_generation"]
+    assert rotated.token != started.token and row["challenge_token"] == rotated.token
+    assert rotated.expires_at == now[0] + 24 * 3600 == row["challenge_expires_at"]
+    assert (rotated.origin, rotated.environment_class, rotated.proof_method, rotated.attestation) == (
+        started.origin, "sandbox", "https-file", OWNERSHIP_ATTESTATION)
+    for column in ("origin", "environment_class", "proof_method", "proof_version", "normalization_version",
+                   "attestation_text", "attestation_version", "attestation_acknowledgement", "attested_by",
+                   "attested_at", "created_at", "status"):
+        assert row[column] == before[column], column
+    assert row["last_failure_code"] == "challenge_replaced" and row["last_check_at"] is None
+    assert service.recover_pending_challenge("ws", "prj", started.environment_id) == rotated
+    # The published old proof no longer verifies; the replacement does, on the same record.
+    proof.token = started.token
+    assert not service.check("ws", "prj", started.environment_id)
+    now[0] += 10
+    proof.token = rotated.token
+    assert service.check("ws", "prj", started.environment_id)
+    assert service.is_executable("ws", "prj", started.environment_id)
+    assert len(_environment_rows(conn)) == 1
+    conn.close()
+
+
+def test_rotate_rejects_live_verified_and_revoked_environment_challenges():
+    from heel.saas.verification import EnvironmentChallengeClosed
+    now = [100.0]
+    class Proof:
+        token = ""
+        def verify(self, origin):
+            return self.token
+    proof = Proof()
+    conn = _environment_db()
+    service = VerifiedEnvironmentService(conn, https_verifier=proof, clock=lambda: now[0])
+    verified = service.start("ws", "prj", "https://verified.example.com", "staging", actor="owner", **_PROOF_FIELDS)
+    proof.token = verified.token
+    assert service.check("ws", "prj", verified.environment_id)
+    revoked = service.start("ws", "prj", "https://revoked.example.com", "staging", actor="owner", **_PROOF_FIELDS)
+    assert service.revoke("ws", "prj", revoked.environment_id, actor="owner", reason="done")
+    expired_then_revoked = service.start("ws", "prj", "https://late.example.com", "staging", actor="owner", **_PROOF_FIELDS)
+    assert service.revoke("ws", "prj", expired_then_revoked.environment_id, actor="owner", reason="done")
+    now[0] += 24 * 3600 + 1
+    before = _environment_rows(conn)
+    for environment_id, reason in ((verified.environment_id, "verified"), (revoked.environment_id, "revoked"),
+                                   (expired_then_revoked.environment_id, "revoked")):
+        for action in (service.recover_pending_challenge, service.rotate_unrecoverable_challenge):
+            with pytest.raises(EnvironmentChallengeClosed) as closed:
+                action("ws", "prj", environment_id)
+            assert closed.value.reason == reason
+    assert _environment_rows(conn) == before
+    assert all(row["challenge_token"] is None for row in before)
+    assert service.is_executable("ws", "prj", verified.environment_id)
+    conn.close()
+
+
+def test_missing_pending_token_is_not_recoverable_but_rotates_in_place():
+    from heel.saas.verification import EnvironmentChallengeClosed
+    conn = _environment_db()
+    service = VerifiedEnvironmentService(conn, clock=lambda: 100.0)
+    started = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner", **_PROOF_FIELDS)
+    conn.execute("UPDATE canary_environments SET challenge_token=NULL WHERE environment_id=?", (started.environment_id,))
+    conn.commit()
+    with pytest.raises(EnvironmentChallengeClosed) as missing:
+        service.recover_pending_challenge("ws", "prj", started.environment_id)
+    assert missing.value.reason == "missing"
+    rotated = service.rotate_unrecoverable_challenge("ws", "prj", started.environment_id)
+    assert rotated.environment_id == started.environment_id and rotated.generation == 2
+    assert len(_environment_rows(conn)) == 1
+    conn.close()
+
+
+def test_check_and_rotate_race_cannot_verify_superseded_challenge():
+    now = [100.0]
+    rotated = [None]
+    class ExpiringThenRotatingProof:
+        def verify(self, origin):
+            # The proof read outlives the challenge; meanwhile the user explicitly rotates it.
+            now[0] += 24 * 3600 + 1
+            rotated[0] = service.rotate_unrecoverable_challenge("ws", "prj", started.environment_id)
+            return started.token
+    conn = _environment_db()
+    service = VerifiedEnvironmentService(conn, https_verifier=ExpiringThenRotatingProof(), clock=lambda: now[0])
+    started = service.start("ws", "prj", "https://staging.example.com", "staging", actor="owner", **_PROOF_FIELDS)
+    assert not service.check("ws", "prj", started.environment_id)
+    row = _environment_rows(conn)[0]
+    assert row["status"] == "pending" and row["verification_record_digest"] is None
+    assert row["challenge_generation"] == rotated[0].generation == 2
+    assert row["challenge_token"] == rotated[0].token
+    assert row["challenge_digest"] == hashlib.sha256(rotated[0].token.encode("ascii")).hexdigest()
+    assert row["last_failure_code"] == "challenge_replaced"
+    assert not service.is_executable("ws", "prj", started.environment_id)
+    assert service.recover_pending_challenge("ws", "prj", started.environment_id) == rotated[0]
+    conn.close()
+
+
+class _EnvironmentHttp:
+    """Real loopback control plane for the recovery ceremony; the proof fetcher is the only seam."""
+
+    def __init__(self):
+        class Proof:
+            token = ""
+            def verify(self, origin):
+                return self.token
+        self.proof = Proof()
+        self.cp = ControlPlane(device_token_pepper=b"p" * 32, enable_device_auth=True,
+                               public_origin="https://heel.example", environment_https_verifier=self.proof)
+        oid = self.cp.store.create_org("org")
+        self.owner = self.cp.store.create_user("owner@example.com")
+        self.wid = self.cp.store.create_workspace(oid, "ws", "free", CATALOG_VERSION)
+        self.cp.store.add_member(self.wid, self.owner, Role.OWNER)
+        self.project = self.cp.projects.create(self.wid, "project", created_by=self.owner).project_ref
+        self.other_project = self.cp.projects.create(self.wid, "other", created_by=self.owner).project_ref
+        self.session = self.cp.auth.create_session(self.owner)
+        self.server = serve(self.cp)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def headers(self, token=None, **changes):
+        base = {"Cookie": f"heel_session={token or self.session.token}", "Origin": "https://heel.example",
+                "X-Heel-Internal-Origin": "same-origin", "Content-Type": "application/json"}
+        base.update(changes)
+        return {key: value for key, value in base.items() if value is not None}
+
+    def request(self, method, path, body=None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        wire = None if body is None else json.dumps(body)
+        connection.request(method, path, body=wire, headers=headers if headers is not None else self.headers())
+        response = connection.getresponse()
+        raw = response.read()
+        self.last_headers = {name.lower(): value for name, value in response.getheaders()}
+        connection.close()
+        return response.status, raw.decode()
+
+    def path(self, suffix="", project=None, wid=None):
+        return f"/v1/workspaces/{wid or self.wid}/projects/{project or self.project}/environments{suffix}"
+
+    def start(self, origin="https://staging.example.com", method="https-file"):
+        status, raw = self.request("POST", self.path(), {
+            "schema_version": "heel.verified-environment-start.v1", "origin": origin, "environment_class": "staging",
+            "proof_method": method, **_PROOF_FIELDS})
+        assert status == 201, raw
+        return json.loads(raw)
+
+    def rows(self):
+        return [dict(row) for row in self.cp.store.conn.execute("SELECT * FROM canary_environments ORDER BY environment_id")]
+
+
+RECOVER = {"schema_version": "heel.verified-environment-challenge-recover.v1"}
+ROTATE = {"schema_version": "heel.verified-environment-challenge-rotate.v1"}
+
+
+def test_environment_challenge_recovery_requires_recent_same_origin_owner_or_admin(caplog, capfd):
+    api = _EnvironmentHttp()
+    try:
+        started = api.start(method="dns-txt")
+        eid = started["environment_id"]
+        recover = api.path(f"/{eid}/challenge")
+        rotate = recover + "/rotate"
+        before = api.rows()
+        outputs = []
+
+        member = api.cp.store.create_user("member@example.com")
+        api.cp.store.add_member(api.wid, member, Role.MEMBER)
+        viewer = api.cp.store.create_user("viewer@example.com")
+        api.cp.store.add_member(api.wid, viewer, Role.VIEWER)
+        outsider = api.cp.store.create_user("outsider@example.com")
+        foreign_wid = api.cp.store.create_workspace(api.cp.store.create_org("org2"), "ws2", "free", CATALOG_VERSION)
+        api.cp.store.add_member(foreign_wid, outsider, Role.OWNER)
+        key = api.cp.store.issue_api_key(api.wid, Role.OWNER, "ci").secret
+        refused = [
+            ("no origin", api.headers(Origin=None), 403, "same_origin_required"),
+            ("foreign origin", api.headers(Origin="https://evil.example"), 403, "same_origin_required"),
+            ("no internal origin", api.headers(**{"X-Heel-Internal-Origin": None}), 403, "same_origin_required"),
+            ("member", api.headers(api.cp.auth.create_session(member).token), 403, "recent_auth_required"),
+            ("viewer", api.headers(api.cp.auth.create_session(viewer).token), 403, "recent_auth_required"),
+            ("other workspace owner", api.headers(api.cp.auth.create_session(outsider).token), 403, "recent_auth_required"),
+            ("owner api key", api.headers(Cookie=None, Authorization=f"Bearer {key}"), 403, "recent_auth_required"),
+        ]
+        for label, headers, status, code in refused:
+            for path, body in ((recover, RECOVER), (rotate, ROTATE)):
+                got, raw = api.request("POST", path, body, headers)
+                outputs.append(raw)
+                assert (got, json.loads(raw).get("code")) == (status, code), (label, path, raw)
+        # The token-bearing read is POST-only, scoped by workspace, project and environment, and schema-exact.
+        for method, path, body, status in (
+            ("GET", recover, None, 404), ("GET", rotate, None, 404),
+            ("POST", recover, ROTATE, 400), ("POST", rotate, RECOVER, 400),
+            ("POST", recover, {**RECOVER, "token": "x"}, 400), ("POST", recover, {}, 400),
+            ("POST", api.path(f"/{eid}/challenge", project=api.other_project), RECOVER, 404),
+            ("POST", api.path(f"/{eid}/challenge/rotate", project=api.other_project), ROTATE, 404),
+            ("POST", api.path(f"/env_{'0' * 32}/challenge"), RECOVER, 404),
+        ):
+            got, raw = api.request(method, path, body)
+            outputs.append(raw)
+            assert got == status, (method, path, raw)
+        assert api.rows() == before
+
+        # Fresh-auth expiry: the 15-minute ceremony is unchanged and fails closed; the pending proof is kept.
+        api.cp.store.conn.execute("UPDATE sessions SET created_at=created_at-901")
+        api.cp.store.conn.commit()
+        for path, body in ((recover, RECOVER), (rotate, ROTATE)):
+            got, raw = api.request("POST", path, body)
+            outputs.append(raw)
+            assert (got, json.loads(raw)["code"]) == (403, "recent_auth_required")
+        assert api.rows() == before
+        api.session = api.cp.auth.create_session(api.owner)
+
+        status, raw = api.request("POST", recover, RECOVER)
+        assert status == 200, raw
+        assert api.last_headers["cache-control"] == "no-store"
+        recovered = json.loads(raw)
+        assert set(recovered) == {"schema_version", "environment_id", "origin", "environment_class", "proof_method",
+                                  "token", "http_url", "dns_record", "challenge_generation", "expires_at",
+                                  "attestation", "attestation_version", "attestation_acknowledgement"}
+        assert recovered["schema_version"] == "heel.verified-environment-challenge-recovery.v1"
+        for field in ("environment_id", "origin", "environment_class", "proof_method", "token", "http_url",
+                      "dns_record", "challenge_generation", "expires_at", "attestation"):
+            assert recovered[field] == started[field], field
+        assert (recovered["attestation_version"], recovered["attestation_acknowledgement"]) == ("v1", "accepted")
+        status, raw = api.request("POST", rotate, ROTATE)
+        outputs.append(raw)
+        assert (status, json.loads(raw)["code"]) == (409, "environment_challenge_live")
+        assert api.rows() == before
+        status, listed = api.request("GET", api.path(), headers={"Cookie": f"heel_session={api.session.token}"})
+        outputs.append(listed)
+        assert status == 200 and len(json.loads(listed)["environments"]) == 1
+        captured = capfd.readouterr()
+        for text in outputs + [caplog.text, captured.out, captured.err]:
+            assert started["token"] not in text
+    finally:
+        api.close()
+
+
+def test_environment_challenge_http_expiry_rotation_verification_and_revocation():
+    api = _EnvironmentHttp()
+    try:
+        started = api.start()
+        eid = started["environment_id"]
+        recover = api.path(f"/{eid}/challenge")
+        rotate = recover + "/rotate"
+        api.cp.store.conn.execute("UPDATE canary_environments SET challenge_expires_at=? WHERE environment_id=?",
+                                  (time.time() - 1, eid))
+        api.cp.store.conn.commit()
+        status, raw = api.request("POST", recover, RECOVER)
+        assert (status, json.loads(raw)) == (409, {"error": "pending proof expired", "code": "environment_challenge_expired"})
+        status, raw = api.request("POST", rotate, ROTATE)
+        assert status == 201, raw
+        assert api.last_headers["cache-control"] == "no-store"
+        rotated = json.loads(raw)
+        assert rotated["schema_version"] == "heel.verified-environment-challenge-recovery.v1"
+        assert rotated["environment_id"] == eid and rotated["challenge_generation"] == started["challenge_generation"] + 1
+        assert rotated["token"] != started["token"] and rotated["origin"] == started["origin"]
+        assert len(api.rows()) == 1
+        status, raw = api.request("POST", recover, RECOVER)
+        assert status == 200 and json.loads(raw) == rotated
+        check = {"schema_version": "heel.verified-environment-check.v1"}
+        api.proof.token = started["token"]
+        status, raw = api.request("POST", api.path(f"/{eid}/check"), check)
+        assert status == 200 and json.loads(raw)["verified"] is False
+        api.cp.store.conn.execute("UPDATE canary_environments SET last_check_at=NULL WHERE environment_id=?", (eid,))
+        api.cp.store.conn.commit()
+        api.proof.token = rotated["token"]
+        status, raw = api.request("POST", api.path(f"/{eid}/check"), check)
+        assert status == 200 and json.loads(raw)["verified"] is True
+        for path, body in ((recover, RECOVER), (rotate, ROTATE)):
+            status, raw = api.request("POST", path, body)
+            assert (status, json.loads(raw)) == (409, {"error": "proof is not pending", "code": "environment_challenge_closed"})
+            assert rotated["token"] not in raw
+        status, raw = api.request("POST", api.path(f"/{eid}/revoke"), {"schema_version": "heel.verified-environment-revoke.v1", "reason": "done"})
+        assert status == 200
+        for path, body in ((recover, RECOVER), (rotate, ROTATE)):
+            status, raw = api.request("POST", path, body)
+            assert (status, json.loads(raw)["code"]) == (409, "environment_challenge_closed")
+        assert len(api.rows()) == 1 and api.rows()[0]["challenge_token"] is None
+    finally:
+        api.close()
+
+
+def test_concurrent_http_rotations_have_exactly_one_winner():
+    api = _EnvironmentHttp()
+    try:
+        started = api.start()
+        eid = started["environment_id"]
+        api.cp.store.conn.execute("UPDATE canary_environments SET challenge_expires_at=? WHERE environment_id=?",
+                                  (time.time() - 1, eid))
+        api.cp.store.conn.commit()
+        barrier = threading.Barrier(4)
+        results = []
+        def rotate():
+            barrier.wait()
+            results.append(api.request("POST", api.path(f"/{eid}/challenge/rotate"), ROTATE))
+        threads = [threading.Thread(target=rotate) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        statuses = sorted(status for status, _ in results)
+        assert statuses == [201, 409, 409, 409], results
+        winner = next(json.loads(raw) for status, raw in results if status == 201)
+        for status, raw in results:
+            if status == 409:
+                assert json.loads(raw)["code"] == "environment_challenge_live" and winner["token"] not in raw
+        row = api.rows()
+        assert len(row) == 1 and row[0]["challenge_generation"] == started["challenge_generation"] + 1
+        assert row[0]["challenge_token"] == winner["token"]
+    finally:
+        api.close()

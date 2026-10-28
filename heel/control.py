@@ -1,5 +1,5 @@
 """
-HEEL — control proposal + search (spec §7/§8). HEEL owns this.
+Heel — control proposal + search (spec §7/§8). Heel owns this.
 
 For each vector, propose a RANKED set of candidate controls by estimated exploitability
 reduction (the §7 "small search for the control that closes it"). v1 ranks the agent's
