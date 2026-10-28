@@ -25,6 +25,13 @@ shape, not with a real nft 1.0.9 listing of this table) is answered only by this
 listing differs, `install` returns `readback_mismatch` → `cleaned`/`quarantined` with no receipt and
 P1-P4/P7 fail. The evidence is kept as it is; the H2-1 oracle is not relaxed from here.
 
+## Dependency refresh
+
+The current candidate pins cryptography 50.0.1 in both the package and the proof wheel closure.
+Only that wheel record changes in the H0 runtime lock; the source, tool, and other Python pins remain fixed.
+Existing proof records do not qualify this refreshed dependency set; the Linux proof and its independent
+runtime review remain required before host qualification.
+
 ## Launcher
 
 `python scripts/host_h2_policy_proof.py` — zero arguments, one fixed profile `h2-policy-v1`, built on
@@ -36,7 +43,7 @@ H2K1's launcher (`scripts/host_lease_key_shape.py`), which stays unchanged. The 
 3. checks the pinned Python 3.13.5 and the host tools, lints `codeql.yml` with H0's pinned actionlint;
 4. fetches the **eight wheels** byte-pinned in the H0 lock (`deploy/host/ingress/runtime-lock.json`):
    the H1F pytest closure (iniconfig, packaging, pluggy, pygments, pytest 9.0.2) plus cryptography
-   45.0.7, cffi 2.1.1 and pycparser 3.11. No new dependency: name, version, file and SHA-256 are
+   50.0.1, cffi 2.1.1 and pycparser 3.11. No new dependency: name, version, file and SHA-256 are
    pinned in the launcher and must equal the lock entry.
 
 One fixed privileged child (`sudo -n`) takes stable host fingerprints, creates an outer
@@ -54,7 +61,7 @@ puts neither the cwd nor `PYTHONPATH` on `sys.path`; only the staged root is ins
 `heel.runner.http_transport`, `tests.support.edge_tls_harness` and `cryptography` are imported and
 every `sys.path` entry and every loaded module's file must lie in the staged root, the closed
 environment or the interpreter's stdlib, with `heel.*`/`tests.*` from the root only and cryptography
-45.0.7 from the environment. There is no host-checkout fallback. In ordinary CI the third-party
+50.0.1 from the environment. There is no host-checkout fallback. In ordinary CI the third-party
 wheels come from the CI test environment; the exact eight-wheel venv exists only in the Linux child.
 
 Acceptance: PASS only if every required case ran with zero skips, every record holds, the import

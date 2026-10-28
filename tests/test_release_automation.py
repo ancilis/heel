@@ -116,9 +116,10 @@ class ReleaseAutomationContractTests(unittest.TestCase):
     def test_release_tool_lock_is_hash_complete(self):
         source = RELEASE_REQUIREMENTS.read_text(encoding="utf-8")
         self.assertIn("build==1.5.0", source)
-        self.assertIn("setuptools==83.0.0", source)
+        self.assertIn("cryptography==50.0.1", source)
+        self.assertIn("setuptools==84.0.0", source)
         self.assertIn("twine==7.0.0", source)
-        self.assertIn("wheel==0.47.0", source)
+        self.assertIn("wheel==0.48.0", source)
         records = re.split(r"\n(?=[a-z0-9][a-z0-9._-]*==)", source.strip())
         self.assertGreaterEqual(len(records), 4)
         for record in records:

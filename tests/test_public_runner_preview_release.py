@@ -32,7 +32,7 @@ VERSION = "1.3.0rc2"
 WHEEL = f"heel_sim-{VERSION}-py3-none-any.whl"
 SDIST = f"heel_sim-{VERSION}.tar.gz"
 MANIFEST = "heel-open-core-manifest.json"
-RUNNER_REQUIREMENT = "cryptography==45.0.7"
+RUNNER_REQUIREMENT = "cryptography==50.0.1"
 INSTALL_REQUIRED = os.environ.get("HEEL_REQUIRE_RUNNER_EXTRA_INSTALL") == "1"
 # Optional reviewer evidence: a directory outside the checkout receives a JSON summary.
 EVIDENCE_DIR = os.environ.get("HEEL_RUNNER_EXTRA_EVIDENCE_DIR")

@@ -63,7 +63,8 @@ UNCHANGED_SHA256 = {
     "scripts/host_authority_proof.py": "af27f68e033cce033a9b48a77dc26a73dc6176829b575476ae904b43b69cb76c",
     "scripts/host_lease_feasibility.py": "62e8bbd346e7b196bdb2946924b93fa59b0b09bfb914997bebd65d76b21eeb51",
     "scripts/host_ingress_proof.py": "a1b32cc45d6395e1ee6d25014b05c5ccd2dbbfbfdadd658d7f38d27404a6f3a3",
-    "deploy/host/ingress/runtime-lock.json": "6e26fa6646a66db24d171d10d263c5b43ac0724646f11684b94f2baf57db50ae",
+    # Dependency refresh: only the cryptography wheel record changes in this lock.
+    "deploy/host/ingress/runtime-lock.json": "c0ff9e8db82224715640881474e3fac89abe836ef2840409d100c262b2866ce1",
 }
 RECORDED_PICK = {"targets": ("8.8.8.8", "8.8.4.4"), "unapproved_target": "1.1.1.1", "wrong_source": "9.9.9.9",
                  "dual_stack_ipv6": "2001:4860:4860::8888"}
@@ -108,14 +109,14 @@ def test_wheel_closure_is_the_eight_h0_locked_wheels_and_a_changed_lock_fails():
     assert LAUNCHER.PYTEST_CLOSURE is LAUNCHER.h1f().PYTEST_CLOSURE
     assert [name for name, *_rest in LAUNCHER.PYTEST_CLOSURE] == ["iniconfig", "packaging", "pluggy", "pygments", "pytest"]
     assert [(name, version) for name, version, *_rest in LAUNCHER.CLIENT_CLOSURE] == [
-        ("cryptography", "45.0.7"), ("cffi", "2.1.1"), ("pycparser", "3.11")]
+        ("cryptography", "50.0.1"), ("cffi", "2.1.1"), ("pycparser", "3.11")]
     closure = LAUNCHER.wheel_closure(lock)
     by_file = {wheel["file"]: wheel for wheel in lock["python"]["wheels"]}
     assert len(closure) == 8 and all(by_file[file]["url"] == url and by_file[file]["sha256"] == digest
                                      for file, url, digest in closure)
-    # No new dependency: cryptography 45.0.7 is the package's one declared runner dependency.
+    # No new dependency: cryptography 50.0.1 is the package's one declared runner dependency.
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
-    assert "cryptography==45.0.7" in project["optional-dependencies"]["runner"]
+    assert "cryptography==50.0.1" in project["optional-dependencies"]["runner"]
     for name, field, value in (("cryptography", "sha256", "0" * 64), ("cffi", "version", "2.1.2"),
                                ("pycparser", "file", "pycparser-3.12-py3-none-any.whl"), ("pytest", "sha256", "1" * 64)):
         changed = json.loads(json.dumps(lock))
@@ -255,7 +256,9 @@ def test_workflow_is_the_five_recorded_jobs_plus_one_constrained_job_for_all_thr
             assert oracle(variant) != [], (name, oracle_name)
 
 
-UNCHANGED_SHA256_WORKFLOW_BASE = "02d44aaca33da7c3a09ee4cd3fcc085c37ce8d7f2e1e8637cd0b6c75cd6db8fc"
+# Dependency refresh: the recorded prefix includes reviewed Action-pin upgrades;
+# hosted-proof job bytes and all mutation checks remain unchanged.
+UNCHANGED_SHA256_WORKFLOW_BASE = "191161826253623c1d971b64b26ebbac29e857f2897653e30948af4d8cda44d4"
 
 
 def test_ordinary_ci_never_runs_the_privileged_proof():
@@ -337,7 +340,7 @@ def test_fixture_literals_are_the_recorded_pick_global_and_outside_the_deny_corp
         assert not ipaddress.ip_address(local).is_global
 
 
-def test_accepted_h2_1_source_old_launchers_lock_and_harness_are_unchanged():
+def test_accepted_h2_1_inputs_and_refreshed_dependency_lock_match_recorded_hashes():
     for name, digest in UNCHANGED_SHA256.items():
         assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest, name
     assert PROOF.H2_SOURCE_SHA256 == UNCHANGED_SHA256["deploy/host/h2_policy.py"]

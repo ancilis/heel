@@ -47,7 +47,7 @@ EXPECTED_METADATA = (
     "License-File: LICENSE\n"
     "License-File: NOTICE\n"
     "Provides-Extra: runner\n"
-    "Requires-Dist: cryptography==45.0.7; extra == \"runner\"\n"
+    "Requires-Dist: cryptography==50.0.1; extra == \"runner\"\n"
     "\n"
 ).encode("utf-8")
 EXPECTED_WHEEL_METADATA = (
@@ -1345,8 +1345,8 @@ class OpenCoreReleaseTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             path.write_text(
                 text.replace(
-                    'runner = ["cryptography==45.0.7"]',
-                    'runner = ["cryptography==45.0.7"]\nllm = ["requests"]',
+                    'runner = ["cryptography==50.0.1"]',
+                    'runner = ["cryptography==50.0.1"]\nllm = ["requests"]',
                     1,
                 ),
                 encoding="utf-8",
@@ -1989,7 +1989,7 @@ class OpenCoreReleaseTests(unittest.TestCase):
                 self.assertEqual(parsed_metadata.get_all("License", []), [])
                 self.assertEqual(
                     parsed_metadata.get_all("Requires-Dist", []),
-                    ['cryptography==45.0.7; extra == "runner"'],
+                    ['cryptography==50.0.1; extra == "runner"'],
                 )
                 self.assertEqual(parsed_metadata.get_all("Provides-Extra", []), ["runner"])
                 for path in wheel_files:

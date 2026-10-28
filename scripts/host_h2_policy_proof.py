@@ -108,14 +108,14 @@ CLEANUP_RESERVE_SECONDS = 60
 # version, file and SHA-256 pinned here AND equal to the H0 lock entry (whose URL is used). No other
 # dependency: ``cryptography`` is the package's only declared runner dependency.
 CLIENT_CLOSURE = (
-    ("cryptography", "45.0.7", "cryptography-45.0.7-cp311-abi3-manylinux_2_34_x86_64.whl",
-     "b6a0e535baec27b528cb07a119f321ac024592388c5681a5ced167ae98e9fff3"),
+    ("cryptography", "50.0.1", "cryptography-50.0.1-cp311-abi3-manylinux_2_34_x86_64.whl",
+     "51afcfceb15597cf2635068e4ac9a56b2abde622edde17f37d85fd7b5306497a"),
     ("cffi", "2.1.1", "cffi-2.1.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
      "a931079504ecc49efed7744c476a5c343a92fabf66dec2db95edb1b2fdc770e2"),
     ("pycparser", "3.11", "pycparser-3.11-py3-none-any.whl",
      "51d5a8ba2be0bbe440b99d2112604c95bbbc3c2748a64260186c541e1729cd80"),
 )
-CRYPTOGRAPHY_VERSION = "45.0.7"
+CRYPTOGRAPHY_VERSION = "50.0.1"
 
 # Every case function in the test module, in file order (a static test keeps this list exact).
 REQUIRED_CASES = (
