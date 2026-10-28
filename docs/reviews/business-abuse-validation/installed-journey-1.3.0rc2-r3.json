@@ -1,0 +1,432 @@
+{
+  "attempt_reuse": {
+    "exit": 2,
+    "message": "Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage."
+  },
+  "candidate": {
+    "manifest_sha256": "60a62e8ab32360b39a74eedcead6c0735145c34a7af0cb642f5d1d510401565d",
+    "sdist": {
+      "name": "heel_sim-1.3.0rc2.tar.gz",
+      "sha256": "658bf5bd907b26e673fc40bd2aae1ac7683f8fcd3c197158b16995a4b9828e7f"
+    },
+    "superseded_candidate_wheel_sha256": "4af09c4cc431dd0fe3cb5b45fd1712e199c274832c7e71adefe57314eb41e801",
+    "wheel": {
+      "name": "heel_sim-1.3.0rc2-py3-none-any.whl",
+      "sha256": "a274c9596e645ba825f5a5ce9a961c6215d086506f573ed08f9f54e77810405c"
+    },
+    "wheel_sha256_matches_manifest": true
+  },
+  "error_envelope_rule": {
+    "adjudicated_counterexample_error_forbidden_with_marker": {
+      "200": {
+        "marker_lower_now": [
+          5,
+          "inconclusive",
+          "marker_undetermined",
+          false
+        ],
+        "marker_lower_parent": [
+          5,
+          "inconclusive",
+          "marker_undetermined",
+          false
+        ],
+        "protected_content_now": null,
+        "protected_content_parent": null
+      },
+      "201": {
+        "marker_lower_now": [
+          5,
+          "inconclusive",
+          "marker_undetermined",
+          false
+        ],
+        "marker_lower_parent": [
+          5,
+          "inconclusive",
+          "marker_undetermined",
+          false
+        ],
+        "protected_content_now": null,
+        "protected_content_parent": null
+      },
+      "204": {
+        "marker_lower_now": [
+          5,
+          "inconclusive",
+          "marker_undetermined",
+          false
+        ],
+        "marker_lower_parent": [
+          5,
+          "inconclusive",
+          "marker_undetermined",
+          false
+        ],
+        "protected_content_now": null,
+        "protected_content_parent": null
+      },
+      "401": {
+        "marker_lower_now": [
+          5,
+          "inconclusive",
+          "marker_undetermined",
+          false
+        ],
+        "marker_lower_parent": [
+          3,
+          "finding",
+          "marker_present",
+          true
+        ],
+        "protected_content_now": null,
+        "protected_content_parent": true
+      },
+      "402": {
+        "marker_lower_now": [
+          5,
+          "inconclusive",
+          "marker_undetermined",
+          false
+        ],
+        "marker_lower_parent": [
+          3,
+          "finding",
+          "marker_present",
+          true
+        ],
+        "protected_content_now": null,
+        "protected_content_parent": true
+      },
+      "403": {
+        "marker_lower_now": [
+          5,
+          "inconclusive",
+          "marker_undetermined",
+          false
+        ],
+        "marker_lower_parent": [
+          3,
+          "finding",
+          "marker_present",
+          true
+        ],
+        "protected_content_now": null,
+        "protected_content_parent": true
+      },
+      "404": {
+        "marker_lower_now": [
+          5,
+          "inconclusive",
+          "marker_undetermined",
+          false
+        ],
+        "marker_lower_parent": [
+          3,
+          "finding",
+          "marker_present",
+          true
+        ],
+        "protected_content_now": null,
+        "protected_content_parent": true
+      },
+      "500": {
+        "marker_lower_now": [
+          5,
+          "inconclusive",
+          "marker_undetermined",
+          false
+        ],
+        "marker_lower_parent": [
+          3,
+          "finding",
+          "marker_present",
+          true
+        ],
+        "protected_content_now": null,
+        "protected_content_parent": true
+      }
+    },
+    "cases": 208,
+    "cases_changed_from_parent_a4fca08": 111,
+    "control_cases_changed_from_parent": 0,
+    "installed_envelope_matrix_equals_source": true,
+    "installed_envelope_matrix_summary": {
+      "ambiguous_or_envelope_adapter_inconclusive": true,
+      "ambiguous_or_envelope_never_finding_or_held": true,
+      "ambiguous_or_envelope_never_true_false": true
+    },
+    "parent_to_now_transitions": {
+      "held->inconclusive marker finding->inconclusive": 40,
+      "held->inconclusive marker held->inconclusive": 40,
+      "inconclusive->inconclusive marker finding->inconclusive": 19,
+      "inconclusive->inconclusive marker held->inconclusive": 3,
+      "inconclusive->inconclusive marker inconclusive->inconclusive": 9
+    },
+    "statement": "A recognized error/denial envelope, or a message-only object (keys normalizing to message, beside at most the exact protected_canary), is undetermined at every status for either identity, with or without the marker."
+  },
+  "evidence_kinds": {
+    "installed_reference_cli": "The reference cases below run the unmodified installed heel CLI against the in-process synthetic reference product through the signed local executor; no sockets.",
+    "pure_evaluator_matrix": "protected_content, the adapter pair and evaluate_plan_pair imported from the installed wheel, no I/O (envelope, opaque and general matrices); equal to the same matrices from source.",
+    "source_cli_replay": "tests/test_runner_plan_differential_cli.py runs the real runner run / regress add / regress run CLI from source against the loopback synthetic target (actual HTTP over loopback); not an installed run."
+  },
+  "install": {
+    "base_python": "3.13.5",
+    "command": "pip --isolated install --no-index --find-links <copied offline wheelhouse> --no-cache-dir './heel_sim-1.3.0rc2-py3-none-any.whl[runner]'",
+    "environment": "env -i with fresh HOME, PATH=/usr/bin:/bin, private TMPDIR; no HEEL_HOME inherited",
+    "heel_saas": "absent",
+    "installed": {
+      "cffi": "2.1.1",
+      "cryptography": "45.0.7",
+      "heel_sim": "1.3.0rc2",
+      "pycparser": "3.12"
+    },
+    "installed_modules_cmp_equal_to_source": [
+      "heel/runner/content_assertion.py",
+      "heel/runner/plan_differential.py",
+      "heel/runner/adapters.py",
+      "heel/runner/execution.py",
+      "heel/reference_rehearsal.py",
+      "heel/reference_product.py",
+      "heel/runner/http_transport.py"
+    ],
+    "module_origin": "private venv site-packages (heel, heel.runner.plan_differential, heel.reference_rehearsal, cryptography)",
+    "offline_bundle_note": "Cached public-index provenance, re-verified locally (PROVENANCE sha256/size, wheel RECORD); not a fresh remote lookup.",
+    "offline_wheels": [
+      {
+        "cached_index_lists_sha256": true,
+        "filename": "cryptography-45.0.7-cp311-abi3-macosx_10_9_universal2.whl",
+        "record_entries_checked": 103,
+        "record_mismatches": 0,
+        "sha256": "3be4f21c6245930688bd9e162829480de027f8bf962ede33d4f8ba7d67a00cee"
+      },
+      {
+        "cached_index_lists_sha256": true,
+        "filename": "cffi-2.1.1-cp313-cp313-macosx_11_0_arm64.whl",
+        "record_entries_checked": 30,
+        "record_mismatches": 0,
+        "sha256": "19ee6127ee34de7d83ce3d371ebc5ed91addbdcc39f9ab15ce4eb35a4e534971"
+      },
+      {
+        "cached_index_lists_sha256": true,
+        "filename": "pycparser-3.12-py3-none-any.whl",
+        "record_entries_checked": 12,
+        "record_mismatches": 0,
+        "sha256": "a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e"
+      }
+    ],
+    "pip_check": true,
+    "private_directory": "new physical directory outside every checkout, mode 700"
+  },
+  "installed_general_matrix_equals_source": true,
+  "installed_opaque_matrix_equals_source": true,
+  "kind": "heel.installed-candidate-proof",
+  "label": "1.3.0rc2 ERROR-ENVELOPE-F3 candidate, revision r3 (unpublished)",
+  "network_denial": {
+    "applies_to": "venv creation, pip install/check, the evaluator matrices, every heel CLI call and the acceptance script",
+    "owned_loopback_control_sandboxed": {
+      "connected": false,
+      "elapsed_s": 0.001,
+      "errno": 1,
+      "error": "PermissionError",
+      "timeout": false
+    },
+    "owned_loopback_control_unsandboxed": {
+      "connected": true,
+      "elapsed_s": 0.001,
+      "status_line": "HTTP/1.0 200 OK"
+    },
+    "public_address_contacted": false,
+    "sandbox_profile": "(version 1)(allow default)(deny network*)"
+  },
+  "reference_acceptance": {
+    "cli": [
+      {
+        "case": "vulnerable",
+        "regression_passed": false,
+        "result": "verified_violation"
+      },
+      {
+        "case": "hardened",
+        "regression_passed": false,
+        "result": "inconclusive"
+      },
+      {
+        "case": "error_envelope",
+        "regression_passed": false,
+        "result": "inconclusive"
+      },
+      {
+        "case": "inconclusive",
+        "regression_passed": false,
+        "result": "inconclusive"
+      },
+      {
+        "case": "public",
+        "regression_passed": true,
+        "result": "invariant_held"
+      },
+      {
+        "case": "redacted",
+        "regression_passed": true,
+        "result": "invariant_held"
+      }
+    ],
+    "mcp": "initialize/list/prepare/execute passed",
+    "replay": "rejected",
+    "unauthorized": "rejected"
+  },
+  "reference_cases": [
+    {
+      "case": "vulnerable",
+      "evidence_state": "verified",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "protected_content": {
+        "higher_plan": true,
+        "lower_plan": true
+      },
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "verified_violation",
+      "run": "vulnerable",
+      "uploaded": false
+    },
+    {
+      "case": "hardened",
+      "evidence_state": "unknown",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "protected_content": {
+        "higher_plan": true,
+        "lower_plan": null
+      },
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "inconclusive",
+      "run": "hardened",
+      "uploaded": false
+    },
+    {
+      "case": "error_envelope",
+      "evidence_state": "unknown",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "protected_content": {
+        "higher_plan": true,
+        "lower_plan": null
+      },
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "inconclusive",
+      "run": "error_envelope",
+      "uploaded": false
+    },
+    {
+      "case": "public",
+      "evidence_state": "verified",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "protected_content": {
+        "higher_plan": true,
+        "lower_plan": false
+      },
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": true,
+      "result": "invariant_held",
+      "run": "public",
+      "uploaded": false
+    },
+    {
+      "case": "redacted",
+      "evidence_state": "verified",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "protected_content": {
+        "higher_plan": true,
+        "lower_plan": false
+      },
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": true,
+      "result": "invariant_held",
+      "run": "redacted",
+      "uploaded": false
+    },
+    {
+      "case": "inconclusive",
+      "evidence_state": "unknown",
+      "execution_disposition": "completed",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "protected_content": {
+        "higher_plan": null,
+        "lower_plan": null
+      },
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "inconclusive",
+      "run": "inconclusive",
+      "uploaded": false
+    },
+    {
+      "case": "vulnerable",
+      "evidence_state": "unknown",
+      "execution_disposition": "stopped",
+      "execution_support": "reference_only",
+      "network_calls": false,
+      "protected_content": {},
+      "provenance_kind": "reference_product_execution",
+      "regression_passed": false,
+      "result": "inconclusive",
+      "run": "vulnerable --stop",
+      "uploaded": false
+    }
+  ],
+  "scope_note": "Packaging/reference evidence only: an offline, source-free install of the regenerated candidate wheel, its pure evaluator and the in-process synthetic reference product. Not public acquisition, not a real target, not hosted execution, not live-SaaS or customer acceptance.",
+  "storage_path": {
+    "note": "Scope creation succeeding does not show the path is safe; opening the private runner/reference storage refuses the symlinked path.",
+    "physical_pwd_P_public_result": "invariant_held",
+    "reference_run_logical_HEEL_HOME_message": "Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage.",
+    "reference_run_with_that_logical_HEEL_HOME_exit": 2,
+    "scope_create_with_logical_HEEL_HOME": "created",
+    "setup": "a symlink owned by the proof inside the private directory (no system /tmp): <private>/logical -> <private>/physical-target"
+  },
+  "viewer_on_installed_reports": {
+    "harness": "the real /runner page component under Vitest/jsdom with fetch stubbed to throw; temporary test file, not committed",
+    "results": [
+      {
+        "case": "vulnerable",
+        "reads_as_pass": false
+      },
+      {
+        "case": "hardened",
+        "reads_as_pass": false
+      },
+      {
+        "case": "error_envelope",
+        "reads_as_pass": false
+      },
+      {
+        "case": "public",
+        "reads_as_pass": true
+      },
+      {
+        "case": "redacted",
+        "reads_as_pass": true
+      },
+      {
+        "case": "inconclusive",
+        "reads_as_pass": false
+      },
+      {
+        "case": "cancelled",
+        "reads_as_pass": false
+      }
+    ]
+  }
+}

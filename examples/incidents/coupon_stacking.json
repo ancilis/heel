@@ -1,0 +1,42 @@
+{
+  "abuse_goal": "coupon stacking and serial discount farming",
+  "affected_surfaces": [
+    "checkout coupon redemption",
+    "trial conversion flow"
+  ],
+  "business_impact": {
+    "estimated_monthly_loss_usd": {
+      "high": 7000,
+      "low": 1200
+    }
+  },
+  "controls_added": [
+    "single active coupon per account",
+    "promotion redemption audit event"
+  ],
+  "controls_missing": [
+    "coupon stacking limit",
+    "per-account promotion velocity limit"
+  ],
+  "customer_type": "trial_user",
+  "data_classes": [
+    "billing_metadata"
+  ],
+  "incident_id": "inc-coupon-stacking-001",
+  "product_area": "billing promotions",
+  "prohibited_fields_removed_confirmed": true,
+  "safety_notes": [
+    "Customer identifiers removed before import.",
+    "Evidence describes only canary-account observations and aggregate impact."
+  ],
+  "sanitized_evidence": {
+    "coupon_attempts": "multiple canary redemptions observed",
+    "evidence_id": "sanitized-ticket-001"
+  },
+  "source": "trust_safety",
+  "steps_observed": [
+    "A canary account redeemed multiple promotions through the normal checkout affordance.",
+    "The missing control allowed the account to retain stacked discounts after trial conversion."
+  ],
+  "summary": "Trial users stacked coupons to avoid paid conversion."
+}

@@ -1,11 +1,16 @@
-# HEEL — one-command bring-up (spec §11). Pure stdlib: no installs needed.
+# Heel — one-command bring-up (spec §11). Pure stdlib: no installs needed.
 PY ?= python3
 
-.PHONY: demo test mcp rest ui ui-data scenarios clean help
+.PHONY: demo demo-import demo-launch-review demo-regressions demo-bench test mcp rest ui ui-data scenarios clean help release-smoke saas-smoke saas-backup saas-restore-verify saas-site
 
 help:
 	@echo "make demo   - synthetic coverage backtest + auth-gate proof (over the MCP boundary)"
+	@echo "make demo-import - validate the sanitized local SaaS ProductModel (imported mode)"
+	@echo "make demo-launch-review - exercise the static SaaS launch-review path (staging mode)"
+	@echo "make demo-regressions - create and run a synthetic abuse regression"
+	@echo "make demo-bench - render a fast local HeelBench report"
 	@echo "make test   - acceptance + safety tests (auth gate, scope tamper-evidence, coverage)"
+	@echo "make release-smoke - build a clean wheel and exercise its installed CLI + MCP"
 	@echo "make mcp    - run the MCP server (stdio JSON-RPC) for a real MCP client"
 	@echo "make rest   - run the thin REST API (same auth gate) on :8780"
 	@echo "make ui-data- regenerate the control-room data snapshot"
@@ -15,8 +20,35 @@ help:
 demo:
 	$(PY) run_demo.py
 
+demo-import:
+	$(PY) scripts/demo_workflows.py import
+
+demo-launch-review:
+	$(PY) scripts/demo_workflows.py launch-review
+
+demo-regressions:
+	$(PY) scripts/demo_workflows.py regressions
+
+demo-bench:
+	$(PY) scripts/demo_workflows.py bench
+
 test:
 	$(PY) -m unittest discover -s tests -p 'test_*.py' -v
+
+release-smoke:
+	$(PY) scripts/release_smoke.py
+
+saas-smoke:
+	$(PY) scripts/saas_smoke.py
+
+saas-backup:
+	$(PY) scripts/saas_backup.py backup $(DB) $(OUT)
+
+saas-restore-verify:
+	$(PY) scripts/saas_backup.py verify $(OUT)
+
+saas-site:
+	$(PY) -c "from heel.saas.site import build; print(*build('build/site'), sep='\n')"
 
 mcp:
 	$(PY) -m heel.mcp_server

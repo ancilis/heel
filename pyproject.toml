@@ -1,21 +1,21 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "heel-sim"
-version = "1.0.0"
-description = "Agent-native abuse-simulation tool — rehearse how a customer could abuse your product before it ships. MCP-first."
-readme = "README.md"
+version = "1.3.0rc2"
+description = "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows."
+readme = "release/open-core/README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Ancilis" }]
 keywords = ["security", "abuse-simulation", "mcp", "red-team", "agent", "appsec", "ai-safety"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Security",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -23,26 +23,17 @@ classifiers = [
 # v1 core is PURE STANDARD LIBRARY by design (DECISIONS D-001) — zero runtime dependencies.
 dependencies = []
 
-[project.urls]
-Homepage = "https://github.com/ancilis/heel"
-Source = "https://github.com/ancilis/heel"
-Issues = "https://github.com/ancilis/heel/issues"
-
-[project.optional-dependencies]
-# the LLM control loop uses the Anthropic Messages API via stdlib urllib (no SDK needed);
-# this extra is only a convenience marker — no package is actually required.
-llm = []
-
 [project.scripts]
 heel = "heel.cli:main"
 heel-mcp = "heel.mcp_server:main"
 heel-rest = "heel.rest:serve"
 
+[project.optional-dependencies]
+runner = ["cryptography==45.0.7"]
+
 [tool.setuptools]
-packages = ["heel"]
+include-package-data = false
+packages = ["heel", "heel.runner"]
 
 [tool.setuptools.package-data]
-heel = ["scenarios_lib/*.json", "heldout/*.json"]
-
-[tool.setuptools.exclude-package-data]
-heel = ["**/__pycache__/*"]
+heel = ["heldout/targets.json", "heldout/test_targets.json", "scenarios_lib/community.json", "scenarios_lib/research_owasp.json"]

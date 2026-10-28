@@ -1,7 +1,7 @@
 """
-HEEL — immutable containment log (spec §6, §10.2.8). Self-audit.
+Heel — immutable containment log (spec §6, §10.2.8). Self-audit.
 
-Every action HEEL takes against any target — and every REJECTED escalation attempt from a
+Every action Heel takes against any target — and every REJECTED escalation attempt from a
 caller — is recorded immutably with a per-entry HASH CHAIN (entry_hash = sha256(prev_hash +
 canonical(entry))), so any tampering with the audit trail is detectable. Append-only.
 """

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 import React from "react";
 
 export const cx = (...c: (string | false | undefined)[]) => c.filter(Boolean).join(" ");
