@@ -1,4 +1,4 @@
-# HEEL — Decision log
+# Heel — Decision log
 
 Every non-obvious decision and assumption (spec §14). Append-only.
 
@@ -48,7 +48,7 @@ Anthropic/LLM control loop and the opportunistic-human class are Phase 3 behind 
 ### D-006 — Classification enrichment is optional, generic, off by default
 **Why:** §8 — annotative only, no governance coupling. `heel/classify.py` is a swappable
 `Classifier` interface with a default field-name/shape heuristic; `enrich(..., enabled=False)` is a
-no-op unless explicitly turned on. HEEL is fully functional with it off; it enforces nothing at
+no-op unless explicitly turned on. Heel is fully functional with it off; it enforces nothing at
 runtime and binds to no external framework.
 
 ### D-007 — `git init` + commit the scaffold locally; do not push
@@ -60,7 +60,7 @@ an explicit request.
 **Why:** §10.2.3 is absolute. The content-guardrail probe sends a **benign canary** to check that a
 guardrail is PRESENT and reports absence at max severity — it never generates, completes, or
 describes any prohibited artifact under any framing. Pure model-jailbreak surfaces are **handed off**
-(`handoff_to_model_redteam`), never weaponized — HEEL's lane is the product/business *consequence*,
+(`handoff_to_model_redteam`), never weaponized — Heel's lane is the product/business *consequence*,
 not the technique (§4.10 boundary).
 
 ---
@@ -138,13 +138,13 @@ categories; scenarios that match no synthetic affordance correctly don't fire (n
 **Why:** §11 "an LLM control loop ... a stub model path so the synthetic demo runs with no API key".
 `heel/model.py`: `StubModel` (deterministic, heuristic discovery, default) and `AnthropicModel`
 (`HEEL_MODEL=anthropic`, Messages API via stdlib urllib, no SDK). The model only sees observable
-properties and only proposes declarative scenario specs — HEEL builds the contained PoC; the model
+properties and only proposes declarative scenario specs — Heel builds the contained PoC; the model
 stays in lane and falls back to the heuristic on error/no-key. Keeps the pure-stdlib core.
 
 ### D-020 — UI is a thin client over a pure-stdlib JSON snapshot
 **Why:** §9 control room. `heel/web_export.py` runs the full synthetic flow over the MCP capability
 (deterministic) and writes `web/public/data/snapshot.json`; the Next.js app reads it. Same pattern
-as the rest of HEEL: the capability is built once (MCP-first) and every surface is a thin client.
+as the rest of Heel: the capability is built once (MCP-first) and every surface is a thin client.
 The UI honors the epistemics (reachability-weighting visible, implausible demoted not hidden;
 predicted/contained PoCs; optional classification shown when on; the scope panel is read-only and
 cannot mint/widen a scope). `node_modules` gitignored; the snapshot is committed so the UI renders
@@ -178,19 +178,19 @@ rested on one over-broad probe, and the CI was mis-modelled. Fixes: report recal
 empirically-MEASURED encoding-overlap (the independent variable) and label it a stated lower bound;
 Wilson CI on the pooled proportion; per-probe FP attribution + boundary decoys; sound chaining FP
 accounting (a chain over a decoy is a real FP, not a laundered "compound"); a synonym-leak regression
-test; honest fan-out wording (GIL-bound thread pool). The honest claim: HEEL detects what its library
+test; honest fan-out wording (GIL-bound thread pool). The honest claim: Heel detects what its library
 anticipates (~the measured overlap); a defensible external accuracy claim needs independently-authored
 or held-out scenarios — stated, not hidden.
 
 ### D-025 — Held-out, independently-authored targets are the strongest detection metric
 **Why:** the blind eval's encoding-overlap was still author-chosen. `heel/heldout/targets.json` is
-authored by an independent LLM swarm blind to HEEL's probes (workflow `heel-heldout-authoring`;
+authored by an independent LLM swarm blind to Heel's probes (workflow `heel-heldout-authoring`;
 provenance in docs/HELDOUT_PROVENANCE.md), removing author control over the vocabulary.
 `heel/heldout_eval.py` reports recall exact-match (~0.26) vs with semantic generalization (~0.57,
 Wilson CI), at ~0.95 precision, with per-category breakdown. Frozen for deterministic offline runs.
 
 ### D-026 — Semantic signal matching is the honest generalization axis (not exact property names)
-**Why:** exact property==value/kind criteria don't generalize to vocabularies HEEL didn't author.
+**Why:** exact property==value/kind criteria don't generalize to vocabularies Heel didn't author.
 `heel/semantic.py` matches weakness FAMILIES by topic keywords in the property KEY + permissive value
 indicators (and absence of a hardened indicator), via `{"semantic": signal}` criteria on kind "*"
 scenarios (agent-category ones gated to has_agent_surface to preserve cat-10 optionality). On the
@@ -231,3 +231,89 @@ Dedup now ranks by (match specificity, severity) — exact prop match > specific
 (`semantic.semantic_specificity`, `agents.run_adversarial`). Developed on DEV, measured ONCE on the
 frozen TEST set: attribution recall 0.27 -> 0.31 (mis-categorization 29% -> 18%), localization and
 precision unchanged. No ground-truth category is consulted, so it's a legitimate heuristic, not tuning.
+
+### D-032 — External research library integrated as declarative JSON, precision-disciplined
+**Why:** the depth of the scenario library was the weak axis. A source-anchored research deliverable
+(45 scenarios across all 10 categories + semantic vocabulary, from OWASP/OAT/WSTG/LLM-Top-10, the MCP
+2025-06-18 schema, and vendor config docs) was integrated as `scenarios_lib/research_owasp.json` +
+enrichment of `semantic.py`. Because it was authored blind to the held-out test set, its measured
+lift there is fair: held-out TEST localization recall 0.38 -> 0.50 at precision 0.97 -> 0.98; library
+67 -> 119 scenarios. Discipline held: polarity-correct topics only (boolean-true-is-bad stays exact);
+`prop_exists` operator added; over-broad `not prop_exists` absence-checks paired with `guard_absent`
+to restore precision without losing recall. docs/RESEARCH_LIBRARY.md records provenance.
+
+### D-033 — Heel supports pre-launch and existing-product abuse rehearsal
+**Why:** pre-launch launch review is the wedge: teams can rehearse abuse before customer traffic,
+before incident pressure, and with the cleanest safety envelope. But SaaS abuse keeps evolving after
+launch through trial farming, seat sharing, export scraping, AI-token cost abuse, integration/OAuth
+overreach, and support/workflow gaming. Supporting existing products widens adoption and turns real
+incidents or sanitized telemetry into regression scenarios without changing Heel's lane.
+
+**Safety consequence:** the broader positioning does not relax authorization. Every non-synthetic
+run, imported product model, sanitized telemetry import, staging rehearsal, or production-like target
+requires an explicit human-created `AuthorizationScope`. MCP, REST, and agent surfaces remain
+execution/read-only and cannot create, widen, relax, or mutate scopes. Real-target adapters are beta
+until adapter coverage matures, and must run with signed scopes, canary-only data, no real
+exfiltration, no resource exhaustion, no automated high-volume probing, and operator-approved limits.
+
+### D-034 — EntitlementGraph is a static model layer that emits ordinary affordances
+**Why:** entitlement abuse is the common SaaS case: a principal gets more feature, data, quota,
+tenant reach, cost shift, integration power, or agent power than intended. `heel.entitlements`
+models those relationships as typed edges and converts suspicious edges into the same declarative
+`Affordance` shape the existing scenario engine already evaluates.
+
+**Safety consequence:** the graph does not add a new execution surface and does not probe live
+systems. It is fed by sanitized ProductModel metadata, emits contained model affordances only, and
+inherits the imported-target rule: any rehearsal run still requires a human-created signed scope.
+MCP/REST/agent surfaces remain unable to create, widen, relax, or mutate scopes.
+
+### D-035 — Findings can become abuse regression tests without becoming repro playbooks
+**Why:** reports alone do not keep controls fixed. `heel.regressions` persists a finding's scenario,
+affordance pattern, declarative success criterion, recommended control, expected status, source run,
+and safety flags so teams can re-run the control check in CI or staging.
+
+**Safety consequence:** regression specs deliberately omit reproduction steps and working payloads.
+Re-runs call the same `HeelServer.heel_run` path, so signed scope verification, allowlist checks,
+resource limits, canary-only findings, and containment logging are reused. The regression CLI has no
+scope creation, widening, allowlist, or limit-mutation command.
+
+### D-036 — Economic severity is report-layer business-impact metadata
+**Why:** SaaS abuse is often a business-loss problem rather than a CVSS-style software vulnerability.
+`heel.economics` estimates directional monthly exposure from existing contained findings plus
+operator-supplied assumptions, keeps assumptions and unknowns visible, and ranks by economic impact
+without replacing the existing security severity.
+
+**Safety consequence:** economic scoring is read-only and report-only. It adds no probe, exploit,
+payment, credential, spam, data-exfiltration, or resource-exhaustion capability, and it does not
+authorize any target. MCP, REST, and agent surfaces remain unable to create, widen, relax, or mutate
+scopes. Missing assumptions produce qualitative scores only rather than fake precision.
+
+### D-037 — Opportunistic humans are first-class customer-incentive personas
+**Why:** abuse reports need to explain not only which affordance is weak, but which motivated
+customer archetype would game it. The old three-profile model was too coarse, so `heel.profiles`
+now defines declarative personas with motivation, sophistication, patience, risk tolerance, target
+affordance types, preferred chains, deterring controls, canary rehearsal examples, and observable
+matching rules. The default library covers coupon stacking, seat sharing, agency resale, data
+brokerage, trial farming, integration overreach, support pressure, marketplace reputation gaming,
+usage-meter optimization, AI cost amplification, and agent-wrapper building.
+
+**Safety consequence:** personas are customer incentive models, not criminal playbooks. Persona
+rules only match observable affordances and emit contained, canary-only evidence. If the
+adversarial class already owns an affordance, it remains primary; persona evidence annotates it
+without changing severity/category/control. Persona-only findings have an explicit deterministic
+ranking rule. No scope creation, widening, target authorization, real exfiltration, payment abuse,
+credential abuse, spam, resource exhaustion, or third-party probing is added.
+
+### D-038 — Control simulation is proposed-fix ranking, not verification
+**Why:** teams need help choosing fixes after Heel identifies a reachable abuse path. A single
+recommended control is too thin for launch and regression planning, so `heel.control_simulator`
+estimates a ranked bundle from vector fields, scenario category, affordance properties, optional
+ProductModel/EntitlementGraph signals, and a local control bank. The ranking is deterministic and
+balances abuse reduction, friction, legitimate-path preservation, and confidence.
+
+**Safety consequence:** the simulator is read-only report logic. It does not touch live targets,
+does not generate exploit payloads, and does not perform exfiltration, credential abuse, payment
+abuse, spam, or resource exhaustion. Its CLI can read stored findings or an operator-provided
+finding JSON file, but it cannot create, widen, relax, or mutate authorization scopes. Output is
+labelled as proposed offline estimates until a human-owned regression or launch review verifies the
+implemented control.

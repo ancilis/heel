@@ -1,5 +1,5 @@
 """
-HEEL — Frozen data contracts (spec §6).
+Heel — Frozen data contracts (spec §6).
 
 These are the versioned interfaces every squad integrates against. Changing a field
 after Phase 1 requires an explicit migration + version bump. All modules import their
@@ -54,6 +54,15 @@ class ScenarioSource(str, Enum):
     DISCOVERED = "discovered"
 
 
+class ScenarioPack(str, Enum):
+    CORE_SAAS = "core_saas"
+    AGENT_MCP = "agent_mcp"
+    PAYMENTS_BILLING = "payments_billing"
+    TRUST_SAFETY = "trust_safety"
+    INTEGRATIONS = "integrations"
+    COMPLIANCE = "compliance"
+
+
 class VerificationStatus(str, Enum):
     PREDICTED = "predicted"     # reachability proven by contained PoC, not yet observed in prod
     OBSERVED = "observed"       # later corroborated by real post-launch telemetry (stretch hook)
@@ -80,10 +89,16 @@ class AbuseScenario:
     containment_limits: dict = field(default_factory=dict)  # per-scenario back-off / sample caps
     applies_when: AppliesWhen = AppliesWhen.ALWAYS
     source: ScenarioSource = ScenarioSource.SEED
+    pack: ScenarioPack = ScenarioPack.CORE_SAAS
     # declarative outputs (so scenarios are addable WITHOUT code, incl. from JSON):
     recommended_control: str = ""
     exploitability_reduction: float = 0.6
     handoff: str = ""                      # "" | "appsec" | "model_redteam"
+    evidence_state: str = "inferred"
+    execution_support: str = "static_only"
+    rule_source: str = "customer declaration required"
+    mechanism_id: str = ""
+    investigation_signals: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -117,10 +132,11 @@ class AbuseVector:
     recommended_control: str
     classification_impact: Optional[dict] = None     # optional annotation (off by default)
     obligation_impact: Optional[dict] = None
+    economic_impact: Optional[dict] = None            # optional business-impact annotation
     estimated_exploitability_reduction: Optional[float] = None
     verification_status: VerificationStatus = VerificationStatus.PREDICTED
-    handoff_to_appsec: bool = False    # true security vuln (memory/crypto/novel) — not HEEL's lane
-    handoff_to_model_redteam: bool = False  # pure jailbreak technique — not HEEL's lane
+    handoff_to_appsec: bool = False    # true security vuln (memory/crypto/novel) — not Heel's lane
+    handoff_to_model_redteam: bool = False  # pure jailbreak technique — not Heel's lane
     target_id: str = ""
     affordance_id: str = ""
     notes: str = ""
@@ -221,7 +237,7 @@ class ContainmentEntry:
     ts: float
     run_id: str
     caller_identity: str
-    action: str                # what HEEL did (probe, reject, finding, backoff, ...)
+    action: str                # what Heel did (probe, reject, finding, backoff, ...)
     detail: dict
     prev_hash: str             # hash chain → tamper-evident
     entry_hash: str = ""
@@ -236,6 +252,7 @@ class RunSpec:
     target: str
     scenario_ids: Optional[list[str]] = None
     agent_classes: Optional[list[str]] = None       # ["adversarial"] for v1 slice
+    packs: Optional[list[str]] = None
     budget: dict = field(default_factory=dict)
 
 

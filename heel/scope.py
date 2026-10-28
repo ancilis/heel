@@ -1,5 +1,5 @@
 """
-HEEL — authorization scope (spec §6, §10.1). The core of the agent-caller safety model.
+Heel — authorization scope (spec §6, §10.1). The core of the agent-caller safety model.
 
 An `AuthorizationScope` is created OUT-OF-BAND by a human only — via the CLI, with explicit
 confirmation, written as a SIGNED file under `.heel/scopes/`. It is **never** created or
