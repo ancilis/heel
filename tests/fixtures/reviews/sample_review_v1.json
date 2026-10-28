@@ -1,0 +1,196 @@
+{
+  "baseline_hash": "4d86c01f77bd7f5c005cfd5acfc90d86b53a003e727c72537d891324304071c0",
+  "engine_version": "1.3.0rc2",
+  "execution_mode": "machine_local",
+  "findings": [
+    {
+      "control": "OAuth scope minimization and approval",
+      "evidence_state": "inferred",
+      "execution_disposition": "static_only",
+      "reachable": false,
+      "reason": "Investigation prompt; intended product rule unknown and behavior unverified. new createoauthapp OAuth app grants overbroad scope",
+      "risk": "oauth_scope_overbroad",
+      "rule_source": "unknown",
+      "severity": "warn",
+      "surface_id": "createoauthapp",
+      "surface_type": "integration_oauth_apps"
+    }
+  ],
+  "gate_status": "warn",
+  "model_hash": "54eee480d642126d3dc832fdd2c4afe120aa140f0ac1f062981727ce6ef584c6",
+  "privacy": {
+    "execution": "machine_local",
+    "network_calls": false,
+    "sync_intent": "none",
+    "uploaded": false
+  },
+  "product_id": "acme-platform-api",
+  "questions": [
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:09ccebb48144",
+      "prompt": "Which plan or entitlement protects this operation?",
+      "required": false,
+      "surface": "runagenttool"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:31b17d57348f",
+      "prompt": "Which plan or entitlement protects this operation?",
+      "required": false,
+      "surface": "inviteseat"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:439b4abb639b",
+      "prompt": "Which plan or entitlement protects this operation?",
+      "required": false,
+      "surface": "downloadbulkexport"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:7816716ce52f",
+      "prompt": "Which plan or entitlement protects this operation?",
+      "required": false,
+      "surface": "readusagemeter"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:8afba0afb7db",
+      "prompt": "Which plan or entitlement protects this operation?",
+      "required": false,
+      "surface": "supportimpersonate"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:a7678a6a458b",
+      "prompt": "Which plan or entitlement protects this operation?",
+      "required": false,
+      "surface": "starttrial"
+    },
+    {
+      "field": "entitlement_check",
+      "id": "entitlement_check:d94dd76ca7ca",
+      "prompt": "Which plan or entitlement protects this operation?",
+      "required": false,
+      "surface": "createoauthapp"
+    },
+    {
+      "field": "product_rule",
+      "id": "product_rule:285d4df2f7ab",
+      "prompt": "Which least-privilege OAuth scopes should protect this surface?",
+      "required": false,
+      "surface": "createoauthapp"
+    },
+    {
+      "field": "product_rule",
+      "id": "product_rule:4445cee2d9d0",
+      "prompt": "What intended and granted scopes constrain this agent operation?",
+      "required": false,
+      "surface": "runagenttool"
+    },
+    {
+      "field": "product_rule",
+      "id": "product_rule:72d6062aa8b6",
+      "prompt": "Which least-privilege OAuth scopes should protect this surface?",
+      "required": false,
+      "surface": "product"
+    },
+    {
+      "field": "rate_limit",
+      "id": "rate_limit:65f70de9e8d9",
+      "prompt": "Which server-side rate limit protects this export operation?",
+      "required": false,
+      "surface": "downloadbulkexport"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:1031a9437228",
+      "prompt": "How is tenant access enforced for this operation?",
+      "required": false,
+      "surface": "runagenttool"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:48c0c3a6d5ad",
+      "prompt": "How is tenant access enforced for this operation?",
+      "required": false,
+      "surface": "supportimpersonate"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:8fa54dcbbaee",
+      "prompt": "How is tenant access enforced for this operation?",
+      "required": false,
+      "surface": "inviteseat"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:cc99ccbd90df",
+      "prompt": "How is tenant access enforced for this operation?",
+      "required": false,
+      "surface": "readusagemeter"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:ce989ffd3a38",
+      "prompt": "How is tenant access enforced for this operation?",
+      "required": false,
+      "surface": "downloadbulkexport"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:ef15af8f4666",
+      "prompt": "How is tenant access enforced for this operation?",
+      "required": false,
+      "surface": "starttrial"
+    },
+    {
+      "field": "tenant_filter",
+      "id": "tenant_filter:f61f00feac61",
+      "prompt": "How is tenant access enforced for this operation?",
+      "required": false,
+      "surface": "createoauthapp"
+    }
+  ],
+  "recommended_controls": [
+    {
+      "control": "OAuth scope minimization and approval",
+      "evidence_state": "inferred",
+      "execution_disposition": "static_only",
+      "reachable": false,
+      "reason": "Investigation prompt; intended product rule unknown and behavior unverified. new createoauthapp OAuth app grants overbroad scope",
+      "risk": "oauth_scope_overbroad",
+      "rule_source": "unknown",
+      "severity": "warn",
+      "surface_id": "createoauthapp",
+      "surface_type": "integration_oauth_apps"
+    }
+  ],
+  "result_hash": "cb98b62f167aae30ef36e741052272b3301e2760cf52f7e3283b5f25b641fdbe",
+  "review_id": "review_cb98b62f167aae30ef36",
+  "safety": {
+    "canary_only": true,
+    "live_probing": false,
+    "mode": "static ProductModel diff",
+    "network_calls": false,
+    "requires_signed_scope_for_live_or_staging_runs": true
+  },
+  "schema_version": "heel.review.v1",
+  "source_hash": "5d949fbd2b11b47aa9c3d9097aee46b198670ebce5a7a9016dd8ccc70346a649",
+  "suggested_regressions": [
+    {
+      "expected_status": "blocked",
+      "name": "launch_review_createoauthapp_oauth_scope_overbroad",
+      "safety": "model-only, canary-contained; no live probing",
+      "scenario_hint": "oauth_scope_overbroad",
+      "surface_id": "createoauthapp",
+      "surface_type": "integration_oauth_apps"
+    }
+  ],
+  "summary": {
+    "blockers": 0,
+    "findings": 1,
+    "questions": 18
+  }
+}

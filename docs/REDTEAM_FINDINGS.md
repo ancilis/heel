@@ -1,4 +1,4 @@
-# HEEL — Red-team findings (v1 safety-spine adversarial review)
+# Heel — Red-team findings (v1 safety-spine adversarial review)
 
 4-agent workflow attacking the auth gate, prompt-injection surface, §10.2 conduct guarantees,
 and backtest honesty. The #1 claim HELD (a prompt-injected MCP caller cannot escape a signed
@@ -104,7 +104,7 @@ scope). Gaps between claim and implementation were fixed — see EVAL §8 / DECI
 
 ### [HIGH] Severity calibration 0.78 is inflated: 7 of 11 scenario priors are set EXACTLY equal to the planted ground-truth severity
 
-**Evidence:** Verified pairs (scenario prior vs planted true_severity, likelihood,impact): sc.export.entitlement (0.7,0.8)==(0.7,0.8); sc.record.tenant (0.8,0.9)==(0.8,0.9); sc.flag.tiergate (0.6,0.7)==(0.6,0.7); sc.trial.serial (0.5,0.5)==(0.5,0.5); sc.audit.coverage (0.6,0.7)==(0.6,0.7); sc.identity.recovery (0.6,0.7)==(0.6,0.7); sc.endpoint.forced (0.3,0.4)==(0.3,0.4) — 7 EXACT. The agent copies the scenario prior straight into the finding (heel/agents.py:117-122 sets likelihood/impact from `scenario.severity_model`), and the backtest then correlates that against the plant (heel/backtest.py:78-81). For the SaaS run, pred_sev==true_sev exactly on 7 of 10 TPs; over the only 3 pairs where they DIFFER the Spearman is 1.0. So the 0.775 is dominated by self-correlation of priors the author tuned near ground truth, not by HEEL inferring severity.
+**Evidence:** Verified pairs (scenario prior vs planted true_severity, likelihood,impact): sc.export.entitlement (0.7,0.8)==(0.7,0.8); sc.record.tenant (0.8,0.9)==(0.8,0.9); sc.flag.tiergate (0.6,0.7)==(0.6,0.7); sc.trial.serial (0.5,0.5)==(0.5,0.5); sc.audit.coverage (0.6,0.7)==(0.6,0.7); sc.identity.recovery (0.6,0.7)==(0.6,0.7); sc.endpoint.forced (0.3,0.4)==(0.3,0.4) — 7 EXACT. The agent copies the scenario prior straight into the finding (heel/agents.py:117-122 sets likelihood/impact from `scenario.severity_model`), and the backtest then correlates that against the plant (heel/backtest.py:78-81). For the SaaS run, pred_sev==true_sev exactly on 7 of 10 TPs; over the only 3 pairs where they DIFFER the Spearman is 1.0. So the 0.775 is dominated by self-correlation of priors the author tuned near ground truth, not by Heel inferring severity.
 
 **Recommendation:** Set scenario priors WITHOUT knowledge of the planted true_severity (or have a different author set them), and add deliberate prior/ground-truth disagreement so the metric can actually drop. Report severity calibration only over the subset where prior != ground-truth. With n=10 (SaaS) / n=16 (AI), also report a confidence interval — Spearman at n=10 has a ~0.55 std error, so 0.78 is not distinguishable from 0.4.
 

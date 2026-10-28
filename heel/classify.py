@@ -1,7 +1,7 @@
 """
-HEEL — optional data-classification enrichment (spec §8). Standalone, swappable, generic.
+Heel — optional data-classification enrichment (spec §8). Standalone, swappable, generic.
 
-OPTIONAL (HEEL is fully functional with it OFF), GENERIC (no binding to any external framework
+OPTIONAL (Heel is fully functional with it OFF), GENERIC (no binding to any external framework
 or runtime-governance system), and ANNOTATIVE ONLY (it enforces nothing at runtime and is not
 runtime governance). Default is a simple field-name/shape heuristic; the `Classifier` interface
 is the documented adapter point for a swap-in.

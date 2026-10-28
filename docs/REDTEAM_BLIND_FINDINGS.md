@@ -1,11 +1,11 @@
-# HEEL — Red-team findings: blind-eval / chaining / fan-out
+# Heel — Red-team findings: blind-eval / chaining / fan-out
 
 3-agent review of the honesty-metric work. The blind eval was found to be structurally less
 circular than the self-consistency backtest (synonyms genuinely don't leak), but recall was a
 re-parameterized knob, precision rested on one probe, and the chaining FP exclusion was unsound.
 All fixed — see EVAL §wave3b / DECISIONS D-024, D-022.
 
-## measurement-skeptic / red-team auditor of the HEEL blind-eval detection metric
+## measurement-skeptic / red-team auditor of the Heel blind-eval detection metric
 
 **Verdict:** PARTIALLY RIGGED — independent ENCODINGS but a DIALED recall. The metric removes the seed/plant co-authorship circularity (synonyms are real blind spots, no synonym leaks into detection), so it is a strictly better number than the 0.93 self-consistency coverage. But recall ≈ 0.25 is a re-parameterized hand-tune, not a discovered property: it equals the matchable-encoding fraction (1/3, minus reachability/category-mix), which the author controls by choosing how many encodings per weakness match a seed. Precision is dominated by one decoy and one over-broad probe. Not yet a defensible third-party detection metric; it is an honest-DISTRIBUTION shaped backtest, and should be labeled a stated LOWER BOUND with held-out/independently-authored scenarios before any external claim.
 
@@ -45,7 +45,7 @@ All fixed — see EVAL §wave3b / DECISIONS D-024, D-022.
 
 **Recommendation:** Ship the metric only with: independently-authored held-out encodings, a Wilson CI on pooled 72/287, a published encoding distribution, and the recall-vs-breadth curve. Then 0.25 becomes a defensible lower bound rather than a re-parameterized hand-tune.
 
-## Red-team reviewer (HEEL chaining + backtest soundness)
+## Red-team reviewer (Heel chaining + backtest soundness)
 
 **Verdict:** Chaining is a real capability and honesty is preserved in the blind eval, BUT the backtest's blanket "chain:"-prefix FP exclusion (backtest.py:64-66) is unsound and exploitable: a chain over hardened decoys is laundered into a zero-FP "compound discovery," and this blind spot propagates into the headline blind-eval precision. Fix required before the FP/precision numbers can be trusted.
 
@@ -84,7 +84,7 @@ All fixed — see EVAL §wave3b / DECISIONS D-024, D-022.
 
 **Recommendation:** Identify compound findings by a structural flag on AbuseVector (e.g., reproduction['strategy']=='affordance_chain', already set at chaining.py:50) plus validated leg membership, rather than by string-prefixing the affordance_id, which is both spoofable and inconsistently applied.
 
-## Security and concurrency reviewer (HEEL blind_eval fan-out)
+## Security and concurrency reviewer (Heel blind_eval fan-out)
 
 **Verdict:** blind_eval is deterministic and race-free (verified: identical across runs and across 1/8/16 workers; per-seed local RNG, read-only module globals, no shared Store/connection). It intentionally runs WITHOUT scope/Store/containment because targets are purely synthetic and in-memory — acceptable for an internal detection-accuracy eval, but the unscoped/unlogged path is structurally reusable and should be guarded against non-synthetic targets. The 'thousand-agent fan-out' label is dishonest: it is 40 targets, 8 GIL-bound threads, deterministic stub, no real parallelism — and the real-LLM concerns in (3) are currently moot because the fan-out hardcodes StubModel and never consults HEEL_MODEL.
 

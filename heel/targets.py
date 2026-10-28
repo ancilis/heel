@@ -1,7 +1,7 @@
 """
-HEEL — synthetic targets with planted abuse vectors (spec §5). The falsifiable spine.
+Heel — synthetic targets with planted abuse vectors (spec §5). The falsifiable spine.
 
-Two built-in synthetic products with seeded ground truth, so HEEL is fully demonstrable
+Two built-in synthetic products with seeded ground truth, so Heel is fully demonstrable
 with NO real target. The adversarial agent probes a target's `Affordance` surface; the
 coverage backtest scores discovered vectors against the planted ones.
 
@@ -29,6 +29,22 @@ PLAUSIBILITY_FLOOR = 0.25
 
 
 def _aff(id, kind, category, planted, reach, sev=None, guard=None, decoy=False, **props):
+    # Explicit commercial policy for these authored model fixtures, independent of
+    # planted labels/decoy flags. This is a declaration, never behavioral evidence.
+    policies = {
+        "export": "Protected bulk exports require the export entitlement",
+        "meter": "Billable consumption is accounted in server-owned windows",
+        "trial": "Each eligibility subject receives at most one trial",
+        "seat": "A paid seat is licensed to one person",
+        "record": "Records are accessible only to their owning tenant",
+        "endpoint": "Checkout discounts and restricted routes obey their declared business policy",
+        "agent_tool": "Tool actions remain within caller scope and the declared cost ceiling",
+        "region": "Regional pricing requires eligibility for that billing region",
+    }
+    if kind in policies:
+        props.setdefault("business_rule", policies[kind])
+        props.setdefault("business_rule_applicable", True)
+        props.setdefault("rule_source", "built-in synthetic fixture policy; customer_declared")
     return Affordance(
         id=id, kind=kind, category=category, properties=props,
         guard_present=(guard if guard is not None else planted is None),
@@ -61,7 +77,8 @@ def build_saas_target() -> SyntheticTarget:
         _aff("usage_meter", "meter", Category.LICENSE_ENTITLEMENT, "meter_reset_exploit",
              0.7, Severity(0.75, 0.7), route="/api/usage", reset_window="client_controlled"),
         _aff("record_get", "record", Category.COMPLIANCE_BOUNDARY, "cross_tenant_idor",
-             0.8, Severity(0.8, 0.9), route="/api/records/{id}", tenant_check="missing"),
+             0.8, Severity(0.8, 0.9), route="/api/records/{id}", tenant_check="missing",
+             id_scheme="sequential"),
         _aff("premium_toggle", "flag", Category.UNINTENDED_ENDPOINTS, "client_flag_tier_bypass",
              0.75, Severity(0.6, 0.7), flag="isPremium", gated_by="client"),
         _aff("trial_signup", "trial", Category.LICENSE_ENTITLEMENT, "serial_trial",
@@ -142,10 +159,10 @@ def build_ai_target() -> SyntheticTarget:
         # content guardrail — PRESENT (hardened). Verified with SAFE canaries only; no generation.
         _aff("content_guardrail", "content_guardrail", Category.CONTENT_POLICY, None, 0.7, guard=True,
              canary="benign", blocks_prohibited=True),
-        # a true-vuln class (SSRF in url-fetch) — HEEL flags handoff_to_appsec, does not weaponize
+        # a true-vuln class (SSRF in url-fetch) — Heel flags handoff_to_appsec, does not weaponize
         _aff("url_fetch", "agent_tool", Category.FUNCTION_ABUSE, "ssrf_url_fetch",
              0.6, Severity(0.6, 0.7), tool="fetch_url", allowlist="missing", handoff="appsec"),
-        # a pure model-jailbreak SURFACE — NOT HEEL's lane; flagged handoff_to_model_redteam, never
+        # a pure model-jailbreak SURFACE — NOT Heel's lane; flagged handoff_to_model_redteam, never
         # weaponized and never counted as a product-abuse finding (lane discipline, §4.10 boundary).
         _aff("agent_prompt_surface", "agent_tool", Category.AGENT_MCP_SURFACE, None,
              0.5, guard=True, tool="chat", jailbreak_surface=True, handoff="model_redteam"),
@@ -159,7 +176,28 @@ def build_ai_target() -> SyntheticTarget:
 
 
 TARGETS = {t.id: t for t in (build_saas_target(), build_ai_target())}
+IMPORTED_TARGETS = {}
+
+
+def register_imported_target(target):
+    """Register a sanitized imported model for in-process rehearsal.
+
+    This does not authorize a run. The MCP/CLI/REST path still requires a signed
+    AuthorizationScope whose allowlist contains the imported target id.
+    """
+    if not getattr(target, "requires_scope", False):
+        raise ValueError("imported targets must require a signed scope")
+    safety = getattr(target, "safety_metadata", {}) or {}
+    if not safety.get("scope_required") or not safety.get("live_probing_disabled"):
+        raise ValueError("imported targets must carry safety metadata")
+    IMPORTED_TARGETS[target.id] = target
+    return target
+
+
+def clear_imported_targets():
+    """Clear in-memory imported targets. Primarily for tests and short-lived CLI sessions."""
+    IMPORTED_TARGETS.clear()
 
 
 def get_target(target_id: str) -> SyntheticTarget | None:
-    return TARGETS.get(target_id)
+    return TARGETS.get(target_id) or IMPORTED_TARGETS.get(target_id)
