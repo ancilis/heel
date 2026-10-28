@@ -160,10 +160,15 @@ def apply_review_answers(
         operation_matches = targets.get(surface, [])
         if len(operation_matches) != 1:
             raise ReviewAnswerError("answer does not identify one existing operation")
+        operation = operation_matches[0]
+        declarations = operation.setdefault("x-heel-customer-declarations", {})
+        if type(declarations) is not dict:
+            raise ReviewAnswerError("customer declarations must be an object")
+        declarations[field] = {"value": answer["value"], "source": "customer answer",
+                               "evidence_state": "unknown" if answer["value"] == "unknown" else "customer_declared"}
         if answer["value"] != "enforced":
             continue
 
-        operation = operation_matches[0]
         if field == "tenant_filter":
             _declare_tenant_scope(operation)
         elif field == "entitlement_check":

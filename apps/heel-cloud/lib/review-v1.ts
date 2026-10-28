@@ -3,12 +3,14 @@
 /** Dependency-free validation for the untrusted Python worker response. */
 
 export const REVIEW_SCHEMA_VERSION = "heel.review.v1" as const;
-export const REVIEW_ENGINE_VERSION = "1.2.0" as const;
-export type ReviewEngineVersion = "1.1.0" | "1.1.1" | typeof REVIEW_ENGINE_VERSION;
+export const REVIEW_ENGINE_VERSION = "1.3.0rc2" as const;
+export type ReviewEngineVersion = "1.1.0" | "1.1.1" | "1.2.0" | "1.3.0rc1" | typeof REVIEW_ENGINE_VERSION;
 
 const SUPPORTED_REVIEW_ENGINE_VERSIONS = new Set<ReviewEngineVersion>([
   "1.1.0",
   "1.1.1",
+  "1.2.0",
+  "1.3.0rc1",
   REVIEW_ENGINE_VERSION,
 ]);
 
@@ -39,6 +41,9 @@ export interface ReviewFindingV1 {
   control: string;
   reason: string;
   reachable: boolean;
+  evidence_state?: "unknown" | "customer_declared" | "inferred";
+  rule_source?: string;
+  execution_disposition?: "static_only";
 }
 
 export interface ReviewRegressionV1 {
@@ -173,7 +178,14 @@ function array(value: unknown, path: string): unknown[] {
 
 function finding(value: unknown, path: string): ReviewFindingV1 {
   const item = record(value, path);
-  exactFields(item, FINDING_FIELDS, path);
+  exactFields(item, "evidence_state" in item ? [...FINDING_FIELDS, "evidence_state", "rule_source", "execution_disposition"] : FINDING_FIELDS, path);
+  let evidence: Pick<ReviewFindingV1, "evidence_state" | "rule_source" | "execution_disposition"> = {};
+  if ("evidence_state" in item) {
+    if (!["unknown", "customer_declared", "inferred"].includes(String(item.evidence_state)) || item.execution_disposition !== "static_only") {
+      throw new ReviewEnvelopeError("Static review cannot verify behavior");
+    }
+    evidence = { evidence_state: item.evidence_state as "unknown" | "customer_declared" | "inferred", rule_source: string(item.rule_source, `${path}.rule_source`), execution_disposition: "static_only" };
+  }
   const severity = string(item.severity, `${path}.severity`);
   if (severity !== "warn" && severity !== "block") {
     throw new ReviewEnvelopeError(`${path}.severity must be warn or block`);
@@ -186,6 +198,7 @@ function finding(value: unknown, path: string): ReviewFindingV1 {
     control: string(item.control, `${path}.control`),
     reason: string(item.reason, `${path}.reason`),
     reachable: boolean(item.reachable, `${path}.reachable`),
+    ...evidence,
   };
 }
 

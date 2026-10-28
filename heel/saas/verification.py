@@ -242,6 +242,17 @@ class EnvironmentCooldown(Exception):
     pass
 
 
+class EnvironmentChallengeClosed(Exception):
+    """A pending proof cannot be recovered or rotated; `reason` is closed and never carries proof material."""
+    REASONS = frozenset({"expired", "missing", "verified", "revoked", "live"})
+
+    def __init__(self, reason: str):
+        if reason not in self.REASONS:
+            raise ValueError("unknown closed challenge reason")
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class EnvironmentChallenge:
     environment_id: str
@@ -253,6 +264,7 @@ class EnvironmentChallenge:
     generation: int
     expires_at: float
     attestation: str = OWNERSHIP_ATTESTATION
+    proof_method: str = "https-file"
 
     @property
     def http_url(self) -> str:
@@ -360,7 +372,71 @@ class VerifiedEnvironmentService:
             self.conn.rollback()
             raise
         return EnvironmentChallenge(environment_id, workspace_id, project_ref, normalized, environment_class,
-                                    token, generation, expires_at)
+                                    token, generation, expires_at, proof_method=proof_method)
+
+    @staticmethod
+    def _challenge_from_row(row) -> EnvironmentChallenge:
+        return EnvironmentChallenge(
+            row["environment_id"], row["workspace_id"], row["project_ref"], row["origin"], row["environment_class"],
+            row["challenge_token"], int(row["challenge_generation"]), float(row["challenge_expires_at"]),
+            attestation=row["attestation_text"], proof_method=row["proof_method"],
+        )
+
+    def _closed_reason(self, row, now: float) -> str | None:
+        """Why this scoped record's current challenge cannot be shown, or None while it is live."""
+        if row["revoked_at"] is not None or row["status"] == "revoked":
+            return "revoked"
+        if row["status"] == "verified":
+            return "verified"
+        if row["status"] != "pending" or not row["challenge_token"]:
+            return "missing"
+        if now >= row["challenge_expires_at"]:
+            return "expired"
+        return None
+
+    def recover_pending_challenge(self, workspace_id: str, project_ref: str, environment_id: str) -> EnvironmentChallenge:
+        """Read-only: the current live challenge of one scoped pending record, without rotation or network I/O."""
+        row = self._row(workspace_id, project_ref, environment_id)
+        if row is None:
+            raise EnvironmentNotFound("environment not found")
+        reason = self._closed_reason(row, self._now())
+        if reason is not None:
+            raise EnvironmentChallengeClosed(reason)
+        return self._challenge_from_row(row)
+
+    def rotate_unrecoverable_challenge(self, workspace_id: str, project_ref: str, environment_id: str) -> EnvironmentChallenge:
+        """Replace an expired or missing pending challenge in the same record; its identity and attestation stay.
+
+        One immediate transaction rereads the row, so of concurrent rotations exactly one replaces the challenge
+        and the others observe the now-live generation and fail closed."""
+        with self._db_lock:
+            now = self._now()
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._row(workspace_id, project_ref, environment_id)
+                if row is None:
+                    raise EnvironmentNotFound("environment not found")
+                reason = self._closed_reason(row, now)
+                if reason not in {"expired", "missing"}:
+                    raise EnvironmentChallengeClosed(reason or "live")
+                token = secrets.token_urlsafe(32)
+                generation = int(row["challenge_generation"] or 0) + 1
+                cursor = self.conn.execute(
+                    "UPDATE canary_environments SET challenge_generation=?,challenge_digest=?,challenge_token=?,"
+                    "challenge_created_at=?,challenge_expires_at=?,last_check_at=NULL,last_failure_code='challenge_replaced' "
+                    "WHERE workspace_id=? AND project_ref=? AND environment_id=? AND challenge_generation=? "
+                    "AND status='pending' AND revoked_at IS NULL",
+                    (generation, self._digest(token), token, now, now + ENVIRONMENT_CHALLENGE_TTL,
+                     workspace_id, project_ref, environment_id, row["challenge_generation"]),
+                )
+                if cursor.rowcount != 1:
+                    raise EnvironmentChallengeClosed("live")
+                fresh = self._row(workspace_id, project_ref, environment_id)
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.rollback()
+                raise
+        return self._challenge_from_row(fresh)
 
     def _record_failure(self, workspace_id: str, project_ref: str, environment_id: str,
                         generation: int, code: str, *, expected_digest: str | None = None,

@@ -29,6 +29,22 @@ PLAUSIBILITY_FLOOR = 0.25
 
 
 def _aff(id, kind, category, planted, reach, sev=None, guard=None, decoy=False, **props):
+    # Explicit commercial policy for these authored model fixtures, independent of
+    # planted labels/decoy flags. This is a declaration, never behavioral evidence.
+    policies = {
+        "export": "Protected bulk exports require the export entitlement",
+        "meter": "Billable consumption is accounted in server-owned windows",
+        "trial": "Each eligibility subject receives at most one trial",
+        "seat": "A paid seat is licensed to one person",
+        "record": "Records are accessible only to their owning tenant",
+        "endpoint": "Checkout discounts and restricted routes obey their declared business policy",
+        "agent_tool": "Tool actions remain within caller scope and the declared cost ceiling",
+        "region": "Regional pricing requires eligibility for that billing region",
+    }
+    if kind in policies:
+        props.setdefault("business_rule", policies[kind])
+        props.setdefault("business_rule_applicable", True)
+        props.setdefault("rule_source", "built-in synthetic fixture policy; customer_declared")
     return Affordance(
         id=id, kind=kind, category=category, properties=props,
         guard_present=(guard if guard is not None else planted is None),

@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from enum import Enum
 try:
     import fcntl
 except ImportError:  # pragma: no cover - POSIX capability gate rejects first
@@ -55,6 +56,15 @@ class UnsupportedSecureStorageError(RuntimeError):
 
 class RunnerStoreError(ValueError):
     """Runner state is corrupt, unsafe, or belongs to another target context."""
+
+
+class RunReservationProbe(str, Enum):
+    """Read-only local reservation fact for one run; only ``ABSENT`` proves no reservation exists."""
+
+    ABSENT = "absent"
+    RESERVED = "reserved"
+    JOURNAL_PENDING = "journal_pending"
+    UNRESOLVED = "unresolved"
 
 
 _DIRECTORY_FLAGS = (
@@ -343,6 +353,34 @@ def _label(value: object) -> str:
     if _LABEL.fullmatch(normalized) is None:
         raise ValueError("credential label must be bounded local text")
     return normalized
+
+
+PLAN_LABEL_ROLES = frozenset({"lower_plan", "higher_plan"})
+
+
+def _plan_label(value: object) -> str:
+    """Validate an operator-chosen plan label (e.g. ``free``); it is a name, never a rule."""
+    if (
+        type(value) is not str or not 1 <= len(value) <= 32
+        or any(not 0x20 <= ord(char) <= 0x7E for char in value)
+        or value != value.strip(" ")
+    ):
+        raise ValueError("plan label must be 1-32 printable ASCII characters")
+    return value
+
+
+def _assert_plan_label_distinct(
+    records: list[dict[str, Any]], semantic_role: str, plan_label: str | None,
+) -> None:
+    if plan_label is None:
+        return
+    if semantic_role not in PLAN_LABEL_ROLES:
+        raise ValueError("plan labels apply only to lower_plan and higher_plan")
+    if any(
+        item.get("plan_label") == plan_label and item["semantic_role"] != semantic_role
+        for item in records
+    ):
+        raise ValueError("plan labels must differ between plan roles")
 
 
 def _handle(value: object) -> str:
@@ -774,7 +812,8 @@ def _credential_record(value: Any) -> dict[str, Any]:
         "credential_handle_id", "semantic_role", "auth_profile", "label",
         "backend", "source_kind", "state",
     }
-    if not isinstance(value, Mapping) or set(value) != fields:
+    # Records written before plan labels existed stay valid; the label is optional.
+    if not isinstance(value, Mapping) or set(value) not in (fields, fields | {"plan_label"}):
         raise RunnerStoreError("invalid credential metadata")
     role = value["semantic_role"]
     profile = value["auth_profile"]
@@ -794,7 +833,7 @@ def _credential_record(value: Any) -> dict[str, Any]:
     )
     if source_kind != expected_source:
         raise RunnerStoreError("invalid credential source convention")
-    return {
+    record = {
         "credential_handle_id": _handle(value["credential_handle_id"]),
         "semantic_role": role,
         "auth_profile": profile,
@@ -803,6 +842,14 @@ def _credential_record(value: Any) -> dict[str, Any]:
         "source_kind": source_kind,
         "state": state,
     }
+    if "plan_label" in value:
+        if role not in PLAN_LABEL_ROLES:
+            raise RunnerStoreError("invalid credential plan label")
+        try:
+            record["plan_label"] = _plan_label(value["plan_label"])
+        except ValueError:
+            raise RunnerStoreError("invalid credential plan label") from None
+    return record
 
 
 def _route_record(value: Any, *, require_canonical: bool) -> dict[str, Any]:
@@ -1126,11 +1173,26 @@ class RunnerStore:
             "schema_version", "workspace_id", "runner_id", "runner_key_id",
             "pairing_exchange_digest", "initial_claim_nonce", "initial_claim_sequence",
             "initial_claim_generation", "capabilities", "control_protocol", "activated_at_ms",
+            "grant_authority",
         }
         if not isinstance(value, Mapping) or set(value) != fields:
             raise RunnerStoreError("invalid executable pairing activation response")
+        # v4 only: the control plane's grant-signing public key arrives inside the approved
+        # ceremony, as raw Ed25519 whose key ID is derived from the key, never chosen by it.
+        authority = value["grant_authority"]
+        if not isinstance(authority, Mapping) or set(authority) != {"key_id", "public_key_b64"}:
+            raise RunnerStoreError("invalid executable pairing activation response")
+        authority_key_id, authority_public_b64 = authority["key_id"], authority["public_key_b64"]
+        try:
+            if type(authority_key_id) is not str or type(authority_public_b64) is not str or len(authority_public_b64) != 44:
+                raise ValueError
+            load_public_key_base64(authority_public_b64)
+            derived_key_id = ed25519_key_id(base64.b64decode(authority_public_b64, validate=True))
+        except (TypeError, ValueError):
+            raise RunnerStoreError("invalid executable pairing activation response") from None
         if (
-            value["schema_version"] != "heel.runner-pairing-activated.v3"
+            value["schema_version"] != "heel.runner-pairing-activated.v4"
+            or derived_key_id != authority_key_id
             or value["runner_id"] != pending["runner_id"]
             or value["runner_key_id"] != material.key_id
             or value["pairing_exchange_digest"] != pending["pairing_exchange_digest"]
@@ -1155,6 +1217,7 @@ class RunnerStore:
             "initial_claim_sequence": 1, "initial_claim_generation": 0,
             "capabilities": list(value["capabilities"]), "control_protocol": value["control_protocol"],
             "activated_at_ms": cls._pairing_time(value["activated_at_ms"], "pairing activation time"),
+            "grant_authority": {"key_id": authority_key_id, "public_key_b64": authority_public_b64},
         }, identity)
 
     def _prepare_pairing_activation(
@@ -6888,20 +6951,39 @@ class RunnerStore:
         value = _read_json(context_fd, "routes.json", None)
         if value is None:
             return []
+        return self._inventory_locked(context_fd, value)["routes"]
+
+    def _inventory_locked(self, context_fd: int, value: Any) -> dict[str, Any]:
         payload = self._validate_envelope(
             context_fd, value,
             schema="heel.runner-route-inventory.v1", payload_field="inventory",
         )
         if not isinstance(payload, Mapping) or set(payload) != {"source_digest", "routes"}:
             raise RunnerStoreError("invalid route inventory")
-        _digest(payload["source_digest"], "OpenAPI source digest")
+        source_digest = _digest(payload["source_digest"], "OpenAPI source digest")
         if not isinstance(payload["routes"], list) or len(payload["routes"]) > 2000:
             raise RunnerStoreError("invalid route inventory")
         result = [_route_record(route, require_canonical=True) for route in payload["routes"]]
         expected = sorted(result, key=lambda item: (item["route_template"], item["method"], item["operation_id"]))
         if result != expected:
             raise RunnerStoreError("route inventory is not canonical")
-        return result
+        return {"source_digest": source_digest, "routes": result}
+
+    def route_inventory(self, artifact: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Return the validated imported inventory: the stored one, or a supplied artifact.
+
+        A supplied artifact must be the complete persisted envelope for this exact bound
+        context. It is only read; the stored inventory is never replaced here.
+        """
+        with self._transaction(exclusive=False) as context_fd:
+            value = _read_json(context_fd, "routes.json", None) if artifact is None else artifact
+            if value is None:
+                raise RunnerStoreError("route inventory is unavailable")
+            return self._inventory_locked(context_fd, value)
+
+    def route_inventory_path(self) -> Path:
+        """Return the stored inventory path of the bound context."""
+        return self.root / "runner" / "contexts" / self.namespace / "routes.json"
 
     def save_mapping(
         self,
@@ -6993,8 +7075,9 @@ class RunnerStore:
     def _new_credential(
         *, semantic_role: str, auth_profile: str, label: str,
         backend: str, source_kind: str | None, state: str,
+        plan_label: str | None = None,
     ) -> dict[str, Any]:
-        return _credential_record({
+        value = {
             "credential_handle_id": secrets.token_hex(16),
             "semantic_role": semantic_role,
             "auth_profile": auth_profile,
@@ -7002,7 +7085,12 @@ class RunnerStore:
             "backend": backend,
             "source_kind": source_kind,
             "state": state,
-        })
+        }
+        if plan_label is not None:
+            if semantic_role not in PLAN_LABEL_ROLES:
+                raise ValueError("plan labels apply only to lower_plan and higher_plan")
+            value["plan_label"] = _plan_label(plan_label)
+        return _credential_record(value)
 
     def register_ephemeral_credential(
         self,
@@ -7011,18 +7099,20 @@ class RunnerStore:
         auth_profile: str,
         source_kind: str,
         label: str,
+        plan_label: str | None = None,
     ) -> dict[str, Any]:
         backend = {"environment": "ephemeral_env", "inherited_fd": "ephemeral_fd"}.get(source_kind)
         if backend is None:
             raise ValueError("ephemeral source must be environment or inherited_fd")
         record = self._new_credential(
             semantic_role=semantic_role, auth_profile=auth_profile, label=label,
-            backend=backend, source_kind=source_kind, state="active",
+            backend=backend, source_kind=source_kind, state="active", plan_label=plan_label,
         )
         with self._transaction(exclusive=True) as context_fd:
             records = self._credentials_locked(context_fd)
             if any(item["semantic_role"] == semantic_role for item in records):
                 raise ValueError("credential semantic role already registered")
+            _assert_plan_label_distinct(records, semantic_role, record.get("plan_label"))
             records.append(record)
             self._write_credentials_locked(context_fd, records)
         return record
@@ -7033,17 +7123,19 @@ class RunnerStore:
         auth_profile: str,
         label: str,
         backend: str,
+        plan_label: str | None = None,
     ) -> dict[str, Any]:
         if backend not in {"macos_keychain", "linux_secret_service"}:
             raise ValueError("invalid OS credential backend")
         record = self._new_credential(
             semantic_role=semantic_role, auth_profile=auth_profile, label=label,
-            backend=backend, source_kind=None, state="pending",
+            backend=backend, source_kind=None, state="pending", plan_label=plan_label,
         )
         with self._transaction(exclusive=True) as context_fd:
             records = self._credentials_locked(context_fd)
             if any(item["semantic_role"] == semantic_role for item in records):
                 raise ValueError("credential semantic role already registered")
+            _assert_plan_label_distinct(records, semantic_role, record.get("plan_label"))
             records.append(record)
             self._write_credentials_locked(context_fd, records)
         return record
@@ -7077,6 +7169,7 @@ class RunnerStore:
         label: str,
         vault: object,
         secret: bytes,
+        plan_label: str | None = None,
     ) -> dict[str, Any]:
         backend = getattr(vault, "backend_id", None)
         if backend not in {"macos_keychain", "linux_secret_service"}:
@@ -7088,12 +7181,14 @@ class RunnerStore:
             backend=backend,
             source_kind=None,
             state="pending",
+            plan_label=plan_label,
         )
         handle_id = record["credential_handle_id"]
         with self._transaction(exclusive=True) as context_fd:
             records = self._credentials_locked(context_fd)
             if any(item["semantic_role"] == semantic_role for item in records):
                 raise ValueError("credential semantic role already registered")
+            _assert_plan_label_distinct(records, semantic_role, record.get("plan_label"))
             records.append(record)
             self._write_credentials_locked(context_fd, records)
             attempted = False
@@ -7144,6 +7239,13 @@ class RunnerStore:
                 if vault.exists(handle_id):
                     self.activate_credential(handle_id)
                 else:
+                    if record["backend"] == "macos_keychain":
+                        # A Keychain store interrupted before its header commit leaves chunk
+                        # items under this handle; sweep them, or keep the record to retry.
+                        try:
+                            vault.delete(handle_id)
+                        except Exception:
+                            continue
                     self._set_credential_state(handle_id, None)
             else:
                 try:
@@ -7511,6 +7613,53 @@ class RunnerStore:
             finally:
                 os.close(runs_fd)
         return state
+
+    def probe_run_reservation(self, run_id: str) -> RunReservationProbe:
+        """Classify one run's local reservation without writing run authority.
+
+        Unlike ``recover_run_reservation`` this never rolls a run-authority or compaction journal
+        forward and never creates ``runs/``; the shared lock excludes every writer.  A pending
+        journal, for any run, is ``JOURNAL_PENDING`` when its signed form validates and
+        ``UNRESOLVED`` otherwise.  Every store or filesystem error is ``UNRESOLVED``, and so is a
+        run the validated index lists without its reservation record: malformed state is never
+        reported as ``ABSENT``.
+        """
+        identity, _signer = self._require_runtime_authority()
+        run_hash = self._run_hash(run_id)
+        try:
+            with self._transaction(exclusive=False) as context_fd:
+                runs_fd = _open_child(context_fd, "runs", create=False)
+                if runs_fd is None:
+                    return RunReservationProbe.ABSENT
+                try:
+                    _secure_directory(runs_fd, "Heel runner runs directory")
+                    journal = _read_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, None)
+                    compaction = _read_json(runs_fd, _RUN_AUTHORITY_COMPACTION_JOURNAL_FILENAME, None)
+                    if journal is not None or compaction is not None:
+                        if journal is not None:
+                            self._validate_run_authority_journal(journal, identity=identity)
+                        if compaction is not None:
+                            self._validate_run_authority_compaction_journal(compaction, identity=identity)
+                        return RunReservationProbe.JOURNAL_PENDING
+                    index = self._run_authority_index_locked(runs_fd, identity=identity)
+                    reservation = _read_json(
+                        runs_fd, self._run_authority_record_filename("reserve", run_hash), None,
+                    )
+                    if reservation is not None:
+                        return RunReservationProbe.RESERVED
+                    # The signed index still names this run, so its missing record is contradictory
+                    # current state, never proof of absence.
+                    if any(
+                        item["run_hash"] == run_hash
+                        for item in (*index["nonterminal_runs"], *index["terminal_queue"])
+                    ):
+                        return RunReservationProbe.UNRESOLVED
+                    return RunReservationProbe.ABSENT
+                finally:
+                    os.close(runs_fd)
+        except (OSError, ValueError, TypeError):
+            # RunnerStoreError and canonical ContractError are ValueErrors.
+            return RunReservationProbe.UNRESOLVED
 
     def recover_run_reservation(self, run_id: str) -> dict[str, Any]:
         """Read committed run authority; only a still-present reserve journal may repair files."""

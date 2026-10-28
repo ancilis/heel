@@ -74,7 +74,8 @@ class TestAbuseRegressions(RegressionBase):
         self.assertEqual(reg["source_run_id"], self.run_id)
         self.assertEqual(reg["expected_status"], "blocked")
         self.assertEqual(reg["target_affordance_pattern"]["affordance_id"], "trial_signup")
-        self.assertEqual(reg["success_criterion"], {"prop": "identity_check", "equals": "email_only"})
+        self.assertEqual(reg["success_criterion"]["all_of"][-1], {"prop": "identity_check", "equals": "email_only"})
+        self.assertIn({"prop": "business_rule_applicable", "equals": True}, reg["success_criterion"]["all_of"])
         self.assertEqual(reg["recommended_control"], "device/identity fingerprinting + trial-per-identity limit")
         self.assertTrue(reg["safety_flags"]["canary_only"])
         self.assertTrue(reg["safety_flags"]["contained"])
@@ -225,3 +226,73 @@ class TestAbuseRegressions(RegressionBase):
         self.assertEqual(reg["scenario_id"], vector["scenario_id"])
         self.assertEqual(reg["success_criterion"]["observed"], vector["reproduction"]["observed"])
         self.assertEqual(result["current_status"], "still_reachable")
+
+    def test_inconclusive_plan_differential_runtime_record_cannot_become_regression(self):
+        from heel.contracts import AbuseVector, Category, Severity
+        from heel.regressions import RegressionError
+
+        def vector(vector_id, scenario_id, reproduction):
+            return AbuseVector(
+                id=vector_id, scenario_id=scenario_id, category=Category.LICENSE_ENTITLEMENT,
+                reproduction=reproduction, severity=Severity(0.3, 0.3, 0.5),
+                reachability_score=0.3, plausible=False, recommended_control="gate exports",
+                target_id="https://staging.heel.dev", affordance_id="GET /api/export",
+            )
+
+        def runtime(state, predicate):
+            return {
+                "contained": True, "sample": "canary_only", "evidence_state": state,
+                "predicate": predicate, "observed": {"predicate": predicate},
+                "provenance": {"kind": "plan_differential_execution", "network_calls": True},
+            }
+
+        run_id = "pdrun-" + "0" * 32
+        self.store.add_run(run_id, self.scope.scope_id, "https://staging.heel.dev", "cli:test",
+                           "complete", 0)
+        rejected = {
+            # Stored by earlier runs: status parity alone and an undecided lower response.
+            "pdv-row8": vector("pdv-row8", "plan_differential.status_parity",
+                               runtime("inconclusive", "status_parity")),
+            "pdv-row9": vector("pdv-row9", "plan_differential.inconclusive",
+                               runtime("inconclusive", "inconclusive")),
+            # Runtime provenance whose scenario does not name its own predicate.
+            "pdv-mismatch": vector("pdv-mismatch", "plan_differential.body_superset",
+                                   runtime("observed", "status_parity")),
+        }
+        admitted = {
+            "pdv-observed": vector("pdv-observed", "plan_differential.body_superset",
+                                   runtime("observed", "body_superset")),
+            "pdv-verified": vector("pdv-verified", "plan_differential.marker_leak",
+                                   runtime("verified", "marker_leak")),
+            # The same name and evidence state without runtime provenance is not a runtime
+            # record: a bare prefix or evidence state is never the discriminator.
+            "static-named": vector("static-named", "plan_differential.status_parity",
+                                   {"evidence_state": "inconclusive", "predicate": "status_parity",
+                                    "provenance": {"kind": "static_review"}}),
+            "static-plain": vector("static-plain", "sc.discovered.export",
+                                   {"evidence_state": "inconclusive", "observed": {}}),
+        }
+        for item in [*rejected.values(), *admitted.values()]:
+            self.store.add_finding(run_id, item)
+
+        for vector_id in rejected:
+            with self.assertRaises(RegressionError) as raised:
+                add_regression_from_finding(self.store, run_id=run_id, vector_id=vector_id,
+                                            name="legacy-" + vector_id)
+            self.assertEqual(
+                str(raised.exception),
+                "an inconclusive plan-differential result cannot become a regression",
+            )
+        self.assertEqual(self.store.list_regressions(), [])
+        for vector_id in admitted:
+            regression = add_regression_from_finding(self.store, run_id=run_id,
+                                                     vector_id=vector_id, name="ok-" + vector_id)
+            self.assertEqual(regression["original_vector_id"], vector_id)
+        self.assertEqual(
+            sorted(item["original_vector_id"] for item in self.store.list_regressions()),
+            sorted(admitted),
+        )
+        # Rejected records stay readable: nothing is deleted or rewritten.
+        for vector_id in rejected:
+            stored = self.store.find_vector(vector_id, run_id=run_id)
+            self.assertEqual(stored["reproduction"], rejected[vector_id].reproduction)

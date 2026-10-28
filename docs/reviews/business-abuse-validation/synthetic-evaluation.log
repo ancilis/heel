@@ -1,0 +1,1 @@
+held-out TEST (synthetic vocabulary, 199 weaknesses, sha 3dba248623ccfc47): localization recall 0.417 cluster-CI [0.335, 0.51], ATTRIBUTION recall 0.251 cluster-CI [0.198, 0.311], precision 0.976 cluster-CI [0.944, 1.0]. exact-match 0.101; DEV 0.711. Not near 1.0: the honest ceiling. (old headline kept below)

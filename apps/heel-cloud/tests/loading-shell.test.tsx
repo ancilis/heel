@@ -12,7 +12,7 @@ describe("Heel server-rendered product shell", () => {
 
     const status = screen.getByRole("status");
     expect(status.getAttribute("aria-live")).toBe("polite");
-    expect(screen.getByRole("heading", { name: /find the launch blocker/i })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /find the abuse hiding/i })).toBeTruthy();
     expect(status.textContent).toContain("Example review complete");
     expect(screen.getAllByText(/global beyond intended tenant/i).length).toBeGreaterThan(0);
   });

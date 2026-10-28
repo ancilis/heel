@@ -168,18 +168,30 @@ function parseReviewSummary(value: unknown): HeelCloudReviewSummary {
 
 
 const PUBLIC_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  account_exists: "An account with that email already exists. Sign in instead.",
   approval_expired: "That approval expired. Review the exact JSON and approve it again.",
   approval_required: "Confirm this exact findings-only preview before syncing.",
   auth_required: "Sign in to use Heel Cloud continuity.",
   conflict: "This local projection no longer matches its cloud record.",
+  forbidden: "Your role in this workspace does not allow that action.",
   invalid_request: "Heel could not safely prepare that cloud request.",
   invalid_response: "Heel Cloud returned an invalid response.",
   invalid_grant: "That device code is invalid, expired, or already used.",
+  invalid_login: "That email and password did not match an account.",
+  invalid_project_request: "Use a project name of 1 to 120 printable characters.",
+  invalid_signup: "Enter a valid email and a password of at least 10 characters.",
   quota_exceeded: "This workspace has reached its synced-review allowance.",
+  rate_limited: "Too many attempts. Wait a few minutes before trying again.",
   unavailable: "Heel Cloud is temporarily unavailable. Your local result is unchanged.",
   recent_auth_required: "Sign in again before authorizing a device.",
 });
 const PUBLIC_ERROR_CODES = new Set(Object.keys(PUBLIC_MESSAGES));
+
+/** Route-specific status meanings; the server's account errors carry free text, never a code. */
+type StatusCodes = Readonly<Partial<Record<number, string>>>;
+const SIGNUP_STATUS: StatusCodes = Object.freeze({ 400: "invalid_signup", 409: "account_exists", 429: "rate_limited" });
+const LOGIN_STATUS: StatusCodes = Object.freeze({ 400: "invalid_request", 403: "invalid_login", 429: "rate_limited" });
+const PROJECT_STATUS: StatusCodes = Object.freeze({ 403: "forbidden" });
 
 export class HeelCloudApiError extends Error {
   readonly code: string;
@@ -203,7 +215,7 @@ export class HeelCloudApi {
   }
 
   async signup(email: string, password: string): Promise<{ userId: string; workspaceRef: string }> {
-    const value = await this.#json("/v1/signup", "POST", { email, password }, 201);
+    const value = await this.#json("/v1/signup", "POST", { email, password }, 201, SIGNUP_STATUS);
     if (!exactFields(value, ["user_id", "workspace_id"])
       || typeof value.user_id !== "string" || !USER_REF.test(value.user_id)
       || typeof value.workspace_id !== "string" || !WORKSPACE_REF.test(value.workspace_id)) {
@@ -213,7 +225,7 @@ export class HeelCloudApi {
   }
 
   async login(email: string, password: string): Promise<{ userId: string }> {
-    const value = await this.#json("/v1/login", "POST", { email, password }, 200);
+    const value = await this.#json("/v1/login", "POST", { email, password }, 200, LOGIN_STATUS);
     if (!exactFields(value, ["user_id"])
       || typeof value.user_id !== "string" || !USER_REF.test(value.user_id)) {
       throw new HeelCloudApiError("invalid_response", 502);
@@ -317,14 +329,14 @@ export class HeelCloudApi {
 
   async createProject(workspaceRef: string, name: string): Promise<HeelCloudProject> {
     if (!closedString(name, 120)) throw new HeelCloudApiError("invalid_request", 0);
-    const value = await this.#jsonPath(projectPath(workspaceRef), "POST", { name }, 201);
+    const value = await this.#jsonPath(projectPath(workspaceRef), "POST", { name }, 201, PROJECT_STATUS);
     const project = parseProject(value);
     if (project.workspaceRef !== workspaceRef) throw new HeelCloudApiError("invalid_response", 502);
     return project;
   }
 
   async listProjects(workspaceRef: string): Promise<HeelCloudProject[]> {
-    const value = await this.#jsonPath(projectPath(workspaceRef), "GET", undefined, 200);
+    const value = await this.#jsonPath(projectPath(workspaceRef), "GET", undefined, 200, PROJECT_STATUS);
     if (!exactFields(value, ["projects"]) || !Array.isArray(value.projects) || value.projects.length > 500) {
       throw new HeelCloudApiError("invalid_response", 502);
     }
@@ -419,8 +431,9 @@ export class HeelCloudApi {
     method: "GET" | "POST",
     body: JsonRecord | undefined,
     expectedStatus: number,
+    statusCodes?: StatusCodes,
   ): Promise<JsonRecord> {
-    return this.#jsonPath(`${CONTROL_PLANE_PREFIX}${path}`, method, body, expectedStatus);
+    return this.#jsonPath(`${CONTROL_PLANE_PREFIX}${path}`, method, body, expectedStatus, statusCodes);
   }
 
   async #jsonPath(
@@ -428,13 +441,14 @@ export class HeelCloudApi {
     method: "GET" | "POST",
     body: JsonRecord | undefined,
     expectedStatus: number,
+    statusCodes?: StatusCodes,
   ): Promise<JsonRecord> {
     const response = await this.#request(
       path,
       method,
       body === undefined ? undefined : JSON.stringify(body),
     );
-    if (response.status !== expectedStatus) throw await this.#responseError(response);
+    if (response.status !== expectedStatus) throw await this.#responseError(response, statusCodes);
     const value = await this.#parsedJson(response);
     if (!isRecord(value)) throw new HeelCloudApiError("invalid_response", 502);
     return value;
@@ -490,11 +504,11 @@ export class HeelCloudApi {
     }
   }
 
-  async #responseError(response: Response): Promise<HeelCloudApiError> {
-    let code = response.status === 401 ? "auth_required"
+  async #responseError(response: Response, statusCodes?: StatusCodes): Promise<HeelCloudApiError> {
+    let code = statusCodes?.[response.status] ?? (response.status === 401 ? "auth_required"
       : response.status === 402 ? "quota_exceeded"
         : response.status === 409 ? "conflict"
-          : "unavailable";
+          : "unavailable");
     try {
       const value = await this.#parsedJson(response);
       if (isRecord(value) && typeof value.code === "string" && PUBLIC_ERROR_CODES.has(value.code)) {

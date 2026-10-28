@@ -94,6 +94,11 @@ class AbuseScenario:
     recommended_control: str = ""
     exploitability_reduction: float = 0.6
     handoff: str = ""                      # "" | "appsec" | "model_redteam"
+    evidence_state: str = "inferred"
+    execution_support: str = "static_only"
+    rule_source: str = "customer declaration required"
+    mechanism_id: str = ""
+    investigation_signals: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #

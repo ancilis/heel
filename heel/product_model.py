@@ -149,6 +149,7 @@ def validate_product_model(model: Mapping[str, Any]) -> ValidationResult:
     if "safety_notes" in model and isinstance(model["safety_notes"], list) and not model["safety_notes"]:
         errors.append("safety_notes must include at least one operator-written safety note")
 
+    _validate_business_context(model, errors)
     _find_secret_material(model, "$", errors)
 
     if "production" in (envs or []) and not model.get("canary_accounts"):
@@ -197,3 +198,40 @@ def _find_secret_material(value: Any, path: str, errors: list[str]) -> None:
             _find_secret_material(item, f"{path}[{i}]", errors)
     elif isinstance(value, str) and _SECRET_VALUE_RE.search(value):
         errors.append(f"{path}: value looks secret-bearing; remove it or replace it with a canary/redacted reference")
+
+
+def _validate_business_context(model: Mapping[str, Any], errors: list[str]) -> None:
+    """Optional product intent beyond OpenAPI; input assertions are declarations only."""
+    rules = model.get("business_rules", [])
+    sequences = model.get("lifecycle_sequences", [])
+    if not isinstance(rules, list) or len(rules) > 64:
+        errors.append("business_rules must be a list of at most 64 declarations")
+        return
+    identifiers = set()
+    for rule in rules:
+        if not isinstance(rule, Mapping) or not all(_nonempty_string(rule.get(k)) for k in ("id", "statement", "source")):
+            errors.append("business rule requires id, statement and source")
+            continue
+        if rule["id"] in identifiers:
+            errors.append("business rule identifiers must be unique")
+        identifiers.add(rule["id"])
+        if rule.get("evidence_state", "customer_declared") not in ("unknown", "customer_declared", "inferred"):
+            errors.append("product input cannot certify observed or verified behavior")
+    if not isinstance(sequences, list) or len(sequences) > 32:
+        errors.append("lifecycle_sequences must be a list of at most 32 sequences")
+        return
+    for sequence in sequences:
+        if not isinstance(sequence, Mapping) or not _nonempty_string(sequence.get("rule_id")) or sequence["rule_id"] not in identifiers:
+            errors.append("lifecycle sequence must reference a declared rule")
+            continue
+        actions = sequence.get("actions")
+        if not isinstance(actions, list) or not actions or len(actions) > 16:
+            errors.append("lifecycle actions must contain 1 to 16 ordered actions")
+            continue
+        if sequence.get("evidence_state", "unknown") not in ("unknown", "customer_declared", "inferred"):
+            errors.append("modeled sequences cannot certify behavior")
+        if sequence.get("executed", False) is not False:
+            errors.append("modeled sequences cannot claim execution")
+        for ordinal, action in enumerate(actions):
+            if not isinstance(action, Mapping) or type(action.get("ordinal")) is not int or action.get("ordinal") != ordinal or not all(_nonempty_string(action.get(k)) for k in ("actor", "action")):
+                errors.append("lifecycle actions require ordered ordinals, actor and action")

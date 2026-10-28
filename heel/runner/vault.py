@@ -1,6 +1,8 @@
 """Fail-closed adapters for runner-local canary credentials."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import platform
@@ -12,12 +14,31 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+from .identity import security_interactive_add_command
+
 MAX_SECRET_BYTES = 16 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 4 * 1024
 _HANDLE = re.compile(r"^[0-9a-f]{32}$", flags=re.ASCII)
 _MACOS_SECURITY = "/usr/bin/security"
 _LINUX_SECRET_TOOLS = frozenset({"/usr/bin/secret-tool"})
 _MINIMAL_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+_KEYCHAIN_CHUNK_CHARS = 3072
+_KEYCHAIN_HEADER = re.compile(rb"^v2\.([1-9][0-9]{0,4})\.([1-8])\.([0-9a-f]{32})$", flags=re.ASCII)
+
+
+def _encoded_length(length: int) -> int:
+    return 4 * ((length + 2) // 3)
+
+
+def _chunk_count(encoded_length: int) -> int:
+    return (encoded_length + _KEYCHAIN_CHUNK_CHARS - 1) // _KEYCHAIN_CHUNK_CHARS
+
+
+def _keychain_tag(secret: bytes) -> str:
+    return hashlib.sha256(secret).hexdigest()[:32]
+
+
+_KEYCHAIN_MAX_CHUNKS = _chunk_count(_encoded_length(MAX_SECRET_BYTES))
 
 
 class SecretTooLargeError(ValueError):
@@ -328,8 +349,28 @@ class _CommandVault:
 
 
 class KeychainVault(_CommandVault):
+    """macOS Keychain credential vault, format v2 (chunked, header-committed).
+
+    Measured ``/usr/bin/security`` limits (macOS 15.1): the prompted ``add-generic-password -w``
+    keeps at most 128 bytes and needs the value twice (given once it stored an EMPTY item with
+    exit 0); a ``security -i`` command line of more than 4095 bytes is cut, stores a truncated
+    value and the rest runs as further commands; ``-i`` exits with the status of its LAST command
+    only. A 16 KiB credential (21 848 base64 characters) therefore cannot be one item.
+
+    v2 stores the base64 text in chunk items ``<handle>.0`` .. ``<handle>.<count-1>`` (3072
+    characters each, the last 1..3072) and commits them with the header item ``<handle>`` =
+    ``v2.<len>.<count>.<sha256 prefix>``, written LAST. Every item is one ``security -i``
+    invocation holding one command line on stdin (never argv, never ``-U``); a duplicate (exit
+    45) means another writer owns the slot and aborts the store without touching it. The tag
+    only detects truncated, swapped or stale chunks; the Keychain ACL is the boundary.
+
+    Items under the earlier v1 service (raw value) are only read and deleted, never written or
+    migrated; an empty one (what every v1 store produced) fails closed.
+    """
+
     backend_id = "macos_keychain"
-    service = "heel.runner.canary.v1"
+    service = "heel.runner.canary.v2"
+    legacy_service = "heel.runner.canary.v1"
 
     def __init__(self, **kwargs):
         super().__init__(
@@ -339,43 +380,118 @@ class KeychainVault(_CommandVault):
             **kwargs,
         )
 
-    def _lookup(self, handle_id: str, *, reveal: bool = False):
+    def _find(self, service: str, account: str, *, reveal: bool = False):
         suffix = ("-w",) if reveal else ()
-        return self._run((
-            "find-generic-password", "-s", self.service, "-a", _handle(handle_id), *suffix,
-        ))
+        return self._run(("find-generic-password", "-s", service, "-a", account, *suffix))
 
-    def exists(self, handle_id: str) -> bool:
-        result = self._lookup(handle_id)
+    @staticmethod
+    def _found(result) -> bool:
         if result.returncode == 0:
             return True
         if result.returncode == 44:
             return False
         raise VaultUnavailable("secure credential vault unavailable")
 
+    def _remove(self, service: str, account: str) -> bool:
+        try:
+            return self._run(("delete-generic-password", "-s", service, "-a", account)).returncode in {0, 44}
+        except VaultUnavailable:
+            return False
+
+    def exists(self, handle_id: str) -> bool:
+        """A committed v2 header or a v1 item; chunks without a header are not a credential."""
+        handle_id = _handle(handle_id)
+        return (
+            self._found(self._find(self.service, handle_id))
+            or self._found(self._find(self.legacy_service, handle_id))
+        )
+
     def load(self, handle_id: str) -> bytes:
-        result = self._lookup(handle_id, reveal=True)
-        if result.returncode == 44:
+        handle_id = _handle(handle_id)
+        header = self._find(self.service, handle_id, reveal=True)
+        if self._found(header):
+            # Once a v2 header exists the legacy item is never consulted, even on failure.
+            return self._load_v2(handle_id, header.stdout.removesuffix(b"\n"))
+        legacy = self._find(self.legacy_service, handle_id, reveal=True)
+        if not self._found(legacy):
             raise VaultUnavailable("secure credential was not found")
-        if result.returncode != 0:
-            raise VaultUnavailable("secure credential vault unavailable")
-        return _secret(result.stdout.removesuffix(b"\n"))
+        value = legacy.stdout.removesuffix(b"\n")
+        if not value:
+            raise VaultUnavailable("secure credential is empty; remove it and add it again")
+        return _secret(value)
+
+    def _load_v2(self, handle_id: str, header: bytes) -> bytes:
+        invalid = VaultUnavailable("secure credential vault returned invalid material")
+        match = _KEYCHAIN_HEADER.fullmatch(header)
+        if match is None:
+            raise invalid
+        length, count, tag = int(match.group(1)), int(match.group(2)), match.group(3).decode("ascii")
+        encoded_length = _encoded_length(length)
+        if length > MAX_SECRET_BYTES or count != _chunk_count(encoded_length):
+            raise invalid
+        encoded = bytearray()
+        for index in range(count):
+            expected = min(_KEYCHAIN_CHUNK_CHARS, encoded_length - index * _KEYCHAIN_CHUNK_CHARS)
+            chunk = self._find(self.service, f"{handle_id}.{index}", reveal=True)
+            if chunk.returncode != 0:
+                raise invalid
+            value = chunk.stdout.removesuffix(b"\n")
+            if len(value) != expected:
+                raise invalid
+            encoded.extend(value)
+        try:
+            secret = base64.b64decode(bytes(encoded), validate=True)
+        except ValueError:
+            raise invalid from None
+        if len(secret) != length or _keychain_tag(secret) != tag:
+            raise invalid
+        return _secret(secret)
 
     def store(self, handle_id: str, secret: bytes) -> None:
         handle_id = _handle(handle_id)
+        secret = _secret(secret)
+        encoded = base64.b64encode(secret)
+        count = _chunk_count(len(encoded))
+        if count > _KEYCHAIN_MAX_CHUNKS:
+            raise SecretTooLargeError("secret exceeds the 16 KiB limit")
+        items = [
+            (f"{handle_id}.{index}", encoded[index * _KEYCHAIN_CHUNK_CHARS:(index + 1) * _KEYCHAIN_CHUNK_CHARS])
+            for index in range(count)
+        ]
+        items.append((handle_id, f"v2.{len(secret)}.{count}.{_keychain_tag(secret)}".encode("ascii")))
+        commands = [security_interactive_add_command(self.service, account, value) for account, value in items]
         if self.exists(handle_id):
             raise VaultUnavailable("secure credential already exists")
-        result = self._run((
-            "add-generic-password", "-s", self.service, "-a", handle_id, "-w",
-        ), payload=_secret(secret))
-        if result.returncode != 0:
-            raise VaultUnavailable("secure credential vault unavailable")
+        created: list[str] = []
+        try:
+            for (account, _value), command in zip(items, commands):
+                returncode = self._run(("-i",), payload=command).returncode
+                if returncode == 45:
+                    # Another writer owns this slot: never touch it, only what this call created.
+                    raise VaultUnavailable("secure credential already exists")
+                if returncode != 0:
+                    raise VaultUnavailable("secure credential vault unavailable")
+                created.append(account)
+            # ``security -i`` exit 0 is not proof of the write: the header commit must read back.
+            try:
+                verified = self.load(handle_id) == secret
+            except VaultUnavailable:
+                verified = False
+            if not verified:
+                raise VaultUnavailable("secure credential vault unavailable")
+        except VaultUnavailable as error:
+            # Header (last created) first, so a partly removed credential is already unreadable.
+            if not all([self._remove(self.service, account) for account in reversed(created)]):
+                error.add_note("secure credential cleanup incomplete")
+            raise
 
     def delete(self, handle_id: str) -> None:
-        result = self._run((
-            "delete-generic-password", "-s", self.service, "-a", _handle(handle_id),
-        ))
-        if result.returncode not in {0, 44}:
+        handle_id = _handle(handle_id)
+        accounts = [(self.service, handle_id)]
+        accounts += [(self.service, f"{handle_id}.{index}") for index in range(_KEYCHAIN_MAX_CHUNKS)]
+        accounts.append((self.legacy_service, handle_id))
+        # Header first makes the credential unreadable at once; every slot is still attempted.
+        if not all([self._remove(service, account) for service, account in accounts]):
             raise VaultUnavailable("secure credential vault unavailable")
 
 

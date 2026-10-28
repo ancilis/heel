@@ -69,6 +69,9 @@ class RiskFinding:
     control: str
     reason: str
     reachable: bool
+    evidence_state: str = "inferred"
+    rule_source: str = "unknown"
+    execution_disposition: str = "static_only"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +82,9 @@ class RiskFinding:
             "control": self.control,
             "reason": self.reason,
             "reachable": self.reachable,
+            "evidence_state": self.evidence_state,
+            "rule_source": self.rule_source,
+            "execution_disposition": self.execution_disposition,
         }
 
 
@@ -134,6 +140,15 @@ def review_product_models(before: Mapping[str, Any], after: Mapping[str, Any]) -
     risks = []
     for surface in changed:
         risks.extend(_risk_findings(surface))
+    # An operation may also be represented as an export; count each invariant once.
+    identities = {(s.surface_type, s.surface_id):
+                  (s.after.get("method"), s.after.get("route")) for s in changed}
+    deduped = {}
+    for risk in risks:
+        location = identities[(risk.surface_type, risk.surface_id)]
+        key = (location if all(location) else (risk.surface_type, risk.surface_id), risk.risk)
+        deduped[key] = risk
+    risks = [deduped[key] for key in deduped]
     high = [r for r in risks if r.severity == "block"]
     gate = "block" if high else "warn" if risks else "pass"
     regressions = _suggested_regressions(risks)
@@ -200,6 +215,8 @@ def _risk_findings(surface: ChangedSurface) -> list[RiskFinding]:
 
 
 def _export_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> list[RiskFinding]:
+    if props.get("bulk_access_permitted") is True:
+        return []
     findings = []
     entitlement_missing = _bad_control(_first(props, "entitlement_check", "authz_check", "guard", "guard_present"))
     quota_missing = _bad_control(_first(props, "tenant_quota", "quota", "rate_limit", "export_limit"))
@@ -288,6 +305,8 @@ def _meter_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> list[Risk
 
 
 def _coupon_risks(surface: ChangedSurface, props: Mapping[str, Any]) -> list[RiskFinding]:
+    if props.get("stacking_permitted") is True:
+        return []
     stackable = _truthy(props.get("stackable"))
     redemption_missing = _bad_control(_first(props, "redemption_limit", "max_redemptions", "per_account_limit", "proof_of_uniqueness"))
     if not (stackable and redemption_missing):
@@ -396,7 +415,9 @@ def _tenant_data_control_risks(surface: ChangedSurface, props: Mapping[str, Any]
 
 
 def _finding(surface: ChangedSurface, *, risk: str, severity: str, control: str, reason: str, reachable: bool) -> RiskFinding:
-    return RiskFinding(surface.surface_type, surface.surface_id, risk, severity, control, reason, reachable)
+    rule = surface.after.get("business_rule") or surface.after.get("required_plan")
+    qualification = "Customer-declared model hypothesis; behavior unverified. " if rule else "Investigation prompt; intended product rule unknown and behavior unverified. "
+    return RiskFinding(surface.surface_type, surface.surface_id, risk, severity, control, qualification + reason, reachable, "inferred", str(surface.after.get("rule_source") or "unknown"))
 
 
 def _suggested_regressions(risks: list[RiskFinding]) -> list[SuggestedRegression]:
@@ -449,7 +470,7 @@ def _first(props: Mapping[str, Any], *names: str) -> Any:
 
 
 def _bad_control(value: Any) -> bool:
-    if value is False or value is None:
+    if value is False:
         return True
     if isinstance(value, str):
         return value.strip().lower() in _MISSING_VALUES

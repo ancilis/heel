@@ -147,3 +147,23 @@ before `HEEL_BILLING_MODE` can change from `free_launch`.
 
 See `RUNBOOKS.md` for incident, restore, rotation, origin-change, and privacy response
 procedures.
+
+## Owner-private local review deployment
+
+The existing Sites project is an owner-only preview at
+`https://heel-agent-first-private.hellostella.chatgpt.site`. Its local review,
+Agent downloads, and reference-result viewer can run without a private control plane.
+For that deployment only, build with:
+
+```bash
+HEEL_DEPLOYMENT_MODE=local_review \
+HEEL_PUBLIC_ORIGIN=https://heel-agent-first-private.hellostella.chatgpt.site \
+  npm run build
+```
+
+This mode emits **no `CONTROL_PLANE` service binding** and rejects a supplied VPC
+service ID. Account/sync APIs retain their existing fail-closed behavior. It does
+not configure or deploy the Python control plane or make cloud runner pairing work.
+The default `full` mode still requires a real VPC service UUID and canonical origin.
+Use Sites version saving and private deployment for the configured project; preserve
+its current audience. Never deploy the example UUID used by artifact tests.

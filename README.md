@@ -17,34 +17,52 @@ Six months later, the same product may be dealing with trial farming already hap
 on mature accounts, export scraping by legitimate customers, AI-token cost abuse, integration/OAuth
 overreach, or support/workflow gaming after an incident.
 
-**Heel is abuse rehearsal for SaaS.** A swarm of adversarial and opportunistic agents
-probes a product *you own*, proves an abuse path is **reachable** with a *contained* proof-of-concept,
-and hands you a ranked report with the fix, before launch and continuously after.
+**Heel helps product and security teams discover business-abuse hypotheses, validate a bounded behavior, and retain the resulting check.** The initial executable workflow is a synthetic export entitlement reference: a lower-plan user obtains protected export value, the hardened product blocks it, and the same invariant becomes a regression.
 
-Pre-launch launch review remains the sharpest default use case. Existing products are supported
-through existing-product rehearsal: authorized, contained, canary-only runs against staging,
-imported product models, sanitized telemetry, or explicitly authorized production-like targets.
-Heel is not a default permission slip for production probing: every non-synthetic path starts with a
-human-created scope and operator-approved limits. There is no scope creation, widening, relaxation,
-or mutation path over MCP, REST, or agent surfaces.
+Static OpenAPI/ProductModel review and the broader scenario library remain useful investigation tools. They do not prove runtime control failures. Unknown specification fields become questions; customer answers are declarations. AI/agent abuse is one optional surface. Trial/promotion eligibility and cumulative usage are modeled but not live-validated.
 
-It is **agent-native** (its canonical surface is an **MCP server** other agents call), **honest** (it
-reports its *real* detection rate against abuse it has never seen, not a vanity number), and
-**safe by construction** (synthetic-first, contained PoCs, an authorization gate no prompt-injected
-agent can talk its way past). Pure Python standard library, **zero dependencies**.
+See the [current capability matrix](docs/CAPABILITIES.md) and [runnable export demo](docs/EXPORT_DEMO.md). The core static analyzer has zero runtime dependencies; the signed reference runner requires the `runner` extra. No production targets, real payments, bulk extraction or exhaustion are supported in this workflow. Cloud pairing and arbitrary customer-target execution are incomplete public journeys.
 
 ## Five-minute local launch review
 
-The Heel Cloud app now carries the verified Agent wheel, source archive, and manifest on its own
-origin. Open `/agent`, choose **Download Heel Agent 1.2.0**, and save
-`/downloads/heel_sim-1.2.0-py3-none-any.whl` in an empty working directory. Then install it into an
-isolated environment and review a sanitized OpenAPI document you own:
+This local review is optional. Heel 1.3.0rc1 is a public preview prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. It is not a stable release, its GitHub
+release record is not immutable, and it is not a deployed Heel Cloud URL or evidence of customer
+acceptance. `heel-sim` is not yet published to PyPI. No source checkout or app deployment is needed.
+In an empty private directory, with a POSIX shell and Python 3.11 or newer, install the hash-pinned
+public wheel and review a sanitized OpenAPI document you own:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.2.0-py3-none-any.whl
-export HEEL_HOME="$PWD/.heel-local"
+.venv/bin/python -m pip --isolated install \
+  'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc1/heel_sim-1.3.0rc1-py3-none-any.whl#sha256=176a17b0d4d7f4ea44420d8099239f32dbb17eeead981e5aa360f0a5bbccb94a'
+export HEEL_HOME="$(pwd -P)/.heel-local"
 .venv/bin/heel review openapi ./sanitized-openapi.json
+```
+
+pip installs the wheel only if it matches that SHA-256. `--isolated` makes pip ignore environment
+variables and user configuration. The `runner` extra downloads the pinned `cryptography` dependency
+from the Python package index; the review itself does not need it. `HEEL_HOME` must be a physical
+path in which no component is a symbolic link. On macOS, `/tmp` and `/var` are symbolic links, so use
+`pwd -P` rather than `$PWD`.
+
+Known 1.3.0rc1 errata: its synthetic reference reports the HTTP 200 `error_envelope` case as
+invariant_held with regression_passed=true. It also reports the `hardened` case, an HTTP 403 error
+envelope, as invariant_held with regression_passed=true. An error envelope is inconclusive at any
+status, so read each result as inconclusive, not a pass; see the [export demo](docs/EXPORT_DEMO.md).
+This repository carries a corrected 1.3.0rc2 candidate that reports each case inconclusive with
+regression_passed=false. That candidate is not yet published as a GitHub release or to PyPI, and no
+public 1.3.0rc2 download exists.
+
+A Heel Cloud deployment built from this repository serves that unpublished 1.3.0rc2 candidate on its
+own origin, not the public 1.3.0rc1 files. From its `/agent` page, choose
+**Download Heel Agent 1.3.0rc2**, save `/downloads/heel_sim-1.3.0rc2-py3-none-any.whl` in an empty
+working directory, compare it with the wheel SHA-256 shown there, and use this install step in place
+of the public one:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl
 ```
 
 The default report is validated Markdown. Add `--json` for the canonical `heel.review.v1`
@@ -57,14 +75,13 @@ envelope used by automation and MCP:
 This path needs no account or signing key, makes no analyzer network calls, uploads and syncs
 nothing, and stores the successful review only under `$HEEL_HOME/reviews/`. Inputs must be
 sanitized UTF-8 OpenAPI JSON without credentials or customer data and no larger than 2 MiB.
-The same-origin files exist in the deployable app now; public customer access still requires the
-approved deployment. `heel-sim` is not yet published to PyPI, and a current public repository export
-is a release-owner action that is not complete. See the [MCP quickstart](docs/MCP_QUICKSTART.md) for
+Customer access to the same-origin files still requires the approved deployment. A current
+public repository export is a release-owner action that is not complete. See the [MCP quickstart](docs/MCP_QUICKSTART.md) for
 the exact acquisition matrix and stdio client configuration.
 
 The base local CLI/MCP is Apache-2.0 and has no commercial usage limit. Its safety and 2 MiB input
-limits still apply. Hosted findings synchronization and remote MCP are paid Heel Cloud features;
-neither is enabled in this private preview. Windows secure local project storage is not supported at
+limits still apply. Cloud accounts and constrained findings continuity are implemented separately;
+this does not establish production deployment or a complete remote execution journey. Windows secure local project storage is not supported at
 launch; use the browser workspace or a supported POSIX environment.
 
 ## Anonymous browser workspace
@@ -79,9 +96,8 @@ IndexedDB and download deterministic JSON or Markdown locally.
 
 This repository state is a **private acceptance preview**, not a claim that a public alpha is live
 or launch-ready. The remaining public claim requires the documented browser acceptance run,
-explicit public-access approval, and a public deployment. There is no account system, cloud save,
-team synchronization, billing, hosted review API, analytics, database, or object-storage binding in
-this browser milestone.
+explicit public-access approval, and a public deployment. Cloud account and findings continuity code now exists alongside the anonymous browser workflow.
+Billing remains disabled; public service readiness requires separate operational acceptance.
 
 Use Node.js 26 for the security gate:
 
@@ -124,8 +140,8 @@ AUTHORIZATION GATE (agent caller is an untrusted, possibly prompt-injected chann
 
 HELD-OUT EVALUATION: targets authored by an INDEPENDENT LLM swarm (blind to Heel's probes):
   TEST (FROZEN, never tuned, 199 weaknesses):
-     LOCALIZATION recall 0.50   ATTRIBUTION recall 0.33   precision 0.98
-  -> the honest real-target ceiling. Semantic generalization on vocabulary it never saw, not near 1.0.
+     LOCALIZATION recall 0.417   ATTRIBUTION recall 0.251   precision 0.976
+  -> synthetic vocabulary matching only; not a live detection accuracy estimate.
 ```
 
 That second number is the point: **Heel tells you what it can't catch yet.**
@@ -164,12 +180,14 @@ make demo-bench
 - 📏 **Radically honest metrics.** Most "AI security" tools quote a number you can't trust. Heel
   publishes a *ladder* (below), measures against abuse authored by an **independent LLM swarm blind to
   its own probes**, on a **frozen, content-hashed test set**, and shows you the overfitting and
-  mis-categorization gaps instead of hiding them. Four adversarial red-team passes, all findings fixed.
-- 🛡️ **Safety spine, non-negotiable.** Synthetic-first. Findings are *contained, canary-only* proofs,
+  mis-categorization gaps instead of hiding them. Historical review records and current limitations are linked in the capability matrix.
+- 🛡️ **Safety spine, non-negotiable.** Synthetic-first. Verified reference results require *contained, canary-only* evidence; static findings are hypotheses,
   never working exploits, real exfiltration, or prohibited content. True software vulns are handed off
   to AppSec, pure model-jailbreaks to model red-team. Heel stays in its lane. See [SECURITY.md](SECURITY.md).
 
-## Pre-launch, post-launch, and after incidents
+## Intended use before launch, after launch, and after incidents
+
+These are investigation contexts. Current executable support is limited to the export reference described above.
 
 - **Pre-launch:** run the launch review before customer traffic arrives. Rehearse trial farming,
   export/rate-limit abuse, weak recovery, entitlement bypass, agent tool over-scope, and integration
@@ -196,7 +214,7 @@ only with contained, canary-only evidence.
 
 See [docs/POSITIONING.md](docs/POSITIONING.md) for the full comparison table.
 
-## What it hunts
+## Library investigation areas (not live execution coverage)
 
 A 10-category abuse taxonomy: license/entitlement gaming, UI backing endpoints used as unpriced bulk
 APIs, data harvesting, unintended endpoints, function abuse, content policy, identity/account
@@ -209,25 +227,20 @@ Scenarios are organized into packs so teams can focus a run without narrowing He
 Agent/MCP is one premium pack for products with agentic surfaces; Heel remains broad SaaS abuse
 rehearsal first. See [docs/SCENARIO_PACKS.md](docs/SCENARIO_PACKS.md).
 
-Two agent classes hunt in parallel: a **programmatic adversary** (finds weak controls) and a
-**motivation-profiled opportunistic human** (games normal affordances, catches what the adversary
-misses, like coupon stacking). Plus **affordance chaining** for multi-step abuse (for example, weak
-recovery and a non-rotated session compose into account takeover).
+Two modeled agent classes generate hypotheses: a programmatic matcher and a motivation-profiled customer. Persona characteristics are assumptions. Coupon stacking requires a conflicting intended rule; the capability alone is not abuse. Affordance chaining represents possible sequences without executing them.
 
 ## Honest about what it can't do
 
-Heel reports four levels, weakest claim to strongest evidence:
+The following legacy evaluations measure authored synthetic models, not runtime evidence. Earlier rows are historical; the TEST row was rerun for this change:
 
 | metric | what it measures | result |
 |---|---|---|
 | self-consistency | wiring works (probes vs. plants authored together) | ~1.0 *(a wiring test, not accuracy)* |
 | blind | independent *encodings* of known weaknesses | ~0.40 |
 | held-out **DEV** | independent authorship, tuned-on | 0.70 |
-| **held-out TEST** | **independent LLM authorship, frozen, never tuned on** | **localization 0.50 · attribution 0.33 · precision 0.98** |
+| **held-out TEST** | **independent LLM authorship, frozen, never tuned on** | **localization 0.417 · attribution 0.251 · precision 0.976** |
 
-The headline is the bottom row: real detection on 199 abuse weaknesses an independent LLM swarm
-invented in its *own* vocabulary, which Heel never saw. It improves only by widening real-vocabulary
-coverage, never by writing probes against known answers. Full method: [EVAL.md](EVAL.md) ·
+The TEST dataset contains 199 authored weaknesses. Its vocabulary scores do not establish live detection accuracy, customer coverage, or launch safety. Full method: [EVAL.md](EVAL.md) ·
 [docs/HELDOUT_PROVENANCE.md](docs/HELDOUT_PROVENANCE.md). Reusable benchmark harness:
 [docs/HEELBENCH.md](docs/HEELBENCH.md).
 
@@ -316,11 +329,9 @@ or escape a signed authorization scope.* See **[TRUST.md](TRUST.md)** and **[SEC
 
 ## Status
 
-**Status: production-ready spine, beta adapters (v1.2.0).** Core coverage runs on Python 3.11 to
-3.13 with zero runtime dependencies and four completed red-team passes. The core authorization gate,
-containment model, and evaluation ladder are the production-ready spine. Real-target adapters remain
-beta until adapter coverage and operator controls mature. The anonymous browser workspace remains a
-private acceptance preview until its separate browser and deployment gates are complete.
+**Status: local reference validation and static triage preview.** The export reference workflow demonstrates one protected-content invariant and its regression. It does not establish broad SaaS readiness, arbitrary-target onboarding, production transport acceptance, or customer effectiveness.
+
+Pre-launch and existing-product investigations help teams reason about existing products. Legacy documentation references explicitly authorized production-like targets; this reference workflow accepts none. There is no scope creation or widening through MCP. Broader claims require new evidence beyond held-out vocabulary evaluation.
 
 ---
 

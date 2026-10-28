@@ -15,7 +15,7 @@ import {
   WORKER_PROTOCOL_VERSION,
   type ReviewWorkerLike,
 } from "../lib/browser-review-client";
-import { parseReviewEnvelopeV1 } from "../lib/review-v1";
+import { parseReviewEnvelopeV1, REVIEW_ENGINE_VERSION } from "../lib/review-v1";
 
 
 function canonicalJson(value: unknown): string {
@@ -598,13 +598,30 @@ describe("BrowserReviewClient", () => {
     await expect(rerun).rejects.toMatchObject({ code: "worker_protocol" });
   });
 
-  test("accepts canonical enforced-answer output when enrichment changes the source hash", async () => {
-    const adapter = canonicalEnforcedRerun as {
+  test("accepts historical enforced-answer output, release identity adapted, when enrichment changes the source hash", async () => {
+    // Historical producer fixture (recorded at engine 1.2.0; the checked-in bytes stay unchanged).
+    // Only engine_version and the derived result_hash/review_id are adapted to the current
+    // release so the current-only client accepts it. Its findings are not current-producer output.
+    const historical = canonicalEnforcedRerun as {
       source: string;
       answer: { surface: string; field: "tenant_filter"; value: "enforced" };
       before: Record<string, unknown>;
       after: Record<string, unknown>;
     };
+    const withCurrentIdentity = (envelope: Record<string, unknown>): Record<string, unknown> => {
+      const body = structuredClone(envelope);
+      delete body.review_id;
+      delete body.result_hash;
+      body.engine_version = REVIEW_ENGINE_VERSION;
+      const resultHash = createHash("sha256").update(canonicalJson(body), "utf8").digest("hex");
+      return { review_id: `review_${resultHash.slice(0, 20)}`, result_hash: resultHash, ...body };
+    };
+    const adapter = {
+      ...historical,
+      before: withCurrentIdentity(historical.before),
+      after: withCurrentIdentity(historical.after),
+    };
+    expect(historical.before.engine_version).toBe("1.2.0");
     expect(adapter.after.source_hash).not.toBe(adapter.before.source_hash);
     const worker = new FakeWorker();
     const client = new BrowserReviewClient({ workerFactory: () => worker });

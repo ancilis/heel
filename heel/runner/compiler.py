@@ -17,7 +17,7 @@ from heel.canary_contracts import (
 from heel.runner.identity import RunnerIdentity, SecureSigner
 
 from .catalog import CATALOG_BY_ID, CATALOG_IDS
-from .openapi_routes import RouteInventory
+from .openapi_routes import RouteInventory, normalize_route_template
 from .store import RunnerStore, UnsupportedSecureStorageError
 from .vault import EphemeralVault, VaultUnavailable, validate_credential_secret
 
@@ -70,6 +70,93 @@ def _binding_identity(identity: RunnerIdentity) -> dict[str, Any]:
         "fingerprint": identity.fingerprint,
         "runner_key_id": identity.key_id,
     }
+
+
+_PLAN_DIFFERENTIAL_SCENARIO = "plan_entitlement_read"
+_ROUTE_FIELDS = frozenset({"method", "route_template", "operation_id", "placeholders"})
+MAX_PLAN_DIFFERENTIAL_ROUTES = 2000
+
+
+def plan_differential_pairs(
+    inventory_routes: Sequence[Mapping[str, Any]],
+    *,
+    mapping: Mapping[str, Any] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Per-route allowlist for a plan-differential run: (planned, not_executed).
+
+    Every entry must be a closed GET/HEAD inventory record. A route with placeholders is
+    planned only with the human-supplied mapping for exactly that method and template;
+    no route is added, rewritten, or derived.
+    """
+    allowed_methods = CATALOG_BY_ID[_PLAN_DIFFERENTIAL_SCENARIO]["allowed_methods"]
+    if isinstance(inventory_routes, (str, bytes)) or not isinstance(inventory_routes, Sequence):
+        raise ValueError("route inventory must be a list of route records")
+    if len(inventory_routes) > MAX_PLAN_DIFFERENTIAL_ROUTES:
+        raise ValueError("route inventory exceeds local limit")
+    mapped: tuple[str, str] | None = None
+    mapped_bindings: dict[str, str] = {}
+    if mapping is not None:
+        if (
+            not isinstance(mapping, Mapping)
+            or mapping.get("scenario_id") != _PLAN_DIFFERENTIAL_SCENARIO
+            or not isinstance(mapping.get("fixture_bindings"), list)
+        ):
+            raise ValueError("plan-differential mapping is invalid")
+        mapped = (mapping.get("method"), mapping.get("route_template"))
+        for binding in mapping["fixture_bindings"]:
+            if (
+                not isinstance(binding, Mapping)
+                or set(binding) != {"parameter_name", "fixture_id"}
+                or type(binding["parameter_name"]) is not str
+                or type(binding["fixture_id"]) is not str
+                or binding["parameter_name"] in mapped_bindings
+            ):
+                raise ValueError("plan-differential mapping is invalid")
+            mapped_bindings[binding["parameter_name"]] = binding["fixture_id"]
+    seen: set[tuple[str, str]] = set()
+    records: list[dict[str, Any]] = []
+    for entry in inventory_routes:
+        if not isinstance(entry, Mapping) or set(entry) != _ROUTE_FIELDS:
+            raise ValueError("route inventory entry is not a closed route record")
+        method = entry["method"]
+        if type(method) is not str or method not in allowed_methods:
+            raise ValueError("route inventory permits GET or HEAD only")
+        route, placeholders = normalize_route_template(entry["route_template"])
+        if route != entry["route_template"] or entry["placeholders"] != placeholders:
+            raise ValueError("route inventory entry is not canonical")
+        if type(entry["operation_id"]) is not str or not entry["operation_id"]:
+            raise ValueError("route inventory entry is not a closed route record")
+        if (method, route) in seen:
+            raise ValueError("route inventory repeats a route")
+        seen.add((method, route))
+        records.append({
+            "method": method,
+            "route_template": route,
+            "operation_id": entry["operation_id"],
+            "placeholders": placeholders,
+        })
+    records.sort(key=lambda item: (item["route_template"], item["method"], item["operation_id"]))
+    planned: list[dict[str, Any]] = []
+    not_executed: list[dict[str, Any]] = []
+    for record in records:
+        coordinate = (record["method"], record["route_template"])
+        if not record["placeholders"]:
+            bindings: dict[str, str] = {}
+        elif coordinate == mapped and sorted(mapped_bindings) == record["placeholders"]:
+            bindings = dict(mapped_bindings)
+        else:
+            not_executed.append({
+                "method": record["method"],
+                "route_template": record["route_template"],
+                "reason": "unbound_placeholder",
+            })
+            continue
+        planned.append({
+            "method": record["method"],
+            "route_template": record["route_template"],
+            "fixture_bindings": bindings,
+        })
+    return planned, not_executed
 
 
 class CanaryCompiler:
@@ -282,6 +369,42 @@ class CanaryCompiler:
         result = CompileResult(manifest=manifest, projection=projection)
         if persist:
             self.store.save_approved_pair(manifest, projection)
+        return result
+
+    def compile_plan_differential_pair(
+        self,
+        *,
+        method: str,
+        route_template: str,
+        fixture_bindings: Mapping[str, str],
+    ) -> CompileResult:
+        """Compile exactly one lower/higher plan read of one inventoried GET/HEAD route."""
+        catalog = CATALOG_BY_ID[_PLAN_DIFFERENTIAL_SCENARIO]
+        if type(method) is not str or method not in catalog["allowed_methods"]:
+            raise ValueError("plan-differential pair permits GET or HEAD only")
+        route, _ = normalize_route_template(route_template)
+        inventory = {
+            (item["method"], item["route_template"]) for item in self.store.list_routes()
+        }
+        if (method, route) not in inventory:
+            raise ValueError("plan-differential route is not in the bound inventory")
+        self.store.save_mapping(
+            _PLAN_DIFFERENTIAL_SCENARIO,
+            method=method,
+            route_template=route,
+            fixture_bindings=fixture_bindings,
+        )
+        result = self.compile([_PLAN_DIFFERENTIAL_SCENARIO])
+        actions = result.manifest["actions"]
+        if (
+            len(actions) != 2
+            or any(action["method"] != method for action in actions)
+            or any(action["route_template"] != route for action in actions)
+            or [action["semantic_auth_role"] for action in actions]
+            != list(catalog["semantic_roles"])
+            or list(catalog["semantic_roles"]) != ["lower_plan", "higher_plan"]
+        ):
+            raise ValueError("plan-differential pair did not compile to the exact two reads")
         return result
 
     def prepare_live(

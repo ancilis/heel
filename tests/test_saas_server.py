@@ -23,6 +23,11 @@ def _pepper(byte: bytes) -> str:
 
 
 class ProductionConfigurationTests(unittest.TestCase):
+    def test_startup_log_excludes_listener_address_details(self):
+        source = Path("heel/saas/server.py").read_text(encoding="utf-8")
+        self.assertNotIn('"host": config.host', source)
+        self.assertNotIn('"port": server.server_address[1]', source)
+
     def valid_environment(self, root: Path) -> dict[str, str]:
         signing = SigningAuthority.generate()
         return {
@@ -67,7 +72,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         )
         self.addCleanup(migrated.close)
         self.addCleanup(runtime.close)
-        self.assertEqual(Migrator(migrated, CONTROL_PLANE_MIGRATIONS).apply_all(), list(range(1, 30)))
+        self.assertEqual(Migrator(migrated, CONTROL_PLANE_MIGRATIONS).apply_all(), list(range(1, 34)))
 
         def schema(connection: sqlite3.Connection) -> dict[str, tuple[tuple, ...]]:
             tables = {
@@ -98,9 +103,10 @@ class ProductionConfigurationTests(unittest.TestCase):
                 self.assertEqual(migrate.main(["status", str(database)]), 1)
                 self.assertEqual(migrate.main(["up", str(database)]), 0)
                 self.assertEqual(migrate.main(["status", str(database)]), 0)
-            self.assertIn("current=0 target=29", output.getvalue())
+            self.assertIn("current=0 target=33", output.getvalue())
             self.assertIn("applied=1,2,3,4,5,6,7,8,9,10", output.getvalue())
-            self.assertIn("current=29 target=29", output.getvalue())
+            self.assertIn(",31,32,33\n", output.getvalue())
+            self.assertIn("current=33 target=33", output.getvalue())
 
     def test_restore_verification_is_read_only_and_rejects_pending_schema(self):
         from heel.saas import migrate
@@ -309,7 +315,7 @@ class ProductionConfigurationTests(unittest.TestCase):
                 version = restarted.control_plane.store.conn.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0]
-                self.assertEqual(version, 29)
+                self.assertEqual(version, 33)
             finally:
                 restarted.server_close()
 
@@ -586,7 +592,13 @@ class ProductionConfigurationTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text()
         self.assertIn('install -d -m 700 "${RUNNER_TEMP}/heel-pytest"', workflow)
         self.assertIn('echo "TMPDIR=${RUNNER_TEMP}/heel-pytest" >> "$GITHUB_ENV"', workflow)
-        self.assertIn("- name: Full Python acceptance + security suite\n        run: python -m pytest -q tests", workflow)
+        self.assertIn('python -m venv --copies "${RUNNER_TEMP}/heel-pytest/venv"', workflow)
+        self.assertIn(
+            "- name: Full Python acceptance + security suite\n"
+            "        run: >-\n"
+            '          "${RUNNER_TEMP}/heel-pytest/venv/bin/python" -m pytest -q tests',
+            workflow,
+        )
         self.assertNotIn("python -m unittest discover -s tests -p 'test_*.py' -v", workflow)
         production_build = (
             "- name: Build Cloudflare-compatible production artifact\n"

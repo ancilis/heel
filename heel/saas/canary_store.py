@@ -1033,6 +1033,46 @@ BEGIN
 END;
 """
 
+# Migration 31 (H1A-2): the host-authority anti-replay/elapsed ledger.  Rows are permanent
+# tombstones once closed; nothing in the product removes a row while the database file exists.
+# ``IF NOT EXISTS`` lets direct ControlPlane construction and a later ``apply_all`` agree.
+HOST_AUTHORITY_GENERATIONS_MIGRATION = r"""
+CREATE TABLE IF NOT EXISTS host_authority_generations(
+ generation_id TEXT PRIMARY KEY CHECK(length(generation_id)=32 AND generation_id NOT GLOB '*[^0-9a-f]*'),
+ host_boot_epoch TEXT NOT NULL CHECK(length(host_boot_epoch) BETWEEN 8 AND 64 AND host_boot_epoch NOT GLOB '*[^a-z0-9-]*'),
+ slot_id TEXT NOT NULL CHECK(length(slot_id) BETWEEN 1 AND 32 AND slot_id NOT GLOB '*[^a-z0-9-]*'),
+ state TEXT NOT NULL CHECK(state IN ('open','closed')),
+ close_reason TEXT CHECK(close_reason IS NULL OR close_reason IN ('replayed_sequence','clock_gap','superseded','identity_mismatch','unenrolled')),
+ enrolled_cp_ms INTEGER NOT NULL CHECK(enrolled_cp_ms>=0),
+ last_sequence INTEGER NOT NULL CHECK(last_sequence>=1),
+ last_monotonic_ms INTEGER NOT NULL CHECK(last_monotonic_ms>=0),
+ last_cp_ms INTEGER NOT NULL CHECK(last_cp_ms>=enrolled_cp_ms),
+ requests INTEGER NOT NULL CHECK(requests>=1),
+ closed_cp_ms INTEGER CHECK(closed_cp_ms IS NULL OR closed_cp_ms>=last_cp_ms),
+ CHECK((state='closed')=(close_reason IS NOT NULL)),
+ CHECK((state='closed')=(closed_cp_ms IS NOT NULL)));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_host_authority_generation_one_open
+ ON host_authority_generations(host_boot_epoch,slot_id) WHERE state='open';
+"""
+
+# Migration 32 (D): the first Cloud-accepted stop acknowledgement's signed runner facts, kept on the
+# run row because the receipt row is replaced by every later UPSERT.  The server receipt time and
+# late status stay in stop_acknowledged_at_ms/stop_ack_late; these three are runner-local signed
+# evidence only.  All three are set together exactly once; NULL means no witness (or pre-v32).
+STOP_ACK_WITNESS_MIGRATION = r"""
+ALTER TABLE canary_runs ADD COLUMN stop_ack_source_event_sequence INTEGER
+  CHECK(stop_ack_source_event_sequence IS NULL OR stop_ack_source_event_sequence >= 0);
+ALTER TABLE canary_runs ADD COLUMN stop_ack_projection_digest TEXT
+  CHECK(stop_ack_projection_digest IS NULL OR
+        (length(stop_ack_projection_digest)=64 AND
+         stop_ack_projection_digest NOT GLOB '*[^0-9a-f]*'));
+ALTER TABLE canary_runs ADD COLUMN stop_ack_runner_local_at_ms INTEGER
+  CHECK(stop_ack_runner_local_at_ms IS NULL OR stop_ack_runner_local_at_ms >= 0);
+"""
+STOP_ACK_WITNESS_COLUMNS = (
+    "stop_ack_source_event_sequence", "stop_ack_projection_digest", "stop_ack_runner_local_at_ms",
+)
+
 _ENVIRONMENT_COLUMNS = (
     "attestation_text", "attestation_version", "attested_by", "attested_at", "proof_method",
     "proof_version", "normalization_version", "challenge_generation", "challenge_digest",
@@ -1539,6 +1579,53 @@ def ensure_runner_context_schema(conn: sqlite3.Connection) -> None:
         raise RuntimeError("runner context binding schema foreign keys are invalid")
 
 
+def ensure_host_authority_schema(conn: sqlite3.Connection) -> None:
+    """Apply the v31 ledger atomically for direct ControlPlane construction."""
+    savepoint = "host_authority_schema_apply"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for statement in _sqlite_schema_statements(HOST_AUTHORITY_GENERATIONS_MIGRATION):
+            if statement:
+                conn.execute(statement)
+    except Exception as error:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise RuntimeError("host authority ledger schema initialization failed") from error
+    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+
+def ensure_stop_ack_witness_schema(conn: sqlite3.Connection) -> None:
+    """Bring direct construction to migration-32 parity, never half of it.
+
+    A migration-tracked database below v32 is left to ``Migrator`` so its ALTERs still apply.
+    """
+    present = {row[1] for row in conn.execute("PRAGMA table_info(canary_runs)")}
+    found = set(STOP_ACK_WITNESS_COLUMNS) & present
+    if found == set(STOP_ACK_WITNESS_COLUMNS):
+        return
+    if found:
+        raise RuntimeError("canary stop acknowledgement witness schema is partially initialized")
+    tracked = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone() is not None
+    if tracked:
+        current = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        if int(current or 0) >= 32:
+            raise RuntimeError("canary stop acknowledgement witness schema does not match migration 32")
+        return
+    savepoint = "stop_ack_witness_schema_apply"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for statement in _sqlite_schema_statements(STOP_ACK_WITNESS_MIGRATION):
+            if statement:
+                conn.execute(statement)
+    except Exception as error:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise RuntimeError("canary stop acknowledgement witness schema initialization failed") from error
+    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+
 class CanaryStore:
     """Typed schema owner. Higher canary services are added in later packets."""
 
@@ -1579,3 +1666,5 @@ class CanaryStore:
         elif not (has_environment_digest and has_coordination_approval and has_control):
             raise RuntimeError("canary coordination schema is partially initialized")
         ensure_runner_context_schema(self.conn)
+        ensure_host_authority_schema(self.conn)
+        ensure_stop_ack_witness_schema(self.conn)
