@@ -9,8 +9,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github/workflows/ci.yml"
 PUBLISH = ROOT / ".github/workflows/publish.yml"
-WHEEL = "heel_sim-1.2.0-py3-none-any.whl"
-SDIST = "heel_sim-1.2.0.tar.gz"
+WHEEL = "heel_sim-1.3.0rc2-py3-none-any.whl"
+SDIST = "heel_sim-1.3.0rc2.tar.gz"
 MANIFEST = "heel-open-core-manifest.json"
 RELEASE_REQUIREMENTS = ROOT / "release/requirements-release.txt"
 
@@ -50,6 +50,13 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         self.assertIn("find_spec(\"heel.saas\") is None", package)
         self.assertIn('environment.pop("PYTHONHOME", None)', package)
         self.assertIn('cwd="/tmp/heel-ci-workspace"', package)
+        # The source-free [runner] installation gate is enforced: it may not pass by skipping.
+        self.assertIn(
+            "HEEL_REQUIRE_RUNNER_EXTRA_INSTALL=1 python -m unittest "
+            "tests.test_public_runner_preview_release -v",
+            package,
+        )
+        self.assertNotIn("HEEL_REQUIRE_RUNNER_EXTRA_INSTALL", source.replace(package, ""))
         self.assertNotIn("npm ci || npm install", source)
         self.assertIn("actionlint_1.7.8_linux_amd64.tar.gz", source)
         self.assertIn(

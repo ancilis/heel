@@ -111,7 +111,11 @@ def test_prepared_route_uses_only_the_manifest_bound_fixture_segment():
     ],
 )
 def test_exact_catalog_order_blocked_matrix(scenario_id, first, second, blocked):
-    assert (evaluate_pair(scenario_id, first, second).outcome == "blocked") is blocked
+    assert evaluate_pair(scenario_id, first, second).outcome == "inconclusive"
+    positive_first = scenario_id == "object_ownership_read"
+    if blocked:
+        assert evaluate_pair(scenario_id, first, second,
+            first_protected=positive_first, second_protected=not positive_first).outcome == "blocked"
 
 
 @pytest.mark.parametrize("scenario_id", tuple(CATALOG_BY_ID))
@@ -121,7 +125,7 @@ def test_observed_requires_two_200s_and_every_other_pair_is_inconclusive(scenari
         for second in allowed:
             result = evaluate_pair(scenario_id, first, second)
             if first == second == 200:
-                assert result.outcome == "observed"
+                assert result.outcome == "inconclusive"
             elif result.outcome != "blocked":
                 assert result.outcome == "inconclusive"
             assert result.finding and result.control
@@ -133,11 +137,11 @@ def test_body_shape_contract_is_closed_and_head_is_always_absent():
     assert evaluate_pair(
         "anonymous_authenticated_read", 401, 200,
         method="HEAD", first_body_shape="absent", second_body_shape="absent",
-    ).outcome == "blocked"
+    ).outcome == "inconclusive"
     assert evaluate_pair(
         "role_bound_read", 403, 200,
         first_body_shape="json_object", second_body_shape="absent",
-    ).outcome == "blocked"
+    ).outcome == "inconclusive"
     assert evaluate_pair(
         "role_bound_read", 403, 200,
         first_body_shape="text", second_body_shape="absent",

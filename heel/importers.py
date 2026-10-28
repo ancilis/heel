@@ -180,7 +180,7 @@ def _guard_present(props: dict) -> bool:
 
 
 def _bad_control_value(value: Any) -> bool:
-    if value is False or value is None:
+    if value is False:
         return True
     if isinstance(value, str):
         return value.strip().lower() in _BAD_CONTROL_VALUES

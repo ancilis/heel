@@ -1,5 +1,8 @@
+import json
 import sqlite3
 import unittest
+
+import pytest
 
 from heel.saas.catalog import (
     CATALOG_VERSION, LEGACY_CATALOG_VERSION, PRE_CANARY_CATALOG_VERSION, Meter, get_plan,
@@ -32,9 +35,8 @@ class CanaryMigrationTests(unittest.TestCase):
 
     def test_current_migrations_create_tenant_bound_unique_tables(self):
         self.assertEqual(
-            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-10:]],
+            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-13:]],
             [
-                (20, "runner_context_bounded_purge"),
                 (21, "runner_context_affinity_guards"),
                 (22, "pending_approval_live_seek"),
                 (23, "runner_context_purge_readiness"),
@@ -44,6 +46,10 @@ class CanaryMigrationTests(unittest.TestCase):
                 (27, "runner_single_open_rotation"),
                 (28, "runner_key_history_expiry"),
                 (29, "runner_auth_bounded_retention"),
+                (30, "self_serve_discovery_and_plan_requests"),
+                (31, "host_authority_generations"),
+                (32, "stop_ack_signed_witness"),
+                (33, "inactive_claim_attestation_audit"),
             ],
         )
         tables = (
@@ -65,9 +71,8 @@ class CanaryMigrationTests(unittest.TestCase):
     def test_migrations_twenty_three_to_twenty_five_add_purge_and_runner_receipts(self):
         """The direct/runtime schema target includes the append-only v23-v25 additions."""
         self.assertEqual(
-            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-10:]],
+            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-13:]],
             [
-                (20, "runner_context_bounded_purge"),
                 (21, "runner_context_affinity_guards"),
                 (22, "pending_approval_live_seek"),
                 (23, "runner_context_purge_readiness"),
@@ -77,6 +82,10 @@ class CanaryMigrationTests(unittest.TestCase):
                 (27, "runner_single_open_rotation"),
                 (28, "runner_key_history_expiry"),
                 (29, "runner_auth_bounded_retention"),
+                (30, "self_serve_discovery_and_plan_requests"),
+                (31, "host_authority_generations"),
+                (32, "stop_ack_signed_witness"),
+                (33, "inactive_claim_attestation_audit"),
             ],
         )
         self.assertIsNotNone(self.conn.execute(
@@ -157,7 +166,7 @@ class CanaryMigrationTests(unittest.TestCase):
 
     def test_migration_twenty_nine_adds_bounded_runner_key_retirement_queue(self):
         self.assertEqual(
-            (CONTROL_PLANE_MIGRATIONS[-1].version, CONTROL_PLANE_MIGRATIONS[-1].name),
+            (CONTROL_PLANE_MIGRATIONS[28].version, CONTROL_PLANE_MIGRATIONS[28].name),
             (29, "runner_auth_bounded_retention"),
         )
         self.assertEqual(
@@ -397,7 +406,7 @@ class CanaryMigrationTests(unittest.TestCase):
         ledger("runner_heartbeat:run", 2, "runner_heartbeat", "/v1/workspaces/ws/runners/runner/runs/run/stop-ack")
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33])
         self.assertEqual([tuple(row) for row in conn.execute(
             "SELECT chain_name,next_sequence,generation FROM canary_runner_chain_cursors ORDER BY chain_name"
         )], [("heartbeat:run", 2, 0), ("progress:run", 3, 0), ("stop-ack:run", 3, 0)])
@@ -442,8 +451,8 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 29)
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 33)
         self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.assertEqual(
             [tuple(row) for row in conn.execute(
@@ -549,8 +558,8 @@ class CanaryMigrationTests(unittest.TestCase):
         conn.commit()
 
         migration = Migrator(conn, CONTROL_PLANE_MIGRATIONS)
-        self.assertEqual(migration.apply_all(), [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
-        self.assertEqual(migration.current_version(), 29)
+        self.assertEqual(migration.apply_all(), [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33])
+        self.assertEqual(migration.current_version(), 33)
         affinity = conn.execute(
             "SELECT project_ref,environment_id,runner_key_id,established_rcb_id,established_binding_digest "
             "FROM canary_runner_context_affinities WHERE workspace_id='ws_affinity' AND runner_id='runr_affinity'",
@@ -824,7 +833,7 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33])
         self.assertEqual(
             [tuple(row) for row in conn.execute("SELECT chain_name,sequence FROM canary_runner_request_ledger")],
             [("progress:real", 1)],
@@ -1084,8 +1093,8 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
         conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
         conn.commit()
-        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
-        self.assertEqual(migration.current_version(), 29)
+        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33])
+        self.assertEqual(migration.current_version(), 33)
         self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):
@@ -1136,3 +1145,356 @@ class CanaryMigrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ledger.refund_consumed_in_transaction(reservation.reservation_id, "platform_fault")
         self.conn.rollback()
+
+
+# --- C2 migration 30.  The discovery contract's provisional name for this gate was
+# ``test_migration_32_adds_discovery_tables_and_inventory_columns_additively``; the real repo was
+# at 29, so the honest version is 30 and ``route_inventories`` is created, not altered. ---
+
+_DISCOVERY_TABLE_COLUMNS = {
+    "route_inventories": {
+        "workspace_id", "project_ref", "environment_id", "inventory_digest", "route_count",
+        "truncated_count", "routes_json", "updated_at_ms",
+    },
+    "discovery_authorizations": {
+        "authorization_id", "workspace_id", "project_ref", "environment_id", "actor_user_id",
+        "actor_role", "bound_json", "seed_digest", "identities_json", "login_exchange_authorized",
+        "authorization_digest", "request_digest", "reservation_id", "idempotency_key", "quota_state",
+        "state", "rounds_issued", "actions_issued", "execution_ms_used", "requests_completed",
+        "bytes_received", "created_at_ms", "expires_at_ms", "closed_at_ms", "close_reason", "revoked_by",
+    },
+    "discovery_rounds": {
+        "round_id", "authorization_id", "workspace_id", "project_ref", "environment_id", "round",
+        "runner_id", "runner_key_id", "run_id", "grant_id", "projection_id", "projection_digest",
+        "frontier_digest", "actions", "cumulative_requests_before", "wall_budget_ms", "state",
+        "refuse_reason", "issued_at_ms", "terminal_at_ms", "requests_completed", "bytes_received",
+        "created_at_ms", "closed_at_ms",
+    },
+    "discovery_round_reports": {
+        "report_id", "authorization_id", "round", "run_id", "runner_key_id", "report_digest",
+        "candidates_json", "excluded_count", "truncated_count", "bytes_received", "created_at_ms",
+    },
+    "canary_plan_requests": {
+        "plan_request_id", "workspace_id", "project_ref", "environment_id", "rcb_id", "binding_digest",
+        "runner_id", "runner_key_id", "plan_kind", "plan_request_nonce", "inventory_digest",
+        "selection_digest", "routes_json", "selected_count", "max_ops", "status", "created_by",
+        "created_at_ms", "expires_at_ms", "approval_id", "run_id", "projection_digest",
+    },
+}
+
+
+def _launch_fixture_at_29():
+    from canary_test_support import ENVIRONMENT, PROJECT, WORKSPACE, seed_authority
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    Migrator(conn, CONTROL_PLANE_MIGRATIONS[:29]).apply_all()
+    conn.execute("INSERT INTO orgs VALUES('org_launch','Launch',1)")
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", (WORKSPACE, "org_launch", "Launch", "free", CATALOG_VERSION, 1))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", (WORKSPACE, PROJECT, "Launch", "user_owner", 1))
+    conn.execute("INSERT INTO users VALUES('user_owner','owner@launch.test',1)")
+    conn.execute("INSERT INTO memberships VALUES(?,?,?,?)", (WORKSPACE, "user_owner", "owner", 1))
+    conn.commit()
+    seed_authority(conn)
+    ledger = UsageLedger(conn)
+    ledger.reserve(get_plan("free", CATALOG_VERSION), WORKSPACE, Meter.CANARY_RUNS, 1, "2027-01",
+                   idempotency_key="ca1-" + "e" * 64, ref="crun_existing")
+    return conn, WORKSPACE, PROJECT, ENVIRONMENT
+
+
+def _dump(conn):
+    tables = [row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    )]
+    return {table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")] for table in tables}
+
+
+def test_migration_30_adds_discovery_tables_and_inventory_columns_additively():
+    conn, workspace, project, environment = _launch_fixture_at_29()
+    before = _dump(conn)
+    assert before["canary_environments"] and before["usage_ledger"] and before["canary_runner_keys"]
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS[:30]).apply_all() == [30]
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS[:30]).current_version() == 30
+    after = _dump(conn)
+    assert after.pop("schema_migrations")[:-1] == before.pop("schema_migrations")
+    for table, rows in before.items():
+        assert after[table] == rows, table
+    assert set(after) - set(before) == set(_DISCOVERY_TABLE_COLUMNS)
+    for table, columns in _DISCOVERY_TABLE_COLUMNS.items():
+        assert {row[1] for row in conn.execute(f"PRAGMA table_info({table})")} == columns, table
+        assert after[table] == []
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS[:30]).apply_all() == []
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [31, 32, 33]
+
+    def authorization(suffix: str, state: str = "open"):
+        closed = None if state == "open" else 2
+        conn.execute(
+            "INSERT INTO discovery_authorizations(authorization_id,workspace_id,project_ref,environment_id,"
+            "actor_user_id,actor_role,bound_json,seed_digest,identities_json,login_exchange_authorized,"
+            "authorization_digest,request_digest,reservation_id,idempotency_key,quota_state,state,"
+            "created_at_ms,expires_at_ms,closed_at_ms,close_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("dau_" + suffix * 32, workspace, project, environment, "user_owner", "owner", "{}", "a" * 64, "[]", 0,
+             suffix * 64, "b" * 64, "resv_" + suffix, "ca1-" + suffix * 64, "reserved", state, 1, 900001,
+             closed, None if state == "open" else "budget"),
+        )
+
+    authorization("1")
+    with pytest.raises(sqlite3.IntegrityError):
+        authorization("2")  # one open authorization per environment
+    authorization("3", "done")
+    for bad in (
+        "UPDATE discovery_authorizations SET login_exchange_authorized=2",
+        "UPDATE discovery_authorizations SET actions_issued=101",
+        "UPDATE discovery_authorizations SET rounds_issued=6",
+        "UPDATE discovery_authorizations SET expires_at_ms=expires_at_ms+1",
+        "UPDATE discovery_authorizations SET state='done'",  # closure needs closed_at_ms and reason
+        "UPDATE discovery_authorizations SET quota_state='refunded',rounds_issued=1",
+    ):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(bad)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO route_inventories VALUES(?,?,?,?,?,?,?,?)",
+            (workspace, project, "env_missing", "a" * 64, 0, 0, "[]", 1),
+        )
+    conn.close()
+
+
+def test_migration_30_is_atomic_and_leaves_29_intact_when_a_table_conflicts():
+    conn, *_ = _launch_fixture_at_29()
+    before = _dump(conn)
+    conn.execute("CREATE TABLE discovery_rounds(round_id TEXT PRIMARY KEY)")
+    conn.commit()
+    with pytest.raises(MigrationError):
+        Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all()
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version() == 29
+    names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "route_inventories" not in names and "discovery_authorizations" not in names
+    after = _dump(conn)
+    after.pop("discovery_rounds")
+    assert after == before
+    conn.close()
+
+
+def test_direct_control_plane_construction_matches_migration_30_discovery_schema():
+    from heel.saas.http_api import ControlPlane
+
+    migrated = sqlite3.connect(":memory:")
+    Migrator(migrated, CONTROL_PLANE_MIGRATIONS).apply_all()
+    control = ControlPlane()
+    try:
+        runtime = control.store.conn
+        for table in _DISCOVERY_TABLE_COLUMNS:
+            migrated_sql = migrated.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
+            runtime_sql = runtime.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
+            assert "".join(migrated_sql.split()) == "".join(runtime_sql.split())
+            assert [tuple(r) for r in migrated.execute(f"PRAGMA index_list({table})")] == [tuple(r) for r in runtime.execute(f"PRAGMA index_list({table})")]
+    finally:
+        control.close()
+        migrated.close()
+
+
+_ACK_WITNESS_COLUMNS = (
+    "stop_ack_source_event_sequence", "stop_ack_projection_digest", "stop_ack_runner_local_at_ms",
+)
+
+
+def _acknowledged_run_at_31():
+    """A v31 database holding a Cloud-acknowledged stop with signed ACK receipt evidence."""
+    from canary_test_support import (
+        NOW, NOW_MS, PROJECT, RUNNER, WORKSPACE, Clock, approval_projection,
+        operational_projection, seed_authority,
+    )
+    from heel.crypto import SigningAuthority
+    from heel.saas.canary_runs import CanaryRunService
+    from heel.saas.runner_auth import RunnerAuthStore
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS[:31]).apply_all() == list(range(1, 32))
+    conn.execute("INSERT INTO orgs VALUES(?,?,?)", ("org_canary", "Canary", NOW))
+    conn.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?)", (WORKSPACE, "org_canary", "Canary", "free", CATALOG_VERSION, NOW))
+    conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", (WORKSPACE, PROJECT, "Canary", "user_owner", NOW))
+    conn.execute("INSERT INTO users VALUES(?,?,?)", ("user_owner", "owner@canary.test", NOW))
+    conn.execute("INSERT INTO memberships VALUES(?,?,?,?)", (WORKSPACE, "user_owner", "owner", NOW))
+    runner = seed_authority(conn)
+    conn.commit()
+    clock = Clock()
+    runs = CanaryRunService(
+        conn, signing=SigningAuthority.generate(),
+        runner_auth=RunnerAuthStore(conn, pepper=b"r" * 32, now=clock), clock=clock,
+        ledger=UsageLedger(conn), initialize_schema=False,
+    )
+    projection = approval_projection(runner)
+    submitted = runs.submit_projection(projection, uploaded_by="user_owner")
+    grant = runs.approve(
+        WORKSPACE, PROJECT, submitted["run_id"], projection_digest=projection["projection_digest"],
+        actor="user_owner", role="owner", reason="Run the bounded canary rehearsal",
+        exact_hostname="canary.acme.dev", recent_auth_at_ms=NOW_MS,
+        idempotency_key="ca1-" + "b" * 64, expected_kill_switch_generation=0,
+    )["grant"]
+    runs.claim(WORKSPACE, RUNNER, runner.key_id)
+    runs.request_stop(
+        WORKSPACE, PROJECT, grant["run_id"], actor="user_owner", reason="cloud_stop",
+        expected_kill_switch_generation=0,
+    )
+    runs.heartbeat(WORKSPACE, PROJECT, grant["run_id"], RUNNER, operational_projection(
+        runner, grant, sequence=1, phase="stop_requested", stop_reason="cloud_stop",
+        stop_requested_at_ms=NOW_MS + 300, stop_acknowledged_at_ms=NOW_MS + 400,
+        updated_at_ms=NOW_MS + 400,
+    ))
+    # Exactly the two server columns a pre-v32 ack_stop wrote on the run row.
+    conn.execute("UPDATE canary_runs SET stop_acknowledged_at_ms=?,stop_ack_late=0", (NOW_MS,))
+    conn.commit()
+    return conn
+
+
+def test_migration_v32_adds_nullable_complete_ack_witness_without_backfill():
+    from heel.saas.http_api import ControlPlane
+
+    conn = _acknowledged_run_at_31()
+    assert not set(_ACK_WITNESS_COLUMNS) & {row[1] for row in conn.execute("PRAGMA table_info(canary_runs)")}
+    assert conn.execute("SELECT stop_acknowledged_at_ms FROM canary_runs").fetchone()[0] is not None
+    assert json.loads(conn.execute("SELECT receipt_json FROM canary_operational_receipts").fetchone()[0])[
+        "timestamps"]["stop_acknowledged_at_ms"] is not None
+    before = _dump(conn)
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [32, 33]
+    assert CONTROL_PLANE_MIGRATIONS[31].version == 32
+    assert CONTROL_PLANE_MIGRATIONS[31].name == "stop_ack_signed_witness"
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == []
+    after = _dump(conn)
+    tracked = after.pop("schema_migrations")
+    assert tracked[:-2] == before.pop("schema_migrations")
+    assert [row[:2] for row in tracked[-2:]] == [(32, "stop_ack_signed_witness"), (33, "inactive_claim_attestation_audit")]
+    assert after.pop("canary_inactive_claim_attestations") == []  # append-only v33 starts empty
+    old_runs, new_runs = before.pop("canary_runs"), after.pop("canary_runs")
+    assert after == before  # every other table is byte-identical
+    # Additive only: each prior run value is unchanged and the witness is never backfilled from
+    # the mutable receipt, the server receipt time, an event or an audit digest.
+    assert [tuple(row)[:-3] for row in new_runs] == [tuple(row) for row in old_runs]
+    assert [tuple(row)[-3:] for row in new_runs] == [(None, None, None)]
+    columns = {row[1]: row for row in conn.execute("PRAGMA table_info(canary_runs)")}
+    for name in _ACK_WITNESS_COLUMNS:
+        assert columns[name]["notnull"] == 0 and columns[name]["dflt_value"] is None
+    assert columns["stop_ack_projection_digest"]["type"] == "TEXT"
+    assert columns["stop_ack_source_event_sequence"]["type"] == columns["stop_ack_runner_local_at_ms"]["type"] == "INTEGER"
+    for column, value in (
+        ("stop_ack_source_event_sequence", -1), ("stop_ack_runner_local_at_ms", -1),
+        ("stop_ack_projection_digest", "a" * 63), ("stop_ack_projection_digest", "A" * 64),
+        ("stop_ack_projection_digest", "g" * 64),
+    ):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(f"UPDATE canary_runs SET {column}=?", (value,))
+    conn.rollback()
+    conn.execute(
+        "UPDATE canary_runs SET stop_ack_source_event_sequence=0,stop_ack_projection_digest=?,"
+        "stop_ack_runner_local_at_ms=0", ("a" * 64,),
+    )
+    conn.rollback()
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    migrated_sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='canary_runs'").fetchone()[0]
+    conn.close()
+
+    # Direct construction reaches the same table, and never adds the columns half-way.
+    control = ControlPlane()
+    try:
+        runtime_sql = control.store.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='canary_runs'",
+        ).fetchone()[0]
+        assert "".join(migrated_sql.split()) == "".join(runtime_sql.split())
+    finally:
+        control.close()
+    from heel.saas.canary_store import CanaryStore
+
+    partial = sqlite3.connect(":memory:")
+    try:
+        partial.execute("PRAGMA foreign_keys=ON")
+        Migrator(partial, CONTROL_PLANE_MIGRATIONS[:31]).apply_all()
+        partial.execute("DROP TABLE schema_migrations")  # a runtime-owned, untracked schema
+        partial.execute("ALTER TABLE canary_runs ADD COLUMN stop_ack_source_event_sequence INTEGER")
+        with pytest.raises(RuntimeError, match="stop acknowledgement witness"):
+            CanaryStore(partial)
+    finally:
+        partial.close()
+    # A migration-tracked database below v32 leaves the ALTER to its Migrator.
+    tracked = sqlite3.connect(":memory:")
+    try:
+        tracked.execute("PRAGMA foreign_keys=ON")
+        Migrator(tracked, CONTROL_PLANE_MIGRATIONS[:31]).apply_all()
+        CanaryStore(tracked)
+        tracked.commit()
+        assert not set(_ACK_WITNESS_COLUMNS) & {row[1] for row in tracked.execute("PRAGMA table_info(canary_runs)")}
+        assert Migrator(tracked, CONTROL_PLANE_MIGRATIONS).apply_all() == [32, 33]
+        CanaryStore(tracked)
+    finally:
+        tracked.close()
+
+
+# Migrations 1-32 exactly as they were at the C2 base 934f3ba (version, name and SQL).
+_MIGRATIONS_1_TO_32_SHA256 = "8909cb32ccdd5b9278791321c4bf65372b4e92fa44d65969f66a5021b931b276"
+
+
+def test_inactive_claim_attestation_migration_is_append_only_and_version_literals_match():
+    import hashlib
+
+    from heel.saas.http_api import ControlPlane
+    from heel.saas.runner_auth import (
+        RUNNER_AUTH_INACTIVE_CLAIM_ATTESTATION_MIGRATION, validate_runner_auth_schema,
+    )
+
+    digest = hashlib.sha256()
+    for migration in CONTROL_PLANE_MIGRATIONS[:32]:
+        digest.update(f"{migration.version}\0{migration.name}\0{migration.sql}\0".encode())
+    assert digest.hexdigest() == _MIGRATIONS_1_TO_32_SHA256
+    assert [(m.version, m.name) for m in CONTROL_PLANE_MIGRATIONS[-2:]] == [
+        (32, "stop_ack_signed_witness"), (33, "inactive_claim_attestation_audit"),
+    ]
+    assert CONTROL_PLANE_MIGRATIONS[-1].sql == RUNNER_AUTH_INACTIVE_CLAIM_ATTESTATION_MIGRATION
+
+    # A populated v32 database gains only the empty audit table; every existing row is unchanged.
+    conn = _acknowledged_run_at_31()
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS[:32]).apply_all() == [32]
+    with pytest.raises(RuntimeError):
+        validate_runner_auth_schema(conn)  # startup must migrate, never repair
+    before = _dump(conn)
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [33]
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version() == 33
+    after = _dump(conn)
+    assert after.pop("canary_inactive_claim_attestations") == []
+    assert after.pop("schema_migrations")[:-1] == before.pop("schema_migrations")
+    assert after == before
+    validate_runner_auth_schema(conn)
+
+    # Direct ControlPlane construction is schema-identical to the migration.
+    control = ControlPlane()
+    try:
+        runtime = control.store.conn
+        for kind, name in (("table", "canary_inactive_claim_attestations"),
+                           ("index", "idx_canary_inactive_claim_attestations_rate")):
+            query = "SELECT sql FROM sqlite_master WHERE type=? AND name=?"
+            assert conn.execute(query, (kind, name)).fetchone()[0] == runtime.execute(query, (kind, name)).fetchone()[0]
+        for pragma in ("table_info", "index_list", "foreign_key_list"):
+            assert [tuple(r) for r in conn.execute(f"PRAGMA {pragma}(canary_inactive_claim_attestations)")] == [
+                tuple(r) for r in runtime.execute(f"PRAGMA {pragma}(canary_inactive_claim_attestations)")]
+        assert [tuple(r) for r in conn.execute("PRAGMA index_xinfo(idx_canary_inactive_claim_attestations_rate)")] == [
+            tuple(r) for r in runtime.execute("PRAGMA index_xinfo(idx_canary_inactive_claim_attestations_rate)")]
+    finally:
+        control.close()
+
+    # Range and ordering guards only; units are proven by exact values in the issuance tests.
+    good = ["ica_" + "a" * 32, "ws", "runner", "run", "grant", "key", "b" * 64, "c" * 64, "terminal", 5, 6]
+    conn.execute("INSERT INTO canary_inactive_claim_attestations VALUES(?,?,?,?,?,?,?,?,?,?,?)", good)
+    for index, bad in (
+        (0, "ica_" + "a" * 31), (0, "icb_" + "a" * 32), (0, "ica_" + "A" * 32),
+        (6, "b" * 63), (7, "c" * 65), (8, "claimed"),
+        (9, -1), (9, 2 ** 53), (9, 5.5), (10, 5), (10, 4), (10, 6.5),
+    ):
+        row = list(good)
+        row[0] = "ica_" + "d" * 32 if index != 0 else bad
+        row[index] = bad
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO canary_inactive_claim_attestations VALUES(?,?,?,?,?,?,?,?,?,?,?)", row)
+    conn.close()

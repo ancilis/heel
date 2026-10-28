@@ -2,10 +2,14 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { closeSync, constants as fsConstants, fstatSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
 import { cp, lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, extname, join, relative } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 import { deflateRawSync, gunzipSync, inflateRawSync } from "node:zlib";
 
 import { validateReleaseDownloads } from "../scripts/prepare-runtime.mjs";
@@ -17,9 +21,9 @@ const clientRoot = join(distRoot, "client");
 const runtimeRoot = join(clientRoot, "heel-runtime");
 const downloadsRoot = join(clientRoot, "downloads");
 const serverRoot = join(distRoot, "server");
-const wheelName = "heel_browser-1.2.0-py3-none-any.whl";
-const agentWheelName = "heel_sim-1.2.0-py3-none-any.whl";
-const agentSourceName = "heel_sim-1.2.0.tar.gz";
+const wheelName = "heel_browser-1.3.0rc2-py3-none-any.whl";
+const agentWheelName = "heel_sim-1.3.0rc2-py3-none-any.whl";
+const agentSourceName = "heel_sim-1.3.0rc2.tar.gz";
 const agentManifestName = "heel-open-core-manifest.json";
 const edgeAuthSecret = "E".repeat(43);
 const expectedDownloadNames = [agentManifestName, agentWheelName, agentSourceName];
@@ -246,11 +250,76 @@ function swapFirstTwoCentralEntries(archive) {
 
 
 function canonicalGzip(payload) {
+  assert.ok(payload.byteLength <= maxReleaseArchiveBytes, "canonical gzip input exceeds the release archive bound");
   const header = Buffer.from("1f8b08000000000002ff", "hex");
   const trailer = Buffer.alloc(8);
   trailer.writeUInt32LE(crc32(payload), 0);
   trailer.writeUInt32LE(payload.byteLength >>> 0, 4);
-  return Buffer.concat([header, deflateRawSync(payload, { level: 9 }), trailer]);
+  // Feed stdin from a private regular file, not spawnSync's input option. On
+  // macOS that option streams through a Unix socket, and the child's read has
+  // been observed to block until the timeout.
+  const directory = mkdtempSync(join(tmpdir(), "heel-canonical-gzip-"));
+  const inputPath = join(directory, "input");
+  let stdinFd = null;
+  try {
+    const writeFd = openSync(inputPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    let written;
+    try {
+      for (let offset = 0; offset < payload.byteLength;) {
+        offset += writeSync(writeFd, payload, offset, payload.byteLength - offset, offset);
+      }
+      written = fstatSync(writeFd);
+    } finally {
+      closeSync(writeFd);
+    }
+    // The child inherits this read-only descriptor as fd 0 at offset 0, reads
+    // it to end of file, and shares the offset, so each call opens its own.
+    stdinFd = openSync(inputPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const stdin = fstatSync(stdinFd);
+    assert.ok(stdin.isFile() && stdin.dev === written.dev && stdin.ino === written.ino
+      && stdin.size === payload.byteLength && (stdin.mode & 0o777) === 0o600 && stdin.uid === process.getuid(),
+    "canonical gzip input is not the private regular file that was written");
+    // Match the Python release builder, not Node's independently changing zlib
+    // implementation. Keep exact canonical-byte validation on Node 26 as well.
+    const options = { stdio: [stdinFd, "pipe", "pipe"], timeout: 10_000, maxBuffer: maxReleaseArchiveBytes };
+    const startedAt = performance.now();
+    const compressed = spawnSync("python3", ["-I", "-c",
+      "import sys,zlib; c=zlib.compressobj(9,zlib.DEFLATED,-15); sys.stdout.buffer.write(c.compress(sys.stdin.buffer.read())+c.flush())"],
+      options);
+    const elapsedMs = performance.now() - startedAt;
+    // Build the failure detail only on failure, so passing calls keep their timing.
+    if (compressed.status !== 0) {
+      assert.equal(compressed.status, 0,
+        `Python canonical release compressor failed ${compressorFailureDetail(compressed, payload, options, elapsedMs)}`);
+    }
+    return Buffer.concat([header, compressed.stdout, trailer]);
+  } finally {
+    if (stdinFd !== null) closeSync(stdinFd);
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+
+// Report how the child ended without its environment or stderr text.
+function compressorFailureDetail(result, payload, options, elapsedMs) {
+  const bounded = (value) => value === undefined || value === null
+    ? null
+    : String(value).replace(/[^\x20-\x7e]/g, "?").slice(0, 160);
+  return JSON.stringify({
+    status: result.status,
+    signal: result.signal,
+    error_code: bounded(result.error?.code),
+    error_message: bounded(result.error?.message),
+    stderr_bytes: result.stderr?.byteLength ?? null,
+    stdout_bytes: result.stdout?.byteLength ?? null,
+    elapsed_ms: Number(elapsedMs.toFixed(1)),
+    stdin: "private regular file",
+    input_bytes: payload.byteLength,
+    input_sha256: sha256(payload),
+    timeout_ms: options.timeout,
+    max_buffer: options.maxBuffer,
+  });
 }
 
 
@@ -554,7 +623,7 @@ function tarMembers(archive, label = "source archive") {
   const payload = expanded.buffer;
   assert.equal(archive.readUInt32LE(archive.byteLength - 8), crc32(payload), `${label} gzip CRC mismatch`);
   assert.equal(archive.readUInt32LE(archive.byteLength - 4), payload.byteLength >>> 0, `${label} gzip size mismatch`);
-  assert.deepEqual(archive, canonicalGzip(payload), `${label} gzip DEFLATE stream is noncanonical`);
+  assert.ok(archive.equals(canonicalGzip(payload)), `${label} gzip DEFLATE stream is noncanonical`);
   assert.equal(payload.byteLength % 512, 0, `${label} has a partial TAR block`);
   const members = [];
   const names = new Set();
@@ -932,7 +1001,7 @@ test("TAR scanner rejects noncanonical and nonempty unused header metadata", asy
 
 
 test("TAR scanner rejects corrupt checksums, padding, termination, and private members", () => {
-  const valid = syntheticTar([{ name: "heel_sim-1.2.0/heel/model.py", payload: Buffer.from("VALUE = 1\n") }]);
+  const valid = syntheticTar([{ name: "heel_sim-1.3.0rc2/heel/model.py", payload: Buffer.from("VALUE = 1\n") }]);
   const raw = gunzipSync(valid);
 
   const badChecksum = Buffer.from(raw);
@@ -953,13 +1022,13 @@ test("TAR scanner rejects corrupt checksums, padding, termination, and private m
   assert.throws(() => tarMembers(canonicalGzip(trailingPayload), "trailing-data source"), /trailing|termination/i);
 
   const privateSource = syntheticTar([
-    { name: "heel_sim-1.2.0/docs/saas/PRODUCT.md", payload: Buffer.from("private\n") },
-    { name: "heel_sim-1.2.0/heel/model.py", payload: Buffer.from("VALUE = 1\n") },
+    { name: "heel_sim-1.3.0rc2/docs/saas/PRODUCT.md", payload: Buffer.from("private\n") },
+    { name: "heel_sim-1.3.0rc2/heel/model.py", payload: Buffer.from("VALUE = 1\n") },
   ]);
   assert.throws(
     () => classifyReleaseMembers(tarMembers(privateSource), {
       label: "mutated source",
-      rootPrefix: "heel_sim-1.2.0/",
+      rootPrefix: "heel_sim-1.3.0rc2/",
     }),
     /commercial boundary/,
   );
@@ -968,7 +1037,7 @@ test("TAR scanner rejects corrupt checksums, padding, termination, and private m
 
 test("TAR decompression budget includes bounded headers and padding", () => {
   const records = Array.from({ length: 6 }, (_, index) => ({
-    name: `heel_sim-1.2.0/heel/payload_${index}.py`,
+    name: `heel_sim-1.3.0rc2/heel/payload_${index}.py`,
     payload: Buffer.alloc(maxReleaseMemberBytes),
   }));
   assert.equal(tarMembers(syntheticTar(records), "limit source").length, records.length);
@@ -1062,7 +1131,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
   const manifest = JSON.parse(decodeUtf8(manifestPayload, `downloads/${agentManifestName}`));
   assert.deepEqual(Object.keys(manifest).sort(), ["artifacts", "schema_version", "version"]);
   assert.equal(manifest.schema_version, "heel.open-core-artifacts.v1");
-  assert.equal(manifest.version, "1.2.0");
+  assert.equal(manifest.version, "1.3.0rc2");
   assert.deepEqual(manifest.artifacts.map(({ name }) => name), [agentWheelName, agentSourceName]);
   await validateReleaseDownloads(downloadsRoot);
 
@@ -1083,7 +1152,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
   const sourceRecords = tarMembers(artifacts.get(agentSourceName), "Heel Agent source archive");
   classifyReleaseMembers(sourceRecords, {
     label: "Heel Agent source archive",
-    rootPrefix: "heel_sim-1.2.0/",
+    rootPrefix: "heel_sim-1.3.0rc2/",
   });
 });
 
@@ -1091,7 +1160,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
 test("release member classification rejects private paths and hostile archive shapes", () => {
   const safeWheel = { name: "heel/model.py", payload: Buffer.from("VALUE = 1\n"), type: "0" };
   const safeSource = {
-    name: "heel_sim-1.2.0/heel/model.py",
+    name: "heel_sim-1.3.0rc2/heel/model.py",
     payload: Buffer.from("VALUE = 1\n"),
     type: "0",
   };
@@ -1104,8 +1173,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "source private documentation",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.2.0/docs/saas/PRODUCT.md" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.2.0/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc2/docs/saas/PRODUCT.md" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc2/" },
       message: /commercial boundary/,
     },
     {
@@ -1128,8 +1197,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "device",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.2.0/heel/device.py", type: "3" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.2.0/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc2/heel/device.py", type: "3" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc2/" },
       message: /not a regular file/,
     },
     {
@@ -1158,8 +1227,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "unexpected extension",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.2.0/private.pem" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.2.0/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc2/private.pem" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc2/" },
       message: /unexpected extension/,
     },
   ];
@@ -1388,9 +1457,9 @@ test("serves the Agent acquisition page only from the canonical route", async ()
   );
   assert.equal(agent.status, 200, "/agent must serve the customer acquisition page");
   const agentBody = await agent.text();
-  assert.match(agentBody, /<h1>Run Heel from your AI client\.<\/h1>/);
-  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.2\.0-py3-none-any\.whl"/);
-  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.2\.0\.tar\.gz"/);
+  assert.match(agentBody, /<h1>Investigate product abuse from your AI client\.<\/h1>/);
+  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.3\.0rc2-py3-none-any\.whl"/);
+  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.3\.0rc2\.tar\.gz"/);
   assert.match(agentBody, /href="\/downloads\/heel-open-core-manifest\.json"/);
   const agentManifest = JSON.parse(
     await readFile(join(downloadsRoot, agentManifestName), "utf8"),
@@ -1591,6 +1660,7 @@ test("production worker streams only the approved findings control-plane routes"
   const environment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    PUBLIC_ORIGIN: "https://heel.example",
     CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
     CONTROL_PLANE: {
       async fetch(request) {
@@ -1694,7 +1764,7 @@ test("production worker streams only the approved findings control-plane routes"
     assert.equal(call.redirect, "manual");
     assert.equal(
       call.url,
-      `https://heel-control-plane.internal${path.replace("/api/control-plane", "")}`,
+      `https://heel.example${path.replace("/api/control-plane", "")}`,
     );
     assert.equal(call.headers.authorization, credentialHeaders.Authorization);
     assert.equal(call.headers.cookie, credentialHeaders.Cookie === undefined ? undefined : "heel_session=private");
@@ -1780,6 +1850,7 @@ test("production worker carries only Heel session cookies on the exact account r
   const environment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    PUBLIC_ORIGIN: "https://heel.example",
     CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
     CONTROL_PLANE: {
       async fetch(request) {
@@ -1829,7 +1900,7 @@ test("production worker carries only Heel session cookies on the exact account r
       "__Host-heel_session=private; HttpOnly; SameSite=Lax; Path=/; Secure",
     );
     const call = calls.at(-1);
-    assert.equal(call.url, `https://heel-control-plane.internal${path}`);
+    assert.equal(call.url, `https://heel.example${path}`);
     assert.equal(call.headers.cookie, undefined, `${path} forwarded a stale session`);
     assert.equal(call.headers["x-customer-metadata"], undefined);
     assert.equal(call.headers["x-heel-edge-auth"], edgeAuthSecret);
@@ -1956,7 +2027,7 @@ test("production worker exposes only the closed device ceremony and separates br
     );
     assert.equal(response.status, 200, route);
     const call = calls.at(-1);
-    assert.equal(call.url, `https://heel-control-plane.internal/v1/device/${route}`);
+    assert.equal(call.url, `https://proxy.heel.invalid/v1/device/${route}`);
     assert.deepEqual(Object.keys(call.headers).sort(), [
       "content-encoding", "content-length", "content-type",
       ...(route === "start" ? ["x-heel-client-key"] : []),
@@ -2075,6 +2146,7 @@ test("findings proxy preserves request and response streaming across the private
   const environment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    PUBLIC_ORIGIN: "https://heel.example",
     CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
     CONTROL_PLANE: {
       async fetch(request) {
@@ -2153,6 +2225,7 @@ test("findings proxy fails closed and leaves anonymous review traffic without a 
   const baseEnvironment = {
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    PUBLIC_ORIGIN: "https://heel.example",
     CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
   };
   const context = { waitUntil() {}, passThroughOnException() {} };
@@ -2202,6 +2275,27 @@ test("findings proxy fails closed and leaves anonymous review traffic without a 
   assert.equal(failed.status, 502);
   assert.equal((await failed.text()).includes(marker), false);
   assert.equal(bindingCalls, 1);
+
+  for (const PUBLIC_ORIGIN of [undefined, "https://heel-control-plane.internal", "http://127.0.0.1:8787"]) {
+    const refused = await artifact.default.fetch(
+      new Request(`https://proxy.heel.invalid${approvedPath}`, {
+        method: "POST",
+        body: marker,
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": String(Buffer.byteLength(marker)),
+          "Idempotency-Key": `fs1-${"e".repeat(64)}`,
+          Cookie: "__Host-heel_session=private",
+        },
+      }),
+      { ...failingEnvironment, PUBLIC_ORIGIN },
+      context,
+    );
+    assert.equal(refused.status, 503, `${PUBLIC_ORIGIN}`);
+    assert.equal(refused.headers.get("cache-control"), "no-store");
+    assert.equal((await refused.text()).includes(marker), false);
+  }
+  assert.equal(bindingCalls, 1, "a missing or refused configured origin reached the private binding");
 
   for (const headers of [
     { "Content-Type": "application/json", Cookie: "__Host-heel_session=private" },
@@ -2265,4 +2359,192 @@ test("findings proxy fails closed and leaves anonymous review traffic without a 
     /\brequest\.(?:arrayBuffer|blob|clone|formData|json|text)\s*\(/,
   );
   assert.doesNotMatch(workerSource, /\bctx\.waitUntil\s*\(/);
+});
+
+test("production worker refuses out-of-shape control-plane configuration with the fixed 503", async (t) => {
+  const artifact = await import(
+    pathToFileURL(join(serverRoot, "index.js")).href + `?configuration-shape=${Date.now()}`
+  );
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  let ambientCalls = 0;
+  let assetCalls = 0;
+  let bindingCalls = 0;
+  const ambientFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    ambientCalls += 1;
+    throw new Error("ambient fetch must never carry control-plane traffic");
+  };
+  t.after(() => { globalThis.fetch = ambientFetch; });
+  const respond = async () => new Response("{}", { headers: { "Content-Type": "application/json" } });
+  const environment = (configuration) => ({
+    ASSETS: { fetch: async () => { assetCalls += 1; return new Response("asset", { status: 404 }); } },
+    IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+    PUBLIC_ORIGIN: "https://heel.example",
+    CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
+    CONTROL_PLANE: { fetch: async (request) => { bindingCalls += 1; return respond(request); } },
+    ...configuration,
+  });
+  const request = () => new Request("https://proxy.heel.invalid/api/control-plane/v1/me", {
+    headers: { Cookie: "__Host-heel_session=private", Host: "attacker.invalid" },
+  });
+
+  for (const [label, configuration] of [
+    ["missing origin", { PUBLIC_ORIGIN: undefined }],
+    ["number secret", { CONTROL_PLANE_EDGE_SECRET: 43 }],
+    ["boolean secret", { CONTROL_PLANE_EDGE_SECRET: false }],
+    ["object secret", { CONTROL_PLANE_EDGE_SECRET: {} }],
+    ["array secret", { CONTROL_PLANE_EDGE_SECRET: [edgeAuthSecret] }],
+    ["String object secret", { CONTROL_PLANE_EDGE_SECRET: new String(edgeAuthSecret) }],
+    ["missing binding", { CONTROL_PLANE: undefined }],
+    ["null binding", { CONTROL_PLANE: null }],
+    ["empty binding", { CONTROL_PLANE: {} }],
+    ["missing fetch binding", { CONTROL_PLANE: { fetch: undefined } }],
+    ["non-callable binding", { CONTROL_PLANE: { fetch: 43 } }],
+  ]) {
+    const response = await artifact.default.fetch(request(), environment(configuration), context);
+    assert.equal(response.status, 503, label);
+    assert.equal(await response.text(), '{"error":"control plane unavailable"}', label);
+    assert.equal(response.headers.get("cache-control"), "no-store", label);
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff", label);
+    assert.equal(response.headers.get("location"), null, label);
+  }
+  assert.deepEqual([ambientCalls, assetCalls, bindingCalls], [0, 0, 0]);
+
+  // Valid configuration keeps its meaning: one attempted private call, upstream failure stays 502.
+  const valid = await artifact.default.fetch(request(), environment({}), context);
+  assert.equal(valid.status, 200);
+  assert.equal(bindingCalls, 1);
+  for (const fetch of [
+    async () => { bindingCalls += 1; throw new Error("private-upstream-marker"); },
+    async () => { bindingCalls += 1; return new Response(null, { status: 302, headers: { Location: "https://attacker.invalid/" } }); },
+  ]) {
+    const failed = await artifact.default.fetch(request(), environment({ CONTROL_PLANE: { fetch } }), context);
+    assert.equal(failed.status, 502);
+    assert.equal(await failed.text(), '{"error":"control plane request failed"}');
+    assert.equal(failed.headers.get("location"), null);
+  }
+  assert.deepEqual([ambientCalls, assetCalls, bindingCalls], [0, 0, 3]);
+});
+
+test("production worker frames every POST family to its declared length and reaches only the private binding", async (t) => {
+  // H0X E3: the frozen build carries the same length authority and sink identity as the source Worker.
+  const artifact = await import(
+    pathToFileURL(join(serverRoot, "index.js")).href + `?sink-identity=${Date.now()}`
+  );
+  const origin = "https://heel.example";
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  const workspace = "ws_0123456789abcdef";
+  const project = `prj_${"a".repeat(32)}`;
+  const runner = "runr_0123456789abcdef0123456789abcdef";
+  const run = `crun_${"c".repeat(32)}`;
+  const session = { Cookie: "__Host-heel_session=private" };
+  const browser = { ...session, Origin: origin, "Sec-Fetch-Site": "same-origin" };
+  const runnerProof = {
+    "X-Heel-Runner-Id": runner, "X-Heel-Runner-Key-Id": "key", "X-Heel-Runner-Timestamp-Ms": "1",
+    "X-Heel-Runner-Nonce": "nonce", "X-Heel-Runner-Sequence": "1", "X-Heel-Runner-Signature": "sig",
+  };
+  const routes = [
+    ["POST", "/v1/signup", { "CF-Connecting-IP": "203.0.113.4" }],
+    ["POST", "/v1/login", {}],
+    ["GET", "/v1/me", session],
+    ["POST", "/v1/logout", session],
+    ["POST", "/v1/device/start", { "CF-Connecting-IP": "203.0.113.4" }],
+    ["POST", "/v1/device/poll", {}],
+    ["POST", "/v1/device/verify", browser],
+    ["GET", `/v1/workspaces/${workspace}/projects`, session],
+    ["POST", `/v1/workspaces/${workspace}/projects`, { Authorization: "Bearer heel_sk_private" }],
+    ["POST", `/v1/workspaces/${workspace}/projects/${project}/findings-sync`, { ...session, "Idempotency-Key": `fs1-${"0".repeat(64)}` }],
+    ["POST", "/v1/runner-pairings/exchange", {}],
+    ["POST", `/v1/workspaces/${workspace}/runners/${runner}/revoke`, browser],
+    ["POST", `/v1/workspaces/${workspace}/runners/${runner}/claim`, runnerProof],
+    ["POST", `/v1/workspaces/${workspace}/runners/${runner}/runs/${run}/result-projection`, runnerProof],
+    ["GET", `/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}`, session],
+    [
+      "POST", `/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}/approve`,
+      { ...browser, "Idempotency-Key": `ca1-${"1".repeat(64)}`, "If-Heel-Control-Generation": "3" },
+    ],
+  ];
+  let ambientCalls = 0;
+  const ambientFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    ambientCalls += 1;
+    throw new Error("ambient fetch must never carry control-plane traffic");
+  };
+  t.after(() => { globalThis.fetch = ambientFetch; });
+  const run1 = async (method, path, headers, body, declared) => {
+    const calls = { asset: 0, binding: [] };
+    const environment = {
+      ASSETS: { fetch: async () => { calls.asset += 1; return new Response("asset", { status: 404 }); } },
+      IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+      PUBLIC_ORIGIN: origin,
+      CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
+      CONTROL_PLANE: {
+        async fetch(upstream) {
+          const call = { url: upstream.url, redirect: upstream.redirect, read: "read" };
+          calls.binding.push(call);
+          try {
+            await upstream.arrayBuffer();
+          } catch (error) {
+            call.read = error.name;
+            throw error;
+          }
+          const setCookie = path === "/v1/logout"
+            ? "heel_session=; Max-Age=0; Path=/"
+            : path === "/v1/signup" || path === "/v1/login" ? "heel_session=private; HttpOnly; SameSite=Lax; Path=/" : null;
+          return new Response("{}", {
+            headers: { "Content-Type": "application/json", ...(setCookie === null ? {} : { "Set-Cookie": setCookie }) },
+          });
+        },
+      },
+    };
+    const requestHeaders = method === "POST"
+      ? { ...headers, "Content-Type": "application/json", "Content-Length": declared }
+      : headers;
+    const response = await artifact.default.fetch(new Request(`https://proxy.heel.invalid/api/control-plane${path}`, {
+      method, headers: requestHeaders, ...(method === "POST" ? { body } : {}),
+    }), environment, context);
+    return { status: response.status, ...calls };
+  };
+  for (const [method, path, headers] of routes) {
+    const exact = await run1(method, path, headers, "{}", "2");
+    assert.deepEqual(exact, {
+      status: 200, asset: 0, binding: [{ url: `${origin}${path}`, redirect: "manual", read: "read" }],
+    }, `${method} ${path}`);
+    if (method !== "POST") continue;
+    for (const declared of ["3", "1"]) {
+      const mismatch = await run1(method, path, headers, "{}", declared);
+      assert.deepEqual(mismatch, {
+        status: 502, asset: 0, binding: [{ url: `${origin}${path}`, redirect: "manual", read: "TypeError" }],
+      }, `${method} ${path} declared ${declared}`);
+    }
+  }
+  // A malformed binding is refused with the fixed 503 before any request check could answer 400.
+  const refusedRequests = [
+    ["foreign human Origin", () => new Request(`https://proxy.heel.invalid/api/control-plane/v1/device/verify`, {
+      method: "POST", body: "{}",
+      headers: { ...session, Origin: "https://attacker.invalid", "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json", "Content-Length": "2" },
+    })],
+    ["runner proof missing", () => new Request(`https://proxy.heel.invalid/api/control-plane/v1/workspaces/${workspace}/runners/${runner}/claim`, {
+      method: "POST", body: "{}", headers: { "Content-Type": "application/json", "Content-Length": "2" },
+    })],
+    ["wrong content type", () => new Request("https://proxy.heel.invalid/api/control-plane/v1/login", {
+      method: "POST", body: "{}", headers: { "Content-Type": "text/plain", "Content-Length": "2" },
+    })],
+  ];
+  for (const [label, binding] of [["missing", undefined], ["null", null], ["empty object", {}], ["non-callable fetch", { fetch: 43 }]]) {
+    for (const [requestLabel, request] of refusedRequests) {
+      let assets = 0;
+      const response = await artifact.default.fetch(request(), {
+        ASSETS: { fetch: async () => { assets += 1; return new Response("asset", { status: 404 }); } },
+        IMAGES: { input: () => { throw new Error("image transform is not used by the proxy"); } },
+        PUBLIC_ORIGIN: origin,
+        CONTROL_PLANE_EDGE_SECRET: edgeAuthSecret,
+        ...(binding === undefined ? {} : { CONTROL_PLANE: binding }),
+      }, context);
+      assert.equal(response.status, 503, `${label} ${requestLabel}`);
+      assert.equal(await response.text(), '{"error":"control plane unavailable"}', `${label} ${requestLabel}`);
+      assert.equal(assets, 0, `${label} ${requestLabel}`);
+    }
+  }
+  assert.equal(ambientCalls, 0);
 });

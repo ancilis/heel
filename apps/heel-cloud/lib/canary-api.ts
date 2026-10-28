@@ -128,10 +128,25 @@ export interface VerifiedEnvironmentRecord {
   environmentClass: "staging" | "sandbox" | "production";
   status: "pending" | "verified" | "revoked";
   proofMethod: "https-file" | "dns-txt";
+  challengeGeneration: number;
+  challengeExpiresAt: number | null;
   proofExpiresAt: number | null;
   lastFailureCode: string | null;
   verificationRecordDigest: string | null;
   isExecutable: boolean;
+}
+
+/** One pending record's current proof instruction; it lives only in the caller's memory, never in storage. */
+export interface PendingEnvironmentProof {
+  environmentId: string;
+  origin: string;
+  environmentClass: VerifiedEnvironmentRecord["environmentClass"];
+  proofMethod: VerifiedEnvironmentRecord["proofMethod"];
+  token: string;
+  httpUrl: string;
+  dnsRecord: string;
+  challengeGeneration: number;
+  expiresAt: number;
 }
 
 const PUBLIC_MESSAGES = Object.freeze({
@@ -156,6 +171,11 @@ const PUBLIC_MESSAGES = Object.freeze({
   invalid_environment_check: "That environment proof check is invalid.",
   environment_not_found: "That environment is unavailable in this project.",
   environment_check_cooldown: "Wait briefly before checking this proof again.",
+  invalid_environment_challenge: "That pending proof request is invalid.",
+  environment_challenge_expired: "This pending proof expired. Issue a replacement proof for the same target.",
+  environment_challenge_missing: "This pending proof is no longer available. Issue a replacement proof for the same target.",
+  environment_challenge_closed: "This target is no longer pending, so its proof cannot be reopened.",
+  environment_challenge_live: "This pending proof is still current. Resume it instead of replacing it.",
   quota_exceeded: "This workspace has reached its current allowance.",
   invalid_runner_pairing: "That runner pairing request is invalid or expired.",
   runner_pairing_not_found: "That runner pairing request is no longer available.",
@@ -599,10 +619,36 @@ function parseEnvironment(value: unknown): VerifiedEnvironmentRecord {
     environmentClass: value.environment_class as VerifiedEnvironmentRecord["environmentClass"],
     status: value.status as VerifiedEnvironmentRecord["status"],
     proofMethod: value.proof_method as VerifiedEnvironmentRecord["proofMethod"],
+    challengeGeneration: value.challenge_generation as number,
+    challengeExpiresAt: value.challenge_expires_at as number | null,
     proofExpiresAt: value.proof_expires_at as number | null,
     lastFailureCode: value.last_failure_code as string | null,
     verificationRecordDigest: value.verification_record_digest as string | null,
     isExecutable: value.is_executable as boolean,
+  });
+}
+
+/** Binds a recovery or rotation response to the listed pending record it was requested for. */
+function parsePendingProof(value: JsonRecord, listed: VerifiedEnvironmentRecord, rotated: boolean): PendingEnvironmentProof {
+  const host = listed.origin.slice("https://".length);
+  if (!exact(value, [
+    "schema_version", "environment_id", "origin", "environment_class", "proof_method", "token", "http_url",
+    "dns_record", "challenge_generation", "expires_at", "attestation", "attestation_version", "attestation_acknowledgement",
+  ]) || value.schema_version !== "heel.verified-environment-challenge-recovery.v1"
+    || value.environment_id !== listed.environmentId || value.origin !== listed.origin
+    || value.environment_class !== listed.environmentClass || value.proof_method !== listed.proofMethod
+    || !identifier(value.token) || !integer(value.challenge_generation, 1)
+    || (rotated ? value.challenge_generation <= listed.challengeGeneration : value.challenge_generation !== listed.challengeGeneration)
+    || value.http_url !== `${listed.origin}/.well-known/heel-verify.txt`
+    || value.dns_record !== `_heel.${host} TXT heel-verify=${value.token}`
+    || typeof value.expires_at !== "number" || !Number.isFinite(value.expires_at) || value.expires_at <= 0
+    || value.attestation !== "ownership verified; environment classification supplied by you"
+    || value.attestation_version !== "v1" || value.attestation_acknowledgement !== "accepted") invalidResponse();
+  return deepFreeze({
+    environmentId: listed.environmentId, origin: listed.origin, environmentClass: listed.environmentClass,
+    proofMethod: listed.proofMethod, token: value.token as string, httpUrl: value.http_url as string,
+    dnsRecord: value.dns_record as string, challengeGeneration: value.challenge_generation as number,
+    expiresAt: value.expires_at as number,
   });
 }
 
@@ -840,6 +886,20 @@ export class CanaryApi {
     const value = await this.#json(environmentPath(workspaceRef, projectRef, `/${environmentRef}/check`), "POST", { schema_version: "heel.verified-environment-check.v1" }, 200);
     if (!exact(value, ["schema_version", "verified"]) || value.schema_version !== "heel.verified-environment-check-result.v1" || typeof value.verified !== "boolean") invalidResponse();
     return value.verified;
+  }
+
+  /** Read-only: shows the current challenge of one listed pending record again; it never rotates or checks it. */
+  async recoverEnvironmentProof(workspaceRef: string, projectRef: string, listed: VerifiedEnvironmentRecord): Promise<PendingEnvironmentProof> {
+    if (!ENVIRONMENT_REF.test(listed.environmentId) || listed.status !== "pending") invalidRequest();
+    const value = await this.#json(environmentPath(workspaceRef, projectRef, `/${listed.environmentId}/challenge`), "POST", { schema_version: "heel.verified-environment-challenge-recover.v1" }, 200);
+    return parsePendingProof(value, listed, false);
+  }
+
+  /** Explicit replacement of an expired or missing pending challenge in the same record. */
+  async rotateEnvironmentProof(workspaceRef: string, projectRef: string, listed: VerifiedEnvironmentRecord): Promise<PendingEnvironmentProof> {
+    if (!ENVIRONMENT_REF.test(listed.environmentId) || listed.status !== "pending") invalidRequest();
+    const value = await this.#json(environmentPath(workspaceRef, projectRef, `/${listed.environmentId}/challenge/rotate`), "POST", { schema_version: "heel.verified-environment-challenge-rotate.v1" }, 201);
+    return parsePendingProof(value, listed, true);
   }
 
   async createRunnerPairingInvitation(workspaceRef: string): Promise<Readonly<{ invitationToken: string; expiresAt: number }>> {

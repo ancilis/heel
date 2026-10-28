@@ -1,3 +1,17 @@
+# Current business-abuse validation architecture — September 4, 2026
+
+OpenAPI and ProductModel feed the pure static review. Optional ProductModel business_rules declare intended invariants and their source; lifecycle_sequences retain ordered actors/actions without asserting execution. Unknown controls produce questions. Static result evidence_state, execution_disposition and severity are distinct; the strict Python/TypeScript contract accepts historical records while rejecting verified behavior in new static records.
+
+`heel reference prepare` connects the export rule to a bounded hypothesis. A human-created signed scope authorizes `reference:export`. CLI or MCP execution consumes an exclusive attempt ID, constructs a reference-only signed compiler manifest/grant and runs the existing LocalCanaryExecutor. A closed in-process transport calls ExportProduct's account and export-license handler twice. It accepts no external origin or replacement product/transport. Reference authority keys never enter cloud trust.
+
+The executor assesses exact protected content from the local bounded evidence sink. Both role actions share an approved fixture. Status alone is insufficient; a positive entitled baseline is mandatory. It retains raw evidence in RunnerStore and emits existing closed projections without response bodies. A reference report explains the rule, result, provenance, fix, regression and gaps. The app imports only a local synthetic report summary; it does not execute targets or authenticate imported report signatures.
+
+Production TargetHTTPSClient, target proof, cryptographic grant binding, replay, stop handling and separate disclosure remain their existing independent safety boundaries. Cloud pairing and arbitrary customer-target CLI/MCP execution are incomplete. See [capabilities](../CAPABILITIES.md) and [demo](../EXPORT_DEMO.md).
+
+---
+
+The following describes the broader existing control-plane implementation, not completion of a public validation journey.
+
 # Heel SaaS Architecture
 
 Heel's free early-access launch has two intentionally different data boundaries:

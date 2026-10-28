@@ -1,5 +1,7 @@
 # Heel — Evaluation
 
+September 4 business-rule correction: current synthetic vocabulary run reports localization recall **0.417**, attribution recall **0.251**, precision **0.976** on 199 authored weaknesses. Rule applicability requirements reduce metadata-only matches. These are model-matching metrics, not live detection accuracy or proof of customer effectiveness. Scenario entries include alternate encodings, not that many independent executable mechanisms. The historical 120 scenarios / localization recall 0.50 / attribution recall 0.33 / precision 0.98 discussion below predates these changes. The export reference has separate behavioral acceptance described in [CAPABILITIES.md](docs/CAPABILITIES.md).
+
 Honest results from the integrated Heel platform. Reproduce with `make demo`, `make demo-bench`, or
 `python3 -m unittest discover -s tests`. Everything is computed locally and deterministically.
 The evaluation story applies to the same product described in README, ARCHITECTURE, SECURITY, TRUST,

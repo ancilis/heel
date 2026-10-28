@@ -327,8 +327,8 @@ class TestOpenAPIImport(unittest.TestCase):
         self.assertNotIn("entitlement_check", endpoint)
         self.assertNotIn("rate_limit", endpoint)
         export = model["exports"][0]
-        self.assertEqual(export["entitlement_check"], "missing")
-        self.assertEqual(export["rate_limit"], "missing")
+        self.assertEqual(export["entitlement_check"], "unknown")
+        self.assertEqual(export["rate_limit"], "unknown")
 
     def test_invalid_heel_extension_types_are_rejected(self):
         from heel.openapi_import import OpenAPIImportError, product_model_from_openapi

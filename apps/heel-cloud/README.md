@@ -28,11 +28,60 @@ The browser experience works on supported Windows browsers. The machine credenti
 fallback and durable machine sync queue require POSIX descriptor and file-locking
 semantics; Windows CLI/MCP cloud continuity is not launch-supported.
 
-The exact verified Agent files advertised on `/agent` are:
+The exact builder-verified Agent files advertised on `/agent` are the 1.3.0rc2 runner preview
+candidate. It corrects both 1.3.0rc1 reference errata: the HTTP 200 `error_envelope` case and the
+HTTP 403 `hardened` error-envelope case are each inconclusive, not a passed regression. The 1.3.0rc2
+candidate is not yet published as a GitHub
+release or to PyPI. The earlier 1.3.0rc1 runner preview is the public GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. That prerelease is not a stable release,
+its release record is not immutable, it is not a deployed Heel Cloud URL, and it does not indicate
+customer acceptance. `heel-sim` is not yet published to PyPI. `/agent` and `/runner` also show a
+no-download install of the hash-pinned public 1.3.0rc1 wheel, with its erratum, and require a
+physical, symlink-free `HEEL_HOME` (for example `"$(pwd -P)/.heel"`). The same-origin candidate
+files are:
 
-- `/downloads/heel_sim-1.2.0-py3-none-any.whl`
-- `/downloads/heel_sim-1.2.0.tar.gz`
+- `/downloads/heel_sim-1.3.0rc2-py3-none-any.whl`
+- `/downloads/heel_sim-1.3.0rc2.tar.gz`
 - `/downloads/heel-open-core-manifest.json`
+
+## Dashboard account onboarding
+
+`/dashboard` lets a visitor create an account or sign in, then choose a workspace and a
+project, using only the existing `/v1/signup`, `/v1/login`, `/v1/logout`, `/v1/me` and
+`/v1/workspaces/{ws}/projects` routes and the HttpOnly session cookie.
+
+- Signup creates the account and one default workspace (server behavior). There is no route
+  to create another workspace, and free workspaces have one seat, so invites return 402.
+- The selected workspace and project are kept in the address as `?workspace=ws_…&project=prj_…`
+  so a reload restores them. They are opaque refs and are honored only when `/v1/me` and the
+  project list for the current session still include them. No password, session token or
+  selection is written to browser storage.
+- Project creation is offered to owner, admin and member roles. The server still decides; a
+  403 is shown as a role message. Billing-only workspaces cannot list projects.
+- Sign-out, an expired session, a workspace/project switch, or same-document Back/Forward to
+  another address starts a new load generation; the address is re-resolved like a reload.
+  Responses (successes and failures, including 401) that arrive for an earlier generation are
+  discarded, so they cannot fill or end a newer view. This includes a local summary file read
+  that finishes after the switch. Busy state belongs to the action that started it: a new
+  generation releases it, so an older pending action cannot disable the new view's controls or
+  Sign out, and its late completion cannot release a newer action's busy state. A follow-up
+  refresh after a binding create/revoke or proof check runs under the generation of the action
+  that started it: if that generation is gone when the action settles, no refresh is sent, and a
+  refresh that settles later cannot restore the old project, runner selection or address. The
+  server-side change itself is not rolled back.
+- If the canary reads (environments, runner context) fail after the account and project
+  resolved, the workspace/project controls and Sign out stay available, the project stays in
+  the address, and verification, runner access and rehearsals stay locked until Try again
+  succeeds. A 401 there is still treated as session loss. When Try again succeeds, the
+  "Project created … blocked" notice is replaced by the ready next step (or removed if staging
+  is already verified); if the outage continues, the notice stays.
+- Error states show fixed messages for invalid input, duplicate email, wrong password, rate
+  limiting, forbidden, signed-out and unavailable. Submitted values are never echoed.
+
+Evidence: `tests/account-onboarding.test.tsx` (stubbed `fetch` and router) and
+`tests/account-loopback.test.ts`, which runs the real Python `ControlPlane` over loopback HTTP
+when `HEEL_LOOPBACK_PYTHON` is set; otherwise it is skipped. Neither test goes through the
+Worker, TLS or a public origin.
 
 ## Production topology
 
@@ -109,6 +158,11 @@ npm run test:node
 ```
 
 The build verifies the committed Agent downloads without regenerating them.
+
+CI also runs `npm audit --omit=dev --audit-level=high --package-lock-only
+--ignore-scripts --no-fund` after `npm ci`. It covers only lockfile packages npm does not mark
+as dev, so it is not complete Worker-runtime coverage: vinext and other dev-declared
+packages are bundled into the Worker but are outside this check.
 
 ## Deployment
 

@@ -40,6 +40,8 @@ _SAFE_RUNNER_CREDENTIAL_FAILURE = "Heel runner credential could not be stored sa
 _SAFE_RUNNER_MAPPING_FAILURE = "Heel runner mapping could not be saved safely."
 _SAFE_RUNNER_LIVE_FAILURE = "Heel runner live preparation is unavailable."
 _SAFE_RUNNER_COMMAND_FAILURE = "Heel runner command was rejected."
+_SAFE_RUNNER_PAIRING_FAILURE = "Heel runner pairing failed: {}."
+_SAFE_RUNNER_SERVE_FAILURE = "Heel runner serve stopped: {}."
 _OPENAPI_READ_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
@@ -161,7 +163,7 @@ def _runner_secret_from_fd(descriptor: int) -> bytes:
 
 
 def _runner_credential_add(args) -> int:
-    from .runner.vault import select_vault
+    from .runner.vault import ephemeral_environment_name, select_vault
 
     try:
         store = _runner_store()
@@ -171,11 +173,12 @@ def _runner_credential_add(args) -> int:
             source_kind = (
                 "environment" if args.backend == "ephemeral-env" else "inherited_fd"
             )
-            store.register_ephemeral_credential(
+            record = store.register_ephemeral_credential(
                 semantic_role=args.role,
                 auth_profile=args.profile,
                 source_kind=source_kind,
                 label=args.label,
+                plan_label=args.plan_label,
             )
         else:
             if args.secret_fd is not None:
@@ -185,18 +188,137 @@ def _runner_credential_add(args) -> int:
                     raise ValueError("interactive secret input requires a TTY")
                 secret = getpass.getpass("Canary credential: ").encode("utf-8")
             vault = select_vault(args.backend)
-            store.create_os_credential(
+            record = store.create_os_credential(
                 semantic_role=args.role,
                 auth_profile=args.profile,
                 label=args.label,
                 vault=vault,
                 secret=secret,
+                plan_label=args.plan_label,
             )
             secret = b""
+        # The handle is a random index into the vault, never derived from the secret.
+        handle = record["credential_handle_id"]
+        if record["source_kind"] is None:
+            source = {"kind": "os_vault"}
+        else:
+            source = {
+                "kind": record["source_kind"],
+                "variable": ephemeral_environment_name(
+                    handle, source_kind=record["source_kind"],
+                ),
+            }
     except Exception:
         print(_SAFE_RUNNER_CREDENTIAL_FAILURE, file=sys.stderr)
         return 2
-    print(json.dumps({"registered_count": 1}, sort_keys=True))
+    printed = {
+        "credential_handle": handle,
+        "credential_source": source,
+        "registered_count": 1,
+    }
+    if "plan_label" in record:
+        # The plan label is the operator's own public name for this plan, unlike --label.
+        printed["plan_label"] = record["plan_label"]
+        printed["role"] = record["semantic_role"]
+    print(json.dumps(printed, sort_keys=True))
+    return 0
+
+
+def _runner_pairing_failure(error: Exception) -> int:
+    from .runner.daemon import RunnerPairingError
+
+    code = error.code if isinstance(error, RunnerPairingError) else "local_state_invalid"
+    if code == "no_supported_secret_service":
+        print(_SAFE_RUNNER_PAIRING_FAILURE.format("no supported runner OS secret service"), file=sys.stderr)
+    else:
+        print(_SAFE_RUNNER_PAIRING_FAILURE.format(code), file=sys.stderr)
+    return 2
+
+
+def _runner_pair(args) -> int:
+    from .runner.daemon import RunnerDaemon
+
+    def emit(event: dict) -> None:
+        print(json.dumps(event, sort_keys=True), flush=True)
+
+    try:
+        RunnerDaemon().pair(args.origin, args.invite, display_name=args.name, emit=emit)
+    except Exception as error:
+        return _runner_pairing_failure(error)
+    return 0
+
+
+def _runner_status(args) -> int:
+    from .runner.daemon import RunnerDaemon
+
+    try:
+        status = RunnerDaemon().status(check_control_plane=not args.offline)
+    except Exception as error:
+        return _runner_pairing_failure(error)
+    print(json.dumps(status, sort_keys=True))
+    return 0 if status["state"] == "active" else 1
+
+
+def _runner_serve(args) -> int:
+    import signal
+    import threading
+
+    from .runner.daemon import SERVE_EXIT_CODES, RunnerDaemon, RunnerPairingError, RunnerServeError
+
+    daemon = RunnerDaemon()
+    # The handler only writes one byte; a watcher thread requests the stop, so no lock the
+    # interrupted main thread may hold is ever taken inside the handler.
+    wake_read, wake_write = os.pipe()
+    os.set_blocking(wake_write, False)
+
+    def on_signal(_signum, _frame):
+        try:
+            os.write(wake_write, b"\0")
+        except OSError:
+            pass
+
+    def watch():
+        try:
+            if os.read(wake_read, 1):
+                daemon.request_stop()
+        except OSError:
+            pass
+
+    def emit(event: dict) -> None:
+        print(json.dumps(event, sort_keys=True), flush=True)
+
+    watcher = threading.Thread(target=watch, daemon=True, name="heel-runner-serve-signals")
+    watcher.start()
+    previous = {
+        number: signal.signal(number, on_signal) for number in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        result = daemon.serve(once=args.once, emit=emit)
+    except Exception as error:
+        code = error.code if isinstance(error, RunnerPairingError) else "local_state_invalid"
+        if code == "no_supported_secret_service":
+            code = "no supported runner OS secret service"
+        print(_SAFE_RUNNER_SERVE_FAILURE.format(code), file=sys.stderr)
+        state = error.state if isinstance(error, RunnerServeError) else "failed"
+        return SERVE_EXIT_CODES.get(state, 2)
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+        os.close(wake_write)
+        watcher.join(1)
+        os.close(wake_read)
+    emit(result)
+    return 0
+
+
+def _runner_unpair(_args) -> int:
+    from .runner.daemon import RunnerDaemon
+
+    try:
+        result = RunnerDaemon().unpair()
+    except Exception as error:
+        return _runner_pairing_failure(error)
+    print(json.dumps(result, sort_keys=True))
     return 0
 
 
@@ -332,6 +454,40 @@ def _runner_prepare(args) -> int:
         "scenario_ids": [item["scenario_id"] for item in result.manifest["scenarios"]],
     }, sort_keys=True))
     return 0
+
+
+def _runner_run(args) -> int:
+    """Plan or execute one plan-differential run. Reflects no input on rejection."""
+    try:
+        from .runner.plan_differential import plan_differential, run_plan_differential
+
+        if type(args.max_ops) is not str or not args.max_ops.isascii() or not args.max_ops.isdecimal():
+            raise ValueError("max ops must be a decimal integer")
+        plans = []
+        for value in args.identity or []:
+            label, separator, handle = value.partition("=")
+            if not separator or "=" in handle:
+                raise ValueError("identity must be LABEL=HANDLE")
+            plans.append((label, handle))
+        artifact = None if args.routes is None else _load_bounded_openapi(args.routes)
+        run = plan_differential if args.dry_run else run_plan_differential
+        result = run(
+            args.scope, args.base_url, plans, caller=_caller(),
+            routes_artifact=artifact, max_ops=int(args.max_ops),
+        )
+        if result["mode"] == "dry_run" and artifact is not None:
+            result["inventory"]["path"] = os.path.abspath(args.routes)
+        rendered = json.dumps(result, indent=2, sort_keys=True)
+    # Command trust boundary: no path, URL, label, handle, route, or exception text escapes.
+    except Exception:
+        print(_SAFE_RUNNER_COMMAND_FAILURE, file=sys.stderr)
+        return 2
+    print(rendered)
+    if result["mode"] == "dry_run":
+        return 0 if result["authorized"] else 3
+    return 1 if any(
+        finding["evidence_state"] in {"observed", "verified"} for finding in result["findings"]
+    ) else 0
 
 
 def _cloud_services(origin: str):
@@ -996,12 +1152,42 @@ def main(argv=None):
         help="emit the canonical heel.review.v1 JSON envelope",
     )
 
+    reference = sub.add_parser("reference", help="closed synthetic export entitlement validation")
+    reference_sub = reference.add_subparsers(dest="referencecmd", required=True)
+    reference_sub.add_parser("prepare", help="show product rule, hypothesis and exact safe boundary")
+    reference_run = reference_sub.add_parser("run", help="execute one signed-scope synthetic reference attempt")
+    reference_run.add_argument("--scope", required=True)
+    reference_run.add_argument("--case", required=True, choices=("vulnerable", "hardened", "error_envelope", "redacted", "public", "inconclusive"))
+    reference_run.add_argument("--attempt", required=True, help="unique 32 lowercase hex characters; consumed once")
+    reference_run.add_argument("--stop", action="store_true", help="exercise cancellation before execution")
+
     runner = sub.add_parser(
         "runner", help="prepare customer-local verified canary rehearsals",
         allow_abbrev=False,
     )
     runner_sub = runner.add_subparsers(
         dest="runnercmd", required=True, parser_class=_RunnerArgumentParser,
+    )
+    runner_pair = runner_sub.add_parser(
+        "pair", help="pair this machine with Heel Cloud using a one-time invitation",
+    )
+    runner_pair.add_argument("--origin", required=True, help="exact https:// Heel Cloud origin")
+    runner_pair.add_argument("--invite", required=True, help="one-time invitation from the dashboard")
+    runner_pair.add_argument("--name", help="display name shown to the approving owner")
+    runner_status = runner_sub.add_parser(
+        "status", help="show the paired runner and confirm it with the control plane",
+    )
+    runner_status.add_argument(
+        "--offline", action="store_true", help="report local state without contacting the control plane",
+    )
+    runner_sub.add_parser(
+        "unpair", help="forget the local runner identity and remove its OS-stored key",
+    )
+    runner_serve = runner_sub.add_parser(
+        "serve", help="keep the paired runner online with Heel Cloud until stopped or revoked",
+    )
+    runner_serve.add_argument(
+        "--once", action="store_true", help="poll the control plane once, then exit",
     )
     runner_import = runner_sub.add_parser(
         "import-openapi", help="import only a minimized local GET/HEAD route inventory",
@@ -1029,6 +1215,10 @@ def main(argv=None):
     )
     runner_credential_add.add_argument("--label", required=True)
     runner_credential_add.add_argument(
+        "--plan-label",
+        help="your own name for this plan (for example free or pro); lower_plan/higher_plan only",
+    )
+    runner_credential_add.add_argument(
         "--backend", required=True,
         choices=("keychain", "secret-service", "ephemeral-env", "ephemeral-fd"),
     )
@@ -1050,6 +1240,15 @@ def main(argv=None):
         "prepare", help="review readiness or compile one local immutable rehearsal",
     )
     runner_prepare.add_argument("--live", action="store_true")
+    runner_run = runner_sub.add_parser(
+        "run", help="replay imported GET/HEAD reads as two canary plans under a signed scope",
+    )
+    runner_run.add_argument("--scope", required=True)
+    runner_run.add_argument("--base-url", required=True)
+    runner_run.add_argument("--as", dest="identity", action="append", metavar="LABEL=HANDLE")
+    runner_run.add_argument("--routes")
+    runner_run.add_argument("--max-ops", default="50")
+    runner_run.add_argument("--dry-run", action="store_true")
 
     cloud = sub.add_parser(
         "cloud",
@@ -1215,7 +1414,25 @@ def main(argv=None):
         return 0
     if args.cmd == "review" and args.reviewcmd == "openapi":
         return _review_openapi_file(args.path, as_json=args.as_json)
+    if args.cmd == "reference":
+        try:
+            from .reference_rehearsal import prepare_reference, run_reference
+            report = prepare_reference() if args.referencecmd == "prepare" else run_reference(
+                args.scope, args.case, args.attempt, stop=args.stop)
+            print(json.dumps(report, indent=2))
+            return 0
+        except Exception:
+            print("Reference rehearsal rejected. Check the signed synthetic scope, unique attempt and private local storage.", file=sys.stderr)
+            return 2
     if args.cmd == "runner":
+        if args.runnercmd == "pair":
+            return _runner_pair(args)
+        if args.runnercmd == "status":
+            return _runner_status(args)
+        if args.runnercmd == "unpair":
+            return _runner_unpair(args)
+        if args.runnercmd == "serve":
+            return _runner_serve(args)
         if args.runnercmd == "import-openapi":
             return _runner_import_openapi(args.path)
         if args.runnercmd == "credential" and args.runnercredentialcmd == "add":
@@ -1224,6 +1441,8 @@ def main(argv=None):
             return _runner_map(args)
         if args.runnercmd == "prepare":
             return _runner_prepare(args)
+        if args.runnercmd == "run":
+            return _runner_run(args)
     if args.cmd == "cloud":
         if not args.origin:
             print(

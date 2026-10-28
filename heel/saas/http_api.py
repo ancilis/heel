@@ -54,6 +54,7 @@ from heel.canary_contracts import (
     validate_runner_context_list,
     validate_runner_context_claim,
     validate_runner_approval_projection_submit,
+    validate_runner_plan_request_claim,
 )
 from heel.crypto import load_public_key_base64, verify_envelope
 
@@ -73,7 +74,10 @@ from .canary_disclosure import (
     CanaryDisclosureError,
     CanaryDisclosureService,
 )
-from .canary_runs import CanaryRunError, CanaryRunService
+from .canary_runs import (
+    CanaryRunError, CanaryRunService, DiscoveryError, InactiveClaimAttestationRefused,
+    ensure_discovery_plan_schema,
+)
 from .runner_contexts import RunnerContextBindingService, RunnerContextError
 from .runner_auth import (
     RunnerActivationAbortConflict,
@@ -116,12 +120,14 @@ from .tenancy import (
     ControlPlaneStore, IntegrationLimitExceeded, Role, SeatLimitExceeded, hash_api_key, require,
 )
 from .verification import (
-    ATTESTATION_ACKNOWLEDGEMENT, ATTESTATION_VERSION, EnvironmentCooldown, EnvironmentNotFound,
+    ATTESTATION_ACKNOWLEDGEMENT, ATTESTATION_VERSION, EnvironmentChallengeClosed, EnvironmentCooldown, EnvironmentNotFound,
     HostnameReuseExceeded, OWNERSHIP_ATTESTATION, TargetLimitExceeded, TargetVerifier,
     VerifiedEnvironmentService,
 )
 
 MAX_BODY = 64 * 1024
+# A terminal discovery result carries its <=64 KiB signed round report beside the <=36 KiB envelope.
+DISCOVERY_RESULT_MAX_BYTES = 36 * 1024 + 64 * 1024 + 1024
 MAX_DEVICE_BODY = 8 * 1024
 REQUEST_IO_TIMEOUT_SECONDS = 10
 REQUEST_BODY_TOTAL_DEADLINE_SECONDS = 10
@@ -131,12 +137,36 @@ REQUEST_DRAIN_TIMEOUT_SECONDS = 30
 _LOGGER = logging.getLogger("heel.saas.control_plane")
 _SYNC_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _CANARY_IDEMPOTENCY = re.compile(r"ca1-[0-9a-f]{64}\Z")
-_CONTROL_GENERATION = re.compile(r"0|[1-9][0-9]*\Z")
 
 
 class _NullLock:
     def __enter__(self): return self
     def __exit__(self, *_): return False
+
+
+def _sqlite_primary_code(error: BaseException) -> int | None:
+    """Primary SQLite result code of a real sqlite3 error, or None.
+
+    Typed and range-checked (exact int in 1..0xFFFF; bool, str, float, negative, zero and
+    oversized values are rejected) so a hostile or absent attribute is never classified or logged.
+    """
+    if not isinstance(error, sqlite3.Error):
+        return None
+    code = getattr(error, "sqlite_errorcode", None)
+    if type(code) is not int or not 1 <= code <= 0xFFFF:
+        return None
+    return code & 0xFF
+
+
+def _is_control_generation(value: str) -> bool:
+    return (
+        value == "0"
+        or (
+            bool(value)
+            and "1" <= value[0] <= "9"
+            and all("0" <= character <= "9" for character in value[1:])
+        )
+    )
 
 
 class _DuplicateJsonKey(ValueError):
@@ -158,6 +188,20 @@ def _reject_json_constant(_value):
 
 def current_period() -> str:
     return time.strftime("%Y-%m", time.gmtime())
+
+
+def _environment_dns_record(challenge) -> str:
+    return "_heel." + challenge.origin[len("https://"):] + " TXT heel-verify=" + challenge.token
+
+
+# Closed, token-free public states for a pending proof that cannot be recovered or rotated.
+_CLOSED_CHALLENGE_ERRORS = {
+    "expired": ("pending proof expired", "environment_challenge_expired"),
+    "missing": ("pending proof is unavailable", "environment_challenge_missing"),
+    "verified": ("proof is not pending", "environment_challenge_closed"),
+    "revoked": ("proof is not pending", "environment_challenge_closed"),
+    "live": ("pending proof is still current", "environment_challenge_live"),
+}
 
 
 class ApiError(Exception):
@@ -244,6 +288,7 @@ class ControlPlane:
             self.runner_connections_are_shared = True if runner_connections_are_shared is None else bool(runner_connections_are_shared)
         conn = self.store.conn
         self.canary_store = CanaryStore(conn)
+        ensure_discovery_plan_schema(conn)
         # Runtime construction (including unit/demo instances) stays schema-parity with the
         # migration, while authentication itself remains disabled absent a distinct pepper.
         initialize_runner_auth_schema(conn)
@@ -544,10 +589,15 @@ class _Handler(BaseHTTPRequestHandler):
             and parts[5] == "runs"
             and parts[7] == "result-projection"
         )
+        canary_result = bool(
+            len(parts) == 8 and parts[:2] == ["v1", "workspaces"] and parts[3] == "runners"
+            and parts[5] == "runs" and parts[7] == "result"
+        )
         maximum = (
             MAX_FINDINGS_SYNC_BYTES
             if sync_path
             else MAX_UPLOAD_BYTES if canary_findings_upload
+            else DISCOVERY_RESULT_MAX_BYTES if canary_result
             else MAX_DEVICE_BODY if device_path else MAX_BODY
         )
         if length > maximum:
@@ -838,9 +888,11 @@ class _Handler(BaseHTTPRequestHandler):
             (len(p) == 6 and p[5] == "claim") or
             (len(p) == 7 and p[5] == "contexts" and p[6] == "list") or
             (len(p) == 8 and p[5] == "contexts" and p[7] in {"claim", "approval-projections"}) or
+            (len(p) == 9 and p[5] == "contexts" and p[7] == "plan-requests" and p[8] == "claim") or
             (len(p) == 7 and p[5] == "resync" and p[6] in {"start", "complete"}) or
             (len(p) == 8 and p[5] == "runs" and p[7] in {
                 "heartbeat", "progress", "result", "stop-ack", "result-projection",
+                "inactive-claim-attestation",
             })
         ))
 
@@ -877,6 +929,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(401, {"schema_version": "heel.runner-error.v1", "code": "invalid_runner_auth"})
         except (CanaryRunError, CanaryDisclosureError) as error:
             self._canary_error(error.code)
+        except DiscoveryError as error:
+            self._json(error.status, {"schema_version": "heel.discovery-error.v1", "code": error.code})
         except RunnerContextError as error:
             status = {"same_origin_required": 403, "recent_auth_required": 403,
                       "runner_context_binding_not_found": 404, "conflict": 409,
@@ -887,12 +941,16 @@ class _Handler(BaseHTTPRequestHandler):
         except ThrottledError as e:
             self._json(429, {"error": str(e)})
         except Exception as error:
-            _LOGGER.error(json.dumps({
+            record = {
                 "event": "control_plane_internal_error",
                 "exception_type": type(error).__name__,
                 "method": getattr(self, "command", "UNKNOWN"),
                 "request_id": getattr(self, "_request_id", "unavailable"),
-            }, sort_keys=True, separators=(",", ":")))
+            }
+            code = _sqlite_primary_code(error)
+            if code is not None:
+                record["sqlite_primary_code"] = code
+            _LOGGER.error(json.dumps(record, sort_keys=True, separators=(",", ":")))
             self._json(500, {"error": "internal error"})
 
     def _match(self, method: str, p: list[str]):
@@ -959,7 +1017,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return lambda: self._runner_rotation_start(wid, tail[1])
             if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "rotations" and tail[4] == "approve":
                 return lambda: self._runner_rotation_approve(wid, tail[3])
-            if method == "DELETE" and len(tail) == 2 and tail[0] == "runners":
+            if method == "POST" and len(tail) == 3 and tail[0] == "runners" and tail[2] == "revoke":
                 return lambda: self._runner_revoke(wid, tail[1])
             if method == "POST" and len(tail) == 3 and tail[0] == "runners" and tail[2] == "claim":
                 return lambda: self._runner_request(wid, tail[1], "runner_claim", None, "claim")
@@ -967,8 +1025,14 @@ class _Handler(BaseHTTPRequestHandler):
                 return lambda: self._runner_request(wid, tail[1], "runner_claim", None, "context-list")
             if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "contexts" and tail[4] in {"claim", "approval-projections"}:
                 return lambda: self._runner_request(wid, tail[1], "runner_claim", tail[3], "context-" + tail[4])
+            if (method == "POST" and len(tail) == 6 and tail[0] == "runners" and tail[2] == "contexts"
+                    and tail[4:] == ("plan-requests", "claim")):
+                return lambda: self._runner_request(wid, tail[1], "runner_claim", tail[3], "context-plan-request-claim")
             if method == "POST" and len(tail) == 4 and tail[0] == "runners" and tail[2] == "resync" and tail[3] in {"start", "complete"}:
                 return lambda: self._runner_resync(wid, tail[1], tail[3])
+            if (method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "runs"
+                    and tail[4] == "inactive-claim-attestation"):
+                return lambda: self._runner_inactive_claim_attestation(wid, tail[1], tail[3])
             if method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "runs" and tail[4] in {"heartbeat", "progress", "result", "stop-ack"}:
                 capability = "runner_heartbeat" if tail[4] in {"heartbeat", "stop-ack"} else "runner_" + tail[4]
                 return lambda: self._runner_request(wid, tail[1], capability, tail[3], tail[4])
@@ -1012,6 +1076,19 @@ class _Handler(BaseHTTPRequestHandler):
                     return lambda: self._ws_environment_check(wid, project_ref, tail[3])
                 if len(tail) == 5 and method == "POST" and tail[4] == "revoke":
                     return lambda: self._ws_environment_revoke(wid, project_ref, tail[3])
+                if len(tail) == 5 and method == "POST" and tail[4] == "challenge":
+                    return lambda: self._ws_environment_challenge(wid, project_ref, tail[3], rotate=False)
+                if len(tail) == 6 and method == "POST" and tail[4] == "challenge" and tail[5] == "rotate":
+                    return lambda: self._ws_environment_challenge(wid, project_ref, tail[3], rotate=True)
+                if len(tail) == 5 and tail[4] == "discovery-authorizations" and method == "POST":
+                    return lambda: self._ws_discovery_authorization_create(wid, project_ref, tail[3])
+                if len(tail) == 6 and tail[4] == "discovery-authorizations" and method == "GET":
+                    return lambda: self._ws_discovery_authorization_get(wid, project_ref, tail[3], tail[5])
+                if (len(tail) == 7 and tail[4] == "discovery-authorizations" and tail[6] == "revoke"
+                        and method == "POST"):
+                    return lambda: self._ws_discovery_authorization_revoke(wid, project_ref, tail[3], tail[5])
+                if len(tail) == 5 and tail[4] == "route-inventory" and method == "GET":
+                    return lambda: self._ws_route_inventory(wid, project_ref, tail[3])
             if len(tail) >= 3 and tail[0] == "projects":
                 project_ref = tail[1]
                 if len(tail) == 3 and tail[2] == "runner-context-bindings":
@@ -1022,6 +1099,9 @@ class _Handler(BaseHTTPRequestHandler):
                 if (method == "POST" and len(tail) == 5 and tail[2] == "runner-context-bindings"
                         and tail[4] == "revoke"):
                     return lambda: self._ws_runner_context_revoke(wid, project_ref, tail[3])
+                if (method == "POST" and len(tail) == 5 and tail[2] == "runner-context-bindings"
+                        and tail[4] == "plan-requests"):
+                    return lambda: self._ws_plan_request_create(wid, project_ref, tail[3])
                 if len(tail) == 3 and tail[2] == "canary-approval-projections" and method == "POST":
                     return lambda: self._ws_canary_projection_submit(wid, project_ref)
                 if len(tail) == 3 and tail[2] == "canary-approval-requests" and method == "GET":
@@ -1120,9 +1200,25 @@ class _Handler(BaseHTTPRequestHandler):
             body = self._body()
             store = self._runner_store()
             if set(body) == {"schema_version", "client_activation_nonce_b64", "signature_b64"} and body["schema_version"] == "heel.runner-pairing-activate.v3":
-                response = store.activate_executable(
-                    pairing_id, body, max_active=self.cp.runner_active_limit(store, pairing_id),
-                )
+                try:
+                    response = store.activate_executable(
+                        pairing_id, body, max_active=self.cp.runner_active_limit(store, pairing_id),
+                        grant_authority=self.cp.grant_authority,
+                    )
+                except sqlite3.OperationalError as error:
+                    # The short runner connection lost its 250 ms busy wait at BEGIN IMMEDIATE or
+                    # COMMIT; activate_executable never opened, or already rolled back, its
+                    # transaction, so the identical sealed activation may be resent. Only this
+                    # executable path was proved side-effect free; every other route stays 500.
+                    if (
+                        not self.cp.runner_connections_are_shared
+                        and _sqlite_primary_code(error) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                        and not store.conn.in_transaction
+                    ):
+                        self._json(503, {"schema_version": "heel.runner-error.v1", "code": "runner_control_busy",
+                                         "retry_after_ms": 1000}, {"Retry-After": "1"})
+                        return
+                    raise
                 self._canonical_json(200, response)
                 return
             if set(body) != {"schema_version", "signature_b64"} or body["schema_version"] != "heel.runner-pairing-activate.v1":
@@ -1295,8 +1391,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _expected_control_generation(self) -> int:
         values = self._header_values("If-Heel-Control-Generation")
-        if (len(values) != 1 or _CONTROL_GENERATION.fullmatch(values[0]) is None
-                or len(values[0]) > 20):
+        if (len(values) != 1 or len(values[0]) > 20
+                or not _is_control_generation(values[0])):
             raise ApiError(
                 400, "invalid canary control generation",
                 code="invalid_canary_approval",
@@ -1353,21 +1449,24 @@ class _Handler(BaseHTTPRequestHandler):
             maximum = (
                 128 if operation == "context-list"
                 else 256 if operation in {"claim", "context-claim"}
+                else 2048 if operation == "context-plan-request-claim"
                 else 69632 if operation == "context-approval-projections"
                 else MAX_UPLOAD_BYTES if operation == "result-projection"
+                else DISCOVERY_RESULT_MAX_BYTES if operation == "result"
                 else 36 * 1024
             )
             parsed = parse_json(self._raw_body(), max_bytes=maximum)
             validators = {"claim": validate_runner_claim_request, "heartbeat": validate_runner_heartbeat_request,
                           "progress": validate_runner_progress_request, "result": validate_runner_result_request,
                           "stop-ack": validate_runner_stop_ack_request, "context-list": validate_runner_context_list,
-                          "context-claim": validate_runner_context_claim, "context-approval-projections": validate_runner_approval_projection_submit}
+                          "context-claim": validate_runner_context_claim, "context-approval-projections": validate_runner_approval_projection_submit,
+                          "context-plan-request-claim": validate_runner_plan_request_claim}
             if operation != "result-projection":
                 parsed = validators[operation](parsed)
             if (canonical_bytes(parsed) != self._raw_body()
                     or (run_id is not None and (parsed.get("run_id", parsed.get("binding_id", parsed.get("context_binding_id"))) != run_id))):
                 raise RunnerAuthError("invalid runner authentication")
-            if operation not in {"claim", "result-projection", "context-list", "context-claim", "context-approval-projections"} and not self._operational_context_matches(
+            if operation not in {"claim", "result-projection", "context-list", "context-claim", "context-approval-projections", "context-plan-request-claim"} and not self._operational_context_matches(
                     self._runner_store().conn, workspace_id=wid, runner_id=runner_id,
                     projection=parsed["operational_projection"]):
                 raise RunnerAuthError("invalid runner authentication")
@@ -1395,6 +1494,9 @@ class _Handler(BaseHTTPRequestHandler):
                     return RunnerHttpAction(200, context_service.list_for_runner_in_transaction(wid, runner_id, key_id))
                 if operation == "context-claim":
                     return RunnerHttpAction(200, context_service.claim_in_transaction(wid, runner_id, key_id, run_id, parsed))
+                if operation == "context-plan-request-claim":
+                    snapshot = context_service.claim_plan_request_in_transaction(wid, runner_id, key_id, run_id, parsed)
+                    return RunnerHttpAction(200, snapshot) if snapshot is not None else RunnerHttpAction(204, None)
                 if operation == "context-approval-projections":
                     binding = context_service.active_binding_for_projection_in_transaction(
                         wid, runner_id, key_id, run_id, parsed["context_binding_digest"],
@@ -1419,7 +1521,9 @@ class _Handler(BaseHTTPRequestHandler):
                 if operation == "progress":
                     return RunnerHttpAction(200, runs.progress(wid, project_ref, run_id, runner_id, projection))
                 if operation == "result":
-                    return RunnerHttpAction(200, runs.result(wid, project_ref, run_id, runner_id, projection))
+                    return RunnerHttpAction(200, runs.result(
+                        wid, project_ref, run_id, runner_id, projection, parsed.get("discovery_round_report"),
+                    ))
                 acknowledged = runs.ack_stop(
                     wid, project_ref, run_id, runner_id, projection,
                 )
@@ -1430,7 +1534,7 @@ class _Handler(BaseHTTPRequestHandler):
                 raw_body=self._raw_body(), headers=all_headers,
                 action=action,
                 chain_name=(
-                    "claim" if operation in {"claim", "context-list", "context-claim", "context-approval-projections"}
+                    "claim" if operation in {"claim", "context-list", "context-claim", "context-approval-projections", "context-plan-request-claim"}
                     else f"result:{run_id}" if operation == "result-projection"
                     else f"{operation}:{run_id}"
                 ),
@@ -1439,6 +1543,15 @@ class _Handler(BaseHTTPRequestHandler):
         except _RunnerContextUnavailable:
             self._json(503, {"schema_version": "heel.runner-context-error.v1", "code": "runner_context_unavailable"})
             return
+        except DiscoveryError as error:
+            # Closed plan/discovery reasons reach an authenticated runner only after its PoP and
+            # binding checks passed; the refused request consumed no nonce and wrote no round.
+            # A closing refusal's close is then committed on its own, re-derived from server state.
+            if error.close is not None and self.cp.grant_authority is not None:
+                CanaryRunService(
+                    self._runner_store().conn, signing=self.cp.grant_authority, initialize_schema=False,
+                ).close_discovery_after_refusal(*error.close)
+            raise
         except RunnerContextError:
             raise RunnerAuthError("invalid runner authentication") from None
         except (CanaryRunError, CanaryDisclosureError):
@@ -1509,6 +1622,35 @@ class _Handler(BaseHTTPRequestHandler):
         except (RunnerAuthRateLimited, RunnerProtocolUpgradeRequired):
             raise
         except (ValueError, RunnerAuthError):
+            raise RunnerAuthError("invalid runner authentication") from None
+        self._json(200, response)
+
+    def _runner_inactive_claim_attestation(self, wid: str, runner_id: str, run_id: str) -> None:
+        """Side-effect-free C attestation on the resync proof family; never forwards a next nonce."""
+        if "?" in self.path or "#" in self.path or "%" in self.path or self.command != "POST":
+            raise RunnerAuthError("invalid runner authentication")
+        headers = {name: self._header_values(name) for name in (
+            "X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
+            "X-Heel-Runner-Signature", "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence",
+            "Authorization", "Cookie")}
+        store = self._runner_store()
+        try:
+            # The service is set up only after the protocol gate and PoP, on the same connection,
+            # so the predicate reads inside the RunnerAuthStore transaction.
+            response = store.attest_inactive_claim(
+                workspace_id=wid, runner_id=runner_id, run_id=run_id, path=self.path,
+                raw_body=self._raw_body(), headers=headers,
+                runs=lambda: self._runner_canary_services(store)[0],
+            )
+        except InactiveClaimAttestationRefused as refused:
+            self._json(409, {
+                "schema_version": "heel.runner-error.v1",
+                "code": "inactive_claim_attestation_refused", "reason": refused.reason,
+            })
+            return
+        except (RunnerAuthRateLimited, RunnerProtocolUpgradeRequired, CanaryRunError):
+            raise
+        except (ValueError, LookupError, RunnerAuthError):
             raise RunnerAuthError("invalid runner authentication") from None
         self._json(200, response)
 
@@ -2365,6 +2507,17 @@ class _Handler(BaseHTTPRequestHandler):
             raise RunnerContextError("invalid_runner_context_binding") from None
         self._json(200, result)
 
+    def _ws_plan_request_create(self, wid: str, project_ref: str, binding_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        actor, role, _ = self._recent_owner_admin_context(wid)
+        try:
+            body = parse_json(self._raw_body(), max_bytes=2048)
+        except ValueError:
+            raise DiscoveryError("invalid_plan_request") from None
+        self._json(201, self._runner_context_service().create_plan_request(
+            wid, project_ref, binding_id, body, actor=actor, role=role,
+        ))
+
     def _ws_runner_context_list(self, wid: str, project_ref: str) -> None:
         self._runner_context_human_path_exact()
         kind, user_id, _ = self._principal()
@@ -2706,6 +2859,56 @@ class _Handler(BaseHTTPRequestHandler):
         _, disclosure = self._human_canary_services()
         self._json(200, disclosure.get(wid, project_ref, run_id))
 
+    # --- discovery authorization and inventory (discovery contract §3) ---
+    def _discovery_scope(self, wid: str, project_ref: str) -> str:
+        """Browser-session members of the exact project only; everything else is not found."""
+        if "?" in self.path or "#" in self.path or "%" in self.path:
+            raise DiscoveryError("environment_not_found")
+        kind, user_id, _ = self._principal()
+        if kind != "session" or user_id is None or self.cp.store.get_role(wid, user_id) is None:
+            raise DiscoveryError("environment_not_found")
+        if self.cp.store.conn.execute(
+            "SELECT 1 FROM projects WHERE workspace_id=? AND project_ref=?", (wid, project_ref),
+        ).fetchone() is None:
+            raise DiscoveryError("environment_not_found")
+        if self.cp.canary_runs is None:
+            raise DiscoveryError("discovery_unavailable")
+        return user_id
+
+    def _ws_discovery_authorization_create(self, wid: str, project_ref: str, environment_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        actor, role, _ = self._recent_owner_admin_context(wid)
+        keys = self._header_values("Idempotency-Key")
+        if len(keys) != 1 or _CANARY_IDEMPOTENCY.fullmatch(keys[0]) is None:
+            raise DiscoveryError("idempotency_key_required")
+        if len(self._raw_body()) > 2048:
+            raise DiscoveryError("invalid_discovery_authorization")
+        try:
+            body = self._body()
+        except ApiError:
+            raise DiscoveryError("invalid_discovery_authorization") from None
+        view, _ = self.cp.canary_runs.create_discovery_authorization(
+            wid, project_ref, environment_id, body, actor=actor, role=role, idempotency_key=keys[0],
+        )
+        self._json(201, view)
+
+    def _ws_discovery_authorization_get(self, wid: str, project_ref: str, environment_id: str, authorization_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        self._json(200, self.cp.canary_runs.get_discovery_authorization(wid, project_ref, environment_id, authorization_id))
+
+    def _ws_discovery_authorization_revoke(self, wid: str, project_ref: str, environment_id: str, authorization_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        actor, role, _ = self._recent_owner_admin_context(wid)
+        if self._raw_body():
+            raise DiscoveryError("invalid_discovery_authorization")
+        self._json(200, self.cp.canary_runs.revoke_discovery_authorization(
+            wid, project_ref, environment_id, authorization_id, actor=actor, role=role,
+        ))
+
+    def _ws_route_inventory(self, wid: str, project_ref: str, environment_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        self._json(200, self.cp.canary_runs.route_inventory_view(wid, project_ref, environment_id))
+
     def _ws_environments_list(self, wid: str, project_ref: str):
         self._authorize(wid, "view")
         try:
@@ -2742,9 +2945,41 @@ class _Handler(BaseHTTPRequestHandler):
             "environment_id": challenge.environment_id, "origin": challenge.origin,
             "environment_class": challenge.environment_class, "proof_method": body["proof_method"],
             "token": challenge.token, "http_url": challenge.http_url,
-            "dns_record": "_heel." + challenge.origin[len("https://"):] + " TXT heel-verify=" + challenge.token,
+            "dns_record": _environment_dns_record(challenge),
             "challenge_generation": challenge.generation, "expires_at": challenge.expires_at,
             "attestation": challenge.attestation,
+        })
+
+    def _ws_environment_challenge(self, wid: str, project_ref: str, environment_id: str, *, rotate: bool):
+        """Explicit pending-proof recovery (read-only) or same-record rotation, under the proof-start ceremony."""
+        self._recent_owner_admin(wid)
+        body = self._body()
+        schema = ("heel.verified-environment-challenge-rotate.v1" if rotate
+                  else "heel.verified-environment-challenge-recover.v1")
+        if set(body) != {"schema_version"} or body.get("schema_version") != schema:
+            raise ApiError(400, "invalid environment challenge request", code="invalid_environment_challenge")
+        try:
+            self.cp.projects.get(wid, project_ref)
+        except ProjectNotFound:
+            raise ApiError(404, "project not found", code="project_not_found") from None
+        action = (self.cp.environments.rotate_unrecoverable_challenge if rotate
+                  else self.cp.environments.recover_pending_challenge)
+        try:
+            challenge = action(wid, project_ref, environment_id)
+        except EnvironmentNotFound:
+            raise ApiError(404, "environment not found", code="environment_not_found") from None
+        except EnvironmentChallengeClosed as closed:
+            message, code = _CLOSED_CHALLENGE_ERRORS[closed.reason]
+            raise ApiError(409, message, code=code) from None
+        self._json(201 if rotate else 200, {
+            "schema_version": "heel.verified-environment-challenge-recovery.v1",
+            "environment_id": challenge.environment_id, "origin": challenge.origin,
+            "environment_class": challenge.environment_class, "proof_method": challenge.proof_method,
+            "token": challenge.token, "http_url": challenge.http_url,
+            "dns_record": _environment_dns_record(challenge),
+            "challenge_generation": challenge.generation, "expires_at": challenge.expires_at,
+            "attestation": challenge.attestation, "attestation_version": ATTESTATION_VERSION,
+            "attestation_acknowledgement": ATTESTATION_ACKNOWLEDGEMENT,
         })
 
     def _ws_environment_check(self, wid: str, project_ref: str, environment_id: str):

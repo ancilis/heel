@@ -11,9 +11,22 @@ import threading
 import unittest
 import urllib.parse
 
+import pytest
+
 from heel.saas.http_api import ControlPlane, serve
+from heel.saas import dashboard
 
 PW = "correct-horse-battery"
+
+
+def test_dashboard_redirect_refuses_header_injection_destinations():
+    class Handler:
+        def send_response(self, _status): pass
+        def send_header(self, _name, _value): pass
+        def end_headers(self): pass
+
+    with pytest.raises(ValueError, match="invalid dashboard redirect"):
+        dashboard._redirect(Handler(), "/app\r\nX-Injected: yes")
 
 
 class DashboardTests(unittest.TestCase):

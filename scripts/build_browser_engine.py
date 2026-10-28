@@ -18,7 +18,7 @@ import zipfile
 
 
 ROOT = Path(os.path.abspath(__file__)).parents[1]
-ENGINE_VERSION = "1.2.0"
+ENGINE_VERSION = "1.3.0rc2"
 WHEEL_NAME = f"heel_browser-{ENGINE_VERSION}-py3-none-any.whl"
 DIST_INFO = f"heel_browser-{ENGINE_VERSION}.dist-info"
 RECORD_PATH = f"{DIST_INFO}/RECORD"
@@ -148,6 +148,7 @@ REVIEWED_DATA_METHOD_CALLS = {
         "values",
     }),
     "product_model": frozenset({
+        "add",
         "append",
         "extend",
         "get",
@@ -805,7 +806,7 @@ def _write_atomic(output: Path, filename: str, payload: bytes) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.chmod(temporary, 0o644)
+        os.chmod(temporary, 0o600)
         _assert_no_symlink_components(output, "browser engine output")
         _assert_no_symlink_components(temporary, "browser engine temporary artifact")
         _assert_no_symlink_components(

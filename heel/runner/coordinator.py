@@ -23,11 +23,14 @@ from heel.runner.control_client import RunnerControlClient
 from heel.runner.execution import (
     ExecutionBundle,
     ExecutionGate,
+    UnactivatedExecution,
+    ValidatedExecutionBundle,
+    _gate_failure,
     validate_execution_bundle,
 )
 from heel.runner.identity import RunnerIdentity, SecureSigner
 from heel.runner.service import ClaimLease
-from heel.runner.store import RunnerContext, RunnerStore, RunnerStoreError
+from heel.runner.store import RunReservationProbe, RunnerContext, RunnerStore, RunnerStoreError
 
 
 _MAX_AUTHENTICATED_GATE_AGE_SECONDS = 0.5
@@ -120,6 +123,9 @@ class RunnerCoordinator:
         self._pending_result_replay_verifier = store.pending_result_replay_verifier(control.runtime)
         try:
             self._recover_terminal_runtime_state()
+            # A claim the Cloud already stopped before it ever activated can never hydrate;
+            # retire it first, from a Cloud-signed attestation, or keep it and fail closed.
+            self._reconcile_inactive_claims()
             self._recover_active_runtime_state()
             self._stage_unstaged_terminal_results()
             self._replay_pending_calls()
@@ -184,6 +190,56 @@ class RunnerCoordinator:
                     self._bindings.pop(run_id, None)
                     self._heartbeat_guards.pop(run_id, None)
             self._terminal_runs.intersection_update(active_ids)
+
+    def _inactive_claim_eligible(self, active: object, pending: tuple[object, ...], now_ms: int) -> bool:
+        """POSTRESET §7.1 L2-L5 for one loaded (L1-valid) active row; L6 is construction order.
+
+        L2 is exactly the hydration failure C exists for: a failed persisted gate or an expired
+        grant.  Every other row keeps its existing restart path.  The coordinator is built before
+        any executor exists and ``serve`` holds the exclusive instance lock, so no reservation can
+        appear between the Store probe and the retirement.
+        """
+        try:
+            gate = ExecutionGate(**dict(active.gate))
+        except (TypeError, ValueError):
+            return False
+        if (
+            _gate_failure(gate, active.grant["kill_switch_generation"]) is None
+            and now_ms < active.grant["expires_at_ms"]
+        ):
+            return False
+        if self.control.runtime.load_terminal_state(active.run_id) is not None:
+            return False
+        if any(
+            item.run_id == active.run_id
+            and (item.chain_operation != "heartbeat" or item.request_operation != "heartbeat")
+            for item in pending
+        ):
+            return False
+        return self.store.probe_run_reservation(active.run_id) is RunReservationProbe.ABSENT
+
+    def _reconcile_inactive_claims(self) -> None:
+        """Retire every eligible pre-activation claim before any active authority is hydrated.
+
+        Only a pinned grant-authority attestation of this exact claim retires it, through the control
+        client's per-run guard.  Any refusal, unusable answer or transport failure is raised with the
+        sealed group intact; the next construction asks again with a new challenge.
+        """
+        pending = self.control.runtime.load_pending_calls(limit=74)
+        now_ms = self._now_ms()
+        for active in self.control.runtime.load_active_run_controls(limit=64):
+            if not self._inactive_claim_eligible(active, pending, now_ms):
+                continue
+            verified = self.control._attest_inactive_claim(active.run_id)
+            self.control._retire_inactive_claim(
+                verified, reservation_probe=RunReservationProbe.ABSENT.value, now_ms=self._now_ms(),
+            )
+            with self._lock:
+                if (
+                    active.run_id in self._gates or active.run_id in self._gate_receipts
+                    or active.run_id in self._bindings
+                ):
+                    raise RunnerStoreError("runtime retired claim authority is invalid")
 
     def _recover_active_runtime_state(self) -> None:
         """Rebuild live coordinator authority from sealed runtime controls.
@@ -844,18 +900,63 @@ class RunnerCoordinator:
 
 
 class RunnerExecutionAdapter:
-    """Bind Task 6 execution to one coordinator gate source and one local target transport."""
+    """Bind Task 6 execution to one coordinator gate source and one local target transport.
 
-    def __init__(self, *, coordinator: RunnerCoordinator, executor: object, transport: object):
+    The transport is either one fixed object or ``transport_factory``, which builds a transport
+    for one lease. The factory runs only after the coordinator's fresh gate and the exact claimed
+    bundle have been revalidated, and it receives only that validated bundle, so no transport can
+    be built for an unvalidated, stale, revoked or mismatched lease. ``transport_precheck`` (pure
+    metadata, no network or secret) refuses before any local reservation. The executor then calls
+    the factory only after it has durably activated the run, so a stop during a blocking factory
+    is acknowledged against that run instead of racing it.
+    """
+
+    def __init__(
+        self,
+        *,
+        coordinator: RunnerCoordinator,
+        executor: object,
+        transport: object = None,
+        transport_factory: Callable[[ValidatedExecutionBundle], object] | None = None,
+        transport_precheck: Callable[[ValidatedExecutionBundle], None] | None = None,
+    ):
         if not isinstance(coordinator, RunnerCoordinator):
             raise TypeError("runner coordinator is required")
         if not callable(getattr(executor, "execute", None)):
             raise TypeError("local canary executor is required")
-        if transport is None:
+        if (transport is None) == (transport_factory is None) or (
+            transport_factory is not None and not callable(transport_factory)
+        ):
             raise TypeError("bounded local target transport is required")
+        if transport_precheck is not None and (
+            transport_factory is None or not callable(transport_precheck)
+        ):
+            raise TypeError("transport precheck requires a lazy target transport")
         self.coordinator = coordinator
         self.executor = executor
         self.transport = transport
+        self.transport_factory = transport_factory
+        self.transport_precheck = transport_precheck
+
+    def _validated_lease(self, lease: ClaimLease) -> ValidatedExecutionBundle:
+        coordinator = self.coordinator
+        gate = coordinator.execution_gate(lease.run_id)
+        validated = validate_execution_bundle(
+            lease.bundle,
+            store=coordinator.store,
+            identity=coordinator.identity,
+            trusted_grant_keys=coordinator.trusted_grant_keys,
+            now_ms=coordinator._now_ms(),
+            gate=gate,
+        )
+        with coordinator._lock:
+            binding = coordinator._bindings.get(lease.run_id)
+        if binding is None or validated.grant["run_id"] != lease.run_id or binding != (
+            validated.grant["grant_id"], validated.projection["projection_id"],
+            validated.projection["projection_digest"],
+        ):
+            raise ValueError("runner claim lease differs from the active claim")
+        return validated
 
     def execute(
         self,
@@ -866,12 +967,33 @@ class RunnerExecutionAdapter:
     ) -> object:
         if not isinstance(lease, ClaimLease):
             raise ValueError("runner claim lease is required")
+        # An authenticated stop already chosen for this lease ends it before any local work;
+        # the executor repeats this check at its activation linearization point.
+        if getattr(cancellation, "stop_reason", None) is not None:
+            return UnactivatedExecution(cancellation.stop_reason)
+
+        def gate_source() -> ExecutionGate:
+            return self.coordinator.execution_gate(lease.run_id)
+
+        if self.transport_factory is None:
+            return self.executor.execute(
+                lease.bundle, transport=self.transport, gate_source=gate_source,
+                cancellation=cancellation, on_progress=on_progress,
+            )
+        try:
+            validated = self._validated_lease(lease)
+        except ValueError:
+            # The gate that refused may be the stop itself, recorded just before the heartbeat
+            # worker chose it; a known stop is then the outcome, not a validation failure.
+            if getattr(cancellation, "stop_reason", None) is not None:
+                return UnactivatedExecution(cancellation.stop_reason)
+            raise
+        if self.transport_precheck is not None:
+            self.transport_precheck(validated)
+        factory = self.transport_factory
         return self.executor.execute(
-            lease.bundle,
-            transport=self.transport,
-            gate_source=lambda: self.coordinator.execution_gate(lease.run_id),
-            cancellation=cancellation,
-            on_progress=on_progress,
+            lease.bundle, transport_factory=lambda: factory(validated), gate_source=gate_source,
+            cancellation=cancellation, on_progress=on_progress,
         )
 
     def prepare_stop_ack(

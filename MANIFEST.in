@@ -7,8 +7,8 @@ include release/open-core-v1.json
 include release/open-core/MCP_QUICKSTART.md release/open-core/README.md release/open-core/SECURITY.md
 exclude LICENSE-COMMERCIAL.md
 exclude README.md
-exclude heel/heldout/test_targets.json
-exclude heel/scenarios_lib/research_owasp.json
+include heel/heldout/test_targets.json
+include heel/scenarios_lib/research_owasp.json
 prune apps
 prune deploy
 prune docs/saas

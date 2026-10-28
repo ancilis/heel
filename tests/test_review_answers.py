@@ -119,7 +119,7 @@ class ReviewAnswerTests(unittest.TestCase):
             if finding["surface_id"] == "exportusers"
         }
         self.assertNotIn("export_without_entitlement", risks)
-        self.assertIn("export_without_tenant_quota", risks)
+        self.assertNotIn("export_without_tenant_quota", risks)
 
     def test_rate_limit_answer_adds_only_rate_limit_control(self):
         from heel.review_answers import apply_review_answers
@@ -153,7 +153,7 @@ class ReviewAnswerTests(unittest.TestCase):
             finding["risk"] for finding in after["findings"]
             if finding["surface_id"] == "exportusers"
         }
-        self.assertIn("export_without_entitlement", risks)
+        self.assertNotIn("export_without_entitlement", risks)
         self.assertNotIn("export_without_tenant_quota", risks)
 
     def test_export_questions_track_each_missing_control_exactly(self):
@@ -225,7 +225,10 @@ class ReviewAnswerTests(unittest.TestCase):
                         "field": field,
                         "value": value,
                     }], questions)
-                    self.assertEqual(enriched, spec)
+                    declaration = enriched["paths"]["/exports"]["get"]["x-heel-customer-declarations"][field]
+                    self.assertEqual(declaration["value"], value)
+                    self.assertIn(declaration["evidence_state"], {"unknown", "customer_declared"})
+                    self.assertNotIn("x-heel-customer-declarations", spec["paths"]["/exports"]["get"])
                     self.assertIsNot(enriched, spec)
 
     def test_answer_application_has_stable_ordering(self):
@@ -373,13 +376,13 @@ class ReviewAnswerTests(unittest.TestCase):
             ),
             "answer_receipts": {
                 "enforced": "applied",
-                "not_enforced": "confirmed_gap",
+                "not_enforced": "declared_gap",
                 "unknown": "unanswered",
             },
             "confidence": {
                 "unanswered_or_unknown": "preliminary",
-                "not_enforced": "confirmed_gaps",
-                "enforced_reduced_questions_without_confirmed_gap": "improved",
+                "not_enforced": "declared_gaps",
+                "enforced_reduced_questions_without_declared_gap": "improved",
             },
         })
 

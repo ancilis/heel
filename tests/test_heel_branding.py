@@ -67,7 +67,9 @@ class HeelBrandingTests(unittest.TestCase):
                 "package-data": {
                     "heel": [
                         "heldout/targets.json",
+                        "heldout/test_targets.json",
                         "scenarios_lib/community.json",
+                        "scenarios_lib/research_owasp.json",
                     ],
                 },
             },
