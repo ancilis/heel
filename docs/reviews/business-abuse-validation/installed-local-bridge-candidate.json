@@ -1,0 +1,44 @@
+{
+  "candidate": "1.3.0rc2 local runner execution bridge (synthetic/local; not deployed, not default managed)",
+  "wheel_sha256": "60d2dfc28fc960269ebbdfd221c2ecf4bd7e3ef40e63831d4841994cd6d33cf3",
+  "install": "offline, sandboxed, runner extra from the cached rc2 dependency bundle",
+  "network": "owned 127.0.0.1 TLS target only",
+  "egress_gate": {
+    "profile": "loopback-only sandbox used by the probe",
+    "target": "192.0.2.1:443",
+    "outcome": "denied:PermissionError:EPERM",
+    "fail_closed": "any other outcome stops before install and probe"
+  },
+  "clock": "real wall clock",
+  "signed_lease": {
+    "target_requests": [
+      "HEAD /health HTTP/1.1",
+      "HEAD /health HTTP/1.1",
+      "GET /items/canary-a-item-0137 HTTP/1.1",
+      "GET /items/canary-a-item-0137 HTTP/1.1"
+    ],
+    "tls_host_verified": "staging.acme.dev",
+    "control": [
+      "claim",
+      "heartbeat",
+      "progress",
+      "result"
+    ],
+    "result_posts": 1,
+    "disposition": "completed",
+    "terminal_instant_equal": true,
+    "credentials_left_target": false
+  },
+  "env_credentials": {
+    "result": "credential_unavailable",
+    "dns": 0,
+    "sockets": 0,
+    "secret_loads": 0,
+    "run_reserved": false
+  },
+  "seams": [
+    "scripted control transport (not a real control plane)",
+    "OS vault double (not a real keychain)",
+    "loopback dial and pinned-peer TLS"
+  ]
+}

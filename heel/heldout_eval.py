@@ -1,15 +1,15 @@
 """
-HEEL — held-out evaluation against INDEPENDENTLY-AUTHORED targets (the strongest honesty test).
+Heel: held-out evaluation against INDEPENDENTLY-AUTHORED targets (the strongest honesty test).
 
-The blind eval still used encodings HEEL's author wrote. These targets were authored by a separate
-LLM swarm given only the abuse TAXONOMY and an output schema — never HEEL's scenarios or property
+The blind eval still used encodings Heel's author wrote. These targets were authored by a separate
+LLM swarm given only the abuse TAXONOMY and an output schema: never Heel's scenarios or property
 vocabulary (see docs/HELDOUT_PROVENANCE.md). They are frozen in heel/heldout/targets.json. So the
-property names/values are genuinely held out, and HEEL's recall here is real detection accuracy with
+property names/values are genuinely held out, and Heel's recall here is real detection accuracy with
 NO author control over the encoding.
 
 It reports recall both ways: EXACT-match scenarios (which key off specific property names + kinds)
-vs the library WITH the SEMANTIC family (synonym generalization). The gap is the honest result —
-exact matching barely generalizes; semantic matching recovers a fraction; neither is near 1.0.
+vs the library WITH the SEMANTIC family (synonym generalization). The gap is the honest result.
+Exact matching barely generalizes; semantic matching recovers a fraction; neither is near 1.0.
 """
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def _build_target(p: dict) -> SyntheticTarget:
 
 
 def _cluster_ci(rows, key_num, key_den, iters=2000):
-    """Target-level (cluster) bootstrap CI — resample the TARGETS, not the weaknesses, because the
+    """Target-level (cluster) bootstrap CI: resample the TARGETS, not the weaknesses, because the
     weaknesses are nested in targets with strong heterogeneity (iid Wilson is ~45% too narrow)."""
     rng = random.Random(20260605)
     n = len(rows)
@@ -116,13 +116,14 @@ def _run(targets, semantic: bool) -> dict:
 
 
 def _eval_split(path: str) -> dict:
-    raw = open(path, "rb").read()
+    with open(path, "rb") as fh:
+        raw = fh.read()
     targets = [_build_target(p) for p in json.loads(raw)]
     n_planted = sum(1 for t in targets for pv in t.planted_vectors)
     n_reach = sum(1 for t in targets for pv in t.planted_vectors if pv.reachable)
     n_decoy = sum(1 for t in targets for a in t.affordances if a.decoy)
     return {"n_targets": len(targets), "total_planted": n_reach,
-            "planted_all": n_planted, "n_below_reachability": n_planted - n_reach,  # currently 0 — the gate is a no-op
+            "planted_all": n_planted, "n_below_reachability": n_planted - n_reach,  # currently 0: the gate is a no-op
             "n_decoys": n_decoy, "sha256": hashlib.sha256(raw).hexdigest()[:16],
             "exact_match": _run(targets, False), "with_semantic": _run(targets, True)}
 
@@ -130,9 +131,9 @@ def _eval_split(path: str) -> dict:
 def heldout_eval() -> dict:
     dev = _eval_split(FIXTURES)
     out = {
-        "provenance": "targets authored by an independent LLM swarm, blind to HEEL's probe vocabulary",
+        "provenance": "targets authored by an independent LLM swarm, blind to Heel's probe vocabulary",
         "discipline": "DEV split was tuned on; TEST split is frozen + content-hashed and was never "
-                      "inspected/tuned on (docs/HELDOUT_PROVENANCE.md) — the TEST number is the unbiased one. "
+                      "inspected/tuned on (docs/HELDOUT_PROVENANCE.md): the TEST number is the unbiased one. "
                       "Recall is reported two ways: LOCALIZATION (right affordance) and the stricter "
                       "ATTRIBUTION (right affordance AND category). CIs are target-level cluster bootstraps.",
         "dev": dev,
@@ -144,17 +145,17 @@ def heldout_eval() -> dict:
         test = _eval_split(TEST_FIXTURES)
         out["test"] = test
         ts = test["with_semantic"]
-        out["headline"] = (f"held-out TEST (unbiased, {test['total_planted']} weaknesses, sha {test['sha256']}): "
+        out["headline"] = (f"held-out TEST (synthetic vocabulary, {test['total_planted']} weaknesses, sha {test['sha256']}): "
                            f"localization recall {ts['recall']} cluster-CI {ts['recall_cluster_ci95']}, "
                            f"ATTRIBUTION recall {ts['attribution_recall']} cluster-CI {ts['attribution_cluster_ci95']}, "
                            f"precision {ts['precision']} cluster-CI {ts['precision_cluster_ci95']}. "
                            f"exact-match {test['exact_match']['recall']}; DEV {dev['with_semantic']['recall']}. "
-                           f"Not near 1.0 — the honest ceiling. (old headline kept below)")
-        out["_headline_legacy"] = (f"held-out TEST recall (unbiased, {test['total_planted']} weaknesses authored "
+                           f"Not near 1.0: the honest ceiling. (old headline kept below)")
+        out["_headline_legacy"] = (f"held-out TEST recall (synthetic vocabulary, {test['total_planted']} weaknesses authored "
                            f"blind to the tuner): exact {test['exact_match']['recall']} -> semantic "
                            f"{test['with_semantic']['recall']} (Wilson CI {test['with_semantic']['wilson_ci95']}) "
                            f"at precision {test['with_semantic']['precision']}. DEV recall {dev['with_semantic']['recall']}. "
-                           f"Generalizes to vocabulary it never saw; not near 1.0 — the honest ceiling.")
+                           f"Generalizes to vocabulary it never saw; not near 1.0: the honest ceiling.")
     return out
 
 

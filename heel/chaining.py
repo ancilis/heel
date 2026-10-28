@@ -1,5 +1,5 @@
 """
-HEEL — affordance-chaining discovery (spec §3.1 "affordance chaining"). Phase 3.
+Heel — affordance-chaining discovery (spec §3.1 "affordance chaining"). Phase 3.
 
 The single-affordance adversarial probes miss abuse that requires COMBINING affordances
 (e.g. a weak account-recovery + a session that isn't rotated → full account takeover). This
@@ -48,7 +48,7 @@ def run_chaining(target, log, run_id: str) -> list[AbuseVector]:
         log("chain_discovered", {"pattern": pat["id"], "affordances": [m.id for m in matched]})
         out.append(AbuseVector(
             id=f"av:{run_id}:{vid}", scenario_id=f"chain.{pat['id']}", category=pat["category"],
-            reproduction={"strategy": "affordance_chain", "chain": [m.id for m in matched],
+            reproduction={"sequence_executed": False, "evidence_state": "inferred", "execution_disposition": "model_only", "strategy": "affordance_chain", "chain": [m.id for m in matched],
                           "steps": [pat["objective"], "halt"], "sample": "canary_only", "contained": True},
             severity=Severity(like, imp, 0.25), reachability_score=reach, plausible=reach >= 0.25,
             recommended_control=pat["control"], estimated_exploitability_reduction=0.8,

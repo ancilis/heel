@@ -1,0 +1,138 @@
+{
+  "candidate": "1.3.0rc2 local runner execution bridge, stop-race repair EXECUTION-F1R (synthetic/local; not deployed, not default managed)",
+  "supersedes_nothing": "installed-local-bridge-candidate.json and earlier proofs are retained unchanged",
+  "wheel_sha256": "7053d9993e691593b5809d7ec08a4f78d0a7b7aadf489ab9eb0ce35afda13dbf",
+  "install": "offline, sandboxed, runner extra from the cached rc2 dependency bundle; installed coordinator/daemon/execution/service byte-equal to source",
+  "network": "owned 127.0.0.1 TLS target only; scripted in-process control transport",
+  "egress_gate": {
+    "profile": "loopback-only sandbox used by the probe",
+    "target": "192.0.2.1:443",
+    "outcome": "denied:PermissionError:EPERM",
+    "fail_closed": "any other outcome stops before install and probe (local fault controls 7/7 PASS)"
+  },
+  "clock": "real wall clock",
+  "regression": {
+    "disposition": "completed",
+    "target_requests": [
+      "HEAD /health HTTP/1.1",
+      "HEAD /health HTTP/1.1",
+      "GET /items/canary-a-item-0137 HTTP/1.1",
+      "GET /items/canary-a-item-0137 HTTP/1.1"
+    ],
+    "result_posts": 1,
+    "terminal_instant_equal": true,
+    "credentials_left_target": false
+  },
+  "env_credentials_refused_before_reservation": {
+    "code": "credential_unavailable",
+    "resolver_calls": 0,
+    "run_reserved": false,
+    "socket_calls": 0,
+    "vault_loads": 0
+  },
+  "stop_while_factory_held_in_dns": {
+    "cloud_stop": {
+      "controller_outcome": "acknowledged",
+      "stop_ack_sent_while_dns_held": true,
+      "result": {
+        "disposition": "stopped",
+        "stop_reason": "cloud_stop",
+        "stop_acknowledged_at_ms": "accepted timestamp",
+        "requests_started": 0
+      },
+      "result_posts": 1,
+      "stop_ack_posts": 1,
+      "dns_preflights": 1,
+      "target_dials": 0,
+      "secret_loads": 0,
+      "fresh_coordinator_restart": "ok",
+      "runtime_rows_after": 0
+    },
+    "runner_revoked": {
+      "controller_outcome": "acknowledged",
+      "stop_ack_sent_while_dns_held": true,
+      "result": {
+        "disposition": "stopped",
+        "stop_reason": "runner_revoked",
+        "stop_acknowledged_at_ms": "accepted timestamp",
+        "requests_started": 0
+      },
+      "result_posts": 1,
+      "stop_ack_posts": 1,
+      "dns_preflights": 1,
+      "target_dials": 0,
+      "secret_loads": 0,
+      "fresh_coordinator_restart": "ok",
+      "runtime_rows_after": 0
+    },
+    "local_emergency_stop": {
+      "controller_outcome": "acknowledged",
+      "stop_ack_sent_while_dns_held": true,
+      "result": {
+        "disposition": "stopped",
+        "stop_reason": "local_emergency_stop",
+        "stop_acknowledged_at_ms": "accepted timestamp",
+        "requests_started": 0
+      },
+      "result_posts": 1,
+      "stop_ack_posts": 1,
+      "dns_preflights": 1,
+      "target_dials": 0,
+      "secret_loads": 0,
+      "fresh_coordinator_restart": "ok",
+      "runtime_rows_after": 0
+    },
+    "cloud_stop_ack_reset_before_acceptance": {
+      "controller_outcome": "unacknowledged",
+      "stop_ack_sent_while_dns_held": true,
+      "result": {
+        "disposition": "stopped",
+        "stop_reason": "cloud_stop",
+        "stop_acknowledged_at_ms": "null",
+        "requests_started": 0
+      },
+      "result_posts": 1,
+      "stop_ack_posts": 1,
+      "dns_preflights": 1,
+      "target_dials": 0,
+      "secret_loads": 0,
+      "fresh_coordinator_restart": "ok",
+      "runtime_rows_after": 0
+    }
+  },
+  "stop_before_local_activation": {
+    "controller_outcome": "not_active",
+    "local_run_reserved": false,
+    "dns_preflights": 0,
+    "target_dials": 0,
+    "secret_loads": 0,
+    "control_operations": [
+      "claim",
+      "heartbeat"
+    ],
+    "fresh_coordinator_restart": "refused:RunnerStoreError:runtime active grant authority is unavailable",
+    "status": "UNRESOLVED: pre-activation reconciliation is a separate design; the runner fabricates no local run"
+  },
+  "dns_failure_after_activation": {
+    "claimed": true,
+    "disposition": "incomplete",
+    "error_category": "target_unavailable",
+    "requests_started": 0,
+    "resolver_calls": 1,
+    "result_posts": 1,
+    "target_dials": 0,
+    "vault_loads": 0
+  },
+  "uncaught_thread_exceptions": [],
+  "not_covered_here": [
+    "accepted-remote acknowledgement with a lost answer (real HTTP: null-ack result refused 409 canary_state_conflict; runner fails closed, restart refuses; tests only)",
+    "real customer control plane, real OS keychain, deployed service"
+  ],
+  "seams": [
+    "scripted control transport (not a real control plane)",
+    "OS vault double (not a real keychain)",
+    "loopback dial and pinned-peer TLS",
+    "held/failing resolver"
+  ],
+  "evidence": "CUSTOMER-TRACK-EXECUTION-F1R/installed/run2 (run1 retained: its 4 ConnectionAbortedError came from the probe's own idle accept() target thread)"
+}
