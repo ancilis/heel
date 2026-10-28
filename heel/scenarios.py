@@ -1,5 +1,5 @@
 """
-HEEL — declarative abuse scenario library (spec §4). Phase-3 full breadth.
+Heel — declarative abuse scenario library (spec §4). Phase-3 full breadth.
 
 Scenarios are pure SPECS (addable WITHOUT code): a surface pattern, a declarative
 `success_criterion` interpreted by the generic evaluator (`agents.evaluate_criterion`), a
@@ -10,23 +10,41 @@ REAL targets) — that is breadth, not false positives. Extra scenarios can also
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import glob
 import json
 import os
 
-from .contracts import AbuseScenario, AppliesWhen, Category, ScenarioSource
+from .business_rules import mechanism_for
+from .contracts import AbuseScenario, AppliesWhen, Category, ScenarioPack, ScenarioSource
 
 _AGENT = AppliesWhen.HAS_AGENT_SURFACE
 
 
+def _default_pack(category: Category) -> ScenarioPack:
+    if category == Category.AGENT_MCP_SURFACE:
+        return ScenarioPack.AGENT_MCP
+    if category in {Category.LICENSE_ENTITLEMENT, Category.DATA_HARVESTING}:
+        return ScenarioPack.PAYMENTS_BILLING
+    if category in {Category.TRUST_ECONOMY, Category.CONTENT_POLICY, Category.IDENTITY_ACCOUNT}:
+        return ScenarioPack.TRUST_SAFETY
+    if category == Category.INTEGRATION_EXTENSIBILITY:
+        return ScenarioPack.INTEGRATIONS
+    if category == Category.COMPLIANCE_BOUNDARY:
+        return ScenarioPack.COMPLIANCE
+    return ScenarioPack.CORE_SAAS
+
+
 def _s(id, cat, objective, kind, crit, like, imp, control, redux=0.75, applies=AppliesWhen.ALWAYS,
-       handoff="", cls=None):
+       handoff="", cls=None, pack=None):
+    scenario_pack = pack or _default_pack(cat)
     return AbuseScenario(
         id=id, category=cat, objective=objective, target_affordance_pattern={"kind": kind},
         probe_strategy=id.split(".", 1)[-1], success_criterion=crit,
         severity_model={"likelihood": like, "impact": imp}, classification_impact=cls,
         applies_when=applies, source=ScenarioSource.SEED, recommended_control=control,
-        exploitability_reduction=redux, handoff=handoff,
+        exploitability_reduction=redux, handoff=handoff, pack=scenario_pack,
         containment_limits={"max_probe_calls": 5, "backoff": True, "sample": "canary_only"})
 
 
@@ -40,6 +58,21 @@ SEED_SCENARIOS: list[AbuseScenario] = [
        "trial", {"prop": "identity_check", "equals": "email_only"}, 0.5, 0.5, "device/identity fingerprinting + trial-per-identity limit"),
     _s("sc.rate.circumvention", Category.LICENSE_ENTITLEMENT, "Rate/concurrency limit circumvention",
        "endpoint", {"prop": "rate_limit", "equals": "none"}, 0.5, 0.5, "server-side rate + concurrency limits"),
+    _s("sc.ui.shadow_api_bulk_access", Category.LICENSE_ENTITLEMENT,
+       "Interactive UI backing endpoint can be scripted as an unpriced bulk API",
+       "endpoint",
+       {"all_of": [
+           {"prop": "ui_backing_endpoint", "equals": True},
+           {"prop": "paid_api_equivalent", "equals": True},
+           {"any_of": [
+               {"prop": "entitlement_signal", "equals": "plan_mismatch"},
+               {"prop_neq": ["required_plan", "reachable_by_plan"]},
+               {"prop": "rate_limit", "equals": "missing"},
+               {"prop": "automation_guard", "equals": "missing"},
+           ]},
+       ]},
+       0.6, 0.8,
+       "share server-side UI/API entitlements; add per-tenant lookup quotas, automation controls, and audit events"),
     # ---------- 4.2 data harvesting ----------
     _s("sc.export.entitlement", Category.DATA_HARVESTING, "Bulk export reachable without an entitlement check",
        "export", {"guard_absent": True}, 0.7, 0.8, "enforce server-side entitlement check on export", cls="records"),
@@ -132,7 +165,8 @@ def _build_semantic_scenarios():
             target_affordance_pattern={"kind": "*"}, probe_strategy="semantic",
             success_criterion={"semantic": signal}, severity_model={"likelihood": like, "impact": imp},
             applies_when=_AGENT if cat == Category.AGENT_MCP_SURFACE else AppliesWhen.ALWAYS,
-            source=ScenarioSource.SEED, recommended_control=control, exploitability_reduction=0.7, handoff=handoff))
+            source=ScenarioSource.SEED, pack=_default_pack(cat), recommended_control=control,
+            exploitability_reduction=0.7, handoff=handoff))
     return out
 
 
@@ -147,6 +181,7 @@ def load_json_scenarios() -> list[AbuseScenario]:
         try:
             with open(fn) as fh:
                 for s in json.load(fh):
+                    cat = Category(s["category"])
                     out.append(AbuseScenario(
                         id=s["id"], category=Category(s["category"]), objective=s["objective"],
                         target_affordance_pattern={"kind": s["kind"]},
@@ -154,9 +189,12 @@ def load_json_scenarios() -> list[AbuseScenario]:
                         success_criterion=s["success_criterion"],
                         severity_model=s["severity_model"],
                         applies_when=AppliesWhen(s.get("applies_when", "always")),
-                        source=ScenarioSource.SEED, recommended_control=s.get("recommended_control", ""),
+                        source=ScenarioSource.SEED, pack=ScenarioPack(s.get("pack", _default_pack(cat).value)),
+                        recommended_control=s.get("recommended_control", ""),
+                        containment_limits=s.get("containment_limits", {}),
                         exploitability_reduction=s.get("exploitability_reduction", 0.6),
-                        handoff=s.get("handoff", ""), classification_impact=s.get("classification_impact")))
+                        handoff=s.get("handoff", ""), classification_impact=s.get("classification_impact"),
+                        investigation_signals=s.get("investigation_signals", {})))
         except Exception:
             continue
     return out
@@ -164,15 +202,45 @@ def load_json_scenarios() -> list[AbuseScenario]:
 
 def all_seed_scenarios(semantic: bool = True) -> list[AbuseScenario]:
     # semantic family ON by default: it generalizes to vocabularies the library didn't author
-    return SEED_SCENARIOS + (SEMANTIC_SCENARIOS if semantic else []) + load_json_scenarios()
+    scenarios = SEED_SCENARIOS + (SEMANTIC_SCENARIOS if semantic else []) + load_json_scenarios()
+    qualified = []
+    for scenario in scenarios:
+        mechanism = mechanism_for(scenario.id)
+        if mechanism != scenario.id:
+            criterion = {"all_of": [
+                {"prop": "business_rule_applicable", "equals": True},
+                {"prop_exists": "rule_source"}, scenario.success_criterion,
+            ]}
+            qualified.append(replace(scenario, success_criterion=criterion,
+                investigation_signals=scenario.investigation_signals or scenario.success_criterion, mechanism_id=mechanism,
+                objective="Investigate declared rule: " + scenario.objective))
+        else:
+            qualified.append(replace(scenario, mechanism_id=mechanism))
+    return qualified
 
 
 def list_scenarios(filter_category: str | None = None, include_discovered: list | None = None,
-                   semantic: bool = True) -> list[AbuseScenario]:
+                   semantic: bool = True, pack_filter: str | None = None,
+                   pack_filters: list[str] | None = None) -> list[AbuseScenario]:
     out = all_seed_scenarios(semantic=semantic) + list(include_discovered or [])
     if filter_category:
         out = [s for s in out if s.category.value == filter_category]
+    packs = _pack_filter_set(pack_filter, pack_filters)
+    if packs:
+        out = [s for s in out if s.pack.value in packs]
     return out
+
+
+def _pack_filter_set(pack_filter: str | None, pack_filters: list[str] | None) -> set[str]:
+    raw = []
+    if pack_filter:
+        raw.extend(str(pack_filter).split(","))
+    for pack in pack_filters or []:
+        raw.extend(str(pack).split(","))
+    packs = {p.strip() for p in raw if p and p.strip()}
+    for pack in packs:
+        ScenarioPack(pack)
+    return packs
 
 
 SEED_BY_ID = {s.id: s for s in SEED_SCENARIOS}
