@@ -367,7 +367,7 @@ The supervisor refuses to start a generation when the preflight fails (`unsafe_d
 answers): no table, no worker, no executor (`start_refused:preflight`). Private, loopback and
 documentation addresses never reach the input because the unchanged validator refuses them first.
 
-### 4.4 Wire protocols (closed, canonical JSON, ≤ 1024 bytes, fixed tokens)
+### 4.4 Wire protocols (closed, canonical JSON, operation-specific byte bounds, fixed tokens)
 
 - **H2-A channel**: unchanged (`heel.h2a.controller.v1`, `heel.h2a.bootstrap.v1`, `heel.h2a.receipt.v1`).
 - **Worker link** `heel.h3.worker-link.v1` (`AF_UNIX` `SOCK_DGRAM` socketpair; supervisor end in the
@@ -398,6 +398,168 @@ Every datagram is matched exactly (schema, keys, types, grammar from `heel/saas/
 `ipaddress.ip_address`); a mismatch is a fixed refusal token and, for the links, ends the generation
 (`link_invalid`). Received descriptors on any message other than `fd_forward` are closed unread and
 refuse the message, as the cycle does (`cycle.py:_close_received`).
+
+#### D-1 amendment candidate — complete frames without changing authority
+
+**Status: Astra design candidate, pending separate fresh review.** This amendment supersedes only
+the original universal 1024-byte H3 link bound. Frozen audit target is implementation
+`c3846e69090fc9905b1293300c36d2fef27bfcec`; parent design is `b168458c`. The audit and reproducible
+offline probe are in `.worktrees/heel-task-evidence/H3-D1-LINK-BOUND-DESIGN/` (`DECISION.md`,
+`audit/frame_audit.py`, `audit/frame-audit.log`). Product implementation and tracked tests belong to
+Opus. This candidate does not accept itself, H3-1, H3-1b, H3-2, C4, H2 runtime or launch.
+
+**CONFIRMED grammar and serialization.** Frozen `deploy/host/executor_link.py:55-153,163-206`
+uses `schema` and `op` (not `t`), exact keys and exact primitive types. Canonical JSON sorts keys,
+uses compact separators, `ensure_ascii=True`, rejects NaN, and emits ASCII bytes (also valid UTF-8).
+Decode must reproduce those bytes exactly: whitespace, alternate escapes, duplicate keys, non-ASCII
+wire text, unknown operations and extra fields remain invalid. Hostname is 1..253 ASCII characters,
+at least two labels of 1..63 lowercase alphanumeric/hyphen characters with alphanumeric ends; origin
+adds `https://` (8 bytes). IDs are `ws_` + 16 hex (19 bytes), `prj_`/`env_`/`rcb_` + 32 hex (36),
+`crun_` + 32 hex (37); runner/key/grant/projection IDs are 1..128 ASCII alphanumeric/underscore/hyphen.
+Digests are 64 lowercase hex, generation/fence 32 hex. Integers exclude booleans: kill generation
+and deadline are 0..9007199254740991 (16 decimal digits); unresolved is 0..64. Fixed enums use their
+longest member in the table below. No identity string or hostname needs JSON escaping.
+
+The address grammar **does** permit escaping: 1..16 strings, each 1..45 ASCII characters accepted by
+`ipaddress.ip_address`; worker `pin` additionally requires `str(parsed) == original`. Python 3.13.5
+accepts scoped IPv6, including `::%` followed by 42 NUL characters, and preserves that representation.
+Each NUL consumes six canonical JSON bytes (`\u0000`). The shortest scope-bearing IPv6 prefix is
+three characters including `%`, giving a maximal 255-byte encoded string interior: `3 + 42*6`.
+Sixteen quoted elements and commas cost `16*(255+2)+15 = 4127` bytes inside brackets. Duplicates are
+not prohibited by the link codec. These are **grammar witnesses**, not assertions that DNS returns
+NUL scopes or that the downstream public-address/IPv4 policy admits them. Do not narrow the address
+grammar or change the public-address validator as part of D-1. A separate scope-policy decision, if
+wanted, needs its own review. This bound covers the frozen parser without making that decision.
+
+**CONFIRMED exhaustive maxima**, including schema/op envelope, braces, keys, punctuation and values
+(probe checks each field against the frozen codec before measuring):
+
+| Link | Operation | Maximum canonical bytes |
+|---|---|---:|
+| Worker | pin | 4582 |
+| Worker | revoke | 153 |
+| Worker | release | 101 |
+| Worker | fd_forward | 157 |
+| Worker | state | 170 |
+| Executor | bound | 663 |
+| Executor | claim_request | 331 |
+| Executor | claimed | 1723 |
+| Executor | resolve | 350 |
+| Executor | released | 127 |
+| Executor | claim_reply | 75 |
+| Executor | authorized | 104 |
+| Executor | refused | 130 |
+| Executor | resolved | 4193 |
+| Executor | resolve_refused | 82 |
+| Executor | stop | 49 |
+
+Unscoped canonical IPv6 is at most 39 characters: `pin` then reaches **1126**, so retaining the worker
+limit is wrong even without scopes. A mixed set of one public IPv4 and fifteen distinct public IPv6
+addresses passes the unchanged public-address selector and gives a **1094-byte** pin at the longest
+hostname. Raw unscoped mixed IPv6/IPv4 notation can reach 45 characters; executor `resolved` then
+reaches **833** (canonical unscoped addresses give 737). Frozen launch input peaks at **719** bytes;
+its separate 1024-byte limit stays unchanged. H3-1b's future control-only pin must use its separately
+reviewed empty-address shape; it is not implemented or accepted by this amendment.
+
+**CONFIRMED operational defect.** The existing signed-grant fixture with the documented three
+grammar-invalid legacy IDs mapped solely for reproducing D-1, and with its full original projection
+ID, produces **1043 bytes**; real `ExecutorLink.claimed` → `_send` raises `ManagedLinkRefused("link_invalid")`
+before accessing a socket. The previous 1708-byte maximum omitted the 15 extra digits of the maximum
+kill-generation integer. Current CP generator shapes fit host authority: workspace 19, project and
+environment 36, runner 37 (`runr_` + 32), key 18 (`k_` + 16), binding 36, run 37, grant 36
+(`cgr_` + 32); compiler-default projection 35 (`projection_` + 24). Substituting these lengths yields
+1085 bytes with `staging.acme.dev` and kill generation 0, or 1322 at a 253-character hostname;
+maximum kill generation adds 15. These are generated-format size calculations, not a real CP ceremony
+or signed end-to-end acceptance. The remediation acceptance test must generate consistent IDs before
+signing and must not mutate a validated grant, truncate IDs or retain the fixture's `proj_1` workaround.
+
+**Selected limits (inclusive, bytes of the entire datagram):**
+
+| Constant | Value | Applies to |
+|---|---:|---|
+| `MAX_SMALL_LINK_BYTES` | 1024 | Every other currently known link operation |
+| `MAX_CLAIMED_BYTES` | 2048 | Executor `claimed` only |
+| `MAX_WORKER_LINK_BYTES` | 4608 | Worker receive ceiling and `pin` only |
+| `MAX_EXECUTOR_LINK_BYTES` | 4352 | Executor receive ceiling and `resolved` only |
+| `MAX_INPUT_BYTES` | 1024 | Launch file, unchanged |
+
+These are the next 256-byte boundaries above each address-bearing maximum, with a conventional
+2048-byte claim bound. A trusted schema selects the receive ceiling **before reading or parsing**;
+`recvmsg` reads ceiling + 1 bytes (4609 worker / 4353 executor), with the existing four-FD ancillary
+buffer. Unknown schemas fail closed. Decode first applies that schema ceiling, then canonical/closed
+schema validation and the `(schema, op)` cap. Encode uses the same known-operation cap; no fallback
+may authorize an unknown schema or operation. Remove the shared `MAX_LINK_BYTES` assumption from
+H3 link code/tests/docs. Preserve `MSG_TRUNC`/`MSG_CTRUNC` refusal and closing every received FD on
+invalid/oversized messages; exactly one FD is legal only for `fd_forward`. Low-cap operations remain
+1024-bounded even though the receive buffer is larger. Do not pad valid messages to the cap.
+
+This increases one receive allocation by 3584 worker / 3328 executor payload bytes; there is no
+reassembly, extra pending message, new queue or changed generation count. Executor reply queues stay
+four entries per existing reply operation; `resolved` can now contain at most four 4193-byte canonical
+documents' worth of data (object overhead remains interpreter-dependent). All DNS count/deadline,
+64-resolution, one-pending-resolution, one-shot-attempt, lease, tick, registry and revoke budgets stay
+unchanged. No claim of target-host timing follows from this byte audit; H3-2 still proves it.
+
+**Alternatives rejected:** executor-only 2048 leaves `pin` and scoped `resolved` broken; a global
+8192 cap increases unrelated admission bounds; removing context fields loses direct tuple/origin/
+authority comparisons and requires a new proof; splitting frames adds assembly, timeout and replay
+state. The selected three operation exceptions preserve every current field and binding.
+
+**Proposed C4 cross-check only.** At fixed unaccepted `5591fc9`, managed-pairing design §8 A-C4-1
+uses a literal `t: pair` spelling despite the H3 schema/op envelope. Its listed maximum fields total
+**591 bytes** with literal `t`, or **628** with H3 `schema`/`op`; the proposed ≈420 claim is incorrect.
+Both fit 1024, interpreting its key-id grammar as the existing H3 maximum of 128 (the generated
+18-character key reduces each by 110). Challenge is 44, pairing ID 40, runner ID 37, workspace 19,
+two digests 64 each, expiry 16 digits; `+`, `/`, `=` do not expand under this encoder. C4 must reconcile
+the envelope in its separate amendment and retain its phase/journal/one-send guards. D-1 adds neither
+`pair` nor `control_only`, and does not approve C4's design or implementation.
+
+**Exact Opus remediation scope (after separate review of this candidate):**
+
+- `deploy/host/executor_link.py`: constants, closed schema/op cap selection, encode/decode and
+  receive sizing, and its stale shared-bound documentation only; no grammar or message-field changes.
+- `tests/test_host_h3.py`: maximum-frame table, real socket transport boundary/FD cases and real
+  supervisor composition coverage below, using existing offline platform seams only.
+- `tests/test_runner_daemon.py`: remove projection shortening and post-validation ID mapping from
+  the managed acceptance path; construct internally consistent signed fixtures and exercise the real
+  daemon/coordinator/execution path through the actual executor link and actual H3 supervisor.
+- `docs/saas/H3_COMPOSITION.md`: exact limits, evidence and component-only status.
+
+No runner production source, CP code, authority/cycle/H2 module, worker/supervisor production behavior,
+download artifact, workflow or other tracked file is authorized by D-1. If the integration test needs
+product changes beyond that list, report a concrete blocker for a new scope decision. Tests may use
+current fixture helpers or local helpers in the two named test files; no tracked helper-file expansion.
+
+**Named tests, written and recorded failing before the fix:**
+
+1. `test_link_maximum_grammar_frames_fit_their_operation_caps`: all 16 rows, 1723/4582/4193 witnesses,
+   raw versus canonical IP, JSON scope escaping, maximum integers, default ID sizes and 719-byte input.
+2. `test_worker_pin_full_public_mixed_answer_set_crosses_real_link`: distinct public mixed set and
+   long valid `.com` hostname, original pin refused red then delivered byte-exact after fix; no DNS call.
+3. `test_daemon_full_identity_claim_reaches_real_supervisor_before_target_socket`: real `RunnerDaemon`
+   serve path, real `ExecutorLink`/codec, real supervisor/controller/`HostCycle` with the documented
+   offline installer/CP seams. Real signed, consistent CP-format fixture fields, no `BridgeLink.claimed`
+   rewrite or fake supervisor. Assert `claimed` consumed, context admitted and `authorized` returned
+   before the test target socket factory is invoked; full projection/identity/digest equality. Run a
+   maximum-length grammar fixture as a separate variant with consistent pre-signing construction.
+4. `test_link_operation_caps_reject_oversize_and_close_received_descriptors`: all cap+1 values,
+   schema-ceiling+1 and truncation, low-cap messages below the larger schema ceiling, duplicate keys,
+   whitespace, alternate escapes, bool integers, unknown schema/op and unsolicited/multiple/truncated
+   FDs; check FD closure. These negatives are regression guards and may already pass on the baseline;
+   pair them with newly accepted >1024-byte positives so the overall test fails first for the defect.
+5. `test_full_size_claim_preserves_cross_identity_origin_and_replay_refusal`: through the real
+   supervisor, individually wrong workspace/project/environment/runner/key/binding/run/grant/digests,
+   origin mismatch, stale/replayed claim, end-generation claim and missing authority each refuse before
+   target sockets; tuple differences not checked locally must be refused by the real cycle's scripted
+   authority exchange. Retain one-shot-attempt and `defer` behavior. Baseline-valid negative cases need
+   not fail first; the full-size matching control case must.
+
+**INFERRED remediation success; exact confirmation action:** Opus records failing-first output and
+then green focused H3/runner-daemon and affected host-cycle/H2/authority tests on the resulting tree;
+fresh independent code/adversarial review verifies the diff and evidence. Exercise Unix SEQPACKET on
+Linux (macOS DGRAM fallback is only component evidence), including oversized payload + received-FD
+closure. Broader existing H3 gates remain required. No local size calculation substitutes for the
+actual daemon → link → supervisor positive case or Linux lifecycle/runtime evidence. C3 remains STOP.
 
 ### 4.5 Executor attachment (after `ready`) and the managed entry
 
