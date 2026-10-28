@@ -1,5 +1,5 @@
 """
-HEEL — pluggable model / LLM control loop (spec §3, §11).
+Heel — pluggable model / LLM control loop (spec §3, §11).
 
 The adversarial agent's reasoning (currently: discovery of un-anticipated abuse affordances) is
 driven by a swappable `Model`. The default `StubModel` is DETERMINISTIC and needs no API key, so
@@ -8,8 +8,8 @@ the synthetic demo runs offline (spec §11). An `AnthropicModel` swaps in behind
 `urllib` (no SDK dependency, keeping the pure-stdlib core).
 
 SAFETY: the model only ever sees OBSERVABLE affordance properties (never planted ground truth),
-and it only PROPOSES declarative scenario specs — HEEL builds the contained PoC itself. The model
-is instructed to stay in HEEL's lane (product/business consequence; no weaponization, no prohibited
+and it only PROPOSES declarative scenario specs — Heel builds the contained PoC itself. The model
+is instructed to stay in Heel's lane (product/business consequence; no weaponization, no prohibited
 content, no jailbreak technique). On any error or missing key it falls back to the heuristic.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ import urllib.request
 from .agents import heuristic_discover
 
 SYSTEM_PROMPT = (
-    "You are HEEL's discovery reasoner. HEEL rehearses product/business-logic ABUSE against a "
+    "You are Heel's discovery reasoner. Heel rehearses product/business-logic ABUSE against a "
     "product the operator owns, to harden it before launch. You see only OBSERVABLE affordance "
     "properties. For affordances that show a likely abuse CONSEQUENCE (unauthorized action, data "
     "over-extraction, cost amplification, license/quota/economy gaming) propose a DECLARATIVE "

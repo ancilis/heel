@@ -1,11 +1,13 @@
-# HEEL — Architecture (v1)
+# Heel — Architecture (v1)
 
-> **HEEL** is the villain you rehearse against before the real one shows up: a swarm of
-> adversarial and opportunistic agents that probe a product *you own*, prove an abuse path is
-> reachable with a **contained** proof-of-concept, and hand you a ranked report with
-> recommended controls — before you ship.
+Current architecture (September 4, 2026): the shipped vertical slice is a customer-local synthetic export entitlement workflow. See [current validation architecture](docs/saas/ARCHITECTURE.md), [capabilities](docs/CAPABILITIES.md), and [demo](docs/EXPORT_DEMO.md). Static inputs are declarations/hypotheses, and modeled sequences are unexecuted. Cloud pairing remains incomplete; the older broad architecture below describes components and intent, not a completed live customer journey.
 
-HEEL is **agent-native**: its canonical surface is an **MCP server** that other agents and AI
+> **Heel** is abuse rehearsal for SaaS: a swarm of adversarial and opportunistic agents that
+> probe a product *you own*, prove an abuse path is reachable with a **contained**
+> proof-of-concept, and hand you a ranked report with recommended controls before launch and
+> throughout production life.
+
+Heel is **agent-native**: its canonical surface is an **MCP server** that other agents and AI
 tools invoke. It is **self-contained** — it depends on no other platform. This document is the
 single mental model every squad shares. Read it first.
 
@@ -13,19 +15,37 @@ single mental model every squad shares. Read it first.
 
 ## 1. North star
 
-A team is about to ship a feature. A human authorizes a target **out-of-band** (§10), then an
-agent (a SOC agent, a CI pipeline, a product copilot, a developer at the CLI) calls HEEL to run
-a swarm against it and receives a ranked **abuse report** as structured data. Each finding is an
-`AbuseVector` with a contained PoC, a severity, an optional data-classification annotation, and a
-recommended control.
+A team is about to ship a feature, review an existing product, or turn an incident into a
+regression. A human authorizes a target **out-of-band** (§10), then an agent (a SOC agent, a CI
+pipeline, a product copilot, a developer at the CLI) calls Heel to run a swarm against it and
+receives a ranked **abuse report** as structured data. Each finding is an `AbuseVector` with a
+contained PoC, a severity, an optional data-classification annotation, an optional economic-impact
+annotation, and a recommended control.
 
-HEEL proves it works by **finding planted abuse vectors in a built-in synthetic product in
+Heel proves it works by **finding planted abuse vectors in a built-in synthetic product in
 advance, at a low false-positive rate.** That coverage backtest is the spine: built first, and
 the acceptance test.
 
-**HEEL works on any SaaS product, not just AI products.** Taxonomy categories 1–9 are a universal
+**Heel works on any SaaS product, not just AI products.** Taxonomy categories 1–9 are a universal
 core; category 10 (agent/MCP surface abuse) auto-applies only when the target *has* agentic/MCP
 surfaces and cleanly yields nothing when it doesn't.
+
+## 1.1. Operating modes
+
+Heel has one safety model across pre-launch and existing-product operating modes:
+
+| mode | purpose | target/data boundary |
+|---|---|---|
+| Synthetic demo | Show the full MCP/auth/eval spine with no customer system | Built-in synthetic targets only |
+| Launch review | Default wedge before a SaaS feature ships | Human-created scope over synthetic, staging, sandbox, or launch-review adapter |
+| Staging rehearsal | Exercise a realistic deployed environment without customer blast radius | Signed scope, synthetic users, canary records, operator-approved limits |
+| Existing-product imported model | Rehearse from product models, sanitized telemetry, configs, or catalogs | Import is authorized out-of-band; no real secrets or raw customer data |
+| Incident-to-scenario | Convert an abuse incident or near miss into a regression scenario | Sanitized incident facts, canaries for reproduction, no real exfiltration |
+| Continuous regression | Re-run approved scenarios in CI or release checks | Existing signed scope and immutable audit trail; no scope mutation from MCP/REST/agents |
+
+All non-synthetic runs, imports, and production-like rehearsals require an explicit human-created
+`AuthorizationScope`. MCP, REST, and agent surfaces can execute within a valid scope and read
+results, but they cannot create, widen, relax, or mutate scopes.
 
 ---
 
@@ -41,6 +61,17 @@ CLI and (future) UI are thin clients over the same capability.
 **Deliberately NOT exposed (human-only, out-of-band, §10.1):** scope creation, widening,
 allowlist modification, limit relaxation. **These tools do not exist in the registry by
 construction** — there is no code path from the MCP/REST/agent surface to mint or widen a scope.
+
+**CLI-only regression harness:** `heel regress add/list/run/export` turns stored findings into
+abuse-control regression tests. It is a thin client over the same store and `HeelServer` run path:
+regression re-runs still require an existing signed scope, never mutate scopes, emit canary-only
+evidence summaries instead of repro steps, and append containment log entries.
+
+**CLI-only control simulator:** `heel controls simulate --vector/--finding-json/--run` estimates
+which controls would block or reduce a finding. It is an offline report layer over stored or imported
+finding data: it reads vector fields, scenario category, affordance properties, optional
+ProductModel/EntitlementGraph signals, and a local control bank. It does not contact a live target
+and does not create, widen, relax, or mutate authorization scopes.
 
 ---
 
@@ -92,9 +123,13 @@ channel that can be prompt-injected. The model (the **confused-deputy** model):
   surface for unintended affordances and weak controls. The swarm-native workload. Built (v1 is
   a deterministic stub model by default; an LLM control loop swaps in via `HEEL_MODEL=anthropic`,
   `heel/model.py`). → `heel/agents.py`.
-- **Opportunistic-human (motivation-profiled).** Ordinary motivated users who *game* the product
-  within normal affordances, conditioned by a small declarative `MotivationProfile`. Contract
-  defined; **built** (`heel/agents_human.py`, `profiles.py`).
+- **Opportunistic-human (persona-modeled).** Ordinary motivated users, agencies, integration
+  owners, or builders who *game* the product within normal affordances. A declarative persona
+  library models motivation, sophistication, patience, risk tolerance, target affordance types,
+  preferred chains, deterring controls, and canary-only rehearsal examples. Persona evidence can
+  annotate a better-calibrated adversarial finding without replacing its severity/category/control;
+  persona-only findings are ranked by a stable severity/reachability rule. Built in
+  `heel/agents_human.py` and `heel/profiles.py`; operator guide in `docs/PERSONAS.md`.
 
 ---
 
@@ -111,6 +146,8 @@ channel that can be prompt-injected. The model (the **confused-deputy** model):
 (reachability-weighted), **false-positive rate**, **severity calibration**, the **non-AI vs AI
 breakdown**, plus honest signals — a genuine miss (FN), a decoy false positive (FP), a degenerate
 demoted by plausibility-weighting, a swarm-**discovered** scenario, and lane-discipline handoffs.
+The public evaluation ladder then separates that self-consistency wiring check from blind lower-bound
+recall and the frozen held-out TEST metrics used as the honest detection headline.
 
 ---
 
@@ -118,7 +155,11 @@ demoted by plausibility-weighting, a swarm-**discovered** scenario, and lane-dis
 
 `AbuseScenario`, `AbuseVector`, `MotivationProfile`, `AuthorizationScope` (signed, immutable),
 `CallerContext`, `SyntheticTarget`/`PlantedVector`, `ContainmentEntry`, plus the MCP tool schema
-in `mcp_server.TOOL_SCHEMAS` (scope-mutation tools absent by construction).
+in `mcp_server.TOOL_SCHEMAS` (scope-mutation tools absent by construction). `AbuseVector` can carry
+an optional `economic_impact` report-layer annotation; economic scoring is read-only and never
+creates, widens, relaxes, or mutates authorization scopes.
+Control simulation is also report-layer metadata: proposed controls are estimates until an operator
+implements the fix and verifies it with a regression or launch review.
 
 ---
 
@@ -131,6 +172,7 @@ in `mcp_server.TOOL_SCHEMAS` (scope-mutation tools absent by construction).
 | **2 — thin vertical slice over MCP** | ✅ scenario → agent → finding → coverage, callable over MCP |
 | **3 — parallelize against frozen contracts** | ▶ wave 1 done: opportunistic-human class (§3.2), REST API (§2), control search (§8), chain-FN; full library + LLM loop + fan-out next |
 | **4 — control-room UI** | ✅ Next.js control room (`web/`, `make ui`) — abuse board, backtest, live swarm, auth gate, scope panel, containment log, MCP/integration, scenario library |
+| **5 — real-target adapters** | beta: must use signed scopes, canary-only data, and operator-approved limits until adapter coverage matures |
 
 ---
 
