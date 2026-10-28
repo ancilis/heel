@@ -1,9 +1,9 @@
-# HEEL — Red-team findings: dev/test held-out methodology (wave 5b)
+# Heel — Red-team findings: dev/test held-out methodology (wave 5b)
 
 3-agent audit of the dev/test split + broadened semantic matcher. Verdict: HONEST with real fixes.
 All applied — see EVAL §wave5b / DECISIONS D-029,D-030.
 
-## auditor of HEEL held-out dev/test split honesty
+## auditor of Heel held-out dev/test split honesty
 
 **Verdict:** HONEST with one caveat. The 0.377 @ 0.962 TEST result is a legitimate, reproducible, unbiased generalization number; precision is earned against real tempting decoys; the catalog is not fitted to the glimpsed bazaarloop product; and DEV is framed as context, not used to inflate the headline. The single caveat: the 'authored blind to the probe vocabulary' provenance claim overstates independence at the matching layer — 73% of the topic tokens that actually fire on TEST also appear in DEV keys, so the firing vocabulary is more DEV-correlated than the prose implies (though 70% of catches still land on TEST-novel keys).
 
@@ -95,7 +95,7 @@ All applied — see EVAL §wave5b / DECISIONS D-029,D-030.
 
 **Recommendation:** Report an attribution-aware precision (finding category must match the affordance's planted category) next to the decoy-avoidance precision, so the headline number reflects correctness of the label, not just localization.
 
-## measurement statistician + skeptic auditing HEEL's held-out detection metric
+## measurement statistician + skeptic auditing Heel's held-out detection metric
 
 **Verdict:** The 0.38 point estimate is honest and the dev->test overfitting gap is disclosed well, but the reported uncertainty is materially understated. The correct headline is "TEST semantic recall 0.38, target-clustered 95% CI approx [0.28,0.48] (n=14 products, 199 weaknesses), precision 0.96 [0.89,0.99]" — replace the iid Wilson with a target-level bootstrap/cluster CI, demote all per-category figures to descriptive-only, and lock the authoring seed + reachability threshold + product count under a pre-registered protocol to close the remaining degrees of freedom.
 
@@ -116,7 +116,7 @@ All applied — see EVAL §wave5b / DECISIONS D-029,D-030.
 ### [MEDIUM] Per-category recall denominators are far too small to support strong/weak category claims
 *Location:* `/Users/hellohelloalbus/heel/heel/heldout_eval.py:80 (recall_by_category) and docs/HELDOUT_PROVENANCE.md:44-45`
 
-**Evidence:** TEST per-category counts and their Wilson CIs: content_policy 1/11=0.09 CI[0.02,0.38]; trust_economy 3/9=0.33 CI[0.12,0.65] (width 0.53); agent_mcp_surface 4/18 CI[0.09,0.45]; every one of the 10 categories has a CI width between 0.33 and 0.53. The provenance doc claims the breakdown 'shows exactly where HEEL is weak vs strong' but with these denominators no two categories are statistically distinguishable — e.g. content_policy's [0.02,0.38] overlaps license_entitlement's [0.31,0.66]. The DEV breakdown is worse (content_policy 0/1, trust_economy 2/2) — single-digit denominators that cannot support any rate claim.
+**Evidence:** TEST per-category counts and their Wilson CIs: content_policy 1/11=0.09 CI[0.02,0.38]; trust_economy 3/9=0.33 CI[0.12,0.65] (width 0.53); agent_mcp_surface 4/18 CI[0.09,0.45]; every one of the 10 categories has a CI width between 0.33 and 0.53. The provenance doc claims the breakdown 'shows exactly where Heel is weak vs strong' but with these denominators no two categories are statistically distinguishable — e.g. content_policy's [0.02,0.38] overlaps license_entitlement's [0.31,0.66]. The DEV breakdown is worse (content_policy 0/1, trust_economy 2/2) — single-digit denominators that cannot support any rate claim.
 
 **Recommendation:** Present recall_by_category as descriptive counts only (k/n), explicitly labelled 'not powered for per-category inference,' and remove any 'strong/weak category' language from docs/HELDOUT_PROVENANCE.md:44-45. If category-level claims are wanted, they require a much larger TEST set (order 50+ weaknesses per category) and category-level CIs printed alongside.
 

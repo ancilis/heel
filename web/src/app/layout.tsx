@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
@@ -13,8 +14,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "HEEL — control room",
-  description: "Rehearse abuse against your own product before it ships.",
+  title: "Heel — control room",
+  description: "Rehearse SaaS abuse before launch and continuously after.",
 };
 
 export default function RootLayout({

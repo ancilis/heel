@@ -1,4 +1,4 @@
-# HEEL — Production launch-readiness red-team (v1.0.0)
+# Heel — Production launch-readiness red-team (v1.0.0)
 
 3-agent security review of the packaged tool. **Launch blockers: NONE — verdict SHIP.**
 Packaging/supply-chain clean (zero deps verified); auth gate has no bypass; HMAC sound + fail-closed.
@@ -20,7 +20,7 @@ The REST-surface HIGH/MEDIUM findings (DNS-rebinding, CSRF, data-dir perms) were
 
 **Recommendation:** Either run the test suite once against the installed wheel in the `package` job (e.g. `/tmp/v/bin/python -m unittest discover -s tests`), or add explicit assertions in the smoke step that both heldout JSONs and community.json load from importlib.resources. Non-blocking; raises confidence that package-data stays correct as files are added.
 
-## Offensive security engineer — pre-launch pentest of AUTH model + network surfaces (HEEL v1.0.0)
+## Offensive security engineer — pre-launch pentest of AUTH model + network surfaces (Heel v1.0.0)
 
 **launch_blocker:** False  ·  **Verdict:** The non-negotiable safety spine holds: the capability/authorization gate has no scope create/widen/escape bypass on any caller path, and the HMAC scheme is cryptographically sound and fail-closed against a no-key attacker. Ship the core. However, the heel-rest surface ships with browser-reachable DNS-rebinding + CSRF + no per-run authorization, and current SECURITY.md guidance ('front it with a gateway') is necessary but understates these specific browser vectors. Recommend gating the launch on a small REST hardening pass (Host allowlist + reject non-simple/disallowed Origins + a loopback bind note) OR shipping heel-rest opt-in/off-by-default with an expanded warning. The MCP server (canonical surface) and CLI are launch-ready as-is.
 

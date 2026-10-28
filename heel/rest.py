@@ -1,5 +1,5 @@
 """
-HEEL — thin REST API beneath the MCP server (spec §2). For non-MCP automation.
+Heel — thin REST API beneath the MCP server (spec §2). For non-MCP automation.
 
 This is a THIN CLIENT over the SAME `HeelServer` capability the MCP server uses — so the §10
 authorization gate is IDENTICAL (build the capability once). There is **no scope-creation/widening
@@ -96,7 +96,7 @@ def serve(port: int = 8780):  # pragma: no cover - exercised via real HTTP clien
     scopemod.ensure_home()
     server = HeelServer(Store(os.path.join(scopemod.heel_home(), "heel.db")))
     httpd = HTTPServer(("127.0.0.1", port), make_handler(server))
-    print(f"HEEL REST API on http://127.0.0.1:{port}  (thin client over the MCP capability; same auth gate)")
+    print(f"Heel REST API on http://127.0.0.1:{port}  (thin client over the MCP capability; same auth gate)")
     httpd.serve_forever()
 
 

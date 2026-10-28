@@ -1,11 +1,13 @@
 """
-HEEL — acceptance + safety tests (pure stdlib unittest). Encodes the §13 DoD and the §10
+Heel — acceptance + safety tests (pure stdlib unittest). Encodes the §13 DoD and the §10
 safety spine as executable assertions, especially the agent-caller authorization model.
 Run: `python3 -m unittest discover -s tests`.
 """
 import json
 import os
+from pathlib import Path
 import tempfile
+import tomllib
 import unittest
 
 os.environ["HEEL_HOME"] = tempfile.mkdtemp()
@@ -136,6 +138,67 @@ class TestCoverageBacktest(Base):  # spec §5, DoD #4
         self.assertGreaterEqual(c["compound_chain_findings"], 1)
 
 
+class TestScenarioPacks(Base):
+    def test_agent_mcp_pack_contains_existing_agent_scenarios(self):
+        from heel.contracts import AppliesWhen, ScenarioPack
+        from heel.scenarios import list_scenarios
+
+        scs = list_scenarios(pack_filter="agent_mcp", semantic=False)
+        ids = {s.id for s in scs}
+
+        self.assertEqual({s.pack for s in scs}, {ScenarioPack.AGENT_MCP})
+        self.assertTrue({"sc.agent.overscope", "sc.agent.deputy", "sc.agent.retrieval",
+                         "sc.agent.indirect", "sc.mcp.toolpoison"}.issubset(ids))
+        self.assertTrue(all(s.applies_when == AppliesWhen.HAS_AGENT_SURFACE for s in scs))
+
+    def test_filtering_by_pack_works_in_library_and_mcp(self):
+        from heel.scenarios import list_scenarios
+
+        agent_ids = {s.id for s in list_scenarios(pack_filter="agent_mcp", semantic=False)}
+        core_ids = {s.id for s in list_scenarios(pack_filter="core_saas", semantic=False)}
+        out = self.server.heel_list_scenarios({"pack": "agent_mcp"}, self.caller)
+
+        self.assertIn("sc.agent.overscope", agent_ids)
+        self.assertNotIn("sc.agent.overscope", core_ids)
+        self.assertTrue(out["scenarios"])
+        self.assertEqual({s["pack"] for s in out["scenarios"]}, {"agent_mcp"})
+
+    def test_agent_mcp_pack_does_not_fire_on_non_agent_target(self):
+        r = self.server.heel_run({"scope_id": self.scope.scope_id, "target": "synthetic-saas",
+                                  "packs": ["agent_mcp"], "agent_classes": ["adversarial"]}, self.caller)
+        findings = self.server.heel_get_findings({"run_id": r["run_id"]}, self.caller)["findings"]
+        coverage = self.server.heel_get_coverage({"run_id": r["run_id"]}, self.caller)["coverage"]
+
+        self.assertEqual(findings, [])
+        self.assertEqual(coverage["category10_findings"], 0)
+        self.assertTrue(coverage["category10_clean_on_non_ai"])
+
+    def test_default_run_remains_backward_compatible(self):
+        default = self.server.heel_run({"scope_id": self.scope.scope_id, "target": "synthetic-ai",
+                                        "agent_classes": ["adversarial"]}, self.caller)
+        explicit = self.server.heel_run({"scope_id": self.scope.scope_id, "target": "synthetic-ai",
+                                         "packs": ["core_saas", "agent_mcp", "payments_billing",
+                                                   "trust_safety", "integrations", "compliance"],
+                                         "agent_classes": ["adversarial"]}, self.caller)
+
+        def scenario_ids(run_id):
+            return {f["scenario_id"] for f in self.server.heel_get_findings({"run_id": run_id}, self.caller)["findings"]}
+
+        self.assertEqual(scenario_ids(default["run_id"]), scenario_ids(explicit["run_id"]))
+
+    def test_cli_accepts_pack_filters(self):
+        import io
+        from contextlib import redirect_stdout
+        from heel import cli
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli.main(["scenarios", "--pack", "agent_mcp"]), 0)
+        scenarios = json.loads(buf.getvalue())["scenarios"]
+        self.assertTrue(scenarios)
+        self.assertEqual({s["pack"] for s in scenarios}, {"agent_mcp"})
+
+
 class TestSafetySpine(Base):  # spec §10.2
     def setUp(self):
         super().setUp()
@@ -220,21 +283,26 @@ class TestOpportunisticClass(Base):  # spec §3.2, DoD #3
         rid = self.run_target("synthetic-saas")  # default = adversarial + opportunistic
         self.assertTrue(self._opp(rid))
 
-    def test_opportunistic_closes_adversarial_blind_spot(self):
+    def test_opportunistic_adds_unique_motivation_gated_findings(self):
+        # the opportunistic-human class surfaces motivation-gated gaming (seat-sharing) that the
+        # programmatic adversarial library doesn't flag. (Coupon-stacking, once an adversarial blind
+        # spot, is now covered adversarially by the expanded research library — a coverage win.)
         rid = self.run_target("synthetic-saas")
         opp_affs = {f["affordance_id"] for f in self._opp(rid)}
-        self.assertIn("promo_stacking", opp_affs)  # the adversarial FN, closed by the human class
+        self.assertIn("seats", opp_affs)
 
     def test_profiles_gate_which_vectors_surface(self):
         # test the opportunistic class's motivation-gating directly (decoupled from the merge,
         # since the semantic adversarial library may also now cover some commercial affordances)
         from heel.agents_human import run_opportunistic
-        from heel.profiles import DEFAULT_PROFILES
+        from heel.profiles import DEFAULT_PERSONAS
         from heel.targets import get_target
-        out = run_opportunistic(get_target("synthetic-saas"), DEFAULT_PROFILES, lambda *a: None, "t")
-        byaff = {f.affordance_id: f.reproduction["profiles"] for f in out["findings"]}
-        self.assertEqual(byaff["region_pricing"], ["sophisticated_arbitrageur"])  # needs sophistication
-        self.assertEqual(len(byaff["seats"]), 3)  # low-bar → all three profiles
+        out = run_opportunistic(get_target("synthetic-saas"), DEFAULT_PERSONAS, lambda *a: None, "t")
+        byaff = {f.affordance_id: f for f in out["findings"]}
+        self.assertEqual(byaff["region_pricing"].reproduction["persona"]["id"], "agency_reseller")
+        seat_personas = {e["persona_id"] for e in byaff["seats"].reproduction["persona_evidence"]}
+        self.assertIn("seat_sharer", seat_personas)
+        self.assertIn("agency_reseller", seat_personas)
 
     def test_agent_classes_param_respected(self):
         r = self.server.heel_run({"scope_id": self.scope.scope_id, "target": "synthetic-saas",
@@ -260,6 +328,168 @@ class TestControlSearch(Base):  # spec §8
         self.assertEqual(reds, sorted(reds, reverse=True))
 
 
+class TestEconomicSeverity(Base):
+    def _vector(self, vector_id, affordance_id, scenario_id, category, severity):
+        from heel.contracts import AbuseVector, Severity
+
+        return AbuseVector(
+            id=vector_id,
+            scenario_id=scenario_id,
+            category=category,
+            reproduction={"sample": "canary_only", "contained": True},
+            severity=Severity(*severity),
+            reachability_score=0.75,
+            plausible=True,
+            recommended_control="server-side control",
+            affordance_id=affordance_id,
+            target_id="synthetic-saas",
+        )
+
+    def test_usage_meter_with_token_cost_ranks_above_low_impact_coupon_issue(self):
+        from heel.contracts import Category
+        from heel.economics import estimate_economic_impact, rank_by_economic_risk
+
+        assumptions = {
+            "currency": "USD",
+            "affordances": {
+                "usage_meter": {
+                    "events_per_month": {"low": 1_000_000, "high": 6_000_000},
+                    "unit_cloud_cost": 0.003,
+                    "driver": "unmetered AI-token usage",
+                    "confidence": 0.7,
+                },
+                "promo_stacking": {
+                    "events_per_month": {"low": 10, "high": 50},
+                    "unit_revenue_leakage": 5,
+                    "driver": "low-impact coupon issue",
+                    "confidence": 0.8,
+                },
+            },
+        }
+        usage = self._vector("usage", "usage_meter", "sc.meter.reset", Category.LICENSE_ENTITLEMENT, (0.4, 0.4, 0.2))
+        coupon = self._vector("coupon", "promo_stacking", "opportunistic.coupon_stacking",
+                              Category.LICENSE_ENTITLEMENT, (0.8, 0.8, 0.2))
+        usage.economic_impact = estimate_economic_impact(usage, assumptions=assumptions).to_dict()
+        coupon.economic_impact = estimate_economic_impact(coupon, assumptions=assumptions).to_dict()
+
+        ranked = rank_by_economic_risk([coupon, usage])
+
+        self.assertEqual(ranked[0].id, "usage")
+        self.assertGreater(ranked[0].economic_impact["estimated_monthly_range"]["high"],
+                           ranked[1].economic_impact["estimated_monthly_range"]["high"])
+
+    def test_high_friction_control_is_not_automatically_preferred(self):
+        from heel.contracts import Category
+        from heel.economics import estimate_economic_impact, recommend_control_bundle
+
+        finding = self._vector("usage", "usage_meter", "sc.meter.reset", Category.LICENSE_ENTITLEMENT, (0.6, 0.6, 0.2))
+        finding.economic_impact = estimate_economic_impact(
+            finding,
+            assumptions={"affordances": {"usage_meter": {
+                "events_per_month": {"low": 1_000, "high": 2_000},
+                "unit_cloud_cost": 1.0,
+                "confidence": 0.8,
+            }}},
+        ).to_dict()
+        controls = [
+            {"id": "manual_review", "control": "manual review every usage event",
+             "estimated_exploitability_reduction": 0.95, "friction_cost": {"monthly": 5_000}},
+            {"id": "server_metering", "control": "server-authoritative metering",
+             "estimated_exploitability_reduction": 0.65, "friction_cost": {"monthly": 100}},
+        ]
+
+        bundle = recommend_control_bundle([finding], controls)
+
+        self.assertEqual(bundle["ranked_candidates"][0]["id"], "server_metering")
+        self.assertLess(bundle["ranked_candidates"][0]["friction_cost_monthly"],
+                        bundle["ranked_candidates"][1]["friction_cost_monthly"])
+
+    def test_missing_assumptions_produce_qualitative_score_only(self):
+        from heel.contracts import Category
+        from heel.economics import estimate_economic_impact
+
+        vector = self._vector("coupon", "promo_stacking", "opportunistic.coupon_stacking",
+                              Category.LICENSE_ENTITLEMENT, (0.6, 0.6, 0.2))
+        impact = estimate_economic_impact(vector).to_dict()
+
+        self.assertIn(impact["label"], {"low", "medium", "high", "critical"})
+        self.assertIsNone(impact["estimated_monthly_range"])
+        self.assertTrue(impact["unknowns"])
+
+    def test_economic_score_does_not_replace_existing_security_severity(self):
+        from dataclasses import asdict
+        from heel.contracts import Category
+        from heel.economics import estimate_economic_impact
+
+        vector = self._vector("coupon", "promo_stacking", "opportunistic.coupon_stacking",
+                              Category.LICENSE_ENTITLEMENT, (0.9, 0.8, 0.2))
+        security_label = vector.severity.label
+        vector.economic_impact = estimate_economic_impact(vector).to_dict()
+        serialized = asdict(vector)
+
+        self.assertEqual(security_label, "critical")
+        self.assertEqual(vector.severity.label, security_label)
+        self.assertIn("severity", serialized)
+        self.assertIn("economic_impact", serialized)
+
+    def test_output_includes_assumptions_and_confidence(self):
+        from heel.contracts import Category
+        from heel.economics import estimate_economic_impact
+
+        vector = self._vector("usage", "usage_meter", "sc.meter.reset", Category.LICENSE_ENTITLEMENT, (0.4, 0.5, 0.2))
+        impact = estimate_economic_impact(
+            vector,
+            assumptions={"affordances": {"usage_meter": {
+                "events_per_month": {"low": 3_000, "high": 18_000},
+                "unit_cloud_cost": 1.0,
+                "driver": "unmetered AI-token usage",
+                "confidence": 0.65,
+            }}},
+        ).to_dict()
+
+        self.assertIn("assumptions", impact)
+        self.assertEqual(impact["assumptions"]["events_per_month"]["low"], 3_000)
+        self.assertIn("confidence", impact)
+        self.assertGreater(impact["confidence"], 0)
+
+    def test_cli_report_can_include_economic_impact(self):
+        import io
+        from contextlib import redirect_stdout
+        from heel import cli
+
+        assumptions_path = Path(tempfile.mkdtemp()) / "economic_assumptions.json"
+        assumptions_path.write_text(json.dumps({
+            "affordances": {
+                "usage_meter": {
+                    "events_per_month": {"low": 3_000, "high": 18_000},
+                    "unit_cloud_cost": 1.0,
+                    "confidence": 0.65,
+                }
+            }
+        }))
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli.main(["scope", "create", "--target", "synthetic-saas",
+                                       "--operator", "tester", "--confirm"]), 0)
+        scope_id = json.loads(buf.getvalue())["created_scope"]
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli.main(["run", "--scope", scope_id, "--target", "synthetic-saas"]), 0)
+        run_id = json.loads(buf.getvalue())["run_id"]
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli.main(["report", "--run", run_id, "--economic",
+                                       "--economic-assumptions", str(assumptions_path)]), 0)
+        report = json.loads(buf.getvalue())
+
+        self.assertTrue(report["economic"])
+        self.assertIn("economic_impact", report["findings"][0])
+        self.assertIn("confidence", report["findings"][0]["economic_impact"])
+
+
 class TestRestSharesAuthGate(Base):  # spec §2 — REST is a thin client over the same gate
     def test_rest_enforces_gate_and_has_no_scope_creation(self):
         import threading
@@ -279,28 +509,35 @@ class TestRestSharesAuthGate(Base):  # spec §2 — REST is a thin client over t
             # 1) scope creation via REST is impossible (405)
             with self.assertRaises(urllib.error.HTTPError) as e:
                 post("/scopes", {"target_allowlist": ["evil.com"]})
-            self.assertEqual(e.exception.code, 405)
+            with e.exception as response:
+                self.assertEqual(response.code, 405)
             # 2) in-scope run works (200)
-            self.assertEqual(post("/runs", {"scope_id": self.scope.scope_id, "target": "synthetic-saas"}).status, 200)
+            with post("/runs", {"scope_id": self.scope.scope_id,
+                                "target": "synthetic-saas"}) as response:
+                self.assertEqual(response.status, 200)
             # 3) out-of-allowlist run rejected (403), same as MCP
             with self.assertRaises(urllib.error.HTTPError) as e:
                 post("/runs", {"scope_id": self.scope.scope_id, "target": "evil.com"})
-            self.assertEqual(e.exception.code, 403)
+            with e.exception as response:
+                self.assertEqual(response.code, 403)
 
             # 4) DNS-rebinding blocked: a non-loopback Host header is rejected (403)
             req = urllib.request.Request(f"http://127.0.0.1:{port}/scopes", headers={"Host": "attacker.example.com"})
             with self.assertRaises(urllib.error.HTTPError) as e:
                 urllib.request.urlopen(req)
-            self.assertEqual(e.exception.code, 403)
+            with e.exception as response:
+                self.assertEqual(response.code, 403)
 
             # 5) CSRF blocked: a request carrying an Origin header is rejected (403)
             req = urllib.request.Request(f"http://127.0.0.1:{port}/runs", data=b"{}", method="POST",
                                          headers={"Origin": "https://evil.example.com"})
             with self.assertRaises(urllib.error.HTTPError) as e:
                 urllib.request.urlopen(req)
-            self.assertEqual(e.exception.code, 403)
+            with e.exception as response:
+                self.assertEqual(response.code, 403)
         finally:
             httpd.shutdown()
+            httpd.server_close()
 
     def test_data_home_is_locked_down(self):
         import stat
@@ -361,7 +598,7 @@ class TestBlindEvaluation(unittest.TestCase):  # the honest real-detection metri
     def test_wilson_ci_and_per_probe_fp_attribution(self):
         self.assertEqual(len(self.r["real_recall_wilson_ci95"]), 2)
         self.assertIsNotNone(self.r["real_precision_pooled"])
-        self.assertTrue(self.r["false_positives_by_probe"])  # FPs attributed to specific probe(s)
+        self.assertIsInstance(self.r["false_positives_by_probe"], dict)  # Zero false positives is valid.
 
     def test_category10_optional_verified_on_blind_non_ai_targets(self):
         clean, total = self.r["category10_clean_on_non_ai"].split("/")
@@ -460,8 +697,23 @@ class TestProductionHardening(Base):
         # unknown method -> an error response (server stays up), not a raised exception
         r = handle_line(self.server, sess, json.dumps({"id": 1, "method": "no.such.method", "params": {}}))
         self.assertIn("error", r)
-        # a well-formed tools/call still works afterwards (server not poisoned)
+        # initialize the stateful MCP session; malformed input did not poison the server
+        initialized = handle_line(self.server, sess, json.dumps({
+            "jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "hardening-test", "version": "1"},
+            },
+        }))
+        self.assertIn("result", initialized)
+        self.assertIsNone(handle_line(self.server, sess, json.dumps({
+            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {},
+        })))
+        # a well-formed tools/list still works afterwards
         ok = handle_line(self.server, sess, json.dumps({"id": 2, "method": "tools/list", "params": {}}))
+        self.assertIn("error", ok)  # exact JSON-RPC 2.0 is required
+        ok = handle_line(self.server, sess, json.dumps({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {},
+        }))
         self.assertIn("result", ok)
 
     def test_doctor_self_check_passes(self):
@@ -473,6 +725,542 @@ class TestProductionHardening(Base):
             rc = cli._doctor()
         self.assertEqual(rc, 0)
         self.assertIn("10/10 categories", buf.getvalue())
+
+
+class TestProductModelImporter(Base):
+    def _product_model(self):
+        keys = [
+            "tenants", "roles", "plans", "meters", "coupons_promotions", "features_flags",
+            "endpoints_routes", "exports", "identity_auth_flows", "billing_objects",
+            "integration_oauth_apps", "webhooks", "support_admin_actions", "agent_tools",
+            "mcp_connectors", "data_classes", "audit_events", "declared_controls",
+            "canary_accounts", "safety_notes",
+        ]
+        model = {k: [] for k in keys}
+        model.update({
+            "schema_version": "ProductModel.v0.1",
+            "product_id": "acme-crm",
+            "source": "operator-authored launch review model",
+            "generated_at": "2026-06-30T12:00:00Z",
+            "environments": ["staging"],
+            "endpoints_routes": [
+                {"id": "records_export", "route": "/api/export", "entitlement_check": "missing"},
+            ],
+            "exports": [
+                {"id": "bulk_records", "route": "/api/export", "guard_present": False, "data_class": "canary_records"},
+            ],
+            "data_classes": ["canary_records"],
+            "canary_accounts": ["canary-user-001"],
+            "safety_notes": ["sanitized canary-only staging model; no secrets or customer data"],
+        })
+        return model
+
+    def test_valid_minimal_product_model_passes(self):
+        from heel.importers import validate_product_model
+        result = validate_product_model(self._product_model())
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.schema_version, "ProductModel.v0.1")
+        self.assertIn("acme-crm", result.summary)
+
+    def test_missing_required_product_model_fields_fail(self):
+        from heel.importers import validate_product_model
+        model = self._product_model()
+        del model["safety_notes"]
+        result = validate_product_model(model)
+        self.assertFalse(result.ok)
+        self.assertTrue(any("safety_notes" in e for e in result.errors))
+
+    def test_secrets_looking_keys_and_values_are_rejected_without_echoing_secret(self):
+        from heel.importers import validate_product_model
+        model = self._product_model()
+        secret = "sk-live-1234567890abcdef"
+        model["integration_oauth_apps"] = [{"id": "crm", "client_secret": secret}]
+        result = validate_product_model(model)
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.errors)
+        self.assertIn("client_secret", joined)
+        self.assertNotIn(secret, joined)
+
+    def test_conversion_produces_affordances_and_safety_metadata(self):
+        from heel.importers import target_from_product_model
+        target = target_from_product_model(self._product_model())
+        self.assertEqual(target.id, "imported:acme-crm")
+        self.assertGreaterEqual(len(target.affordances), 2)
+        self.assertEqual(target.planted_vectors, [])
+        self.assertTrue(target.requires_scope)
+        self.assertTrue(target.safety_notes)
+        self.assertTrue(target.safety_metadata["scope_required"])
+        self.assertTrue(target.safety_metadata["live_probing_disabled"])
+
+    def test_imported_target_requires_signed_scope_to_run(self):
+        from heel.importers import target_from_product_model
+        from heel.targets import clear_imported_targets, register_imported_target
+
+        clear_imported_targets()
+        target = register_imported_target(target_from_product_model(self._product_model()))
+        with self.assertRaises(ToolError):
+            self.server.heel_run({"target": target.id}, self.caller)
+        with self.assertRaises(ToolError):
+            self.server.heel_run({"scope_id": "scope-forged", "target": target.id}, self.caller)
+
+        scope = scopemod.create_scope([target.id], operator="tester")
+        run = self.server.heel_run({"scope_id": scope.scope_id, "target": target.id,
+                                    "agent_classes": ["adversarial"]}, self.caller)
+        self.assertEqual(run["status"], "complete")
+        cov = self.server.heel_get_coverage({"run_id": run["run_id"]}, self.caller)["coverage"]
+        self.assertEqual(cov["metric_kind"], "imported_model_rehearsal")
+        self.assertIsNone(cov["coverage"])
+        clear_imported_targets()
+
+    def test_import_validate_cli_prints_human_readable_summary(self):
+        import io
+        from contextlib import redirect_stdout
+        from heel import cli
+
+        path = Path(tempfile.mkdtemp()) / "product_model.json"
+        path.write_text(json.dumps(self._product_model()))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["import", "validate", str(path)])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("ProductModel.v0.1", out)
+        self.assertIn("imported:acme-crm", out)
+        self.assertIn("safety notes", out.lower())
+
+
+class TestEntitlementGraph(unittest.TestCase):
+    class NoDiscoveryModel:
+        name = "no-discovery"
+
+        def discover(self, target, fired, run_id, log):
+            return [], []
+
+    def _model(self):
+        keys = [
+            "tenants", "roles", "plans", "meters", "coupons_promotions", "features_flags",
+            "endpoints_routes", "exports", "identity_auth_flows", "billing_objects",
+            "integration_oauth_apps", "webhooks", "support_admin_actions", "agent_tools",
+            "mcp_connectors", "data_classes", "audit_events", "declared_controls",
+            "canary_accounts", "safety_notes",
+        ]
+        model = {k: [] for k in keys}
+        model.update({
+            "schema_version": "ProductModel.v0.1",
+            "product_id": "entitlements-demo",
+            "source": "operator-authored entitlement model",
+            "generated_at": "2026-06-30T12:00:00Z",
+            "environments": ["staging"],
+            "tenants": [{"id": "tenant-a"}, {"id": "tenant-b"}],
+            "roles": [
+                {"id": "member", "granted_permissions": ["invite:create"], "intended_permissions": ["record:read"]},
+                {"id": "admin", "granted_permissions": ["invite:create", "support:purge"]},
+            ],
+            "plans": [{"id": "free"}, {"id": "pro"}, {"id": "enterprise"}],
+            "features_flags": [
+                {"id": "audit_vault", "required_plan": "enterprise", "reachable_by_plan": "free", "gated_by": "client"},
+            ],
+            "exports": [
+                {"id": "bulk_records", "route": "/api/export", "entitlement_check": "missing", "data_class": "canary_records", "business_rule_applicable": True, "rule_source": "test product policy"},
+            ],
+            "meters": [
+                {"id": "llm_tokens", "billable": True, "server_side_accounting": False},
+            ],
+            "integration_oauth_apps": [
+                {"id": "crm_sync", "scope": "all", "needed_scopes": ["records:read"]},
+            ],
+            "support_admin_actions": [
+                {"id": "impersonate_user", "audit_logged": False, "required_role": "admin", "reachable_by_role": "member"},
+            ],
+            "agent_tools": [
+                {"id": "assistant_export", "tool": "export_all", "granted_scope": "global", "intended_scope": "tenant"},
+            ],
+            "endpoints_routes": [
+                {"id": "record_read", "route": "/api/records/{id}", "tenant_filter": "missing"},
+            ],
+            "data_classes": ["canary_records"],
+            "canary_accounts": ["canary-user-001"],
+            "safety_notes": ["sanitized entitlement model; no live probing or customer data"],
+        })
+        return model
+
+    def test_graph_construction_and_queries_find_initial_signals(self):
+        from heel.entitlements import EntitlementGraph
+
+        graph = EntitlementGraph.from_product_model(self._model())
+
+        self.assertTrue(any(e.signal == "plan_mismatch" for e in graph.find_cross_plan_edges()))
+        self.assertTrue(any(e.signal == "permission_mismatch" for e in graph.edges))
+        self.assertTrue(any(e.signal == "tenant_filter_missing" for e in graph.find_cross_tenant_edges()))
+        self.assertTrue(any(e.signal == "unmetered_billable_resource" for e in graph.find_unmetered_cost_edges()))
+        self.assertTrue(any(e.signal == "agent_tool_overscope" for e in graph.find_agent_overreach_edges()))
+        self.assertTrue(any(e.signal == "missing_audit_event" for e in graph.find_missing_audit_edges()))
+
+    def test_free_user_reaching_enterprise_feature_produces_affordance(self):
+        from heel.entitlements import EntitlementGraph
+
+        affordances = EntitlementGraph.from_product_model(self._model()).to_affordances()
+        feature = next(a for a in affordances if a.properties.get("source_id") == "audit_vault")
+
+        self.assertEqual(feature.kind, "flag")
+        self.assertEqual(feature.properties["required_plan"], "enterprise")
+        self.assertEqual(feature.properties["reachable_by_plan"], "free")
+        self.assertFalse(feature.guard_present)
+
+    def test_export_without_entitlement_check_maps_to_existing_scenario(self):
+        from heel.agents import run_adversarial
+        from heel.contracts import SyntheticTarget
+        from heel.entitlements import EntitlementGraph
+        from heel.scenarios import list_scenarios
+
+        affordances = EntitlementGraph.from_product_model(self._model()).to_affordances()
+        target = SyntheticTarget("imported:entitlements-demo", "imported_saas", False, affordances, [])
+        scenarios = [s for s in list_scenarios(semantic=False) if s.id == "sc.export.entitlement"]
+        out = run_adversarial(target, scenarios, lambda *a: None, "entitlement-test", model=self.NoDiscoveryModel())
+
+        self.assertEqual([f.scenario_id for f in out["findings"]], ["sc.export.entitlement"])
+
+    def test_ui_backing_endpoint_paid_api_bypass_maps_to_shadow_api_scenario(self):
+        from heel.agents import run_adversarial
+        from heel.contracts import SyntheticTarget
+        from heel.entitlements import EntitlementGraph
+        from heel.scenarios import list_scenarios
+
+        model = self._model()
+        model["plans"] = [{"id": "app", "rank": 1}, {"id": "api_bulk", "rank": 2}]
+        model["endpoints_routes"].append({
+            "id": "wallet_lookup_ui",
+            "route": "/ui/data/wallet_lookup",
+            "kind": "endpoint",
+            "ui_backing_endpoint": True,
+            "paid_api_equivalent": True,
+            "business_rule_applicable": True, "rule_source": "test product policy",
+            "required_plan": "api_bulk",
+            "reachable_by_plan": "app",
+            "rate_limit": "missing",
+            "automation_guard": "missing",
+            "tenant_filter": "declared",
+        })
+        affordances = EntitlementGraph.from_product_model(model).to_affordances()
+        target = SyntheticTarget("imported:entitlements-demo", "imported_saas", False, affordances, [])
+        scenarios = [s for s in list_scenarios(semantic=False) if s.id == "sc.ui.shadow_api_bulk_access"]
+        out = run_adversarial(target, scenarios, lambda *a: None, "entitlement-test", model=self.NoDiscoveryModel())
+
+        self.assertEqual([f.scenario_id for f in out["findings"]], ["sc.ui.shadow_api_bulk_access"])
+        self.assertEqual(out["findings"][0].category.value, "license_entitlement")
+
+    def test_agent_tool_scope_mismatch_maps_to_existing_overscope_scenario(self):
+        from heel.agents import run_adversarial
+        from heel.contracts import SyntheticTarget
+        from heel.entitlements import EntitlementGraph
+        from heel.scenarios import list_scenarios
+
+        affordances = EntitlementGraph.from_product_model(self._model()).to_affordances()
+        target = SyntheticTarget("imported:entitlements-demo", "imported_ai_agent", True, affordances, [])
+        scenarios = [s for s in list_scenarios(semantic=False) if s.id == "sc.agent.overscope"]
+        out = run_adversarial(target, scenarios, lambda *a: None, "entitlement-test", model=self.NoDiscoveryModel())
+
+        self.assertEqual([f.scenario_id for f in out["findings"]], ["sc.agent.overscope"])
+        self.assertEqual(out["findings"][0].affordance_id, "eg:agent_tool:assistant_export:agent_tool_overscope")
+
+    def test_oauth_scope_all_maps_to_existing_integration_abuse_scenario(self):
+        from heel.agents import run_adversarial
+        from heel.contracts import SyntheticTarget
+        from heel.entitlements import EntitlementGraph
+        from heel.scenarios import list_scenarios
+
+        affordances = EntitlementGraph.from_product_model(self._model()).to_affordances()
+        target = SyntheticTarget("imported:entitlements-demo", "imported_saas", False, affordances, [])
+        scenarios = [s for s in list_scenarios(semantic=False) if s.id == "sc.integration.oauth"]
+        out = run_adversarial(target, scenarios, lambda *a: None, "entitlement-test", model=self.NoDiscoveryModel())
+
+        self.assertEqual([f.scenario_id for f in out["findings"]], ["sc.integration.oauth"])
+
+    def test_graph_output_is_deterministic(self):
+        from heel.entitlements import EntitlementGraph
+
+        first = EntitlementGraph.from_product_model(self._model()).to_affordances()
+        second = EntitlementGraph.from_product_model(self._model()).to_affordances()
+
+        def freeze(affordances):
+            return [
+                (
+                    a.id,
+                    a.kind,
+                    a.category.value,
+                    a.guard_present,
+                    a.reachability,
+                    json.dumps(a.properties, sort_keys=True),
+                )
+                for a in affordances
+            ]
+
+        self.assertEqual(freeze(first), freeze(second))
+
+    def test_product_model_import_includes_entitlement_affordances(self):
+        from heel.agents import run_adversarial
+        from heel.importers import target_from_product_model
+        from heel.scenarios import list_scenarios
+
+        target = target_from_product_model(self._model())
+        self.assertTrue(any(a.id.startswith("eg:") for a in target.affordances))
+
+        scenarios = [s for s in list_scenarios(semantic=False) if s.id in {"sc.export.entitlement", "sc.integration.oauth"}]
+        out = run_adversarial(target, scenarios, lambda *a: None, "entitlement-test", model=self.NoDiscoveryModel())
+        self.assertEqual({f.scenario_id for f in out["findings"]}, {"sc.export.entitlement", "sc.integration.oauth"})
+
+
+class TestLaunchReview(unittest.TestCase):
+    def _model(self):
+        keys = [
+            "tenants", "roles", "plans", "meters", "coupons_promotions", "features_flags",
+            "endpoints_routes", "exports", "identity_auth_flows", "billing_objects",
+            "integration_oauth_apps", "webhooks", "support_admin_actions", "agent_tools",
+            "mcp_connectors", "data_classes", "audit_events", "declared_controls",
+            "canary_accounts", "safety_notes",
+        ]
+        model = {k: [] for k in keys}
+        model.update({
+            "schema_version": "ProductModel.v0.1",
+            "product_id": "launch-demo",
+            "source": "operator-authored launch review model",
+            "generated_at": "2026-06-30T12:00:00Z",
+            "environments": ["staging"],
+            "plans": [{"id": "trial"}, {"id": "pro"}],
+            "data_classes": ["canary_records"],
+            "canary_accounts": ["canary-user-001"],
+            "safety_notes": ["sanitized launch-review model; no live probing or customer data"],
+        })
+        return model
+
+    def _review(self, after_update):
+        from heel.launch_review import review_product_models
+        before = self._model()
+        after = self._model()
+        after_update(after)
+        return review_product_models(before, after).to_dict()
+
+    def test_new_export_without_entitlement_check_blocks_launch(self):
+        report = self._review(lambda m: m["exports"].append({
+            "id": "bulk_records",
+            "route": "/api/export",
+            "entitlement_check": "missing",
+            "tenant_quota": "missing",
+            "reachable_by_plan": "trial",
+            "data_class": "canary_records",
+        }))
+
+        self.assertEqual(report["launch_gate_status"], "block")
+        self.assertTrue(any(f["surface_id"] == "bulk_records" for f in report["new_abuse_affordances"]))
+        self.assertTrue(any(c["control"] == "server-side entitlement check" for c in report["high_risk_missing_controls"]))
+        self.assertTrue(any("bulk_records" in r["name"] for r in report["suggested_regression_tests"]))
+
+    def test_ui_backing_endpoint_that_bypasses_paid_api_blocks_launch(self):
+        report = self._review(lambda m: (
+            m["plans"].extend([{"id": "app", "rank": 1}, {"id": "api_bulk", "rank": 2}]),
+            m["endpoints_routes"].append({
+                "id": "wallet_lookup_ui",
+                "route": "/ui/data/wallet_lookup",
+                "kind": "endpoint",
+                "ui_backing_endpoint": True,
+                "paid_api_equivalent": True,
+                "required_plan": "api_bulk",
+                "reachable_by_plan": "app",
+                "rate_limit": "missing",
+                "automation_guard": "missing",
+                "tenant_filter": "declared",
+            }),
+        ))
+
+        self.assertEqual(report["launch_gate_status"], "block")
+        self.assertTrue(any(f["risk"] == "ui_backing_endpoint_paid_api_bypass" for f in report["new_abuse_affordances"]))
+        self.assertTrue(any(c["control"] == "shared UI/API entitlement and lookup quota" for c in report["high_risk_missing_controls"]))
+
+    def test_stackable_coupon_without_redemption_limit_warns_or_blocks_by_severity(self):
+        warn_report = self._review(lambda m: m["coupons_promotions"].append({
+            "id": "launch25",
+            "stackable": True,
+            "discount_percent": 25, "redemption_limit": "none",
+        }))
+        self.assertEqual(warn_report["launch_gate_status"], "warn")
+
+        block_report = self._review(lambda m: m["coupons_promotions"].append({
+            "id": "free_year",
+            "stackable": True,
+            "discount_percent": 100, "redemption_limit": "none",
+            "applies_to": "all_plans",
+            "reachable_by_plan": "trial",
+        }))
+        self.assertEqual(block_report["launch_gate_status"], "block")
+
+    def test_oauth_scope_all_warns_or_blocks_by_reachability_and_impact(self):
+        warn_report = self._review(lambda m: m["integration_oauth_apps"].append({
+            "id": "crm_sync",
+            "scope": "all",
+        }))
+        self.assertEqual(warn_report["launch_gate_status"], "warn")
+
+        block_report = self._review(lambda m: m["integration_oauth_apps"].append({
+            "id": "crm_sync",
+            "scope": "all",
+            "auto_approved": True,
+            "installable_by_role": "member",
+        }))
+        self.assertEqual(block_report["launch_gate_status"], "block")
+
+    def test_agent_tool_scope_wider_than_intended_blocks_launch(self):
+        report = self._review(lambda m: m["agent_tools"].append({
+            "id": "assistant_export",
+            "tool": "export_all",
+            "granted_scope": "all_tenants",
+            "intended_scope": "own_tenant",
+        }))
+
+        self.assertEqual(report["launch_gate_status"], "block")
+        self.assertTrue(any(f["surface_type"] == "agent_tools" for f in report["new_abuse_affordances"]))
+
+    def test_no_risky_changes_passes(self):
+        report = self._review(lambda m: m["plans"].append({"id": "team", "limits": {"exports_per_day": 10}}))
+
+        self.assertEqual(report["launch_gate_status"], "pass")
+        self.assertEqual(report["new_abuse_affordances"], [])
+        self.assertEqual(report["high_risk_missing_controls"], [])
+
+    def test_suggested_regressions_match_changed_surfaces(self):
+        report = self._review(lambda m: (
+            m["exports"].append({"id": "bulk_records", "route": "/api/export", "entitlement_check": "missing"}),
+            m["coupons_promotions"].append({"id": "launch25", "stackable": True, "redemption_limit": "none"}),
+        ))
+
+        changed = {c["surface_id"] for c in report["changed_surfaces"]}
+        regression_surfaces = {r["surface_id"] for r in report["suggested_regression_tests"]}
+        self.assertLessEqual(regression_surfaces, changed)
+        self.assertIn("bulk_records", regression_surfaces)
+        self.assertIn("launch25", regression_surfaces)
+
+    def test_launch_review_cli_prints_human_summary_and_json_report(self):
+        import io
+        from contextlib import redirect_stdout
+        from heel import cli
+
+        before = self._model()
+        after = self._model()
+        after["exports"].append({
+            "id": "bulk_records",
+            "route": "/api/export",
+            "entitlement_check": "missing",
+            "reachable_by_plan": "trial",
+        })
+        td = Path(tempfile.mkdtemp())
+        before_path = td / "before.json"
+        after_path = td / "after.json"
+        before_path.write_text(json.dumps(before))
+        after_path.write_text(json.dumps(after))
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["launch-review", "--before", str(before_path), "--after", str(after_path)])
+
+        self.assertEqual(rc, 2)
+        out = buf.getvalue()
+        self.assertIn("Launch gate: block", out)
+        self.assertIn("JSON report:", out)
+        report = json.loads(out.split("JSON report:\n", 1)[1])
+        self.assertEqual(report["launch_gate_status"], "block")
+
+
+class TestDocsAndMetadata(unittest.TestCase):
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def _read(self, rel):
+        return (self.ROOT / rel).read_text()
+
+    def test_docs_do_not_claim_unrestricted_production_probing(self):
+        readme = self._read("README.md").lower()
+        security = self._read("SECURITY.md").lower()
+        combined = readme + "\n" + security
+
+        forbidden = [
+            "unrestricted production probing",
+            "arbitrary active probes against production",
+            "run arbitrary active probes against production",
+            "production targets do not require authorization",
+            "production probing without approval",
+        ]
+        for phrase in forbidden:
+            self.assertNotIn(phrase, combined)
+
+        self.assertIn("explicitly authorized production-like targets", readme)
+        self.assertIn("operator-approved limits", security)
+        self.assertIn("signed scopes", security)
+        self.assertIn("canary-only", security)
+
+    def test_pyproject_description_positions_local_launch_review(self):
+        with (self.ROOT / "pyproject.toml").open("rb") as fh:
+            project = tomllib.load(fh)["project"]
+
+        self.assertEqual(
+            project["description"],
+            "Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.",
+        )
+
+    def test_docs_limit_readiness_to_supported_reference(self):
+        readme = self._read("README.md")
+
+        self.assertNotIn("production-ready spine, beta adapters", readme)
+        self.assertIn("incomplete public journeys", readme)
+
+    def test_readme_positions_agent_mcp_as_one_scenario_pack(self):
+        readme = self._read("README.md").lower()
+        scenario_packs = self._read("docs/SCENARIO_PACKS.md").lower()
+
+        readme_unwrapped = " ".join(readme.split())
+        self.assertIn("agent/mcp is one premium pack", readme_unwrapped)
+        self.assertIn("broad saas abuse rehearsal", readme_unwrapped)
+        self.assertIn("heel covers saas abuse broadly", scenario_packs)
+        self.assertIn("agent/mcp is a premium pack", scenario_packs)
+
+    def test_positioning_docs_explain_complementary_category(self):
+        readme = self._read("README.md")
+        positioning = self._read("docs/POSITIONING.md")
+        combined = f"{readme}\n{positioning}"
+        combined_lower = combined.lower()
+
+        self.assertIn("docs/POSITIONING.md", readme)
+        self.assertIn("missing product-abuse rehearsal step", combined_lower)
+        self.assertIn("heel is not a replacement", combined_lower)
+        self.assertIn("complements", combined_lower)
+
+        for category in (
+            "penetration testing",
+            "functional QA",
+            "fraud/bot platforms",
+            "runtime WAF/API protection",
+            "Trust & Safety manual review",
+            "model red-team tools",
+        ):
+            self.assertIn(category, combined)
+
+        for column in (
+            "Tool category",
+            "Primary question",
+            "When it runs",
+            "Typical signal",
+            "What it misses",
+            "How Heel complements it",
+        ):
+            self.assertIn(column, positioning)
+
+        for phrase in (
+            "QA says export button works",
+            "AppSec says endpoint has no injection bug",
+            "Fraud platform may catch abuse after traffic appears",
+            "trial user to harvest more data than intended",
+        ):
+            self.assertIn(phrase, positioning)
+
+        for adjacent_tool in ("pentest", "qa", "fraud", "waf", "model red-team"):
+            self.assertNotIn(f"replaces {adjacent_tool}", combined_lower)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,83 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Plan-differential synthetic staging API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/billing": {
+      "get": {
+        "operationId": "getBilling",
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/api/echo": {
+      "get": {
+        "operationId": "getEcho",
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/api/empty": {
+      "get": {
+        "operationId": "getEmpty",
+        "responses": {"204": {"description": "empty"}}
+      }
+    },
+    "/api/export": {
+      "get": {
+        "operationId": "getExport",
+        "responses": {"200": {"description": "ok"}}
+      },
+      "head": {
+        "operationId": "headExport",
+        "responses": {"200": {"description": "ok"}}
+      },
+      "post": {
+        "operationId": "createExport",
+        "responses": {"201": {"description": "created"}}
+      }
+    },
+    "/api/pricing": {
+      "get": {
+        "operationId": "getPricing",
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/api/redirect": {
+      "get": {
+        "operationId": "getRedirect",
+        "responses": {"302": {"description": "redirect"}}
+      }
+    },
+    "/api/reports": {
+      "get": {
+        "operationId": "listReports",
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/api/summary": {
+      "get": {
+        "operationId": "getSummary",
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/api/text": {
+      "get": {
+        "operationId": "getText",
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/exports/{id}": {
+      "get": {
+        "operationId": "getExportById",
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/items/{id}": {
+      "get": {
+        "operationId": "getItem",
+        "responses": {"200": {"description": "ok"}}
+      }
+    }
+  }
+}

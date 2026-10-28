@@ -7,6 +7,7 @@ on:
   schedule:
     - cron: '24 7 * * 1'
   workflow_dispatch: {}
+permissions: {}
 jobs:
   analyze:
     name: Analyze (python)
@@ -16,9 +17,200 @@ jobs:
       actions: read
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           languages: python
           queries: security-extended
-      - uses: github/codeql-action/analyze@v4
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+
+  # H0B: the real nginx+njs ingress proof on an isolated, disposable Linux VM. Manual dispatch of
+  # the literal reviewed proof branch only; no inputs, secrets, environment, cache or write token.
+  # The fixed launcher (docs/saas/HOST_INGRESS_PROOF.md) owns every runtime input and its hash.
+  host-ingress-proof:
+    name: host-ingress-proof (ingress-v1)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/self-serve-host-ingress-proof'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: host-ingress-proof
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13.5"
+      - name: Fixed ingress-v1 launcher (20-minute budget, tests 12 minutes)
+        timeout-minutes: 20
+        run: python scripts/host_ingress_proof.py
+      - name: Upload allowlisted safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: host-ingress-proof
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            host-ingress-proof/summary.json
+            host-ingress-proof/cases.jsonl
+            host-ingress-proof/versions.txt
+            host-ingress-proof/cleanup.json
+            host-ingress-proof/report.txt
+            host-ingress-proof/build-manifest.json
+
+  host-lease-feasibility:
+    # H1F: the isolated prepared-gate lease primitive proof on a disposable Linux VM. Manual dispatch
+    # of the literal reviewed proof branch only; no inputs, credentials, deployment target or saved state.
+    # The fixed launcher (docs/saas/HOST_LEASE_FEASIBILITY.md) owns every runtime input and its hash.
+    name: host-lease-feasibility (lease-v1)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/self-serve-host-lease-proof'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    concurrency:
+      group: host-lease-feasibility
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13.5"
+      - name: Fixed lease-v1 launcher (20-minute budget, tests 10 minutes)
+        timeout-minutes: 20
+        run: python scripts/host_lease_feasibility.py
+      - name: Upload allowlisted safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: host-lease-feasibility
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            host-lease-feasibility/summary.json
+            host-lease-feasibility/cases.jsonl
+            host-lease-feasibility/versions.txt
+            host-lease-feasibility/cleanup.json
+            host-lease-feasibility/report.txt
+
+  host-authority-proof:
+    # H1A-1: the isolated lease-domain and host-authority transport proof on a disposable Linux VM.
+    # Manual dispatch of the literal reviewed proof branch only; no parameters, credentials or saved state.
+    # The fixed launcher (docs/saas/HOST_AUTHORITY_PROOF.md) owns every runtime input and its hash.
+    name: host-authority-proof (authority-v1)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/self-serve-host-authority-proof'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    concurrency:
+      group: host-authority-proof
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13.5"
+      - name: Fixed authority-v1 launcher (20-minute budget, tests 10 minutes)
+        timeout-minutes: 20
+        run: python scripts/host_authority_proof.py
+      - name: Upload allowlisted safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: host-authority-proof
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            host-authority-proof/summary.json
+            host-authority-proof/cases.jsonl
+            host-authority-proof/versions.txt
+            host-authority-proof/cleanup.json
+            host-authority-proof/report.txt
+
+  host-lease-key-shape:
+    # H2K1: the isolated lease-key shape proof (immediate-constant logical key) on a disposable Linux VM.
+    # Manual dispatch of the literal reviewed proof branch only; no parameters, credentials or saved state.
+    # The fixed launcher (docs/saas/HOST_LEASE_KEY_SHAPE.md) owns every runtime input and its hash.
+    name: host-lease-key-shape (lease-key-v1)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/self-serve-host-lease-key-shape-proof'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    concurrency:
+      group: host-lease-key-shape
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13.5"
+      - name: Fixed lease-key-v1 launcher (20-minute budget, tests 10 minutes)
+        timeout-minutes: 20
+        run: python scripts/host_lease_key_shape.py
+      - name: Upload allowlisted safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: host-lease-key-shape
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            host-lease-key-shape/summary.json
+            host-lease-key-shape/cases.jsonl
+            host-lease-key-shape/versions.txt
+            host-lease-key-shape/cleanup.json
+            host-lease-key-shape/report.txt
+
+  host-h2-policy-proof:
+    # H2-2: the isolated generation-policy proof (real H2-1 installer, H1 lease, unchanged client) on a disposable VM.
+    # Manual dispatch of the literal reviewed proof branch only; no parameters, credentials or saved state.
+    # The fixed launcher (docs/saas/H2_POLICY_PROOF.md) owns every runtime input and its hash.
+    name: host-h2-policy-proof (h2-policy-v1)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/self-serve-host-h2-policy-proof'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    concurrency:
+      group: host-h2-policy-proof
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13.5"
+      - name: Fixed h2-policy-v1 launcher (20-minute budget, tests 10 minutes)
+        timeout-minutes: 20
+        run: python scripts/host_h2_policy_proof.py
+      - name: Upload allowlisted safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: host-h2-policy-proof
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            host-h2-policy-proof/summary.json
+            host-h2-policy-proof/cases.jsonl
+            host-h2-policy-proof/versions.txt
+            host-h2-policy-proof/cleanup.json
+            host-h2-policy-proof/report.txt
