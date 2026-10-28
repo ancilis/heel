@@ -1828,10 +1828,17 @@ def test_stop_ack_is_not_started_when_projection_preparation_exhausts_deadline()
             now[0] = 5.0
             return projection
 
+    class NoCloudStopCoordinator(StopCoordinator):
+        # The local request must be the only initiator.  A heartbeat Cloud stop could
+        # otherwise stop, unwind and unregister the run before the request is made.
+        def heartbeat(self, run_id, operational_projection):
+            self.heartbeats.append(time.monotonic())
+            return ExecutionGate(True, "active", "valid", 20_000, 7, "none", 2_000)
+
     lease = ClaimLease("run_123456789", object(), {
         "run_id": "run_123456789", "lifecycle_phase": "running",
     })
-    coordinator = StopCoordinator(lease)
+    coordinator = NoCloudStopCoordinator(lease)
     executor = DeadlineExecutor()
     service = RunnerService(
         coordinator=coordinator, executor=executor, heartbeat_interval=0.05,
