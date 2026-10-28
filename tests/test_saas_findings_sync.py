@@ -44,7 +44,7 @@ def _request(project_ref: str, key: bytes, *, title: str, operation_suffix: str 
     spec = copy.deepcopy(SPEC)
     spec["info"]["title"] = title
     if operation_suffix:
-        operation = spec["paths"]["/api/export/bulk"]["get"]
+        operation = spec["paths"]["/oauth/apps"]["post"]
         operation["operationId"] += operation_suffix
     review = review_openapi(spec, execution_mode="machine_local")
     return project_findings_sync(review, project_ref, key)
@@ -74,7 +74,7 @@ class CatalogCapabilityMigrationTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
         migrator = Migrator(conn, CONTROL_PLANE_MIGRATIONS)
-        self.assertEqual(migrator.apply_all(), list(range(1, 30)))
+        self.assertEqual(migrator.apply_all(), list(range(1, 34)))
         self.assertEqual(migrator.apply_all(), [])
         tables = {
             row[0] for row in conn.execute(

@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import secrets
 import socket
 import subprocess
 import sys
@@ -113,9 +114,9 @@ class LocalAgentJourneyTests(unittest.TestCase):
             "info": {"title": "Many exports", "version": "1"},
             "paths": {
                 f"/exports/{index}": {
-                    "get": {"operationId": f"exportRecord{index}"},
+                    "get": {"operationId": f"exportRecord{index}", "x-heel-control": {"entitlement_check": False, "rate_limit": False}},
                 }
-                for index in range(300)
+                for index in range(1800)
             },
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -179,18 +180,18 @@ class LocalAgentJourneyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             home = root / "heel-home"
-            secret = "sk-live-never-print-1234567890abcdef"
+            fixture_value = "sk-" + secrets.token_urlsafe(32)
 
             oversized = root / "oversized-secret.json"
             oversized.write_bytes(b"{" + b"x" * MAX_OPENAPI_PAYLOAD_BYTES)
             malformed = root / "malformed-secret.json"
-            malformed.write_text("{not-json " + secret, encoding="utf-8")
+            malformed.write_text("{not-json " + fixture_value, encoding="utf-8")
             secret_spec = root / "secret-spec.json"
             secret_spec.write_text(json.dumps({
                 "openapi": "3.1.0",
                 "info": {"title": "Secret", "version": "1"},
                 "paths": {},
-                "components": {"examples": {"credential": {"value": secret}}},
+                "components": {"examples": {"credential": {"value": fixture_value}}},
             }), encoding="utf-8")
             directory = root / "directory-input"
             directory.mkdir()
@@ -202,7 +203,7 @@ class LocalAgentJourneyTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2)
                     self.assertEqual(result.stdout, "")
                     self.assertEqual(result.stderr, SAFE_FAILURE)
-                    self.assertNotIn(secret, result.stderr)
+                    self.assertNotIn(fixture_value, result.stderr)
                     self.assertNotIn(str(input_path), result.stderr)
 
             self.assertFalse((home / "reviews").exists())
@@ -285,10 +286,10 @@ class LocalAgentJourneyTests(unittest.TestCase):
 
         self.assertIn("heel review openapi", readme)
         self.assertIn(
-            ".venv/bin/python -m pip install ./heel_sim-1.2.0-py3-none-any.whl",
+            ".venv/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl",
             readme,
         )
-        self.assertIn("/downloads/heel_sim-1.2.0-py3-none-any.whl", readme)
+        self.assertIn("/downloads/heel_sim-1.3.0rc2-py3-none-any.whl", readme)
         self.assertIn("not yet published", readme.lower())
         self.assertNotIn("git clone https://github.com/ancilis/heel", readme)
         self.assertIn("python3 -m pip install heel-sim", quickstart)

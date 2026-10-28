@@ -4,12 +4,15 @@ from .identity import (
     RUNNER_CAPABILITIES, InMemorySecretBackend, LinuxSecretServiceBackend,
     MacOSKeychainSecretBackend, RunnerIdentity, RunnerPairingMaterial, SecureSigner,
     SystemSecureSigner, bind_runner_identity, create_runner_identity,
-    create_runner_pairing_material, runner_phrase_words, validate_pairing_phrase,
+    create_runner_pairing_material, runner_pairing_signer_label, runner_phrase_words,
+    validate_pairing_phrase,
 )
 from .control_client import (
     PendingRunnerResync, RecoveredRunnerChain, RunnerControlClient,
     RunnerRotationActivated,
 )
+from .control_transport import ControlTransportError, HTTPSControlTransport
+from .daemon import RunnerDaemon, RunnerPairingError, self_serve_access
 from .coordinator import (
     RunnerCoordinator, RunnerExecutionAdapter, RunnerStopAcknowledgement,
 )
@@ -44,7 +47,9 @@ __all__ = [
     "RUNNER_CAPABILITIES", "RunnerIdentity", "RunnerPairingMaterial", "SecureSigner", "SystemSecureSigner",
     "InMemorySecretBackend", "MacOSKeychainSecretBackend", "LinuxSecretServiceBackend",
     "create_runner_identity", "create_runner_pairing_material", "bind_runner_identity",
-    "runner_phrase_words", "validate_pairing_phrase", "RunnerControlClient",
+    "runner_phrase_words", "validate_pairing_phrase", "runner_pairing_signer_label",
+    "RunnerControlClient", "ControlTransportError", "HTTPSControlTransport",
+    "RunnerDaemon", "RunnerPairingError", "self_serve_access",
     "PendingRunnerResync", "RecoveredRunnerChain",
     "RunnerRotationActivated",
     "RunnerCoordinator", "RunnerExecutionAdapter", "RunnerStopAcknowledgement",

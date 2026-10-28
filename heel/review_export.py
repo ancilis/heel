@@ -36,6 +36,7 @@ def review_to_markdown(envelope: Mapping[str, Any]) -> str:
         f"Review: {_markdown_plaintext(review['review_id'])}",
         f"Gate: **{_markdown_plaintext(review['gate_status'].upper())}**",
         f"Findings: {summary['findings']} · Blockers: {summary['blockers']}",
+        "Static triage only. No findings does not establish complete coverage or launch safety.",
     ]
     if review["execution_mode"] in {"browser_local", "machine_local"}:
         lines.append(
@@ -61,10 +62,15 @@ def review_to_markdown(envelope: Mapping[str, Any]) -> str:
             "",
             f"- Severity: **{_markdown_plaintext(finding['severity'].upper())}**",
             f"- Surface: {surface}",
+            f"- Evidence: {_markdown_plaintext(finding.get('evidence_state', 'legacy static claim'))}; execution: static only",
             f"- Reason: {_markdown_plaintext(finding['reason'])}",
             f"- Recommended control: {_markdown_plaintext(finding['control'])}",
             "",
         ])
+    lines.extend(["", "## Unanswered questions", ""])
+    for question in review["questions"]:
+        lines.append(f"- {_markdown_plaintext(question['surface'])}: {_markdown_plaintext(question['prompt'])}")
+    lines.append("Customer answers declare intent or controls; they do not verify behavior.")
     return "\n".join(lines).rstrip() + "\n"
 
 

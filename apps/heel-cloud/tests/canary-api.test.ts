@@ -2,7 +2,7 @@
 // @vitest-environment node
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -422,8 +422,9 @@ it("runner UI keeps invitation material out of argv, URLs, and ambient browser a
   assert.equal(runnerPage.includes("?invitation="), false);
   assert.equal(runnerPage.includes("window"), false);
   assert.equal(runnerPage.includes("navigator"), false);
-  assert.match(runnerPage, /heel runner pair --cloud <origin>/);
-  assert.match(runnerPage, /read --silent|paste it only when the runner prompts/i);
+  assert.doesNotMatch(runnerPage, /heel runner pair --cloud/);
+  assert.match(runnerPage, /heel reference prepare/);
+  assert.match(runnerPage, /MCP cannot authorize itself/);
 });
 
 
@@ -433,8 +434,18 @@ it("actual worker isolates human canary and runner-result authority headers and 
     .replace('import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";', 'const handleImageOptimization = async () => new Response("unused"); const DEFAULT_DEVICE_SIZES: number[] = []; const DEFAULT_IMAGE_SIZES: number[] = [];')
     .replace('import handler from "vinext/server/app-router-entry";', 'const handler = { fetch: async () => new Response("unused", { status: 404 }) };');
   const directory = await mkdtemp(join(tmpdir(), "heel-edge-test-"));
-  const modulePath = join(directory, "worker.ts");
+  // Mirror the app layout so the Worker loads the real shared origin validator and dispatch module, byte for byte.
+  const modulePath = join(directory, "worker", "index.ts");
+  const helper = await readFile(join(process.cwd(), "build/deployment-config.ts"));
+  const dispatch = await readFile(join(process.cwd(), "worker/control-plane-dispatch.ts"));
   onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  assert.equal(runnable.split('import { canonicalPublicOrigin } from "../build/deployment-config";').length - 1, 1);
+  await mkdir(join(directory, "worker"));
+  await mkdir(join(directory, "build"));
+  await writeFile(join(directory, "build", "deployment-config.ts"), helper);
+  assert.deepEqual(await readFile(join(directory, "build", "deployment-config.ts")), helper);
+  await writeFile(join(directory, "worker", "control-plane-dispatch.ts"), dispatch);
+  assert.deepEqual(await readFile(join(directory, "worker", "control-plane-dispatch.ts")), dispatch);
   await writeFile(modulePath, runnable);
   class LengthStream extends TransformStream<Uint8Array, Uint8Array> {
     constructor(expected: number) {
@@ -533,4 +544,128 @@ it("actual worker isolates human canary and runner-result authority headers and 
   assert.equal(invalidNonce.headers.get("x-heel-runner-next-nonce"), null);
 });
 
+});
+
+
+// CUSTOMER-TRACK-UX-F1: explicit pending-proof recovery and same-record rotation, bound to the listed record.
+describe("pending ownership-proof recovery", () => {
+  const environment = "env_0123456789abcdef0123456789abcdef";
+  const origin = "https://staging.acme.dev";
+  const token = "Zx_9-proof.token";
+  const base = `/api/control-plane/v1/workspaces/${workspace}/projects/${project}/environments/${environment}`;
+  const pendingWire = {
+    schema_version: "VerifiedEnvironment.v1", environment_id: environment, origin, environment_class: "staging",
+    status: "pending", attestation: "ownership verified; environment classification supplied by you",
+    attestation_version: "v1", attestation_acknowledgement: "accepted", proof_method: "dns-txt",
+    proof_version: "dns-txt.v1", normalization_version: "exact-origin.v1", challenge_generation: 3,
+    challenge_expires_at: 5000.5, last_failure_code: null, verified_at: null, proof_expires_at: null,
+    verification_record_digest: null, revoked_at: null, is_executable: false,
+  };
+  function recovery(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      schema_version: "heel.verified-environment-challenge-recovery.v1", environment_id: environment, origin,
+      environment_class: "staging", proof_method: "dns-txt", token,
+      http_url: `${origin}/.well-known/heel-verify.txt`, dns_record: `_heel.staging.acme.dev TXT heel-verify=${token}`,
+      challenge_generation: 3, expires_at: 5000.5, attestation: "ownership verified; environment classification supplied by you",
+      attestation_version: "v1", attestation_acknowledgement: "accepted", ...overrides,
+    };
+  }
+  async function listed(overrides: Record<string, unknown> = {}) {
+    const api = new CanaryApi({ transport: async () => jsonResponse({ schema_version: "heel.verified-environment-list.v1", environments: [{ ...pendingWire, ...overrides }] }) });
+    return (await api.listEnvironments(workspace, project))[0];
+  }
+
+  it("lists the pending generation and expiry without any proof material", async () => {
+    const record = await listed();
+    expect(record.challengeGeneration).toBe(3);
+    expect(record.challengeExpiresAt).toBe(5000.5);
+    expect(JSON.stringify(record)).not.toMatch(/token|heel-verify/);
+  });
+
+  it("recovers by an exact schema-only POST and binds the instruction to the chosen record", async () => {
+    const calls: Array<[string, RequestInit]> = [];
+    const api = new CanaryApi({ transport: async (path, init) => { calls.push([path, init]); return jsonResponse(recovery()); } });
+    const proof = await api.recoverEnvironmentProof(workspace, project, await listed());
+    expect(calls.map(([path, init]) => [path, init.method, init.body, init.credentials, init.cache])).toEqual([
+      [`${base}/challenge`, "POST", '{"schema_version":"heel.verified-environment-challenge-recover.v1"}', "same-origin", "no-store"],
+    ]);
+    expect(proof).toEqual({
+      environmentId: environment, origin, environmentClass: "staging", proofMethod: "dns-txt", token,
+      httpUrl: `${origin}/.well-known/heel-verify.txt`, dnsRecord: `_heel.staging.acme.dev TXT heel-verify=${token}`,
+      challengeGeneration: 3, expiresAt: 5000.5,
+    });
+    expect(Object.isFrozen(proof)).toBe(true);
+  });
+
+  it("rotates by an exact schema-only POST and accepts only a newer generation of the same record", async () => {
+    const calls: Array<[string, RequestInit]> = [];
+    const api = new CanaryApi({ transport: async (path, init) => { calls.push([path, init]); return jsonResponse(recovery({ challenge_generation: 4 }), 201); } });
+    const proof = await api.rotateEnvironmentProof(workspace, project, await listed());
+    expect(calls.map(([path, init]) => [path, init.method, init.body])).toEqual([
+      [`${base}/challenge/rotate`, "POST", '{"schema_version":"heel.verified-environment-challenge-rotate.v1"}'],
+    ]);
+    expect(proof.challengeGeneration).toBe(4);
+    const same = new CanaryApi({ transport: async () => jsonResponse(recovery(), 201) });
+    await expect(same.rotateEnvironmentProof(workspace, project, await listed())).rejects.toMatchObject({ code: "invalid_response" });
+    const recoveredAsRotation = new CanaryApi({ transport: async () => jsonResponse(recovery({ challenge_generation: 4 }), 200) });
+    await expect(recoveredAsRotation.rotateEnvironmentProof(workspace, project, await listed())).rejects.toBeInstanceOf(CanaryApiError);
+  });
+
+  it("refuses malformed, foreign or non-canonical recovery responses", async () => {
+    const cases: Array<[string, unknown]> = [
+      ["extra field", { ...recovery(), raw_body: "x" }],
+      ["missing field", (() => { const body = recovery(); delete body.attestation_version; return body; })()],
+      ["schema", recovery({ schema_version: "heel.verified-environment-challenge.v1" })],
+      ["foreign environment", recovery({ environment_id: "env_ffffffffffffffffffffffffffffffff" })],
+      ["foreign origin", recovery({ origin: "https://other.acme.dev", http_url: "https://other.acme.dev/.well-known/heel-verify.txt", dns_record: `_heel.other.acme.dev TXT heel-verify=${token}` })],
+      ["origin field alone", recovery({ origin: "https://other.acme.dev" })],
+      ["other class", recovery({ environment_class: "sandbox" })],
+      ["other method", recovery({ proof_method: "https-file" })],
+      ["other generation", recovery({ challenge_generation: 4 })],
+      ["http url", recovery({ http_url: `${origin}/.well-known/other.txt` })],
+      ["dns record", recovery({ dns_record: `_heel.staging.acme.dev TXT heel-verify=other` })],
+      ["token shape", recovery({ token: "bad token", dns_record: "_heel.staging.acme.dev TXT heel-verify=bad token" })],
+      ["expiry", recovery({ expires_at: 0 })],
+      ["attestation", recovery({ attestation: "forged" })],
+      ["acknowledgement", recovery({ attestation_acknowledgement: "declined" })],
+      ["array", [recovery()]],
+    ];
+    for (const [label, body] of cases) {
+      const api = new CanaryApi({ transport: async () => jsonResponse(body) });
+      await expect(api.recoverEnvironmentProof(workspace, project, await listed()), label).rejects.toMatchObject({ code: "invalid_response" });
+    }
+    const text = new CanaryApi({ transport: async () => new Response(JSON.stringify(recovery()), { headers: { "Content-Type": "text/plain" } }) });
+    await expect(text.recoverEnvironmentProof(workspace, project, await listed())).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("maps closed recovery states and fresh-auth expiry to public messages without proof material", async () => {
+    for (const [status, code, expected] of [
+      [409, "environment_challenge_expired", "environment_challenge_expired"],
+      [409, "environment_challenge_missing", "environment_challenge_missing"],
+      [409, "environment_challenge_closed", "environment_challenge_closed"],
+      [409, "environment_challenge_live", "environment_challenge_live"],
+      [403, "recent_auth_required", "recent_auth_required"],
+      [400, "invalid_environment_challenge", "invalid_environment_challenge"],
+      [409, "environment_challenge_secret", "unavailable"],
+    ] as const) {
+      const api = new CanaryApi({ transport: async () => jsonResponse({ error: "closed", code }, status) });
+      const error = await api.recoverEnvironmentProof(workspace, project, await listed()).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(CanaryApiError);
+      expect((error as CanaryApiError).code).toBe(expected);
+      expect((error as CanaryApiError).status).toBe(status);
+      expect((error as CanaryApiError).message).not.toContain(token);
+    }
+  });
+
+  it("never requests recovery or rotation for a record that is not pending or not well formed", async () => {
+    const transport = vi.fn(async () => jsonResponse(recovery()));
+    const api = new CanaryApi({ transport });
+    for (const record of [await listed({ status: "verified", verified_at: 1, proof_expires_at: 9, verification_record_digest: digest }), await listed({ status: "revoked", revoked_at: 1 })]) {
+      await expect(api.recoverEnvironmentProof(workspace, project, record)).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(api.rotateEnvironmentProof(workspace, project, record)).rejects.toMatchObject({ code: "invalid_request" });
+    }
+    const forged = { ...(await listed()), environmentId: "env_../../check" };
+    await expect(api.recoverEnvironmentProof(workspace, project, forged)).rejects.toMatchObject({ code: "invalid_request" });
+    expect(transport).not.toHaveBeenCalled();
+  });
 });

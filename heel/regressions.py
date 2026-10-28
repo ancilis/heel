@@ -47,6 +47,27 @@ def _affordance_pattern_from_vector(vector: dict) -> dict:
     return pattern
 
 
+def _inconclusive_runtime_vector(vector: dict) -> bool:
+    """A stored plan-differential execution record that never established a boundary result.
+
+    Older runs stored status-only and undecided pairs as findings. Their runtime provenance,
+    not the scenario name, identifies them; a record with that provenance is admitted only
+    when it is a verified or observed result for its own predicate.
+    """
+    reproduction = vector.get("reproduction")
+    if not isinstance(reproduction, dict):
+        return False
+    provenance = reproduction.get("provenance")
+    if not isinstance(provenance, dict) or provenance.get("kind") != "plan_differential_execution":
+        return False
+    predicate = reproduction.get("predicate")
+    return (
+        reproduction.get("evidence_state") not in {"verified", "observed"}
+        or not isinstance(predicate, str)
+        or vector.get("scenario_id") != "plan_differential." + predicate
+    )
+
+
 def _regression_id(run_id: str, vector_id: str, name: str) -> str:
     digest = hashlib.sha1(f"{run_id}:{vector_id}:{name}".encode()).hexdigest()[:12]
     return f"reg-{digest}"
@@ -67,6 +88,11 @@ def add_regression_from_finding(store, run_id: str, vector_id: str, name: str,
     scenario = _scenario_by_id(vector.get("scenario_id", ""))
     if not vector.get("scenario_id"):
         raise RegressionError(f"vector '{vector_id}' has no scenario_id")
+    if _inconclusive_runtime_vector(vector):
+        # The stored record stays readable; it just cannot become a new regression.
+        raise RegressionError(
+            "an inconclusive plan-differential result cannot become a regression"
+        )
 
     created_at = now if now is not None else time.time()
     reproduction = vector.get("reproduction") or {}
@@ -146,6 +172,33 @@ def run_regressions(store, server, scope_id: str, target: str, caller: str,
     regressions = [r for r in store.list_regressions() if not wanted or r["regression_id"] in wanted]
     results = []
     for regression in regressions:
+        # A plan-differential regression replays its saved pair against its https origin and
+        # never reaches the synthetic-target run path; the two kinds never share a target.
+        plan_differential = str(regression.get("scenario_id", "")).startswith("plan_differential.")
+        if plan_differential != target.startswith("https://"):
+            continue
+        if plan_differential:
+            from .runner.plan_differential import replay_plan_differential
+
+            result = replay_plan_differential(
+                store, regression, scope_id=scope_id, target=target, caller=caller,
+            )
+            ContainmentLog(store, result["run_id"] or "security", caller).append(
+                "regression_result",
+                {
+                    "regression_id": regression["regression_id"],
+                    "name": regression["name"],
+                    "result": result["result"],
+                    "current_status": result["current_status"],
+                    "expected_status": regression["expected_status"],
+                    "scope_id": scope_id,
+                    "target": target,
+                    "canary_only": True,
+                },
+            )
+            store.add_regression_result(result)
+            results.append(result)
+            continue
         args = {
             "scope_id": scope_id,
             "target": target,

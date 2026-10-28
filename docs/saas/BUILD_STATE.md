@@ -1,6 +1,10 @@
+# Latest private deployment
+
+The owner-private Sites update is recorded in [DEPLOYMENT_2026-09-05.md](DEPLOYMENT_2026-09-05.md). No public launch or Python control-plane deployment is claimed.
+
 # Heel SaaS Build State
 
-Updated 2026-08-04. This file records the product that exists in the current
+Updated 2026-09-04; the download-artifact and launch-readiness entries were corrected 2026-10-23. The current validation wedge is the [synthetic export entitlement workflow](../EXPORT_DEMO.md); see [capabilities](../CAPABILITIES.md). Cloud pairing is not a supported end-to-end customer journey. Passing static gates does not establish launch safety. This file records the product that exists in the current
 repository state. It does not record a public deployment.
 
 ## Launch decision
@@ -20,7 +24,17 @@ The implemented launch is **Heel free early access**:
   result on first use.
 - Pinned same-origin browser runtime and dedicated Python Web Worker.
 - Optional local browser save, delete, clear, JSON export, and Markdown export.
-- Downloadable Heel 1.2.0 wheel/source/manifest and local MCP setup.
+- Checked-in Heel 1.3.0rc2 runner preview candidate wheel/source/manifest under
+  `apps/heel-cloud/public/downloads/`, and local MCP setup. The candidate is unreleased: it is
+  not published as a GitHub release or to PyPI, and it is not publicly deployed. It treats a
+  recognized error envelope as inconclusive at every HTTP status, so the synthetic reference
+  `error_envelope` (HTTP 200) and `hardened` (HTTP 403) cases are inconclusive and only the
+  non-error `public` and `redacted` cases pass; no inconclusive plan-differential pair stores a
+  finding, and a denial status that still carries the higher plan's payload is inconclusive,
+  never a regression pass. The earlier 1.3.0rc1 preview is a public GitHub prerelease whose
+  `error_envelope` and `hardened` results are documented errata; its files are no longer in the
+  tree. Earlier versions of this file listed the 1.2.0 files, which are no longer in the
+  tree either.
 - Local CLI and MCP review without an account.
 - Free signup/login/logout at the website.
 - Browser-mediated device authorization for a local machine.
@@ -130,9 +144,15 @@ docker compose --env-file deploy/.env.production \
 - Production secrets have not been supplied.
 - Legal/privacy/support materials still require owner approval for public use.
 - Staging and public acceptance against the selected provider/domain remain to be run.
+- The full self-serve product is not launch-ready. Paired runner execution, the cloud route
+  inventory bridge, and approval wiring are incomplete, and final launch acceptance has not
+  been given. Owner actions alone do not close these gaps.
+- The 1.3.0rc2 candidate files are not yet published, and a one-command public install of a
+  corrected release is later work.
 
 ## Exact next action
 
-Complete `OWNER_ACTIONS.md`, run the verification commands against the real deploy
+Finish the incomplete product work listed above, complete `OWNER_ACTIONS.md`, run the
+verification commands against the real deploy
 candidate, deploy first to staging, complete the go/no-go gates in `LAUNCH.md`, and
 only then authorize the first public free early-access deployment.

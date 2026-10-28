@@ -764,8 +764,8 @@ class ReviewExportTests(unittest.TestCase):
         self.assertIn(f"Blockers: {envelope['summary']['blockers']}", markdown)
         finding = envelope["findings"][0]
         self.assertIn(f"Severity: **{finding['severity'].upper()}**", markdown)
-        self.assertIn("endpoints\\_routes / createoauthapp", markdown)
-        self.assertIn(finding["reason"].replace("-", "\\-"), markdown)
+        self.assertIn("integration\\_oauth\\_apps / createoauthapp", markdown)
+        self.assertIn(finding["reason"].replace("-", "\\-").replace(";", "\\;").replace(".", "\\."), markdown)
         self.assertIn(f"Recommended control: {finding['control']}", markdown)
         self.assertIn("Envelope declares local analysis", markdown)
         self.assertIn("no upload", markdown)

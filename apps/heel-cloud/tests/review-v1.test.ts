@@ -99,7 +99,7 @@ describe("parseReviewEnvelopeV1", () => {
     expect(parsed).not.toBe(source);
     expect(parsed.findings).not.toBe(source.findings);
     expect(parsed.schema_version).toBe("heel.review.v1");
-    expect(parsed.engine_version).toBe("1.2.0");
+    expect(parsed.engine_version).toBe("1.3.0rc2");
     expect(parsed.execution_mode).toBe("browser_local");
     expect(parsed.privacy).toEqual({
       execution: "browser_local",
@@ -125,7 +125,11 @@ describe("parseReviewEnvelopeV1", () => {
       (value.summary as Record<string, unknown>).questions = 0;
     }],
     ["non-canonical finding order", (value: Record<string, unknown>) => {
-      (value.findings as unknown[]).reverse();
+      const items = value.findings as Array<Record<string, unknown>>;
+      items.push({ ...items[0], surface_id: "aaa" });
+      (value.summary as Record<string, unknown>).findings = items.length;
+      value.recommended_controls = [...items];
+      // The original id sorts after aaa, so this array is deliberately noncanonical.
     }],
     ["non-static safety", (value: Record<string, unknown>) => {
       (value.safety as Record<string, unknown>).live_probing = true;
@@ -162,7 +166,7 @@ describe("parseReviewEnvelopeV1", () => {
     expect(parsed).toEqual(legacy);
     expect(parsed.engine_version).toBe(version);
     expect(() => parseCurrentReviewEnvelopeV1(legacy)).toThrow(/engine_version/i);
-    expect(parseCurrentReviewEnvelopeV1(browserEnvelope()).engine_version).toBe("1.2.0");
+    expect(parseCurrentReviewEnvelopeV1(browserEnvelope()).engine_version).toBe("1.3.0rc2");
   });
 
   test("rejects an unknown next engine version even when its hash is recomputed", () => {
@@ -229,7 +233,7 @@ describe("deriveAnswerReceipt", () => {
   });
 
   test.each([
-    ["not_enforced", "confirmed_gap", "confirmed_gaps"],
+    ["not_enforced", "declared_gap", "declared_gaps"],
     ["unknown", "unanswered", "preliminary"],
   ] as const)("keeps a %s question visible and projects its exact receipt", (value, receipt, confidence) => {
     const before = parseReviewEnvelopeV1(browserEnvelope());

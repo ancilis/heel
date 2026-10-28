@@ -145,13 +145,13 @@ def heldout_eval() -> dict:
         test = _eval_split(TEST_FIXTURES)
         out["test"] = test
         ts = test["with_semantic"]
-        out["headline"] = (f"held-out TEST (unbiased, {test['total_planted']} weaknesses, sha {test['sha256']}): "
+        out["headline"] = (f"held-out TEST (synthetic vocabulary, {test['total_planted']} weaknesses, sha {test['sha256']}): "
                            f"localization recall {ts['recall']} cluster-CI {ts['recall_cluster_ci95']}, "
                            f"ATTRIBUTION recall {ts['attribution_recall']} cluster-CI {ts['attribution_cluster_ci95']}, "
                            f"precision {ts['precision']} cluster-CI {ts['precision_cluster_ci95']}. "
                            f"exact-match {test['exact_match']['recall']}; DEV {dev['with_semantic']['recall']}. "
                            f"Not near 1.0: the honest ceiling. (old headline kept below)")
-        out["_headline_legacy"] = (f"held-out TEST recall (unbiased, {test['total_planted']} weaknesses authored "
+        out["_headline_legacy"] = (f"held-out TEST recall (synthetic vocabulary, {test['total_planted']} weaknesses authored "
                            f"blind to the tuner): exact {test['exact_match']['recall']} -> semantic "
                            f"{test['with_semantic']['recall']} (Wilson CI {test['with_semantic']['wilson_ci95']}) "
                            f"at precision {test['with_semantic']['precision']}. DEV recall {dev['with_semantic']['recall']}. "

@@ -24,14 +24,14 @@ import zlib
 
 ROOT = Path(os.path.abspath(__file__)).parents[1]
 CONTRACT_PATH = "release/open-core-v1.json"
-RELEASE_VERSION = "1.2.0"
-WHEEL_NAME = "heel_sim-1.2.0-py3-none-any.whl"
-SDIST_NAME = "heel_sim-1.2.0.tar.gz"
+RELEASE_VERSION = "1.3.0rc2"
+WHEEL_NAME = f"heel_sim-{RELEASE_VERSION}-py3-none-any.whl"
+SDIST_NAME = f"heel_sim-{RELEASE_VERSION}.tar.gz"
 MANIFEST_NAME = "heel-open-core-manifest.json"
 ARTIFACT_NAMES = (WHEEL_NAME, SDIST_NAME, MANIFEST_NAME)
-DIST_INFO = "heel_sim-1.2.0.dist-info"
+DIST_INFO = f"heel_sim-{RELEASE_VERSION}.dist-info"
 RECORD_PATH = f"{DIST_INFO}/RECORD"
-SDIST_PREFIX = "heel_sim-1.2.0/"
+SDIST_PREFIX = f"heel_sim-{RELEASE_VERSION}/"
 FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 FIXED_TAR_MTIME = 0
 EXPECTED_GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff"
@@ -72,7 +72,9 @@ EXPECTED_DOCUMENTS = (
 EXPECTED_LICENSES = ("DCO", "LICENSE", "NOTICE")
 EXPECTED_PACKAGE_DATA = (
     "heel/heldout/targets.json",
+    "heel/heldout/test_targets.json",
     "heel/scenarios_lib/community.json",
+    "heel/scenarios_lib/research_owasp.json",
 )
 EXPECTED_CONSOLE_SCRIPTS = {
     "heel": "heel.cli:main",
@@ -98,7 +100,7 @@ FORBIDDEN_CONTENT = (
 METADATA = (
     "Metadata-Version: 2.4\n"
     "Name: heel-sim\n"
-    "Version: 1.2.0\n"
+    f"Version: {RELEASE_VERSION}\n"
     "Summary: Privacy-first local SaaS launch review for browser, CLI, and MCP workflows.\n"
     "Requires-Python: >=3.11\n"
     "License-Expression: Apache-2.0\n"

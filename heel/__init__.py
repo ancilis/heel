@@ -3,4 +3,4 @@
 Synthetic-target backtests are the evaluation spine; the safety spine in section 10 is
 non-negotiable.
 """
-__version__ = "1.2.0"
+__version__ = "1.3.0rc2"

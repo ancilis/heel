@@ -5,11 +5,24 @@ import sys
 import tempfile
 import unittest
 
+from heel.mcp_server import ToolError
+from run_demo import mcp
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class DemoCommandTests(unittest.TestCase):
+    def test_demo_mcp_wrapper_marks_expected_tool_rejections_as_errors(self):
+        class RejectingServer:
+            def dispatch(self, method, params, session):
+                raise ToolError("unknown tool", code="unknown_tool")
+
+        response = mcp(RejectingServer(), {}, "heel_widen_scope", {})
+
+        self.assertTrue(response["isError"])
+        self.assertEqual(response["code"], "unknown_tool")
+
     def run_make(self, target):
         with tempfile.TemporaryDirectory() as home:
             env = os.environ.copy()

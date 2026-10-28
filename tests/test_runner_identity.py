@@ -139,30 +139,56 @@ class _FakeProcess:
     def kill(self): self.killed = True
 
 
-def test_macos_first_create_never_places_ed25519_seed_in_process_argv(monkeypatch):
-    expected_seed = b"k" * 32
-    encoded_seed = base64.b64encode(expected_seed)
+def _scripted_keychain(monkeypatch, *, persisted, add_returncode=0, stored_value=None):
+    """Fake ``security``: find/-i add/delete against one dict, recording argv and stdin."""
     calls = []
 
     def popen(argv, **kwargs):
-        process = _FakeProcess(
-            argv, returncode=44 if argv[1] == "find-generic-password" else 0,
-            stdout=b"",
-        )
-        calls.append((tuple(argv), kwargs, process))
+        argv = tuple(argv)
+        if argv[1] == "find-generic-password":
+            account = argv[argv.index("-a") + 1]
+            found = account in persisted
+            process = _FakeProcess(argv, returncode=0 if found else 44,
+                                   stdout=persisted.get(account, b"") + b"\n" if found else b"")
+        elif argv[1] == "delete-generic-password":
+            account = argv[argv.index("-a") + 1]
+            process = _FakeProcess(argv, returncode=0 if persisted.pop(account, None) is not None else 44,
+                                   stdout=b"")
+        else:
+            process = _FakeProcess(argv, returncode=add_returncode, stdout=b"")
+            original_close = process.stdin.close
+
+            def close():
+                tokens = bytes(process.stdin.data).split()
+                if add_returncode == 0 and len(tokens) == 7:
+                    persisted[tokens[4].decode()] = tokens[6] if stored_value is None else stored_value
+                original_close()
+            process.stdin.close = close
+        calls.append((argv, kwargs, process))
         return process
 
     monkeypatch.setattr("heel.runner.identity._verified_security_path",
                         lambda: "/usr/bin/security")
+    return popen, calls
+
+
+def test_macos_first_create_never_places_ed25519_seed_in_process_argv(monkeypatch):
+    expected_seed = b"k" * 32
+    encoded_seed = base64.b64encode(expected_seed)
+    persisted = {}
+    popen, calls = _scripted_keychain(monkeypatch, persisted=persisted)
     monkeypatch.setattr("heel.runner.identity.secrets.token_bytes", lambda count: expected_seed)
     signer = SystemSecureSigner(
         "runner-one", backend=MacOSKeychainSecretBackend(popen=popen),
     )
     assert signer.public_key and encoded_seed not in repr(signer).encode()
-    assert len(calls) == 2
+    assert [argv for argv, _, _ in calls] == [
+        ("/usr/bin/security", "find-generic-password", "-s", "heel.runner.ed25519.v1", "-a", "runner-one", "-w"),
+        ("/usr/bin/security", "-i"),
+        ("/usr/bin/security", "find-generic-password", "-s", "heel.runner.ed25519.v1", "-a", "runner-one", "-w"),
+    ]
     for argv, kwargs, process in calls:
-        assert argv[0] == "/usr/bin/security" and argv[-1] == "-w"
-        assert encoded_seed.decode() not in argv
+        assert encoded_seed.decode() not in " ".join(argv)
         assert kwargs == {
             "stdin": subprocess.PIPE, "stdout": subprocess.PIPE,
             "stderr": subprocess.DEVNULL, "shell": False, "bufsize": 0,
@@ -170,7 +196,100 @@ def test_macos_first_create_never_places_ed25519_seed_in_process_argv(monkeypatc
         }
         assert process.wait_timeouts == [5]
     assert bytes(calls[0][2].stdin.data) == b""
-    assert bytes(calls[1][2].stdin.data) == encoded_seed
+    # Exactly one documented interactive command line, no -U, the seed only on stdin.
+    assert bytes(calls[1][2].stdin.data) == (
+        b"add-generic-password -s heel.runner.ed25519.v1 -a runner-one -w " + encoded_seed + b"\n"
+    )
+    assert persisted == {"runner-one": encoded_seed}
+
+
+def test_macos_store_deletes_its_item_and_fails_when_the_value_does_not_read_back(monkeypatch):
+    seed = b"t" * 32
+    for stored_value in (b"", base64.b64encode(b"x" * 32), base64.b64encode(seed)[:40]):
+        persisted = {}
+        popen, calls = _scripted_keychain(monkeypatch, persisted=persisted, stored_value=stored_value)
+        with pytest.raises(RuntimeError, match="runner OS secret service unavailable") as caught:
+            MacOSKeychainSecretBackend(popen=popen).store("runner-trunc", seed)
+        assert persisted == {}
+        assert calls[-1][0] == (
+            "/usr/bin/security", "delete-generic-password", "-s", "heel.runner.ed25519.v1", "-a", "runner-trunc",
+        )
+        assert base64.b64encode(seed).decode() not in str(caught.value)
+
+
+def test_macos_legacy_empty_or_short_items_fail_closed_and_are_never_rewritten(monkeypatch):
+    for legacy in (b"", base64.b64encode(b"s" * 16)):
+        persisted = {"runner-legacy": legacy}
+        popen, calls = _scripted_keychain(monkeypatch, persisted=persisted)
+        backend = MacOSKeychainSecretBackend(popen=popen)
+        with pytest.raises(RuntimeError, match="invalid material"):
+            backend.load("runner-legacy")
+        with pytest.raises(RuntimeError):
+            SystemSecureSigner.create_new("runner-legacy", backend=backend)
+        with pytest.raises(RuntimeError):
+            SystemSecureSigner("runner-legacy", backend=backend)
+        assert persisted == {"runner-legacy": legacy}
+        assert all(argv[1] == "find-generic-password" for argv, _, _ in calls)
+    valid = base64.b64encode(b"v" * 32)
+    persisted = {"runner-valid": valid}
+    popen, _ = _scripted_keychain(monkeypatch, persisted=persisted)
+    assert MacOSKeychainSecretBackend(popen=popen).load("runner-valid") == b"v" * 32
+
+
+@pytest.mark.parametrize("label", [
+    "runner one", "runner\none", "-U", "runner;one", "runner\"one", "runner'one", "runner#one", "ü",
+])
+def test_macos_store_refuses_labels_outside_the_interactive_token_alphabet_before_any_process(
+    monkeypatch, label,
+):
+    popen, calls = _scripted_keychain(monkeypatch, persisted={})
+    with pytest.raises(ValueError, match="invalid runner signing label"):
+        MacOSKeychainSecretBackend(popen=popen).store(label, b"q" * 32)
+    assert calls == []
+
+
+def test_security_interactive_command_is_one_bounded_line_of_inert_tokens():
+    from heel.runner.identity import SECURITY_INTERACTIVE_MAX_LINE_BYTES, security_interactive_add_command
+
+    line = security_interactive_add_command("svc.v1", "acct_.:-1", b"+/=AZaz09")
+    assert line == b"add-generic-password -s svc.v1 -a acct_.:-1 -w +/=AZaz09\n"
+    for bad in (b"", b"a b", b"a\nb", b"a\rb", b"-w", b"a\x00", b"a'b", b'a"b', b"a\\b", b"a#b", b"a" * 3201):
+        with pytest.raises(ValueError):
+            security_interactive_add_command("svc", "acct", bad)
+    with pytest.raises(ValueError, match="line limit"):
+        security_interactive_add_command("s" * 200, "a" * 200, b"v" * 3200)
+    assert len(security_interactive_add_command("s", "a", b"v" * 3000)) <= SECURITY_INTERACTIVE_MAX_LINE_BYTES
+
+
+def test_macos_delete_tolerates_a_missing_item_and_fails_closed_otherwise(monkeypatch):
+    persisted = {"runner-del": base64.b64encode(b"d" * 32)}
+    popen, calls = _scripted_keychain(monkeypatch, persisted=persisted)
+    backend = MacOSKeychainSecretBackend(popen=popen)
+    backend.delete("runner-del")
+    backend.delete("runner-del")
+    assert persisted == {}
+    failing = lambda argv, **kwargs: _FakeProcess(argv, returncode=1, stdout=b"")
+    with pytest.raises(RuntimeError, match="unavailable"):
+        MacOSKeychainSecretBackend(popen=failing).delete("runner-del")
+
+
+@pytest.mark.skipif(
+    __import__("platform").system() != "Darwin" or not __import__("os").path.isfile("/usr/bin/security"),
+    reason="real macOS Keychain only",
+)
+def test_real_macos_keychain_round_trips_a_dummy_seed_and_removes_it():
+    import secrets as _secrets
+
+    backend = MacOSKeychainSecretBackend()
+    label = "heel-test-" + _secrets.token_hex(12)
+    try:
+        signer = SystemSecureSigner.create_new(label, backend=backend)
+        assert SystemSecureSigner.load_existing(label, backend=backend).key_id == signer.key_id
+        with pytest.raises(ValueError, match="already exists"):
+            SystemSecureSigner.create_new(label, backend=backend)
+    finally:
+        backend.delete(label)
+    assert backend.load(label) is None
 
 
 def test_macos_load_is_bounded_and_never_exposes_helper_output(monkeypatch):
@@ -196,36 +315,27 @@ def test_macos_load_is_bounded_and_never_exposes_helper_output(monkeypatch):
 
 def test_macos_first_create_never_overwrites_a_racing_keychain_account(monkeypatch):
     generated_seed = b"n" * 32
-    existing_seed = b"e" * 32
-    persisted = bytearray(existing_seed)
-    calls = []
-
-    def popen(argv, **kwargs):
-        if argv[1] == "find-generic-password":
-            process = _FakeProcess(argv, returncode=44, stdout=b"")
-        else:
-            if "-U" in argv:
-                persisted[:] = generated_seed
-                process = _FakeProcess(argv, returncode=0, stdout=b"")
-            else:
-                process = _FakeProcess(argv, returncode=45, stdout=b"")
-        calls.append((tuple(argv), kwargs, process))
-        return process
-
-    monkeypatch.setattr("heel.runner.identity._verified_security_path",
-                        lambda: "/usr/bin/security")
+    existing_seed = base64.b64encode(b"e" * 32)
+    persisted = {}
+    popen, calls = _scripted_keychain(monkeypatch, persisted=persisted, add_returncode=45)
     monkeypatch.setattr("heel.runner.identity.secrets.token_bytes", lambda count: generated_seed)
+    # The racing writer's item appears between our lookup and our add; add (no -U) fails with 45.
+    original = popen
+
+    def racing(argv, **kwargs):
+        if argv[1] == "-i":
+            persisted["runner-race"] = existing_seed
+        return original(argv, **kwargs)
 
     with pytest.raises(RuntimeError, match="runner OS secret service unavailable") as caught:
-        SystemSecureSigner("runner-race", backend=MacOSKeychainSecretBackend(popen=popen))
+        SystemSecureSigner("runner-race", backend=MacOSKeychainSecretBackend(popen=racing))
 
     store_argv, _, store_process = calls[1]
-    assert store_argv == (
-        "/usr/bin/security", "add-generic-password", "-s",
-        "heel.runner.ed25519.v1", "-a", "runner-race", "-w",
-    )
-    assert bytes(store_process.stdin.data) == base64.b64encode(generated_seed)
-    assert bytes(persisted) == existing_seed
+    assert store_argv == ("/usr/bin/security", "-i")
+    assert b" -U" not in bytes(store_process.stdin.data)
+    assert bytes(store_process.stdin.data).endswith(b" -w " + base64.b64encode(generated_seed) + b"\n")
+    assert persisted == {"runner-race": existing_seed}
+    assert len(calls) == 2
     assert base64.b64encode(generated_seed).decode() not in str(caught.value)
 
 
@@ -296,3 +406,15 @@ def test_linux_helper_rejects_path_resolution_before_process_launch(
     with pytest.raises(RuntimeError, match="secret service unavailable"):
         backend.load("runner-linux")
     assert calls == []
+
+
+def test_pairing_signer_label_namespace_is_fixed_bounded_and_random_id_only():
+    from heel.runner.identity import RUNNER_PAIRING_SIGNER_LABEL_PREFIX, runner_pairing_signer_label
+
+    label = runner_pairing_signer_label("0123456789abcdef0123456789abcdef")
+    assert label == RUNNER_PAIRING_SIGNER_LABEL_PREFIX + "0123456789abcdef0123456789abcdef"
+    assert len(label) <= 128 and SystemSecureSigner._label(label) == label
+    for bad in ("", "0" * 31, "0" * 33, "0123456789ABCDEF0123456789abcdef", "g" * 32, None, b"0" * 32,
+                "../" + "0" * 29, "0" * 31 + "\x00"):
+        with pytest.raises(ValueError):
+            runner_pairing_signer_label(bad)

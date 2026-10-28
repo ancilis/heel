@@ -172,6 +172,8 @@ def evaluate_pair(
     method: str = "GET",
     first_body_shape: str = "absent",
     second_body_shape: str = "absent",
+    first_protected: bool | None = None,
+    second_protected: bool | None = None,
 ) -> PairEvaluation:
     """Evaluate two observations in the exact role order declared by the catalog."""
     if scenario_id not in ADAPTER_REGISTRY:
@@ -188,18 +190,19 @@ def evaluate_pair(
         or any(status not in adapter["allowed_status_codes"] for status in statuses)
     ):
         return PairEvaluation("inconclusive", finding, control)
-    if statuses == (200, 200):
-        return PairEvaluation("observed", finding, control)
-    blocked = False
-    if scenario_id == "anonymous_authenticated_read":
-        blocked = first_status in {401, 403, 404} and second_status == 200
-    elif scenario_id == "object_ownership_read":
-        blocked = first_status == 200 and second_status in {403, 404}
-    elif scenario_id == "role_bound_read":
-        blocked = first_status in {403, 404} and second_status == 200
-    elif scenario_id == "plan_entitlement_read":
-        blocked = first_status in {402, 403, 404} and second_status == 200
-    return PairEvaluation("blocked" if blocked else "inconclusive", finding, control)
+    # These are locally established content observations, never status-derived flags.
+    if method != "GET":
+        return PairEvaluation("inconclusive", finding, control)
+    positive, lower = ((first_protected, second_protected)
+                       if scenario_id == "object_ownership_read"
+                       else (second_protected, first_protected))
+    positive_status = first_status if scenario_id == "object_ownership_read" else second_status
+    if positive is not True or positive_status != 200 or type(lower) is not bool:
+        return PairEvaluation("inconclusive", finding, control)
+    if lower:
+        return PairEvaluation("observed", "Protected canary content crossed the selected boundary", control)
+    return PairEvaluation("blocked", finding, control)
+
 
 
 __all__ = [

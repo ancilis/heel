@@ -4,6 +4,15 @@ All notable changes to Heel are documented here. Format loosely follows Keep a C
 
 ## [Unreleased]
 
+- Answer a v3 runner pairing activation that loses its short SQLite busy wait (numeric `SQLITE_BUSY`/`SQLITE_LOCKED`, no open transaction, independent runner connection) with `503 runner_control_busy` (`retry_after_ms: 1000`, `Retry-After: 1`); `heel runner pair` resends the identical sealed activation after that bounded hint and never past the challenge deadline. Every other route and error stays a generic 500, whose log line gains only a typed `sqlite_primary_code` (H1A3-1F3DF).
+- Add the control-plane host-authority snapshot decision and private listener wiring (H1A-2), default off: migration 31 adds a permanent anti-replay generation ledger (no row ever leaves it; 65 536 rows, fail-closed), `HEEL_MANAGED_HOST=1` refuses a missing or unsafe listener configuration before any lock or bind, and a listener thread that outlives its bounded stop keeps database ownership until the process exits. See `docs/saas/HOST_AUTHORITY_SNAPSHOT.md`.
+- Move owner runner revocation to `POST /v1/workspaces/{ws}/runners/{id}/revoke` (same `heel.runner-revoke.v1` body and recent owner/admin same-origin checks) at the control plane and the edge Worker; the old `DELETE …/runners/{id}` could never succeed and is no longer routed.
+- Add a signed-scope, customer-local synthetic export entitlement reference through CLI and MCP, plus app instructions and local report viewing.
+- Require protected content and an entitled positive control for boundary results; status-only reads are inconclusive.
+- Preserve unknown metadata as questions, separate evidence state from severity/disposition, deduplicate operation representations and require applicable commercial rules for relevant library hypotheses.
+- Label personas/economics as assumptions and lifecycle models as unexecuted; publish current capability gaps.
+
+
 Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 
 ### Integrated
@@ -21,6 +30,57 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - incident-to-scenario workflow for sanitized incidents and near misses.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
+
+## [1.3.0rc2]: unpublished candidate
+
+Corrected runner preview release candidate. It carries the changes listed under Unreleased at its
+candidate commit and is not yet published as a GitHub release or to PyPI.
+
+### Fixed
+- A response that is a recognized error or denial envelope is inconclusive for either plan at
+  every HTTP status, even when it also carries the protected marker. 1.3.0rc1 has two synthetic
+  reference errata, neither of which is a pass: the HTTP 200 `error_envelope` case and the HTTP 403
+  `hardened` case each report `invariant_held` with `regression_passed=true`. This candidate
+  reports each as `inconclusive` with `regression_passed=false`; the vulnerable result is
+  unchanged. The shared content predicate and the plan-differential evaluator read one denial
+  vocabulary.
+- Plan-differential status parity alone and undecided lower responses no longer store a finding
+  or add to local finding counts. Their pairs, redacted observations, raw attempt evidence and
+  containment entries are kept.
+- `heel regress add` refuses an `inconclusive` plan-differential execution record stored by an
+  earlier version, identified by its runtime provenance; such records remain readable. A saved
+  regression whose replayed pair is status parity alone reports `inconclusive`, not
+  `still_reachable`.
+- The local `/runner` report viewer no longer presents a 1.3.0rc1 held `error_envelope` (HTTP 200)
+  or `hardened` (HTTP 403) report as a passed regression; it names each as an inconclusive error
+  envelope, not a pass. It presents a pass only for a held `public` or `redacted` report with
+  `regression_passed=true`, verified evidence and a completed reference-only run without network
+  calls. It checks the report's shape and does not authenticate the file.
+
+### Changed
+- Python package, release contract, MCP `serverInfo`, `server.json`, browser engine and newly
+  generated reviews identify `1.3.0rc2`; the npm package uses `1.3.0-rc.2`. Saved `1.3.0rc1`
+  reviews and findings-sync sources remain readable alongside `1.1.0`, `1.1.1` and `1.2.0`.
+- Regenerated `heel_sim-1.3.0rc2` and `heel_browser-1.3.0rc2` artifacts through the existing
+  deterministic builders. The published 1.3.0rc1 release and its assets are unchanged.
+
+## [1.3.0rc1]: 2026-10-23
+
+Runner preview prerelease, published as a GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. It carries the changes listed under
+Unreleased at its candidate commit. It is not a stable release and is not published to PyPI.
+
+### Changed
+- Python package, release contract, MCP `serverInfo`, `server.json`, browser engine and newly
+  generated reviews identify `1.3.0rc1` (PEP 440). The Heel Cloud npm package uses the equivalent
+  SemVer spelling `1.3.0-rc.1`.
+- Regenerated `heel_sim-1.3.0rc1` wheel, source archive and manifest, and the
+  `heel_browser-1.3.0rc1` wheel and manifest, through the existing deterministic builders.
+- Saved `1.1.0`, `1.1.1` and `1.2.0` reviews and findings-sync sources remain readable; the
+  `heel.review.v1` and `heel.findings-sync.v1` schemas and all wire protocols are unchanged.
+- The `runner` extra still pins `cryptography==45.0.7`. A source-free test installs the candidate
+  wheel with that extra and runs the synthetic vulnerable and hardened reference cases. This is
+  packaging evidence only, not runner pairing, serving, HTTP or hosted-findings evidence.
 
 ## [1.2.0]: 2026-08-04
 
