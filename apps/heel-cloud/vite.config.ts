@@ -20,6 +20,8 @@ export default defineConfig(async ({ command }) => {
   const deployment = deploymentConfig(process.env, command);
   const localBindingConfig = {
     main: "./worker/index.ts",
+    // Pin the Workers runtime date; the plugin's default moves with each release.
+    compatibility_date: "2026-08-20",
     compatibility_flags: ["nodejs_compat"],
     observability: { enabled: false },
     ...deployment,
@@ -29,6 +31,8 @@ export default defineConfig(async ({ command }) => {
     server: isCodexSeatbeltSandbox
       ? { watch: { useFsEvents: false, usePolling: true } }
       : undefined,
+    // Never emit or upload source maps; newer plugins default Worker maps on.
+    build: { sourcemap: false },
     plugins: [
       vinext(),
       sites(),
