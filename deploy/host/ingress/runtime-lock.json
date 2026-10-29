@@ -110,11 +110,11 @@
       },
       {
         "name": "cryptography",
-        "version": "45.0.7",
-        "file": "cryptography-45.0.7-cp311-abi3-manylinux_2_34_x86_64.whl",
-        "url": "https://files.pythonhosted.org/packages/0e/e4/b3e68a4ac363406a56cf7b741eeb80d05284d8c60ee1a55cdc7587e2a553/cryptography-45.0.7-cp311-abi3-manylinux_2_34_x86_64.whl",
-        "sha256": "b6a0e535baec27b528cb07a119f321ac024592388c5681a5ced167ae98e9fff3",
-        "bytes": 4460397
+        "version": "50.0.1",
+        "file": "cryptography-50.0.1-cp311-abi3-manylinux_2_34_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/85/66/6ccca4722987ddedaa7fc9c3f4708af7431f5535666c174350830888c6b7/cryptography-50.0.1-cp311-abi3-manylinux_2_34_x86_64.whl",
+        "sha256": "51afcfceb15597cf2635068e4ac9a56b2abde622edde17f37d85fd7b5306497a",
+        "bytes": 4746230
       },
       {
         "name": "dnspython",

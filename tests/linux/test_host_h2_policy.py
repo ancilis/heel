@@ -127,8 +127,10 @@ FAULT_TRIGGERS = ("_install", "_drive")  # the H2-1 functions whose clock() call
 # The recorded parent .github/workflows/codeql.yml at 4bce951 (analyze + four proof jobs, fixed values
 # so the staged copy checks them without git history), and the one job this unit appends.
 
+# Dependency refresh: the recorded prefix includes reviewed Action-pin upgrades;
+# hosted-proof job bytes and all mutation checks remain unchanged.
 BASE_WORKFLOW_BYTES = 7249
-BASE_WORKFLOW_SHA256 = "02d44aaca33da7c3a09ee4cd3fcc085c37ce8d7f2e1e8637cd0b6c75cd6db8fc"
+BASE_WORKFLOW_SHA256 = "191161826253623c1d971b64b26ebbac29e857f2897653e30948af4d8cda44d4"
 EXPECTED_JOBS = ["analyze", "host-ingress-proof", "host-lease-feasibility", "host-authority-proof", "host-lease-key-shape",
                  "host-h2-policy-proof"]
 H2_POLICY_GATE = ("if: github.event_name == 'workflow_dispatch' && "

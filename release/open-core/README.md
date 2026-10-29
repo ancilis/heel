@@ -41,6 +41,9 @@ exposing a local service.
 
 ## Synthetic export entitlement validation
 
+This candidate pins `cryptography==50.0.1` for the optional runner. Its prebuilt macOS wheels
+require Apple silicon; Intel macOS is not supported by this runner candidate.
+
 In the same shell, first set `HEEL_HOME` to an absolute physical path in which no component is a symbolic link, for example `export HEEL_HOME="$(pwd -P)/.heel"` from a private working directory; `pwd -P` prints that physical path and plain `$PWD` may not. Use that same physical `HEEL_HOME` from the first command for `heel scope create` and every `heel reference` command. On macOS, `/tmp` and `/var` are symbolic links to `/private/tmp` and `/private/var`. `heel scope create` does not check the storage path and can succeed with a `HEEL_HOME` built from a `$PWD` under `/tmp`, `/var` or `$TMPDIR`; that success does not show the path is safe. `heel reference run` opens the private runner and reference storage without following symbolic links, on purpose, and refuses that `HEEL_HOME` with the generic rejection message. Do not disable or work around that check.
 
 The supplied wheel supports `heel reference prepare` and `heel reference run`. Install the runner extra with `python -m pip install './heel_sim-1.3.0rc2-py3-none-any.whl[runner]'` (Python 3.11 or newer; it adds the pinned `cryptography` dependency). Then run `heel scope create --target reference:export --operator "your name" --confirm` outside MCP. Use its returned scope ID:

@@ -91,8 +91,10 @@ SO_MARK = getattr(socket, "SO_MARK", 36)
 # The recorded parent .github/workflows/codeql.yml at bd21978 (analyze + three proof jobs, fixed
 # values so the staged copy checks them without git history), and the one job this unit appends.
 
+# Dependency refresh: the recorded prefix includes reviewed Action-pin upgrades;
+# hosted-proof job bytes and all mutation checks remain unchanged.
 PRIOR_WORKFLOW_BYTES = 5598
-PRIOR_WORKFLOW_SHA256 = "f30734710ad81081cd45bf428f85a263c88bd1c3fe5e598491a0b1534318964f"
+PRIOR_WORKFLOW_SHA256 = "95650c11471e8d55a4b8e0a86e96c4b673877511066c3f062bf1b5d299cb116e"
 # H2-2 appends one later job after this unit's; it is bound here by its fixed bytes and hash only (its
 # own module, tests/linux/test_host_h2_policy.py, constrains every line of it).
 H2_POLICY_JOB_BYTES = 1652

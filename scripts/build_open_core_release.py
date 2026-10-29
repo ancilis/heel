@@ -81,7 +81,7 @@ EXPECTED_CONSOLE_SCRIPTS = {
     "heel-mcp": "heel.mcp_server:main",
     "heel-rest": "heel.rest:serve",
 }
-EXPECTED_OPTIONAL_DEPENDENCIES = {"runner": ["cryptography==45.0.7"]}
+EXPECTED_OPTIONAL_DEPENDENCIES = {"runner": ["cryptography==50.0.1"]}
 FORBIDDEN_PREFIXES = (
     "apps/",
     "deploy/",
@@ -107,7 +107,7 @@ METADATA = (
     "License-File: LICENSE\n"
     "License-File: NOTICE\n"
     "Provides-Extra: runner\n"
-    "Requires-Dist: cryptography==45.0.7; extra == \"runner\"\n"
+    "Requires-Dist: cryptography==50.0.1; extra == \"runner\"\n"
     "\n"
 ).encode("utf-8")
 WHEEL_METADATA = (

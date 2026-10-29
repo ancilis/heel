@@ -29,7 +29,7 @@ heel-mcp = "heel.mcp_server:main"
 heel-rest = "heel.rest:serve"
 
 [project.optional-dependencies]
-runner = ["cryptography==45.0.7"]
+runner = ["cryptography==50.0.1"]
 
 [tool.setuptools]
 include-package-data = false

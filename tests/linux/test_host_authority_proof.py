@@ -92,10 +92,12 @@ SO_PEERCRED = getattr(socket, "SO_PEERCRED", 17)
 # The recorded base of .github/workflows/codeql.yml at 1d2ae3d (fixed values, so a shallow checkout
 # or the staged copy checks them without git history), and the one job this unit appends.
 
+# Dependency refresh: the recorded prefix includes reviewed Action-pin upgrades;
+# hosted-proof job bytes and all mutation checks remain unchanged.
 BASELINE_WORKFLOW_BYTES = 2309
-BASELINE_WORKFLOW_SHA256 = "d56b36ee5e4deaa48b4c074f7456b940be6730ce7bc44ea3ac3cfc2168c906a6"
+BASELINE_WORKFLOW_SHA256 = "0d2efed30d9985a93ffc21fc5b2cda0843d2cb46f3267cccabc2156f330d706e"
 BASELINE_JOB_SHA256 = {
-    "analyze": "3843172453a5a965f41b878766af9b2bb313efa5ac41221bb9d47284925e3a13",
+    "analyze": "2ae70cbd1c7bd1483b4e4a0534ecec3ebd97cbe6ac529d65ae17483c17666e99",
     "host-ingress-proof": "6c5f0f58d512a5e43df1648594b9d324aa88b561d95d3fa307901df63b296b70",
     "host-lease-feasibility": "dc1653f586afaf5f86f473866be32d4d1f51426af271c56308ae26198f2bd0c5",
 }
