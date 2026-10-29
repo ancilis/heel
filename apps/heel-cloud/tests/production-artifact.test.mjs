@@ -3,9 +3,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { closeSync, constants as fsConstants, fstatSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
-import { cp, lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, extname, join, relative } from "node:path";
+import { basename, dirname, extname, join, relative } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
@@ -431,6 +431,15 @@ function decodeUtf8(payload, label) {
 }
 
 
+function decodeOptionalUtf8(payload) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(payload);
+  } catch {
+    return null;
+  }
+}
+
+
 function assertSafeArchivePath(name, label) {
   assert.ok(name && !name.startsWith("/") && !name.includes("\\"), `${label} has an unsafe path`);
   assert.equal(name.includes("\0"), false, `${label} contains NUL`);
@@ -782,18 +791,21 @@ function classifyReleaseMembers(records, { label, rootPrefix = "" }) {
 }
 
 
-async function deploymentInventory() {
-  const files = await filesUnder(distRoot);
+async function deploymentInventory(root = distRoot) {
+  const files = await filesUnder(root);
   const records = await Promise.all(files.map(async (path) => {
-    const artifactPath = relative(distRoot, path).replaceAll("\\", "/");
+    const artifactPath = relative(root, path).replaceAll("\\", "/");
     const extension = extname(path).toLowerCase();
     const payload = await readFile(path);
+    const text = scannedTextExtensions.has(extension) ? decodeUtf8(payload, artifactPath) : null;
     return {
       artifactPath,
       extension,
       path,
       payload,
-      text: scannedTextExtensions.has(extension) ? decodeUtf8(payload, artifactPath) : null,
+      text,
+      // Other suffixes stay unscanned; when they decode as UTF-8 they are still checked for source maps.
+      unclassifiedText: text === null ? decodeOptionalUtf8(payload) : null,
     };
   }));
   return { files, records };
@@ -877,22 +889,41 @@ function approvedWorkerConfigFixture() {
 }
 
 
+// Source Map v3: a regular map lists sources with mappings or embedded sourcesContent; an index map
+// places sections at offsets, each embedding a map or naming one by url.
+function isSourceMapValue(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (Array.isArray(value.sources) && (typeof value.mappings === "string" || Array.isArray(value.sourcesContent))) {
+    return true;
+  }
+  return Array.isArray(value.sections) && value.sections.some((section) =>
+    Boolean(section?.offset) && typeof section.offset === "object"
+    && (isSourceMapValue(section.map) || typeof section.url === "string"));
+}
+
+
 function isSourceMapDocument(text) {
+  // A map may begin with the )]}' line that consumers strip before parsing.
+  const body = text.startsWith(")]}'") ? text.slice(text.indexOf("\n") + 1) : text;
+  if (!body.trimStart().startsWith("{")) return false;
+  let value;
   try {
-    const value = JSON.parse(text);
-    return Boolean(value) && typeof value === "object" && typeof value.mappings === "string" && Array.isArray(value.sources);
+    value = JSON.parse(body);
   } catch {
     return false;
   }
+  // Outside the try: a structure too deep to inspect fails the guard instead of passing as "not a map".
+  return isSourceMapValue(value);
 }
 
 
 function assertNoSourceMaps(records) {
-  for (const { artifactPath, extension, text } of records) {
+  for (const { artifactPath, text, unclassifiedText } of records) {
     assert.notEqual(extname(artifactPath).toLowerCase(), ".map", `source map shipped: ${artifactPath}`);
-    if (text === null) continue;
-    assert.doesNotMatch(text, sourceMapDirective, artifactPath);
-    if (extension === ".json") assert.equal(isSourceMapDocument(text), false, `source map document shipped: ${artifactPath}`);
+    const decoded = text ?? unclassifiedText;
+    if (decoded === null || decoded === undefined) continue;
+    assert.doesNotMatch(decoded, sourceMapDirective, artifactPath);
+    assert.equal(isSourceMapDocument(decoded), false, `source map document shipped: ${artifactPath}`);
   }
 }
 
@@ -1671,6 +1702,71 @@ test("source map guard rejects map files, directives, and map documents anywhere
   ]) {
     assert.throws(() => assertNoSourceMaps([...clean, hostile]), assert.AssertionError, label);
   }
+});
+
+
+test("deployment inventory rejects source map documents under any name or suffix", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "heel-map-inventory-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const map = {
+    version: 3,
+    sources: ["worker/index.ts"],
+    sourcesContent: ["export const privateSource = 1;"],
+    names: [],
+    mappings: "AAAA",
+  };
+  const indexed = (entry) => JSON.stringify({ version: 3, sections: [{ offset: { line: 0, column: 0 }, ...entry }] });
+  const clean = [
+    ["client/assets/app-A1.js", "export const app = 1;\n"],
+    ["server/wrangler.json", JSON.stringify({ main: "index.js" })],
+    ["server/BUILD_ID", "build-1\n"],
+    ["client/_headers", "/*\n  X-Content-Type-Options: nosniff\n"],
+    ["client/notes.json", JSON.stringify({ version: 3, sources: ["a.py", "b.py"] })],
+    ["client/outline.json", JSON.stringify({ version: 3, sections: [{ title: "Intro", offset: 12 }, { offset: { line: 1 } }] })],
+    ["client/glossary.txt", JSON.stringify({ mappings: 1, sources: "none", note: "mappings, sources and sections" })],
+    ["client/readme", "mappings sources sections sourcesContent\n"],
+    ["client/og.png", Buffer.concat([Buffer.from("\x89PNG\r\n\x1a\n", "latin1"), Buffer.alloc(64, 0xff)])],
+  ];
+  async function inventoryWith(entries) {
+    await rm(root, { recursive: true, force: true });
+    for (const [path, contents] of entries) {
+      await mkdir(join(root, dirname(path)), { recursive: true });
+      await writeFile(join(root, path), contents);
+    }
+    return (await deploymentInventory(root)).records;
+  }
+
+  assertNoSourceMaps(await inventoryWith(clean));
+  const accepted = [];
+  for (const [path, contents] of [
+    ["client/review-map.json", JSON.stringify(map)],
+    ["client/review-map.txt", JSON.stringify(map)],
+    ["client/review-map", JSON.stringify(map)],
+    ["client/assets/review-map.dat", JSON.stringify(map)],
+    ["server/ssr/review-map.js", JSON.stringify(map)],
+    ["client/review-guarded.txt", `)]}'\n${JSON.stringify(map)}`],
+    ["client/review-sources.json", JSON.stringify({ version: 3, sources: map.sources, sourcesContent: map.sourcesContent })],
+    ["client/review-indexed.json", indexed({ map })],
+    ["client/review-indexed.txt", indexed({ map })],
+    ["client/review-indexed-url.json", indexed({ url: "private.js.map" })],
+    ["client/review-nested", indexed({ map: JSON.parse(indexed({ map })) })],
+  ]) {
+    const records = await inventoryWith([...clean, [path, contents]]);
+    try {
+      assertNoSourceMaps(records);
+      accepted.push(path);
+    } catch (error) {
+      assert.equal(error.message.split("\n")[0], `source map document shipped: ${path}`);
+    }
+  }
+  const directive = await inventoryWith([...clean, ["client/review-loader", "export {};\n//# sourceMappingURL=app.js.map\n"]]);
+  try {
+    assertNoSourceMaps(directive);
+    accepted.push("client/review-loader");
+  } catch (error) {
+    assert.equal(error.message, "client/review-loader");
+  }
+  assert.deepEqual(accepted, [], "source map documents accepted by the deployment inventory");
 });
 
 
