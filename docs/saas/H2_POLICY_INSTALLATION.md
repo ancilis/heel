@@ -5,7 +5,11 @@ enablement and no launch claim. **H2 remains HOLD** until a fresh Fable source r
 the separate H2-2 isolated Linux proof and its runtime review. This change adds
 no `Enablement` member, no customer mode, no environment variable, flag or entry point, no daemon or
 runner wiring, no controller/worker protocol change and no production bypass. Contract: H2-POLICY-FABLE-REFRESH
-`DECISION.md` revision 5, sections 4 and 6.1, with Astra's design disposition.
+`DECISION.md` revision 5, sections 4 and 6.1, with Astra's design disposition, amended by **H2-3**
+(accepted H3 composition design `b168458c`, section 8.1): one fixed control accept and the
+`control_only` shape (below). H2-3 is a source candidate too: it needs a fresh Fable source review,
+a fresh closed-set digest and a reviewed Linux run of the existing H2-2 job on its own bytes; no
+earlier runtime evidence covers it.
 
 `deploy/host/h2_policy.py` is the policy builder, installer and readback oracle the future H3
 bootstrap worker calls after H2-A hands it one generation namespace descriptor. It loads
@@ -25,20 +29,25 @@ A frozen, slotted, keyword-only local worker type, not a wire schema. Constructi
 | `slot_hop_src`, `slot_hop_dst` | request (= the H1 lease-key `src`/`dst`) | canonical dotted IPv4, distinct |
 | `bootstrap_fence` | request | `[0-9a-f]{32}` |
 | `egress_hostname`, `egress_port` | the validated `CycleContext` | lowercase hostname characters; port exactly 443 |
-| `observed_public_addresses` | trusted constructor (H3) | canonical shape only, below |
-| `ipv4_egress_targets` | derived: the IPv4 members | never passed in; empty means IPv6-only |
+| `observed_public_addresses` | trusted constructor (H3) | canonical shape only, below; `()` iff `control_only` |
+| `control_only` | the H3 worker's `pin` (H2-3), keyword-only, default `False` | exactly a `bool` (`control_only_invalid`) |
+| `ipv4_egress_targets` | derived: the IPv4 members | never passed in; empty means IPv6-only, or the control-only shape |
 
 **Trust precondition (H3, trusted constructor):** `observed_public_addresses` is the tuple the unchanged `select_public_addresses` returned for the preflight of the validated `egress_hostname`, unmodified.
 
 The builder enforces shape only: every element is an `IPv4Address` or `IPv6Address`, the tuple is
-strictly increasing by `(version, packed)` (no duplicates), and 1 to 16 long. It performs no DNS or
+strictly increasing by `(version, packed)` (no duplicates), and 1 to 16 long; under `control_only`
+it is exactly the empty tuple. The two are a biconditional: `()` without `control_only` and
+`control_only=True` with any non-empty tuple (IPv4, dual-stack or IPv6-only) are both
+`observed_public_addresses_invalid`; an IPv6-only tuple without `control_only` stays
+`unsupported_ipv6_only` at render and install. It performs no DNS or
 network request, imports no resolver and never judges public-ness; a sorted private tuple passes the
 shape check, and only the precondition above keeps it out. Route, method, budget, scope expiry,
 claim, bundle, nonce, path, PID and controller capability are not fields.
 
 ## Policy shape
 
-One table, three rules, one accept, both key uses carrying the typed gateway of the slot's `dst`:
+One table, four rules, two accepts, both key uses carrying the typed gateway of the slot's `dst`:
 
 ```
 table inet heel_lease {
@@ -48,6 +57,7 @@ table inet heel_lease {
     type filter hook output priority 0 ; policy drop ;
     meta mark set 0
     meta mark set ip saddr . (ip daddr & 0.0.0.0 | <slot_hop_dst>) map @activated
+    ip saddr <slot_hop_src> ip daddr <slot_hop_dst> tcp dport 443 accept
     ip saddr . (ip daddr & 0.0.0.0 | <slot_hop_dst>) . meta mark @prepared ip daddr { <sorted IPv4 targets> } tcp dport 443 accept
   }
 }
@@ -55,8 +65,21 @@ table inet heel_lease {
 
 The target set is compile-time data from the validated input. H1 alone writes `prepared` and
 `activated` elements through `LeaseDomain`'s public API; this module writes none. No NAT, redirect,
-forward or input chain, second table or chain, second accept, dynamic set mutation, IPv6 accept or
-`ip6` rule. IPv6 drops by the chain policy, which is not an IPv6 coverage claim.
+forward or input chain, second table or chain, accept other than these two, dynamic set mutation,
+IPv6 accept or `ip6` rule. IPv6 drops by the chain policy, which is not an IPv6 coverage claim.
+
+**H2-3 control accept.** Immediately before the target accept, one rule admits the slot source to
+the slot gateway itself on TCP 443 (the per-slot runner control listener the executor's control
+transport dials). It has no mark condition, no set or map reference and no lease: one fixed source,
+one fixed destination (`slot_hop_dst`, the same literal as the typed-gateway key) and one port. It is
+not generic or wildcard forwarding: nothing else is admitted to the gateway (another port, UDP,
+another source, IPv6), and the target accept, the typed gateway key, the single table and the exact
+readback keep their semantics. The host-side INPUT restriction to that gateway and port is H6's.
+
+**H2-3 control-only shape (`control_only`).** A binding generation, whose origin is not yet known,
+installs the same table without the target accept: three rules, one accept (the control accept).
+`render_table`, `install()` and the readback accept an empty IPv4 target set only under
+`control_only`.
 
 ## Dual stack
 
@@ -112,11 +135,15 @@ Failure states (fixed tokens, never nft text or addresses): `refused_input`, `re
   anything else `quarantined`. Before an install was launched, nothing is cleaned. An unreaped child
   is `quarantined` and counted by `unresolved_helpers()`.
 - The readback is exact for the named table only: metainfo, the table, the empty typed `prepared`
-  set and `activated` map, the output/drop chain and exactly the three rules, the typed gateway
-  readback `(ip daddr & dst) | int(dst)` in both keys, exactly the input's IPv4 targets and TCP 443.
-  Handles are ignored; the enumerated alternative encodings are a `timeout` flag as a string or list,
-  a mark of 0 as an integer or `0x00000000`, `==` or `in` for the two set lookups, and one target as a
-  bare string or a one-member set. Anything else is `readback_mismatch`. Whether the namespace holds
+  set and `activated` map, the output/drop chain and exactly the rules in the order reset, lookup,
+  control, admit (eight items after the metainfo; seven, the admit absent, iff `control_only`), the
+  typed gateway readback `(ip daddr & dst) | int(dst)` in both keys, the control rule's `expr` exactly
+  `[ip saddr == src, ip daddr == dst, tcp dport == 443, accept]` (no `meta`, no set reference, `dst`
+  byte-equal to the key's literal), exactly the input's IPv4 targets and TCP 443. The readback part
+  tokens gain `control_rule` between `lookup_rule` and `admit_rule`. Handles are ignored; the
+  enumerated alternative encodings are a `timeout` flag as a string or list, a mark of 0 as an
+  integer or `0x00000000`, `==` or `in` for the two set lookups and the control source, and one
+  target as a bare string or a one-member set. Anything else is `readback_mismatch`. Whether the namespace holds
   other tables is an H2-2 fixture check (`nft -j list ruleset`), not a product claim. The exact nft
   1.0.9 listing is confirmed only by H2-2.
 - `Outcome(state, receipt, tokens)` is frozen and sealed: constructing it outside the module raises

@@ -10,6 +10,13 @@ Design: `H2-POLICY-FABLE-REFRESH/DECISION.md` revision 5, section 6.2 (items E a
 installer contract of `docs/saas/H2_POLICY_INSTALLATION.md` (H2-1, accepted as source at
 `7dcad343` + `4bce9513`; this unit changes none of it).
 
+**H2-3 amendment** (accepted H3 composition design `b168458c`, section 8.1): the installer gains the
+fixed control accept (slot source → slot gateway, TCP 443, no mark or set) and the `control_only`
+shape. The same job and launcher re-prove it on the H2-3 candidate's own bytes: the pinned H2 source
+hash changes, so the staged closure digest is new and no earlier run (cycles 1-3) covers this code.
+The case names and the record table are unchanged; P1, P2 and P5 gain the gateway and control-only
+records described below. Until that run is reviewed, everything H2-3 adds is **UNRUN**.
+
 ## Question
 
 Does the real, unmodified H2-1 `install(fd, input)` (the real `Popen` helper, the real `setns` into a
@@ -79,15 +86,17 @@ allow-listed artifacts only (`summary.json`, `cases.jsonl`, `versions.txt`, `cle
 - Peer namespace R: `unshare` on a fixture thread, held only by descriptor; one veth by raw rtnetlink
   with `IFLA_NET_NS_FD` (a dup the fixture closes). No namespace path, name, PID lookup or host
   namespace execution; no default route, uplink or DNS in either namespace.
-- Addresses: the slot hop `198.51.100.20` → logical gateway `192.0.2.1` (documentation addresses, as
-  H2K1); Astra's recorded public pick (FIXTURE-LITERALS.json) — targets `8.8.4.4`/`8.8.8.8`,
+- Addresses: the slot hop `198.51.100.20` → gateway `192.0.2.1` (documentation addresses, as
+  H2K1). H2-3: R holds the gateway address (and the ULA `fd48:4b31::1` as its IPv6 twin) with fixed
+  listeners on `192.0.2.1` TCP 443, TCP 8443, UDP 443 and `[fd48:4b31::1]` TCP 443, and L routes to them
+  from the slot source; Astra's recorded public pick (FIXTURE-LITERALS.json) — targets `8.8.4.4`/`8.8.8.8`,
   unapproved `1.1.1.1`, wrong source `9.9.9.9`, dual-stack AAAA `2001:4860:4860::8888` — assigned only
   inside L/R, never contacted outside them. L's IPv6 source is ULA `fd48:4b31::20`.
 - Input: every admitting case installs the canonical dual-stack tuple
   `select_public_addresses([8.8.4.4, 8.8.8.8, 2001:4860:4860::8888])` (the trusted-constructor
   precondition); the kernel allow-list is the two IPv4 members, the AAAA stays in the tuple.
 - Whole-namespace check vs product readback: `nft -j list ruleset` in L must hold exactly one
-  `inet heel_lease` table of seven objects (a fixture assertion), and, separately, the product's
+  `inet heel_lease` table of eight objects, seven for the H2-3 control-only shape (a fixture assertion), and, separately, the product's
   `readback_matches` must accept `nft -j list table inet heel_lease` (the narrower product claim).
 - P4's TLS origin: listeners on both IPv4 targets and the AAAA in R using the harness's
   `EphemeralCA` leaf for `h2-policy-proof.example.com` and its `raw_json_response`. The harness's
@@ -108,10 +117,15 @@ allow-listed artifacts only (`summary.json`, `cases.jsonl`, `versions.txt`, `cle
   and H2-2 forbids itself any assignment, deletion or private read of an H2 name instead.
 - **P1** real install → exact receipt (the H2-A canonical document), whole ruleset exactly one table,
   product readback exact; then H1 `prepare`/`activate` admits only the two pinned targets on TCP 443
-  while live, nothing after the bound, and interleaved unapproved/8443 probes stay closed.
+  while live, nothing after the bound, and interleaved unapproved/8443 probes stay closed. H2-3: the
+  slot source reaches the gateway on TCP 443 without any key (before `prepare`), while the key is
+  live and after its bound, every probe admitted and delivered.
 - **P2** with every listener reachable before the table: the table alone and a prepared-only key
   admit nothing; with a live key the wrong source, the unapproved target, port 8443, UDP 443 and IPv6
   are denied while the controls admit; after `H2.cleanup` every kind reaches its listener again.
+  H2-3 gateway cases (the existing `wrong_port`/`udp` kinds target a TLS peer, not the gateway): the
+  slot source → gateway TCP 443 is admitted with and without a key, while wrong source → gateway 443,
+  gateway TCP 8443, gateway UDP 443 and gateway IPv6 are denied without a key and under the live key.
 - **P3** a short key admits while live and no fresh connection after the conservative bound; an
   expired key activated late revives nothing; a fresh key admits and closing it denies again.
 - **P4** (mandatory) the unchanged client: succeeds before any table (topology control); with the
@@ -122,7 +136,10 @@ allow-listed artifacts only (`summary.json`, `cases.jsonl`, `versions.txt`, `cle
   member (`dns_changed`) and a private or loopback member (`unsafe_dns`) without connecting; resolves
   once per attempt; is denied again after the key is closed.
 - **P5** an IPv6-only tuple returns `unsupported_ipv6_only` with no receipt and no helper, the ruleset
-  stays empty, and the H1 `prepare` is refused without a table.
+  stays empty, and the H1 `prepare` is refused without a table. H2-3 control-only shape in the same
+  namespace: `control_only` with the empty tuple installs with an exact receipt, the whole ruleset is
+  one table of seven objects with no target rule, the product readback is exact, the gateway TCP 443 is
+  admitted and both targets are denied without a key and under a live key; `H2.cleanup` empties it.
 - **P6** faults never receipt. **FAULT-INJECTION** (the one labelled seam, `LAUNCHER.SEAMS`): (a) an
   input naming another namespace → `identity_mismatch`, nothing installed; (b) a pre-seeded
   conflicting chain → the real readback differs → `cleaned`, ruleset empty; (c) the public `clock`

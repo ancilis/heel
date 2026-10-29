@@ -53,8 +53,8 @@ DESIGN_STAGE_FILES = (
     "docs/saas/H2_POLICY_INSTALLATION.md",
 )
 UNCHANGED_SHA256 = {
-    "deploy/host/h2_policy.py": "0bd7d171fdb69e10d58d4422ef45ee16e57ad7319e77b90e518a70a2a38f0a8a",
-    "docs/saas/H2_POLICY_INSTALLATION.md": "7808c5a6c5bab429c562dfe29f6e9dd3732cf16f9ce383bee83bf72c7b70bf29",
+    "deploy/host/h2_policy.py": "2511dae4352bbf2006fb638164375da1d80a097a4bb6117dc7ea96328b5b4af6",
+    "docs/saas/H2_POLICY_INSTALLATION.md": "5253af83f800485822cd76a383fe99ffea2f53ad44cf215ad013b99396c20646",
     "deploy/host/authority.py": "4c9a1fc6078060c1fcea0a858be601c34a558517a25a7134ec8042134e6967a5",
     "deploy/host/profile.py": "e697da2bf90a5e5e3bdf80aac2c18c9a8ab53f9018a35f977de1c857915dab83",
     "deploy/host/cycle.py": "a991548afa98a3423e360eff634ae7251c2f31b2dffe1778c727616bf6ca0e64",

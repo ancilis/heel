@@ -7,7 +7,9 @@ Status: source candidate, component evidence only. No runtime verdict, no custom
 The future H3 bootstrap worker receives one generation namespace descriptor from the cycle (H2-A)
 and calls ``install(fd, input)``. The installer writes one named table (``authority.TABLE``) into
 that namespace: the chain clears the packet mark, looks it up by ``ip saddr . GATEWAY`` in the H1
-``activated`` map, and accepts only a live ``prepared`` element to a fixed IPv4 target on TCP 443.
+``activated`` map, accepts the slot source to the slot gateway itself on TCP 443 (H2-3, the fixed
+control path; no mark, set or lease), and accepts only a live ``prepared`` element to a fixed IPv4
+target on TCP 443. A binding generation (``control_only``, empty tuple) has no target accept.
 H1 alone writes elements, through its public API; this module never does. The receipt bytes exist
 only on the one transition ``readback_ok -> receipt_ready`` inside ``install()``.
 
@@ -128,6 +130,7 @@ class H2PolicyInput:
     egress_hostname: str
     egress_port: int
     observed_public_addresses: tuple
+    control_only: bool = False  # H2-3: a binding generation; True iff observed_public_addresses == ()
     ipv4_egress_targets: tuple = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
@@ -156,8 +159,13 @@ class H2PolicyInput:
             raise ValueError("egress_hostname_invalid")
         if type(self.egress_port) is not int or self.egress_port != EGRESS_PORT:
             raise ValueError("egress_port_invalid")
+        if type(self.control_only) is not bool:
+            raise ValueError("control_only_invalid")
         addresses = self.observed_public_addresses
-        if (type(addresses) is not tuple or not 1 <= len(addresses) <= MAX_ADDRESSES
+        if self.control_only:
+            if type(addresses) is not tuple or addresses:
+                raise ValueError("observed_public_addresses_invalid")
+        elif (type(addresses) is not tuple or not 1 <= len(addresses) <= MAX_ADDRESSES
                 or not all(type(a) in (ipaddress.IPv4Address, ipaddress.IPv6Address) for a in addresses)
                 or any((a.version, a.packed) >= (b.version, b.packed) for a, b in zip(addresses, addresses[1:]))):
             raise ValueError("observed_public_addresses_invalid")
@@ -177,15 +185,18 @@ def build_input(**fields) -> H2PolicyInput:
 # The table (section 4.2) and its exact readback (section 4.4).
 
 def render_table(policy: H2PolicyInput) -> bytes:
-    """One table, three rules, one accept; both key uses carry the typed gateway of the slot's dst."""
+    """One table, four rules, two accepts (three and one under ``control_only``); both key uses carry
+    the typed gateway of the slot's dst; the control accept names the slot hop itself, before the target accept."""
     if type(policy) is not H2PolicyInput:
         raise TypeError("input_invalid")
-    if not policy.ipv4_egress_targets:
+    if not policy.ipv4_egress_targets and not policy.control_only:
         raise ValueError("unsupported_ipv6_only")
     gateway = f"(ip daddr & 0.0.0.0 | {policy.slot_hop_dst})"
     targets = ", ".join(map(str, policy.ipv4_egress_targets))
     table, prepared, activated, gate = (_authority.TABLE, _authority.PREPARED_SET, _authority.ACTIVATED_MAP,
                                         _authority.GATE_CHAIN)
+    admit = ("" if policy.control_only else
+             f"    ip saddr . {gateway} . meta mark @{prepared} ip daddr {{ {targets} }} tcp dport {EGRESS_PORT} accept\n")
     text = (f"table inet {table} {{\n"
             f"  set {prepared} {{ type ipv4_addr . ipv4_addr . mark ; flags timeout ; }}\n"
             f"  map {activated} {{ type ipv4_addr . ipv4_addr : mark ; }}\n"
@@ -193,7 +204,8 @@ def render_table(policy: H2PolicyInput) -> bytes:
             "    type filter hook output priority 0 ; policy drop ;\n"
             "    meta mark set 0\n"
             f"    meta mark set ip saddr . {gateway} map @{activated}\n"
-            f"    ip saddr . {gateway} . meta mark @{prepared} ip daddr {{ {targets} }} tcp dport {EGRESS_PORT} accept\n"
+            f"    ip saddr {policy.slot_hop_src} ip daddr {policy.slot_hop_dst} tcp dport {EGRESS_PORT} accept\n"
+            f"{admit}"
             "  }\n"
             "}\n").encode("ascii")
     if len(text) > MAX_BATCH_BYTES:
@@ -206,7 +218,7 @@ _SADDR = {"payload": {"protocol": "ip", "field": "saddr"}}
 _DADDR = {"payload": {"protocol": "ip", "field": "daddr"}}
 _DPORT = {"payload": {"protocol": "tcp", "field": "dport"}}
 _READBACK_PARTS = ("document", "metainfo", "items", "table", "prepared_set", "activated_map", "chain", "reset_rule",
-                   "lookup_rule", "admit_rule")
+                   "lookup_rule", "control_rule", "admit_rule")
 
 
 def _same(value, expected) -> bool:
@@ -242,11 +254,13 @@ def _match(op_choices, left, right) -> list:
 
 def readback_matches(document: object, policy: H2PolicyInput) -> tuple[bool, dict[str, str]]:
     """The exact oracle over ``nft -j list table inet heel_lease`` for this input: the metainfo, the
-    table, the two H1 sets empty and typed, the output/drop chain and exactly the three rules, the
-    typed gateway in both keys, exactly the input's IPv4 targets and TCP 443. Only the named table is
-    judged. Enumerated encodings only (handles dropped; mark 0 as integer or 0x0 string; ``==`` or
-    ``in`` for the two set lookups as the H2K1 oracle; one target as a bare string or a one-member
-    set); anything else is a mismatch. Total: never raises."""
+    table, the two H1 sets empty and typed, the output/drop chain and exactly the rules in order reset,
+    lookup, control, admit (eight items; seven and no admit under ``control_only``), the typed gateway
+    in both keys, the control rule exactly ``ip saddr <src> ip daddr <dst> tcp dport 443 accept``,
+    exactly the input's IPv4 targets and TCP 443. Only the named table is judged. Enumerated encodings
+    only (handles dropped; mark 0 as integer or 0x0 string; ``==`` or ``in`` for the two set lookups
+    as the H2K1 oracle and for the control source; one target as a bare string or a one-member set);
+    anything else is a mismatch. Total: never raises."""
     try:
         return _readback(document, policy)
     except (TypeError, ValueError, KeyError, AttributeError, IndexError, RecursionError):
@@ -257,7 +271,7 @@ def _readback(document: object, policy: H2PolicyInput) -> tuple[bool, dict[str, 
     def miss(part: str) -> tuple[bool, dict[str, str]]:
         return False, {"readback": "mismatch", "part": part}
 
-    if type(policy) is not H2PolicyInput or not policy.ipv4_egress_targets:
+    if type(policy) is not H2PolicyInput or bool(policy.ipv4_egress_targets) == policy.control_only:
         return miss("document")
     if not isinstance(document, dict) or list(document) != ["nftables"] or not isinstance(document["nftables"], list):
         return miss("document")
@@ -266,7 +280,7 @@ def _readback(document: object, policy: H2PolicyInput) -> tuple[bool, dict[str, 
     if not isinstance(meta, dict) or not _same(meta.get("json_schema_version"), 1):
         return miss("metainfo")
     items = items[1:]
-    if len(items) != 7:
+    if len(items) != (7 if policy.control_only else 8):
         return miss("items")
     table, gate = _authority.TABLE, _authority.GATE_CHAIN
     if not _same(_body(items[0], "table"), {"family": "inet", "name": table}):
@@ -287,7 +301,7 @@ def _readback(document: object, policy: H2PolicyInput) -> tuple[bool, dict[str, 
                and _same([rule["family"], rule["table"], rule["chain"]], ["inet", table, gate])
                and isinstance(rule["expr"], list) for rule in rules):
         return miss("items")
-    reset, lookup, admit = (rule["expr"] for rule in rules)
+    reset, lookup, control, *admit = (rule["expr"] for rule in rules)
     if not _one_of(reset, [[{"mangle": {"key": _META_MARK, "value": value}}] for value in (0, "0x00000000")]):
         return miss("reset_rule")
     dst = policy.slot_hop_dst
@@ -295,6 +309,12 @@ def _readback(document: object, policy: H2PolicyInput) -> tuple[bool, dict[str, 
     if not _same(lookup, [{"mangle": {"key": _META_MARK, "value": {"map": {
             "key": {"concat": [_SADDR, gateway]}, "data": "@" + _authority.ACTIVATED_MAP}}}}]):
         return miss("lookup_rule")
+    if not _one_of(control, [[*_match((op,), _SADDR, policy.slot_hop_src), *_match(("==",), _DADDR, dst),
+                              *_match(("==",), _DPORT, EGRESS_PORT), {"accept": None}] for op in ("==", "in")]):
+        return miss("control_rule")
+    if policy.control_only:
+        return True, {"readback": "exact", "part": "none"}
+    admit, = admit
     targets = [str(address) for address in policy.ipv4_egress_targets]
     if len(admit) != 4 or not _same(admit[3], {"accept": None}):
         return miss("admit_rule")
@@ -519,7 +539,7 @@ def install(fd: int, policy: H2PolicyInput, *, clock=time.monotonic_ns) -> Outco
     start = clock()
     if type(policy) is not H2PolicyInput or type(fd) is not int or fd < 0:
         return _outcome("refused_input", phase="entry")
-    if not policy.ipv4_egress_targets:
+    if not policy.ipv4_egress_targets and not policy.control_only:
         return _outcome("unsupported_ipv6_only", phase="entry")
     if not _platform_ok():
         return _outcome("refused_platform", phase="entry")

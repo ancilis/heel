@@ -70,6 +70,7 @@ CTX = {
 _META = {"meta": {"key": "mark"}}
 _SADDR = {"payload": {"protocol": "ip", "field": "saddr"}}
 _DADDR = {"payload": {"protocol": "ip", "field": "daddr"}}
+_DPORT = {"payload": {"protocol": "tcp", "field": "dport"}}
 
 
 def addresses(*values: str) -> tuple:
@@ -84,9 +85,11 @@ def fields(identity=(1, 2), targets=TARGETS[1:3], **overrides) -> dict:
             "observed_public_addresses": addresses(*targets), **overrides}
 
 
-def synthetic_readback(dst: str, targets, *, flags=("timeout",), mark=0, op="==", bare_single=False, handles=True):
-    """Oracle unit input modelled on H2K1F1's ``_synthetic_readback`` plus the kernel handles and the
-    two empty H1 sets. Not a claim about what nft 1.0.9 prints; H2-2 parses the real listing."""
+def synthetic_readback(dst: str, targets, *, flags=("timeout",), mark=0, op="==", bare_single=False, handles=True,
+                       src=SLOT_SRC, control_op="==", control_only=False):
+    """Oracle unit input modelled on H2K1F1's ``_synthetic_readback`` plus the kernel handles, the
+    two empty H1 sets and the H2-3 control accept (no target accept when ``control_only``). Not a
+    claim about what nft 1.0.9 prints; H2-2 parses the real listing."""
     numbers = iter(range(1, 64))
 
     def item(kind: str, body: dict) -> dict:
@@ -95,7 +98,12 @@ def synthetic_readback(dst: str, targets, *, flags=("timeout",), mark=0, op="=="
     gateway = {"|": [{"&": [_DADDR, dst]}, int(ipaddress.IPv4Address(dst))]}
     pins = list(targets)[0] if bare_single else {"set": list(targets)}
     rule = {"family": "inet", "table": "heel_lease", "chain": "gate"}
-    return {"nftables": [
+    control = item("rule", {**rule, "expr": [
+        {"match": {"op": control_op, "left": _SADDR, "right": src}},
+        {"match": {"op": "==", "left": _DADDR, "right": dst}},
+        {"match": {"op": "==", "left": _DPORT, "right": 443}},
+        {"accept": None}]})
+    document = {"nftables": [
         {"metainfo": {"version": "1.0.9", "release_name": "Old Doc Yak #3", "json_schema_version": 1}},
         item("table", {"family": "inet", "name": "heel_lease"}),
         item("set", {"family": "inet", "name": "prepared", "table": "heel_lease",
@@ -107,12 +115,15 @@ def synthetic_readback(dst: str, targets, *, flags=("timeout",), mark=0, op="=="
         item("rule", {**rule, "expr": [{"mangle": {"key": _META, "value": mark}}]}),
         item("rule", {**rule, "expr": [{"mangle": {"key": _META, "value": {"map": {
             "key": {"concat": [_SADDR, gateway]}, "data": "@activated"}}}}]}),
-        item("rule", {**rule, "expr": [
+        control,
+    ]}
+    if not control_only:
+        document["nftables"].append(item("rule", {**rule, "expr": [
             {"match": {"op": op, "left": {"concat": [_SADDR, gateway, _META]}, "right": "@prepared"}},
             {"match": {"op": "==", "left": _DADDR, "right": pins}},
-            {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 443}},
-            {"accept": None}]}),
-    ]}
+            {"match": {"op": "==", "left": _DPORT, "right": 443}},
+            {"accept": None}]}))
+    return document
 
 
 class StepClock:
@@ -238,8 +249,9 @@ def launches(monkeypatch):
 
 def ready_input(identity, fake_nft: FakeNft, **overrides):
     policy = h2.build_input(**fields(identity=identity, **overrides))
-    if policy.ipv4_egress_targets:
-        fake_nft.set_readback(synthetic_readback(policy.slot_hop_dst, map(str, policy.ipv4_egress_targets)))
+    if policy.ipv4_egress_targets or policy.control_only:
+        fake_nft.set_readback(synthetic_readback(policy.slot_hop_dst, map(str, policy.ipv4_egress_targets),
+                                                 control_only=policy.control_only))
     return policy
 
 
@@ -357,7 +369,10 @@ def test_input_maps_only_real_generationbootstrap_and_cyclecontext_fields():
                             observed_public_addresses=selected)
     names = [f.name for f in dataclasses.fields(h2.H2PolicyInput)]
     from_bootstrap = [f.name for f in dataclasses.fields(cycle.GenerationBootstrap)]
-    assert names == [*from_bootstrap, "egress_hostname", "egress_port", "observed_public_addresses", "ipv4_egress_targets"]
+    assert names == [*from_bootstrap, "egress_hostname", "egress_port", "observed_public_addresses", "control_only",
+                     "ipv4_egress_targets"]  # control_only: the worker's pin (H2-3), never a cycle field
+    assert "control_only" not in {f.name for f in dataclasses.fields(cycle.CycleContext)} | set(from_bootstrap)
+    assert policy.control_only is False
     assert {"egress_hostname", "egress_port"} <= {f.name for f in dataclasses.fields(cycle.CycleContext)}
     assert [f.name for f in dataclasses.fields(h2.H2PolicyInput) if not f.init] == ["ipv4_egress_targets"]
     for name in from_bootstrap:
@@ -377,14 +392,17 @@ ONE_TARGET = (b"table inet heel_lease {\n"
               b"    type filter hook output priority 0 ; policy drop ;\n"
               b"    meta mark set 0\n"
               b"    meta mark set ip saddr . (ip daddr & 0.0.0.0 | 203.0.113.10) map @activated\n"
+              b"    ip saddr 198.51.100.10 ip daddr 203.0.113.10 tcp dport 443 accept\n"
               b"    ip saddr . (ip daddr & 0.0.0.0 | 203.0.113.10) . meta mark @prepared ip daddr { 8.8.8.8 } tcp dport 443 accept\n"
               b"  }\n"
               b"}\n")
-THREE_TARGETS = ONE_TARGET.replace(b"203.0.113.10", b"192.0.2.1").replace(
+THREE_TARGETS = ONE_TARGET.replace(b"203.0.113.10", b"192.0.2.1").replace(b"198.51.100.10", b"192.0.2.2").replace(
     b"{ 8.8.8.8 }", b"{ 1.1.1.1, 8.8.4.4, 8.8.8.8 }")
+# H2-3 binding generation: the same table without the target accept (control_only, empty tuple).
+CONTROL_ONLY = b"".join(line for line in ONE_TARGET.splitlines(keepends=True) if b"@prepared" not in line)
 
 
-def test_rendered_table_is_exactly_one_table_three_rules_one_accept_with_typed_gateway_in_both_keys():
+def test_rendered_table_is_exactly_one_table_four_rules_two_accepts_with_typed_gateway_in_both_keys():
     assert (authority.TABLE, authority.PREPARED_SET, authority.ACTIVATED_MAP, authority.GATE_CHAIN) == (
         "heel_lease", "prepared", "activated", "gate")
     one = h2.build_input(**fields(observed_public_addresses=addresses("8.8.8.8", DUAL_V6)))
@@ -396,8 +414,8 @@ def test_rendered_table_is_exactly_one_table_three_rules_one_accept_with_typed_g
     for policy in (one, three, h2.build_input(**fields(observed_public_addresses=addresses(*(f"8.8.8.{n}" for n in range(1, 17)))))):
         text = h2.render_table(policy).decode()
         gateway = f"(ip daddr & 0.0.0.0 | {policy.slot_hop_dst})"
-        assert text.count("table ") == 1 and text.count("chain ") == 1 and text.count("accept") == 1
-        assert text.count(gateway) == 2 and text.count(policy.slot_hop_dst) == 2 and policy.slot_hop_src not in text
+        assert text.count("table ") == 1 and text.count("chain ") == 1 and text.count("accept") == 2
+        assert text.count(gateway) == 2 and text.count(policy.slot_hop_dst) == 3 and text.count(policy.slot_hop_src) == 1
         assert text.count("meta mark set") == 2 and "policy drop" in text and "hook output" in text
         for forbidden in ("nat", "redirect", "masquerade", "tproxy", "forward", "hook input", "ip6", "add element",
                           "elements", "jump", "goto", "flush", "delete", "dup", "fwd"):
@@ -427,7 +445,7 @@ def test_readback_requires_exact_typed_gateway_targets_port_policy_and_nothing_e
         return copy
 
     def admit(items):
-        return items[7]["rule"]["expr"]
+        return items[8]["rule"]["expr"]
 
     def lookup_key(items):
         return items[6]["rule"]["expr"][0]["mangle"]["value"]["map"]["key"]["concat"]
@@ -484,14 +502,211 @@ def test_readback_requires_exact_typed_gateway_targets_port_policy_and_nothing_e
     other_dst = h2.build_input(**fields(slot_hop_dst="203.0.113.11", observed_public_addresses=policy.observed_public_addresses))
     assert not readback_ok(good, other_dst)
     for junk in (None, [], {}, {"nftables": None}, {"nftables": [None]}, {"nftables": [{"metainfo": {}}]}, "x", 3,
-                 {"nftables": [{"metainfo": {"json_schema_version": 1}}, *[{"rule": None}] * 7]},
+                 {"nftables": [{"metainfo": {"json_schema_version": 1}}, *[{"rule": None}] * 8]},
                  {"nftables": good["nftables"], "extra": 1}):
         assert h2.readback_matches(junk, policy)[0] is False
     deep = []
     for _ in range(100_000):
         deep = [deep]
-    assert h2.readback_matches({"nftables": [{"metainfo": {"json_schema_version": 1}}, *[{"rule": deep}] * 7]}, policy)[0] is False
+    assert h2.readback_matches({"nftables": [{"metainfo": {"json_schema_version": 1}}, *[{"rule": deep}] * 8]}, policy)[0] is False
     assert h2.readback_matches(good, fields())[0] is False
+
+
+# ---------------------------------------------------------------------------------------------
+# H2-3: the fixed control accept and the control-only shape (H3 design section 8.1).
+
+def _rule_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.startswith("    ") and not line.startswith("    type ")]
+
+
+def test_control_accept_is_rendered_before_the_target_accept_with_fixed_src_dst_port_and_no_mark():
+    for src, dst, observed in ((SLOT_SRC, SLOT_DST, addresses("8.8.8.8", DUAL_V6)),
+                               ("192.0.2.2", "192.0.2.1", addresses("8.8.8.8", "1.1.1.1", "8.8.4.4")),
+                               (SLOT_SRC, SLOT_DST, addresses(*(f"8.8.8.{n}" for n in range(1, 17))))):
+        policy = h2.build_input(**fields(slot_hop_src=src, slot_hop_dst=dst, observed_public_addresses=observed))
+        rules = _rule_lines(h2.render_table(policy).decode())
+        control = f"ip saddr {src} ip daddr {dst} tcp dport 443 accept"
+        assert len(rules) == 4 and rules[0] == "meta mark set 0" and rules[1].startswith("meta mark set ip saddr . (")
+        assert rules[2] == control and rules[3].endswith("tcp dport 443 accept") and "@prepared" in rules[3]
+        # Exactly ten tokens: one fixed source, one fixed destination (the slot gateway itself), TCP 443.
+        assert rules[2].split() == ["ip", "saddr", src, "ip", "daddr", dst, "tcp", "dport", "443", "accept"]
+        assert [rule for rule in rules if rule.endswith("accept")] == [control, rules[3]]
+        assert dst == f"{ipaddress.IPv4Address(dst)}" and rules[1].count(f"| {dst})") == 1 and rules[3].count(f"| {dst})") == 1
+    assert h2.render_table(h2.build_input(**fields(observed_public_addresses=addresses("8.8.8.8", DUAL_V6)))) == ONE_TARGET
+    # No mark, set, map, lease, wildcard, range, other protocol, interface or verdict in the control rule.
+    control_line = next(line for line in ONE_TARGET.decode().splitlines() if line.strip().startswith(f"ip saddr {SLOT_SRC}"))
+    for forbidden in ("mark", "@", "{", "}", "map", "&", "|", "-", "/", "*", "ct ", "iif", "oif", "meta", "udp", "ip6",
+                      "drop", "jump", "goto", "counter", "!=", "8443"):
+        assert forbidden not in control_line, forbidden
+
+
+def test_control_only_is_a_biconditional_with_the_empty_tuple_and_renders_no_target_accept():
+    field = {f.name: f for f in dataclasses.fields(h2.H2PolicyInput)}["control_only"]
+    assert field.default is False and field.kw_only and field.init
+    shape = h2.build_input(**fields(observed_public_addresses=(), control_only=True))
+    assert shape.control_only is True and shape.observed_public_addresses == () and shape.ipv4_egress_targets == ()
+    assert h2.build_input(**fields()).control_only is False
+    assert h2.build_input(**fields(control_only=False)).ipv4_egress_targets == addresses(*TARGETS[1:3])
+    for observed in (addresses("8.8.8.8"), addresses(DUAL_V6), addresses("8.8.8.8", DUAL_V6), [], None, ("8.8.8.8",)):
+        with pytest.raises(ValueError, match="observed_public_addresses_invalid"):
+            h2.build_input(**fields(observed_public_addresses=observed, control_only=True))
+    for flag in (False, None):
+        options = {} if flag is None else {"control_only": flag}
+        with pytest.raises(ValueError, match="observed_public_addresses_invalid"):
+            h2.build_input(**fields(observed_public_addresses=(), **options))
+    for bad in (1, 0, "true", None, (), [True]):
+        with pytest.raises(ValueError, match="control_only_invalid"):
+            h2.build_input(**fields(observed_public_addresses=(), control_only=bad))
+    with pytest.raises(ValueError):
+        dataclasses.replace(h2.build_input(**fields()), control_only=True)
+    with pytest.raises(ValueError):
+        dataclasses.replace(shape, control_only=False)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        shape.control_only = False
+    # IPv6-only without control_only stays unsupported; control_only never makes it supported.
+    ipv6_only = h2.build_input(**fields(observed_public_addresses=addresses(DUAL_V6)))
+    assert ipv6_only.control_only is False and ipv6_only.ipv4_egress_targets == ()
+    with pytest.raises(ValueError, match="unsupported_ipv6_only"):
+        h2.render_table(ipv6_only)
+    text = h2.render_table(shape)
+    assert text == CONTROL_ONLY
+    rules = _rule_lines(text.decode())
+    assert len(rules) == 3 and rules[2] == f"ip saddr {SLOT_SRC} ip daddr {SLOT_DST} tcp dport 443 accept"
+    assert text.count(b"accept") == 1 and b"@prepared" not in text and b"ip daddr {" not in text
+    assert b"set prepared { type ipv4_addr . ipv4_addr . mark ; flags timeout ; }" in text  # H1's sets stay declared
+    assert b"map @activated" in text and b"policy drop" in text
+
+
+def test_readback_requires_the_control_rule_exactly_and_refuses_another_address_port_source_or_meta():
+    policy = h2.build_input(**fields(observed_public_addresses=addresses("8.8.8.8", "8.8.4.4")))
+    shape = h2.build_input(**fields(observed_public_addresses=(), control_only=True))
+    good = synthetic_readback(SLOT_DST, ["8.8.8.8", "8.8.4.4"])
+    good_only = synthetic_readback(SLOT_DST, [], control_only=True)
+    assert len(good["nftables"]) == 1 + 8 and len(good_only["nftables"]) == 1 + 7
+    assert h2.readback_matches(good, policy) == (True, {"readback": "exact", "part": "none"})
+    assert h2.readback_matches(good_only, shape) == (True, {"readback": "exact", "part": "none"})
+    assert readback_ok(synthetic_readback(SLOT_DST, ["8.8.8.8", "8.8.4.4"], control_op="in"), policy)
+    assert readback_ok(synthetic_readback(SLOT_DST, [], control_op="in", control_only=True, handles=False), shape)
+    parts = h2._READBACK_PARTS
+    assert parts.index("lookup_rule") + 1 == parts.index("control_rule") == parts.index("admit_rule") - 1
+    # The two shapes never stand in for each other.
+    assert h2.readback_matches(good_only, policy) == (False, {"readback": "mismatch", "part": "items"})
+    assert h2.readback_matches(good, shape) == (False, {"readback": "mismatch", "part": "items"})
+
+    def mutated(change, document):
+        copy = json.loads(json.dumps(document))
+        change(copy["nftables"])
+        return copy
+
+    def control(items):
+        return items[7]["rule"]["expr"]
+
+    def match(index, key, value):
+        return lambda items: control(items)[index]["match"].__setitem__(key, value)
+
+    gateway = {"|": [{"&": [_DADDR, SLOT_DST]}, int(ipaddress.IPv4Address(SLOT_DST))]}
+    expr_changes = {
+        "other_source": match(0, "right", "198.51.100.11"),
+        "wrong_source_literal": match(0, "right", "9.9.9.9"),
+        "source_prefix": match(0, "right", {"prefix": {"addr": SLOT_SRC, "len": 24}}),
+        "source_set": match(0, "right", {"set": [SLOT_SRC]}),
+        "source_neq": match(0, "op", "!="),
+        "source_ip6": match(0, "left", {"payload": {"protocol": "ip6", "field": "saddr"}}),
+        "source_is_daddr": match(0, "left", _DADDR),
+        "other_destination": match(1, "right", "203.0.113.11"),
+        "destination_is_target": match(1, "right", "8.8.8.8"),
+        "destination_typed_gateway": match(1, "right", gateway),
+        "destination_set": match(1, "right", {"set": [SLOT_DST]}),
+        "destination_prefix": match(1, "right", {"prefix": {"addr": SLOT_DST, "len": 24}}),
+        "destination_in": match(1, "op", "in"),
+        "destination_is_saddr": match(1, "left", _SADDR),
+        "port_8443": match(2, "right", 8443),
+        "port_80": match(2, "right", 80),
+        "port_string": match(2, "right", "443"),
+        "port_bool": match(2, "right", True),
+        "port_float": match(2, "right", 443.0),
+        "port_range": match(2, "right", {"range": [443, 8443]}),
+        "port_set": match(2, "right", {"set": [443]}),
+        "port_neq": match(2, "op", "!="),
+        "port_udp": match(2, "left", {"payload": {"protocol": "udp", "field": "dport"}}),
+        "port_sport": match(2, "left", {"payload": {"protocol": "tcp", "field": "sport"}}),
+        "verdict_drop": lambda items: control(items).__setitem__(3, {"drop": None}),
+        "verdict_jump": lambda items: control(items).__setitem__(3, {"jump": {"target": "gate"}}),
+        "no_verdict": lambda items: control(items).pop(3),
+        "no_port": lambda items: control(items).pop(2),
+        "no_destination": lambda items: control(items).pop(1),
+        "no_source": lambda items: control(items).pop(0),
+        "meta_mark": lambda items: control(items).insert(0, {"match": {"op": "==", "left": _META, "right": 0}}),
+        "meta_l4proto": lambda items: control(items).insert(2, {"match": {"op": "==", "left": {"meta": {"key": "l4proto"}},
+                                                                          "right": "tcp"}}),
+        "prepared_reference": lambda items: control(items).insert(
+            0, {"match": {"op": "==", "left": {"concat": [_SADDR, gateway, _META]}, "right": "@prepared"}}),
+        "counter": lambda items: control(items).insert(3, {"counter": {"packets": 0, "bytes": 0}}),
+        "mark_set": lambda items: control(items).insert(3, {"mangle": {"key": _META, "value": 1}}),
+        "dnat": lambda items: control(items).insert(3, {"dnat": {"addr": "8.8.8.8"}}),
+        "iifname": lambda items: control(items).insert(0, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}},
+                                                                     "right": "lo"}}),
+        "duplicated_expr": lambda items: control(items).insert(1, dict(control(items)[0])),
+    }
+    order_changes = {
+        "control_after_admit": lambda items: items.__setitem__(slice(7, 9), [items[8], items[7]]),
+        "control_before_lookup": lambda items: items.__setitem__(slice(6, 8), [items[7], items[6]]),
+        "control_before_reset": lambda items: items.__setitem__(slice(5, 8), [items[7], items[5], items[6]]),
+        "control_missing": lambda items: items.pop(7),
+        "control_twice": lambda items: items.insert(7, json.loads(json.dumps(items[7]))),
+        "control_comment": lambda items: items[7]["rule"].__setitem__("comment", "x"),
+        "control_other_chain": lambda items: items[7]["rule"].__setitem__("chain", "other"),
+        "control_family_ip": lambda items: items[7]["rule"].__setitem__("family", "ip"),
+    }
+    for name, change in expr_changes.items():
+        for document, which in ((good, policy), (good_only, shape)):
+            assert h2.readback_matches(mutated(change, document), which) == (
+                False, {"readback": "mismatch", "part": "control_rule"}), name
+    for name, change in order_changes.items():
+        for document, which in ((good, policy), (good_only, shape))[:1 if name == "control_after_admit" else 2]:
+            ok, tokens = h2.readback_matches(mutated(change, document), which)
+            assert ok is False and tokens["readback"] == "mismatch" and tokens["part"] in parts, name
+    # The control rule of another slot hop, and an extra admit under control_only, are refused.
+    other_src = h2.build_input(**fields(slot_hop_src="198.51.100.11", observed_public_addresses=addresses("8.8.8.8", "8.8.4.4")))
+    assert h2.readback_matches(good, other_src) == (False, {"readback": "mismatch", "part": "control_rule"})
+    other_dst = h2.build_input(**fields(slot_hop_dst="203.0.113.11", observed_public_addresses=(), control_only=True))
+    assert h2.readback_matches(good_only, other_dst) == (False, {"readback": "mismatch", "part": "lookup_rule"})
+    extra_admit = mutated(lambda items: items.append(json.loads(json.dumps(good["nftables"][8]))), good_only)
+    assert h2.readback_matches(extra_admit, shape) == (False, {"readback": "mismatch", "part": "items"})
+    ipv6_only = h2.build_input(**fields(observed_public_addresses=addresses(DUAL_V6)))
+    for document in (good, good_only):
+        assert h2.readback_matches(document, ipv6_only) == (False, {"readback": "mismatch", "part": "document"})
+
+
+def test_install_and_readback_accept_an_empty_target_set_only_under_control_only(fake, stand_in, launches):
+    fd, identity = stand_in
+    nft = fake()
+    shape = ready_input(identity, nft, observed_public_addresses=(), control_only=True)
+    outcome = h2.install(fd, shape)
+    assert outcome.state == "receipt_ready" and dict(outcome.tokens) == {"phase": "none", "readback": "exact"}
+    assert outcome.receipt == codec.canonical(h2._receipt_document(shape))  # the receipt shape is unchanged
+    assert nft.calls() == ["check -c -f -", "install -f -", "readback -j list table inet heel_lease"]
+    assert nft.stdin_of("check") == nft.stdin_of("install") == h2.render_table(shape) == CONTROL_ONLY
+    assert h2.cleanup(fd, shape).state == "cleaned"
+    # IPv6-only (no control_only): refused at entry, nothing launched.
+    launches.calls.clear()
+    ipv6_only = h2.build_input(**fields(identity=identity, observed_public_addresses=addresses(DUAL_V6)))
+    refused = h2.install(fd, ipv6_only)
+    assert (refused.state, dict(refused.tokens), refused.receipt) == ("unsupported_ipv6_only", {"phase": "entry"}, None)
+    assert launches.calls == []
+    # A control-only install whose listing still carries a target accept is a mismatch and is removed.
+    stale = fake()
+    shape = ready_input(identity, stale, observed_public_addresses=(), control_only=True)
+    stale.set_readback(synthetic_readback(SLOT_DST, ["8.8.8.8"]))
+    mismatch = h2.install(fd, shape)
+    assert mismatch.state == "cleaned" and dict(mismatch.tokens) == {
+        "phase": "readback", "cause": "readback_mismatch", "cleanup": "cleaned", "readback": "items"}
+    assert "cleanup -f -" in stale.calls() and mismatch.receipt is None
+    # A target install whose listing is control-only is a mismatch too.
+    bare = fake()
+    policy = ready_input(identity, bare)
+    bare.set_readback(synthetic_readback(SLOT_DST, [], control_only=True))
+    assert dict(h2.install(fd, policy).tokens)["readback"] == "items"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1225,7 +1440,10 @@ def test_doc_names_every_state_token_and_the_non_goals():
                    "not an IPv6 coverage claim", "H2-2", "H3", "H6", "fresh Fable", "no negative receipt",
                    "`H2_WORKER_BUDGET_MS`", "4000", "2500", "`refused_platform`", "`_HELPER_SOURCE`", "`_PLATFORM_OK`",
                    "`NFT_PATH`", "test_worker_sends_receipt_once_only_from_receipt_ready",
-                   "test_worker_reports_unresolved_when_unresolved_helpers_is_nonzero", "C3"):
+                   "test_worker_reports_unresolved_when_unresolved_helpers_is_nonzero", "C3",
+                   "**H2-3 control accept.**", "**H2-3 control-only shape (`control_only`).**", "`control_only_invalid`",
+                   "`control_rule`", "ip saddr <slot_hop_src> ip daddr <slot_hop_dst> tcp dport 443 accept",
+                   "not generic or wildcard forwarding", "earlier runtime evidence covers it"):
         assert phrase in text, phrase
     for token in ("124", "125", "126"):
         assert token in text
