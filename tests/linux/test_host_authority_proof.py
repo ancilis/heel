@@ -67,13 +67,17 @@ def _load(name: str, path: Path):
 
 
 LAUNCHER = _load("host_authority_proof", LAUNCHER_FILE)
-AUTHORITY = _load("heel_host_authority_domain", AUTHORITY_FILE)
-LISTENER = _load("heel_host_authority_listener", LISTENER_FILE)
-PROFILE = LAUNCHER.profile()
-sys.modules.setdefault("heel_host_authority_domain", AUTHORITY)
-sys.modules.setdefault("heel_host_profile", PROFILE)
-sys.modules.setdefault("heel_host_authority_codec", LISTENER)
+# One authority/profile/codec set per process: the cycle's loader reuses a module already installed under its
+# canonical name (another collector's, such as H2's), so the fixture binds to the cycle's own objects instead of
+# loading second copies (a second exception hierarchy and an invisible second cleanup registry). In a fresh
+# process (the launcher's child) the launcher's own profile becomes that set's profile.
+sys.modules.setdefault("heel_host_profile", LAUNCHER.profile())
 CYCLE = _load("heel_host_cycle_proof", ROOT / "deploy" / "host" / "cycle.py")
+AUTHORITY, PROFILE, LISTENER = CYCLE.authority, CYCLE.profile, CYCLE.codec
+for _module, _file in ((AUTHORITY, AUTHORITY_FILE), (PROFILE, ROOT / "deploy" / "host" / "profile.py"),
+                       (LISTENER, LISTENER_FILE)):
+    if Path(_module.__file__).resolve() != _file:
+        raise RuntimeError(f"{_module.__name__} is not this checkout's {_file}")
 REQUIRED = os.environ.get(LAUNCHER.REQUIRED_ENV) == "1"
 
 MS = 1_000_000
