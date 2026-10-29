@@ -34,6 +34,50 @@ const generatedPrerenderFiles = [
   "server/ssr/vinext-server.json",
   "server/vinext-server.json",
 ];
+// The Worker runtime date is pinned in vite.config.ts so a plugin upgrade cannot move it.
+const productionCompatibilityDate = "2026-08-20";
+const sourceMapDirective = /(?:\/\/[#@]|\/\*#)\s*sourceMappingURL=/i;
+const requiredEmptyCapabilities = [
+  "d1_databases",
+  "r2_buckets",
+  "kv_namespaces",
+  "durable_objects",
+  "queues",
+  "services",
+  "analytics_engine_datasets",
+  "hyperdrive",
+  "workflows",
+  "secrets_store_secrets",
+  "vectorize",
+  "ai_search_namespaces",
+  "ai_search",
+  "artifacts",
+  "worker_loaders",
+  "pipelines",
+  "vpc_networks",
+  "send_email",
+  "mtls_certificates",
+  "dispatch_namespaces",
+];
+const approvedWorkerConfiguration = new Set([
+  "topLevelName",
+  "dev",
+  "name",
+  "compatibility_date",
+  "compatibility_flags",
+  "legacy_env",
+  "main",
+  "jsx_factory",
+  "jsx_fragment",
+  "rules",
+  "build",
+  "no_bundle",
+  "assets",
+  "observability",
+  "python_modules",
+  "vars",
+  "vpc_services",
+]);
 const maxReleaseArchiveBytes = 32 * 1024 * 1024;
 const maxReleaseMemberBytes = 4 * 1024 * 1024;
 const maxReleaseMembers = 128;
@@ -794,6 +838,65 @@ function assertEmptyCapability(value, label) {
 }
 
 
+function assertProductionWorkerConfig(workerConfig) {
+  assert.equal(workerConfig.compatibility_date, productionCompatibilityDate, "Worker runtime compatibility_date drifted");
+  assert.deepEqual(workerConfig.compatibility_flags, ["nodejs_compat"]);
+  assert.deepEqual(workerConfig.vars, { PUBLIC_ORIGIN: "https://heel.example" });
+  assert.deepEqual(workerConfig.assets, { directory: "../client" });
+  assert.deepEqual(workerConfig.observability, { enabled: false });
+  assert.deepEqual(workerConfig.vpc_services, [{
+    binding: "CONTROL_PLANE",
+    service_id: "00000000-0000-4000-8000-000000000001",
+  }]);
+  for (const field of requiredEmptyCapabilities) {
+    assert.ok(Object.hasOwn(workerConfig, field), `${field} is absent from the deployment manifest`);
+    assertEmptyCapability(workerConfig[field], field);
+  }
+  // Newer Wrangler emits k2; it stays unapproved and is accepted only as an empty list.
+  if (Object.hasOwn(workerConfig, "k2")) assert.deepEqual(workerConfig.k2, [], "k2 bindings");
+  for (const [field, value] of Object.entries(workerConfig)) {
+    if (!approvedWorkerConfiguration.has(field)) assertEmptyCapability(value, field);
+  }
+}
+
+
+function approvedWorkerConfigFixture() {
+  return {
+    name: "heel-cloud",
+    compatibility_date: productionCompatibilityDate,
+    compatibility_flags: ["nodejs_compat"],
+    main: "index.js",
+    vars: { PUBLIC_ORIGIN: "https://heel.example" },
+    assets: { directory: "../client" },
+    observability: { enabled: false },
+    vpc_services: [{ binding: "CONTROL_PLANE", service_id: "00000000-0000-4000-8000-000000000001" }],
+    ...Object.fromEntries(requiredEmptyCapabilities.map((field) => [field, []])),
+    durable_objects: { bindings: [] },
+    queues: { producers: [], consumers: [] },
+  };
+}
+
+
+function isSourceMapDocument(text) {
+  try {
+    const value = JSON.parse(text);
+    return Boolean(value) && typeof value === "object" && typeof value.mappings === "string" && Array.isArray(value.sources);
+  } catch {
+    return false;
+  }
+}
+
+
+function assertNoSourceMaps(records) {
+  for (const { artifactPath, extension, text } of records) {
+    assert.notEqual(extname(artifactPath).toLowerCase(), ".map", `source map shipped: ${artifactPath}`);
+    if (text === null) continue;
+    assert.doesNotMatch(text, sourceMapDirective, artifactPath);
+    if (extension === ".json") assert.equal(isSourceMapDocument(text), false, `source map document shipped: ${artifactPath}`);
+  }
+}
+
+
 async function firstPartyBrowserSources() {
   const manifest = await json(join(clientRoot, ".vite/manifest.json"));
   const workspace = manifest["components/review/ReviewWorkspace.tsx"]?.file;
@@ -1353,7 +1456,7 @@ test("recursively scans every deployed executable, text manifest, and wheel memb
   const textRecords = records.filter(({ text }) => text !== null);
   assert.ok(executableRecords.length > 3, "deployment scan did not cover generated executables");
 
-  assert.equal(relativeFiles.some((path) => /\.map$/i.test(path)), false, "source map shipped");
+  assertNoSourceMaps(records);
   assert.equal(
     relativeFiles.some((path) => /(?:^|\/)\.env(?:\.|$)|\.(?:pem|key|p12|pfx)$/i.test(path)),
     false,
@@ -1370,7 +1473,6 @@ test("recursively scans every deployed executable, text manifest, and wheel memb
   const prerenderRecords = [];
   for (const record of textRecords) {
     const label = record.artifactPath;
-    assert.doesNotMatch(record.text, /(?:\/\/[#@]|\/\*#)\s*sourceMappingURL=/i, label);
     assert.doesNotMatch(
       record.text,
       /https?:\/\/(?:cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com|esm\.sh|pypi\.org|files\.pythonhosted\.org)/i,
@@ -1509,6 +1611,69 @@ test("serves the device confirmation entry point with a no-approval initial stat
 });
 
 
+test("Worker config guard rejects runtime drift, telemetry, exposure changes, and unexpected capabilities", () => {
+  assertProductionWorkerConfig(approvedWorkerConfigFixture());
+  assertProductionWorkerConfig({ ...approvedWorkerConfigFixture(), k2: [] });
+  const binding = { binding: "UNEXPECTED", id: "00000000000000000000000000000000" };
+  const drift = [
+    ["moved compatibility date", { compatibility_date: "2026-10-06" }],
+    ["missing compatibility date", { compatibility_date: undefined }],
+    ["extra compatibility flag", { compatibility_flags: ["nodejs_compat", "nodejs_als"] }],
+    ["missing compatibility flag", { compatibility_flags: [] }],
+    ["enabled observability", { observability: { enabled: true } }],
+    ["sampled observability", { observability: { enabled: false, head_sampling_rate: 1 } }],
+    ["missing observability", { observability: undefined }],
+    ["second VPC service", { vpc_services: [
+      { binding: "CONTROL_PLANE", service_id: "00000000-0000-4000-8000-000000000001" },
+      { binding: "SECOND", service_id: "00000000-0000-4000-8000-000000000002" },
+    ] }],
+    ["moved VPC service", { vpc_services: [{ binding: "CONTROL_PLANE", service_id: "00000000-0000-4000-8000-000000000002" }] }],
+    ["private assets root", { assets: { directory: "../server" } }],
+    ["assets binding", { assets: { directory: "../client", binding: "ASSETS" } }],
+    ["nonempty k2", { k2: [binding] }],
+    ["object k2", { k2: { bindings: [] } }],
+    ["nonempty required capability", { kv_namespaces: [binding] }],
+    ["nonempty nested capability", { queues: { producers: [binding], consumers: [] } }],
+    ["unknown capability", { brand_new_bindings: [binding] }],
+    ["unknown nested capability", { brand_new_bindings: { bindings: [binding] } }],
+    ["uploaded source maps", { upload_source_maps: true }],
+    ["logpush", { logpush: true }],
+  ];
+  for (const [label, change] of drift) {
+    const config = { ...approvedWorkerConfigFixture(), ...change };
+    for (const [field, value] of Object.entries(change)) if (value === undefined) delete config[field];
+    assert.throws(() => assertProductionWorkerConfig(config), assert.AssertionError, label);
+  }
+  const missingCapability = approvedWorkerConfigFixture();
+  delete missingCapability.services;
+  assert.throws(() => assertProductionWorkerConfig(missingCapability), assert.AssertionError, "missing services");
+});
+
+
+test("source map guard rejects map files, directives, and map documents anywhere in the inventory", () => {
+  const record = (artifactPath, text) => ({ artifactPath, extension: extname(artifactPath).toLowerCase(), text });
+  const clean = [
+    record("client/assets/app-A1.js", "export const app = 1;\n"),
+    record("server/index.js", "export default {};\n"),
+    record("server/wrangler.json", JSON.stringify({ main: "index.js" })),
+    record("client/og.png", null),
+  ];
+  assertNoSourceMaps(clean);
+  for (const [label, hostile] of [
+    ["Worker map file", record("server/index.js.map", null)],
+    ["nested SSR map file", record("server/ssr/_next/static/chunk-B2.js.MAP", null)],
+    ["client map file", record("client/assets/app-A1.js.map", JSON.stringify({ version: 3, sources: [], mappings: "" }))],
+    ["line directive", record("server/ssr/index.js", "export {};\n//# sourceMappingURL=index.js.map\n")],
+    ["legacy directive", record("client/assets/app-A1.js", "export {};\n//@ sourceMappingURL=app.js.map\n")],
+    ["inline data directive", record("server/index.js", "export {};\n//# sourceMappingURL=data:application/json;base64,e30=\n")],
+    ["CSS directive", record("client/assets/app-A1.css", "a{}\n/*# sourceMappingURL=app.css.map */\n")],
+    ["renamed map document", record("server/_next/static/chunk-B2.json", JSON.stringify({ version: 3, sources: ["worker/index.ts"], mappings: "AAAA" }))],
+  ]) {
+    assert.throws(() => assertNoSourceMaps([...clean, hostile]), assert.AssertionError, label);
+  }
+});
+
+
 test("production worker exposes exact headers, request-URL metadata, and only the private control-plane binding", async () => {
   const [workerConfig, hostingConfig, socialCard] = await Promise.all([
     json(join(serverRoot, "wrangler.json")),
@@ -1519,61 +1684,7 @@ test("production worker exposes exact headers, request-URL metadata, and only th
   assert.match(hostingConfig.project_id, /^appgprj_[0-9a-f]{32}$/);
   assert.equal(hostingConfig.d1, null);
   assert.equal(hostingConfig.r2, null);
-  assert.deepEqual(workerConfig.vars, { PUBLIC_ORIGIN: "https://heel.example" });
-  assert.deepEqual(workerConfig.assets, { directory: "../client" });
-  assert.deepEqual(workerConfig.observability, { enabled: false });
-  assert.deepEqual(workerConfig.vpc_services, [{
-    binding: "CONTROL_PLANE",
-    service_id: "00000000-0000-4000-8000-000000000001",
-  }]);
-  const requiredEmptyCapabilities = [
-    "d1_databases",
-    "r2_buckets",
-    "kv_namespaces",
-    "durable_objects",
-    "queues",
-    "services",
-    "analytics_engine_datasets",
-    "hyperdrive",
-    "workflows",
-    "secrets_store_secrets",
-    "vectorize",
-    "ai_search_namespaces",
-    "ai_search",
-    "artifacts",
-    "worker_loaders",
-    "pipelines",
-    "vpc_networks",
-    "send_email",
-    "mtls_certificates",
-    "dispatch_namespaces",
-  ];
-  for (const field of requiredEmptyCapabilities) {
-    assert.ok(Object.hasOwn(workerConfig, field), `${field} is absent from the deployment manifest`);
-    assertEmptyCapability(workerConfig[field], field);
-  }
-  const approvedConfiguration = new Set([
-    "topLevelName",
-    "dev",
-    "name",
-    "compatibility_date",
-    "compatibility_flags",
-    "legacy_env",
-    "main",
-    "jsx_factory",
-    "jsx_fragment",
-    "rules",
-    "build",
-    "no_bundle",
-    "assets",
-    "observability",
-    "python_modules",
-    "vars",
-    "vpc_services",
-  ]);
-  for (const [field, value] of Object.entries(workerConfig)) {
-    if (!approvedConfiguration.has(field)) assertEmptyCapability(value, field);
-  }
+  assertProductionWorkerConfig(workerConfig);
 
   assert.equal(socialCard.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
   assert.equal(socialCard.readUInt32BE(16), 1200);
