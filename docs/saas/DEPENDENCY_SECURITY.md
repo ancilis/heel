@@ -47,9 +47,19 @@ the following:
 - The exact date and the `["nodejs_compat"]` flags.
 - Disabled observability.
 - The fixed `CONTROL_PLANE` VPC service and the `../client` assets root.
-- No `.map` file, `sourceMappingURL` directive or source-map document
-  anywhere in `dist`.
+- No `.map` file anywhere in `dist`.
+- No `sourceMappingURL` directive in any `dist` file that decodes as
+  UTF-8, whatever its suffix.
+- No Source Map v3 document in any `dist` file that decodes as UTF-8,
+  whatever its name or suffix. A regular map is a JSON object with a
+  `sources` list and either `mappings` or `sourcesContent`. An index map
+  has `sections` at offsets that embed such a map or name one by `url`.
+  A leading `)]}'` line is ignored.
 - Every unapproved binding list stays empty. `k2` is accepted only as `[]`.
+
+The map check does not inspect binary or compressed files (gzip, zip,
+wheel, wasm), other encodings such as base64, or a map nested under
+another JSON key. The current build output contains no map document.
 
 No application source, Worker code, Next/ESLint config, static-export
 setting, VPC binding or origin/auth/CSRF control changed.
