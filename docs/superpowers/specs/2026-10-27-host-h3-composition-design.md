@@ -406,7 +406,11 @@ the original universal 1024-byte H3 link bound. Frozen audit target is implement
 `c3846e69090fc9905b1293300c36d2fef27bfcec`; parent design is `b168458c`. The audit and reproducible
 offline probe are in `.worktrees/heel-task-evidence/H3-D1-LINK-BOUND-DESIGN/` (`DECISION.md`,
 `audit/frame_audit.py`, `audit/frame-audit.log`). Product implementation and tracked tests belong to
-Opus. This candidate does not accept itself, H3-1, H3-1b, H3-2, C4, H2 runtime or launch.
+Opus. Cycle 1 review of `e7218f1` failed on its impossible maximum-grammar signed-daemon
+fixture requirement; that verdict remains in `H3-D1-LINK-BOUND-DESIGN-REVIEW/REPORT.md`. The bounded
+Astra R1 correction and offline witnesses are in `H3-D1-LINK-BOUND-DESIGN-R1/` under the same evidence
+root. This revised candidate requires fresh independent design review before an Opus coding grant;
+it does not accept itself, H3-1, H3-1b, H3-2, C4, H2 runtime or launch.
 
 **CONFIRMED grammar and serialization.** Frozen `deploy/host/executor_link.py:55-153,163-206`
 uses `schema` and `op` (not `t`), exact keys and exact primitive types. Canonical JSON sorts keys,
@@ -473,6 +477,48 @@ maximum kill generation adds 15. These are generated-format size calculations, n
 or signed end-to-end acceptance. The remediation acceptance test must generate consistent IDs before
 signing and must not mutate a validated grant, truncate IDs or retain the fixture's `proj_1` workaround.
 
+**R1: distinguish codec maximum from signed operational maximum. CONFIRMED source constraint:**
+`heel/crypto.py:30-34` derives `k_` plus 16 hex characters from the actual public key. Identity
+construction checks that derivation (`identity.py:627-629,688-690`); stored identity loading checks it
+again (`store.py:775-798`), and daemon startup loads the real signer and verifies the persisted pair
+(`daemon.py:1098-1117`). Thus the 128-character key in the **1723-byte** grammar witness is synthetic;
+it cannot be a valid signed runner identity. Preserve that witness through the actual codec and real
+socket link/supervisor ingress where structurally legal, but do not describe it as signed-daemon or
+HostCycle functional acceptance. No identity-validation override, `_active_identity` monkeypatch,
+post-validation ID rewrite, fake supervisor or weakened signature check is permitted.
+
+**CONFIRMED additional signed-contract constraint:** `canary_contracts.py:209-213,371-380` passes
+`egress.hostname` through the 128-byte identifier limit and requires equality with the environment
+origin hostname. R1's real compiler refused a 253-character hostname; its repeatable probe also
+refuses 129 and 253 through that unchanged validator. Thus 1613 bytes (only replacing the key) is
+still a codec size witness, not a realizable signed bundle. Do not widen that validator in D-1.
+
+The separate maximum-realizable signed variant must produce **1488 bytes = 1723 - 110 - 125**:
+runner, grant and projection IDs are each 128 characters; workspace is 19, project/environment/binding
+are each 36, and run is 37, using their existing prefixes and hex grammar. Hostname is 128 characters
+(labels 63/60/3 ending in `.com`), with the matching 136-character HTTPS origin throughout the
+context, manifest, projection, grant and pinned supervisor origin. Kill generation is 9007199254740991
+in the signed grant and corresponding authority/gate answers. Runner key ID remains the actual
+18-character derived value everywhere. All six digest fields remain their full 64 characters:
+verification record, public key, binding, grant, approval projection and manifest; derive them from
+their actual artifacts/keys as applicable and keep every reference consistent. Digests need not be
+all `f` to attain maximum length. Preserve the fixed schema/op envelope and every field.
+
+**CONFIRMED bounded feasibility witness:** R1 `probe.py` imports verified frozen c3846e6 sources,
+accepts the derived stored identity and refuses the 128-character key. It compiles a 128-character
+projection through the existing `compile(projection_id=...)` seam (`compiler.py:338`), with a
+128-character runner and longest signed-contract-valid origin, and validates a newly signed
+128-character grant at maximum kill generation using unchanged `validate_execution_bundle` (`execution.py:240-323`). That validator
+checks immutable local artifacts, both signatures, exact environment/identity/digest relationships,
+limits, adapters and gate. The codec validates the corresponding field shape and measures 1488;
+cloud binding ID/digest in this size probe are fixed-width placeholders, not validated cloud binding
+evidence. **INFERRED full signed journey; exact confirmation:** test 3 must build a real consistent
+cloud binding and persisted daemon identity before use, preserve those checks and deliver this exact
+1488-byte claim through the actual daemon/link/supervisor/HostCycle. The ordinary CP-generator-format
+signed variant remains independently mandatory; arbitrary 128-character runner/grant/projection IDs
+are a runner-contract boundary fixture, not a claim that current CP generators emit those lengths.
+No other ID or projection may be shortened to fit. These distinctions change no cap or wire grammar.
+
 **Selected limits (inclusive, bytes of the entire datagram):**
 
 | Constant | Value | Applies to |
@@ -534,6 +580,10 @@ current fixture helpers or local helpers in the two named test files; no tracked
 
 1. `test_link_maximum_grammar_frames_fit_their_operation_caps`: all 16 rows, 1723/4582/4193 witnesses,
    raw versus canonical IP, JSON scope escaping, maximum integers, default ID sizes and 719-byte input.
+   Assert the synthetic 128-character-key claim is exactly 1723 bytes and round-trips unchanged through
+   the actual codec and real socket link into real supervisor ingress with a matching slot fixture;
+   assert byte/field equality at ingress, without claiming a signed identity or successful authority
+   activation. Keep this boundary witness separate from test 3's signed positives.
 2. `test_worker_pin_full_public_mixed_answer_set_crosses_real_link`: distinct public mixed set and
    long valid `.com` hostname, original pin refused red then delivered byte-exact after fix; no DNS call.
 3. `test_daemon_full_identity_claim_reaches_real_supervisor_before_target_socket`: real `RunnerDaemon`
@@ -541,7 +591,13 @@ current fixture helpers or local helpers in the two named test files; no tracked
    offline installer/CP seams. Real signed, consistent CP-format fixture fields, no `BridgeLink.claimed`
    rewrite or fake supervisor. Assert `claimed` consumed, context admitted and `authorized` returned
    before the test target socket factory is invoked; full projection/identity/digest equality. Run a
-   maximum-length grammar fixture as a separate variant with consistent pre-signing construction.
+   maximum-realizable signed fixture as a separate variant: exact 1488-byte canonical claim and every
+   field length/value described above, including the derived 18-character key. Construct identity,
+   context, cloud binding, manifest, full projection, grant and expected authority consistently before
+   signing/validation; preserve real digest/signature checks and derive scripted CP authority answers
+   from independently held expected state. Both signed variants must prove the same full field
+   equality, real HostCycle admission and `authorized`-before-target-socket ordering. Record baseline
+   >1024 refusal and resulting delivery; the separate 1723-byte synthetic case cannot satisfy this test.
 4. `test_link_operation_caps_reject_oversize_and_close_received_descriptors`: all cap+1 values,
    schema-ceiling+1 and truncation, low-cap messages below the larger schema ceiling, duplicate keys,
    whitespace, alternate escapes, bool integers, unknown schema/op and unsolicited/multiple/truncated
