@@ -3,9 +3,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { closeSync, constants as fsConstants, fstatSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
-import { cp, lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, extname, join, relative } from "node:path";
+import { basename, dirname, extname, join, relative } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
@@ -34,6 +34,50 @@ const generatedPrerenderFiles = [
   "server/ssr/vinext-server.json",
   "server/vinext-server.json",
 ];
+// The Worker runtime date is pinned in vite.config.ts so a plugin upgrade cannot move it.
+const productionCompatibilityDate = "2026-08-20";
+const sourceMapDirective = /(?:\/\/[#@]|\/\*#)\s*sourceMappingURL=/i;
+const requiredEmptyCapabilities = [
+  "d1_databases",
+  "r2_buckets",
+  "kv_namespaces",
+  "durable_objects",
+  "queues",
+  "services",
+  "analytics_engine_datasets",
+  "hyperdrive",
+  "workflows",
+  "secrets_store_secrets",
+  "vectorize",
+  "ai_search_namespaces",
+  "ai_search",
+  "artifacts",
+  "worker_loaders",
+  "pipelines",
+  "vpc_networks",
+  "send_email",
+  "mtls_certificates",
+  "dispatch_namespaces",
+];
+const approvedWorkerConfiguration = new Set([
+  "topLevelName",
+  "dev",
+  "name",
+  "compatibility_date",
+  "compatibility_flags",
+  "legacy_env",
+  "main",
+  "jsx_factory",
+  "jsx_fragment",
+  "rules",
+  "build",
+  "no_bundle",
+  "assets",
+  "observability",
+  "python_modules",
+  "vars",
+  "vpc_services",
+]);
 const maxReleaseArchiveBytes = 32 * 1024 * 1024;
 const maxReleaseMemberBytes = 4 * 1024 * 1024;
 const maxReleaseMembers = 128;
@@ -383,6 +427,15 @@ function decodeUtf8(payload, label) {
     return new TextDecoder("utf-8", { fatal: true }).decode(payload);
   } catch {
     assert.fail(`${label} is not valid UTF-8`);
+  }
+}
+
+
+function decodeOptionalUtf8(payload) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(payload);
+  } catch {
+    return null;
   }
 }
 
@@ -738,18 +791,21 @@ function classifyReleaseMembers(records, { label, rootPrefix = "" }) {
 }
 
 
-async function deploymentInventory() {
-  const files = await filesUnder(distRoot);
+async function deploymentInventory(root = distRoot) {
+  const files = await filesUnder(root);
   const records = await Promise.all(files.map(async (path) => {
-    const artifactPath = relative(distRoot, path).replaceAll("\\", "/");
+    const artifactPath = relative(root, path).replaceAll("\\", "/");
     const extension = extname(path).toLowerCase();
     const payload = await readFile(path);
+    const text = scannedTextExtensions.has(extension) ? decodeUtf8(payload, artifactPath) : null;
     return {
       artifactPath,
       extension,
       path,
       payload,
-      text: scannedTextExtensions.has(extension) ? decodeUtf8(payload, artifactPath) : null,
+      text,
+      // Other suffixes stay unscanned; when they decode as UTF-8 they are still checked for source maps.
+      unclassifiedText: text === null ? decodeOptionalUtf8(payload) : null,
     };
   }));
   return { files, records };
@@ -790,6 +846,84 @@ function assertEmptyCapability(value, label) {
   for (const entries of Object.values(value)) {
     assert.ok(Array.isArray(entries), `${label} has a non-array binding collection`);
     assert.deepEqual(entries, [], `${label} bindings`);
+  }
+}
+
+
+function assertProductionWorkerConfig(workerConfig) {
+  assert.equal(workerConfig.compatibility_date, productionCompatibilityDate, "Worker runtime compatibility_date drifted");
+  assert.deepEqual(workerConfig.compatibility_flags, ["nodejs_compat"]);
+  assert.deepEqual(workerConfig.vars, { PUBLIC_ORIGIN: "https://heel.example" });
+  assert.deepEqual(workerConfig.assets, { directory: "../client" });
+  assert.deepEqual(workerConfig.observability, { enabled: false });
+  assert.deepEqual(workerConfig.vpc_services, [{
+    binding: "CONTROL_PLANE",
+    service_id: "00000000-0000-4000-8000-000000000001",
+  }]);
+  for (const field of requiredEmptyCapabilities) {
+    assert.ok(Object.hasOwn(workerConfig, field), `${field} is absent from the deployment manifest`);
+    assertEmptyCapability(workerConfig[field], field);
+  }
+  // Newer Wrangler emits k2; it stays unapproved and is accepted only as an empty list.
+  if (Object.hasOwn(workerConfig, "k2")) assert.deepEqual(workerConfig.k2, [], "k2 bindings");
+  for (const [field, value] of Object.entries(workerConfig)) {
+    if (!approvedWorkerConfiguration.has(field)) assertEmptyCapability(value, field);
+  }
+}
+
+
+function approvedWorkerConfigFixture() {
+  return {
+    name: "heel-cloud",
+    compatibility_date: productionCompatibilityDate,
+    compatibility_flags: ["nodejs_compat"],
+    main: "index.js",
+    vars: { PUBLIC_ORIGIN: "https://heel.example" },
+    assets: { directory: "../client" },
+    observability: { enabled: false },
+    vpc_services: [{ binding: "CONTROL_PLANE", service_id: "00000000-0000-4000-8000-000000000001" }],
+    ...Object.fromEntries(requiredEmptyCapabilities.map((field) => [field, []])),
+    durable_objects: { bindings: [] },
+    queues: { producers: [], consumers: [] },
+  };
+}
+
+
+// Source Map v3: a regular map lists sources with mappings or embedded sourcesContent; an index map
+// places sections at offsets, each embedding a map or naming one by url.
+function isSourceMapValue(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (Array.isArray(value.sources) && (typeof value.mappings === "string" || Array.isArray(value.sourcesContent))) {
+    return true;
+  }
+  return Array.isArray(value.sections) && value.sections.some((section) =>
+    Boolean(section?.offset) && typeof section.offset === "object"
+    && (isSourceMapValue(section.map) || typeof section.url === "string"));
+}
+
+
+function isSourceMapDocument(text) {
+  // A map may begin with the )]}' line that consumers strip before parsing.
+  const body = text.startsWith(")]}'") ? text.slice(text.indexOf("\n") + 1) : text;
+  if (!body.trimStart().startsWith("{")) return false;
+  let value;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  // Outside the try: a structure too deep to inspect fails the guard instead of passing as "not a map".
+  return isSourceMapValue(value);
+}
+
+
+function assertNoSourceMaps(records) {
+  for (const { artifactPath, text, unclassifiedText } of records) {
+    assert.notEqual(extname(artifactPath).toLowerCase(), ".map", `source map shipped: ${artifactPath}`);
+    const decoded = text ?? unclassifiedText;
+    if (decoded === null || decoded === undefined) continue;
+    assert.doesNotMatch(decoded, sourceMapDirective, artifactPath);
+    assert.equal(isSourceMapDocument(decoded), false, `source map document shipped: ${artifactPath}`);
   }
 }
 
@@ -1353,7 +1487,7 @@ test("recursively scans every deployed executable, text manifest, and wheel memb
   const textRecords = records.filter(({ text }) => text !== null);
   assert.ok(executableRecords.length > 3, "deployment scan did not cover generated executables");
 
-  assert.equal(relativeFiles.some((path) => /\.map$/i.test(path)), false, "source map shipped");
+  assertNoSourceMaps(records);
   assert.equal(
     relativeFiles.some((path) => /(?:^|\/)\.env(?:\.|$)|\.(?:pem|key|p12|pfx)$/i.test(path)),
     false,
@@ -1370,7 +1504,6 @@ test("recursively scans every deployed executable, text manifest, and wheel memb
   const prerenderRecords = [];
   for (const record of textRecords) {
     const label = record.artifactPath;
-    assert.doesNotMatch(record.text, /(?:\/\/[#@]|\/\*#)\s*sourceMappingURL=/i, label);
     assert.doesNotMatch(
       record.text,
       /https?:\/\/(?:cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com|esm\.sh|pypi\.org|files\.pythonhosted\.org)/i,
@@ -1509,6 +1642,134 @@ test("serves the device confirmation entry point with a no-approval initial stat
 });
 
 
+test("Worker config guard rejects runtime drift, telemetry, exposure changes, and unexpected capabilities", () => {
+  assertProductionWorkerConfig(approvedWorkerConfigFixture());
+  assertProductionWorkerConfig({ ...approvedWorkerConfigFixture(), k2: [] });
+  const binding = { binding: "UNEXPECTED", id: "00000000000000000000000000000000" };
+  const drift = [
+    ["moved compatibility date", { compatibility_date: "2026-10-06" }],
+    ["missing compatibility date", { compatibility_date: undefined }],
+    ["extra compatibility flag", { compatibility_flags: ["nodejs_compat", "nodejs_als"] }],
+    ["missing compatibility flag", { compatibility_flags: [] }],
+    ["enabled observability", { observability: { enabled: true } }],
+    ["sampled observability", { observability: { enabled: false, head_sampling_rate: 1 } }],
+    ["missing observability", { observability: undefined }],
+    ["second VPC service", { vpc_services: [
+      { binding: "CONTROL_PLANE", service_id: "00000000-0000-4000-8000-000000000001" },
+      { binding: "SECOND", service_id: "00000000-0000-4000-8000-000000000002" },
+    ] }],
+    ["moved VPC service", { vpc_services: [{ binding: "CONTROL_PLANE", service_id: "00000000-0000-4000-8000-000000000002" }] }],
+    ["private assets root", { assets: { directory: "../server" } }],
+    ["assets binding", { assets: { directory: "../client", binding: "ASSETS" } }],
+    ["nonempty k2", { k2: [binding] }],
+    ["object k2", { k2: { bindings: [] } }],
+    ["nonempty required capability", { kv_namespaces: [binding] }],
+    ["nonempty nested capability", { queues: { producers: [binding], consumers: [] } }],
+    ["unknown capability", { brand_new_bindings: [binding] }],
+    ["unknown nested capability", { brand_new_bindings: { bindings: [binding] } }],
+    ["uploaded source maps", { upload_source_maps: true }],
+    ["logpush", { logpush: true }],
+  ];
+  for (const [label, change] of drift) {
+    const config = { ...approvedWorkerConfigFixture(), ...change };
+    for (const [field, value] of Object.entries(change)) if (value === undefined) delete config[field];
+    assert.throws(() => assertProductionWorkerConfig(config), assert.AssertionError, label);
+  }
+  const missingCapability = approvedWorkerConfigFixture();
+  delete missingCapability.services;
+  assert.throws(() => assertProductionWorkerConfig(missingCapability), assert.AssertionError, "missing services");
+});
+
+
+test("source map guard rejects map files, directives, and map documents anywhere in the inventory", () => {
+  const record = (artifactPath, text) => ({ artifactPath, extension: extname(artifactPath).toLowerCase(), text });
+  const clean = [
+    record("client/assets/app-A1.js", "export const app = 1;\n"),
+    record("server/index.js", "export default {};\n"),
+    record("server/wrangler.json", JSON.stringify({ main: "index.js" })),
+    record("client/og.png", null),
+  ];
+  assertNoSourceMaps(clean);
+  for (const [label, hostile] of [
+    ["Worker map file", record("server/index.js.map", null)],
+    ["nested SSR map file", record("server/ssr/_next/static/chunk-B2.js.MAP", null)],
+    ["client map file", record("client/assets/app-A1.js.map", JSON.stringify({ version: 3, sources: [], mappings: "" }))],
+    ["line directive", record("server/ssr/index.js", "export {};\n//# sourceMappingURL=index.js.map\n")],
+    ["legacy directive", record("client/assets/app-A1.js", "export {};\n//@ sourceMappingURL=app.js.map\n")],
+    ["inline data directive", record("server/index.js", "export {};\n//# sourceMappingURL=data:application/json;base64,e30=\n")],
+    ["CSS directive", record("client/assets/app-A1.css", "a{}\n/*# sourceMappingURL=app.css.map */\n")],
+    ["renamed map document", record("server/_next/static/chunk-B2.json", JSON.stringify({ version: 3, sources: ["worker/index.ts"], mappings: "AAAA" }))],
+  ]) {
+    assert.throws(() => assertNoSourceMaps([...clean, hostile]), assert.AssertionError, label);
+  }
+});
+
+
+test("deployment inventory rejects source map documents under any name or suffix", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "heel-map-inventory-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const map = {
+    version: 3,
+    sources: ["worker/index.ts"],
+    sourcesContent: ["export const privateSource = 1;"],
+    names: [],
+    mappings: "AAAA",
+  };
+  const indexed = (entry) => JSON.stringify({ version: 3, sections: [{ offset: { line: 0, column: 0 }, ...entry }] });
+  const clean = [
+    ["client/assets/app-A1.js", "export const app = 1;\n"],
+    ["server/wrangler.json", JSON.stringify({ main: "index.js" })],
+    ["server/BUILD_ID", "build-1\n"],
+    ["client/_headers", "/*\n  X-Content-Type-Options: nosniff\n"],
+    ["client/notes.json", JSON.stringify({ version: 3, sources: ["a.py", "b.py"] })],
+    ["client/outline.json", JSON.stringify({ version: 3, sections: [{ title: "Intro", offset: 12 }, { offset: { line: 1 } }] })],
+    ["client/glossary.txt", JSON.stringify({ mappings: 1, sources: "none", note: "mappings, sources and sections" })],
+    ["client/readme", "mappings sources sections sourcesContent\n"],
+    ["client/og.png", Buffer.concat([Buffer.from("\x89PNG\r\n\x1a\n", "latin1"), Buffer.alloc(64, 0xff)])],
+  ];
+  async function inventoryWith(entries) {
+    await rm(root, { recursive: true, force: true });
+    for (const [path, contents] of entries) {
+      await mkdir(join(root, dirname(path)), { recursive: true });
+      await writeFile(join(root, path), contents);
+    }
+    return (await deploymentInventory(root)).records;
+  }
+
+  assertNoSourceMaps(await inventoryWith(clean));
+  const accepted = [];
+  for (const [path, contents] of [
+    ["client/review-map.json", JSON.stringify(map)],
+    ["client/review-map.txt", JSON.stringify(map)],
+    ["client/review-map", JSON.stringify(map)],
+    ["client/assets/review-map.dat", JSON.stringify(map)],
+    ["server/ssr/review-map.js", JSON.stringify(map)],
+    ["client/review-guarded.txt", `)]}'\n${JSON.stringify(map)}`],
+    ["client/review-sources.json", JSON.stringify({ version: 3, sources: map.sources, sourcesContent: map.sourcesContent })],
+    ["client/review-indexed.json", indexed({ map })],
+    ["client/review-indexed.txt", indexed({ map })],
+    ["client/review-indexed-url.json", indexed({ url: "private.js.map" })],
+    ["client/review-nested", indexed({ map: JSON.parse(indexed({ map })) })],
+  ]) {
+    const records = await inventoryWith([...clean, [path, contents]]);
+    try {
+      assertNoSourceMaps(records);
+      accepted.push(path);
+    } catch (error) {
+      assert.equal(error.message.split("\n")[0], `source map document shipped: ${path}`);
+    }
+  }
+  const directive = await inventoryWith([...clean, ["client/review-loader", "export {};\n//# sourceMappingURL=app.js.map\n"]]);
+  try {
+    assertNoSourceMaps(directive);
+    accepted.push("client/review-loader");
+  } catch (error) {
+    assert.equal(error.message, "client/review-loader");
+  }
+  assert.deepEqual(accepted, [], "source map documents accepted by the deployment inventory");
+});
+
+
 test("production worker exposes exact headers, request-URL metadata, and only the private control-plane binding", async () => {
   const [workerConfig, hostingConfig, socialCard] = await Promise.all([
     json(join(serverRoot, "wrangler.json")),
@@ -1519,61 +1780,7 @@ test("production worker exposes exact headers, request-URL metadata, and only th
   assert.match(hostingConfig.project_id, /^appgprj_[0-9a-f]{32}$/);
   assert.equal(hostingConfig.d1, null);
   assert.equal(hostingConfig.r2, null);
-  assert.deepEqual(workerConfig.vars, { PUBLIC_ORIGIN: "https://heel.example" });
-  assert.deepEqual(workerConfig.assets, { directory: "../client" });
-  assert.deepEqual(workerConfig.observability, { enabled: false });
-  assert.deepEqual(workerConfig.vpc_services, [{
-    binding: "CONTROL_PLANE",
-    service_id: "00000000-0000-4000-8000-000000000001",
-  }]);
-  const requiredEmptyCapabilities = [
-    "d1_databases",
-    "r2_buckets",
-    "kv_namespaces",
-    "durable_objects",
-    "queues",
-    "services",
-    "analytics_engine_datasets",
-    "hyperdrive",
-    "workflows",
-    "secrets_store_secrets",
-    "vectorize",
-    "ai_search_namespaces",
-    "ai_search",
-    "artifacts",
-    "worker_loaders",
-    "pipelines",
-    "vpc_networks",
-    "send_email",
-    "mtls_certificates",
-    "dispatch_namespaces",
-  ];
-  for (const field of requiredEmptyCapabilities) {
-    assert.ok(Object.hasOwn(workerConfig, field), `${field} is absent from the deployment manifest`);
-    assertEmptyCapability(workerConfig[field], field);
-  }
-  const approvedConfiguration = new Set([
-    "topLevelName",
-    "dev",
-    "name",
-    "compatibility_date",
-    "compatibility_flags",
-    "legacy_env",
-    "main",
-    "jsx_factory",
-    "jsx_fragment",
-    "rules",
-    "build",
-    "no_bundle",
-    "assets",
-    "observability",
-    "python_modules",
-    "vars",
-    "vpc_services",
-  ]);
-  for (const [field, value] of Object.entries(workerConfig)) {
-    if (!approvedConfiguration.has(field)) assertEmptyCapability(value, field);
-  }
+  assertProductionWorkerConfig(workerConfig);
 
   assert.equal(socialCard.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
   assert.equal(socialCard.readUInt32BE(16), 1200);
