@@ -326,6 +326,58 @@ class ManagedAuthorityContractTests(unittest.TestCase):
         self.assertRefused("invalid_field", mac.route_template_digest, "GET", "/" + "a" * 1024)
         self.assertRefused("invalid_field", mac.route_digest, "POST", route)
 
+    def test_template_digest_refuses_unencodable_text_with_a_fixed_unchained_error(self):
+        marker = "DO_NOT_ECHO"
+        # Lone high/low surrogates anywhere, a reversed pair, and two lone surrogates whose ASCII JSON
+        # escapes are byte-identical to a real astral character (the commitment must stay injective).
+        unencodable = ("/\ud800" + marker, "/\udfff" + marker, "\udc00/" + marker, "/" + marker + "\udbff",
+                       "/\udc00\ud800" + marker, "/\ud83d\ude00", "/" + "a" * 900 + "\ud800" + marker,
+                       "/" + "a" * 2000 + "\udfff" + marker)
+        for template in unencodable:
+            for method in ("GET", "HEAD"):
+                with self.subTest(template=template[:24], method=method):
+                    error = self.assertRefused("invalid_field", mac.route_template_digest, method, template)
+                    self.assertEqual(error.field, "route_template")
+                    self.assertEqual(type(error), ManagedContractError)
+                    self.assertNotIsInstance(error, UnicodeError)
+                    self.assertIsNone(error.__cause__)
+                    self.assertIsNone(error.__context__)
+                    self.assertFalse(hasattr(error, "object"))
+                    self.assertFalse(hasattr(error, "__notes__"))
+                    self.assertEqual(error.args, ("invalid_field:route_template",))
+                    self.assertEqual(vars(error), {"code": "invalid_field", "field": "route_template"})
+                    for surface in (str(error), repr(error)):
+                        self.assertNotIn(marker, surface)
+                        self.assertNotIn("\\ud", surface.lower())
+        # The method is still checked first and is equally fixed.
+        self.assertEqual(self.assertRefused("invalid_field", mac.route_template_digest, "POST", "/\ud800").field,
+                         "method")
+        # Legal non-ASCII templates keep the Q ASCII canonical commitment; literal known digests were
+        # computed outside the module from sorted compact ensure_ascii JSON.
+        known = {"/\u00e9": "a752aad7a901e3c99aecc8b3a2594f9389fc01764cbb4a6ffecd14a7f3a030bc",
+                 "/\u65e5\u672c/{id}": "5974a5f548ed0fc7977cf6b77cb28f4ed6d44ad09f073b43fdc40d94941d3ee5",
+                 "/\U0001F600": "03566cd74bff7a17a2e1221282b20583982bbb040f6278943428253cfcbf04ce"}
+        for template, digest in known.items():
+            with self.subTest(known=template):
+                self.assertEqual(mac.route_template_digest("GET", template), digest)
+                self.assertEqual(_h({"method": "GET", "route_template": template}), digest)
+        # Why the refusal is needed: two lone surrogates would otherwise commit like the real character.
+        self.assertEqual(_c({"t": "/\ud83d\ude00"}), _c({"t": "/\U0001F600"}))
+        # The existing bound is UTF-8 bytes (not code points), unchanged for multibyte text.
+        for template, legal in (("/a" + "\u00e9" * 511, True), ("/aa" + "\u00e9" * 511, False),
+                                ("/" + "\U0001F600" * 255 + "abc", True), ("/" + "\U0001F600" * 256, False),
+                                ("/" + "\u65e5" * 341, True), ("/" + "\u65e5" * 342, False)):
+            with self.subTest(size=len(template.encode("utf-8")), legal=legal):
+                if legal:
+                    self.assertEqual(mac.route_template_digest("GET", template),
+                                     _h({"method": "GET", "route_template": template}))
+                else:
+                    error = self.assertRefused("invalid_field", mac.route_template_digest, "GET", template)
+                    self.assertIsNone(error.__context__)
+        for bad in ("", None, b"/bytes", 7):
+            with self.subTest(bad=bad):
+                self.assertIsNone(self.assertRefused("invalid_field", mac.route_template_digest, "GET", bad).__context__)
+
     def test_descriptor_hash_has_no_cycle(self):
         useful = _fixture()["useful_scan"]
         for request_name, descriptor_name, verify in (
@@ -562,6 +614,113 @@ class ManagedAuthorityContractTests(unittest.TestCase):
         maximal = _fixture()["maximal"]["observation"]
         self.assertLessEqual(len(_c(maximal)), 4096)
         self.assertEqual(mac.decode("observation", _c(maximal)), maximal)
+
+    def test_observation_phase_matrix_follows_s_14_2(self):
+        """S 14.2 identity/cancellation matrix, as retained by Observation ed901650 section 7.
+
+        Identity phases: pre-invite (no pairing/runner/expiry), post-invite/pre-exchange (pairing +
+        original expiry, no runner), matched (pairing + runner + expiry). CP ``pending`` follows
+        exchange+approve, so pending/active are matched with a nonnull key; a terminal row preserves
+        its adopted phase and keeps the reservation's nonnull key; revoked always has a pairing.
+        cancellation_phase is null exactly for nonterminal rows; ``completed`` claims a matching
+        retired ack, so any other ack state contradicts it. A historical active ack stays legal on a
+        terminal row that has not claimed completion. Structural only: no durable ack or
+        reconciliation is proven here.
+        """
+        base = {"schema_version": "heel.managed-executor-observation.v1", "managed_executor_id": "mex_" + "b" * 32,
+                "observation_kind": "historical_not_authorization", "authority_revision": 3,
+                "observed_at_ms": 1793000000123, "delivery_status": "delivered", "recovery_code": None,
+                "retry_after_ms": None, "host_ack_state": None, "cancellation_phase": None}
+        pre = {"pairing_id": None, "runner_id": None, "original_pairing_expires_at_ms": None,
+               "runner_key_id": "k_" + "c" * 16}
+        invited = {**pre, "pairing_id": "pending_" + "d" * 32, "original_pairing_expires_at_ms": 1793000900000}
+        matched = {**invited, "runner_id": "runr_" + "e" * 32}
+        phases = {"pre": pre, "invited": invited, "matched": matched}
+        terminal_phases = {"revoked": ("invited", "matched"), "aborted": ("pre", "invited", "matched"),
+                           "expired": ("pre", "invited", "matched")}
+        acks = (None, "active", "retired", "cleanup_pending", "cleanup_failed", "capacity_unavailable")
+
+        def body(state, phase, **changes):
+            return {**base, **phases[phase], "observed_state": state, **changes}
+
+        def accepted(document):
+            self.assertEqual(mac.decode("observation", _c(document)), document)
+            self.assertEqual(mac.validate("observation", copy.deepcopy(document)), document)
+
+        def refused(field, document):
+            for function, argument in ((mac.decode, _c(document)), (mac.validate, copy.deepcopy(document))):
+                error = self.assertRefused("phase_nullability", function, "observation", argument)
+                self.assertEqual(error.field, field)
+                self.assertIsNone(error.__context__)
+                self.assertIsNone(error.__cause__)
+
+        valid, invalid = [], []
+        # Nonterminal rows: offered may be at any identity phase (the fixture keeps a null offered
+        # key, see REPORT source tension); pending/active only matched with a key; never a phase.
+        for phase in phases:
+            valid.append(body("offered", phase))
+            for cancellation in ("authority_revoked", "cleanup_pending", "completed"):
+                invalid.append(("cancellation_phase", body("offered", phase, cancellation_phase=cancellation)))
+        valid.append(body("offered", "pre", runner_key_id=None))
+        for state in ("pending", "active"):
+            for ack in (None, "active"):
+                valid.append(body(state, "matched", host_ack_state=ack))
+            invalid.append(("pairing_id", body(state, "pre")))
+            invalid.append(("runner_id", body(state, "invited")))
+            invalid.append(("runner_key_id", body(state, "matched", runner_key_id=None)))
+            for cancellation in ("authority_revoked", "cleanup_pending", "completed"):
+                invalid.append(("cancellation_phase", body(state, "matched", cancellation_phase=cancellation)))
+        # Terminal rows at every adopted phase.
+        for state, allowed in terminal_phases.items():
+            for phase in allowed:
+                for cancellation in ("authority_revoked", "cleanup_pending"):
+                    for ack in acks:
+                        valid.append(body(state, phase, cancellation_phase=cancellation, host_ack_state=ack))
+                valid.append(body(state, phase, cancellation_phase="completed", host_ack_state="retired"))
+                for ack in acks:
+                    if ack != "retired":
+                        invalid.append(("host_ack_state",
+                                        body(state, phase, cancellation_phase="completed", host_ack_state=ack)))
+                invalid.append(("cancellation_phase", body(state, phase, host_ack_state="active")))
+                invalid.append(("cancellation_phase", body(state, phase, host_ack_state="retired")))
+                invalid.append(("runner_key_id", body(state, phase, runner_key_id=None,
+                                                      cancellation_phase="authority_revoked")))
+        invalid.append(("pairing_id", body("revoked", "pre", cancellation_phase="authority_revoked")))
+        invalid.append(("pairing_id", body("revoked", "pre", cancellation_phase="completed", host_ack_state="retired")))
+        # Existing pairing/expiry/runner implications are kept for every state.
+        for state in mac.NONTERMINAL_STATES + ("revoked", "aborted", "expired"):
+            terminal = state not in mac.NONTERMINAL_STATES
+            extra = {"cancellation_phase": "authority_revoked"} if terminal else {}
+            invalid.append(("original_pairing_expires_at_ms",
+                            body(state, "matched", original_pairing_expires_at_ms=None, **extra)))
+            if state not in ("pending", "active", "revoked"):
+                invalid.append(("original_pairing_expires_at_ms",
+                                body(state, "pre", original_pairing_expires_at_ms=1793000900000, **extra)))
+            if state not in ("pending", "active", "revoked"):
+                invalid.append(("runner_id", body(state, "pre", runner_id="runr_" + "e" * 32, **extra)))
+        self.assertEqual(len(valid), 112)
+        self.assertEqual(len(invalid), 99)
+        for document in valid:
+            with self.subTest(valid=(document["observed_state"], document["pairing_id"] is not None,
+                                     document["runner_id"] is not None, document["cancellation_phase"],
+                                     document["host_ack_state"], document["runner_key_id"] is not None)):
+                accepted(document)
+        for field, document in invalid:
+            with self.subTest(invalid=field, state=document["observed_state"],
+                              phase=document["cancellation_phase"], ack=document["host_ack_state"]):
+                refused(field, document)
+        # The four reviewer-shaped contradictions, rebuilt here: active without a key, revoked without a
+        # cancellation phase, completed without an ack and completed over a historical active ack.
+        refused("runner_key_id", body("active", "matched", runner_key_id=None, host_ack_state="active"))
+        refused("cancellation_phase", body("revoked", "matched", host_ack_state="active"))
+        refused("host_ack_state", body("revoked", "matched", cancellation_phase="completed"))
+        refused("host_ack_state", body("revoked", "matched", cancellation_phase="completed", host_ack_state="active"))
+        # The positive controls the review retained: historical active ack on an incomplete terminal,
+        # and a pre-invite terminal that completed with a retired ack.
+        accepted(body("revoked", "matched", cancellation_phase="cleanup_pending", host_ack_state="active"))
+        accepted(body("aborted", "pre", cancellation_phase="completed", host_ack_state="retired"))
+        # observation_kind and its meaning are unchanged; no phase makes it an authorization.
+        self.assertEqual(mac.OBSERVATION_KIND, "historical_not_authorization")
 
     # -------------------------------------------------------------------------------------------
     def test_domain_classification_is_server_owned(self):

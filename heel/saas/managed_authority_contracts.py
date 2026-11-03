@@ -74,6 +74,7 @@ _HOSTNAME = re.compile(
 # The stricter H host slot grammar. S slot ids outside it (underscores, trailing hyphen) are refused
 # for managed enrollment, never normalised.
 _SLOT = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?")
+_SURROGATE = re.compile("[\ud800-\udfff]")  # code points with no UTF-8 encoding
 _PATTERNS = {
     "hex32": _HEX32, "hex64": _HEX64, "long_id": _LONG_ID, "slot": _SLOT, "hostname": _HOSTNAME,
     "boot": re.compile(r"[a-z0-9-]{8,64}"),
@@ -628,14 +629,28 @@ def _observation(document: Any) -> dict:
     state = document["observed_state"]
     if state in NONTERMINAL_STATES and document["cancellation_phase"] is not None:
         _fail("phase_nullability", "cancellation_phase")
+    # S 14.2 matrix: CP pending follows exchange+approve, so pending/active are the matched phase.
     if state in ("pending", "active") and document["pairing_id"] is None:
         _fail("phase_nullability", "pairing_id")
-    if state == "active" and document["runner_id"] is None:
+    if state in ("pending", "active") and document["runner_id"] is None:
         _fail("phase_nullability", "runner_id")
     if (document["pairing_id"] is None) != (document["original_pairing_expires_at_ms"] is None):
         _fail("phase_nullability", "original_pairing_expires_at_ms")
     if document["runner_id"] is not None and document["pairing_id"] is None:
         _fail("phase_nullability", "runner_id")
+    if state not in NONTERMINAL_STATES and document["cancellation_phase"] is None:
+        _fail("phase_nullability", "cancellation_phase")
+    if state == "revoked" and document["pairing_id"] is None:  # revocation always has a pairing
+        _fail("phase_nullability", "pairing_id")
+    # The key is fixed at reservation; only the pre-pair offered row is left nullable (see the
+    # observation fixture), every matched and adopted-terminal row keeps it.
+    if state != "offered" and document["runner_key_id"] is None:
+        _fail("phase_nullability", "runner_key_id")
+    # ``completed`` claims a matching retired ack in the same row; another ack state contradicts it.
+    # A historical active ack remains legal on a terminal row that has not claimed completion. This
+    # is structural only and does not prove a durable ack or auth reconciliation.
+    if document["cancellation_phase"] == "completed" and document["host_ack_state"] != "retired":
+        _fail("phase_nullability", "host_ack_state")
     return document
 
 
@@ -717,7 +732,11 @@ def route_template_digest(method: str, route_template: str) -> str:
     """Commitment to the signed projected template; CP can recompute it from the stored projection."""
     if method not in METHODS:
         _fail("invalid_field", "method")
-    if not isinstance(route_template, str) or not route_template or len(route_template.encode("utf-8")) > 1024:
+    # Text with a lone surrogate has no UTF-8 form. Detect it without raising, so the fixed refusal
+    # never chains (or retains) an encoder exception holding the supplied value. The code point
+    # precheck bounds the scan; it cannot refuse a legal template (UTF-8 is >= 1 byte per point).
+    if (not isinstance(route_template, str) or not route_template or len(route_template) > 1024
+            or _SURROGATE.search(route_template) is not None or len(route_template.encode("utf-8")) > 1024):
         _fail("invalid_field", "route_template")
     return _sha({"method": method, "route_template": route_template})
 

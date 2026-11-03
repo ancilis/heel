@@ -36,8 +36,12 @@ CONTRACT = ROOT / "release/open-core-v1.json"
 BUILDER = ROOT / "scripts/build_open_core_release.py"
 PRIVATE_CODEC = "heel/saas/managed_authority_contracts.py"
 OLD_PUBLIC_PATH = "heel/managed_authority_contracts.py"
-# The original P01 codec bytes (candidate 5fa01be8); the move must not change one byte.
-CODEC_SHA256 = "126b2186636579fd3206609526355abdbd32a2aba4582510317befcbd2cb3915"
+# Pinned private codec revisions. 126b2186 is the original P01 codec (candidate 5fa01be8), moved
+# byte-identically to heel/saas at cee76db7. The current pin is the deliberate C4-P01-SEMANTIC-FIX
+# revision of those bytes (observation phase matrix + fixed surrogate refusal only), pending independent
+# review. Any other change to the private codec must update this pin consciously, never silently.
+RELOCATED_CODEC_SHA256 = "126b2186636579fd3206609526355abdbd32a2aba4582510317befcbd2cb3915"
+CODEC_SHA256 = "c02b5ae91f2bf52f18c365502f98e0934ef7914072a3d5a2602bde69042ec28e"
 COMMERCIAL_MARKER = b"LicenseRef-Heel-Commercial"
 VERSION = json.loads(CONTRACT.read_text(encoding="utf-8"))["version"]
 WHEEL = f"heel_sim-{VERSION}-py3-none-any.whl"
@@ -140,11 +144,11 @@ def _absolute_import_targets(path: str, tree: ast.Module) -> set[str]:
 # Source classification
 
 
-def test_private_codec_is_moved_byte_identically_under_saas_with_its_commercial_header():
+def test_private_codec_is_under_saas_at_its_pinned_revision_with_its_commercial_header():
     assert PRIVATE_CODEC in _tracked("heel"), "private codec is not tracked under heel/saas"
     assert OLD_PUBLIC_PATH not in _tracked("heel") and not (ROOT / OLD_PUBLIC_PATH).exists(), "old public path remains"
     payload = (ROOT / PRIVATE_CODEC).read_bytes()
-    assert _sha256(payload) == CODEC_SHA256
+    assert _sha256(payload) == CODEC_SHA256 != RELOCATED_CODEC_SHA256
     assert b"SPDX-License-Identifier: " + COMMERCIAL_MARKER in payload.split(b"\n\n", 2)[1]
     # No shim, copy or second definition anywhere in the tracked heel tree.
     for name in sorted(_tracked("heel")):
