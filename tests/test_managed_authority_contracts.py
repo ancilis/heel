@@ -17,7 +17,9 @@ from heel.saas.managed_authority_contracts import ManagedContractError
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/canary/contracts/managed-authority-v1.json"
-FIXTURE_SHA256 = "cdd3576a266cc0c6799487449e3abcbb8c82897c335ddeadde979065cf3fb212"
+# cdd3576a... was the fixture before C4-P01-PHASE-R2 changed only observation_offered.runner_key_id
+# from null to a synthetic reserved key (S 14.2: key nonnull at reservation).
+FIXTURE_SHA256 = "44df3c4f78d59e23403f219df6644b91850415c8f278f599b1212cf53cca5eee"
 
 WINDOW_ROUTE, ATTEMPT_ROUTE, CEREMONY_ROUTE = (
     "/host/v3/managed-operation", "/host/v1/managed-attempt", "/host/v3/managed-ceremony")
@@ -610,6 +612,9 @@ class ManagedAuthorityContractTests(unittest.TestCase):
         refused("phase_nullability", {**offered, "cancellation_phase": "completed"})
         refused("phase_nullability", {**offered, "observed_state": "pending"})
         refused("phase_nullability", {**offered, "original_pairing_expires_at_ms": 1})
+        # S 14.2: the managed offered row is a reservation, so its key is nonnull (no keyless phase).
+        self.assertEqual(offered["runner_key_id"], "k_1111111111111111")
+        refused("phase_nullability", {**offered, "runner_key_id": None})
         refused("extra_key", {**offered, "active": True})
         maximal = _fixture()["maximal"]["observation"]
         self.assertLessEqual(len(_c(maximal)), 4096)
@@ -624,7 +629,9 @@ class ManagedAuthorityContractTests(unittest.TestCase):
         its adopted phase and keeps the reservation's nonnull key; revoked always has a pairing.
         cancellation_phase is null exactly for nonterminal rows; ``completed`` claims a matching
         retired ack, so any other ack state contradicts it. A historical active ack stays legal on a
-        terminal row that has not claimed completion. Structural only: no durable ack or
+        terminal row that has not claimed completion only WITH its pairing (host_ack.v1: active
+        requires nonnull pairing; terminal identity preserves the adopted pairing). The managed
+        offered row is a reservation, so its key is nonnull too. Structural only: no durable ack or
         reconciliation is proven here.
         """
         base = {"schema_version": "heel.managed-executor-observation.v1", "managed_executor_id": "mex_" + "b" * 32,
@@ -655,13 +662,14 @@ class ManagedAuthorityContractTests(unittest.TestCase):
                 self.assertIsNone(error.__cause__)
 
         valid, invalid = [], []
-        # Nonterminal rows: offered may be at any identity phase (the fixture keeps a null offered
-        # key, see REPORT source tension); pending/active only matched with a key; never a phase.
+        # Nonterminal rows: offered may be at any identity phase but always has its reservation key
+        # (S 14.2 governs over the S 4.3 / EA 8 nullable shorthand); pending/active only matched with
+        # a key; never a cancellation phase.
         for phase in phases:
             valid.append(body("offered", phase))
             for cancellation in ("authority_revoked", "cleanup_pending", "completed"):
                 invalid.append(("cancellation_phase", body("offered", phase, cancellation_phase=cancellation)))
-        valid.append(body("offered", "pre", runner_key_id=None))
+        invalid.append(("runner_key_id", body("offered", "pre", runner_key_id=None)))
         for state in ("pending", "active"):
             for ack in (None, "active"):
                 valid.append(body(state, "matched", host_ack_state=ack))
@@ -675,7 +683,11 @@ class ManagedAuthorityContractTests(unittest.TestCase):
             for phase in allowed:
                 for cancellation in ("authority_revoked", "cleanup_pending"):
                     for ack in acks:
-                        valid.append(body(state, phase, cancellation_phase=cancellation, host_ack_state=ack))
+                        document = body(state, phase, cancellation_phase=cancellation, host_ack_state=ack)
+                        if ack == "active" and phase == "pre":  # active ack requires a pairing
+                            invalid.append(("pairing_id", document))
+                        else:
+                            valid.append(document)
                 valid.append(body(state, phase, cancellation_phase="completed", host_ack_state="retired"))
                 for ack in acks:
                     if ack != "retired":
@@ -698,8 +710,8 @@ class ManagedAuthorityContractTests(unittest.TestCase):
                                 body(state, "pre", original_pairing_expires_at_ms=1793000900000, **extra)))
             if state not in ("pending", "active", "revoked"):
                 invalid.append(("runner_id", body(state, "pre", runner_id="runr_" + "e" * 32, **extra)))
-        self.assertEqual(len(valid), 112)
-        self.assertEqual(len(invalid), 99)
+        self.assertEqual(len(valid), 107)
+        self.assertEqual(len(invalid), 104)
         for document in valid:
             with self.subTest(valid=(document["observed_state"], document["pairing_id"] is not None,
                                      document["runner_id"] is not None, document["cancellation_phase"],
@@ -719,8 +731,88 @@ class ManagedAuthorityContractTests(unittest.TestCase):
         # and a pre-invite terminal that completed with a retired ack.
         accepted(body("revoked", "matched", cancellation_phase="cleanup_pending", host_ack_state="active"))
         accepted(body("aborted", "pre", cancellation_phase="completed", host_ack_state="retired"))
+        # C4-P01-SEMANTIC-REVIEW F1a: an active ack without any pairing, on offered/aborted/expired.
+        refused("pairing_id", body("offered", "pre", host_ack_state="active"))
+        refused("pairing_id", body("aborted", "pre", cancellation_phase="cleanup_pending", host_ack_state="active"))
+        refused("pairing_id", body("expired", "pre", cancellation_phase="cleanup_pending", host_ack_state="active"))
+        # F1b: the managed offered reservation without its key; the keyed offered row stays valid.
+        refused("runner_key_id", body("offered", "pre", runner_key_id=None))
+        accepted(body("offered", "pre"))
+        # Positive controls: pre-invite retired completion, post-invite historical active history.
+        for state in ("aborted", "expired"):
+            accepted(body(state, "pre", cancellation_phase="completed", host_ack_state="retired"))
+            for phase in ("invited", "matched"):
+                accepted(body(state, phase, cancellation_phase="cleanup_pending", host_ack_state="active"))
         # observation_kind and its meaning are unchanged; no phase makes it an authorization.
         self.assertEqual(mac.OBSERVATION_KIND, "historical_not_authorization")
+
+    def test_observation_full_combination_matrix_maps_to_s_14_2(self):
+        """Every state x identity phase x ack x cancellation x key combination, against named S rules.
+
+        Each rule cites retained S 2a712217 14.2 (as kept by Observation ed901650 section 7). The oracle
+        returns the set of violated rule fields; the codec must accept exactly the combinations with no
+        violation and refuse the others with phase_nullability naming one violated field. Nothing here
+        infers a database row, a durable ack, auth reconciliation or current authority.
+        """
+        pre = {"pairing_id": None, "runner_id": None, "original_pairing_expires_at_ms": None}
+        invited = {**pre, "pairing_id": "pending_" + "d" * 32, "original_pairing_expires_at_ms": 1793000900000}
+        matched = {**invited, "runner_id": "runr_" + "e" * 32}
+        phases = {"pre": pre, "invited": invited, "matched": matched}
+        rules = (
+            # Public response "cancellation_phase is null for nonterminal rows".
+            ("cancellation_phase", lambda s, p, a, c, k: s in mac.NONTERMINAL_STATES and c is not None),
+            # Terminal rows carry authority_revoked/cleanup_pending/completed after terminal commit.
+            ("cancellation_phase", lambda s, p, a, c, k: s not in mac.NONTERMINAL_STATES and c is None),
+            # Identity table: matched pending/activating/active rows have pairing and runner.
+            ("pairing_id", lambda s, p, a, c, k: s in ("pending", "active") and p == "pre"),
+            ("runner_id", lambda s, p, a, c, k: s in ("pending", "active") and p != "matched"),
+            # "Matched pending/activated/revoked and cancellation always require nonnull pairing id."
+            ("pairing_id", lambda s, p, a, c, k: s == "revoked" and p == "pre"),
+            # "IDs/slot/epoch/key/digest are nonnull at reservation" (offered is the reserved row).
+            ("runner_key_id", lambda s, p, a, c, k: k is None),
+            # "completed ONLY after durable matching retired ack": another ack contradicts the claim.
+            ("host_ack_state", lambda s, p, a, c, k: c == "completed" and a != "retired"),
+            # host_ack.v1 "active requires nonnull pairing"; terminal identity keeps the pairing.
+            ("pairing_id", lambda s, p, a, c, k: a == "active" and p == "pre"),
+        )
+        accepted = refused = 0
+        for state in mac.MANAGED_STATES:
+            for phase in phases:
+                for ack in (None,) + mac.HOST_ACK_STATES:
+                    for cancellation in (None,) + mac.CANCELLATION_PHASES:
+                        for key in ("k_" + "c" * 16, None):
+                            document = {"schema_version": "heel.managed-executor-observation.v1",
+                                        "managed_executor_id": "mex_" + "b" * 32,
+                                        "observation_kind": "historical_not_authorization",
+                                        "authority_revision": 3, "observed_at_ms": 1793000000123,
+                                        "observed_state": state, **phases[phase], "runner_key_id": key,
+                                        "delivery_status": "delivered", "host_ack_state": ack,
+                                        "recovery_code": None, "retry_after_ms": None,
+                                        "cancellation_phase": cancellation}
+                            violated = {field for field, rule in rules
+                                        if rule(state, phase, ack, cancellation, key)}
+                            with self.subTest(state=state, phase=phase, ack=ack, cancellation=cancellation,
+                                              key=key is not None):
+                                if violated:
+                                    error = self.assertRefused("phase_nullability", mac.decode, "observation",
+                                                               _c(document))
+                                    self.assertIn(error.field, violated)
+                                    refused += 1
+                                else:
+                                    self.assertEqual(mac.decode("observation", _c(document)), document)
+                                    accepted += 1
+        self.assertEqual(accepted + refused, 6 * 3 * 6 * 4 * 2)
+        self.assertEqual((accepted, refused), (129, 735))
+
+    def test_unreserved_root_key_offer_stays_a_separate_ceremony_message(self):
+        """The unreserved root key offer (null managed/workspace identity) is the ceremony public_key
+        request, not this observation; the offered-key rule neither rejects nor alters it."""
+        first = _fixture()["ceremony_phases"]["first_offer"]
+        self.assertIsNone(first["managed_executor_id"])
+        self.assertEqual([first["payload"][k] for k in ("previous_managed_executor_id", "previous_epoch_id",
+                                                        "previous_terminal_pairing_id")], [None, None, None])
+        self.assertEqual(mac.decode("ceremony_request", _c(first)), first)
+        self.assertEqual(mac.decode_route_request(CEREMONY_ROUTE, _c(first)), first)
 
     # -------------------------------------------------------------------------------------------
     def test_domain_classification_is_server_owned(self):

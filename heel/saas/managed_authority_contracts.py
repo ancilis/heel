@@ -642,15 +642,20 @@ def _observation(document: Any) -> dict:
         _fail("phase_nullability", "cancellation_phase")
     if state == "revoked" and document["pairing_id"] is None:  # revocation always has a pairing
         _fail("phase_nullability", "pairing_id")
-    # The key is fixed at reservation; only the pre-pair offered row is left nullable (see the
-    # observation fixture), every matched and adopted-terminal row keeps it.
-    if state != "offered" and document["runner_key_id"] is None:
+    # S 14.2: the key is nonnull at reservation, and a managed observation row (offered included) is
+    # a reservation. The detailed S 14.2 rule governs over the nullable S 4.3 / EA 8 shorthand; the
+    # unreserved root key offer is the separate ceremony public_key message, not this schema.
+    if document["runner_key_id"] is None:
         _fail("phase_nullability", "runner_key_id")
     # ``completed`` claims a matching retired ack in the same row; another ack state contradicts it.
     # A historical active ack remains legal on a terminal row that has not claimed completion. This
     # is structural only and does not prove a durable ack or auth reconciliation.
     if document["cancellation_phase"] == "completed" and document["host_ack_state"] != "retired":
         _fail("phase_nullability", "host_ack_state")
+    # S 14.2 host_ack.v1: an active ack requires a nonnull pairing, and terminal identity preserves
+    # the adopted pairing, so an active ack (current or historical) with no pairing contradicts itself.
+    if document["host_ack_state"] == "active" and document["pairing_id"] is None:
+        _fail("phase_nullability", "pairing_id")
     return document
 
 

@@ -37,11 +37,15 @@ BUILDER = ROOT / "scripts/build_open_core_release.py"
 PRIVATE_CODEC = "heel/saas/managed_authority_contracts.py"
 OLD_PUBLIC_PATH = "heel/managed_authority_contracts.py"
 # Pinned private codec revisions. 126b2186 is the original P01 codec (candidate 5fa01be8), moved
-# byte-identically to heel/saas at cee76db7. The current pin is the deliberate C4-P01-SEMANTIC-FIX
-# revision of those bytes (observation phase matrix + fixed surrogate refusal only), pending independent
-# review. Any other change to the private codec must update this pin consciously, never silently.
+# byte-identically to heel/saas at cee76db7. c02b5ae9 was the C4-P01-SEMANTIC-FIX revision (9bd9104:
+# observation phase matrix + fixed surrogate refusal), which failed independent review on two observation
+# guards. The current pin is the deliberate C4-P01-PHASE-R2 revision of c02b5ae9: only the observation
+# guards change (active host ack requires a pairing; the managed offered row keeps its reservation key),
+# pending independent review. Lineage 126b2186 -> c02b5ae9 -> 71663cd1. Any other change to the private
+# codec must update this pin consciously, never silently.
 RELOCATED_CODEC_SHA256 = "126b2186636579fd3206609526355abdbd32a2aba4582510317befcbd2cb3915"
-CODEC_SHA256 = "c02b5ae91f2bf52f18c365502f98e0934ef7914072a3d5a2602bde69042ec28e"
+SEMANTIC_FIX_CODEC_SHA256 = "c02b5ae91f2bf52f18c365502f98e0934ef7914072a3d5a2602bde69042ec28e"
+CODEC_SHA256 = "71663cd19a032e15bd1ce54009ca102236d4a1d3281ab83dd6133ca7d30720e9"
 COMMERCIAL_MARKER = b"LicenseRef-Heel-Commercial"
 VERSION = json.loads(CONTRACT.read_text(encoding="utf-8"))["version"]
 WHEEL = f"heel_sim-{VERSION}-py3-none-any.whl"
@@ -148,7 +152,8 @@ def test_private_codec_is_under_saas_at_its_pinned_revision_with_its_commercial_
     assert PRIVATE_CODEC in _tracked("heel"), "private codec is not tracked under heel/saas"
     assert OLD_PUBLIC_PATH not in _tracked("heel") and not (ROOT / OLD_PUBLIC_PATH).exists(), "old public path remains"
     payload = (ROOT / PRIVATE_CODEC).read_bytes()
-    assert _sha256(payload) == CODEC_SHA256 != RELOCATED_CODEC_SHA256
+    assert _sha256(payload) == CODEC_SHA256
+    assert CODEC_SHA256 not in (RELOCATED_CODEC_SHA256, SEMANTIC_FIX_CODEC_SHA256)
     assert b"SPDX-License-Identifier: " + COMMERCIAL_MARKER in payload.split(b"\n\n", 2)[1]
     # No shim, copy or second definition anywhere in the tracked heel tree.
     for name in sorted(_tracked("heel")):
