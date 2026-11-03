@@ -1432,6 +1432,104 @@ class OpenCoreReleaseTests(unittest.TestCase):
             with self.subTest(label):
                 self._assert_mutated_snapshot_is_rejected(mutation, expected_message)
 
+    def _build_snapshot_with_appended_imports(
+        self,
+        appended: tuple[tuple[str, str], ...],
+        temporary_path: Path,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        source = temporary_path / "source"
+        source.mkdir()
+        _copy_public_builder_snapshot(source)
+        for relative_name, statement in appended:
+            with (source / relative_name).open("a", encoding="utf-8") as stream:
+                stream.write("\n" + statement + "\n")
+        output = temporary_path / "output"
+        result = _run_release_builder(
+            output,
+            builder=source / "scripts/build_open_core_release.py",
+        )
+        return result, output
+
+    def test_builder_resolves_relative_imports_in_the_importing_module_context(self):
+        execution = "heel/runner/execution.py"
+        runner_package = "heel/runner/__init__.py"
+        root_package = "heel/__init__.py"
+        forbidden = "forbidden local import: heel.saas in "
+        above_root = "invalid relative import beyond top-level package in "
+        rejected = (
+            # The two confirmed standalone-builder gaps (review F3).
+            ("level-two module form", execution, "from ..saas import ledger", forbidden),
+            ("level-two parent alias form", execution, "from .. import saas", forbidden),
+            ("level-two aliased name", execution, "from .. import saas as private_saas", forbidden),
+            ("level-two dotted module", execution, "from ..saas.ledger import record as r", forbidden),
+            ("level-two mixed names", execution, "from .. import model, saas", forbidden),
+            ("level-two star import", execution, "from ..saas import *", forbidden),
+            (
+                "level-two import inside a function",
+                execution,
+                "def _late_private_import():\n    from ..saas import ledger\n    return ledger",
+                forbidden,
+            ),
+            ("absolute control in subpackage", execution, "from heel.saas import ledger", forbidden),
+            ("absolute import control in subpackage", execution, "import heel.saas.ledger", forbidden),
+            ("preserved level-one saas spelling", execution, "from .saas import ledger", forbidden),
+            ("package init level-two name", runner_package, "from .. import saas", forbidden),
+            ("package init level-two module", runner_package, "from ..saas import ledger", forbidden),
+            ("root package init level-one module", root_package, "from .saas import ledger", forbidden),
+            ("root package init level-one name", root_package, "from . import saas", forbidden),
+            ("level three above subpackage root", execution, "from ... import saas", above_root),
+            ("level three dotted above root", execution, "from ...heel.saas import ledger", above_root),
+            ("level four above root", execution, "from .... import model", above_root),
+            ("package init level three above root", runner_package, "from ... import saas", above_root),
+            ("top-level module level two above root", "heel/cli.py", "from .. import saas", above_root),
+            ("top-level module dotted above root", "heel/cli.py", "from ..heel import saas", above_root),
+            ("root package init level two above root", root_package, "from .. import model", above_root),
+        )
+        for label, relative_name, statement, expected_message in rejected:
+            with self.subTest(label):
+                with tempfile.TemporaryDirectory(prefix="heel-open-core-import-") as temporary:
+                    result, output = self._build_snapshot_with_appended_imports(
+                        ((relative_name, statement),),
+                        Path(temporary).resolve(),
+                    )
+                    combined = result.stdout + result.stderr
+                    self.assertNotEqual(result.returncode, 0, combined)
+                    self.assertIn(expected_message + relative_name, combined)
+                    self.assertFalse((output / WHEEL).exists(), combined)
+                    self.assertFalse((output / SDIST).exists(), combined)
+
+        legal = (
+            (execution, "from . import store as _sibling_store"),
+            (execution, "from .store import RunnerStore as _SiblingName"),
+            (execution, "from .. import model as _parent_model"),
+            (execution, "from ..scope import ScopeError as _ParentName"),
+            (execution, "from ..runner import store as _round_trip"),
+            (execution, "from .. import saasy as _similar_name"),
+            (execution, "from ..saas_public_name import value as _similar_module"),
+            (runner_package, "from . import execution as _package_sibling"),
+            (runner_package, "from .. import model as _package_parent"),
+            (root_package, "from . import model as _root_child"),
+            (root_package, "from .runner import store as _root_grandchild"),
+            ("heel/cli.py", "from . import scope as _top_sibling"),
+            ("heel/cli.py", "from .saasy import value as _top_similar"),
+        )
+        with tempfile.TemporaryDirectory(prefix="heel-open-core-import-") as temporary:
+            result, output = self._build_snapshot_with_appended_imports(
+                legal,
+                Path(temporary).resolve(),
+            )
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, combined)
+            with zipfile.ZipFile(output / WHEEL) as archive:
+                names = set(archive.namelist())
+                self.assertFalse(any(name.startswith("heel/saas") for name in names))
+                for relative_name, statement in legal:
+                    with self.subTest(relative_name=relative_name, statement=statement):
+                        self.assertIn(
+                            ("\n" + statement + "\n").encode("utf-8"),
+                            archive.read(relative_name),
+                        )
+
     def test_zip64_signature_inside_regular_payload_is_not_rejected(self):
         with tempfile.TemporaryDirectory(prefix="heel-open-core-zip64-payload-") as temporary:
             temporary_path = Path(temporary).resolve()
