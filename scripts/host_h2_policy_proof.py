@@ -94,6 +94,7 @@ HEEL_TREE_FILES = (
     "heel/saas/dashboard.py", "heel/saas/device_auth.py", "heel/saas/egress.py", "heel/saas/entitlement.py",
     "heel/saas/findings_sync.py", "heel/saas/host_authority.py", "heel/saas/host_snapshot.py",
     "heel/saas/http_api.py", "heel/saas/iana_root_tlds.py", "heel/saas/jobs.py", "heel/saas/ledger.py",
+    "heel/saas/managed_authority_contracts.py",
     "heel/saas/migrate.py", "heel/saas/network_guard.py", "heel/saas/ops.py", "heel/saas/projects.py",
     "heel/saas/reconcile.py", "heel/saas/runner_auth.py", "heel/saas/runner_contexts.py", "heel/saas/server.py",
     "heel/saas/site.py", "heel/saas/tenancy.py", "heel/saas/verification.py", "heel/scenario_validate.py",
