@@ -12,8 +12,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from heel import managed_authority_contracts as mac
-from heel.managed_authority_contracts import ManagedContractError
+from heel.saas import managed_authority_contracts as mac
+from heel.saas.managed_authority_contracts import ManagedContractError
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/canary/contracts/managed-authority-v1.json"

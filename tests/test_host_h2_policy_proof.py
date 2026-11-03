@@ -89,7 +89,7 @@ def test_staged_closure_is_the_design_list_plus_exactly_the_tracked_heel_tree(tm
     assert LAUNCHER.STAGE_FILES == DESIGN_STAGE_FILES
     tracked = subprocess.run(["git", "ls-files", "-z", "--", "heel"], cwd=ROOT, capture_output=True, check=True).stdout
     assert tuple(name for name in tracked.decode().split("\0") if name) == LAUNCHER.HEEL_TREE_FILES
-    assert len(LAUNCHER.HEEL_TREE_FILES) == 109 and LAUNCHER.staged_files() == LAUNCHER.HEEL_TREE_FILES + DESIGN_STAGE_FILES
+    assert len(LAUNCHER.HEEL_TREE_FILES) == 110 and LAUNCHER.staged_files() == LAUNCHER.HEEL_TREE_FILES + DESIGN_STAGE_FILES
     # The staged copy is exactly the closure, byte for byte, and its digest moves with any one byte.
     source = LAUNCHER.stage_tree(tmp_path / "src")
     staged = sorted(str(path.relative_to(source)) for path in source.rglob("*") if path.is_file())
@@ -101,6 +101,62 @@ def test_staged_closure_is_the_design_list_plus_exactly_the_tracked_heel_tree(tm
     (source / "docs/saas/H2_POLICY_PROOF.md").write_bytes(b"changed\n")
     assert LAUNCHER.closure_digest(hashes, LAUNCHER.STAGE_FILES, root=source) != digest
     assert LAUNCHER.closure_digest({**hashes, "heel/__init__.py": "0" * 64}, LAUNCHER.STAGE_FILES) != digest
+
+
+PRIVATE_CODEC = "heel/saas/managed_authority_contracts.py"
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@invalid", "-c", "commit.gpgsign=false",
+                           *args], cwd=cwd, capture_output=True, text=True, check=True).stdout
+
+
+def test_private_codec_is_one_ordered_member_and_the_launcher_refuses_a_missing_or_extra_member(tmp_path, monkeypatch):
+    """C4 P01 moved the commercial codec under heel/saas: the closure is 110 heel + 14 stage files. An
+    owned git fixture (an exact staged copy, committed) shows the launcher's own provenance check refuses
+    a missing or an unexpected tracked heel member, and that one byte of the new member moves the digest."""
+    tree = LAUNCHER.HEEL_TREE_FILES
+    assert tree.count(PRIVATE_CODEC) == 1 and "heel/managed_authority_contracts.py" not in tree
+    index = tree.index(PRIVATE_CODEC)
+    assert tree[index - 1:index + 2] == ("heel/saas/ledger.py", PRIVATE_CODEC, "heel/saas/migrate.py")
+    assert len(tree) + len(LAUNCHER.STAGE_FILES) == 124 == len(set(LAUNCHER.staged_files()))
+    fixture = LAUNCHER.stage_tree(tmp_path / "fixture")
+    _git(fixture, "init", "-q")
+    _git(fixture, "add", "--", ".")
+    _git(fixture, "commit", "-q", "-m", "exact staged closure")
+    monkeypatch.setattr(LAUNCHER, "ROOT", fixture)
+    exact = LAUNCHER.candidate_provenance()
+    assert exact["heel_tree_file_count"] == 110 and exact["proof_file_count"] == 14
+    assert exact["heel_tree_files"][PRIVATE_CODEC] == LAUNCHER._sha256(ROOT / PRIVATE_CODEC)
+    assert exact["staged_closure_sha256"] == LAUNCHER.closure_digest(
+        {name: LAUNCHER._sha256(ROOT / name) for name in tree}, LAUNCHER.STAGE_FILES)
+
+    # Missing member: the private codec is no longer tracked.
+    _git(fixture, "rm", "-q", "--", PRIVATE_CODEC)
+    _git(fixture, "commit", "-q", "-m", "missing member")
+    with pytest.raises(LAUNCHER.ProofFailure, match="heel_tree_differs"):
+        LAUNCHER.candidate_provenance()
+    _git(fixture, "revert", "--no-edit", "HEAD")
+    assert LAUNCHER.candidate_provenance()["staged_closure_sha256"] == exact["staged_closure_sha256"]
+
+    # Extra member: the old public path (or any unlisted file) tracked again under heel/.
+    shutil.copyfile(ROOT / PRIVATE_CODEC, fixture / "heel/managed_authority_contracts.py")
+    _git(fixture, "add", "--", "heel/managed_authority_contracts.py")
+    _git(fixture, "commit", "-q", "-m", "extra member")
+    with pytest.raises(LAUNCHER.ProofFailure, match="heel_tree_differs"):
+        LAUNCHER.candidate_provenance()
+    _git(fixture, "revert", "--no-edit", "HEAD")
+
+    # Member byte change: provenance still matches the tuple, but the member hash and digest move.
+    codec = fixture / PRIVATE_CODEC
+    codec.write_bytes(codec.read_bytes() + b"\n")
+    _git(fixture, "commit", "-q", "-am", "member byte change")
+    changed = LAUNCHER.candidate_provenance()
+    assert changed["heel_tree_file_count"] == 110
+    assert changed["heel_tree_files"][PRIVATE_CODEC] != exact["heel_tree_files"][PRIVATE_CODEC]
+    assert {k: v for k, v in changed["heel_tree_files"].items() if k != PRIVATE_CODEC} == {
+        k: v for k, v in exact["heel_tree_files"].items() if k != PRIVATE_CODEC}
+    assert changed["staged_closure_sha256"] != exact["staged_closure_sha256"]
 
 
 def test_wheel_closure_is_the_eight_h0_locked_wheels_and_a_changed_lock_fails():

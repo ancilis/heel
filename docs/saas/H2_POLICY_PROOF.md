@@ -17,6 +17,16 @@ hash changes, so the staged closure digest is new and no earlier run (cycles 1-3
 The case names and the record table are unchanged; P1, P2 and P5 gain the gateway and control-only
 records described below. Until that run is reviewed, everything H2-3 adds is **UNRUN**.
 
+**C4 P01 inventory amendment** (private managed codec): the commercial, inert codec moved
+byte-for-byte to `heel/saas/managed_authority_contracts.py`, so the tracked `heel/` tree and
+`HEEL_TREE_FILES` are now 110 paths (was 109) and the ordered staged closure is 110 + 14 = 124 files.
+The 14 `STAGE_FILES`, the profile, the reviewed ref, the wheel closure and every case are unchanged.
+The new staged closure digest is **UNRUN**: no earlier run, including the cycles above and any H2-3
+run, covers it. It becomes evidence only after a fresh, unfiltered launcher run on the literal proof
+branch (all 18 cases, eight p0-p7 records, zero skips) and an independent runtime review. Earlier
+records stay historical evidence of their own closures only. The codec is not imported by any staged
+proof path; staging it is inventory, not use.
+
 ## Question
 
 Does the real, unmodified H2-1 `install(fd, input)` (the real `Popen` helper, the real `setns` into a
@@ -46,7 +56,7 @@ H2K1's launcher (`scripts/host_lease_key_shape.py`), which stays unchanged. The 
 
 1. refuses any `GITHUB_REF` but `refs/heads/codex/self-serve-host-h2-policy-proof`;
 2. requires a clean checkout, `STAGE_FILES` tracked, and `HEEL_TREE_FILES` equal to `git ls-files heel`
-   (109 paths at the candidate);
+   (110 paths at the candidate, including the private `heel/saas/managed_authority_contracts.py`);
 3. checks the pinned Python 3.13.5 and the host tools, lints `codeql.yml` with H0's pinned actionlint;
 4. fetches the **eight wheels** byte-pinned in the H0 lock (`deploy/host/ingress/runtime-lock.json`):
    the H1F pytest closure (iniconfig, packaging, pluggy, pygments, pytest 9.0.2) plus cryptography
