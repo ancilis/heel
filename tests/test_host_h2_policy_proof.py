@@ -475,9 +475,11 @@ def test_linux_module_guards_reject_seam_assignment_fakes_skips_and_missing_case
 import ast
 import functools
 import time
+import tracemalloc
 import types
 
 H0 = LAUNCHER.h0()
+_PARSE = LAUNCHER.parse_link_line  # unpatched, for the modeled host only
 DIAG_KEY = bytes(range(32))
 HOST_NS = (7, 4026531840)
 GATE_SOURCE_SHA256 = {  # function source at the pinned base 945537376436 (the gate is not edited)
@@ -553,7 +555,7 @@ class _Host:
         return subprocess.CompletedProcess(argv, 0, "fixed " + " ".join(argv) + "\n", "")
 
     def kinds(self, deadline_ns, *, clock):
-        entries = [LAUNCHER.parse_link_line(line) for line in self.current.splitlines()]
+        entries = [_PARSE(line) for line in self.current.splitlines()]  # the modeled listing, not collector work
         return "ok", {f["ifindex"]: (f["name"], self.kind_names.get(f["name"], "veth" if "@" in f["line"] else "none"))
                       for f in entries if f}
 
@@ -742,14 +744,17 @@ def test_diag_order_only_flag_mtu_and_hardware_addition_all_retain_fail(monkeypa
         assert LAUNCHER.diagnostic_result("FAIL", result["clean"]) == ("FAIL", None)
 
 
-def test_diag_proof_endpoint_leak_is_matched_only_with_corroborated_ownership(monkeypatch, tmp_path):
+def test_diag_proof_endpoint_leak_is_correlated_only_with_corroborated_ownership(monkeypatch, tmp_path):
+    # R2: a corroborated name+MAC registry match is labelled as a correlation only; proof identity
+    # stays unknown (no lifecycle witness), and hardware metadata is reported beside it, not hidden.
     leak = _endpoint(9, "hp3l", "02:48:32:00:03:0a", 10)
     matched = _audit(monkeypatch, [(0, BASE), (0, BASE), (0, _text(LO, ETH0, leak))],
-                     devices={"hp3l": ("yes", "pci", "mlx5_core")})  # hardware-like metadata does not outrank identity
+                     devices={"hp3l": ("yes", "pci", "mlx5_core")})
     pair = _pair(matched)
     assert matched["differing"] == ["links"] and _gate(tmp_path, False) == "FAIL"
-    assert pair["changes"][0]["proof_identity"] == "proof_identity_match" and pair["classes"] == ["proof_identity_match"]
-    assert matched["clean"]["ownership"] == {"status": "valid", "endpoints": 4, "matched": 1, "ambiguous": 0,
+    assert (pair["changes"][0]["proof_identity"], pair["changes"][0]["correlation"]) == ("unknown", "fixture_name_mac")
+    assert pair["classes"] == ["fixture_name_mac_correlation", "hardware_backed_change"]
+    assert matched["clean"]["ownership"] == {"status": "valid", "endpoints": 4, "correlated": 1, "ambiguous": 0,
                                              "namespace_conflicts": 0}
     cases = {
         # A real-looking hp... name with no registry at all.
@@ -775,6 +780,7 @@ def test_diag_proof_endpoint_leak_is_matched_only_with_corroborated_ownership(mo
         pair = _pair(result)
         assert result["differing"] == ["links"], name
         assert [c["proof_identity"] for c in pair["changes"]] == ["unknown"] and pair["classes"] == ["unknown"], name
+        assert [c["correlation"] for c in pair["changes"]] == ["ambiguous" if name == "ambiguous" else "none"], name
         assert "proof_identity_match" not in json.dumps(result["clean"]), name
     assert _audit(monkeypatch, [(0, BASE)] * 3, registry=cases["ambiguous"]["registry"])["clean"]["ownership"]["ambiguous"] == 0
     conflict = _audit(monkeypatch, [(0, BASE), (0, BASE), (0, _text(LO, ETH0, leak))], registry=cases["namespace_conflict"]["registry"])
@@ -785,7 +791,8 @@ def test_diag_proof_endpoint_leak_is_matched_only_with_corroborated_ownership(mo
     # A pre-existing host link with a fixture-like name that only changed is not the fixture's endpoint.
     old = _endpoint(9, "hp3l", "02:48:32:00:03:0a", 10)
     lifecycle = _audit(monkeypatch, [(0, _text(LO, old)), (0, _text(LO, old)), (0, _text(LO, old.replace("mtu 1500", "mtu 1400")))])
-    assert [(c["change"], c["proof_identity"]) for c in _pair(lifecycle)["changes"]] == [("changed", "unknown")]
+    assert [(c["change"], c["proof_identity"], c["correlation"]) for c in _pair(lifecycle)["changes"]] == [
+        ("changed", "unknown", "none")]
 
 
 def test_diag_driver_only_enrichment_change_is_diagnostic_evidence_never_a_fingerprint_delta(monkeypatch, tmp_path):
@@ -844,7 +851,10 @@ def test_diag_unknown_syntax_caps_and_incompleteness_can_only_hold_a_pass(monkey
     many = _text(*[_endpoint(10 + i, f"vx{i}", "02:00:00:00:%02x:01" % i, 200 + i) for i in range(70)])
     capped = _audit(monkeypatch, [(0, BASE), (0, BASE), (0, BASE + many)], registry=fixture_registry())
     capture = capped["clean"]["captures"][2]
-    assert capture["line_count"] == 72 and len(capture["lines"]) == len(capture["links"]) == 64
+    # R2: the scan stops at 64 lines, so the total line/byte counts are unknown, never estimated.
+    assert capture["line_count"] is None and capture["bytes"] is None and capture["scan"] == "truncated"
+    assert capture["lines_scanned"] == len(capture["lines"]) == len(capture["links"]) == 64
+    assert capture["chars"] == len(BASE + many)
     assert "line_cap" in capped["clean"]["incomplete_reasons"] and "changed_cap" not in capped["clean"]["incomplete_reasons"]
     pair = _pair(capped)
     assert len(pair["changes"]) == 62 and pair["added"] == 62 and "unknown" in pair["classes"]
@@ -991,7 +1001,7 @@ def test_diag_metadata_reads_are_fixed_bounded_inside_the_roots_and_unknown_on_r
     unknown = {"device_backed": "unknown", "bus": "unknown", "driver": "unknown", "status": "unknown"}
     assert LAUNCHER.link_metadata("eth1", 4, far, root=str(root)) == unknown  # another link now holds the name
     reads = iter(["3", "9"])
-    assert LAUNCHER.link_metadata("eth1", 3, far, root=str(root), read=lambda _path: next(reads)) == unknown  # race
+    assert LAUNCHER.link_metadata("eth1", 3, far, root=str(root), read=lambda _directory, _name: next(reads)) == unknown
     assert LAUNCHER.link_metadata("eth1", 3, 0, root=str(root)) == unknown  # past the deadline
     assert LAUNCHER.link_metadata("gone0", 3, far, root=str(root)) == unknown  # disappeared
     outside = tmp_path / "elsewhere" / "net" / "esc0"
@@ -1002,10 +1012,14 @@ def test_diag_metadata_reads_are_fixed_bounded_inside_the_roots_and_unknown_on_r
     for name in ("../x", "a/b", "", ".", "x" * 16, "eé0"):
         assert LAUNCHER.link_metadata(name, 1, far, root=str(root)) == unknown, name
     (root / "class" / "net" / "big0").symlink_to(root / "devices" / "virtual" / "net" / "veth0")
-    with pytest.raises(ValueError):
-        big = tmp_path / "big"
-        big.write_text("1" * 65)
-        LAUNCHER._sysfs_read(str(big))
+    big = tmp_path / "big"
+    big.write_text("1" * 65)
+    directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(ValueError):
+            LAUNCHER._sysfs_read(directory, "big")
+    finally:
+        os.close(directory)
 
 
 def test_diag_ancillary_command_is_the_one_fixed_read_only_listing_and_is_bounded(tmp_path):
@@ -1037,11 +1051,14 @@ def test_diag_ancillary_command_is_the_one_fixed_read_only_listing_and_is_bounde
     assert section.count("subprocess.Popen(") == 1 and "subprocess.run(" not in section
     assert re.findall(r"run\(([A-Z_]+), deadline_ns", section) == ["ANCILLARY_LINK_KINDS"]
     assert section.count("bounded_command") == 2  # the definition and the default ``run``
-    assert sorted(set(re.findall(r"os\.O_[A-Z]+", section))) == ["os.O_CLOEXEC", "os.O_NOFOLLOW", "os.O_NONBLOCK", "os.O_RDONLY"]
+    assert sorted(set(re.findall(r"os\.O_[A-Z]+", section))) == ["os.O_CLOEXEC", "os.O_DIRECTORY", "os.O_NOFOLLOW",
+                                                                 "os.O_NONBLOCK", "os.O_RDONLY"]
     for forbidden in ("modprobe", "insmod", "ethtool", "dmesg", "socket", "urllib", "write", "unlink", "rename", "chmod",
                       "setns", "unshare", "sysctl", "/proc/sys", '"w"', "netns exec", "link set", "link add", "link del"):
         assert forbidden not in section, forbidden
-    assert not re.search(r"(?<![.\w])open\(", section) and section.count("os.open(") == 2
+    # R2: the attribute read, the descriptor walk (anchor + component), the root and its recheck, the registry.
+    assert not re.search(r"(?<![.\w])open\(", section) and section.count("os.open(") == 6
+    assert "os.path.realpath(f" not in section and "startswith(devices)" not in section  # no path-string containment
 
 
 def test_diag_ownership_registry_records_are_closed_keyed_and_corroborated():
@@ -1084,3 +1101,411 @@ def test_diag_wiring_child_parent_and_fixture_channels():
     assert module.count("self._register(") == 1 and not re.search(r"(?<![_\w])record\(", register)
     wire = module[module.index("    def _wire("):module.index("    def _register(")]
     assert wire.index("self._create_veth(a, mac_l, b, mac_r)") < wire.index("self._register(") < wire.index("steps = [")
+
+
+# ---------------------------------------------------------------------------------------------
+# H2-LINK-DIAGNOSTICS-R2: the review's three counterexamples (F1 early bounds, F2 correlation is not
+# lifecycle identity, F3 descriptor-anchored sysfs traversal), each through the real collector.
+
+def _counted(monkeypatch):
+    """Count every parser invocation and every keyed commitment (with its input length)."""
+    fixture_registry()  # the cached registry is built before counting starts
+    parse, commit = LAUNCHER.parse_link_line, LAUNCHER.link_commitment
+    parses, commits = [], []
+    monkeypatch.setattr(LAUNCHER, "parse_link_line", lambda line: parses.append(len(line)) or parse(line))
+    monkeypatch.setattr(LAUNCHER, "link_commitment",
+                        lambda key, kind, value: commits.append((kind, len(value))) or commit(key, kind, value))
+    return parses, commits
+
+
+def _drive(texts, *, registry=None, status="ok"):
+    """The collector alone over given links captures (no H0), with constant metadata."""
+    clock = _Clock()
+    collector = LAUNCHER.LinkCollector(
+        DIAG_KEY, clock.t0, clock=clock, sleep=clock.sleep, namespace=lambda: HOST_NS,
+        kinds=lambda deadline_ns, *, clock: ("ok", {}),
+        metadata=lambda name, ifindex, deadline_ns, *, clock: {"device_backed": "no", "bus": "none", "driver": "none",
+                                                               "status": "ok"})
+    for text in texts:
+        phase = collector.begin()
+        collector.observe(name="links", status=status, returncode=0 if status == "ok" else 1, stdout=text,
+                          digest="0" * 64, started_ns=clock(), ended_ns=clock())
+        collector.end(phase)
+    return collector
+
+
+def test_diag_r2_capture_work_is_bounded_before_parsing_committing_encoding_or_sorting(monkeypatch, tmp_path):
+    parses, commits = _counted(monkeypatch)
+    cap, chars = LAUNCHER.DIAG_LIMITS["links_per_capture"], LAUNCHER.DIAG_LIMITS["line_chars"]
+    # 128 distinct well-formed lines per capture: at most 64 parser invocations each, the rest unread.
+    many = _text(*[_endpoint(10 + i, f"vx{i}", "02:00:00:00:%02x:01" % i, 300 + i) for i in range(128)])
+    result = _audit(monkeypatch, [(0, many)] * 3)
+    assert len(parses) <= 3 * cap, len(parses)
+    assert len([kind for kind, _n in commits if kind == "line"]) <= 3 * 2 * cap
+    assert result["differing"] == [] and result["after"]["links"] == hashlib.sha256(("0" + many).encode()).hexdigest()
+    capture = result["clean"]["captures"][2]
+    assert (capture["scan"], capture["line_count"], capture["bytes"], capture["multiset"]) == ("truncated", None, None, None)
+    assert capture["chars"] == len(many) and capture["lines_scanned"] == len(capture["lines"]) == cap
+    assert "line_cap" in result["clean"]["incomplete_reasons"] and result["clean"]["complete"] is False
+    assert LAUNCHER.diagnostic_result("PASS", result["clean"]) == ("FAIL", "link_diagnostics_incomplete")
+    # One oversized line (8 MiB, no newline): never copied into the parser or a commitment; the scan
+    # stops there, explicitly, while the gate still digests the exact full capture.
+    parses.clear(), commits.clear()
+    huge = BASE + "9: big0: <UP> mtu 1500 " + "a" * (8 * 2 ** 20) + "\n" + _endpoint(11, "late0", "02:00:00:00:00:11", 12) + "\n"
+    result = _audit(monkeypatch, [(0, huge)] * 3)
+    assert max(parses) <= chars and max(n for _kind, n in commits) <= 2 * chars
+    assert result["after"]["links"] == hashlib.sha256(("0" + huge).encode()).hexdigest() and result["differing"] == []
+    capture = result["clean"]["captures"][0]
+    assert (capture["scan"], capture["lines_scanned"], capture["bytes"], capture["chars"]) == ("truncated", 2, None, len(huge))
+    assert "line_length_cap" in result["clean"]["incomplete_reasons"] and result["clean"]["complete"] is False
+    # Repeated unknown lines (16 MiB): bounded parser calls and bounded allocation in enrich + result.
+    parses.clear(), commits.clear()
+    garbage = "not a link line\n" * 2 ** 20
+    collector = _drive([garbage] * 3)
+    tracemalloc.start()
+    try:
+        collector.enrich()
+        raw = collector.result(None)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 2 ** 20, peak
+    assert len(parses) <= 3 * cap and len(commits) <= 3 * (cap + 8)
+    assert {c["scan"] for c in raw["captures"]} == {"truncated"} and "unsupported_syntax" in raw["incomplete_reasons"]
+    # Unicode: exact UTF-8 byte counts when the scan completes; the aggregate scan bound counts
+    # characters before any encoding; an unencodable lone surrogate is a closed reason, not a crash.
+    small = _text(LO, ETH0 + "\\    alias café-été")
+    capture = _audit(monkeypatch, [(0, small)] * 3)["clean"]["captures"][2]
+    assert (capture["scan"], capture["bytes"], capture["chars"], capture["line_count"]) == (
+        "complete", len(small.encode()), len(small), 2)
+    wide = _text(LO, *[f"{10 + i}: u{i}: <UP> mtu 1500\\    alias " + "\U0001F600" * 3000 for i in range(40)])
+    parses.clear()
+    result = _audit(monkeypatch, [(0, wide)] * 3)
+    capture = result["clean"]["captures"][2]
+    assert capture["scan"] == "truncated" and capture["bytes"] is None and capture["chars"] == len(wide)
+    assert "scan_cap" in result["clean"]["incomplete_reasons"]
+    assert sum(parses) <= 3 * LAUNCHER.DIAG_LIMITS["scan_chars"]
+    lone = _drive([_text(LO, "5: s0: <UP> mtu 1500\\    alias x\ud800y", ETH0)] * 3).result(None)
+    assert len(lone["captures"]) == 3 and "collector_failed" not in lone["incomplete_reasons"]
+    assert "unsupported_encoding" in lone["incomplete_reasons"] and lone["captures"][0]["lines_scanned"] == 1
+    # Order-only is claimed only between two complete scans: a reorder past the scanned prefix is unknown.
+    lines = [_endpoint(10 + i, f"vo{i}", "02:00:00:00:%02x:03" % i, 400 + i) for i in range(70)]
+    swapped = lines[:68] + [lines[69], lines[68]]
+    reordered = _audit(monkeypatch, [(0, _text(*lines))] * 2 + [(0, _text(*swapped))])
+    pair = _pair(reordered)
+    assert reordered["differing"] == ["links"] and _gate(tmp_path, False) == "FAIL"
+    assert pair["order_only"] is False and "unknown" in pair["classes"] and "order_only_text_change" not in pair["classes"]
+    # A reordered scanned prefix with different unscanned content is not order-only either.
+    changed = [lines[1], lines[0]] + lines[2:69] + [_endpoint(99, "vz0", "02:00:00:00:99:03", 499)]
+    prefix = _audit(monkeypatch, [(0, _text(*lines))] * 2 + [(0, _text(*changed))])
+    pair = _pair(prefix)
+    assert prefix["differing"] == ["links"] and pair["order_only"] is False and "order_only_text_change" not in pair["classes"]
+
+
+def test_diag_r2_name_and_mac_are_correlation_only_never_lifecycle_identity(monkeypatch, tmp_path):
+    # The review's case: created in a fixture namespace at index 2, a later separate host object at
+    # 900/901 with the same name, MAC and hardware metadata. No move or lifetime witness joins them.
+    mac = "02:48:32:00:03:0a"
+    lookalike = _endpoint(900, "hp3l", mac, 901)
+    hardware = {"hp3l": ("yes", "pci", "mlx5_core")}
+    result = _audit(monkeypatch, [(0, BASE), (0, BASE), (0, _text(LO, ETH0, lookalike))], devices=hardware)
+    assert "proof_identity_match" not in json.dumps(result["raw"]) + json.dumps(result["clean"])
+    assert result["differing"] == ["links"] and _gate(tmp_path, False) == "FAIL"
+    assert LAUNCHER.diagnostic_result("FAIL", result["clean"]) == ("FAIL", None)
+    pair = _pair(result)
+    change = pair["changes"][0]
+    assert (change["change"], change["proof_identity"], change["correlation"], change["hardware"]) == (
+        "added", "unknown", "fixture_name_mac", "device_backed")
+    assert pair["classes"] == ["fixture_name_mac_correlation", "hardware_backed_change"]
+    # Completeness of the captures is not attribution certainty.
+    clean = result["clean"]
+    assert clean["complete"] is True and clean["attribution"] == "correlation_only"
+    assert clean["ownership"] == {"status": "valid", "endpoints": 4, "correlated": 1, "ambiguous": 0, "namespace_conflicts": 0}
+    # The same ifindex/iflink as at creation is still no continuity witness.
+    same_index = _audit(monkeypatch, [(0, BASE), (0, BASE), (0, _text(LO, ETH0, _endpoint(2, "hp3l", mac, 2)))])
+    change = _pair(same_index)["changes"][0]
+    assert (change["proof_identity"], change["correlation"], change["hardware"]) == ("unknown", "fixture_name_mac", "virtual")
+    assert _pair(same_index)["classes"] == ["fixture_name_mac_correlation", "unknown"]
+    # The same name and MAC registered by two fixtures in separate namespaces/lifetimes: ambiguous.
+    twice = fixture_registry() + _registry((7, "l", (7, 4026532701), "hp3l", mac, _endpoint(2, "hp3l", mac, 2)))
+    ambiguous = _audit(monkeypatch, [(0, BASE), (0, BASE), (0, _text(LO, ETH0, lookalike))], registry=twice, devices=hardware)
+    change = _pair(ambiguous)["changes"][0]
+    assert (change["proof_identity"], change["correlation"]) == ("unknown", "ambiguous")
+    assert _pair(ambiguous)["classes"] == ["hardware_backed_change"]
+    assert (ambiguous["clean"]["ownership"]["correlated"], ambiguous["clean"]["ownership"]["ambiguous"]) == (0, 1)
+    # A stale/reused lookalike already present in both baselines that later changes: no correlation.
+    changed = lookalike.replace("mtu 1500", "mtu 1400")
+    stale = _audit(monkeypatch, [(0, _text(LO, lookalike))] * 2 + [(0, _text(LO, changed))], devices=hardware)
+    change = _pair(stale)["changes"][0]
+    assert (change["change"], change["proof_identity"], change["correlation"]) == ("changed", "unknown", "none")
+    assert _pair(stale)["classes"] == ["hardware_backed_change"] and stale["differing"] == ["links"]
+    # The baseline pair never correlates.
+    assert {c["correlation"] for p in stale["clean"]["pairs"] if p["name"] == "baseline" for c in p["changes"]} <= {"not_applicable"}
+    # The parent refuses a child payload that asserts lifecycle identity or an open attribution.
+    good = result["raw"]
+    for path, value in ((("pairs", 1, "changes", 0, "proof_identity"), "proof_identity_match"),
+                        (("pairs", 1, "classes"), ["fixture_name_mac_correlation", "proof_identity_match"]),
+                        (("pairs", 1, "changes", 0, "correlation"), "owned"), (("attribution",), "lifecycle_identity"),
+                        (("ownership", "matched"), 1)):
+        copy = json.loads(json.dumps(good))
+        target = copy
+        for part in path[:-1]:
+            target = target[part]
+        target[path[-1]] = value
+        assert LAUNCHER.sanitize_link_diagnostics(copy)["incomplete_reasons"] == ["diagnostics_invalid"], path
+
+
+class _Opens:
+    """The launcher's ``os`` with ``open`` observed: the (device, inode) every successful open reached,
+    and one callback on the nth open whose final component is ``component`` (the race timing). The
+    candidate performs every actual open and read itself."""
+
+    def __init__(self, monkeypatch, component: str | None = None, nth: int = 1, action=None, foreign=()):
+        self.reached, self.count = [], 0
+        outer, real = self, os
+
+        class _Proxy:
+            def __getattr__(self, attribute):
+                return getattr(real, attribute)
+
+            def fstat(self, descriptor):
+                """``foreign`` inodes appear to sit on another filesystem (a mount inside the tree)."""
+                info = real.fstat(descriptor)
+                if info.st_ino in foreign:
+                    return os.stat_result((info.st_mode, info.st_ino, info.st_dev + 1, *tuple(info)[3:10]))
+                return info
+
+            def open(self, path, flags, mode=0o777, *, dir_fd=None):
+                if action is not None and real.path.basename(str(path)) == component:
+                    outer.count += 1
+                    if outer.count == nth:
+                        action()
+                descriptor = real.open(path, flags, mode, dir_fd=dir_fd)
+                info = real.fstat(descriptor)
+                outer.reached.append((info.st_dev, info.st_ino))
+                return descriptor
+
+        monkeypatch.setattr(LAUNCHER, "os", _Proxy())
+
+
+def _real_sysfs(base: Path, name: str, ifindex: int, *, bus: str | None = None, driver: str | None = None,
+                slot: str = "0000:00:02.0") -> tuple[Path, Path]:
+    """A fake sysfs shaped like the real one: relative class/device/subsystem/driver links."""
+    root = base / "sys"
+    (root / "class" / "net").mkdir(parents=True, exist_ok=True)
+    if bus is None:
+        device_dir = root / "devices" / "virtual" / "net" / name
+        device_dir.mkdir(parents=True)
+    else:
+        parent = root / "devices" / "pci0000:00" / slot
+        device_dir = parent / "net" / name
+        device_dir.mkdir(parents=True)
+        (root / "bus" / bus / "drivers").mkdir(parents=True, exist_ok=True)
+        os.symlink(os.path.relpath(root / "bus" / bus, parent), parent / "subsystem")
+        os.symlink(os.path.relpath(parent, device_dir), device_dir / "device")
+        if driver:
+            (root / "bus" / bus / "drivers" / driver).mkdir(exist_ok=True)
+            os.symlink(os.path.relpath(root / "bus" / bus / "drivers" / driver, parent), parent / "driver")
+    (device_dir / "ifindex").write_text(f"{ifindex}\n")
+    os.symlink(os.path.relpath(device_dir, root / "class" / "net"), root / "class" / "net" / name)
+    return root, device_dir
+
+
+def _identity(path: Path) -> tuple[int, int]:
+    info = os.stat(path, follow_symlinks=False)
+    return info.st_dev, info.st_ino
+
+
+def test_diag_r2_sysfs_traversal_is_descriptor_anchored_contained_and_rechecked(monkeypatch, tmp_path):
+    far = time.monotonic_ns() + 10 ** 10
+    unknown = {"device_backed": "unknown", "bus": "unknown", "driver": "unknown", "status": "unknown"}
+
+    def scratch(label: str) -> Path:
+        path = tmp_path / label
+        path.mkdir()
+        return path
+
+    def outside_tree(base: Path, ifindex: int = 7) -> Path:
+        """A lookalike outside the fake sysfs root (never to be read)."""
+        tree = base / "outside" / "virtual" / "net" / "mock0"
+        tree.mkdir(parents=True)
+        (tree / "ifindex").write_text(f"{ifindex}\n")
+        return tree
+
+    # Positive: real-sysfs-shaped relative links inside the root are followed, and only those.
+    base = scratch("positive")
+    root, _dir = _real_sysfs(base, "veth0", 4)
+    _real_sysfs(base, "eth1", 3, bus="pci", driver="mlx5_core")
+    _real_sysfs(base, "eth2", 5, bus="vmbus", driver="hv_netvsc", slot="vmbus-0")
+    probe = _Opens(monkeypatch)
+    assert LAUNCHER.link_metadata("veth0", 4, far, root=str(root)) == {"device_backed": "no", "bus": "none", "driver": "none",
+                                                                      "status": "ok"}
+    assert LAUNCHER.link_metadata("eth1", 3, far, root=str(root)) == {"device_backed": "yes", "bus": "pci",
+                                                                     "driver": "mlx5_core", "status": "ok"}
+    assert LAUNCHER.link_metadata("eth2", 5, far, root=str(root)) == {"device_backed": "yes", "bus": "vmbus",
+                                                                     "driver": "hv_netvsc", "status": "ok"}
+    assert probe.reached
+    monkeypatch.undo()
+
+    # Parent replacement at the first attribute read (the review's timing): the checked parent becomes
+    # a symlink to a lookalike outside the root. Unknown, and the outside object is never reached.
+    base = scratch("parent")
+    root, device_dir = _real_sysfs(base, "mock0", 7)
+    outside = outside_tree(base)
+
+    def replace_parent():
+        device_dir.rename(device_dir.with_name("old"))
+        device_dir.symlink_to(outside)
+
+    probe = _Opens(monkeypatch, "ifindex", 1, replace_parent)
+    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown
+    assert probe.count >= 1 and _identity(outside / "ifindex") not in probe.reached and _identity(outside) not in probe.reached
+    monkeypatch.undo()
+
+    # Nested parent substitution: an ancestor (devices/virtual) replaced by a symlink to a full
+    # lookalike tree outside the root, at the first read; and the same substitution made beforehand.
+    for when in ("during", "before"):
+        base = scratch("nested-" + when)
+        root, device_dir = _real_sysfs(base, "mock0", 7)
+        outside = outside_tree(base)
+        ancestor = root / "devices" / "virtual"
+
+        def replace_ancestor(ancestor=ancestor, outside=outside):
+            ancestor.rename(ancestor.with_name("virtual.old"))
+            ancestor.symlink_to(outside.parent.parent)
+
+        if when == "before":
+            replace_ancestor()
+        probe = _Opens(monkeypatch, "ifindex", 1, replace_ancestor if when == "during" else None)
+        assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown, when
+        assert _identity(outside / "ifindex") not in probe.reached, when
+        monkeypatch.undo()
+
+    # Static escapes: lexical, absolute, ancestor symlinks and metadata links that leave their trees.
+    base = scratch("static")
+    root, _dir = _real_sysfs(base, "ok0", 2, bus="pci", driver="mlx5_core")
+    outside = outside_tree(base, 6)
+    net = root / "class" / "net"
+    os.symlink("../../../outside/virtual/net/mock0", net / "esc1")
+    os.symlink("../../devices/../../outside/virtual/net/mock0", net / "esc2")
+    os.symlink(str(outside), net / "esc3")
+    (root / "devices" / "jump").symlink_to(outside.parent.parent)
+    os.symlink("../../devices/jump/net/mock0", net / "esc4")
+    _real_sysfs(base, "dev5", 8, bus="pci", driver="mlx5_core", slot="0000:00:05.0")
+    (root / "devices" / "pci0000:00" / "0000:00:05.0" / "net" / "dev5" / "device").unlink()
+    os.symlink("../../../../../outside", root / "devices" / "pci0000:00" / "0000:00:05.0" / "net" / "dev5" / "device")
+    _real_sysfs(base, "dev6", 9, bus="pci", slot="0000:00:06.0")
+    (root / "devices" / "pci0000:00" / "0000:00:06.0" / "subsystem").unlink()
+    os.symlink("../../../class/net", root / "devices" / "pci0000:00" / "0000:00:06.0" / "subsystem")
+    _real_sysfs(base, "dev7", 10, bus="pci", driver="mlx5_core", slot="0000:00:07.0")
+    (root / "devices" / "pci0000:00" / "0000:00:07.0" / "driver").unlink()
+    os.symlink("../../../../outside", root / "devices" / "pci0000:00" / "0000:00:07.0" / "driver")
+    probe = _Opens(monkeypatch)
+    for name, index in (("esc1", 6), ("esc2", 6), ("esc3", 6), ("esc4", 6), ("dev5", 8), ("dev6", 9), ("dev7", 10)):
+        assert LAUNCHER.link_metadata(name, index, far, root=str(root)) == unknown, name
+    assert _identity(outside / "ifindex") not in probe.reached
+    assert LAUNCHER.link_metadata("ok0", 2, far, root=str(root))["status"] == "ok"  # the contained neighbour still reads
+    monkeypatch.undo()
+
+    # Escapes that a weaker check would accept: a ``..`` above the root whose clamped form exists in
+    # it; an absolute link into a sibling sharing the root's name prefix; in-root targets outside the
+    # intended tree (a class link off devices/…/net/<name>, a driver link off bus/<bus>/drivers).
+    base = scratch("lookalike")
+    root, _dir = _real_sysfs(base, "x0", 11)
+    escaped = base / "devices" / "virtual" / "net" / "up0"  # above the root: the real target
+    escaped.mkdir(parents=True)
+    (escaped / "ifindex").write_text("11\n")
+    os.symlink("../../../devices/virtual/net/up0", root / "class" / "net" / "up0")
+    (root / "devices" / "virtual" / "net" / "up0").mkdir()
+    (root / "devices" / "virtual" / "net" / "up0" / "ifindex").write_text("11\n")
+    sibling = Path(str(root) + "x") / "devices" / "virtual" / "net" / "sib0"
+    sibling.mkdir(parents=True)
+    (sibling / "ifindex").write_text("12\n")
+    (root / "devices" / "virtual" / "net" / "sib0").mkdir()
+    (root / "devices" / "virtual" / "net" / "sib0" / "ifindex").write_text("12\n")
+    os.symlink(str(sibling), root / "class" / "net" / "sib0")
+    (root / "misc" / "deep" / "odd0").mkdir(parents=True)
+    (root / "misc" / "deep" / "odd0" / "ifindex").write_text("13\n")
+    os.symlink("../../misc/deep/odd0", root / "class" / "net" / "odd0")
+    _real_sysfs(base, "drv0", 14, bus="pci", driver="mlx5_core", slot="0000:00:0e.0")
+    (root / "devices" / "pci0000:00" / "0000:00:0e.0" / "driver").unlink()
+    (root / "bus" / "usb" / "drivers" / "ixgbe").mkdir(parents=True)  # a driver of another bus
+    os.symlink("../../../bus/usb/drivers/ixgbe", root / "devices" / "pci0000:00" / "0000:00:0e.0" / "driver")
+    probe = _Opens(monkeypatch)
+    for name, index in (("up0", 11), ("sib0", 12), ("odd0", 13), ("drv0", 14)):
+        assert LAUNCHER.link_metadata(name, index, far, root=str(root)) == unknown, name
+    assert _identity(escaped) not in probe.reached and _identity(sibling) not in probe.reached
+    assert LAUNCHER.link_metadata("x0", 11, far, root=str(root))["status"] == "ok"
+    monkeypatch.undo()
+
+    # An object on another filesystem (a mount inside the tree) is refused.
+    base = scratch("foreign")
+    root, device_dir = _real_sysfs(base, "mnt0", 15)
+    _Opens(monkeypatch, foreign={_identity(device_dir)[1]})
+    assert LAUNCHER.link_metadata("mnt0", 15, far, root=str(root)) == unknown
+    monkeypatch.undo()
+    assert LAUNCHER.link_metadata("mnt0", 15, far, root=str(root))["status"] == "ok"
+
+    # The root itself replaced by a lookalike copy during the read: the anchor is no longer /sys.
+    base = scratch("root")
+    root, _dir = _real_sysfs(base, "mock0", 7)
+
+    def replace_root():
+        root.rename(root.with_name("sys.old"))
+        shutil.copytree(root.with_name("sys.old"), root, symlinks=True)
+
+    _Opens(monkeypatch, "ifindex", 1, replace_root)
+    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown
+    monkeypatch.undo()
+
+    # A value that flickers between the reads of one pass, though both passes begin alike.
+    base = scratch("flicker")
+    root, _dir = _real_sysfs(base, "mock0", 7)
+    values = iter(["7", "7", "9", "7", "7", "7"])
+    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root), read=lambda _directory, _name: next(values)) == unknown
+
+    # The same ifindex on a replaced object (the name's directory recreated at the first read).
+    base = scratch("reuse")
+    root, device_dir = _real_sysfs(base, "mock0", 7)
+
+    def recreate():
+        device_dir.rename(device_dir.with_name("gone"))
+        device_dir.mkdir()
+        (device_dir / "ifindex").write_text("7\n")
+
+    _Opens(monkeypatch, "ifindex", 1, recreate)
+    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown
+    monkeypatch.undo()
+
+    # The name's class link retargeted to another same-ifindex device, and the device link retargeted.
+    base = scratch("retarget")
+    root, _dir = _real_sysfs(base, "mock0", 7)
+    other = root / "devices" / "pci0000:00" / "0000:00:03.0" / "net" / "mock0"
+    other.mkdir(parents=True)
+    (other / "ifindex").write_text("7\n")
+
+    def retarget_class():
+        (root / "class" / "net" / "mock0").unlink()
+        os.symlink(os.path.relpath(other, root / "class" / "net"), root / "class" / "net" / "mock0")
+
+    _Opens(monkeypatch, "ifindex", 1, retarget_class)
+    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown
+    monkeypatch.undo()
+    base = scratch("retarget-device")
+    root, device_dir = _real_sysfs(base, "eth1", 3, bus="pci", driver="mlx5_core")
+    _real_sysfs(base, "eth9", 9, bus="pci", driver="ixgbe", slot="0000:00:09.0")
+
+    def retarget_device():
+        (device_dir / "device").unlink()
+        os.symlink("../../../0000:00:09.0", device_dir / "device")
+
+    _Opens(monkeypatch, "ifindex", 2, retarget_device)
+    assert LAUNCHER.link_metadata("eth1", 3, far, root=str(root)) == unknown
+    monkeypatch.undo()
+
+    # Disappearance during enrichment.
+    base = scratch("gone")
+    root, _dir = _real_sysfs(base, "mock0", 7)
+    _Opens(monkeypatch, "ifindex", 1, lambda: (root / "class" / "net" / "mock0").unlink())
+    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown
+    monkeypatch.undo()

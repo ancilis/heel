@@ -304,13 +304,15 @@ def profile_fields(by_case: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------
-# Supplementary host-link diagnostics (H2-LINK-DIAGNOSTICS-R1). Never part of the acceptance rule:
-# the gate still hashes H0's own capture exactly as before. This describes that same captured
-# ``ip -o link show`` text, keyed with a run-private HMAC key and bounded, as one closed object in
-# cleanup.json. Incomplete diagnostics can only hold a PASS back, never make one; a change class is
-# an observation class, never actor attribution.
+# Supplementary host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, bounded correction R2). Never part of
+# the acceptance rule: the gate still hashes H0's own capture exactly as before. This describes that
+# same captured ``ip -o link show`` text, keyed with a run-private HMAC key and bounded before any
+# work (at most 64 lines, 4096 characters per line and 65536 in all are ever scanned), as one closed
+# object in cleanup.json. Incomplete diagnostics can only hold a PASS back, never make one; a change
+# class is an observation class, never actor attribution, and a name/MAC match with a fixture
+# registry entry is a correlation only: no capture witnesses lifecycle continuity.
 
-DIAG_SCHEMA = "heel.host-h2-policy-proof.link-diagnostics.v1"
+DIAG_SCHEMA = "heel.host-h2-policy-proof.link-diagnostics.v2"
 OWNERSHIP_SCHEMA = "heel.host-h2-policy-proof.ownership.v1"
 OWNERSHIP_FILE = "ownership.raw.jsonl"
 DIAG_PHASES = ("baseline_first", "baseline_second", "after_namespace_exit")
@@ -318,14 +320,17 @@ DIAG_PAIRS = (("baseline", 0, 1), ("audit", 1, 2))
 DIAG_LIMITS = {"links_per_capture": 64, "captures": 3, "fixture_endpoints": 32, "changed_entries": 64,
                "fields_per_link": 16, "driver_token_chars": 64, "commitment_hex_chars": 64, "payload_bytes": 262144,
                "ancillary_read_bytes": 65536, "ancillary_command_ms": 2000, "ancillary_total_ms": 5000,
-               "line_chars": 4096, "tokens_per_line": 64, "ownership_bytes": 65536, "sysfs_read_bytes": 64}
-DIAG_REASONS = ("capture_missing", "capture_not_ok", "line_cap", "unsupported_syntax", "field_cap", "enrichment_timeout",
+               "line_chars": 4096, "scan_chars": 65536, "tokens_per_line": 64, "ownership_bytes": 65536, "sysfs_read_bytes": 64,
+               "sysfs_link_chars": 512, "sysfs_components": 32}
+DIAG_REASONS = ("capture_missing", "capture_not_ok", "line_cap", "line_length_cap", "scan_cap", "unsupported_encoding",
+                "unsupported_syntax", "field_cap", "enrichment_timeout",
                 "enrichment_cap", "enrichment_budget", "enrichment_failed", "enrichment_unknown", "namespace_mismatch",
                 "collector_failed", "observer_failed", "ownership_missing", "ownership_invalid", "ownership_cap",
                 "changed_cap", "payload_cap", "diagnostics_missing", "diagnostics_invalid")
 CAPTURE_STATUSES = ("ok", "nonzero", "timeout", "oserror", "missing")
 ENRICH_STATUSES = ("ok", "timeout", "oserror", "nonzero", "cap", "invalid", "budget", "namespace_mismatch", "not_run")
 PARSE_STATUSES = ("complete", "incomplete", "not_applicable")
+SCAN_STATES = ("complete", "truncated")
 LINK_FLAGS = ("allmulti", "automedia", "broadcast", "debug", "dormant", "dynamic", "echo", "loopback", "lower_up", "m_down",
               "master", "multicast", "no_carrier", "noarp", "notrailers", "pointopoint", "portsel", "promisc", "running",
               "slave", "up")
@@ -342,10 +347,12 @@ FIELD_LABELS = ("ifindex", "iflink", "peer", "flags", "operstate", "link_type", 
                 "line")
 PROVENANCE_LABELS = ("device_backed", "bus", "kind", "driver")
 CHANGE_KINDS = ("added", "removed", "changed")
-PROOF_IDENTITY = ("proof_identity_match", "unknown", "not_applicable")
+PROOF_IDENTITY = ("unknown", "not_applicable")  # never asserted: no capture witnesses lifecycle continuity
+CORRELATIONS = ("fixture_name_mac", "ambiguous", "none", "not_applicable")
+ATTRIBUTION = ("correlation_only",)
 HARDWARE = ("device_backed", "virtual", "unknown")
-DELTA_CLASSES = ("none", "command_status_change", "order_only_text_change", "proof_identity_match", "hardware_backed_change",
-                 "unknown")
+DELTA_CLASSES = ("none", "command_status_change", "order_only_text_change", "fixture_name_mac_correlation",
+                 "hardware_backed_change", "unknown")
 OWNERSHIP_STATUSES = ("valid", "missing", "invalid", "capped")
 _MS = 1_000_000
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -435,6 +442,47 @@ def parse_link_line(line: str) -> dict | None:
     return fields
 
 
+def scan_capture(key: bytes, stdout, *, parse: bool) -> dict:
+    """The only pass the diagnostics make over a captured text, bounded before any work: at most 64
+    lines, each found by a newline search confined to 4096 characters past its start, and 65536
+    characters in all; only such bounded slices are ever copied, encoded, committed or (for a
+    successful capture) parsed. An oversized line, more output or an unencodable line ends the scan as
+    ``truncated`` with a closed reason; the total byte and line counts are then unknown (None), never
+    estimated. ``chars`` is the exact length of the captured text (no pass over it)."""
+    limits = DIAG_LIMITS
+    text = stdout if isinstance(stdout, str) else ""
+    size, position, scanned, total_bytes = len(text), 0, 0, 0
+    lines, commitments, reasons = [], [], set()
+    while position < size:
+        if len(lines) >= limits["links_per_capture"]:
+            reasons.add("line_cap")
+            break
+        window = min(size, position + limits["line_chars"] + 1)
+        newline = text.find("\n", position, window)
+        stop = newline if newline >= 0 else window
+        if newline < 0 and (window < size or stop - position > limits["line_chars"]):
+            reasons.add("line_length_cap")
+            break
+        if scanned + (stop - position) > limits["scan_chars"]:
+            reasons.add("scan_cap")
+            break
+        line = text[position:stop]
+        try:
+            encoded = len(line.encode("utf-8", "surrogateescape"))
+        except UnicodeEncodeError:
+            reasons.add("unsupported_encoding")
+            break
+        scanned += stop - position
+        total_bytes += encoded + (1 if newline >= 0 else 0)
+        commitments.append(link_commitment(key, "line", line))
+        lines.append((line, parse_link_line(line) if parse else None))
+        position = stop + 1 if newline >= 0 else stop
+    complete = not reasons
+    return {"state": "complete" if complete else "truncated", "reasons": reasons, "lines": lines,
+            "commitments": commitments, "chars": size, "bytes": total_bytes if complete else None,
+            "line_count": len(lines) if complete else None}
+
+
 def _field_value(fields: dict, label: str):
     if label == "unknown":
         return tuple(fields["unknown"])
@@ -483,9 +531,12 @@ def link_entry(fields: dict, key: bytes, provenance: dict) -> dict:
 UNKNOWN_PROVENANCE = {"device_backed": "unknown", "bus": "unknown", "kind": "unknown", "driver": "unknown", "scope": "unknown"}
 
 
-def _sysfs_read(path: str, limit: int = DIAG_LIMITS["sysfs_read_bytes"]) -> str:
-    """One small, fixed sysfs attribute (O_NOFOLLOW on the attribute itself, at most ``limit`` bytes)."""
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+_SYSFS_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _sysfs_read(directory: int, name: str, limit: int = DIAG_LIMITS["sysfs_read_bytes"]) -> str:
+    """One small, fixed attribute of an already opened sysfs directory (O_NOFOLLOW, at most ``limit``)."""
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory)
     try:
         data = os.read(descriptor, limit + 1)
     finally:
@@ -495,44 +546,150 @@ def _sysfs_read(path: str, limit: int = DIAG_LIMITS["sysfs_read_bytes"]) -> str:
     return data.decode("ascii").strip()
 
 
+def _sysfs_target(parts: tuple, directory: int, link: str, real_root: str) -> tuple | None:
+    """One intended metadata link (read at its directory's descriptor), resolved lexically against
+    that directory's components below the root. Lexical ``..`` is sound because every directory on
+    the way was reached through real entries only (see ``_sysfs_open``). None for a target that is
+    too long, leaves the root, or is absolute outside it; never a raw path out of this module."""
+    target = os.readlink(link, dir_fd=directory)
+    if not isinstance(target, str) or not target or len(target) > DIAG_LIMITS["sysfs_link_chars"] or "\0" in target:
+        return None
+    if target.startswith("/"):
+        if not target.startswith(real_root + "/"):
+            return None
+        components, target = [], target[len(real_root) + 1:]
+    else:
+        components = list(parts)
+    for component in target.split("/"):
+        if component in ("", "."):
+            continue
+        if component == "..":
+            if not components:
+                return None
+            components.pop()
+        else:
+            components.append(component)
+    return tuple(components) if len(components) <= DIAG_LIMITS["sysfs_components"] else None
+
+
+def _sysfs_open(root: int, parts: tuple) -> int:
+    """A directory descriptor reached from the root descriptor one real component at a time
+    (O_DIRECTORY | O_NOFOLLOW at each parent's descriptor): no symlink is ever followed on the way,
+    so a substituted parent or ancestor fails instead of leading out of the root."""
+    current = os.open(".", _SYSFS_DIRECTORY, dir_fd=root)
+    try:
+        for component in parts:
+            if component in ("", ".", "..") or "/" in component:
+                raise ValueError("sysfs_component")
+            following = os.open(component, _SYSFS_DIRECTORY, dir_fd=current)
+            os.close(current)
+            current = following
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _sysfs_identity(descriptor: int, device: int) -> tuple[int, int]:
+    info = os.fstat(descriptor)
+    if info.st_dev != device:
+        raise ValueError("sysfs_device")
+    return info.st_dev, info.st_ino
+
+
+def _sysfs_pass(root: int, device: int, real_root: str, name: str, ifindex: int, read) -> tuple | None:
+    """One complete descriptor-anchored pass: the link's class entry, its directory (ifindex read at
+    that descriptor before and after), and for a device-backed link its device, bus and driver, each
+    reached only through those four intended links. Returns the facts plus every object identity and
+    resolved location on the way, so a second pass can prove nothing moved; None when anything is
+    outside its tree, missing or inconsistent."""
+    opened = []
+    try:
+        def reach(parts: tuple) -> tuple[int, tuple]:
+            descriptor = _sysfs_open(root, parts)
+            opened.append(descriptor)
+            return descriptor, (parts, _sysfs_identity(descriptor, device))
+
+        def target(parts: tuple, directory: int, link: str):
+            try:
+                return _sysfs_target(parts, directory, link, real_root)
+            except FileNotFoundError:
+                return False
+
+        net, net_id = reach(("class", "net"))
+        base_parts = _sysfs_target(("class", "net"), net, name, real_root)
+        if not base_parts or len(base_parts) < 3 or base_parts[0] != "devices" or base_parts[-2:] != ("net", name):
+            return None
+        base, base_id = reach(base_parts)
+        if int(read(base, "ifindex")) != ifindex:
+            return None
+        trail = [net_id, base_id]
+        device_parts = target(base_parts, base, "device")
+        if device_parts is False:
+            facts = ("no", "none", "none")
+        else:
+            if not device_parts or len(device_parts) < 2 or device_parts[0] != "devices":
+                return None
+            device_dir, device_id = reach(device_parts)
+            subsystem_parts = target(device_parts, device_dir, "subsystem")
+            if not subsystem_parts or len(subsystem_parts) != 2 or subsystem_parts[0] != "bus":
+                return None
+            trail += [device_id, reach(subsystem_parts)[1]]
+            bus = subsystem_parts[1]
+            driver_parts = target(device_parts, device_dir, "driver")
+            if driver_parts is False:
+                driver = "none"
+            else:
+                if not driver_parts or len(driver_parts) != 4 or driver_parts[:3] != ("bus", bus, "drivers"):
+                    return None
+                trail.append(reach(driver_parts)[1])
+                token = driver_parts[3]
+                driver = token if len(token) <= DIAG_LIMITS["driver_token_chars"] and token in DRIVERS else "unknown"
+            facts = ("yes", bus if bus in BUSES else "other", driver)
+        if int(read(base, "ifindex")) != ifindex:
+            return None
+        return facts, tuple(trail)
+    finally:
+        for descriptor in opened:
+            os.close(descriptor)
+
+
 def link_metadata(name: str, ifindex: int, deadline_ns: int, *, clock=time.monotonic_ns, root: str = "/sys",
                   read=_sysfs_read) -> dict:
     """Read-only device facts for one link observed in the host capture: whether a device backs it,
-    that device's bus and an allowlisted driver token. Only fixed attributes under ``root`` whose real
-    path stays inside its devices/bus trees; the ifindex is read before and after, and any race,
-    escape, missing entry or deadline leaves the answer ``unknown``. Never a bus path or serial."""
+    that device's bus and an allowlisted driver token. Every read is anchored at one root directory
+    descriptor and reached through real directories plus only the class/device/subsystem/driver links,
+    each resolved inside its own tree and every object on one filesystem. A second full pass must find
+    the same objects (device, inode), locations and facts, and the root must still be the same
+    object; any substitution, race, reuse, escape, disappearance or deadline leaves the answer
+    ``unknown``. Never a bus path, serial or raw path."""
     answer = {"device_backed": "unknown", "bus": "unknown", "driver": "unknown", "status": "unknown"}
     if not _LINK_NAME.fullmatch(name or "") or name in (".", ".."):
         return answer
     real_root = os.path.realpath(root)
-    devices, buses = real_root + "/devices/", real_root + "/bus/"
     try:
-        base = os.path.realpath(f"{real_root}/class/net/{name}")
-        if not base.startswith(devices) or os.path.basename(base) != name:
+        anchor = os.open(real_root, _SYSFS_DIRECTORY)
+    except OSError:
+        return answer
+    try:
+        device = os.fstat(anchor).st_dev
+        first = _sysfs_pass(anchor, device, real_root, name, ifindex, read)
+        if first is None or clock() > deadline_ns:
             return answer
-        if int(read(base + "/ifindex")) != ifindex:
+        second = _sysfs_pass(anchor, device, real_root, name, ifindex, read)
+        again = os.open(real_root, _SYSFS_DIRECTORY)
+        try:
+            same_root = os.fstat(again)[1:3] == os.fstat(anchor)[1:3]
+        finally:
+            os.close(again)
+        if second != first or not same_root or clock() > deadline_ns:
             return answer
-        device = base + "/device"
-        if not os.path.lexists(device):
-            facts = {"device_backed": "no", "bus": "none", "driver": "none"}
-        else:
-            target = os.path.realpath(device)
-            subsystem = os.path.realpath(device + "/subsystem")
-            if not target.startswith(devices) or not subsystem.startswith(buses):
-                return answer
-            bus = os.path.basename(subsystem)
-            driver = "none"
-            if os.path.lexists(device + "/driver"):
-                bound = os.path.realpath(device + "/driver")
-                token = os.path.basename(bound)
-                driver = token if bound.startswith(buses) and len(token) <= DIAG_LIMITS["driver_token_chars"] and \
-                    token in DRIVERS else "unknown"
-            facts = {"device_backed": "yes", "bus": bus if bus in BUSES else "other", "driver": driver}
-        if int(read(base + "/ifindex")) != ifindex or clock() > deadline_ns:
-            return answer
-        return {**facts, "status": "ok"}
+        backed, bus, driver = first[0]
+        return {"device_backed": backed, "bus": bus, "driver": driver, "status": "ok"}
     except (OSError, ValueError):
         return answer
+    finally:
+        os.close(anchor)
 
 
 def bounded_command(argv: tuple[str, ...], deadline_ns: int, *, clock=time.monotonic_ns,
@@ -604,8 +761,9 @@ def _host_namespace() -> tuple[int, int]:
 
 def empty_diagnostics(reasons) -> dict:
     return {"schema": DIAG_SCHEMA, "complete": False, "incomplete_reasons": sorted(set(reasons) & set(DIAG_REASONS)),
-            "host_namespace": None, "baseline_pause_ms": None, "ancillary_ms": 0, "captures": [], "pairs": [],
-            "ownership": {"status": "missing", "endpoints": 0, "matched": 0, "ambiguous": 0, "namespace_conflicts": 0}}
+            "attribution": "correlation_only", "host_namespace": None, "baseline_pause_ms": None, "ancillary_ms": 0,
+            "captures": [], "pairs": [],
+            "ownership": {"status": "missing", "endpoints": 0, "correlated": 0, "ambiguous": 0, "namespace_conflicts": 0}}
 
 
 _OWNERSHIP_KEYS = {"schema", "fixture", "side", "namespace", "outer", "requested_name", "requested_mac", "observed", "name",
@@ -699,7 +857,7 @@ class LinkCollector:
                 self.failures.add("collector_failed")
                 return None
             phase = {"phase": DIAG_PHASES[len(self.phases)], "ordinal": len(self.phases), "namespace_before": self._namespace_id(),
-                     "namespace_after": None, "capture": None, "enrichment": None, "parsed": None}
+                     "namespace_after": None, "capture": None, "enrichment": None, "scan": None}
             self.phases.append(phase)
             return phase
         except Exception:  # noqa: BLE001
@@ -744,12 +902,12 @@ class LinkCollector:
             self.sleep(remaining)
         self.pause_ms = max(0, (self.clock() - started) // _MS)
 
-    def _parsed(self, phase) -> list:
-        if phase["parsed"] is None:
-            capture = phase["capture"]
-            lines = capture["stdout"].splitlines() if capture and isinstance(capture["stdout"], str) else []
-            phase["parsed"] = [(line, parse_link_line(line)) for line in lines]
-        return phase["parsed"]
+    def _scan(self, phase) -> dict:
+        """The one bounded scan of this phase's capture (cached); only a successful capture is parsed."""
+        if phase["scan"] is None:
+            capture = phase["capture"] or {}
+            phase["scan"] = scan_capture(self.key, capture.get("stdout"), parse=capture.get("status") == "ok")
+        return phase["scan"]
 
     def enrich(self, limit_ns: int | None = None) -> None:
         """Metadata for the latest snapshot: the fixed link-kind listing, then device facts per link,
@@ -778,7 +936,7 @@ class LinkCollector:
             record["kinds"] = kinds if status == "ok" else {}
             if status != "ok":
                 record["status"] = status
-            for _line, fields in self._parsed(phase)[:DIAG_LIMITS["links_per_capture"]]:
+            for _line, fields in self._scan(phase)["lines"]:
                 if fields is None:
                     continue
                 if self.clock() >= deadline:
@@ -821,9 +979,9 @@ class LinkCollector:
             capture, enrichment = phase["capture"], phase["enrichment"] or {"status": "not_run", "started_ns": None,
                                                                               "ended_ns": None}
             status = capture["status"] if capture else "missing"
-            stdout = capture["stdout"] if capture and isinstance(capture["stdout"], str) else ""
-            parsed = self._parsed(phase) if capture else []
-            described = parsed if status == "ok" else []  # a failed capture's text is committed, never read as links
+            scan = self._scan(phase) if capture else scan_capture(key, None, parse=False)
+            described = scan["lines"] if status == "ok" else []  # a failed capture's text is committed, never read as links
+            reasons |= scan["reasons"]
             if status != "ok":
                 reasons.add("capture_missing" if status == "missing" else "capture_not_ok")
             if phase["namespace_before"] is None or phase["namespace_before"] != phase["namespace_after"]:
@@ -831,9 +989,10 @@ class LinkCollector:
             if status == "ok" and enrichment["status"] != "ok":
                 reasons.add({"timeout": "enrichment_timeout", "cap": "enrichment_cap", "budget": "enrichment_budget",
                              "namespace_mismatch": "namespace_mismatch"}.get(enrichment["status"], "enrichment_failed"))
-            line_commitments = [link_commitment(key, "line", line) for line, _fields in parsed]
-            links, view, parse_ok = [], {}, status == "ok"
-            for line, fields in described[:DIAG_LIMITS["links_per_capture"]]:
+            line_commitments = scan["commitments"]
+            scanned = scan["state"] == "complete"
+            links, view, parse_ok = [], {}, status == "ok" and scanned
+            for line, fields in described:
                 if fields is None:
                     reasons.add("unsupported_syntax")
                     parse_ok = False
@@ -853,29 +1012,28 @@ class LinkCollector:
                     parse_ok = False
                 view[entry["id"]] = (fields, entry)
                 links.append(entry)
-            if len(described) > DIAG_LIMITS["links_per_capture"]:
-                reasons.add("line_cap")
-                parse_ok = False
             captures.append({
                 "phase": phase["phase"], "ordinal": phase["ordinal"], "namespace_before": phase["namespace_before"],
                 "namespace_after": phase["namespace_after"], "start_ms": self._ms(capture["started_ns"]) if capture else None,
                 "end_ms": self._ms(capture["ended_ns"]) if capture else None, "status": status,
                 "returncode": _bounded_int(capture["returncode"], -255, 255) if capture else None,
-                "gate_digest": capture["digest"] if capture else None, "bytes": len(stdout.encode("utf-8", "surrogateescape")),
-                "line_count": len(parsed), "parse": "not_applicable" if status != "ok" else ("complete" if parse_ok else "incomplete"),
-                "lines": line_commitments[:DIAG_LIMITS["links_per_capture"]],
-                "multiset": link_commitment(key, "multiset", "\n".join(sorted(line_commitments))) if capture else None,
+                "gate_digest": capture["digest"] if capture else None, "chars": scan["chars"], "bytes": scan["bytes"],
+                "line_count": scan["line_count"], "lines_scanned": len(scan["lines"]), "scan": scan["state"],
+                "parse": "not_applicable" if status != "ok" else ("complete" if parse_ok else "incomplete"),
+                "lines": line_commitments,
+                "multiset": link_commitment(key, "multiset", "\n".join(sorted(line_commitments)))
+                if capture and scanned else None,
                 "links": links, "enrichment": {"status": enrichment["status"], "start_ms": self._ms(enrichment["started_ns"]),
                                                "end_ms": self._ms(enrichment["ended_ns"])}})
             views.append({"status": status, "returncode": capture["returncode"] if capture else None,
                           "digest": capture["digest"] if capture else None, "lines": line_commitments, "view": view,
-                          "complete": parse_ok})
+                          "complete": parse_ok, "scanned": scanned})
         identities = {phase["namespace_before"] for phase in self.phases} | {phase["namespace_after"] for phase in self.phases}
         host = next(iter(identities)) if len(identities) == 1 else None
         if self.phases and host is None:
             reasons.add("namespace_mismatch")
         ownership_status, registry = sanitize_ownership(ownership_raw)
-        ownership = {"status": ownership_status, "endpoints": 0, "matched": 0, "ambiguous": 0, "namespace_conflicts": 0}
+        ownership = {"status": ownership_status, "endpoints": 0, "correlated": 0, "ambiguous": 0, "namespace_conflicts": 0}
         usable = []
         for entry in registry:
             if host is not None and host in (entry["namespace"], entry["outer"]):
@@ -896,7 +1054,8 @@ class LinkCollector:
             pair, budget = self._pair(name, views, first, second, usable if ownership_status == "valid" else None,
                                       ownership, budget, reasons)
             pairs.append(pair)
-        return {"schema": DIAG_SCHEMA, "complete": not reasons, "incomplete_reasons": sorted(reasons), "host_namespace": host,
+        return {"schema": DIAG_SCHEMA, "complete": not reasons, "incomplete_reasons": sorted(reasons),
+                "attribution": "correlation_only", "host_namespace": host,
                 "baseline_pause_ms": None if self.pause_ms is None else min(self.pause_ms, 10 ** 7),
                 "ancillary_ms": max(0, min(10 ** 7, (DIAG_LIMITS["ancillary_total_ms"] * _MS - self.budget_ns) // _MS)),
                 "captures": captures, "pairs": pairs, "ownership": ownership}
@@ -905,8 +1064,8 @@ class LinkCollector:
         a, b = views[first], views[second]
         gate_equal = a["digest"] is not None and a["digest"] == b["digest"]
         status_change = (a["status"], a["returncode"]) != (b["status"], b["returncode"])
-        order_only = (not gate_equal and not status_change and sorted(a["lines"]) == sorted(b["lines"])
-                      and a["lines"] != b["lines"])
+        order_only = (not gate_equal and not status_change and a["scanned"] and b["scanned"]  # whole texts only
+                      and sorted(a["lines"]) == sorted(b["lines"]) and a["lines"] != b["lines"])
         changes, enrichment_changes, counts = [], [], {"added": 0, "removed": 0, "changed": 0}
         comparable = a["status"] == b["status"] == "ok"  # links are compared only between two successful captures
         for link_id in sorted(set(a["view"]) | set(b["view"])) if comparable else []:
@@ -934,16 +1093,22 @@ class LinkCollector:
             observed = (after or before)[1]["provenance"]
             hardware = ("unknown" if observed["scope"] != "host_verified"
                         else {"yes": "device_backed", "no": "virtual"}.get(observed["device_backed"], "unknown"))
+            # Proof identity is never asserted: the registry records creation in a fixture namespace,
+            # and no capture witnesses that endpoint's later existence, move or teardown. A name/MAC
+            # match with one registry entry is labelled as that correlation and nothing more.
             identity = "not_applicable" if name == "baseline" else "unknown"
+            correlation = "not_applicable" if name == "baseline" else "none"
             if name == "audit" and kind == "added" and registry is not None and link_id not in views[0]["view"]:
                 candidates = [entry for entry in registry if entry["name"] == link_id and entry["mac"] is not None
                               and entry["mac"] == after[1]["mac"]]
                 if len(candidates) == 1:
-                    identity = "proof_identity_match"
-                    ownership["matched"] += 1
+                    correlation = "fixture_name_mac"
+                    ownership["correlated"] += 1
                 elif len(candidates) > 1:
+                    correlation = "ambiguous"
                     ownership["ambiguous"] += 1
-            changes.append({"id": link_id, "change": kind, "fields": labels, "proof_identity": identity, "hardware": hardware})
+            changes.append({"id": link_id, "change": kind, "fields": labels, "proof_identity": identity,
+                            "correlation": correlation, "hardware": hardware})
             budget -= 1
         if gate_equal:
             classes = {"none"}
@@ -954,8 +1119,9 @@ class LinkCollector:
             elif order_only:
                 classes.add("order_only_text_change")
             for change in changes:
-                classes.add("proof_identity_match" if change["proof_identity"] == "proof_identity_match"
-                            else "hardware_backed_change" if change["hardware"] == "device_backed" else "unknown")
+                classes.add("hardware_backed_change" if change["hardware"] == "device_backed" else "unknown")
+                if change["correlation"] == "fixture_name_mac":
+                    classes.add("fixture_name_mac_correlation")
             if not classes or (comparable and not (a["complete"] and b["complete"])) or "changed_cap" in reasons:
                 classes.add("unknown")
         return ({"name": name, "from": DIAG_PHASES[first], "to": DIAG_PHASES[second], "gate_digest_equal": gate_equal,
@@ -1001,12 +1167,16 @@ _LINK_SPEC = ("dict", {"id": _HEX, "ifindex": _INDEX, "iflink": ("opt", _INDEX),
 _CAPTURE_SPEC = ("dict", {"phase": ("enum", DIAG_PHASES), "ordinal": ("int", 0, 2), "namespace_before": ("opt", _HEX),
                           "namespace_after": ("opt", _HEX), "start_ms": _MS_INT, "end_ms": _MS_INT,
                           "status": ("enum", CAPTURE_STATUSES), "returncode": ("opt", ("int", -255, 255)),
-                          "gate_digest": ("opt", ("digest",)), "bytes": ("int", 0, 10 ** 9), "line_count": ("int", 0, 10 ** 6),
+                          "gate_digest": ("opt", ("digest",)), "chars": ("int", 0, 2 ** 62),
+                          "bytes": ("opt", ("int", 0, 4 * DIAG_LIMITS["scan_chars"] + DIAG_LIMITS["links_per_capture"])),
+                          "line_count": ("opt", ("int", 0, DIAG_LIMITS["links_per_capture"])),
+                          "lines_scanned": ("int", 0, DIAG_LIMITS["links_per_capture"]), "scan": ("enum", SCAN_STATES),
                           "parse": ("enum", PARSE_STATUSES), "lines": ("list", _HEX, DIAG_LIMITS["links_per_capture"]),
                           "multiset": ("opt", _HEX), "links": ("list", _LINK_SPEC, DIAG_LIMITS["links_per_capture"]),
                           "enrichment": ("dict", {"status": ("enum", ENRICH_STATUSES), "start_ms": _MS_INT, "end_ms": _MS_INT})})
 _CHANGE_SPEC = ("dict", {"id": _HEX, "change": ("enum", CHANGE_KINDS), "fields": ("set", FIELD_LABELS),
-                         "proof_identity": ("enum", PROOF_IDENTITY), "hardware": ("enum", HARDWARE)})
+                         "proof_identity": ("enum", PROOF_IDENTITY), "correlation": ("enum", CORRELATIONS),
+                         "hardware": ("enum", HARDWARE)})
 _COUNT = ("int", 0, 10 ** 6)
 _PAIR_SPEC = ("dict", {"name": ("enum", ("baseline", "audit")), "from": ("enum", DIAG_PHASES), "to": ("enum", DIAG_PHASES),
                        "gate_digest_equal": ("bool",), "status_change": ("bool",), "order_only": ("bool",), "added": _COUNT,
@@ -1015,12 +1185,13 @@ _PAIR_SPEC = ("dict", {"name": ("enum", ("baseline", "audit")), "from": ("enum",
                        "enrichment_changes": ("list", ("dict", {"id": _HEX, "fields": ("set", PROVENANCE_LABELS)}),
                                               DIAG_LIMITS["changed_entries"])})
 DIAGNOSTICS_SPEC = ("dict", {"schema": ("enum", (DIAG_SCHEMA,)), "complete": ("bool",),
-                             "incomplete_reasons": ("set", DIAG_REASONS), "host_namespace": ("opt", _HEX),
+                             "incomplete_reasons": ("set", DIAG_REASONS), "attribution": ("enum", ATTRIBUTION),
+                             "host_namespace": ("opt", _HEX),
                              "baseline_pause_ms": _MS_INT, "ancillary_ms": ("int", 0, 10 ** 7),
                              "captures": ("list", _CAPTURE_SPEC, DIAG_LIMITS["captures"]),
                              "pairs": ("list", _PAIR_SPEC, len(DIAG_PAIRS)),
                              "ownership": ("dict", {"status": ("enum", OWNERSHIP_STATUSES), "endpoints": _COUNT,
-                                                    "matched": _COUNT, "ambiguous": _COUNT, "namespace_conflicts": _COUNT})})
+                                                    "correlated": _COUNT, "ambiguous": _COUNT, "namespace_conflicts": _COUNT})})
 
 
 def sanitize_link_diagnostics(raw) -> dict:

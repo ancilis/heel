@@ -162,11 +162,13 @@ allow-listed artifacts only (`summary.json`, `cases.jsonl`, `versions.txt`, `cle
   injected failure in a live fixture resolves; then no fixture, domain, namespace descriptor, veth,
   socket, thread, helper, child process or outer-namespace change remains.
 
-## Host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, supplementary)
+## Host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, corrected in R2, supplementary)
 
 Run 41621515465 failed the host audit on `links` with no evidence of what changed (the original
 FAIL stands; its cause is underdetermined). This addition describes the same captured text; it does
-not change the gate. Its new closure is **UNRUN** until a reviewed execution.
+not change the gate. Its new closure is **UNRUN** until a reviewed execution. R2 corrects three
+source-review findings: diagnostic work is bounded before it starts (F1), a name/MAC registry match
+is a correlation only (F2), and sysfs reads are descriptor-anchored and rechecked (F3).
 
 - **Same capture.** H0 `host_fingerprints(observer=None)` gains a default-disabled observer. With an
   observer, H0 hands it each fixed command's status (`ok`, `nonzero`, `timeout`, `oserror`), return
@@ -181,13 +183,28 @@ not change the gate. Its new closure is **UNRUN** until a reviewed execution.
   `differing` rule. The first snapshot's metadata is sampled inside at most 1.5 s of the 2 s pause,
   and the rest of the pause is slept. The three phases are `baseline_first`, `baseline_second` and
   `after_namespace_exit`.
+- **Bounded before work (R2).** The diagnostics make one scan over each captured text, and the
+  gate's own digest of the full text is unchanged. The scan:
+  - reads at most 64 lines, finding each newline with a search confined to 4096 characters past the
+    line's start, and at most 65536 characters in all;
+  - copies, encodes, commits and (for a successful capture) parses only those bounded slices, so
+    at most 64 lines per capture are ever parsed and committed;
+  - stops as `truncated` on more lines (`line_cap`), an oversized line (`line_length_cap`), the
+    aggregate bound (`scan_cap`) or an unencodable line (`unsupported_encoding`).
+  - A truncated scan reports the exact character length of the captured text (`chars`, no pass over
+    it), but its total `bytes` and `line_count` are `null`, never estimated, and it has no multiset
+    commitment. Order-only is claimed only between two complete scans.
 - **Closed output.** `cleanup.json` gains `link_diagnostics`
-  (`heel.host-h2-policy-proof.link-diagnostics.v1`), and the parent re-checks it all or nothing.
+  (`heel.host-h2-policy-proof.link-diagnostics.v2`), and the parent re-checks it all or nothing.
+  - Top level: `attribution` is always `correlation_only` (see the ownership registry below).
   - Per capture it records:
     - run-local namespace identities before and after;
     - start/end ms relative to the parent's monotonic start;
-    - status, return code, gate digest, bytes and lines;
-    - per-line keyed commitments and a sorted multiset commitment;
+    - status, return code and gate digest;
+    - `chars`, `bytes` and `line_count` (both `null` unless the scan is complete), `lines_scanned`
+      and `scan` (`complete` or `truncated`);
+    - per-line keyed commitments for the scanned lines, and a sorted multiset commitment only for a
+      complete scan;
     - up to 64 links of exactly 16 fields: keyed id/peer/MAC/master/line/other commitments, bounded
       ifindex/iflink/MTU/qlen/netnsid, closed flag/operstate/link-type enums, an unknown count and
       provenance.
@@ -196,10 +213,11 @@ not change the gate. Its new closure is **UNRUN** until a reviewed execution.
     - status-change and order-only flags;
     - added/removed/changed counts;
     - up to 64 changes with closed field labels;
-    - `proof_identity` and `hardware`;
+    - `proof_identity` (always `unknown`, or `not_applicable` in the baseline pair), `correlation`
+      (`fixture_name_mac`, `ambiguous`, `none`, `not_applicable`) and `hardware`;
     - enrichment-only changes;
     - delta classes from `none`, `command_status_change`, `order_only_text_change`,
-      `proof_identity_match`, `hardware_backed_change` and `unknown`.
+      `fixture_name_mac_correlation`, `hardware_backed_change` and `unknown`.
   - Raw names, MACs, aliases, altnames, addresses, bus paths, inodes, the HMAC key and command
     output are never exported.
   - Commitments are HMAC-SHA256 under a run-private 32-byte key. The parent creates it, sends it only
@@ -207,13 +225,26 @@ not change the gate. Its new closure is **UNRUN** until a reviewed execution.
 - **Metadata (read-only, bounded).**
   - One fixed listing, `ip -d -j link show`, is used for the link kind: at most 64 KiB, 2 s per
     command, 5 s in total.
-  - Fixed sysfs attributes give `ifindex`, `device`, `subsystem` and `driver`:
-    - reads are at most 64 bytes each;
-    - the attribute itself is opened `O_NOFOLLOW`;
-    - real paths must stay under the `devices`/`bus` trees;
+  - Fixed sysfs attributes give `ifindex`, `device`, `subsystem` and `driver` (R2: descriptor-anchored):
+    - every read starts from one descriptor of the sysfs root and walks real directories one
+      component at a time (`O_DIRECTORY | O_NOFOLLOW` at each parent descriptor), so a substituted
+      parent or ancestor fails instead of being followed;
+    - only the four intended links are read (`class/net/<name>`, `device`, `subsystem`, `driver`),
+      each resolved lexically against its own directory, at most 512 characters and 32 components,
+      and required to stay in its tree: `devices/…/net/<name>`, `devices/…`, `bus/<bus>`,
+      `bus/<bus>/drivers/<driver>`;
+    - every object reached must be on the root's filesystem;
+    - `ifindex` is read at the link directory's descriptor (at most 64 bytes, `O_NOFOLLOW`) before
+      and after;
+    - a second full pass must reach the same objects (device, inode), locations and facts, and the
+      root must still be the same object;
     - the bus is an enum, and the driver comes from an allowlist (otherwise `unknown`).
-  - The namespace identity is rechecked around each read, and the ifindex is read before and after.
-    Any race, escape, disappearance or deadline gives `unknown`.
+  - The namespace identity is rechecked around the enrichment. Any substitution, race, reuse of the
+    name by another object, retargeted link, escape, disappearance or deadline gives `unknown`, which
+    marks the diagnostics incomplete (`enrichment_unknown`).
+  - Limit (INFERRED): an object reused with the same inode, or a directory already opened and then
+    moved within one filesystem, cannot be excluded by identity; the facts are then a sample, and the
+    recheck discards any pass that differs. No raw path leaves the launcher.
   - Metadata is sampled next to the capture, never atomically with it.
   - There is no module loading, probing, mutation, dmesg or network path.
 - **Ownership registry.**
@@ -224,15 +255,24 @@ not change the gate. Its new closure is **UNRUN** until a reviewed execution.
     - the L/R and outer namespace commitments.
   - The registry is copied out with the records. It is supplementary only: it is not a case,
     record or verdict, and the 18-case/eight-record inventory is unchanged.
-  - `proof_identity_match` needs one corroborated entry whose name and MAC commitments both match a
-    link that was added in the audit pair and was absent from both baselines.
-  - A name prefix, MAC alone, ifindex, link type or module never sets it. Ambiguity, index reuse, a
-    registry entry that claims the host namespace, an unobserved entry or an invalid registry give
-    `unknown`.
+  - The registry records creation in a fixture namespace only. No capture witnesses that endpoint's
+    later existence, move into the host or teardown, so proof (lifecycle) identity is never
+    asserted: `proof_identity` is `unknown`. A reused name/MAC, a stale record, a moved endpoint and
+    a separate hardware lookalike are indistinguishable here.
+  - `correlation` is `fixture_name_mac` when exactly one corroborated entry's name and MAC
+    commitments both match a link that was added in the audit pair and was absent from both
+    baselines. It is a correlation only, reported beside (never instead of) the hardware class.
+    Two or more such entries give `ambiguous`.
+  - A name prefix, MAC alone, ifindex/iflink equality, link type or module never sets it. Index
+    reuse, a registry entry that claims the host namespace, an unobserved entry or an invalid
+    registry give `none`. The fixture namespace, ifindex and iflink stay bounded registry data;
+    their presence alone proves no continuity.
+  - Completeness (`complete`) describes the captures and inputs only, never attribution certainty.
 - **Limits and reasons.**
-  - Limits: 64 links per capture, 3 captures, 32 fixture endpoints, 64 changed entries, 16 fields
-    per link, 64-character driver tokens, 64-hex commitments, and 256 KiB payload (over that, details
-    are dropped with `payload_cap`).
+  - Limits: 64 links per capture, 4096 characters per line, 65536 scanned characters per capture,
+    3 captures, 32 fixture endpoints, 64 changed entries, 16 fields per link, 64-character driver
+    tokens, 64-hex commitments, and 256 KiB payload (over that, details are dropped with
+    `payload_cap`).
   - The gate still hashes the whole original output.
   - Every overflow, unsupported syntax, enrichment failure, namespace mismatch, collector or observer
     failure and ownership gap sets `complete=false` with a closed reason.
