@@ -162,13 +162,16 @@ allow-listed artifacts only (`summary.json`, `cases.jsonl`, `versions.txt`, `cle
   injected failure in a live fixture resolves; then no fixture, domain, namespace descriptor, veth,
   socket, thread, helper, child process or outer-namespace change remains.
 
-## Host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, corrected in R2, supplementary)
+## Host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, corrected in R2 and R3, supplementary)
 
 Run 41621515465 failed the host audit on `links` with no evidence of what changed (the original
 FAIL stands; its cause is underdetermined). This addition describes the same captured text; it does
 not change the gate. Its new closure is **UNRUN** until a reviewed execution. R2 corrects three
 source-review findings: diagnostic work is bounded before it starts (F1), a name/MAC registry match
-is a correlation only (F2), and sysfs reads are descriptor-anchored and rechecked (F3).
+is a correlation only (F2), and sysfs reads are descriptor-anchored and rechecked (F3). R3 extends
+the early bounds to every other diagnostic input (fixture listing and registry, ancillary listing,
+the child's cleanup file and the parent's closed check) and reports device facts only under a
+verified, supported sysfs mount, with claims limited to the sampled objects.
 
 - **Same capture.** H0 `host_fingerprints(observer=None)` gains a default-disabled observer. With an
   observer, H0 hands it each fixed command's status (`ok`, `nonzero`, `timeout`, `oserror`), return
@@ -223,8 +226,19 @@ is a correlation only (F2), and sysfs reads are descriptor-anchored and rechecke
   - Commitments are HMAC-SHA256 under a run-private 32-byte key. The parent creates it, sends it only
     to the child and the fixture, and scans every artifact for it.
 - **Metadata (read-only, bounded).**
-  - One fixed listing, `ip -d -j link show`, is used for the link kind: at most 64 KiB, 2 s per
-    command, 5 s in total.
+  - One fixed listing, `ip -d -j link show`, is used for the link kind: at most 64 KiB read (no
+    single read asks past the bound), 2 s per command, 5 s in total; more than 64 entries is `cap`
+    before any entry is visited, and an `ifname` over 64 characters is `invalid`.
+  - Supported layout only (R3). Device facts are reported (`status=ok`) only on Linux and only when
+    the sysfs root descriptor is the root of a verified real sysfs mount: its `mnt_id` (from
+    `/proc/self/fdinfo/<fd>`, at most 1024 bytes read) names exactly one `/proc/self/mountinfo` entry
+    (at most 64 KiB read, otherwise unsupported) whose filesystem type is `sysfs`, whose mount root is
+    `/`, whose mount point is the root path and whose major:minor is the descriptor's device. Every
+    descriptor opened afterwards (each directory on every walk, each endpoint, each attribute file,
+    the re-opened root) must be on that same device and mount id. Anything else (another platform,
+    another filesystem type, a bind of a subdirectory, an overmount anywhere on the walked path,
+    oversized or malformed /proc text) is `unknown`. These reads use the existing 64 KiB and 5 s
+    ancillary budgets; no mount path, mount id, inode or error text is exported.
   - Fixed sysfs attributes give `ifindex`, `device`, `subsystem` and `driver` (R2: descriptor-anchored):
     - every read starts from one descriptor of the sysfs root and walks real directories one
       component at a time (`O_DIRECTORY | O_NOFOLLOW` at each parent descriptor), so a substituted
@@ -233,25 +247,32 @@ is a correlation only (F2), and sysfs reads are descriptor-anchored and rechecke
       each resolved lexically against its own directory, at most 512 characters and 32 components,
       and required to stay in its tree: `devices/…/net/<name>`, `devices/…`, `bus/<bus>`,
       `bus/<bus>/drivers/<driver>`;
-    - every object reached must be on the root's filesystem;
-    - `ifindex` is read at the link directory's descriptor (at most 64 bytes, `O_NOFOLLOW`) before
-      and after;
+    - every descriptor opened must be on the root's device and verified mount (above);
+    - `ifindex` is read at the link directory's descriptor (a regular file on the verified mount, at
+      most 64 bytes, `O_NOFOLLOW`) before and after;
     - a second full pass must reach the same objects (device, inode), locations and facts, and the
       root must still be the same object;
     - the bus is an enum, and the driver comes from an allowlist (otherwise `unknown`).
-  - The namespace identity is rechecked around the enrichment. Any substitution, race, reuse of the
-    name by another object, retargeted link, escape, disappearance or deadline gives `unknown`, which
-    marks the diagnostics incomplete (`enrichment_unknown`).
-  - Limit (INFERRED): an object reused with the same inode, or a directory already opened and then
-    moved within one filesystem, cannot be excluded by identity; the facts are then a sample, and the
-    recheck discards any pass that differs. No raw path leaves the launcher.
+  - The namespace identity is rechecked around the enrichment. A failed check, a difference between
+    the two passes or the deadline gives `unknown`, which marks the diagnostics incomplete
+    (`enrichment_unknown`).
+  - What `ok` means (sampled objects only): each object was, when it was sampled, an object of the
+    verified sysfs mount at an intended location, and the two passes agreed. Because the mount root
+    is the filesystem root, no object reached on that mount lies outside it. It is not lifecycle
+    identity: an object replaced by another with the same (device, inode) between samples, or a
+    change after the second pass, is not excluded, and the facts describe the sample, not the link's
+    history. The synthetic tests model the mount contract on fake trees (labelled as a model); they
+    are not mount proof. Linux verification of the contract on a real `/sys` is UNRUN (it belongs to
+    the parent-controlled diagnostic proof). No raw path leaves the launcher.
   - Metadata is sampled next to the capture, never atomically with it.
   - There is no module loading, probing, mutation, dmesg or network path.
 - **Ownership registry.**
   - After each successful veth creation, the fixture appends two entries to `ownership.raw.jsonl`
     beside the records. Each entry holds:
     - the requested name/MAC commitments;
-    - a read-only post-creation listing of the endpoint in its own namespace (by descriptor);
+    - a read-only post-creation listing of the endpoint in its own namespace (by descriptor), run by
+      the launcher's bounded command on a thread inside that namespace: at most 4097 bytes in 2 s,
+      and its length is checked before any split or parse (more than one line is unobserved);
     - the L/R and outer namespace commitments.
   - The registry is copied out with the records. It is supplementary only: it is not a case,
     record or verdict, and the 18-case/eight-record inventory is unchanged.
@@ -268,12 +289,21 @@ is a correlation only (F2), and sysfs reads are descriptor-anchored and rechecke
     registry give `none`. The fixture namespace, ifindex and iflink stay bounded registry data;
     their presence alone proves no continuity.
   - Completeness (`complete`) describes the captures and inputs only, never attribution certainty.
+  - Reading the registry (R3): a regular file of at most 64 KiB by its size; then at most 32
+    newline-terminated lines, each at most 2048 printable-ASCII bytes, are counted and shaped before
+    any decode or JSON parse. More than 32 lines is `ownership_cap` with nothing parsed.
 - **Limits and reasons.**
   - Limits: 64 links per capture, 4096 characters per line, 65536 scanned characters per capture,
     3 captures, 32 fixture endpoints, 64 changed entries, 16 fields per link, 64-character driver
     tokens, 64-hex commitments, and 256 KiB payload (over that, details are dropped with
     `payload_cap`).
-  - The gate still hashes the whole original output.
+  - The gate still hashes the whole original output (the one unchanged exception: H0's own digest).
+  - Early bounds (R3): every diagnostic input is bounded before work that grows with it. The parent
+    reads `cleanup.raw.json` only as a regular file of at most 1 MiB by its size (bounded read, before
+    any decode or JSON parse); larger, not regular or a symlink gives no cleanup fields (the gate
+    fails closed) and `diagnostics_invalid`. The parent's closed check requires exact JSON types and
+    checks dict key counts, list lengths, set cardinality and every string's length before any
+    traversal, membership, hash, set or sort.
   - Every overflow, unsupported syntax, enrichment failure, namespace mismatch, collector or observer
     failure and ownership gap sets `complete=false` with a closed reason.
 - **Acceptance.** `evaluate` is unchanged and its verdict is reported as `gate_result`. A gate PASS

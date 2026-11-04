@@ -304,13 +304,16 @@ def profile_fields(by_case: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------
-# Supplementary host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, bounded correction R2). Never part of
-# the acceptance rule: the gate still hashes H0's own capture exactly as before. This describes that
-# same captured ``ip -o link show`` text, keyed with a run-private HMAC key and bounded before any
+# Supplementary host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, bounded corrections R2 and R3). Never
+# part of the acceptance rule: the gate still hashes H0's own capture exactly as before. This describes
+# that same captured ``ip -o link show`` text, keyed with a run-private HMAC key and bounded before any
 # work (at most 64 lines, 4096 characters per line and 65536 in all are ever scanned), as one closed
-# object in cleanup.json. Incomplete diagnostics can only hold a PASS back, never make one; a change
-# class is an observation class, never actor attribution, and a name/MAC match with a fixture
-# registry entry is a correlation only: no capture witnesses lifecycle continuity.
+# object in cleanup.json. Every other diagnostic input (the fixture listing and registry, the
+# ancillary listing, /proc and sysfs text, the child's cleanup file and the parent's closed check) is
+# also bounded in bytes, lines, items and string length before it is copied, split, parsed, traversed,
+# hashed or sorted. Incomplete diagnostics can only hold a PASS back, never make one; a change class is
+# an observation class, never actor attribution, and a name/MAC match with a fixture registry entry is
+# a correlation only: no capture witnesses lifecycle continuity.
 
 DIAG_SCHEMA = "heel.host-h2-policy-proof.link-diagnostics.v2"
 OWNERSHIP_SCHEMA = "heel.host-h2-policy-proof.ownership.v1"
@@ -321,7 +324,8 @@ DIAG_LIMITS = {"links_per_capture": 64, "captures": 3, "fixture_endpoints": 32, 
                "fields_per_link": 16, "driver_token_chars": 64, "commitment_hex_chars": 64, "payload_bytes": 262144,
                "ancillary_read_bytes": 65536, "ancillary_command_ms": 2000, "ancillary_total_ms": 5000,
                "line_chars": 4096, "scan_chars": 65536, "tokens_per_line": 64, "ownership_bytes": 65536, "sysfs_read_bytes": 64,
-               "sysfs_link_chars": 512, "sysfs_components": 32}
+               "sysfs_link_chars": 512, "sysfs_components": 32, "ownership_line_bytes": 2048, "mac_chars": 64,
+               "fdinfo_bytes": 1024, "mountinfo_bytes": 65536, "cleanup_bytes": 1048576}
 DIAG_REASONS = ("capture_missing", "capture_not_ok", "line_cap", "line_length_cap", "scan_cap", "unsupported_encoding",
                 "unsupported_syntax", "field_cap", "enrichment_timeout",
                 "enrichment_cap", "enrichment_budget", "enrichment_failed", "enrichment_unknown", "namespace_mismatch",
@@ -532,12 +536,93 @@ UNKNOWN_PROVENANCE = {"device_backed": "unknown", "bus": "unknown", "kind": "unk
 
 
 _SYSFS_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_PROC_FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
-def _sysfs_read(directory: int, name: str, limit: int = DIAG_LIMITS["sysfs_read_bytes"]) -> str:
-    """One small, fixed attribute of an already opened sysfs directory (O_NOFOLLOW, at most ``limit``)."""
+def _proc_read(path: str, limit: int) -> bytes | None:
+    """One small read-only /proc text of this process, read in a loop that never reads more than
+    ``limit`` + 1 bytes in all; None when it is longer than ``limit`` (it is then never split or parsed)."""
+    descriptor = os.open(path, _PROC_FILE)
+    try:
+        chunks, size = [], 0
+        while size <= limit:
+            chunk = os.read(descriptor, limit + 1 - size)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            size += len(chunk)
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def fdinfo_mount_id(data: bytes) -> int | None:
+    """The single ``mnt_id`` of a bounded /proc/self/fdinfo text; None if absent, repeated or malformed."""
+    found = None
+    for line in data.split(b"\n"):
+        if line.startswith(b"mnt_id:"):
+            value = line[7:].strip()
+            if found is not None or not re.fullmatch(rb"[0-9]{1,10}", value):
+                return None
+            found = int(value)
+    return found
+
+
+def sysfs_mount_supported(data: bytes, mount_id: int, device: int, root: str) -> bool:
+    """The one supported real-sysfs layout, decided from a bounded /proc/self/mountinfo text: exactly
+    one entry has this mount id, and it is a ``sysfs`` filesystem mounted from its own root ``/`` at
+    ``root`` on the anchor's device. A bind of a subdirectory, another filesystem type or mount point,
+    a duplicate or a malformed entry is unsupported."""
+    found = None
+    for line in data.split(b"\n"):
+        if not line:
+            continue
+        fields = line.split(b" ")
+        if len(fields) < 10 or not re.fullmatch(rb"[0-9]{1,10}", fields[0]) or b"-" not in fields[6:]:
+            return False
+        if int(fields[0]) != mount_id:
+            continue
+        if found is not None:
+            return False
+        found = fields
+    if found is None:
+        return False
+    tail = found.index(b"-", 6)
+    return (len(found) > tail + 1 and found[tail + 1] == b"sysfs" and found[3] == b"/"
+            and found[4] == root.encode("utf-8", "surrogateescape")
+            and found[2] == f"{os.major(device)}:{os.minor(device)}".encode("ascii"))
+
+
+class SysfsMount:
+    """The supported-root contract for link metadata: Linux only, read-only and bounded. ``descriptor``
+    names the mount of one descriptor this module owns (its fdinfo ``mnt_id``); ``supported`` says
+    whether that mount is the real sysfs root at ``root``. Anywhere else both answer "unsupported" and
+    metadata stays ``unknown``. No FFI, no host inventory; a mount id never leaves this module."""
+
+    def descriptor(self, descriptor: int) -> int | None:
+        if not sys.platform.startswith("linux"):
+            return None
+        data = _proc_read("/proc/self/fdinfo/%d" % descriptor, DIAG_LIMITS["fdinfo_bytes"])
+        return None if data is None else fdinfo_mount_id(data)
+
+    def supported(self, mount_id: int, device: int, root: str) -> bool:
+        if not sys.platform.startswith("linux"):
+            return False
+        data = _proc_read("/proc/self/mountinfo", DIAG_LIMITS["mountinfo_bytes"])
+        return data is not None and sysfs_mount_supported(data, mount_id, device, root)
+
+
+SYSFS_MOUNT = SysfsMount()
+
+
+def _sysfs_read(directory: int, name: str, verify, limit: int = DIAG_LIMITS["sysfs_read_bytes"]) -> str:
+    """One small, fixed attribute of an already opened sysfs directory (O_NOFOLLOW, at most ``limit``):
+    the attribute's own descriptor must be a regular file on the verified mount before it is read."""
     descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory)
     try:
+        verify(descriptor)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("sysfs_type")
         data = os.read(descriptor, limit + 1)
     finally:
         os.close(descriptor)
@@ -572,43 +657,47 @@ def _sysfs_target(parts: tuple, directory: int, link: str, real_root: str) -> tu
     return tuple(components) if len(components) <= DIAG_LIMITS["sysfs_components"] else None
 
 
-def _sysfs_open(root: int, parts: tuple) -> int:
+def _sysfs_open(root: int, parts: tuple, verify) -> tuple[int, tuple[int, int]]:
     """A directory descriptor reached from the root descriptor one real component at a time
-    (O_DIRECTORY | O_NOFOLLOW at each parent's descriptor): no symlink is ever followed on the way,
-    so a substituted parent or ancestor fails instead of leading out of the root."""
+    (O_DIRECTORY | O_NOFOLLOW at each parent's descriptor), each one verified on the anchor's mount:
+    no symlink is ever followed and no other mount is ever entered on the way, so a substituted parent
+    or ancestor, or an overmount, fails instead of leading out of the verified sysfs root."""
     current = os.open(".", _SYSFS_DIRECTORY, dir_fd=root)
     try:
+        identity = verify(current)
         for component in parts:
             if component in ("", ".", "..") or "/" in component:
                 raise ValueError("sysfs_component")
             following = os.open(component, _SYSFS_DIRECTORY, dir_fd=current)
             os.close(current)
             current = following
-        return current
+            identity = verify(current)
+        return current, identity
     except BaseException:
         os.close(current)
         raise
 
 
-def _sysfs_identity(descriptor: int, device: int) -> tuple[int, int]:
+def _sysfs_identity(descriptor: int, device: int, mount_id: int, mount) -> tuple[int, int]:
+    """(device, inode) of a descriptor on the verified mount: the anchor's device and mount id."""
     info = os.fstat(descriptor)
-    if info.st_dev != device:
-        raise ValueError("sysfs_device")
+    if info.st_dev != device or mount.descriptor(descriptor) != mount_id:
+        raise ValueError("sysfs_mount")
     return info.st_dev, info.st_ino
 
 
-def _sysfs_pass(root: int, device: int, real_root: str, name: str, ifindex: int, read) -> tuple | None:
+def _sysfs_pass(root: int, verify, real_root: str, name: str, ifindex: int, read) -> tuple | None:
     """One complete descriptor-anchored pass: the link's class entry, its directory (ifindex read at
     that descriptor before and after), and for a device-backed link its device, bus and driver, each
-    reached only through those four intended links. Returns the facts plus every object identity and
-    resolved location on the way, so a second pass can prove nothing moved; None when anything is
-    outside its tree, missing or inconsistent."""
+    reached only through those four intended links. Returns the facts plus every endpoint identity and
+    resolved location on the way, so a second pass can compare them; None when anything is outside its
+    tree, missing or inconsistent."""
     opened = []
     try:
         def reach(parts: tuple) -> tuple[int, tuple]:
-            descriptor = _sysfs_open(root, parts)
+            descriptor, identity = _sysfs_open(root, parts, verify)
             opened.append(descriptor)
-            return descriptor, (parts, _sysfs_identity(descriptor, device))
+            return descriptor, (parts, identity)
 
         def target(parts: tuple, directory: int, link: str):
             try:
@@ -621,7 +710,7 @@ def _sysfs_pass(root: int, device: int, real_root: str, name: str, ifindex: int,
         if not base_parts or len(base_parts) < 3 or base_parts[0] != "devices" or base_parts[-2:] != ("net", name):
             return None
         base, base_id = reach(base_parts)
-        if int(read(base, "ifindex")) != ifindex:
+        if int(read(base, "ifindex", verify)) != ifindex:
             return None
         trail = [net_id, base_id]
         device_parts = target(base_parts, base, "device")
@@ -646,7 +735,7 @@ def _sysfs_pass(root: int, device: int, real_root: str, name: str, ifindex: int,
                 token = driver_parts[3]
                 driver = token if len(token) <= DIAG_LIMITS["driver_token_chars"] and token in DRIVERS else "unknown"
             facts = ("yes", bus if bus in BUSES else "other", driver)
-        if int(read(base, "ifindex")) != ifindex:
+        if int(read(base, "ifindex", verify)) != ifindex:
             return None
         return facts, tuple(trail)
     finally:
@@ -655,14 +744,24 @@ def _sysfs_pass(root: int, device: int, real_root: str, name: str, ifindex: int,
 
 
 def link_metadata(name: str, ifindex: int, deadline_ns: int, *, clock=time.monotonic_ns, root: str = "/sys",
-                  read=_sysfs_read) -> dict:
+                  read=_sysfs_read, mount=SYSFS_MOUNT) -> dict:
     """Read-only device facts for one link observed in the host capture: whether a device backs it,
-    that device's bus and an allowlisted driver token. Every read is anchored at one root directory
-    descriptor and reached through real directories plus only the class/device/subsystem/driver links,
-    each resolved inside its own tree and every object on one filesystem. A second full pass must find
-    the same objects (device, inode), locations and facts, and the root must still be the same
-    object; any substitution, race, reuse, escape, disappearance or deadline leaves the answer
-    ``unknown``. Never a bus path, serial or raw path."""
+    that device's bus and an allowlisted driver token, or ``unknown``.
+
+    Supported layout only: ``ok`` requires that the root descriptor is the root of a verified real
+    sysfs mount (``mount``: Linux fdinfo mount id + mountinfo entry of fstype sysfs, mount root ``/``,
+    mount point ``root``, the descriptor's device) and that every descriptor opened afterwards (each
+    directory on every walk, each endpoint, each attribute file) is on that same device and mount.
+    Directories are reached from the root descriptor through real entries plus only the
+    class/device/subsystem/driver links, each resolved inside its own tree. A second full pass must
+    reach the same (device, inode) endpoints at the same locations with the same facts, and the
+    re-opened root must be the same object on the same mount.
+
+    What ``ok`` means: every sampled object was, when it was sampled, an object of that verified sysfs
+    mount at an intended location, and the two samples agreed. It is not lifecycle identity: an object
+    replaced by one with the same (device, inode) between samples, or a change after the second pass,
+    is not excluded. Any other layout, a failed check, a difference between passes or the deadline
+    leaves the answer ``unknown``. Never a bus path, serial, raw path, mount id or inode."""
     answer = {"device_backed": "unknown", "bus": "unknown", "driver": "unknown", "status": "unknown"}
     if not _LINK_NAME.fullmatch(name or "") or name in (".", ".."):
         return answer
@@ -673,13 +772,20 @@ def link_metadata(name: str, ifindex: int, deadline_ns: int, *, clock=time.monot
         return answer
     try:
         device = os.fstat(anchor).st_dev
-        first = _sysfs_pass(anchor, device, real_root, name, ifindex, read)
+        mount_id = mount.descriptor(anchor)
+        if mount_id is None or not mount.supported(mount_id, device, real_root):
+            return answer
+
+        def verify(descriptor: int) -> tuple[int, int]:
+            return _sysfs_identity(descriptor, device, mount_id, mount)
+
+        first = _sysfs_pass(anchor, verify, real_root, name, ifindex, read)
         if first is None or clock() > deadline_ns:
             return answer
-        second = _sysfs_pass(anchor, device, real_root, name, ifindex, read)
+        second = _sysfs_pass(anchor, verify, real_root, name, ifindex, read)
         again = os.open(real_root, _SYSFS_DIRECTORY)
         try:
-            same_root = os.fstat(again)[1:3] == os.fstat(anchor)[1:3]
+            same_root = verify(again) == verify(anchor)
         finally:
             os.close(again)
         if second != first or not same_root or clock() > deadline_ns:
@@ -708,7 +814,7 @@ def bounded_command(argv: tuple[str, ...], deadline_ns: int, *, clock=time.monot
             if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
                 status = "timeout"
                 break
-            chunk = os.read(process.stdout.fileno(), 65536)
+            chunk = os.read(process.stdout.fileno(), min(65536, limit + 1 - size))
             if not chunk:
                 break
             size += len(chunk)
@@ -744,9 +850,12 @@ def link_kinds(deadline_ns: int, *, clock=time.monotonic_ns, run=bounded_command
         return "invalid", {}
     if not isinstance(document, list):
         return "invalid", {}
+    if len(document) > DIAG_LIMITS["links_per_capture"]:  # more links than a capture is ever scanned for
+        return "cap", {}
     kinds = {}
-    for item in document[:4096]:
-        if not isinstance(item, dict) or type(item.get("ifindex")) is not int or not isinstance(item.get("ifname"), str):
+    for item in document:
+        if (not isinstance(item, dict) or type(item.get("ifindex")) is not int or not isinstance(item.get("ifname"), str)
+                or len(item["ifname"]) > 64):
             return "invalid", {}
         info = item.get("linkinfo")
         kind = info.get("info_kind") if isinstance(info, dict) else None
@@ -773,8 +882,13 @@ _OWNERSHIP_KEYS = {"schema", "fixture", "side", "namespace", "outer", "requested
 def ownership_record(key: bytes, fixture: int, side: str, namespace: tuple[int, int], outer: tuple[int, int], name: str,
                      mac: str, listing: str | None) -> dict:
     """The fixture's registry entry for one endpoint it just created: the requested name/MAC and the
-    read-only post-creation listing of that endpoint in its own namespace, keyed with the run key."""
-    lines = listing.splitlines() if isinstance(listing, str) else []
+    read-only post-creation listing of that endpoint in its own namespace, keyed with the run key. The
+    listing's length is checked before any split or parse: more than one line's worth of text is
+    simply unobserved. A requested name or MAC outside the fixture's own shape is refused outright."""
+    if not isinstance(name, str) or not isinstance(mac, str) or not _LINK_NAME.fullmatch(name) or len(mac) > DIAG_LIMITS["mac_chars"]:
+        raise ValueError("ownership_request")
+    bounded = isinstance(listing, str) and len(listing) <= DIAG_LIMITS["line_chars"] + 1
+    lines = listing.splitlines() if bounded else []
     fields = parse_link_line(lines[0]) if len(lines) == 1 else None
     observed = fields is not None and fields["name"] == name and not fields["unknown"]
     return {"schema": OWNERSHIP_SCHEMA, "fixture": fixture, "side": side,
@@ -785,15 +899,29 @@ def ownership_record(key: bytes, fixture: int, side: str, namespace: tuple[int, 
             "ifindex": fields["ifindex"] if observed else None, "iflink": fields["iflink"] if observed else None}
 
 
+_REGISTRY_LINE = re.compile(rb"[\x20-\x7e]+")
+
+
 def sanitize_ownership(raw: bytes | None) -> tuple[str, list[dict]]:
-    """All or nothing: at most 32 closed registry entries, each a unique (fixture, side)."""
+    """All or nothing: at most 32 closed registry entries, each a unique (fixture, side). The byte size,
+    the line count (more than 32 lines is ``capped`` with nothing parsed) and every line's length and
+    printable-ASCII shape are checked before any decode or JSON parse."""
     if raw is None:
         return "missing", []
-    if len(raw) > DIAG_LIMITS["ownership_bytes"]:
+    if not isinstance(raw, bytes) or len(raw) > DIAG_LIMITS["ownership_bytes"]:
         return "invalid", []
+    lines, position, size = [], 0, len(raw)
+    while position < size:
+        if len(lines) >= DIAG_LIMITS["fixture_endpoints"]:
+            return "capped", []
+        newline = raw.find(b"\n", position, position + DIAG_LIMITS["ownership_line_bytes"] + 1)
+        stop = newline if newline >= 0 else size
+        if stop - position > DIAG_LIMITS["ownership_line_bytes"] or not _REGISTRY_LINE.fullmatch(raw, position, stop):
+            return "invalid", []
+        lines.append((position, stop))
+        position = stop + 1
     try:
-        lines = raw.decode("utf-8").splitlines()
-        entries = [json.loads(line, parse_constant=_no_constant) for line in lines]
+        entries = [json.loads(raw[start:stop].decode("ascii"), parse_constant=_no_constant) for start, stop in lines]
     except (ValueError, RecursionError):
         return "invalid", []
     seen = set()
@@ -810,21 +938,36 @@ def sanitize_ownership(raw: bytes | None) -> tuple[str, list[dict]]:
                 or (entry["fixture"], entry["side"]) in seen):
             return "invalid", []
         seen.add((entry["fixture"], entry["side"]))
-    if len(entries) > DIAG_LIMITS["fixture_endpoints"]:
-        return "capped", []
     return "valid", entries
 
 
 def read_ownership(out: Path) -> bytes | None:
-    """The fixture registry the namespace init copied out (O_NOFOLLOW, bounded; absent -> None)."""
+    """The fixture registry the namespace init copied out (O_NOFOLLOW; absent -> None). A regular file of
+    at most 64 KiB by its size, and never more than 64 KiB + 1 bytes read; anything else is invalid."""
     try:
-        descriptor = os.open(out / OWNERSHIP_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        descriptor = os.open(out / OWNERSHIP_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     try:
-        return os.read(descriptor, DIAG_LIMITS["ownership_bytes"] + 1)
+        return _bounded_file(descriptor, DIAG_LIMITS["ownership_bytes"])
     finally:
         os.close(descriptor)
+
+
+def _bounded_file(descriptor: int, limit: int) -> bytes:
+    """The bytes of one regular file whose size is at most ``limit``, read in a loop that never reads
+    more than ``limit`` + 1 bytes in all. ValueError (never an over-long read) otherwise."""
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+        raise ValueError("diagnostic_file")
+    chunks, size = [], 0
+    while size <= limit:
+        chunk = os.read(descriptor, limit + 1 - size)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        size += len(chunk)
+    raise ValueError("diagnostic_file")
 
 
 class LinkCollector:
@@ -1129,27 +1272,48 @@ class LinkCollector:
                  "changes": changes, "enrichment_changes": enrichment_changes}, budget)
 
 
+def _longest(choices) -> int:
+    return max(len(choice) for choice in choices)
+
+
 def _spec_ok(value, spec) -> bool:
+    """The parent's closed check of one value. Every container must be the exact JSON type and pass
+    its size check (dict key count, list length, set cardinality) before it is traversed, and every
+    string (dict keys and set items included) its length check before any regex, membership, hash,
+    set or sort: rejecting an oversized or malformed value costs at most the spec's own bounds."""
     kind = spec[0]
     if kind == "hex":
-        return isinstance(value, str) and _HEX64.fullmatch(value) is not None
+        return type(value) is str and len(value) == 64 and _HEX64.fullmatch(value) is not None
     if kind == "digest":
-        return isinstance(value, str) and (value == "unavailable" or _HEX64.fullmatch(value) is not None)
+        return type(value) is str and (value == "unavailable" or (len(value) == 64 and _HEX64.fullmatch(value) is not None))
     if kind == "int":
         return type(value) is int and spec[1] <= value <= spec[2]
     if kind == "bool":
         return type(value) is bool
     if kind == "enum":
-        return isinstance(value, str) and value in spec[1]
+        return type(value) is str and len(value) <= _longest(spec[1]) and value in spec[1]
     if kind == "opt":
         return value is None or _spec_ok(value, spec[1])
     if kind == "list":
-        return isinstance(value, list) and len(value) <= spec[2] and all(_spec_ok(item, spec[1]) for item in value)
+        if type(value) is not list or len(value) > spec[2]:
+            return False
+        return all(_spec_ok(item, spec[1]) for item in value)
     if kind == "set":
-        return (isinstance(value, list) and all(isinstance(item, str) and item in spec[1] for item in value)
-                and value == sorted(set(value)))
+        if type(value) is not list or len(value) > len(spec[1]):
+            return False
+        longest = _longest(spec[1])
+        for item in value:
+            if type(item) is not str or len(item) > longest or item not in spec[1]:
+                return False
+        return value == sorted(set(value))
     if kind == "dict":
-        return isinstance(value, dict) and set(value) == set(spec[1]) and all(_spec_ok(value[k], s) for k, s in spec[1].items())
+        if type(value) is not dict or len(value) != len(spec[1]):
+            return False
+        longest = _longest(spec[1])
+        for key in value:
+            if type(key) is not str or len(key) > longest or key not in spec[1]:
+                return False
+        return all(_spec_ok(value[key], item) for key, item in spec[1].items())
     return False
 
 
@@ -1211,6 +1375,26 @@ def sanitize_link_diagnostics(raw) -> dict:
         clean["incomplete_reasons"] = sorted(set(clean["incomplete_reasons"]) | {"payload_cap"})
         clean["complete"] = False
     return clean
+
+
+def load_cleanup(path: Path) -> tuple[dict, bool]:
+    """The child's cleanup.raw.json, bounded before any decode or JSON parse: a regular file (O_NOFOLLOW)
+    of at most 1 MiB by its size, never more than 1 MiB + 1 bytes read. Absent -> ({}, False). Larger
+    or not a regular file -> ({}, True): nothing is parsed, so every cleanup field is absent (the gate
+    then fails closed on ``host_fingerprints_unchanged``) and the diagnostics are ``diagnostics_invalid``."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {}, False
+    except OSError:  # a symlink or another unreadable entry: refused, never followed
+        return {}, True
+    try:
+        data = _bounded_file(descriptor, DIAG_LIMITS["cleanup_bytes"])
+    except (OSError, ValueError):
+        return {}, True
+    finally:
+        os.close(descriptor)
+    return json.loads(data.decode("utf-8")), False
 
 
 def diagnostic_result(gate_result: str, diagnostics: dict) -> tuple[str, str | None]:
@@ -1435,7 +1619,7 @@ def parent() -> int:
                                env={"PATH": FIXED_PATH, "LC_ALL": "C"})
         timings["privileged_child"] = round(time.monotonic() - child_started, 3)
         inner = json.loads((out / "inner.json").read_text()) if (out / "inner.json").exists() else {}
-        raw_cleanup = json.loads((out / "cleanup.raw.json").read_text()) if (out / "cleanup.raw.json").exists() else {}
+        raw_cleanup, cleanup_capped = load_cleanup(out / "cleanup.raw.json")
         names = h0().FINGERPRINT_NAMES
         cleanup.update({
             "child_exit": child.returncode, "namespace_child_exit": raw_cleanup.get("namespace_child_exit"),
@@ -1448,7 +1632,8 @@ def parent() -> int:
             "leftover_processes": inner.get("leftover_processes"), "leftover_after_kill": inner.get("leftover_after_kill"),
             "leftover_records": h0().sanitize_leftovers(inner.get("leftover_records")),
             "reaped_before_count": inner.get("reaped_before_count"),
-            "link_diagnostics": sanitize_link_diagnostics(raw_cleanup.get("link_diagnostics"))})
+            "link_diagnostics": empty_diagnostics(["diagnostics_invalid"]) if cleanup_capped
+            else sanitize_link_diagnostics(raw_cleanup.get("link_diagnostics"))})
         if isinstance(inner.get("pytest_seconds"), (int, float)):
             timings["inner_pytest"] = round(float(inner["pytest_seconds"]), 3)
         junit = summarize_junit(out / "junit.xml")

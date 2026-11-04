@@ -909,6 +909,20 @@ def _in_netns(fd: int, function):
     return result["value"]
 
 
+def _endpoint_listing(fd: int, name: str) -> str | None:
+    """The registry's read-only listing of one endpoint, in its own namespace (a thread that entered it
+    starts the launcher's bounded command, which inherits that namespace): at most one line's worth of
+    output (4097 bytes) is ever read, within the 2 s ancillary command budget; anything else is None."""
+    limits = LAUNCHER.DIAG_LIMITS
+    status, data = _in_netns(fd, lambda: LAUNCHER.bounded_command(
+        (AUTHORITY.IP_PATH, "-o", "link", "show", "dev", name),
+        time.monotonic_ns() + limits["ancillary_command_ms"] * 1_000_000, limit=limits["line_chars"] + 1))
+    try:
+        return data.decode("utf-8") if status == "ok" else None
+    except UnicodeDecodeError:
+        return None
+
+
 def _fresh_namespace() -> int:
     """A new network namespace held only by the returned descriptor: a fixture thread unshares its
     own network namespace, opens it once and exits (no helper process, no name, no PID)."""
@@ -1372,9 +1386,8 @@ class Fixture:
             outer = os.stat("/proc/self/ns/net")
             lines = []
             for fd, name, mac, side in endpoints:
-                listing = _run_in(fd, [AUTHORITY.IP_PATH, "-o", "link", "show", "dev", name])
                 lines.append(LAUNCHER.ownership_record(DIAG_KEY, self.n, side, _identity(fd), (outer.st_dev, outer.st_ino),
-                                                       name, mac, listing.stdout if listing.returncode == 0 else None))
+                                                       name, mac, _endpoint_listing(fd, name)))
             path = Path(os.environ[LAUNCHER.RECORDS_ENV]).with_name(LAUNCHER.OWNERSHIP_FILE)
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write("".join(json.dumps(line, sort_keys=True) + "\n" for line in lines))

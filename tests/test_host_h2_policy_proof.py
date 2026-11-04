@@ -967,6 +967,45 @@ def test_diag_observer_and_collector_failures_are_closed_reasons_never_gate_chan
     assert exploded.result(None) == LAUNCHER.empty_diagnostics(["collector_failed"])
 
 
+def _descriptor_path(descriptor: int) -> str:
+    """The current path of an open descriptor (test-only: macOS F_GETPATH, Linux /proc/self/fd)."""
+    if sys.platform == "darwin":
+        import fcntl
+        return fcntl.fcntl(descriptor, fcntl.F_GETPATH, bytes(1024)).rstrip(b"\0").decode()
+    return os.readlink("/proc/self/fd/" + str(descriptor))
+
+
+class _ModelMount:
+    """SYNTHETIC model of the launcher's supported-mount contract over a fake tree, never mount proof:
+    the fake root plays a verified sysfs mount root (mount 1), each path in ``over`` plays an overmount
+    (mount 2) and anything else another filesystem (mount 3). It shows only how ``link_metadata`` uses
+    the contract; whether a real /sys satisfies the contract is decided by ``SysfsMount`` on Linux."""
+
+    def __init__(self, root: Path, over=(), supported: bool = True, drift: int | None = None):
+        self.root, self.over = os.path.realpath(root), [os.path.realpath(path) for path in over]
+        self.ok, self.drift, self.calls = supported, drift, 0
+        self.paths: list[str] = []
+
+    def descriptor(self, descriptor: int) -> int | None:
+        self.calls += 1
+        path = os.path.realpath(_descriptor_path(descriptor))
+        self.paths.append(path)
+        if self.drift is not None and self.calls > self.drift:
+            return 4  # the mount id of the same path changes mid-walk
+        if any(path == item or path.startswith(item + "/") for item in self.over):
+            return 2
+        return 1 if path == self.root or path.startswith(self.root + "/") else 3
+
+    def supported(self, mount_id: int, device: int, root: str) -> bool:
+        return self.ok and mount_id == 1 and root == self.root
+
+
+def _meta(name: str, ifindex: int, deadline_ns: int, *, root, read=None, **model):
+    """``link_metadata`` under the synthetic mount model (see ``_ModelMount``)."""
+    extra = {} if read is None else {"read": read}
+    return LAUNCHER.link_metadata(name, ifindex, deadline_ns, root=str(root), mount=_ModelMount(root, **model), **extra)
+
+
 def _sysfs(tmp_path: Path, name: str, ifindex: int, *, bus: str | None = None, driver: str | None = None) -> Path:
     root = tmp_path / "sys"
     (root / "class" / "net").mkdir(parents=True, exist_ok=True)
@@ -991,33 +1030,33 @@ def _sysfs(tmp_path: Path, name: str, ifindex: int, *, bus: str | None = None, d
 def test_diag_metadata_reads_are_fixed_bounded_inside_the_roots_and_unknown_on_races(tmp_path):
     far = time.monotonic_ns() + 10 ** 10
     root = _sysfs(tmp_path, "veth0", 4)
-    assert LAUNCHER.link_metadata("veth0", 4, far, root=str(root)) == {"device_backed": "no", "bus": "none", "driver": "none",
+    assert _meta("veth0", 4, far, root=root) == {"device_backed": "no", "bus": "none", "driver": "none",
                                                                       "status": "ok"}
     _sysfs(tmp_path, "eth1", 3, bus="pci", driver="mlx5_core")
-    assert LAUNCHER.link_metadata("eth1", 3, far, root=str(root)) == {"device_backed": "yes", "bus": "pci",
+    assert _meta("eth1", 3, far, root=root) == {"device_backed": "yes", "bus": "pci",
                                                                      "driver": "mlx5_core", "status": "ok"}
     _sysfs(tmp_path, "eth2", 5, bus="pci", driver="vendor_secret_drv")
-    assert LAUNCHER.link_metadata("eth2", 5, far, root=str(root))["driver"] == "unknown"
+    assert _meta("eth2", 5, far, root=root)["driver"] == "unknown"
     unknown = {"device_backed": "unknown", "bus": "unknown", "driver": "unknown", "status": "unknown"}
-    assert LAUNCHER.link_metadata("eth1", 4, far, root=str(root)) == unknown  # another link now holds the name
+    assert _meta("eth1", 4, far, root=root) == unknown  # another link now holds the name
     reads = iter(["3", "9"])
-    assert LAUNCHER.link_metadata("eth1", 3, far, root=str(root), read=lambda _directory, _name: next(reads)) == unknown
-    assert LAUNCHER.link_metadata("eth1", 3, 0, root=str(root)) == unknown  # past the deadline
-    assert LAUNCHER.link_metadata("gone0", 3, far, root=str(root)) == unknown  # disappeared
+    assert _meta("eth1", 3, far, root=root, read=lambda _directory, _name, _verify: next(reads)) == unknown
+    assert _meta("eth1", 3, 0, root=root) == unknown  # past the deadline
+    assert _meta("gone0", 3, far, root=root) == unknown  # disappeared
     outside = tmp_path / "elsewhere" / "net" / "esc0"
     outside.mkdir(parents=True)
     (outside / "ifindex").write_text("6\n")
     os.symlink(outside, root / "class" / "net" / "esc0")
-    assert LAUNCHER.link_metadata("esc0", 6, far, root=str(root)) == unknown  # a symlink out of the devices tree
+    assert _meta("esc0", 6, far, root=root) == unknown  # a symlink out of the devices tree
     for name in ("../x", "a/b", "", ".", "x" * 16, "eé0"):
-        assert LAUNCHER.link_metadata(name, 1, far, root=str(root)) == unknown, name
+        assert _meta(name, 1, far, root=root) == unknown, name
     (root / "class" / "net" / "big0").symlink_to(root / "devices" / "virtual" / "net" / "veth0")
     big = tmp_path / "big"
     big.write_text("1" * 65)
     directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         with pytest.raises(ValueError):
-            LAUNCHER._sysfs_read(directory, "big")
+            LAUNCHER._sysfs_read(directory, "big", lambda _descriptor: None)
     finally:
         os.close(directory)
 
@@ -1056,8 +1095,11 @@ def test_diag_ancillary_command_is_the_one_fixed_read_only_listing_and_is_bounde
     for forbidden in ("modprobe", "insmod", "ethtool", "dmesg", "socket", "urllib", "write", "unlink", "rename", "chmod",
                       "setns", "unshare", "sysctl", "/proc/sys", '"w"', "netns exec", "link set", "link add", "link del"):
         assert forbidden not in section, forbidden
-    # R2: the attribute read, the descriptor walk (anchor + component), the root and its recheck, the registry.
-    assert not re.search(r"(?<![.\w])open\(", section) and section.count("os.open(") == 6
+    # R2: the attribute read, the descriptor walk (anchor + component), the root and its recheck, the registry;
+    # R3: the bounded /proc read of the mount contract and the child's cleanup file.
+    assert not re.search(r"(?<![.\w])open\(", section) and section.count("os.open(") == 8
+    assert sorted(set(re.findall(r'"/proc/[^"]*"', section))) == ['"/proc/self/fdinfo/%d"', '"/proc/self/mountinfo"',
+                                                                       '"/proc/self/ns/net"']
     assert "os.path.realpath(f" not in section and "startswith(devices)" not in section  # no path-string containment
 
 
@@ -1090,13 +1132,19 @@ def test_diag_wiring_child_parent_and_fixture_channels():
     assert 'for name in ("junit.xml", "records.raw.jsonl", OWNERSHIP_FILE):' in inside
     assert 'DIAG_KEY_ENV: request["diagnostic_key"]' in inside
     parent = source[source.index("def parent("):source.index("# Privileged child:")]
-    assert '"link_diagnostics": sanitize_link_diagnostics(raw_cleanup.get("link_diagnostics"))' in parent
+    assert 'raw_cleanup, cleanup_capped = load_cleanup(out / "cleanup.raw.json")' in parent
+    assert ('"link_diagnostics": empty_diagnostics(["diagnostics_invalid"]) if cleanup_capped\n'
+            '            else sanitize_link_diagnostics(raw_cleanup.get("link_diagnostics"))})') in parent
     assert 'result, hold = diagnostic_result(verdict["result"], cleanup["link_diagnostics"])' in parent
     assert 'exit_code = 0 if result == "PASS" else 1' in parent and "secrets.token_hex(32)" in parent
     # The registry is written only by Fixture._register, beside the records, from a read-only listing.
     module = LINUX_MODULE_FILE.read_text(encoding="utf-8")
     register = module[module.index("    def _register("):module.index("    def _baseline(")]
-    assert '_run_in(fd, [AUTHORITY.IP_PATH, "-o", "link", "show", "dev", name])' in register
+    assert "name, mac, _endpoint_listing(fd, name)))" in register and "_run_in(" not in register
+    listing = module[module.index("def _endpoint_listing("):module.index("def _fresh_namespace(")]
+    assert "_in_netns(fd, lambda: LAUNCHER.bounded_command(" in listing
+    assert '(AUTHORITY.IP_PATH, "-o", "link", "show", "dev", name)' in listing
+    assert 'limit=limits["line_chars"] + 1' in listing and 'limits["ancillary_command_ms"] * 1_000_000' in listing
     assert "with_name(LAUNCHER.OWNERSHIP_FILE)" in register and module.count("LAUNCHER.OWNERSHIP_FILE") == 1
     assert module.count("self._register(") == 1 and not re.search(r"(?<![_\w])record\(", register)
     wire = module[module.index("    def _wire("):module.index("    def _register(")]
@@ -1338,11 +1386,11 @@ def test_diag_r2_sysfs_traversal_is_descriptor_anchored_contained_and_rechecked(
     _real_sysfs(base, "eth1", 3, bus="pci", driver="mlx5_core")
     _real_sysfs(base, "eth2", 5, bus="vmbus", driver="hv_netvsc", slot="vmbus-0")
     probe = _Opens(monkeypatch)
-    assert LAUNCHER.link_metadata("veth0", 4, far, root=str(root)) == {"device_backed": "no", "bus": "none", "driver": "none",
+    assert _meta("veth0", 4, far, root=root) == {"device_backed": "no", "bus": "none", "driver": "none",
                                                                       "status": "ok"}
-    assert LAUNCHER.link_metadata("eth1", 3, far, root=str(root)) == {"device_backed": "yes", "bus": "pci",
+    assert _meta("eth1", 3, far, root=root) == {"device_backed": "yes", "bus": "pci",
                                                                      "driver": "mlx5_core", "status": "ok"}
-    assert LAUNCHER.link_metadata("eth2", 5, far, root=str(root)) == {"device_backed": "yes", "bus": "vmbus",
+    assert _meta("eth2", 5, far, root=root) == {"device_backed": "yes", "bus": "vmbus",
                                                                      "driver": "hv_netvsc", "status": "ok"}
     assert probe.reached
     monkeypatch.undo()
@@ -1358,7 +1406,7 @@ def test_diag_r2_sysfs_traversal_is_descriptor_anchored_contained_and_rechecked(
         device_dir.symlink_to(outside)
 
     probe = _Opens(monkeypatch, "ifindex", 1, replace_parent)
-    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown
+    assert _meta("mock0", 7, far, root=root) == unknown
     assert probe.count >= 1 and _identity(outside / "ifindex") not in probe.reached and _identity(outside) not in probe.reached
     monkeypatch.undo()
 
@@ -1377,7 +1425,7 @@ def test_diag_r2_sysfs_traversal_is_descriptor_anchored_contained_and_rechecked(
         if when == "before":
             replace_ancestor()
         probe = _Opens(monkeypatch, "ifindex", 1, replace_ancestor if when == "during" else None)
-        assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown, when
+        assert _meta("mock0", 7, far, root=root) == unknown, when
         assert _identity(outside / "ifindex") not in probe.reached, when
         monkeypatch.undo()
 
@@ -1402,9 +1450,9 @@ def test_diag_r2_sysfs_traversal_is_descriptor_anchored_contained_and_rechecked(
     os.symlink("../../../../outside", root / "devices" / "pci0000:00" / "0000:00:07.0" / "driver")
     probe = _Opens(monkeypatch)
     for name, index in (("esc1", 6), ("esc2", 6), ("esc3", 6), ("esc4", 6), ("dev5", 8), ("dev6", 9), ("dev7", 10)):
-        assert LAUNCHER.link_metadata(name, index, far, root=str(root)) == unknown, name
+        assert _meta(name, index, far, root=root) == unknown, name
     assert _identity(outside / "ifindex") not in probe.reached
-    assert LAUNCHER.link_metadata("ok0", 2, far, root=str(root))["status"] == "ok"  # the contained neighbour still reads
+    assert _meta("ok0", 2, far, root=root)["status"] == "ok"  # the contained neighbour still reads
     monkeypatch.undo()
 
     # Escapes that a weaker check would accept: a ``..`` above the root whose clamped form exists in
@@ -1433,18 +1481,18 @@ def test_diag_r2_sysfs_traversal_is_descriptor_anchored_contained_and_rechecked(
     os.symlink("../../../bus/usb/drivers/ixgbe", root / "devices" / "pci0000:00" / "0000:00:0e.0" / "driver")
     probe = _Opens(monkeypatch)
     for name, index in (("up0", 11), ("sib0", 12), ("odd0", 13), ("drv0", 14)):
-        assert LAUNCHER.link_metadata(name, index, far, root=str(root)) == unknown, name
+        assert _meta(name, index, far, root=root) == unknown, name
     assert _identity(escaped) not in probe.reached and _identity(sibling) not in probe.reached
-    assert LAUNCHER.link_metadata("x0", 11, far, root=str(root))["status"] == "ok"
+    assert _meta("x0", 11, far, root=root)["status"] == "ok"
     monkeypatch.undo()
 
     # An object on another filesystem (a mount inside the tree) is refused.
     base = scratch("foreign")
     root, device_dir = _real_sysfs(base, "mnt0", 15)
     _Opens(monkeypatch, foreign={_identity(device_dir)[1]})
-    assert LAUNCHER.link_metadata("mnt0", 15, far, root=str(root)) == unknown
+    assert _meta("mnt0", 15, far, root=root) == unknown
     monkeypatch.undo()
-    assert LAUNCHER.link_metadata("mnt0", 15, far, root=str(root))["status"] == "ok"
+    assert _meta("mnt0", 15, far, root=root)["status"] == "ok"
 
     # The root itself replaced by a lookalike copy during the read: the anchor is no longer /sys.
     base = scratch("root")
@@ -1455,14 +1503,14 @@ def test_diag_r2_sysfs_traversal_is_descriptor_anchored_contained_and_rechecked(
         shutil.copytree(root.with_name("sys.old"), root, symlinks=True)
 
     _Opens(monkeypatch, "ifindex", 1, replace_root)
-    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown
+    assert _meta("mock0", 7, far, root=root) == unknown
     monkeypatch.undo()
 
     # A value that flickers between the reads of one pass, though both passes begin alike.
     base = scratch("flicker")
     root, _dir = _real_sysfs(base, "mock0", 7)
     values = iter(["7", "7", "9", "7", "7", "7"])
-    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root), read=lambda _directory, _name: next(values)) == unknown
+    assert _meta("mock0", 7, far, root=root, read=lambda _directory, _name, _verify: next(values)) == unknown
 
     # The same ifindex on a replaced object (the name's directory recreated at the first read).
     base = scratch("reuse")
@@ -1474,7 +1522,7 @@ def test_diag_r2_sysfs_traversal_is_descriptor_anchored_contained_and_rechecked(
         (device_dir / "ifindex").write_text("7\n")
 
     _Opens(monkeypatch, "ifindex", 1, recreate)
-    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown
+    assert _meta("mock0", 7, far, root=root) == unknown
     monkeypatch.undo()
 
     # The name's class link retargeted to another same-ifindex device, and the device link retargeted.
@@ -1489,7 +1537,7 @@ def test_diag_r2_sysfs_traversal_is_descriptor_anchored_contained_and_rechecked(
         os.symlink(os.path.relpath(other, root / "class" / "net"), root / "class" / "net" / "mock0")
 
     _Opens(monkeypatch, "ifindex", 1, retarget_class)
-    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown
+    assert _meta("mock0", 7, far, root=root) == unknown
     monkeypatch.undo()
     base = scratch("retarget-device")
     root, device_dir = _real_sysfs(base, "eth1", 3, bus="pci", driver="mlx5_core")
@@ -1500,12 +1548,450 @@ def test_diag_r2_sysfs_traversal_is_descriptor_anchored_contained_and_rechecked(
         os.symlink("../../../0000:00:09.0", device_dir / "device")
 
     _Opens(monkeypatch, "ifindex", 2, retarget_device)
-    assert LAUNCHER.link_metadata("eth1", 3, far, root=str(root)) == unknown
+    assert _meta("eth1", 3, far, root=root) == unknown
     monkeypatch.undo()
 
     # Disappearance during enrichment.
     base = scratch("gone")
     root, _dir = _real_sysfs(base, "mock0", 7)
     _Opens(monkeypatch, "ifindex", 1, lambda: (root / "class" / "net" / "mock0").unlink())
-    assert LAUNCHER.link_metadata("mock0", 7, far, root=str(root)) == unknown
+    assert _meta("mock0", 7, far, root=root) == unknown
     monkeypatch.undo()
+
+
+# ---------------------------------------------------------------------------------------------
+# H2-LINK-DIAGNOSTICS-R3: early bounds on every remaining diagnostic path (fixture listing and
+# registry, parent validation and cleanup loading, ancillary listing) and the supported-sysfs-mount
+# contract. Inputs are plain JSON/str/bytes; work is observed with sys.setprofile (Python frames,
+# generator resumes and C builtins called) and tracemalloc, never by instrumenting the input.
+
+import collections  # noqa: E402
+
+
+def _work(function, *args, **kwargs):
+    """(result, Counter of profile events) for one call: ``py:<code name>`` and ``c:<builtin name>``."""
+    events = collections.Counter()
+
+    def hook(frame, event, arg):
+        if event == "call":
+            events["py:" + frame.f_code.co_name] += 1
+        elif event == "c_call":
+            events["c:" + getattr(arg, "__name__", "?")] += 1
+
+    sys.setprofile(hook)
+    try:
+        result = function(*args, **kwargs)
+    finally:
+        sys.setprofile(None)
+    return result, events
+
+
+def _peak(function, *args):
+    tracemalloc.start()
+    try:
+        result = function(*args)
+        return result, tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+class _Reads:
+    """The launcher's ``os`` with every ``read`` request size and every returned byte count recorded
+    (the candidate does every read itself)."""
+
+    def __init__(self, monkeypatch):
+        self.requests, self.returned, real = [], [], os
+
+        class _Proxy:
+            def __getattr__(self, attribute):
+                return getattr(real, attribute)
+
+            def read(inner, descriptor, size):  # noqa: N805
+                self.requests.append(size)
+                data = real.read(descriptor, size)
+                self.returned.append(len(data))
+                return data
+
+        monkeypatch.setattr(LAUNCHER, "os", _Proxy())
+
+    def within(self, limit: int) -> bool:
+        """No single request and no total of bytes read ever exceeds ``limit`` + 1."""
+        return max(self.requests, default=0) <= limit + 1 and sum(self.returned) <= limit + 1
+
+    def clear(self):
+        self.requests.clear()
+        self.returned.clear()
+
+
+def _max_hex(n: int) -> str:
+    return hashlib.sha256(str(n).encode()).hexdigest()
+
+
+def _max_diagnostics() -> dict:
+    """A largest valid child payload: 3 captures x 64 lines and 64 links with every field at its widest,
+    every reason (complete false), 64 changes. Built by hand against the closed spec."""
+    link = {"id": _max_hex(1), "ifindex": 2 ** 31 - 1, "iflink": 2 ** 31 - 1, "peer": _max_hex(2),
+            "flags": sorted(LAUNCHER.LINK_FLAGS),
+            "operstate": "lowerlayerdown", "link_type": "infiniband", "mtu": 2 ** 31 - 1, "qlen": 2 ** 32, "mac": _max_hex(3),
+            "master": _max_hex(4), "netnsid": 2 ** 31 - 1, "line": _max_hex(5), "other": _max_hex(6), "unknown": 4096,
+            "provenance": {"device_backed": "unknown", "bus": "auxiliary", "kind": "macvtap", "driver": "mlx5_core",
+                           "scope": "host_verified"}}
+    captures = [{"phase": phase, "ordinal": ordinal, "namespace_before": _max_hex(7), "namespace_after": _max_hex(7),
+                 "start_ms": 10 ** 7, "end_ms": 10 ** 7, "status": "ok", "returncode": -255, "gate_digest": _max_hex(8),
+                 "chars": 2 ** 62, "bytes": 4 * 65536 + 64, "line_count": 64, "lines_scanned": 64, "scan": "truncated",
+                 "parse": "incomplete", "lines": [_max_hex(100 + i) for i in range(64)], "multiset": _max_hex(9),
+                 "links": [dict(link, id=_max_hex(200 + i)) for i in range(64)],
+                 "enrichment": {"status": "namespace_mismatch", "start_ms": 10 ** 7, "end_ms": 10 ** 7}}
+                for ordinal, phase in enumerate(LAUNCHER.DIAG_PHASES)]
+    change = {"id": _max_hex(10), "change": "changed", "fields": sorted(LAUNCHER.FIELD_LABELS), "proof_identity": "not_applicable",
+              "correlation": "fixture_name_mac", "hardware": "device_backed"}
+    pairs = [{"name": name, "from": LAUNCHER.DIAG_PHASES[first], "to": LAUNCHER.DIAG_PHASES[second], "gate_digest_equal": False,
+              "status_change": True, "order_only": True, "added": 10 ** 6, "removed": 10 ** 6, "changed": 10 ** 6,
+              "classes": sorted(LAUNCHER.DELTA_CLASSES), "changes": [dict(change, id=_max_hex(300 + i)) for i in range(32)],
+              "enrichment_changes": []} for name, first, second in LAUNCHER.DIAG_PAIRS]
+    return {"schema": LAUNCHER.DIAG_SCHEMA, "complete": False, "incomplete_reasons": sorted(LAUNCHER.DIAG_REASONS),
+            "attribution": "correlation_only", "host_namespace": _max_hex(7), "baseline_pause_ms": 10 ** 7, "ancillary_ms": 10 ** 7,
+            "captures": captures, "pairs": pairs,
+            "ownership": {"status": "capped", "endpoints": 10 ** 6, "correlated": 10 ** 6, "ambiguous": 10 ** 6,
+                          "namespace_conflicts": 10 ** 6}}
+
+
+def _max_registry_line(fixture: int, side: str) -> bytes:
+    entry = {"schema": LAUNCHER.OWNERSHIP_SCHEMA, "fixture": fixture, "side": side, "namespace": _max_hex(1), "outer": _max_hex(2),
+             "requested_name": _max_hex(3), "requested_mac": _max_hex(4), "observed": True, "name": _max_hex(3),
+             "mac": _max_hex(4), "ifindex": 2 ** 31 - 1, "iflink": 2 ** 31 - 1}
+    return (json.dumps(entry, sort_keys=True) + "\n").encode()
+
+
+def test_diag_r3_fixture_listing_and_registry_are_bounded_before_any_split_or_parse(monkeypatch, tmp_path):
+    record = functools.partial(LAUNCHER.ownership_record, DIAG_KEY, 1, "l", (7, 1), (7, 2), "hp1l", "02:48:32:00:01:0a")
+    # The review's counterexample with plain strings: a rejected multi-line listing costs neither a
+    # split, a parse nor an allocation that grows with it.
+    rows = []
+    for lines in (4096, 32768):
+        listing = ("x" * 64 + "\n") * lines
+        (result, events), peak = _peak(lambda listing=listing: _work(record, listing))
+        assert result["observed"] is False and events["c:splitlines"] == 0 and events["py:parse_link_line"] == 0, lines
+        rows.append((peak, sum(events.values())))
+    assert rows[0][1] == rows[1][1] and max(peak for peak, _ in rows) < 16384, rows
+    # Positives at the bound: one real listing line (with or without its newline) is still observed.
+    line = _endpoint(2, "hp1l", "02:48:32:00:01:0a", 2)
+    assert record(line)["observed"] and record(line.rstrip("\n"))["observed"]
+    padded = line.rstrip("\n").ljust(LAUNCHER.DIAG_LIMITS["line_chars"])  # trailing spaces: still one supported line
+    assert len(padded) == 4096 and record(padded + "\n")["observed"] and not record(padded + " \n")["observed"]
+    assert not record(line + line)["observed"] and not record(None)["observed"]
+    for name, mac in (("x" * 16, "02:00:00:00:00:01"), ("hp1l", "0" * 65), ("hp1l", None), (None, "02:00:00:00:00:01")):
+        with pytest.raises(ValueError):
+            LAUNCHER.ownership_record(DIAG_KEY, 1, "l", (7, 1), (7, 2), name, mac, line)
+
+    # sanitize_ownership: lines are counted and shaped before any decode or JSON parse.
+    widest_33 = b"".join(_max_registry_line(n, "l") for n in range(1, 34))
+    for raw, status in ((b"null\n" * 1024, "capped"), (b"{}\n" * 33, "capped"), (widest_33, "capped"),
+                        (b"x" * 2049, "invalid"), (b"{}\r\n", "invalid"), (b"{}\n\n{}\n", "invalid"),
+                        ("é".encode() + b"\n", "invalid"), (b"\x00\n", "invalid"), (b"\n" * 70000, "invalid")):
+        (result, entries), events = _work(LAUNCHER.sanitize_ownership, raw)
+        assert (result, entries) == (status, []) and events["py:loads"] == 0, raw[:16]
+        assert events["c:decode"] == 0 and events["c:splitlines"] == 0, raw[:16]
+    # Positive at the bound: 32 widest valid records (2 x 16 fixtures) are all parsed and kept.
+    widest = b"".join(_max_registry_line(n, side) for n in range(4081, 4097) for side in ("l", "r"))
+    assert len(_max_registry_line(4096, "r")) < LAUNCHER.DIAG_LIMITS["ownership_line_bytes"] and len(widest) < 65536
+    (status, entries), events = _work(LAUNCHER.sanitize_ownership, widest)
+    assert status == "valid" and len(entries) == 32 and events["py:loads"] == 32
+    assert LAUNCHER.sanitize_ownership(widest.rstrip(b"\n"))[0] == "valid"  # the last newline is optional
+    assert LAUNCHER.sanitize_ownership(fixture_registry())[0] == "valid" and LAUNCHER.sanitize_ownership(b"") == ("valid", [])
+    assert LAUNCHER.sanitize_ownership(b'{"a": 1}\n')[0] == "invalid" and LAUNCHER.sanitize_ownership("{}")[0] == "invalid"
+
+    # read_ownership: a regular file of at most 64 KiB by size; nothing else is read past the bound.
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / LAUNCHER.OWNERSHIP_FILE
+    target.write_bytes(fixture_registry())
+    reads = _Reads(monkeypatch)
+    assert LAUNCHER.read_ownership(out) == fixture_registry() and reads.within(65536)
+    target.write_bytes(b"x" * 65537)
+    reads.clear()
+    with pytest.raises(ValueError):
+        LAUNCHER.read_ownership(out)
+    assert reads.requests == []  # refused by its size: not one byte read
+    target.unlink()
+    os.mkfifo(target)
+    with pytest.raises(ValueError):  # a FIFO without a writer: refused before any (blocking) read
+        LAUNCHER.read_ownership(out)
+    target.unlink()
+    target.symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(OSError):
+        LAUNCHER.read_ownership(out)
+    target.unlink()
+    assert LAUNCHER.read_ownership(out) is None and reads.requests == []
+
+
+def test_diag_r3_parent_validation_bounds_cardinality_type_and_length_before_traversal(monkeypatch):
+    def check(mutate):
+        raw = LAUNCHER.empty_diagnostics(["collector_failed"])
+        mutate(raw)
+        return _work(LAUNCHER.sanitize_link_diagnostics, raw)
+
+    invalid = ["diagnostics_invalid"]
+    # The review's counterexample with a plain list: n copies of an allowed reason. Rejection work is
+    # the same for every n (no traversal, set or sort of the oversized list).
+    counts = []
+    for n in (24, 128, 8192, 65536):
+        clean, events = check(lambda raw, n=n: raw.update(incomplete_reasons=["collector_failed"] * n))
+        # one sort only: the closed empty result's own one-element reason list
+        assert clean["incomplete_reasons"] == invalid and events["c:sorted"] == 1 and events["py:<genexpr>"] < 64, n
+        counts.append(sum(events.values()))
+    assert len(set(counts)) == 1, counts
+    # One over-long reason string and an over-long key or hex value: rejected by length, at a constant cost.
+    counts = []
+    for size in (32, 1 << 20):
+        for mutate in (lambda raw: raw.update(incomplete_reasons=["c" * size]),
+                       lambda raw: raw.update(host_namespace="a" * size),
+                       lambda raw: raw["ownership"].update({"s" * size: 0}) or raw["ownership"].pop("status")):
+            clean, events = check(mutate)
+            assert clean["incomplete_reasons"] == invalid
+            counts.append(sum(events.values()))
+    assert counts[:3] == counts[3:], counts
+    # A plain dict with many extra keys: refused by its key count (no key set is built).
+    rows = []
+    for extra in (16, 65536):
+        raw = LAUNCHER.empty_diagnostics(["collector_failed"])
+        raw["ownership"] = {**raw["ownership"], **{f"k{i}": 0 for i in range(extra)}}
+        (clean, events), peak = _peak(lambda raw=raw: _work(LAUNCHER.sanitize_link_diagnostics, raw))
+        assert clean["incomplete_reasons"] == invalid
+        rows.append((sum(events.values()), peak))
+    assert rows[0][0] == rows[1][0] and rows[1][1] < 16384, rows
+    # Only a JSON list is a list: an empty tuple is not an empty capture list.
+    for name in ("captures", "pairs"):
+        assert check(lambda raw, name=name: raw.update({name: ()}))[0]["incomplete_reasons"] == invalid, name
+    # Oversized lists are refused by length before any item is visited.
+    for path, value in ((("captures",), [{}] * 4), (("pairs",), [{}] * 3)):
+        clean, events = check(lambda raw, path=path, value=value: raw.update({path[0]: value}))
+        assert clean["incomplete_reasons"] == invalid and events["py:_spec_ok"] < 32, path
+    # Only the exact JSON types are accepted (a subclass could misreport its length or items).
+    class Lying(list):
+        def __len__(self):
+            return 1
+
+    for value in (Lying(["collector_failed"] * 4), ("collector_failed",)):
+        assert check(lambda raw, value=value: raw.update(incomplete_reasons=value))[0]["incomplete_reasons"] == invalid
+    assert check(lambda raw: raw.update(schema=type("S", (str,), {})(LAUNCHER.DIAG_SCHEMA)))[0]["incomplete_reasons"] == invalid
+    # Positives at every bound: the full reason set (23 distinct), and a widest whole payload.
+    clean, _events = check(lambda raw: raw.update(incomplete_reasons=sorted(LAUNCHER.DIAG_REASONS)))
+    assert clean["incomplete_reasons"] == sorted(LAUNCHER.DIAG_REASONS)
+    widest = _max_diagnostics()
+    clean = LAUNCHER.sanitize_link_diagnostics(json.loads(json.dumps(widest)))
+    assert clean["incomplete_reasons"] == sorted(LAUNCHER.DIAG_REASONS) and len(clean["captures"]) == 3  # accepted, not emptied
+    assert [len(pair["changes"]) for pair in clean["pairs"]] in ([32, 32], [0, 0])  # kept, or stripped by the payload cap
+    assert len(json.dumps({"link_diagnostics": widest}).encode()) < LAUNCHER.DIAG_LIMITS["cleanup_bytes"]
+    for duplicate in (["collector_failed", "collector_failed"], ["line_cap", "collector_failed"]):  # unique and sorted still
+        assert check(lambda raw, duplicate=duplicate: raw.update(incomplete_reasons=duplicate))[0]["incomplete_reasons"] == invalid
+    # End to end at the bounds: 64 links in each of 3 captures and 32 widest registry endpoints go
+    # through the real collector and the parent's check complete and usable.
+    text = _text(*(_endpoint(i + 2, f"v{i}", f"02:00:00:00:00:{i:02x}", i + 100) for i in range(64)))
+    collector = _drive([text] * 3)
+    for phase in collector.phases:
+        collector.phases, keep = [phase], collector.phases
+        collector.enrich()
+        collector.phases = keep
+    registry = b"".join(_max_registry_line(n, side) for n in range(1, 17) for side in ("l", "r"))
+    clean = LAUNCHER.sanitize_link_diagnostics(json.loads(json.dumps(collector.result(registry))))
+    assert [(c["lines_scanned"], c["scan"], c["parse"], len(c["links"]))
+            for c in clean["captures"]] == [(64, "complete", "complete", 64)] * 3
+    assert clean["ownership"]["status"] == "valid" and clean["ownership"]["endpoints"] == 32
+    assert "diagnostics_invalid" not in clean["incomplete_reasons"] and "ownership_cap" not in clean["incomplete_reasons"]
+
+
+def test_diag_r3_parent_cleanup_file_is_byte_bounded_before_decode_and_fails_closed(monkeypatch, tmp_path):
+    path = tmp_path / "cleanup.raw.json"
+    assert LAUNCHER.load_cleanup(path) == ({}, False)
+    widest = {"namespace_child_exit": 0, "host_fingerprints_unchanged": True, "differing_fingerprints": [],
+              "unstable_fingerprints": [], "kernel_modules_loaded": ["m" * 56] * 64, "link_diagnostics": _max_diagnostics()}
+    path.write_text(json.dumps(widest), encoding="utf-8")  # exactly as the child's finish() writes it
+    reads = _Reads(monkeypatch)
+    assert LAUNCHER.load_cleanup(path) == (widest, False) and reads.within(LAUNCHER.DIAG_LIMITS["cleanup_bytes"])
+    # Over the bound: refused by its size, before any read, decode or JSON parse.
+    path.write_text(json.dumps({"host_fingerprints_unchanged": True, "pad": "x" * (4 << 20)}), encoding="utf-8")
+    reads.clear()
+    (result, events), peak = _peak(lambda: _work(LAUNCHER.load_cleanup, path))
+    assert result == ({}, True) and reads.requests == [] and events["py:loads"] == 0 and peak < 16384
+    monkeypatch.undo()
+    for make in (lambda: os.mkfifo(path), lambda: path.symlink_to(tmp_path / "other"), lambda: path.mkdir()):
+        if path.is_dir() and not path.is_symlink():
+            path.rmdir()
+        elif path.exists() or path.is_symlink():
+            path.unlink()
+        make()
+        assert LAUNCHER.load_cleanup(path) == ({}, True)
+    # The closed outcome: invalid diagnostics, and with no cleanup fields the gate itself fails closed.
+    records = [{"case": case, "verdict": "pass", "control": item[1], "ints": {}, "tokens": {}}
+               for case, item in LAUNCHER.RECORD_CASES.items()]
+    junit = LAUNCHER.summarize_junit(_junit(tmp_path))
+    inner = {"pytest_exit": 0, "leftover_processes": 0, "import_smoke": "ok"}
+    assert LAUNCHER.evaluate(junit, records, 0, {}, inner, 0)["result"] == "FAIL"
+    assert LAUNCHER.diagnostic_result("PASS", LAUNCHER.empty_diagnostics(["diagnostics_invalid"])) == (
+        "FAIL", "link_diagnostics_incomplete")
+
+
+def test_diag_r3_ancillary_listing_is_bounded_before_traversal(monkeypatch):
+    def kinds(document):
+        return _work(LAUNCHER.link_kinds, 0, run=lambda *a, **k: ("ok", json.dumps(document).encode()))
+
+    exact = [{"ifindex": i, "ifname": f"l{i}"} for i in range(64)]
+    (status, found), _events = kinds(exact)
+    assert status == "ok" and len(found) == 64  # the positive bound
+    for extra in (65, 4096):
+        (status, found), events = kinds([{"ifindex": i, "ifname": "x"} for i in range(extra)])
+        assert (status, found) == ("cap", {}) and events["c:get"] == 0, extra
+    assert kinds([{"ifindex": 1, "ifname": "n" * 65}])[0] == ("invalid", {})
+    # The runner never asks for more than limit + 1 bytes in all.
+    reads = _Reads(monkeypatch)
+    soon = time.monotonic_ns() + 20 * 10 ** 9
+    assert LAUNCHER.bounded_command((sys.executable, "-c", "print('x' * 70000)"), soon, limit=4097)[0] == "cap"
+    assert reads.within(4097)
+
+
+def test_diag_r3_sysfs_mount_contract_parsers_and_platform_gate(monkeypatch, tmp_path):
+    device = os.makedev(0, 22)
+    line = b"23 1 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw"
+    other = b"24 1 0:5 / /dev rw,nosuid - devtmpfs udev rw,size=8g"
+    assert LAUNCHER.sysfs_mount_supported(other + b"\n" + line + b"\n", 23, device, "/sys")
+    assert LAUNCHER.sysfs_mount_supported(b"23 1 0:22 / /sys rw - sysfs sysfs rw\n", 23, device, "/sys")  # no optional fields
+    for data, mount_id, dev, root in (
+            (line.replace(b"- sysfs", b"- tmpfs"), 23, device, "/sys"),            # another filesystem type
+            (line.replace(b" / /sys", b" /class /sys"), 23, device, "/sys"),      # a bind of a subdirectory
+            (line.replace(b"/sys rw", b"/host/sys rw"), 23, device, "/sys"),      # another mount point
+            (line, 23, os.makedev(0, 23), "/sys"),                                 # another device
+            (line, 24, device, "/sys"), (line + b"\n" + line, 23, device, "/sys"),  # absent; duplicated
+            (b"23 1 0:22 / /sys rw shared:7 sysfs sysfs rw", 23, device, "/sys"),  # no separator
+            (b"23 1 0:22 / /sys", 23, device, "/sys"), (b"x " + line, 23, device, "/sys"), (b"", 23, device, "/sys")):
+        assert not LAUNCHER.sysfs_mount_supported(data, mount_id, dev, root), data
+    assert LAUNCHER.fdinfo_mount_id(b"pos:\t0\nflags:\t02104000\nmnt_id:\t23\nino:\t1\n") == 23
+    for data in (b"pos:\t0\n", b"mnt_id:\t23\nmnt_id:\t23\n", b"mnt_id:\tx\n", b"mnt_id:\t" + b"9" * 11 + b"\n"):
+        assert LAUNCHER.fdinfo_mount_id(data) is None, data
+
+    # Non-Linux: no /proc is touched and the contract is unsupported.
+    def no_proc(*_args):
+        raise AssertionError("proc read off Linux")
+
+    monkeypatch.setattr(LAUNCHER, "_proc_read", no_proc)
+    monkeypatch.setattr(LAUNCHER, "sys", types.SimpleNamespace(platform="darwin"))
+    assert LAUNCHER.SYSFS_MOUNT.descriptor(0) is None and LAUNCHER.SYSFS_MOUNT.supported(23, device, "/sys") is False
+    # Linux (modelled /proc text): exactly the two fixed paths, each with its own byte bound.
+    asked = []
+
+    def proc(path, limit):
+        asked.append((path, limit))
+        return {"/proc/self/fdinfo/5": b"pos:\t0\nmnt_id:\t23\n", "/proc/self/mountinfo": other + b"\n" + line + b"\n"}.get(path)
+
+    monkeypatch.setattr(LAUNCHER, "_proc_read", proc)
+    monkeypatch.setattr(LAUNCHER, "sys", types.SimpleNamespace(platform="linux"))
+    assert LAUNCHER.SYSFS_MOUNT.descriptor(5) == 23 and LAUNCHER.SYSFS_MOUNT.supported(23, device, "/sys")
+    assert LAUNCHER.SYSFS_MOUNT.descriptor(6) is None and not LAUNCHER.SYSFS_MOUNT.supported(23, device, "/host/sys")
+    assert asked[:2] == [("/proc/self/fdinfo/5", 1024), ("/proc/self/mountinfo", 65536)]
+    monkeypatch.undo()
+
+    # The bounded /proc reader itself, on a plain file: over the limit is None, never a longer read.
+    sample = tmp_path / "text"
+    sample.write_bytes(b"a" * 5000)
+    reads = _Reads(monkeypatch)
+    assert LAUNCHER._proc_read(str(sample), 4999) is None and reads.within(4999)
+    reads.clear()
+    assert LAUNCHER._proc_read(str(sample), 5000) == b"a" * 5000 and reads.within(5000)
+    monkeypatch.undo()
+    # The default contract never accepts a fake tree as sysfs (any platform: off Linux it is
+    # unsupported outright; on Linux the tree is not a sysfs mount root at that path).
+    root, _dir = _real_sysfs(tmp_path, "veth0", 4)
+    far = time.monotonic_ns() + 10 ** 10
+    assert LAUNCHER.link_metadata("veth0", 4, far, root=str(root))["status"] == "unknown"
+    assert _meta("veth0", 4, far, root=root)["status"] == "ok"  # the same tree under the synthetic model
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the real fdinfo/mountinfo contract exists on Linux only")
+def test_diag_r3_sysfs_mount_contract_refuses_a_real_non_sysfs_directory_on_linux(tmp_path):
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        mount_id = LAUNCHER.SYSFS_MOUNT.descriptor(descriptor)
+        assert type(mount_id) is int
+        assert not LAUNCHER.SYSFS_MOUNT.supported(mount_id, os.fstat(descriptor).st_dev, os.path.realpath(tmp_path))
+    finally:
+        os.close(descriptor)
+
+
+def test_diag_r3_sysfs_ok_requires_every_descriptor_on_the_verified_mount(monkeypatch, tmp_path):
+    far = time.monotonic_ns() + 10 ** 10
+    unknown = {"device_backed": "unknown", "bus": "unknown", "driver": "unknown", "status": "unknown"}
+
+    def scratch(label: str) -> Path:
+        path = tmp_path / label
+        path.mkdir()
+        return path
+
+    base = scratch("positive")
+    root, veth = _real_sysfs(base, "veth0", 4)
+    _sysfs_pci = _real_sysfs(base, "eth1", 3, bus="pci", driver="mlx5_core")[1]
+    _real_sysfs(base, "eth2", 5, bus="vmbus", driver="hv_netvsc", slot="vmbus-0")
+    positives = {"veth0": (4, ("no", "none", "none")), "eth1": (3, ("yes", "pci", "mlx5_core")),
+                 "eth2": (5, ("yes", "vmbus", "hv_netvsc"))}
+    for name, (index, facts) in positives.items():
+        assert _meta(name, index, far, root=root) == dict(zip(("device_backed", "bus", "driver"), facts), status="ok"), name
+        assert _meta(name, index, far, root=root, over=[root / "kernel"])["status"] == "ok"  # an unrelated overmount
+    # An overmount anywhere on the walked path (a directory, an endpoint, the attribute file) or an
+    # unsupported mount leaves the answer unknown.
+    pci = _sysfs_pci.parent.parent
+    for over in ([root / "class" / "net"], [root / "devices" / "virtual"], [veth], [veth / "ifindex"]):
+        assert _meta("veth0", 4, far, root=root, over=over) == unknown, over
+    for over in ([pci], [root / "bus" / "pci"], [root / "bus" / "pci" / "drivers" / "mlx5_core"]):
+        assert _meta("eth1", 3, far, root=root, over=over) == unknown, over
+    assert _meta("veth0", 4, far, root=root, supported=False) == unknown
+    # A mount change at any single descriptor check of the walk: unknown every time.
+    model = _ModelMount(root)
+    assert LAUNCHER.link_metadata("eth1", 3, far, root=str(root), mount=model)["status"] == "ok"
+    total = model.calls
+    assert total > 20
+    # The last two checks are the re-opened root and the anchor: a root re-bound over itself (same
+    # device and inode, another mount) is refused, not only a replaced root object.
+    assert model.paths[-2:] == [model.root, model.root] and model.paths[0] == model.root
+    for drift in range(total):
+        assert _meta("eth1", 3, far, root=root, drift=drift) == unknown, drift
+
+    # The review's move-out-and-restore: the opened link directory moved outside the root right before
+    # each attribute read, then put back. The attribute's own descriptor is no longer on the verified
+    # mount, so nothing is read and the answer is unknown.
+    base = scratch("move")
+    root, link_dir = _real_sysfs(base, "mock0", 7)
+    outside, calls = base / "outside", []
+
+    def read(descriptor, name, verify):
+        link_dir.rename(outside)
+        try:
+            calls.append(LAUNCHER._sysfs_read(descriptor, name, verify))
+            return calls[-1]
+        finally:
+            outside.rename(link_dir)
+
+    assert _meta("mock0", 7, far, root=root, read=read) == unknown and calls == []
+    assert _meta("mock0", 7, far, root=root)["status"] == "ok"  # unmoved, the same tree reads
+
+    # No descriptor leaks on positive, unsupported, overmounted and missing paths.
+    active, real = set(), os
+
+    class _Count:
+        def __getattr__(self, attribute):
+            return getattr(real, attribute)
+
+        def open(self, *args, **kwargs):
+            descriptor = real.open(*args, **kwargs)
+            active.add(descriptor)
+            return descriptor
+
+        def close(self, descriptor):
+            active.discard(descriptor)
+            return real.close(descriptor)
+
+    monkeypatch.setattr(LAUNCHER, "os", _Count())
+    for _ in range(5):
+        assert _meta("mock0", 7, far, root=root)["status"] == "ok"
+        assert _meta("mock0", 7, far, root=root, supported=False) == unknown
+        assert _meta("mock0", 7, far, root=root, over=[link_dir]) == unknown
+        assert _meta("absent", 7, far, root=root) == unknown
+        assert not active
