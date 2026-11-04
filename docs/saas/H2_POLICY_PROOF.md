@@ -162,6 +162,90 @@ allow-listed artifacts only (`summary.json`, `cases.jsonl`, `versions.txt`, `cle
   injected failure in a live fixture resolves; then no fixture, domain, namespace descriptor, veth,
   socket, thread, helper, child process or outer-namespace change remains.
 
+## Host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, supplementary)
+
+Run 41621515465 failed the host audit on `links` with no evidence of what changed (the original
+FAIL stands; its cause is underdetermined). This addition describes the same captured text; it does
+not change the gate. Its new closure is **UNRUN** until a reviewed execution.
+
+- **Same capture.** H0 `host_fingerprints(observer=None)` gains a default-disabled observer. With an
+  observer, H0 hands it each fixed command's status (`ok`, `nonzero`, `timeout`, `oserror`), return
+  code, the exact stdout object the digest was computed from, that digest and monotonic bounds. The
+  digest, normalization, commands and `unavailable` rule are unchanged. The observer is called
+  outside the capture's `try`, and its exceptions are swallowed, so it cannot alter or hide a
+  digest. H0's own child and the H1F/H1/key-shape launchers pass no observer. Invalid UTF-8 still
+  aborts the capture exactly as before. This is a shared-helper change, so H0/H1F regressions and a
+  fresh H0 qualification are required.
+- **Same baseline.** The privileged child calls `stable_fingerprints(snapshot=..., pause=...)`. That
+  is two H0 snapshots before fork/unshare and one after the namespace child exits, with the same
+  `differing` rule. The first snapshot's metadata is sampled inside at most 1.5 s of the 2 s pause,
+  and the rest of the pause is slept. The three phases are `baseline_first`, `baseline_second` and
+  `after_namespace_exit`.
+- **Closed output.** `cleanup.json` gains `link_diagnostics`
+  (`heel.host-h2-policy-proof.link-diagnostics.v1`), and the parent re-checks it all or nothing.
+  - Per capture it records:
+    - run-local namespace identities before and after;
+    - start/end ms relative to the parent's monotonic start;
+    - status, return code, gate digest, bytes and lines;
+    - per-line keyed commitments and a sorted multiset commitment;
+    - up to 64 links of exactly 16 fields: keyed id/peer/MAC/master/line/other commitments, bounded
+      ifindex/iflink/MTU/qlen/netnsid, closed flag/operstate/link-type enums, an unknown count and
+      provenance.
+  - Per pair (`baseline`, `audit`) it records:
+    - whether the gate digests are equal;
+    - status-change and order-only flags;
+    - added/removed/changed counts;
+    - up to 64 changes with closed field labels;
+    - `proof_identity` and `hardware`;
+    - enrichment-only changes;
+    - delta classes from `none`, `command_status_change`, `order_only_text_change`,
+      `proof_identity_match`, `hardware_backed_change` and `unknown`.
+  - Raw names, MACs, aliases, altnames, addresses, bus paths, inodes, the HMAC key and command
+    output are never exported.
+  - Commitments are HMAC-SHA256 under a run-private 32-byte key. The parent creates it, sends it only
+    to the child and the fixture, and scans every artifact for it.
+- **Metadata (read-only, bounded).**
+  - One fixed listing, `ip -d -j link show`, is used for the link kind: at most 64 KiB, 2 s per
+    command, 5 s in total.
+  - Fixed sysfs attributes give `ifindex`, `device`, `subsystem` and `driver`:
+    - reads are at most 64 bytes each;
+    - the attribute itself is opened `O_NOFOLLOW`;
+    - real paths must stay under the `devices`/`bus` trees;
+    - the bus is an enum, and the driver comes from an allowlist (otherwise `unknown`).
+  - The namespace identity is rechecked around each read, and the ifindex is read before and after.
+    Any race, escape, disappearance or deadline gives `unknown`.
+  - Metadata is sampled next to the capture, never atomically with it.
+  - There is no module loading, probing, mutation, dmesg or network path.
+- **Ownership registry.**
+  - After each successful veth creation, the fixture appends two entries to `ownership.raw.jsonl`
+    beside the records. Each entry holds:
+    - the requested name/MAC commitments;
+    - a read-only post-creation listing of the endpoint in its own namespace (by descriptor);
+    - the L/R and outer namespace commitments.
+  - The registry is copied out with the records. It is supplementary only: it is not a case,
+    record or verdict, and the 18-case/eight-record inventory is unchanged.
+  - `proof_identity_match` needs one corroborated entry whose name and MAC commitments both match a
+    link that was added in the audit pair and was absent from both baselines.
+  - A name prefix, MAC alone, ifindex, link type or module never sets it. Ambiguity, index reuse, a
+    registry entry that claims the host namespace, an unobserved entry or an invalid registry give
+    `unknown`.
+- **Limits and reasons.**
+  - Limits: 64 links per capture, 3 captures, 32 fixture endpoints, 64 changed entries, 16 fields
+    per link, 64-character driver tokens, 64-hex commitments, and 256 KiB payload (over that, details
+    are dropped with `payload_cap`).
+  - The gate still hashes the whole original output.
+  - Every overflow, unsupported syntax, enrichment failure, namespace mismatch, collector or observer
+    failure and ownership gap sets `complete=false` with a closed reason.
+- **Acceptance.** `evaluate` is unchanged and its verdict is reported as `gate_result`. A gate PASS
+  with incomplete diagnostics is held as FAIL (`diagnostic_hold link_diagnostics_incomplete`), and
+  no other result moves.
+- **What it does not prove.**
+  - A change class describes an observation, not who caused it.
+  - `hardware_backed_change` means observed device evidence, not provider responsibility. A device
+    can still be changed by proof-triggered shared-kernel effects.
+  - An endpoint registry cannot attribute every transient event.
+  - Hardware correlation alone never justifies a retry.
+
 ## Workflow
 
 `.github/workflows/codeql.yml` gains one job, `host-h2-policy-proof (h2-policy-v1)`, appended after

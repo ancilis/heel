@@ -606,12 +606,15 @@ def test_static_launcher_has_one_fixed_profile_branch_budgets_and_no_inputs(tmp_
     for name in LAUNCHER.WHEEL_FILES:
         (wheels / name).write_bytes(b"")
     good = {"schema": LAUNCHER.CHILD_SCHEMA, "wheels": str(wheels), "out": str(out), "uid": os.getuid(),
-            "tests_seconds": 600, "token": "0123456789abcdef0123456789abcdef"}
+            "tests_seconds": 600, "token": "0123456789abcdef0123456789abcdef", "diagnostic_key": "ab" * 32,
+            "anchor_ns": 123456789}
     if os.getuid() != 0:
         assert LAUNCHER.validated_request(json.dumps(good)) is not None
     for mutation in ({"extra": 1}, {"schema": "heel.host-lease-key-shape.child.v1"}, {"uid": True}, {"uid": 0},
                      {"tests_seconds": 601}, {"tests_seconds": 5.0}, {"token": "0123456789ABCDEF0123456789ABCDEF"},
-                     {"out": str(base)}, {"wheels": str(wheels) + "/"}, {"out": "relative/out"}):
+                     {"out": str(base)}, {"wheels": str(wheels) + "/"}, {"out": "relative/out"}, {"diagnostic_key": "ab" * 31},
+                     {"diagnostic_key": "AB" * 32}, {"diagnostic_key": None}, {"anchor_ns": -1}, {"anchor_ns": 1.0},
+                     {"anchor_ns": True}):
         assert LAUNCHER.validated_request(json.dumps({**good, **mutation})) is None, mutation
     assert LAUNCHER.validated_request("[]") is None and LAUNCHER.validated_request("{") is None
     (wheels / LAUNCHER.WHEEL_FILES[-1]).unlink()  # seven wheels: the client closure is incomplete
@@ -842,6 +845,15 @@ def _run_token() -> bytes:
 
 
 TOKEN = _run_token()
+
+
+def _diagnostic_key() -> bytes | None:
+    """The launcher's run-private link-diagnostic HMAC key (absent outside the launcher: no registry)."""
+    value = os.environ.get(LAUNCHER.DIAG_KEY_ENV, "")
+    return bytes.fromhex(value) if re.fullmatch(r"[0-9a-f]{64}", value) else None
+
+
+DIAG_KEY = _diagnostic_key()
 
 
 def sleep_until(target_ns: int) -> None:
@@ -1320,6 +1332,7 @@ class Fixture:
         mac_l, mac_r = bytes((2, 0x48, 0x32, 0, self.n & 255, 0x0a)), bytes((2, 0x48, 0x32, 0, self.n & 255, 0x0b))
         text_l, text_r = (":".join(f"{byte:02x}" for byte in mac) for mac in (mac_l, mac_r))
         self._create_veth(a, mac_l, b, mac_r)
+        self._register(((self.l_fd, a, text_l, "l"), (self.r_fd, b, text_r, "r")))
         self.facts["peer_link_in_r"] = int(self.ip(self.r_fd, "link", "show", "dev", b))
         steps = [(self.l_fd, "link", "set", "lo", "up"), (self.r_fd, "link", "set", "lo", "up"),
                  (self.l_fd, "addr", "add", f"{SLOT_SRC}/32", "dev", a), (self.l_fd, "addr", "add", f"{WRONG_SOURCE}/32", "dev", a),
@@ -1347,6 +1360,26 @@ class Fixture:
         routes = _run_in(self.l_fd, [AUTHORITY.IP_PATH, "-4", "route", "show", "default"]).stdout.strip()
         routes6 = _run_in(self.l_fd, [AUTHORITY.IP_PATH, "-6", "route", "show", "default"]).stdout.strip()
         self.facts["default_routes"] = int(bool(routes)) + int(bool(routes6))
+
+    def _register(self, endpoints) -> None:
+        """Supplementary ownership evidence for the launcher's host-link diagnostics, never a case, fact
+        or verdict: right after the veth exists, a read-only listing of each endpoint in its own
+        namespace (by descriptor), keyed with the run key and appended to the registry beside the
+        records. Any failure here only leaves the registry short or unobserved."""
+        if DIAG_KEY is None:
+            return
+        try:
+            outer = os.stat("/proc/self/ns/net")
+            lines = []
+            for fd, name, mac, side in endpoints:
+                listing = _run_in(fd, [AUTHORITY.IP_PATH, "-o", "link", "show", "dev", name])
+                lines.append(LAUNCHER.ownership_record(DIAG_KEY, self.n, side, _identity(fd), (outer.st_dev, outer.st_ino),
+                                                       name, mac, listing.stdout if listing.returncode == 0 else None))
+            path = Path(os.environ[LAUNCHER.RECORDS_ENV]).with_name(LAUNCHER.OWNERSHIP_FILE)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("".join(json.dumps(line, sort_keys=True) + "\n" for line in lines))
+        except Exception:  # noqa: BLE001 - diagnostics only; the fixture and every verdict are unaffected
+            return
 
     def _baseline(self) -> dict:
         """Before any table exists every fixed probe kind connects/delivers, so a later denial is the
