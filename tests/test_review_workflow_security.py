@@ -52,13 +52,86 @@ _REQUIRED_FRAGMENTS = (
     "        if: steps.claude_auth.outputs.enabled == 'true' && (failure() || steps.claude.outcome != 'success')\n",
 )
 _FORBIDDEN_FRAGMENTS = ("pull_request_target", "workflow_run")
+_TOP_LEVEL_PERMISSIONS = (
+    (2, "contents", "read"),
+    (2, "pull-requests", "write"),
+    (2, "issues", "write"),
+    (2, "id-token", "write"),
+    (2, "actions", "read"),
+)
+
+# The accepted document shape is deliberately narrow; it is not a YAML parser.
+# Outside block scalars, every non-blank, non-comment line must be one plain
+# mapping key, optionally as a block-sequence item, with a single-line value.
+# Anything else (quoted/explicit/tagged keys, anchors, aliases, flow mappings,
+# multi-line quoted values, document markers, tabs, CR, non-ASCII) is rejected,
+# so a key the policy cannot see cannot reach GitHub's parser unnoticed.
+_KEY_LINE = re.compile(r"(?P<indent> *)(?P<dash>- +)?(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?: +(?P<value>.*))?")
+_BLOCK_SCALAR = re.compile(r"[|>][-+]?(?: +#.*)?")
+_PLAIN_VALUE = re.compile(r"""[^\s\-?:,\[\]{}#&*!|>'"%@`].*|-[^\s].*""")
+_QUOTED_VALUE = re.compile(r"""(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')(?: +#.*)?""")
+_FLOW_SEQUENCE = re.compile(r"\[[A-Za-z0-9_, -]*\](?: +#.*)?")
+_SUPPORTED_CHARACTERS = re.compile(r"[\x20-\x7e\n]*")
+
+
+def _structure(text: str) -> tuple[list[tuple[int, int, str, str, str]], list[str]]:
+    """Return (line, indent, key, value, raw) for every structural key, plus unsupported lines."""
+    entries: list[tuple[int, int, str, str, str]] = []
+    unsupported: list[str] = []
+    if not _SUPPORTED_CHARACTERS.fullmatch(text):
+        unsupported.append("tab, carriage return or non-ASCII character")
+    block_floor: int | None = None
+    block_indent: int | None = None
+    for number, raw in enumerate(text.split("\n"), 1):
+        indent = len(raw) - len(raw.lstrip(" "))
+        if block_floor is not None:
+            if not raw.strip():
+                continue
+            if block_indent is None and indent > block_floor:
+                block_indent = indent
+            if block_indent is not None and indent >= block_indent:
+                continue
+            block_floor = block_indent = None
+        if not raw.strip() or raw[indent:].startswith("#"):
+            continue
+        match = _KEY_LINE.fullmatch(raw)
+        if match is None:
+            unsupported.append(f"line {number}: {raw.strip()[:60]}")
+            continue
+        value = match["value"] or ""
+        if _BLOCK_SCALAR.fullmatch(value):
+            block_floor = indent + len(match["dash"] or "")
+        elif value and not value.startswith("#") and not (
+                _PLAIN_VALUE.fullmatch(value) or _QUOTED_VALUE.fullmatch(value)
+                or _FLOW_SEQUENCE.fullmatch(value)):
+            unsupported.append(f"line {number}: unsupported value form {value[:40]}")
+        entries.append((number, len(match["indent"]) + len(match["dash"] or ""), match["key"], value, raw))
+    return entries, unsupported
+
+
+def _permission_violations(entries: list[tuple[int, int, str, str, str]]) -> list[str]:
+    positions = [i for i, entry in enumerate(entries) if entry[2].lower() == "permissions"]
+    if len(positions) != 1 or entries[positions[0]][1:4] != (0, "permissions", ""):
+        return ["permissions must be exactly the top-level block, with no job or other override"]
+    block = []
+    for entry in entries[positions[0] + 1:]:
+        if entry[1] == 0:
+            break
+        block.append(entry[1:4])
+    if tuple(block) != _TOP_LEVEL_PERMISSIONS:
+        return ["top-level permissions block differs from the accepted entries"]
+    return []
 
 
 def policy_violations(text: str) -> list[str]:
     """Return every violation of the reviewer workflow's security policy."""
     violations: list[str] = []
-    references = _USES_LINE.findall(text)
-    if len(references) != len(_USES_KEY.findall(text)):
+    entries, unsupported = _structure(text)
+    violations.extend(f"unsupported workflow shape: {item}" for item in unsupported)
+    violations.extend(_permission_violations(entries))
+    uses_lines = [raw for _, _, key, _, raw in entries if key.lower() == "uses"]
+    references = [match.group(1) for match in map(_USES_LINE.fullmatch, uses_lines) if match]
+    if len(references) != len(uses_lines) or len(references) != len(_USES_KEY.findall(text)):
         violations.append("a uses: key is not in the plain block form this policy can verify")
     if not references:
         violations.append("no action references found")
@@ -158,6 +231,92 @@ class ReviewWorkflowSecurityTest(unittest.TestCase):
             with self.subTest(name):
                 self.assertIn(old, self.source)
                 self.assertTrue(self._check_fixture(self.source.replace(old, new, 1)))
+
+    def _variant(self, old: str, new: str) -> str:
+        self.assertEqual(self.source.count(old), 1, f"anchor is not unique: {old!r}")
+        mutated = self.source.replace(old, new, 1)
+        self.assertNotEqual(mutated, self.source, "mutation did not apply")
+        return mutated
+
+    def test_independent_review_counterexamples_are_rejected(self):
+        for name, (old, new) in _REVIEW_COUNTEREXAMPLES.items():
+            with self.subTest(name):
+                self.assertTrue(self._check_fixture(self._variant(old, new)))
+
+    def test_quoted_or_unsupported_uses_keys_are_rejected(self):
+        for name, (old, new) in _UNSUPPORTED_USES_KEYS.items():
+            with self.subTest(name):
+                self.assertTrue(self._check_fixture(self._variant(old, new)))
+
+    def test_permission_overrides_and_widening_are_rejected(self):
+        for name, (old, new) in _PERMISSION_OVERRIDES.items():
+            with self.subTest(name):
+                self.assertTrue(self._check_fixture(self._variant(old, new)))
+        second_job = self.source + (
+            "\n  extra:\n    permissions: write-all\n    runs-on: ubuntu-latest\n"
+            "    steps:\n      - run: echo extra\n")
+        self.assertTrue(self._check_fixture(second_job))
+
+    def test_unsupported_document_shapes_fail_closed(self):
+        for name, (old, new) in _UNSUPPORTED_SHAPES.items():
+            with self.subTest(name):
+                self.assertTrue(self._check_fixture(self._variant(old, new)))
+
+    def test_supported_shape_variants_are_accepted(self):
+        for name, (old, new) in _ACCEPTED_VARIANTS.items():
+            with self.subTest(name):
+                self.assertEqual(self._check_fixture(self._variant(old, new)), [])
+
+
+_RESOLVE = "      - name: Resolve PR number\n"
+_RUNS_ON = "    runs-on: ubuntu-latest\n"
+_CHECKOUT_PREFIX = "      - uses: actions/checkout@"
+
+# Byte-for-byte the independent review's two valid-YAML counterexamples (actionlint 1.7.8 exit 0).
+_REVIEW_COUNTEREXAMPLES = {
+    "quoted-uses-key": (_RESOLVE, '      - "uses": actions/setup-node@v4\n' + _RESOLVE),
+    "job-permission-override": (_RUNS_ON, "    permissions: write-all\n" + _RUNS_ON),
+}
+_UNSUPPORTED_USES_KEYS = {
+    "single-quoted": (_RESOLVE, "      - 'uses': actions/setup-node@v4\n" + _RESOLVE),
+    "quoted-with-pinned-ref": (
+        _RESOLVE, '      - "uses": actions/setup-node@' + "0123456789abcdef" * 2 + "01234567\n" + _RESOLVE),
+    "quoted-existing-key": (_CHECKOUT_PREFIX, '      - "uses": actions/checkout@'),
+    "escaped-quoted": (_RESOLVE, '      - "u\\x73es": actions/setup-node@v4\n' + _RESOLVE),
+    "space-before-colon": (_RESOLVE, "      - uses : actions/setup-node@v4\n" + _RESOLVE),
+    "explicit-key": (_RESOLVE, "      - ? uses\n        : actions/setup-node@v4\n" + _RESOLVE),
+    "capitalized": (_RESOLVE, "      - Uses: actions/setup-node@v4\n" + _RESOLVE),
+}
+_PERMISSION_OVERRIDES = {
+    "job-mapping": (_RUNS_ON, "    permissions:\n      contents: write\n" + _RUNS_ON),
+    "job-read-all": (_RUNS_ON, "    permissions: read-all\n" + _RUNS_ON),
+    "quoted-job-key": (_RUNS_ON, '    "permissions": write-all\n' + _RUNS_ON),
+    "capitalized-job-key": (_RUNS_ON, "    Permissions: write-all\n" + _RUNS_ON),
+    "top-level-entry-after-blank": ("  actions: read\n\n", "  actions: read\n\n  checks: write\n\n"),
+    "top-level-entry-replaced": ("  issues: write\n", "  checks: write\n"),
+}
+_UNSUPPORTED_SHAPES = {
+    "tab-indent": (_RESOLVE, "\t- uses: actions/setup-node@v4\n" + _RESOLVE),
+    # read_text() maps CR/CRLF to "\n" as YAML does; NEL is a YAML 1.1 break Python does not split on.
+    "next-line-break": (_RESOLVE, "      - name: Note\x85      uses: actions/setup-node@v4\n" + _RESOLVE),
+    "under-indented-block-line": (
+        "       github.event.pull_request.head.repo.full_name == github.repository)\n",
+        "       github.event.pull_request.head.repo.full_name == github.repository)\n"
+        '     "uses": actions/setup-node@v4\n'),
+    "anchor": ("    runs-on: ubuntu-latest\n", "    runs-on: &runner ubuntu-latest\n"),
+    "flow-mapping-value": ("          fetch-depth: 0\n", "          fetch-depth: {uses: actions/setup-node@v4}\n"),
+    "unterminated-quote": ("          fetch-depth: 0\n", '          fetch-depth: "0\n'),
+    "document-marker": ("name: Claude reviewer\n", "---\nname: Claude reviewer\n"),
+    "non-ascii": ("name: Claude reviewer\n", "name: Claude reviewer \n"),
+}
+_ACCEPTED_VARIANTS = {
+    "quoted-value": ("          fetch-depth: 0\n", '          fetch-depth: "0"\n'),
+    "extra-run-step": (_RESOLVE, "      - name: Note\n        run: echo note\n" + _RESOLVE),
+    "block-text-mentions-keys": (
+        "            ## Output format\n",
+        '            "uses": actions/setup-node@v4\n            permissions: write-all\n\n'
+        "            ## Output format\n"),
+}
 
 
 if __name__ == "__main__":
